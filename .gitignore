@@ -81,3 +81,8 @@ benchmarks/prod_compare/*/flink-job/target/
 # A stray local-path interpretation of the rocksdb:// URI can drop a
 # rocksdb:/ dir next to the bench when a child process cwd's locally.
 benchmarks/prod_compare/*/rocksdb:/
+
+# Internal work-tracking docs live locally only; never under version control.
+# (the buildable consumer-examples stay tracked)
+/docs/*
+!/docs/consumer-examples/

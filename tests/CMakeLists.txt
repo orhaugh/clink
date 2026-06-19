@@ -46,6 +46,7 @@ add_executable(clink_core_tests
     test_dag_self_join.cpp
     test_broadcast_state.cpp
     test_parallel_reduce.cpp
+    test_keyed_aggregate_operator.cpp
     test_network_channel.cpp
     test_network_channel_credit.cpp
     test_state_schema_version.cpp
