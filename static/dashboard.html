@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>clink dashboard</title>
+<style>
+:root {
+  color-scheme: dark light;
+  --fg: #d4d4d4;
+  --bg: #1e1e1e;
+  --bg-card: #252526;
+  --accent: #569cd6;
+  --ok: #6a9955;
+  --warn: #d7ba7d;
+  --err: #f48771;
+  --muted: #808080;
+  --line: #333;
+}
+body {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  background: var(--bg);
+  color: var(--fg);
+  margin: 0;
+  padding: 1rem;
+  font-size: 13px;
+}
+h1 { font-size: 1.05rem; margin: 0 0 1rem 0; color: var(--accent); display: flex; align-items: center; gap: 0.75rem; }
+h2 { font-size: 0.85rem; margin: 0 0 0.5rem 0; color: var(--accent); text-transform: uppercase; letter-spacing: 0.05em; }
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 0.75rem;
+}
+.row { display: flex; justify-content: space-between; gap: 1rem; padding: 0.1rem 0; }
+.row > span:first-child { color: var(--muted); }
+.muted { color: var(--muted); }
+.ok { color: var(--ok); }
+.warn { color: var(--warn); }
+.err { color: var(--err); }
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+th, td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: normal; text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.7rem; }
+tr:last-child td { border-bottom: none; }
+button {
+  background: transparent; border: 1px solid var(--line); color: var(--fg);
+  padding: 0.15rem 0.5rem; cursor: pointer; font-family: inherit; font-size: 0.75rem;
+  border-radius: 3px;
+}
+button:hover { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: 0.3; cursor: default; }
+.live-pill {
+  display: inline-block; padding: 0.1rem 0.55rem; border-radius: 999px;
+  background: var(--line); font-size: 0.7rem; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.05em;
+}
+.live-pill.on { background: var(--ok); color: #1e1e1e; }
+.live-pill.off { background: var(--err); color: #1e1e1e; }
+.event { padding: 0.2rem 0; border-bottom: 1px solid var(--line); font-size: 0.8rem; }
+.event:last-child { border-bottom: none; }
+.event .ts { color: var(--muted); margin-right: 0.6rem; }
+.event .type { color: var(--accent); margin-right: 0.6rem; }
+.logs > div { padding: 0.15rem 0; font-size: 0.8rem; }
+.logs .level-info { color: var(--fg); }
+.logs .level-warn { color: var(--warn); }
+.logs .level-error { color: var(--err); }
+.scroll { max-height: 14rem; overflow-y: auto; padding-right: 0.25rem; }
+.scroll::-webkit-scrollbar { width: 6px; }
+.scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+.detail { padding: 0.5rem 0.75rem; background: rgba(0,0,0,0.2); border-radius: 3px; margin: 0.25rem 0 0.5rem 0; font-size: 0.8rem; }
+.detail h3 { font-size: 0.7rem; margin: 0.5rem 0 0.25rem 0; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.detail h3:first-child { margin-top: 0; }
+.detail .errors { color: var(--err); }
+.bar { display: inline-block; width: 5rem; height: 0.5rem; background: var(--line); border-radius: 2px; vertical-align: middle; overflow: hidden; }
+.bar > div { height: 100%; background: var(--ok); }
+.bar > div.warn { background: var(--warn); }
+.bar > div.err { background: var(--err); }
+.row-clickable { cursor: pointer; }
+.row-clickable:hover td { background: rgba(86,156,214,0.05); }
+input[type=file], input[type=text] {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+  font-family: inherit; font-size: 0.8rem; padding: 0.25rem 0.4rem; border-radius: 3px;
+}
+input[type=text] { width: 12rem; }
+.submit-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+.submit-status { font-size: 0.8rem; color: var(--muted); }
+.submit-status.ok { color: var(--ok); }
+.submit-status.err { color: var(--err); }
+</style>
+</head>
+<body>
+<h1>clink dashboard <span id="live" class="live-pill">connecting</span></h1>
+
+<div class="card">
+  <h2>cluster</h2>
+  <div id="cluster" class="muted">loading...</div>
+</div>
+
+<div class="card">
+  <h2>submit job</h2>
+  <form id="submit-form" class="submit-row">
+    <input type="file" id="submit-file" name="job_so" accept=".so,application/octet-stream" required>
+    <input type="text" id="submit-name" name="job_name" placeholder="name (optional)">
+    <button type="submit">submit</button>
+    <span id="submit-status" class="submit-status">no upload yet</span>
+  </form>
+</div>
+
+<div class="card">
+  <h2>task managers</h2>
+  <div id="tms" class="muted">loading...</div>
+</div>
+
+<div class="card">
+  <h2>backpressure <span class="muted">(max input depth across operators)</span></h2>
+  <div id="backpressure" class="muted">scraping TMs...</div>
+</div>
+
+<div class="card">
+  <h2>jobs</h2>
+  <div id="jobs" class="muted">loading...</div>
+</div>
+
+<div class="card">
+  <h2>events <span class="muted">(live)</span></h2>
+  <div id="events" class="scroll muted">waiting for events...</div>
+</div>
+
+<div class="card">
+  <h2>logs <span class="muted">(info and above)</span></h2>
+  <div id="logs" class="scroll logs muted">loading...</div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+  // clink dashboard SPA. No build step, no external dependencies -
+  // ships embedded as a C++ string constant alongside clink_node.
+  // Talks only to the JM's own HTTP API.
+
+  const $ = (id) => document.getElementById(id);
+  const fmtTs = (ms) => new Date(ms).toISOString().substring(11, 19);
+  const esc = (s) => String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+  const POLL_MS = 3000;
+  const MAX_EVENTS = 50;
+  const MAX_LOGS = 100;
+  const events = [];
+
+  async function fetchJson(path) {
+    const r = await fetch(path);
+    if (!r.ok) throw new Error(path + ': ' + r.status);
+    return r.json();
+  }
+
+  function renderCluster(c) {
+    $('cluster').classList.remove('muted');
+    $('cluster').innerHTML =
+      '<div class="row"><span>bind</span><span>' + esc(c.bind_host) + ':' + c.control_port + '</span></div>' +
+      '<div class="row"><span>advertise</span><span>' + esc(c.advertise_host) + '</span></div>' +
+      '<div class="row"><span>slots</span><span>' + c.slots_in_use + ' / ' + c.total_slot_capacity + '</span></div>' +
+      '<div class="row"><span>jobs</span><span>' + c.jobs_running + ' running, ' + c.jobs_completed + ' completed (' + c.jobs_total + ' total)</span></div>';
+  }
+
+  function renderTms(tms) {
+    const el = $('tms');
+    if (!tms || !tms.length) { el.innerHTML = '<span class="muted">no TMs registered</span>'; return; }
+    el.classList.remove('muted');
+    let h = '<table><tr><th>tm_id</th><th>host</th><th>slots</th><th>http</th><th>status</th></tr>';
+    for (const t of tms) {
+      const status = t.lost ? '<span class="err">lost</span>' : '<span class="ok">ok</span>';
+      h += '<tr><td>' + esc(t.tm_id) + '</td>'
+        + '<td>' + esc(t.data_host) + '</td>'
+        + '<td>' + t.slots_in_use + ' / ' + t.slot_capacity + '</td>'
+        + '<td>' + (t.http_port || '-') + '</td>'
+        + '<td>' + status + '</td></tr>';
+    }
+    h += '</table>';
+    el.innerHTML = h;
+  }
+
+  // Tracks which job rows are expanded so re-renders don't collapse
+  // them. Keyed by job id (number).
+  const expandedJobs = new Set();
+
+  function renderJobs(jobs) {
+    const el = $('jobs');
+    if (!jobs || !jobs.length) { el.innerHTML = '<span class="muted">no jobs</span>'; return; }
+    el.classList.remove('muted');
+    let h = '<table><tr><th>id</th><th>status</th><th>progress</th><th>errors</th><th></th></tr>';
+    for (const j of jobs) {
+      let status;
+      if (j.cancel_requested && !j.completion_signalled) status = '<span class="warn">cancelling</span>';
+      else if (!j.completion_signalled) status = '<span class="ok">running</span>';
+      else if (j.cancel_requested) status = '<span class="warn">cancelled</span>';
+      else if (j.error_count > 0) status = '<span class="err">failed</span>';
+      else status = '<span class="muted">ok</span>';
+      const btn = (!j.completion_signalled && !j.cancel_requested)
+        ? '<button data-cancel="' + j.id + '">cancel</button>' : '';
+      h += '<tr class="row-clickable" data-job="' + j.id + '">'
+        + '<td>#' + j.id + (expandedJobs.has(j.id) ? ' ▾' : ' ▸') + '</td>'
+        + '<td>' + status + '</td>'
+        + '<td>' + j.completed_count + ' / ' + j.expected_completion + '</td>'
+        + '<td>' + (j.error_count || '') + '</td>'
+        + '<td>' + btn + '</td></tr>';
+      if (expandedJobs.has(j.id)) {
+        h += '<tr><td colspan="5"><div class="detail" id="detail-' + j.id + '">loading...</div></td></tr>';
+      }
+    }
+    h += '</table>';
+    el.innerHTML = h;
+    el.querySelectorAll('[data-cancel]').forEach(b => {
+      b.onclick = async (e) => {
+        e.stopPropagation();
+        b.disabled = true;
+        await fetch('/api/v1/jobs/' + b.dataset.cancel + '/cancel', { method: 'POST' });
+        refresh();
+      };
+    });
+    el.querySelectorAll('[data-job]').forEach(row => {
+      row.onclick = () => {
+        const id = parseInt(row.dataset.job, 10);
+        if (expandedJobs.has(id)) expandedJobs.delete(id);
+        else expandedJobs.add(id);
+        refresh();
+      };
+    });
+    // Lazily fetch detail for each expanded job. Detail is /api/v1/jobs/:id,
+    // which carries errors[], tasks[], and checkpoint state.
+    for (const j of jobs) {
+      if (!expandedJobs.has(j.id)) continue;
+      fetchJson('/api/v1/jobs/' + j.id).then(d => {
+        const dEl = document.getElementById('detail-' + j.id);
+        if (!dEl) return;
+        let dh = '';
+        dh += '<h3>checkpoints</h3>';
+        dh += '<div>latest completed: ' + (d.latest_completed_checkpoint_id || '<span class="muted">none</span>') + '</div>';
+        dh += '<div>pending: ' + (d.pending_checkpoint_ids && d.pending_checkpoint_ids.length
+          ? d.pending_checkpoint_ids.join(', ')
+          : '<span class="muted">none</span>') + '</div>';
+        if (d.errors && d.errors.length) {
+          dh += '<h3 class="errors">errors</h3>';
+          for (const er of d.errors) dh += '<div class="errors">' + esc(er) + '</div>';
+        }
+        if (d.tasks && d.tasks.length) {
+          dh += '<h3>tasks</h3>';
+          for (const t of d.tasks) {
+            dh += '<div>' + esc(t.role) + '[' + t.subtask_idx + '] @ ' + esc(t.tm_id) + '</div>';
+          }
+        }
+        dEl.innerHTML = dh;
+      }).catch(e => {
+        const dEl = document.getElementById('detail-' + j.id);
+        if (dEl) dEl.innerHTML = '<span class="err">detail fetch failed: ' + esc(String(e)) + '</span>';
+      });
+    }
+  }
+
+  // Parse a Prometheus exposition body and return the highest
+  // value across metrics whose name matches `predicate(name)`.
+  function maxMetric(body, predicate) {
+    let max = 0;
+    let max_for = null;
+    for (const line of body.split('\n')) {
+      if (!line || line.startsWith('#')) continue;
+      const sp = line.indexOf(' ');
+      if (sp < 0) continue;
+      const name = line.substring(0, sp);
+      const v = parseFloat(line.substring(sp + 1));
+      if (!isFinite(v)) continue;
+      if (predicate(name) && v > max) { max = v; max_for = name; }
+    }
+    return { max, name: max_for };
+  }
+
+  async function refreshBackpressure(tms) {
+    const el = $('backpressure');
+    if (!tms || !tms.length) { el.innerHTML = '<span class="muted">no TMs</span>'; return; }
+    // Scrape each TM's /metrics via the JM proxy. Pick the worst
+    // (depth/capacity) ratio across all operators on all TMs.
+    let worstRatio = 0;
+    let worstLabel = null;
+    let worstTm = null;
+    for (const t of tms) {
+      if (!t.http_port || t.lost) continue;
+      try {
+        const r = await fetch('/api/v1/tms/' + encodeURIComponent(t.tm_id) + '/metrics');
+        if (!r.ok) continue;
+        const body = await r.text();
+        // Find max input_depth across operators, and the matching capacity.
+        const depths = {};
+        const caps = {};
+        for (const line of body.split('\n')) {
+          if (!line || line.startsWith('#')) continue;
+          const sp = line.indexOf(' ');
+          if (sp < 0) continue;
+          const name = line.substring(0, sp);
+          const v = parseFloat(line.substring(sp + 1));
+          const m = name.match(/^operator\.(\d+)\.input_(depth|capacity)$/);
+          if (!m) continue;
+          if (m[2] === 'depth') depths[m[1]] = v;
+          else caps[m[1]] = v;
+        }
+        for (const id of Object.keys(depths)) {
+          const c = caps[id] || 0;
+          if (c <= 0) continue;
+          const ratio = depths[id] / c;
+          if (ratio > worstRatio) {
+            worstRatio = ratio;
+            worstLabel = depths[id] + ' / ' + c;
+            worstTm = t.tm_id + ' op #' + id;
+          }
+        }
+      } catch (e) { /* TM offline / no operators */ }
+    }
+    el.classList.remove('muted');
+    if (worstLabel) {
+      const pct = Math.round(worstRatio * 100);
+      const cls = pct > 80 ? 'err' : pct > 50 ? 'warn' : '';
+      el.innerHTML =
+        '<div class="row"><span>worst queue</span>'
+        + '<span><span class="bar"><div class="' + cls + '" style="width:' + Math.min(pct, 100) + '%"></div></span> '
+        + pct + '% (' + esc(worstLabel) + ')</span></div>'
+        + '<div class="row"><span>operator</span><span>' + esc(worstTm) + '</span></div>';
+    } else {
+      el.innerHTML = '<span class="muted">no operators reporting depth / all idle</span>';
+    }
+  }
+
+  function renderLogs(logs) {
+    const el = $('logs');
+    if (!logs || !logs.length) { el.innerHTML = '<span class="muted">no logs</span>'; return; }
+    el.classList.remove('muted');
+    let h = '';
+    for (const l of logs.slice(-MAX_LOGS)) {
+      h += '<div class="level-' + esc(l.level) + '">'
+        + '<span class="muted">' + fmtTs(l.ts_ms) + '</span> '
+        + '[' + esc(l.level) + '] ' + esc(l.source) + ': ' + esc(l.message)
+        + '</div>';
+    }
+    el.innerHTML = h;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function pushEvent(type, data) {
+    events.push({ ts_ms: Date.now(), type: type, data: data });
+    while (events.length > MAX_EVENTS) events.shift();
+    const el = $('events');
+    el.classList.remove('muted');
+    let h = '';
+    for (const e of events) {
+      h += '<div class="event">'
+        + '<span class="ts">' + fmtTs(e.ts_ms) + '</span>'
+        + '<span class="type">' + esc(e.type) + '</span>'
+        + '<span>' + esc(e.data) + '</span></div>';
+    }
+    el.innerHTML = h;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  async function refresh() {
+    try {
+      const [c, t, j, l] = await Promise.all([
+        fetchJson('/api/v1/cluster'),
+        fetchJson('/api/v1/tms').then(x => x.task_managers || []),
+        fetchJson('/api/v1/jobs').then(x => x.jobs || []),
+        fetchJson('/api/v1/logs?level=info&limit=100').then(x => x.logs || []),
+      ]);
+      renderCluster(c);
+      renderTms(t);
+      renderJobs(j);
+      renderLogs(l);
+      refreshBackpressure(t);  // fire-and-forget; updates async
+    } catch (e) {
+      // Don't blow the loop on a transient failure; pill turns off via SSE.
+      console.error('refresh failed:', e);
+    }
+  }
+
+  function wireSubmitForm() {
+    const form = $('submit-form');
+    const status = $('submit-status');
+    form.onsubmit = async (ev) => {
+      ev.preventDefault();
+      const file = $('submit-file').files[0];
+      if (!file) { status.textContent = 'pick a .so first'; status.className = 'submit-status err'; return; }
+      const name = $('submit-name').value.trim();
+      status.textContent = 'uploading...';
+      status.className = 'submit-status';
+      const fd = new FormData();
+      fd.append('job_so', file, file.name);
+      if (name) fd.append('job_name', name);
+      try {
+        const r = await fetch('/api/v1/jobs', { method: 'POST', body: fd });
+        const j = await r.json();
+        if (j.ok) {
+          status.textContent = 'submitted job #' + j.job_id + ' (name=' + j.name + ')';
+          status.className = 'submit-status ok';
+          form.reset();
+          refresh();
+        } else {
+          status.textContent = 'failed: ' + (j.error || 'unknown');
+          status.className = 'submit-status err';
+        }
+      } catch (e) {
+        status.textContent = 'failed: ' + e;
+        status.className = 'submit-status err';
+      }
+    };
+  }
+
+  function connectEvents() {
+    const pill = $('live');
+    const es = new EventSource('/api/v1/events');
+    es.onopen = () => { pill.textContent = 'live'; pill.className = 'live-pill on'; };
+    es.onerror = () => { pill.textContent = 'reconnecting'; pill.className = 'live-pill off'; };
+    const onEvent = (ev) => { pushEvent(ev.type, ev.data || ''); refresh(); };
+    // Subscribe to known event types explicitly. An unrecognised type
+    // arriving on the stream is a programming error, not silently
+    // dropped UI state.
+    for (const t of ['jm.tm_registered', 'jm.tm_lost', 'jm.job_submitted', 'jm.job_completed']) {
+      es.addEventListener(t, onEvent);
+    }
+  }
+
+  refresh();
+  setInterval(refresh, POLL_MS);
+  connectEvents();
+  wireSubmitForm();
+})();
+</script>
+</body>
+</html>

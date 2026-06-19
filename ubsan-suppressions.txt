@@ -1,0 +1,25 @@
+# UndefinedBehaviorSanitizer suppressions for clink.
+#
+# Format: <check>:<source-path-substring> (one rule per line, # for comments).
+# Loaded via UBSAN_OPTIONS=suppressions=...:print_suppressions=1.
+#
+# Like tsan-suppressions.txt: we only suppress reports that originate
+# inside third-party libraries we vendor - not anything in clink's
+# own code. UBSan reports against vendored code are upstream's
+# concern, not ours, and surface as test failures that mask real
+# issues we *should* catch.
+
+# RocksDB v11.1.1 ships a hand-tuned ARM64 CRC32C implementation in
+# util/crc32c_arm64.cc that loads 8 bytes from a not-necessarily-
+# 8-byte-aligned address. Compiles down to a NEON sequence that
+# tolerates the misalignment, but UBSan's `alignment` check fires
+# on the raw load. Well-known upstream issue. Suppress for now -
+# the fix lives in RocksDB.
+alignment:rocksdb-src/
+
+# RocksDB's port/port_posix and util layers occasionally hit
+# `function` (cast to mismatched function pointer type) and
+# `vptr` (member call on dynamic-type mismatch) checks for the same
+# reason - vendored code we don't instrument cleanly.
+function:rocksdb-src/
+vptr:rocksdb-src/

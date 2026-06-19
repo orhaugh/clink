@@ -1,0 +1,83 @@
+# Build dirs (build_and_test.sh creates one per sanitizer mode)
+build/
+build-*/
+cmake-build-*/
+out/
+
+# Local install-staging dir used to dry-run `cmake --install`
+_stage/
+
+# IDEs / language servers
+.vscode/
+.idea/
+.cache/
+.clangd/
+.ccls-cache/
+.claude/
+compile_flags.txt
+*.iml
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# Binaries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.dSYM/
+
+# Coverage (build_and_test.sh --sanitizer coverage outputs)
+coverage-report/
+*.gcda
+*.gcno
+*.gcov
+*.info
+*.profraw
+*.profdata
+
+# Sanitizer / debug artefacts (core dump files at repo root).
+# Anchored to / so it doesn't match include/clink/core/ etc.
+/core
+core.*
+
+# Package managers
+vcpkg_installed/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Linux build of example plugin .so dropped here by the cluster
+# demo flow (built via clink-build:latest, not host toolchain).
+canonical_pipeline_job.so
+build-linux-jobs/
+
+# In-proc bench artifacts: results logs and Maven shade output.
+benchmarks/inproc_compare/results/
+benchmarks/inproc_compare/flink-job/target/
+
+# Prod-feature bench suite: per-bench results dirs and Maven targets.
+benchmarks/prod_compare/*/results/
+benchmarks/prod_compare/*/flink-job/target/
+# A stray local-path interpretation of the rocksdb:// URI can drop a
+# rocksdb:/ dir next to the bench when a child process cwd's locally.
+benchmarks/prod_compare/*/rocksdb:/

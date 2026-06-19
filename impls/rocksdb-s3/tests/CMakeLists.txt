@@ -1,0 +1,19 @@
+# clink_rocksdb_s3_tests - tests for the rocksdb_s3 remote-state schemes.
+# Links clink::core + clink::rocksdb_s3 (which brings rocksdb + s3).
+
+add_executable(clink_rocksdb_s3_tests
+    register.cpp
+    test_s3_rocksdb_scheme.cpp
+)
+target_link_libraries(clink_rocksdb_s3_tests PRIVATE
+    clink::core
+    clink::rocksdb_s3
+    GTest::gtest_main
+)
+clink_set_warnings(clink_rocksdb_s3_tests)
+gtest_discover_tests(clink_rocksdb_s3_tests
+    DISCOVERY_MODE PRE_TEST
+    # 60s: the live S3 tests exercise the AWS SDK; the dead-endpoint
+    # construction path stays well under it.
+    PROPERTIES TIMEOUT 60 LABELS rocksdb_s3
+)

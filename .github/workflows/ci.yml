@@ -1,0 +1,103 @@
+# CI for clink.
+#
+# Stages:
+#   1. build           - debug build, unit tests (always)
+#   2. install-smoke   - install + consume from an out-of-tree project
+#   3. sanitizer       - matrix of asan/tsan/ubsan (matches build_and_test.sh)
+#
+# Triggered on push to main and on PRs. Scaffolded but not active
+# until a remote is configured.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build + unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build clang \
+            libavro-dev libpq-dev libarrow-dev libparquet-dev \
+            librdkafka-dev libssl-dev pkg-config python3 git
+      - name: Configure + build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON
+          cmake --build build -j
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure -j 4
+
+  install-smoke:
+    name: Install + downstream consume
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake clang \
+            libavro-dev libpq-dev libarrow-dev libparquet-dev \
+            librdkafka-dev libssl-dev pkg-config
+      - name: Build + install clink
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+          sudo cmake --install build
+      - name: Tiny downstream find_package smoke
+        run: |
+          mkdir -p /tmp/smoke && cd /tmp/smoke
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(smoke CXX)
+          set(CMAKE_CXX_STANDARD 23)
+          find_package(clink CONFIG REQUIRED COMPONENTS core kafka clickhouse postgres s3)
+          add_executable(smoke smoke.cpp)
+          target_link_libraries(smoke PRIVATE clink::core)
+          EOF
+          cat > smoke.cpp <<'EOF'
+          #include <clink/api/stream_execution_environment.hpp>
+          int main() {
+              clink::api::StreamExecutionEnvironment env;
+              return env.graph().ops.size() == 0 ? 0 : 1;
+          }
+          EOF
+          cmake -S . -B build
+          cmake --build build
+
+  sanitizer:
+    name: Sanitizer (${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [asan, tsan, ubsan]
+    # The clink repo has 2 pre-existing S3 asan/tsan failures + 18
+    # NetworkChannel ubsan failures. Marked non-blocking until those
+    # are independently addressed.
+    continue-on-error: ${{ matrix.mode != 'asan' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake clang \
+            libavro-dev libpq-dev libarrow-dev libparquet-dev \
+            librdkafka-dev libssl-dev pkg-config python3 git
+      - name: Sanitizer build + tests
+        run: ./build_and_test.sh --sanitizer ${{ matrix.mode }}

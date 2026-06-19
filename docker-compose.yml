@@ -1,0 +1,119 @@
+# clink local cluster - 1 JobManager + 3 TaskManagers.
+#
+# Usage:
+#   # one-time: build the toolchain image (~15 min cold)
+#   docker build -t clink-build:latest -f docker/Dockerfile .
+#
+#   # build runtime image and bring up the cluster
+#   docker compose up --build
+#
+#   # browse the dashboard
+#   open http://localhost:8081
+#
+# Tear down with `docker compose down`. To run a job against this
+# cluster, target jm:6123 from another container on the `clink`
+# network, or expose the JM control port to the host by adding
+# "6123:6123" to the jm service's `ports:` list.
+
+services:
+  jm:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.runtime
+    image: clink-runtime:latest
+    hostname: jm
+    command:
+      - --role=jm
+      - --port=6123
+      - --bind-host=0.0.0.0
+      - --advertise-host=jm
+      - --http-port=8081
+      - --http-bind=0.0.0.0
+    ports:
+      - "8081:8081"  # dashboard / HTTP API
+    networks: [clink]
+    healthcheck:
+      # TMs wait on this - without it, they race the JM's bind() and
+      # exit. /api/v1/health is served as soon as the JM has bound its
+      # control port, so passing this is a reliable readiness signal.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/api/v1/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  tm1:
+    image: clink-runtime:latest
+    hostname: tm1
+    depends_on:
+      jm:
+        condition: service_healthy
+    command:
+      - --role=tm
+      - --id=tm-1
+      - --jm-host=jm
+      - --jm-port=6123
+      - --data-host=tm1
+      - --slots=4
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+    environment:
+      # Subtask data-plane bridges bind 127.0.0.1 by default (safe for
+      # single-host tests). In compose, peer subtasks live in other
+      # containers and need to reach this TM via the bridge network -
+      # bind 0.0.0.0 so cross-container connect() succeeds.
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+    networks: [clink]
+    restart: on-failure
+
+  tm2:
+    image: clink-runtime:latest
+    hostname: tm2
+    depends_on:
+      jm:
+        condition: service_healthy
+    command:
+      - --role=tm
+      - --id=tm-2
+      - --jm-host=jm
+      - --jm-port=6123
+      - --data-host=tm2
+      - --slots=4
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+    environment:
+      # Subtask data-plane bridges bind 127.0.0.1 by default (safe for
+      # single-host tests). In compose, peer subtasks live in other
+      # containers and need to reach this TM via the bridge network -
+      # bind 0.0.0.0 so cross-container connect() succeeds.
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+    networks: [clink]
+    restart: on-failure
+
+  tm3:
+    image: clink-runtime:latest
+    hostname: tm3
+    depends_on:
+      jm:
+        condition: service_healthy
+    command:
+      - --role=tm
+      - --id=tm-3
+      - --jm-host=jm
+      - --jm-port=6123
+      - --data-host=tm3
+      - --slots=4
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+    environment:
+      # Subtask data-plane bridges bind 127.0.0.1 by default (safe for
+      # single-host tests). In compose, peer subtasks live in other
+      # containers and need to reach this TM via the bridge network -
+      # bind 0.0.0.0 so cross-container connect() succeeds.
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+    networks: [clink]
+    restart: on-failure
+
+networks:
+  clink:
+    driver: bridge

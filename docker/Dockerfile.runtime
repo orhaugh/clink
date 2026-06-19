@@ -1,0 +1,41 @@
+## clink runtime image - builds clink_node from source against the
+## pinned build toolchain and ships it ready to run as JM or TM.
+##
+## Prereq: clink-build:latest must exist locally. Build it once with:
+##   docker build -t clink-build:latest -f docker/Dockerfile .
+##
+## After that, docker-compose.yml (at the repo root) builds this image
+## and spins up a 1 JM + 3 TM cluster.
+FROM clink-build:latest
+
+USER root
+WORKDIR /src
+COPY . /src
+# Build clink_node + the unified `clink` client CLI. Release mode
+# for a reasonable runtime footprint; the build image already has
+# every dependency installed so no extra apt-get steps are needed.
+# RocksDB (bundled at the pinned tag in impls/rocksdb/CMakeLists.txt)
+# is fetched and compiled during this step - first build adds ~5-8
+# min, subsequent rebuilds reuse the Docker layer cache.
+#
+# CMAKE_BUILD_PARALLEL_LEVEL caps job-count so the container doesn't
+# spawn one compile per host core. Docker Desktop on Mac caps the
+# container's nproc anyway, but being explicit here keeps the build
+# polite on hosts that haven't tuned Docker's resource allocation.
+ENV CMAKE_BUILD_PARALLEL_LEVEL=4
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --target clink_node \
+    && cmake --build build --target clink \
+    && cp build/clink_node /usr/local/bin/clink_node \
+    && cp build/clink     /usr/local/bin/clink \
+    && rm -rf build
+
+WORKDIR /var/lib/clink
+
+# 6123: JM control plane (TMs connect here)
+# 8081: JM dashboard + HTTP API (also TM HTTP API when set)
+# 6124+: data plane ports - left implicit (auto-bound), reachable via
+# the compose-internal network so no explicit EXPOSE needed.
+EXPOSE 6123 8081
+
+ENTRYPOINT ["clink_node"]

@@ -1,0 +1,14 @@
+// Auto-generated at CMake configure time from static/dashboard.html.
+// Re-run `cmake -S . -B build` to refresh after editing the HTML.
+//
+// The HTML is embedded as a raw string with delimiter `DASHBOARD`. If
+// you ever need to use the literal `)DASHBOARD"` substring in the page,
+// pick a different delimiter here AND in the CMake template.
+
+#pragma once
+
+namespace clink::http {
+
+inline constexpr const char* kDashboardHtml = R"DASHBOARD(@DASHBOARD_HTML_CONTENT@)DASHBOARD";
+
+}  // namespace clink::http

@@ -1,0 +1,91 @@
+add_executable(clink_bench clink_bench.cpp)
+target_link_libraries(clink_bench PRIVATE clink::core)
+clink_set_warnings(clink_bench)
+
+# Serde benchmark - compares the legacy record-by-record Codec<T>
+# wire encoding against the Arrow RecordBatch + IPC path. The Arrow
+# path is the production path; the legacy path is benched as a
+# reference. CLINK_HAS_ARROW is always defined on clink::core.
+add_executable(clink_serde_bench clink_serde_bench.cpp)
+target_link_libraries(clink_serde_bench PRIVATE clink::core)
+clink_set_warnings(clink_serde_bench)
+
+# flink_compare/clink-job: CLINK_REGISTER_JOB .so for the
+# clink-vs-Flink head-to-head harness. Requires the kafka impl
+# headers for the message_source / message_sink helpers.
+if(TARGET clink::kafka)
+    add_library(clink_bench_canonical_pipeline MODULE
+        flink_compare/clink-job/canonical_pipeline.cpp)
+    target_link_libraries(clink_bench_canonical_pipeline PRIVATE
+        clink::core clink::kafka)
+    set_target_properties(clink_bench_canonical_pipeline PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "bench_canonical_pipeline")
+    clink_set_warnings(clink_bench_canonical_pipeline)
+endif()
+
+# inproc_compare/clink-job: in-process bench that drives source + sink
+# from inside the .so so we measure engine work (operator dispatch,
+# RocksDB writes, checkpoint serde) instead of Kafka throughput.
+#
+# Links clink::rocksdb directly into the .so. The .so dlopens with
+# RTLD_LOCAL so its StateBackendFactory::default_instance() singleton
+# is private; the host's clink::rocksdb::install() registration never
+# reaches it. Linking + calling install() from inside define_job
+# closes that gap.
+add_library(clink_inproc_bench_pipeline MODULE
+    inproc_compare/clink-job/inproc_pipeline.cpp)
+target_link_libraries(clink_inproc_bench_pipeline PRIVATE
+    clink::core clink::rocksdb)
+set_target_properties(clink_inproc_bench_pipeline PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "inproc_bench_pipeline")
+clink_set_warnings(clink_inproc_bench_pipeline)
+
+# prod_compare/sliding_window: same shape as inproc but with sliding
+# instead of tumbling - exercises the size/slide=4 fan-out path.
+add_library(clink_sliding_bench_pipeline MODULE
+    prod_compare/sliding_window/clink-job/sliding_pipeline.cpp)
+target_link_libraries(clink_sliding_bench_pipeline PRIVATE
+    clink::core clink::rocksdb)
+set_target_properties(clink_sliding_bench_pipeline PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "sliding_bench_pipeline")
+clink_set_warnings(clink_sliding_bench_pipeline)
+
+# prod_compare/process_function: KeyedProcessFunction with two state
+# slots per key (ValueState + ListState). Emits one record per input
+# record; exercises the read+update+write loop on multiple state slots.
+add_library(clink_process_bench_pipeline MODULE
+    prod_compare/process_function/clink-job/process_pipeline.cpp)
+target_link_libraries(clink_process_bench_pipeline PRIVATE
+    clink::core clink::rocksdb)
+set_target_properties(clink_process_bench_pipeline PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "process_bench_pipeline")
+clink_set_warnings(clink_process_bench_pipeline)
+
+# prod_compare/interval_join: two-stream connect + KeyedCoProcessFunction
+# joining orders with payments via latest-per-key state. v1 has no time
+# window enforcement; v2 will layer event-time bounds + broadcast state.
+add_library(clink_join_bench_pipeline MODULE
+    prod_compare/interval_join/clink-job/join_pipeline.cpp)
+target_link_libraries(clink_join_bench_pipeline PRIVATE
+    clink::core clink::rocksdb)
+set_target_properties(clink_join_bench_pipeline PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "join_bench_pipeline")
+clink_set_warnings(clink_join_bench_pipeline)
+
+# prod_compare/parallel_recovery: same workload as inproc_compare but
+# at parallelism=N. Source shards the cursor across subtasks; key_by
+# routes by extractor name so hash-partitioning is consistent. v1 has
+# no induced-crash test; v2 will kill the TM mid-run.
+add_library(clink_parallel_bench_pipeline MODULE
+    prod_compare/parallel_recovery/clink-job/parallel_pipeline.cpp)
+target_link_libraries(clink_parallel_bench_pipeline PRIVATE
+    clink::core clink::rocksdb)
+set_target_properties(clink_parallel_bench_pipeline PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "parallel_bench_pipeline")
+clink_set_warnings(clink_parallel_bench_pipeline)

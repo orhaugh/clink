@@ -1,0 +1,26 @@
+# Build outputs - each variant lives under its own root in .gitignore
+build/
+build-*/
+cmake-build-*/
+out/
+
+# Tooling caches that would otherwise balloon the build context
+# (.git is intentionally NOT ignored - CMake hashes HEAD into the
+# plugin ABI version so JM and plugin .so's must agree on it. ~10MB.)
+.cache/
+.clangd/
+.ccls-cache/
+.vscode/
+.idea/
+compile_commands.json
+compile_flags.txt
+
+# Test artifacts
+Testing/
+*.gcda
+*.gcno
+*.gcov
+
+# OS / editor cruft
+.DS_Store
+*.swp

@@ -1,0 +1,55 @@
+# ThreadSanitizer suppressions for clink.
+#
+# Format: <type>:<symbol_substring> (one rule per line, # for comments).
+# Loaded via TSAN_OPTIONS=suppressions=...:print_suppressions=1.
+#
+# We only suppress reports that originate inside third-party libraries
+# we don't compile with TSan ourselves. TSan can't reason about the
+# internal synchronisation of pre-built shared libraries, so the
+# reports it produces against them are noise - not signal.
+
+# librdkafka has a heavily threaded internal architecture (broker
+# threads, producer queue thread, mock cluster threads). It uses
+# atomic primitives that bypass TSan's instrumentation, which TSan
+# reports as races. The library's own test suite is clean.
+race:librdkafka.so
+race:rdkafka_msg_partitioner
+race:rd_kafka_
+
+# OpenSSL's internal locking is correct but uses CRYPTO_THREAD_lock_*
+# primitives that TSan doesn't always recognise.
+race:libssl.so
+race:libcrypto.so
+
+# libpq uses thread-local storage in ways TSan misreports under
+# concurrent connections.
+race:libpq.so
+
+# Apache Arrow uses lock-free atomic primitives + shared memory pools
+# whose synchronisation TSan can't follow when libarrow.so is built
+# without -fsanitize=thread (it isn't, in any standard distribution).
+# All clink wire-path traffic goes through Arrow IPC, so without
+# this suppression nearly every distributed/inline-ops test trips on
+# memcpy/memset races deep inside libarrow's IPC writers and Buffer
+# allocators. The library itself is correct under its own tests.
+race:libarrow.so
+race:libparquet.so
+# Arrow Builder / Buffer / RecordBatch allocations on different
+# threads share a thread-safe MemoryPool; TSan flags the freelist
+# reuse pattern as a race even though Arrow's pool is atomic-safe.
+race:arrow::MemoryPool
+race:arrow::Buffer
+race:arrow::ipc::
+race:arrow::BinaryBuilder
+race:arrow::Int64Builder
+race:arrow::StringBuilder
+# Arrow's S3FileSystem (the S3 client + its AWS-SDK transport) spins up
+# background IO threads that are not joined at process exit, which TSan
+# reports as a "thread leak" from pthread_create inside libarrow.so. It
+# surfaces on the dead-endpoint ParquetS3 open tests (the connection fails
+# but the client's threads have already been created) and on the
+# S3MaterializationStore / S3SnapshotStore tests. The leak is in the
+# pre-built libarrow, not clink code (no clink frame is in the leak stack);
+# the OS reclaims the threads at exit. We deliberately do NOT call
+# FinalizeS3 (it races S3FileSystem destructors at shutdown).
+thread:libarrow.so

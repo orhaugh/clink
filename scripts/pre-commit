@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run clang-format check via the CMake format-check target. Exits
+# non-zero if any source file violates formatting.
+
+BUILD_DIR="cmake-build-debug"
+
+if [ ! -d "$BUILD_DIR" ]; then
+    echo "pre-commit: build directory '$BUILD_DIR' not found, skipping format check"
+    exit 0
+fi
+
+echo "pre-commit: checking clang-format..."
+if ! cmake --build "$BUILD_DIR" --target format-check 2>&1; then
+    echo ""
+    echo "pre-commit: formatting violations found."
+    echo "Run 'cmake --build $BUILD_DIR --target format' to fix, then re-stage."
+    exit 1
+fi

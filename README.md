@@ -1,0 +1,776 @@
+# clink
+
+`clink` is a semantics-first, Arrow-native, stateful stream
+processing engine in modern C++ (C++23).
+
+The thesis is simple: existing native stream engines are either toy projects
+that ignore correctness (no event time, no checkpoints, no keyed state) or
+production systems that are too coupled to a particular runtime (Seastar,
+gRPC, Arrow Flight) to evolve cleanly. clink is an attempt to build a
+credible engine out of the right primitives - typed operator DAGs, in-band
+watermarks, in-band checkpoint barriers, keyed state, bounded backpressure -
+without nailing those primitives to a particular runtime, executor, or wire
+format.
+
+clink is heavily inspired by Apache Flink. Flink's model of typed operator
+DAGs, event-time processing, in-band watermarks and checkpoint barriers, keyed
+state, and exactly-once semantics is the conceptual foundation this engine
+builds on. clink reworks that model in modern C++ around Arrow-native columnar
+execution and JVM-free deployment.
+
+This is a working engine, not a toy. The operator model, in-process and
+distributed runtimes, event-time windowing, exactly-once checkpointing (with
+rescale and restart-from-checkpoint), in-memory / RocksDB / changelog /
+file-backed state, the Arrow columnar wire format, a JobManager/TaskManager
+cluster control plane, the connector suite, and a SQL frontend are all
+implemented and covered by tests. It is a young project rather than a
+battle-tested production deployment: a number of features are config-gated or
+carry correctness caveats, and those are called out explicitly in the Status
+section below.
+
+## Contents
+
+- [Status](#status)
+- [Build & test](#build--test)
+  - [Reproducible build + sanitizer matrix](#reproducible-build--sanitizer-matrix)
+  - [Optional dependencies](#optional-dependencies)
+- [Installing clink](#installing-clink)
+- [Using clink as a library](#using-clink-as-a-library)
+  - [One-call default registration](#one-call-default-registration)
+  - [Typed fluent helpers (Kafka, ClickHouse, Avro, S3 Parquet)](#typed-fluent-helpers-kafka-clickhouse-avro-s3-parquet)
+- [Code examples](#code-examples)
+  - [Hello pipeline (map → filter → sink)](#hello-pipeline-map--filter--sink)
+  - [Event-time tumbling window](#event-time-tumbling-window)
+  - [Keyed state in a process function](#keyed-state-in-a-process-function)
+  - [Interval join across two streams](#interval-join-across-two-streams)
+  - [Cluster job plugin (StreamExecutionEnvironment)](#cluster-job-plugin-streamexecutionenvironment)
+- [SQL frontend](#sql-frontend)
+- [Running the in-tree examples](#running-the-in-tree-examples)
+- [Linting & formatting](#linting--formatting)
+- [Repository layout](#repository-layout)
+- [Reading order (for new contributors)](#reading-order-for-new-contributors)
+- [License](#license)
+
+## Status
+
+Grouped by area. A capability is listed as implemented only where it is backed
+by code and tests. Where a feature is config-gated, partial, or carries a
+correctness caveat, the caveat is stated in the row.
+
+### Runtime and operators
+
+| Subsystem                   | Status                                              |
+|----------------------------|-----------------------------------------------------|
+| Core domain types          | implemented                                         |
+| Local in-process runtime   | implemented (`LocalExecutor`, one `std::jthread` per operator) |
+| Bounded channel / backpressure | implemented                                     |
+| Map / Filter operators     | implemented                                         |
+| ReduceOperator             | per-key streaming reduce, `OnEachInput` or `OnFlush` emit modes |
+| KeyBy operator             | implemented; per-subtask keyed-state isolation (no in-operator cross-partition reshuffle) |
+| Operator parallelism       | `Dag::add_parallel_{source,operator,operator_shuffled,sink}`; hash-partitioned shuffle on `add_parallel_operator_shuffled`; per-subtask `OperatorId` + `RuntimeContext` so keyed state stays isolated across subtasks |
+| Branching DAG              | broadcast `Dag::fork<T>` (tee to N branches)        |
+| Multi-input alignment      | `MultiInputAlignment` + `Dag::union_streams<T>(...)` (watermark = min, Chandy-Lamport barrier alignment) |
+| Fluent API                 | `StreamExecutionEnvironment` / `DataStream<T>` builder chain |
+| Operator-thread errors     | `LocalExecutor::operator_errors()` captures worker-thread exceptions instead of terminating the process |
+| Stable `OperatorId`        | hash of `(stage_index, operator_name)`; same DAG → same ids across restarts |
+| Columnar execution         | `ArrowBatcher<T>`; operators opt in via `supports_columnar()` + `process_columnar()` and read columns through `Batch<T>::is_columnar()` / `arrow()`; built-in int/string batchers, binary-column fallback for user types |
+
+### Time, windows, CEP
+
+| Subsystem                   | Status                                              |
+|----------------------------|-----------------------------------------------------|
+| Watermarks                 | assigner + strategies (monotonic, bounded-out-of-orderness) |
+| Tumbling window            | implemented (flush hook fires residual windows)     |
+| Sliding window             | implemented; supports custom triggers, `allowed_lateness`, `late_output_tag` |
+| Session window             | implemented; supports `allowed_lateness`, `late_output_tag` (no custom triggers). Evictors are not supported on any window operator |
+| Interval join              | `Dag::interval_join<A,B,K,C>`; keyed stream-stream join with `[lower, upper]` event-time window, watermark-driven eviction, all 8 join types (`Inner`, `Left/Right/FullOuter`, `Left/RightSemi`, `Left/RightAnti`), `KeyedState`-backed persistence, `LateArrivalPolicy::{Allow, Drop}` with per-side drop counters, self-join via `fork` + `interval_join` |
+| Complex event processing   | `CEPOperator` + fluent `Pattern` DSL (NFA-based). v1 subset: linear patterns, greedy quantifiers, strict/relaxed contiguity. Also reachable from SQL `MATCH_RECOGNIZE` |
+
+### State and checkpointing
+
+| Subsystem                   | Status                                              |
+|----------------------------|-----------------------------------------------------|
+| Operator-side keyed state  | `RuntimeContext::keyed_state<K,V>` over `Codec<T>` codecs |
+| Broadcast state            | `RuntimeContext::broadcast_state<V>` for non-keyed values; `Dag::broadcast_connect<Main, Brod, Out, State>` |
+| In-memory state backend    | implemented (Arrow IPC snapshot/restore)            |
+| RocksDB state backend      | always built (bundled via `FetchContent`); native SST checkpoints, incremental via hard-link |
+| Changelog state backend    | write-ahead log + periodic materialisation; in-blob or external-store modes |
+| File-backed state backend  | Arrow IPC snapshots                                 |
+| State recovery on startup  | `JobConfig::restore_from` runs `StateBackend::restore` before any operator |
+| Checkpoint coordinator     | barrier creation + per-operator ack tracking; barriers injected into sources |
+| Exactly-once               | snapshot-on-barrier + two-phase-commit sinks (`FileSink2PC`: stage then atomic rename), source-offset recovery. Caveat: exactly-once applies to sinks implementing the `on_barrier` / `on_commit` contract; the Parquet and S3 sinks are not 2PC |
+| Unaligned checkpoints      | barriers overtake in-flight records at multi-input operators (captured into state for replay); mode set per `JobConfig`. An adaptive backpressure-driven resolver seam exists; the backpressure signal wiring is left to the hosting runtime |
+| Checkpoint rescale         | key-group repartitioning on deploy; scale-up and scale-down for file / RocksDB / changelog backends without full replay. Caveat: sources must store offsets as operator-state to survive rescale |
+| Async snapshot worker      | off-thread durable write for FileBacked and disk-backed changelog backends; capture runs on the operator thread, persist + ack run on the worker. In-memory and RAM-only changelog stay synchronous |
+| Fsync durability           | `write_fsync_rename` fsyncs file + directory before checkpoint ack; toggle off with `CLINK_STATE_FSYNC=0` for fsync-hostile CI or throughput benchmarks |
+| State schema evolution     | migrate-at-restore via a migration registry; version map carried in `JobGraphSpec`; pre-deploy compatibility gate (best-effort, real enforcement at restore time) |
+| Savepoint / state-processor| offline savepoint read + transform API (`state_processor/savepoint.hpp`); tested |
+| Queryable state            | HTTP registry + JM-side key routing expose operator state for external reads; `RemoteReadBackend` offers two-tier reads (hot in-memory tier + remote tier, blocking load on cold miss) |
+
+### Distributed and cluster
+
+| Subsystem                   | Status                                              |
+|----------------------------|-----------------------------------------------------|
+| TCP transport              | `NetworkChannelSink<T>` / `NetworkChannelSource<T>` round-trip `StreamElement<T>`s over TCP with length-prefixed framing; same push/pop semantics as `BoundedChannel` |
+| Distributed bridges        | `NetworkBridgeSink<T>` / `NetworkBridgeSource<T>` adapt the TCP transport into the operator interface so two `LocalExecutor`s link via a `NetworkChannel` |
+| JobManager / TaskManager   | cluster control plane: binary length-prefixed protocol over TCP, register/deploy/finish/cancel/heartbeat; JM watchdog declares lost TMs at `heartbeat_timeout` and broadcasts `CancelJob`; `JobGraphSpec` carries serialized `(op_type, params)` chains; `clink_node --role=jm|tm` for multi-process deployment (verified end-to-end via a `posix_spawn` integration test) |
+| Failover / restart-from-checkpoint | JM watchdog detects a lost TM, surviving subtasks drain (bounded by `restart_drain_timeout`), then the job redeploys from the latest completed checkpoint with state restored per subtask. Default is fail-fast: `max_restarts_on_tm_loss = 0` and a checkpoint dir must be configured |
+| Autoscaler                 | load-driven rescale trigger (`autoscaler.hpp`)      |
+| TLS / mTLS transport       | `clink_node --tls-cert` / `--tls-ca` (and `--tls-client-*` for mTLS) install custom accept/connect factories on JM and TM |
+| etcd HA coordinator        | leader election via etcd v3 (optional, `CLINK_WITH_ETCD`). Job persistence is filesystem-backed (`--ha-dir`) regardless of coordinator choice |
+| HTTP / JSON API + dashboard| `CLINK_BUILD_HTTP` (on by default): `clink_node` serves `/api/v1/jobs`, `/api/v1/jobs/:id`, `/api/v1/cluster`, `/metrics` (Prometheus), an SSE event stream, and an embedded SPA at `/`. Off unless `--http-port` is set (default 0 = disabled) |
+
+### Connectors
+
+| Connector                   | Status                                              |
+|----------------------------|-----------------------------------------------------|
+| File source / sink         | header-only, `TextFormat<T>` codec                  |
+| Parquet source / sink      | header-only, ZSTD-compressed, shares `ArrowBatcher<T>` with the wire; `parquet_{int64,string}_{sink,source}` built-ins; files readable by pyarrow / duckdb / polars |
+| S3 + Parquet source / sink | reads/writes Parquet directly to `s3://bucket/key` via Arrow's S3FileSystem; AWS credential chain; `endpoint_override` for MinIO / localstack |
+| Kafka source / sink        | typed `message_source` / `message_sink`; behind `CLINK_WITH_KAFKA` |
+| PostgresSource             | snapshot reader: runs a query, emits typed `PostgresRow`s, closes |
+| PostgresCdcSource          | streaming CDC via `test_decoding` and `pgoutput`; type fidelity via OID table; Standby Status Update keepalives; optional snapshot-then-stream |
+| Postgres sink              | typed insert sink; all three behind `CLINK_WITH_POSTGRES` |
+| ClickHouse source / sink   | typed source + typed sink (row-binary / JSONEachRow); behind `CLINK_WITH_CLICKHOUSE` |
+| Avro                       | header-only `binary_codec` / `json_codec` / `keyed_record_codec`; behind `CLINK_WITH_AVRO`; no registration step required |
+
+### SQL and Table API
+
+See the [SQL frontend](#sql-frontend) section for the full supported-feature
+list. Built behind `CLINK_BUILD_SQL=ON` (default off). A programmatic Table API
+produces the same `JobGraphSpec` as SQL.
+
+### Observability and wire format
+
+| Subsystem                   | Status                                              |
+|----------------------------|-----------------------------------------------------|
+| Metrics registry           | implemented (counter + gauge)                       |
+| OpenTelemetry integration  | boundary defined (`otel_boundary.hpp`); no exporter wired yet |
+| Arrow wire format          | every operator-to-operator data frame is an Arrow IPC stream (`Kind::ArrowBatch=7`); columnar schemas for built-in types, binary-column fallback for user types; control frames stay compact; `clink_serde_bench` shows roughly 4-9x over the per-record `Codec<T>` path |
+
+## Build & test
+
+The fast path:
+
+```bash
+cmake -S . -B build
+cmake --build build --parallel 10
+ctest --test-dir build --parallel 8
+```
+
+Common test labels: `-L core` runs `clink_core_tests`; `-L kafka`, `-L postgres`,
+`-L clickhouse`, `-L s3`, `-L rocksdb`, `-L tls`, `-L integration` hit the
+per-impl test exes.
+
+Required deps on the host: a C++23 compiler (Clang 17+ / GCC 13+ / MSVC 2022),
+CMake 3.24+, Apache Arrow + Parquet (always required). GoogleTest is pulled in
+via `FetchContent` so you don't have to install it.
+
+### Reproducible build + sanitizer matrix
+
+`build_and_test.sh` drives the build in a dedicated directory per
+configuration; each sanitizer pass uses its own build dir (`build`,
+`build-asan`, ...) and is wiped on success.
+
+```bash
+./build_and_test.sh                       # normal build + ctest
+./build_and_test.sh --sanitizer asan      # AddressSanitizer
+./build_and_test.sh --sanitizer tsan      # ThreadSanitizer (Kafka tests skipped - librdkafka isn't TSan-clean)
+./build_and_test.sh --sanitizer ubsan     # UndefinedBehaviourSanitizer
+./build_and_test.sh --sanitizer all       # normal + asan + tsan + ubsan, sequentially
+./build_and_test.sh --sanitizer coverage  # coverage build + lcov / SonarQube reports under coverage-report/
+```
+
+For the hermetic CI-matching path, run the same script inside the project's
+Debian 13 image (the image bakes in `librdkafka`, `aws-sdk-cpp`,
+`clickhouse-cpp`, etc.):
+
+```bash
+docker build -t clink-build:latest -f docker/Dockerfile .
+./build_and_test.sh --image clink-build:latest --sanitizer all
+```
+
+First image build is ~20-30 minutes because it compiles `aws-sdk-cpp` and
+`clickhouse-cpp` from source; subsequent builds reuse the cached layers.
+
+### Optional dependencies
+
+Each connector / state-backend impl is gated by `find_package()`. When the
+dep is present, `clink::<impl>` is built; when absent, the impl module
+returns early and the target is simply not defined - call sites should
+guard on `if(TARGET clink::<impl>)`.
+
+| Connector / backend     | Detected via                                    | Debian package(s) / source              |
+|-------------------------|-------------------------------------------------|-----------------------------------------|
+| Apache Arrow + Parquet  | `find_package(Arrow)` + `find_package(Parquet)` | `libarrow-dev libparquet-dev` (required)|
+| RocksDB state backend   | bundled via `FetchContent` (always built)       | upstream tag pinned in CMake            |
+| Kafka source / sink     | three-tier: CMake → pkg-config → manual probe   | `librdkafka-dev librdkafka++1`          |
+| S3 + Parquet S3         | `find_package(AWSSDK COMPONENTS s3)` + Arrow S3 | built from source in setup script       |
+| ClickHouse source / sink| CMake config → manual probe fallback            | built from source in setup script       |
+| PostgreSQL source / CDC | `find_package(PostgreSQL)`                      | `libpq-dev`                             |
+| Avro codec              | `find_package(AvroCpp)`                         | `avro-cpp` (source / homebrew)          |
+| TLS transport           | `find_package(OpenSSL)`                         | `libssl-dev`                            |
+| etcd HA coordinator     | `find_package(etcd-cpp-apiv3)`                  | built from source                       |
+
+Each `CLINK_WITH_*` cache variable is `AUTO` by default (the dep is used when
+found and skipped otherwise). Set `=ON` to make a missing dep a hard configure
+error or `=OFF` to always skip the impl. RocksDB is the exception: it is always
+built and cannot be turned off. Separately, the `CLINK_BUILD_*` options toggle
+whole subsystems: `CLINK_BUILD_TESTS` / `CLINK_BUILD_EXAMPLES` (on),
+`CLINK_BUILD_HTTP` (on), `CLINK_BUILD_SQL` (off), `CLINK_BUILD_BENCH` (off).
+
+## Installing clink
+
+clink ships as a regular CMake package: install it once, then consume it
+from any downstream project with `find_package(clink REQUIRED)`.
+
+```bash
+cmake -S . -B build -DCLINK_BUILD_TESTS=OFF -DCLINK_BUILD_EXAMPLES=OFF \
+                    -DCMAKE_INSTALL_PREFIX=/usr/local
+cmake --build build --parallel 10
+sudo cmake --install build
+```
+
+This writes:
+
+| Path                               | Contents                                                                 |
+|------------------------------------|--------------------------------------------------------------------------|
+| `<prefix>/include/clink/`          | Public headers (core + every built impl)                                 |
+| `<prefix>/lib/libclink_core.a`     | Engine static library                                                    |
+| `<prefix>/lib/libclink_<impl>.a`   | One static lib per built impl (`kafka`, `postgres`, `s3`, `rocksdb`, …)  |
+| `<prefix>/lib/librocksdb.a`        | Bundled RocksDB (transitive dep of `clink::rocksdb`)                     |
+| `<prefix>/bin/clink`               | client CLI (`run`, `run-application`, `cancel`, `savepoint`, `check-savepoint`, `rescale`, `rescale-op`, `list`) |
+| `<prefix>/bin/clink_node`          | Server daemon (run as `--role=jm` or `--role=tm` for cluster mode)       |
+| `<prefix>/bin/clink_{submit_job,app,cancel_job,rescale_job,savepoint}` | Standalone client binaries (the `clink` subcommands dispatch to these) |
+| `<prefix>/lib/cmake/clink/`        | `clinkConfig.cmake`, `clinkTargets.cmake`, version file                  |
+
+`clink_submit_sql` is installed when `CLINK_BUILD_SQL=ON`. `clink_check_savepoint`
+and `clink_rescale_op` are built but not added to the install rule; copy them
+from the build directory or extend `install(TARGETS ...)` if you need them on
+the path.
+
+Install to a non-system prefix (e.g. `~/.local` or `/opt/clink`) by setting
+`CMAKE_INSTALL_PREFIX` accordingly; downstream consumers then need
+`CMAKE_PREFIX_PATH` pointed at it.
+
+## Using clink as a library
+
+Once installed, link `clink::clink` (or pick targets explicitly) from any
+downstream CMake project:
+
+```cmake
+cmake_minimum_required(VERSION 3.24)
+project(my_pipeline LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(clink REQUIRED)
+
+add_executable(my_pipeline src/main.cpp)
+target_link_libraries(my_pipeline PRIVATE clink::clink)   # everything
+# or pick à la carte:
+#   clink::core         (engine only, no connectors)
+#   clink::kafka        (KafkaSource / KafkaSink)
+#   clink::postgres     (PostgresSource, PostgresSink, PostgresCdcSource)
+#   clink::clickhouse   (ClickHouseSource, ClickHouseSink)
+#   clink::s3           (S3 + Parquet-S3 source/sink)
+#   clink::rocksdb      (RocksDB state backend)
+#   clink::rocksdb_s3   (S3 remote state backend with a RocksDB tier)
+#   clink::tls          (mTLS transport)
+#   clink::etcd         (etcd HA coordinator)
+#   clink::avro         (Avro codec helpers)
+```
+
+After `find_package(clink REQUIRED)` succeeds, `clink_AVAILABLE_IMPLS` is set
+to the semicolon-separated list of impls that were built and installed - gate
+optional features on it (e.g. `if("kafka" IN_LIST clink_AVAILABLE_IMPLS)`).
+
+A complete set of consumer-facing examples - every core feature wired up as
+its own standalone executable, all built by a single `find_package`-based
+`CMakeLists.txt` - lives in [`docs/consumer-examples/`](docs/consumer-examples/).
+That's the recommended starting point for embedding clink in your own service.
+
+### One-call default registration
+
+Inside a plugin `.so` or any process building a fluent topology, replace the
+hand-rolled `ensure_built_ins_registered()` +
+`clink::<impl>::install(reg)` sequence (one call per linked impl) with a
+single `install_defaults(env.registry())`:
+
+```cpp
+#include <clink/plugin/install_defaults.hpp>
+#include <clink/api/stream_execution_environment.hpp>
+
+clink::api::StreamExecutionEnvironment env;
+clink::plugin::install_defaults(env.registry());     // built-ins + every
+                                                     // linked impl, in order
+```
+
+`install_defaults` is idempotent and conditional on the `CLINK_HAS_<NAME>`
+defines the impl static libs propagate, so it's safe across configurations
+that link different impl subsets. Internally it calls
+`cluster::ensure_built_ins_registered()` followed by `kafka::install`,
+`postgres::install`, `clickhouse::install`, `s3::install`, `rocksdb::install`,
+and `tls::install` as available. Avro is not in this list: its codecs are
+header-only with no operator factories to register, so you call them directly.
+
+### Typed fluent helpers (Kafka, ClickHouse, Avro, S3 Parquet)
+
+The `<impl>::install` factories register every built-in op type by `(in_type,
+op_type)` pair; on the fluent API side, the matching typed helpers attach
+sources/sinks to a `DataStream<T>` for any registered channel type `T`:
+
+```cpp
+// Kafka - typed message source/sink with KafkaMessageCodec framing.
+auto raw = clink::kafka::message_source(env,
+    clink::kafka::KafkaSourceOptions{.brokers = "kafka:9092", .topic = "in"});
+clink::kafka::message_sink(raw,
+    clink::kafka::KafkaSinkOptions{.brokers = "kafka:9092", .topic = "out"});
+
+// ClickHouse - typed sink; the encoder turns each record into a row string.
+clink::clickhouse::sink<MyEvent>(stream,
+    clink::clickhouse::SinkOptions{.host = "ch", .port = 9000,
+                                    .database = "warehouse", .table = "events"},
+    [](const MyEvent& e) { return to_jsoneachrow(e); });
+
+// S3 Parquet - typed parquet sink for any registered T, default batcher
+// frames as a single `value_bytes:binary` column via the supplied Codec<T>.
+clink::s3::parquet_sink<MyEvent>(stream,
+    clink::s3::ParquetSinkOptions{.bucket = "raw", .key = "events.parquet"},
+    my_event_codec());
+
+// Avro - codec helpers for generated record types (no install step needed).
+auto codec = clink::avro::binary_codec<MyAvroRecord>();
+```
+
+Same shape as the typed source/sink builder API: each helper mints an
+inline op type via `mint_inline_op_type`, registers a per-T factory via
+`PluginRegistry::register_source<T>` / `register_sink<T>`, and appends the
+matching descriptor on the env. No JSON wiring; no manual op_type strings.
+
+## Code examples
+
+The snippets below are condensed views of the matching files under
+[`docs/consumer-examples/`](docs/consumer-examples/), which are the
+copy-pasteable, fully-compileable versions.
+
+### Hello pipeline (map → filter → sink)
+
+The smallest possible clink job: a bounded source, a `MapOperator`, a
+`FilterOperator`, and a sink that prints to stdout. Runs in-process via
+`LocalExecutor` - no JobManager, no TaskManager.
+
+```
+VectorSource<int64_t> -> Map(v * 2) -> Filter(v > 10) -> FunctionSink(print)
+```
+
+```cpp
+#include <clink/operators/filter_operator.hpp>
+#include <clink/operators/map_operator.hpp>
+#include <clink/operators/sink_operator.hpp>
+#include <clink/operators/source_operator.hpp>
+#include <clink/runtime/dag.hpp>
+#include <clink/runtime/local_executor.hpp>
+
+using namespace clink;
+
+std::vector<Record<std::int64_t>> input;
+for (std::int64_t i = 1; i <= 10; ++i) {
+    input.emplace_back(Record<std::int64_t>{i, EventTime{i}});
+}
+
+Dag dag;
+auto s0 = dag.add_source<std::int64_t>(
+    std::make_shared<VectorSource<std::int64_t>>(std::move(input)));
+auto s1 = dag.add_operator<std::int64_t, std::int64_t>(
+    s0, std::make_shared<MapOperator<std::int64_t, std::int64_t>>(
+            [](const std::int64_t& v) { return v * 2; }));
+auto s2 = dag.add_operator<std::int64_t, std::int64_t>(
+    s1, std::make_shared<FilterOperator<std::int64_t>>(
+            [](const std::int64_t& v) { return v > 10; }));
+dag.add_sink<std::int64_t>(s2,
+    std::make_shared<FunctionSink<std::int64_t>>(
+        [](const std::int64_t& v) { std::cout << v << '\n'; }));
+
+LocalExecutor(std::move(dag)).run();
+```
+
+→ Full source: [`01_hello_pipeline.cpp`](docs/consumer-examples/01_hello_pipeline.cpp)
+
+### Event-time tumbling window
+
+Counts events per user in 1-second tumbling windows. The window fires
+when the watermark crosses each window boundary. `VectorSource` emits
+`Watermark::max()` at end-of-stream so all outstanding windows flush
+before the sink shuts down.
+
+```
+VectorSource<Event> -> KeyBy(user_id) -> TumblingWindow(1s, count) -> Sink
+```
+
+```cpp
+struct Event { std::string user_id; };
+
+auto src    = std::make_shared<VectorSource<Event>>(std::move(input));
+auto key_by = std::make_shared<KeyByOperator<Event, std::string>>(
+    [](const Event& e) { return e.user_id; });
+auto window = std::make_shared<TumblingWindowOperator<std::string, Event, std::uint64_t>>(
+    1000ms,
+    []() -> std::uint64_t { return 0; },
+    [](const std::uint64_t& acc, const Event& /*e*/) { return acc + 1; });
+auto sink   = std::make_shared<FunctionSink<std::pair<std::string, std::uint64_t>>>(
+    [](const auto& kv) {
+        std::cout << "user=" << kv.first << " count=" << kv.second << '\n';
+    });
+
+auto s0 = dag.add_source<Event>(src);
+auto s1 = dag.add_operator<Event, std::pair<std::string, Event>>(s0, key_by);
+auto s2 = dag.add_operator<std::pair<std::string, Event>,
+                           std::pair<std::string, std::uint64_t>>(s1, window);
+dag.add_sink<std::pair<std::string, std::uint64_t>>(s2, sink);
+```
+
+→ Full source: [`02_event_time_tumbling.cpp`](docs/consumer-examples/02_event_time_tumbling.cpp).
+Also see [`03_sliding_window_aggregate.cpp`](docs/consumer-examples/03_sliding_window_aggregate.cpp)
+for `SlidingWindowOperator` with `size` + `slide`.
+
+### Keyed state in a process function
+
+A `KeyedProcessFunction` maintains per-key state through
+`RuntimeContext::keyed_state<K, V>(...)`. The same code works against
+`InMemoryStateBackend` (shown), the file-backed backend, or
+`clink::rocksdb` for durability - just swap the backend instance on
+`JobConfig`.
+
+```cpp
+class RunningTotal final
+    : public KeyedProcessFunction<std::int64_t, std::int64_t, std::int64_t> {
+public:
+    void open(RuntimeContext& ctx) override {
+        state_ = std::make_unique<KeyedState<std::int64_t, std::int64_t>>(
+            ctx.keyed_state<std::int64_t, std::int64_t>(
+                "running_total", int64_codec(), int64_codec()));
+    }
+    void process_element(const std::int64_t& v,
+                         ProcessFunctionContext<std::int64_t>& /*ctx*/,
+                         Collector<std::int64_t>& out) override {
+        const auto next = state_->get(current_key()).value_or(0) + v;
+        state_->put(current_key(), next);
+        out.collect(next);
+    }
+private:
+    std::unique_ptr<KeyedState<std::int64_t, std::int64_t>> state_;
+};
+
+JobConfig cfg;
+cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+// ... build dag with detail::KeyedProcessFunctionAdapter wrapping RunningTotal ...
+LocalExecutor(std::move(dag), std::move(cfg)).run();
+```
+
+→ Full source: [`04_keyed_process_state.cpp`](docs/consumer-examples/04_keyed_process_state.cpp)
+
+### Interval join across two streams
+
+Joins clicks against orders for the same user when
+`delta = order_time - click_time` falls in `[-lower, +upper]`. Default
+join type is `Inner`; pass `Dag::JoinType::LeftOuter` (and friends) to
+emit unmatched left rows after the watermark advances past their
+upper-bound deadline.
+
+```
+VectorSource<Click>  ─┐
+                      ├── interval_join(key=user_id, [-50ms, +200ms]) -> Sink<Joined>
+VectorSource<Order>  ─┘
+```
+
+```cpp
+auto h_clicks = dag.add_source<Click>(
+    std::make_shared<VectorSource<Click>>(std::move(clicks), "clicks"));
+auto h_orders = dag.add_source<Order>(
+    std::make_shared<VectorSource<Order>>(std::move(orders), "orders"));
+
+auto h_joined = dag.interval_join<Click, Order, std::string, Joined>(
+    h_clicks, h_orders,
+    [](const Click& c) { return c.user_id; },
+    [](const Order& o) { return o.user_id; },
+    50ms,    // look-back: order may precede click by up to 50ms
+    200ms,   // look-ahead: order may follow click by up to 200ms
+    [](const std::optional<Click>& c, const std::optional<Order>& o) {
+        return Joined{c->user_id, c->url, o->sku};
+    });
+dag.add_sink<Joined>(h_joined, sink);
+```
+
+→ Full source: [`05_interval_join.cpp`](docs/consumer-examples/05_interval_join.cpp)
+
+### Cluster job plugin (`StreamExecutionEnvironment`)
+
+The fluent API. The build function is packaged into a `.so`
+via `CLINK_REGISTER_JOB(...)` and submitted to a running cluster:
+
+```bash
+clink_node --role=jm --rpc-port=6123 &
+clink_node --role=tm --jm-host=127.0.0.1 --jm-port=6123 &
+clink run --jobmanager 127.0.0.1:6123 ./my_job.so
+```
+
+```cpp
+#include <clink/api/builtin_connectors.hpp>
+#include <clink/api/stream_execution_environment.hpp>
+#include <clink/job/register_job.hpp>
+
+void define_job(clink::api::StreamExecutionEnvironment& env) {
+    using namespace std::chrono_literals;
+
+    env.from_elements<std::int64_t>({1, 2, 3, 4, 5})
+        .map<std::int64_t>([](const std::int64_t& v) { return v * 10; })
+        .filter([](const std::int64_t& v) { return v > 20; })
+        .assign_timestamps_monotonic(
+            [](const std::int64_t& v) { return clink::EventTime{v}; })
+        .key_by([](const std::int64_t& v) { return (v / 10) % 2; })
+        .sliding_window(60ms, 60ms)
+        .aggregate<std::int64_t>(
+            []() -> std::int64_t { return 0; },
+            [](const std::int64_t& acc, const std::int64_t& v) { return acc + v; })
+        .sink(clink::api::FileInt64Sink::builder().path("/tmp/out.txt").build());
+}
+
+CLINK_REGISTER_JOB("my-job", "1.0", "demo pipeline", define_job);
+```
+
+→ Full source: [`08_cluster_job_plugin.cpp`](docs/consumer-examples/08_cluster_job_plugin.cpp).
+Build the plugin module from your downstream CMake project using
+`add_library(my_job MODULE ...)`; see the `CLINK_BUILD_PLUGIN_EXAMPLE`
+branch of [`docs/consumer-examples/CMakeLists.txt`](docs/consumer-examples/CMakeLists.txt).
+
+## SQL frontend
+
+Built when `CLINK_BUILD_SQL=ON` (default off; flip it on to opt in). Compiles a
+PostgreSQL-shaped subset of SQL to a `JobGraphSpec` and submits it to a running
+cluster through the same HTTP path as a compiled job plugin.
+
+Pipeline: `libpg_query` parses the input; an AST builder normalises
+the parse tree into a parser-agnostic AST under `clink::sql::ast`;
+the binder type-checks against a `Catalog`, lowers expressions to
+JSON predicates / value-expressions, and emits `LogicalPlan` nodes;
+a small optimizer runs projection pushdown into the source's column
+hint; the physical planner lowers the logical tree to a `JobGraphSpec`
+of registered operators. All SQL ops live in `clink::sql::install(reg)`
+which `clink_node` calls at startup when the SQL frontend is linked.
+
+Supported today:
+
+DDL and basics
+
+- `CREATE TABLE t (col TYPE, ...) WITH (connector=..., format='json', path=...,
+  bootstrap=..., topic=..., event_time_column=..., watermark_lag_ms=...)`
+- `INSERT INTO sink SELECT ... FROM source`
+- `SHOW TABLES`, `DROP TABLE [IF EXISTS]`, persistent JSON catalog under
+  `~/.clink/catalog/`
+- `EXPLAIN <stmt>` prints the bound `LogicalPlan` tree
+
+Projection and filtering
+
+- `WHERE` with `AND` / `OR` / `NOT`, `IS [NOT] NULL`, `LIKE`, three-valued null
+  semantics
+- Expression `SELECT`: arithmetic, concat (`||`), `UPPER` / `LOWER` / `LENGTH` /
+  `COALESCE`, `CAST(... AS BIGINT|DOUBLE|TEXT)`
+- `SELECT DISTINCT` (dedupe across the run)
+- `ORDER BY` with `LIMIT n` / `OFFSET m` (sorted, emitted at end-of-stream)
+
+Aggregation and windows
+
+- `GROUP BY` over `TUMBLE`, `HOP`, `SESSION`, `CUMULATE`, or plain columns
+  (unbounded upsert-style aggregate); `SUM` / `COUNT` / `MIN` / `MAX` / `AVG`
+- `HAVING` referencing aggregate aliases or group columns
+- `OVER` aggregates (running `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`) with bounded
+  `ROWS` / `RANGE <n> PRECEDING ... CURRENT ROW` frames (bounded frames are for
+  aggregates only); navigation functions `FIRST_VALUE` / `LAST_VALUE` / `LAG`
+  on the running frame
+- `ROW_NUMBER()` / `RANK()` / `DENSE_RANK()` as bounded Top-N-per-partition
+
+Joins
+
+- Stream-stream interval joins `JOIN ... ON a.k = b.k AND a.ts BETWEEN b.ts +
+  low AND b.ts + high`, in `INNER`, `LEFT`, `RIGHT`, and `FULL OUTER` variants
+  (unmatched rows null-padded at watermark eviction, append-only)
+- Lookup / temporal-enrichment joins: a `connector='lookup'` table whose
+  `function=` names a registered async `Row -> Task<Row>` coroutine, joined via
+  `JOIN` (INNER) or `LEFT JOIN` (processing-time, right side only)
+
+Complex types and exact numerics
+
+- `ARRAY` types and literals, element access `a[i]`, `array_agg([DISTINCT] x)`
+  (with retraction and SESSION-window merge)
+- `ROW(...)` and `MAP(...)` construction, field access `(r).f`, element access
+  `m['k']`; roundtrip as nested JSON. Whole ROW/MAP values flow to matching
+  typed sink columns
+- Set operations `UNION` / `INTERSECT` / `EXCEPT` (and `ALL` multiset forms,
+  per-key count model for retraction correctness)
+- Exact `DECIMAL(p, s)` 128-bit arithmetic (`+ - * / mod`, comparison, `CAST`,
+  `SUM`/`MIN`/`MAX`), HALF_UP rounding, overflow to NULL. Caveat: source values
+  beyond ~15-17 significant digits are limited by JSON double precision; mixed
+  decimal/double demotes to double
+
+Subqueries
+
+- Scalar subqueries in the `SELECT` list (uncorrelated single-aggregate) and in
+  `WHERE` comparisons
+- `IN` / `NOT IN` (single- and multi-column, NULL-aware anti), `EXISTS` /
+  `NOT EXISTS`
+- Common table expressions `WITH cte AS (...)` (nested bodies; each CTE
+  referenced at most once per query)
+
+Advanced and extensibility (each a documented v1 subset)
+
+- `MATCH_RECOGNIZE (PARTITION BY ... ORDER BY ... PATTERN ... DEFINE ...
+  MEASURES ...)`: linear greedy patterns, simple DEFINE predicates, FIRST/LAST
+  measures, ONE ROW PER MATCH; lowered onto the CEP engine
+- `CREATE MATERIALIZED VIEW ... AS <SELECT>` with continuous maintenance; keyed
+  GROUP BY auto-derives upsert mode and primary key
+- Process table functions: a C++-registered `KeyedProcessFunction<string,Row,
+  Row>` callable as `fn(TABLE t PARTITION BY cols)` with isolated per-key state
+  (v1 is timerless)
+- Scalar UDFs and aggregate UDFs (UDAFs): C++-registered closures invoked by
+  name (a UDAF needs `retract` for changelog GROUP BY and `merge` for SESSION
+  windows)
+- Programmatic Table API (v1): a fluent C++ builder, `from(...)` then optional
+  `filter(...)` then either `select(...)` or `group_by(...).agg(...)` then
+  `insert_into(...)`, sharing the binder's lowering so it produces a
+  `JobGraphSpec` identical to the equivalent SQL
+
+Submit via the CLI:
+
+```bash
+clink_node --role=jm --rpc-port=6123 &
+clink_node --role=tm --jm-host=127.0.0.1 --jm-port=6123 &
+
+clink_submit_sql --jobmanager 127.0.0.1:6123 <<'SQL'
+CREATE TABLE clicks (user_id BIGINT, ts BIGINT, url TEXT)
+    WITH (connector='file', format='json', path='/tmp/clicks.ndjson',
+          event_time_column='ts');
+CREATE TABLE per_user (user_id BIGINT, total BIGINT)
+    WITH (connector='file', format='json', path='/tmp/per_user.ndjson');
+
+INSERT INTO per_user
+SELECT user_id, COUNT(*) AS total
+FROM clicks
+GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE), user_id
+HAVING total > 0;
+SQL
+```
+
+Or compile and submit programmatically:
+
+```cpp
+#include <clink/sql/binder.hpp>
+#include <clink/sql/catalog.hpp>
+#include <clink/sql/parser.hpp>
+#include <clink/sql/physical_plan.hpp>
+
+clink::sql::Catalog cat;
+// ... register tables via cat.register_table(...) ...
+
+clink::sql::Binder b(cat);
+auto plan = b.bind_insert(std::get<clink::sql::ast::InsertStmt>(
+    clink::sql::parse("INSERT INTO out SELECT ...").statements[0]));
+auto spec = clink::sql::PhysicalPlanner{}.compile(
+    static_cast<const clink::sql::LogicalSink&>(*plan));
+
+clink::application::JobSubmitter submitter("127.0.0.1", jm_port);
+submitter.submit(spec.to_json(), /*plugins=*/{}, opts);
+```
+
+End-to-end coverage lives in `tests/test_sql_runtime.cpp`: compiles
+SQL, submits to an in-process JM + TM pair, and asserts the sink file
+content across the supported feature surface.
+
+## Running the in-tree examples
+
+The examples bundled with the source tree are built into `build/examples/`:
+
+```bash
+./build/examples/clink_word_count
+./build/examples/clink_event_time_tumbling
+./build/examples/clink_file_word_count
+./build/examples/clink_clickstream_join
+```
+
+For consumer-style examples that you can copy/paste into your own project,
+see [`docs/consumer-examples/`](docs/consumer-examples/).
+
+## Linting & formatting
+
+Three CMake targets, declared in [`cmake/ClangTools.cmake`](cmake/ClangTools.cmake):
+
+```bash
+cmake --build build --target format        # format every source file in place
+cmake --build build --target format-check  # CI-friendly: dry-run, exits non-zero on violations
+cmake --build build --target tidy          # run clang-tidy across the tree
+```
+
+Targets glob `src/`, `include/clink/`, `tests/`, `tools/`, and `examples/`,
+so newly-added files are picked up at the next configure. `compile_commands.json`
+is always emitted (`CMAKE_EXPORT_COMPILE_COMMANDS=ON`) so `clang-tidy` and
+`clangd` can resolve per-TU flags without extra plumbing. The targets degrade
+gracefully - they print a status line if `clang-format` / `clang-tidy` aren't
+installed instead of failing the configure.
+
+A pre-commit git hook is installed automatically at configure time
+(see [`cmake/GitHooks.cmake`](cmake/GitHooks.cmake)). It invokes the
+`format-check` target so commits fail on unformatted code; if you don't have
+a `cmake-build-debug/` build dir, the hook skips silently.
+
+The format and tidy rulesets live in `.clang-format` and `.clang-tidy` at
+the repo root.
+
+## Repository layout
+
+```
+include/clink/
+    api/             # public API facade (StreamExecutionEnvironment, descriptors)
+    application/     # application-mode lifecycle and configuration
+    async/           # async utilities and continuations (Task<T>)
+    cep/             # complex event processing (pattern DSL + operator)
+    checkpoint/      # barriers + coordinator + 2PC sinks
+    cluster/         # JobManager, TaskManager, HA, autoscaler, rescale
+    config/          # configuration types (incl. exact decimal)
+    connectors/      # built-in sources/sinks (file, parquet, text, 2PC)
+    core/            # types, records, batches, stream elements, Arrow batcher
+    http/            # HTTP server + JSON API + dashboard assets
+    job/             # job registration and lifecycle (CLINK_REGISTER_JOB)
+    metrics/         # registry, counter, gauge, otel boundary
+    operators/       # source/map/filter/key_by/window/reduce/sink, UDF registries
+    plugin/          # plugin registry + install_defaults
+    queryable_state/ # external state query registry + routing
+    runtime/         # bounded channel, dag, executor, key groups, network
+    sql/             # AST, catalog, binder, optimizer, planner, Table API
+    state/           # state backend interface + in-memory/file/rocksdb/changelog
+    state_processor/ # offline savepoint read + transform API
+    time/            # event time, watermark, timers
+src/                 # out-of-line impls: application, async, checkpoint, cluster,
+                     #   config, http, metrics, runtime, sql, state
+                     #   (template-heavy generic code stays header-only)
+impls/               # optional connectors/backends: kafka, postgres, clickhouse,
+                     #   s3, rocksdb, rocksdb-s3, avro, etcd, tls
+tests/               # GoogleTest suites (unit + integration)
+examples/            # in-tree example jobs
+docs/                # design docs + consumer-examples/
+benchmarks/          # clink_bench, clink_serde_bench, failover_coldstart,
+                     #   inproc_compare, prod_compare, flink_compare
+tools/               # clink (unified CLI), clink_node, clink_submit_sql, and
+                     #   the standalone client binaries
+```
+
+## Reading order (for new contributors)
+
+1. `docs/architecture.md` - the conceptual model
+2. `include/clink/core/stream_element.hpp` - the wire format between operators
+3. `include/clink/runtime/dag.hpp` - how the DAG is built and run
+4. `tests/test_map_filter.cpp` - the smallest end-to-end integration
+
+## License
+
+Apache License 2.0. See [`LICENSE`](LICENSE).

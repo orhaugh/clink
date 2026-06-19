@@ -1,0 +1,334 @@
+// Postgres factory registrations.
+//
+// Contains:
+//   * StringPostgresCdcSource - adapter that serialises each CdcEvent
+//     as a JSON line so it's addressable on the "string" channel.
+//   * StringPostgresSource    - adapter that joins each row's column
+//     values with a configurable delimiter.
+//   * clink::postgres::install() - registers postgres_text_source
+//     and postgres_cdc_text_source with the supplied PluginRegistry.
+//     Callers invoke explicitly after ensure_built_ins_registered().
+
+#include <cstddef>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+
+#include "clink/connectors/cdc_event.hpp"
+#include "clink/connectors/postgres_cdc_source.hpp"
+#include "clink/connectors/postgres_row.hpp"
+#include "clink/connectors/postgres_source.hpp"
+#include "clink/core/record.hpp"
+#include "clink/operators/source_operator.hpp"
+#include "clink/plugin/plugin.hpp"
+#include "clink/postgres/cdc_event_codec.hpp"
+#include "clink/postgres/install.hpp"
+#include "clink/postgres/postgres_row_codec.hpp"
+
+namespace clink::postgres {
+
+namespace {
+
+// Adapter that turns a PostgresCdcSource into a Source<std::string>,
+// serialising each CdcEvent as a JSON-shaped line:
+//   {"op":"insert","table":"public.users","lsn":"0/16E2A38","xid":42,
+//    "values":{"id":"1","name":"alice"}}
+// Sinks downstream can parse the JSON or do regex-based extraction; the
+// goal here is to make the CDC stream consumable through the same
+// string-channel submission path as kafka_text / file_text.
+class StringPostgresCdcSource final : public Source<std::string> {
+public:
+    explicit StringPostgresCdcSource(PostgresCdcSource::Options opts) : inner_(std::move(opts)) {}
+
+    void open() override { inner_.open(); }
+    void close() override { inner_.close(); }
+    void cancel() override {
+        Source<std::string>::cancel();
+        inner_.cancel();
+    }
+
+    bool produce(Emitter<std::string>& out) override {
+        Emitter<CdcEvent> forwarder(
+            Emitter<CdcEvent>::Forward([&out](StreamElement<CdcEvent> e) -> bool {
+                if (e.is_data()) {
+                    Batch<std::string> b;
+                    for (const auto& r : e.as_data()) {
+                        b.emplace(serialize(r.value()));
+                    }
+                    return out.emit_data(std::move(b));
+                }
+                if (e.is_watermark()) {
+                    return out.emit_watermark(e.as_watermark());
+                }
+                return out.emit_barrier(e.as_barrier());
+            }));
+        return inner_.produce(forwarder);
+    }
+
+    // #57: forward source-replay to the inner source so the string/SQL path
+    // inherits whatever offset replay the inner connector implements (symmetry
+    // with the data path; the inner CDC LSN replay is a connector follow-up).
+    void snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId ckpt_id) override {
+        inner_.snapshot_offset(backend, op_id, ckpt_id);
+    }
+    bool restore_offset(StateBackend& backend, OperatorId op_id) override {
+        return inner_.restore_offset(backend, op_id);
+    }
+
+    std::string name() const override { return "postgres_cdc_text_source"; }
+
+private:
+    static std::string escape(std::string_view s) {
+        std::string out;
+        out.reserve(s.size() + 2);
+        out += '"';
+        for (char c : s) {
+            switch (c) {
+                case '"':
+                    out += "\\\"";
+                    break;
+                case '\\':
+                    out += "\\\\";
+                    break;
+                case '\n':
+                    out += "\\n";
+                    break;
+                case '\r':
+                    out += "\\r";
+                    break;
+                case '\t':
+                    out += "\\t";
+                    break;
+                default:
+                    out += c;
+            }
+        }
+        out += '"';
+        return out;
+    }
+
+    static std::string op_name(CdcEvent::Op op) {
+        switch (op) {
+            case CdcEvent::Op::Begin:
+                return "begin";
+            case CdcEvent::Op::Insert:
+                return "insert";
+            case CdcEvent::Op::Update:
+                return "update";
+            case CdcEvent::Op::Delete:
+                return "delete";
+            case CdcEvent::Op::Truncate:
+                return "truncate";
+            case CdcEvent::Op::Commit:
+                return "commit";
+            case CdcEvent::Op::Unknown:
+                return "unknown";
+        }
+        return "unknown";
+    }
+
+    static std::string serialize(const CdcEvent& ev) {
+        std::string out;
+        out += "{\"op\":";
+        out += escape(op_name(ev.op));
+        out += ",\"table\":";
+        out += escape(ev.table);
+        out += ",\"lsn\":";
+        out += escape(ev.lsn);
+        out += ",\"xid\":";
+        out += std::to_string(ev.xid);
+        out += ",\"values\":{";
+        for (std::size_t i = 0; i < ev.values.size(); ++i) {
+            if (i > 0) {
+                out += ',';
+            }
+            out += escape(ev.values[i].name);
+            out += ':';
+            if (ev.values[i].is_null) {
+                out += "null";
+            } else {
+                out += escape(ev.values[i].value);
+            }
+        }
+        out += "}}";
+        return out;
+    }
+
+    PostgresCdcSource inner_;
+};
+
+// Adapter that turns a PostgresSource into a Source<std::string>,
+// joining each row's column values with a configurable delimiter.
+// Caller controls the delimiter to avoid collisions with payload text.
+class StringPostgresSource final : public Source<std::string> {
+public:
+    StringPostgresSource(PostgresSource::Options opts, std::string delim)
+        : inner_(std::move(opts)), delim_(std::move(delim)) {}
+
+    void open() override { inner_.open(); }
+    void close() override { inner_.close(); }
+    void cancel() override { Source<std::string>::cancel(); }
+
+    bool produce(Emitter<std::string>& out) override {
+        const auto& delim = delim_;
+        Emitter<PostgresRow> forwarder(
+            Emitter<PostgresRow>::Forward([&out, &delim](StreamElement<PostgresRow> e) -> bool {
+                if (e.is_data()) {
+                    Batch<std::string> b;
+                    for (const auto& r : e.as_data()) {
+                        std::string joined;
+                        const auto& vs = r.value().values();
+                        for (std::size_t i = 0; i < vs.size(); ++i) {
+                            if (i > 0) {
+                                joined += delim;
+                            }
+                            joined += vs[i];
+                        }
+                        b.emplace(std::move(joined));
+                    }
+                    return out.emit_data(std::move(b));
+                }
+                if (e.is_watermark()) {
+                    return out.emit_watermark(e.as_watermark());
+                }
+                return out.emit_barrier(e.as_barrier());
+            }));
+        return inner_.produce(forwarder);
+    }
+
+    // #57: forward source-replay to the inner source (symmetry with the data
+    // path; the inner bounded-query replay is a connector follow-up).
+    void snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId ckpt_id) override {
+        inner_.snapshot_offset(backend, op_id, ckpt_id);
+    }
+    bool restore_offset(StateBackend& backend, OperatorId op_id) override {
+        return inner_.restore_offset(backend, op_id);
+    }
+
+    std::string name() const override { return "postgres_text_source"; }
+
+private:
+    PostgresSource inner_;
+    std::string delim_;
+};
+
+}  // namespace
+
+void install(clink::plugin::PluginRegistry& reg) {
+    using clink::plugin::BuildContext;
+
+    // Register the typed channels for PostgresRow and CdcEvent so
+    // pipelines can carry full row/event records through the cluster
+    // without flattening to a delimiter-joined or JSON-encoded
+    // std::string at the connector boundary. The typed channels
+    // preserve column names, type names, null indicators, and
+    // transaction metadata end-to-end.
+    reg.register_type<PostgresRow>(std::string{kChannelPostgresRow}, postgres_row_codec());
+    reg.register_type<CdcEvent>(std::string{kChannelPostgresCdcEvent}, cdc_event_codec());
+
+    // postgres_row_source: SELECT rows emitted as typed PostgresRow.
+    // Same options as postgres_text_source except no `delim` - the
+    // typed channel keeps columns separate, so downstream operators
+    // address them by name via PostgresRow::at("column_name").
+    reg.register_source<PostgresRow>(
+        "postgres_row_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<PostgresRow>> {
+            PostgresSource::Options opts;
+            opts.conninfo = ctx.param_or("conninfo");
+            opts.query = ctx.param_or("query");
+            opts.batch_size = static_cast<std::size_t>(ctx.param_int64_or("batch_size", 256));
+            if (opts.conninfo.empty()) {
+                throw std::runtime_error("postgres_row_source: 'conninfo' is required");
+            }
+            if (opts.query.empty()) {
+                throw std::runtime_error("postgres_row_source: 'query' is required");
+            }
+            return std::make_shared<PostgresSource>(std::move(opts));
+        });
+
+    // postgres_cdc_event_source: subscribe to a logical replication
+    // slot and emit each CdcEvent as a typed record. Same options as
+    // postgres_cdc_text_source. Downstream operators see the full
+    // event (op/table/lsn/xid + typed per-column CdcFields including
+    // type names and is_null sentinels) instead of a JSON line.
+    reg.register_source<CdcEvent>(
+        "postgres_cdc_event_source",
+        [](const BuildContext& ctx) -> std::shared_ptr<Source<CdcEvent>> {
+            PostgresCdcSource::Options opts;
+            opts.conninfo = ctx.param_or("conninfo");
+            opts.slot_name = ctx.param_or("slot_name");
+            opts.plugin = ctx.param_or("plugin", "test_decoding");
+            opts.publication_names = ctx.param_or("publication_names");
+            opts.create_slot = ctx.param_or("create_slot", "true") == "true";
+            opts.drop_slot_on_close = ctx.param_or("drop_slot_on_close", "false") == "true";
+            if (opts.conninfo.empty()) {
+                throw std::runtime_error("postgres_cdc_event_source: 'conninfo' is required");
+            }
+            if (opts.slot_name.empty()) {
+                throw std::runtime_error("postgres_cdc_event_source: 'slot_name' is required");
+            }
+            if (opts.plugin == "pgoutput" && opts.publication_names.empty()) {
+                throw std::runtime_error(
+                    "postgres_cdc_event_source: 'publication_names' is required when "
+                    "plugin='pgoutput'");
+            }
+            return std::make_shared<PostgresCdcSource>(std::move(opts));
+        });
+
+    // postgres_cdc_text_source: subscribe to a logical replication slot
+    // and emit each CdcEvent as a JSON line. params:
+    //   conninfo (required), slot_name (required)
+    //   plugin (default "test_decoding"): "test_decoding" or "pgoutput"
+    //   publication_names (required when plugin == "pgoutput")
+    //   create_slot (default "true")
+    //   drop_slot_on_close (default "false")
+    reg.register_source<std::string>(
+        "postgres_cdc_text_source",
+        [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
+            PostgresCdcSource::Options opts;
+            opts.conninfo = ctx.param_or("conninfo");
+            opts.slot_name = ctx.param_or("slot_name");
+            opts.plugin = ctx.param_or("plugin", "test_decoding");
+            opts.publication_names = ctx.param_or("publication_names");
+            opts.create_slot = ctx.param_or("create_slot", "true") == "true";
+            opts.drop_slot_on_close = ctx.param_or("drop_slot_on_close", "false") == "true";
+            if (opts.conninfo.empty()) {
+                throw std::runtime_error("postgres_cdc_text_source: 'conninfo' is required");
+            }
+            if (opts.slot_name.empty()) {
+                throw std::runtime_error("postgres_cdc_text_source: 'slot_name' is required");
+            }
+            if (opts.plugin == "pgoutput" && opts.publication_names.empty()) {
+                throw std::runtime_error(
+                    "postgres_cdc_text_source: 'publication_names' is required when "
+                    "plugin='pgoutput'");
+            }
+            return std::make_shared<StringPostgresCdcSource>(std::move(opts));
+        });
+
+    // postgres_text_source: SELECT rows joined with `delim` (default "|").
+    // params:
+    //   conninfo (required): libpq connection string.
+    //   query (required): SELECT statement (no trailing ';').
+    //   delim (default "|"): column-value separator.
+    //   batch_size (default 256): rows per produce() batch.
+    reg.register_source<std::string>(
+        "postgres_text_source",
+        [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
+            PostgresSource::Options opts;
+            opts.conninfo = ctx.param_or("conninfo");
+            opts.query = ctx.param_or("query");
+            opts.batch_size = static_cast<std::size_t>(ctx.param_int64_or("batch_size", 256));
+            if (opts.conninfo.empty()) {
+                throw std::runtime_error("postgres_text_source: 'conninfo' is required");
+            }
+            if (opts.query.empty()) {
+                throw std::runtime_error("postgres_text_source: 'query' is required");
+            }
+            return std::make_shared<StringPostgresSource>(std::move(opts),
+                                                          ctx.param_or("delim", "|"));
+        });
+}
+
+}  // namespace clink::postgres
