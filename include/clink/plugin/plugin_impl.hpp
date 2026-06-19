@@ -80,10 +80,16 @@ inline const clink::cluster::TypeOps& require_type_ops(const clink::cluster::Typ
 // the snapshot file so LocalExecutor's restore-on-start path can load
 // it. Adding a new backend (e.g. s3://) means registering a scheme
 // with the factory at startup; no change to this function.
+//
+// When state_backend_uri is set it overrides checkpoint_dir as the
+// backend URI, so a remote/disaggregated backend (e.g. remote-read://)
+// can be used while checkpoint_dir stays the JM's LOCAL coordination
+// directory for COMPLETED-N markers and HA recovery. Empty preserves the
+// legacy behaviour where checkpoint_dir doubles as the backend URI.
 inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerContext& rctx) {
     clink::JobConfig cfg;
     clink::StateBackendSpec spec;
-    spec.uri = rctx.checkpoint_dir;
+    spec.uri = rctx.state_backend_uri.empty() ? rctx.checkpoint_dir : rctx.state_backend_uri;
     spec.subtask_idx = rctx.chain.subtask_idx;
     spec.restore_uri = rctx.restore_from_dir;
     spec.restore_checkpoint_id = rctx.restore_from_checkpoint_id;

@@ -81,7 +81,17 @@ public:
     explicit RemoteReadBackend(std::shared_ptr<RemotePool> pool, std::size_t io_threads = 1)
         : pool_(std::move(pool)) {
         loader_ = [this](OperatorId op, std::string key) -> std::optional<Value> {
-            return pool_->read(CheckpointId{last_ckpt_.load(std::memory_order_relaxed)}, op, key);
+            const auto ck = last_ckpt_.load(std::memory_order_relaxed);
+            // No committed checkpoint yet (fresh job, nothing restored): there
+            // is definitionally no cold state, so don't probe the pool. A
+            // store like S3 treats a missing checkpoint manifest as an error
+            // (unlike the in-memory double, which returns nullopt), so reading
+            // checkpoint 0 would throw on every first-touch key and starve the
+            // operator of output. Absent == nullopt is the correct contract.
+            if (ck == 0) {
+                return std::nullopt;
+            }
+            return pool_->read(CheckpointId{ck}, op, key);
         };
         start_workers_(io_threads);
     }

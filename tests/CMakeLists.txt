@@ -378,3 +378,21 @@ if(CLINK_BUILD_SQL)
         PROPERTIES TIMEOUT 30 LABELS sql
     )
 endif()
+
+# SQL-on-disaggregated-state end-to-end. Needs both the SQL frontend and the
+# S3 impl (which provides the remote-read:// state-backend scheme), so it only
+# builds when the AWS SDK was found (clink::s3 exists). Live tests gate on
+# CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET at runtime; skipped otherwise.
+if(CLINK_BUILD_SQL AND TARGET clink::s3)
+    add_executable(clink_sql_s3_e2e_tests test_sql_remote_read_e2e.cpp)
+    target_link_libraries(clink_sql_s3_e2e_tests PRIVATE
+        clink::sql
+        clink::s3
+        GTest::gtest_main
+    )
+    clink_set_warnings(clink_sql_s3_e2e_tests)
+    gtest_discover_tests(clink_sql_s3_e2e_tests
+        DISCOVERY_MODE PRE_TEST
+        PROPERTIES TIMEOUT 120 LABELS "sql;s3"
+    )
+endif()

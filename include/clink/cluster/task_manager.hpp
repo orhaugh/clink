@@ -226,6 +226,9 @@ private:
         std::string checkpoint_dir;
         std::string restore_from_dir;
         std::uint64_t restore_from_checkpoint_id{0};
+        // Per-subtask state-backend URI (decoupled from checkpoint_dir).
+        // Empty -> checkpoint_dir is the backend URI (legacy).
+        std::string state_backend_uri;
     };
     std::unordered_map<JobId, JobCheckpointState> per_job_checkpoint_;
 

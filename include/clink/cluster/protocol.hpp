@@ -203,6 +203,13 @@ struct DeployMsg {
     // operators run. Empty for jobs that declare none. v1 trailing field -
     // old TMs see EOF and leave it empty (no migration).
     std::string expected_state_versions_packed;
+    // Per-subtask state-backend URI, echoed from CheckpointConfig. When
+    // non-empty it overrides checkpoint_dir as the StateBackendSpec.uri so
+    // the subtask builds a remote/disaggregated backend; checkpoint_dir
+    // stays the local coordination dir. Empty -> checkpoint_dir is the
+    // backend URI (legacy). v1 trailing field - old TMs see EOF and leave
+    // it empty.
+    std::string state_backend_uri;
 };
 
 struct StartJobMsg {
@@ -352,6 +359,17 @@ struct CheckpointConfig {
     // Aligned vs unaligned barrier handling at multi-input operators.
     // Default Aligned - back-compat with every existing job.
     CheckpointAlignment alignment{CheckpointAlignment::Aligned};
+
+    // Per-subtask state-backend URI, decoupled from checkpoint_dir. When
+    // set, each subtask builds its state backend from this URI via the
+    // StateBackendFactory (e.g. "remote-read://bucket/job?endpoint=...");
+    // checkpoint_dir then stays the JM's LOCAL coordination directory for
+    // COMPLETED-N markers and HA recovery. Empty keeps the legacy
+    // behaviour: checkpoint_dir doubles as the backend URI (bare path =
+    // file scheme). This is what makes the remote/disaggregated backends
+    // (remote-read, s3+rocksdb, changelog+s3) usable in a cluster job
+    // without the JM writing markers to a non-filesystem path.
+    std::string state_backend_uri;
 };
 
 // Client → JM. Carries a JobGraphSpec serialized as JSON, plus any

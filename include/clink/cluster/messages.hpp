@@ -90,6 +90,9 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
     // Trailing packed expected state-version map. Older TMs see EOF
     // before this string and leave it empty (no schema migration).
     b.put_string(m.expected_state_versions_packed);
+    // Trailing state-backend URI. Older TMs see EOF before this string and
+    // leave it empty, so checkpoint_dir doubles as the backend URI.
+    b.put_string(m.state_backend_uri);
 }
 
 inline void encode_body(MessageBuilder& b, const StartJobMsg& m) {
@@ -175,6 +178,10 @@ inline void encode_body(MessageBuilder& b, const SubmitJobMsg& m) {
     // Older JMs ignore the trailing byte and see alignment=Aligned via
     // the default-init, which matches their historical behaviour.
     b.put_u8(static_cast<std::uint8_t>(m.checkpoint.alignment));
+    // Trailing state-backend URI (decoupled from checkpoint_dir). Older
+    // JMs see EOF before this string and leave it empty, so checkpoint_dir
+    // doubles as the backend URI (legacy behaviour).
+    b.put_string(m.checkpoint.state_backend_uri);
 }
 
 inline void encode_body(MessageBuilder& b, const SubmitJobAckMsg& m) {
@@ -355,6 +362,11 @@ inline DeployMsg decode_deploy(MessageReader& r) {
     if (!r.eof()) {
         m.expected_state_versions_packed = r.read_string();
     }
+    // Trailing state-backend URI. Absent from older JM peers -> stays
+    // empty (checkpoint_dir is the backend URI).
+    if (!r.eof()) {
+        m.state_backend_uri = r.read_string();
+    }
     return m;
 }
 
@@ -482,6 +494,11 @@ inline SubmitJobMsg decode_submit_job(MessageReader& r) {
         m.checkpoint.alignment = (raw == static_cast<std::uint8_t>(CheckpointAlignment::Unaligned))
                                      ? CheckpointAlignment::Unaligned
                                      : CheckpointAlignment::Aligned;
+    }
+    if (!r.eof()) {
+        // Trailing state-backend URI. Absent from older clients -> stays
+        // empty (checkpoint_dir is the backend URI).
+        m.checkpoint.state_backend_uri = r.read_string();
     }
     return m;
 }

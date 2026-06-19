@@ -87,6 +87,12 @@ struct RunnerContext {
     std::string checkpoint_dir;
     std::string restore_from_dir;
     std::uint64_t restore_from_checkpoint_id{0};
+    // Per-subtask state-backend URI, decoupled from checkpoint_dir. When
+    // non-empty, make_subtask_job_config uses it as the StateBackendSpec
+    // uri (so the factory builds a remote/disaggregated backend) and
+    // checkpoint_dir stays the local coordination directory. Empty keeps
+    // the legacy behaviour where checkpoint_dir is the backend URI.
+    std::string state_backend_uri;
     // Per-job alignment policy. false = aligned (default); true =
     // unaligned (barriers overtake in-flight records at multi-input
     // operators). Propagated through the wire from CheckpointConfig

@@ -255,6 +255,7 @@ void persist_job_manifest_(const std::string& ha_dir,
     std::string manifest;
     manifest += "{\"graph_json\":" + q(graph_json);
     manifest += ",\"checkpoint_dir\":" + q(checkpoint.checkpoint_dir);
+    manifest += ",\"state_backend_uri\":" + q(checkpoint.state_backend_uri);
     manifest += ",\"interval_ms\":" + std::to_string(checkpoint.interval_ms);
     manifest += ",\"restore_from_dir\":" + q(checkpoint.restore_from_dir);
     manifest +=
@@ -430,6 +431,7 @@ void JobManager::recover_persisted_jobs() {
             continue;
         CheckpointConfig ckpt;
         ckpt.checkpoint_dir = read_string_field(body, "checkpoint_dir");
+        ckpt.state_backend_uri = read_string_field(body, "state_backend_uri");
         ckpt.interval_ms = static_cast<std::int64_t>(read_uint_field(body, "interval_ms"));
         ckpt.restore_from_dir = read_string_field(body, "restore_from_dir");
         ckpt.restore_from_checkpoint_id = read_uint_field(body, "restore_from_checkpoint_id");
@@ -1691,6 +1693,7 @@ JobId JobManager::deploy_internal_(const JobPlan& plan,
         deploy_msg.tasks = std::move(tasks);
         deploy_msg.plugins = plugins;
         deploy_msg.checkpoint_dir = checkpoint.checkpoint_dir;
+        deploy_msg.state_backend_uri = checkpoint.state_backend_uri;
         deploy_msg.restore_from_dir = checkpoint.restore_from_dir;
         deploy_msg.restore_from_checkpoint_id = checkpoint.restore_from_checkpoint_id;
         deploy_msg.unaligned_checkpoints = checkpoint.alignment == CheckpointAlignment::Unaligned;
@@ -2399,6 +2402,7 @@ std::vector<JobManager::PendingDeploy> JobManager::restart_job_locked_(JobState&
         deploy_msg.tasks = std::move(tasks);
         deploy_msg.plugins = job.plugins;
         deploy_msg.checkpoint_dir = job.checkpoint.checkpoint_dir;
+        deploy_msg.state_backend_uri = job.checkpoint.state_backend_uri;
         // Restart point: use the JM's own checkpoint dir as the
         // restore source, last completed checkpoint id we acknowledged.
         deploy_msg.restore_from_dir = job.checkpoint.checkpoint_dir;
@@ -2590,6 +2594,7 @@ void JobManager::dispatch_cutover_deploy_locked_(JobState& job,
         deploy_msg.tasks = std::move(tasks);
         deploy_msg.plugins = job.plugins;
         deploy_msg.checkpoint_dir = job.checkpoint.checkpoint_dir;
+        deploy_msg.state_backend_uri = job.checkpoint.state_backend_uri;
         // The new subtasks restore from the cutover checkpoint, NOT
         // the latest. This is the key difference from restart_job_locked_:
         // we use the coordinator-chosen cutover_checkpoint so all new

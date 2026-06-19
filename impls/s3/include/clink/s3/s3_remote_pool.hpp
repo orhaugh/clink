@@ -58,7 +58,10 @@ public:
         auto fs = fs_();
         Manifest m;
         if (base.value() != 0) {
-            m = load_manifest_(*fs, base);  // inherit the base checkpoint
+            // Inherit the base checkpoint. Absent == empty: a subtask that
+            // committed nothing at `base` (no keyed state, or a source/sink
+            // subtask) has no manifest there, which is not an error.
+            m = load_manifest_or_empty_(*fs, base);
         }
         for (const auto& d : deleted) {
             m.erase({d.op.value(), d.key});
@@ -135,13 +138,26 @@ private:
         auto it = cache_.find(id.value());
         if (it == cache_.end()) {
             auto fs = fs_();
-            it = cache_.emplace(id.value(), load_manifest_(*fs, id)).first;
+            it = cache_.emplace(id.value(), load_manifest_or_empty_(*fs, id)).first;
         }
         return it->second;
     }
 
     Manifest load_manifest_(arrow::fs::S3FileSystem& fs, CheckpointId id) const {
         return decode_manifest_(read_object_(fs, manifest_path_(id)));
+    }
+
+    // Load a manifest, treating an ABSENT manifest object as an empty one.
+    // A checkpoint id with no manifest at this subtask's prefix means the
+    // subtask committed no state there (empty keyed state, or a source/sink
+    // subtask) - that is "no entries", not an error, matching the in-memory
+    // pool double. A present-but-unreadable object still throws (real fault).
+    Manifest load_manifest_or_empty_(arrow::fs::S3FileSystem& fs, CheckpointId id) const {
+        const auto path = manifest_path_(id);
+        if (!object_present_(fs, path)) {
+            return Manifest{};
+        }
+        return decode_manifest_(read_object_(fs, path));
     }
 
     // --- binary manifest codec (length-prefixed; keys may be arbitrary bytes) ---

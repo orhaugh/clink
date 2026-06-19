@@ -744,6 +744,7 @@ void TaskManager::handle_deploy_(MessageReader& r) {
             .checkpoint_dir = msg.checkpoint_dir,
             .restore_from_dir = msg.restore_from_dir,
             .restore_from_checkpoint_id = msg.restore_from_checkpoint_id,
+            .state_backend_uri = msg.state_backend_uri,
         };
     }
     for (auto& task : msg.tasks) {
@@ -901,6 +902,9 @@ void TaskManager::run_generic_subtask_(JobId job_id,
     const RunnerRegistry* job_rr = nullptr;
     const OperatorRegistry* job_or = nullptr;
     const DagBuilderRegistry* job_dbr = nullptr;
+    // Per-subtask state-backend URI (decoupled from checkpoint_dir). Empty
+    // keeps the legacy behaviour where checkpoint_dir is the backend URI.
+    std::string state_backend_uri;
     {
         std::lock_guard lock(mu_);
         auto it = per_job_bundle_.find(job_id);
@@ -909,6 +913,9 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             job_rr = &it->second->runner_registry();
             job_or = &it->second->operator_registry();
             job_dbr = &it->second->dag_builder_registry();
+        }
+        if (auto ck = per_job_checkpoint_.find(job_id); ck != per_job_checkpoint_.end()) {
+            state_backend_uri = ck->second.state_backend_uri;
         }
     }
     const auto& bundle_tr = *job_tr;
@@ -1200,6 +1207,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 .checkpoint_dir = checkpoint_dir,
                 .restore_from_dir = restore_from_dir,
                 .restore_from_checkpoint_id = restore_from_checkpoint_id,
+                .state_backend_uri = state_backend_uri,
                 .unaligned_checkpoints = unaligned_ckpt,
                 .expected_state_versions_packed = expected_state_versions_packed,
                 .restore_from_subtask_idx = rescale_parent_idx,
@@ -1467,6 +1475,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             .checkpoint_dir = checkpoint_dir,
             .restore_from_dir = restore_from_dir,
             .restore_from_checkpoint_id = restore_from_checkpoint_id,
+            .state_backend_uri = state_backend_uri,
             .unaligned_checkpoints = unaligned_ckpt,
             .expected_state_versions_packed = expected_state_versions_packed,
             .restore_from_subtask_idx = task.restore_from_subtask_idx == kRestoreFromSelf
