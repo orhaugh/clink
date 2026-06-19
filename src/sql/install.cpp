@@ -33,6 +33,8 @@
 #include "clink/operators/map_operator.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/operators/watermark_assigner_operator.hpp"
+#include "clink/runtime/async_execution_controller.hpp"
+#include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/async_function_registry.hpp"
 #include "clink/sql/ptf_registry.hpp"
 #include "clink/sql/row.hpp"
@@ -163,6 +165,219 @@ struct AggState {
     clink::config::JsonValue udaf_acc{nullptr};
     bool udaf_initialised = false;
 };
+
+// A per-group accumulator bucket: the group-key column values plus one
+// AggState per aggregate. Lifted to file scope (was nested in
+// AggregateRowOp) so it can ride KeyedState<std::string, AggBucket> on the
+// async/backend-backed path.
+struct AggBucket {
+    Row group_values;
+    std::vector<AggState> agg_states;
+};
+
+// Exact, round-trip serialisation of AggBucket so the SQL GROUP BY operator
+// can hold per-group state in a StateBackend (KeyedState) instead of an
+// in-memory map - the prerequisite for the async-state path and for
+// checkpointed aggregates. Every AggState field is encoded; a serialisation
+// bug would silently corrupt aggregates, so the end-to-end test compares the
+// backend-backed path against the in-memory path across many aggregate
+// functions. Layout is little-endian binary: doubles by exact bit pattern
+// (no JSON-text precision loss), JsonValues via their canonical JSON text.
+namespace agg_codec_detail {
+
+inline void put_u32(std::vector<std::byte>& o, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i)
+        o.push_back(static_cast<std::byte>((v >> (i * 8)) & 0xFF));
+}
+inline void put_u64(std::vector<std::byte>& o, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i)
+        o.push_back(static_cast<std::byte>((v >> (i * 8)) & 0xFF));
+}
+inline void put_double(std::vector<std::byte>& o, double d) {
+    std::uint64_t b = 0;
+    std::memcpy(&b, &d, 8);
+    put_u64(o, b);
+}
+inline void put_bool(std::vector<std::byte>& o, bool b) {
+    o.push_back(static_cast<std::byte>(b ? 1 : 0));
+}
+inline void put_str(std::vector<std::byte>& o, const std::string& s) {
+    put_u32(o, static_cast<std::uint32_t>(s.size()));
+    for (char c : s)
+        o.push_back(static_cast<std::byte>(static_cast<unsigned char>(c)));
+}
+inline void put_json(std::vector<std::byte>& o, const clink::config::JsonValue& v) {
+    put_str(o, v.serialize(0));
+}
+
+struct Reader {
+    std::span<const std::byte> buf;
+    std::size_t pos = 0;
+    bool ok = true;
+    bool need(std::size_t n) {
+        if (pos + n > buf.size())
+            ok = false;
+        return ok;
+    }
+    std::uint32_t u32() {
+        if (!need(4))
+            return 0;
+        std::uint32_t v = 0;
+        for (int i = 0; i < 4; ++i)
+            v |= static_cast<std::uint32_t>(static_cast<std::uint8_t>(buf[pos + i])) << (i * 8);
+        pos += 4;
+        return v;
+    }
+    std::uint64_t u64() {
+        if (!need(8))
+            return 0;
+        std::uint64_t v = 0;
+        for (int i = 0; i < 8; ++i)
+            v |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(buf[pos + i])) << (i * 8);
+        pos += 8;
+        return v;
+    }
+    double dbl() {
+        std::uint64_t b = u64();
+        double d = 0.0;
+        std::memcpy(&d, &b, 8);
+        return d;
+    }
+    bool boolean() {
+        if (!need(1))
+            return false;
+        return static_cast<std::uint8_t>(buf[pos++]) != 0;
+    }
+    std::string str() {
+        const std::uint32_t n = u32();
+        if (!need(n))
+            return {};
+        std::string s(reinterpret_cast<const char*>(buf.data() + pos), n);
+        pos += n;
+        return s;
+    }
+    clink::config::JsonValue json() {
+        const std::string text = str();
+        if (!ok)
+            return clink::config::JsonValue{nullptr};
+        try {
+            return clink::config::parse(text);
+        } catch (...) {
+            ok = false;
+            return clink::config::JsonValue{nullptr};
+        }
+    }
+};
+
+inline void encode_agg_state(std::vector<std::byte>& o, const AggState& s) {
+    put_double(o, s.running_sum);
+    put_double(o, s.running_sum_sq);
+    put_u64(o, static_cast<std::uint64_t>(s.running_count));
+    put_json(o, s.running_min);
+    put_json(o, s.running_max);
+    put_bool(o, s.initialised);
+    put_u32(o, static_cast<std::uint32_t>(s.value_counts.size()));
+    for (const auto& [k, v] : s.value_counts) {
+        put_str(o, k);
+        put_u32(o, static_cast<std::uint32_t>(v));
+    }
+    put_u32(o, static_cast<std::uint32_t>(s.minmax_counts.size()));
+    for (const auto& [k, v] : s.minmax_counts) {
+        put_json(o, k);
+        put_u32(o, static_cast<std::uint32_t>(v));
+    }
+    // exact-decimal sum: dec-string text (default Decimal -> "0").
+    put_str(o,
+            clink::config::make_dec_value(s.running_sum_dec).is_string()
+                ? clink::config::make_dec_value(s.running_sum_dec).as_string()
+                : std::string{});
+    put_bool(o, s.sum_dec_started);
+    put_bool(o, s.sum_saw_decimal);
+    put_bool(o, s.sum_dec_complete);
+    put_u32(o, static_cast<std::uint32_t>(s.percentile_values.size()));
+    for (double d : s.percentile_values)
+        put_double(o, d);
+    put_u32(o, static_cast<std::uint32_t>(s.array_values.size()));
+    for (const auto& v : s.array_values)
+        put_json(o, v);
+    put_json(o, s.udaf_acc);
+    put_bool(o, s.udaf_initialised);
+}
+
+inline AggState decode_agg_state(Reader& r) {
+    AggState s;
+    s.running_sum = r.dbl();
+    s.running_sum_sq = r.dbl();
+    s.running_count = static_cast<std::int64_t>(r.u64());
+    s.running_min = r.json();
+    s.running_max = r.json();
+    s.initialised = r.boolean();
+    for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i) {
+        std::string k = r.str();
+        s.value_counts[k] = static_cast<int>(r.u32());
+    }
+    for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i) {
+        clink::config::JsonValue k = r.json();
+        s.minmax_counts[k] = static_cast<int>(r.u32());
+    }
+    {
+        const std::string dec = r.str();
+        if (!dec.empty()) {
+            if (auto d = clink::config::dec_parse(dec))
+                s.running_sum_dec = *d;
+        }
+    }
+    s.sum_dec_started = r.boolean();
+    s.sum_saw_decimal = r.boolean();
+    s.sum_dec_complete = r.boolean();
+    for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i)
+        s.percentile_values.push_back(r.dbl());
+    for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i)
+        s.array_values.push_back(r.json());
+    s.udaf_acc = r.json();
+    s.udaf_initialised = r.boolean();
+    return s;
+}
+
+}  // namespace agg_codec_detail
+
+inline clink::Codec<AggBucket> agg_bucket_codec() {
+    using Bytes = clink::Codec<AggBucket>::Bytes;
+    using BytesView = clink::Codec<AggBucket>::BytesView;
+    return clink::Codec<AggBucket>{
+        .encode = [](const AggBucket& b) -> Bytes {
+            Bytes o;
+            clink::config::JsonValue gv{clink::config::JsonObject{b.group_values.values}};
+            agg_codec_detail::put_str(o, gv.serialize(0));
+            agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(b.agg_states.size()));
+            for (const auto& s : b.agg_states)
+                agg_codec_detail::encode_agg_state(o, s);
+            return o;
+        },
+        .decode = [](BytesView buf) -> std::optional<AggBucket> {
+            agg_codec_detail::Reader r{buf, 0, true};
+            AggBucket b;
+            const std::string gv_text = r.str();
+            if (!r.ok)
+                return std::nullopt;
+            try {
+                auto j = clink::config::parse(gv_text);
+                if (j.is_object())
+                    b.group_values.values = j.as_object();
+            } catch (...) {
+                return std::nullopt;
+            }
+            const std::uint32_t n = r.u32();
+            b.agg_states.reserve(n);
+            for (std::uint32_t i = 0; i < n && r.ok; ++i)
+                b.agg_states.push_back(agg_codec_detail::decode_agg_state(r));
+            if (!r.ok)
+                return std::nullopt;
+            return b;
+        },
+        .encode_into = {},
+    };
+}
 
 // Key a value for the multiplicity map. STRING_AGG joins the raw text
 // (strings unquoted); COUNT(DISTINCT) keys on the canonical
@@ -1310,14 +1525,23 @@ private:
 // group columns plus the latest finalised aggregate values
 // (upsert-style stream). Watermarks and barriers are forwarded
 // unchanged; state never expires.
+// async_state=true makes per-group state live in KeyedState (the
+// StateBackend) instead of the in-memory map, which (a) makes the
+// aggregate checkpointed/recoverable and (b) lets it ride the async-state
+// execution path (process_async) so a slow remote/disaggregated read
+// suspends a record instead of blocking the runner. The in-memory path is
+// the default and is byte-for-byte unchanged. The fold logic is shared by
+// both paths, so they produce identical results.
 class AggregateRowOp final : public Operator<Row, Row> {
 public:
     AggregateRowOp(std::vector<std::string> group_keys,
                    std::vector<AggSpec> aggregates,
-                   std::vector<std::string> group_key_outputs = {})
+                   std::vector<std::string> group_key_outputs = {},
+                   bool async_state = false)
         : group_keys_(std::move(group_keys)),
           aggregates_(std::move(aggregates)),
-          group_key_outputs_(std::move(group_key_outputs)) {
+          group_key_outputs_(std::move(group_key_outputs)),
+          async_state_(async_state) {
         if (group_key_outputs_.size() != group_keys_.size()) {
             group_key_outputs_ = group_keys_;  // default: emit each key under its raw name
         }
@@ -1326,9 +1550,23 @@ public:
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (element.is_data()) {
             Batch<Row> emit_batch;
-            for (const auto& rec : element.as_data()) {
-                if (auto out_row = handle_record_(rec.value())) {
-                    emit_batch.push(Record<Row>{std::move(*out_row)});
+            if (async_state_) {
+                // KeyedState (synchronous) path: used when async_state is on
+                // but the backend cannot defer reads, so the runner stays on
+                // process(). State still rides the StateBackend.
+                auto kv = keyed_state_();
+                for (const auto& rec : element.as_data()) {
+                    const Row& row = rec.value();
+                    const std::string key = group_key_(row);
+                    auto cur = kv.get(key);
+                    AggBucket bucket = cur.has_value() ? std::move(*cur) : init_bucket_(row);
+                    Row out_row = fold_into_(bucket, row);
+                    kv.put(key, bucket);
+                    emit_batch.push(Record<Row>{std::move(out_row)});
+                }
+            } else {
+                for (const auto& rec : element.as_data()) {
+                    emit_batch.push(Record<Row>{handle_record_inmem_(rec.value())});
                 }
             }
             if (!emit_batch.empty())
@@ -1340,15 +1578,42 @@ public:
         }
     }
 
+    [[nodiscard]] bool supports_async() const noexcept override { return async_state_; }
+
+    void process_async(const StreamElement<Row>& element,
+                       Emitter<Row>& out,
+                       AsyncExecutionController& aec) override {
+        if (!element.is_data()) {
+            return;  // the runner routes watermarks/barriers through the controller
+        }
+        auto kv = keyed_state_();
+        for (const auto& rec : element.as_data()) {
+            Row row = rec.value();
+            std::string key = group_key_(row);
+            auto factory =
+                [this, kv, row = std::move(row), key, &out]() mutable -> async::Task<void> {
+                auto cur = co_await kv.get_async(key);
+                AggBucket bucket = cur.has_value() ? std::move(*cur) : init_bucket_(row);
+                Row out_row = fold_into_(bucket, row);
+                kv.put(key, bucket);
+                Batch<Row> b;
+                b.push(Record<Row>{std::move(out_row)});
+                out.emit_data(std::move(b));
+                co_return;
+            };
+            // Backpressure: at the in-flight cap submit() refuses without
+            // consuming the factory; poll() drains completions and we retry.
+            while (!aec.submit(key, factory)) {
+                aec.poll();
+            }
+        }
+    }
+
     std::string name() const override { return "aggregate_row"; }
 
 private:
-    struct Bucket {
-        Row group_values;
-        std::vector<AggState> agg_states;
-    };
-
-    std::optional<Row> handle_record_(const Row& row) {
+    // Concatenated group-key values; the KeyedState key and the per-key gate key.
+    std::string group_key_(const Row& row) const {
         std::string key;
         for (std::size_t i = 0; i < group_keys_.size(); ++i) {
             if (i > 0)
@@ -1358,37 +1623,41 @@ private:
                 key += vit->second.serialize(0);
             }
         }
-        auto it = state_.find(key);
-        if (it == state_.end()) {
-            Bucket b;
-            b.agg_states.resize(aggregates_.size());
-            for (std::size_t i = 0; i < group_keys_.size(); ++i) {
-                auto v = row.values.find(group_keys_[i]);
-                if (v != row.values.end())
-                    b.group_values.values[group_key_outputs_[i]] = v->second;
-            }
-            it = state_.emplace(key, std::move(b)).first;
+        return key;
+    }
+
+    // A fresh bucket: group-key output columns populated, one AggState per aggregate.
+    AggBucket init_bucket_(const Row& row) const {
+        AggBucket b;
+        b.agg_states.resize(aggregates_.size());
+        for (std::size_t i = 0; i < group_keys_.size(); ++i) {
+            auto v = row.values.find(group_keys_[i]);
+            if (v != row.values.end())
+                b.group_values.values[group_key_outputs_[i]] = v->second;
         }
-        // Phase 24b: retraction-aware aggregation. Input rows tagged
-        // delete or update_before subtract from the running state;
-        // insert / update_after / untagged add. When the input
-        // stream is a changelog (any __row_kind present), tag the
-        // output as update_after so downstream upsert sinks treat
-        // each emission as the latest snapshot of the group key.
+        return b;
+    }
+
+    // Fold one input row into the bucket and produce the upsert output row.
+    // Phase 24b: retraction-aware. Input rows tagged delete / update_before
+    // subtract; insert / update_after / untagged add. A changelog input
+    // (any __row_kind) tags the output update_after so upsert sinks treat
+    // each emission as the latest snapshot of the group key.
+    Row fold_into_(AggBucket& b, const Row& row) const {
         const bool input_has_kind = has_row_kind(row);
         const auto kind = input_has_kind ? row_kind_of(row) : std::string{};
         const bool retract = input_has_kind && is_delete_like(kind);
         for (std::size_t i = 0; i < aggregates_.size(); ++i) {
             if (retract) {
-                retract_agg(it->second.agg_states[i], aggregates_[i], row);
+                retract_agg(b.agg_states[i], aggregates_[i], row);
             } else {
-                update_agg(it->second.agg_states[i], aggregates_[i], row);
+                update_agg(b.agg_states[i], aggregates_[i], row);
             }
         }
-        Row out_row = it->second.group_values;
+        Row out_row = b.group_values;
         for (std::size_t i = 0; i < aggregates_.size(); ++i) {
             out_row.values[aggregates_[i].output_name] =
-                finalize_agg(it->second.agg_states[i], aggregates_[i]);
+                finalize_agg(b.agg_states[i], aggregates_[i]);
         }
         if (input_has_kind) {
             set_row_kind(out_row, kRowKindUpdateAfter);
@@ -1396,10 +1665,26 @@ private:
         return out_row;
     }
 
+    // In-memory (default) per-record path.
+    Row handle_record_inmem_(const Row& row) {
+        const std::string key = group_key_(row);
+        auto it = state_.find(key);
+        if (it == state_.end()) {
+            it = state_.emplace(key, init_bucket_(row)).first;
+        }
+        return fold_into_(it->second, row);
+    }
+
+    KeyedState<std::string, AggBucket> keyed_state_() {
+        return this->runtime()->template keyed_state<std::string, AggBucket>(
+            "agg", clink::string_codec(), agg_bucket_codec());
+    }
+
     std::vector<std::string> group_keys_;
     std::vector<AggSpec> aggregates_;
     std::vector<std::string> group_key_outputs_;
-    std::unordered_map<std::string, Bucket> state_;
+    bool async_state_ = false;
+    std::unordered_map<std::string, AggBucket> state_;
 };
 
 enum class EquiJoinKind { Inner, LeftOuter, RightOuter, FullOuter };
@@ -4231,8 +4516,11 @@ void install(clink::plugin::PluginRegistry& reg) {
                 spec.retractable = true;
                 aggregates.push_back(std::move(spec));
             }
-            return std::make_shared<AggregateRowOp>(
-                std::move(group_keys), std::move(aggregates), std::move(group_key_outputs));
+            const bool async_state = ctx.param_or("async_state", "false") == "true";
+            return std::make_shared<AggregateRowOp>(std::move(group_keys),
+                                                    std::move(aggregates),
+                                                    std::move(group_key_outputs),
+                                                    async_state);
         });
 
     // project_row: per-row expression evaluation. The 'outputs' param

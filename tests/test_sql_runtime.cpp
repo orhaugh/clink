@@ -88,11 +88,12 @@ void ensure_sql_installed_once() {
     (void)done;
 }
 
-cluster::JobGraphSpec compile(const Catalog& cat, const char* sql) {
+cluster::JobGraphSpec compile(const Catalog& cat, const char* sql, bool async_agg = false) {
     Binder b(cat);
     auto plan = b.bind_insert(std::get<ast::InsertStmt>(parse(sql).statements[0]));
     plan = optimize(std::move(plan));
     PhysicalPlanner pp;
+    pp.set_async_state_for_aggregation(async_agg);
     return pp.compile(static_cast<const LogicalSink&>(*plan));
 }
 
@@ -5695,6 +5696,107 @@ TEST(SqlRuntime, ParquetTypedColumnarRoundTripEndToEnd) {
     EXPECT_TRUE(got[3].active);
 
     for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
+// Async-state SQL GROUP BY: with the planner's async-state switch on, the
+// aggregate holds per-group state in KeyedState (serialising every AggBucket
+// through the codec on each record) instead of the in-memory map. Running the
+// same GROUP BY both ways must yield identical final aggregates - which proves
+// the AggState/AggBucket codec round-trips every accumulator field. Covers
+// SUM (+exact-decimal), COUNT, MIN/MAX (multiset), AVG, COUNT(DISTINCT).
+TEST(SqlRuntime, AsyncStateGroupByMatchesInMemory) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_aggasync_in.ndjson";
+    const auto sync_out = tmp / "clink_sql_aggasync_sync.ndjson";
+    const auto async_out = tmp / "clink_sql_aggasync_async.ndjson";
+    for (const auto& p : {in_path, sync_out, async_out})
+        std::filesystem::remove(p);
+
+    write_lines(in_path,
+                {
+                    R"({"user_id":1,"amount":10})",
+                    R"({"user_id":2,"amount":20})",
+                    R"({"user_id":1,"amount":30})",
+                    R"({"user_id":2,"amount":5})",
+                    R"({"user_id":1,"amount":10})",  // repeat -> COUNT(DISTINCT) < COUNT
+                    R"({"user_id":1,"amount":7})",
+                    R"({"user_id":2,"amount":20})",  // repeat
+                });
+
+    const std::string select =
+        "SELECT user_id, SUM(amount) AS s, COUNT(*) AS c, MIN(amount) AS mn, "
+        "MAX(amount) AS mx, AVG(amount) AS av, COUNT(DISTINCT amount) AS cd "
+        "FROM orders GROUP BY user_id";
+
+    auto run = [&](const std::filesystem::path& out_path, bool async_agg, const char* tm_id) {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE orders (user_id BIGINT, amount BIGINT) "
+                                     "WITH (connector='file', format='json', path='"} +
+                         in_path.string() +
+                         "');"
+                         "CREATE TABLE dst (user_id BIGINT, s BIGINT, c BIGINT, mn BIGINT, "
+                         "mx BIGINT, av DOUBLE, cd BIGINT) "
+                         "WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, ("INSERT INTO dst " + select).c_str(), async_agg);
+        InProcessCluster cluster(tm_id, 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto result = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+        ASSERT_TRUE(result.ok) << "errors: "
+                               << (result.errors.empty() ? "(none)" : result.errors[0]);
+    };
+
+    run(sync_out, /*async_agg=*/false, "tm-agg-sync");
+    run(async_out, /*async_agg=*/true, "tm-agg-async");
+
+    // Last emission per group is its final aggregate (upsert stream). Order
+    // across keys is not guaranteed, so compare per-key finals, not raw lines.
+    auto finals = [](const std::vector<std::string>& lines) {
+        std::map<std::int64_t, clink::config::JsonValue> m;
+        for (const auto& l : lines) {
+            auto j = clink::config::parse(l);
+            if (j.is_object())
+                m[static_cast<std::int64_t>(j.at("user_id").as_number())] = j;
+        }
+        return m;
+    };
+    auto sync_finals = finals(read_lines(sync_out));
+    auto async_finals = finals(read_lines(async_out));
+
+    // Expected in-memory values (sanity, so we are not just comparing two wrongs):
+    //   user 1: amounts 10,30,10,7 -> s=57 c=4 mn=7 mx=30 av=14.25 cd=3
+    //   user 2: amounts 20,5,20    -> s=45 c=3 mn=5 mx=20 av=15.0  cd=2
+    ASSERT_EQ(sync_finals.size(), 2u);
+    EXPECT_EQ(sync_finals[1].at("s").as_number(), 57);
+    EXPECT_EQ(sync_finals[1].at("c").as_number(), 4);
+    EXPECT_EQ(sync_finals[1].at("mn").as_number(), 7);
+    EXPECT_EQ(sync_finals[1].at("mx").as_number(), 30);
+    EXPECT_NEAR(sync_finals[1].at("av").as_number(), 14.25, 1e-9);
+    EXPECT_EQ(sync_finals[1].at("cd").as_number(), 3);
+    EXPECT_EQ(sync_finals[2].at("s").as_number(), 45);
+    EXPECT_EQ(sync_finals[2].at("cd").as_number(), 2);
+
+    // The codec proof: async-state (KeyedState) finals match in-memory finals.
+    ASSERT_EQ(async_finals.size(), sync_finals.size());
+    for (const auto& [k, jrow] : sync_finals) {
+        ASSERT_TRUE(async_finals.count(k)) << "missing group " << k;
+        const auto& jb = async_finals.at(k);
+        for (const char* f : {"s", "c", "mn", "mx", "cd"}) {
+            EXPECT_EQ(jrow.at(f).as_number(), jb.at(f).as_number())
+                << "group " << k << " field " << f;
+        }
+        EXPECT_NEAR(jrow.at("av").as_number(), jb.at("av").as_number(), 1e-9) << "group " << k;
+    }
+
+    for (const auto& p : {in_path, sync_out, async_out})
         std::filesystem::remove(p);
 }
 

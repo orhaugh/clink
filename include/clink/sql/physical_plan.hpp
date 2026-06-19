@@ -44,6 +44,18 @@ public:
     // Throws TranslationError when the plan uses constructs outside
     // Phase 1 scope (multi-column tables, unknown connectors, etc.).
     [[nodiscard]] cluster::JobGraphSpec compile(const LogicalSink& root) const;
+
+    // Opt into the async-state execution path for unbounded GROUP BY.
+    // When set, aggregate_row operators are marked async_state=true: at
+    // runtime they hold per-group state in KeyedState (checkpointed) and
+    // take process_async() when the state backend can defer reads, so a
+    // slow remote/disaggregated read suspends a record instead of blocking
+    // the runner. Default off keeps the in-memory aggregate path unchanged.
+    // Flink analogue: table.exec.async-state.enabled.
+    void set_async_state_for_aggregation(bool v) noexcept { async_state_for_aggregation_ = v; }
+
+private:
+    bool async_state_for_aggregation_ = false;
 };
 
 }  // namespace clink::sql

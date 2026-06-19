@@ -259,7 +259,8 @@ std::optional<std::string> maybe_emit_assign_timestamps(const TableDef& table,
 std::string compile_node(const LogicalPlan& node,
                          Channel ch,
                          cluster::JobGraphSpec& spec,
-                         int& next_id) {
+                         int& next_id,
+                         bool async_agg) {
     if (node.kind() == "Scan") {
         const auto& scan = static_cast<const LogicalScan&>(node);
         const auto& table = scan.table();
@@ -336,8 +337,8 @@ std::string compile_node(const LogicalPlan& node,
         if (ch != Channel::Row) {
             unsupported("equi-join requires format='json' Row channel on both sides");
         }
-        std::string left_id = compile_node(jn.left(), ch, spec, next_id);
-        std::string right_id = compile_node(jn.right(), ch, spec, next_id);
+        std::string left_id = compile_node(jn.left(), ch, spec, next_id, async_agg);
+        std::string right_id = compile_node(jn.right(), ch, spec, next_id, async_agg);
 
         auto emit_key = [&](const std::string& input, const std::string& column) {
             cluster::OperatorSpec keyer;
@@ -405,7 +406,7 @@ std::string compile_node(const LogicalPlan& node,
         if (ch != Channel::Row) {
             unsupported("lookup join requires format='json' Row channel");
         }
-        std::string input_id = compile_node(lj.input(), ch, spec, next_id);
+        std::string input_id = compile_node(lj.input(), ch, spec, next_id, async_agg);
 
         auto join_csv = [](const std::vector<std::string>& cols) {
             std::string out;
@@ -452,8 +453,8 @@ std::string compile_node(const LogicalPlan& node,
         if (ch != Channel::Row) {
             unsupported("semi/anti join requires format='json' Row channel on both sides");
         }
-        std::string left_id = compile_node(jn.left(), ch, spec, next_id);
-        std::string right_id = compile_node(jn.right(), ch, spec, next_id);
+        std::string left_id = compile_node(jn.left(), ch, spec, next_id, async_agg);
+        std::string right_id = compile_node(jn.right(), ch, spec, next_id, async_agg);
         auto emit_key = [&](const std::string& input, const std::string& column) {
             cluster::OperatorSpec keyer;
             keyer.id = "key_" + std::to_string(next_id++);
@@ -502,8 +503,8 @@ std::string compile_node(const LogicalPlan& node,
         if (ch != Channel::Row) {
             unsupported("scalar subquery requires format='json' Row channel");
         }
-        std::string main_id = compile_node(sb.main(), ch, spec, next_id);
-        std::string scalar_id = compile_node(sb.scalar(), ch, spec, next_id);
+        std::string main_id = compile_node(sb.main(), ch, spec, next_id, async_agg);
+        std::string scalar_id = compile_node(sb.scalar(), ch, spec, next_id, async_agg);
         cluster::OperatorSpec op;
         op.id = "scalarbcast_" + std::to_string(next_id++);
         op.type = "scalar_broadcast_filter_row";
@@ -524,8 +525,8 @@ std::string compile_node(const LogicalPlan& node,
         if (ch != Channel::Row) {
             unsupported("scalar subquery requires format='json' Row channel");
         }
-        std::string main_id = compile_node(sp.main(), ch, spec, next_id);
-        std::string scalar_id = compile_node(sp.scalar(), ch, spec, next_id);
+        std::string main_id = compile_node(sp.main(), ch, spec, next_id, async_agg);
+        std::string scalar_id = compile_node(sp.scalar(), ch, spec, next_id, async_agg);
         cluster::OperatorSpec op;
         op.id = "scalarproj_" + std::to_string(next_id++);
         op.type = "scalar_project_row";
@@ -542,8 +543,8 @@ std::string compile_node(const LogicalPlan& node,
         if (ch != Channel::Row) {
             unsupported("interval join requires format='json' Row channel on both sides");
         }
-        std::string left_id = compile_node(jn.left(), ch, spec, next_id);
-        std::string right_id = compile_node(jn.right(), ch, spec, next_id);
+        std::string left_id = compile_node(jn.left(), ch, spec, next_id, async_agg);
+        std::string right_id = compile_node(jn.right(), ch, spec, next_id, async_agg);
 
         // Phase 7: insert row_compute_key on each side so the
         // upstream routing layer hash-partitions records by the
@@ -614,7 +615,7 @@ std::string compile_node(const LogicalPlan& node,
         // keeps each group on one subtask. Emits an upsert-style Row
         // per input record carrying the latest aggregate values.
         const auto& agg = static_cast<const LogicalAggregate&>(node);
-        std::string input_id = compile_node(agg.input(), ch, spec, next_id);
+        std::string input_id = compile_node(agg.input(), ch, spec, next_id, async_agg);
         if (ch != Channel::Row) {
             unsupported("unbounded GROUP BY requires format='json' Row channel");
         }
@@ -641,6 +642,8 @@ std::string compile_node(const LogicalPlan& node,
         op.type = "aggregate_row";
         op.inputs = {std::move(input_id)};
         op.out_channel = std::string{kChannelRow};
+        if (async_agg)
+            op.params["async_state"] = "true";
         if (!agg.group_keys().empty())
             op.key_by = "row_key";
 
@@ -687,7 +690,7 @@ std::string compile_node(const LogicalPlan& node,
         // match_recognize_row op rebuilds a Pattern<Row> from the params and
         // drives CepOperator<Row,Row>. ONE ROW PER MATCH, append-only.
         const auto& mr = static_cast<const LogicalMatchRecognize&>(node);
-        std::string input_id = compile_node(mr.input(), ch, spec, next_id);
+        std::string input_id = compile_node(mr.input(), ch, spec, next_id, async_agg);
         if (ch != Channel::Row) {
             unsupported("MATCH_RECOGNIZE requires format='json' Row channel");
         }
@@ -760,7 +763,7 @@ std::string compile_node(const LogicalPlan& node,
         // process_table_function_row op resolves the registered
         // KeyedProcessFunction<string,Row,Row> by name and drives it.
         const auto& ptf = static_cast<const LogicalProcessTableFunction&>(node);
-        std::string input_id = compile_node(ptf.input(), ch, spec, next_id);
+        std::string input_id = compile_node(ptf.input(), ch, spec, next_id, async_agg);
         if (ch != Channel::Row) {
             unsupported("process table function requires format='json' Row channel");
         }
@@ -798,7 +801,7 @@ std::string compile_node(const LogicalPlan& node,
     }
     if (node.kind() == "WindowAggregate") {
         const auto& agg = static_cast<const LogicalWindowAggregate&>(node);
-        std::string input_id = compile_node(agg.input(), ch, spec, next_id);
+        std::string input_id = compile_node(agg.input(), ch, spec, next_id, async_agg);
         if (ch != Channel::Row) {
             unsupported("windowed aggregation requires format='json' Row channel");
         }
@@ -901,8 +904,8 @@ std::string compile_node(const LogicalPlan& node,
         if (ch != Channel::Row) {
             unsupported("UNION ALL requires format='json' Row channel");
         }
-        std::string left_id = compile_node(un.left(), ch, spec, next_id);
-        std::string right_id = compile_node(un.right(), ch, spec, next_id);
+        std::string left_id = compile_node(un.left(), ch, spec, next_id, async_agg);
+        std::string right_id = compile_node(un.right(), ch, spec, next_id, async_agg);
         cluster::OperatorSpec op;
         op.id = "uni_" + std::to_string(next_id++);
         op.type = "union_row";
@@ -924,8 +927,8 @@ std::string compile_node(const LogicalPlan& node,
         if (ch != Channel::Row) {
             unsupported("set operation requires format='json' Row channel on both sides");
         }
-        std::string left_id = compile_node(so.left(), ch, spec, next_id);
-        std::string right_id = compile_node(so.right(), ch, spec, next_id);
+        std::string left_id = compile_node(so.left(), ch, spec, next_id, async_agg);
+        std::string right_id = compile_node(so.right(), ch, spec, next_id, async_agg);
 
         auto all_columns_csv = [](const std::shared_ptr<arrow::Schema>& s) {
             std::string out;
@@ -968,7 +971,7 @@ std::string compile_node(const LogicalPlan& node,
     }
     if (node.kind() == "TopN") {
         const auto& topn = static_cast<const LogicalTopN&>(node);
-        std::string input_id = compile_node(topn.input(), ch, spec, next_id);
+        std::string input_id = compile_node(topn.input(), ch, spec, next_id, async_agg);
         if (ch != Channel::Row) {
             unsupported("ORDER BY requires format='json' Row channel");
         }
@@ -1002,7 +1005,7 @@ std::string compile_node(const LogicalPlan& node,
         // first n records and drops the rest. Per-subtask semantics
         // at parallelism > 1 - same caveat as the runtime op.
         const auto& lim = static_cast<const LogicalLimit&>(node);
-        std::string input_id = compile_node(lim.input(), ch, spec, next_id);
+        std::string input_id = compile_node(lim.input(), ch, spec, next_id, async_agg);
         if (ch != Channel::Row) {
             unsupported("LIMIT requires format='json' Row channel");
         }
@@ -1025,7 +1028,7 @@ std::string compile_node(const LogicalPlan& node,
         // deterministic subtask and the per-subtask seen-set is
         // sufficient. String-channel DISTINCT is not yet supported.
         const auto& d = static_cast<const LogicalDistinct&>(node);
-        std::string input_id = compile_node(d.input(), ch, spec, next_id);
+        std::string input_id = compile_node(d.input(), ch, spec, next_id, async_agg);
         if (ch != Channel::Row) {
             unsupported("SELECT DISTINCT requires format='json' Row channel");
         }
@@ -1058,7 +1061,7 @@ std::string compile_node(const LogicalPlan& node,
     }
     if (node.kind() == "Filter") {
         const auto& filter = static_cast<const LogicalFilter&>(node);
-        std::string input_id = compile_node(filter.input(), ch, spec, next_id);
+        std::string input_id = compile_node(filter.input(), ch, spec, next_id, async_agg);
         cluster::OperatorSpec op;
         op.id = "filt_" + std::to_string(next_id++);
         op.type = ch == Channel::Row ? "filter_row_predicate" : "filter_string_predicate";
@@ -1076,7 +1079,7 @@ std::string compile_node(const LogicalPlan& node,
         // in AsyncFunctionRegistry::global(). Row channel only (the
         // enrichment is whole-row).
         const auto& amap = static_cast<const LogicalAsyncMap&>(node);
-        std::string input_id = compile_node(amap.input(), ch, spec, next_id);
+        std::string input_id = compile_node(amap.input(), ch, spec, next_id, async_agg);
         cluster::OperatorSpec op;
         op.id = "async_" + std::to_string(next_id++);
         op.type = "async_lookup_row";
@@ -1089,7 +1092,7 @@ std::string compile_node(const LogicalPlan& node,
     }
     if (node.kind() == "Project") {
         const auto& proj = static_cast<const LogicalProject&>(node);
-        std::string input_id = compile_node(proj.input(), ch, spec, next_id);
+        std::string input_id = compile_node(proj.input(), ch, spec, next_id, async_agg);
         cluster::OperatorSpec op;
         op.id = "proj_" + std::to_string(next_id++);
         op.inputs = {std::move(input_id)};
@@ -1131,7 +1134,7 @@ std::string compile_node(const LogicalPlan& node,
         const auto& table = sink.table();
         if (ch == Channel::String)
             check_string_channel_table(table);
-        std::string input_id = compile_node(sink.input(), ch, spec, next_id);
+        std::string input_id = compile_node(sink.input(), ch, spec, next_id, async_agg);
 
         if (ch == Channel::Row) {
             auto binding = row_sink_binding_for(table);
@@ -1193,7 +1196,7 @@ std::string compile_node(const LogicalPlan& node,
         if (ch != Channel::Row) {
             unsupported("OVER aggregates require format='json' Row channel");
         }
-        std::string input_id = compile_node(ov.input(), ch, spec, next_id);
+        std::string input_id = compile_node(ov.input(), ch, spec, next_id, async_agg);
         std::string part_csv;
         for (std::size_t i = 0; i < ov.partition_columns().size(); ++i) {
             if (i > 0)
@@ -1244,7 +1247,7 @@ std::string compile_node(const LogicalPlan& node,
         if (ch != Channel::Row) {
             unsupported("ROW_NUMBER TOP-N requires format='json' Row channel");
         }
-        std::string input_id = compile_node(tn.input(), ch, spec, next_id);
+        std::string input_id = compile_node(tn.input(), ch, spec, next_id, async_agg);
         if (!tn.partition_columns().empty()) {
             std::string keys_csv;
             for (std::size_t i = 0; i < tn.partition_columns().size(); ++i) {
@@ -1345,7 +1348,7 @@ cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
             "source and sink tables must use the same channel (string vs row): "
             "either both single-TEXT-column or both format='json'");
     }
-    compile_node(root, ch, spec, next_id);
+    compile_node(root, ch, spec, next_id, async_state_for_aggregation_);
     spec.validate();
     const auto dt =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)

@@ -219,6 +219,36 @@ TEST(SqlPhysical, MultiColumnParquetMapsToRowFactoriesWithSchema) {
 
 // delivery_guarantee='exactly_once' routes the parquet row sink to the
 // 2PC variant.
+// The planner's async-state switch stamps async_state=true on the
+// aggregate_row op (and leaves it off by default), which is what makes the
+// runtime aggregate take the KeyedState-backed path.
+TEST(SqlPhysical, AsyncStateFlagMarksAggregateRow) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE orders (user_id BIGINT, amount BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE dst (user_id BIGINT, s BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/out.ndjson')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(
+        cat, "INSERT INTO dst SELECT user_id, SUM(amount) AS s FROM orders GROUP BY user_id");
+
+    PhysicalPlanner on;
+    on.set_async_state_for_aggregation(true);
+    auto spec_on = on.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* agg_on = find_op(spec_on, "aggregate_row");
+    ASSERT_NE(agg_on, nullptr);
+    ASSERT_EQ(agg_on->params.count("async_state"), 1u);
+    EXPECT_EQ(agg_on->params.at("async_state"), "true");
+
+    PhysicalPlanner off;  // default: switch off
+    auto spec_off = off.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* agg_off = find_op(spec_off, "aggregate_row");
+    ASSERT_NE(agg_off, nullptr);
+    EXPECT_EQ(agg_off->params.count("async_state"), 0u);
+}
+
 TEST(SqlPhysical, ExactlyOnceParquetMapsTo2pcRowSink) {
     Catalog cat;
     auto s = parse(
