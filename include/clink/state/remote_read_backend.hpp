@@ -25,10 +25,18 @@
 // non-blocking twin. If no ResumeScheduler is wired, get_async degrades to a
 // safe inline blocking load (correct, just not deferred).
 //
-// Scope: ASYNC-8 is about the READ path. snapshot/restore capture the hot tier
-// (the authoritative recent writes); durable write-back of the hot tier to the
-// remote pool on checkpoint is the disaggregation binding (the CAS store), a
-// separate concern from the async-read mechanism delivered here.
+// Two constructions:
+//   * Loader-only (the original ASYNC-8 read tier): cold reads go through a
+//     RemoteLoader; snapshot/restore capture the hot tier only; no durable
+//     remote write-back. Kept for read-through caching over an external loader
+//     and for tests.
+//   * Pool-backed (production disaggregation binding): state lives in a durable
+//     RemotePool. Cold reads fetch (op,key) from the pool as-of the current
+//     committed checkpoint; snapshot commits only the delta since the last
+//     checkpoint (state is off the checkpoint-barrier path); restore is LAZY
+//     (cold reads serve the restored checkpoint, nothing is loaded eagerly),
+//     which is the fast-recovery / fast-rescale win. v1 bounds: same-parallelism
+//     restore (rescale deferred) and no hot-tier eviction yet.
 
 #include <atomic>
 #include <chrono>
@@ -38,8 +46,10 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -48,6 +58,7 @@
 #include "clink/async/task.hpp"
 #include "clink/metrics/disagg_metrics.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+#include "clink/state/remote_pool.hpp"
 #include "clink/state/state_backend.hpp"
 
 namespace clink {
@@ -63,12 +74,16 @@ public:
 
     explicit RemoteReadBackend(RemoteLoader loader, std::size_t io_threads = 1)
         : loader_(std::move(loader)) {
-        if (io_threads == 0) {
-            io_threads = 1;
-        }
-        for (std::size_t i = 0; i < io_threads; ++i) {
-            workers_.emplace_back([this] { io_loop_(); });
-        }
+        start_workers_(io_threads);
+    }
+
+    // Pool-backed (production) construction. State is durable in `pool`.
+    explicit RemoteReadBackend(std::shared_ptr<RemotePool> pool, std::size_t io_threads = 1)
+        : pool_(std::move(pool)) {
+        loader_ = [this](OperatorId op, std::string key) -> std::optional<Value> {
+            return pool_->read(CheckpointId{last_ckpt_.load(std::memory_order_relaxed)}, op, key);
+        };
+        start_workers_(io_threads);
     }
 
     ~RemoteReadBackend() override {
@@ -97,7 +112,14 @@ public:
 
     // --- sync StateBackend surface ---
 
-    void put(OperatorId op, KeyView key, ValueView value) override { hot_.put(op, key, value); }
+    void put(OperatorId op, KeyView key, ValueView value) override {
+        hot_.put(op, key, value);
+        if (pool_) {  // track the write so the next checkpoint commits the delta
+            auto k = std::make_pair(op.value(), std::string(key));
+            deleted_.erase(k);
+            dirty_.insert(std::move(k));
+        }
+    }
 
     // Hot hit, else a BLOCKING remote load (the truly-blocking read), filled
     // through into the hot tier.
@@ -115,12 +137,66 @@ public:
         return v;
     }
 
-    void erase(OperatorId op, KeyView key) override { hot_.erase(op, key); }
-    void scan(OperatorId op, const ScanVisitor& visit) const override { hot_.scan(op, visit); }
-    Snapshot snapshot(CheckpointId id) override { return hot_.snapshot(id); }
-    void restore(const Snapshot& snap, const KeyGroupRange& kg_filter = {}) override {
-        hot_.restore(snap, kg_filter);
+    void erase(OperatorId op, KeyView key) override {
+        hot_.erase(op, key);
+        if (pool_) {
+            auto k = std::make_pair(op.value(), std::string(key));
+            dirty_.erase(k);
+            deleted_.insert(std::move(k));
+        }
     }
+    void scan(OperatorId op, const ScanVisitor& visit) const override { hot_.scan(op, visit); }
+
+    Snapshot snapshot(CheckpointId id) override {
+        if (!pool_) {
+            return hot_.snapshot(id);  // loader-only: hot tier only
+        }
+        // Commit only the delta since the last checkpoint; unchanged keys are
+        // inherited from the base inside the pool. State stays off the
+        // checkpoint-barrier path, so the framework Snapshot is just a marker.
+        std::vector<RemotePoolEntry> changed;
+        changed.reserve(dirty_.size());
+        for (const auto& [opv, key] : dirty_) {
+            const OperatorId op{opv};
+            if (auto v = hot_.get(op, std::string_view{key})) {
+                changed.push_back(RemotePoolEntry{op, key, std::move(*v)});
+            }
+        }
+        std::vector<RemotePoolKey> deleted;
+        deleted.reserve(deleted_.size());
+        for (const auto& [opv, key] : deleted_) {
+            deleted.push_back(RemotePoolKey{OperatorId{opv}, key});
+        }
+        const CheckpointId base{last_ckpt_.load(std::memory_order_relaxed)};
+        pool_->commit(id, base, changed, deleted);
+        last_ckpt_.store(id.value(), std::memory_order_relaxed);
+        dirty_.clear();
+        deleted_.clear();
+        Snapshot s;
+        s.checkpoint_id = id;  // the authoritative bytes are in the pool
+        return s;
+    }
+
+    void restore(const Snapshot& snap, const KeyGroupRange& kg_filter = {}) override {
+        if (!pool_) {
+            hot_.restore(snap, kg_filter);
+            return;
+        }
+        // Lazy restore: point cold reads at the restored checkpoint and load
+        // nothing eagerly (the fast-recovery win). v1: same-parallelism; the
+        // rescale key-group filter is a follow-on.
+        (void)kg_filter;
+        last_ckpt_.store(snap.checkpoint_id.value(), std::memory_order_relaxed);
+        dirty_.clear();
+        deleted_.clear();
+    }
+
+    void purge_checkpoint(CheckpointId id) override {
+        if (pool_) {
+            pool_->purge(id);
+        }
+    }
+
     [[nodiscard]] std::string description() const override { return "remote-read"; }
 
     // --- async read surface (ASYNC-8) ---
@@ -206,6 +282,15 @@ private:
         io_cv_.notify_one();
     }
 
+    void start_workers_(std::size_t io_threads) {
+        if (io_threads == 0) {
+            io_threads = 1;
+        }
+        for (std::size_t i = 0; i < io_threads; ++i) {
+            workers_.emplace_back([this] { io_loop_(); });
+        }
+    }
+
     void io_loop_() {
         for (;;) {
             std::function<void()> job;
@@ -236,6 +321,17 @@ private:
 
     mutable std::atomic<std::uint64_t> remote_loads_{0};
     mutable std::atomic<std::uint64_t> hot_hits_{0};
+
+    // Pool-backed (production) state. pool_ is null for the loader-only ctor.
+    // last_ckpt_ is the checkpoint cold reads serve and the base for the next
+    // commit; it is read on IO threads (the loader) and written on the runner
+    // thread (snapshot/restore) after the async work has drained, so atomic.
+    // dirty_/deleted_ track writes since the last checkpoint and are touched
+    // only on the runner thread (the hot-tier single-writer invariant).
+    std::shared_ptr<RemotePool> pool_;
+    mutable std::atomic<std::uint64_t> last_ckpt_{0};
+    std::set<std::pair<std::uint64_t, std::string>> dirty_;
+    std::set<std::pair<std::uint64_t, std::string>> deleted_;
 };
 
 }  // namespace clink

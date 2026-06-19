@@ -26,6 +26,7 @@ add_library(clink_s3 STATIC
     src/s3_source.cpp
     src/s3_sink.cpp
     src/register_factories.cpp
+    src/register_state_backend.cpp
 )
 add_library(clink::s3 ALIAS clink_s3)
 

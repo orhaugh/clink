@@ -13,6 +13,7 @@ add_executable(clink_s3_tests
     test_local_object_cache.cpp
     test_cas_manifest.cpp
     test_s3_cas_snapshot_store.cpp
+    test_s3_remote_pool.cpp
     test_state_parquet_export_s3.cpp
 )
 target_link_libraries(clink_s3_tests PRIVATE

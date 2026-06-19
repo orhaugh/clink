@@ -1255,6 +1255,7 @@ void install_linked_impls() {
 #endif
 #ifdef CLINK_LINKED_S3
     clink::s3::install(reg);
+    clink::s3::install_state_backend();  // remote-read:// disaggregated state backend
 #endif
     // RocksDB is unconditionally linked into clink_node (matches
     // bundled rocksdb-jni model). install() registers the

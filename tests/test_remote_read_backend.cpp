@@ -10,6 +10,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -139,4 +140,47 @@ TEST(RemoteReadBackend, AsyncColdReadRidesControllerAndResumesOnRunner) {
     // The loaded value is now hot: a follow-up sync get does no new remote load.
     EXPECT_EQ(to_string(*backend.get(OperatorId{1}, sv("cold"))), "remote-v");
     EXPECT_EQ(backend.remote_loads(), 1u);
+}
+
+// Pool-backed productionisation: state lives in a durable RemotePool, snapshot
+// commits only the delta against the previous checkpoint (incremental), and
+// restore is lazy (cold reads serve the restored checkpoint, nothing loaded
+// eagerly). Verified here with the in-memory pool double.
+TEST(RemoteReadBackend, PoolBackedIncrementalSnapshotAndLazyRestore) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    const OperatorId op{42};
+
+    {
+        RemoteReadBackend b(pool);
+        b.put(op, sv("a"), sv("v1"));
+        b.put(op, sv("b"), sv("v2"));
+        b.put(op, sv("d"), sv("v4"));
+        b.snapshot(CheckpointId{1});
+        // cp2 delta: update a, delete b, add c, leave d untouched (inherited).
+        b.put(op, sv("a"), sv("v1b"));
+        b.erase(op, sv("b"));
+        b.put(op, sv("c"), sv("v3"));
+        b.snapshot(CheckpointId{2});
+    }  // backend destroyed; state is durable in the pool
+
+    // Fresh backend, lazy restore from cp2.
+    RemoteReadBackend b2(pool);
+    Snapshot snap;
+    snap.checkpoint_id = CheckpointId{2};
+    b2.restore(snap);
+    EXPECT_EQ(b2.remote_loads(), 0u);  // restore loaded nothing eagerly
+
+    EXPECT_EQ(to_string(*b2.get(op, sv("a"))), "v1b");  // updated in cp2
+    EXPECT_EQ(to_string(*b2.get(op, sv("c"))), "v3");   // added in cp2
+    EXPECT_EQ(to_string(*b2.get(op, sv("d"))), "v4");   // inherited from cp1
+    EXPECT_FALSE(b2.get(op, sv("b")).has_value());      // deleted in cp2
+    EXPECT_GT(b2.remote_loads(), 0u);                   // cold reads fetched lazily from the pool
+
+    // Purging the superseded cp1 does not affect cp2 (full materialised ckpt).
+    pool->purge(CheckpointId{1});
+    RemoteReadBackend b3(pool);
+    Snapshot s2;
+    s2.checkpoint_id = CheckpointId{2};
+    b3.restore(s2);
+    EXPECT_EQ(to_string(*b3.get(op, sv("d"))), "v4");
 }
