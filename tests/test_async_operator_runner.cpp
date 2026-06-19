@@ -7,10 +7,12 @@
 // async-capable backend (async branch) must produce byte-identical output -
 // the core ASYNC-6 acceptance.
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -27,6 +29,7 @@
 #include "clink/runtime/local_executor.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/keyed_state.hpp"
+#include "clink/state/remote_read_backend.hpp"
 
 using namespace clink;
 
@@ -228,4 +231,104 @@ TEST(AsyncOperatorRunner, RefusesAsyncOperatorThatFiresStateTouchingTimers) {
         }
     }
     EXPECT_TRUE(found) << "expected the async-timer-gate guard error";
+}
+
+// Production async link: the DAG runner must wire a deferring backend's
+// resume scheduler to the per-subtask AsyncExecutionController. With it, a
+// cold get_async suspends and loads on an IO thread, resuming on the runner
+// thread; WITHOUT it, get_async falls back to an inline blocking load on the
+// runner thread. We prove the wiring by asserting the loader ran on a thread
+// other than the runner thread - impossible under the inline fallback.
+namespace {
+std::atomic<std::thread::id> g_rrb_runner_tid;
+std::atomic<std::thread::id> g_rrb_loader_tid;
+
+class RrbProbeOp final : public Operator<std::int64_t, std::int64_t> {
+public:
+    void process(const StreamElement<std::int64_t>& e, Emitter<std::int64_t>& out) override {
+        // Synchronous fallback (not exercised here: the backend defers).
+        if (e.is_data()) {
+            Batch<std::int64_t> b;
+            for (const auto& r : e.as_data())
+                b.emplace(r.value());
+            out.emit_data(std::move(b));
+        } else if (e.is_watermark()) {
+            this->on_watermark(e.as_watermark(), out);
+        } else {
+            this->on_barrier(e.as_barrier(), out);
+        }
+    }
+    [[nodiscard]] bool supports_async() const noexcept override { return true; }
+    void process_async(const StreamElement<std::int64_t>& e,
+                       Emitter<std::int64_t>& out,
+                       AsyncExecutionController& aec) override {
+        if (!e.is_data()) {
+            return;
+        }
+        g_rrb_runner_tid.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        for (const auto& rec : e.as_data()) {
+            const std::int64_t key = rec.value();
+            auto kv = state_();
+            aec.submit(std::to_string(key), [kv, key, &out]() mutable -> async::Task<void> {
+                auto v = co_await kv.get_async(key);  // cold miss -> defers iff wired
+                Batch<std::int64_t> b;
+                b.emplace(v.value_or(key));
+                out.emit_data(std::move(b));
+                co_return;
+            });
+        }
+    }
+    std::string name() const override { return "rrb_probe"; }
+
+private:
+    KeyedState<std::int64_t, std::int64_t> state_() {
+        return this->runtime()->keyed_state<std::int64_t, std::int64_t>(
+            "p", int64_codec(), int64_codec());
+    }
+};
+}  // namespace
+
+TEST(AsyncOperatorRunner, RunnerWiresResumeSchedulerSoColdReadsDeferOffRunner) {
+    g_rrb_runner_tid.store(std::thread::id{});
+    g_rrb_loader_tid.store(std::thread::id{});
+
+    // Loader records its thread and returns nullopt (every key is a cold miss),
+    // so every first get_async on a key is a remote (cold) read.
+    auto backend = std::make_shared<RemoteReadBackend>(
+        [](OperatorId, std::string) -> std::optional<StateBackend::Value> {
+            g_rrb_loader_tid.store(std::this_thread::get_id(), std::memory_order_relaxed);
+            return std::nullopt;
+        });
+
+    std::vector<Record<std::int64_t>> in;
+    for (std::int64_t k : {std::int64_t{1}, std::int64_t{2}, std::int64_t{3}}) {
+        in.emplace_back(k);
+    }
+
+    Dag dag;
+    auto src = std::make_shared<VectorSource<std::int64_t>>(std::move(in));
+    auto op = std::make_shared<RrbProbeOp>();
+    auto sink = std::make_shared<CollectingSink<std::int64_t>>();
+    auto h0 = dag.add_source<std::int64_t>(src);
+    auto h1 = dag.add_operator<std::int64_t, std::int64_t>(h0, op);
+    dag.add_sink<std::int64_t>(h1, sink);
+
+    JobConfig cfg;
+    cfg.state_backend = backend;  // RemoteReadBackend, supports_async_get() == true
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    EXPECT_EQ(sink->collected().size(), 3u);
+    EXPECT_GT(backend->remote_loads(), 0u) << "no cold reads happened";
+
+    const auto runner_tid = g_rrb_runner_tid.load();
+    const auto loader_tid = g_rrb_loader_tid.load();
+    ASSERT_NE(runner_tid, std::thread::id{});
+    ASSERT_NE(loader_tid, std::thread::id{});
+    // The decisive check: the cold load ran on an IO thread, not the runner
+    // thread. That can only happen if the runner wired set_async_resume_scheduler
+    // (the inline fallback would run the loader on the runner thread).
+    EXPECT_NE(loader_tid, runner_tid)
+        << "cold load ran on the runner thread: the runner did not wire the async "
+           "resume scheduler, so get_async fell back to an inline blocking load";
 }

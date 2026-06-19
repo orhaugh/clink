@@ -89,8 +89,11 @@ public:
 
     // Wired once by the runner before any read, so the IO thread can post
     // resumptions to the controller. Not thread-safe vs concurrent reads (set
-    // at wire-up).
-    void set_resume_scheduler(ResumeScheduler s) { resume_scheduler_ = std::move(s); }
+    // at wire-up). Overrides the StateBackend hook the runner calls generically
+    // for any async-capable backend (the type matches AsyncResumeScheduler).
+    void set_async_resume_scheduler(AsyncResumeScheduler s) override {
+        resume_scheduler_ = std::move(s);
+    }
 
     // --- sync StateBackend surface ---
 

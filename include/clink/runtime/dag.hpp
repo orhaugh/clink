@@ -376,6 +376,18 @@ public:
                         "per-key gate); build the gated-timer path before enabling async here");
                 }
                 aec = std::make_unique<AsyncExecutionController>();
+                // Wire the backend's async-read completions to THIS subtask's
+                // controller: a deferring backend (RemoteReadBackend, a future
+                // ForSt backend) posts a suspended handle here and the
+                // controller resumes it on this runner thread. Without this a
+                // deferring get_async has nowhere to hand the completion and
+                // falls back to an inline blocking load - this is the missing
+                // production link for the disaggregated async path. Cleared at
+                // teardown (below) before `aec` is destroyed.
+                ctx.state_backend()->set_async_resume_scheduler(
+                    [aec_ptr = aec.get()](std::coroutine_handle<> h) {
+                        aec_ptr->schedule_resume(h);
+                    });
             }
             auto* timers = ctx.timer_service();
             // Drive timers through the op-level virtuals so chained
@@ -520,6 +532,13 @@ public:
                 }
                 fire_due();
                 op->flush(emitter);
+            }
+            // Drop the controller pointer from the backend before `aec` is
+            // destroyed at the end of this closure (all async work has been
+            // drained above), so a late IO completion can never call into a
+            // dangling controller.
+            if (async_mode && ctx.has_state_backend()) {
+                ctx.state_backend()->set_async_resume_scheduler({});
             }
             op->close();
             op->attach_runtime(nullptr);

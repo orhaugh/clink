@@ -112,7 +112,8 @@ TEST(RemoteReadBackend, AsyncColdReadRidesControllerAndResumesOnRunner) {
     });
 
     AsyncExecutionController aec;
-    backend.set_resume_scheduler([&aec](std::coroutine_handle<> h) { aec.schedule_resume(h); });
+    backend.set_async_resume_scheduler(
+        [&aec](std::coroutine_handle<> h) { aec.schedule_resume(h); });
 
     std::optional<std::string> resolved;
     std::thread::id resume_thread;

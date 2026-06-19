@@ -1,5 +1,6 @@
 #pragma once
 
+#include <coroutine>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -95,6 +96,20 @@ public:
     virtual async::Task<std::optional<Value>> get_async(OperatorId op, KeyView key) const {
         co_return get(op, key);
     }
+
+    // Wired by the runner when it routes this backend through the async
+    // execution path (it does so iff supports_async_get()). A deferring
+    // backend posts a completed async read's suspended coroutine handle to
+    // `schedule`, and the runner resumes it on the runner thread (via
+    // AsyncExecutionController::schedule_resume). The default is a no-op:
+    // the base get_async never suspends, so it never calls it. WITHOUT this
+    // wiring a deferring get_async has no way to hand a completion back and
+    // must fall back to an inline blocking load - so this is the link that
+    // makes a disaggregated backend actually suspend in production. Set once
+    // at wire-up, before any read; the runner clears it (passes {}) at
+    // teardown before the controller is destroyed.
+    using AsyncResumeScheduler = std::function<void(std::coroutine_handle<>)>;
+    virtual void set_async_resume_scheduler(AsyncResumeScheduler /*schedule*/) {}
 
     // Operator (non-keyed) state: source offsets, broadcast slots - state
     // that has no key and therefore no key group. It is stored under the
