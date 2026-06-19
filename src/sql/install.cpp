@@ -22,6 +22,9 @@
 #include "clink/connectors/file_2pc_sink.hpp"
 #include "clink/connectors/file_sink.hpp"
 #include "clink/connectors/file_source.hpp"
+#include "clink/connectors/parquet_2pc_sink.hpp"
+#include "clink/connectors/parquet_sink.hpp"
+#include "clink/connectors/parquet_source.hpp"
 #include "clink/operators/agg_function_registry.hpp"
 #include "clink/operators/async_lookup_operator.hpp"
 #include "clink/operators/filter_operator.hpp"
@@ -33,6 +36,7 @@
 #include "clink/sql/async_function_registry.hpp"
 #include "clink/sql/ptf_registry.hpp"
 #include "clink/sql/row.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/row_kind.hpp"
 #include "clink/time/watermark_strategy.hpp"
 
@@ -3032,6 +3036,68 @@ void install(clink::plugin::PluginRegistry& reg) {
                 "file_2pc_sink_row");
             // Phase 30a: declare commit-group membership so the JM can
             // gate this sink's CommitCheckpoint on its group peers.
+            if (auto cg = ctx.param_or("commit_group", ""); !cg.empty()) {
+                sink->set_commit_group(cg);
+            }
+            return sink;
+        });
+
+    // ---- Typed-columnar Parquet for the Row channel ----
+    //
+    // connector='parquet' (format='json') tables. Each declared SQL
+    // column becomes its own typed Arrow/Parquet column via the
+    // schema-driven Row batcher, so the files are externally readable
+    // field-by-field (pyarrow/duckdb/polars). The planner threads the
+    // column schema in the "schema_columns" param (see row_columnar_batcher).
+
+    // parquet_row_source: read a typed-columnar Parquet file into Rows.
+    //   path (required), schema_columns (required for typed columns)
+    reg.register_source<Row>(
+        "parquet_row_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<Row>> {
+            auto path = ctx.param_or("path");
+            if (path.empty()) {
+                throw std::runtime_error("parquet_row_source: 'path' param is required");
+            }
+            return std::make_shared<ParquetSource<Row>>(
+                path,
+                make_row_columnar_arrow_batcher(parse_row_schema(ctx.param_or("schema_columns"))),
+                "parquet_row_source");
+        });
+
+    // parquet_row_sink: write Rows as one typed Parquet file per subtask.
+    //   path (required), schema_columns (required for typed columns)
+    reg.register_sink<Row>(
+        "parquet_row_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<Row>> {
+            auto path = ctx.param_or("path");
+            if (path.empty()) {
+                throw std::runtime_error("parquet_row_sink: 'path' param is required");
+            }
+            if (ctx.parallelism > 1) {
+                path += "." + std::to_string(ctx.subtask_idx) + ".parquet";
+            }
+            return std::make_shared<ParquetSink<Row>>(
+                path,
+                make_row_columnar_arrow_batcher(parse_row_schema(ctx.param_or("schema_columns"))),
+                parquet::Compression::ZSTD,
+                "parquet_row_sink");
+        });
+
+    // parquet_row_2pc_sink: transactional typed-columnar Parquet
+    // (delivery_guarantee='exactly_once'). Staged per checkpoint and
+    // atomically committed when the checkpoint is globally durable.
+    //   dir|path (required), schema_columns (required for typed columns)
+    reg.register_sink<Row>(
+        "parquet_row_2pc_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<Row>> {
+            const auto dir = ctx.param_or("dir", ctx.param_or("path", ""));
+            if (dir.empty()) {
+                throw std::runtime_error("parquet_row_2pc_sink: 'dir' or 'path' is required");
+            }
+            auto sink = std::make_shared<ParquetSink2PC<Row>>(
+                dir,
+                make_row_columnar_arrow_batcher(parse_row_schema(ctx.param_or("schema_columns"))),
+                ctx.subtask_idx,
+                parquet::Compression::ZSTD,
+                "parquet_row_2pc_sink");
             if (auto cg = ctx.param_or("commit_group", ""); !cg.empty()) {
                 sink->set_commit_group(cg);
             }

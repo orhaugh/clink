@@ -187,6 +187,53 @@ TEST(SqlPhysical, ParquetSourceAndSinkMap) {
     EXPECT_NE(find_op(spec, "parquet_string_sink"), nullptr);
 }
 
+// A multi-column parquet table runs on the Row channel and binds to the
+// typed-columnar parquet_row factories, with the column schema threaded
+// in the schema_columns param.
+TEST(SqlPhysical, MultiColumnParquetMapsToRowFactoriesWithSchema) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE pq_in (id BIGINT, name VARCHAR, px DOUBLE) "
+        "WITH (connector='parquet', path='/tmp/in.parquet');"
+        "CREATE TABLE pq_out (id BIGINT, name VARCHAR, px DOUBLE) "
+        "WITH (connector='parquet', path='/tmp/out.parquet')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO pq_out SELECT id, name, px FROM pq_in");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+
+    const auto* src = find_op(spec, "parquet_row_source");
+    const auto* snk = find_op(spec, "parquet_row_sink");
+    ASSERT_NE(src, nullptr);
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(src->out_channel, "row");
+    EXPECT_EQ(snk->out_channel, "row");
+
+    // The full column schema is threaded so the factory can build a typed
+    // Arrow batcher at runtime.
+    const std::string expected = "id:i64;name:str;px:f64";
+    EXPECT_EQ(src->params.at("schema_columns"), expected);
+    EXPECT_EQ(snk->params.at("schema_columns"), expected);
+}
+
+// delivery_guarantee='exactly_once' routes the parquet row sink to the
+// 2PC variant.
+TEST(SqlPhysical, ExactlyOnceParquetMapsTo2pcRowSink) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE pq_in2 (id BIGINT, px DOUBLE) WITH (connector='parquet', path='/tmp/in.pq');"
+        "CREATE TABLE pq_out2 (id BIGINT, px DOUBLE) "
+        "WITH (connector='parquet', path='/tmp/out', delivery_guarantee='exactly_once')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO pq_out2 SELECT id, px FROM pq_in2");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    EXPECT_NE(find_op(spec, "parquet_row_2pc_sink"), nullptr);
+    EXPECT_EQ(find_op(spec, "parquet_row_sink"), nullptr);
+}
+
 TEST(SqlPhysical, S3ParquetSourceAndSinkMap) {
     Catalog cat;
     auto s = parse(

@@ -28,6 +28,12 @@ add_executable(clink_core_tests
     test_periodic_checkpoint.cpp
     test_file_connector.cpp
     test_arrow_batcher.cpp
+    test_columnar_batcher.cpp
+    test_row_columnar_batcher.cpp
+    test_columnar_registration.cpp
+    test_columnar_parquet.cpp
+    test_parquet_2pc_sink.cpp
+    test_columnar_parquet_factories.cpp
     test_parquet_connector.cpp
     test_file_2pc_sink.cpp
     test_state_recovery.cpp

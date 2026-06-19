@@ -9,6 +9,7 @@
 #include "clink/config/json.hpp"
 #include "clink/metrics/sql_metrics.hpp"
 #include "clink/sql/parser.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/type.hpp"
 
 namespace clink::sql {
@@ -132,6 +133,17 @@ struct RowConnectorBinding {
     std::string bridge_op;               // optional Map op converting between string and Row
 };
 
+// Convert a table's declared columns to the RowColumn list the
+// schema-driven Row batcher (and its param serialiser) consume.
+std::vector<RowColumn> row_columns_of(const TableDef& table) {
+    std::vector<RowColumn> rc;
+    rc.reserve(table.columns.size());
+    for (const auto& c : table.columns) {
+        rc.push_back(RowColumn{c.name, c.type});
+    }
+    return rc;
+}
+
 RowConnectorBinding row_source_binding_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
     if (connector == "file" || connector == "filesystem") {
@@ -140,8 +152,13 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
     if (connector == "kafka") {
         return RowConnectorBinding{"kafka_source_string", kChannelString, "json_string_to_row"};
     }
-    unsupported("format='json' source requires connector='file' or 'kafka' (got '" + connector +
-                "')");
+    if (connector == "parquet") {
+        // Typed-columnar Parquet: each declared column is its own Arrow
+        // column. The Row batcher is built from the schema_columns param.
+        return RowConnectorBinding{"parquet_row_source", kChannelRow, {}};
+    }
+    unsupported("format='json' source requires connector='file', 'kafka' or 'parquet' (got '" +
+                connector + "')");
 }
 
 RowConnectorBinding row_sink_binding_for(const TableDef& table) {
@@ -174,8 +191,20 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{"kafka_sink_string", kChannelString, "row_to_json_string"};
     }
-    unsupported("format='json' sink requires connector='file' or 'kafka' (got '" + connector +
-                "')");
+    if (connector == "parquet") {
+        // Typed-columnar Parquet. exactly_once routes to the 2PC variant
+        // (staging/ + atomic commit on checkpoint); else one file/subtask.
+        // upsert is not supported for the Parquet sink (append-only).
+        if (upsert) {
+            unsupported("connector='parquet' sink does not support mode='upsert'");
+        }
+        if (exactly_once) {
+            return RowConnectorBinding{"parquet_row_2pc_sink", kChannelRow, {}};
+        }
+        return RowConnectorBinding{"parquet_row_sink", kChannelRow, {}};
+    }
+    unsupported("format='json' sink requires connector='file', 'kafka' or 'parquet' (got '" +
+                connector + "')");
 }
 
 // Copy properties from a TableDef to an OperatorSpec's params,
@@ -255,6 +284,10 @@ std::string compile_node(const LogicalPlan& node,
             }
             if (!dec_csv.empty())
                 op.params["decimal_columns"] = std::move(dec_csv);
+            // Typed-columnar connectors (parquet) read the full column
+            // schema from here to build their Arrow batcher. Other Row
+            // connectors ignore it.
+            op.params["schema_columns"] = serialize_row_schema(row_columns_of(table));
         }
         if (!scan.projected_columns().empty()) {
             std::string csv;
@@ -1134,6 +1167,9 @@ std::string compile_node(const LogicalPlan& node,
             }
             if (!dec_csv.empty())
                 op.params["decimal_columns"] = std::move(dec_csv);
+            // Typed-columnar sinks (parquet) build their Arrow batcher from
+            // the full column schema; other Row sinks ignore it.
+            op.params["schema_columns"] = serialize_row_schema(row_columns_of(table));
             std::string id = op.id;
             spec.ops.push_back(std::move(op));
             return id;

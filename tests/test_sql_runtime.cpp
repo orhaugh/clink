@@ -17,7 +17,10 @@
 #include <thread>
 #include <vector>
 
+#include <arrow/api.h>
+#include <arrow/io/file.h>
 #include <gtest/gtest.h>
+#include <parquet/arrow/reader.h>
 
 #include "clink/application/job_submitter.hpp"
 #include "clink/async/task.hpp"
@@ -5579,6 +5582,120 @@ TEST(SqlRuntime, CountDistinctAndStringAggGroupBy) {
 
     std::filesystem::remove(in_path);
     std::filesystem::remove(out_path);
+}
+
+// CREATE TABLE ... WITH (connector='parquet') over a multi-column table:
+// NDJSON -> typed-columnar Parquet -> NDJSON. Proves the SQL DDL path
+// writes externally-typed Parquet (one Arrow column per SQL column) and
+// reads it back losslessly.
+TEST(SqlRuntime, ParquetTypedColumnarRoundTripEndToEnd) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_pq_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_pq_data.parquet";
+    const auto out_path = tmp / "clink_sql_pq_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    write_lines(in_path,
+                {
+                    R"({"id":1,"name":"AAPL","px":191.25,"active":true})",
+                    R"({"id":2,"name":"MSFT","px":410.10,"active":false})",
+                    R"({"id":3,"name":"NVDA","px":1203.99,"active":true})",
+                });
+
+    const std::string cols = "(id BIGINT, name VARCHAR, px DOUBLE, active BOOLEAN)";
+
+    // Job 1: NDJSON source -> typed-columnar Parquet sink.
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT id, name, px, active FROM ev");
+
+        InProcessCluster cluster("tm-sql-pq-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto result = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+        EXPECT_TRUE(result.ok) << "errors: "
+                               << (result.errors.empty() ? "(none)" : result.errors[0]);
+    }
+
+    // The Parquet file is externally typed: one Arrow column per SQL column.
+    ASSERT_TRUE(std::filesystem::exists(pq_path)) << pq_path.string();
+    {
+        auto in = arrow::io::ReadableFile::Open(pq_path.string());
+        ASSERT_TRUE(in.ok());
+        auto rr = parquet::arrow::OpenFile(*in, arrow::default_memory_pool());
+        ASSERT_TRUE(rr.ok());
+        std::shared_ptr<arrow::Schema> schema;
+        ASSERT_TRUE((*rr)->GetSchema(&schema).ok());
+        ASSERT_NE(schema->GetFieldByName("id"), nullptr);
+        EXPECT_EQ(schema->GetFieldByName("id")->type()->id(), arrow::Type::INT64);
+        EXPECT_EQ(schema->GetFieldByName("name")->type()->id(), arrow::Type::STRING);
+        EXPECT_EQ(schema->GetFieldByName("px")->type()->id(), arrow::Type::DOUBLE);
+        EXPECT_EQ(schema->GetFieldByName("active")->type()->id(), arrow::Type::BOOL);
+    }
+
+    // Job 2: read the Parquet back via a parquet source -> NDJSON sink.
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE pq_in "} + cols +
+                         " WITH (connector='parquet', path='" + pq_path.string() +
+                         "');"
+                         "CREATE TABLE final_t " +
+                         cols + " WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO final_t SELECT id, name, px, active FROM pq_in");
+
+        InProcessCluster cluster("tm-sql-pq-read", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto result = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+        EXPECT_TRUE(result.ok) << "errors: "
+                               << (result.errors.empty() ? "(none)" : result.errors[0]);
+    }
+
+    // The values round-trip through Parquet unchanged.
+    auto lines = read_lines(out_path);
+    ASSERT_EQ(lines.size(), 3u);
+    struct RowOut {
+        std::string name;
+        double px;
+        bool active;
+    };
+    std::map<std::int64_t, RowOut> got;
+    for (const auto& line : lines) {
+        auto js = clink::config::parse(line);
+        ASSERT_TRUE(js.is_object()) << "bad output line: " << line;
+        const auto id = static_cast<std::int64_t>(js.at("id").as_number());
+        got[id] = {js.at("name").as_string(), js.at("px").as_number(), js.at("active").as_bool()};
+    }
+    ASSERT_EQ(got.size(), 3u);
+    EXPECT_EQ(got[1].name, "AAPL");
+    EXPECT_NEAR(got[1].px, 191.25, 1e-6);
+    EXPECT_TRUE(got[1].active);
+    EXPECT_EQ(got[2].name, "MSFT");
+    EXPECT_NEAR(got[2].px, 410.10, 1e-6);
+    EXPECT_FALSE(got[2].active);
+    EXPECT_EQ(got[3].name, "NVDA");
+    EXPECT_NEAR(got[3].px, 1203.99, 1e-6);
+    EXPECT_TRUE(got[3].active);
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
 }
 
 }  // namespace clink::sql
