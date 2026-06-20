@@ -803,6 +803,31 @@ public:
     virtual void process_element1(const StreamElement<In1>& element, Emitter<Out>& out) = 0;
     virtual void process_element2(const StreamElement<In2>& element, Emitter<Out>& out) = 0;
 
+    // Opt-in async-state path (mirrors Operator<In,Out>). When supports_async()
+    // and the backend defers reads, the co-operator runner routes data through
+    // process_async{1,2} - each submits a coroutine per record to the ONE
+    // per-subtask AsyncExecutionController, so a slow/remote read for one key
+    // overlaps progress on other keys. Both inputs share the controller (and
+    // thus the per-key gate + the epoch), so same-key records from EITHER input
+    // serialise and observe each other's writes to the shared keyed state. The
+    // sync process_element{1,2} above are the fallback for a non-deferring
+    // backend and must produce identical output.
+    [[nodiscard]] virtual bool supports_async() const noexcept { return false; }
+    virtual void process_async1(const StreamElement<In1>& /*element*/,
+                                Emitter<Out>& /*out*/,
+                                AsyncExecutionController& /*aec*/) {}
+    virtual void process_async2(const StreamElement<In2>& /*element*/,
+                                Emitter<Out>& /*out*/,
+                                AsyncExecutionController& /*aec*/) {}
+
+    // Timer-kind flags (see Operator<In,Out>): the co-op async runner gates
+    // processing-time timers through the per-key gate and fires event-time
+    // timers inside the merged-watermark epoch release, so both are safe.
+    [[nodiscard]] virtual bool fires_state_touching_timers() const noexcept { return false; }
+    [[nodiscard]] virtual bool fires_state_touching_processing_time_timers() const noexcept {
+        return fires_state_touching_timers();
+    }
+
     // Default watermark handling: fire any event-time timers whose
     // timestamp ≤ wm, then forward unchanged. Barriers forward as-is.
     virtual void on_watermark(Watermark wm, Emitter<Out>& out) {

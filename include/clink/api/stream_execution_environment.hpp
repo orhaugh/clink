@@ -19,6 +19,7 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/operator_registry.hpp"
+#include "clink/operators/async_co_process_function.hpp"
 #include "clink/operators/async_process_function.hpp"
 #include "clink/operators/evicting_tumbling_window_operator.hpp"
 #include "clink/operators/filter_operator.hpp"
@@ -2039,6 +2040,44 @@ public:
             std::move(key1),
             std::move(key2),
             std::move(timer_key_fn));
+        cluster::OperatorSpec op;
+        op.id = std::move(id);
+        op.type = op_type;
+        op.inputs = {upstream_id_, other.id()};
+        op.out_channel = ChannelName<U>::get();
+        op.key_by = key_by_;
+        auto new_id = env_->append_op(std::move(op));
+        return DataStream<U>(env_, std::move(new_id), ChannelName<U>::get());
+    }
+
+    // Async-state inline KeyedCoProcessFunction connect. Like connect_process
+    // but registers the AsyncKeyedCoProcessFunctionAdapter, whose
+    // process_element{1,2} co_await keyed-state reads under the shared per-key
+    // gate. Needs a Codec<K> for the gate-key/timer-key encoding (the one extra
+    // argument vs the sync connect_process); the throughput win materialises
+    // only on a deferring backend.
+    template <typename T2, typename K, typename U>
+    DataStream<U> connect_process_async(
+        const KeyedDataStream<T2>& other,
+        std::shared_ptr<AsyncKeyedCoProcessFunction<K, T, T2, U>> fn,
+        std::function<K(const T&)> key1,
+        std::function<K(const T2&)> key2,
+        Codec<K> key_codec,
+        std::string id = {}) {
+        if (key_by_ != other.key_by()) {
+            throw std::runtime_error(
+                "KeyedDataStream::connect_process_async: key extractor names must match (got '" +
+                key_by_ + "' vs '" + other.key_by() + "')");
+        }
+        cluster::ensure_built_ins_registered();
+        const std::string op_type = env_->mint_inline_op_type("async_keyed_co_process");
+        auto& reg = env_->registry();
+        reg.template register_async_keyed_co_operator<K, T, T2, U>(
+            op_type,
+            [fn](const clink::plugin::BuildContext&) { return fn; },
+            std::move(key1),
+            std::move(key2),
+            std::move(key_codec));
         cluster::OperatorSpec op;
         op.id = std::move(id);
         op.type = op_type;

@@ -668,6 +668,25 @@ void PluginRegistry::register_keyed_co_operator(
         });
 }
 
+template <typename K, typename In1, typename In2, typename Out>
+void PluginRegistry::register_async_keyed_co_operator(
+    const std::string& op_type,
+    std::function<std::shared_ptr<AsyncKeyedCoProcessFunction<K, In1, In2, Out>>(
+        const BuildContext&)> fn_factory,
+    std::function<K(const In1&)> key1,
+    std::function<K(const In2&)> key2,
+    Codec<K> key_codec) {
+    register_co_operator<In1, In2, Out>(
+        op_type,
+        [fn_factory, key1, key2, key_codec, op_type](
+            const BuildContext& ctx) -> std::shared_ptr<CoOperator<In1, In2, Out>> {
+            auto fn = fn_factory(ctx);
+            return std::make_shared<
+                ::clink::detail::AsyncKeyedCoProcessFunctionAdapter<K, In1, In2, Out>>(
+                fn, key1, key2, key_codec, op_type);
+        });
+}
+
 template <typename T>
 void PluginRegistry::register_key_extractor(const std::string& name,
                                             std::function<std::int64_t(const T&)> fn) {

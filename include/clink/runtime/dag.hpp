@@ -355,7 +355,10 @@ public:
             // regardless of the barrier's mode, because drain-to-quiescence is
             // incompatible with unaligned in-flight capture. For a single
             // input this is lossless (there is no cross-input alignment to
-            // skip); multi-input async (co-operator) is deferred.
+            // skip). Multi-input async (co-operator) is now supported too (see
+            // add_co_operator): it force-aligns the popped/in-flight tail via
+            // drain_for_barrier while keeping the unaligned in-flight-capture
+            // fast path for the unpopped other-channel records.
             std::unique_ptr<AsyncExecutionController> aec;
             const bool async_mode = op->supports_async() && ctx.has_state_backend() &&
                                     ctx.state_backend()->supports_async_get();
@@ -2398,6 +2401,24 @@ public:
                 op->restore_timers(*ctx.state_backend(), id);
             }
             op->open();
+            // Async-state path: ONE controller per subtask, shared by BOTH
+            // inputs - so same-key records from either side serialise through
+            // the per-key gate (observing each other's writes to the shared
+            // keyed state) and share the epoch. Multi-input async is now
+            // supported: the popped/in-flight tail force-aligns via
+            // drain_for_barrier at the barrier, while the unpopped other-channel
+            // records keep the unaligned in-flight-capture fast path. A
+            // non-deferring backend takes the byte-identical sync process path.
+            std::unique_ptr<AsyncExecutionController> aec;
+            const bool async_mode = op->supports_async() && ctx.has_state_backend() &&
+                                    ctx.state_backend()->supports_async_get();
+            if (async_mode) {
+                aec = std::make_unique<AsyncExecutionController>();
+                ctx.state_backend()->set_async_resume_scheduler(
+                    [aec_ptr = aec.get()](std::coroutine_handle<> h) {
+                        aec_ptr->schedule_resume(h);
+                    });
+            }
             // Per-subtask async snapshot worker (FileBacked + disk-backed
             // changelog). Same contract as the single-input runner: capture
             // on this thread, forward the barrier, persist + ack off-thread.
@@ -2428,8 +2449,34 @@ public:
                     op->on_processing_time_timer(ts, key, out_emitter);
                 });
             };
+            // Under async, processing-time timers fire through the per-key gate
+            // (same as the single-input runner); a no-op when none are pending.
+            auto fire_due_async = [&] {
+                detail::gated_fire_processing_time_timers(*op, out_emitter, timers->now_ms(), *aec);
+            };
+            // Forward the merged (min) watermark. Under async this is the ONLY
+            // epoch boundary: the release (fire due event-time timers + forward)
+            // runs after the closing epoch drains, so a timer at T fires only
+            // once every pre-T record from BOTH inputs has applied its write.
+            auto forward_watermark = [&](Watermark merged) {
+                if (aec) {
+                    aec->on_watermark(
+                        [op, merged, &out_emitter] { op->on_watermark(merged, out_emitter); });
+                    aec->poll();
+                } else {
+                    op->on_watermark(merged, out_emitter);
+                }
+            };
 
             auto snapshot_and_ack = [&](CheckpointBarrier barrier) {
+                // Quiesce all in-flight async reads from BOTH inputs before the
+                // cut, so capture() reflects every pre-barrier record's write
+                // (no torn/half-applied state). The unpopped other-channel
+                // records were captured separately (capture_*_inflight) before
+                // this runs; the two populations are disjoint.
+                if (aec) {
+                    aec->drain_for_barrier();
+                }
                 if (!ctx.has_state_backend()) {
                     op->on_barrier(barrier, out_emitter);
                     return;
@@ -2516,10 +2563,15 @@ public:
 
             auto handle_left = [&](const StreamElement<In1>& el) {
                 if (el.is_data()) {
-                    op->process_element1(el, out_emitter);
+                    if (aec) {
+                        op->process_async1(el, out_emitter, *aec);
+                        aec->poll();
+                    } else {
+                        op->process_element1(el, out_emitter);
+                    }
                 } else if (el.is_watermark()) {
                     if (auto adv = align.on_watermark(0, el.as_watermark()); adv.forward) {
-                        op->on_watermark(adv.watermark, out_emitter);
+                        forward_watermark(adv.watermark);
                     }
                 } else {
                     auto adv =
@@ -2534,10 +2586,15 @@ public:
             };
             auto handle_right = [&](const StreamElement<In2>& el) {
                 if (el.is_data()) {
-                    op->process_element2(el, out_emitter);
+                    if (aec) {
+                        op->process_async2(el, out_emitter, *aec);
+                        aec->poll();
+                    } else {
+                        op->process_element2(el, out_emitter);
+                    }
                 } else if (el.is_watermark()) {
                     if (auto adv = align.on_watermark(1, el.as_watermark()); adv.forward) {
-                        op->on_watermark(adv.watermark, out_emitter);
+                        forward_watermark(adv.watermark);
                     }
                 } else {
                     auto adv =
@@ -2585,7 +2642,15 @@ public:
             }
 
             while (!should_stop()) {
-                fire_due();
+                // Processing-time timers fire through the per-key gate under
+                // async (so a state-touching callback serialises behind an
+                // in-flight same-key read from EITHER input); ungated on the
+                // sync path. Mirrors the single-input runner's loop-top choice.
+                if (aec) {
+                    fire_due_async();
+                } else {
+                    fire_due();
+                }
                 bool any_progress = false;
                 if (!align.input_paused(0)) {
                     if (!pending_left.empty()) {
@@ -2599,7 +2664,7 @@ public:
                     } else if (left_ch->closed()) {
                         align.on_input_closed(0);
                         if (auto wm = align.refresh_watermark(); wm.forward) {
-                            op->on_watermark(wm.watermark, out_emitter);
+                            forward_watermark(wm.watermark);
                         }
                     }
                 }
@@ -2615,7 +2680,7 @@ public:
                     } else if (right_ch->closed()) {
                         align.on_input_closed(1);
                         if (auto wm = align.refresh_watermark(); wm.forward) {
-                            op->on_watermark(wm.watermark, out_emitter);
+                            forward_watermark(wm.watermark);
                         }
                     }
                 }
@@ -2648,8 +2713,31 @@ public:
                     snap_worker->drain_and_join();
                 }
             }
-            fire_due();
-            op->flush(out_emitter);
+            // Async EOS: drain in-flight reads, fire any close-time
+            // processing-time timers through the gate, drain again so they ran,
+            // then flush. The WHOLE async close sequence is skipped on cancel
+            // (the job is being torn down; a drain could block on completions
+            // that never arrive, and flush after a half-drained gate is
+            // pointless) - mirrors the single-input runner's if(!should_stop())
+            // guard. The sync path keeps its existing unconditional fire_due +
+            // flush.
+            if (aec) {
+                if (!should_stop()) {
+                    aec->drain();
+                    fire_due_async();
+                    aec->drain();
+                    op->flush(out_emitter);
+                }
+            } else {
+                fire_due();
+                op->flush(out_emitter);
+            }
+            // Drop the controller pointer from the backend before `aec` is
+            // destroyed, so a late IO completion cannot call a dangling
+            // controller (mirrors the single-input runner).
+            if (async_mode && ctx.has_state_backend()) {
+                ctx.state_backend()->set_async_resume_scheduler({});
+            }
             op->close();
             op->attach_runtime(nullptr);
             out_channel->close();

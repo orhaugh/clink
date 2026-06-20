@@ -44,8 +44,12 @@ namespace clink::detail {
 // the runner thread, under the gate - so its synchronous keyed-state access is
 // safe (no same-key async read can be outstanding when it runs). A timer the
 // callback re-registers lands in the service and fires on a later pass.
-template <typename In, typename Out>
-void gated_fire_processing_time_timers(Operator<In, Out>& op,
+//
+// Op is any operator with runtime() and on_processing_time_timer(ts, key, out):
+// both Operator<In, Out> (single-input runner) and CoOperator<In1, In2, Out>
+// (the co-operator runner) qualify. Out is deduced from the Emitter argument.
+template <typename Op, typename Out>
+void gated_fire_processing_time_timers(Op& op,
                                        Emitter<Out>& out,
                                        std::int64_t now_ms,
                                        AsyncExecutionController& aec) {

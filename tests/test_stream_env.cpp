@@ -225,6 +225,57 @@ TEST(StreamEnvBuilder, InlineProcessAsyncMintsOpTypeAndCarriesKeyBy) {
         << "async keyed process must carry the upstream key_by so the planner hash-routes inputs";
 }
 
+namespace {
+class SmokeAsyncCoFn final
+    : public AsyncKeyedCoProcessFunction<std::int64_t, std::int64_t, std::int64_t, std::int64_t> {
+public:
+    async::Task<void> process_element1(const std::int64_t& /*key*/,
+                                       const std::int64_t& v,
+                                       AsyncKeyedProcessContext<std::int64_t>& /*ctx*/,
+                                       Collector<std::int64_t>& out) override {
+        out.collect(v);
+        co_return;
+    }
+    async::Task<void> process_element2(const std::int64_t& /*key*/,
+                                       const std::int64_t& v,
+                                       AsyncKeyedProcessContext<std::int64_t>& /*ctx*/,
+                                       Collector<std::int64_t>& out) override {
+        out.collect(v);
+        co_return;
+    }
+};
+}  // namespace
+
+TEST(StreamEnvBuilder, InlineConnectProcessAsyncMintsOpTypeAndCarriesKeyBy) {
+    auto env = StreamExecutionEnvironment::create();
+    // Both streams must share the same key_by NAME for connect (the guard); a
+    // named (vs inline) key_by keeps the two names identical for this
+    // graph-shape test.
+    auto a = env.source<std::int64_t>(IntRangeSource::builder().count(4).build())
+                 .key_by(std::string("kx"));
+    auto b = env.source<std::int64_t>(IntRangeSource::builder().count(4).build())
+                 .key_by(std::string("kx"));
+    a.connect_process_async<std::int64_t, std::int64_t, std::int64_t>(
+         b,
+         std::make_shared<SmokeAsyncCoFn>(),
+         [](const std::int64_t& v) { return v; },
+         [](const std::int64_t& v) { return v; },
+         int64_codec())
+        .sink(FileInt64Sink::builder().path("/tmp/clink_inline_async_co.out").build());
+
+    const auto& graph = env.graph();
+    // 2 sources + the co-op + the sink.
+    ASSERT_EQ(graph.ops.size(), 4u);
+    bool found = false;
+    for (const auto& op : graph.ops) {
+        if (op.type.starts_with("_inline_async_keyed_co_process_") && op.inputs.size() == 2u &&
+            !op.key_by.empty()) {
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found) << "the async co-process op must be a 2-input keyed op";
+}
+
 TEST(StreamEnvBuilder, InlineReduceMintsOpTypeAndCarriesKeyBy) {
     auto env = StreamExecutionEnvironment::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(4).build());

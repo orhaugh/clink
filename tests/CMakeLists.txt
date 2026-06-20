@@ -89,6 +89,7 @@ add_executable(clink_core_tests
     test_async_session_window_operator.cpp
     test_gated_timer_fire.cpp
     test_async_keyed_process_function.cpp
+    test_async_co_process_function.cpp
     test_watermark_assigner_operator.cpp
     test_metrics_registry.cpp
     test_histogram.cpp

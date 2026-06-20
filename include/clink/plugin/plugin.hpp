@@ -45,6 +45,7 @@
 #include "clink/cluster/type_registry.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/operators/async_co_process_function.hpp"  // AsyncKeyedCoProcessFunction
 #include "clink/operators/operator_base.hpp"
 #include "clink/operators/process_function.hpp"  // KeyedProcessFunction, KeyedCoProcessFunction
 #include "clink/plugin/abi_version.hpp"
@@ -275,6 +276,19 @@ public:
         std::function<K(const In1&)> key1,
         std::function<K(const In2&)> key2,
         std::function<K(const std::string&)> timer_key_fn = nullptr);
+
+    // Async-state two-input co-operator: an AsyncKeyedCoProcessFunction whose
+    // process_element{1,2} co_await keyed-state reads under the per-key gate.
+    // The adapter owns the key Codec<K> (the gate + timer key encoding); each
+    // side supplies its own per-record extractor.
+    template <typename K, typename In1, typename In2, typename Out>
+    void register_async_keyed_co_operator(
+        const std::string& op_type,
+        std::function<std::shared_ptr<AsyncKeyedCoProcessFunction<K, In1, In2, Out>>(
+            const BuildContext&)> fn_factory,
+        std::function<K(const In1&)> key1,
+        std::function<K(const In2&)> key2,
+        Codec<K> key_codec);
 
     // (`install_defaults` lives in clink/plugin/install_defaults.hpp as
     // a free function - keeps this header free of every impl include.)
