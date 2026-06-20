@@ -193,6 +193,38 @@ TEST(StreamEnvBuilder, InlineKeyByRegistersExtractorAndChains) {
         graph.ops[1].out_channel.empty() ? "int64" : "int64", graph.ops[1].key_by));
 }
 
+namespace {
+// Minimal async keyed process function for the fluent-wiring smoke test.
+class SmokeAsyncFn final
+    : public AsyncKeyedProcessFunction<std::int64_t, std::int64_t, std::int64_t> {
+public:
+    async::Task<void> process_element(const std::int64_t& /*key*/,
+                                      const std::int64_t& value,
+                                      AsyncKeyedProcessContext<std::int64_t>& /*ctx*/,
+                                      Collector<std::int64_t>& out) override {
+        out.collect(value);
+        co_return;
+    }
+};
+}  // namespace
+
+TEST(StreamEnvBuilder, InlineProcessAsyncMintsOpTypeAndCarriesKeyBy) {
+    auto env = StreamExecutionEnvironment::create();
+    auto src = env.source<std::int64_t>(IntRangeSource::builder().count(4).build());
+    src.key_by([](const std::int64_t& v) { return v % 2; })
+        .process_async<std::int64_t, std::int64_t>(
+            std::make_shared<SmokeAsyncFn>(),
+            [](const std::int64_t& v) { return v; },
+            int64_codec())
+        .sink(FileInt64Sink::builder().path("/tmp/clink_inline_async_kpf.out").build());
+
+    const auto& graph = env.graph();
+    ASSERT_EQ(graph.ops.size(), 3u);
+    EXPECT_TRUE(graph.ops[1].type.starts_with("_inline_async_keyed_process_typed_"));
+    EXPECT_FALSE(graph.ops[1].key_by.empty())
+        << "async keyed process must carry the upstream key_by so the planner hash-routes inputs";
+}
+
 TEST(StreamEnvBuilder, InlineReduceMintsOpTypeAndCarriesKeyBy) {
     auto env = StreamExecutionEnvironment::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(4).build());

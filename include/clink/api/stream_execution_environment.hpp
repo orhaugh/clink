@@ -19,6 +19,7 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/operator_registry.hpp"
+#include "clink/operators/async_process_function.hpp"
 #include "clink/operators/evicting_tumbling_window_operator.hpp"
 #include "clink/operators/filter_operator.hpp"
 #include "clink/operators/flat_map_operator.hpp"
@@ -1823,6 +1824,40 @@ public:
                 const clink::plugin::BuildContext&) -> std::shared_ptr<Operator<T, U>> {
                 return std::make_shared<clink::detail::KeyedProcessFunctionAdapter<K, T, U>>(
                     fn, key_fn, /*timer_key_fn=*/nullptr, op_type);
+            });
+        cluster::OperatorSpec op;
+        op.id = std::move(id);
+        op.type = op_type;
+        op.inputs = {upstream_id_};
+        op.out_channel = ChannelName<U>::get();
+        op.key_by = key_by_;
+        auto new_id = env_->append_op(std::move(op));
+        return DataStream<U>(env_, std::move(new_id), ChannelName<U>::get());
+    }
+
+    // Async-state KeyedProcessFunction transform. Registers the
+    // AsyncKeyedProcessFunctionAdapter, which runs the user's coroutine
+    // process_element under the per-key gate (co_await async state reads
+    // overlap across keys) and routes its synchronous on_timer through the
+    // gated processing-time / epoch-gated event-time paths. Needs a Codec<K>
+    // for the gate-key/timer-key encode+decode (the one argument the sync
+    // typed process() does not carry). Partitioning still uses the int64
+    // extractor from .key_by(); the throughput win materialises only on a
+    // deferring backend.
+    template <typename K, typename U>
+    DataStream<U> process_async(std::shared_ptr<AsyncKeyedProcessFunction<K, T, U>> fn,
+                                std::function<K(const T&)> key_fn,
+                                Codec<K> key_codec,
+                                std::string id = {}) {
+        cluster::ensure_built_ins_registered();
+        const std::string op_type = env_->mint_inline_op_type("async_keyed_process_typed");
+        auto& reg = env_->registry();
+        reg.template register_operator<T, U>(
+            op_type,
+            [fn, key_fn, key_codec, op_type](
+                const clink::plugin::BuildContext&) -> std::shared_ptr<Operator<T, U>> {
+                return std::make_shared<clink::detail::AsyncKeyedProcessFunctionAdapter<K, T, U>>(
+                    fn, key_fn, key_codec, op_type);
             });
         cluster::OperatorSpec op;
         op.id = std::move(id);
