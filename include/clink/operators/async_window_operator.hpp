@@ -71,11 +71,13 @@ namespace clink {
 // byte-identical and used when the backend cannot defer reads.
 //
 // PaneInfo parity: under the default (and only) event-time trigger the async
-// family models, the sync operator sets OnTime.is_last = (allowed_lateness == 0)
-// and never sets is_last on a late pane; this reproduces that exactly. The one
-// genuine async limitation is the absence of pluggable triggers (no Early
-// panes) - pre-existing and documented. Rescale routing of the timers + the
-// "wm" slot is a deferred follow-on (same as the no-lateness version).
+// family models, the sync operator sets OnTime.is_last when the window is purged
+// in the same sweep as its on-time fire (allowed_lateness == 0, or a watermark
+// that jumped past the purge deadline) and never sets is_last on a late pane;
+// this reproduces that exactly. The one genuine async limitation is the absence
+// of pluggable triggers (no Early panes) - pre-existing and documented. Rescale
+// routing of the timers + the "wm" slot is a deferred follow-on (same as the
+// no-lateness version).
 template <typename Key, typename Value, typename Agg>
 class AsyncWindowOperator : public Operator<std::pair<Key, Value>, std::pair<Key, Agg>> {
 public:
@@ -225,17 +227,22 @@ public:
         // tick). A window already fired here is a stale/duplicate fire timer.
         Entry e = std::move(*cur);
         if (!e.fired) {
+            // The window is purged in this same sweep when its lateness deadline
+            // has already passed (lateness == 0, or a watermark that jumped past
+            // both window_end and purge_at). is_last marks that final pane,
+            // matching the sync TumblingWindowOperator's is_last = (fire && purge).
+            const bool purge_now = allowed_lateness_ms_ == 0 || current_watermark_ >= purge_at;
             emit_pane_(out,
                        sk,
                        e.agg,
                        PaneInfo::Timing::OnTime,
                        e.next_pane_index,
                        /*is_first=*/e.next_pane_index == 0,
-                       /*is_last=*/allowed_lateness_ms_ == 0);
+                       /*is_last=*/purge_now);
             ++e.next_pane_index;
             e.fired = true;
-            if (allowed_lateness_ms_ == 0) {
-                kv.erase(sk);  // window_end == purge_at: fire + purge, as before
+            if (purge_now) {
+                kv.erase(sk);  // fire + purge in one tick (idempotent vs the purge timer)
             } else {
                 kv.put(sk, e);  // keep it alive for the lateness band
             }

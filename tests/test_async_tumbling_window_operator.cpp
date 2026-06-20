@@ -638,6 +638,59 @@ TEST(AsyncTumblingWindowOperator, SyncAsyncLatenessParityWithSyncOperator) {
     EXPECT_EQ(async_out, sync_out) << "async window output must match the sync operator exactly";
 }
 
+TEST(AsyncTumblingWindowOperator, OnTimePaneIsLastWhenWatermarkJumpsPastPurge) {
+    // lateness>0 but a SINGLE watermark jumps past both window_end (1000) and the
+    // purge deadline (1500): the on-time pane is the window's last pane, so
+    // is_last must be true (the window purges in the same sweep). Regression for
+    // the is_last parity bug the adversarial review found.
+    auto run = [](auto& op, auto& out) {
+        Batch<KV> b;
+        b.emplace(KV{1, 10}, EventTime{100});
+        op.process(StreamElement<KV>::data(std::move(b)), out);
+        op.process(StreamElement<KV>::watermark(Watermark{EventTime{1600}}), out);  // one jump
+    };
+
+    std::vector<AtwEmit> async_out;
+    {
+        auto backend = std::make_shared<InMemoryStateBackend>();
+        const OperatorId op_id{15};
+        RuntimeContext ctx(op_id, "win_sum", backend.get(), nullptr);
+        auto op = make_late_op(500);
+        op->set_id(op_id);
+        op->attach_runtime(&ctx);
+        op->open();
+        BoundedChannel<StreamElement<KA>> ch(64);
+        Emitter<KA> em(&ch);
+        run(*op, em);
+        async_out = collect_emits(ch);
+        // No further emission after the jump (window already purged).
+        op->on_watermark(Watermark{EventTime{5000}}, em);
+        EXPECT_TRUE(collect_emits(ch).empty());
+    }
+
+    ASSERT_EQ(async_out.size(), 1u);
+    EXPECT_EQ(async_out[0].value, (KA{1, 10}));
+    EXPECT_EQ(async_out[0].pane.timing, PaneInfo::Timing::OnTime);
+    EXPECT_TRUE(async_out[0].pane.is_first);
+    EXPECT_TRUE(async_out[0].pane.is_last)
+        << "a window purged in the same sweep as its on-time fire must mark is_last";
+
+    // The sync operator agrees.
+    std::vector<AtwEmit> sync_out;
+    {
+        TumblingWindowOperator<std::int64_t, std::int64_t, std::int64_t> op(
+            1000ms,
+            [] { return std::int64_t{0}; },
+            [](std::int64_t a, std::int64_t v) { return a + v; });
+        op.allowed_lateness(500ms);
+        BoundedChannel<StreamElement<KA>> ch(64);
+        Emitter<KA> em(&ch);
+        run(op, em);
+        sync_out = collect_emits(ch);
+    }
+    EXPECT_EQ(async_out, sync_out) << "is_last on a watermark jump must match the sync operator";
+}
+
 TEST(AsyncTumblingWindowOperator, LatenessAndPaneIndexSurviveRestore) {
     const OperatorId op_id{14};
 
