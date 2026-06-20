@@ -10,6 +10,15 @@ add_executable(clink_async_state_bench clink_async_state_bench.cpp)
 target_link_libraries(clink_async_state_bench PRIVATE clink::core)
 clink_set_warnings(clink_async_state_bench)
 
+# Async-state SCALE benchmark - the per-key overlap win composed with
+# share-nothing data parallelism via ShardedKeyedStage: each shard owns a
+# private deferring backend, so async overlaps cold reads within each shard AND
+# across S shards, while the sync baseline only gets the parallelism. Synthetic
+# controlled-latency loader (the honest remote-read model); self-validating.
+add_executable(clink_async_scale_bench clink_async_scale_bench.cpp)
+target_link_libraries(clink_async_scale_bench PRIVATE clink::core)
+clink_set_warnings(clink_async_scale_bench)
+
 # Serde benchmark - compares the legacy record-by-record Codec<T>
 # wire encoding against the Arrow RecordBatch + IPC path. The Arrow
 # path is the production path; the legacy path is benched as a
