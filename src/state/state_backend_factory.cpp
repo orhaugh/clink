@@ -16,6 +16,8 @@
 #include "clink/state/file_backed_state_backend.hpp"
 #include "clink/state/file_materialization_store.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+#include "clink/state/remote_pool.hpp"
+#include "clink/state/remote_read_backend.hpp"
 #include "clink/state/sharded_in_memory_state_backend.hpp"
 
 namespace clink {
@@ -46,6 +48,63 @@ BuiltStateBackend build_memory(const StateBackendSpec& /*spec*/) {
 BuiltStateBackend build_memory_sharded(const StateBackendSpec& /*spec*/) {
     BuiltStateBackend out;
     out.backend = std::make_shared<ShardedInMemoryStateBackend>();
+    return out;
+}
+
+// disagg-local://[?io_threads=N&hot_max_bytes=M]
+//
+// A RemoteReadBackend (the same async-deferring class as the S3-backed
+// remote-read:// scheme) over a process-local InMemoryRemotePool.
+// supports_async_get() is true, so the async/disaggregated execution path
+// activates automatically with NO S3 and NO manual opt-in - the point is to
+// make that path reachable for correctness coverage and dev/test without an
+// object store.
+//
+// CAVEATS (honest, load-bearing):
+//   * The pool lives in process RAM, so state is NOT durable across a process
+//     restart: there is no cross-process failover or rescale. snapshot/restore
+//     work only WITHIN a process (same-parallelism suspend/resume).
+//   * Reads hit RAM, so there is no remote IO latency to overlap: this is NOT a
+//     throughput win over memory://. The throughput win needs a real remote
+//     tier (remote-read:// on S3).
+BuiltStateBackend build_disagg_local(const StateBackendSpec& spec) {
+    auto [scheme, base] = split_uri(spec.uri);
+    (void)scheme;
+    std::size_t io_threads = 1;     // connection-pool size (knob; no real IO here)
+    std::size_t hot_max_bytes = 0;  // 0 = unbounded hot tier (no eviction)
+    if (const auto q = base.find('?'); q != std::string::npos) {
+        const std::string query = base.substr(q + 1);
+        for (std::size_t start = 0; start < query.size();) {
+            const auto amp = query.find('&', start);
+            const std::string kv =
+                query.substr(start, amp == std::string::npos ? std::string::npos : amp - start);
+            if (const auto eq = kv.find('='); eq != std::string::npos) {
+                const std::string k = kv.substr(0, eq);
+                const std::string v = kv.substr(eq + 1);
+                try {
+                    if (k == "io_threads") {
+                        io_threads = static_cast<std::size_t>(std::stoull(v));
+                    } else if (k == "hot_max_bytes") {
+                        hot_max_bytes = static_cast<std::size_t>(std::stoull(v));
+                    }
+                } catch (...) {
+                    // malformed value -> keep the safe default
+                }
+            }
+            if (amp == std::string::npos) {
+                break;
+            }
+            start = amp + 1;
+        }
+    }
+    if (io_threads == 0) {
+        io_threads = 1;
+    }
+    BuiltStateBackend out;
+    out.backend = std::make_shared<RemoteReadBackend>(
+        std::make_shared<InMemoryRemotePool>(), io_threads, hot_max_bytes);
+    // No restore_from: the in-memory pool holds nothing across a restart, so
+    // there is no cross-process checkpoint to stage.
     return out;
 }
 
@@ -259,6 +318,7 @@ StateBackendFactory::StateBackendFactory() {
     builders_["file"] = &build_file;
     builders_["changelog"] = &build_changelog;
     builders_["changelog+file"] = &build_changelog_file;
+    builders_["disagg-local"] = &build_disagg_local;
 }
 
 void StateBackendFactory::register_scheme(std::string scheme, Builder builder) {

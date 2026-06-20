@@ -50,6 +50,8 @@
 #include "clink/sql/row_kind.hpp"
 #include "clink/sql/table_api.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+#include "clink/state/remote_pool.hpp"
+#include "clink/state/remote_read_backend.hpp"
 
 using namespace clink;
 using namespace std::chrono_literals;
@@ -240,6 +242,116 @@ TEST(SqlRuntime, UnboundedGroupBySumRunsEndToEnd) {
 
     std::filesystem::remove(in_path);
     std::filesystem::remove(out_path);
+}
+
+// Auto-on: a GROUP BY compiled WITHOUT set_async_state_for_aggregation still
+// rides the deferring async-state path when the bound backend can defer reads
+// (supports_async_get()). On a non-deferring backend the byte-for-byte
+// in-memory path runs and produces identical totals. This is the production
+// "deferring backend is the default" behaviour - no manual opt-in - exercised
+// cluster-free (VectorSource -> aggregate_row -> CollectingSink) so we can
+// inject the backend instance and read its counters.
+TEST(SqlRuntime, GroupByAutoActivatesAsyncOnDeferringBackend) {
+    ensure_sql_installed_once();
+
+    // Compile with async_agg=FALSE: the plan carries NO async_state param, so
+    // the operator's async_state_ is false and only its backend-aware open()
+    // can turn the async path on.
+    Catalog cat;
+    auto ddl = parse(
+        std::string{"CREATE TABLE orders (user_id BIGINT, amount BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/auto_on_orders.ndjson');"
+                    "CREATE TABLE out_t (user_id BIGINT, total BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/auto_on_totals.ndjson')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT user_id, SUM(amount) AS total "
+                        "FROM orders GROUP BY user_id",
+                        /*async_agg=*/false);
+
+    std::map<std::string, std::string> agg_params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "aggregate_row") {
+            agg_params = op.params;
+        }
+    }
+    ASSERT_FALSE(agg_params.empty()) << "no aggregate_row op in the compiled spec";
+    EXPECT_EQ(agg_params.count("async_state"), 0u)
+        << "async_state must NOT be in the plan (auto-on must not depend on the manual flag)";
+
+    auto mk = [](std::int64_t uid, std::int64_t amount) {
+        Row r;
+        r.values["user_id"] = clink::config::JsonValue{static_cast<double>(uid)};
+        r.values["amount"] = clink::config::JsonValue{static_cast<double>(amount)};
+        return Record<Row>{std::move(r)};
+    };
+    const std::vector<Record<Row>> input = {
+        mk(1, 10),
+        mk(2, 20),
+        mk(1, 30),
+        mk(2, 5),
+        mk(1, 7),
+    };
+
+    auto build_agg = [&]() {
+        const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+            "aggregate_row", std::string{kChannelRow}, std::string{kChannelRow});
+        EXPECT_NE(factory, nullptr);
+        cluster::OperatorBuildContext octx;
+        octx.params = agg_params;
+        return std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+    };
+
+    // Drive the GROUP BY through a cluster-free Dag on `backend`; return the
+    // final per-key totals (unbounded GROUP BY emits the running total per
+    // input row, so the last emit per key is the answer).
+    auto run_on = [&](std::shared_ptr<StateBackend> backend) {
+        Dag dag;
+        auto src = std::make_shared<VectorSource<Row>>(input);
+        auto h_src = dag.add_source<Row>(src);
+        auto h_op = dag.add_operator<Row, Row>(h_src, build_agg());
+        auto sink = std::make_shared<CollectingSink<Row>>();
+        dag.add_sink<Row>(h_op, sink);
+        JobConfig cfg;
+        cfg.state_backend = std::move(backend);
+        LocalExecutor exec(std::move(dag), std::move(cfg));
+        exec.run();
+        std::int64_t u1 = -1;
+        std::int64_t u2 = -1;
+        for (const auto& rec : sink->collected_records()) {
+            const Row& row = rec.value();
+            const auto uid = static_cast<std::int64_t>(row.values.at("user_id").as_number());
+            const auto total = static_cast<std::int64_t>(row.values.at("total").as_number());
+            if (uid == 1) {
+                u1 = total;
+            } else if (uid == 2) {
+                u2 = total;
+            }
+        }
+        return std::make_pair(u1, u2);
+    };
+
+    // Baseline: non-deferring in-memory backend -> in-memory map path (today's
+    // default), totals 1->10+30+7=47, 2->20+5=25.
+    const auto [base1, base2] = run_on(std::make_shared<InMemoryStateBackend>());
+    EXPECT_EQ(base1, 47);
+    EXPECT_EQ(base2, 25);
+
+    // Auto-on: a deferring backend (RemoteReadBackend over an in-memory pool,
+    // i.e. the disagg-local:// scheme) activates the async KeyedState path with
+    // NO manual flag. Identical totals, and remote_loads() proves group state
+    // was read THROUGH the deferring tier - the in-memory map path never reads
+    // the backend, so it would leave remote_loads() == 0. Two distinct keys =>
+    // at least two first-touch cold reads.
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    const auto [auto1, auto2] = run_on(rrb);
+    EXPECT_EQ(auto1, 47);
+    EXPECT_EQ(auto2, 25);
+    EXPECT_GE(rrb->remote_loads(), 2u)
+        << "auto-on did not route GROUP BY state through the deferring backend";
 }
 
 // #59: the same unbounded GROUP BY built through the programmatic Table API

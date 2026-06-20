@@ -1541,7 +1541,8 @@ public:
         : group_keys_(std::move(group_keys)),
           aggregates_(std::move(aggregates)),
           group_key_outputs_(std::move(group_key_outputs)),
-          async_state_(async_state) {
+          async_state_(async_state),
+          effective_async_state_(async_state) {
         if (group_key_outputs_.size() != group_keys_.size()) {
             group_key_outputs_ = group_keys_;  // default: emit each key under its raw name
         }
@@ -1550,10 +1551,10 @@ public:
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (element.is_data()) {
             Batch<Row> emit_batch;
-            if (async_state_) {
-                // KeyedState (synchronous) path: used when async_state is on
-                // but the backend cannot defer reads, so the runner stays on
-                // process(). State still rides the StateBackend.
+            if (effective_async_state_) {
+                // KeyedState (synchronous) path: used when async is on but the
+                // backend cannot defer reads, so the runner stays on process().
+                // State still rides the StateBackend.
                 auto kv = keyed_state_();
                 for (const auto& rec : element.as_data()) {
                     const Row& row = rec.value();
@@ -1578,7 +1579,21 @@ public:
         }
     }
 
-    [[nodiscard]] bool supports_async() const noexcept override { return async_state_; }
+    // Auto-on: finalise the storage decision once the runtime + backend are
+    // attached (the runner calls open() before supports_async() and before any
+    // process()). Ride the async/disaggregated KeyedState path whenever the
+    // bound backend can genuinely defer reads (supports_async_get()), with no
+    // manual opt-in; an explicit async_state_ still forces it. On a
+    // non-deferring backend (memory/file/changelog) this stays false, so
+    // process() keeps the byte-for-byte in-memory path and the runner stays
+    // synchronous - existing jobs are unchanged.
+    void open() override {
+        effective_async_state_ =
+            async_state_ || (this->runtime() != nullptr && this->runtime()->has_state_backend() &&
+                             this->runtime()->state_backend()->supports_async_get());
+    }
+
+    [[nodiscard]] bool supports_async() const noexcept override { return effective_async_state_; }
 
     void process_async(const StreamElement<Row>& element,
                        Emitter<Row>& out,
@@ -1684,6 +1699,11 @@ private:
     std::vector<AggSpec> aggregates_;
     std::vector<std::string> group_key_outputs_;
     bool async_state_ = false;
+    // Effective decision: async_state_ OR the bound backend can defer reads.
+    // Seeded from async_state_ in the ctor and finalised in open() once the
+    // runtime + backend are attached, so process()/process_async()/
+    // supports_async() all agree on one storage choice (no split-brain).
+    bool effective_async_state_ = false;
     std::unordered_map<std::string, AggBucket> state_;
 };
 

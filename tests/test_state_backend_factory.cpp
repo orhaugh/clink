@@ -234,4 +234,48 @@ TEST(StateBackendFactory, UnknownSchemeThrows) {
     EXPECT_THROW(factory.build(spec), std::runtime_error);
 }
 
+// disagg-local:// builds a deferring backend (RemoteReadBackend over an
+// in-memory pool) with NO S3, so the async/disaggregated execution path can
+// auto-activate. supports_async_get()==true is the capability the runner and
+// the SQL aggregate's backend-aware open() gate on.
+TEST(StateBackendFactory, DisaggLocalSchemeYieldsDeferringBackend) {
+    clink::StateBackendSpec spec;
+    spec.uri = "disagg-local://";
+    const auto built = clink::StateBackendFactory::default_instance().build(spec);
+    ASSERT_NE(built.backend, nullptr);
+    EXPECT_TRUE(built.backend->supports_async_get())
+        << "disagg-local must report a deferring backend so the async path auto-activates";
+    // Process-local, no durable remote tier: nothing to stage on restore.
+    EXPECT_FALSE(built.restore_from.has_value());
+}
+
+// The URI query params (io_threads, hot_max_bytes) parse without throwing and
+// the result stays a deferring backend. Malformed values fall back to defaults.
+TEST(StateBackendFactory, DisaggLocalParsesParamsAndStaysDeferring) {
+    auto& factory = clink::StateBackendFactory::default_instance();
+    for (const char* uri : {"disagg-local://?io_threads=4&hot_max_bytes=4096",
+                            "disagg-local://?io_threads=0",
+                            "disagg-local://?hot_max_bytes=oops"}) {
+        clink::StateBackendSpec spec;
+        spec.uri = uri;
+        const auto built = factory.build(spec);
+        ASSERT_NE(built.backend, nullptr) << uri;
+        EXPECT_TRUE(built.backend->supports_async_get()) << uri;
+    }
+}
+
+// The common backends are NOT deferring, so the async path must never
+// auto-activate on them - the guarantee that makes auto-on safe for existing
+// memory/file jobs (they keep their synchronous, byte-for-byte path).
+TEST(StateBackendFactory, CommonSchemesAreNotDeferring) {
+    auto& factory = clink::StateBackendFactory::default_instance();
+    for (const char* uri : {"memory://", "memory+sharded://", "changelog://"}) {
+        clink::StateBackendSpec spec;
+        spec.uri = uri;
+        const auto built = factory.build(spec);
+        ASSERT_NE(built.backend, nullptr) << uri;
+        EXPECT_FALSE(built.backend->supports_async_get()) << uri;
+    }
+}
+
 }  // namespace
