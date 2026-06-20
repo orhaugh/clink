@@ -306,6 +306,15 @@ public:
 
         auto in_channel = upstream.output;
 
+        // Become the chain's checkpoint owner; demote the previous operator so
+        // only the most-downstream one snapshots the shared backend. See
+        // chain_checkpoint_owner_.
+        auto owner_flag = std::make_shared<bool>(true);
+        if (chain_checkpoint_owner_) {
+            *chain_checkpoint_owner_ = false;
+        }
+        chain_checkpoint_owner_ = owner_flag;
+
         detail::OperatorRunner runner;
         runner.name = op->name();
         runner.id = id;
@@ -313,7 +322,7 @@ public:
         // Dag::side_output() calls made between add_operator and run()
         // are observed by the closure at runtime.
         auto side_channels = side_channels_ptr_(runners_.size());
-        runner.run = [op, in_channel, out_channel, side_channels, id](
+        runner.run = [op, in_channel, out_channel, side_channels, id, owner_flag](
                          RuntimeContext& ctx, const std::function<bool()>& should_stop) {
             using namespace std::chrono_literals;
             op->attach_runtime(&ctx);
@@ -448,55 +457,77 @@ public:
                         }
                         const auto ckpt_id = maybe->as_barrier().id();
                         auto* backend = ctx.state_backend();
-                        if (snap_worker) {
-                            // Async path: capture a detached point-in-time
-                            // blob on this thread, forward the barrier
-                            // downstream immediately (the blob already
-                            // reflects state at the barrier point, so this
-                            // is sound and shaves the durable-write latency
-                            // off the critical path), then let the worker
-                            // durably persist + ack off-thread. The ack
-                            // fires only after persist() returns, so the
-                            // ack-after-durable invariant holds.
-                            std::string err;
-                            bool ok = true;
-                            CaptureHandle handle;
-                            try {
-                                op->snapshot_timers(*backend, id);
-                                handle = backend->capture(ckpt_id);
-                            } catch (const std::exception& e) {
-                                ok = false;
-                                err = e.what();
-                            }
-                            op->process(*maybe, emitter);
-                            if (!ok) {
-                                // Capture failed on-thread: ack the failure
-                                // now; there is nothing for the worker to do.
-                                if (const auto& cb = ctx.checkpoint_ack(); cb) {
-                                    cb(ckpt_id, false, std::move(err));
+                        // Only the chain's checkpoint OWNER (the most-downstream
+                        // operator sharing this backend) snapshots/commits/acks
+                        // it, exactly once per barrier; non-owners stage their
+                        // own timer slice and forward. Keeps a shared backend
+                        // single-writer for snapshot, which a delta-commit
+                        // backend (RemoteReadBackend) requires; full-state
+                        // backends are unaffected.
+                        if (*owner_flag) {
+                            if (snap_worker) {
+                                // Async path: capture a detached point-in-time
+                                // blob on this thread, forward the barrier
+                                // downstream immediately (the blob already
+                                // reflects state at the barrier point, so this
+                                // is sound and shaves the durable-write latency
+                                // off the critical path), then let the worker
+                                // durably persist + ack off-thread. The ack
+                                // fires only after persist() returns, so the
+                                // ack-after-durable invariant holds.
+                                std::string err;
+                                bool ok = true;
+                                CaptureHandle handle;
+                                try {
+                                    op->snapshot_timers(*backend, id);
+                                    handle = backend->capture(ckpt_id);
+                                } catch (const std::exception& e) {
+                                    ok = false;
+                                    err = e.what();
+                                }
+                                op->process(*maybe, emitter);
+                                if (!ok) {
+                                    // Capture failed on-thread: ack the failure
+                                    // now; there is nothing for the worker to do.
+                                    if (const auto& cb = ctx.checkpoint_ack(); cb) {
+                                        cb(ckpt_id, false, std::move(err));
+                                    }
+                                } else {
+                                    snap_worker->enqueue(
+                                        SnapshotWorker::Job{.handle = std::move(handle),
+                                                            .backend = backend,
+                                                            .ack = ctx.checkpoint_ack()});
                                 }
                             } else {
-                                snap_worker->enqueue(
-                                    SnapshotWorker::Job{.handle = std::move(handle),
-                                                        .backend = backend,
-                                                        .ack = ctx.checkpoint_ack()});
+                                // Synchronous path (InMemory / Changelog /
+                                // RocksDB): snapshot then ack on this thread.
+                                std::string err;
+                                bool ok = true;
+                                try {
+                                    op->snapshot_timers(*backend, id);
+                                    backend->snapshot(ckpt_id);
+                                } catch (const std::exception& e) {
+                                    ok = false;
+                                    err = e.what();
+                                }
+                                op->process(*maybe, emitter);
+                                if (const auto& cb = ctx.checkpoint_ack(); cb) {
+                                    cb(ckpt_id, ok, std::move(err));
+                                }
                             }
                         } else {
-                            // Synchronous path (InMemory / Changelog /
-                            // RocksDB): snapshot then ack on this thread.
-                            std::string err;
-                            bool ok = true;
+                            // Non-owner in a fused chain: stage this op's timer
+                            // slice into the shared backend (the owner, which is
+                            // downstream, commits it in its single snapshot) and
+                            // forward the barrier. The owner is the only writer
+                            // of the shared backend's snapshot.
                             try {
                                 op->snapshot_timers(*backend, id);
-                                backend->snapshot(ckpt_id);
-                            } catch (const std::exception& e) {
-                                ok = false;
-                                err = e.what();
+                            } catch (...) {
+                                // A timer-stage failure surfaces at the owner's
+                                // snapshot (it reads the same shared dirty set).
                             }
                             op->process(*maybe, emitter);
-                            if (const auto& cb = ctx.checkpoint_ack(); cb) {
-                                cb(ckpt_id, ok, std::move(err));
-                            }
                         }
                     } else if (aec && maybe->is_watermark()) {
                         // Async mode: the watermark forwards (and fires its due
@@ -3227,12 +3258,21 @@ public:
         sink->set_id(id);
         sinks_.push_back(sink);
         auto in_channel = upstream.output;
+        // The sink snapshots the shared backend only when it is the (sub)task's
+        // checkpoint owner - i.e. NO upstream operator already owns it. In a
+        // fused chain the most-downstream operator owns + commits the shared
+        // backend (including any state the sink staged via put), so the sink
+        // must NOT snapshot it again: a delta-commit backend (RemoteReadBackend)
+        // must be single-writer per barrier. A pure source->sink subtask has no
+        // operator owner, so the sink owns + commits as before. on_barrier and
+        // the terminal on_commit always run regardless.
+        const bool sink_owns_checkpoint = (chain_checkpoint_owner_ == nullptr);
 
         detail::OperatorRunner runner;
         runner.name = sink->name();
         runner.id = id;
-        runner.run = [sink, in_channel](RuntimeContext& ctx,
-                                        const std::function<bool()>& should_stop) {
+        runner.run = [sink, in_channel, sink_owns_checkpoint](
+                         RuntimeContext& ctx, const std::function<bool()>& should_stop) {
             sink->attach_runtime(&ctx);
             sink->open();
             // Per-subtask async snapshot worker (FileBacked + disk-backed
@@ -3268,7 +3308,16 @@ public:
                     // checkpoint once every subtask has reported.
                     const auto& barrier = maybe->as_barrier();
                     const auto ckpt_id = barrier.id();
-                    if (snap_worker && ctx.has_state_backend() && !barrier.is_terminal()) {
+                    if (!sink_owns_checkpoint) {
+                        // An upstream operator owns the shared backend's
+                        // checkpoint; the sink must not double-snapshot a
+                        // delta-commit backend. Run the user hook + terminal
+                        // commit only - no snapshot, no ack (the owner acks).
+                        sink->on_barrier(barrier);
+                        if (barrier.is_terminal()) {
+                            sink->on_commit(ckpt_id.value());
+                        }
+                    } else if (snap_worker && ctx.has_state_backend() && !barrier.is_terminal()) {
                         // Async path: capture on this thread, run the user
                         // barrier hook, persist + ack off-thread. The ack
                         // fires after persist returns (ack-after-durable).
@@ -3623,6 +3672,20 @@ private:
     std::vector<std::shared_ptr<void>> operators_;
     std::vector<std::shared_ptr<void>> sinks_;
     std::vector<detail::OperatorRunner> runners_;
+    // Per-(sub)task checkpoint-owner tracking. In a fused chain every operator
+    // runner shares ONE state backend and would otherwise each snapshot it on a
+    // barrier - which corrupts a delta-commit backend (RemoteReadBackend's
+    // delta-then-clear is single-writer) and races on its hot tier. The OWNER is
+    // the LAST operator/co-operator added: the runner the in-order barrier
+    // reaches last, by which point every upstream op has drained its state into
+    // the shared backend. Only the owner snapshots/commits/acks (exactly once);
+    // non-owners stage their own timer slice and forward the barrier, so the
+    // owner's single snapshot still captures every op's state + timers.
+    // Full-state backends are unaffected (one whole-state snapshot == the prior
+    // redundant per-op snapshots). Points at the current last operator's flag so
+    // adding a later operator flips it false. The cluster builds one Dag per
+    // subtask, so this is naturally per-subtask.
+    std::shared_ptr<bool> chain_checkpoint_owner_;
     std::vector<BarrierInjector> source_injectors_;
     std::vector<OperatorId> source_ids_;
     // Boundedness recorded at registration, parallel to source_ids_ (BATCH-1).
