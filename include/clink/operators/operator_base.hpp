@@ -267,29 +267,26 @@ public:
     // True iff this operator's on_event_time_timer / on_processing_time_timer
     // callbacks read or write keyed state (the ProcessFunction adapter does;
     // window/CEP operators touch state via on_watermark, not timer virtuals, so
-    // they return false here). The async runners refuse to run an operator that
-    // is BOTH async-capable AND fires state-touching timers: under async, a
-    // processing-time timer callback can fire ungated while an async read for
-    // the same key is still in flight (a torn-read / lost-update). The
-    // per-key-gated timer path is a deferred increment (see the async-timer note
-    // in docs/disaggregated-async-roadmap.md). Until it lands, this virtual is
-    // the tripwire: a timer-bearing operator that opts into async fails loudly
-    // at runner start rather than silently racing. No production operator is
-    // async today, so this never trips on main.
+    // they return false here). Used by the SHARDED keyed stage, which has no
+    // processing-time fire path and refuses such operators under async (via the
+    // processing-time refinement below). The single-input runner gates both
+    // timer kinds safely (see below), so it does not refuse on this flag.
     [[nodiscard]] virtual bool fires_state_touching_timers() const noexcept { return false; }
 
-    // Refinement of the above for the async runner: true iff this operator
-    // fires state-touching PROCESSING-TIME timer callbacks. Those fire ungated
-    // at the top of the runner loop (fire_due()), so under async they can race
-    // an in-flight read for the same key - the async runner refuses them.
-    // EVENT-TIME timers, by contrast, fire from INSIDE the aec->on_watermark
-    // release closure (after the epoch has fully drained), so no in-flight async
-    // read for the same key is outstanding when they touch state - they are
-    // safe. An operator that touches keyed state ONLY from event-time timers
-    // (e.g. AsyncTumblingWindowOperator) overrides this to return false while
-    // keeping fires_state_touching_timers() true, so the async runner admits it.
-    // The default is conservative: assume any state-touching timer might be a
-    // processing-time one, matching the historic blanket tripwire.
+    // True iff this operator fires state-touching PROCESSING-TIME timer
+    // callbacks. EVENT-TIME timers fire from INSIDE the aec->on_watermark release
+    // closure (after the epoch has fully drained), so no in-flight async read for
+    // the same key is outstanding when they touch state - they are always safe.
+    // PROCESSING-TIME timers fire at the top of the runner loop; the single-input
+    // async runner routes them through the per-key gate (gated_timer_fire.hpp) so
+    // a state-touching callback serialises behind any in-flight read for the same
+    // key - SAFE there, provided the operator registers each processing-time
+    // timer with the SAME key bytes it uses as its record gate key in
+    // process_async (the documented contract). The SHARDED keyed stage has no
+    // processing-time fire path and still refuses an operator that returns true
+    // here. An operator that touches keyed state ONLY from event-time timers
+    // (e.g. AsyncTumblingWindowOperator) overrides this to return false; the
+    // default is conservative (any state-touching timer might be processing-time).
     [[nodiscard]] virtual bool fires_state_touching_processing_time_timers() const noexcept {
         return fires_state_touching_timers();
     }
@@ -313,6 +310,14 @@ public:
     // runtime()->timer_service()->register_processing_time_timer(t, k)
     // becomes due. Fired between input pops on the operator's thread, so
     // state access is single-threaded with process(). Default no-op.
+    //
+    // ASYNC CONTRACT: under async-state execution the single-input runner fires
+    // this through the per-key gate, so synchronous keyed-state access here is
+    // safe (no same-key async read is outstanding when it runs). For that
+    // serialisation to protect the right state, an async operator MUST register
+    // each processing-time timer with the SAME key bytes `k` it uses as the
+    // record gate key in process_async (the runner passes `k` straight through
+    // as the gate key). See gated_timer_fire.hpp.
     virtual void on_processing_time_timer(std::int64_t /*timestamp_ms*/,
                                           const std::string& /*key*/,
                                           Emitter<Out>& /*out*/) {}

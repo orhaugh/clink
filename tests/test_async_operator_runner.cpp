@@ -180,10 +180,11 @@ TEST(AsyncOperatorRunner, NonOptingOperatorIgnoresAsyncBackend) {
     EXPECT_EQ(sink->collected(), (std::vector<int>{10, 12, 14}));
 }
 
-// async-timer gate tripwire: an operator that is BOTH async-capable AND fires
-// state-touching timers is refused at runner start (the per-key-gated timer
-// path is a deferred increment), so it fails loudly rather than silently racing
-// a timer callback against an in-flight async read for the same key.
+// The single-input async runner now GATES processing-time timers through the
+// per-key gate (gated_timer_fire.hpp), so an async + timer-bearing operator is
+// ADMITTED (no longer refused). The deep serialisation + end-to-end coverage
+// lives in test_gated_timer_fire.cpp; here we only assert the historic startup
+// throw is gone and such an operator runs to completion.
 namespace {
 class TimerBearingAsyncOperator final : public Operator<int, int> {
 public:
@@ -205,8 +206,8 @@ public:
 };
 }  // namespace
 
-TEST(AsyncOperatorRunner, RefusesAsyncOperatorThatFiresStateTouchingTimers) {
-    // Sanity: the base default is false (a plain op never trips the guard).
+TEST(AsyncOperatorRunner, AdmitsAsyncOperatorThatFiresStateTouchingTimers) {
+    // Sanity: the base default is false (a plain op declares no timers).
     MapOperator<int, int> plain([](int x) { return x; });
     EXPECT_FALSE(plain.fires_state_touching_timers());
 
@@ -220,22 +221,10 @@ TEST(AsyncOperatorRunner, RefusesAsyncOperatorThatFiresStateTouchingTimers) {
     JobConfig cfg;
     cfg.state_backend = std::make_shared<InlineAsyncBackend>();  // supports_async_get()
     LocalExecutor exec(std::move(dag), std::move(cfg));
-    exec.run();  // the operator thread throws at setup; LocalExecutor records it
+    exec.run();  // no longer throws at setup: the gated timer path admits it
 
-    const auto errs = exec.operator_errors();
-    ASSERT_FALSE(errs.empty()) << "the async + timer-bearing operator must be refused";
-    // The guard distinguishes timer kinds: a generic timer-bearing op leaves
-    // fires_state_touching_processing_time_timers() at its conservative default
-    // (== fires_state_touching_timers() == true), so it is still refused. An
-    // event-time-ONLY operator is admitted (see
-    // AsyncTumblingWindowOperator.TripwireAdmitsEventTimeOnlyWindowUnderAsync).
-    bool found = false;
-    for (const auto& [op_name, msg] : errs) {
-        if (msg.find("state-touching processing-time timers under async") != std::string::npos) {
-            found = true;
-        }
-    }
-    EXPECT_TRUE(found) << "expected the async processing-time-timer-gate guard error";
+    EXPECT_TRUE(exec.operator_errors().empty())
+        << "the single-input runner now gates processing-time timers and admits the operator";
 }
 
 // Production async link: the DAG runner must wire a deferring backend's

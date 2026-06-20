@@ -372,19 +372,23 @@ private:
                 // Tripwire (async-timer gate): this branch fires event-time
                 // timers by calling sh.op->on_watermark inline AFTER a blunt
                 // aec->drain() (it bypasses aec->on_watermark's per-epoch FIFO
-                // release - over-serialising, but correct). Like the single-input
-                // runner it does NOT gate processing-time timer callbacks, so an
-                // operator that touches keyed state in a timer under async is not
-                // yet safe here. But event-time timers fire from on_watermark,
-                // which this stage calls only AFTER aec->drain() (below), so an
-                // event-time-only operator is gated and safe; only PROCESSING-
-                // time state-touching timers (ungated fire_due) are refused.
+                // release - over-serialising, but correct), so an event-time-only
+                // operator is gated and safe. PROCESSING-time timers, however,
+                // have NO fire path in this stage at all: the worker loop below
+                // uses a blocking queue pop with no loop-top fire_due, so a
+                // processing-time timer would never fire even synchronously.
+                // Admitting such an operator would silently swallow its timers,
+                // which is worse than refusing it - so this tripwire stays. (The
+                // single-input runner DOES now gate processing-time timers via
+                // gated_timer_fire.hpp; a deadline-driven pop + per-shard gated
+                // fire for this stage is a separate, larger structural change.)
                 if (sh.op->fires_state_touching_processing_time_timers()) {
                     throw std::logic_error(
                         "clink: operator '" + sh.op->name() +
                         "' fires state-touching processing-time timers under async execution, "
-                        "which is not yet supported in the sharded keyed stage; build the "
-                        "per-key-gated timer path first");
+                        "which the sharded keyed stage cannot serve (it has no processing-time "
+                        "fire path); the single-input runner gates these, the sharded stage does "
+                        "not yet");
                 }
                 aec = std::make_unique<AsyncExecutionController>();
             }

@@ -24,6 +24,7 @@
 #include "clink/runtime/blocking_exchange.hpp"
 #endif
 #include "clink/runtime/bounded_channel.hpp"
+#include "clink/runtime/gated_timer_fire.hpp"
 #include "clink/runtime/multi_input_alignment.hpp"
 #include "clink/runtime/output_tag.hpp"
 #include "clink/runtime/runtime_context.hpp"
@@ -359,31 +360,16 @@ public:
             const bool async_mode = op->supports_async() && ctx.has_state_backend() &&
                                     ctx.state_backend()->supports_async_get();
             if (async_mode) {
-                // Tripwire (async-timer gate): under async, the event-time timer
-                // path is epoch-gated (watermarks route through aec->on_watermark
-                // below, firing on_event_time_timer only after the epoch drains),
-                // but the steady-state processing-time fire_due() at the top of
-                // the loop runs UNGATED - a processing-time timer callback that
-                // touches keyed state could race an in-flight async read for the
-                // same key. No production operator is async + timer-bearing today,
-                // so this never trips; if one is introduced the per-key-gated
-                // timer path must be built first (deferred increment).
-                //
-                // Only PROCESSING-TIME state-touching timers are unsafe: they
-                // fire via fire_due() at the loop top, ungated, and can race an
-                // in-flight async read. Event-time timers fire inside the
-                // aec->on_watermark release closure below (after the epoch
-                // drains), so an event-time-only operator (e.g. an async window
-                // aggregate) is admitted - it returns false here while keeping
-                // fires_state_touching_timers() true.
-                if (op->fires_state_touching_processing_time_timers()) {
-                    throw std::logic_error(
-                        "clink: operator '" + op->name() +
-                        "' fires state-touching processing-time timers under async execution, "
-                        "which is not yet supported (the callbacks fire ungated at the loop top "
-                        "and can race an in-flight async read for the same key); build the "
-                        "per-key-gated timer path before enabling async here");
-                }
+                // Under async, the event-time timer path is epoch-gated
+                // (watermarks route through aec->on_watermark below, firing
+                // on_event_time_timer only after the epoch drains). The
+                // PROCESSING-time fire path is routed through the per-key gate by
+                // fire_due_gated() (below) so a state-touching processing-time
+                // timer for key K serialises behind any in-flight async read for
+                // K - see gated_timer_fire.hpp. An async operator that fires
+                // processing-time timers must register them with its record gate
+                // key (the operator contract documented there); the runner no
+                // longer refuses such operators.
                 aec = std::make_unique<AsyncExecutionController>();
                 // Wire the backend's async-read completions to THIS subtask's
                 // controller: a deferring backend (RemoteReadBackend, a future
@@ -404,10 +390,21 @@ public:
             // (each of which has its own per-RC TimerService). Regular
             // ops' default impl just polls ctx.timer_service().
             auto fire_due = [&] { op->fire_due_timers(emitter, timers->now_ms()); };
+            // Under async, processing-time timers fire through the per-key gate
+            // (gated_timer_fire.hpp) so a state-touching callback serialises
+            // behind any in-flight read for the same key; a no-op when the op
+            // registers no processing-time timers (every async op today).
+            auto fire_due_async = [&] {
+                detail::gated_fire_processing_time_timers(*op, emitter, timers->now_ms(), *aec);
+            };
             while (!should_stop()) {
                 // Fire any timers whose deadline has passed before
                 // waiting on input.
-                fire_due();
+                if (aec) {
+                    fire_due_async();
+                } else {
+                    fire_due();
+                }
                 // Wait until the next timer is due, or 30s otherwise.
                 // Cancellation propagates via channel close (set on
                 // the runner's cancel hook and by the executor's
@@ -537,9 +534,16 @@ public:
             // emissions aren't silently dropped.
             if (!should_stop()) {
                 if (aec) {
-                    aec->drain();  // finish any in-flight async state work before flush
+                    // drain (quiesce in-flight reads so no key is held) -> fire
+                    // due processing-time timers through the gate (each finds its
+                    // key free) -> drain again so every timer coroutine has run
+                    // before flush.
+                    aec->drain();
+                    fire_due_async();
+                    aec->drain();
+                } else {
+                    fire_due();
                 }
-                fire_due();
                 op->flush(emitter);
             }
             // Drop the controller pointer from the backend before `aec` is
