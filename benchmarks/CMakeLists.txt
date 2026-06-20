@@ -2,6 +2,14 @@ add_executable(clink_bench clink_bench.cpp)
 target_link_libraries(clink_bench PRIVATE clink::core)
 clink_set_warnings(clink_bench)
 
+# Async-state throughput benchmark - async-vs-sync overlap of cold reads on a
+# deferring (RemoteReadBackend) tier with a controlled-latency synthetic loader.
+# Proves the per-key-gated async path overlaps remote reads the synchronous path
+# serialises. Self-validating (hard-fails if it stops measuring real cold IO).
+add_executable(clink_async_state_bench clink_async_state_bench.cpp)
+target_link_libraries(clink_async_state_bench PRIVATE clink::core)
+clink_set_warnings(clink_async_state_bench)
+
 # Serde benchmark - compares the legacy record-by-record Codec<T>
 # wire encoding against the Arrow RecordBatch + IPC path. The Arrow
 # path is the production path; the legacy path is benched as a
