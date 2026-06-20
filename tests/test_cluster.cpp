@@ -32,6 +32,77 @@ using namespace clink::cluster;
 using namespace clink::network;
 using namespace std::chrono_literals;
 
+// The submit-time default state-backend policy: a cluster-level default
+// (clink_node --default-state-backend / JobManager::Config.default_state_backend_uri)
+// fills in a job's backend only when the submitter chose none, so an operator
+// can make the async/disaggregated path the default without each job opting in.
+TEST(DefaultStateBackendPolicy, AppliesDefaultWhenJobChoseNone) {
+    CheckpointConfig c;  // state_backend_uri empty -> would resolve to memory
+    apply_default_state_backend(c, "disagg-local://");
+    EXPECT_EQ(c.state_backend_uri, "disagg-local://");
+}
+
+TEST(DefaultStateBackendPolicy, PerJobUriOverridesDefault) {
+    CheckpointConfig c;
+    c.state_backend_uri = "remote-read://bucket/prefix";  // explicit per-job --state-backend
+    apply_default_state_backend(c, "disagg-local://");
+    EXPECT_EQ(c.state_backend_uri, "remote-read://bucket/prefix") << "per-job choice must win";
+}
+
+TEST(DefaultStateBackendPolicy, EmptyDefaultIsNoOp) {
+    CheckpointConfig c;  // both empty
+    apply_default_state_backend(c, "");
+    EXPECT_TRUE(c.state_backend_uri.empty()) << "no default -> legacy resolution preserved";
+}
+
+TEST(DefaultStateBackendPolicy, CheckpointDirIsNotABackendChoice) {
+    // A job that set only checkpoint_dir (HA/coordination) but no backend still
+    // inherits the default, so an operator pointing the cluster at a durable
+    // deferring tier covers HA-enabled jobs too.
+    CheckpointConfig c;
+    c.checkpoint_dir = "/var/clink/ckpts";  // set, but no backend choice
+    apply_default_state_backend(c, "remote-read://bucket");
+    EXPECT_EQ(c.state_backend_uri, "remote-read://bucket");
+    EXPECT_EQ(c.checkpoint_dir, "/var/clink/ckpts") << "checkpoint_dir is untouched";
+}
+
+// Recovery pins an empty (unspecified) backend to its legacy equivalent so a
+// recovered job keeps the backend it ran with.
+TEST(DefaultStateBackendPolicy, RecoveryPinsCheckpointDirToFile) {
+    CheckpointConfig c;
+    c.checkpoint_dir = "/var/clink/ckpts";  // file-durable via legacy resolution
+    pin_recovered_state_backend(c);
+    EXPECT_EQ(c.state_backend_uri, "/var/clink/ckpts");
+}
+
+TEST(DefaultStateBackendPolicy, RecoveryPinsEmptyToMemory) {
+    CheckpointConfig c;  // no backend, no checkpoint_dir -> legacy memory
+    pin_recovered_state_backend(c);
+    EXPECT_EQ(c.state_backend_uri, "memory://");
+}
+
+TEST(DefaultStateBackendPolicy, RecoveryLeavesExplicitUriUntouched) {
+    CheckpointConfig c;
+    c.state_backend_uri = "remote-read://bucket";
+    pin_recovered_state_backend(c);
+    EXPECT_EQ(c.state_backend_uri, "remote-read://bucket");
+}
+
+// The defect this closes: a job submitted under an EMPTY cluster default (so it
+// relied on checkpoint_dir -> file durability) must NOT be rebound when the JM
+// is later restarted with a default configured. Recovery runs pin first, then
+// submit_job's apply_default - the pin makes the default a no-op, so the
+// recovered job keeps its file backend instead of silently switching to the
+// (non-durable) disagg-local default and abandoning its checkpoints.
+TEST(DefaultStateBackendPolicy, RecoveryDoesNotRebindAcrossDefaultChange) {
+    CheckpointConfig c;
+    c.checkpoint_dir = "/var/clink/ckpts";              // persisted state_backend_uri was empty
+    pin_recovered_state_backend(c);                     // recovery pins to file...
+    apply_default_state_backend(c, "disagg-local://");  // ...new default cannot rebind it
+    EXPECT_EQ(c.state_backend_uri, "/var/clink/ckpts")
+        << "a recovered job must keep its original backend across a default config change";
+}
+
 // 1 JobManager + 2 TaskManagers running in 3 threads. JM coordinates the
 // deployment of a producer/consumer pipeline split across the TMs:
 //   TM-A: producer role - emits int64s into a NetworkBridgeSink.
