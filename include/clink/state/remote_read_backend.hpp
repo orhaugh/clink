@@ -221,10 +221,13 @@ public:
             hot_.restore(snap, kg_filter);
             return;
         }
-        // Lazy restore: point cold reads at the restored checkpoint and load
-        // nothing eagerly (the fast-recovery win). v1: same-parallelism; the
-        // rescale key-group filter is a follow-on.
-        (void)kg_filter;
+        // Rescale / cross-location: let the pool materialise the restored
+        // checkpoint under this subtask's own location first (merge the parent
+        // checkpoints, key-group-filter to `kg_filter`, relocate objects, write
+        // the merged manifest as cp-restore_cp). A no-op for same-location
+        // same-parallelism restore. After this, cold reads + the first
+        // incremental commit work against this subtask's own prefix.
+        pool_->prepare_restore(snap.checkpoint_id, kg_filter);
         // Drop any stale hot-tier entries before repointing at the new
         // checkpoint. A fresh backend has an empty hot tier (the production
         // path), so this is a no-op there; it makes restore() self-consistent

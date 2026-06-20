@@ -171,6 +171,248 @@ TEST(S3RemotePool, SweepReclaimsOrphanedObjectsKeepsLiveOnes) {
     pool->purge(CheckpointId{2});
 }
 
+namespace {
+// A key-group-prefixed state key: the leading byte IS the key group (mirrors
+// KeyedState::encode_key, which a backend reads at key[0] to filter on rescale).
+std::string kkey(int kg, const std::string& suffix) {
+    std::string k;
+    k.push_back(static_cast<char>(kg));
+    k += suffix;
+    return k;
+}
+S3RemotePool::Options sub_opts(const std::string& job, std::uint32_t subtask) {
+    return pool_opts(job + "/" + std::to_string(subtask));
+}
+}  // namespace
+
+// 2d rescale SCALE-UP (1 -> 2): each new subtask inherits the single parent's
+// checkpoint narrowed to its assigned key-group range, and - the core trap -
+// the inherited state SURVIVES the new subtask's first incremental checkpoint.
+TEST(S3RemotePool, RescaleScaleUpKeyGroupFiltersAndSurvivesCheckpoint) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    const std::string job = unique_prefix() + "-up";
+    const OperatorId op{8};
+    const std::string kLo = kkey(5, "a");     // kg 5  -> new subtask 0 [0,64)
+    const std::string kZero = kkey(0, "d");   // kg 0  -> new subtask 0
+    const std::string kHi = kkey(66, "b");    // kg 66 -> new subtask 1 [64,128)
+    const std::string kTop = kkey(127, "c");  // kg 127-> new subtask 1
+    const std::string kNew = kkey(100, "e");  // kg 100-> new subtask 1 (added post-rescale)
+
+    // Old parallelism 1: subtask 0 holds the whole key space, checkpoint 100.
+    {
+        auto p0 = std::make_shared<S3RemotePool>(sub_opts(job, 0));
+        RemoteReadBackend b(p0);
+        b.put(op, std::string_view{kLo}, vv("va"));
+        b.put(op, std::string_view{kZero}, vv("vd"));
+        b.put(op, std::string_view{kHi}, vv("vb"));
+        b.put(op, std::string_view{kTop}, vv("vc"));
+        b.snapshot(CheckpointId{100});
+    }
+
+    // New subtask 1 owns key-groups [64,128): inherits parent 0 filtered.
+    auto p1 = std::make_shared<S3RemotePool>(sub_opts(job, 1));
+    p1->set_restore_sources({job + "/0"});
+    RemoteReadBackend b1(p1);
+    Snapshot s;
+    s.checkpoint_id = CheckpointId{100};
+    b1.restore(s, clink::KeyGroupRange{64, 128});
+    EXPECT_EQ(str(b1.get(op, std::string_view{kHi})), "vb");      // kg 66 in range
+    EXPECT_EQ(str(b1.get(op, std::string_view{kTop})), "vc");     // kg 127 in range
+    EXPECT_FALSE(b1.get(op, std::string_view{kLo}).has_value());  // kg 5 filtered out
+    EXPECT_FALSE(b1.get(op, std::string_view{kZero}).has_value());
+
+    // Failover BEFORE the first post-rescale checkpoint: a plain self-restore
+    // (no rescale sources) of cp-100 must recover the filtered state from the
+    // durable sidecar - not lose it (the cache is gone on a fresh process).
+    {
+        auto p1f = std::make_shared<S3RemotePool>(sub_opts(job, 1));
+        RemoteReadBackend b1f(p1f);
+        Snapshot sf;
+        sf.checkpoint_id = CheckpointId{100};
+        b1f.restore(sf);  // no sources -> reads job/1's rescaled-cp-100 sidecar
+        EXPECT_EQ(str(b1f.get(op, std::string_view{kHi})), "vb");
+        EXPECT_EQ(str(b1f.get(op, std::string_view{kTop})), "vc");
+        EXPECT_FALSE(b1f.get(op, std::string_view{kLo}).has_value());
+    }
+
+    // The parent's full cp-100 was NOT clobbered by the rescale (sidecar only),
+    // so a sibling reading parent 0 still sees the whole key space.
+    {
+        auto p0parent = std::make_shared<S3RemotePool>(sub_opts(job, 0));
+        RemoteReadBackend bp(p0parent);
+        Snapshot sp;
+        sp.checkpoint_id = CheckpointId{100};
+        bp.restore(sp);                                           // plain read of parent 0's cp-100
+        EXPECT_EQ(str(bp.get(op, std::string_view{kLo})), "va");  // kg 5 still there
+        EXPECT_EQ(str(bp.get(op, std::string_view{kHi})), "vb");  // kg 66 still there
+    }
+
+    // Incremental-base survival: add a new key, checkpoint, then a FRESH backend
+    // restores the new checkpoint and must still see the inherited keys (the
+    // merged base was carried into cp-101, not dropped).
+    b1.put(op, std::string_view{kNew}, vv("vnew"));
+    b1.snapshot(CheckpointId{101});
+    auto p1b = std::make_shared<S3RemotePool>(sub_opts(job, 1));
+    RemoteReadBackend b1b(p1b);
+    Snapshot s101;
+    s101.checkpoint_id = CheckpointId{101};
+    b1b.restore(s101);
+    EXPECT_EQ(str(b1b.get(op, std::string_view{kHi})), "vb");      // inherited, survived
+    EXPECT_EQ(str(b1b.get(op, std::string_view{kTop})), "vc");     // inherited, survived
+    EXPECT_EQ(str(b1b.get(op, std::string_view{kNew})), "vnew");   // added post-rescale
+    EXPECT_FALSE(b1b.get(op, std::string_view{kLo}).has_value());  // never owned
+
+    // New subtask 0 owns [0,64): self-merge of parent 0 (its own prefix),
+    // filtered. The parent's full cp-100 is never overwritten by the filter.
+    auto p0n = std::make_shared<S3RemotePool>(sub_opts(job, 0));
+    p0n->set_restore_sources({job + "/0"});
+    RemoteReadBackend b0n(p0n);
+    Snapshot s100;
+    s100.checkpoint_id = CheckpointId{100};
+    b0n.restore(s100, clink::KeyGroupRange{0, 64});
+    EXPECT_EQ(str(b0n.get(op, std::string_view{kLo})), "va");      // kg 5 in [0,64)
+    EXPECT_EQ(str(b0n.get(op, std::string_view{kZero})), "vd");    // kg 0 in [0,64)
+    EXPECT_FALSE(b0n.get(op, std::string_view{kHi}).has_value());  // kg 66 filtered out
+
+    p1->purge(CheckpointId{101});
+    p1->purge(CheckpointId{100});
+}
+
+// 2d rescale SCALE-DOWN (2 -> 1): the new subtask MERGES two parents' state and
+// the merge survives its first incremental checkpoint.
+TEST(S3RemotePool, RescaleScaleDownMergesParentsAndSurvivesCheckpoint) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    const std::string job = unique_prefix() + "-down";
+    const OperatorId op{9};
+    const std::string k10 = kkey(10, "a"), k20 = kkey(20, "d");  // parent 0
+    const std::string k70 = kkey(70, "b"), k90 = kkey(90, "c");  // parent 1
+    const std::string kNew = kkey(50, "e");
+
+    {
+        auto p0 = std::make_shared<S3RemotePool>(sub_opts(job, 0));
+        RemoteReadBackend b(p0);
+        b.put(op, std::string_view{k10}, vv("v10"));
+        b.put(op, std::string_view{k20}, vv("v20"));
+        b.snapshot(CheckpointId{200});
+    }
+    {
+        auto p1 = std::make_shared<S3RemotePool>(sub_opts(job, 1));
+        RemoteReadBackend b(p1);
+        b.put(op, std::string_view{k70}, vv("v70"));
+        b.put(op, std::string_view{k90}, vv("v90"));
+        b.snapshot(CheckpointId{200});
+    }
+
+    // New subtask 0 owns everything, inheriting parents 0 and 1.
+    auto p = std::make_shared<S3RemotePool>(sub_opts(job, 0));
+    p->set_restore_sources({job + "/0", job + "/1"});
+    RemoteReadBackend b(p);
+    Snapshot s;
+    s.checkpoint_id = CheckpointId{200};
+    b.restore(s, clink::KeyGroupRange{0, 128});
+    EXPECT_EQ(str(b.get(op, std::string_view{k10})), "v10");
+    EXPECT_EQ(str(b.get(op, std::string_view{k20})), "v20");
+    EXPECT_EQ(str(b.get(op, std::string_view{k70})), "v70");  // merged from parent 1
+    EXPECT_EQ(str(b.get(op, std::string_view{k90})), "v90");
+
+    b.put(op, std::string_view{kNew}, vv("vnew"));
+    b.snapshot(CheckpointId{201});
+    auto pb = std::make_shared<S3RemotePool>(sub_opts(job, 0));
+    RemoteReadBackend b2(pb);
+    Snapshot s201;
+    s201.checkpoint_id = CheckpointId{201};
+    b2.restore(s201);
+    EXPECT_EQ(str(b2.get(op, std::string_view{k10})), "v10");  // parent 0, survived
+    EXPECT_EQ(str(b2.get(op, std::string_view{k90})), "v90");  // parent 1, survived
+    EXPECT_EQ(str(b2.get(op, std::string_view{kNew})), "vnew");
+
+    p->purge(CheckpointId{201});
+    p->purge(CheckpointId{200});
+}
+
+// 2d cross-location relocate: export a checkpoint to a different base, then a
+// fresh pool pointed there restores it as an ordinary same-location restore.
+TEST(S3RemotePool, ExportCheckpointRelocatesToNewBase) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    const std::string base_a = unique_prefix() + "-loc-a";
+    const std::string base_b = unique_prefix() + "-loc-b";
+    const OperatorId op{11};
+    const std::string ka = kkey(3, "a"), kb = kkey(40, "b");
+
+    auto pa = std::make_shared<S3RemotePool>(sub_opts(base_a, 0));
+    {
+        RemoteReadBackend b(pa);
+        b.put(op, std::string_view{ka}, vv("va"));
+        b.put(op, std::string_view{kb}, vv("vb"));
+        b.snapshot(CheckpointId{300});
+    }
+    // Relocate cp-300 (this subtask's manifest + objects) to base B.
+    pa->export_checkpoint(CheckpointId{300}, base_b + "/0");
+
+    // A fresh pool at base B restores it with no rescale plan (same-location).
+    auto pb = std::make_shared<S3RemotePool>(sub_opts(base_b, 0));
+    RemoteReadBackend b2(pb);
+    Snapshot s;
+    s.checkpoint_id = CheckpointId{300};
+    b2.restore(s);
+    EXPECT_EQ(str(b2.get(op, std::string_view{ka})), "va");
+    EXPECT_EQ(str(b2.get(op, std::string_view{kb})), "vb");
+
+    pa->purge(CheckpointId{300});
+    pb->purge(CheckpointId{300});
+}
+
+// 2d cross-location of a RESCALED subtask: export must carry the subtask's
+// EFFECTIVE slice (the rescale sidecar - it has no plain cp-<id>), so a job at
+// the new base restores that slice. Closes the rescale->export->restore gap.
+TEST(S3RemotePool, ExportOfRescaledSubtaskCarriesItsEffectiveSlice) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    const std::string job = unique_prefix() + "-rxp";
+    const std::string dst = unique_prefix() + "-rxp-dst";
+    const OperatorId op{12};
+    const std::string kLo = kkey(5, "a"), kHi = kkey(66, "b");
+
+    // Parent 0 holds the full key space at cp-400.
+    {
+        auto p0 = std::make_shared<S3RemotePool>(sub_opts(job, 0));
+        RemoteReadBackend b(p0);
+        b.put(op, std::string_view{kLo}, vv("va"));
+        b.put(op, std::string_view{kHi}, vv("vb"));
+        b.snapshot(CheckpointId{400});
+    }
+    // Rescale new subtask 1 onto [64,128): writes only the sidecar (no cp-400).
+    auto p1 = std::make_shared<S3RemotePool>(sub_opts(job, 1));
+    p1->set_restore_sources({job + "/0"});
+    RemoteReadBackend b1(p1);
+    Snapshot s;
+    s.checkpoint_id = CheckpointId{400};
+    b1.restore(s, clink::KeyGroupRange{64, 128});
+
+    // Relocate subtask 1's effective slice to a new base.
+    p1->export_checkpoint(CheckpointId{400}, dst + "/1");
+
+    // A job at the new base restores it (plain same-location restore) and sees
+    // subtask 1's slice - kg 66 present, kg 5 (subtask 0's) absent.
+    auto pd = std::make_shared<S3RemotePool>(sub_opts(dst, 1));
+    RemoteReadBackend bd(pd);
+    Snapshot sd;
+    sd.checkpoint_id = CheckpointId{400};
+    bd.restore(sd);
+    EXPECT_EQ(str(bd.get(op, std::string_view{kHi})), "vb");
+    EXPECT_FALSE(bd.get(op, std::string_view{kLo}).has_value());
+
+    p1->purge(CheckpointId{400});
+    pd->purge(CheckpointId{400});
+}
+
 // Scheme resolution + backend build (no S3 I/O, so not gated): remote-read://
 // registers and builds a RemoteReadBackend; a restore spec yields the marker
 // Snapshot carrying the checkpoint id.

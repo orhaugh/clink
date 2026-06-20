@@ -63,6 +63,20 @@ public:
     // purges superseded checkpoints); a content-addressed pool refcounts
     // shared objects across live checkpoints.
     virtual void purge(CheckpointId id) = 0;
+
+    // Hook called by RemoteReadBackend::restore() BEFORE it points cold reads at
+    // `restore_cp`, giving the pool a chance to MATERIALISE that checkpoint under
+    // this subtask's own location when the restore is a rescale or cross-location
+    // relocate (the committed state lives under OTHER subtasks' prefixes). The
+    // pool merges the relevant parent checkpoints, keeps keyed entries whose
+    // key-group is in `kg` (operator-state entries are unioned, never filtered),
+    // relocates the referenced objects into its own prefix, and writes the merged
+    // manifest as cp-`restore_cp` - so the first post-restore incremental commit
+    // (base = restore_cp) inherits the full assigned state instead of an empty
+    // base (which would silently drop inherited-but-unmodified keys). Default is
+    // a no-op: same-location same-parallelism restore needs nothing (cp-restore_cp
+    // already exists under this subtask's prefix and cold reads are lazy).
+    virtual void prepare_restore(CheckpointId /*restore_cp*/, const KeyGroupRange& /*kg*/) {}
 };
 
 // In-memory RemotePool: each checkpoint is a full materialised key->value map

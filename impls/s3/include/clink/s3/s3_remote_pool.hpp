@@ -34,6 +34,7 @@
 #include "clink/connectors/parquet_s3_sink.hpp"  // clink::detail::ensure_arrow_s3_initialised
 #include "clink/core/sha256.hpp"
 #include "clink/core/types.hpp"
+#include "clink/runtime/key_groups.hpp"  // kNumKeyGroups, KeyGroup
 #include "clink/state/remote_pool.hpp"
 #include "clink/state/state_backend.hpp"
 
@@ -62,10 +63,25 @@ public:
         auto fs = fs_();
         Manifest m;
         if (base.value() != 0) {
-            // Inherit the base checkpoint. Absent == empty: a subtask that
-            // committed nothing at `base` (no keyed state, or a source/sink
-            // subtask) has no manifest there, which is not an error.
-            m = load_manifest_or_empty_(*fs, base);
+            // Inherit the base checkpoint. Prefer a CACHED base: a rescale
+            // restore materialises the merged + key-group-filtered base only in
+            // the cache (never persisted to this prefix), and the cache also
+            // holds the previous commit's manifest, so this avoids re-reading it
+            // from S3. Fall back to S3 when the cache is cold (a process that
+            // restarted mid-run). Absent == empty: a subtask that committed
+            // nothing at `base` (no keyed state, or a source/sink subtask) has no
+            // manifest there, which is not an error.
+            bool cached = false;
+            {
+                std::lock_guard<std::mutex> lk(cache_mu_);
+                if (auto it = cache_.find(base.value()); it != cache_.end()) {
+                    m = it->second;
+                    cached = true;
+                }
+            }
+            if (!cached) {
+                m = load_manifest_or_empty_(*fs, base);
+            }
         }
         for (const auto& d : deleted) {
             m.erase({d.op.value(), d.key});
@@ -105,7 +121,8 @@ public:
         } catch (...) {
             return;  // cannot reach the store; leave everything (safe)
         }
-        (void)fs->DeleteFile(manifest_path_(id));  // best-effort; objects reclaimed by sweep()
+        (void)fs->DeleteFile(manifest_path_(id));          // best-effort; objects via sweep()
+        (void)fs->DeleteFile(rescale_manifest_path_(id));  // rescale sidecar, if any
         std::lock_guard<std::mutex> lk(cache_mu_);
         cache_.erase(id.value());
     }
@@ -187,6 +204,104 @@ public:
         return objects_reclaimed_.load(std::memory_order_relaxed);
     }
 
+    // Configure rescale restore: the PARENT subtask prefixes (each a full
+    // "<job-prefix>/<old-subtask>" sans bucket) whose checkpoint this new
+    // subtask inherits. Set by build_remote_read on a rescale deploy; empty
+    // (the default) means same-parallelism restore - prepare_restore is a no-op.
+    void set_restore_sources(std::vector<std::string> parent_prefixes) {
+        restore_parent_prefixes_ = std::move(parent_prefixes);
+    }
+
+    // Materialise checkpoint `restore_cp` under THIS subtask's prefix from the
+    // configured parent prefixes (see RemotePool::prepare_restore). Merges every
+    // parent's manifest cp-restore_cp: keyed entries (key[0] < kNumKeyGroups) are
+    // kept only if their key-group is in `kg`; operator-state entries (key[0] ==
+    // kOperatorStateKeyPrefix) are unioned across all parents (last parent wins
+    // on collision - a documented v1 limitation for monotonic offsets). The
+    // referenced objects are server-side-copied into this subtask's objects/ so
+    // cold reads + the first incremental commit resolve against this prefix.
+    //
+    // The merged manifest is written to the SIDECAR (rescaled-cp-restore_cp), NOT
+    // to cp-restore_cp: on scale-up several new subtasks share a parent prefix, so
+    // overwriting cp-restore_cp there would corrupt a checkpoint a sibling still
+    // reads. The sidecar is this subtask's own durable view (the loader prefers
+    // it), so a failover before the first post-restore checkpoint still recovers
+    // the filtered state, while the parents stay immutable. No-op when no parents
+    // are configured (same-location same-parallelism restore - cp-restore_cp
+    // already lives under this prefix).
+    void prepare_restore(CheckpointId restore_cp, const KeyGroupRange& kg) override {
+        if (restore_parent_prefixes_.empty()) {
+            return;
+        }
+        auto fs = fs_();
+        Manifest merged;
+        std::map<ManifestKey, std::string> src_prefix;  // entry -> the parent it came from
+        for (const auto& parent : restore_parent_prefixes_) {
+            const Manifest pm = load_prefix_manifest_or_empty_(*fs, parent, restore_cp);
+            for (const auto& [k, v] : pm) {
+                // key[0] is the key group for a keyed entry; operator-state keys
+                // (>= kNumKeyGroups, i.e. 0xFF) and keyless entries are exempt and
+                // unioned across all parents (matches InMemoryStateBackend's
+                // rescale filter). Guarding empty keys avoids OOB on key[0].
+                const bool exempt =
+                    k.second.empty() || static_cast<std::uint8_t>(k.second[0]) >= kNumKeyGroups;
+                if (exempt) {
+                    merged[k] = v;  // union (last parent wins)
+                    src_prefix[k] = parent;
+                } else if (kg.contains(
+                               static_cast<KeyGroup>(static_cast<std::uint8_t>(k.second[0])))) {
+                    merged[k] = v;
+                    src_prefix[k] = parent;
+                }
+            }
+        }
+        // Relocate the referenced objects into THIS subtask's prefix (objects are
+        // per-subtask). Content-addressed: skip if already present.
+        for (const auto& [k, v] : merged) {
+            const std::string dst = object_path_(v.first);
+            if (object_present_(*fs, dst)) {
+                continue;
+            }
+            const std::string src = parent_path_(src_prefix[k], "/objects/" + v.first);
+            copy_object_(*fs, src, dst);
+        }
+        // Persist to the sidecar (durable; never clobbers a parent) + cache it so
+        // the first post-restore commit inherits it without an S3 round-trip.
+        write_object_(*fs, rescale_manifest_path_(restore_cp), encode_manifest_(merged));
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        cache_[restore_cp.value()] = std::move(merged);
+    }
+
+    // Cross-location relocate: copy this subtask's checkpoint `id` (its manifest
+    // + every referenced object) to `dst_prefix` (a full "<job-prefix>/<subtask>"
+    // sans bucket under a DIFFERENT base). The result is self-contained, so a job
+    // pointed at the new base restores it as an ordinary same-location restore.
+    // Mirrors S3CasSnapshotStore::export_savepoint; idempotent (write-once hashes).
+    //
+    // Exports this subtask's EFFECTIVE view: load_manifest_or_empty_ prefers the
+    // rescale sidecar, so a rescaled subtask exports its assigned key-group slice
+    // (which is the only state it has - a scale-up subtask never wrote a plain
+    // cp-<id>), written as a normal cp-<id> at the destination. That is correct
+    // for per-subtask relocation; a whole-job relocate exports every subtask, and
+    // together they cover the full key space.
+    void export_checkpoint(CheckpointId id, const std::string& dst_prefix) {
+        auto fs = fs_();
+        const Manifest m = load_manifest_or_empty_(*fs, id);
+        std::unordered_set<std::string> copied;
+        for (const auto& [k, v] : m) {
+            if (!copied.insert(v.first).second) {
+                continue;  // dedup within the manifest
+            }
+            const std::string dst = parent_path_(dst_prefix, "/objects/" + v.first);
+            if (!object_present_(*fs, dst)) {
+                copy_object_(*fs, object_path_(v.first), dst);
+            }
+        }
+        write_object_(*fs,
+                      parent_path_(dst_prefix, "/manifests/cp-" + std::to_string(id.value())),
+                      encode_manifest_(m));
+    }
+
 private:
     // (op, key) -> (value-hash, value-size).
     using ManifestKey = std::pair<std::uint64_t, std::string>;
@@ -201,6 +316,19 @@ private:
     }
     std::string manifest_path_(CheckpointId id) const {
         return base_prefix_() + "/manifests/cp-" + std::to_string(id.value());
+    }
+    // Rescale SIDECAR manifest. A rescale target writes its merged +
+    // key-group-filtered checkpoint here, NOT to cp-<id>, so it never overwrites
+    // the shared parent checkpoint that sibling new subtasks still read on
+    // scale-up. The manifest loader prefers it, so it IS this subtask's view of
+    // <id> while remaining durable across a failover.
+    std::string rescale_manifest_path_(CheckpointId id) const {
+        return base_prefix_() + "/manifests/rescaled-cp-" + std::to_string(id.value());
+    }
+    // A path under an arbitrary prefix (sans bucket), e.g. a parent subtask's or
+    // a relocate destination's. `suffix` includes its leading slash.
+    std::string parent_path_(const std::string& prefix, const std::string& suffix) const {
+        return opts_.bucket + "/" + prefix + suffix;
     }
 
     static std::string to_string_(const StateBackend::Value& v) {
@@ -228,13 +356,26 @@ private:
         return decode_manifest_(read_object_(fs, manifest_path_(id)));
     }
 
-    // Load a manifest, treating an ABSENT manifest object as an empty one.
-    // A checkpoint id with no manifest at this subtask's prefix means the
-    // subtask committed no state there (empty keyed state, or a source/sink
-    // subtask) - that is "no entries", not an error, matching the in-memory
+    // Load this subtask's manifest for `id`, preferring the rescale sidecar and
+    // treating an ABSENT manifest as an empty one. A checkpoint id with no
+    // manifest means the subtask committed no state there (empty keyed state, or
+    // a source/sink subtask) - "no entries", not an error, matching the in-memory
     // pool double. A present-but-unreadable object still throws (real fault).
     Manifest load_manifest_or_empty_(arrow::fs::S3FileSystem& fs, CheckpointId id) const {
-        const auto path = manifest_path_(id);
+        return load_prefix_manifest_or_empty_(fs, opts_.prefix, id);
+    }
+    // As above for an arbitrary prefix (a parent subtask's, on rescale). The
+    // sidecar (rescaled-cp-<id>) wins over cp-<id>, so a parent that was itself a
+    // rescale target contributes its post-rescale view.
+    Manifest load_prefix_manifest_or_empty_(arrow::fs::S3FileSystem& fs,
+                                            const std::string& prefix,
+                                            CheckpointId id) const {
+        const auto sidecar =
+            parent_path_(prefix, "/manifests/rescaled-cp-" + std::to_string(id.value()));
+        if (object_present_(fs, sidecar)) {
+            return decode_manifest_(read_object_(fs, sidecar));
+        }
+        const auto path = parent_path_(prefix, "/manifests/cp-" + std::to_string(id.value()));
         if (!object_present_(fs, path)) {
             return Manifest{};
         }
@@ -309,6 +450,17 @@ private:
     static bool object_present_(arrow::fs::S3FileSystem& fs, const std::string& key) {
         auto info = fs.GetFileInfo(key);
         return info.ok() && info->type() == arrow::fs::FileType::File;
+    }
+    // Server-side object copy (S3-to-S3, no client data transfer). Used to
+    // relocate content-addressed objects into a subtask's prefix on rescale or
+    // cross-location restore.
+    static void copy_object_(arrow::fs::S3FileSystem& fs,
+                             const std::string& src,
+                             const std::string& dst) {
+        if (auto st = fs.CopyFile(src, dst); !st.ok()) {
+            throw std::runtime_error("S3RemotePool::copy_object CopyFile(" + src + " -> " + dst +
+                                     "): " + st.ToString());
+        }
     }
     static void write_object_(arrow::fs::S3FileSystem& fs,
                               const std::string& key,
@@ -407,6 +559,10 @@ private:
     mutable std::mutex cache_mu_;
     mutable std::map<std::uint64_t, Manifest> cache_;
     std::atomic<std::uint64_t> objects_reclaimed_{0};
+    // Parent subtask prefixes to merge on a rescale restore (set by
+    // build_remote_read). Empty = same-parallelism restore (prepare_restore
+    // is a no-op).
+    std::vector<std::string> restore_parent_prefixes_;
 };
 
 }  // namespace clink::s3
