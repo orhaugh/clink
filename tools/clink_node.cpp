@@ -712,6 +712,14 @@ int run_jm(int argc, char** argv) {
     // poll cadence is tunable too.
     const auto heartbeat_timeout_str = get_arg(argc, argv, "heartbeat-timeout-ms", "5000");
     const auto watchdog_interval_str = get_arg(argc, argv, "watchdog-interval-ms", "200");
+    // Cluster-level default state backend for jobs that submit without their
+    // own --state-backend. Empty (default) keeps the legacy resolution
+    // (memory / file-from-checkpoint-dir). Set it to a deferring backend to
+    // make the async/disaggregated path the default cluster-wide, e.g.
+    // --default-state-backend=remote-read://bucket/prefix. Note disagg-local://
+    // is process-local + non-durable (dev/test only); use a durable tier here
+    // on a production cluster. A per-job --state-backend still overrides.
+    const auto default_state_backend = get_arg(argc, argv, "default-state-backend", "");
 
     JobManager::Config cfg;
     cfg.bind_host = bind_host;
@@ -719,6 +727,7 @@ int run_jm(int argc, char** argv) {
     cfg.heartbeat_timeout = std::chrono::milliseconds{std::stoll(heartbeat_timeout_str)};
     cfg.watchdog_interval = std::chrono::milliseconds{std::stoll(watchdog_interval_str)};
     cfg.restart_drain_timeout = std::chrono::milliseconds{std::stoll(restart_drain_timeout_str)};
+    cfg.default_state_backend_uri = default_state_backend;
     if (!ha_dir.empty()) {
         // Takeover recovery races a TM restart: the standby tries to
         // resubmit persisted jobs as soon as it wins leadership, but

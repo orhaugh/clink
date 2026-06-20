@@ -226,6 +226,29 @@ void persist_history_record_(const std::string& ha_dir, const CompletedJobRecord
     atomic_write_file(history_dir / (std::to_string(rec.job_id) + ".json"), body);
 }
 
+void apply_default_state_backend(CheckpointConfig& checkpoint, const std::string& default_uri) {
+    // Only the backend CHOICE (state_backend_uri) gates the default; an empty
+    // default_uri is a no-op. checkpoint_dir is intentionally NOT consulted -
+    // it doubles as the HA/coordination dir, so an HA-enabled job that set only
+    // checkpoint_dir should still inherit a configured durable deferring tier.
+    if (checkpoint.state_backend_uri.empty() && !default_uri.empty()) {
+        checkpoint.state_backend_uri = default_uri;
+    }
+}
+
+void pin_recovered_state_backend(CheckpointConfig& checkpoint) {
+    // Resolve an empty (unspecified) backend to its legacy equivalent so the
+    // recovered job keeps exactly the backend it ran with - and submit_job's
+    // apply_default_state_backend, which runs next, is a no-op (URI non-empty)
+    // even if a cluster default was configured after this job was submitted.
+    // The resolution mirrors plugin_impl.hpp: bare checkpoint_dir -> file,
+    // empty -> memory, so the rebuilt backend is byte-identical to the original.
+    if (checkpoint.state_backend_uri.empty()) {
+        checkpoint.state_backend_uri =
+            checkpoint.checkpoint_dir.empty() ? "memory://" : checkpoint.checkpoint_dir;
+    }
+}
+
 void persist_job_manifest_(const std::string& ha_dir,
                            JobId job_id,
                            const std::string& graph_json,
@@ -437,6 +460,11 @@ void JobManager::recover_persisted_jobs() {
         ckpt.restore_from_checkpoint_id = read_uint_field(body, "restore_from_checkpoint_id");
         ckpt.max_restarts_on_tm_loss =
             static_cast<std::uint32_t>(read_uint_field(body, "max_restarts_on_tm_loss"));
+        // Pin the recovered job to the backend it ran with BEFORE submit_job
+        // re-applies the cluster default: a job persisted with an empty URI
+        // (legacy resolution via checkpoint_dir) must not be silently rebound
+        // to a default configured after it was first submitted.
+        pin_recovered_state_backend(ckpt);
         // For recovery, always restore from this job's checkpoint dir
         // at the latest COMPLETED-N marker the previous leader managed
         // to write.
@@ -1360,6 +1388,14 @@ JobId JobManager::submit_job(const JobGraphSpec& graph,
                              CheckpointConfig checkpoint,
                              std::unique_ptr<JobBundle> bundle,
                              network::Connection* notify_client_conn) {
+    // Cluster-level default: when the submitter chose no state backend, apply
+    // the configured default here - before the HA manifest snapshot (line
+    // ~1408) and the deploy below - so the resolved URI is what gets persisted
+    // and what every subtask (and any HA-recovered restart, which reads the
+    // resolved URI back from the manifest) builds. A per-job --state-backend
+    // sets a non-empty URI and wins; an empty default preserves the legacy
+    // resolution (empty -> memory, bare checkpoint_dir -> file).
+    apply_default_state_backend(checkpoint, cfg_.default_state_backend_uri);
     // Use the bundle's OperatorRegistry (parent-fallback to default
     // singleton for built-ins) when one is provided so the planner's
     // chain-eligibility check can find inline-lambda ops registered by

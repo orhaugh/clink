@@ -82,10 +82,15 @@ void usage() {
     std::cerr << "Usage: clink run-application --job=<path.so>\n"
               << "                   [--port=N] [--bind=<host>] [--advertise=<host>]\n"
               << "                   [--wait-slots-s=N] [--wait-job-s=N] [--name=<label>]\n"
+              << "                   [--state-backend=<uri>]\n"
               << "\n"
               << "Start a JM in this process, dlopen the job .so locally, submit\n"
               << "via the in-process API, wait for completion. External TMs must\n"
-              << "register with this JM during the --wait-slots-s window.\n";
+              << "register with this JM during the --wait-slots-s window.\n"
+              << "\n"
+              << "--state-backend defaults to disagg-local:// (process-local, async\n"
+              << "path on, not durable). Use file:///dir or remote-read://bucket for\n"
+              << "a durable run; an empty value falls back to the in-memory backend.\n";
 }
 
 }  // namespace
@@ -103,6 +108,14 @@ int clink_cmd_run_application(int argc, char** argv) {
     const auto wait_slots_str = get_arg(argc, argv, "wait-slots-s", "30");
     const auto wait_job_str = get_arg(argc, argv, "wait-job-s", "300");
     const auto job_name = get_arg(argc, argv, "name", "app");
+    // run-application is the local one-shot dev runner, so it defaults to the
+    // disagg-local:// deferring backend: keyed state works out of the box AND
+    // the async/disaggregated execution path is exercised without S3. It is
+    // process-local + non-durable, which is correct for a single-process local
+    // run. Override for a durable run, e.g. --state-backend=remote-read://bkt
+    // or --state-backend=file:///var/clink. An empty value falls back to the
+    // legacy memory backend. Applied via the JM's default lever below.
+    const auto state_backend = get_arg(argc, argv, "state-backend", "disagg-local://");
 
     if (job_path.empty()) {
         std::cerr << "clink_app: --job=<path.so> is required\n";
@@ -131,6 +144,7 @@ int clink_cmd_run_application(int argc, char** argv) {
     cfg.bind_host = bind_host;
     cfg.advertise_host = advertise;
     cfg.submit_wait_for_slots = wait_slots;
+    cfg.default_state_backend_uri = state_backend;
     clink::cluster::JobManager jm(cfg);
     const auto bound = jm.start(bind_port);
     std::cerr << "clink_app: JM listening on " << advertise << ":" << bound << "\n";

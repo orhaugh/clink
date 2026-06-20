@@ -88,6 +88,28 @@ inline constexpr std::uint16_t kDefaultJobManagerPort = 6123;
 //     JobGraphSpec, and the JM plans/deploys/tracks/reports completion
 //     entirely via the protocol. Multiple jobs can be in flight at once
 //     so long as the cluster has spare slots.
+
+// Apply a cluster-level default state-backend URI to a job's CheckpointConfig
+// when the submitter chose none. A non-empty checkpoint.state_backend_uri (a
+// per-job --state-backend) is preserved; an empty default_uri is a no-op, so
+// the legacy resolution stands (empty -> memory, bare checkpoint_dir -> file).
+// checkpoint_dir is NOT a backend choice (it doubles as the HA/coordination
+// dir), so a job that set only checkpoint_dir still receives the default -
+// letting an operator point HA-enabled jobs at a durable deferring tier
+// (remote-read://). Exposed for direct testing of the submit-time policy.
+void apply_default_state_backend(CheckpointConfig& checkpoint, const std::string& default_uri);
+
+// Pin a recovered job's state-backend URI to the backend it ALREADY ran with,
+// so HA recovery never re-applies a cluster default that may have been
+// configured AFTER the job was submitted (which would silently rebind the job
+// - e.g. a checkpoint_dir-durable job onto a non-durable default - and abandon
+// its checkpoints). The manifest stores the per-job choice verbatim; an empty
+// value means the job used the legacy resolution (checkpoint_dir -> file, else
+// memory), so resolve that explicitly here. Run before submit_job during
+// recovery so apply_default_state_backend then sees a non-empty URI and is a
+// no-op. Exposed for direct testing of the recovery policy.
+void pin_recovered_state_backend(CheckpointConfig& checkpoint);
+
 class JobManager {
 public:
     struct Config {
@@ -122,6 +144,18 @@ public:
         // returning a rejection ack to the client. 0 means "never wait,
         // reject immediately". Useful when clusters auto-scale.
         std::chrono::milliseconds submit_wait_for_slots{0};
+        // Cluster-level default state-backend URI applied to a submitted job
+        // that chose none (empty CheckpointConfig.state_backend_uri). Lets an
+        // operator point every job at a deferring backend (e.g.
+        // remote-read://bucket) so the async/disaggregated execution path
+        // activates by default, without each job specifying it; a per-job
+        // --state-backend still wins. Applied before the HA manifest is
+        // persisted, so the resolved URI survives recovery. Empty (the
+        // default) preserves the legacy resolution: empty -> memory, bare
+        // checkpoint_dir -> file. WARNING: disagg-local:// is process-local and
+        // NOT durable across a restart - safe only for dev/test; production
+        // clusters should set a durable tier (remote-read:// on S3).
+        std::string default_state_backend_uri{};
         // Phase 29h: optional adaptive autoscaler config. When set,
         // every submitted job whose graph declares at least one
         // operator with Phase 29a [min, max] bounds spawns a per-job
