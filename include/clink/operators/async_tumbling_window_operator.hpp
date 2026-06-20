@@ -1,62 +1,27 @@
 #pragma once
 
-#include <algorithm>
 #include <cstdint>
-#include <functional>
-#include <span>
-#include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
-#include "clink/async/task.hpp"
 #include "clink/core/codec.hpp"
-#include "clink/operators/operator_base.hpp"
-#include "clink/runtime/async_execution_controller.hpp"
-#include "clink/state/keyed_state.hpp"
+#include "clink/operators/async_window_operator.hpp"
 
 namespace clink {
 
-// AsyncTumblingWindowOperator<Key, Value, Agg> - an event-time tumbling-window
-// aggregate that disaggregates its accumulators into the StateBackend and is
-// the first WINDOW operator to adopt the async-state execution path.
-//
-//   * Per record: assign to the window [start, start+size), read-combine-write
-//     that window's accumulator in KeyedState (so the heavy aggregate values
-//     live in the backend, not all in RAM), and register ONE event-time timer
-//     at window.end for (window, key). process_async() reads the accumulator via
-//     co_await get_async(), so a slow/remote read suspends that record instead
-//     of blocking the runner; the AsyncExecutionController serialises same-
-//     (window,key) records (per-key gate) and gates the watermark (epoch).
-//   * On watermark: the runner runs on_watermark() INSIDE the controller's
-//     release closure - i.e. only after every record that arrived before the
-//     watermark has drained - so firing observes all of each window's records.
-//     The base on_watermark fires every due event-time timer
-//     (on_event_time_timer), which reads the accumulator, emits (key, agg) for
-//     the window, and purges it.
-//
-// Which windows are due is enumerated by the framework TimerService's event-
-// time queue, which the runner CHECKPOINTS (snapshot_timers) and RESTORES
-// (restore_timers) automatically, so a fresh subtask re-fires every still-open
-// window. The accumulators ride KeyedState, checkpointed like any keyed state.
-// Nothing window-specific needs an extra persistence hook.
-//
-// Firing touches state ONLY via the event-time timer, which fires from the
-// gated on_watermark release closure - so fires_state_touching_processing_time_
-// timers() is false and the async runner admits it (fires_state_touching_timers()
-// stays true). The sync process() path is byte-identical and used when the
-// backend cannot defer reads.
-//
-// v1 scope: event-time tumbling only. A record whose window already fired (its
-// end <= the latest watermark) is dropped (at-most-once for late data; no late
-// panes / allowed-lateness / custom triggers / rescale-routed timers - those
-// are follow-ons). The two paths produce identical output for the same input.
+// AsyncTumblingWindowOperator<Key, Value, Agg> - event-time tumbling-window
+// aggregate on the async-state execution path. The shared async machinery
+// (disaggregated accumulators, per-key-gated async fold, epoch-gated
+// watermark firing, durable timer-driven enumeration, late-drop,
+// checkpoint/restore) lives in AsyncWindowOperator; this only assigns each
+// record to its single window [start, start + size).
 template <typename Key, typename Value, typename Agg>
-class AsyncTumblingWindowOperator final
-    : public Operator<std::pair<Key, Value>, std::pair<Key, Agg>> {
+class AsyncTumblingWindowOperator final : public AsyncWindowOperator<Key, Value, Agg> {
 public:
-    using Initial = std::function<Agg()>;
-    using Combiner = std::function<Agg(const Agg&, const Value&)>;
-    using StateKey = std::pair<std::int64_t, Key>;  // (window_start, key)
+    using Base = AsyncWindowOperator<Key, Value, Agg>;
+    using Initial = typename Base::Initial;
+    using Combiner = typename Base::Combiner;
 
     AsyncTumblingWindowOperator(std::int64_t window_size_ms,
                                 Initial initial,
@@ -64,175 +29,17 @@ public:
                                 Codec<Key> key_codec,
                                 Codec<Agg> agg_codec,
                                 std::string name = "async_tumbling_window")
-        : window_size_ms_(window_size_ms),
-          initial_(std::move(initial)),
-          combiner_(std::move(combiner)),
-          key_codec_(std::move(key_codec)),
-          agg_codec_(std::move(agg_codec)),
-          name_(std::move(name)) {
-        if (window_size_ms_ <= 0) {
-            throw std::invalid_argument("AsyncTumblingWindowOperator: window_size_ms must be > 0");
-        }
-    }
+        : Base(window_size_ms,
+               std::move(initial),
+               std::move(combiner),
+               std::move(key_codec),
+               std::move(agg_codec),
+               std::move(name)) {}
 
-    // --- synchronous path (non-deferring backend) ---
-    void process(const StreamElement<std::pair<Key, Value>>& element,
-                 Emitter<std::pair<Key, Agg>>& out) override {
-        if (element.is_data()) {
-            auto kv = state_();
-            for (const auto& rec : element.as_data()) {
-                const auto& [k, v] = rec.value();
-                const std::int64_t ws = window_start_(event_ms_(rec));
-                if (is_late_(ws)) {
-                    continue;
-                }
-                const StateKey sk{ws, k};
-                kv.put(sk, combiner_(kv.get(sk).value_or(initial_()), v));
-                register_fire_(ws, encode_state_key_(sk));
-            }
-        } else if (element.is_watermark()) {
-            this->on_watermark(element.as_watermark(), out);
-        } else {
-            this->on_barrier(element.as_barrier(), out);
-        }
+protected:
+    std::vector<std::int64_t> assign_windows(std::int64_t ts) const override {
+        return {(ts / this->window_size_ms_) * this->window_size_ms_};
     }
-
-    // --- async path (deferring backend) ---
-    [[nodiscard]] bool supports_async() const noexcept override { return true; }
-
-    void process_async(const StreamElement<std::pair<Key, Value>>& element,
-                       Emitter<std::pair<Key, Agg>>& /*out*/,
-                       AsyncExecutionController& aec) override {
-        // Windows emit on fire (on_watermark), not per record, so the emitter is
-        // unused here; the runner routes watermarks/barriers through the AEC.
-        if (!element.is_data()) {
-            return;
-        }
-        for (const auto& rec : element.as_data()) {
-            const auto& [k, v] = rec.value();
-            const std::int64_t ws = window_start_(event_ms_(rec));
-            if (is_late_(ws)) {
-                continue;
-            }
-            const StateKey sk{ws, k};
-            const std::string gate = encode_state_key_(sk);  // per-key gate + timer key
-            auto kv = state_();
-            // Capture by value: kv owns only a backend ptr + codecs; sk/ws/v and
-            // the combiner/initial are copied into the coroutine frame; the timer
-            // registration runs on the runner thread on resume. Nothing dangles.
-            auto factory =
-                [this, kv, sk, ws, v, gate, initial = initial_, combiner = combiner_]() mutable
-                -> async::Task<void> {
-                auto cur = co_await kv.get_async(sk);
-                kv.put(sk, combiner(cur.value_or(initial()), v));
-                register_fire_(ws, gate);
-                co_return;
-            };
-            while (!aec.submit(gate, factory)) {
-                aec.poll();
-            }
-        }
-    }
-
-    // Restore the late-drop boundary on (re)start so a record that is late
-    // relative to a PRE-checkpoint watermark stays dropped after a restore
-    // (otherwise a genuinely-late record arriving before the watermark
-    // re-advances could re-open and re-emit an already-fired window).
-    void open() override { current_watermark_ = wm_state_().get(0).value_or(0); }
-
-    // Runs inside the AEC's epoch-gated release closure under async (and inline
-    // under sync). Advances the late-drop watermark (persisted so it survives a
-    // restore), then the base fires every due event-time timer
-    // (on_event_time_timer) and forwards the watermark.
-    void on_watermark(Watermark wm, Emitter<std::pair<Key, Agg>>& out) override {
-        current_watermark_ = std::max(current_watermark_, wm.timestamp().millis());
-        wm_state_().put(0, current_watermark_);
-        Operator<std::pair<Key, Value>, std::pair<Key, Agg>>::on_watermark(wm, out);
-    }
-
-    // Fire one window: read its accumulator (hot, or a safe cold read - the
-    // epoch has drained), emit (key, agg) at the window's max timestamp, purge.
-    // Idempotent: a missing accumulator means the window already fired.
-    void on_event_time_timer(std::int64_t /*window_end*/,
-                             const std::string& key,
-                             Emitter<std::pair<Key, Agg>>& out) override {
-        const StateKey sk = decode_state_key_(key);
-        auto kv = state_();
-        auto agg = kv.get(sk);
-        if (!agg.has_value()) {
-            return;
-        }
-        Batch<std::pair<Key, Agg>> batch;
-        batch.emplace(std::make_pair(sk.second, std::move(*agg)),
-                      EventTime{sk.first + window_size_ms_ - 1});
-        out.emit_data(std::move(batch));
-        kv.erase(sk);
-    }
-
-    [[nodiscard]] bool fires_state_touching_timers() const noexcept override { return true; }
-    [[nodiscard]] bool fires_state_touching_processing_time_timers() const noexcept override {
-        return false;  // event-time timers only - they fire in the gated closure
-    }
-
-    std::string name() const override { return name_; }
-
-private:
-    static std::int64_t event_ms_(const Record<std::pair<Key, Value>>& rec) {
-        return rec.event_time().value_or(EventTime{0}).millis();
-    }
-    std::int64_t window_start_(std::int64_t ts) const {
-        return (ts / window_size_ms_) * window_size_ms_;
-    }
-    bool is_late_(std::int64_t window_start) const noexcept {
-        return window_start + window_size_ms_ <= current_watermark_;
-    }
-    void register_fire_(std::int64_t window_start, const std::string& state_key) {
-        // Idempotent (the TimerService dedupes by (timestamp, key)).
-        this->runtime()->timer_service()->register_event_time_timer(window_start + window_size_ms_,
-                                                                    state_key);
-    }
-    std::string encode_state_key_(const StateKey& sk) const {
-        const auto b = state_key_codec_().encode(sk);
-        return std::string(reinterpret_cast<const char*>(b.data()), b.size());
-    }
-    StateKey decode_state_key_(const std::string& s) const {
-        auto v = state_key_codec_().decode(
-            std::span<const std::byte>{reinterpret_cast<const std::byte*>(s.data()), s.size()});
-        if (!v.has_value()) {
-            // A symmetric codec round-trips, so this only fires on genuine
-            // corruption. Fail loudly rather than silently read+erase the
-            // default StateKey{} (which would strand the real accumulator).
-            throw std::runtime_error(
-                "AsyncTumblingWindowOperator: corrupt event-time timer key (state-key decode "
-                "failed)");
-        }
-        return *v;
-    }
-    KeyedState<StateKey, Agg> state_() {
-        return this->runtime()->template keyed_state<StateKey, Agg>(
-            "win", state_key_codec_(), agg_codec_);
-    }
-    // Operator-scoped late-drop boundary, persisted under a fixed key so it
-    // survives checkpoint/restore (v1: same-parallelism; like the timer service,
-    // rescale routing of this slot is a follow-on).
-    KeyedState<std::int64_t, std::int64_t> wm_state_() {
-        return this->runtime()->template keyed_state<std::int64_t, std::int64_t>(
-            "wm", int64_codec(), int64_codec());
-    }
-    Codec<StateKey> state_key_codec_() const {
-        return pair_codec<std::int64_t, Key>(int64_codec(), key_codec_);
-    }
-
-    std::int64_t window_size_ms_;
-    Initial initial_;
-    Combiner combiner_;
-    Codec<Key> key_codec_;
-    Codec<Agg> agg_codec_;
-    std::string name_;
-    // Latest watermark seen (in-RAM; not checkpointed - source replay re-
-    // establishes watermark order on restore, and pre-checkpoint late records
-    // are before the replayed source offset, so they never reappear).
-    std::int64_t current_watermark_{0};
 };
 
 }  // namespace clink

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -30,18 +31,22 @@
 
 #include "clink/async/task.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/core/pane_info.hpp"
 #include "clink/operators/async_tumbling_window_operator.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
+#include "clink/operators/tumbling_window_operator.hpp"
 #include "clink/runtime/async_execution_controller.hpp"
 #include "clink/runtime/bounded_channel.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/job_config.hpp"
 #include "clink/runtime/local_executor.hpp"
+#include "clink/runtime/output_tag.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 
 using namespace clink;
+using namespace std::chrono_literals;
 
 namespace {
 
@@ -198,6 +203,48 @@ std::vector<StreamElement<T>> drain_ch(BoundedChannel<StreamElement<T>>& ch) {
         out.push_back(std::move(*e));
     }
     return out;
+}
+
+// One emitted pane: value, event-time-ms, and PaneInfo (window ops always set it).
+struct AtwEmit {
+    KA value;
+    std::int64_t ts;
+    PaneInfo pane;
+    bool operator==(const AtwEmit&) const = default;
+};
+
+std::vector<AtwEmit> collect_emits(BoundedChannel<StreamElement<KA>>& ch) {
+    std::vector<AtwEmit> out;
+    for (const auto& e : drain_ch(ch)) {
+        if (!e.is_data()) {
+            continue;
+        }
+        for (const auto& r : e.as_data()) {
+            out.push_back(AtwEmit{r.value(),
+                                  r.event_time().value_or(EventTime{0}).millis(),
+                                  r.pane().value_or(PaneInfo{})});
+        }
+    }
+    return out;
+}
+
+// Attach a RuntimeContext owning a typed side-output channel for `tag` (mirrors
+// what the executor wires up). Returned ctx must outlive every op call.
+template <typename Op>
+RuntimeContext attach_late_channel(Op& op,
+                                   StateBackend* backend,
+                                   BoundedChannel<StreamElement<std::int64_t>>& late_ch,
+                                   const std::string& tag) {
+    RuntimeContext ctx(OperatorId{1}, "win_sum", backend, nullptr);
+    SideOutputChannelMap channels;
+    auto shared =
+        std::shared_ptr<BoundedChannel<StreamElement<std::int64_t>>>(&late_ch, [](auto*) {});
+    SideOutputChannelEntry entry;
+    entry.channel = std::static_pointer_cast<void>(shared);
+    entry.close_fn = [shared] { shared->close(); };
+    channels.emplace(tag, std::move(entry));
+    ctx.set_side_output_channels(std::move(channels));
+    return ctx;
 }
 
 }  // namespace
@@ -378,4 +425,268 @@ TEST(AsyncTumblingWindowOperator, LateDropBoundarySurvivesRestore) {
         }
     }
     EXPECT_FALSE(any_data) << "a late record for a pre-restore-fired window must not re-emit";
+}
+
+// ---- allowed-lateness + late panes + late-output-tag ----------------------
+
+// gap-style helper: a window-sum op with allowed_lateness set.
+std::shared_ptr<AsyncTumblingWindowOperator<std::int64_t, std::int64_t, std::int64_t>> make_late_op(
+    std::int64_t lateness_ms) {
+    auto op =
+        std::make_shared<AsyncTumblingWindowOperator<std::int64_t, std::int64_t, std::int64_t>>(
+            /*window_size_ms=*/1000,
+            [] { return std::int64_t{0}; },
+            [](const std::int64_t& a, const std::int64_t& v) { return a + v; },
+            int64_codec(),
+            int64_codec(),
+            "win_sum");
+    op->allowed_lateness(std::chrono::milliseconds{lateness_ms});
+    return op;
+}
+
+TEST(AsyncTumblingWindowOperator, AllowedLatenessOnTimeThenLatePaneThenPurge) {
+    // window [0,1000), lateness 500 -> purge deadline 1500.
+    auto backend = std::make_shared<InMemoryStateBackend>();
+    const OperatorId op_id{10};
+    RuntimeContext ctx(op_id, "win_sum", backend.get(), nullptr);
+    auto op = make_late_op(500);
+    op->set_id(op_id);
+    op->attach_runtime(&ctx);
+    op->open();
+
+    BoundedChannel<StreamElement<KA>> ch(64);
+    Emitter<KA> em(&ch);
+
+    Batch<KV> b;
+    b.emplace(KV{1, 10}, EventTime{100});
+    op->process(StreamElement<KV>::data(std::move(b)), em);
+    op->on_watermark(Watermark{EventTime{1000}}, em);  // on-time fire, window KEPT
+    auto e1 = collect_emits(ch);
+    ASSERT_EQ(e1.size(), 1u);
+    EXPECT_EQ(e1[0].value, (KA{1, 10}));
+    EXPECT_EQ(e1[0].ts, 999);  // window max timestamp
+    EXPECT_EQ(e1[0].pane.timing, PaneInfo::Timing::OnTime);
+    EXPECT_EQ(e1[0].pane.pane_index, 0);
+    EXPECT_TRUE(e1[0].pane.is_first);
+    EXPECT_FALSE(e1[0].pane.is_last) << "lateness>0 so the on-time pane is not the last";
+
+    // Within-band late record (watermark 1000 < purge 1500): re-fire a Late pane.
+    Batch<KV> late;
+    late.emplace(KV{1, 5}, EventTime{200});
+    op->process(StreamElement<KV>::data(std::move(late)), em);
+    auto e2 = collect_emits(ch);
+    ASSERT_EQ(e2.size(), 1u) << "a within-band late record must re-emit immediately";
+    EXPECT_EQ(e2[0].value, (KA{1, 15})) << "late pane carries the updated aggregate";
+    EXPECT_EQ(e2[0].pane.timing, PaneInfo::Timing::Late);
+    EXPECT_EQ(e2[0].pane.pane_index, 1);
+    EXPECT_FALSE(e2[0].pane.is_first);
+    EXPECT_FALSE(e2[0].pane.is_last);
+
+    // Cross the purge deadline: the window is erased, no further emission.
+    op->on_watermark(Watermark{EventTime{1500}}, em);
+    EXPECT_TRUE(collect_emits(ch).empty()) << "purge emits nothing";
+
+    // A now-late-late record for the purged window is dropped (no tag).
+    Batch<KV> latelate;
+    latelate.emplace(KV{1, 99}, EventTime{300});
+    op->process(StreamElement<KV>::data(std::move(latelate)), em);
+    op->on_watermark(Watermark{EventTime{3000}}, em);
+    EXPECT_TRUE(collect_emits(ch).empty()) << "a record for a purged window must not re-open it";
+}
+
+TEST(AsyncTumblingWindowOperator, LateLateRecordRoutedToSideOutputNotAggregated) {
+    auto backend = std::make_shared<InMemoryStateBackend>();
+    BoundedChannel<StreamElement<std::int64_t>> late_ch(64);
+    const OperatorId op_id{11};
+    auto op = make_late_op(500);
+    OutputTag<std::int64_t> tag("late");
+    op->late_output_tag(tag);
+    auto ctx = attach_late_channel(*op, backend.get(), late_ch, "late");
+    op->set_id(op_id);
+    op->attach_runtime(&ctx);
+    op->open();
+
+    BoundedChannel<StreamElement<KA>> ch(64);
+    Emitter<KA> em(&ch);
+
+    Batch<KV> b;
+    b.emplace(KV{1, 10}, EventTime{100});
+    op->process(StreamElement<KV>::data(std::move(b)), em);
+    op->on_watermark(Watermark{EventTime{1700}}, em);  // fires + purges [0,1000)
+    (void)collect_emits(ch);
+
+    // Past the purge deadline (1500): route to the side output, do NOT aggregate.
+    Batch<KV> latelate;
+    latelate.emplace(KV{1, 99}, EventTime{200});
+    op->process(StreamElement<KV>::data(std::move(latelate)), em);
+    op->on_watermark(Watermark{EventTime{3000}}, em);
+    EXPECT_TRUE(collect_emits(ch).empty()) << "late-late record must not feed the aggregate";
+
+    std::vector<std::pair<std::int64_t, std::int64_t>> side;
+    for (const auto& e : drain_ch(late_ch)) {
+        if (e.is_data()) {
+            for (const auto& r : e.as_data()) {
+                side.emplace_back(r.value(), r.event_time().value_or(EventTime{0}).millis());
+            }
+        }
+    }
+    ASSERT_EQ(side.size(), 1u);
+    EXPECT_EQ(side[0].first, 99);
+    EXPECT_EQ(side[0].second, 200) << "raw value + original event_time preserved";
+}
+
+TEST(AsyncTumblingWindowOperator, AsyncPathEmitsLatePaneFromCoroutine) {
+    // The within-band late re-fire must emit from the resumed coroutine on the
+    // async path (an inline-async backend forces process_async).
+    auto backend = std::make_shared<AtwInlineAsyncBackend>();
+    const OperatorId op_id{12};
+    RuntimeContext ctx(op_id, "win_sum", backend.get(), nullptr);
+    auto op = make_late_op(500);
+    op->set_id(op_id);
+    op->attach_runtime(&ctx);
+    op->open();
+
+    AsyncExecutionController aec;
+    BoundedChannel<StreamElement<KA>> ch(64);
+    Emitter<KA> em(&ch);
+
+    Batch<KV> b;
+    b.emplace(KV{1, 10}, EventTime{100});
+    op->process_async(StreamElement<KV>::data(std::move(b)), em, aec);
+    aec.poll();
+    aec.on_watermark([&] { op->on_watermark(Watermark{EventTime{1000}}, em); });
+    aec.drain();
+    auto e1 = collect_emits(ch);
+    ASSERT_EQ(e1.size(), 1u);
+    EXPECT_EQ(e1[0].pane.timing, PaneInfo::Timing::OnTime);
+
+    Batch<KV> late;
+    late.emplace(KV{1, 5}, EventTime{200});
+    op->process_async(StreamElement<KV>::data(std::move(late)), em, aec);
+    aec.poll();
+    auto e2 = collect_emits(ch);
+    ASSERT_EQ(e2.size(), 1u) << "the late pane must be emitted from the fold coroutine";
+    EXPECT_EQ(e2[0].value, (KA{1, 15}));
+    EXPECT_EQ(e2[0].pane.timing, PaneInfo::Timing::Late);
+    EXPECT_EQ(e2[0].pane.pane_index, 1);
+}
+
+TEST(AsyncTumblingWindowOperator, SyncAsyncLatenessParityWithSyncOperator) {
+    // The async operator's main output (aggregate + full PaneInfo) must be
+    // byte-identical to the synchronous TumblingWindowOperator for the same
+    // (record, watermark) script through on-time + within-band-late + purge.
+    const auto script = [](auto& op, auto& out, auto send, auto wm) {
+        send(op, out, 1, 10, 100);  // [0,1000)
+        wm(op, out, 1000);          // on-time fire (1,10)
+        send(op, out, 1, 5, 200);   // within band -> late pane (1,15)
+        send(op, out, 1, 7, 1100);  // window [1000,2000)
+        wm(op, out, 1500);          // purge [0,1000)
+        wm(op, out, 2000);          // fire [1000,2000) (1,7)
+    };
+
+    // --- async op ---
+    std::vector<AtwEmit> async_out;
+    {
+        auto backend = std::make_shared<InMemoryStateBackend>();
+        const OperatorId op_id{13};
+        RuntimeContext ctx(op_id, "win_sum", backend.get(), nullptr);
+        auto op = make_late_op(500);
+        op->set_id(op_id);
+        op->attach_runtime(&ctx);
+        op->open();
+        BoundedChannel<StreamElement<KA>> ch(64);
+        Emitter<KA> em(&ch);
+        script(
+            *op,
+            em,
+            [](auto& o, auto& e, std::int64_t k, std::int64_t v, std::int64_t ts) {
+                Batch<KV> b;
+                b.emplace(KV{k, v}, EventTime{ts});
+                o.process(StreamElement<KV>::data(std::move(b)), e);
+            },
+            [](auto& o, auto& e, std::int64_t ts) {
+                o.process(StreamElement<KV>::watermark(Watermark{EventTime{ts}}), e);
+            });
+        async_out = collect_emits(ch);
+    }
+
+    // --- sync reference op (in-memory TumblingWindowOperator) ---
+    std::vector<AtwEmit> sync_out;
+    {
+        TumblingWindowOperator<std::int64_t, std::int64_t, std::int64_t> op(
+            1000ms,
+            [] { return std::int64_t{0}; },
+            [](std::int64_t a, std::int64_t v) { return a + v; });
+        op.allowed_lateness(500ms);
+        BoundedChannel<StreamElement<KA>> ch(64);
+        Emitter<KA> em(&ch);
+        script(
+            op,
+            em,
+            [](auto& o, auto& e, std::int64_t k, std::int64_t v, std::int64_t ts) {
+                Batch<KV> b;
+                b.emplace(KV{k, v}, EventTime{ts});
+                o.process(StreamElement<KV>::data(std::move(b)), e);
+            },
+            [](auto& o, auto& e, std::int64_t ts) {
+                o.process(StreamElement<KV>::watermark(Watermark{EventTime{ts}}), e);
+            });
+        sync_out = collect_emits(ch);
+    }
+
+    ASSERT_EQ(async_out.size(), sync_out.size());
+    EXPECT_EQ(async_out, sync_out) << "async window output must match the sync operator exactly";
+}
+
+TEST(AsyncTumblingWindowOperator, LatenessAndPaneIndexSurviveRestore) {
+    const OperatorId op_id{14};
+
+    // Phase 1: on-time fire with lateness>0 (fired=true, pane_index bumped, the
+    // purge timer pending), then checkpoint.
+    auto backend1 = std::make_shared<InMemoryStateBackend>();
+    Snapshot snap;
+    {
+        RuntimeContext ctx(op_id, "win_sum", backend1.get(), nullptr);
+        auto op = make_late_op(500);
+        op->set_id(op_id);
+        op->attach_runtime(&ctx);
+        op->open();
+        BoundedChannel<StreamElement<KA>> ch(64);
+        Emitter<KA> em(&ch);
+        Batch<KV> b;
+        b.emplace(KV{1, 10}, EventTime{100});
+        op->process(StreamElement<KV>::data(std::move(b)), em);
+        op->on_watermark(Watermark{EventTime{1000}}, em);  // on-time pane, window kept
+        op->snapshot_timers(*backend1, op_id);
+        snap = backend1->snapshot(CheckpointId{1});
+        auto e = collect_emits(ch);
+        ASSERT_EQ(e.size(), 1u);
+        EXPECT_EQ(e[0].pane.pane_index, 0);
+    }
+
+    // Phase 2: restore, then a within-band late record continues the pane index
+    // monotonically; advancing past the deadline erases with no on-time re-emit.
+    auto backend2 = std::make_shared<InMemoryStateBackend>();
+    backend2->restore(snap);
+    RuntimeContext ctx2(op_id, "win_sum", backend2.get(), nullptr);
+    auto op2 = make_late_op(500);
+    op2->set_id(op_id);
+    op2->attach_runtime(&ctx2);
+    op2->restore_timers(*backend2, op_id);
+    op2->open();  // reloads current_watermark_ = 1000
+
+    BoundedChannel<StreamElement<KA>> ch2(64);
+    Emitter<KA> em2(&ch2);
+    Batch<KV> late;
+    late.emplace(KV{1, 5}, EventTime{200});
+    op2->process(StreamElement<KV>::data(std::move(late)), em2);
+    auto e2 = collect_emits(ch2);
+    ASSERT_EQ(e2.size(), 1u) << "restored open window must re-fire a late pane";
+    EXPECT_EQ(e2[0].value, (KA{1, 15})) << "restored accumulator continued";
+    EXPECT_EQ(e2[0].pane.timing, PaneInfo::Timing::Late);
+    EXPECT_EQ(e2[0].pane.pane_index, 1) << "pane_index continues monotonically across restore";
+
+    op2->on_watermark(Watermark{EventTime{1500}}, em2);  // purge
+    op2->on_watermark(Watermark{EventTime{3000}}, em2);
+    EXPECT_TRUE(collect_emits(ch2).empty()) << "purged window does not re-emit";
 }
