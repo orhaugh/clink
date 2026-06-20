@@ -356,7 +356,17 @@ struct FailoverResult {
     bool real_failover{false};  // JM watchdog actually detected the TM loss
 };
 
-FailoverResult failover_once(const fs::path& node, const fs::path& submit, const fs::path& job_so) {
+// default_state_backend_uri (when non-empty) is passed to the JM as
+// --default-state-backend, so the 2PC job's keyed + operator state (the source
+// offset) lives there instead of the local checkpoint dir. With a
+// remote-read:// URI the state is in S3 and is LAZILY restored from the last
+// committed checkpoint after the crash - the same exactly-once invariant must
+// still hold, which proves disaggregated state recovers correctly through a
+// failover. checkpoint_dir stays the JM's local coordination dir either way.
+FailoverResult failover_once(const fs::path& node,
+                             const fs::path& submit,
+                             const fs::path& job_so,
+                             const std::string& default_state_backend_uri = "") {
     FailoverResult r;
     r.heartbeat_ms = 1000;  // > the TM's 500ms heartbeat interval, << the 5s default
     const int total = 400;
@@ -372,14 +382,16 @@ FailoverResult failover_once(const fs::path& node, const fs::path& submit, const
     ::setenv("CLINK_2PC_TICK_MS", "20", 1);  // ~8s of runtime: room to crash mid-flight
 
     const auto port = probe_free_port();
-    const pid_t jm = spawn_logged({"clink_node",
-                                   "--role=jm",
-                                   "--port=" + std::to_string(port),
-                                   "--bind-host=127.0.0.1",
-                                   "--heartbeat-timeout-ms=" + std::to_string(r.heartbeat_ms),
-                                   "--watchdog-interval-ms=50"},
-                                  node,
-                                  ckpt_dir / "jm.log");
+    std::vector<std::string> jm_args{"clink_node",
+                                     "--role=jm",
+                                     "--port=" + std::to_string(port),
+                                     "--bind-host=127.0.0.1",
+                                     "--heartbeat-timeout-ms=" + std::to_string(r.heartbeat_ms),
+                                     "--watchdog-interval-ms=50"};
+    if (!default_state_backend_uri.empty()) {
+        jm_args.push_back("--default-state-backend=" + default_state_backend_uri);
+    }
+    const pid_t jm = spawn_logged(jm_args, node, ckpt_dir / "jm.log");
     if (jm <= 0 || await_port_open(port, 5s) < 0) {
         kill_quietly(jm);
         return r;
@@ -570,7 +582,38 @@ int main() {
                 f.expected,
                 f.exactly_once ? "yes" : "NO");
 
-    const bool ok = cold_ok == kIters && f.ok;
+    // ---- failover on the disaggregated remote-read:// backend (real S3/MinIO) ----
+    // Same scenario, but the job's state lives in S3 instead of a local dir, so
+    // recovery must LAZILY restore the source offset from the last committed S3
+    // checkpoint - there is no local state to fall back on. The exactly-once
+    // invariant holding is the proof that disaggregated state survives failover.
+    // Gated on a configured endpoint so the bench still runs (skips this leg)
+    // where no MinIO/S3 is available.
+    bool remote_ok = true;  // treated as pass when skipped
+    const char* s3_endpoint = std::getenv("CLINK_S3_TEST_ENDPOINT");
+    const char* s3_bucket = std::getenv("CLINK_S3_TEST_BUCKET");
+    std::printf("\n---- failover on remote-read:// (disaggregated S3 state) ----\n");
+    if (s3_endpoint != nullptr && s3_bucket != nullptr) {
+        // Unique per-process prefix so reruns never read a stale checkpoint.
+        const std::string uri = "remote-read://" + std::string{s3_bucket} + "/failover-" +
+                                std::to_string(static_cast<long long>(::getpid())) +
+                                "?endpoint=" + s3_endpoint + "&region=us-east-1";
+        std::printf("  backend=%s\n", uri.c_str());
+        const auto rf = failover_once(node, submit, job_so, uri);
+        std::printf("  real failover          %s\n",
+                    rf.real_failover ? "yes" : "NO - kill was a no-op, number invalid");
+        std::printf("  recovery_ms            %.1f ms (lazy S3 restore + redeploy + resume)\n",
+                    rf.recovery_ms);
+        std::printf("  committed records      %zu / %zu (exactly-once via S3 restore: %s)\n",
+                    rf.committed,
+                    rf.expected,
+                    rf.exactly_once ? "yes" : "NO");
+        remote_ok = rf.ok;
+    } else {
+        std::printf("  SKIPPED (set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET to run)\n");
+    }
+
+    const bool ok = cold_ok == kIters && f.ok && remote_ok;
     std::printf("\n==== %s ====\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
