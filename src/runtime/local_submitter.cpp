@@ -13,11 +13,23 @@
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/local_executor.hpp"
+#include "clink/state/state_backend_factory.hpp"
 
 namespace clink::cluster {
 
 void LocalSubmitter::submit(api::StreamExecutionEnvironment& env) {
-    submit(env, JobConfig{});
+    // Convenience default: a bare submit(env) with no chosen backend rides the
+    // disagg-local:// deferring backend, so keyed pipelines work out of the box
+    // AND the async/disaggregated execution path is exercised without S3. It is
+    // process-local + non-durable, which is correct for a single-process local
+    // run (mirrors `clink run-application`). The explicit submit(env, config)
+    // overload is unchanged: it honours the caller's config exactly (a null
+    // state_backend still throws on keyed state), so a production embedder must
+    // choose its backend deliberately.
+    JobConfig config;
+    config.state_backend =
+        clink::StateBackendFactory::default_instance().build({.uri = "disagg-local://"}).backend;
+    submit(env, std::move(config));
 }
 
 void LocalSubmitter::submit(api::StreamExecutionEnvironment& env, JobConfig config) {

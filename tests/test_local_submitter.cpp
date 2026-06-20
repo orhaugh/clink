@@ -336,9 +336,9 @@ TEST(LocalSubmitter, JobConfigOverloadProvidesStateBackendForKeyedState) {
     // The keyed `RunningSumFn` opens its state slot in open(), which
     // calls `ctx.keyed_state(...)` - that throws unless a state_backend
     // is configured. So this test exercises that the `submit(env,
-    // JobConfig)` overload actually threads the backend through to
-    // LocalExecutor (the bare `submit(env)` overload constructs a
-    // default JobConfig with no backend, which would fail here).
+    // JobConfig)` overload actually threads the GIVEN backend through to
+    // LocalExecutor. (The bare `submit(env)` overload now defaults a
+    // disagg-local:// backend in; this test pins the explicit-backend path.)
     //
     // Per-key sum sequence given source order {1,2,3,4,5}:
     //   key=1: 1, 1+3=4, 4+5=9
@@ -372,13 +372,42 @@ TEST(LocalSubmitter, JobConfigOverloadProvidesStateBackendForKeyedState) {
     std::filesystem::remove(out_path);
 }
 
-TEST(LocalSubmitter, KeyedStateWithoutJobConfigBackendRejected) {
-    // Symmetric negative case: the same keyed pipeline without a
-    // configured state_backend must fail (not silently produce
-    // garbage). This guards against a regression where the
-    // `submit(env)` zero-config overload defaults a backend in -
-    // which would mask user-mistakes that the JobConfig overload
-    // is the explicit fix for.
+TEST(LocalSubmitter, BareSubmitDefaultsToDisaggLocalForKeyedState) {
+    // The bare `submit(env)` overload defaults a disagg-local:// backend in, so
+    // the same keyed pipeline that needs a state_backend runs out of the box
+    // (process-local, non-durable - correct for a local one-shot run). Output
+    // matches the explicit-InMemory case above: 1, 2, 4, 6, 9.
+    cluster::ensure_built_ins_registered();
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_local_submitter_keyed_default.txt";
+    std::filesystem::remove(out_path);
+
+    auto env = StreamExecutionEnvironment::create();
+    env.source<std::int64_t>(IntRangeSource::builder().count(5).start(1).build())
+        .key_by([](const std::int64_t& v) { return v % 2; })
+        .process<std::int64_t>(std::make_shared<RunningSumFn>())
+        .uid("running-sum-default")
+        .sink(FileInt64Sink::builder().path(out_path.string()).build());
+
+    EXPECT_NO_THROW(cluster::LocalSubmitter::submit(env));
+
+    auto lines = read_lines(out_path);
+    std::sort(lines.begin(), lines.end());
+    ASSERT_EQ(lines.size(), 5u);
+    EXPECT_EQ(lines[0], "1");
+    EXPECT_EQ(lines[1], "2");
+    EXPECT_EQ(lines[2], "4");
+    EXPECT_EQ(lines[3], "6");
+    EXPECT_EQ(lines[4], "9");
+
+    std::filesystem::remove(out_path);
+}
+
+TEST(LocalSubmitter, ExplicitEmptyJobConfigStillRejectsKeyedState) {
+    // The convenience default lives ONLY on the bare overload. An explicit
+    // submit(env, JobConfig{}) honours the caller's config verbatim, so a keyed
+    // pipeline with a null state_backend must still fail rather than silently
+    // default a backend - a production embedder chooses its backend deliberately.
     cluster::ensure_built_ins_registered();
     const auto out_path =
         std::filesystem::temp_directory_path() / "clink_local_submitter_keyed_state_no_backend.txt";
@@ -391,7 +420,7 @@ TEST(LocalSubmitter, KeyedStateWithoutJobConfigBackendRejected) {
         .uid("running-sum-nobackend")
         .sink(FileInt64Sink::builder().path(out_path.string()).build());
 
-    EXPECT_THROW(cluster::LocalSubmitter::submit(env), std::runtime_error);
+    EXPECT_THROW(cluster::LocalSubmitter::submit(env, JobConfig{}), std::runtime_error);
 
     std::filesystem::remove(out_path);
 }
