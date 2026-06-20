@@ -15,6 +15,10 @@
 #include "clink/cluster/protocol.hpp"
 #include "clink/state/state_backend.hpp"
 
+namespace clink {
+class StateBackendFactory;
+}
+
 namespace clink::cluster {
 
 struct OperatorChainSpec;
@@ -93,6 +97,15 @@ struct RunnerContext {
     // checkpoint_dir stays the local coordination directory. Empty keeps
     // the legacy behaviour where checkpoint_dir is the backend URI.
     std::string state_backend_uri;
+    // The HOST's StateBackendFactory (clink_node's process-wide singleton),
+    // which has the dynamically-registered schemes (remote-read://, rocksdb://,
+    // s3+rocksdb://) installed by install_linked_impls(). The runner builds its
+    // backend through THIS rather than the .so-local default_instance(): a
+    // dlopen'd plugin (RTLD_LOCAL + static clink_core) has its OWN factory
+    // singleton holding only the ctor builtins (memory/file/changelog), so a
+    // dynamically-registered scheme would otherwise report "no builder". nullptr
+    // falls back to the local default_instance() (in-process / legacy paths).
+    StateBackendFactory* state_backend_factory{nullptr};
     // Per-job alignment policy. false = aligned (default); true =
     // unaligned (barriers overtake in-flight records at multi-input
     // operators). Propagated through the wire from CheckpointConfig

@@ -95,7 +95,16 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     spec.restore_checkpoint_id = rctx.restore_from_checkpoint_id;
     spec.restore_from_subtask_idx = rctx.restore_from_subtask_idx;
     spec.restore_from_parent_count = rctx.restore_from_parent_count;
-    auto built = clink::StateBackendFactory::default_instance().build(spec);
+    // Build through the HOST's factory when provided (rctx.state_backend_factory):
+    // a dlopen'd plugin's .so-local StateBackendFactory singleton only has the
+    // ctor builtins (memory/file/changelog), NOT the dynamically-registered
+    // schemes (remote-read://, rocksdb://, ...) that install_linked_impls()
+    // registered on the host's singleton. Falling back to the .so-local
+    // default_instance() (nullptr) preserves the in-process / legacy paths.
+    clink::StateBackendFactory& factory = rctx.state_backend_factory != nullptr
+                                              ? *rctx.state_backend_factory
+                                              : clink::StateBackendFactory::default_instance();
+    auto built = factory.build(spec);
     cfg.state_backend = built.backend;
     // Hand the freshly-built backend to the TM (if it registered a hook)
     // so it can purge this subtask's superseded checkpoints under the

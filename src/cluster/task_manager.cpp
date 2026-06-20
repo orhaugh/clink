@@ -33,6 +33,7 @@
 #include "clink/runtime/log_buffer.hpp"
 #include "clink/runtime/network/network_bridge.hpp"
 #include "clink/runtime/network/network_socket.hpp"
+#include "clink/state/state_backend_factory.hpp"
 
 namespace clink::cluster {
 
@@ -1208,6 +1209,11 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 .restore_from_dir = restore_from_dir,
                 .restore_from_checkpoint_id = restore_from_checkpoint_id,
                 .state_backend_uri = state_backend_uri,
+                // Build the backend through the HOST's factory (this TU is
+                // clink_node, whose singleton has the dynamically-registered
+                // remote-read://-style schemes), not the dlopen'd plugin's
+                // .so-local singleton which only has the ctor builtins.
+                .state_backend_factory = &clink::StateBackendFactory::default_instance(),
                 .unaligned_checkpoints = unaligned_ckpt,
                 .expected_state_versions_packed = expected_state_versions_packed,
                 .restore_from_subtask_idx = rescale_parent_idx,
