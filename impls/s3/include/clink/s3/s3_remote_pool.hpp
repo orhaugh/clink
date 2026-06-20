@@ -12,16 +12,20 @@
 // cold read loads the checkpoint's manifest once (cached) then GETs one value
 // object by hash, so restore is lazy: a key is fetched only when first read.
 //
-// v1 bounds: purge drops a checkpoint's manifest but leaves its (shared) value
-// objects; a refcount sweep over live manifests (as in S3CasSnapshotStore)
-// reclaims orphans and is the follow-on.
+// purge() drops a checkpoint's manifest but leaves its (shared) value objects;
+// sweep(min_age) reclaims the orphans - it deletes every objects/<hash> that no
+// live manifest references (the live manifest set IS the refcount), mirroring
+// S3CasSnapshotStore::sweep.
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -101,9 +105,86 @@ public:
         } catch (...) {
             return;  // cannot reach the store; leave everything (safe)
         }
-        (void)fs->DeleteFile(manifest_path_(id));  // best-effort; objects GC deferred
+        (void)fs->DeleteFile(manifest_path_(id));  // best-effort; objects reclaimed by sweep()
         std::lock_guard<std::mutex> lk(cache_mu_);
         cache_.erase(id.value());
+    }
+
+    // Orphan reclamation for this subtask's prefix - a SPACE backstop, not
+    // retention correctness (purge already bounds the live set). Deletes every
+    // objects/<hash> referenced by NO live manifest (the live manifest list is
+    // the refcount), reclaiming objects left by a purged checkpoint or an
+    // aborted write (object uploaded, manifest never written). Returns the count
+    // reclaimed. Mirrors S3CasSnapshotStore::sweep.
+    //
+    // SAFETY: a sweep races an in-flight checkpoint whose objects are uploaded
+    // but whose manifest is not yet written - those look like orphans. `min_age`
+    // guards that: an object younger than min_age is never deleted, so as long
+    // as min_age exceeds the max checkpoint persist duration an in-flight
+    // checkpoint's objects survive until its manifest lands. Conservative: if any
+    // manifest is unreadable the sweep does nothing (it cannot prove an object
+    // is unreferenced). Intended for an admin / periodic trigger, not the
+    // checkpoint hot path; not thread-safe against a concurrent commit() to the
+    // SAME object hash within min_age (which min_age also protects).
+    std::uint64_t sweep(std::chrono::seconds min_age) {
+        std::shared_ptr<arrow::fs::S3FileSystem> fs;
+        try {
+            fs = fs_();
+        } catch (...) {
+            return 0;
+        }
+        // 1. Referenced object hashes across every live manifest.
+        std::unordered_set<std::string> live;
+        for (const auto& mkey : list_keys_(*fs, base_prefix_() + "/manifests")) {
+            Manifest m;
+            try {
+                m = decode_manifest_(read_object_(*fs, mkey));
+            } catch (...) {
+                return 0;  // unreadable manifest: cannot safely sweep
+            }
+            for (const auto& [k, v] : m) {
+                live.insert(v.first);  // v.first == value-hash
+            }
+        }
+        // 2. Delete unreferenced objects older than min_age.
+        arrow::fs::FileSelector sel;
+        sel.base_dir = base_prefix_() + "/objects";
+        sel.recursive = false;
+        sel.allow_not_found = true;
+        auto infos = fs->GetFileInfo(sel);
+        if (!infos.ok()) {
+            return 0;
+        }
+        const auto now = std::chrono::system_clock::now();
+        std::uint64_t reclaimed = 0;
+        for (const auto& info : *infos) {
+            if (info.type() != arrow::fs::FileType::File) {
+                continue;
+            }
+            const std::string& path = info.path();
+            const auto slash = path.rfind('/');
+            const std::string hash = slash == std::string::npos ? path : path.substr(slash + 1);
+            if (live.find(hash) != live.end()) {
+                continue;  // still referenced by a live manifest
+            }
+            if (min_age.count() > 0) {
+                const auto age =
+                    std::chrono::duration_cast<std::chrono::seconds>(now - info.mtime());
+                if (age < min_age) {
+                    continue;  // too young: may be an in-flight checkpoint's object
+                }
+            }
+            if (fs->DeleteFile(path).ok()) {
+                ++reclaimed;
+            }
+        }
+        objects_reclaimed_.fetch_add(reclaimed, std::memory_order_relaxed);
+        return reclaimed;
+    }
+
+    // Objects reclaimed by sweep() so far (for tests / metrics).
+    [[nodiscard]] std::uint64_t objects_reclaimed() const noexcept {
+        return objects_reclaimed_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -249,6 +330,27 @@ private:
             throw std::runtime_error("S3RemotePool::write Close(" + key + "): " + st.ToString());
         }
     }
+    // List the regular-file keys directly under `dir` (non-recursive). Used by
+    // sweep to enumerate live manifests; missing dir -> empty (not an error).
+    static std::vector<std::string> list_keys_(arrow::fs::S3FileSystem& fs,
+                                               const std::string& dir) {
+        arrow::fs::FileSelector sel;
+        sel.base_dir = dir;
+        sel.recursive = false;
+        sel.allow_not_found = true;
+        std::vector<std::string> out;
+        auto infos = fs.GetFileInfo(sel);
+        if (!infos.ok()) {
+            return out;
+        }
+        for (const auto& info : *infos) {
+            if (info.type() == arrow::fs::FileType::File) {
+                out.push_back(info.path());
+            }
+        }
+        return out;
+    }
+
     static std::string read_object_(arrow::fs::S3FileSystem& fs, const std::string& key) {
         auto file_result = fs.OpenInputFile(key);
         if (!file_result.ok()) {
@@ -304,6 +406,7 @@ private:
     mutable std::shared_ptr<arrow::fs::S3FileSystem> fs_cached_;
     mutable std::mutex cache_mu_;
     mutable std::map<std::uint64_t, Manifest> cache_;
+    std::atomic<std::uint64_t> objects_reclaimed_{0};
 };
 
 }  // namespace clink::s3

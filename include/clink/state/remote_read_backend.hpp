@@ -46,12 +46,14 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -78,8 +80,21 @@ public:
     }
 
     // Pool-backed (production) construction. State is durable in `pool`.
-    explicit RemoteReadBackend(std::shared_ptr<RemotePool> pool, std::size_t io_threads = 1)
-        : pool_(std::move(pool)) {
+    //
+    // hot_max_bytes bounds the in-memory hot tier (key+value bytes). 0 =
+    // unbounded (the legacy behaviour: the hot tier holds the whole working
+    // set, so only RESTORE is disaggregated). A non-zero budget makes working
+    // state genuinely exceed RAM: once over budget, the LRU CLEAN keys (those
+    // already durable in the pool at the last committed checkpoint) are evicted
+    // and re-fetched from the pool on next read. Dirty keys - written since the
+    // last checkpoint - are NEVER evicted (the pool does not yet hold their
+    // latest value), so eviction never loses state. Only meaningful with a pool
+    // (the durable tier); the loader-only ctor has no write-back, so it stays
+    // unbounded regardless.
+    explicit RemoteReadBackend(std::shared_ptr<RemotePool> pool,
+                               std::size_t io_threads = 1,
+                               std::size_t hot_max_bytes = 0)
+        : pool_(std::move(pool)), hot_max_bytes_(hot_max_bytes) {
         loader_ = [this](OperatorId op, std::string key) -> std::optional<Value> {
             const auto ck = last_ckpt_.load(std::memory_order_relaxed);
             // No committed checkpoint yet (fresh job, nothing restored): there
@@ -129,6 +144,8 @@ public:
             deleted_.erase(k);
             dirty_.insert(std::move(k));
         }
+        touch_(op, key, value.size());  // hot-tier recency + byte accounting
+        maybe_evict_();
     }
 
     // Hot hit, else a BLOCKING remote load (the truly-blocking read), filled
@@ -138,6 +155,12 @@ public:
             ++hot_hits_;
             metrics::disagg::remote_hot_hit();
             return v;
+        }
+        // Erased since the last checkpoint: logically absent. The pool still
+        // holds the pre-erase value (the delete is only committed at the next
+        // checkpoint), so we must NOT load + return it - and must not re-cache.
+        if (pool_ && is_deleted_(op, key)) {
+            return std::nullopt;
         }
         std::string owned(key);
         auto v = timed_remote_load_(op, owned);
@@ -154,6 +177,7 @@ public:
             dirty_.erase(k);
             deleted_.insert(std::move(k));
         }
+        forget_hot_(op, key);  // drop from the hot-tier index + byte total
     }
     void scan(OperatorId op, const ScanVisitor& visit) const override { hot_.scan(op, visit); }
 
@@ -182,6 +206,11 @@ public:
         last_ckpt_.store(id.value(), std::memory_order_relaxed);
         dirty_.clear();
         deleted_.clear();
+        // Everything is now durable at `id`, so the keys that were pinned hot
+        // as dirty are eligible for eviction - run the budget down to size and
+        // publish the resident footprint.
+        maybe_evict_();
+        metrics::disagg::hot_resident_bytes_set(static_cast<std::int64_t>(hot_bytes_));
         Snapshot s;
         s.checkpoint_id = id;  // the authoritative bytes are in the pool
         return s;
@@ -196,6 +225,15 @@ public:
         // nothing eagerly (the fast-recovery win). v1: same-parallelism; the
         // rescale key-group filter is a follow-on.
         (void)kg_filter;
+        // Drop any stale hot-tier entries before repointing at the new
+        // checkpoint. A fresh backend has an empty hot tier (the production
+        // path), so this is a no-op there; it makes restore() self-consistent
+        // if a backend instance is reused to restore a DIFFERENT checkpoint
+        // (the hot tier must not keep serving the old checkpoint's values).
+        hot_.clear();
+        lru_.clear();
+        index_.clear();
+        hot_bytes_ = 0;
         last_ckpt_.store(snap.checkpoint_id.value(), std::memory_order_relaxed);
         dirty_.clear();
         deleted_.clear();
@@ -220,6 +258,11 @@ public:
             metrics::disagg::remote_hot_hit();
             co_return v;  // hot hit: no suspension, single resume
         }
+        // Erased-but-uncommitted: absent (see get()). Short-circuit before any
+        // suspension so we never load or re-cache the pre-erase pool value.
+        if (pool_ && is_deleted_(op, std::string_view{owned})) {
+            co_return std::nullopt;
+        }
         if (!resume_scheduler_) {
             // No runner to marshal resumes to: safe inline blocking load.
             auto v = timed_remote_load_(op, owned);
@@ -239,6 +282,12 @@ public:
     [[nodiscard]] std::uint64_t hot_hits() const noexcept {
         return hot_hits_.load(std::memory_order_relaxed);
     }
+    // Hot-tier observability (only tracked when a byte budget is set + pooled).
+    [[nodiscard]] std::uint64_t hot_evictions() const noexcept {
+        return hot_evictions_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t hot_resident_bytes() const noexcept { return hot_bytes_; }
+    [[nodiscard]] std::size_t hot_resident_keys() const noexcept { return index_.size(); }
 
 private:
     // Awaiter for a cold read: the IO thread fills `value` then posts the handle
@@ -279,9 +328,106 @@ private:
     }
 
     void fill_hot_(OperatorId op, const std::string& key, const Value& v) const {
+        // Defensive: if the key was erased while this load was in flight, honour
+        // the delete rather than resurrect the pre-erase value into the hot
+        // tier. (The async per-key gate makes a same-key erase-during-load
+        // unreachable today, but the backend must be correct regardless.)
+        if (pool_ && is_deleted_(op, std::string_view{key})) {
+            return;
+        }
         hot_.put(op,
                  std::string_view{key},
                  std::string_view{reinterpret_cast<const char*>(v.data()), v.size()});
+        // A filled key is CLEAN (it equals the committed value it came from),
+        // so it is immediately eligible for eviction. Account for it and run
+        // the budget so a read-heavy scan can't grow the hot tier without bound.
+        touch_(op, std::string_view{key}, v.size());
+        maybe_evict_();
+    }
+
+    // --- hot-tier eviction (bounded cache over the durable pool) ---
+    //
+    // All of these run on the RUNNER thread only (put/erase/sync-get and the
+    // async await_resume write-through are all runner-thread; the IO thread
+    // only runs the loader and never touches hot_/lru_/index_). So the LRU
+    // structures need no lock, matching the hot_ single-writer invariant. They
+    // are mutable + the methods const because fill_hot_ runs from const get().
+
+    // True if (op, key) was erased since the last checkpoint (delete pending
+    // commit). Runner-thread only (deleted_ is mutated on the runner). The
+    // empty-set fast path avoids building a std::string on the common cold-read
+    // (e.g. an append-only SUM workload never erases).
+    bool is_deleted_(OperatorId op, std::string_view key) const {
+        return !deleted_.empty() &&
+               deleted_.count(std::make_pair(op.value(), std::string(key))) != 0;
+    }
+
+    static std::string compose_(OperatorId op, std::string_view key) {
+        std::string s;
+        s.reserve(20 + key.size());
+        s += std::to_string(op.value());
+        s.push_back('\x1f');
+        s.append(key.data(), key.size());
+        return s;
+    }
+
+    // Record/refresh a hot key's recency (front = most recent) and byte size.
+    // No-op unless eviction is active (budget set + pooled).
+    void touch_(OperatorId op, std::string_view key, std::size_t value_size) const {
+        if (hot_max_bytes_ == 0 || !pool_) {
+            return;
+        }
+        const std::size_t entry_bytes = key.size() + value_size;
+        const auto ck = compose_(op, key);
+        if (auto it = index_.find(ck); it != index_.end()) {
+            hot_bytes_ += entry_bytes;
+            hot_bytes_ -= it->second->bytes;
+            it->second->bytes = entry_bytes;
+            lru_.splice(lru_.begin(), lru_, it->second);  // move to front (MRU)
+        } else {
+            lru_.push_front(HotEntry{op.value(), std::string(key), entry_bytes});
+            index_.emplace(ck, lru_.begin());
+            hot_bytes_ += entry_bytes;
+        }
+    }
+
+    // Drop a key from the hot-tier index + byte total (on logical erase or
+    // eviction). hot_ itself is updated separately by the caller.
+    void forget_hot_(OperatorId op, std::string_view key) const {
+        if (hot_max_bytes_ == 0 || !pool_) {
+            return;
+        }
+        const auto ck = compose_(op, key);
+        if (auto it = index_.find(ck); it != index_.end()) {
+            hot_bytes_ -= it->second->bytes;
+            lru_.erase(it->second);
+            index_.erase(it);
+        }
+    }
+
+    // Evict least-recently-used CLEAN keys until under budget. A key that is
+    // dirty (written since the last checkpoint) or deleted is NEVER evicted -
+    // the pool does not yet hold its latest value, so dropping it would lose
+    // state; it stays hot until the next checkpoint commits it. If every
+    // over-budget key is dirty the hot tier transiently exceeds the budget
+    // (correct, not a leak): the next snapshot clears dirty_ and re-runs this.
+    void maybe_evict_() const {
+        if (hot_max_bytes_ == 0 || !pool_) {
+            return;
+        }
+        for (auto it = lru_.end(); hot_bytes_ > hot_max_bytes_ && it != lru_.begin();) {
+            --it;
+            const std::pair<std::uint64_t, std::string> ck{it->op, it->key};
+            if (dirty_.count(ck) != 0 || deleted_.count(ck) != 0) {
+                continue;  // not yet durable in the pool: must stay hot
+            }
+            hot_.erase(OperatorId{it->op}, std::string_view{it->key});
+            hot_bytes_ -= it->bytes;
+            index_.erase(compose_(OperatorId{it->op}, it->key));
+            hot_evictions_.fetch_add(1, std::memory_order_relaxed);
+            metrics::disagg::hot_evicted();
+            it = lru_.erase(it);
+        }
     }
 
     void enqueue_io_(std::function<void()> job) const {
@@ -342,6 +488,21 @@ private:
     mutable std::atomic<std::uint64_t> last_ckpt_{0};
     std::set<std::pair<std::uint64_t, std::string>> dirty_;
     std::set<std::pair<std::uint64_t, std::string>> deleted_;
+
+    // Bounded hot tier (eviction). hot_max_bytes_ == 0 => unbounded (no
+    // eviction, no bookkeeping). lru_ front = most-recently-used; index_ maps
+    // compose_(op,key) -> its node for O(1) refresh/erase. Runner-thread only,
+    // so unlocked; mutable because the cold-read write-through is on const get.
+    struct HotEntry {
+        std::uint64_t op;
+        std::string key;
+        std::size_t bytes;  // key.size() + value.size() at last touch
+    };
+    std::size_t hot_max_bytes_{0};
+    mutable std::size_t hot_bytes_{0};
+    mutable std::list<HotEntry> lru_;
+    mutable std::unordered_map<std::string, std::list<HotEntry>::iterator> index_;
+    mutable std::atomic<std::uint64_t> hot_evictions_{0};
 };
 
 }  // namespace clink

@@ -1,12 +1,14 @@
 // Registers the remote-read:// state-backend scheme: an S3-backed,
 // async-capable, disaggregated RemoteReadBackend.
 //
-//   remote-read://<bucket>/<prefix>[?endpoint=<url>&region=<r>&anonymous=1]
+//   remote-read://<bucket>/<prefix>[?endpoint=<url>&region=<r>&anonymous=1
+//                                    &hot_max_bytes=<n>]
 //
 // State lives in S3 (content-addressed value objects + per-checkpoint
 // manifests via S3RemotePool); cold reads defer to S3 through the async
 // execution path; restore is lazy. Per-subtask key prefix is
-// "<prefix>/<subtask_idx>".
+// "<prefix>/<subtask_idx>". hot_max_bytes bounds the in-memory hot tier so
+// working state genuinely exceeds RAM (0 / absent = unbounded hot tier).
 //
 // v1 bounds: same-location, same-parallelism (failover) restore; cross-location
 // savepoint relocation and rescale are follow-ons.
@@ -42,6 +44,7 @@ struct Cfg {
     std::string endpoint;
     std::string region;
     bool anonymous{false};
+    std::size_t hot_max_bytes{0};  // 0 = unbounded hot tier (no eviction)
 };
 
 Cfg parse_cfg(const std::string& base) {
@@ -74,6 +77,12 @@ Cfg parse_cfg(const std::string& base) {
                 c.region = v;
             } else if (k == "anonymous") {
                 c.anonymous = (v == "1" || v == "true");
+            } else if (k == "hot_max_bytes") {
+                try {
+                    c.hot_max_bytes = static_cast<std::size_t>(std::stoull(v));
+                } catch (...) {
+                    c.hot_max_bytes = 0;  // malformed -> unbounded (safe default)
+                }
             }
         }
         if (amp == std::string::npos) {
@@ -108,7 +117,8 @@ clink::BuiltStateBackend build_remote_read(const clink::StateBackendSpec& spec) 
     o.allow_anonymous = cfg.anonymous;
 
     clink::BuiltStateBackend out;
-    out.backend = std::make_shared<clink::RemoteReadBackend>(std::make_shared<S3RemotePool>(o));
+    out.backend = std::make_shared<clink::RemoteReadBackend>(
+        std::make_shared<S3RemotePool>(o), /*io_threads=*/1, cfg.hot_max_bytes);
 
     if (!spec.restore_uri.empty() && spec.restore_checkpoint_id != 0) {
         // v1: same-location, same-parallelism failover. The pool reads cp-<id>

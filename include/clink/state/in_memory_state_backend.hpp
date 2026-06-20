@@ -83,6 +83,14 @@ public:
         }
     }
 
+    // Drop all keyed entries (state-version metadata is left intact). Used by
+    // wrapping backends (e.g. RemoteReadBackend's hot tier) to discard a stale
+    // cache before repointing at a different checkpoint.
+    void clear() {
+        std::lock_guard lock(mu_);
+        state_.clear();
+    }
+
     void scan(OperatorId op, const ScanVisitor& visit) const override {
         // Snapshot under the lock so the visitor isn't holding it (and so
         // the visitor can call back into put/erase without deadlock).

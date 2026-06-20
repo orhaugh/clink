@@ -5,6 +5,7 @@
 // simulated restart) - cold reads fetch per key from the pool, unchanged keys
 // are inherited across checkpoints, and deletes propagate.
 
+#include <chrono>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -100,6 +101,76 @@ TEST(S3RemotePool, RemoteReadBackendIncrementalCommitAndLazyRestoreOverS3) {
     pool2->purge(CheckpointId{2});
 }
 
+// 2c-1: bounded hot tier over real S3. A small byte budget forces eviction of
+// clean (committed) keys, and a later read transparently re-fetches them from
+// S3 - working state genuinely exceeds the hot budget yet every key is correct.
+TEST(S3RemotePool, BoundedHotTierEvictsAndRefetchesFromS3) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    const std::string prefix = unique_prefix() + "-evict";
+    const OperatorId op{3};
+    auto pool = std::make_shared<S3RemotePool>(pool_opts(prefix));
+    // "k0".."k9"/"v0".."v9" are 4 bytes each; a 12-byte budget holds ~3.
+    RemoteReadBackend b(pool, /*io_threads=*/1, /*hot_max_bytes=*/12);
+    for (int i = 0; i < 10; ++i) {
+        const std::string k = "k" + std::to_string(i);
+        const std::string v = "v" + std::to_string(i);
+        b.put(op, StateBackend::ValueView{k}, StateBackend::ValueView{v});
+    }
+    b.snapshot(CheckpointId{1});  // commit to S3 -> clean -> evict to budget
+    EXPECT_GT(b.hot_evictions(), 0u);
+    EXPECT_LE(b.hot_resident_bytes(), 12u);
+    EXPECT_LT(b.hot_resident_keys(), 10u);
+
+    const auto loads_before = b.remote_loads();
+    for (int i = 0; i < 10; ++i) {
+        const std::string k = "k" + std::to_string(i);
+        EXPECT_EQ(str(b.get(op, StateBackend::ValueView{k})), "v" + std::to_string(i));
+    }
+    EXPECT_GT(b.remote_loads(), loads_before);  // evicted keys re-fetched from S3
+    EXPECT_LE(b.hot_resident_bytes(), 12u);
+
+    pool->purge(CheckpointId{1});
+}
+
+// 2c-2: object-GC sweep reclaims value objects orphaned by a purged checkpoint
+// while objects still referenced by a live manifest survive.
+TEST(S3RemotePool, SweepReclaimsOrphanedObjectsKeepsLiveOnes) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    const std::string prefix = unique_prefix() + "-sweep";
+    const OperatorId op{5};
+    auto pool = std::make_shared<S3RemotePool>(pool_opts(prefix));
+    {
+        RemoteReadBackend b(pool);
+        b.put(op, vv("a"), vv("v1"));  // object hash(v1)
+        b.put(op, vv("b"), vv("v2"));  // object hash(v2)
+        b.snapshot(CheckpointId{1});
+        b.put(op, vv("a"), vv("v1b"));  // object hash(v1b); v1 now only in cp1
+        b.snapshot(CheckpointId{2});    // cp2 references v1b + v2 (inherited)
+    }
+    // Drop cp1: hash(v1) is now referenced by no live manifest (orphan).
+    pool->purge(CheckpointId{1});
+    const std::uint64_t reclaimed = pool->sweep(std::chrono::seconds{0});
+    EXPECT_EQ(reclaimed, 1u);  // exactly the orphaned v1 object
+    EXPECT_EQ(pool->objects_reclaimed(), 1u);
+
+    // cp2 is intact: its referenced objects (v1b, v2) survived the sweep.
+    RemoteReadBackend b2(pool);
+    Snapshot snap;
+    snap.checkpoint_id = CheckpointId{2};
+    b2.restore(snap);
+    EXPECT_EQ(str(b2.get(op, vv("a"))), "v1b");
+    EXPECT_EQ(str(b2.get(op, vv("b"))), "v2");
+
+    // A second sweep with cp2 still live reclaims nothing more.
+    EXPECT_EQ(pool->sweep(std::chrono::seconds{0}), 0u);
+
+    pool->purge(CheckpointId{2});
+}
+
 // Scheme resolution + backend build (no S3 I/O, so not gated): remote-read://
 // registers and builds a RemoteReadBackend; a restore spec yields the marker
 // Snapshot carrying the checkpoint id.
@@ -123,4 +194,38 @@ TEST(S3RemotePoolScheme, RegistersAndBuildsBackendFromUri) {
     auto rbuilt = f.build(rspec);
     ASSERT_TRUE(rbuilt.restore_from.has_value());
     EXPECT_EQ(rbuilt.restore_from->checkpoint_id.value(), 7u);
+}
+
+// Construction-path symmetry: the hot_max_bytes URI query must reach the
+// backend ctor, else it silently falls back to an unbounded hot tier (no
+// eviction). Build via the factory from a URI carrying a tiny budget and prove
+// eviction actually fires - a broken parse would leave hot_evictions()==0.
+TEST(S3RemotePoolScheme, HotMaxBytesUriProducesEvictingBackend) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    clink::s3::install_state_backend();
+    const std::string bucket = std::getenv("CLINK_S3_TEST_BUCKET");
+    const std::string endpoint = std::getenv("CLINK_S3_TEST_ENDPOINT");
+    const std::string prefix = unique_prefix() + "-uri";
+
+    clink::StateBackendSpec spec;
+    spec.uri = "remote-read://" + bucket + "/" + prefix + "?endpoint=" + endpoint +
+               "&region=us-east-1&hot_max_bytes=12";
+    spec.subtask_idx = 0;
+    auto built = clink::StateBackendFactory::default_instance().build(spec);
+    auto* rrb = dynamic_cast<RemoteReadBackend*>(built.backend.get());
+    ASSERT_NE(rrb, nullptr);
+
+    const OperatorId op{1};
+    for (int i = 0; i < 10; ++i) {
+        const std::string k = "k" + std::to_string(i);
+        const std::string v = "v" + std::to_string(i);
+        rrb->put(op, StateBackend::ValueView{k}, StateBackend::ValueView{v});
+    }
+    rrb->snapshot(CheckpointId{1});
+    EXPECT_GT(rrb->hot_evictions(), 0u);  // the URI budget took effect
+    EXPECT_LE(rrb->hot_resident_bytes(), 12u);
+
+    rrb->purge_checkpoint(CheckpointId{1});
 }

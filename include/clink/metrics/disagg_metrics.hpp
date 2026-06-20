@@ -22,6 +22,8 @@ namespace clink::metrics {
 inline constexpr const char* kRemoteHotHits = "clink_disagg_remote_hot_hits_total";
 inline constexpr const char* kRemoteLoads = "clink_disagg_remote_loads_total";
 inline constexpr const char* kRemoteLoadLatencyNs = "clink_disagg_remote_load_latency_ns";
+inline constexpr const char* kHotEvictions = "clink_disagg_hot_evictions_total";
+inline constexpr const char* kHotResidentBytes = "clink_disagg_hot_resident_bytes";
 inline constexpr const char* kObjectCacheHits = "clink_disagg_object_cache_hits_total";
 inline constexpr const char* kObjectCacheMisses = "clink_disagg_object_cache_misses_total";
 inline constexpr const char* kObjectCacheEntries = "clink_disagg_object_cache_entries";
@@ -44,6 +46,20 @@ inline void remote_load_observe(std::uint64_t latency_ns) {
     MetricsRegistry::global()
         .histogram(kRemoteLoadLatencyNs)
         .observe(static_cast<double>(latency_ns));
+}
+
+// RemoteReadBackend: a clean (durably-committed) key was evicted from the hot
+// tier to honour the byte budget; a later read of it cold-fetches from the pool.
+// This is the signal that working state genuinely exceeds the hot budget (true
+// state-greater-than-RAM disaggregation), not just fast restore.
+inline void hot_evicted() {
+    MetricsRegistry::global().counter(kHotEvictions).increment();
+}
+
+// RemoteReadBackend: current resident hot-tier footprint in bytes (a gauge;
+// publish on change-points like checkpoint, not per record).
+inline void hot_resident_bytes_set(std::int64_t bytes) {
+    MetricsRegistry::global().gauge(kHotResidentBytes).set(bytes);
 }
 
 // LocalObjectCache: a served-from-cache hit / a miss that fell through to S3.
