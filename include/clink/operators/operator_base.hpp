@@ -278,6 +278,22 @@ public:
     // async today, so this never trips on main.
     [[nodiscard]] virtual bool fires_state_touching_timers() const noexcept { return false; }
 
+    // Refinement of the above for the async runner: true iff this operator
+    // fires state-touching PROCESSING-TIME timer callbacks. Those fire ungated
+    // at the top of the runner loop (fire_due()), so under async they can race
+    // an in-flight read for the same key - the async runner refuses them.
+    // EVENT-TIME timers, by contrast, fire from INSIDE the aec->on_watermark
+    // release closure (after the epoch has fully drained), so no in-flight async
+    // read for the same key is outstanding when they touch state - they are
+    // safe. An operator that touches keyed state ONLY from event-time timers
+    // (e.g. AsyncTumblingWindowOperator) overrides this to return false while
+    // keeping fires_state_touching_timers() true, so the async runner admits it.
+    // The default is conservative: assume any state-touching timer might be a
+    // processing-time one, matching the historic blanket tripwire.
+    [[nodiscard]] virtual bool fires_state_touching_processing_time_timers() const noexcept {
+        return fires_state_touching_timers();
+    }
+
     // Hooks for time and checkpointing. Default behaviour for watermarks
     // is to fire any event-time timers whose timestamp ≤ the watermark
     // and then forward the watermark unchanged. Operators that override

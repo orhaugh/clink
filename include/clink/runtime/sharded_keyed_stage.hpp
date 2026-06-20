@@ -375,13 +375,16 @@ private:
                 // release - over-serialising, but correct). Like the single-input
                 // runner it does NOT gate processing-time timer callbacks, so an
                 // operator that touches keyed state in a timer under async is not
-                // yet safe here. No production operator is async + timer-bearing
-                // today; refuse one loudly until the gated-timer path is built.
-                if (sh.op->fires_state_touching_timers()) {
+                // yet safe here. But event-time timers fire from on_watermark,
+                // which this stage calls only AFTER aec->drain() (below), so an
+                // event-time-only operator is gated and safe; only PROCESSING-
+                // time state-touching timers (ungated fire_due) are refused.
+                if (sh.op->fires_state_touching_processing_time_timers()) {
                     throw std::logic_error(
                         "clink: operator '" + sh.op->name() +
-                        "' fires state-touching timers under async execution, which is not yet "
-                        "supported in the sharded keyed stage; build the gated-timer path first");
+                        "' fires state-touching processing-time timers under async execution, "
+                        "which is not yet supported in the sharded keyed stage; build the "
+                        "per-key-gated timer path first");
                 }
                 aec = std::make_unique<AsyncExecutionController>();
             }

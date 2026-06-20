@@ -368,12 +368,21 @@ public:
                 // same key. No production operator is async + timer-bearing today,
                 // so this never trips; if one is introduced the per-key-gated
                 // timer path must be built first (deferred increment).
-                if (op->fires_state_touching_timers()) {
+                //
+                // Only PROCESSING-TIME state-touching timers are unsafe: they
+                // fire via fire_due() at the loop top, ungated, and can race an
+                // in-flight async read. Event-time timers fire inside the
+                // aec->on_watermark release closure below (after the epoch
+                // drains), so an event-time-only operator (e.g. an async window
+                // aggregate) is admitted - it returns false here while keeping
+                // fires_state_touching_timers() true.
+                if (op->fires_state_touching_processing_time_timers()) {
                     throw std::logic_error(
                         "clink: operator '" + op->name() +
-                        "' fires state-touching timers under async execution, which is not yet "
-                        "supported (processing-time timer callbacks are not routed through the "
-                        "per-key gate); build the gated-timer path before enabling async here");
+                        "' fires state-touching processing-time timers under async execution, "
+                        "which is not yet supported (the callbacks fire ungated at the loop top "
+                        "and can race an in-flight async read for the same key); build the "
+                        "per-key-gated timer path before enabling async here");
                 }
                 aec = std::make_unique<AsyncExecutionController>();
                 // Wire the backend's async-read completions to THIS subtask's

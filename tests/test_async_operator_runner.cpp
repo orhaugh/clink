@@ -224,13 +224,18 @@ TEST(AsyncOperatorRunner, RefusesAsyncOperatorThatFiresStateTouchingTimers) {
 
     const auto errs = exec.operator_errors();
     ASSERT_FALSE(errs.empty()) << "the async + timer-bearing operator must be refused";
+    // The guard distinguishes timer kinds: a generic timer-bearing op leaves
+    // fires_state_touching_processing_time_timers() at its conservative default
+    // (== fires_state_touching_timers() == true), so it is still refused. An
+    // event-time-ONLY operator is admitted (see
+    // AsyncTumblingWindowOperator.TripwireAdmitsEventTimeOnlyWindowUnderAsync).
     bool found = false;
     for (const auto& [op_name, msg] : errs) {
-        if (msg.find("state-touching timers under async") != std::string::npos) {
+        if (msg.find("state-touching processing-time timers under async") != std::string::npos) {
             found = true;
         }
     }
-    EXPECT_TRUE(found) << "expected the async-timer-gate guard error";
+    EXPECT_TRUE(found) << "expected the async processing-time-timer-gate guard error";
 }
 
 // Production async link: the DAG runner must wire a deferring backend's

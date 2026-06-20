@@ -84,6 +84,7 @@ add_executable(clink_core_tests
     test_flat_map_operator.cpp
     test_key_by_operator.cpp
     test_tumbling_window_operator.cpp
+    test_async_tumbling_window_operator.cpp
     test_watermark_assigner_operator.cpp
     test_metrics_registry.cpp
     test_histogram.cpp
