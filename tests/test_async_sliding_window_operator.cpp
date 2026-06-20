@@ -277,6 +277,11 @@ TEST(AsyncSlidingWindowOperator, OneRecordFansIntoAllOverlappingWindows) {
 }
 
 TEST(AsyncSlidingWindowOperator, EpochGatedFiringObservesAllInFlightReads) {
+    // Declare the controller BEFORE the deferring backend so the backend's
+    // worker thread is joined (in its dtor) before aec's condition_variable is
+    // destroyed; otherwise the worker could signal a being-destroyed cv on
+    // scope exit (a TSan data race).
+    AsyncExecutionController aec;
     auto backend = std::make_shared<AswDeferringBackend>();
     const OperatorId op_id{1};
     RuntimeContext ctx(op_id, "slide_sum", backend.get(), nullptr);
@@ -285,7 +290,6 @@ TEST(AsyncSlidingWindowOperator, EpochGatedFiringObservesAllInFlightReads) {
     op->attach_runtime(&ctx);
     op->open();
 
-    AsyncExecutionController aec;
     backend->set_async_resume_scheduler(
         [&aec](std::coroutine_handle<> h) { aec.schedule_resume(h); });
 

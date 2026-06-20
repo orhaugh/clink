@@ -105,6 +105,10 @@ TEST(RemoteReadBackend, AsyncWithoutSchedulerFallsBackToInlineLoad) {
 // resumes on the RUNNER thread via the controller - not on the IO thread.
 TEST(RemoteReadBackend, AsyncColdReadRidesControllerAndResumesOnRunner) {
     std::atomic<std::thread::id> io_thread{};
+    // Declare the controller BEFORE the backend so the backend (whose IO thread
+    // may call schedule_resume) is destroyed/quiesced before aec's
+    // condition_variable is destroyed (a TSan data race otherwise).
+    AsyncExecutionController aec;
     RemoteReadBackend backend([&](OperatorId, std::string k) -> std::optional<StateBackend::Value> {
         io_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
         std::this_thread::sleep_for(20ms);  // let the runner reach drain() first
@@ -112,7 +116,6 @@ TEST(RemoteReadBackend, AsyncColdReadRidesControllerAndResumesOnRunner) {
                            : std::nullopt;
     });
 
-    AsyncExecutionController aec;
     backend.set_async_resume_scheduler(
         [&aec](std::coroutine_handle<> h) { aec.schedule_resume(h); });
 
