@@ -359,7 +359,7 @@ public:
             // add_co_operator): it force-aligns the popped/in-flight tail via
             // drain_for_barrier while keeping the unaligned in-flight-capture
             // fast path for the unpopped other-channel records.
-            std::unique_ptr<AsyncExecutionController> aec;
+            std::shared_ptr<AsyncExecutionController> aec;
             const bool async_mode = op->supports_async() && ctx.has_state_backend() &&
                                     ctx.state_backend()->supports_async_get();
             if (async_mode) {
@@ -373,7 +373,7 @@ public:
                 // processing-time timers must register them with its record gate
                 // key (the operator contract documented there); the runner no
                 // longer refuses such operators.
-                aec = std::make_unique<AsyncExecutionController>();
+                aec = std::make_shared<AsyncExecutionController>();
                 // Wire the backend's async-read completions to THIS subtask's
                 // controller: a deferring backend (RemoteReadBackend, a future
                 // ForSt backend) posts a suspended handle here and the
@@ -383,8 +383,13 @@ public:
                 // production link for the disaggregated async path. Cleared at
                 // teardown (below) before `aec` is destroyed.
                 ctx.state_backend()->set_async_resume_scheduler(
-                    [aec_ptr = aec.get()](std::coroutine_handle<> h) {
-                        aec_ptr->schedule_resume(h);
+                    [wk = std::weak_ptr<AsyncExecutionController>(aec)](std::coroutine_handle<> h) {
+                        // weak_ptr: a completion that lands after teardown (the
+                        // controller already destroyed, e.g. on the fault path)
+                        // is a safe no-op instead of a dangling resume.
+                        if (auto sp = wk.lock()) {
+                            sp->schedule_resume(h);
+                        }
                     });
             }
             auto* timers = ctx.timer_service();
@@ -2409,14 +2414,19 @@ public:
             // drain_for_barrier at the barrier, while the unpopped other-channel
             // records keep the unaligned in-flight-capture fast path. A
             // non-deferring backend takes the byte-identical sync process path.
-            std::unique_ptr<AsyncExecutionController> aec;
+            std::shared_ptr<AsyncExecutionController> aec;
             const bool async_mode = op->supports_async() && ctx.has_state_backend() &&
                                     ctx.state_backend()->supports_async_get();
             if (async_mode) {
-                aec = std::make_unique<AsyncExecutionController>();
+                aec = std::make_shared<AsyncExecutionController>();
                 ctx.state_backend()->set_async_resume_scheduler(
-                    [aec_ptr = aec.get()](std::coroutine_handle<> h) {
-                        aec_ptr->schedule_resume(h);
+                    [wk = std::weak_ptr<AsyncExecutionController>(aec)](std::coroutine_handle<> h) {
+                        // weak_ptr: a completion that lands after teardown (the
+                        // controller already destroyed, e.g. on the fault path)
+                        // is a safe no-op instead of a dangling resume.
+                        if (auto sp = wk.lock()) {
+                            sp->schedule_resume(h);
+                        }
                     });
             }
             // Per-subtask async snapshot worker (FileBacked + disk-backed

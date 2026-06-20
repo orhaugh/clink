@@ -72,6 +72,7 @@
 #include "clink/runtime/async_execution_controller.hpp"
 #include "clink/runtime/bounded_channel.hpp"
 #include "clink/runtime/cpu_affinity.hpp"
+#include "clink/runtime/gated_timer_fire.hpp"
 #include "clink/runtime/key_group_partitioner.hpp"
 #include "clink/runtime/key_groups.hpp"
 #include "clink/runtime/runtime_context.hpp"
@@ -96,10 +97,18 @@ public:
     // it MUST be thread-safe.
     using Downstream = std::function<bool(OutElement)>;
 
+    // Builds a shard's private state backend. Empty (the default) -> each shard
+    // gets an InMemoryStateBackend (inline reads, no async overlap). Supply a
+    // factory returning a DEFERRING backend (supports_async_get()==true) to get
+    // real per-shard read overlap on the async path; each shard owns its own
+    // single-writer backend instance.
+    using ShardBackendFactory = std::function<std::unique_ptr<StateBackend>(std::size_t)>;
+
     struct Options {
         bool pin_threads = false;  // pin worker i to core i (best-effort)
         std::size_t queue_capacity = 1024;
         MetricsRegistry* metrics = nullptr;
+        ShardBackendFactory shard_backend_factory{};
     };
 
     // Result of a coordinated in-band checkpoint: the merged subtask snapshot
@@ -130,7 +139,8 @@ public:
                                                     static_cast<std::uint32_t>(num_shards_))) {
         shards_.reserve(num_shards_);
         for (std::size_t i = 0; i < num_shards_; ++i) {
-            shards_.push_back(std::make_unique<Shard>(opts_.queue_capacity, op_id_, opts_.metrics));
+            shards_.push_back(std::make_unique<Shard>(
+                opts_.queue_capacity, op_id_, opts_.metrics, opts_.shard_backend_factory, i));
         }
     }
 
@@ -309,14 +319,21 @@ public:
 
 private:
     struct Shard {
-        std::unique_ptr<InMemoryStateBackend> backend;
+        std::unique_ptr<StateBackend> backend;
         std::unique_ptr<RuntimeContext> ctx;
         std::unique_ptr<Operator<In, Out>> op;
         std::shared_ptr<BoundedChannel<InElement>> queue;
         std::jthread thread;
 
-        Shard(std::size_t cap, OperatorId op_id, MetricsRegistry* metrics)
-            : backend(std::make_unique<InMemoryStateBackend>()),
+        // backend is declared before ctx, and member-init runs in declaration
+        // order, so backend is live when ctx captures backend.get().
+        Shard(std::size_t cap,
+              OperatorId op_id,
+              MetricsRegistry* metrics,
+              const ShardBackendFactory& backend_factory,
+              std::size_t shard_idx)
+            : backend(backend_factory ? backend_factory(shard_idx)
+                                      : std::make_unique<InMemoryStateBackend>()),
               ctx(std::make_unique<RuntimeContext>(
                   op_id, "sharded_keyed_stage", backend.get(), metrics)),
               queue(std::make_shared<BoundedChannel<InElement>>(cap, "sharded_keyed_stage")) {}
@@ -367,32 +384,79 @@ private:
             // (reads complete inline today), so this provides the gate + drain
             // wiring; a genuinely-deferring per-shard backend whose reads
             // actually suspend is a follow-on (the remote backend lands then).
-            std::unique_ptr<AsyncExecutionController> aec;
+            // Per-shard async controller. Built whenever the op opts in (so the
+            // per-key gate + drain-before-capture apply); the resume scheduler
+            // is wired only when the backend actually DEFERS reads (async_io) -
+            // an async op over the default InMemory backend completes reads
+            // inline and needs no scheduler. Each shard owns its own backend +
+            // AEC + thread, so the per-key gate + scheduler are single-shard and
+            // the per-shard backend stays single-writer.
+            std::shared_ptr<AsyncExecutionController> aec;
+            const bool async_io = sh.op->supports_async() && sh.backend->supports_async_get();
             if (sh.op->supports_async()) {
-                // Tripwire (async-timer gate): this branch fires event-time
-                // timers by calling sh.op->on_watermark inline AFTER a blunt
-                // aec->drain() (it bypasses aec->on_watermark's per-epoch FIFO
-                // release - over-serialising, but correct), so an event-time-only
-                // operator is gated and safe. PROCESSING-time timers, however,
-                // have NO fire path in this stage at all: the worker loop below
-                // uses a blocking queue pop with no loop-top fire_due, so a
-                // processing-time timer would never fire even synchronously.
-                // Admitting such an operator would silently swallow its timers,
-                // which is worse than refusing it - so this tripwire stays. (The
-                // single-input runner DOES now gate processing-time timers via
-                // gated_timer_fire.hpp; a deadline-driven pop + per-shard gated
-                // fire for this stage is a separate, larger structural change.)
-                if (sh.op->fires_state_touching_processing_time_timers()) {
-                    throw std::logic_error(
-                        "clink: operator '" + sh.op->name() +
-                        "' fires state-touching processing-time timers under async execution, "
-                        "which the sharded keyed stage cannot serve (it has no processing-time "
-                        "fire path); the single-input runner gates these, the sharded stage does "
-                        "not yet");
+                aec = std::make_shared<AsyncExecutionController>();
+                if (async_io) {
+                    sh.backend->set_async_resume_scheduler(
+                        [wk = std::weak_ptr<AsyncExecutionController>(aec)](
+                            std::coroutine_handle<> h) {
+                            // weak_ptr: a completion that lands after this shard
+                            // tears down (controller destroyed, e.g. on the fault
+                            // path) is a safe no-op instead of a dangling resume.
+                            if (auto sp = wk.lock()) {
+                                sp->schedule_resume(h);
+                            }
+                        });
                 }
-                aec = std::make_unique<AsyncExecutionController>();
             }
-            while (auto elem = sh.queue->pop()) {
+            // Clear the backend's resume scheduler before `aec` is destroyed on
+            // ANY exit path (declared after aec, so its dtor runs first - even
+            // during exception unwinding), so a late completion on a foreign IO
+            // thread can never resume into a dangling controller.
+            struct SchedulerClearGuard {
+                StateBackend* backend;
+                bool active;
+                ~SchedulerClearGuard() {
+                    if (active) {
+                        backend->set_async_resume_scheduler({});
+                    }
+                }
+            } scheduler_clear_guard{sh.backend.get(), async_io};
+
+            auto* timers = sh.ctx->timer_service();
+            // Processing-time timers: gated through the per-key gate under async
+            // (a state-touching callback serialises behind an in-flight same-key
+            // read within this shard), ungated on the sync path. Output is data
+            // and flows downstream via `out` (unlike the watermark, which the
+            // coordinator min-merges).
+            auto fire_due = [&] { sh.op->fire_due_timers(out, timers->now_ms()); };
+            auto fire_due_async = [&] {
+                detail::gated_fire_processing_time_timers(*sh.op, out, timers->now_ms(), *aec);
+            };
+
+            using namespace std::chrono_literals;
+            // Deadline-driven pop: wake to fire a due processing-time timer even
+            // when the shard is otherwise idle. A timeout (nullopt, not closed)
+            // loops to fire newly-due timers; closed+drained exits to the EOS
+            // path. No busy-spin: with no pending timer the timeout is a 30s
+            // heartbeat, and a push/close wakes pop_for immediately.
+            while (true) {
+                if (aec) {
+                    fire_due_async();
+                } else {
+                    fire_due();
+                }
+                std::chrono::milliseconds timeout = 30s;
+                if (auto next = sh.op->next_timer_deadline_ms(); next.has_value()) {
+                    const auto delay = *next - timers->now_ms();
+                    timeout = delay > 0 ? std::chrono::milliseconds(delay) : 0ms;
+                }
+                auto elem = sh.queue->pop_for(timeout);
+                if (!elem.has_value()) {
+                    if (sh.queue->closed()) {
+                        break;
+                    }
+                    continue;
+                }
                 const InElement& e = *elem;
                 if (e.is_data()) {
                     // Per-shard records-in: reveals shard skew (one hot shard
@@ -452,8 +516,14 @@ private:
                     deliver_capture_(i, {}, true, "");
                 }
             }
+            // EOS: drain in-flight reads, fire any close-time processing-time
+            // timers through the gate, drain again so they ran - then flush.
             if (aec) {
-                aec->drain();  // finish any in-flight async work before flush
+                aec->drain();
+                fire_due_async();
+                aec->drain();
+            } else {
+                fire_due();
             }
             sh.op->flush(out);
             sh.op->close();

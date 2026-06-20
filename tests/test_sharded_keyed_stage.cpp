@@ -7,12 +7,17 @@
 // range, and pinning never changes results.
 
 #include <atomic>
+#include <condition_variable>
+#include <coroutine>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -489,6 +494,296 @@ TEST(ShardedKeyedStage, AsyncMidStreamCheckpointIsConsistent) {
     stage.close_input();
     stage.await();
     EXPECT_TRUE(stage.worker_errors().empty());
+}
+
+// A genuinely-DEFERRING per-shard backend double: get_async parks the handle
+// and a per-instance background releaser thread resumes it shortly after (via
+// the shard's wired scheduler), so reads actually suspend and the stage's
+// blocking public API drives end to end. Single-writer per shard (the stage
+// gives each shard its own instance); put/get/snapshot delegate to an inner
+// InMemory store so the merge wire format is unchanged. resume_ + pending_ are
+// mutex-guarded because the releaser thread and the shard worker both touch
+// them.
+class ShardDeferringBackend final : public StateBackend {
+public:
+    ShardDeferringBackend() : releaser_([this] { release_loop_(); }) {}
+    ~ShardDeferringBackend() override {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        releaser_.join();
+    }
+    void put(OperatorId op, KeyView key, ValueView value) override { store_.put(op, key, value); }
+    std::optional<Value> get(OperatorId op, KeyView key) const override {
+        return store_.get(op, key);
+    }
+    void erase(OperatorId op, KeyView key) override { store_.erase(op, key); }
+    void scan(OperatorId op, const ScanVisitor& visit) const override { store_.scan(op, visit); }
+    Snapshot snapshot(CheckpointId id) override { return store_.snapshot(id); }
+    void restore(const Snapshot& snap, const KeyGroupRange& kg = {}) override {
+        store_.restore(snap, kg);
+    }
+    std::string description() const override { return "shard-deferring"; }
+    [[nodiscard]] bool supports_async_get() const noexcept override { return true; }
+    void set_async_resume_scheduler(AsyncResumeScheduler s) override {
+        std::lock_guard<std::mutex> lk(mu_);
+        resume_ = std::move(s);
+    }
+    async::Task<std::optional<Value>> get_async(OperatorId op, KeyView key) const override {
+        co_return co_await Defer{this, op, std::string(key)};
+    }
+
+private:
+    struct Defer {
+        const ShardDeferringBackend* self;
+        OperatorId op;
+        std::string key;
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> h) const {
+            std::lock_guard<std::mutex> lk(self->mu_);
+            self->pending_.push_back(h);
+            self->cv_.notify_all();
+        }
+        std::optional<Value> await_resume() const { return self->get(op, key); }
+    };
+    void release_loop_() {
+        for (;;) {
+            std::vector<std::coroutine_handle<>> batch;
+            AsyncResumeScheduler resume;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [this] { return stop_ || !pending_.empty(); });
+                if (stop_ && pending_.empty()) {
+                    return;
+                }
+                batch.swap(pending_);
+                resume = resume_;
+            }
+            // A tiny pause so the read genuinely overlaps other work before the
+            // worker resumes it (foreign-thread post, runner-thread resume).
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            for (auto h : batch) {
+                if (resume) {
+                    resume(h);  // hand back to the shard's controller (runner resumes)
+                }
+            }
+        }
+    }
+    InMemoryStateBackend store_;
+    AsyncResumeScheduler resume_;
+    mutable std::mutex mu_;
+    mutable std::condition_variable cv_;
+    mutable std::vector<std::coroutine_handle<>> pending_;
+    bool stop_{false};
+    std::thread releaser_;
+};
+
+ShardedKeyedStage<std::int64_t, std::int64_t>::ShardBackendFactory deferring_backend() {
+    return [](std::size_t) -> std::unique_ptr<StateBackend> {
+        return std::make_unique<ShardDeferringBackend>();
+    };
+}
+
+// The deferring backend makes the per-shard reads genuinely suspend, so the
+// whole async path (per-key gate + drain) runs for real, not inline. Counts
+// must still be exact.
+TEST(ShardedKeyedStage, AsyncDeferringBackendCountsCorrectly) {
+    std::vector<std::int64_t> keys;
+    for (std::int64_t k = 0; k < 200; ++k) {
+        keys.push_back(k);
+    }
+    std::atomic<std::int64_t> emits{0};
+    ShardedKeyedStage<std::int64_t, std::int64_t>::Options opts;
+    opts.shard_backend_factory = deferring_backend();
+    ShardedKeyedStage<std::int64_t, std::int64_t> stage(
+        8,
+        OperatorId{7},
+        async_counting_factory(),
+        int64_key_bytes(),
+        [&emits](StreamElement<std::int64_t> e) {
+            if (e.is_data()) {
+                emits.fetch_add(static_cast<std::int64_t>(e.as_data().size()),
+                                std::memory_order_relaxed);
+            }
+            return true;
+        },
+        opts);
+    stage.start();
+    for (int r = 0; r < 50; ++r) {
+        Batch<std::int64_t> b;
+        for (const auto k : keys) {
+            b.emplace(k);
+        }
+        stage.submit(std::move(b));
+    }
+    stage.close_input();
+    stage.await();
+
+    EXPECT_EQ(emits.load(), 200 * 50);
+    EXPECT_TRUE(stage.worker_errors().empty());
+    InMemoryStateBackend mono;
+    mono.restore(stage.snapshot(CheckpointId{1}));
+    for (std::int64_t k = 0; k < 200; ++k) {
+        EXPECT_EQ(count_in(mono, k), 50) << "deferring async key " << k << " mis-counted";
+    }
+}
+
+// drain_for_barrier must quiesce a genuinely-suspending backend before capture.
+TEST(ShardedKeyedStage, AsyncDeferringCheckpointConsistent) {
+    constexpr std::size_t kShards = 4;
+    ShardedKeyedStage<std::int64_t, std::int64_t>::Options opts;
+    opts.shard_backend_factory = deferring_backend();
+    ShardedKeyedStage<std::int64_t, std::int64_t> stage(
+        kShards,
+        OperatorId{7},
+        async_counting_factory(),
+        int64_key_bytes(),
+        [](StreamElement<std::int64_t>) { return true; },
+        opts);
+    stage.start();
+    const std::vector<std::int64_t> keys{1, 2, 3, 4, 5};
+    for (int r = 0; r < 10; ++r) {
+        Batch<std::int64_t> b;
+        for (const auto k : keys) {
+            b.emplace(k);
+        }
+        stage.submit(std::move(b));
+    }
+    auto r1 = stage.checkpoint(
+        CheckpointBarrier{CheckpointId{1}, false, CheckpointBarrier::Mode::Aligned});
+    ASSERT_TRUE(r1.ok);
+    {
+        InMemoryStateBackend mono;
+        mono.restore(r1.snapshot);
+        for (const auto k : keys) {
+            EXPECT_EQ(count_in(mono, k), 10) << "deferring ckpt key " << k << " torn";
+        }
+    }
+    stage.close_input();
+    stage.await();
+    EXPECT_TRUE(stage.worker_errors().empty());
+}
+
+// Async op that fires a state-touching PROCESSING-TIME timer - previously
+// REFUSED by the sharded stage's tripwire. process_async registers a timer with
+// the gate key (== the record gate); on_timer emits a sentinel. Proves the
+// stage now admits it (no worker error), the deadline pop fires the timer
+// (sentinels reach downstream), and the per-key data counts stay correct (the
+// gate kept the timer from corrupting an in-flight same-key read).
+class CountingOpAsyncProcTimer final : public Operator<std::int64_t, std::int64_t> {
+public:
+    static constexpr std::int64_t kSentinel = 1'000'000;
+    void open() override {
+        state_.emplace(this->runtime()->template keyed_state<std::int64_t, std::int64_t>(
+            "counts", int64_codec(), int64_codec()));
+    }
+    void process(const StreamElement<std::int64_t>& el, Emitter<std::int64_t>& out) override {
+        if (!el.is_data()) {
+            return;
+        }
+        Batch<std::int64_t> b;
+        for (const auto& r : el.as_data()) {
+            const auto k = r.value();
+            const auto c = state_->get(k).value_or(0) + 1;
+            state_->put(k, c);
+            this->runtime()->timer_service()->register_processing_time_timer(0, std::to_string(k));
+            b.emplace(c);
+        }
+        out.emit_data(std::move(b));
+    }
+    [[nodiscard]] bool supports_async() const noexcept override { return true; }
+    void process_async(const StreamElement<std::int64_t>& el,
+                       Emitter<std::int64_t>& out,
+                       AsyncExecutionController& aec) override {
+        if (!el.is_data()) {
+            return;
+        }
+        for (const auto& r : el.as_data()) {
+            const auto k = r.value();
+            auto ks = *state_;
+            const std::string gate = std::to_string(k);
+            auto* rt = this->runtime();
+            aec.submit(gate, [ks, k, gate, rt, &out]() mutable -> async::Task<void> {
+                auto cur = co_await ks.get_async(k);
+                const auto c = cur.value_or(0) + 1;
+                ks.put(k, c);
+                rt->timer_service()->register_processing_time_timer(0, gate);
+                Batch<std::int64_t> b;
+                b.emplace(c);
+                out.emit_data(std::move(b));
+                co_return;
+            });
+        }
+    }
+    void on_processing_time_timer(std::int64_t /*ts*/,
+                                  const std::string& /*key*/,
+                                  Emitter<std::int64_t>& out) override {
+        Batch<std::int64_t> b;
+        b.emplace(kSentinel);  // sentinel proves the timer fired (no state mutation)
+        out.emit_data(std::move(b));
+    }
+    [[nodiscard]] bool fires_state_touching_timers() const noexcept override { return true; }
+    [[nodiscard]] bool fires_state_touching_processing_time_timers() const noexcept override {
+        return true;
+    }
+    std::string name() const override { return "counter_async_proctimer"; }
+
+private:
+    std::optional<KeyedState<std::int64_t, std::int64_t>> state_;
+};
+
+TEST(ShardedKeyedStage, ProctimeTimerAdmittedAndGated) {
+    std::vector<std::int64_t> keys{1, 2, 3, 4, 5, 6, 7, 8};
+    std::atomic<std::int64_t> data_emits{0};
+    std::atomic<std::int64_t> sentinels{0};
+    ShardedKeyedStage<std::int64_t, std::int64_t>::Options opts;
+    opts.shard_backend_factory = deferring_backend();
+    ShardedKeyedStage<std::int64_t, std::int64_t> stage(
+        4,
+        OperatorId{7},
+        [](std::size_t) { return std::make_unique<CountingOpAsyncProcTimer>(); },
+        int64_key_bytes(),
+        [&](StreamElement<std::int64_t> e) {
+            if (e.is_data()) {
+                for (const auto& r : e.as_data()) {
+                    if (r.value() == CountingOpAsyncProcTimer::kSentinel) {
+                        sentinels.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        data_emits.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+            return true;
+        },
+        opts);
+    stage.start();  // must NOT throw (the tripwire is gone)
+    for (int r = 0; r < 20; ++r) {
+        Batch<std::int64_t> b;
+        for (const auto k : keys) {
+            b.emplace(k);
+        }
+        stage.submit(std::move(b));
+    }
+    stage.close_input();
+    stage.await();
+
+    EXPECT_TRUE(stage.worker_errors().empty()) << "the proctime-timer op must be admitted";
+    // The per-key data counts (== 20 below) are the real GATING proof: an
+    // ungated timer racing an in-flight same-key read would corrupt the running
+    // count. The sentinel count proves the timer FIRED through the deadline pop,
+    // but is only asserted >= 1 (not one-per-record): timers dedupe by (ts, key)
+    // and are registered asynchronously from the resumed coroutine, so the
+    // number of fires is timing-dependent.
+    EXPECT_EQ(data_emits.load(), 8 * 20) << "data records counted exactly once";
+    EXPECT_GE(sentinels.load(), 1) << "the processing-time timer fired through the deadline pop";
+    InMemoryStateBackend mono;
+    mono.restore(stage.snapshot(CheckpointId{1}));
+    for (const auto k : keys) {
+        EXPECT_EQ(count_in(mono, k), 20)
+            << "key " << k << " mis-counted (timer corrupted gated state?)";
+    }
 }
 
 // An async operator whose coroutine throws must fault the worker cleanly
