@@ -138,6 +138,7 @@ public:
     // --- sync StateBackend surface ---
 
     void put(OperatorId op, KeyView key, ValueView value) override {
+        std::lock_guard<std::mutex> lk(sync_mu_);
         hot_.put(op, key, value);
         if (pool_) {  // track the write so the next checkpoint commits the delta
             auto k = std::make_pair(op.value(), std::string(key));
@@ -151,26 +152,34 @@ public:
     // Hot hit, else a BLOCKING remote load (the truly-blocking read), filled
     // through into the hot tier.
     std::optional<Value> get(OperatorId op, KeyView key) const override {
-        if (auto v = hot_.get(op, key)) {
-            ++hot_hits_;
-            metrics::disagg::remote_hot_hit();
-            return v;
+        {
+            std::lock_guard<std::mutex> lk(sync_mu_);
+            if (auto v = hot_.get(op, key)) {
+                ++hot_hits_;
+                metrics::disagg::remote_hot_hit();
+                return v;
+            }
+            // Erased since the last checkpoint: logically absent. The pool still
+            // holds the pre-erase value (the delete is only committed at the
+            // next checkpoint), so we must NOT load + return it - and must not
+            // re-cache.
+            if (pool_ && is_deleted_(op, key)) {
+                return std::nullopt;
+            }
         }
-        // Erased since the last checkpoint: logically absent. The pool still
-        // holds the pre-erase value (the delete is only committed at the next
-        // checkpoint), so we must NOT load + return it - and must not re-cache.
-        if (pool_ && is_deleted_(op, key)) {
-            return std::nullopt;
-        }
+        // Blocking remote load with the lock RELEASED, so a concurrent snapshot
+        // (owner thread) or put (writer thread) is not stalled behind the read.
         std::string owned(key);
         auto v = timed_remote_load_(op, owned);
         if (v) {
+            std::lock_guard<std::mutex> lk(sync_mu_);
             fill_hot_(op, owned, *v);
         }
         return v;
     }
 
     void erase(OperatorId op, KeyView key) override {
+        std::lock_guard<std::mutex> lk(sync_mu_);
         hot_.erase(op, key);
         if (pool_) {
             auto k = std::make_pair(op.value(), std::string(key));
@@ -179,9 +188,13 @@ public:
         }
         forget_hot_(op, key);  // drop from the hot-tier index + byte total
     }
-    void scan(OperatorId op, const ScanVisitor& visit) const override { hot_.scan(op, visit); }
+    void scan(OperatorId op, const ScanVisitor& visit) const override {
+        std::lock_guard<std::mutex> lk(sync_mu_);
+        hot_.scan(op, visit);
+    }
 
     Snapshot snapshot(CheckpointId id) override {
+        std::lock_guard<std::mutex> lk(sync_mu_);
         if (!pool_) {
             return hot_.snapshot(id);  // loader-only: hot tier only
         }
@@ -217,6 +230,7 @@ public:
     }
 
     void restore(const Snapshot& snap, const KeyGroupRange& kg_filter = {}) override {
+        std::lock_guard<std::mutex> lk(sync_mu_);
         if (!pool_) {
             hot_.restore(snap, kg_filter);
             return;
@@ -256,20 +270,25 @@ public:
 
     async::Task<std::optional<Value>> get_async(OperatorId op, KeyView key) const override {
         std::string owned(key);  // own the bytes across the suspension
-        if (auto v = hot_.get(op, std::string_view{owned})) {
-            ++hot_hits_;
-            metrics::disagg::remote_hot_hit();
-            co_return v;  // hot hit: no suspension, single resume
-        }
-        // Erased-but-uncommitted: absent (see get()). Short-circuit before any
-        // suspension so we never load or re-cache the pre-erase pool value.
-        if (pool_ && is_deleted_(op, std::string_view{owned})) {
-            co_return std::nullopt;
+        {
+            std::lock_guard<std::mutex> lk(sync_mu_);
+            if (auto v = hot_.get(op, std::string_view{owned})) {
+                ++hot_hits_;
+                metrics::disagg::remote_hot_hit();
+                co_return v;  // hot hit: no suspension, single resume
+            }
+            // Erased-but-uncommitted: absent (see get()). Short-circuit before
+            // any suspension so we never load or re-cache the pre-erase value.
+            if (pool_ && is_deleted_(op, std::string_view{owned})) {
+                co_return std::nullopt;
+            }
         }
         if (!resume_scheduler_) {
-            // No runner to marshal resumes to: safe inline blocking load.
+            // No runner to marshal resumes to: safe inline blocking load. The
+            // lock is held only for the write-through, never the load itself.
             auto v = timed_remote_load_(op, owned);
             if (v) {
+                std::lock_guard<std::mutex> lk(sync_mu_);
                 fill_hot_(op, owned, *v);
             }
             co_return v;
@@ -310,7 +329,10 @@ private:
         }
         std::optional<Value> await_resume() {
             if (value) {
-                self->fill_hot_(op, key, *value);  // write-through on the runner
+                // Write-through on the runner thread, under the backend lock so
+                // it cannot race a concurrent put/snapshot on a sibling runner.
+                std::lock_guard<std::mutex> lk(self->sync_mu_);
+                self->fill_hot_(op, key, *value);
             }
             return std::move(value);
         }
@@ -330,12 +352,21 @@ private:
         return v;
     }
 
+    // Write-through of a freshly loaded cold value. The CALLER must hold
+    // sync_mu_ (the load itself ran with the lock released, so re-check the
+    // working set under the lock before mutating it).
     void fill_hot_(OperatorId op, const std::string& key, const Value& v) const {
         // Defensive: if the key was erased while this load was in flight, honour
         // the delete rather than resurrect the pre-erase value into the hot
         // tier. (The async per-key gate makes a same-key erase-during-load
         // unreachable today, but the backend must be correct regardless.)
         if (pool_ && is_deleted_(op, std::string_view{key})) {
+            return;
+        }
+        // A concurrent put on a sibling runner may have landed a NEWER value
+        // while the lock was released for the load. That write is authoritative
+        // (and is tracked dirty); do not clobber it with the older pool value.
+        if (hot_.get(op, std::string_view{key})) {
             return;
         }
         hot_.put(op,
@@ -350,11 +381,11 @@ private:
 
     // --- hot-tier eviction (bounded cache over the durable pool) ---
     //
-    // All of these run on the RUNNER thread only (put/erase/sync-get and the
-    // async await_resume write-through are all runner-thread; the IO thread
-    // only runs the loader and never touches hot_/lru_/index_). So the LRU
-    // structures need no lock, matching the hot_ single-writer invariant. They
-    // are mutable + the methods const because fill_hot_ runs from const get().
+    // These mutate the LRU bookkeeping (lru_/index_/hot_bytes_) and hot_. They
+    // assume the CALLER holds sync_mu_ (every caller - put/erase/snapshot and
+    // the fill_hot_ write-through - takes it first). The IO thread only runs
+    // the loader and never touches these. They are mutable + the methods const
+    // because fill_hot_ runs from the const get()/get_async path.
 
     // True if (op, key) was erased since the last checkpoint (delete pending
     // commit). Runner-thread only (deleted_ is mutated on the runner). The
@@ -468,8 +499,21 @@ private:
 
     RemoteLoader loader_;
     ResumeScheduler resume_scheduler_;
-    // Hot tier: only ever touched on the runner thread (sync calls + async
-    // await_resume), so it needs no lock. mutable because reads fill it through.
+    // Guards the mutable working set (hot_, dirty_, deleted_, and the LRU
+    // bookkeeping lru_/index_/hot_bytes_). A single backend instance is SHARED
+    // by every runner of a fused subtask, so the state WRITER and the checkpoint
+    // OWNER can be different threads: a source writes its offset (operator
+    // state) on the source-runner thread, while the downstream owner runner
+    // takes the snapshot that must commit that write. Without this lock the
+    // owner's snapshot races the writer's dirty_ inserts and silently drops them
+    // (the delta commits empty, so the durable value freezes at the first
+    // checkpoint - a correctness bug across failover). The async cold-read path
+    // never holds this lock across the blocking remote load: the IO thread only
+    // runs the loader (which touches pool_/last_ckpt_, never the guarded state),
+    // and the write-through (fill_hot_) re-takes the lock on the runner thread.
+    mutable std::mutex sync_mu_;
+    // Hot tier: recent writes + filled-on-read keys. Guarded by sync_mu_ (see
+    // above). mutable because cold reads fill it through on a const get.
     mutable InMemoryStateBackend hot_;
 
     mutable std::mutex io_mu_;
@@ -485,8 +529,9 @@ private:
     // last_ckpt_ is the checkpoint cold reads serve and the base for the next
     // commit; it is read on IO threads (the loader) and written on the runner
     // thread (snapshot/restore) after the async work has drained, so atomic.
-    // dirty_/deleted_ track writes since the last checkpoint and are touched
-    // only on the runner thread (the hot-tier single-writer invariant).
+    // dirty_/deleted_ track writes since the last checkpoint. They are written
+    // by put/erase (any runner of a fused subtask) and read+cleared by snapshot
+    // (the owner runner), so all access is guarded by sync_mu_.
     std::shared_ptr<RemotePool> pool_;
     mutable std::atomic<std::uint64_t> last_ckpt_{0};
     std::set<std::pair<std::uint64_t, std::string>> dirty_;
@@ -494,8 +539,8 @@ private:
 
     // Bounded hot tier (eviction). hot_max_bytes_ == 0 => unbounded (no
     // eviction, no bookkeeping). lru_ front = most-recently-used; index_ maps
-    // compose_(op,key) -> its node for O(1) refresh/erase. Runner-thread only,
-    // so unlocked; mutable because the cold-read write-through is on const get.
+    // compose_(op,key) -> its node for O(1) refresh/erase. Guarded by sync_mu_;
+    // mutable because the cold-read write-through is on a const get.
     struct HotEntry {
         std::uint64_t op;
         std::string key;
