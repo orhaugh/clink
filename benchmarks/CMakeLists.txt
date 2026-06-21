@@ -19,6 +19,16 @@ add_executable(clink_async_scale_bench clink_async_scale_bench.cpp)
 target_link_libraries(clink_async_scale_bench PRIVATE clink::core)
 clink_set_warnings(clink_async_scale_bench)
 
+# M-Fast benchmark - quantifies the ASYNC-10 (read coalescing: N per-key
+# round-trips collapse to 1 batched) + ASYNC-12 (deadline-aware resume: urgent
+# reads served first within a completion batch) wins, clink-vs-clink A/B on a
+# controlled-latency pool/parking backend. Reports the premise-free counter
+# (round-trip count / emit position) alongside wall-clock; self-validating.
+# (The ASYNC-9A io_threads fix is the io_threads sweep in clink_async_state_bench.)
+add_executable(clink_mfast_bench clink_mfast_bench.cpp)
+target_link_libraries(clink_mfast_bench PRIVATE clink::core)
+clink_set_warnings(clink_mfast_bench)
+
 # Serde benchmark - compares the legacy record-by-record Codec<T>
 # wire encoding against the Arrow RecordBatch + IPC path. The Arrow
 # path is the production path; the legacy path is benched as a
