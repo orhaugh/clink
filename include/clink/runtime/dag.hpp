@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -34,6 +35,23 @@
 #include "clink/state/keyed_state.hpp"
 
 namespace clink {
+
+// Bounded timeout a source waits at clean EOS for its JM-coordinated final
+// checkpoint to commit before giving up (and throwing -> watchdog restart).
+// Configurable via CLINK_EOS_FINAL_CKPT_TIMEOUT_MS (default 30s); read once.
+// A shorter value lets failure/recovery integration tests run quickly.
+inline std::chrono::milliseconds eos_final_checkpoint_timeout() {
+    static const std::chrono::milliseconds t = [] {
+        if (const char* p = std::getenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS"); p != nullptr && *p) {
+            try {
+                return std::chrono::milliseconds{std::stoll(p)};
+            } catch (...) {
+            }
+        }
+        return std::chrono::milliseconds{30000};
+    }();
+    return t;
+}
 
 // A DAG node is one of: Source, Operator, Sink. We capture them via type-erased
 // runners; each runner knows how to drive its own operator from input channels
@@ -297,7 +315,7 @@ public:
                         // restart + replay, instead of silently completing the job
                         // with an uncommitted tail. On cancel we exit cleanly (the
                         // job is being torn down, not failed - no spurious restart).
-                        if ((!wait || !wait(final_id, std::chrono::seconds(30))) &&
+                        if ((!wait || !wait(final_id, eos_final_checkpoint_timeout())) &&
                             !should_stop()) {
                             throw std::runtime_error(
                                 "source EOS final checkpoint did not commit within timeout");
@@ -3001,7 +3019,7 @@ public:
                             // return (and thus complete the job) until the tail is
                             // durable; throw on timeout (unless cancelled) to drive
                             // restart + replay rather than silent completion.
-                            if ((!wait || !wait(final_id, std::chrono::seconds(30))) &&
+                            if ((!wait || !wait(final_id, eos_final_checkpoint_timeout())) &&
                                 !should_stop()) {
                                 throw std::runtime_error(
                                     "source EOS final checkpoint did not commit within timeout");

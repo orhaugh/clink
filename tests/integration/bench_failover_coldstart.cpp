@@ -773,6 +773,116 @@ SeqFailoverResult failover_sequential(const fs::path& node,
     return r;
 }
 
+struct EosRecoveryResult {
+    std::size_t expected{0};
+    std::size_t committed{0};
+    std::size_t dups{0};
+    int submit_exit{-1};
+    bool restart_observed{false};  // a whole-job restart fired (the EOS-timeout surfaced)
+    bool exactly_once{false};
+    bool ok{false};
+};
+
+// NO-CRASH end-of-stream final-checkpoint TIMEOUT, exercised deterministically.
+// The JM is told (CLINK_TEST_STALL_FIRST_FINAL_CKPT) to drop every ack for the
+// FIRST final checkpoint's first-acking subtask, so that checkpoint never
+// completes; with a short EOS-wait timeout (CLINK_EOS_FINAL_CKPT_TIMEOUT_MS) the
+// bounded source's wait_final_committed times out WITHOUT any crash, throws, and
+// (the fix under test) that surfaces as had_error -> a whole-job rollback to the
+// last completed checkpoint -> replay -> the replay's fresh final checkpoint
+// completes -> exactly-once. Pre-fix the throw was swallowed and the job
+// completed with the tail uncommitted; the assertions below (exactly-once AND a
+// whole-job restart) fail pre-fix and pass post-fix. No TM is ever killed.
+EosRecoveryResult eos_timeout_recovery(const fs::path& node,
+                                       const fs::path& submit,
+                                       const fs::path& job_so) {
+    EosRecoveryResult r;
+    const int total = 300;
+    r.expected = static_cast<std::size_t>(total);
+
+    ScopedDirs scratch;
+    const auto ckpt_dir = mktmpdir("eos_ckpt");
+    const auto out_dir = mktmpdir("eos_out");
+    scratch.add(ckpt_dir);
+    scratch.add(out_dir);
+    ::setenv("CLINK_2PC_OUT_DIR", out_dir.c_str(), 1);
+    ::setenv("CLINK_2PC_TOTAL", std::to_string(total).c_str(), 1);
+    ::setenv("CLINK_2PC_TICK_MS", "15", 1);
+    // The two fault-injection / config hooks the scenario needs.
+    ::setenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS", "3000", 1);
+    ::setenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT", "1", 1);
+
+    const auto port = probe_free_port();
+    const pid_t jm = spawn_logged({"clink_node",
+                                   "--role=jm",
+                                   "--port=" + std::to_string(port),
+                                   "--bind-host=127.0.0.1",
+                                   "--heartbeat-timeout-ms=1000",
+                                   "--watchdog-interval-ms=50"},
+                                  node,
+                                  ckpt_dir / "jm.log");
+    if (jm <= 0 || await_port_open(port, 5s) < 0) {
+        kill_quietly(jm);
+        ::unsetenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT");
+        ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
+        return r;
+    }
+    const pid_t tm = spawn_logged({"clink_node",
+                                   "--role=tm",
+                                   "--id=tm-0",
+                                   "--jm-host=127.0.0.1",
+                                   "--jm-port=" + std::to_string(port),
+                                   "--slots=4"},
+                                  node,
+                                  ckpt_dir / "tm0.log");
+    if (tm <= 0 ||
+        await_log_contains(ckpt_dir / "tm0.log", "registered", clock_t_::now(), 5s) < 0) {
+        kill_quietly(tm);
+        kill_quietly(jm);
+        ::unsetenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT");
+        ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
+        return r;
+    }
+    const pid_t sub = spawn_logged({"clink_submit_job",
+                                    "--job=" + job_so.string(),
+                                    "--jm-host=127.0.0.1",
+                                    "--jm-port=" + std::to_string(port),
+                                    "--wait-timeout-s=90",
+                                    "--checkpoint-dir=" + ckpt_dir.string(),
+                                    "--checkpoint-interval-ms=150",
+                                    "--max-restarts-on-tm-loss=3"},
+                                   submit,
+                                   ckpt_dir / "submit.log");
+    // The hooks are now in the spawned children's environment; unset in this
+    // process so no later leg inherits them.
+    ::unsetenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT");
+    ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
+    const bool exited = (sub > 0) && wait_for_exit(sub, 90s, &r.submit_exit);
+
+    std::vector<std::string> lines;
+    std::set<std::string> uniq;
+    const auto deadline = clock_t_::now() + 10s;
+    while (clock_t_::now() < deadline) {
+        lines = read_committed_lines(out_dir);
+        uniq = std::set<std::string>(lines.begin(), lines.end());
+        if (uniq.size() >= r.expected) {
+            break;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    r.committed = uniq.size();
+    r.dups = lines.size() - uniq.size();
+    // The EOS-timeout surfaced as a whole-job restart (vs the pre-fix swallow).
+    r.restart_observed = file_contains(ckpt_dir / "jm.log", "subtask error -> whole-job restart");
+    r.exactly_once =
+        exited && r.submit_exit == 0 && lines.size() == uniq.size() && r.committed == r.expected;
+    r.ok = r.exactly_once && r.restart_observed;
+
+    kill_quietly(tm);
+    kill_quietly(jm);
+    return r;
+}
+
 }  // namespace
 
 int main() {
@@ -934,7 +1044,28 @@ int main() {
         std::printf("  SKIPPED (set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET to run)\n");
     }
 
-    const bool ok = cold_ok == kIters && f.ok && remote_ok && seq_file.ok && seq_remote_ok;
+    // ---- no-crash end-of-stream final-checkpoint TIMEOUT -> recovery ----
+    // The one path the failover legs cannot reach (they all crash a TM): a
+    // source's EOS final checkpoint stalls while the JM stays alive. It must
+    // surface as a whole-job restart + replay, recovering exactly-once, NOT
+    // silently complete with an uncommitted tail. Runs last so its test hooks
+    // never leak to the other legs. Local-only (no S3 needed).
+    std::printf("\n---- end-of-stream final-checkpoint timeout (no crash) ----\n");
+    const auto eos = eos_timeout_recovery(node, submit, job_so);
+    std::printf(
+        "  committed=%zu/%zu dups=%zu submit_exit=%d whole_job_restart=%s exactly_once=%s\n",
+        eos.committed,
+        eos.expected,
+        eos.dups,
+        eos.submit_exit,
+        eos.restart_observed ? "yes" : "NO",
+        eos.exactly_once ? "yes" : "NO");
+    std::printf(
+        "  (the stalled final checkpoint timed out -> the source threw -> the JM rolled\n"
+        "   the whole job back to the last checkpoint and replayed, recovering the tail)\n");
+
+    const bool ok =
+        cold_ok == kIters && f.ok && remote_ok && seq_file.ok && seq_remote_ok && eos.ok;
     std::printf("\n==== %s ====\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

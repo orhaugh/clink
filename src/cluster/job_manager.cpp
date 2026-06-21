@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -2663,6 +2664,9 @@ void JobManager::handle_subtask_finished_(MessageReader& r) {
     JobId job_id = msg.job_id;
     std::shared_ptr<JobState> job_to_signal;
     std::vector<PendingDeploy> restart_deploys;
+    // CancelJob frames to drain still-running subtasks when a subtask error
+    // triggers a whole-job restart of a checkpointed job; sent outside mu_.
+    std::vector<std::pair<network::Connection*, JobId>> error_restart_cancels;
     {
         std::lock_guard lock(mu_);
         auto job_it = jobs_.find(job_id);
@@ -2701,7 +2705,12 @@ void JobManager::handle_subtask_finished_(MessageReader& r) {
             }
         }
 
-        if (msg.had_error && cfg_.max_restarts > 0) {
+        // Per-subtask retry is the best-effort path for NON-checkpointed jobs
+        // only. A checkpointed job recovers consistently by rolling the WHOLE
+        // job back to its last checkpoint + replaying (the branch below), so a
+        // per-subtask redeploy (which leaves the other subtasks un-rolled-back)
+        // would break exactly-once - skip it when there is a checkpoint dir.
+        if (msg.had_error && cfg_.max_restarts > 0 && job.checkpoint.checkpoint_dir.empty()) {
             const int attempts = ++job.attempt_counts[key];
             if (attempts <= cfg_.max_restarts) {
                 auto rec_it = job.task_records.find(key);
@@ -2759,6 +2768,77 @@ void JobManager::handle_subtask_finished_(MessageReader& r) {
             if (ready_for_restart) {
                 restart_deploys = restart_job_locked_(job);
             }
+        } else if (!retry && msg.had_error && !job.completion_signalled && !job.cancel_requested &&
+                   !job.checkpoint.checkpoint_dir.empty() &&
+                   job.restart_attempts < job.checkpoint.max_restarts_on_tm_loss) {
+            // Checkpointed job + restart budget: a subtask error (e.g. a
+            // source's EOS final-checkpoint timeout that threw) rolls the WHOLE
+            // job back to its last completed checkpoint and replays - exactly as
+            // a TM loss does - rather than failing. Mirrors mark_tm_lost_locked_:
+            // the failed subtask already finished, so it goes into restart_pending
+            // (redeploy); the other in-flight subtasks drain via CancelJob
+            // (restart_drain_expected) and are redeployed too. Gated on the same
+            // max_restarts_on_tm_loss budget as TM-loss recovery.
+            auto pending_it = job.pending_per_tm.find(msg.tm_id);
+            if (pending_it != job.pending_per_tm.end()) {
+                std::erase_if(pending_it->second, [&](const auto& p) {
+                    return p.first == msg.role && p.second == msg.subtask_idx;
+                });
+            }
+            auto tm_it = registered_.find(msg.tm_id);
+            if (tm_it != registered_.end() && tm_it->second->slots_in_use > 0) {
+                --tm_it->second->slots_in_use;
+                metrics::jm::slots_in_use_delta(-1);
+            }
+            job.awaiting_restart = true;
+            job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
+            // Drain the still-IN-FLIGHT subtasks (pending_per_tm, after removing
+            // the just-failed one above), and redeploy EVERY subtask of the job
+            // (tasks_by_tm) - including the failed one and any that ALREADY
+            // FINISHED. A bounded job re-runs its whole topology from the last
+            // checkpoint, so finished subtasks (e.g. a sink that exited at EOS
+            // before the source's final-checkpoint timed out) must redeploy too;
+            // redeploying only the in-flight + failed ones would orphan them.
+            std::unordered_set<std::string> in_flight;
+            for (const auto& [other_tm, pending] : job.pending_per_tm) {
+                for (const auto& [role, sub] : pending) {
+                    in_flight.insert(role + ":" + std::to_string(sub));
+                }
+            }
+            job.restart_drain_expected = in_flight;
+            for (const auto& [other_tm, dts] : job.tasks_by_tm) {
+                for (const auto& dt : dts) {
+                    const std::string k = dt.role + ":" + std::to_string(dt.subtask_idx);
+                    if (in_flight.count(k) == 0) {
+                        job.restart_pending.emplace_back(dt.role, dt.subtask_idx);
+                    }
+                }
+            }
+            job.completed_count = 0;  // belongs to the failed attempt
+            job.errors.clear();
+            log::warn("jm.restart",
+                      "job_id=" + std::to_string(job.id) + " subtask error -> whole-job restart" +
+                          " (attempt " + std::to_string(job.restart_attempts + 1) + "/" +
+                          std::to_string(job.checkpoint.max_restarts_on_tm_loss) +
+                          ") drain_expected=" + std::to_string(job.restart_drain_expected.size()) +
+                          " cause=" + msg.error_message);
+            if (job.restart_drain_expected.empty()) {
+                // No in-flight subtasks (all finished, e.g. a bounded job whose
+                // sink exited before the source timed out): redeploy now. Do NOT
+                // broadcast CancelJob - there is nothing to drain, and a cancel
+                // would race the just-redeployed subtasks.
+                restart_deploys = restart_job_locked_(job);
+            } else {
+                // Cancel the in-flight subtasks so they drain; when all have
+                // reported (the awaiting_restart branch above), restart_job_locked_
+                // redeploys the whole job from the last checkpoint.
+                for (const auto& [tm_id2, _] : job.tasks_by_tm) {
+                    auto cit = registered_.find(tm_id2);
+                    if (cit != registered_.end() && !cit->second->lost && cit->second->conn) {
+                        error_restart_cancels.emplace_back(cit->second->conn.get(), job_id);
+                    }
+                }
+            }
         } else if (!retry) {
             ++job.completed_count;
             if (msg.had_error) {
@@ -2789,6 +2869,16 @@ void JobManager::handle_subtask_finished_(MessageReader& r) {
     for (auto& d : restart_deploys) {
         if (d.conn)
             send_frame(*d.conn, d.frame);
+    }
+    // Drain the still-running subtasks of a checkpointed job we just put into
+    // awaiting_restart (their SubtaskFinished arrivals count toward the drain,
+    // then restart_job_locked_ redeploys from the last checkpoint).
+    for (const auto& [conn, jid] : error_restart_cancels) {
+        if (conn) {
+            CancelJobMsg cj;
+            cj.job_id = jid;
+            send_frame(*conn, encode_frame(MessageKind::CancelJob, cj));
+        }
     }
 
     if (retry && target_conn && target_conn->conn) {
@@ -3091,6 +3181,26 @@ void JobManager::handle_subtask_checkpointed_(MessageReader& r) {
         auto ckpt_it = job.pending_checkpoint_acks.find(msg.checkpoint_id);
         if (ckpt_it == job.pending_checkpoint_acks.end()) {
             return;  // unknown / superseded checkpoint
+        }
+        // Test-only fault injection (env-gated, default off): drop the FIRST ack
+        // for a job's first FINAL checkpoint, once, so its pending set never
+        // empties and the source hits the no-crash EOS-timeout path (its
+        // wait_final_committed times out -> it throws -> watchdog restarts). The
+        // restart assigns a fresh final id (final_checkpoint_id is cleared on
+        // restart; the once-flag is not) so the replay's final checkpoint commits
+        // normally. Used by the failover bench's eos_timeout_recovery leg.
+        static const bool kTestStallFirstFinal =
+            std::getenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT") != nullptr;
+        if (kTestStallFirstFinal && job.final_checkpoint_id.has_value() &&
+            msg.checkpoint_id == *job.final_checkpoint_id) {
+            const auto fid = *job.final_checkpoint_id;
+            if (!job.test_stalled_final_id.has_value()) {
+                job.test_stalled_final_id = fid;  // bind the stall to the FIRST final id
+                job.test_stall_key = key;         // and the first subtask that acks it
+            }
+            if (job.test_stalled_final_id == fid && key == job.test_stall_key) {
+                return;  // drop EVERY ack for this (key, final id) -> never completes
+            }
         }
         ckpt_it->second.erase(key);
 

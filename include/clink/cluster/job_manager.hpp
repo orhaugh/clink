@@ -619,6 +619,18 @@ private:
         // EOS re-requests a fresh id seeded from the post-restart task set.
         std::optional<std::uint64_t> final_checkpoint_id;
         std::unordered_set<std::string> sources_requested_final;
+        // Test-only (CLINK_TEST_STALL_FIRST_FINAL_CKPT): force the no-crash
+        // EOS-timeout path. On the FIRST final checkpoint, the JM picks the
+        // first subtask that acks it (test_stall_key) and drops EVERY ack for
+        // that (key, id) pair, so its pending entry never clears and the final
+        // checkpoint never completes -> the source's wait_final_committed times
+        // out -> it throws. Dropping ALL acks for the key (not just one) is
+        // required because the source subtask acks its key twice (source drain +
+        // owner snapshot). Bound to the first final id only (test_stalled_final_id),
+        // and NOT cleared on restart, so the replay's NEW final id completes
+        // normally. Both default-empty in production (env unset).
+        std::optional<std::uint64_t> test_stalled_final_id;
+        std::string test_stall_key;
 
         // Phase 30b: commit-group memberships derived from the job's
         // sink operator params at submit time. group_name -> ordered
