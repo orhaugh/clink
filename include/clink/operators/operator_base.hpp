@@ -272,6 +272,17 @@ public:
     // enabling for a remote/disaggregated backend where a round-trip is costly.
     [[nodiscard]] virtual bool coalesce_reads() const noexcept { return false; }
 
+    // ASYNC-12 opt-in: when true (and supports_async() + the backend defers
+    // reads), the runner flips its AsyncExecutionController to
+    // ResumeOrder::Priority and wires the backend's deadline-aware hand-back, so
+    // a poll's ready completions resume in ascending order_key (most urgent
+    // first). The operator tags each record's read via get_async(k, order_key)
+    // (lower = sooner; e.g. a deadline in ms). Default false: completions resume
+    // in arrival order (the byte-identical FIFO path). Independent of
+    // coalesce_reads (the coalescer batches everything into one round-trip, so
+    // intra-batch deadline ordering does not apply); an operator picks one.
+    [[nodiscard]] virtual bool deadline_aware() const noexcept { return false; }
+
     // True iff this operator's on_event_time_timer / on_processing_time_timer
     // callbacks read or write keyed state (the ProcessFunction adapter does;
     // window/CEP operators touch state via on_watermark, not timer virtuals, so
@@ -833,6 +844,13 @@ public:
     // backend in a CoalescingBackend so a process_async1/2 batch's per-record
     // get_async calls collapse into one get_many_async. Default false.
     [[nodiscard]] virtual bool coalesce_reads() const noexcept { return false; }
+
+    // ASYNC-12 opt-in (mirrors Operator<In,Out>::deadline_aware): when true (and
+    // supports_async() + a deferring backend), the co-op runner flips its
+    // controller to ResumeOrder::Priority and wires the deadline-aware hand-back,
+    // so process_async1/2 reads tagged via get_async(k, order_key) resume most
+    // urgent first. Default false (FIFO). Independent of coalesce_reads.
+    [[nodiscard]] virtual bool deadline_aware() const noexcept { return false; }
 
     // Timer-kind flags (see Operator<In,Out>): the co-op async runner gates
     // processing-time timers through the per-key gate and fires event-time

@@ -492,6 +492,21 @@ public:
                     aec->set_flush_hook(
                         [b = ctx.state_backend()] { return b->flush_pending_reads(); });
                 }
+                // ASYNC-12: deadline-aware resume. When the operator tags its
+                // reads with order_keys (get_async(k, order_key)), flip the
+                // controller to Priority and wire the order_key-carrying
+                // hand-back, so a poll's ready completions resume most-urgent
+                // first. Off (default) leaves the byte-identical FIFO path.
+                if (op->deadline_aware()) {
+                    aec->set_resume_order(AsyncExecutionController::ResumeOrder::Priority);
+                    ctx.state_backend()->set_deadline_resume_scheduler(
+                        [wk = std::weak_ptr<AsyncExecutionController>(aec)](
+                            std::coroutine_handle<> h, std::uint64_t ok) {
+                            if (auto sp = wk.lock()) {
+                                sp->schedule_resume(h, ok);
+                            }
+                        });
+                }
             }
             auto* timers = ctx.timer_service();
             // Drive timers through the op-level virtuals so chained
@@ -698,6 +713,7 @@ public:
             // dangling controller.
             if (async_mode && ctx.has_state_backend()) {
                 ctx.state_backend()->set_async_resume_scheduler({});
+                ctx.state_backend()->set_deadline_resume_scheduler({});  // ASYNC-12
             }
             op->close();
             op->attach_runtime(nullptr);
@@ -2597,6 +2613,19 @@ public:
                     aec->set_flush_hook(
                         [b = ctx.state_backend()] { return b->flush_pending_reads(); });
                 }
+                // ASYNC-12: deadline-aware resume (mirrors the single-input
+                // runner). process_async1/2 reads tagged via get_async(k,
+                // order_key) resume most-urgent-first; off leaves FIFO.
+                if (op->deadline_aware()) {
+                    aec->set_resume_order(AsyncExecutionController::ResumeOrder::Priority);
+                    ctx.state_backend()->set_deadline_resume_scheduler(
+                        [wk = std::weak_ptr<AsyncExecutionController>(aec)](
+                            std::coroutine_handle<> h, std::uint64_t ok) {
+                            if (auto sp = wk.lock()) {
+                                sp->schedule_resume(h, ok);
+                            }
+                        });
+                }
             }
             // Per-subtask async snapshot worker (FileBacked + disk-backed
             // changelog). Same contract as the single-input runner: capture
@@ -2926,6 +2955,7 @@ public:
             // controller (mirrors the single-input runner).
             if (async_mode && ctx.has_state_backend()) {
                 ctx.state_backend()->set_async_resume_scheduler({});
+                ctx.state_backend()->set_deadline_resume_scheduler({});  // ASYNC-12
             }
             op->close();
             op->attach_runtime(nullptr);

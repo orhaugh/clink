@@ -145,6 +145,13 @@ public:
         resume_scheduler_ = std::move(s);
     }
 
+    // Deadline-aware hand-back (ASYNC-12 consumer), wired alongside the plain
+    // scheduler when the operator opts into deadline-aware resume. When set,
+    // post_resume_ uses it so the cold-load completion carries its order_key.
+    void set_deadline_resume_scheduler(DeadlineResumeScheduler s) override {
+        deadline_scheduler_ = std::move(s);
+    }
+
     // --- sync StateBackend surface ---
 
     void put(OperatorId op, KeyView key, ValueView value) override {
@@ -278,7 +285,19 @@ public:
 
     [[nodiscard]] bool supports_async_get() const noexcept override { return true; }
 
+    // The 2-arg path is the deadline-aware body with an unset (0) order_key.
     async::Task<std::optional<Value>> get_async(OperatorId op, KeyView key) const override {
+        return get_async(op, key, 0);
+    }
+
+    // Deadline-aware read (ASYNC-12 consumer): identical to the 2-arg path
+    // except the cold-load awaiter carries `order_key` to its completion
+    // hand-back, so a poll's ready batch resumes most-urgent-first under
+    // ResumeOrder::Priority. order_key is inert on the hot-hit / inline-fallback
+    // paths (no suspension to reorder).
+    async::Task<std::optional<Value>> get_async(OperatorId op,
+                                                KeyView key,
+                                                std::uint64_t order_key) const override {
         std::string owned(key);  // own the bytes across the suspension
         {
             std::lock_guard<std::mutex> lk(sync_mu_);
@@ -305,7 +324,7 @@ public:
         }
         // Cold key + wired runner: suspend, load on an IO thread, resume on the
         // runner. await_resume (on the runner) does the write-through.
-        co_return co_await RemoteLoad{this, op, std::move(owned)};
+        co_return co_await RemoteLoad{this, op, std::move(owned), order_key};
     }
 
     // Batched read (ASYNC-10): serve hot hits immediately, then fetch ALL cold
@@ -382,13 +401,14 @@ private:
         const RemoteReadBackend* self;
         OperatorId op;
         std::string key;
-        std::optional<Value> value;
+        std::uint64_t order_key{0};  // ASYNC-12 resume priority (0 = unset/FIFO)
+        std::optional<Value> value{};
 
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> h) {
             self->executor_->submit_blocking([this, h]() {
                 value = self->timed_remote_load_(op, key);  // BLOCKING remote read, executor thread
-                self->resume_scheduler_(h);                 // hand back to the runner thread
+                self->post_resume_(h, order_key);           // hand back to the runner thread
             });
         }
         std::optional<Value> await_resume() {
@@ -416,7 +436,7 @@ private:
         void await_suspend(std::coroutine_handle<> h) {
             self->executor_->submit_blocking([this, h]() {
                 values = self->batch_remote_load_(op, keys);  // batched read, executor thread
-                self->resume_scheduler_(h);                   // hand back to the runner thread
+                self->post_resume_(h, 0);  // hand back to the runner thread (FIFO)
             });
         }
         std::vector<std::optional<Value>> await_resume() {
@@ -589,8 +609,21 @@ private:
         }
     }
 
+    // Hand a completed cold read back to the runner. Prefers the deadline-aware
+    // scheduler (carries order_key) when wired; otherwise the plain one (FIFO).
+    // Called on the IO/executor thread, after the load, exactly like the old
+    // direct resume_scheduler_(h) call.
+    void post_resume_(std::coroutine_handle<> h, std::uint64_t order_key) const {
+        if (deadline_scheduler_) {
+            deadline_scheduler_(h, order_key);
+        } else if (resume_scheduler_) {
+            resume_scheduler_(h);
+        }
+    }
+
     RemoteLoader loader_;
     ResumeScheduler resume_scheduler_;
+    DeadlineResumeScheduler deadline_scheduler_;  // ASYNC-12: order_key-carrying hand-back
     // Guards the mutable working set (hot_, dirty_, deleted_, and the LRU
     // bookkeeping lru_/index_/hot_bytes_). A single backend instance is SHARED
     // by every runner of a fused subtask, so the state WRITER and the checkpoint

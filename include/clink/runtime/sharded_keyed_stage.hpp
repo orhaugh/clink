@@ -440,6 +440,20 @@ private:
                     aec->set_flush_hook(
                         [b = sh.ctx->state_backend()] { return b->flush_pending_reads(); });
                 }
+                // ASYNC-12: deadline-aware resume for this shard (mirrors the
+                // single-input / co-op runners). Wired on the inner backend (the
+                // CoalescingBackend forwards it through), same as the resume
+                // scheduler above.
+                if (async_io && sh.op->deadline_aware()) {
+                    aec->set_resume_order(AsyncExecutionController::ResumeOrder::Priority);
+                    sh.backend->set_deadline_resume_scheduler(
+                        [wk = std::weak_ptr<AsyncExecutionController>(aec)](
+                            std::coroutine_handle<> h, std::uint64_t ok) {
+                            if (auto sp = wk.lock()) {
+                                sp->schedule_resume(h, ok);
+                            }
+                        });
+                }
             }
             // Clear the backend's resume scheduler before `aec` is destroyed on
             // ANY exit path (declared after aec, so its dtor runs first - even
@@ -451,6 +465,7 @@ private:
                 ~SchedulerClearGuard() {
                     if (active) {
                         backend->set_async_resume_scheduler({});
+                        backend->set_deadline_resume_scheduler({});  // ASYNC-12
                     }
                 }
             } scheduler_clear_guard{sh.backend.get(), async_io};

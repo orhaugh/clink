@@ -97,6 +97,21 @@ public:
         co_return get(op, key);
     }
 
+    // Deadline-aware read (ASYNC-12 consumer): the twin of get_async that tags
+    // the read with an `order_key` (lower = more urgent; e.g. a deadline in ms).
+    // A deferring backend carries the tag from suspend (runner thread) through
+    // to its completion hand-back, posting it as the schedule_resume order_key
+    // so that - under AsyncExecutionController::ResumeOrder::Priority - a poll's
+    // ready batch resumes the most urgent records first. The base default DROPS
+    // the tag and serves the plain get_async, so a backend that does not reorder
+    // (including every test double that overrides only the 2-arg get_async) is
+    // unaffected and behaves FIFO. order_key 0 is byte-identical to get_async.
+    virtual async::Task<std::optional<Value>> get_async(OperatorId op,
+                                                        KeyView key,
+                                                        std::uint64_t /*order_key*/) const {
+        return get_async(op, key);
+    }
+
     // Batched non-blocking read (ASYNC-10): yields one optional<Value> per
     // input key, positionally. The base default loops get_async, so every
     // backend is correct unchanged. A remote/disaggregated backend overrides
@@ -130,6 +145,19 @@ public:
     // teardown before the controller is destroyed.
     using AsyncResumeScheduler = std::function<void(std::coroutine_handle<>)>;
     virtual void set_async_resume_scheduler(AsyncResumeScheduler /*schedule*/) {}
+
+    // Deadline-aware completion hand-back (ASYNC-12 consumer). Wired by the
+    // runner ALONGSIDE set_async_resume_scheduler only when the operator opts
+    // into deadline-aware resume (Operator::deadline_aware()); the runner also
+    // flips the controller to ResumeOrder::Priority. A deferring backend that
+    // honours read deadlines posts a completion through this (handle + the
+    // order_key the read was tagged with) instead of the plain scheduler, so
+    // schedule_resume carries the order_key. The default is a no-op: a backend
+    // that does not reorder (or an operator that did not opt in) never has this
+    // set and uses the plain scheduler. Same lifetime contract as the plain
+    // scheduler: set once at wire-up, cleared ({}) at teardown.
+    using DeadlineResumeScheduler = std::function<void(std::coroutine_handle<>, std::uint64_t)>;
+    virtual void set_deadline_resume_scheduler(DeadlineResumeScheduler /*schedule*/) {}
 
     // ASYNC-10 coalescing hook. A read-coalescing decorator (CoalescingBackend)
     // accumulates get_async reads into a pending batch instead of issuing them;

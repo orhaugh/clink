@@ -92,6 +92,14 @@ public:
     void set_async_resume_scheduler(AsyncResumeScheduler s) override {
         inner_->set_async_resume_scheduler(std::move(s));
     }
+    // Forward the deadline-aware hand-back to the inner backend too. Note the
+    // coalesced path resumes parked records INLINE via flush()'s FlushTask (not
+    // schedule_resume), so the order_key is inert when coalescing is active; the
+    // forward keeps the seam complete (an op that opts into deadlines without
+    // coalescing reads through the inner backend directly).
+    void set_deadline_resume_scheduler(DeadlineResumeScheduler s) override {
+        inner_->set_deadline_resume_scheduler(std::move(s));
+    }
 
     // The runner's flush hook (and its post-process_async call) route here.
     bool flush_pending_reads() override { return flush(); }

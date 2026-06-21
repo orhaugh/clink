@@ -181,6 +181,17 @@ public:
         co_return decode_one_(key_str, co_await backend_->get_async(op_, key_str));
     }
 
+    // Deadline-aware twin of get_async (ASYNC-12 consumer). `order_key` tags the
+    // read with its urgency (lower = sooner; e.g. a deadline in ms): a deferring
+    // backend carries the tag to its completion hand-back so that, when the
+    // operator opted into deadline-aware resume, a poll's ready completions
+    // resume most-urgent-first. order_key 0 is byte-identical to get_async(k).
+    // Same lifetime + owned-bytes contract as get_async.
+    async::Task<std::optional<V>> get_async(K k, std::uint64_t order_key) const {
+        const std::string key_str = encode_key(k);
+        co_return decode_one_(key_str, co_await backend_->get_async(op_, key_str, order_key));
+    }
+
     // Batched non-blocking read (ASYNC-10): the typed twin of get_async over a
     // batch of keys. Encodes every key, issues ONE backend get_many_async (a
     // remote backend coalesces it into one batched fetch + single suspension),

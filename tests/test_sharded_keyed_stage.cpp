@@ -1660,6 +1660,111 @@ private:
     std::optional<KeyedState<std::int64_t, std::int64_t>> state_;
 };
 
+// Defers every read and releases the whole parked set together once `release_at`
+// reads are outstanding (so all completions land in one controller poll), the
+// condition under which deadline ordering is observable. The deadline-aware path
+// carries the operator's order_key, which the release posts through the deadline
+// scheduler. Used by the sharded deadline-resume parity test.
+class ShardDeadlineParkingBackend final : public StateBackend {
+public:
+    explicit ShardDeadlineParkingBackend(std::size_t release_at) : release_at_(release_at) {}
+    void put(OperatorId op, KeyView key, ValueView value) override { store_.put(op, key, value); }
+    std::optional<Value> get(OperatorId op, KeyView key) const override {
+        return store_.get(op, key);
+    }
+    void erase(OperatorId op, KeyView key) override { store_.erase(op, key); }
+    void scan(OperatorId op, const ScanVisitor& visit) const override { store_.scan(op, visit); }
+    Snapshot snapshot(CheckpointId id) override { return store_.snapshot(id); }
+    void restore(const Snapshot& snap, const KeyGroupRange& kg = {}) override {
+        store_.restore(snap, kg);
+    }
+    [[nodiscard]] std::string description() const override { return "shard-deadline-parking"; }
+    [[nodiscard]] bool supports_async_get() const noexcept override { return true; }
+    void set_async_resume_scheduler(AsyncResumeScheduler s) override { plain_ = std::move(s); }
+    void set_deadline_resume_scheduler(DeadlineResumeScheduler s) override {
+        deadline_ = std::move(s);
+    }
+    async::Task<std::optional<Value>> get_async(OperatorId op, KeyView key) const override {
+        co_return co_await Park{this, op, std::string(key), 0};
+    }
+    async::Task<std::optional<Value>> get_async(OperatorId op,
+                                                KeyView key,
+                                                std::uint64_t order_key) const override {
+        co_return co_await Park{this, op, std::string(key), order_key};
+    }
+
+private:
+    struct Park {
+        const ShardDeadlineParkingBackend* self;
+        OperatorId op;
+        std::string key;
+        std::uint64_t order_key;
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> h) const { self->park_(h, order_key); }
+        std::optional<Value> await_resume() const { return self->get(op, key); }
+    };
+    void park_(std::coroutine_handle<> h, std::uint64_t order_key) const {
+        std::vector<std::pair<std::coroutine_handle<>, std::uint64_t>> to_release;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            pending_.push_back({h, order_key});
+            if (pending_.size() < release_at_) {
+                return;
+            }
+            to_release.swap(pending_);
+        }
+        for (const auto& [handle, ok] : to_release) {
+            if (deadline_) {
+                deadline_(handle, ok);
+            } else if (plain_) {
+                plain_(handle);
+            }
+        }
+    }
+    InMemoryStateBackend store_;
+    std::size_t release_at_;
+    AsyncResumeScheduler plain_;
+    DeadlineResumeScheduler deadline_;
+    mutable std::mutex mu_;
+    mutable std::vector<std::pair<std::coroutine_handle<>, std::uint64_t>> pending_;
+};
+
+// Deadline-aware sharded operator: tags each key's read with a rank (the
+// deadline), so urgent keys resume first. ranks: k2 < k3 < k1 -> emit [2, 3, 1].
+class DeadlinePriorityShardOp final : public Operator<std::int64_t, std::int64_t> {
+public:
+    void open() override {
+        state_.emplace(this->runtime()->template keyed_state<std::int64_t, std::int64_t>(
+            "dl", int64_codec(), int64_codec()));
+    }
+    void process(const StreamElement<std::int64_t>&, Emitter<std::int64_t>&) override {}
+    [[nodiscard]] bool supports_async() const noexcept override { return true; }
+    [[nodiscard]] bool deadline_aware() const noexcept override { return true; }
+    void process_async(const StreamElement<std::int64_t>& el,
+                       Emitter<std::int64_t>& out,
+                       AsyncExecutionController& aec) override {
+        if (!el.is_data()) {
+            return;
+        }
+        for (const auto& r : el.as_data()) {
+            const auto k = r.value();
+            const std::uint64_t deadline = k == 1 ? 3 : k == 2 ? 1 : 2;
+            auto ks = *state_;
+            aec.submit(std::to_string(k), [ks, k, deadline, &out]() mutable -> async::Task<void> {
+                (void)co_await ks.get_async(k, deadline);  // deadline-tagged read
+                Batch<std::int64_t> b;
+                b.emplace(k);
+                out.emit_data(std::move(b));
+                co_return;
+            });
+        }
+    }
+    std::string name() const override { return "deadline_priority_shard"; }
+
+private:
+    std::optional<KeyedState<std::int64_t, std::int64_t>> state_;
+};
+
 }  // namespace
 
 // With a deferring per-shard backend + an opted-in operator, the records routed
@@ -1699,4 +1804,43 @@ TEST(ShardedKeyedStage, CoalescesShardReadsIntoOneGetMany) {
     EXPECT_EQ(emits.load(), 4);    // every record emitted
     EXPECT_EQ(many->load(), 1);    // one batch -> one get_many on the shard
     EXPECT_EQ(single->load(), 0);  // never the per-key path
+}
+
+// ASYNC-12 parity: a deadline_aware operator on a shard whose reads all park
+// then release together resumes them most-urgent-first (the shard runner flips
+// its controller to Priority and wires the order_key-carrying hand-back on the
+// shard's backend). ranks k2<k3<k1 -> emit order [2, 3, 1], not arrival [1,2,3].
+TEST(ShardedKeyedStage, DeadlineAwareResumesUrgentShardReadsFirst) {
+    ShardedKeyedStage<std::int64_t, std::int64_t>::Options opts;
+    opts.shard_backend_factory = [](std::size_t) -> std::unique_ptr<StateBackend> {
+        return std::make_unique<ShardDeadlineParkingBackend>(/*release_at=*/3);
+    };
+    std::mutex om;
+    std::vector<std::int64_t> emit_order;
+    ShardedKeyedStage<std::int64_t, std::int64_t> stage(
+        /*shards=*/1,
+        OperatorId{8},
+        [](std::size_t) { return std::make_unique<DeadlinePriorityShardOp>(); },
+        int64_key_bytes(),
+        [&](StreamElement<std::int64_t> e) {
+            if (e.is_data()) {
+                std::lock_guard<std::mutex> lk(om);
+                for (const auto& r : e.as_data()) {
+                    emit_order.push_back(r.value());
+                }
+            }
+            return true;
+        },
+        opts);
+    stage.start();
+    Batch<std::int64_t> b;
+    for (std::int64_t k : {1, 2, 3}) {
+        b.emplace(k);
+    }
+    stage.submit(std::move(b));
+    stage.close_input();
+    stage.await();
+
+    EXPECT_EQ(emit_order, (std::vector<std::int64_t>{2, 3, 1}))
+        << "shard reads must resume in ascending-deadline order";
 }
