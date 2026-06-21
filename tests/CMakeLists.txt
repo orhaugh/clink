@@ -56,6 +56,7 @@ add_executable(clink_core_tests
     test_async_lookup_operator.cpp
     test_async_pool_primitives.cpp
     test_io_uring_reactor.cpp
+    test_io_uring_completion_executor.cpp
     test_http_pool_io_uring.cpp
     test_pid_controller.cpp
     test_rescale_coordinator.cpp
