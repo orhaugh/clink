@@ -635,9 +635,18 @@ public:
                         op->process_async(*maybe, emitter, *aec);
                         // ASYNC-10: the whole batch's reads are now parked in the
                         // coalescer; flush them into ONE get_many_async before
-                        // polling (no-op when not coalescing).
+                        // polling. Loop so a record that issues a SECOND
+                        // sequential get_async (resumed inline by a synchronous
+                        // inner backend) gets its follow-on read flushed this
+                        // turn too, rather than waiting for the next trigger;
+                        // each round is one get_many. flush returns false once
+                        // nothing is pending (an async inner leaves its read in
+                        // flight -> false -> the loop ends, completion polled
+                        // later). No-op when not coalescing.
                         if (do_coalesce) {
-                            ctx.state_backend()->flush_pending_reads();
+                            while (ctx.state_backend()->flush_pending_reads()) {
+                                aec->poll();
+                            }
                         }
                         aec->poll();
                     } else if (op->supports_columnar() && maybe->is_data() &&

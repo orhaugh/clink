@@ -471,3 +471,90 @@ TEST(AsyncOperatorRunner, NonCoalescingOperatorIssuesPerKeyReads) {
     EXPECT_EQ(backend->get_async_calls(), 4);  // per-record reads
     EXPECT_EQ(backend->get_many_calls(), 0);
 }
+
+namespace {
+
+// Issues TWO sequential get_async per record (different slots), so a record's
+// SECOND read is a follow-on round after the first resumes. With coalescing +
+// the looped post-process flush, each round is one get_many; both rounds drain
+// within the data turn (not deferred to the EOS drain). Emits has-value counts
+// (0 for empty state) - the point is that both reads resolve + the round count.
+class TwoReadOperator final : public Operator<int, std::int64_t> {
+public:
+    explicit TwoReadOperator(bool coalesce) : coalesce_(coalesce) {}
+
+    void process(const StreamElement<int>& element, Emitter<std::int64_t>& out) override {
+        if (element.is_data()) {
+            Batch<std::int64_t> batch;
+            for (const auto& rec : element.as_data()) {
+                (void)rec;
+                batch.emplace(0);
+            }
+            out.emit_data(std::move(batch));
+        } else if (element.is_watermark()) {
+            this->on_watermark(element.as_watermark(), out);
+        } else {
+            this->on_barrier(element.as_barrier(), out);
+        }
+    }
+
+    [[nodiscard]] bool supports_async() const noexcept override { return true; }
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return coalesce_; }
+
+    void process_async(const StreamElement<int>& element,
+                       Emitter<std::int64_t>& out,
+                       AsyncExecutionController& aec) override {
+        if (!element.is_data()) {
+            return;
+        }
+        for (const auto& rec : element.as_data()) {
+            const std::int64_t key = rec.value();
+            auto kx = this->runtime()->keyed_state<std::int64_t, std::int64_t>(
+                "x", int64_codec(), int64_codec());
+            auto ky = this->runtime()->keyed_state<std::int64_t, std::int64_t>(
+                "y", int64_codec(), int64_codec());
+            aec.submit(std::to_string(key), [kx, ky, key, &out]() mutable -> async::Task<void> {
+                auto a = co_await kx.get_async(key);  // round 1
+                auto b = co_await ky.get_async(key);  // round 2 (follow-on)
+                Batch<std::int64_t> batch;
+                batch.emplace((a.has_value() ? 1 : 0) + (b.has_value() ? 1 : 0));
+                out.emit_data(std::move(batch));
+                co_return;
+            });
+        }
+    }
+
+    std::string name() const override { return "two_read"; }
+
+private:
+    bool coalesce_;
+};
+
+int run_two_read(const std::vector<int>& input, std::shared_ptr<CountingAsyncBackend> backend) {
+    Dag dag;
+    auto src = std::make_shared<VectorSource<int>>(records(input));
+    auto op = std::make_shared<TwoReadOperator>(/*coalesce=*/true);
+    auto sink = std::make_shared<CollectingSink<std::int64_t>>();
+    auto h0 = dag.add_source<int>(src);
+    auto h1 = dag.add_operator<int, std::int64_t>(h0, op);
+    dag.add_sink<std::int64_t>(h1, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return static_cast<int>(sink->collected().size());
+}
+
+}  // namespace
+
+// A record that issues two sequential get_async resolves BOTH (the looped
+// post-process flush drains the follow-on round this turn); each round is one
+// get_many, so a 3-record batch with two read rounds does exactly 2 get_many,
+// never the per-key get_async path.
+TEST(AsyncOperatorRunner, SequentialMultiReadCoalescesEachRound) {
+    auto backend = std::make_shared<CountingAsyncBackend>();
+    const int emitted = run_two_read({1, 2, 3}, backend);
+    EXPECT_EQ(emitted, 3);                     // every record completed (both reads resolved)
+    EXPECT_EQ(backend->get_many_calls(), 2);   // two read rounds, one get_many each
+    EXPECT_EQ(backend->get_async_calls(), 0);  // never the per-key path
+}
