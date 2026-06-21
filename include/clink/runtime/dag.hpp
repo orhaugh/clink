@@ -302,11 +302,13 @@ public:
                             throw std::runtime_error(
                                 "source EOS final checkpoint did not commit within timeout");
                         }
-                    } else {
+                    } else if (!should_stop()) {
                         // In-process / no JM / JM declined: fall back to the local
                         // terminal commit (UINT64_MAX sentinel), unchanged. 2PC
                         // sinks pre-commit + commit the tail locally. No recovery
                         // after end-of-stream on this path (in-process only).
+                        // Skipped on cancel (request returns 0 on a cancel-wake):
+                        // a torn-down job should not commit a terminal.
                         channel->push(StreamElement<T>::barrier(CheckpointBarrier{
                             CheckpointId{std::numeric_limits<std::uint64_t>::max()},
                             /*terminal=*/true,
@@ -3004,11 +3006,12 @@ public:
                                 throw std::runtime_error(
                                     "source EOS final checkpoint did not commit within timeout");
                             }
-                        } else {
+                        } else if (!should_stop()) {
                             // In-process / no JM / JM declined: fall back to the
                             // local terminal commit (UINT64_MAX), mirroring the
                             // single-source runner so a parallel bounded 2PC job
                             // never silently drops its tail on the decline path.
+                            // Skipped on cancel (a torn-down job should not commit).
                             typed_emitter.emit_barrier(CheckpointBarrier{
                                 CheckpointId{std::numeric_limits<std::uint64_t>::max()},
                                 /*terminal=*/true,

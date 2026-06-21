@@ -500,6 +500,10 @@ void TaskManager::reader_loop_() {
                     }
                 }
                 cv_.notify_all();
+                // Wake any source blocked in the EOS final-checkpoint waits so
+                // it observes the flipped cancel token at once (its predicate
+                // checks cancel_token) instead of stalling its 30s wait.
+                final_ckpt_cv_.notify_all();
                 break;
             }
             case MessageKind::StartJob:
@@ -1139,13 +1143,24 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 m.error = std::move(error);
                 send_frame_(encode_frame(MessageKind::SubtaskCheckpointed, m));
             };
+            // Cancel token for this subtask: ORed into the runner's stop
+            // predicate via JobConfig.external_cancel_token (so should_stop()
+            // observes it) AND captured by the EOS final-checkpoint waits below
+            // so a CancelJob/TM-stop wakes a source blocked at EOS promptly
+            // instead of stalling its bounded 30s wait. Registered under mu_ (and
+            // threaded onto rctx) just before the runner starts, lower down.
+            auto cancel_token = std::make_shared<std::atomic<bool>>(false);
             // Bounded-source EOS hooks. request_final_checkpoint asks the JM for
             // a final coordinated checkpoint id and blocks (bounded) for the
             // reply; wait_final_committed blocks (bounded) until this TM observes
             // CommitCheckpoint for that id. Only a real bounded source at clean
-            // EOS invokes these (relays/unbounded sources never do).
-            auto request_final_ckpt =
-                [this, job_id, role = task.role, sub = task.subtask_idx]() -> std::uint64_t {
+            // EOS invokes these (relays/unbounded sources never do). Both waits
+            // also wake on cancel_token / stop_ for prompt teardown.
+            auto request_final_ckpt = [this,
+                                       job_id,
+                                       role = task.role,
+                                       sub = task.subtask_idx,
+                                       cancel_token]() -> std::uint64_t {
                 const std::string key =
                     std::to_string(job_id) + ":" + role + ":" + std::to_string(sub);
                 {
@@ -1162,19 +1177,30 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                     return 0;
                 }
                 std::unique_lock lk(final_ckpt_mu_);
-                final_ckpt_cv_.wait_for(
-                    lk, std::chrono::seconds(30), [&] { return final_assigned_[key].has_value(); });
+                final_ckpt_cv_.wait_for(lk, std::chrono::seconds(30), [&] {
+                    return final_assigned_[key].has_value() ||
+                           cancel_token->load(std::memory_order_acquire) ||
+                           stop_.load(std::memory_order_acquire);
+                });
                 const auto v = final_assigned_[key];
                 final_assigned_.erase(key);
-                return v.value_or(0);
+                return v.value_or(0);  // 0 on cancel/stop -> source skips the commit
             };
-            auto wait_final_committed = [this, job_id](std::uint64_t id,
-                                                       std::chrono::milliseconds timeout) -> bool {
+            auto wait_final_committed = [this, job_id, cancel_token](
+                                            std::uint64_t id,
+                                            std::chrono::milliseconds timeout) -> bool {
                 std::unique_lock lk(final_ckpt_mu_);
-                return final_ckpt_cv_.wait_for(lk, timeout, [&] {
+                final_ckpt_cv_.wait_for(lk, timeout, [&] {
                     auto it = final_committed_high_water_.find(job_id);
-                    return it != final_committed_high_water_.end() && it->second >= id;
+                    return (it != final_committed_high_water_.end() && it->second >= id) ||
+                           cancel_token->load(std::memory_order_acquire) ||
+                           stop_.load(std::memory_order_acquire);
                 });
+                // Return the ACTUAL committed status: a cancel/stop wake returns
+                // false so the source exits cleanly (the runner's !should_stop()
+                // gate suppresses the throw) rather than claiming the tail durable.
+                auto it = final_committed_high_water_.find(job_id);
+                return it != final_committed_high_water_.end() && it->second >= id;
             };
             // Callback the source runner uses to register its barrier
             // injectors with the TM. Multiple subtasks per (job, sub_idx)
@@ -1292,11 +1318,9 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 .register_drain_callbacks = std::move(register_drains),
                 .register_checkpoint_backend = std::move(register_backend),
             };
-            // Cancel token threaded into the runner's LocalExecutor via
-            // make_subtask_job_config. CancelJob handler signals it.
-            // Allocated under mu_ so the handler sees it the moment we
-            // start the runner; cleared in run_task_'s finally block.
-            auto cancel_token = std::make_shared<std::atomic<bool>>(false);
+            // Register the cancel token (created above so the EOS waits could
+            // capture it) under mu_ before the runner starts, so the CancelJob
+            // handler sees it immediately; cleared in run_task_'s finally block.
             {
                 std::lock_guard lock(mu_);
                 per_job_cancel_tokens_[job_id][task.subtask_idx] = cancel_token;
@@ -1727,6 +1751,9 @@ void TaskManager::stop() {
             pt->cv.notify_all();
         }
     }
+    // Wake any source blocked in the EOS final-checkpoint waits (their
+    // predicates check stop_) so the runner threads can be joined promptly.
+    final_ckpt_cv_.notify_all();
     if (conn_) {
         conn_->shutdown_read();
     }
