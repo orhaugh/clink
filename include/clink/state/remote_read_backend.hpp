@@ -308,6 +308,60 @@ public:
         co_return co_await RemoteLoad{this, op, std::move(owned)};
     }
 
+    // Batched read (ASYNC-10): serve hot hits immediately, then fetch ALL cold
+    // misses in ONE batched call with a SINGLE suspension (vs N suspensions +
+    // N round-trips on get_async-per-key). The pool's read_many coalesces
+    // same-content-hash objects into one fetch; write-through of every cold
+    // value happens on the runner thread (await_resume), so the hot tier stays
+    // single-writer. Results scatter back positionally.
+    async::Task<std::vector<std::optional<Value>>> get_many_async(
+        OperatorId op, const std::vector<std::string>& keys) const override {
+        std::vector<std::optional<Value>> out(keys.size());
+        std::vector<std::size_t> cold_idx;
+        std::vector<std::string> cold_keys;
+        {
+            std::lock_guard<std::mutex> lk(sync_mu_);
+            for (std::size_t i = 0; i < keys.size(); ++i) {
+                if (auto v = hot_.get(op, std::string_view{keys[i]})) {
+                    ++hot_hits_;
+                    metrics::disagg::remote_hot_hit();
+                    out[i] = std::move(v);  // hot hit
+                } else if (pool_ && is_deleted_(op, std::string_view{keys[i]})) {
+                    out[i] = std::nullopt;  // erased-but-uncommitted: absent
+                } else {
+                    cold_idx.push_back(i);
+                    cold_keys.push_back(keys[i]);  // own across the suspension
+                }
+            }
+        }
+        if (cold_keys.empty()) {
+            co_return out;  // all hot/deleted: no suspension
+        }
+        if (!resume_scheduler_) {
+            // No runner: inline batched blocking load (lock held only for the
+            // write-through, never the load).
+            auto vals = batch_remote_load_(op, cold_keys);
+            {
+                std::lock_guard<std::mutex> lk(sync_mu_);
+                for (std::size_t j = 0; j < cold_keys.size(); ++j) {
+                    if (vals[j]) {
+                        fill_hot_(op, cold_keys[j], *vals[j]);
+                    }
+                }
+            }
+            for (std::size_t j = 0; j < cold_idx.size(); ++j) {
+                out[cold_idx[j]] = std::move(vals[j]);
+            }
+            co_return out;
+        }
+        // Cold misses + wired runner: ONE batched fetch, ONE suspension.
+        auto vals = co_await RemoteLoadMany{this, op, std::move(cold_keys), {}};
+        for (std::size_t j = 0; j < cold_idx.size(); ++j) {
+            out[cold_idx[j]] = std::move(vals[j]);
+        }
+        co_return out;
+    }
+
     [[nodiscard]] std::uint64_t remote_loads() const noexcept {
         return remote_loads_.load(std::memory_order_relaxed);
     }
@@ -348,6 +402,34 @@ private:
         }
     };
 
+    // Batched awaiter (ASYNC-10): one suspension for the whole cold-key batch.
+    // The executor runs ONE batched remote read (the pool coalesces same-hash
+    // objects), then posts the handle back; await_resume writes every cold
+    // value through on the runner thread and returns them positionally.
+    struct RemoteLoadMany {
+        const RemoteReadBackend* self;
+        OperatorId op;
+        std::vector<std::string> keys;
+        std::vector<std::optional<Value>> values;
+
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> h) {
+            self->executor_->submit_blocking([this, h]() {
+                values = self->batch_remote_load_(op, keys);  // batched read, executor thread
+                self->resume_scheduler_(h);                   // hand back to the runner thread
+            });
+        }
+        std::vector<std::optional<Value>> await_resume() {
+            std::lock_guard<std::mutex> lk(self->sync_mu_);
+            for (std::size_t j = 0; j < keys.size(); ++j) {
+                if (values[j]) {
+                    self->fill_hot_(op, keys[j], *values[j]);
+                }
+            }
+            return std::move(values);
+        }
+    };
+
     // Run the (blocking) remote loader, timing it and recording the disagg
     // remote-load counter + latency histogram (OBS-3). Central so the sync,
     // inline-async, and IO-thread paths all report identically.
@@ -360,6 +442,39 @@ private:
         remote_loads_.fetch_add(1, std::memory_order_relaxed);
         metrics::disagg::remote_load_observe(static_cast<std::uint64_t>(ns));
         return v;
+    }
+
+    // Batched remote read (ASYNC-10): one round-trip class for the whole cold
+    // batch. Pool path uses RemotePool::read_many (the S3 pool coalesces
+    // same-content-hash objects + loads the manifest once); loader-only path
+    // loops the opaque loader (no coalescing possible). Times the WHOLE batch
+    // as one latency observation and counts one logical load per key; the
+    // pool's own object-fetch counter reflects the coalesced GET count. Runs on
+    // an executor thread, so it must be thread-safe (it touches only
+    // pool_/loader_/last_ckpt_, never the sync_mu_-guarded working set).
+    std::vector<std::optional<Value>> batch_remote_load_(
+        OperatorId op, const std::vector<std::string>& keys) const {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::optional<Value>> vals;
+        if (pool_) {
+            const auto ck = last_ckpt_.load(std::memory_order_relaxed);
+            if (ck == 0) {
+                vals.assign(keys.size(), std::nullopt);  // no committed checkpoint: all absent
+            } else {
+                vals = pool_->read_many(CheckpointId{ck}, op, keys);
+            }
+        } else {
+            vals.reserve(keys.size());
+            for (const auto& k : keys) {
+                vals.push_back(loader_(op, k));
+            }
+        }
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        remote_loads_.fetch_add(keys.size(), std::memory_order_relaxed);
+        metrics::disagg::remote_load_observe(static_cast<std::uint64_t>(ns));
+        return vals;
     }
 
     // Write-through of a freshly loaded cold value. The CALLER must hold

@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 #include <arrow/filesystem/s3fs.h>
 #include <gtest/gtest.h>
@@ -99,6 +100,41 @@ TEST(S3RemotePool, RemoteReadBackendIncrementalCommitAndLazyRestoreOverS3) {
     // Best-effort cleanup of this run's checkpoints.
     pool2->purge(CheckpointId{1});
     pool2->purge(CheckpointId{2});
+}
+
+// ASYNC-10: read_many over a content-addressed pool coalesces keys that share a
+// content hash into ONE object GET. k1 and k2 hold identical bytes (same hash),
+// k3 differs, absent is missing -> 3 present keys, but only 2 object GETs.
+TEST(S3RemotePool, ReadManyCoalescesSameContentHashIntoOneGet) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    const std::string prefix = unique_prefix() + "/coalesce";
+    const OperatorId op{9};
+    auto pool = std::make_shared<S3RemotePool>(pool_opts(prefix));
+
+    auto val = [](const char* s) {
+        return StateBackend::Value{
+            reinterpret_cast<const std::byte*>(s),
+            reinterpret_cast<const std::byte*>(s + std::char_traits<char>::length(s))};
+    };
+    std::vector<clink::RemotePoolEntry> changed{
+        {op, "k1", val("same")}, {op, "k2", val("same")}, {op, "k3", val("other")}};
+    pool->commit(CheckpointId{1}, CheckpointId{0}, changed, {});
+
+    const std::uint64_t before = pool->object_gets();
+    auto out = pool->read_many(CheckpointId{1}, op, {"k1", "k2", "k3", "absent"});
+    const std::uint64_t gets = pool->object_gets() - before;
+
+    ASSERT_EQ(out.size(), 4u);
+    EXPECT_EQ(str(out[0]), "same");
+    EXPECT_EQ(str(out[1]), "same");
+    EXPECT_EQ(str(out[2]), "other");
+    EXPECT_FALSE(out[3].has_value());
+    // k1+k2 share a hash -> one GET; k3 -> one GET; absent -> none. 2, not 3.
+    EXPECT_EQ(gets, 2u);
+
+    pool->purge(CheckpointId{1});
 }
 
 // 2c-1: bounded hot tier over real S3. A small byte budget forces eviction of

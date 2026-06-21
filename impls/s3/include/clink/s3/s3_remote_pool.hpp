@@ -109,9 +109,48 @@ public:
             return std::nullopt;
         }
         auto fs = fs_();
+        object_gets_.fetch_add(1, std::memory_order_relaxed);
         const std::string bytes = read_object_(*fs, object_path_(it->second.first));
         return StateBackend::Value{reinterpret_cast<const std::byte*>(bytes.data()),
                                    reinterpret_cast<const std::byte*>(bytes.data() + bytes.size())};
+    }
+
+    // Batched read (ASYNC-10): load the manifest ONCE, then coalesce keys that
+    // map to the same content hash into a SINGLE object GET (distinct keys with
+    // identical bytes share an object - the content-addressed win). Absent keys
+    // yield nullopt. The number of object GETs is the number of DISTINCT hashes
+    // in the batch, not the number of keys.
+    std::vector<std::optional<StateBackend::Value>> read_many(
+        CheckpointId id, OperatorId op, const std::vector<std::string>& keys) const override {
+        const Manifest& m = manifest_for_(id);  // one manifest load (cached)
+        std::vector<std::optional<StateBackend::Value>> out(keys.size());
+        std::map<std::string, StateBackend::Value> by_hash;  // hash -> fetched bytes
+        auto fs = fs_();
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            auto it = m.find({op.value(), keys[i]});
+            if (it == m.end()) {
+                continue;  // absent -> nullopt (default-constructed slot)
+            }
+            const std::string& hash = it->second.first;
+            auto hit = by_hash.find(hash);
+            if (hit == by_hash.end()) {
+                object_gets_.fetch_add(1, std::memory_order_relaxed);  // one GET per distinct hash
+                const std::string bytes = read_object_(*fs, object_path_(hash));
+                StateBackend::Value v{
+                    reinterpret_cast<const std::byte*>(bytes.data()),
+                    reinterpret_cast<const std::byte*>(bytes.data() + bytes.size())};
+                hit = by_hash.emplace(hash, std::move(v)).first;
+            }
+            out[i] = hit->second;  // scatter the (coalesced) object to this key's slot
+        }
+        return out;
+    }
+
+    // Count of value-object GETs (read + read_many). With coalescing, a
+    // read_many over keys sharing a content hash increments this once, not
+    // per key - the observable batching/dedup win. Diagnostic, for tests.
+    [[nodiscard]] std::uint64_t object_gets() const noexcept {
+        return object_gets_.load(std::memory_order_relaxed);
     }
 
     void purge(CheckpointId id) override {
@@ -558,6 +597,7 @@ private:
     mutable std::shared_ptr<arrow::fs::S3FileSystem> fs_cached_;
     mutable std::mutex cache_mu_;
     mutable std::map<std::uint64_t, Manifest> cache_;
+    mutable std::atomic<std::uint64_t> object_gets_{0};  // value-object GETs (ASYNC-10 diag)
     std::atomic<std::uint64_t> objects_reclaimed_{0};
     // Parent subtask prefixes to merge on a rescale restore (set by
     // build_remote_read). Empty = same-parallelism restore (prepare_restore

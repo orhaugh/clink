@@ -97,6 +97,26 @@ public:
         co_return get(op, key);
     }
 
+    // Batched non-blocking read (ASYNC-10): yields one optional<Value> per
+    // input key, positionally. The base default loops get_async, so every
+    // backend is correct unchanged. A remote/disaggregated backend overrides
+    // it to coalesce the COLD misses into ONE batched fetch and a SINGLE
+    // suspension (cutting N remote round-trips toward one, and de-duplicating
+    // identical-content objects), then scatters the results back. Keys are
+    // owned std::strings (not KeyView): a batch must hold every key across the
+    // fetch, so owning the bytes sidesteps the borrowed-view-across-suspension
+    // hazard get_async carries. The caller still owns the `keys` vector for the
+    // duration of the returned Task.
+    virtual async::Task<std::vector<std::optional<Value>>> get_many_async(
+        OperatorId op, const std::vector<std::string>& keys) const {
+        std::vector<std::optional<Value>> out;
+        out.reserve(keys.size());
+        for (const auto& k : keys) {
+            out.push_back(co_await get_async(op, KeyView{k}));
+        }
+        co_return out;
+    }
+
     // Wired by the runner when it routes this backend through the async
     // execution path (it does so iff supports_async_get()). A deferring
     // backend posts a completed async read's suspended coroutine handle to

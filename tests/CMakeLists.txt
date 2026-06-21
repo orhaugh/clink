@@ -113,6 +113,7 @@ add_executable(clink_core_tests
     test_async_state_get.cpp
     test_async_execution_controller.cpp
     test_completion_executor.cpp
+    test_get_many_async.cpp
     test_async_operator_runner.cpp
     test_bounded_channel.cpp
     test_timer_service.cpp

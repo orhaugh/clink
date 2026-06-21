@@ -178,40 +178,28 @@ public:
     // lands, those writes must own their bytes the same way.
     async::Task<std::optional<V>> get_async(K k) const {
         const std::string key_str = encode_key(k);
-        auto v = co_await backend_->get_async(op_, key_str);
-        if (!v.has_value()) {
-            co_return std::nullopt;
+        co_return decode_one_(key_str, co_await backend_->get_async(op_, key_str));
+    }
+
+    // Batched non-blocking read (ASYNC-10): the typed twin of get_async over a
+    // batch of keys. Encodes every key, issues ONE backend get_many_async (a
+    // remote backend coalesces it into one batched fetch + single suspension),
+    // then applies the same TTL decode / lazy-purge / refresh-on-read per
+    // result. Returns one optional<V> per input key, positionally. Same
+    // lifetime contract as get_async: this KeyedState must outlive the Task.
+    async::Task<std::vector<std::optional<V>>> get_many_async(std::vector<K> ks) const {
+        std::vector<std::string> key_strs;
+        key_strs.reserve(ks.size());
+        for (const auto& k : ks) {
+            key_strs.push_back(encode_key(k));
         }
-        if (!ttl_.enabled()) {
-            co_return value_codec_.decode(std::span<const std::byte>{v->data(), v->size()});
+        auto raws = co_await backend_->get_many_async(op_, key_strs);
+        std::vector<std::optional<V>> out;
+        out.reserve(raws.size());
+        for (std::size_t i = 0; i < raws.size() && i < key_strs.size(); ++i) {
+            out.push_back(decode_one_(key_strs[i], std::move(raws[i])));
         }
-        if (v->size() < 8) {
-            co_return std::nullopt;  // truncated; treat as missing
-        }
-        const auto expire_at = read_i64_le_(v->data());
-        if (expire_at <= now_ms_()) {
-            // Lazy purge: synchronous erase; key_str is owned by this frame.
-            backend_->erase(op_, key_str);
-            co_return std::nullopt;
-        }
-        auto decoded =
-            value_codec_.decode(std::span<const std::byte>{v->data() + 8, v->size() - 8});
-        if (!decoded.has_value()) {
-            co_return std::nullopt;
-        }
-        if (ttl_.refresh_on_read) {
-            // Re-put with a refreshed expiry. Only the leading expire_at
-            // advances; the user value bytes are unchanged. `stamped` is a
-            // frame local consumed by the synchronous put below.
-            const auto new_expire_at = now_ms_() + ttl_.ttl.count();
-            std::vector<std::byte> stamped(v->size());
-            write_i64_le_at_(stamped.data(), new_expire_at);
-            std::copy(v->data() + 8, v->data() + v->size(), stamped.data() + 8);
-            const std::string_view value_view(reinterpret_cast<const char*>(stamped.data()),
-                                              stamped.size());
-            backend_->put(op_, key_str, value_view);
-        }
-        co_return std::move(decoded);
+        co_return out;
     }
 
     void erase(const K& k) { backend_->erase(op_, encode_key(k)); }
@@ -264,6 +252,49 @@ public:
     const TtlConfig& ttl_config() const noexcept { return ttl_; }
 
 private:
+    // Apply TTL decode to one raw backend value: nullopt passthrough, no-TTL
+    // decode, or TTL unwrap with lazy-purge (synchronous erase of an expired
+    // entry) and refresh-on-read (synchronous re-put with an advanced expiry).
+    // Synchronous (the TTL writes have no async surface yet) and runs on the
+    // runner thread after the read resumes; key_str must stay owned by the
+    // caller's frame for the (synchronous) erase/put. Shared by get_async and
+    // get_many_async so both have byte-identical TTL semantics.
+    std::optional<V> decode_one_(const std::string& key_str,
+                                 std::optional<StateBackend::Value> v) const {
+        if (!v.has_value()) {
+            return std::nullopt;
+        }
+        if (!ttl_.enabled()) {
+            return value_codec_.decode(std::span<const std::byte>{v->data(), v->size()});
+        }
+        if (v->size() < 8) {
+            return std::nullopt;  // truncated; treat as missing
+        }
+        const auto expire_at = read_i64_le_(v->data());
+        if (expire_at <= now_ms_()) {
+            backend_->erase(op_, key_str);  // lazy purge
+            return std::nullopt;
+        }
+        auto decoded =
+            value_codec_.decode(std::span<const std::byte>{v->data() + 8, v->size() - 8});
+        if (!decoded.has_value()) {
+            return std::nullopt;
+        }
+        if (ttl_.refresh_on_read) {
+            // Re-put with a refreshed expiry; only the leading expire_at
+            // advances, user value bytes unchanged. `stamped` is a frame local
+            // consumed by the synchronous put below.
+            const auto new_expire_at = now_ms_() + ttl_.ttl.count();
+            std::vector<std::byte> stamped(v->size());
+            write_i64_le_at_(stamped.data(), new_expire_at);
+            std::copy(v->data() + 8, v->data() + v->size(), stamped.data() + 8);
+            const std::string_view value_view(reinterpret_cast<const char*>(stamped.data()),
+                                              stamped.size());
+            backend_->put(op_, key_str, value_view);
+        }
+        return decoded;
+    }
+
     // Reject slot names that would break the stored-key layout or the
     // state-version pack format. '|' is the slot/user-key separator in the
     // stored key (see encode_key_into) - a slot name containing '|' would

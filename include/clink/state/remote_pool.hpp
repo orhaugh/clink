@@ -59,6 +59,21 @@ public:
                                                                   OperatorId op,
                                                                   const std::string& key) const = 0;
 
+    // Batched read of many keys as-of `id` (ASYNC-10): one optional per input
+    // key, positionally. The default loops read(); a content-addressed pool
+    // overrides it to load the checkpoint manifest ONCE and coalesce keys whose
+    // values share a content hash into a single object fetch (distinct keys
+    // with identical bytes resolve to the same object). Thread-safe (IO threads).
+    [[nodiscard]] virtual std::vector<std::optional<StateBackend::Value>> read_many(
+        CheckpointId id, OperatorId op, const std::vector<std::string>& keys) const {
+        std::vector<std::optional<StateBackend::Value>> out;
+        out.reserve(keys.size());
+        for (const auto& k : keys) {
+            out.push_back(read(id, op, k));
+        }
+        return out;
+    }
+
     // Drop checkpoint `id`. v1 keeps the retained set small (the coordinator
     // purges superseded checkpoints); a content-addressed pool refcounts
     // shared objects across live checkpoints.
