@@ -287,11 +287,20 @@ public:
                                                                          /*terminal=*/false,
                                                                          source_barrier_mode});
                         drain_pending_barriers();
-                        if (const auto& wait = ctx.wait_final_committed(); wait) {
-                            // Bounded: on timeout the runner returns un-committed
-                            // and the normal restart/fail path takes over (never a
-                            // silent complete-with-lost-tail).
-                            (void)wait(final_id, std::chrono::seconds(30));
+                        const auto& wait = ctx.wait_final_committed();
+                        // The runner's clean return is what emits SubtaskFinished
+                        // and drives job completion, so we must NOT return until
+                        // the final checkpoint is durably committed. If it does
+                        // not commit within the bound (JM unreachable / a sibling
+                        // subtask stuck) AND we are not being cancelled, THROW:
+                        // that surfaces as had_error and drives the watchdog
+                        // restart + replay, instead of silently completing the job
+                        // with an uncommitted tail. On cancel we exit cleanly (the
+                        // job is being torn down, not failed - no spurious restart).
+                        if ((!wait || !wait(final_id, std::chrono::seconds(30))) &&
+                            !should_stop()) {
+                            throw std::runtime_error(
+                                "source EOS final checkpoint did not commit within timeout");
                         }
                     } else {
                         // In-process / no JM / JM declined: fall back to the local
@@ -2978,18 +2987,32 @@ public:
                         if (const auto& req = ctx.request_final_checkpoint(); req) {
                             final_id = req();
                         }
+                        const auto eos_mode = ctx.barrier_mode_override().value_or(
+                            ctx.unaligned_checkpoints() ? CheckpointBarrier::Mode::Unaligned
+                                                        : CheckpointBarrier::Mode::Aligned);
                         if (final_id != 0) {
-                            source->inject_pending_barrier(
-                                CheckpointBarrier{CheckpointId{final_id},
-                                                  /*terminal=*/false,
-                                                  ctx.barrier_mode_override().value_or(
-                                                      ctx.unaligned_checkpoints()
-                                                          ? CheckpointBarrier::Mode::Unaligned
-                                                          : CheckpointBarrier::Mode::Aligned)});
+                            source->inject_pending_barrier(CheckpointBarrier{
+                                CheckpointId{final_id}, /*terminal=*/false, eos_mode});
                             drain_pending_barriers();
-                            if (const auto& wait = ctx.wait_final_committed(); wait) {
-                                (void)wait(final_id, std::chrono::seconds(30));
+                            const auto& wait = ctx.wait_final_committed();
+                            // Same invariant as the single-source runner: do not
+                            // return (and thus complete the job) until the tail is
+                            // durable; throw on timeout (unless cancelled) to drive
+                            // restart + replay rather than silent completion.
+                            if ((!wait || !wait(final_id, std::chrono::seconds(30))) &&
+                                !should_stop()) {
+                                throw std::runtime_error(
+                                    "source EOS final checkpoint did not commit within timeout");
                             }
+                        } else {
+                            // In-process / no JM / JM declined: fall back to the
+                            // local terminal commit (UINT64_MAX), mirroring the
+                            // single-source runner so a parallel bounded 2PC job
+                            // never silently drops its tail on the decline path.
+                            typed_emitter.emit_barrier(CheckpointBarrier{
+                                CheckpointId{std::numeric_limits<std::uint64_t>::max()},
+                                /*terminal=*/true,
+                                eos_mode});
                         }
                     }
                 }

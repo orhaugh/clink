@@ -604,7 +604,12 @@ void TaskManager::handle_final_checkpoint_assigned_(MessageReader& r) {
         std::to_string(msg.job_id) + ":" + msg.role + ":" + std::to_string(msg.subtask_idx);
     {
         std::lock_guard lk(final_ckpt_mu_);
-        final_assigned_[key] = msg.final_checkpoint_id;  // 0 = JM declined
+        // Only fulfil a request that is still waiting; a reply that arrives after
+        // the source already timed out + erased its entry is dropped (no leak).
+        auto it = final_assigned_.find(key);
+        if (it != final_assigned_.end()) {
+            it->second = msg.final_checkpoint_id;  // 0 = JM declined
+        }
     }
     final_ckpt_cv_.notify_all();
 }

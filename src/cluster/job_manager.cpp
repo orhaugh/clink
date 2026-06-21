@@ -3273,6 +3273,14 @@ void JobManager::checkpoint_trigger_loop_() {
                 if (job.completion_signalled) {
                     continue;
                 }
+                // Once a bounded source has reached EOS and the final
+                // checkpoint id is assigned, stop firing periodic checkpoints:
+                // a higher periodic id would otherwise overtake the lower final
+                // id on the wire and stall its barrier alignment (and a bounded
+                // job needs no further periodic checkpoint after its final one).
+                if (job.final_checkpoint_id.has_value()) {
+                    continue;
+                }
                 // Hold off triggering until peer updates have been
                 // resolved. Before that the subtasks are not yet
                 // running, so a barrier would arrive before any source
