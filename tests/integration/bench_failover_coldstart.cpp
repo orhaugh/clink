@@ -259,6 +259,23 @@ std::size_t count_occurrences(const fs::path& path, const std::string& needle) {
     return n;
 }
 
+// True if any single line of `path` contains BOTH needles. Used to assert a
+// specific field on a specific log line (e.g. the whole-job-restart line also
+// carries drain_expected=0), rather than the two substrings appearing anywhere.
+bool line_contains_both(const fs::path& path, const std::string& a, const std::string& b) {
+    std::ifstream in(path);
+    if (!in) {
+        return false;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.find(a) != std::string::npos && line.find(b) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::vector<std::string> read_committed_lines(const fs::path& out_dir) {
     std::vector<std::string> lines;
     const auto committed = out_dir / "committed";
@@ -982,6 +999,123 @@ EosBudgetResult eos_budget_exhaustion(const fs::path& node,
     return r;
 }
 
+struct EosFinishedPeerResult {
+    std::size_t expected{0};
+    std::size_t committed{0};
+    std::size_t dups{0};
+    int submit_exit{-1};
+    bool finished_peer_path{false};  // restart fired with drain_expected=0
+    bool exactly_once{false};
+    bool ok{false};
+};
+
+// FINISHED-PEER redeploy, exercised DETERMINISTICALLY. The whole-job restart on
+// a subtask error has two sub-cases: drain_expected>0 (a peer is still in
+// flight, so it is cancelled + drained before redeploy) and drain_expected=0 (a
+// peer already FINISHED, so restart_pending - built from tasks_by_tm minus
+// in_flight - must re-add it, else it is orphaned). The eos_timeout_recovery leg
+// hits whichever the source-error-vs-sink-finish race lands on (~1/3 the
+// finished-peer one), so the finished-peer redeploy can silently rot. Here
+// CLINK_TEST_DELAY_ERROR_FINISH_MS delays the failed source's SubtaskFinished so
+// the cleanly-finishing 2PC sink always reports FIRST -> drain_expected=0 every
+// run. Asserts the restart line carries drain_expected=0 (the finished-peer
+// path was taken) AND recovery is exactly-once (the finished peer was redeployed
+// and re-committed the tail - no orphan, no loss). No TM is killed.
+EosFinishedPeerResult eos_finished_peer_recovery(const fs::path& node,
+                                                 const fs::path& submit,
+                                                 const fs::path& job_so) {
+    EosFinishedPeerResult r;
+    const int total = 300;
+    r.expected = static_cast<std::size_t>(total);
+
+    ScopedDirs scratch;
+    const auto ckpt_dir = mktmpdir("eosfp_ckpt");
+    const auto out_dir = mktmpdir("eosfp_out");
+    scratch.add(ckpt_dir);
+    scratch.add(out_dir);
+    ::setenv("CLINK_2PC_OUT_DIR", out_dir.c_str(), 1);
+    ::setenv("CLINK_2PC_TOTAL", std::to_string(total).c_str(), 1);
+    ::setenv("CLINK_2PC_TICK_MS", "15", 1);
+    ::setenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS", "3000", 1);
+    ::setenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT", "1", 1);
+    // Tip the source-error-vs-sink-finish race so the sink reports first: the
+    // failed source holds its SubtaskFinished for 1.5s, well past the sink's
+    // clean EOF + finish, forcing the drain_expected=0 (finished-peer) sub-case.
+    ::setenv("CLINK_TEST_DELAY_ERROR_FINISH_MS", "1500", 1);
+
+    const auto port = probe_free_port();
+    const pid_t jm = spawn_logged({"clink_node",
+                                   "--role=jm",
+                                   "--port=" + std::to_string(port),
+                                   "--bind-host=127.0.0.1",
+                                   "--heartbeat-timeout-ms=1000",
+                                   "--watchdog-interval-ms=50"},
+                                  node,
+                                  ckpt_dir / "jm.log");
+    auto cleanup_env = [] {
+        ::unsetenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT");
+        ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
+        ::unsetenv("CLINK_TEST_DELAY_ERROR_FINISH_MS");
+    };
+    if (jm <= 0 || await_port_open(port, 5s) < 0) {
+        kill_quietly(jm);
+        cleanup_env();
+        return r;
+    }
+    const pid_t tm = spawn_logged({"clink_node",
+                                   "--role=tm",
+                                   "--id=tm-0",
+                                   "--jm-host=127.0.0.1",
+                                   "--jm-port=" + std::to_string(port),
+                                   "--slots=4"},
+                                  node,
+                                  ckpt_dir / "tm0.log");
+    if (tm <= 0 ||
+        await_log_contains(ckpt_dir / "tm0.log", "registered", clock_t_::now(), 5s) < 0) {
+        kill_quietly(tm);
+        kill_quietly(jm);
+        cleanup_env();
+        return r;
+    }
+    const pid_t sub = spawn_logged({"clink_submit_job",
+                                    "--job=" + job_so.string(),
+                                    "--jm-host=127.0.0.1",
+                                    "--jm-port=" + std::to_string(port),
+                                    "--wait-timeout-s=90",
+                                    "--checkpoint-dir=" + ckpt_dir.string(),
+                                    "--checkpoint-interval-ms=150",
+                                    "--max-restarts-on-tm-loss=3"},
+                                   submit,
+                                   ckpt_dir / "submit.log");
+    cleanup_env();  // hooks are now in the children's env; clear ours
+    const bool exited = (sub > 0) && wait_for_exit(sub, 95s, &r.submit_exit);
+
+    std::vector<std::string> lines;
+    std::set<std::string> uniq;
+    const auto deadline = clock_t_::now() + 10s;
+    while (clock_t_::now() < deadline) {
+        lines = read_committed_lines(out_dir);
+        uniq = std::set<std::string>(lines.begin(), lines.end());
+        if (uniq.size() >= r.expected) {
+            break;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    r.committed = uniq.size();
+    r.dups = lines.size() - uniq.size();
+    // The restart fired specifically as the finished-peer (drain_expected=0)
+    // sub-case: the peer had already finished, so restart_pending re-added it.
+    r.finished_peer_path =
+        line_contains_both(ckpt_dir / "jm.log", "whole-job restart", "drain_expected=0");
+    r.exactly_once =
+        exited && r.submit_exit == 0 && lines.size() == uniq.size() && r.committed == r.expected;
+    r.ok = r.exactly_once && r.finished_peer_path;
+
+    kill_quietly(tm);
+    kill_quietly(jm);
+    return r;
+}
+
 }  // namespace
 
 int main() {
@@ -1181,8 +1315,28 @@ int main() {
         "  (a permanently-stalling final checkpoint restarts the whole job exactly\n"
         "   budget times, then fails loudly - the recovery loop is bounded)\n");
 
-    const bool ok =
-        cold_ok == kIters && f.ok && remote_ok && seq_file.ok && seq_remote_ok && eos.ok && eosb.ok;
+    // ---- EOS final-checkpoint timeout, FINISHED-PEER redeploy sub-case ----
+    // The eos_timeout_recovery leg races which restart sub-case it hits; this
+    // one forces the finished-peer one (a peer finishes before the source's
+    // error, so the restart must re-add the already-finished peer or orphan it)
+    // and asserts exactly that path fired AND recovered exactly-once. Local-only.
+    std::printf("\n---- end-of-stream final-checkpoint timeout (finished-peer redeploy) ----\n");
+    const auto eosfp = eos_finished_peer_recovery(node, submit, job_so);
+    std::printf(
+        "  committed=%zu/%zu dups=%zu submit_exit=%d finished_peer_path=%s exactly_once=%s\n",
+        eosfp.committed,
+        eosfp.expected,
+        eosfp.dups,
+        eosfp.submit_exit,
+        eosfp.finished_peer_path ? "yes" : "NO",
+        eosfp.exactly_once ? "yes" : "NO");
+    std::printf(
+        "  (the peer finished before the source's final-checkpoint error, so the\n"
+        "   whole-job restart re-added the finished peer - drain_expected=0 - and\n"
+        "   replayed, recovering the tail with no orphaned subtask)\n");
+
+    const bool ok = cold_ok == kIters && f.ok && remote_ok && seq_file.ok && seq_remote_ok &&
+                    eos.ok && eosb.ok && eosfp.ok;
     std::printf("\n==== %s ====\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

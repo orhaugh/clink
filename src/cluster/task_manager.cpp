@@ -3,11 +3,13 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -902,6 +904,19 @@ void TaskManager::run_task_(JobId job_id,
     }
     if (had_error) {
         metrics::tm::subtask_failed();
+        // Test-only (env-gated, default off): delay a FAILED subtask's
+        // SubtaskFinished so a peer that finishes cleanly in the same window
+        // reports first. Lets the failover bench deterministically exercise the
+        // JM's finished-peer redeploy path (a subtask errors AFTER its peer
+        // already finished -> restart_drain_expected empty -> restart_pending
+        // must re-add the finished peer) instead of racing it. No-op in
+        // production.
+        if (const char* d = std::getenv("CLINK_TEST_DELAY_ERROR_FINISH_MS")) {
+            const long ms = std::strtol(d, nullptr, 10);
+            if (ms > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            }
+        }
     } else {
         metrics::tm::subtask_completed_ok();
     }
