@@ -23,3 +23,16 @@ alignment:rocksdb-src/
 # reason - vendored code we don't instrument cleanly.
 function:rocksdb-src/
 vptr:rocksdb-src/
+
+# Apache Arrow's columnar arrays load multi-byte values (offsets in
+# array_binary.h, primitives in array_primitive.h) straight out of
+# packed buffers whose slices are not guaranteed 4/8-byte aligned.
+# This is by design - Arrow's format permits unaligned access and its
+# accessors compile to instructions that tolerate it - but UBSan's
+# `alignment` check fires on the raw load. Every report is inside the
+# system Arrow headers (/usr/include/arrow/...), never clink code;
+# clink's own Arrow code lives under include/clink/, so this scope
+# cannot hide a clink alignment bug. Surfaces via the Arrow-IPC wire
+# path (NetworkChannel) and the S3 object cache. Same third-party
+# class as the libarrow TSan suppressions.
+alignment:include/arrow/

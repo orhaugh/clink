@@ -129,7 +129,11 @@ TEST(AsyncStateGet, BaseDefaultPresentKeyMatchesSyncGetInOneResume) {
     OperatorId op{7};
     backend.put(op, sv(std::string{"k"}), sv(std::string{"v"}));
 
-    auto task = backend.get_async(op, sv(std::string{"k"}));
+    // get_async borrows the key as a view; its backing must outlive the first
+    // resume (the lazy task does not read the key until then). A temporary
+    // would dangle - keep it in a named local.
+    const std::string k = "k";
+    auto task = backend.get_async(op, sv(k));
     EXPECT_FALSE(task.done());  // lazy: not started until resumed
     task.resume();
     EXPECT_TRUE(task.done());  // single synchronous step
@@ -145,7 +149,8 @@ TEST(AsyncStateGet, BaseDefaultAbsentKeyYieldsNullopt) {
     InMemoryStateBackend backend;
     OperatorId op{7};
 
-    auto task = backend.get_async(op, sv(std::string{"missing"}));
+    const std::string missing = "missing";  // keep the borrowed key alive past resume
+    auto task = backend.get_async(op, sv(missing));
     task.resume();
     ASSERT_TRUE(task.done());
     EXPECT_FALSE(task.get().has_value());
@@ -159,7 +164,8 @@ TEST(AsyncStateGet, DeferredBackendYieldsValueOnlyAfterRelease) {
     OperatorId op{9};
     backend.put(op, sv(std::string{"k"}), sv(std::string{"v"}));
 
-    auto task = backend.get_async(op, sv(std::string{"k"}));
+    const std::string k = "k";  // keep the borrowed key alive past the first resume
+    auto task = backend.get_async(op, sv(k));
     EXPECT_FALSE(backend.parked());  // lazy: nothing started yet
 
     task.resume();  // runs to the suspension point and parks

@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -22,8 +23,17 @@ namespace {
 namespace fs = std::filesystem;
 
 fs::path scratch(const std::string& tag) {
+    // getpid() makes the dir unique PER PROCESS. ctest runs each test in its
+    // own process and may run them concurrently; a process-shared name (the
+    // old per-process static counter alone, which resets to 0 in every
+    // process) collides across concurrent tests using the same tag, and the
+    // remove_all below then wipes a sibling test's files mid-run. That race is
+    // wide enough to fail count_files()/entry_count() assertions under the
+    // slower sanitizer builds (parallel nproc/2) while passing the fast normal
+    // build. The pid prefix isolates each process's scratch space.
     static int n = 0;
-    auto p = fs::temp_directory_path() / ("clink_objcache_" + tag + std::to_string(n++));
+    auto p = fs::temp_directory_path() /
+             ("clink_objcache_" + std::to_string(::getpid()) + "_" + tag + std::to_string(n++));
     std::error_code ec;
     fs::remove_all(p, ec);
     fs::create_directories(p, ec);

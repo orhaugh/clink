@@ -1,0 +1,19 @@
+# LeakSanitizer suppressions for clink.
+#
+# Format: leak:<substring> matching a frame (module or symbol) anywhere in
+# the allocation stack (one rule per line, # for comments). Read via
+# LSAN_OPTIONS, which AddressSanitizer's integrated leak pass honours.
+#
+# Like tsan-/ubsan-suppressions.txt: we only suppress leaks that originate
+# inside third-party libraries we link but do not own - never clink code.
+
+# Apache Arrow's S3 subsystem allocates a small one-time global the first
+# time the S3FileSystem is initialised. clink deliberately does NOT call
+# arrow::fs::FinalizeS3 at exit - doing so races libarrow's own static
+# destructors and can crash (see the s3 connector notes) - so that global
+# is still live at process exit and LSan reports it as a 16-byte direct
+# leak whose entire allocation stack is inside libarrow.so, with no clink
+# frame. The library is stripped, so the only matchable frame is the
+# module. Mirrors the existing `thread:libarrow.so` TSan suppression for
+# the very same subsystem.
+leak:libarrow.so

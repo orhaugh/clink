@@ -20,7 +20,10 @@ build_and_run_tests() {
         "-DCMAKE_C_FLAGS=-fsanitize=address -fno-omit-frame-pointer"
         "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address"
       )
-      test_env="ASAN_OPTIONS=detect_leaks=1:halt_on_error=1"
+      # LSAN_OPTIONS suppressions are honoured by ASan's integrated leak
+      # pass; ignores one-time leaks inside libraries we link but don't own
+      # (Arrow's S3 init global). See lsan-suppressions.txt.
+      test_env="ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 LSAN_OPTIONS=suppressions=${src_dir}/lsan-suppressions.txt"
       echo "▶ AddressSanitizer build"
       ;;
     tsan)
