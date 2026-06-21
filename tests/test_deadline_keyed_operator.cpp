@@ -29,6 +29,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/core/codec.hpp"
+#include "clink/operators/deadline_keyed_co_operator.hpp"
 #include "clink/operators/deadline_keyed_operator.hpp"
 #include "clink/operators/keyed_aggregate_operator.hpp"
 #include "clink/operators/sink_operator.hpp"
@@ -201,6 +202,39 @@ std::vector<KV> run(std::shared_ptr<Operator<KV, KV>> op,
     return sink->collected();
 }
 
+auto make_deadline_co_op() {
+    return std::make_shared<
+        DeadlineKeyedCoAggregateOperator<std::int64_t, std::int64_t, std::int64_t>>(
+        [] { return std::int64_t{0}; },
+        [](const std::int64_t& acc, const std::int64_t& v) { return acc + v; },
+        [](const std::int64_t& /*k*/, const std::int64_t& v) {
+            return static_cast<std::uint64_t>(v);  // the value IS the deadline
+        },
+        int64_codec(),
+        int64_codec(),
+        "deadline_co_sum");
+}
+
+std::vector<KV> run_co(std::shared_ptr<CoOperator<KV, KV, KV>> op,
+                       const std::vector<KV>& left,
+                       const std::vector<KV>& right,
+                       std::shared_ptr<StateBackend> backend) {
+    Dag dag;
+    auto l = std::make_shared<VectorSource<KV>>(dk_records(left));
+    auto r = std::make_shared<VectorSource<KV>>(dk_records(right));
+    auto sink = std::make_shared<CollectingSink<KV>>();
+    auto h_l = dag.add_source<KV>(l);
+    auto h_r = dag.add_source<KV>(r);
+    auto h_co = dag.add_co_operator<KV, KV, KV>(h_l, h_r, std::move(op));
+    dag.add_sink<KV>(h_co, sink);
+
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return sink->collected();
+}
+
 }  // namespace
 
 TEST(DeadlineKeyedOperator, SyncAndAsyncProduceIdenticalRunningSums) {
@@ -269,4 +303,50 @@ TEST(DeadlineKeyedOperator, FifoWithoutDeadlineAware) {
 
     // The plain operator tags nothing: every read parked with order_key 0.
     EXPECT_EQ(backend->posted_order_keys(), (std::vector<std::uint64_t>{0, 0, 0}));
+}
+
+// ---- the two-input sibling: DeadlineKeyedCoAggregateOperator ----------------
+
+TEST(DeadlineKeyedCoOperator, SyncAndAsyncProduceIdenticalSums) {
+    // Disjoint keys (left {1,2}, right {3,4}), one record each -> sum = value.
+    // Order-independent, so a sorted compare is deterministic across the two
+    // channels' interleaving on both the sync and inline-async paths.
+    const std::vector<KV> left = {{1, 10}, {2, 20}};
+    const std::vector<KV> right = {{3, 30}, {4, 40}};
+    const std::vector<KV> expected = {{1, 10}, {2, 20}, {3, 30}, {4, 40}};
+
+    auto sync_out =
+        run_co(make_deadline_co_op(), left, right, std::make_shared<InMemoryStateBackend>());
+    auto async_out =
+        run_co(make_deadline_co_op(), left, right, std::make_shared<DkInlineAsyncBackend>());
+    std::sort(sync_out.begin(), sync_out.end());
+    std::sort(async_out.begin(), async_out.end());
+
+    EXPECT_EQ(sync_out, expected) << "synchronous co-op path";
+    EXPECT_EQ(async_out, expected) << "async co-op path (inline completion)";
+    EXPECT_EQ(sync_out, async_out);
+}
+
+TEST(DeadlineKeyedCoOperator, DeadlineAwareResumesUrgentReadsAcrossInputs) {
+    // Both inputs feed the ONE controller, so a poll's ready batch mixes left
+    // and right completions. Distinct keys with out-of-order deadlines (= value)
+    // across the two inputs: left {(1,50),(3,30)}, right {(2,40),(4,10)}. All
+    // four reads park until the batch is outstanding, then release together ->
+    // ascending deadline 10,30,40,50 -> emit keys [4(r), 3(l), 2(r), 1(l)],
+    // interleaving the inputs (a FIFO controller would give arrival order).
+    auto backend = std::make_shared<DkParkingBatchBackend>(/*release_at=*/4);
+    auto out = run_co(make_deadline_co_op(), {{1, 50}, {3, 30}}, {{2, 40}, {4, 10}}, backend);
+
+    ASSERT_EQ(out.size(), 4u);
+    std::vector<std::int64_t> key_order;
+    key_order.reserve(out.size());
+    for (const auto& kv : out) {
+        key_order.push_back(kv.first);
+    }
+    EXPECT_EQ(key_order, (std::vector<std::int64_t>{4, 3, 2, 1}))
+        << "co-op completions resume in ascending-deadline order across BOTH inputs";
+
+    auto tags = backend->posted_order_keys();
+    std::sort(tags.begin(), tags.end());
+    EXPECT_EQ(tags, (std::vector<std::uint64_t>{10, 30, 40, 50}));
 }
