@@ -502,7 +502,14 @@ void TaskManager::reader_loop_() {
                 cv_.notify_all();
                 // Wake any source blocked in the EOS final-checkpoint waits so
                 // it observes the flipped cancel token at once (its predicate
-                // checks cancel_token) instead of stalling its 30s wait.
+                // checks cancel_token) instead of stalling its 30s wait. The
+                // predicate state (the token) is mutated outside final_ckpt_mu_,
+                // so briefly take that mutex before notifying: this serialises
+                // against a waiter mid-predicate and closes the lost-wakeup window
+                // (a notify that would otherwise land before the waiter suspends).
+                {
+                    std::lock_guard<std::mutex> wake(final_ckpt_mu_);
+                }
                 final_ckpt_cv_.notify_all();
                 break;
             }
@@ -1753,6 +1760,11 @@ void TaskManager::stop() {
     }
     // Wake any source blocked in the EOS final-checkpoint waits (their
     // predicates check stop_) so the runner threads can be joined promptly.
+    // Brief final_ckpt_mu_ acquire serialises against a mid-predicate waiter
+    // (stop_ lives outside the mutex), closing the lost-wakeup window.
+    {
+        std::lock_guard<std::mutex> wake(final_ckpt_mu_);
+    }
     final_ckpt_cv_.notify_all();
     if (conn_) {
         conn_->shutdown_read();

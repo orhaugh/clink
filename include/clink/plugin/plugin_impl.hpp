@@ -156,6 +156,32 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     return cfg;
 }
 
+// Run a deployed subtask's LocalExecutor to completion and PROPAGATE any
+// operator-thread failure. The executor catches operator exceptions into
+// operator_errors_ and returns normally (so an in-process caller can inspect
+// them); on the cluster path the subtask runner must instead let them escape
+// so run_task_ reports had_error=true and the JM restarts. Without this, a
+// bounded source's end-of-stream final-checkpoint throw (the watchdog-restart
+// signal when the final checkpoint times out) would be silently swallowed and
+// the job could complete with an uncommitted tail. Skipped when the subtask was
+// cancelled: teardown can legitimately throw (closed channels) and a cancelled
+// job must not spuriously restart - run_task_ already reports had_error there.
+inline void run_subtask_to_completion(clink::LocalExecutor& exec,
+                                      const std::shared_ptr<std::atomic<bool>>& cancel_token) {
+    exec.run();
+    if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
+        return;
+    }
+    auto errs = exec.operator_errors();
+    if (!errs.empty()) {
+        std::string msg = "subtask operator failure:";
+        for (const auto& [op_name, err] : errs) {
+            msg.append(" [").append(op_name).append("] ").append(err);
+        }
+        throw std::runtime_error(msg);
+    }
+}
+
 }  // namespace detail
 
 template <typename T>
@@ -263,7 +289,7 @@ void PluginRegistry::register_source(
             auto cfg = detail::make_subtask_job_config(rctx);
             cfg.drain_target = drain_signal;
             clink::LocalExecutor exec(std::move(dag), std::move(cfg));
-            exec.run();
+            detail::run_subtask_to_completion(exec, rctx.cancel_token);
         };
     runner_registry_.register_source(op_type, channel, std::move(runner));
 
@@ -362,7 +388,7 @@ void PluginRegistry::register_sink(
         auto h0 = clink::cluster::build_typed_input_stage<T>(dag, rctx.in_bridges);
         dag.template add_sink<T>(h0, sink);
         clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
-        exec.run();
+        detail::run_subtask_to_completion(exec, rctx.cancel_token);
     };
     runner_registry_.register_sink(op_type, channel, std::move(runner));
 
@@ -453,7 +479,7 @@ void PluginRegistry::register_operator(
                 chain.output_selector_fn);
             clink::cluster::attach_side_output_groups(dag, h1.runner_index, rctx.output_groups);
             clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
-            exec.run();
+            detail::run_subtask_to_completion(exec, rctx.cancel_token);
         };
     runner_registry_.register_operator(op_type, in_channel, out_channel, std::move(runner));
 
@@ -617,7 +643,7 @@ void PluginRegistry::register_co_operator(
             chain.output_selector_fn);
         clink::cluster::attach_side_output_groups(dag, h_out.runner_index, rctx.output_groups);
         clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
-        exec.run();
+        detail::run_subtask_to_completion(exec, rctx.cancel_token);
     };
     runner_registry_.register_co_operator(
         op_type, in1_channel, in2_channel, out_channel, std::move(runner));
