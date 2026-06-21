@@ -61,6 +61,11 @@ public:
 
     StateBackend* state_backend() const noexcept { return backend_; }
     bool has_state_backend() const noexcept { return backend_ != nullptr; }
+    // ASYNC-10: the single-input runner swaps in a CoalescingBackend wrapping
+    // this one before the operator binds its KeyedState (and restores it at
+    // teardown), so an opted-in operator's reads route through the coalescer
+    // transparently. Runner-thread-only, set before open().
+    void set_state_backend(StateBackend* b) noexcept { backend_ = b; }
 
     MetricsRegistry* metrics() const noexcept { return metrics_; }
 

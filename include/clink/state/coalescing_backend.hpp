@@ -93,6 +93,9 @@ public:
         inner_->set_async_resume_scheduler(std::move(s));
     }
 
+    // The runner's flush hook (and its post-process_async call) route here.
+    bool flush_pending_reads() override { return flush(); }
+
     // The coalescing seam: register the read and suspend; flush() resolves it.
     async::Task<std::optional<Value>> get_async(OperatorId op, KeyView key) const override {
         co_return co_await BatchedRead{this, op.value(), std::string(key), std::nullopt};

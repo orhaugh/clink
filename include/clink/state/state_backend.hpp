@@ -131,6 +131,15 @@ public:
     using AsyncResumeScheduler = std::function<void(std::coroutine_handle<>)>;
     virtual void set_async_resume_scheduler(AsyncResumeScheduler /*schedule*/) {}
 
+    // ASYNC-10 coalescing hook. A read-coalescing decorator (CoalescingBackend)
+    // accumulates get_async reads into a pending batch instead of issuing them;
+    // the runner calls this when the controller is otherwise stuck (and after a
+    // process_async batch) to issue ONE get_many_async for the whole batch.
+    // Returns true if it had reads to flush. The default is a no-op false: a
+    // plain backend issues each get_async immediately and has nothing pending,
+    // so the runner's call is harmless when the backend is not a coalescer.
+    virtual bool flush_pending_reads() { return false; }
+
     // Operator (non-keyed) state: source offsets, broadcast slots - state
     // that has no key and therefore no key group. It is stored under the
     // same per-(operator, key) primitives but with a reserved leading byte

@@ -32,6 +32,7 @@
 #include "clink/runtime/sharded_keyed_stage.hpp"
 #include "clink/runtime/snapshot_worker.hpp"
 #include "clink/runtime/subtask_emitter.hpp"
+#include "clink/state/coalescing_backend.hpp"
 #include "clink/state/keyed_state.hpp"
 
 namespace clink {
@@ -379,6 +380,35 @@ public:
         runner.run = [op, in_channel, out_channel, side_channels, id, owner_flag](
                          RuntimeContext& ctx, const std::function<bool()>& should_stop) {
             using namespace std::chrono_literals;
+            // ASYNC-10 transparent read coalescing (opt-in). BEFORE the operator
+            // binds its KeyedState in open(), swap the backend for a
+            // CoalescingBackend so the per-record get_async calls in one
+            // process_async batch collapse into ONE get_many_async round-trip.
+            // Gated on the operator opting in AND a deferring backend; when off,
+            // the backend and every path stay byte-identical. The scope guard
+            // restores the original backend at teardown (covering throw paths)
+            // so ctx never dangles past this runner.
+            StateBackend* const original_backend =
+                ctx.has_state_backend() ? ctx.state_backend() : nullptr;
+            const bool do_coalesce = op->supports_async() && op->coalesce_reads() &&
+                                     original_backend != nullptr &&
+                                     original_backend->supports_async_get();
+            std::unique_ptr<CoalescingBackend> coalescer;
+            if (do_coalesce) {
+                coalescer = std::make_unique<CoalescingBackend>(*original_backend);
+                ctx.set_state_backend(coalescer.get());
+            }
+            struct BackendRestore {
+                RuntimeContext& ctx;
+                StateBackend* original;
+                bool active;
+                ~BackendRestore() {
+                    if (active) {
+                        ctx.set_state_backend(original);
+                    }
+                }
+            } backend_restore{ctx, original_backend, do_coalesce};
+
             op->attach_runtime(&ctx);
             // Reload any checkpointed timers (same-parallelism restore)
             // before open() so user open() sees the restored timer set.
@@ -454,6 +484,14 @@ public:
                             sp->schedule_resume(h);
                         }
                     });
+                // ASYNC-10: when coalescing, let the controller flush the
+                // pending read batch through one get_many_async whenever it is
+                // otherwise stuck (this also makes drain_for_barrier() flush the
+                // batch before a checkpoint capture, keeping the cut consistent).
+                if (do_coalesce) {
+                    aec->set_flush_hook(
+                        [b = ctx.state_backend()] { return b->flush_pending_reads(); });
+                }
             }
             auto* timers = ctx.timer_service();
             // Drive timers through the op-level virtuals so chained
@@ -595,6 +633,12 @@ public:
                         // record to the controller; poll services any that
                         // completed inline (a non-deferring backend) this turn.
                         op->process_async(*maybe, emitter, *aec);
+                        // ASYNC-10: the whole batch's reads are now parked in the
+                        // coalescer; flush them into ONE get_many_async before
+                        // polling (no-op when not coalescing).
+                        if (do_coalesce) {
+                            ctx.state_backend()->flush_pending_reads();
+                        }
                         aec->poll();
                     } else if (op->supports_columnar() && maybe->is_data() &&
                                maybe->as_data().is_columnar() &&

@@ -7,6 +7,7 @@
 // async-capable backend (async branch) must produce byte-identical output -
 // the core ASYNC-6 acceptance.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -325,4 +326,148 @@ TEST(AsyncOperatorRunner, RunnerWiresResumeSchedulerSoColdReadsDeferOffRunner) {
     EXPECT_NE(loader_tid, runner_tid)
         << "cold load ran on the runner thread: the runner did not wire the async "
            "resume scheduler, so get_async fell back to an inline blocking load";
+}
+
+// ---- ASYNC-10: transparent read coalescing wired into the runner --------
+
+namespace {
+
+// Async backend that counts per-key get_async vs batched get_many_async, so a
+// test can prove the runner routed an opted-in operator's reads through ONE
+// get_many (coalesced) rather than N individual reads. Composes InMemory.
+class CountingAsyncBackend : public StateBackend {
+public:
+    void put(OperatorId op, KeyView key, ValueView value) override { store_.put(op, key, value); }
+    std::optional<Value> get(OperatorId op, KeyView key) const override {
+        return store_.get(op, key);
+    }
+    void erase(OperatorId op, KeyView key) override { store_.erase(op, key); }
+    void scan(OperatorId op, const ScanVisitor& visit) const override { store_.scan(op, visit); }
+    Snapshot snapshot(CheckpointId id) override { return store_.snapshot(id); }
+    void restore(const Snapshot& snap, const KeyGroupRange& kg = {}) override {
+        store_.restore(snap, kg);
+    }
+    [[nodiscard]] std::string description() const override { return "counting-async"; }
+
+    [[nodiscard]] bool supports_async_get() const noexcept override { return true; }
+    async::Task<std::optional<Value>> get_async(OperatorId op, KeyView key) const override {
+        ++get_async_calls_;
+        co_return store_.get(op, key);
+    }
+    async::Task<std::vector<std::optional<Value>>> get_many_async(
+        OperatorId op, const std::vector<std::string>& keys) const override {
+        ++get_many_calls_;
+        std::vector<std::optional<Value>> out;
+        out.reserve(keys.size());
+        for (const auto& k : keys) {
+            out.push_back(store_.get(op, KeyView{k}));
+        }
+        co_return out;
+    }
+
+    [[nodiscard]] int get_async_calls() const { return get_async_calls_; }
+    [[nodiscard]] int get_many_calls() const { return get_many_calls_; }
+
+private:
+    InMemoryStateBackend store_;
+    mutable int get_async_calls_{0};
+    mutable int get_many_calls_{0};
+};
+
+// Same per-key count as KeyedCountOperator, but with a configurable
+// coalesce_reads() opt-in so a test can run the identical workload with and
+// without coalescing on the same backend.
+class CoalescingCountOperator final : public Operator<int, std::int64_t> {
+public:
+    explicit CoalescingCountOperator(bool coalesce) : coalesce_(coalesce) {}
+
+    void process(const StreamElement<int>& element, Emitter<std::int64_t>& out) override {
+        if (element.is_data()) {
+            auto kv = state_();
+            Batch<std::int64_t> batch;
+            for (const auto& rec : element.as_data()) {
+                const std::int64_t c = kv.get(rec.value()).value_or(0) + 1;
+                kv.put(rec.value(), c);
+                batch.emplace(c);
+            }
+            out.emit_data(std::move(batch));
+        } else if (element.is_watermark()) {
+            this->on_watermark(element.as_watermark(), out);
+        } else {
+            this->on_barrier(element.as_barrier(), out);
+        }
+    }
+
+    [[nodiscard]] bool supports_async() const noexcept override { return true; }
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return coalesce_; }
+
+    void process_async(const StreamElement<int>& element,
+                       Emitter<std::int64_t>& out,
+                       AsyncExecutionController& aec) override {
+        if (!element.is_data()) {
+            return;
+        }
+        for (const auto& rec : element.as_data()) {
+            const std::int64_t key = rec.value();
+            auto kv = state_();
+            aec.submit(std::to_string(key), [kv, key, &out]() mutable -> async::Task<void> {
+                const std::int64_t c = (co_await kv.get_async(key)).value_or(0) + 1;
+                kv.put(key, c);
+                Batch<std::int64_t> batch;
+                batch.emplace(c);
+                out.emit_data(std::move(batch));
+                co_return;
+            });
+        }
+    }
+
+    std::string name() const override { return "coalescing_count"; }
+
+private:
+    KeyedState<std::int64_t, std::int64_t> state_() {
+        return this->runtime()->keyed_state<std::int64_t, std::int64_t>(
+            "c", int64_codec(), int64_codec());
+    }
+    bool coalesce_;
+};
+
+std::vector<std::int64_t> run_coalesce(const std::vector<int>& input,
+                                       std::shared_ptr<CountingAsyncBackend> backend,
+                                       bool coalesce) {
+    Dag dag;
+    auto src = std::make_shared<VectorSource<int>>(records(input));
+    auto op = std::make_shared<CoalescingCountOperator>(coalesce);
+    auto sink = std::make_shared<CollectingSink<std::int64_t>>();
+    auto h0 = dag.add_source<int>(src);
+    auto h1 = dag.add_operator<int, std::int64_t>(h0, op);
+    dag.add_sink<std::int64_t>(h1, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    auto out = sink->collected();
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+}  // namespace
+
+// An opted-in operator's per-record reads in one batch collapse into ONE
+// get_many_async; the per-key get_async path is never taken.
+TEST(AsyncOperatorRunner, CoalescingOperatorBatchesReadsIntoOneGetMany) {
+    auto backend = std::make_shared<CountingAsyncBackend>();
+    const auto out = run_coalesce({10, 20, 30, 40}, backend, /*coalesce=*/true);
+    EXPECT_EQ(out, (std::vector<std::int64_t>{1, 1, 1, 1}));  // each key first-seen
+    EXPECT_EQ(backend->get_many_calls(), 1);                  // the whole batch in one round-trip
+    EXPECT_EQ(backend->get_async_calls(), 0);                 // never the per-key path
+}
+
+// The SAME workload + backend without the opt-in issues one read per record
+// (no coalescing) - the byte-identical pre-coalescing async path.
+TEST(AsyncOperatorRunner, NonCoalescingOperatorIssuesPerKeyReads) {
+    auto backend = std::make_shared<CountingAsyncBackend>();
+    const auto out = run_coalesce({10, 20, 30, 40}, backend, /*coalesce=*/false);
+    EXPECT_EQ(out, (std::vector<std::int64_t>{1, 1, 1, 1}));
+    EXPECT_EQ(backend->get_async_calls(), 4);  // per-record reads
+    EXPECT_EQ(backend->get_many_calls(), 0);
 }

@@ -264,6 +264,14 @@ public:
                                Emitter<Out>& /*out*/,
                                AsyncExecutionController& /*aec*/) {}
 
+    // ASYNC-10 opt-in: when true (and supports_async() + the backend defers
+    // reads), the single-input runner wraps the state backend in a
+    // CoalescingBackend, so the per-record get_async calls in one process_async
+    // batch collapse into ONE get_many_async round-trip. Default false: each
+    // read issues individually (the byte-identical pre-coalescing path). Worth
+    // enabling for a remote/disaggregated backend where a round-trip is costly.
+    [[nodiscard]] virtual bool coalesce_reads() const noexcept { return false; }
+
     // True iff this operator's on_event_time_timer / on_processing_time_timer
     // callbacks read or write keyed state (the ProcessFunction adapter does;
     // window/CEP operators touch state via on_watermark, not timer virtuals, so
