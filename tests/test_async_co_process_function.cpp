@@ -18,6 +18,7 @@
 //     epoch release.
 
 #include <algorithm>
+#include <atomic>
 #include <coroutine>
 #include <cstdint>
 #include <memory>
@@ -383,4 +384,123 @@ TEST(AsyncCoProcessFunction, EventTimeTimerFiresOnMergedWatermark) {
     ASSERT_EQ(out.size(), 2u);
     EXPECT_EQ(out[0], 7);
     EXPECT_EQ(out[1], 107) << "event-time timer fired after the epoch drained (7 + 100)";
+}
+
+// ---- ASYNC-10: coalescing wired into the co-operator runner -------------
+
+namespace {
+
+// Counts batched vs per-key reads via shared atomics (survive teardown).
+class CountingCoBackend final : public StateBackend {
+public:
+    CountingCoBackend(std::shared_ptr<std::atomic<int>> many,
+                      std::shared_ptr<std::atomic<int>> single)
+        : many_(std::move(many)), single_(std::move(single)) {}
+    void put(OperatorId op, KeyView key, ValueView value) override { store_.put(op, key, value); }
+    std::optional<Value> get(OperatorId op, KeyView key) const override {
+        return store_.get(op, key);
+    }
+    void erase(OperatorId op, KeyView key) override { store_.erase(op, key); }
+    void scan(OperatorId op, const ScanVisitor& visit) const override { store_.scan(op, visit); }
+    Snapshot snapshot(CheckpointId id) override { return store_.snapshot(id); }
+    void restore(const Snapshot& snap, const KeyGroupRange& kg = {}) override {
+        store_.restore(snap, kg);
+    }
+    [[nodiscard]] std::string description() const override { return "counting-co"; }
+    [[nodiscard]] bool supports_async_get() const noexcept override { return true; }
+    async::Task<std::optional<Value>> get_async(OperatorId op, KeyView key) const override {
+        single_->fetch_add(1, std::memory_order_relaxed);
+        co_return store_.get(op, key);
+    }
+    async::Task<std::vector<std::optional<Value>>> get_many_async(
+        OperatorId op, const std::vector<std::string>& keys) const override {
+        many_->fetch_add(1, std::memory_order_relaxed);
+        std::vector<std::optional<Value>> out;
+        out.reserve(keys.size());
+        for (const auto& k : keys) {
+            out.push_back(store_.get(op, KeyView{k}));
+        }
+        co_return out;
+    }
+
+private:
+    InMemoryStateBackend store_;
+    std::shared_ptr<std::atomic<int>> many_;
+    std::shared_ptr<std::atomic<int>> single_;
+};
+
+// A coalescing async co-op: per-record get_async on each input, emit 0.
+class CoalescingCoOp final : public CoOperator<std::int64_t, std::int64_t, std::int64_t> {
+public:
+    void open() override {
+        state_.emplace(this->runtime()->keyed_state<std::int64_t, std::int64_t>(
+            "c", int64_codec(), int64_codec()));
+    }
+    void process_element1(const StreamElement<std::int64_t>&, Emitter<std::int64_t>&) override {}
+    void process_element2(const StreamElement<std::int64_t>&, Emitter<std::int64_t>&) override {}
+    [[nodiscard]] bool supports_async() const noexcept override { return true; }
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
+    void process_async1(const StreamElement<std::int64_t>& el,
+                        Emitter<std::int64_t>& out,
+                        AsyncExecutionController& aec) override {
+        submit_each(el, out, aec);
+    }
+    void process_async2(const StreamElement<std::int64_t>& el,
+                        Emitter<std::int64_t>& out,
+                        AsyncExecutionController& aec) override {
+        submit_each(el, out, aec);
+    }
+
+private:
+    void submit_each(const StreamElement<std::int64_t>& el,
+                     Emitter<std::int64_t>& out,
+                     AsyncExecutionController& aec) {
+        if (!el.is_data()) {
+            return;
+        }
+        for (const auto& r : el.as_data()) {
+            const auto k = r.value();
+            auto ks = *state_;
+            aec.submit(std::to_string(k), [ks, k, &out]() mutable -> async::Task<void> {
+                (void)co_await ks.get_async(k);
+                Batch<std::int64_t> b;
+                b.emplace(0);
+                out.emit_data(std::move(b));
+                co_return;
+            });
+        }
+    }
+    std::optional<KeyedState<std::int64_t, std::int64_t>> state_;
+};
+
+}  // namespace
+
+// Through the real add_co_operator runner: a batch of distinct keys on ONE
+// input collapses into ONE get_many_async on the (deferring) backend, never the
+// per-key get_async.
+TEST(AsyncCoProcessFunction, CoalescesInputBatchIntoOneGetMany) {
+    auto many = std::make_shared<std::atomic<int>>(0);
+    auto single = std::make_shared<std::atomic<int>>(0);
+
+    Dag dag;
+    std::vector<Record<std::int64_t>> lrecs;
+    for (std::int64_t k : {10, 20, 30, 40}) {
+        lrecs.emplace_back(k);
+    }
+    auto left = std::make_shared<VectorSource<std::int64_t>>(lrecs);
+    auto right = std::make_shared<VectorSource<std::int64_t>>(std::vector<Record<std::int64_t>>{});
+    auto h_l = dag.add_source<std::int64_t>(left);
+    auto h_r = dag.add_source<std::int64_t>(right);
+    auto op = std::make_shared<CoalescingCoOp>();
+    auto h_co = dag.add_co_operator<std::int64_t, std::int64_t, std::int64_t>(h_l, h_r, op);
+    auto sink = std::make_shared<CollectingSink<std::int64_t>>();
+    dag.add_sink<std::int64_t>(h_co, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<CountingCoBackend>(many, single);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    EXPECT_EQ(sink->collected().size(), 4u);  // every left record emitted
+    EXPECT_EQ(many->load(), 1);               // one input batch -> one get_many
+    EXPECT_EQ(single->load(), 0);             // never the per-key path
 }

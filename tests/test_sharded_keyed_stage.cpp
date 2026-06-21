@@ -1582,3 +1582,121 @@ TEST(ShardedKeyedStage, DrainThroughRunnerDoesNotDisruptData) {
 }
 
 }  // namespace
+
+namespace {
+
+// Deferring shard backend that counts batched vs per-key reads (shared atomics
+// survive the stage teardown so the test can read them after await()).
+class CountingShardBackend final : public StateBackend {
+public:
+    CountingShardBackend(std::shared_ptr<std::atomic<int>> many,
+                         std::shared_ptr<std::atomic<int>> single)
+        : many_(std::move(many)), single_(std::move(single)) {}
+    void put(OperatorId op, KeyView key, ValueView value) override { store_.put(op, key, value); }
+    std::optional<Value> get(OperatorId op, KeyView key) const override {
+        return store_.get(op, key);
+    }
+    void erase(OperatorId op, KeyView key) override { store_.erase(op, key); }
+    void scan(OperatorId op, const ScanVisitor& visit) const override { store_.scan(op, visit); }
+    Snapshot snapshot(CheckpointId id) override { return store_.snapshot(id); }
+    void restore(const Snapshot& snap, const KeyGroupRange& kg = {}) override {
+        store_.restore(snap, kg);
+    }
+    [[nodiscard]] std::string description() const override { return "counting-shard"; }
+    [[nodiscard]] bool supports_async_get() const noexcept override { return true; }
+    async::Task<std::optional<Value>> get_async(OperatorId op, KeyView key) const override {
+        single_->fetch_add(1, std::memory_order_relaxed);
+        co_return store_.get(op, key);
+    }
+    async::Task<std::vector<std::optional<Value>>> get_many_async(
+        OperatorId op, const std::vector<std::string>& keys) const override {
+        many_->fetch_add(1, std::memory_order_relaxed);
+        std::vector<std::optional<Value>> out;
+        out.reserve(keys.size());
+        for (const auto& k : keys) {
+            out.push_back(store_.get(op, KeyView{k}));
+        }
+        co_return out;
+    }
+
+private:
+    InMemoryStateBackend store_;
+    std::shared_ptr<std::atomic<int>> many_;
+    std::shared_ptr<std::atomic<int>> single_;
+};
+
+// CountingOpAsync that opts into read coalescing.
+class CoalescingCountOpAsync final : public Operator<std::int64_t, std::int64_t> {
+public:
+    void open() override {
+        state_.emplace(this->runtime()->template keyed_state<std::int64_t, std::int64_t>(
+            "counts", int64_codec(), int64_codec()));
+    }
+    void process(const StreamElement<std::int64_t>&, Emitter<std::int64_t>&) override {}
+    [[nodiscard]] bool supports_async() const noexcept override { return true; }
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
+    void process_async(const StreamElement<std::int64_t>& el,
+                       Emitter<std::int64_t>& out,
+                       AsyncExecutionController& aec) override {
+        if (!el.is_data()) {
+            return;
+        }
+        for (const auto& r : el.as_data()) {
+            const auto k = r.value();
+            auto ks = *state_;
+            aec.submit(std::to_string(k), [ks, k, &out]() mutable -> async::Task<void> {
+                const auto c = (co_await ks.get_async(k)).value_or(0) + 1;
+                ks.put(k, c);
+                Batch<std::int64_t> b;
+                b.emplace(c);
+                out.emit_data(std::move(b));
+                co_return;
+            });
+        }
+    }
+    std::string name() const override { return "coalescing_counter_async"; }
+
+private:
+    std::optional<KeyedState<std::int64_t, std::int64_t>> state_;
+};
+
+}  // namespace
+
+// With a deferring per-shard backend + an opted-in operator, the records routed
+// to a shard in one batch collapse into ONE get_many_async on that shard's
+// backend, never the per-key get_async. One shard so all keys land together.
+TEST(ShardedKeyedStage, CoalescesShardReadsIntoOneGetMany) {
+    auto many = std::make_shared<std::atomic<int>>(0);
+    auto single = std::make_shared<std::atomic<int>>(0);
+    std::atomic<std::int64_t> emits{0};
+
+    ShardedKeyedStage<std::int64_t, std::int64_t>::Options opts;
+    opts.shard_backend_factory = [many, single](std::size_t) -> std::unique_ptr<StateBackend> {
+        return std::make_unique<CountingShardBackend>(many, single);
+    };
+    ShardedKeyedStage<std::int64_t, std::int64_t> stage(
+        /*shards=*/1,
+        OperatorId{7},
+        [](std::size_t) { return std::make_unique<CoalescingCountOpAsync>(); },
+        int64_key_bytes(),
+        [&emits](StreamElement<std::int64_t> e) {
+            if (e.is_data()) {
+                emits.fetch_add(static_cast<std::int64_t>(e.as_data().size()),
+                                std::memory_order_relaxed);
+            }
+            return true;
+        },
+        opts);
+    stage.start();
+    Batch<std::int64_t> b;
+    for (std::int64_t k : {10, 20, 30, 40}) {
+        b.emplace(k);
+    }
+    stage.submit(std::move(b));
+    stage.close_input();
+    stage.await();
+
+    EXPECT_EQ(emits.load(), 4);    // every record emitted
+    EXPECT_EQ(many->load(), 1);    // one batch -> one get_many on the shard
+    EXPECT_EQ(single->load(), 0);  // never the per-key path
+}

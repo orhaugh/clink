@@ -77,6 +77,7 @@
 #include "clink/runtime/key_groups.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/runtime/subtask_emitter.hpp"
+#include "clink/state/coalescing_backend.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/state_backend.hpp"
 
@@ -373,6 +374,31 @@ private:
             // Build this shard's operator instance over its PRIVATE backend.
             sh.op = factory_(i);
             sh.op->set_id(op_id_);
+            // ASYNC-10 per-shard read coalescing (opt-in), same recipe as the
+            // single-input runner: wrap this shard's PRIVATE backend BEFORE the
+            // operator binds to it (via this shard's RuntimeContext), restored at
+            // teardown by the guard. Only meaningful when a deferring
+            // shard_backend_factory is configured; off = byte-identical. The
+            // worker's own sh.backend uses (snapshot, the resume scheduler) stay
+            // on the inner backend, which the decorator forwards transparently.
+            const bool do_coalesce = sh.op->supports_async() && sh.op->coalesce_reads() &&
+                                     sh.backend->supports_async_get();
+            std::unique_ptr<CoalescingBackend> coalescer;
+            if (do_coalesce) {
+                coalescer = std::make_unique<CoalescingBackend>(*sh.backend);
+                sh.ctx->set_state_backend(coalescer.get());
+            }
+            struct ShardBackendRestore {
+                RuntimeContext* ctx;
+                StateBackend* original;
+                bool active;
+                ~ShardBackendRestore() {
+                    if (active) {
+                        ctx->set_state_backend(original);
+                    }
+                }
+            } shard_backend_restore{sh.ctx.get(), sh.backend.get(), do_coalesce};
+
             sh.op->attach_runtime(sh.ctx.get());
 
             sh.op->open();
@@ -406,6 +432,13 @@ private:
                                 sp->schedule_resume(h);
                             }
                         });
+                }
+                // ASYNC-10: flush this shard's coalescer when the controller is
+                // stuck (and before a barrier capture). sh.ctx->state_backend()
+                // is the CoalescingBackend when do_coalesce.
+                if (do_coalesce) {
+                    aec->set_flush_hook(
+                        [b = sh.ctx->state_backend()] { return b->flush_pending_reads(); });
                 }
             }
             // Clear the backend's resume scheduler before `aec` is destroyed on
@@ -464,6 +497,11 @@ private:
                     clink::metrics::op::shard_records_in_inc(op_id_.value(), i, e.as_data().size());
                     if (aec) {
                         sh.op->process_async(e, out, *aec);
+                        if (do_coalesce) {  // ASYNC-10: batch this shard's reads -> one get_many
+                            while (sh.ctx->state_backend()->flush_pending_reads()) {
+                                aec->poll();
+                            }
+                        }
                         aec->poll();
                     } else {
                         sh.op->process(e, out);

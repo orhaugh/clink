@@ -828,6 +828,12 @@ public:
                                 Emitter<Out>& /*out*/,
                                 AsyncExecutionController& /*aec*/) {}
 
+    // ASYNC-10 opt-in (mirrors Operator<In,Out>::coalesce_reads): when true (and
+    // supports_async() + a deferring backend), the co-op runner wraps the
+    // backend in a CoalescingBackend so a process_async1/2 batch's per-record
+    // get_async calls collapse into one get_many_async. Default false.
+    [[nodiscard]] virtual bool coalesce_reads() const noexcept { return false; }
+
     // Timer-kind flags (see Operator<In,Out>): the co-op async runner gates
     // processing-time timers through the per-key gate and fires event-time
     // timers inside the merged-watermark epoch release, so both are safe.

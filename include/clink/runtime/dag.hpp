@@ -2537,6 +2537,31 @@ public:
         runner.run = [op, left_ch, right_ch, out_channel, side_channels, id, in1_codec, in2_codec](
                          RuntimeContext& ctx, const std::function<bool()>& should_stop) {
             using namespace std::chrono_literals;
+            // ASYNC-10 transparent read coalescing (opt-in), same recipe as the
+            // single-input runner: wrap the backend BEFORE open() so the
+            // operator binds its KeyedState to the coalescer; a scope guard
+            // restores it at teardown. Off = byte-identical.
+            StateBackend* const original_backend =
+                ctx.has_state_backend() ? ctx.state_backend() : nullptr;
+            const bool do_coalesce = op->supports_async() && op->coalesce_reads() &&
+                                     original_backend != nullptr &&
+                                     original_backend->supports_async_get();
+            std::unique_ptr<CoalescingBackend> coalescer;
+            if (do_coalesce) {
+                coalescer = std::make_unique<CoalescingBackend>(*original_backend);
+                ctx.set_state_backend(coalescer.get());
+            }
+            struct BackendRestore {
+                RuntimeContext& ctx;
+                StateBackend* original;
+                bool active;
+                ~BackendRestore() {
+                    if (active) {
+                        ctx.set_state_backend(original);
+                    }
+                }
+            } backend_restore{ctx, original_backend, do_coalesce};
+
             op->attach_runtime(&ctx);
             // Reload checkpointed timers (same-parallelism restore) before
             // open(); both inputs share the one per-operator TimerService.
@@ -2566,6 +2591,12 @@ public:
                             sp->schedule_resume(h);
                         }
                     });
+                // ASYNC-10: flush the coalescer's pending batch when the
+                // controller is stuck (also drains it before a barrier capture).
+                if (do_coalesce) {
+                    aec->set_flush_hook(
+                        [b = ctx.state_backend()] { return b->flush_pending_reads(); });
+                }
             }
             // Per-subtask async snapshot worker (FileBacked + disk-backed
             // changelog). Same contract as the single-input runner: capture
@@ -2713,6 +2744,11 @@ public:
                 if (el.is_data()) {
                     if (aec) {
                         op->process_async1(el, out_emitter, *aec);
+                        if (do_coalesce) {  // ASYNC-10: batch this input's reads -> one get_many
+                            while (ctx.state_backend()->flush_pending_reads()) {
+                                aec->poll();
+                            }
+                        }
                         aec->poll();
                     } else {
                         op->process_element1(el, out_emitter);
@@ -2736,6 +2772,11 @@ public:
                 if (el.is_data()) {
                     if (aec) {
                         op->process_async2(el, out_emitter, *aec);
+                        if (do_coalesce) {  // ASYNC-10: batch this input's reads -> one get_many
+                            while (ctx.state_backend()->flush_pending_reads()) {
+                                aec->poll();
+                            }
+                        }
                         aec->poll();
                     } else {
                         op->process_element2(el, out_emitter);
