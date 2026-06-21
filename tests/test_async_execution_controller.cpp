@@ -388,3 +388,96 @@ TEST(AsyncExecutionController, ThrowingRecordIsAccountedAndSurfaced) {
     aec.drain();
     EXPECT_EQ(aec.in_flight(), 0u);
 }
+
+// ---- ASYNC-12: deadline/priority-aware resume ---------------------------
+
+// Default (Fifo): a poll's ready batch resumes in ARRIVAL order, byte-identical
+// to the original controller. Three distinct-key records arrive c, a, b.
+TEST(AsyncExecutionController, ResumeOrderFifoIsArrivalOrderByDefault) {
+    AsyncExecutionController aec;
+    std::vector<std::string> ev;
+    Gate ga;
+    Gate gb;
+    Gate gc;
+    ASSERT_TRUE(aec.submit("a", gated(&ga, &ev, "a")));
+    ASSERT_TRUE(aec.submit("b", gated(&gb, &ev, "b")));
+    ASSERT_TRUE(aec.submit("c", gated(&gc, &ev, "c")));
+    ASSERT_EQ(aec.in_flight(), 3u);
+
+    aec.schedule_resume(gc.handle);
+    aec.schedule_resume(ga.handle);
+    aec.schedule_resume(gb.handle);
+    aec.poll();
+
+    EXPECT_EQ(ev, (std::vector<std::string>{"c", "a", "b"}));  // arrival order
+    EXPECT_EQ(aec.in_flight(), 0u);
+}
+
+// Priority: the ready batch resumes lowest order_key first, regardless of the
+// order completions arrived in.
+TEST(AsyncExecutionController, ResumeOrderPriorityResumesLowestOrderKeyFirst) {
+    AsyncExecutionController aec;
+    aec.set_resume_order(AsyncExecutionController::ResumeOrder::Priority);
+    std::vector<std::string> ev;
+    Gate ga;
+    Gate gb;
+    Gate gc;
+    aec.submit("a", gated(&ga, &ev, "a"));
+    aec.submit("b", gated(&gb, &ev, "b"));
+    aec.submit("c", gated(&gc, &ev, "c"));
+
+    // Arrive c, a, b with order_keys 30, 10, 20 -> resume a, b, c.
+    aec.schedule_resume(gc.handle, 30);
+    aec.schedule_resume(ga.handle, 10);
+    aec.schedule_resume(gb.handle, 20);
+    aec.poll();
+
+    EXPECT_EQ(ev, (std::vector<std::string>{"a", "b", "c"}));
+    EXPECT_EQ(aec.in_flight(), 0u);
+}
+
+// Priority ties keep arrival order (stable sort) - FIFO within a priority class.
+TEST(AsyncExecutionController, ResumeOrderPriorityTiesKeepArrivalOrder) {
+    AsyncExecutionController aec;
+    aec.set_resume_order(AsyncExecutionController::ResumeOrder::Priority);
+    std::vector<std::string> ev;
+    Gate ga;
+    Gate gb;
+    Gate gc;
+    aec.submit("a", gated(&ga, &ev, "a"));
+    aec.submit("b", gated(&gb, &ev, "b"));
+    aec.submit("c", gated(&gc, &ev, "c"));
+
+    aec.schedule_resume(gb.handle, 5);  // all equal priority
+    aec.schedule_resume(gc.handle, 5);
+    aec.schedule_resume(ga.handle, 5);
+    aec.poll();
+
+    EXPECT_EQ(ev, (std::vector<std::string>{"b", "c", "a"}));  // arrival order preserved
+}
+
+// The safety guarantee: reordering resumes does NOT disturb watermark/epoch
+// release. A watermark closes the epoch the three records arrived in; the
+// release fires only AFTER all three finish, regardless of the priority-
+// reordered resume order, so "WM" lands last.
+TEST(AsyncExecutionController, PriorityResumeStillReleasesWatermarkAfterEpochDrains) {
+    AsyncExecutionController aec;
+    aec.set_resume_order(AsyncExecutionController::ResumeOrder::Priority);
+    std::vector<std::string> ev;
+    Gate ga;
+    Gate gb;
+    Gate gc;
+    aec.submit("a", gated(&ga, &ev, "a"));
+    aec.submit("b", gated(&gb, &ev, "b"));
+    aec.submit("c", gated(&gc, &ev, "c"));
+    aec.on_watermark([&] { ev.push_back("WM"); });
+    EXPECT_EQ(aec.pending_watermarks(), 1u);  // epoch still has 3 in-flight
+
+    aec.schedule_resume(gc.handle, 30);
+    aec.schedule_resume(ga.handle, 10);
+    aec.schedule_resume(gb.handle, 20);
+    aec.poll();
+
+    EXPECT_EQ(ev, (std::vector<std::string>{"a", "b", "c", "WM"}));  // WM after the epoch drains
+    EXPECT_EQ(aec.pending_watermarks(), 0u);
+}

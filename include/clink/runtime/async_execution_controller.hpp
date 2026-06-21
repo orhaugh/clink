@@ -44,6 +44,7 @@
 // (io_uring vs thread-pool) is swapped in later increments; this controller
 // is agnostic to it.
 
+#include <algorithm>
 #include <condition_variable>
 #include <coroutine>
 #include <cstddef>
@@ -73,6 +74,15 @@ public:
     // To suspend for IO it co_awaits an awaitable whose completion (on any
     // thread) calls schedule_resume() with the suspended handle.
     using CoroFactory = std::function<async::Task<void>()>;
+
+    // ASYNC-12: how poll() orders a batch of ready completions before resuming.
+    //   Fifo (default): arrival order - byte-identical to the original AEC.
+    //   Priority: ascending schedule_resume order_key (lower = sooner; e.g. a
+    //     deadline in ms), ties broken by arrival. Set once at wire-up on the
+    //     runner thread, before any submit/poll.
+    enum class ResumeOrder { Fifo, Priority };
+    void set_resume_order(ResumeOrder o) noexcept { resume_order_ = o; }
+    [[nodiscard]] ResumeOrder resume_order() const noexcept { return resume_order_; }
 
     static constexpr std::size_t kDefaultMaxInFlight = 6000;
 
@@ -125,10 +135,20 @@ public:
     // resumption and wake a runner blocked in drain(). The handle is the
     // deepest suspended coroutine (the one the IO awaitable captured); its
     // resumption propagates completion up through the continuation chain.
-    void schedule_resume(std::coroutine_handle<> h) {
+    void schedule_resume(std::coroutine_handle<> h) { schedule_resume(h, 0); }
+
+    // Priority-aware variant (ASYNC-12). order_key tags this completion's resume
+    // position: under ResumeOrder::Priority the runner resumes a poll's ready
+    // batch in ascending order_key (lower = sooner), ties broken by arrival
+    // (stable); under the default Fifo it is ignored. Reordering is always safe:
+    // the per-key gate guarantees every ready completion is for a DISTINCT key,
+    // and epoch/watermark releases are count-based and happen in
+    // process_completed_ AFTER the resume loop, so resume order cannot change
+    // which records belong to an epoch or when a watermark releases.
+    void schedule_resume(std::coroutine_handle<> h, std::uint64_t order_key) {
         {
             std::lock_guard<std::mutex> lk(mu_);
-            ready_.push_back(h);
+            ready_.push_back(ReadyEntry{h, order_key});
         }
         cv_.notify_one();
     }
@@ -138,14 +158,24 @@ public:
     // epochs, release any now-finished head watermarks). Returns the number
     // of records that completed.
     std::size_t poll() {
-        std::vector<std::coroutine_handle<>> ready;
+        std::vector<ReadyEntry> ready;
         {
             std::lock_guard<std::mutex> lk(mu_);
             ready.swap(ready_);
         }
-        for (auto h : ready) {
-            if (h && !h.done()) {
-                h.resume();  // runner-thread resume: stage3 runs here, not on the completion thread
+        if (resume_order_ == ResumeOrder::Priority && ready.size() > 1) {
+            // Reorder only THIS batch of already-ready, distinct-key
+            // completions (see schedule_resume's safety note). Stable so equal
+            // order_keys keep arrival order (FIFO within a priority class).
+            std::stable_sort(
+                ready.begin(), ready.end(), [](const ReadyEntry& a, const ReadyEntry& b) {
+                    return a.order_key < b.order_key;
+                });
+        }
+        for (const auto& e : ready) {
+            if (e.handle && !e.handle.done()) {
+                e.handle
+                    .resume();  // runner-thread resume: stage3 runs here, not the completion thread
             }
         }
         const std::size_t finished = process_completed_();
@@ -340,9 +370,14 @@ private:
     std::deque<PendingWatermark> wm_queue_;                 // closed epochs awaiting release
 
     // --- Cross-thread boundary (the only shared state) ------------------
+    struct ReadyEntry {
+        std::coroutine_handle<> handle;
+        std::uint64_t order_key;  // resume priority under ResumeOrder::Priority
+    };
     std::mutex mu_;
     std::condition_variable cv_;
-    std::vector<std::coroutine_handle<>> ready_;
+    std::vector<ReadyEntry> ready_;
+    ResumeOrder resume_order_{ResumeOrder::Fifo};  // runner-thread config, set once at wire-up
 };
 
 }  // namespace clink
