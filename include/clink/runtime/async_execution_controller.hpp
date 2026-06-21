@@ -84,6 +84,15 @@ public:
     void set_resume_order(ResumeOrder o) noexcept { resume_order_ = o; }
     [[nodiscard]] ResumeOrder resume_order() const noexcept { return resume_order_; }
 
+    // ASYNC-10 consumer hook: a read coalescer (CoalescingBackend) registers
+    // its flush() here. When the controller would otherwise block with records
+    // in flight but nothing ready, it calls the hook FIRST, giving a pending
+    // read batch the chance to issue ONE coalesced get_many_async before the
+    // runner waits. The hook returns true if it had work to issue. Default
+    // unset -> drain blocks exactly as before. Set on the runner thread at
+    // wire-up. Runner-thread-only (not the cross-thread surface).
+    void set_flush_hook(std::function<bool()> flush) { flush_hook_ = std::move(flush); }
+
     static constexpr std::size_t kDefaultMaxInFlight = 6000;
 
     explicit AsyncExecutionController(std::size_t max_in_flight = kDefaultMaxInFlight)
@@ -190,6 +199,15 @@ public:
             poll();
             if (records_.empty() && parked_count_ == 0) {
                 return;
+            }
+            // Stuck (work in flight, nothing ready): let a read coalescer flush
+            // its pending batch before we block. If it issued work the next
+            // poll() settles a synchronous backend, or the cv wakes on an
+            // asynchronous completion; a no-op flush (nothing pending) falls
+            // through to the wait, so a record genuinely blocked on real IO is
+            // unaffected.
+            if (flush_hook_ && flush_hook_()) {
+                continue;
             }
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [&] { return !ready_.empty(); });
@@ -378,6 +396,7 @@ private:
     std::condition_variable cv_;
     std::vector<ReadyEntry> ready_;
     ResumeOrder resume_order_{ResumeOrder::Fifo};  // runner-thread config, set once at wire-up
+    std::function<bool()> flush_hook_;             // ASYNC-10 coalescer flush (runner-thread)
 };
 
 }  // namespace clink
