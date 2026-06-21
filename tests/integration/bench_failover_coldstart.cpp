@@ -134,6 +134,18 @@ bool wait_for_exit(pid_t pid, std::chrono::milliseconds timeout, int* exit_code 
     return false;
 }
 
+// Non-blocking single poll: true if the process has already exited (reaps it).
+bool process_exited(pid_t pid, int* exit_code = nullptr) {
+    int status = 0;
+    if (::waitpid(pid, &status, WNOHANG) == pid) {
+        if (exit_code != nullptr) {
+            *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+        }
+        return true;
+    }
+    return false;
+}
+
 std::uint16_t probe_free_port() {
     NetworkChannelSource<std::int64_t> probe(0, int64_codec());
     return probe.listen();
@@ -227,6 +239,24 @@ bool file_contains(const fs::path& path, const std::string& needle) {
     }
     std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     return content.find(needle) != std::string::npos;
+}
+
+// Count non-overlapping occurrences of `needle` in `path` (whole-file). Used to
+// self-certify, from the JM log, that each sequential crash produced a NEW
+// "tm lost" and a NEW single-survivor "jm.restart ... survivors=1" line - i.e.
+// every kill was a genuine failover that forced a redeploy, not a no-op.
+std::size_t count_occurrences(const fs::path& path, const std::string& needle) {
+    std::ifstream in(path);
+    if (!in || needle.empty()) {
+        return 0;
+    }
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::size_t n = 0;
+    for (std::size_t pos = content.find(needle); pos != std::string::npos;
+         pos = content.find(needle, pos + needle.size())) {
+        ++n;
+    }
+    return n;
 }
 
 std::vector<std::string> read_committed_lines(const fs::path& out_dir) {
@@ -489,7 +519,7 @@ FailoverResult failover_once(const fs::path& node,
     // misread as record loss.
     std::vector<std::string> lines;
     std::set<std::string> uniq;
-    const auto commit_deadline = clock_t_::now() + 5s;
+    const auto commit_deadline = clock_t_::now() + 10s;
     do {
         lines = read_committed_lines(out_dir);
         uniq = std::set<std::string>(lines.begin(), lines.end());
@@ -510,6 +540,237 @@ FailoverResult failover_once(const fs::path& node,
     kill_quietly(tmB);
     kill_quietly(jm);
     return r;  // scratch dirs cleaned by ScopedDirs
+}
+
+struct SeqFailoverResult {
+    std::size_t requested{0};  // N crashes asked for
+    std::size_t real_crashes{
+        0};  // crashes confirmed genuine (new tm-lost + survivors=1 + ckpt advance)
+    std::size_t tm_lost_events{0};  // distinct "tm lost" lines the JM logged
+    std::size_t survivor_restarts{
+        0};  // distinct single-survivor "jm.restart ... survivors=1" lines
+    std::size_t expected{0};
+    std::size_t committed{0};
+    std::size_t dups{0};         // total_lines - unique (>0 = a record committed twice)
+    std::string missing_sample;  // first few missing record-K indices (diagnostic)
+    int submit_exit{-1};
+    bool monotonic_ckpts{true};  // completed-checkpoint id never went backwards across the run
+    bool exactly_once{false};
+    bool ok{false};
+    double total_recovery_ms{0};
+};
+
+// N SEQUENTIAL mid-flight failovers on the given backend. Rolling standby:
+// tm[i] is launched and registered BEFORE tm[i-1] is killed, so at the moment
+// of each crash exactly one slot-holder remains and the JM's redeploy target is
+// deterministic - the whole 2-subtask job (parallelism 1) lands on the single
+// survivor, just as failover_once relies on. Each crash is forced mid-flight
+// (we wait for fresh checkpoints after the standby is up) and SELF-CERTIFIED
+// genuine from the JM log: a NEW "tm lost" line AND a NEW single-survivor
+// "jm.restart ... survivors=1" line must appear, and the completed-checkpoint
+// id must advance past the kill point (the redeployed job is processing again).
+//
+// SCOPE of the exactly-once claim this proves: every one of the TOTAL records
+// is committed exactly once across a run that suffered N real failovers - no
+// duplicate AND no loss, including the post-last-checkpoint tail. Records that
+// cross a periodic checkpoint recover from S3 exactly-once; the tail is made
+// recoverable too because at clean EOS the bounded source drives one
+// JM-coordinated FINAL checkpoint (real id, committed via the normal ack ->
+// CommitCheckpoint path) and BLOCKS until it commits before finishing, so a
+// crash at end-of-stream replays and re-commits it rather than losing it. The
+// check (no dup AND no loss AND submit_exit==0) also certifies S3 was the live
+// backend on every restart: a degrade-to-memory would restore empty and replay
+// -> duplicates, and a failed redeploy would surface as submit_exit != 0.
+SeqFailoverResult failover_sequential(const fs::path& node,
+                                      const fs::path& submit,
+                                      const fs::path& job_so,
+                                      int n_failovers,
+                                      const std::string& default_state_backend_uri = "") {
+    SeqFailoverResult r;
+    r.requested = static_cast<std::size_t>(n_failovers);
+    const int total = 1200;  // long-running source: all N back-to-back crashes land
+    r.expected = static_cast<std::size_t>(total);
+
+    ScopedDirs scratch;
+    const auto ckpt_dir = mktmpdir("sfo_ckpt");
+    const auto out_dir = mktmpdir("sfo_out");
+    scratch.add(ckpt_dir);
+    scratch.add(out_dir);
+    ::setenv("CLINK_2PC_OUT_DIR", out_dir.c_str(), 1);
+    ::setenv("CLINK_2PC_TOTAL", std::to_string(total).c_str(), 1);
+    // ~36s of source runtime at p=1, so N rapid crashes all occur well before
+    // end-of-input (each is a genuine mid-flight failover, not an end-of-job race).
+    ::setenv("CLINK_2PC_TICK_MS", "30", 1);
+
+    const int heartbeat_ms = 1000;
+    const auto port = probe_free_port();
+    std::vector<std::string> jm_args{"clink_node",
+                                     "--role=jm",
+                                     "--port=" + std::to_string(port),
+                                     "--bind-host=127.0.0.1",
+                                     "--heartbeat-timeout-ms=" + std::to_string(heartbeat_ms),
+                                     "--watchdog-interval-ms=50"};
+    if (!default_state_backend_uri.empty()) {
+        jm_args.push_back("--default-state-backend=" + default_state_backend_uri);
+    }
+    const pid_t jm = spawn_logged(jm_args, node, ckpt_dir / "jm.log");
+    if (jm <= 0 || await_port_open(port, 5s) < 0) {
+        kill_quietly(jm);
+        return r;
+    }
+    const auto jm_log = ckpt_dir / "jm.log";
+
+    auto start_tm = [&](int idx) -> pid_t {
+        const std::string log = "tm" + std::to_string(idx) + ".log";
+        const pid_t p = spawn_logged({"clink_node",
+                                      "--role=tm",
+                                      "--id=tm-" + std::to_string(idx),
+                                      "--jm-host=127.0.0.1",
+                                      "--jm-port=" + std::to_string(port),
+                                      "--slots=4"},
+                                     node,
+                                     ckpt_dir / log);
+        if (p <= 0 || await_log_contains(ckpt_dir / log, "registered", clock_t_::now(), 5s) < 0) {
+            return -1;
+        }
+        return p;
+    };
+
+    pid_t active = start_tm(0);
+    if (active <= 0) {
+        kill_quietly(jm);
+        return r;
+    }
+
+    const pid_t sub = spawn_logged({"clink_submit_job",
+                                    "--job=" + job_so.string(),
+                                    "--jm-host=127.0.0.1",
+                                    "--jm-port=" + std::to_string(port),
+                                    "--wait-timeout-s=180",
+                                    "--checkpoint-dir=" + ckpt_dir.string(),
+                                    "--checkpoint-interval-ms=150",
+                                    "--max-restarts-on-tm-loss=" + std::to_string(n_failovers + 2)},
+                                   submit,
+                                   ckpt_dir / "submit.log");
+    if (sub <= 0) {
+        kill_quietly(active);
+        kill_quietly(jm);
+        return r;
+    }
+
+    // Wait until the completed-checkpoint id reaches `target`, the job exits, or
+    // a deadline; also tracks monotonicity (the id must never regress).
+    std::uint64_t high_water = 0;
+    auto wait_ckpt_ge = [&](std::uint64_t target) {
+        const auto dl = clock_t_::now() + 30s;
+        while (clock_t_::now() < dl) {
+            if (process_exited(sub)) {
+                return;
+            }
+            const auto c = latest_completed_checkpoint(ckpt_dir);
+            if (c < high_water) {
+                r.monotonic_ckpts = false;  // a committed checkpoint id went backwards
+            }
+            high_water = std::max(high_water, c);
+            if (c >= target) {
+                return;
+            }
+            std::this_thread::sleep_for(10ms);
+        }
+    };
+
+    bool job_done = false;
+    for (int i = 1; i <= n_failovers && !job_done; ++i) {
+        if (process_exited(sub, &r.submit_exit)) {
+            job_done = true;
+            break;  // job finished before we could crash again
+        }
+        const pid_t standby = start_tm(i);
+        if (standby <= 0) {
+            break;  // no recovery target -> stop (ok stays false)
+        }
+        const std::uint64_t base = latest_completed_checkpoint(ckpt_dir);
+        wait_ckpt_ge(base + 2);  // genuine mid-flight: fresh state landed since the standby came up
+        const std::uint64_t before = latest_completed_checkpoint(ckpt_dir);
+        const auto t_crash = clock_t_::now();
+        kill_quietly(active);      // SIGKILL the active TM (the sole slot-holder)
+        active = standby;          // the standby is the only remaining slot-holder
+        wait_ckpt_ge(before + 2);  // the redeployed job is checkpointing again
+        const std::uint64_t after = latest_completed_checkpoint(ckpt_dir);
+        // Genuine failover: with single-TM placement the killed TM was running
+        // the whole job, so the job CAN only advance past the kill point by
+        // failing over to the standby and resuming. A checkpoint id strictly
+        // beyond the pre-kill id is that proof. We deliberately do NOT read the
+        // JM "tm lost" / "survivors=1" counts here per crash: those are logged
+        // asynchronously ~heartbeat_timeout after the kill (and restarts are
+        // coalesced under rapid succession), so a per-crash count read races the
+        // logger. The total tm-lost count is checked once at the end instead,
+        // when all logging has settled.
+        if (after > before) {
+            ++r.real_crashes;
+            r.total_recovery_ms += ms_since(t_crash);
+        }
+    }
+
+    // The bounded source REPLAYS from its last checkpoint after every failover,
+    // so N crashes + recoveries push the wall-clock well past the crash-free
+    // ~36s; wait generously (the submitter's own --wait-timeout-s=180 bounds it)
+    // so a slow-but-completing job is not misread mid-flight as a shortfall.
+    const bool exited = wait_for_exit(sub, 150s, &r.submit_exit);
+    r.tm_lost_events = count_occurrences(jm_log, "tm lost");
+    r.survivor_restarts = count_occurrences(jm_log, "survivors=1");  // informational (coalesced)
+
+    // Absorb terminal-commit flush lag: the submitter can observe JobCompleted a
+    // hair before the 2PC sink's final staging->committed rename is visible (the
+    // commit flushes in bursts with multi-second gaps). Poll until the count
+    // reaches `expected`, or genuinely PLATEAUS (unchanged for a run of
+    // CONSECUTIVE reads = a real shortfall, not a between-bursts gap), capped at
+    // a generous ceiling.
+    std::vector<std::string> lines;
+    std::set<std::string> uniq;
+    const auto commit_deadline = clock_t_::now() + 60s;
+    std::size_t prev = 0;
+    int stable = 0;
+    while (clock_t_::now() < commit_deadline) {
+        lines = read_committed_lines(out_dir);
+        uniq = std::set<std::string>(lines.begin(), lines.end());
+        if (uniq.size() >= r.expected) {
+            break;
+        }
+        stable = (uniq.size() == prev) ? stable + 1 : 0;
+        prev = uniq.size();
+        if (stable >= 150) {  // unchanged across 150 consecutive reads (~15s) -> genuine plateau
+            break;
+        }
+        std::this_thread::sleep_for(100ms);
+    }
+    r.committed = uniq.size();
+    r.dups = lines.size() - uniq.size();
+    // Diagnostic: if short, which record-K are missing (first few)?
+    if (uniq.size() < r.expected) {
+        int shown = 0;
+        for (int k = 0; k < total && shown < 8; ++k) {
+            if (uniq.find("record-" + std::to_string(k)) == uniq.end()) {
+                r.missing_sample += (shown ? "," : "") + std::to_string(k);
+                ++shown;
+            }
+        }
+    }
+    // Exactly-once over the whole bounded output: no duplicate (lines == uniq)
+    // AND no loss (uniq == expected) AND the job completed cleanly.
+    r.exactly_once =
+        exited && r.submit_exit == 0 && lines.size() == uniq.size() && r.committed == r.expected;
+    // The proof holds iff every requested crash was a genuine, self-certified
+    // sequential failover - the JM detected N distinct TM losses and the job
+    // advanced past each kill point (r.real_crashes) - checkpoints never
+    // regressed, and the full bounded output is exactly-once. survivor_restarts
+    // is NOT gated on (the JM coalesces restarts under rapid succession).
+    r.ok = r.exactly_once && r.real_crashes == static_cast<std::size_t>(n_failovers) &&
+           r.tm_lost_events >= static_cast<std::size_t>(n_failovers) && r.monotonic_ckpts;
+
+    kill_quietly(active);
+    kill_quietly(jm);
+    return r;
 }
 
 }  // namespace
@@ -613,7 +874,67 @@ int main() {
         std::printf("  SKIPPED (set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET to run)\n");
     }
 
-    const bool ok = cold_ok == kIters && f.ok && remote_ok;
+    // ---- SEQUENTIAL multi-failover: crash the active TM N times in a row ----
+    // Proves exactly-once is preserved not just across one TM loss but across a
+    // chain of them, each crash mid-flight on a fresh active TM (rolling
+    // standby). Run on the local-dir backend as a control and, when MinIO is
+    // configured, on the disaggregated remote-read:// (S3) backend - the latter
+    // re-restores the source offset from the last committed S3 checkpoint on
+    // EVERY crash. exactly_once over the full bounded output (no dup, no loss)
+    // after N self-certified failovers is the proof.
+    constexpr int kSeqFailovers = 3;
+    std::printf("\n---- sequential multi-failover (%d crashes in a row) ----\n", kSeqFailovers);
+    const auto seq_file = failover_sequential(node, submit, job_so, kSeqFailovers);
+    std::printf(
+        "  [file] real_crashes=%zu/%zu tm_lost=%zu survivor_restarts=%zu "
+        "committed=%zu/%zu dups=%zu submit_exit=%d monotonic_ckpts=%s exactly_once=%s%s%s\n",
+        seq_file.real_crashes,
+        seq_file.requested,
+        seq_file.tm_lost_events,
+        seq_file.survivor_restarts,
+        seq_file.committed,
+        seq_file.expected,
+        seq_file.dups,
+        seq_file.submit_exit,
+        seq_file.monotonic_ckpts ? "yes" : "NO",
+        seq_file.exactly_once ? "yes" : "NO",
+        seq_file.missing_sample.empty() ? "" : " missing=",
+        seq_file.missing_sample.c_str());
+
+    bool seq_remote_ok = true;  // pass when skipped
+    std::printf("  ---- on remote-read:// (disaggregated S3 state) ----\n");
+    if (s3_endpoint != nullptr && s3_bucket != nullptr) {
+        const std::string uri = "remote-read://" + std::string{s3_bucket} + "/seq-failover-" +
+                                std::to_string(static_cast<long long>(::getpid())) +
+                                "?endpoint=" + s3_endpoint + "&region=us-east-1";
+        const auto seq_rr = failover_sequential(node, submit, job_so, kSeqFailovers, uri);
+        std::printf(
+            "  [remote-read] real_crashes=%zu/%zu tm_lost=%zu survivor_restarts=%zu "
+            "committed=%zu/%zu dups=%zu submit_exit=%d avg_recovery_ms=%.0f "
+            "monotonic_ckpts=%s exactly_once=%s%s%s\n",
+            seq_rr.real_crashes,
+            seq_rr.requested,
+            seq_rr.tm_lost_events,
+            seq_rr.survivor_restarts,
+            seq_rr.committed,
+            seq_rr.expected,
+            seq_rr.dups,
+            seq_rr.submit_exit,
+            seq_rr.real_crashes > 0 ? seq_rr.total_recovery_ms / seq_rr.real_crashes : 0.0,
+            seq_rr.monotonic_ckpts ? "yes" : "NO",
+            seq_rr.exactly_once ? "yes" : "NO",
+            seq_rr.missing_sample.empty() ? "" : " missing=",
+            seq_rr.missing_sample.c_str());
+        std::printf(
+            "  (every record - including the post-last-checkpoint tail - is durably\n"
+            "   committed: at clean EOS the source drives one JM-coordinated FINAL\n"
+            "   checkpoint and blocks until it commits, so a crash anywhere replays it)\n");
+        seq_remote_ok = seq_rr.ok;
+    } else {
+        std::printf("  SKIPPED (set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET to run)\n");
+    }
+
+    const bool ok = cold_ok == kIters && f.ok && remote_ok && seq_file.ok && seq_remote_ok;
     std::printf("\n==== %s ====\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

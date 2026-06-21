@@ -262,22 +262,47 @@ public:
                 if (source->is_bounded()) {
                     emitter.emit_watermark(Watermark::max());
                 }
-                // Terminal barrier: signals to downstream sinks that
-                // the stream has ended, so any 2PC sink can pre-commit
-                // + commit the tail records that didn't fall inside a
-                // JM-coordinated checkpoint. Skipped for relay sources
-                // (NetworkBridgeSource): they only forward whatever
-                // arrived from upstream, and the upstream's terminal
-                // is already in the relayed stream. Adding a second
-                // would make 2PC sinks commit twice and overwrite the
-                // first commit. Sentinel is max uint64 so it can't
-                // collide with a real ckpt id from periodic
-                // checkpointing.
+                // End-of-stream tail commit. Skipped for relay sources
+                // (NetworkBridgeSource): they only forward whatever arrived from
+                // upstream, whose terminal is already in the relayed stream.
                 if (ctx.has_state_backend() && source->emit_terminal_barrier_on_exit()) {
-                    channel->push(StreamElement<T>::barrier(
-                        CheckpointBarrier{CheckpointId{std::numeric_limits<std::uint64_t>::max()},
-                                          /*terminal=*/true,
-                                          source_barrier_mode}));
+                    // Cluster path: ask the JM for one FINAL JM-coordinated
+                    // checkpoint that durably + recoverably commits the tail
+                    // (records since the last completed periodic checkpoint),
+                    // then BLOCK until it commits before closing. Because the
+                    // runner's return is what emits SubtaskFinished (and drives
+                    // job completion), this makes "job complete" impossible
+                    // before the tail is durable; a crash in the window leaves
+                    // the source un-finished -> restart -> replay -> re-commit.
+                    // The final id is injected through the source's OWN drain so
+                    // snapshot_offset captures the EOS offset atomically and the
+                    // barrier is a NORMAL (non-terminal) one the sink commits via
+                    // the standard ack -> CommitCheckpoint path.
+                    std::uint64_t final_id = 0;
+                    if (const auto& req = ctx.request_final_checkpoint(); req) {
+                        final_id = req();  // 0 = JM declined / timed out / unwired
+                    }
+                    if (final_id != 0) {
+                        source->inject_pending_barrier(CheckpointBarrier{CheckpointId{final_id},
+                                                                         /*terminal=*/false,
+                                                                         source_barrier_mode});
+                        drain_pending_barriers();
+                        if (const auto& wait = ctx.wait_final_committed(); wait) {
+                            // Bounded: on timeout the runner returns un-committed
+                            // and the normal restart/fail path takes over (never a
+                            // silent complete-with-lost-tail).
+                            (void)wait(final_id, std::chrono::seconds(30));
+                        }
+                    } else {
+                        // In-process / no JM / JM declined: fall back to the local
+                        // terminal commit (UINT64_MAX sentinel), unchanged. 2PC
+                        // sinks pre-commit + commit the tail locally. No recovery
+                        // after end-of-stream on this path (in-process only).
+                        channel->push(StreamElement<T>::barrier(CheckpointBarrier{
+                            CheckpointId{std::numeric_limits<std::uint64_t>::max()},
+                            /*terminal=*/true,
+                            source_barrier_mode}));
+                    }
                 }
             }
             source->close();
@@ -2937,6 +2962,35 @@ public:
                     // timers fire before the channels close.
                     if (source->is_bounded()) {
                         typed_emitter.emit_watermark(Watermark::max());
+                    }
+                    // Cluster-path EOS final checkpoint, identical to the
+                    // single-source runner: request one JM-coordinated final
+                    // checkpoint that durably + recoverably commits the tail,
+                    // inject it through this subtask's own drain (snapshot_offset
+                    // captures the EOS offset), and block until it commits before
+                    // closing - so job completion (driven by SubtaskFinished on
+                    // return) cannot precede the tail being durable. Every
+                    // parallel source subtask injects the SAME JM-assigned id and
+                    // they align downstream. In-process / declined (final_id == 0)
+                    // falls through unchanged (this path emits no local terminal).
+                    if (ctx.has_state_backend() && source->emit_terminal_barrier_on_exit()) {
+                        std::uint64_t final_id = 0;
+                        if (const auto& req = ctx.request_final_checkpoint(); req) {
+                            final_id = req();
+                        }
+                        if (final_id != 0) {
+                            source->inject_pending_barrier(
+                                CheckpointBarrier{CheckpointId{final_id},
+                                                  /*terminal=*/false,
+                                                  ctx.barrier_mode_override().value_or(
+                                                      ctx.unaligned_checkpoints()
+                                                          ? CheckpointBarrier::Mode::Unaligned
+                                                          : CheckpointBarrier::Mode::Aligned)});
+                            drain_pending_barriers();
+                            if (const auto& wait = ctx.wait_final_committed(); wait) {
+                                (void)wait(final_id, std::chrono::seconds(30));
+                            }
+                        }
                     }
                 }
                 source->close();

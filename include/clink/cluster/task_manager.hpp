@@ -152,6 +152,9 @@ private:
                               const std::string& expected_state_versions_packed);
     void handle_trigger_checkpoint_(MessageReader& r);
     void handle_commit_checkpoint_(MessageReader& r);
+    // Reply to a source's RequestFinalCheckpoint: records the JM-assigned id and
+    // wakes the blocked source runner (see request_final_checkpoint hook wiring).
+    void handle_final_checkpoint_assigned_(MessageReader& r);
     // Phase 30c: dispatch AbortCheckpoint to per-subtask abort
     // callbacks. Mirrors handle_commit_checkpoint_; sinks register
     // their abort callback alongside their commit callback at
@@ -199,6 +202,17 @@ private:
     std::mutex send_mu_;
     std::condition_variable cv_;
     std::size_t in_flight_tasks_{0};
+
+    // Bounded-source EOS final-checkpoint coordination (cluster path). A source
+    // runner blocks in request_final_checkpoint() until the JM replies with the
+    // assigned id (final_assigned_, keyed "job:role:subtask"), then blocks in
+    // wait_final_committed() until this TM observes CommitCheckpoint for that id
+    // (final_committed_high_water_, per job). Both waits are bounded; the reader
+    // thread fills these and notifies final_ckpt_cv_.
+    std::mutex final_ckpt_mu_;
+    std::condition_variable final_ckpt_cv_;
+    std::unordered_map<std::string, std::optional<std::uint64_t>> final_assigned_;
+    std::unordered_map<JobId, std::uint64_t> final_committed_high_water_;
 
     // Per-task pending state: when Deploy arrives, we register one
     // PendingTask per (job_id, role, subtask_idx) so the reader thread

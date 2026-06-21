@@ -272,6 +272,19 @@ inline void encode_body(MessageBuilder& b, const PeerUpdateMsg& m) {
     }
 }
 
+inline void encode_body(MessageBuilder& b, const RequestFinalCheckpointMsg& m) {
+    b.put_u64_be(m.job_id);
+    b.put_string(m.role);
+    b.put_u32_be(m.subtask_idx);
+}
+
+inline void encode_body(MessageBuilder& b, const FinalCheckpointAssignedMsg& m) {
+    b.put_u64_be(m.job_id);
+    b.put_string(m.role);
+    b.put_u32_be(m.subtask_idx);
+    b.put_u64_be(m.final_checkpoint_id);
+}
+
 // Wrap any typed message: produces the final framed byte buffer ready
 // for socket send_all.
 template <typename Msg>
@@ -462,6 +475,23 @@ inline SubtaskFinishedMsg decode_subtask_finished(MessageReader& r) {
 
 inline HeartbeatMsg decode_heartbeat(MessageReader& r) {
     return HeartbeatMsg{r.read_string()};
+}
+
+inline RequestFinalCheckpointMsg decode_request_final_checkpoint(MessageReader& r) {
+    RequestFinalCheckpointMsg m;
+    m.job_id = r.read_u64_be();
+    m.role = r.read_string();
+    m.subtask_idx = r.read_u32_be();
+    return m;
+}
+
+inline FinalCheckpointAssignedMsg decode_final_checkpoint_assigned(MessageReader& r) {
+    FinalCheckpointAssignedMsg m;
+    m.job_id = r.read_u64_be();
+    m.role = r.read_string();
+    m.subtask_idx = r.read_u32_be();
+    m.final_checkpoint_id = r.read_u64_be();
+    return m;
 }
 
 inline HelloClientMsg decode_hello_client(MessageReader&) {

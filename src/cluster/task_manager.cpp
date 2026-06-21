@@ -510,6 +510,9 @@ void TaskManager::reader_loop_() {
             case MessageKind::CommitCheckpoint:
                 handle_commit_checkpoint_(r);
                 break;
+            case MessageKind::FinalCheckpointAssigned:
+                handle_final_checkpoint_assigned_(r);
+                break;
             case MessageKind::AbortCheckpoint:
                 handle_abort_checkpoint_(r);
                 break;
@@ -524,6 +527,14 @@ void TaskManager::reader_loop_() {
 
 void TaskManager::handle_commit_checkpoint_(MessageReader& r) {
     auto msg = decode_commit_checkpoint(r);
+    // Record the committed high-water mark + wake any source blocked in
+    // wait_final_committed() for its final checkpoint id (see EOS handling).
+    {
+        std::lock_guard lk(final_ckpt_mu_);
+        auto& hw = final_committed_high_water_[msg.job_id];
+        hw = std::max(hw, msg.checkpoint_id);
+    }
+    final_ckpt_cv_.notify_all();
     // Snapshot per-job commit callbacks under the lock, then dispatch
     // without it. The sink's commit work (atomic rename, Kafka commitTx,
     // SQL COMMIT PREPARED) may block on the external system; doing it
@@ -585,6 +596,17 @@ void TaskManager::handle_commit_checkpoint_(MessageReader& r) {
             // Best-effort: a failed purge only leaves disk un-reclaimed.
         }
     }
+}
+
+void TaskManager::handle_final_checkpoint_assigned_(MessageReader& r) {
+    auto msg = decode_final_checkpoint_assigned(r);
+    const std::string key =
+        std::to_string(msg.job_id) + ":" + msg.role + ":" + std::to_string(msg.subtask_idx);
+    {
+        std::lock_guard lk(final_ckpt_mu_);
+        final_assigned_[key] = msg.final_checkpoint_id;  // 0 = JM declined
+    }
+    final_ckpt_cv_.notify_all();
 }
 
 void TaskManager::handle_begin_rescale_(MessageReader& r) {
@@ -1112,6 +1134,43 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 m.error = std::move(error);
                 send_frame_(encode_frame(MessageKind::SubtaskCheckpointed, m));
             };
+            // Bounded-source EOS hooks. request_final_checkpoint asks the JM for
+            // a final coordinated checkpoint id and blocks (bounded) for the
+            // reply; wait_final_committed blocks (bounded) until this TM observes
+            // CommitCheckpoint for that id. Only a real bounded source at clean
+            // EOS invokes these (relays/unbounded sources never do).
+            auto request_final_ckpt =
+                [this, job_id, role = task.role, sub = task.subtask_idx]() -> std::uint64_t {
+                const std::string key =
+                    std::to_string(job_id) + ":" + role + ":" + std::to_string(sub);
+                {
+                    std::lock_guard lk(final_ckpt_mu_);
+                    final_assigned_[key] = std::nullopt;  // register before sending
+                }
+                RequestFinalCheckpointMsg req;
+                req.job_id = job_id;
+                req.role = role;
+                req.subtask_idx = sub;
+                if (!send_frame_(encode_frame(MessageKind::RequestFinalCheckpoint, req))) {
+                    std::lock_guard lk(final_ckpt_mu_);
+                    final_assigned_.erase(key);
+                    return 0;
+                }
+                std::unique_lock lk(final_ckpt_mu_);
+                final_ckpt_cv_.wait_for(
+                    lk, std::chrono::seconds(30), [&] { return final_assigned_[key].has_value(); });
+                const auto v = final_assigned_[key];
+                final_assigned_.erase(key);
+                return v.value_or(0);
+            };
+            auto wait_final_committed = [this, job_id](std::uint64_t id,
+                                                       std::chrono::milliseconds timeout) -> bool {
+                std::unique_lock lk(final_ckpt_mu_);
+                return final_ckpt_cv_.wait_for(lk, timeout, [&] {
+                    auto it = final_committed_high_water_.find(job_id);
+                    return it != final_committed_high_water_.end() && it->second >= id;
+                });
+            };
             // Callback the source runner uses to register its barrier
             // injectors with the TM. Multiple subtasks per (job, sub_idx)
             // would overwrite; in v1 each subtask has at most one set.
@@ -1220,6 +1279,8 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 .restore_from_parent_count = rescale_parent_count,
                 .restore_key_group_filter = kg_filter,
                 .on_checkpoint_ack = std::move(ack_cb),
+                .request_final_checkpoint = std::move(request_final_ckpt),
+                .wait_final_committed = std::move(wait_final_committed),
                 .register_source_injectors = std::move(register_injectors),
                 .register_commit_callbacks = std::move(register_commits),
                 .register_abort_callbacks = std::move(register_aborts),

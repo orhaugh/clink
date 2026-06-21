@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -76,6 +77,33 @@ public:
     using CheckpointAckFn = std::function<void(CheckpointId, bool /*ok*/, std::string /*error*/)>;
     void set_checkpoint_ack(CheckpointAckFn fn) noexcept { ack_fn_ = std::move(fn); }
     const CheckpointAckFn& checkpoint_ack() const noexcept { return ack_fn_; }
+
+    // Bounded-source end-of-stream FINAL checkpoint (cluster path only).
+    // At clean bounded EOS the source runner asks the JM to trigger ONE
+    // JM-coordinated checkpoint that durably captures the EOS offset and drives
+    // the sink's tail commit through the normal ack -> CommitCheckpoint path,
+    // then BLOCKS until that checkpoint is committed before the runner returns.
+    // Because the runner's return is what emits SubtaskFinished (which drives
+    // job completion), this makes "job complete" impossible before the tail is
+    // durable, and a crash in the window leaves the source unfinished -> restart
+    // -> replay -> re-commit. Both hooks are empty on in-process / non-cluster
+    // runs, where the source falls back to the local terminal commit (unchanged).
+    // request_final_checkpoint() returns the JM-assigned final checkpoint id, or
+    // 0 if the JM declined (job cancelling/completing) or the hook is unwired.
+    using RequestFinalCheckpointFn = std::function<std::uint64_t()>;
+    using WaitFinalCommittedFn = std::function<bool(std::uint64_t, std::chrono::milliseconds)>;
+    void set_request_final_checkpoint(RequestFinalCheckpointFn fn) noexcept {
+        request_final_ckpt_ = std::move(fn);
+    }
+    const RequestFinalCheckpointFn& request_final_checkpoint() const noexcept {
+        return request_final_ckpt_;
+    }
+    void set_wait_final_committed(WaitFinalCommittedFn fn) noexcept {
+        wait_final_committed_ = std::move(fn);
+    }
+    const WaitFinalCommittedFn& wait_final_committed() const noexcept {
+        return wait_final_committed_;
+    }
 
     // Aligned vs unaligned checkpoint barrier handling. Set by the
     // executor at open(); multi-input operator runners read it to
@@ -280,6 +308,8 @@ private:
     TimerService timer_service_{};
     SideOutputChannelMap side_outputs_;
     CheckpointAckFn ack_fn_;
+    RequestFinalCheckpointFn request_final_ckpt_;
+    WaitFinalCommittedFn wait_final_committed_;
     bool unaligned_checkpoints_{false};
     KeyGroupRange restore_kg_range_{};  // default {0, kNumKeyGroups} = covers all
     std::optional<CheckpointBarrier::Mode> barrier_mode_override_;

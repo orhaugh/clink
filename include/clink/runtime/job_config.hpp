@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -80,6 +82,17 @@ struct JobConfig {
     using CheckpointAckFn =
         std::function<void(CheckpointId /*id*/, bool /*ok*/, std::string /*error*/)>;
     CheckpointAckFn on_checkpoint_ack;
+
+    // Bounded-source end-of-stream FINAL checkpoint hooks (cluster path). The
+    // TaskManager wires these to request a JM-coordinated final checkpoint at
+    // EOS and block until it commits, so a bounded job is not marked complete
+    // until its post-last-checkpoint tail is durable + recoverable. Empty for
+    // in-process runs (the source falls back to its local terminal commit).
+    // See RuntimeContext::request_final_checkpoint / wait_final_committed.
+    using RequestFinalCheckpointFn = std::function<std::uint64_t()>;
+    using WaitFinalCommittedFn = std::function<bool(std::uint64_t, std::chrono::milliseconds)>;
+    RequestFinalCheckpointFn request_final_checkpoint;
+    WaitFinalCommittedFn wait_final_committed;
 
     // External cancellation flag. If set, the LocalExecutor's stop
     // predicate ORs with `external_cancel_token->load()` so an outside

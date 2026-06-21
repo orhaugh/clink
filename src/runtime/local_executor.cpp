@@ -60,6 +60,15 @@ void LocalExecutor::start() {
         if (config_.on_checkpoint_ack) {
             contexts_.back()->set_checkpoint_ack(config_.on_checkpoint_ack);
         }
+        // Bounded-source EOS final-checkpoint hooks (cluster path only). Only
+        // the source runner invokes them at clean bounded EOS; copying onto
+        // every context is harmless (no other runner calls them).
+        if (config_.request_final_checkpoint) {
+            contexts_.back()->set_request_final_checkpoint(config_.request_final_checkpoint);
+        }
+        if (config_.wait_final_committed) {
+            contexts_.back()->set_wait_final_committed(config_.wait_final_committed);
+        }
         contexts_.back()->set_unaligned_checkpoints(config_.unaligned_checkpoints);
         // Give operators the restore key-group range so timer restore can
         // route each timer to the subtask owning its key group on a rescale

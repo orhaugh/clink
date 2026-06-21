@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -136,6 +137,12 @@ struct RunnerContext {
     // back to the JM.
     std::function<void(std::uint64_t /*checkpoint_id*/, bool /*ok*/, std::string /*error*/)>
         on_checkpoint_ack;
+    // Bounded-source EOS final-checkpoint hooks (see RuntimeContext /
+    // JobConfig). request_final_checkpoint asks the JM for a final coordinated
+    // checkpoint id (0 = declined); wait_final_committed blocks until this TM
+    // observes CommitCheckpoint for that id. Empty for non-cluster runs.
+    std::function<std::uint64_t()> request_final_checkpoint;
+    std::function<bool(std::uint64_t, std::chrono::milliseconds)> wait_final_committed;
     // Source-side barrier injectors the runner hands to the TM before
     // it starts running. For source subtasks the vector has one entry
     // (the injector for the source's outbound channel). For non-source

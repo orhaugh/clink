@@ -1778,6 +1778,11 @@ void JobManager::start_reader_for_(std::shared_ptr<TmConnection> tm) {
                 case MessageKind::SubtaskCheckpointed:
                     handle_subtask_checkpointed_(r);
                     break;
+                case MessageKind::RequestFinalCheckpoint:
+                    if (tm->conn) {
+                        handle_request_final_checkpoint_(r, *tm->conn);
+                    }
+                    break;
                 default:
                     break;
             }
@@ -2329,6 +2334,11 @@ std::vector<JobManager::PendingDeploy> JobManager::restart_job_locked_(JobState&
     job.tasks_by_tm.clear();
     job.pending_per_tm.clear();
     job.pending_checkpoint_acks.clear();
+    // Clear the bounded-source final-checkpoint coordination so a replayed EOS
+    // after this restart re-requests a FRESH final id seeded from the new task
+    // set (the old pending set referenced pre-restart subtask keys).
+    job.final_checkpoint_id.reset();
+    job.sources_requested_final.clear();
     if (is_rescale) {
         job.expected_completion = tasks_to_redeploy.size();
     }
@@ -3005,6 +3015,56 @@ void JobManager::stop() {
         }
         tm->conn.reset();  // destructor closes
     }
+}
+
+void JobManager::handle_request_final_checkpoint_(MessageReader& r,
+                                                  network::Connection& reply_conn) {
+    auto msg = decode_request_final_checkpoint(r);
+    std::uint64_t final_id = 0;  // 0 == declined (job completing/cancelling/no dir)
+    {
+        std::lock_guard lock(mu_);
+        auto it = jobs_.find(msg.job_id);
+        if (it != jobs_.end()) {
+            auto& job = *it->second;
+            if (!job.completion_signalled && !job.cancel_requested &&
+                !job.checkpoint.checkpoint_dir.empty()) {
+                if (!job.final_checkpoint_id.has_value()) {
+                    // First source to reach EOS: assign ONE final id for the job,
+                    // seed its pending-ack set from the live task set (every
+                    // subtask must ack it before it completes), and stamp the
+                    // start time. We do NOT broadcast TriggerCheckpoint: the
+                    // requesting source(s) inject this id through their own EOS
+                    // drain (so snapshot_offset captures the EOS offset), and the
+                    // barrier propagates downstream through the data plane exactly
+                    // like a periodic one - a broadcast would double-inject at the
+                    // source. handle_subtask_checkpointed_ completes it normally
+                    // (COMPLETED-<id> + CommitCheckpoint broadcast) once all ack.
+                    final_id = job.next_checkpoint_id++;
+                    job.final_checkpoint_id = final_id;
+                    std::unordered_set<std::string> pending;
+                    for (const auto& [tkey, _] : job.task_records) {
+                        pending.insert(tkey);
+                    }
+                    job.pending_checkpoint_acks[final_id] = std::move(pending);
+                    job.pending_checkpoint_start_times[final_id] = std::chrono::steady_clock::now();
+                    clink::metrics::ckpt::triggered();
+                    log::info("jm.final_checkpoint",
+                              "job_id=" + std::to_string(msg.job_id) +
+                                  " final_id=" + std::to_string(final_id));
+                } else {
+                    final_id = *job.final_checkpoint_id;
+                }
+                job.sources_requested_final.insert(msg.role + ":" +
+                                                   std::to_string(msg.subtask_idx));
+            }
+        }
+    }
+    FinalCheckpointAssignedMsg reply;
+    reply.job_id = msg.job_id;
+    reply.role = msg.role;
+    reply.subtask_idx = msg.subtask_idx;
+    reply.final_checkpoint_id = final_id;
+    send_frame(reply_conn, encode_frame(MessageKind::FinalCheckpointAssigned, reply));
 }
 
 void JobManager::handle_subtask_checkpointed_(MessageReader& r) {

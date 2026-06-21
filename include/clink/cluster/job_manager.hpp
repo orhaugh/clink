@@ -610,6 +610,16 @@ private:
         std::uint64_t latest_completed_checkpoint_id{0};
         std::uint64_t next_checkpoint_id{1};
 
+        // Bounded-source end-of-stream FINAL checkpoint coordination. When the
+        // first bounded source reaches clean EOS and sends RequestFinalCheckpoint,
+        // the JM assigns ONE final checkpoint id for the whole job (so every
+        // parallel source subtask injects + acks the SAME id), seeds its pending
+        // ack set from the live task set, and broadcasts TriggerCheckpoint for it.
+        // Every requester is replied the same id. Cleared on restart so a replayed
+        // EOS re-requests a fresh id seeded from the post-restart task set.
+        std::optional<std::uint64_t> final_checkpoint_id;
+        std::unordered_set<std::string> sources_requested_final;
+
         // Phase 30b: commit-group memberships derived from the job's
         // sink operator params at submit time. group_name -> ordered
         // set of "role:subtask_idx" keys belonging to the group.
@@ -728,6 +738,10 @@ private:
                            std::unique_ptr<JobBundle> bundle,
                            std::string expected_state_versions_packed = {});
     void handle_subtask_checkpointed_(MessageReader& r);
+    // A bounded source at clean EOS requested a final coordinated checkpoint.
+    // Assigns (once per job) the final id, seeds its pending ack set, broadcasts
+    // TriggerCheckpoint, and replies FinalCheckpointAssigned on `reply_conn`.
+    void handle_request_final_checkpoint_(MessageReader& r, network::Connection& reply_conn);
     void checkpoint_trigger_loop_();
     // Read every <ha_dir>/history/*.json on startup so the JM's
     // in-memory ring picks up where the previous leader left off.

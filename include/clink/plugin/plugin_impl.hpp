@@ -126,6 +126,16 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
             ack(id.value(), ok, std::move(error));
         };
     }
+    // Bounded-source EOS final-checkpoint hooks (cluster path). Bridge the
+    // cluster RunnerContext callbacks onto JobConfig so the source runner can
+    // request a JM-coordinated final checkpoint at EOS and block until it
+    // commits. Empty in in-process paths (source falls back to local terminal).
+    if (rctx.request_final_checkpoint) {
+        cfg.request_final_checkpoint = rctx.request_final_checkpoint;
+    }
+    if (rctx.wait_final_committed) {
+        cfg.wait_final_committed = rctx.wait_final_committed;
+    }
     // Thread the TaskManager-owned cancel token through so a
     // CancelJob message can wind the LocalExecutor down without a
     // reference to it. nullptr in legacy/in-process paths.

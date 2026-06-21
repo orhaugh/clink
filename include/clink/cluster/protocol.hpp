@@ -28,6 +28,12 @@ enum class MessageKind : std::uint8_t {
     Heartbeat = 3,
     SubtaskListening = 6,
     SubtaskCheckpointed = 9,
+    // TM → JM. A bounded source at clean end-of-stream asks the JM to
+    // trigger one FINAL JM-coordinated checkpoint that durably commits the
+    // post-last-checkpoint tail before the job is allowed to complete. The
+    // JM replies with FinalCheckpointAssigned carrying the assigned id (or 0
+    // to decline if the job is already completing/cancelling).
+    RequestFinalCheckpoint = 10,
     // Client → JM
     HelloClient = 4,
     SubmitJob = 5,
@@ -92,6 +98,11 @@ enum class MessageKind : std::uint8_t {
     RescaleJobAck = 111,
     RescaleOperatorAck = 115,
     SavepointAck = 112,
+    // JM → TM. Reply to RequestFinalCheckpoint: the JM-assigned final
+    // checkpoint id (0 = declined). The requesting source subtask injects
+    // this id as a normal barrier through its own drain path, then blocks
+    // until it observes CommitCheckpoint for it.
+    FinalCheckpointAssigned = 116,
 };
 
 // Sentinel marking "no rescale-specific restore override" on a
@@ -310,6 +321,25 @@ struct SubtaskFinishedMsg {
 
 struct HeartbeatMsg {
     std::string tm_id;
+};
+
+// TM → JM. A bounded source subtask reached clean end-of-stream and asks the
+// JM to coordinate one final checkpoint so its tail is durably committed
+// before the job completes. See MessageKind::RequestFinalCheckpoint.
+struct RequestFinalCheckpointMsg {
+    JobId job_id{};
+    std::string role;
+    std::uint32_t subtask_idx{};
+};
+
+// JM → TM. Reply to RequestFinalCheckpoint. final_checkpoint_id == 0 means the
+// JM declined (job already completing/cancelling, or no checkpoint dir); the
+// source then falls back / returns and the normal restart path takes over.
+struct FinalCheckpointAssignedMsg {
+    JobId job_id{};
+    std::string role;
+    std::uint32_t subtask_idx{};
+    std::uint64_t final_checkpoint_id{};
 };
 
 // Sent by the client as the first frame on a control connection so the JM
