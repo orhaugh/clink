@@ -49,6 +49,10 @@ struct Cfg {
     std::string region;
     bool anonymous{false};
     std::size_t hot_max_bytes{0};  // 0 = unbounded hot tier (no eviction)
+    // IO concurrency for the completion executor (ASYNC-9). The cold-read load
+    // is a blocking S3 GET; one thread serializes every in-flight read, so the
+    // default is well above 1. Raise it for high remote-read fan-out.
+    std::size_t io_threads{clink::async::kDefaultIoThreads};
 };
 
 Cfg parse_cfg(const std::string& base) {
@@ -86,6 +90,12 @@ Cfg parse_cfg(const std::string& base) {
                     c.hot_max_bytes = static_cast<std::size_t>(std::stoull(v));
                 } catch (...) {
                     c.hot_max_bytes = 0;  // malformed -> unbounded (safe default)
+                }
+            } else if (k == "io_threads") {
+                try {
+                    c.io_threads = static_cast<std::size_t>(std::stoull(v));
+                } catch (...) {
+                    // malformed -> keep the default
                 }
             }
         }
@@ -142,7 +152,7 @@ clink::BuiltStateBackend build_remote_read(const clink::StateBackendSpec& spec) 
 
     clink::BuiltStateBackend out;
     out.backend =
-        std::make_shared<clink::RemoteReadBackend>(pool, /*io_threads=*/1, cfg.hot_max_bytes);
+        std::make_shared<clink::RemoteReadBackend>(pool, cfg.io_threads, cfg.hot_max_bytes);
 
     if (!spec.restore_uri.empty() && spec.restore_checkpoint_id != 0) {
         // The pool reads cp-<id> from this subtask's prefix (same-parallelism

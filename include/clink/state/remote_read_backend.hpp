@@ -57,6 +57,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/async/completion_executor.hpp"
 #include "clink/async/task.hpp"
 #include "clink/metrics/disagg_metrics.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
@@ -74,9 +75,18 @@ public:
     // The runner wires this to AsyncExecutionController::schedule_resume.
     using ResumeScheduler = std::function<void(std::coroutine_handle<>)>;
 
-    explicit RemoteReadBackend(RemoteLoader loader, std::size_t io_threads = 1)
+    // io_threads sizes the DEFAULT completion executor (a sized thread pool);
+    // inject `executor` to share one sized IO pool across backends or to use
+    // the io_uring-backed executor on Linux. The completion source (thread pool
+    // vs io_uring) is swapped here without touching the async read path or the
+    // controller - the executor only runs the load off-thread and posts the
+    // resume (ASYNC-9).
+    explicit RemoteReadBackend(RemoteLoader loader,
+                               std::size_t io_threads = async::kDefaultIoThreads,
+                               std::shared_ptr<async::CompletionExecutor> executor = nullptr)
         : loader_(std::move(loader)) {
-        start_workers_(io_threads);
+        executor_ = executor ? std::move(executor)
+                             : std::make_shared<async::ThreadPoolCompletionExecutor>(io_threads);
     }
 
     // Pool-backed (production) construction. State is durable in `pool`.
@@ -92,9 +102,12 @@ public:
     // (the durable tier); the loader-only ctor has no write-back, so it stays
     // unbounded regardless.
     explicit RemoteReadBackend(std::shared_ptr<RemotePool> pool,
-                               std::size_t io_threads = 1,
-                               std::size_t hot_max_bytes = 0)
+                               std::size_t io_threads = async::kDefaultIoThreads,
+                               std::size_t hot_max_bytes = 0,
+                               std::shared_ptr<async::CompletionExecutor> executor = nullptr)
         : pool_(std::move(pool)), hot_max_bytes_(hot_max_bytes) {
+        executor_ = executor ? std::move(executor)
+                             : std::make_shared<async::ThreadPoolCompletionExecutor>(io_threads);
         loader_ = [this](OperatorId op, std::string key) -> std::optional<Value> {
             const auto ck = last_ckpt_.load(std::memory_order_relaxed);
             // No committed checkpoint yet (fresh job, nothing restored): there
@@ -108,20 +121,17 @@ public:
             }
             return pool_->read(CheckpointId{ck}, op, key);
         };
-        start_workers_(io_threads);
     }
 
     ~RemoteReadBackend() override {
-        {
-            std::lock_guard<std::mutex> lk(io_mu_);
-            stop_ = true;
-        }
-        io_cv_.notify_all();
-        for (auto& t : workers_) {
-            if (t.joinable()) {
-                t.join();
-            }
-        }
+        // Drop our reference to the executor BEFORE the members its in-flight
+        // jobs touch (loader_/pool_/resume_scheduler_/hot_) are destroyed. If
+        // this is the sole owner (the default per-backend executor) the reset
+        // joins its workers here, so any in-flight load finishes against
+        // still-live state; a shared executor (more than one owner) relies on
+        // the runner having drained before teardown (the ASYNC-5/6 barrier
+        // contract), and is released by the last owner.
+        executor_.reset();
     }
 
     RemoteReadBackend(const RemoteReadBackend&) = delete;
@@ -322,8 +332,8 @@ private:
 
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> h) {
-            self->enqueue_io_([this, h]() {
-                value = self->timed_remote_load_(op, key);  // BLOCKING remote read, IO thread
+            self->executor_->submit_blocking([this, h]() {
+                value = self->timed_remote_load_(op, key);  // BLOCKING remote read, executor thread
                 self->resume_scheduler_(h);                 // hand back to the runner thread
             });
         }
@@ -464,39 +474,6 @@ private:
         }
     }
 
-    void enqueue_io_(std::function<void()> job) const {
-        {
-            std::lock_guard<std::mutex> lk(io_mu_);
-            io_jobs_.push_back(std::move(job));
-        }
-        io_cv_.notify_one();
-    }
-
-    void start_workers_(std::size_t io_threads) {
-        if (io_threads == 0) {
-            io_threads = 1;
-        }
-        for (std::size_t i = 0; i < io_threads; ++i) {
-            workers_.emplace_back([this] { io_loop_(); });
-        }
-    }
-
-    void io_loop_() {
-        for (;;) {
-            std::function<void()> job;
-            {
-                std::unique_lock<std::mutex> lk(io_mu_);
-                io_cv_.wait(lk, [this] { return stop_ || !io_jobs_.empty(); });
-                if (stop_ && io_jobs_.empty()) {
-                    return;
-                }
-                job = std::move(io_jobs_.front());
-                io_jobs_.pop_front();
-            }
-            job();
-        }
-    }
-
     RemoteLoader loader_;
     ResumeScheduler resume_scheduler_;
     // Guards the mutable working set (hot_, dirty_, deleted_, and the LRU
@@ -516,11 +493,12 @@ private:
     // above). mutable because cold reads fill it through on a const get.
     mutable InMemoryStateBackend hot_;
 
-    mutable std::mutex io_mu_;
-    mutable std::condition_variable io_cv_;
-    mutable std::deque<std::function<void()>> io_jobs_;
-    bool stop_{false};
-    std::vector<std::thread> workers_;
+    // The off-runner-thread IO executor (ASYNC-9). Default is a per-backend
+    // sized ThreadPoolCompletionExecutor; a shared or io_uring-backed executor
+    // can be injected at construction. The cold-read path posts its blocking
+    // load here; the executor invokes resume_scheduler_ (schedule_resume) when
+    // done. shared_ptr so it can be shared across a process's backends.
+    std::shared_ptr<async::CompletionExecutor> executor_;
 
     mutable std::atomic<std::uint64_t> remote_loads_{0};
     mutable std::atomic<std::uint64_t> hot_hits_{0};
