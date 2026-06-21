@@ -3182,21 +3182,26 @@ void JobManager::handle_subtask_checkpointed_(MessageReader& r) {
         if (ckpt_it == job.pending_checkpoint_acks.end()) {
             return;  // unknown / superseded checkpoint
         }
-        // Test-only fault injection (env-gated, default off): drop the FIRST ack
-        // for a job's first FINAL checkpoint, once, so its pending set never
+        // Test-only fault injection (env-gated, default off): drop EVERY ack for
+        // a final checkpoint's first-acking subtask so its pending set never
         // empties and the source hits the no-crash EOS-timeout path (its
-        // wait_final_committed times out -> it throws -> watchdog restarts). The
-        // restart assigns a fresh final id (final_checkpoint_id is cleared on
-        // restart; the once-flag is not) so the replay's final checkpoint commits
-        // normally. Used by the failover bench's eos_timeout_recovery leg.
-        static const bool kTestStallFirstFinal =
-            std::getenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT") != nullptr;
-        if (kTestStallFirstFinal && job.final_checkpoint_id.has_value() &&
+        // wait_final_committed times out -> it throws -> whole-job restart).
+        //   FIRST: stall only the FIRST final id (bound once, not re-armed), so
+        //   the replay's fresh final id commits -> exactly-once recovery (the
+        //   eos_timeout_recovery leg).
+        //   EVERY: re-arm on each new final id, so every attempt's final ckpt
+        //   stalls -> the source errors every attempt -> the job exhausts its
+        //   restart budget then fails loudly (the eos_budget_exhaustion leg,
+        //   proving the recovery is bounded - no infinite restart loop).
+        static const bool kStallFirst = std::getenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT") != nullptr;
+        static const bool kStallEvery = std::getenv("CLINK_TEST_STALL_EVERY_FINAL_CKPT") != nullptr;
+        if ((kStallFirst || kStallEvery) && job.final_checkpoint_id.has_value() &&
             msg.checkpoint_id == *job.final_checkpoint_id) {
             const auto fid = *job.final_checkpoint_id;
-            if (!job.test_stalled_final_id.has_value()) {
-                job.test_stalled_final_id = fid;  // bind the stall to the FIRST final id
-                job.test_stall_key = key;         // and the first subtask that acks it
+            if (job.test_stalled_final_id != fid &&
+                (kStallEvery || !job.test_stalled_final_id.has_value())) {
+                job.test_stalled_final_id = fid;  // (re-)arm for this final id
+                job.test_stall_key = key;         // first subtask that acks it
             }
             if (job.test_stalled_final_id == fid && key == job.test_stall_key) {
                 return;  // drop EVERY ack for this (key, final id) -> never completes

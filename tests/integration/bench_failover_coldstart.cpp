@@ -883,6 +883,105 @@ EosRecoveryResult eos_timeout_recovery(const fs::path& node,
     return r;
 }
 
+struct EosBudgetResult {
+    int max_restarts{0};
+    std::size_t expected{0};
+    std::size_t committed{0};
+    std::size_t whole_job_restarts{0};  // "subtask error -> whole-job restart" count
+    int submit_exit{-1};
+    bool ok{false};
+};
+
+// PERMANENT no-crash EOS final-checkpoint failure: prove the whole-job restart
+// recovery is BOUNDED (no infinite loop). CLINK_TEST_STALL_EVERY_FINAL_CKPT
+// re-arms the stall on EVERY attempt's final checkpoint, so the bounded
+// source's wait_final_committed times out and it throws on every replay. With a
+// small budget (--max-restarts-on-tm-loss=2) the job must restart EXACTLY that
+// many times then FAIL LOUDLY - not retry forever, not silently complete. Only
+// the source ever throws on an EOS timeout (sinks don't wait), so exactly one
+// restart fires per cycle; the assertions below check the restart count equals
+// the budget and the submitter exits non-zero (failed or timed out, never
+// 0/success). Companion to eos_timeout_recovery (which proves the RECOVERING
+// case); this proves the GIVE-UP case is bounded. No TM is ever killed.
+EosBudgetResult eos_budget_exhaustion(const fs::path& node,
+                                      const fs::path& submit,
+                                      const fs::path& job_so) {
+    EosBudgetResult r;
+    r.max_restarts = 2;
+    const int total = 160;
+    r.expected = static_cast<std::size_t>(total);
+
+    ScopedDirs scratch;
+    const auto ckpt_dir = mktmpdir("eosbudget_ckpt");
+    const auto out_dir = mktmpdir("eosbudget_out");
+    scratch.add(ckpt_dir);
+    scratch.add(out_dir);
+    ::setenv("CLINK_2PC_OUT_DIR", out_dir.c_str(), 1);
+    ::setenv("CLINK_2PC_TOTAL", std::to_string(total).c_str(), 1);
+    ::setenv("CLINK_2PC_TICK_MS", "10", 1);
+    ::setenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS", "2000", 1);
+    ::setenv("CLINK_TEST_STALL_EVERY_FINAL_CKPT", "1", 1);
+
+    const auto port = probe_free_port();
+    const pid_t jm = spawn_logged({"clink_node",
+                                   "--role=jm",
+                                   "--port=" + std::to_string(port),
+                                   "--bind-host=127.0.0.1",
+                                   "--heartbeat-timeout-ms=1000",
+                                   "--watchdog-interval-ms=50"},
+                                  node,
+                                  ckpt_dir / "jm.log");
+    if (jm <= 0 || await_port_open(port, 5s) < 0) {
+        kill_quietly(jm);
+        ::unsetenv("CLINK_TEST_STALL_EVERY_FINAL_CKPT");
+        ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
+        return r;
+    }
+    const pid_t tm = spawn_logged({"clink_node",
+                                   "--role=tm",
+                                   "--id=tm-0",
+                                   "--jm-host=127.0.0.1",
+                                   "--jm-port=" + std::to_string(port),
+                                   "--slots=4"},
+                                  node,
+                                  ckpt_dir / "tm0.log");
+    if (tm <= 0 ||
+        await_log_contains(ckpt_dir / "tm0.log", "registered", clock_t_::now(), 5s) < 0) {
+        kill_quietly(tm);
+        kill_quietly(jm);
+        ::unsetenv("CLINK_TEST_STALL_EVERY_FINAL_CKPT");
+        ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
+        return r;
+    }
+    const pid_t sub = spawn_logged({"clink_submit_job",
+                                    "--job=" + job_so.string(),
+                                    "--jm-host=127.0.0.1",
+                                    "--jm-port=" + std::to_string(port),
+                                    "--wait-timeout-s=60",
+                                    "--checkpoint-dir=" + ckpt_dir.string(),
+                                    "--checkpoint-interval-ms=150",
+                                    "--max-restarts-on-tm-loss=" + std::to_string(r.max_restarts)},
+                                   submit,
+                                   ckpt_dir / "submit.log");
+    ::unsetenv("CLINK_TEST_STALL_EVERY_FINAL_CKPT");
+    ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
+    const bool exited = (sub > 0) && wait_for_exit(sub, 75s, &r.submit_exit);
+
+    const auto lines = read_committed_lines(out_dir);
+    const std::set<std::string> uniq(lines.begin(), lines.end());
+    r.committed = uniq.size();
+    r.whole_job_restarts =
+        count_occurrences(ckpt_dir / "jm.log", "subtask error -> whole-job restart");
+    // Bounded recovery: EXACTLY max_restarts whole-job restarts (no infinite
+    // loop), and the job ends in failure (submit_exit != 0), never success.
+    r.ok = exited && r.whole_job_restarts == static_cast<std::size_t>(r.max_restarts) &&
+           r.submit_exit != 0;
+
+    kill_quietly(tm);
+    kill_quietly(jm);
+    return r;
+}
+
 }  // namespace
 
 int main() {
@@ -1064,8 +1163,26 @@ int main() {
         "  (the stalled final checkpoint timed out -> the source threw -> the JM rolled\n"
         "   the whole job back to the last checkpoint and replayed, recovering the tail)\n");
 
+    // ---- PERMANENT EOS final-checkpoint failure -> bounded restart + loud fail ----
+    // Same no-crash EOS-timeout path, but the stall RE-ARMS every attempt, so the
+    // source errors on every replay. The recovery must be BOUNDED: exactly
+    // max_restarts whole-job restarts, then a loud failure - never an infinite
+    // restart loop, never silent success. Local-only.
+    std::printf("\n---- end-of-stream final-checkpoint PERMANENT failure (bounded restart) ----\n");
+    const auto eosb = eos_budget_exhaustion(node, submit, job_so);
+    std::printf("  budget=%d whole_job_restarts=%zu submit_exit=%d committed=%zu/%zu bounded=%s\n",
+                eosb.max_restarts,
+                eosb.whole_job_restarts,
+                eosb.submit_exit,
+                eosb.committed,
+                eosb.expected,
+                eosb.ok ? "yes" : "NO");
+    std::printf(
+        "  (a permanently-stalling final checkpoint restarts the whole job exactly\n"
+        "   budget times, then fails loudly - the recovery loop is bounded)\n");
+
     const bool ok =
-        cold_ok == kIters && f.ok && remote_ok && seq_file.ok && seq_remote_ok && eos.ok;
+        cold_ok == kIters && f.ok && remote_ok && seq_file.ok && seq_remote_ok && eos.ok && eosb.ok;
     std::printf("\n==== %s ====\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
