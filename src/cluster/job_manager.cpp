@@ -2082,6 +2082,22 @@ void JobManager::mark_tm_lost_locked_(TmConnection& tm) {
             // restart_drain_timeout, the watchdog fails the job rather than
             // wedge (e.g. a survivor that hangs without acking the cancel).
             job->restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
+            // Redeploy set on TM loss = lost-TM subtasks (restart_pending, from
+            // it->second) plus surviving in-flight subtasks to drain
+            // (restart_drain_expected, below). Both halves draw ONLY from
+            // pending_per_tm, so a subtask that finished cleanly on a survivor
+            // is in NEITHER set and is not redeployed. This is the one
+            // deliberate difference from the subtask-error / EOS-timeout restart
+            // path in handle_subtask_finished_, which redeploys the FULL
+            // topology (tasks_by_tm) including already-finished peers. The
+            // narrower set here is safe, not accidental: peers[] point
+            // downstream, and in a bounded job a downstream reaches clean EOS
+            // only after every upstream has finished and forwarded EOS, so no
+            // still-pending subtask holds a peer reference to a cleanly-finished
+            // one. That no-loss property assumes forward-only network edges; a
+            // future back-edge topology (a downstream peer pointing upstream)
+            // would break it, at which point this set should be built like the
+            // error path's (tasks_by_tm minus in-flight).
             for (const auto& [role, sub] : it->second) {
                 job->restart_pending.emplace_back(role, sub);
             }
@@ -2799,6 +2815,12 @@ void JobManager::handle_subtask_finished_(MessageReader& r) {
             // checkpoint, so finished subtasks (e.g. a sink that exited at EOS
             // before the source's final-checkpoint timed out) must redeploy too;
             // redeploying only the in-flight + failed ones would orphan them.
+            // Contrast mark_tm_lost_locked_, whose redeploy set draws only from
+            // pending_per_tm. This path MUST include finished peers because its
+            // trigger is a bounded subtask erroring AFTER a peer finished
+            // cleanly, so it builds restart_pending from tasks_by_tm minus
+            // in_flight, re-adding the cleanly-finished subtasks the TM-loss
+            // path omits.
             std::unordered_set<std::string> in_flight;
             for (const auto& [other_tm, pending] : job.pending_per_tm) {
                 for (const auto& [role, sub] : pending) {
