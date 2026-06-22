@@ -16,6 +16,7 @@
 // value / zero) rather than failing the scrape.
 
 #include <string>
+#include <vector>
 
 namespace clink::metrics {
 
@@ -32,14 +33,31 @@ inline constexpr const char* kProcCpuPercent = "clink_process_cpu_percent";
 inline constexpr const char* kProcOpenFds = "clink_process_open_fds";
 // Gauge: live thread count.
 inline constexpr const char* kProcThreads = "clink_process_threads";
-// Gauges: filesystem capacity for the node's working/data path, in bytes.
+// Gauges: filesystem capacity in bytes, per monitored volume. Each carries a
+// volume="<label>" label (e.g. workdir, checkpoint), so a node with checkpoints
+// on a separate mount reports both. Base names below; the label is appended at
+// emit time.
 inline constexpr const char* kDiskTotalBytes = "clink_disk_total_bytes";
 inline constexpr const char* kDiskFreeBytes = "clink_disk_free_bytes";
 inline constexpr const char* kDiskUsedBytes = "clink_disk_used_bytes";
 
+// One filesystem to report under the clink_disk_* gauges. `label` becomes the
+// volume="..." label; `path` is any path on the target filesystem.
+struct DiskVolume {
+    std::string label;
+    std::string path;
+};
+
+// Configure which volumes the disk gauges report. Called once at node startup
+// (e.g. workdir + the checkpoint/state mount). Volumes that resolve to a
+// filesystem already covered by an earlier volume are skipped, so a node with
+// everything on one disk reports a single volume. If never called, the sampler
+// reports the working directory as volume="workdir".
+void configure_disk_volumes(std::vector<DiskVolume> volumes);
+
 // Sample the current process + host resource values into
-// MetricsRegistry::global(). `disk_path` selects the filesystem measured for
-// the clink_disk_* gauges (defaults to the working directory).
-void sample_system_metrics(const std::string& disk_path = ".");
+// MetricsRegistry::global(), including the configured disk volumes. Called
+// sample-on-scrape from the /metrics handler.
+void sample_system_metrics();
 
 }  // namespace clink::metrics

@@ -8,8 +8,11 @@
 #include <optional>
 #include <string>
 #include <unistd.h>
+#include <unordered_set>
+#include <vector>
 
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 
 #include "clink/metrics/metrics_registry.hpp"
@@ -143,9 +146,51 @@ std::int64_t now_wall_ms() {
         .count();
 }
 
+// Configured disk volumes, set once at startup. Guarded so a scrape that races
+// startup sees a consistent list.
+struct DiskConfig {
+    std::mutex mu;
+    std::vector<DiskVolume> volumes;
+};
+
+DiskConfig& disk_config() {
+    static DiskConfig c;
+    return c;
+}
+
+// Device id backing `path`, for de-duplicating volumes on the same filesystem.
+std::optional<std::uint64_t> device_of(const std::string& path) {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint64_t>(st.st_dev);
+}
+
+void emit_disk_volume(MetricsRegistry& r, const DiskVolume& vol) {
+    struct statvfs vfs{};
+    if (::statvfs(vol.path.c_str(), &vfs) != 0) {
+        return;
+    }
+    const auto frsize = static_cast<std::int64_t>(vfs.f_frsize);
+    const std::int64_t total = static_cast<std::int64_t>(vfs.f_blocks) * frsize;
+    const std::int64_t avail = static_cast<std::int64_t>(vfs.f_bavail) * frsize;
+    const std::int64_t freeb = static_cast<std::int64_t>(vfs.f_bfree) * frsize;
+    const std::string label = "{volume=\"" + vol.label + "\"}";
+    r.gauge(std::string(kDiskTotalBytes) + label).set(total);
+    r.gauge(std::string(kDiskFreeBytes) + label).set(avail);
+    r.gauge(std::string(kDiskUsedBytes) + label).set(total - freeb);
+}
+
 }  // namespace
 
-void sample_system_metrics(const std::string& disk_path) {
+void configure_disk_volumes(std::vector<DiskVolume> volumes) {
+    auto& c = disk_config();
+    std::lock_guard lock(c.mu);
+    c.volumes = std::move(volumes);
+}
+
+void sample_system_metrics() {
     auto& r = MetricsRegistry::global();
 
     const MemSample mem = read_memory();
@@ -183,16 +228,25 @@ void sample_system_metrics(const std::string& disk_path) {
         st.primed = true;
     }
 
-    // Disk: capacity of the filesystem backing the node's working/data path.
-    struct statvfs vfs{};
-    if (::statvfs(disk_path.c_str(), &vfs) == 0) {
-        const auto frsize = static_cast<std::int64_t>(vfs.f_frsize);
-        const std::int64_t total = static_cast<std::int64_t>(vfs.f_blocks) * frsize;
-        const std::int64_t avail = static_cast<std::int64_t>(vfs.f_bavail) * frsize;
-        const std::int64_t freeb = static_cast<std::int64_t>(vfs.f_bfree) * frsize;
-        r.gauge(kDiskTotalBytes).set(total);
-        r.gauge(kDiskFreeBytes).set(avail);
-        r.gauge(kDiskUsedBytes).set(total - freeb);
+    // Disk: one labeled set per configured volume, de-duplicated by filesystem
+    // so volumes that share a device are reported once (the first wins).
+    std::vector<DiskVolume> volumes;
+    {
+        auto& c = disk_config();
+        std::lock_guard lock(c.mu);
+        volumes = c.volumes;
+    }
+    if (volumes.empty()) {
+        volumes.push_back({"workdir", "."});
+    }
+    std::unordered_set<std::uint64_t> seen_devices;
+    for (const auto& vol : volumes) {
+        if (const auto dev = device_of(vol.path)) {
+            if (!seen_devices.insert(*dev).second) {
+                continue;  // same filesystem as an earlier volume
+            }
+        }
+        emit_disk_volume(r, vol);
     }
 }
 

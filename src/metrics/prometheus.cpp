@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <sstream>
+#include <string>
+#include <unordered_set>
 
 namespace clink::metrics {
 
@@ -41,12 +43,28 @@ std::string render_prometheus(const MetricsRegistry::Snapshot& snap) {
         return a.name < b.name;
     });
 
+    // A metric may carry inlined labels in its name (e.g.
+    // `clink_disk_total_bytes{volume="checkpoint"}`); the # TYPE line must name
+    // the bare metric without labels, and be emitted once per base name even
+    // when several label sets share it.
+    const auto base_name = [](const std::string& n) {
+        const auto pos = n.find('{');
+        return pos == std::string::npos ? n : n.substr(0, pos);
+    };
+    std::unordered_set<std::string> typed;
+
     std::ostringstream out;
     for (const auto& [name, value] : counters) {
-        out << "# TYPE " << name << " counter\n" << name << ' ' << value << '\n';
+        if (typed.insert(base_name(name)).second) {
+            out << "# TYPE " << base_name(name) << " counter\n";
+        }
+        out << name << ' ' << value << '\n';
     }
     for (const auto& [name, value] : gauges) {
-        out << "# TYPE " << name << " gauge\n" << name << ' ' << value << '\n';
+        if (typed.insert(base_name(name)).second) {
+            out << "# TYPE " << base_name(name) << " gauge\n";
+        }
+        out << name << ' ' << value << '\n';
     }
     for (const auto& h : histograms) {
         // Prometheus histogram: cumulative _bucket{le} lines (ascending), a

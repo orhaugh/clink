@@ -913,6 +913,17 @@ int run_jm(int argc, char** argv) {
         if (const auto cors = get_arg(argc, argv, "http-cors-origin", ""); !cors.empty()) {
             http_srv->enable_cors(cors);
         }
+        // Disk volumes reported by /metrics: always the working dir, plus the
+        // checkpoint/state mount (--metrics-disk-path, defaulting to the HA dir
+        // where a leader persists checkpoints). Same-filesystem volumes are
+        // de-duplicated by the sampler.
+        {
+            std::vector<clink::metrics::DiskVolume> vols{{"workdir", "."}};
+            if (const auto ckpt = get_arg(argc, argv, "metrics-disk-path", ha_dir); !ckpt.empty()) {
+                vols.push_back({"checkpoint", ckpt});
+            }
+            clink::metrics::configure_disk_volumes(std::move(vols));
+        }
         auto* jm_ptr = &jm;
         http_srv->get("/api/v1/health", [start_time, jm_ptr](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
@@ -1367,6 +1378,15 @@ int run_tm(int argc, char** argv) {
         if (const auto cors = get_arg(argc, argv, "http-cors-origin", ""); !cors.empty()) {
             http_srv->enable_cors(cors);
         }
+        // Disk volumes for /metrics: working dir + the TM's checkpoint/state
+        // mount when the operator names one (--metrics-disk-path).
+        {
+            std::vector<clink::metrics::DiskVolume> vols{{"workdir", "."}};
+            if (const auto ckpt = get_arg(argc, argv, "metrics-disk-path", ""); !ckpt.empty()) {
+                vols.push_back({"checkpoint", ckpt});
+            }
+            clink::metrics::configure_disk_volumes(std::move(vols));
+        }
         auto* tm_ptr = &tm;
         http_srv->get("/api/v1/health", [start_time, &http_bound](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
@@ -1535,6 +1555,8 @@ int main(int argc, char** argv) {
                 << "  --http-cors-origin=<origin>  Send CORS headers for this origin "
                    "(e.g. '*' or http://host:5181) so a standalone console can call the\n"
                    "                               API cross-origin. Unset = same-origin only.\n"
+                << "  --metrics-disk-path=<path>   Report disk usage for this filesystem as the "
+                   "'checkpoint' volume in /metrics (JM defaults to --ha-dir).\n"
                 << "\n"
                 << "Global flags:\n"
                 << "  --version    Print version + commit and exit.\n"
