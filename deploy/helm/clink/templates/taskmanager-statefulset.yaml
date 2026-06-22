@@ -34,6 +34,23 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      initContainers:
+        # k8s has no compose-style depends_on; without this gate the TM races
+        # the JobManager's bind, fails connect_to_jm, exits, and crash-loops
+        # until the JM is up. Wait for the JM's health endpoint (the same
+        # readiness signal compose used) before starting clink_node.
+        - name: wait-for-jobmanager
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              until curl -fsS "http://{{ include "clink.jobmanager.fullname" . }}:{{ .Values.jobmanager.httpPort }}/api/v1/health" >/dev/null 2>&1; do
+                echo "waiting for jobmanager..."
+                sleep 2
+              done
+              echo "jobmanager is ready"
       containers:
         - name: taskmanager
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

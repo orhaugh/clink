@@ -6,11 +6,21 @@ topology onto k8s primitives.
 
 ## Status
 
-Authored and **statically validated** (`helm lint`, `helm template`, and
-`kubeconform -strict` against the k8s 1.29 API schemas - 5/5 resources valid).
-It has **not yet been run on a live cluster**; an end-to-end smoke test on
-`kind`/minikube (build + load `clink-runtime`, `helm install`, confirm JM+TMs
-register and a job runs) is the next step. Treat it accordingly.
+Statically validated (`helm lint`, `helm template`, `kubeconform -strict` vs the
+k8s 1.29 API schemas - 5/5 valid) **and live-verified on a `kind` cluster** via
+`kind-smoke.sh`: the JobManager and TaskManagers come up Ready, every TM
+registers with the JM (its own pod IP + stable ordinal id), and a cold start is
+clean (0 restarts - the `wait-for-jobmanager` initContainer gates the JM race).
+
+```sh
+deploy/helm/clink/kind-smoke.sh            # create kind cluster, deploy, assert
+deploy/helm/clink/kind-smoke.sh --cleanup  # tear the cluster down
+```
+
+The smoke validates the deployment surface (the chart). A job-submission
+end-to-end on k8s (build a `CLINK_REGISTER_JOB` `.so` matching the image's
+`clink_node` commit, submit via the control port, confirm output) is the
+remaining follow-on, along with true multi-JM HA (see below).
 
 ## Topology
 
