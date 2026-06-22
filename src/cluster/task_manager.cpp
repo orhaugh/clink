@@ -1512,6 +1512,10 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             bctx.parallelism = 1;  // chain dispatch is per-subtask
             auto handle = (*builder)(dag, std::vector<std::any>{std::move(prev)}, bctx);
             runner_indexes.push_back(handle.runner_index);
+            // Stamp the spec node id + uid so LocalExecutor emits the
+            // op_id<->node mapping (clink_op_info). The DagBuilder doesn't carry
+            // the chain identity, so do it here where co.id/co.uid are known.
+            dag.set_runner_identity(handle.runner_index, co.id, co.uid);
             prev = std::move(handle.main_handle);
         }
 

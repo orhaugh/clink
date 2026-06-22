@@ -37,6 +37,8 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -56,6 +58,7 @@
 #include "clink/cluster/task_manager.hpp"
 #ifdef CLINK_HAS_HTTP
 #include "clink/cluster/snapshots.hpp"
+#include "clink/core/types.hpp"  // operator_id_from_uid
 #include "clink/http/dashboard_assets.hpp"
 #include "clink/http/http_client.hpp"
 #include "clink/http/http_server.hpp"
@@ -697,6 +700,326 @@ clink::http::HttpResponse make_log_components_response() {
 
 // over HttpClient and surfaces status + body to the client. 502 with
 // a JSON error body on transport failure (timeout, peer dead).
+// --- per-operator runtime stats (GET /api/v1/jobs/:id/operators) -----------
+//
+// Aggregates the per-operator clink_op_* series the runtime emits into each
+// TM's host registry. The JM scrapes every TM hosting the job, parses the
+// Prometheus text, maps the numeric op_id back to a graph node (via the
+// clink_op_info series the runtime emits, plus operator_id_from_uid for uid'd
+// nodes), and folds the per-(op_id, TM) values into per-operator totals. The
+// host registry is one-per-TM-process shared across that TM's subtasks, so the
+// finest separable granularity is per-TM (the /graph placement lists which
+// exact subtasks run on each TM); per-TM rows are included alongside the
+// node-level totals.
+namespace opstats {
+
+// Parse the label block of a Prometheus series (text between { and }).
+inline std::unordered_map<std::string, std::string> parse_labels(std::string_view s) {
+    std::unordered_map<std::string, std::string> out;
+    std::size_t i = 0;
+    while (i < s.size()) {
+        const auto eq = s.find('=', i);
+        if (eq == std::string_view::npos)
+            break;
+        std::string key{s.substr(i, eq - i)};
+        const auto q1 = s.find('"', eq);
+        if (q1 == std::string_view::npos)
+            break;
+        const auto q2 = s.find('"', q1 + 1);
+        if (q2 == std::string_view::npos)
+            break;
+        out.emplace(std::move(key), std::string{s.substr(q1 + 1, q2 - q1 - 1)});
+        i = q2 + 1;
+        if (i < s.size() && s[i] == ',')
+            ++i;
+    }
+    return out;
+}
+
+struct ParsedSeries {
+    std::string base;  // metric name before '{'
+    std::unordered_map<std::string, std::string> labels;
+    double value{0};
+    bool ok{false};
+};
+
+inline ParsedSeries parse_line(const std::string& line) {
+    ParsedSeries p;
+    if (line.empty() || line[0] == '#')
+        return p;
+    const auto sp = line.rfind(' ');
+    if (sp == std::string::npos)
+        return p;
+    try {
+        p.value = std::stod(line.substr(sp + 1));
+    } catch (...) {
+        return p;
+    }
+    const std::string series = line.substr(0, sp);
+    const auto br = series.find('{');
+    if (br == std::string::npos) {
+        p.base = series;
+        p.ok = true;
+        return p;
+    }
+    p.base = series.substr(0, br);
+    const auto end = series.rfind('}');
+    if (end != std::string::npos && end > br) {
+        p.labels = parse_labels(std::string_view{series}.substr(br + 1, end - br - 1));
+    }
+    p.ok = true;
+    return p;
+}
+
+// One operator's aggregated runtime stats.
+struct OpRuntime {
+    std::string node;  // spec graph id
+    std::string uid;
+    std::string kind;
+    std::string op_type;
+    std::string display_name;
+    std::uint32_t parallelism{0};
+    bool keyed{false};
+    std::vector<clink::cluster::GraphSubtaskPlacement> subtasks;
+    std::uint64_t op_id{0};
+    bool op_id_known{false};
+
+    std::uint64_t records_in{0};
+    std::uint64_t records_out{0};
+    std::uint64_t records_dropped{0};
+    std::uint64_t side_output{0};
+    std::uint64_t bytes_sent{0};
+    std::uint64_t bytes_received{0};
+    bool has_metrics{false};
+    std::int64_t watermark_ms{0};
+    bool has_watermark{false};
+    std::int64_t input_depth{0};
+    std::int64_t input_capacity{0};
+    bool stale{false};  // at least one hosting TM was unreachable
+
+    struct TmRow {
+        std::string tm_id;
+        std::uint64_t records_in{0};
+        std::uint64_t records_out{0};
+        std::int64_t input_depth{0};
+        std::int64_t input_capacity{0};
+    };
+    std::vector<TmRow> per_tm;
+};
+
+// Build the per-operator stats by scraping every TM hosting the job.
+inline std::vector<OpRuntime> build(const clink::cluster::JobManager& jm,
+                                    clink::cluster::JobId job_id,
+                                    bool& available) {
+    auto g = jm.snapshot_job_graph(job_id);
+    if (!g.has_value()) {
+        available = false;
+        return {};
+    }
+    available = g->available;
+    std::vector<OpRuntime> ops;
+    std::unordered_map<std::string, std::size_t> by_node;    // node id -> index
+    std::unordered_map<std::uint64_t, std::size_t> by_opid;  // op_id -> index
+    ops.reserve(g->nodes.size());
+    for (const auto& n : g->nodes) {
+        OpRuntime o;
+        o.node = n.id;
+        o.uid = n.uid;
+        o.kind = n.kind;
+        o.op_type = n.op_type;
+        o.display_name = n.display_name;
+        o.parallelism = n.parallelism;
+        o.keyed = n.keyed;
+        o.subtasks = n.subtasks;
+        if (!n.uid.empty()) {
+            o.op_id = clink::operator_id_from_uid(n.uid).value();
+            o.op_id_known = true;
+        }
+        by_node.emplace(n.id, ops.size());
+        if (o.op_id_known)
+            by_opid[o.op_id] = ops.size();
+        ops.push_back(std::move(o));
+    }
+    if (!available)
+        return ops;
+
+    // Distinct TMs hosting any subtask of this job.
+    std::vector<std::string> tms;
+    std::unordered_set<std::string> seen_tm;
+    for (const auto& o : ops) {
+        for (const auto& s : o.subtasks) {
+            if (seen_tm.insert(s.tm_id).second)
+                tms.push_back(s.tm_id);
+        }
+    }
+
+    for (const auto& tm_id : tms) {
+        auto tgt = jm.tm_http_target(tm_id);
+        std::string body;
+        bool reachable = tgt.has_value();
+        if (reachable) {
+            clink::http::HttpClient client(tgt->first, tgt->second);
+            auto r = client.get("/metrics");
+            if (r.status != 200) {
+                reachable = false;
+            } else {
+                body = std::move(r.body);
+            }
+        }
+        if (!reachable) {
+            for (auto& o : ops) {
+                for (const auto& s : o.subtasks) {
+                    if (s.tm_id == tm_id) {
+                        o.stale = true;
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        struct M {
+            std::uint64_t ri{0}, ro{0}, rd{0}, so{0}, bs{0}, br{0};
+            std::int64_t depth{0}, cap{0}, wm{0};
+            bool has_wm{false};
+        };
+        std::unordered_map<std::uint64_t, M> by_op;  // op_id -> metrics on this TM
+
+        std::istringstream iss(body);
+        std::string line;
+        while (std::getline(iss, line)) {
+            const auto p = parse_line(line);
+            if (!p.ok || p.base.rfind("clink_op_", 0) != 0)
+                continue;
+            const auto oit = p.labels.find("op_id");
+            if (oit == p.labels.end())
+                continue;
+            std::uint64_t oid = 0;
+            try {
+                oid = std::stoull(oit->second);
+            } catch (...) {
+                continue;
+            }
+            if (p.base == "clink_op_info") {
+                // Map op_id -> node via the runtime-emitted identity series
+                // (covers non-uid operators the JM cannot recompute).
+                const auto nit = p.labels.find("node");
+                if (nit != p.labels.end()) {
+                    const auto idx = by_node.find(nit->second);
+                    if (idx != by_node.end()) {
+                        by_opid[oid] = idx->second;
+                        ops[idx->second].op_id = oid;
+                        ops[idx->second].op_id_known = true;
+                    }
+                }
+                continue;
+            }
+            const auto v = static_cast<std::uint64_t>(p.value);
+            M& m = by_op[oid];
+            if (p.base == "clink_op_records_in_total")
+                m.ri = v;
+            else if (p.base == "clink_op_records_out_total")
+                m.ro = v;
+            else if (p.base == "clink_op_records_dropped_total")
+                m.rd = v;
+            else if (p.base == "clink_op_side_output_records_total")
+                m.so = v;
+            else if (p.base == "clink_op_bytes_sent_total")
+                m.bs = v;
+            else if (p.base == "clink_op_bytes_received_total")
+                m.br = v;
+            else if (p.base == "clink_op_input_depth")
+                m.depth = static_cast<std::int64_t>(p.value);
+            else if (p.base == "clink_op_input_capacity")
+                m.cap = static_cast<std::int64_t>(p.value);
+            else if (p.base == "clink_op_watermark_ms") {
+                m.wm = static_cast<std::int64_t>(p.value);
+                m.has_wm = true;
+            }
+        }
+
+        for (const auto& [oid, m] : by_op) {
+            const auto iit = by_opid.find(oid);
+            if (iit == by_opid.end())
+                continue;  // op_id we couldn't map to a node
+            auto& o = ops[iit->second];
+            o.records_in += m.ri;
+            o.records_out += m.ro;
+            o.records_dropped += m.rd;
+            o.side_output += m.so;
+            o.bytes_sent += m.bs;
+            o.bytes_received += m.br;
+            o.input_depth += m.depth;
+            o.input_capacity += m.cap;
+            o.has_metrics = true;
+            if (m.has_wm && (!o.has_watermark || m.wm < o.watermark_ms)) {
+                o.watermark_ms = m.wm;  // operator watermark = min over its subtasks
+                o.has_watermark = true;
+            }
+            o.per_tm.push_back({tm_id, m.ri, m.ro, m.depth, m.cap});
+        }
+    }
+    return ops;
+}
+
+inline void write_json(clink::http::JsonWriter& w,
+                       clink::cluster::JobId job_id,
+                       bool available,
+                       const std::vector<OpRuntime>& ops) {
+    w.begin_object();
+    w.kv("job_id", static_cast<std::int64_t>(job_id));
+    w.kv("available", available);
+    w.key("operators").begin_array();
+    for (const auto& o : ops) {
+        w.begin_object();
+        w.kv("node", o.node);
+        w.kv("op_id", o.op_id_known ? std::to_string(o.op_id) : std::string{});
+        w.kv("uid", o.uid);
+        w.kv("kind", o.kind);
+        w.kv("op_type", o.op_type);
+        w.kv("display_name", o.display_name);
+        w.kv("parallelism", static_cast<std::int64_t>(o.parallelism));
+        w.kv("keyed", o.keyed);
+        w.kv("metrics_available", o.has_metrics);
+        w.kv("stale", o.stale);
+        w.kv("records_in", o.records_in);
+        w.kv("records_out", o.records_out);
+        w.kv("records_dropped", o.records_dropped);
+        w.kv("side_output", o.side_output);
+        w.kv("bytes_sent", o.bytes_sent);
+        w.kv("bytes_received", o.bytes_received);
+        w.kv("input_depth", o.input_depth);
+        w.kv("input_capacity", o.input_capacity);
+        w.kv("has_watermark", o.has_watermark);
+        if (o.has_watermark)
+            w.kv("watermark_ms", o.watermark_ms);
+        w.key("subtasks").begin_array();
+        for (const auto& s : o.subtasks) {
+            w.begin_object();
+            w.kv("subtask_idx", static_cast<std::int64_t>(s.subtask_idx));
+            w.kv("tm_id", s.tm_id);
+            w.end_object();
+        }
+        w.end_array();
+        w.key("per_tm").begin_array();
+        for (const auto& t : o.per_tm) {
+            w.begin_object();
+            w.kv("tm_id", t.tm_id);
+            w.kv("records_in", t.records_in);
+            w.kv("records_out", t.records_out);
+            w.kv("input_depth", t.input_depth);
+            w.kv("input_capacity", t.input_capacity);
+            w.end_object();
+        }
+        w.end_array();
+        w.end_object();
+    }
+    w.end_array();
+    w.end_object();
+}
+
+}  // namespace opstats
+
 clink::http::HttpResponse proxy_to_tm(const clink::cluster::JobManager& jm,
                                       const std::string& tm_id,
                                       const std::string& remote_path) {
@@ -1042,6 +1365,38 @@ int run_jm(int argc, char** argv) {
             }
             clink::http::JsonWriter w;
             write_job_graph(w, *g);
+            resp.body = w.str();
+            return resp;
+        });
+        // GET /api/v1/jobs/:id/operators - per-operator runtime stats (records
+        // in/out/dropped, backpressure, bytes, watermark) aggregated across the
+        // TMs hosting the job, for the console's per-node DAG overlays. Polled
+        // fast (the topology /graph is polled slowly); a slow/lost TM yields a
+        // partial response with the affected operators marked stale.
+        http_srv->get("/api/v1/jobs/:id/operators", [jm_ptr](const clink::http::HttpRequest& req) {
+            clink::http::HttpResponse resp;
+            clink::cluster::JobId job_id = 0;
+            if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
+                try {
+                    job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
+                } catch (...) {
+                    resp.status = 400;
+                    resp.body = R"({"error":"invalid job id"})";
+                    return resp;
+                }
+            }
+            bool available = false;
+            auto ops = opstats::build(*jm_ptr, job_id, available);
+            if (ops.empty() && !available) {
+                // snapshot_job_graph returned nullopt only for an unknown job.
+                if (!jm_ptr->snapshot_job(job_id).has_value()) {
+                    resp.status = 404;
+                    resp.body = R"({"error":"no such job"})";
+                    return resp;
+                }
+            }
+            clink::http::JsonWriter w;
+            opstats::write_json(w, job_id, available, ops);
             resp.body = w.str();
             return resp;
         });

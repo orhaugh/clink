@@ -192,6 +192,20 @@ public:
         return p ? *p : kEmpty;
     }
 
+    // Stamp the spec graph node id + uid onto a runner after construction.
+    // The fluent / plugin add_* paths copy these from the operator (set by
+    // apply_chain_identity), but the cluster chain-dispatch build path
+    // (task_manager.cpp) builds operators via DagBuilders that don't carry the
+    // chain identity, so it stamps each runner here from the chain spec. This
+    // lets LocalExecutor emit clink_op_info{op_id,node,uid} for every operator.
+    // No-op if runner_index is out of range.
+    void set_runner_identity(std::size_t runner_index, std::string spec_node_id, std::string uid) {
+        if (runner_index < runners_.size()) {
+            runners_[runner_index].spec_node_id = std::move(spec_node_id);
+            runners_[runner_index].spec_uid = std::move(uid);
+        }
+    }
+
     // ---- Source ----------------------------------------------------------
     template <typename T>
     StageHandle<T> add_source(std::shared_ptr<Source<T>> source) {
