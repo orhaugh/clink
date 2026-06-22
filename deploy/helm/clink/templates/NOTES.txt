@@ -1,0 +1,23 @@
+clink cluster "{{ .Release.Name }}" deployed.
+
+  JobManager : {{ include "clink.jobmanager.fullname" . }} (1 replica)
+  TaskManagers: {{ include "clink.taskmanager.fullname" . }} ({{ .Values.taskmanager.replicas }} replicas x {{ .Values.taskmanager.slots }} slots)
+
+Watch them come up:
+
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -w
+
+Open the dashboard / HTTP API (port-forward the JobManager):
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "clink.jobmanager.fullname" . }} {{ .Values.jobmanager.httpPort }}:{{ .Values.jobmanager.httpPort }}
+  # then: open http://localhost:{{ .Values.jobmanager.httpPort }}
+
+Submit a job against the control port from inside the cluster (target):
+
+  {{ include "clink.jobmanager.fullname" . }}:{{ .Values.jobmanager.controlPort }}
+
+{{- if not .Values.ha.enabled }}
+
+Note: this release runs a SINGLE JobManager (no HA). For multi-JM leader
+election, set ha.enabled=true with an etcd endpoint (see values.yaml).
+{{- end }}

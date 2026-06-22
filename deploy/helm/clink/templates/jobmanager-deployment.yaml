@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "clink.jobmanager.fullname" . }}
+  labels:
+    {{- include "clink.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jobmanager
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # Single leader. Two JobManagers on one control port would race; true
+  # multi-JM HA (replicas > 1 + etcd leader election) is the documented
+  # follow-on (see values.ha). Pinned to 1 here on purpose.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "clink.componentSelectorLabels" (dict "root" . "component" "jobmanager") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "clink.labels" . | nindent 8 }}
+        app.kubernetes.io/component: jobmanager
+      {{- with .Values.jobmanager.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "clink.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: jobmanager
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --role=jm
+            - --port={{ .Values.jobmanager.controlPort }}
+            - --bind-host=0.0.0.0
+            # TMs reach the JM via this Service DNS name; the JM advertises it.
+            - --advertise-host={{ include "clink.jobmanager.fullname" . }}
+            - --http-port={{ .Values.jobmanager.httpPort }}
+            - --http-bind=0.0.0.0
+            {{- if .Values.jobmanager.stateBackend }}
+            - --state-backend={{ .Values.jobmanager.stateBackend }}
+            {{- end }}
+            {{- if .Values.ha.enabled }}
+            - --etcd-endpoints={{ required "ha.etcdEndpoints is required when ha.enabled" .Values.ha.etcdEndpoints }}
+            - --etcd-cluster={{ .Values.ha.etcdCluster }}
+            - --ha-dir=/var/lib/clink/ha
+            {{- end }}
+            {{- with .Values.jobmanager.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: control
+              containerPort: {{ .Values.jobmanager.controlPort }}
+            - name: http
+              containerPort: {{ .Values.jobmanager.httpPort }}
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          {{- with .Values.jobmanager.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.jobmanager.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.jobmanager.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.jobmanager.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

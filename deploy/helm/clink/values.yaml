@@ -1,0 +1,68 @@
+# Default values for the clink chart.
+
+image:
+  # The clink runtime image (built from docker/Dockerfile.runtime). Push it to a
+  # registry your cluster can pull, then set repository/tag here.
+  repository: clink-runtime
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Extra labels/annotations applied to every object.
+commonLabels: {}
+commonAnnotations: {}
+
+serviceAccount:
+  # Create a ServiceAccount for the pods. A future etcd/k8s-native HA mode that
+  # uses leader election will need RBAC on this account.
+  create: true
+  name: ""
+  annotations: {}
+
+jobmanager:
+  # The control plane is a single leader. v1 runs ONE JobManager (HA multi-JM
+  # leader election is a documented follow-on - see ha below). Pinned to 1.
+  controlPort: 6123
+  httpPort: 8081
+  service:
+    # ClusterIP keeps the dashboard in-cluster. Use NodePort/LoadBalancer (or an
+    # Ingress) to expose http externally; the control port should stay internal.
+    type: ClusterIP
+    annotations: {}
+  # Extra clink_node args, e.g. ["--heartbeat-timeout-ms=8000"].
+  extraArgs: []
+  # State backend URI passed as --state-backend (empty = node default). e.g.
+  # "s3+rocksdb://bucket/prefix?..." for disaggregated state.
+  stateBackend: ""
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+taskmanager:
+  replicas: 3
+  # Task slots per TaskManager (parallelism capacity).
+  slots: 4
+  httpPort: 8082
+  extraArgs: []
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  # How long to let an in-flight subtask drain on pod termination before SIGKILL.
+  terminationGracePeriodSeconds: 30
+
+# Multi-machine HA via the etcd coordinator (clink already ships it; clink_node
+# selects it with --etcd-endpoints). v1 of THIS chart deploys a single JM and
+# does NOT stand up etcd or run multiple JM replicas - enabling true HA here is
+# the documented follow-on (multiple JM replicas racing for leadership + an etcd
+# endpoint + RBAC). The stanza is present so the surface is stable.
+ha:
+  enabled: false
+  etcdEndpoints: ""
+  etcdCluster: "default"

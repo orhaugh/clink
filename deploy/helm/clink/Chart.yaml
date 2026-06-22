@@ -1,0 +1,21 @@
+apiVersion: v2
+name: clink
+description: |
+  A clink streaming cluster: one JobManager (control plane + dashboard) and a
+  pool of TaskManagers. Maps the docker-compose topology onto Kubernetes - the
+  JobManager is a Deployment fronted by a Service (its advertised host is the
+  Service DNS name), and the TaskManagers are a StatefulSet so each has a stable
+  id across restarts and advertises its own pod IP for the data plane.
+type: application
+# Chart version; bump on chart changes.
+version: 0.1.0
+# The clink_node version this chart was written against. Override
+# image.tag to deploy a specific build.
+appVersion: "0.1.0"
+keywords:
+  - streaming
+  - dataflow
+  - clink
+home: https://github.com/orhaugh/clink
+sources:
+  - https://github.com/orhaugh/clink

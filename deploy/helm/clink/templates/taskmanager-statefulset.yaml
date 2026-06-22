@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "clink.taskmanager.fullname" . }}
+  labels:
+    {{- include "clink.labels" . | nindent 4 }}
+    app.kubernetes.io/component: taskmanager
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  serviceName: {{ include "clink.taskmanager.headless" . }}
+  replicas: {{ .Values.taskmanager.replicas }}
+  # TMs are independent; start/stop them in parallel rather than one ordinal
+  # at a time.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "clink.componentSelectorLabels" (dict "root" . "component" "taskmanager") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "clink.labels" . | nindent 8 }}
+        app.kubernetes.io/component: taskmanager
+      {{- with .Values.taskmanager.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "clink.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.taskmanager.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: taskmanager
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            # Stable ordinal pod name -> stable TM id across restarts.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # The TM advertises its own pod IP for the data plane; reachable
+            # cluster-wide on the flat pod network.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Bind the data-plane listener on all interfaces so peer pods can
+            # connect (the default 127.0.0.1 is single-host only).
+            - name: CLINK_DATA_BIND_HOST
+              value: "0.0.0.0"
+          args:
+            - --role=tm
+            - --id=$(POD_NAME)
+            - --jm-host={{ include "clink.jobmanager.fullname" . }}
+            - --jm-port={{ .Values.jobmanager.controlPort }}
+            - --data-host=$(POD_IP)
+            - --slots={{ .Values.taskmanager.slots }}
+            - --http-port={{ .Values.taskmanager.httpPort }}
+            - --http-bind=0.0.0.0
+            {{- if .Values.ha.enabled }}
+            - --etcd-endpoints={{ required "ha.etcdEndpoints is required when ha.enabled" .Values.ha.etcdEndpoints }}
+            - --etcd-cluster={{ .Values.ha.etcdCluster }}
+            {{- end }}
+            {{- with .Values.taskmanager.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.taskmanager.httpPort }}
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          {{- with .Values.taskmanager.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.taskmanager.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.taskmanager.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.taskmanager.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

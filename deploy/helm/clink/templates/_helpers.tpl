@@ -1,0 +1,67 @@
+{{/* Expand the name of the chart. */}}
+{{- define "clink.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/* Fully qualified app name. */}}
+{{- define "clink.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "clink.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/* Common labels on every object. */}}
+{{- define "clink.labels" -}}
+helm.sh/chart: {{ include "clink.chart" . }}
+{{ include "clink.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- with .Values.commonLabels }}
+{{ toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{- define "clink.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "clink.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{/* Per-component selector labels (jobmanager / taskmanager). */}}
+{{- define "clink.componentSelectorLabels" -}}
+{{ include "clink.selectorLabels" .root }}
+app.kubernetes.io/component: {{ .component }}
+{{- end -}}
+
+{{/* Object names. */}}
+{{- define "clink.jobmanager.fullname" -}}
+{{- printf "%s-jobmanager" (include "clink.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "clink.taskmanager.fullname" -}}
+{{- printf "%s-taskmanager" (include "clink.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "clink.taskmanager.headless" -}}
+{{- printf "%s-taskmanager-headless" (include "clink.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "clink.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+{{- default (include "clink.fullname" .) .Values.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}
