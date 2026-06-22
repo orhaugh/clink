@@ -165,6 +165,7 @@ add_executable(clink_core_tests
     test_json_value_expr.cpp
     test_decimal.cpp
     test_logging.cpp
+    test_system_metrics.cpp
 )
 
 target_link_libraries(clink_core_tests PRIVATE
@@ -177,6 +178,12 @@ target_link_libraries(clink_core_tests PRIVATE
 # plugin .so, so the per-.so registry hazard does not apply).
 if(TARGET spdlog::spdlog_header_only)
     target_link_libraries(clink_core_tests PRIVATE spdlog::spdlog_header_only)
+    # Force the pinned FetchContent spdlog ahead of any Homebrew copy on the
+    # -isystem path (same fix as clink_core); otherwise a system spdlog +
+    # external fmt v12 shadows it and leaves fmt symbols undefined at link.
+    if(spdlog_SOURCE_DIR)
+        target_include_directories(clink_core_tests BEFORE PRIVATE ${spdlog_SOURCE_DIR}/include)
+    endif()
 endif()
 clink_set_warnings(clink_core_tests)
 
