@@ -22,8 +22,8 @@ deploy/helm/clink/kind-smoke.sh --cleanup  # tear the cluster down
 The smoke submits the baked-in `k8s_smoke_job.so` (a bounded
 `from_elements -> map -> filter -> FileSink` pipeline) over HTTP and confirms
 the `30,40,50` sink output on a TaskManager - end-to-end proof that a submitted
-job executes on the deployed cluster. The remaining follow-on is true multi-JM
-HA (see below).
+job executes on the deployed cluster. Multi-JobManager HA is also supported and
+kind-verified (see HA below).
 
 ## Topology
 
@@ -75,11 +75,33 @@ kubectl port-forward svc/my-clink-jobmanager 8081:8081
 | `jobmanager.stateBackend` | `""` | `--state-backend` URI (e.g. a `s3+rocksdb://...` disaggregated backend) |
 | `ha.enabled` | `false` | see below |
 
-## HA (follow-on)
+## HA (multi-JobManager)
 
-clink ships an etcd-backed HA coordinator (`clink_node --etcd-endpoints`), and
-`ha.enabled=true` wires those args onto the pods. But this chart v1 still
-deploys a **single** JobManager and does not stand up etcd or run multiple JM
-replicas, so it is not yet true multi-JM HA. Closing that out (multiple JM
-replicas racing for leadership, an etcd endpoint or subchart, and the RBAC for
-k8s-native leader election) is the documented next increment.
+`ha.enabled=true` runs `ha.replicas` JobManagers with leader election via
+clink's **file coordinator** (always compiled in, no extra dependency): every
+JM races an `fcntl` lock on a **shared** `--ha-dir`; the winner binds the
+control port and writes `active-leader.json`, standbys wait, and TaskManagers
+discover the leader from that shared dir. On leader death a standby acquires the
+lock and takes over.
+
+Shared storage is required (`ha.storage`):
+- `type: pvc` (production) - a **ReadWriteMany** PVC; needs an RWX StorageClass
+  (NFS/CephFS/...). `fcntl` over a network FS carries a stale-lock risk under
+  pathological hangs.
+- `type: hostPath` (single-node dev / kind) - a node-local path shared by
+  co-located pods.
+
+```sh
+helm install my-clink deploy/helm/clink --set ha.enabled=true --set ha.replicas=3 \
+  --set ha.storage.pvc.storageClassName=<rwx-class>
+```
+
+Verified by `kind-ha-smoke.sh` (single-node hostPath): a leader is elected, TMs
+register with it, the leader is killed, a standby takes over, and the TMs
+re-register with the new leader.
+
+Follow-on: the **etcd** coordinator is the more robust multi-machine election
+primitive (no `fcntl`-over-NFS), but needs a `clink_node` built with
+`-DCLINK_WITH_ETCD=ON` + `etcd-cpp-apiv3` - which the default runtime image is
+not - so it is not wired here. A CRD Operator (lifecycle/upgrade automation)
+remains a separate follow-on.

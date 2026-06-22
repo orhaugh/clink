@@ -81,8 +81,10 @@ spec:
             - --http-port={{ .Values.taskmanager.httpPort }}
             - --http-bind=0.0.0.0
             {{- if .Values.ha.enabled }}
-            - --etcd-endpoints={{ required "ha.etcdEndpoints is required when ha.enabled" .Values.ha.etcdEndpoints }}
-            - --etcd-cluster={{ .Values.ha.etcdCluster }}
+            # In HA the TM discovers the current leader from the shared
+            # active-leader.json (overriding --jm-host) and re-discovers after a
+            # leader change when k8s restarts it on JM disconnect.
+            - --ha-dir={{ .Values.ha.storage.mountPath }}
             {{- end }}
             {{- with .Values.taskmanager.extraArgs }}
             {{- toYaml . | nindent 12 }}
@@ -110,6 +112,14 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- if .Values.ha.enabled }}
+          volumeMounts:
+            {{- include "clink.haVolumeMount" . | nindent 12 }}
+          {{- end }}
+      {{- if .Values.ha.enabled }}
+      volumes:
+        {{- include "clink.haVolume" . | nindent 8 }}
+      {{- end }}
       {{- with .Values.taskmanager.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

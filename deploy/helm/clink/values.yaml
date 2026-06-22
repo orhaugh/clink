@@ -57,12 +57,35 @@ taskmanager:
   # How long to let an in-flight subtask drain on pod termination before SIGKILL.
   terminationGracePeriodSeconds: 30
 
-# Multi-machine HA via the etcd coordinator (clink already ships it; clink_node
-# selects it with --etcd-endpoints). v1 of THIS chart deploys a single JM and
-# does NOT stand up etcd or run multiple JM replicas - enabling true HA here is
-# the documented follow-on (multiple JM replicas racing for leadership + an etcd
-# endpoint + RBAC). The stanza is present so the surface is stable.
+# High availability: run multiple JobManager replicas with leader election.
+#
+# Uses clink's FILE coordinator (always compiled into clink_node, no extra
+# dependency): every JM races an fcntl lock on a SHARED --ha-dir; the winner
+# binds the control port and writes its endpoint to active-leader.json, standbys
+# wait, and TaskManagers discover the leader from that same shared dir. On
+# leader death a standby acquires the lock and takes over.
+#
+# REQUIRES shared storage mounted by every JM and TM pod:
+#   storage.type=pvc  : a ReadWriteMany PVC (production; needs an RWX-capable
+#                       StorageClass - NFS/CephFS/etc). fcntl over a network FS
+#                       carries a stale-lock risk under pathological hangs.
+#   storage.type=hostPath: a node-local path shared by co-located pods. Correct
+#                       ONLY on a single-node cluster (kind/minikube/dev).
+#
+# (The etcd coordinator is the more robust multi-machine election primitive but
+# needs a clink_node built with -DCLINK_WITH_ETCD=ON + etcd-cpp-apiv3, which the
+# default runtime image is not - so it is a documented follow-on, not wired here.)
 ha:
   enabled: false
-  etcdEndpoints: ""
-  etcdCluster: "default"
+  # JobManager replica count (the leader + standbys).
+  replicas: 2
+  storage:
+    type: pvc            # pvc | hostPath
+    mountPath: /var/lib/clink/ha
+    pvc:
+      # MUST be ReadWriteMany-capable for a real multi-node cluster.
+      storageClassName: ""
+      size: 1Gi
+    hostPath:
+      # Single-node only (kind/dev). All pods share this node path.
+      path: /var/lib/clink-ha

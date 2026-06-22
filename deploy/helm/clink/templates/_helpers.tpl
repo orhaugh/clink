@@ -58,6 +58,29 @@ app.kubernetes.io/component: {{ .component }}
 {{- printf "%s-taskmanager-headless" (include "clink.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{/* Shared HA volume (file-coordinator --ha-dir): name, PVC name, volume + mount. */}}
+{{- define "clink.haVolumeName" -}}ha-shared{{- end -}}
+{{- define "clink.haPvcName" -}}
+{{- printf "%s-ha" (include "clink.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "clink.haVolume" -}}
+- name: {{ include "clink.haVolumeName" . }}
+{{- if eq .Values.ha.storage.type "hostPath" }}
+  hostPath:
+    path: {{ .Values.ha.storage.hostPath.path }}
+    type: DirectoryOrCreate
+{{- else }}
+  persistentVolumeClaim:
+    claimName: {{ include "clink.haPvcName" . }}
+{{- end }}
+{{- end -}}
+
+{{- define "clink.haVolumeMount" -}}
+- name: {{ include "clink.haVolumeName" . }}
+  mountPath: {{ .Values.ha.storage.mountPath }}
+{{- end -}}
+
 {{- define "clink.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create -}}
 {{- default (include "clink.fullname" .) .Values.serviceAccount.name -}}

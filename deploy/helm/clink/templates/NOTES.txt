@@ -16,8 +16,15 @@ Submit a job against the control port from inside the cluster (target):
 
   {{ include "clink.jobmanager.fullname" . }}:{{ .Values.jobmanager.controlPort }}
 
-{{- if not .Values.ha.enabled }}
+{{- if .Values.ha.enabled }}
+
+HA: {{ .Values.ha.replicas }} JobManagers race for leadership on the shared
+--ha-dir ({{ .Values.ha.storage.type }}); the leader binds the control port,
+standbys take over on its death. Inspect the current leader:
+
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "clink.jobmanager.fullname" . }} -- cat {{ .Values.ha.storage.mountPath }}/active-leader.json
+{{- else }}
 
 Note: this release runs a SINGLE JobManager (no HA). For multi-JM leader
-election, set ha.enabled=true with an etcd endpoint (see values.yaml).
+election set ha.enabled=true (shared-storage file coordinator; see values.yaml).
 {{- end }}
