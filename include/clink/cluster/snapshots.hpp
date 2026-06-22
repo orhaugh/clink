@@ -90,6 +90,11 @@ struct JobDetail {
 struct GraphSubtaskPlacement {
     std::uint32_t subtask_idx{0};
     std::string tm_id;
+    // Lifecycle timestamps (unix ms), 0 when unknown. started at deploy,
+    // finished at SubtaskFinished (0 = still running). The console derives
+    // duration / uptime from these.
+    std::int64_t started_at_unix_ms{0};
+    std::int64_t finished_at_unix_ms{0};
 };
 
 // One operator (node).

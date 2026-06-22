@@ -15,6 +15,7 @@
 #include "clink/core/codec.hpp"
 #include "clink/core/stream_element.hpp"
 #include "clink/core/types.hpp"
+#include "clink/metrics/operator_metrics.hpp"
 #include "clink/runtime/bounded_channel.hpp"
 #include "clink/runtime/log_buffer.hpp"
 #include "clink/runtime/output_tag.hpp"
@@ -41,6 +42,29 @@ struct SideOutputChannelEntry {
     std::function<void()> close_fn;  // invokes channel->close()
 };
 using SideOutputChannelMap = std::unordered_map<std::string, SideOutputChannelEntry>;
+
+// A named user accumulator handle, scoped to one operator. Obtained from
+// RuntimeContext::accumulator(name). add() folds a delta into a per-operator
+// value that merges across every subtask of the operator (within a process via
+// one atomic gauge, across TaskManagers via the JM's per-operator aggregation),
+// the clink equivalent of a Flink accumulator. Cheap to copy; holds no state of
+// its own beyond the (registry, op id, name) it writes through.
+class Accumulator {
+public:
+    Accumulator() = default;
+    Accumulator(MetricsRegistry* reg, std::uint64_t op_id, std::string name)
+        : reg_(reg), op_id_(op_id), name_(std::move(name)) {}
+
+    // Add `delta` (may be negative). Default +1 for the count case.
+    void add(std::int64_t delta = 1) const {
+        clink::metrics::op::accumulator_add(reg_, op_id_, name_, delta);
+    }
+
+private:
+    MetricsRegistry* reg_{nullptr};
+    std::uint64_t op_id_{0};
+    std::string name_;
+};
 
 // RuntimeContext is the per-operator handle the engine hands to user code at
 // open() time. It is the only sanctioned way for an operator to reach state,
@@ -69,6 +93,15 @@ public:
     void set_state_backend(StateBackend* b) noexcept { backend_ = b; }
 
     MetricsRegistry* metrics() const noexcept { return metrics_; }
+
+    // Named user accumulator scoped to this operator. The returned handle's
+    // add() merges across all of the operator's subtasks (Flink-style
+    // accumulator), surfaced per operator on GET /api/v1/jobs/:id/operators.
+    // Routes through the host registry (metrics()), so it is correct on the
+    // cluster path; a no-op when no registry is configured.
+    [[nodiscard]] Accumulator accumulator(std::string name) {
+        return Accumulator{metrics_, op_id_.value(), std::move(name)};
+    }
 
     // Logging seam. The executor sets the host-owned logger (threaded across
     // the plugin boundary by data); operators log via the log_* helpers, which

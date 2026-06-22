@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <poll.h>
 #include <sstream>
@@ -317,6 +318,8 @@ void write_job_graph(clink::http::JsonWriter& w, const clink::cluster::JobGraphD
             w.begin_object();
             w.kv("subtask_idx", static_cast<std::int64_t>(s.subtask_idx));
             w.kv("tm_id", s.tm_id);
+            w.kv("started_at_unix_ms", s.started_at_unix_ms);
+            w.kv("finished_at_unix_ms", s.finished_at_unix_ms);
             w.end_object();
         }
         w.end_array();
@@ -805,6 +808,9 @@ struct OpRuntime {
         std::int64_t input_capacity{0};
     };
     std::vector<TmRow> per_tm;
+    // Named user accumulators, summed across TMs (within a TM the gauge already
+    // merged the operator's subtasks). Sorted for stable JSON output.
+    std::map<std::string, std::int64_t> accumulators;
 };
 
 // Build the per-operator stats by scraping every TM hosting the job.
@@ -884,6 +890,9 @@ inline std::vector<OpRuntime> build(const clink::cluster::JobManager& jm,
             bool has_wm{false};
         };
         std::unordered_map<std::uint64_t, M> by_op;  // op_id -> metrics on this TM
+        // op_id -> {accumulator name -> value} on this TM (gauge already merged
+        // the operator's subtasks within the process).
+        std::unordered_map<std::uint64_t, std::map<std::string, std::int64_t>> by_op_acc;
 
         std::istringstream iss(body);
         std::string line;
@@ -911,6 +920,12 @@ inline std::vector<OpRuntime> build(const clink::cluster::JobManager& jm,
                         ops[idx->second].op_id = oid;
                         ops[idx->second].op_id_known = true;
                     }
+                }
+                continue;
+            }
+            if (p.base == "clink_op_acc") {
+                if (const auto nm = p.labels.find("name"); nm != p.labels.end()) {
+                    by_op_acc[oid][nm->second] = static_cast<std::int64_t>(p.value);
                 }
                 continue;
             }
@@ -958,6 +973,17 @@ inline std::vector<OpRuntime> build(const clink::cluster::JobManager& jm,
             }
             o.per_tm.push_back({tm_id, m.ri, m.ro, m.depth, m.cap});
         }
+
+        for (const auto& [oid, accs] : by_op_acc) {
+            const auto iit = by_opid.find(oid);
+            if (iit == by_opid.end())
+                continue;
+            auto& o = ops[iit->second];
+            o.has_metrics = true;
+            for (const auto& [name, val] : accs) {
+                o.accumulators[name] += val;  // sum across TMs
+            }
+        }
     }
     return ops;
 }
@@ -998,6 +1024,8 @@ inline void write_json(clink::http::JsonWriter& w,
             w.begin_object();
             w.kv("subtask_idx", static_cast<std::int64_t>(s.subtask_idx));
             w.kv("tm_id", s.tm_id);
+            w.kv("started_at_unix_ms", s.started_at_unix_ms);
+            w.kv("finished_at_unix_ms", s.finished_at_unix_ms);
             w.end_object();
         }
         w.end_array();
@@ -1012,6 +1040,11 @@ inline void write_json(clink::http::JsonWriter& w,
             w.end_object();
         }
         w.end_array();
+        w.key("accumulators").begin_object();
+        for (const auto& [name, val] : o.accumulators) {
+            w.kv(name, val);
+        }
+        w.end_object();
         w.end_object();
     }
     w.end_array();

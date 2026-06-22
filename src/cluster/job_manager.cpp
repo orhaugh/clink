@@ -905,8 +905,15 @@ std::optional<JobGraphDetail> JobManager::snapshot_job_graph(JobId job_id) const
             }
             try {
                 const auto chain = OperatorChainSpec::from_json(t.extra_config);
+                const std::string tkey = t.role + ":" + std::to_string(t.subtask_idx);
+                std::int64_t started_ms = 0;
+                std::int64_t finished_ms = 0;
+                if (auto tit = job.subtask_timing.find(tkey); tit != job.subtask_timing.end()) {
+                    started_ms = tit->second.started_ms;
+                    finished_ms = tit->second.finished_ms;
+                }
                 for (const auto& cop : chain.ops) {
-                    placement[cop.id].push_back({t.subtask_idx, tm_id});
+                    placement[cop.id].push_back({t.subtask_idx, tm_id, started_ms, finished_ms});
                 }
             } catch (...) {
                 // Non-generic / unparseable task config: skip placement for it.
@@ -1836,9 +1843,14 @@ JobId JobManager::deploy_internal_(const JobPlan& plan,
     {
         std::lock_guard lock(mu_);
         for (const auto& [tm_id, tasks] : by_tm) {
+            const auto deploy_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
             for (const auto& t : tasks) {
                 const std::string key = t.role + ":" + std::to_string(t.subtask_idx);
                 job->task_records[key] = {tm_id, t};
+                job->subtask_timing[key].started_ms = deploy_ms;
+                job->subtask_timing[key].finished_ms = 0;  // (re)deploy clears any prior finish
                 job->pending_per_tm[tm_id].emplace_back(t.role, t.subtask_idx);
             }
             job->tasks_by_tm[tm_id] = tasks;
@@ -2849,6 +2861,11 @@ void JobManager::handle_subtask_finished_(MessageReader& r) {
         }
         auto& job = *job_it->second;
         const std::string key = msg.role + ":" + std::to_string(msg.subtask_idx);
+        if (auto tit = job.subtask_timing.find(key); tit != job.subtask_timing.end()) {
+            tit->second.finished_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::system_clock::now().time_since_epoch())
+                                          .count();
+        }
 
         // Phase 29d-3: if the operator this subtask belonged to is in
         // the Draining state, count this SubtaskFinished as a drained

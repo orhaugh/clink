@@ -104,26 +104,52 @@ inline std::string env_str(const char* name, const std::string& fallback) {
 // Slow source: emits sequential int64 values 0..count-1, with a
 // sleep_for between each so the pipeline stays alive long enough for
 // the rescale-driving test to land its CLI invocation between
-// checkpoints.
+// checkpoints. Behaviourally the old GeneratorSource, but a real Source
+// subclass so it can demonstrate a user accumulator (records_emitted)
+// through the RuntimeContext - it shows up live on the source node in
+// the console's per-operator overlay.
+class SlowCountingSource final : public clink::Source<std::int64_t> {
+public:
+    SlowCountingSource(std::int64_t count,
+                       std::int64_t tick_ms,
+                       std::int64_t parallelism,
+                       std::int64_t subtask_idx)
+        : state_(subtask_idx), count_(count), tick_ms_(tick_ms), parallelism_(parallelism) {}
+
+    [[nodiscard]] bool is_bounded() const noexcept override { return false; }
+
+    bool produce(clink::Emitter<std::int64_t>& out) override {
+        if (this->cancelled() || state_ >= count_) {
+            out.emit_watermark(clink::Watermark::max());
+            return false;
+        }
+        if (tick_ms_ > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{tick_ms_});
+        }
+        clink::Batch<std::int64_t> b;
+        b.push(clink::Record<std::int64_t>{state_});
+        out.emit_data(std::move(b));
+        state_ += parallelism_;
+        if (auto* rt = this->runtime()) {
+            rt->accumulator("records_emitted").add(1);
+        }
+        return true;
+    }
+
+    std::string name() const override { return "rescale_slow_source"; }
+
+private:
+    std::int64_t state_;
+    std::int64_t count_;
+    std::int64_t tick_ms_;
+    std::int64_t parallelism_;
+};
+
 inline std::shared_ptr<clink::Source<std::int64_t>> make_slow_source(std::int64_t count,
                                                                      std::int64_t tick_ms,
                                                                      std::int64_t parallelism,
                                                                      std::int64_t subtask_idx) {
-    auto state = std::make_shared<std::int64_t>(subtask_idx);
-    auto gen =
-        [state, count, tick_ms, parallelism]() -> std::optional<clink::Record<std::int64_t>> {
-        if (*state >= count) {
-            return std::nullopt;
-        }
-        if (tick_ms > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds{tick_ms});
-        }
-        clink::Record<std::int64_t> r{*state};
-        *state += parallelism;
-        return r;
-    };
-    return std::make_shared<clink::GeneratorSource<std::int64_t>>(std::move(gen),
-                                                                  "rescale_slow_source");
+    return std::make_shared<SlowCountingSource>(count, tick_ms, parallelism, subtask_idx);
 }
 
 inline void define_job(clink::api::StreamExecutionEnvironment& env) {

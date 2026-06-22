@@ -76,6 +76,24 @@ inline std::string op_shard_metric_name(const char* metric,
     return out;
 }
 
+// Named user accumulator: clink_op_acc{op_id="N",name="<name>"}. A gauge (not a
+// counter) so it supports +/- deltas, and because a gauge is a single atomic
+// per (op_id,name) it merges every subtask of the operator that runs in the
+// SAME process automatically; the JM aggregator sums it across TMs for the
+// operator-wide value. This is how clink surfaces Flink-style accumulators -
+// the host metrics registry is already threaded into every RuntimeContext and
+// scraped by the JM, so it is the natural cross-subtask transport (a separate
+// per-subtask wire message would just duplicate it).
+inline std::string op_acc_metric_name(std::uint64_t op_id, const std::string& acc_name) {
+    std::string out = kOpMetricPrefix;
+    out += "acc{op_id=\"";
+    out += std::to_string(op_id);
+    out += "\",name=\"";
+    out += acc_name;
+    out += "\"}";
+    return out;
+}
+
 namespace op {
 
 // IMPORTANT: every accessor takes the MetricsRegistry to write into as its
@@ -181,6 +199,17 @@ inline void bytes_received_inc(MetricsRegistry* reg, std::uint64_t op_id, std::u
     if (reg == nullptr)
         return;
     reg->counter(op_metric_name("bytes_received_total", op_id)).increment(n);
+}
+
+// Add a delta to a named user accumulator for this operator (see
+// op_acc_metric_name). v may be negative.
+inline void accumulator_add(MetricsRegistry* reg,
+                            std::uint64_t op_id,
+                            const std::string& name,
+                            std::int64_t v) {
+    if (reg == nullptr)
+        return;
+    reg->gauge(op_acc_metric_name(op_id, name)).add(v);
 }
 
 // Identity mapping: clink_op_info{op_id="N",node="op_X",uid="..."} = 1. Emitted

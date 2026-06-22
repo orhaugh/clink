@@ -479,6 +479,15 @@ private:
         // re-send the original Deploy entry to the original TM.
         std::unordered_map<std::string, std::pair<std::string, DeploymentTask>> task_records;
         std::unordered_map<std::string, int> attempt_counts;
+        // Per-subtask lifecycle timestamps (unix ms), keyed like task_records
+        // ("role:subtask_idx"). started stamped at deploy, finished at
+        // SubtaskFinished. Surfaced per subtask on the job graph / operators
+        // endpoints so the console can show start time + (running) duration.
+        struct SubtaskTiming {
+            std::int64_t started_ms{0};
+            std::int64_t finished_ms{0};
+        };
+        std::unordered_map<std::string, SubtaskTiming> subtask_timing;
         // Tasks per TM (for grouping PeerUpdate by tm_id).
         std::unordered_map<std::string, std::vector<DeploymentTask>> tasks_by_tm;
         // Tasks pending completion per TM (for synthesised errors when

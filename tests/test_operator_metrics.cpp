@@ -21,6 +21,7 @@
 #include "clink/operators/source_operator.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/local_executor.hpp"
+#include "clink/runtime/runtime_context.hpp"
 
 using namespace clink;
 using namespace std::chrono_literals;
@@ -164,4 +165,29 @@ TEST(OperatorMetrics, HelpersAreReentrantForArbitraryOperatorIds) {
     EXPECT_EQ(hist_count(op_metric_name("process_latency_ns", op_id)) - before_lat_count, 2u);
     const auto sum = hist_sum(op_metric_name("process_latency_ns", op_id));
     EXPECT_GE(sum, 4000.0);
+}
+
+TEST(OperatorMetrics, AccumulatorMergesAcrossSubtasksForSameOpId) {
+    // A user accumulator is a per-(op_id, name) gauge, so two RuntimeContexts
+    // for the SAME operator (two subtasks in one process) merge their adds -
+    // the in-process half of the cross-subtask merge the JM completes across
+    // TaskManagers. Negative deltas are supported.
+    using namespace clink::metrics;
+    auto& reg = MetricsRegistry::global();
+    const clink::OperatorId op{777'001u};
+    const auto name = op_acc_metric_name(op.value(), "widgets");
+    const auto before = reg.gauge(name).value();
+
+    clink::RuntimeContext c1(op, "acc_op", nullptr, &reg);
+    clink::RuntimeContext c2(op, "acc_op", nullptr, &reg);
+    c1.accumulator("widgets").add(5);
+    c2.accumulator("widgets").add(3);
+    EXPECT_EQ(reg.gauge(name).value() - before, 8);
+    c1.accumulator("widgets").add(-2);
+    EXPECT_EQ(reg.gauge(name).value() - before, 6);
+
+    // A null registry (no metrics configured) is a safe no-op.
+    clink::RuntimeContext c3(op, "acc_op", nullptr, nullptr);
+    c3.accumulator("widgets").add(100);
+    EXPECT_EQ(reg.gauge(name).value() - before, 6);
 }
