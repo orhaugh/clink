@@ -68,6 +68,7 @@
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/event_bus.hpp"
 #include "clink/runtime/log_buffer.hpp"
+#include "clink/runtime/logging.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
 #ifdef CLINK_HAS_HTTP
@@ -586,7 +587,21 @@ clink::http::HttpResponse make_logs_response(const clink::http::HttpRequest& req
             // fall through with default
         }
     }
-    auto records = clink::LogBuffer::global().tail(limit, level);
+    // ?since_ms=<ts> is a follow/tail cursor: return only records strictly
+    // newer than ts. ?source=<prefix> filters by the component source field.
+    std::int64_t since_ms = 0;
+    if (auto it = req.query.find("since_ms"); it != req.query.end()) {
+        try {
+            since_ms = std::stoll(it->second);
+        } catch (...) {
+            // fall through with no cursor
+        }
+    }
+    std::string source_prefix;
+    if (auto it = req.query.find("source"); it != req.query.end()) {
+        source_prefix = it->second;
+    }
+    auto records = clink::LogBuffer::global().tail(limit, level, since_ms, source_prefix);
     clink::http::JsonWriter w;
     w.begin_object();
     w.key("logs").begin_array();
@@ -597,6 +612,24 @@ clink::http::HttpResponse make_logs_response(const clink::http::HttpRequest& req
         w.kv("source", r.source);
         w.kv("message", r.message);
         w.end_object();
+    }
+    w.end_array();
+    w.end_object();
+    clink::http::HttpResponse resp;
+    resp.body = w.str();
+    return resp;
+}
+
+// Render the distinct source/component values currently in the ring as JSON
+// for /api/v1/logs/components, so a UI can populate a component filter
+// dropdown without scanning every record.
+clink::http::HttpResponse make_log_components_response() {
+    auto sources = clink::LogBuffer::global().distinct_sources();
+    clink::http::JsonWriter w;
+    w.begin_object();
+    w.key("components").begin_array();
+    for (const auto& s : sources) {
+        w.string_value(s);
     }
     w.end_array();
     w.end_object();
@@ -659,10 +692,39 @@ bool has_flag(int argc, char** argv, std::string_view flag) {
     return false;
 }
 
+// Build the logging config from --log-* flags. Defaults reproduce the
+// pre-spdlog behaviour: info level, console (stderr) on, no file sink. The
+// log level resolves --log-level, then the CLINK_LOG_LEVEL env, then "info".
+clink::logging::LoggingConfig make_logging_config(int argc, char** argv, std::string node_name) {
+    clink::logging::LoggingConfig cfg;
+    cfg.node_name = std::move(node_name);
+    std::string level = get_arg(argc, argv, "log-level", "");
+    if (level.empty()) {
+        if (const char* env = std::getenv("CLINK_LOG_LEVEL"); env != nullptr) {
+            level = env;
+        }
+    }
+    if (!level.empty()) {
+        cfg.level = level;
+    }
+    cfg.file_path = get_arg(argc, argv, "log-file", "");
+    cfg.max_file_size_mb = std::stoul(get_arg(argc, argv, "log-max-size-mb", "50"));
+    cfg.max_files = std::stoul(get_arg(argc, argv, "log-max-files", "10"));
+    cfg.compress_rotated = get_arg(argc, argv, "log-compress", "true") != "false";
+    cfg.zstd_level = std::stoi(get_arg(argc, argv, "log-zstd-level", "3"));
+    cfg.console = !has_flag(argc, argv, "log-no-console");
+    cfg.async = get_arg(argc, argv, "log-async", "true") != "false";
+    return cfg;
+}
+
 // JM mode. Bind, idle, await jobs. Stops cleanly on SIGINT/SIGTERM. The
 // binary stays up until killed; jobs come and go entirely over the
 // submission protocol.
 int run_jm(int argc, char** argv) {
+    // Initialise logging before anything emits. Configures console + optional
+    // rolling (zstd-compressed) file sink + the /api/v1/logs ring; all
+    // clink::log calls and the daemon diagnostics below route through it.
+    clink::logging::init(make_logging_config(argc, argv, "jm"));
 #ifdef CLINK_HAS_HTTP
     clink::metrics::init_jm_metrics();
     clink::metrics::init_checkpoint_metrics();
@@ -755,13 +817,16 @@ int run_jm(int argc, char** argv) {
     }
 #else
     if (!tls_cert.empty() || !tls_key.empty() || !tls_client_ca.empty()) {
-        std::cerr << "JM: --tls-* flags ignored (clink_tls not linked)\n";
+        clink::log::warn("jm.tls", "--tls-* flags ignored (clink_tls not linked)");
     }
 #endif
     const auto want_port = static_cast<std::uint16_t>(std::stoi(port_str));
     std::unique_ptr<clink::cluster::HaCoordinator> ha_coord;
     if (ha_dir.empty()) {
         const auto bound = jm.start(want_port);
+        // Load-bearing readiness banner on STDOUT: test harnesses and operators
+        // grep stdout for "JM listening". Keep it on std::cout (NOT the logger)
+        // so it survives --log-no-console and is not reordered by async logging.
         std::cout << "JM listening on " << advertise_host << ":" << bound << "\n";
         std::cout.flush();
     } else {
@@ -1000,6 +1065,10 @@ int run_jm(int argc, char** argv) {
             clink::metrics::http::request_seen();
             return make_logs_response(req);
         });
+        http_srv->get("/api/v1/logs/components", [](const clink::http::HttpRequest&) {
+            clink::metrics::http::request_seen();
+            return make_log_components_response();
+        });
 
         // Embedded SPA. Both `/` and `/dashboard` serve the same page
         // so curl-friendly paths (`curl host/`) and -muscle-memory
@@ -1085,6 +1154,8 @@ int run_tm(int argc, char** argv) {
         std::cerr << "tm requires --id\n";
         return 1;
     }
+    // Initialise logging now that the id is known (root logger %n = tm@<id>).
+    clink::logging::init(make_logging_config(argc, argv, "tm@" + tm_id));
     std::string discovered_jm_host = jm_host;
     std::uint16_t discovered_jm_port = static_cast<std::uint16_t>(std::stoi(jm_port));
     if (!etcd_endpoints.empty() || !ha_dir.empty()) {
@@ -1144,7 +1215,7 @@ int run_tm(int argc, char** argv) {
     }
 #else
     if (!tls_ca.empty() || !tls_client_cert.empty() || !tls_client_key.empty()) {
-        std::cerr << "TM: --tls-* flags ignored (clink_tls not linked)\n";
+        clink::log::warn("tm.tls", "--tls-* flags ignored (clink_tls not linked)");
     }
 #endif
 
@@ -1206,6 +1277,10 @@ int run_tm(int argc, char** argv) {
             clink::metrics::http::request_seen();
             return make_logs_response(req);
         });
+        http_srv->get("/api/v1/logs/components", [](const clink::http::HttpRequest&) {
+            clink::metrics::http::request_seen();
+            return make_log_components_response();
+        });
         http_srv->sse("/api/v1/events", make_event_bus_sse_factory());
         http_bound = http_srv->start(http_bind, http_port_req);
         std::cout << "TM HTTP on " << http_bind << ":" << http_bound << "\n";
@@ -1220,6 +1295,10 @@ int run_tm(int argc, char** argv) {
 #endif
 
     tm.connect_to_jm(discovered_jm_host, discovered_jm_port);
+    // Load-bearing readiness banner on STDOUT: bench_failover_coldstart greps the
+    // child's captured stdout for "registered" at several sites. Keep it on
+    // std::cout (NOT the logger) so it survives --log-no-console and is not
+    // reordered by async logging.
     std::cout << "TM " << tm_id << " registered with " << discovered_jm_host << ":"
               << discovered_jm_port << "\n";
     std::cout.flush();
@@ -1303,6 +1382,20 @@ int main(int argc, char** argv) {
                       << "  --heartbeat-timeout-ms=<n>   TM-loss detection window (default 5000).\n"
                       << "  --watchdog-interval-ms=<n>   TM-liveness poll cadence (default 200).\n"
                       << "\n"
+                      << "Logging flags:\n"
+                      << "  --log-level=<lvl>            trace|debug|info|warn|error|off "
+                         "(default info; CLINK_LOG_LEVEL env as fallback).\n"
+                      << "  --log-file=<path>            Enable the rolling file sink at "
+                         "<path> (default off: console + ring only).\n"
+                      << "  --log-max-size-mb=<n>        Rotate the log file at this size "
+                         "(default 50).\n"
+                      << "  --log-max-files=<n>          Rotated segments to keep (default 10).\n"
+                      << "  --log-compress=true|false    zstd-compress rotated segments "
+                         "(default true).\n"
+                      << "  --log-zstd-level=<1..19>     zstd compression level (default 3).\n"
+                      << "  --log-async=true|false       Async logging (default true).\n"
+                      << "  --log-no-console             Disable the console (stderr) sink.\n"
+                      << "\n"
                       << "Global flags:\n"
                       << "  --version    Print version + commit and exit.\n"
                       << "  --help       Print this message and exit.\n";
@@ -1313,15 +1406,19 @@ int main(int argc, char** argv) {
         // arrived at any point catches an idempotent flag flip.
         install_shutdown_signal_handler();
         const auto role = get_arg(argc, argv, "role");
-        if (role == "jm") {
-            return run_jm(argc, argv);
-        }
-        if (role == "tm") {
-            return run_tm(argc, argv);
+        if (role == "jm" || role == "tm") {
+            const int rc = role == "jm" ? run_jm(argc, argv) : run_tm(argc, argv);
+            // Flush + join the async worker/flush threads on the clean exit
+            // path. Not called from the signal handler (atomic-only); the role
+            // mainloops observe the flag and return here.
+            clink::logging::shutdown();
+            return rc;
         }
         std::cerr << "Usage: clink_node --role={jm|tm} ... (--help for details)\n";
         return 1;
     } catch (const std::exception& e) {
+        // Fatal path stays on std::cerr (synchronous) so the message is not
+        // lost to an un-drained async queue as the process unwinds.
         std::cerr << "fatal: " << e.what() << "\n";
         return 99;
     }

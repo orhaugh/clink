@@ -164,12 +164,20 @@ add_executable(clink_core_tests
     test_json_predicate.cpp
     test_json_value_expr.cpp
     test_decimal.cpp
+    test_logging.cpp
 )
 
 target_link_libraries(clink_core_tests PRIVATE
     clink::core
     GTest::gtest_main
 )
+# test_logging.cpp constructs the spdlog-backed sinks directly. spdlog is
+# linked PRIVATE to clink_core (header-only) so its include path does not
+# reach this test exe; add it here. Harmless for the test binary (it is not a
+# plugin .so, so the per-.so registry hazard does not apply).
+if(TARGET spdlog::spdlog_header_only)
+    target_link_libraries(clink_core_tests PRIVATE spdlog::spdlog_header_only)
+endif()
 clink_set_warnings(clink_core_tests)
 
 # ---------------------------------------------------------------------------

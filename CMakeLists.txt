@@ -132,6 +132,7 @@ add_library(clink_core STATIC
     src/runtime/local_executor.cpp
     src/runtime/local_submitter.cpp
     src/runtime/log_buffer.cpp
+    src/runtime/logging.cpp
     src/runtime/network/connection.cpp
     src/runtime/network/network_socket.cpp
     src/state/in_memory_state_backend.cpp
@@ -212,6 +213,70 @@ find_package(Parquet REQUIRED)
 target_link_libraries(clink_core PUBLIC Parquet::parquet_shared)
 target_compile_definitions(clink_core PUBLIC CLINK_HAS_PARQUET=1)
 message(STATUS "clink::core - Parquet enabled")
+
+# ---------------------------------------------------------------------------
+# Logging: spdlog behind the clink::logging module. clink does not use fmt
+# directly, so spdlog uses its OWN bundled, header-only fmt (it includes
+# <spdlog/fmt/bundled/...>, never <fmt/...>). That deliberately sidesteps the
+# Homebrew-fmt-shadow hazard: a stray /opt/homebrew/include on the include
+# path cannot shadow a bundled header that is reached by its full spdlog path,
+# and there is no external libfmt to link. Pinned tag for reproducibility.
+# SPDLOG_INSTALL OFF so the FetchContent target is not in clink's export set.
+#
+# spdlog is linked PRIVATE and header-only: only logging.cpp and the
+# build-private logging headers include <spdlog/...>; the installed public
+# headers (runtime_context.hpp, job_config.hpp, runner_registry.hpp) merely
+# forward-declare spdlog::logger and pass it by raw pointer. PRIVATE keeps
+# spdlog/fmt include dirs out of the dlopen'd plugin .so MODULE targets, the
+# header-only target means there is no compiled spdlog symbol to leak, and the
+# $<BUILD_INTERFACE:> wrap keeps the non-installed FetchContent target out of
+# clink's install(EXPORT) set (clink_core is a static lib, so a bare PRIVATE
+# dep would otherwise propagate as LINK_ONLY into the export interface). The
+# net effect: a plugin never instantiates a second, sink-less per-.so spdlog
+# registry (the RTLD_LOCAL hazard the operator-logging seam is built to avoid).
+# ---------------------------------------------------------------------------
+include(FetchContent)
+set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    spdlog
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG v1.15.2
+    GIT_SHALLOW TRUE
+    SYSTEM
+)
+FetchContent_MakeAvailable(spdlog)
+
+# GCC-only: re-export the header-only template includes as SYSTEM so spdlog's
+# (and its bundled fmt's) header-only template warnings cannot trip -Werror.
+# NOT on macOS, where -isystem lets a Homebrew spdlog shadow the fetched one.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    if(TARGET spdlog::spdlog_header_only)
+        get_target_property(_inc spdlog::spdlog_header_only INTERFACE_INCLUDE_DIRECTORIES)
+        if(_inc)
+            set_property(TARGET spdlog::spdlog_header_only APPEND PROPERTY
+                INTERFACE_SYSTEM_INCLUDE_DIRECTORIES ${_inc})
+        endif()
+    endif()
+endif()
+
+target_link_libraries(clink_core PRIVATE $<BUILD_INTERFACE:spdlog::spdlog_header_only>)
+target_compile_definitions(clink_core PRIVATE CLINK_HAS_SPDLOG=1)
+
+# zstd for the compressing rotating file sink. Arrow already links zstd
+# transitively (zstd::libzstd_* is created under its static-build branch),
+# but a shared-only Arrow skips that, so resolve the target explicitly and
+# fall back to Arrow's transitive link. PRIVATE - only the sink TU needs the
+# symbols.
+find_package(zstd QUIET)
+if(TARGET zstd::libzstd_shared)
+    target_link_libraries(clink_core PRIVATE zstd::libzstd_shared)
+    message(STATUS "clink::core - zstd via zstd::libzstd_shared")
+elseif(TARGET zstd::libzstd_static)
+    target_link_libraries(clink_core PRIVATE zstd::libzstd_static)
+    message(STATUS "clink::core - zstd via zstd::libzstd_static")
+else()
+    message(STATUS "clink::core - zstd target not found directly; relying on Arrow transitive link")
+endif()
 
 # liburing - Linux-only optional. Provides the io_uring submission /
 # completion ring used by Phase 28e's IoUringReactor: a coroutine

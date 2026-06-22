@@ -1,6 +1,6 @@
 #include "clink/runtime/log_buffer.hpp"
 
-#include <iostream>
+#include <algorithm>
 #include <utility>
 
 namespace clink {
@@ -28,7 +28,10 @@ int LogBuffer::level_rank_(std::string_view level) {
     return 1;  // "info" and unknown
 }
 
-std::vector<LogRecord> LogBuffer::tail(std::size_t limit, std::string_view level_filter) const {
+std::vector<LogRecord> LogBuffer::tail(std::size_t limit,
+                                       std::string_view level_filter,
+                                       std::int64_t since_ms,
+                                       std::string_view source_prefix) const {
     std::lock_guard lock(mu_);
     std::vector<LogRecord> out;
     if (size_ == 0 || limit == 0) {
@@ -43,6 +46,12 @@ std::vector<LogRecord> LogBuffer::tail(std::size_t limit, std::string_view level
         if (min_rank >= 0 && level_rank_(rec.level) < min_rank) {
             continue;
         }
+        if (since_ms > 0 && rec.ts_ms <= since_ms) {
+            continue;
+        }
+        if (!source_prefix.empty() && !std::string_view{rec.source}.starts_with(source_prefix)) {
+            continue;
+        }
         out.push_back(rec);
     }
     // If more than limit matched, keep the most recent `limit` entries.
@@ -52,48 +61,28 @@ std::vector<LogRecord> LogBuffer::tail(std::size_t limit, std::string_view level
     return out;
 }
 
+std::vector<std::string> LogBuffer::distinct_sources() const {
+    std::lock_guard lock(mu_);
+    std::vector<std::string> sources;
+    const std::size_t start = (head_ + capacity_ - size_) % capacity_;
+    for (std::size_t i = 0; i < size_; ++i) {
+        const auto& src = buf_[(start + i) % capacity_].source;
+        if (std::find(sources.begin(), sources.end(), src) == sources.end()) {
+            sources.push_back(src);
+        }
+    }
+    std::sort(sources.begin(), sources.end());
+    return sources;
+}
+
 LogBuffer& LogBuffer::global() {
     static LogBuffer instance;
     return instance;
 }
 
-namespace log {
-
-namespace {
-
-std::int64_t now_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-void emit(std::string level, std::string_view source, std::string message) {
-    // Mirror to stderr so existing operator-log tooling keeps seeing events.
-    // Format matches the prior std::cerr lines closely enough that grep
-    // patterns are preserved.
-    std::cerr << '[' << level << "] " << source << ": " << message << '\n';
-    LogRecord rec;
-    rec.ts_ms = now_ms();
-    rec.level = std::move(level);
-    rec.source = std::string(source);
-    rec.message = std::move(message);
-    LogBuffer::global().push(std::move(rec));
-}
-
-}  // namespace
-
-void info(std::string_view source, std::string message) {
-    emit("info", source, std::move(message));
-}
-
-void warn(std::string_view source, std::string message) {
-    emit("warn", source, std::move(message));
-}
-
-void error(std::string_view source, std::string message) {
-    emit("error", source, std::move(message));
-}
-
-}  // namespace log
+// The clink::log facade and clink::logging::op_log are implemented in
+// logging.cpp (which owns the spdlog pipeline). This translation unit keeps
+// only the spdlog-free ring buffer so log_buffer.hpp stays includable by
+// plugin operator code.
 
 }  // namespace clink

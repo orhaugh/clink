@@ -16,6 +16,7 @@
 #include "clink/core/stream_element.hpp"
 #include "clink/core/types.hpp"
 #include "clink/runtime/bounded_channel.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/runtime/output_tag.hpp"
 #include "clink/runtime/timer_service.hpp"
 #include "clink/state/broadcast_state.hpp"
@@ -68,6 +69,22 @@ public:
     void set_state_backend(StateBackend* b) noexcept { backend_ = b; }
 
     MetricsRegistry* metrics() const noexcept { return metrics_; }
+
+    // Logging seam. The executor sets the host-owned logger (threaded across
+    // the plugin boundary by data); operators log via the log_* helpers, which
+    // route through clink::logging::op_log so the record reaches the node's
+    // sinks and the /api/v1/logs ring with this operator's name as the source.
+    // Operators MUST use these rather than the clink::log facade or
+    // spdlog::default_logger(), which resolve a private per-.so registry.
+    void set_logger(spdlog::logger* lg) noexcept { host_logger_ = lg; }
+    spdlog::logger* logger() const noexcept { return host_logger_; }
+    void log(LogSeverity level, std::string_view message) const {
+        clink::logging::op_log(host_logger_, level, op_name_, message);
+    }
+    void log_debug(std::string_view message) const { log(LogSeverity::Debug, message); }
+    void log_info(std::string_view message) const { log(LogSeverity::Info, message); }
+    void log_warn(std::string_view message) const { log(LogSeverity::Warn, message); }
+    void log_error(std::string_view message) const { log(LogSeverity::Error, message); }
 
     // Per-operator processing-time TimerService. Always present; users
     // call timer_service()->register_processing_time_timer(...) from
@@ -310,6 +327,7 @@ private:
     std::string op_name_;
     StateBackend* backend_{nullptr};
     MetricsRegistry* metrics_{nullptr};
+    spdlog::logger* host_logger_{nullptr};
     TimerService timer_service_{};
     SideOutputChannelMap side_outputs_;
     CheckpointAckFn ack_fn_;

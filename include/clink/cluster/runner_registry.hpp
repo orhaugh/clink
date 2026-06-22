@@ -16,9 +16,14 @@
 #include "clink/cluster/protocol.hpp"
 #include "clink/state/state_backend.hpp"
 
+namespace spdlog {
+class logger;
+}
+
 namespace clink {
 class StateBackendFactory;
-}
+class MetricsRegistry;
+}  // namespace clink
 
 namespace clink::cluster {
 
@@ -107,6 +112,18 @@ struct RunnerContext {
     // dynamically-registered scheme would otherwise report "no builder". nullptr
     // falls back to the local default_instance() (in-process / legacy paths).
     StateBackendFactory* state_backend_factory{nullptr};
+    // The HOST's spdlog logger and metrics registry, captured in the clink_node
+    // TU and carried across the dlopen boundary by data. Same rationale as
+    // state_backend_factory above: make_subtask_job_config runs inside the
+    // plugin .so on the SubtaskRunner dispatch path, where
+    // clink::logging::host_logger() / MetricsRegistry::global() would resolve
+    // the .so's OWN private singletons (RTLD_LOCAL + static clink_core), not
+    // the node's. Setting these host-side and copying them onto JobConfig means
+    // an operator's logs reach the node's sinks (/api/v1/logs) and its gauges
+    // reach the node's /metrics. nullptr falls back to the in-process globals
+    // (correct for same-address-space LocalExecutor / legacy paths).
+    spdlog::logger* logger{nullptr};
+    MetricsRegistry* metrics{nullptr};
     // Per-job alignment policy. false = aligned (default); true =
     // unaligned (barriers overtake in-flight records at multi-input
     // operators). Propagated through the wire from CheckpointConfig

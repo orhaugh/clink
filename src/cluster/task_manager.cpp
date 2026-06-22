@@ -25,6 +25,7 @@
 #include "clink/cluster/service_discovery.hpp"
 #include "clink/cluster/type_registry.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/metrics/metrics_registry.hpp"
 #include "clink/metrics/process_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/plugin/plugin.hpp"       // BuildContext
@@ -33,6 +34,7 @@
 #include "clink/runtime/key_groups.hpp"
 #include "clink/runtime/local_executor.hpp"
 #include "clink/runtime/log_buffer.hpp"
+#include "clink/runtime/logging.hpp"
 #include "clink/runtime/network/network_bridge.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 #include "clink/state/state_backend_factory.hpp"
@@ -1326,6 +1328,12 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 // remote-read://-style schemes), not the dlopen'd plugin's
                 // .so-local singleton which only has the ctor builtins.
                 .state_backend_factory = &clink::StateBackendFactory::default_instance(),
+                // Capture the HOST's logger + metrics registry in this clink_node
+                // TU and carry them across the dlopen boundary by data, so an
+                // operator's logs/gauges reach the node (not the .so's private
+                // per-RTLD_LOCAL singletons). See RunnerContext::logger.
+                .logger = clink::logging::host_logger(),
+                .metrics = &clink::MetricsRegistry::global(),
                 .unaligned_checkpoints = unaligned_ckpt,
                 .expected_state_versions_packed = expected_state_versions_packed,
                 .restore_from_subtask_idx = rescale_parent_idx,
@@ -1594,6 +1602,10 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             .restore_from_dir = restore_from_dir,
             .restore_from_checkpoint_id = restore_from_checkpoint_id,
             .state_backend_uri = state_backend_uri,
+            // Host-captured logger + metrics (this is the clink_node TU), carried
+            // across the dlopen boundary by data. See RunnerContext::logger.
+            .logger = clink::logging::host_logger(),
+            .metrics = &clink::MetricsRegistry::global(),
             .unaligned_checkpoints = unaligned_ckpt,
             .expected_state_versions_packed = expected_state_versions_packed,
             .restore_from_subtask_idx = task.restore_from_subtask_idx == kRestoreFromSelf

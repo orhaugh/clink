@@ -148,11 +148,18 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
         cfg.expected_state_versions =
             clink::StateVersionMap::unpack(rctx.expected_state_versions_packed);
     }
-    // Per-process metrics registry - same global the TM's /metrics
-    // endpoint scrapes. LocalExecutor's metrics-poll thread will
-    // populate operator.<id>.input_depth/capacity gauges into this
-    // registry, surfacing backpressure to the dashboard.
-    cfg.metrics = &clink::MetricsRegistry::global();
+    // Metrics registry + host logger. CRITICAL: take these from the
+    // host-captured rctx pointers, NOT by resolving the global() / host_logger()
+    // singletons here. This function is inline and compiles into the plugin .so
+    // too; on the SubtaskRunner dispatch path it RUNS inside the .so, where
+    // MetricsRegistry::global() / clink::logging::host_logger() would resolve
+    // the .so's OWN private singletons (RTLD_LOCAL + static clink_core), so the
+    // operator's gauges and logs would never reach the node's /metrics and
+    // /api/v1/logs. rctx.metrics / rctx.logger were captured in the clink_node
+    // TU (task_manager.cpp). Fall back to the in-process global only when the
+    // host did not set them (LocalExecutor / legacy same-address-space paths).
+    cfg.metrics = rctx.metrics != nullptr ? rctx.metrics : &clink::MetricsRegistry::global();
+    cfg.logger = rctx.logger;
     return cfg;
 }
 

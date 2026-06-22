@@ -14,6 +14,10 @@
 #include "clink/state/schema_version.hpp"
 #include "clink/state/state_backend.hpp"
 
+namespace spdlog {
+class logger;
+}
+
 namespace clink {
 
 class MetricsRegistry;
@@ -74,6 +78,15 @@ struct JobConfig {
     // Optional sink for counter/gauge metrics. The executor seeds it with
     // per-operator gauges at startup; downstream tooling can scrape it.
     MetricsRegistry* metrics{nullptr};
+
+    // Host-owned spdlog logger threaded across the dlopen plugin boundary by
+    // data (NOT resolved via a per-.so singleton). The executor copies this
+    // onto every RuntimeContext so an operator's ctx.log_*() reaches the
+    // node's sinks and the /api/v1/logs ring. nullptr in in-process / legacy
+    // paths, where RuntimeContext falls back to the process LogBuffer (same
+    // address space, so still correct). Raw non-owning pointer, lifetime owned
+    // by clink::logging.
+    spdlog::logger* logger{nullptr};
 
     // Called by each operator runner after it successfully snapshots its
     // state in response to a CheckpointBarrier. The cluster's TaskManager
