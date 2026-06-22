@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -859,10 +860,25 @@ std::optional<JobGraphDetail> JobManager::snapshot_job_graph(JobId job_id) const
         return d;
     }
 
-    // Strip a "::sideTag" suffix from an input ref to the upstream op id.
-    const auto base_id = [](const std::string& ref) {
-        const auto pos = ref.find("::");
-        return pos == std::string::npos ? ref : ref.substr(0, pos);
+    // Resolve an input ref to (upstream op id, side-output tag). Forms:
+    //   "id"        - main output
+    //   "id.N"      - split branch N (N all-digits)
+    //   "id::tag"   - named side output
+    // Mirrors the planner's parse_input_ref so split / side-output topologies
+    // resolve to real node ids (not "id.0") and carry the right channel type.
+    const auto parse_ref = [](const std::string& ref) -> std::pair<std::string, std::string> {
+        if (const auto p = ref.find("::"); p != std::string::npos) {
+            return {ref.substr(0, p), ref.substr(p + 2)};
+        }
+        if (const auto p = ref.rfind('.'); p != std::string::npos && p + 1 < ref.size()) {
+            const auto suffix = ref.substr(p + 1);
+            const bool all_digits = std::all_of(
+                suffix.begin(), suffix.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+            if (all_digits) {
+                return {ref.substr(0, p), std::string{}};
+            }
+        }
+        return {ref, std::string{}};
     };
 
     // Index ops by id, and collect every id used as an input so terminal ops
@@ -875,7 +891,7 @@ std::optional<JobGraphDetail> JobManager::snapshot_job_graph(JobId job_id) const
     }
     for (const auto& op : spec.ops) {
         for (const auto& in : op.inputs) {
-            has_downstream.insert(base_id(in));
+            has_downstream.insert(parse_ref(in).first);
         }
     }
 
@@ -898,6 +914,34 @@ std::optional<JobGraphDetail> JobManager::snapshot_job_graph(JobId job_id) const
         }
     }
 
+    // Actual (physical) parallelism per op from placement, which stays correct
+    // across a rescale even though the retained spec holds the original value.
+    // Falls back to the spec parallelism for ops with no observed placement.
+    const auto actual_par = [&](const OperatorSpec& op) -> std::uint32_t {
+        const auto it = placement.find(op.id);
+        return (it != placement.end() && !it->second.empty())
+                   ? static_cast<std::uint32_t>(it->second.size())
+                   : op.parallelism;
+    };
+
+    // Channel type carried on an edge from `ref` into a consumer: the upstream's
+    // declared side-output type when the ref names one, else its main output.
+    const auto edge_channel = [&](const std::string& from_id,
+                                  const std::string& tag,
+                                  const OperatorSpec* from_op) -> std::string {
+        if (from_op == nullptr) {
+            return {};
+        }
+        if (!tag.empty()) {
+            for (const auto& so : from_op->side_outputs) {
+                if (so.tag == tag) {
+                    return so.channel_type;
+                }
+            }
+        }
+        return from_op->out_channel;
+    };
+
     d.nodes.reserve(spec.ops.size());
     for (const auto& op : spec.ops) {
         GraphNode n;
@@ -905,7 +949,7 @@ std::optional<JobGraphDetail> JobManager::snapshot_job_graph(JobId job_id) const
         n.op_type = op.type;
         n.display_name = op.display_name;
         n.uid = op.uid;
-        n.parallelism = op.parallelism;
+        n.parallelism = actual_par(op);
         n.out_channel = op.out_channel;
         n.keyed = !op.key_by.empty();
         n.kind = op.inputs.empty()
@@ -917,18 +961,17 @@ std::optional<JobGraphDetail> JobManager::snapshot_job_graph(JobId job_id) const
         d.nodes.push_back(std::move(n));
 
         for (const auto& in : op.inputs) {
-            const auto from = base_id(in);
+            const auto [from, tag] = parse_ref(in);
+            const auto* from_op = [&]() -> const OperatorSpec* {
+                const auto fit = by_id.find(from);
+                return fit == by_id.end() ? nullptr : fit->second;
+            }();
             GraphEdge e;
             e.from = from;
             e.to = op.id;
-            if (auto fit = by_id.find(from); fit != by_id.end()) {
-                e.channel = fit->second->out_channel;
-                e.routing = n.keyed                                        ? "hash"
-                            : (fit->second->parallelism != op.parallelism) ? "rebalance"
-                                                                           : "forward";
-            } else {
-                e.routing = n.keyed ? "hash" : "forward";
-            }
+            e.channel = edge_channel(from, tag, from_op);
+            const auto up_par = (from_op != nullptr) ? actual_par(*from_op) : op.parallelism;
+            e.routing = n.keyed ? "hash" : (up_par != n.parallelism ? "rebalance" : "forward");
             d.edges.push_back(std::move(e));
         }
     }
