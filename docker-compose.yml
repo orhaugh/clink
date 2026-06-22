@@ -29,6 +29,10 @@ services:
       - --advertise-host=jm
       - --http-port=8081
       - --http-bind=0.0.0.0
+      # Allow the standalone console (Vite dev server on another origin) to call
+      # the API directly. The dev proxy works without this too; it is here so
+      # opening the console straight against http://localhost:8081 also works.
+      - --http-cors-origin=*
     ports:
       - "8081:8081"  # dashboard / HTTP API
     networks: [clink]
