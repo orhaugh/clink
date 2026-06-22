@@ -204,7 +204,8 @@ private:
         // operator can't tell - Out is opaque); user code can
         // call clink::metrics::op::async_lookup_miss_inc(id) from
         // within the LookupFn when it returns a miss sentinel.
-        clink::metrics::op::async_lookup_hit_inc(this->id().value());
+        clink::metrics::op::async_lookup_hit_inc(
+            this->runtime() ? this->runtime()->metrics() : nullptr, this->id().value());
     }
 
     LookupFn fn_;

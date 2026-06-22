@@ -58,6 +58,12 @@ inline void apply_chain_identity(OpPtr& op, const clink::cluster::RunnerContext&
     if (!co.display_name.empty()) {
         op->set_display_name(co.display_name);
     }
+    // Stamp the spec graph node id so the Dag can carry it onto the runner and
+    // LocalExecutor can emit the op_id<->node mapping (clink_op_info). All
+    // operators (custom plugin + inline lambda) flow through here.
+    if (!co.id.empty()) {
+        op->set_spec_node_id(co.id);
+    }
 }
 
 // Look up TypeOps for a channel name; throw with a clear message if

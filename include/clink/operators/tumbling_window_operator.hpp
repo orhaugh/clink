@@ -664,7 +664,8 @@ private:
             .timing = timing, .pane_index = pane_index, .is_first = is_first, .is_last = is_last});
         b.push(std::move(r));
         out.emit_data(std::move(b));
-        clink::metrics::op::window_panes_fired_inc(this->id().value());
+        clink::metrics::op::window_panes_fired_inc(
+            this->runtime() ? this->runtime()->metrics() : nullptr, this->id().value());
     }
 
     std::chrono::milliseconds window_size_;

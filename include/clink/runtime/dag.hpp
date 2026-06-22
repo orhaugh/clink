@@ -76,6 +76,13 @@ namespace detail {
 struct OperatorRunner {
     std::string name;
     OperatorId id;
+    // The JobGraphSpec node id (op_0, ...) this runner's user operator was
+    // built from, copied from the operator's stamped spec_node_id in add_*.
+    // Empty for internal runners (bridges, fork/split, union). LocalExecutor
+    // emits clink_op_info{op_id,node} for runners with a non-empty value so a
+    // metrics scraper can map the numeric op_id back to a graph node.
+    std::string spec_node_id;
+    std::string spec_uid;
     std::function<void(RuntimeContext& ctx, const std::function<bool()>& should_stop)> run;
     std::function<void()> cancel;
     // Channel introspection for metrics. nullopt for sources/sinks where it
@@ -212,6 +219,8 @@ public:
         detail::OperatorRunner runner;
         runner.name = source->name();
         runner.id = id;
+        runner.spec_node_id = source->spec_node_id();
+        runner.spec_uid = source->uid();
         runner.run = [source, channel, ack_ref, id](RuntimeContext& ctx,
                                                     const std::function<bool()>& should_stop) {
             source->attach_runtime(&ctx);
@@ -233,6 +242,7 @@ public:
             source->open();
             Emitter<T> emitter(channel.get());
             emitter.set_operator_id(id.value());
+            emitter.set_metrics_registry(ctx.metrics());
             // Phase 26a: stamp the job-global checkpoint mode onto
             // every barrier the source emits. Sources stay
             // mode-agnostic; the runner translates
@@ -373,6 +383,8 @@ public:
         detail::OperatorRunner runner;
         runner.name = op->name();
         runner.id = id;
+        runner.spec_node_id = op->spec_node_id();
+        runner.spec_uid = op->uid();
         // Capture this runner's side-channel map by shared_ptr so any
         // Dag::side_output() calls made between add_operator and run()
         // are observed by the closure at runtime.
@@ -429,6 +441,7 @@ public:
             }
             Emitter<Out> emitter(out_channel.get());
             emitter.set_operator_id(id.value());
+            emitter.set_metrics_registry(ctx.metrics());
             // Phase 26b: if this operator carries a per-operator mode
             // override, stamp every emitted barrier with it. Source
             // operators have already stamped from JobConfig in their
@@ -547,7 +560,8 @@ public:
                 auto maybe = in_channel->pop_for(timeout);
                 if (maybe.has_value()) {
                     if (maybe->is_data()) {
-                        clink::metrics::op::records_in_inc(id.value(), maybe->as_data().size());
+                        clink::metrics::op::records_in_inc(
+                            ctx.metrics(), id.value(), maybe->as_data().size());
                     }
                     if (maybe->is_barrier() && ctx.has_state_backend()) {
                         // Snapshot the operator's state slice as the
@@ -822,10 +836,15 @@ public:
             // The stage's workers emit into the (thread-safe) output channel; the
             // coordinator (this thread) forwards barriers/watermarks through the
             // same channel inside checkpoint()/advance_watermark().
+            typename ShardedKeyedStage<In, Out>::Options stage_opts;
+            stage_opts.metrics = ctx.metrics();  // host registry for per-shard records_in
             ShardedKeyedStage<In, Out> stage(
-                num_shards, id, factory, key_bytes_of, [out_channel](StreamElement<Out> e) {
-                    return out_channel->push(std::move(e));
-                });
+                num_shards,
+                id,
+                factory,
+                key_bytes_of,
+                [out_channel](StreamElement<Out> e) { return out_channel->push(std::move(e)); },
+                stage_opts);
             if (!restore_from.bytes.empty()) {
                 stage.restore(restore_from);
             }
@@ -836,7 +855,8 @@ public:
                 auto maybe = in_channel->pop_for(1s);
                 if (maybe.has_value()) {
                     if (maybe->is_data()) {
-                        clink::metrics::op::records_in_inc(id.value(), maybe->as_data().size());
+                        clink::metrics::op::records_in_inc(
+                            ctx.metrics(), id.value(), maybe->as_data().size());
                         stage.submit(std::move(maybe->as_data()));
                     } else if (maybe->is_watermark()) {
                         stage.advance_watermark(maybe->as_watermark());
@@ -1887,20 +1907,20 @@ public:
                 batch.emplace(joiner(std::optional<A>{a_val}, std::optional<B>{b_val}),
                               EventTime{std::max(a_t.millis(), b_t.millis())});
                 out_channel->push(StreamElement<C>::data(std::move(batch)));
-                clink::metrics::op::join_matches_inc(id.value());
-                clink::metrics::op::records_out_inc(id.value());
+                clink::metrics::op::join_matches_inc(ctx.metrics(), id.value());
+                clink::metrics::op::records_out_inc(ctx.metrics(), id.value());
             };
             auto emit_left_only = [&, id](const A& a_val, EventTime a_t) {
                 Batch<C> batch;
                 batch.emplace(joiner(std::optional<A>{a_val}, std::optional<B>{}), a_t);
                 out_channel->push(StreamElement<C>::data(std::move(batch)));
-                clink::metrics::op::records_out_inc(id.value());
+                clink::metrics::op::records_out_inc(ctx.metrics(), id.value());
             };
             auto emit_right_only = [&, id](const B& b_val, EventTime b_t) {
                 Batch<C> batch;
                 batch.emplace(joiner(std::optional<A>{}, std::optional<B>{b_val}), b_t);
                 out_channel->push(StreamElement<C>::data(std::move(batch)));
-                clink::metrics::op::records_out_inc(id.value());
+                clink::metrics::op::records_out_inc(ctx.metrics(), id.value());
             };
 
             auto evict = [&](EventTime W) {
@@ -2549,6 +2569,8 @@ public:
         detail::OperatorRunner runner;
         runner.name = op->name();
         runner.id = id;
+        runner.spec_node_id = op->spec_node_id();
+        runner.spec_uid = op->uid();
         auto side_channels = side_channels_ptr_(runners_.size());
         runner.run = [op, left_ch, right_ch, out_channel, side_channels, id, in1_codec, in2_codec](
                          RuntimeContext& ctx, const std::function<bool()>& should_stop) {
@@ -2636,6 +2658,8 @@ public:
                 snap_worker->start();
             }
             Emitter<Out> out_emitter(out_channel.get());
+            out_emitter.set_operator_id(id.value());
+            out_emitter.set_metrics_registry(ctx.metrics());
             MultiInputAlignment align(2);
             // Unaligned-checkpoint in-flight capture. When the first
             // barrier arrives on one input, we snapshot immediately and
@@ -3493,7 +3517,9 @@ public:
         detail::OperatorRunner runner;
         runner.name = sink->name();
         runner.id = id;
-        runner.run = [sink, in_channel, sink_owns_checkpoint](
+        runner.spec_node_id = sink->spec_node_id();
+        runner.spec_uid = sink->uid();
+        runner.run = [sink, in_channel, sink_owns_checkpoint, id](
                          RuntimeContext& ctx, const std::function<bool()>& should_stop) {
             sink->attach_runtime(&ctx);
             sink->open();
@@ -3512,6 +3538,11 @@ public:
                     break;
                 }
                 if (maybe->is_data()) {
+                    // Count input records before the move hands the batch to
+                    // the sink (a sink has no Emitter, so records_in is its
+                    // only throughput signal).
+                    clink::metrics::op::records_in_inc(
+                        ctx.metrics(), id.value(), maybe->as_data().size());
                     // Pass by rvalue so move-aware sinks (e.g.
                     // NetworkBridgeSink forwarding to a channel) can
                     // take ownership instead of deep-copying.

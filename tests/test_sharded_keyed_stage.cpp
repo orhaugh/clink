@@ -1460,14 +1460,23 @@ TEST(ShardedKeyedStage, PerShardMetricsRecordSkew) {
     constexpr std::size_t kShards = 4;
     constexpr OperatorId kOp{4242};  // unique to this test
     std::atomic<std::int64_t> e{0};
+    // Per-shard records_in now routes through the configured registry (not the
+    // hardcoded global), so point the stage at the global one this test reads.
+    ShardedKeyedStage<std::int64_t, std::int64_t>::Options opts;
+    opts.metrics = &MetricsRegistry::global();
     ShardedKeyedStage<std::int64_t, std::int64_t> stage(
-        kShards, kOp, counting_factory(), int64_key_bytes(), [&e](StreamElement<std::int64_t> el) {
+        kShards,
+        kOp,
+        counting_factory(),
+        int64_key_bytes(),
+        [&e](StreamElement<std::int64_t> el) {
             if (el.is_data()) {
                 e.fetch_add(static_cast<std::int64_t>(el.as_data().size()),
                             std::memory_order_relaxed);
             }
             return true;
-        });
+        },
+        opts);
     stage.start();
     Batch<std::int64_t> b;
     for (std::int64_t k = 0; k < 200; ++k) {

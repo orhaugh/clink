@@ -509,7 +509,8 @@ private:
                 if (e.is_data()) {
                     // Per-shard records-in: reveals shard skew (one hot shard
                     // vs idle peers) for a single keyed operator.
-                    clink::metrics::op::shard_records_in_inc(op_id_.value(), i, e.as_data().size());
+                    clink::metrics::op::shard_records_in_inc(
+                        opts_.metrics, op_id_.value(), i, e.as_data().size());
                     if (aec) {
                         sh.op->process_async(e, out, *aec);
                         if (do_coalesce) {  // ASYNC-10: batch this shard's reads -> one get_many

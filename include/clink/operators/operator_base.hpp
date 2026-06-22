@@ -128,6 +128,12 @@ public:
     // anonymous internal Emitters in tests.
     void set_operator_id(std::uint64_t op_id) noexcept { op_id_for_metrics_ = op_id; }
 
+    // The registry records_out_total is written into. Must be the HOST registry
+    // (RuntimeContext::metrics()); the runner sets it alongside set_operator_id.
+    // Null leaves the bump a no-op (records_out_inc null-guards), which is the
+    // correct behaviour for anonymous internal / test Emitters.
+    void set_metrics_registry(clink::MetricsRegistry* reg) noexcept { metrics_for_op_ = reg; }
+
     // Blocking emit. Returns false only when the downstream has been closed.
     bool emit(Element e) {
         if (forward_) {
@@ -153,7 +159,7 @@ public:
 
     bool emit_data(Batch<Out> batch) {
         if (op_id_for_metrics_ != 0) {
-            clink::metrics::op::records_out_inc(op_id_for_metrics_, batch.size());
+            clink::metrics::op::records_out_inc(metrics_for_op_, op_id_for_metrics_, batch.size());
         }
         if (forward_) {
             return forward_(Element::data(std::move(batch)));
@@ -210,6 +216,7 @@ private:
     // 0 = unbound (skip records_out_total bumps). Set by the runner
     // that builds the Emitter; see dag.hpp's per-operator factories.
     std::uint64_t op_id_for_metrics_{0};
+    clink::MetricsRegistry* metrics_for_op_{nullptr};
 };
 
 // Base interface for any single-input single-output operator.
@@ -457,6 +464,12 @@ public:
     void set_display_name(std::string s) noexcept { display_name_ = std::move(s); }
     [[nodiscard]] const std::string& display_name() const noexcept { return display_name_; }
 
+    // The JobGraphSpec node id (op_0, op_1, ...) this operator was built from.
+    // Stamped by apply_chain_identity from the chain spec; the Dag copies it
+    // onto the runner so LocalExecutor can emit the op_id<->node info metric.
+    void set_spec_node_id(std::string s) noexcept { spec_node_id_ = std::move(s); }
+    [[nodiscard]] const std::string& spec_node_id() const noexcept { return spec_node_id_; }
+
     // Set by the runtime before open(). Operators that need state, metrics,
     // or their own id reach for runtime() inside open()/process().
     void attach_runtime(RuntimeContext* ctx) noexcept { runtime_ = ctx; }
@@ -466,6 +479,7 @@ private:
     OperatorId id_{0};
     std::string uid_;
     std::string display_name_;
+    std::string spec_node_id_;
     RuntimeContext* runtime_{nullptr};
 };
 
@@ -543,6 +557,12 @@ public:
     void set_display_name(std::string s) noexcept { display_name_ = std::move(s); }
     [[nodiscard]] const std::string& display_name() const noexcept { return display_name_; }
 
+    // The JobGraphSpec node id (op_0, op_1, ...) this operator was built from.
+    // Stamped by apply_chain_identity from the chain spec; the Dag copies it
+    // onto the runner so LocalExecutor can emit the op_id<->node info metric.
+    void set_spec_node_id(std::string s) noexcept { spec_node_id_ = std::move(s); }
+    [[nodiscard]] const std::string& spec_node_id() const noexcept { return spec_node_id_; }
+
     void attach_runtime(RuntimeContext* ctx) noexcept { runtime_ = ctx; }
     RuntimeContext* runtime() const noexcept { return runtime_; }
 
@@ -588,6 +608,7 @@ private:
     OperatorId id_{0};
     std::string uid_;
     std::string display_name_;
+    std::string spec_node_id_;
     std::atomic<bool> cancelled_{false};
     RuntimeContext* runtime_{nullptr};
     std::mutex barrier_mu_;
@@ -929,6 +950,12 @@ public:
     void set_display_name(std::string s) noexcept { display_name_ = std::move(s); }
     [[nodiscard]] const std::string& display_name() const noexcept { return display_name_; }
 
+    // The JobGraphSpec node id (op_0, op_1, ...) this operator was built from.
+    // Stamped by apply_chain_identity from the chain spec; the Dag copies it
+    // onto the runner so LocalExecutor can emit the op_id<->node info metric.
+    void set_spec_node_id(std::string s) noexcept { spec_node_id_ = std::move(s); }
+    [[nodiscard]] const std::string& spec_node_id() const noexcept { return spec_node_id_; }
+
     void attach_runtime(RuntimeContext* ctx) noexcept { runtime_ = ctx; }
     RuntimeContext* runtime() const noexcept { return runtime_; }
 
@@ -936,6 +963,7 @@ private:
     OperatorId id_{0};
     std::string uid_;
     std::string display_name_;
+    std::string spec_node_id_;
     RuntimeContext* runtime_{nullptr};
 };
 
@@ -989,6 +1017,12 @@ public:
     void set_display_name(std::string s) noexcept { display_name_ = std::move(s); }
     [[nodiscard]] const std::string& display_name() const noexcept { return display_name_; }
 
+    // The JobGraphSpec node id (op_0, op_1, ...) this operator was built from.
+    // Stamped by apply_chain_identity from the chain spec; the Dag copies it
+    // onto the runner so LocalExecutor can emit the op_id<->node info metric.
+    void set_spec_node_id(std::string s) noexcept { spec_node_id_ = std::move(s); }
+    [[nodiscard]] const std::string& spec_node_id() const noexcept { return spec_node_id_; }
+
     void attach_runtime(RuntimeContext* ctx) noexcept { runtime_ = ctx; }
     RuntimeContext* runtime() const noexcept { return runtime_; }
 
@@ -1008,6 +1042,7 @@ private:
     OperatorId id_{0};
     std::string uid_;
     std::string display_name_;
+    std::string spec_node_id_;
     std::string commit_group_;
     RuntimeContext* runtime_{nullptr};
 };

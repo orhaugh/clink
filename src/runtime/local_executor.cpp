@@ -10,6 +10,7 @@
 #endif
 
 #include "clink/metrics/metrics_registry.hpp"
+#include "clink/metrics/operator_metrics.hpp"
 #include "clink/runtime/cpu_affinity.hpp"
 #include "clink/state/state_migration_on_restore.hpp"
 
@@ -248,12 +249,20 @@ void LocalExecutor::register_metrics() {
         return;
     }
     for (const auto& runner : dag_.runners()) {
-        const std::string base = "operator." + std::to_string(runner.id.value()) + ".";
-        // Touch the gauges so they exist before the runner starts; the
-        // metrics-poll thread updates them in metrics_poll_loop_().
-        config_.metrics->gauge(base + "input_depth");
-        config_.metrics->gauge(base + "input_capacity");
-        config_.metrics->gauge(base + "input_depth_high_water");
+        const auto id = runner.id.value();
+        // Touch the backpressure gauges so they exist before the runner starts;
+        // the metrics-poll thread updates them in metrics_poll_loop_(). Keyed by
+        // op_id (clink_op_input_depth{op_id="N"}) so the per-operator overlay
+        // joins them uniformly with the other clink_op_* series.
+        config_.metrics->gauge(metrics::op_metric_name("input_depth", id));
+        config_.metrics->gauge(metrics::op_metric_name("input_capacity", id));
+        config_.metrics->gauge(metrics::op_metric_name("input_depth_high_water", id));
+        // Identity mapping so a metrics scraper can map this numeric op_id back
+        // to a graph node. Only runners that carry a spec node id (user
+        // operators built via apply_chain_identity) emit it; internal runners
+        // (bridges, fork/split) and uid-only keyed stages do not (the JM maps
+        // uid'd nodes by computing operator_id_from_uid directly).
+        metrics::op::op_info_set(config_.metrics, id, runner.spec_node_id, runner.spec_uid);
     }
 }
 
@@ -263,7 +272,9 @@ void LocalExecutor::metrics_poll_loop_() {
     // dag_.runners() inside the loop (it's stable for the lifetime of
     // the executor, but the local snapshot keeps the loop tight).
     struct Probe {
-        std::string base;
+        std::string depth_name;
+        std::string capacity_name;
+        std::string high_water_name;
         std::function<std::size_t()> depth;
         std::function<std::size_t()> capacity;
         std::int64_t high_water{0};
@@ -272,7 +283,11 @@ void LocalExecutor::metrics_poll_loop_() {
     probes.reserve(dag_.runners().size());
     for (const auto& runner : dag_.runners()) {
         Probe p;
-        p.base = "operator." + std::to_string(runner.id.value()) + ".";
+        // clink_op_input_depth{op_id="N"} (and _capacity / _high_water), keyed
+        // like the rest of the per-operator series so the overlay joins them.
+        p.depth_name = metrics::op_metric_name("input_depth", runner.id.value());
+        p.capacity_name = metrics::op_metric_name("input_capacity", runner.id.value());
+        p.high_water_name = metrics::op_metric_name("input_depth_high_water", runner.id.value());
         p.depth = runner.input_depth;
         p.capacity = runner.input_capacity;
         probes.push_back(std::move(p));
@@ -282,11 +297,11 @@ void LocalExecutor::metrics_poll_loop_() {
         for (auto& p : probes) {
             const std::int64_t d = p.depth ? static_cast<std::int64_t>(p.depth()) : 0;
             const std::int64_t c = p.capacity ? static_cast<std::int64_t>(p.capacity()) : 0;
-            config_.metrics->gauge(p.base + "input_depth").set(d);
-            config_.metrics->gauge(p.base + "input_capacity").set(c);
+            config_.metrics->gauge(p.depth_name).set(d);
+            config_.metrics->gauge(p.capacity_name).set(c);
             if (d > p.high_water) {
                 p.high_water = d;
-                config_.metrics->gauge(p.base + "input_depth_high_water").set(d);
+                config_.metrics->gauge(p.high_water_name).set(d);
             }
         }
         // 100ms is fine-grained enough to catch transient saturation

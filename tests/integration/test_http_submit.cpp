@@ -7,7 +7,7 @@
 //
 // Backpressure:
 //   * Once a job is running, the TM's /metrics exposes
-//     operator.<id>.input_depth and operator.<id>.input_capacity gauges
+//     clink_op_input_depth{op_id} and clink_op_input_capacity{op_id} gauges
 //     (populated by LocalExecutor's metrics-poll thread). We don't
 //     assert specific depths - just that the gauges exist with sane
 //     values (capacity > 0).
@@ -316,16 +316,15 @@ TEST(HttpBackpressure, TmMetricsExposeOperatorInputGauges) {
         const auto m = http_get("127.0.0.1", c->jm_http_port, "/api/v1/tms/" + tm_id + "/metrics");
         if (m.status != 200)
             continue;
-        if (m.body.find("operator.") != std::string::npos &&
-            m.body.find(".input_depth") != std::string::npos) {
+        if (m.body.find("clink_op_input_depth{op_id=") != std::string::npos) {
             saw_depth = true;
         }
-        if (m.body.find(".input_capacity") != std::string::npos) {
+        if (m.body.find("clink_op_input_capacity{op_id=") != std::string::npos) {
             saw_capacity = true;
         }
     }
-    EXPECT_TRUE(saw_depth) << "no operator.<id>.input_depth gauge on any TM";
-    EXPECT_TRUE(saw_capacity) << "no operator.<id>.input_capacity gauge on any TM";
+    EXPECT_TRUE(saw_depth) << "no clink_op_input_depth{op_id} gauge on any TM";
+    EXPECT_TRUE(saw_capacity) << "no clink_op_input_capacity{op_id} gauge on any TM";
 
     http_post_empty("127.0.0.1", c->jm_http_port, "/api/v1/jobs/1/cancel");
 }

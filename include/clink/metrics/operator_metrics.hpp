@@ -78,59 +78,134 @@ inline std::string op_shard_metric_name(const char* metric,
 
 namespace op {
 
-inline void records_in_inc(std::uint64_t op_id, std::uint64_t n = 1) {
-    MetricsRegistry::global().counter(op_metric_name("records_in_total", op_id)).increment(n);
+// IMPORTANT: every accessor takes the MetricsRegistry to write into as its
+// first argument and no-ops on nullptr. This is load-bearing on the cluster
+// path: operator code runs inside a dlopen'd job .so (RTLD_LOCAL + static
+// clink_core), so MetricsRegistry::global() there resolves the .so's PRIVATE
+// singleton, NOT the host registry the node's /metrics endpoint reads. Callers
+// must pass the HOST registry, reached via RuntimeContext::metrics() (threaded
+// as JobConfig::metrics across the plugin boundary by data). See the same
+// pattern for the host logger in runtime_context.hpp.
+
+inline void records_in_inc(MetricsRegistry* reg, std::uint64_t op_id, std::uint64_t n = 1) {
+    if (reg == nullptr)
+        return;
+    reg->counter(op_metric_name("records_in_total", op_id)).increment(n);
 }
 // Per-shard records-in for the sharded keyed stage: each shard worker counts
 // the records it processed, so shard skew is observable per (op_id, shard).
-inline void shard_records_in_inc(std::uint64_t op_id, std::size_t shard, std::uint64_t n = 1) {
-    MetricsRegistry::global()
-        .counter(op_shard_metric_name("shard_records_in_total", op_id, shard))
-        .increment(n);
+inline void shard_records_in_inc(MetricsRegistry* reg,
+                                 std::uint64_t op_id,
+                                 std::size_t shard,
+                                 std::uint64_t n = 1) {
+    if (reg == nullptr)
+        return;
+    reg->counter(op_shard_metric_name("shard_records_in_total", op_id, shard)).increment(n);
 }
-inline void records_out_inc(std::uint64_t op_id, std::uint64_t n = 1) {
-    MetricsRegistry::global().counter(op_metric_name("records_out_total", op_id)).increment(n);
+inline void records_out_inc(MetricsRegistry* reg, std::uint64_t op_id, std::uint64_t n = 1) {
+    if (reg == nullptr)
+        return;
+    reg->counter(op_metric_name("records_out_total", op_id)).increment(n);
 }
-inline void records_dropped_inc(std::uint64_t op_id, std::uint64_t n = 1) {
-    MetricsRegistry::global().counter(op_metric_name("records_dropped_total", op_id)).increment(n);
+inline void records_dropped_inc(MetricsRegistry* reg, std::uint64_t op_id, std::uint64_t n = 1) {
+    if (reg == nullptr)
+        return;
+    reg->counter(op_metric_name("records_dropped_total", op_id)).increment(n);
 }
-inline void side_output_records_inc(std::uint64_t op_id, std::uint64_t n = 1) {
-    MetricsRegistry::global()
-        .counter(op_metric_name("side_output_records_total", op_id))
-        .increment(n);
+inline void side_output_records_inc(MetricsRegistry* reg,
+                                    std::uint64_t op_id,
+                                    std::uint64_t n = 1) {
+    if (reg == nullptr)
+        return;
+    reg->counter(op_metric_name("side_output_records_total", op_id)).increment(n);
 }
-inline void window_panes_fired_inc(std::uint64_t op_id, std::uint64_t n = 1) {
-    MetricsRegistry::global()
-        .counter(op_metric_name("window_panes_fired_total", op_id))
-        .increment(n);
+inline void window_panes_fired_inc(MetricsRegistry* reg, std::uint64_t op_id, std::uint64_t n = 1) {
+    if (reg == nullptr)
+        return;
+    reg->counter(op_metric_name("window_panes_fired_total", op_id)).increment(n);
 }
-inline void join_matches_inc(std::uint64_t op_id, std::uint64_t n = 1) {
-    MetricsRegistry::global().counter(op_metric_name("join_matches_total", op_id)).increment(n);
+inline void join_matches_inc(MetricsRegistry* reg, std::uint64_t op_id, std::uint64_t n = 1) {
+    if (reg == nullptr)
+        return;
+    reg->counter(op_metric_name("join_matches_total", op_id)).increment(n);
 }
-inline void async_lookup_hit_inc(std::uint64_t op_id, std::uint64_t n = 1) {
-    MetricsRegistry::global()
-        .counter(op_metric_name("async_lookup_hits_total", op_id))
-        .increment(n);
+inline void async_lookup_hit_inc(MetricsRegistry* reg, std::uint64_t op_id, std::uint64_t n = 1) {
+    if (reg == nullptr)
+        return;
+    reg->counter(op_metric_name("async_lookup_hits_total", op_id)).increment(n);
 }
-inline void async_lookup_miss_inc(std::uint64_t op_id, std::uint64_t n = 1) {
-    MetricsRegistry::global()
-        .counter(op_metric_name("async_lookup_misses_total", op_id))
-        .increment(n);
+inline void async_lookup_miss_inc(MetricsRegistry* reg, std::uint64_t op_id, std::uint64_t n = 1) {
+    if (reg == nullptr)
+        return;
+    reg->counter(op_metric_name("async_lookup_misses_total", op_id)).increment(n);
 }
-inline void retractions_emitted_inc(std::uint64_t op_id, std::uint64_t n = 1) {
-    MetricsRegistry::global()
-        .counter(op_metric_name("retractions_emitted_total", op_id))
-        .increment(n);
+inline void retractions_emitted_inc(MetricsRegistry* reg,
+                                    std::uint64_t op_id,
+                                    std::uint64_t n = 1) {
+    if (reg == nullptr)
+        return;
+    reg->counter(op_metric_name("retractions_emitted_total", op_id)).increment(n);
 }
 
 // Aggregated process() latency as a histogram (OBS-1b). The exposition keeps
 // the historical process_latency_ns_sum / _count line names (a Prometheus
 // histogram emits both) and adds _bucket lines, so the moving mean still works
 // and p50/p95/p99 are now available.
-inline void process_latency_observe(std::uint64_t op_id, std::uint64_t nanos) {
-    MetricsRegistry::global()
-        .histogram(op_metric_name("process_latency_ns", op_id))
-        .observe(static_cast<double>(nanos));
+inline void process_latency_observe(MetricsRegistry* reg,
+                                    std::uint64_t op_id,
+                                    std::uint64_t nanos) {
+    if (reg == nullptr)
+        return;
+    reg->histogram(op_metric_name("process_latency_ns", op_id)).observe(static_cast<double>(nanos));
+}
+
+// Last-value gauge for the operator's current low-watermark (event time, ms).
+// A gauge (not counter) because a watermark moves monotonically forward but is
+// a level, not an accumulation. idle = 1 when the operator has seen the
+// long-max idle watermark (no active event-time progress).
+inline void watermark_set(MetricsRegistry* reg, std::uint64_t op_id, std::int64_t millis) {
+    if (reg == nullptr)
+        return;
+    reg->gauge(op_metric_name("watermark_ms", op_id)).set(millis);
+}
+
+// Per-operator bytes crossing the network bridge. Counted only at a serialising
+// boundary (cross-TM edges); intra-process / chained edges move shared_ptr<Batch>
+// with no serialisation, so they are deliberately not counted here.
+inline void bytes_sent_inc(MetricsRegistry* reg, std::uint64_t op_id, std::uint64_t n) {
+    if (reg == nullptr)
+        return;
+    reg->counter(op_metric_name("bytes_sent_total", op_id)).increment(n);
+}
+inline void bytes_received_inc(MetricsRegistry* reg, std::uint64_t op_id, std::uint64_t n) {
+    if (reg == nullptr)
+        return;
+    reg->counter(op_metric_name("bytes_received_total", op_id)).increment(n);
+}
+
+// Identity mapping: clink_op_info{op_id="N",node="op_X",uid="..."} = 1. Emitted
+// once per subtask runner into the HOST registry so a metrics scraper can join
+// the numeric op_id back to the spec graph node id (which the runtime derives
+// privately, and which is not otherwise recomputable for non-uid operators). A
+// gauge whose value is always 1; the information lives in the labels (the
+// Prometheus "info metric" convention). `node` is the JobGraphSpec id (op_0,
+// op_1, ...); `uid` is the operator's stable uid (empty for unkeyed/stateless
+// ops). Label values are kept to safe tokens (ids/uids) so no escaping is needed.
+inline void op_info_set(MetricsRegistry* reg,
+                        std::uint64_t op_id,
+                        const std::string& node,
+                        const std::string& uid) {
+    if (reg == nullptr || node.empty())
+        return;
+    std::string name = kOpMetricPrefix;
+    name += "info{op_id=\"";
+    name += std::to_string(op_id);
+    name += "\",node=\"";
+    name += node;
+    name += "\",uid=\"";
+    name += uid;
+    name += "\"}";
+    reg->gauge(name).set(1);
 }
 
 }  // namespace op

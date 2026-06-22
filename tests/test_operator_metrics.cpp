@@ -78,7 +78,12 @@ TEST(OperatorMetrics, RecordsInAndOutIncrementForMapStage) {
     const auto map_out_before =
         counter_value(clink::metrics::op_metric_name("records_out_total", map_id));
 
-    LocalExecutor exec(std::move(dag));
+    // Per-operator metrics now route through the configured registry (the
+    // host one on the cluster path); point the in-process executor at the
+    // global registry this test reads.
+    JobConfig cfg;
+    cfg.metrics = &MetricsRegistry::global();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
     exec.run();
 
     EXPECT_EQ(sink->collected(), (std::vector<std::int64_t>{10, 20, 30, 40, 50}));
@@ -120,7 +125,12 @@ TEST(OperatorMetrics, CountersIsolatedPerOperatorId) {
     const auto m2_in_before =
         counter_value(clink::metrics::op_metric_name("records_in_total", m2_id));
 
-    LocalExecutor exec(std::move(dag));
+    // Per-operator metrics now route through the configured registry (the
+    // host one on the cluster path); point the in-process executor at the
+    // global registry this test reads.
+    JobConfig cfg;
+    cfg.metrics = &MetricsRegistry::global();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
     exec.run();
 
     const auto m1_in_after =
@@ -137,19 +147,20 @@ TEST(OperatorMetrics, HelpersAreReentrantForArbitraryOperatorIds) {
     // op_id must accumulate rather than overwrite.
     using namespace clink::metrics;
     const std::uint64_t op_id = 999'999u;  // synthetic, won't collide
+    auto* reg = &MetricsRegistry::global();
     const auto before = counter_value(op_metric_name("records_out_total", op_id));
-    op::records_out_inc(op_id, 3);
-    op::records_out_inc(op_id, 4);
+    op::records_out_inc(reg, op_id, 3);
+    op::records_out_inc(reg, op_id, 4);
     EXPECT_EQ(counter_value(op_metric_name("records_out_total", op_id)) - before, 7u);
 
     const auto before_drop = counter_value(op_metric_name("records_dropped_total", op_id));
-    op::records_dropped_inc(op_id);
-    op::records_dropped_inc(op_id);
+    op::records_dropped_inc(reg, op_id);
+    op::records_dropped_inc(reg, op_id);
     EXPECT_EQ(counter_value(op_metric_name("records_dropped_total", op_id)) - before_drop, 2u);
 
     const auto before_lat_count = hist_count(op_metric_name("process_latency_ns", op_id));
-    op::process_latency_observe(op_id, 1500);
-    op::process_latency_observe(op_id, 2500);
+    op::process_latency_observe(reg, op_id, 1500);
+    op::process_latency_observe(reg, op_id, 2500);
     EXPECT_EQ(hist_count(op_metric_name("process_latency_ns", op_id)) - before_lat_count, 2u);
     const auto sum = hist_sum(op_metric_name("process_latency_ns", op_id));
     EXPECT_GE(sum, 4000.0);
