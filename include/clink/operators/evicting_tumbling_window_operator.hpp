@@ -289,6 +289,8 @@ private:
         ++buf.next_pane_index;
         b.push(std::move(rec));
         out.emit_data(std::move(b));
+        clink::metrics::op::window_panes_fired_inc(
+            this->runtime() ? this->runtime()->metrics() : nullptr, this->id().value());
     }
 
     void on_watermark_advance_(Watermark wm, Emitter<std::pair<Key, Out>>& out) {

@@ -210,6 +210,10 @@ public:
         }
         auto* ch = static_cast<BoundedChannel<StreamElement<T>>*>(it->second.channel.get());
         Emitter<T> out(ch);
+        // Count emits through this tagged channel toward side_output_records_total
+        // (via the host registry), keyed by the producing operator's id.
+        out.set_metrics_registry(metrics_);
+        out.set_side_output(true);
         // Side-output emits also count toward the producing operator's
         // records_out_total + side_output_records_total. The latter is
         // bumped lazily on each emit through this Emitter via a small

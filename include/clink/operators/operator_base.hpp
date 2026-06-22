@@ -134,6 +134,12 @@ public:
     // correct behaviour for anonymous internal / test Emitters.
     void set_metrics_registry(clink::MetricsRegistry* reg) noexcept { metrics_for_op_ = reg; }
 
+    // Mark this Emitter as a side-output channel: its records count toward the
+    // producing operator's side_output_records_total instead of records_out
+    // (they leave via a tagged channel, not the main output). Set by
+    // RuntimeContext::side_output alongside the op id + registry.
+    void set_side_output(bool v) noexcept { is_side_output_ = v; }
+
     // Blocking emit. Returns false only when the downstream has been closed.
     bool emit(Element e) {
         if (forward_) {
@@ -159,7 +165,13 @@ public:
 
     bool emit_data(Batch<Out> batch) {
         if (op_id_for_metrics_ != 0) {
-            clink::metrics::op::records_out_inc(metrics_for_op_, op_id_for_metrics_, batch.size());
+            if (is_side_output_) {
+                clink::metrics::op::side_output_records_inc(
+                    metrics_for_op_, op_id_for_metrics_, batch.size());
+            } else {
+                clink::metrics::op::records_out_inc(
+                    metrics_for_op_, op_id_for_metrics_, batch.size());
+            }
         }
         if (forward_) {
             return forward_(Element::data(std::move(batch)));
@@ -170,6 +182,15 @@ public:
         return emit(Element::data(std::move(batch)));
     }
     bool emit_watermark(Watermark wm) {
+        // Record the operator's current output watermark (a last-value gauge).
+        // emit_watermark is the universal choke point: single-input operators,
+        // co-operators, sources and the multi-input aligner all forward their
+        // (merged) watermark through a bound Emitter, so one site covers every
+        // operator. Skipped for side-output channels (same op, same level).
+        if (op_id_for_metrics_ != 0 && !is_side_output_) {
+            clink::metrics::op::watermark_set(
+                metrics_for_op_, op_id_for_metrics_, wm.timestamp().millis());
+        }
         if (forward_) {
             return forward_(Element::watermark(wm));
         }
@@ -217,6 +238,7 @@ private:
     // that builds the Emitter; see dag.hpp's per-operator factories.
     std::uint64_t op_id_for_metrics_{0};
     clink::MetricsRegistry* metrics_for_op_{nullptr};
+    bool is_side_output_{false};
 };
 
 // Base interface for any single-input single-output operator.

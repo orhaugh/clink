@@ -699,7 +699,21 @@ public:
                         // Arrow sidecar directly (vectorized), no row decode.
                         // A false return falls through to the row path below.
                     } else {
-                        op->process(*maybe, emitter);
+                        // Time the synchronous data-process call into the
+                        // per-operator latency histogram (p50/p95/p99). Data
+                        // only; cheap and skipped entirely when no registry is
+                        // configured (in-process / benchmark paths).
+                        if (auto* mreg = maybe->is_data() ? ctx.metrics() : nullptr) {
+                            const auto t0 = std::chrono::steady_clock::now();
+                            op->process(*maybe, emitter);
+                            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - t0)
+                                                .count();
+                            clink::metrics::op::process_latency_observe(
+                                mreg, id.value(), static_cast<std::uint64_t>(ns));
+                        } else {
+                            op->process(*maybe, emitter);
+                        }
                     }
                 } else if (in_channel->closed()) {
                     break;

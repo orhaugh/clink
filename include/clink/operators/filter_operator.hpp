@@ -27,6 +27,12 @@ public:
                     out_batch.push(record);
                 }
             }
+            if (const auto dropped = in_batch.size() - out_batch.size(); dropped > 0) {
+                clink::metrics::op::records_dropped_inc(
+                    this->runtime() ? this->runtime()->metrics() : nullptr,
+                    this->id().value(),
+                    dropped);
+            }
             if (!out_batch.empty()) {
                 out.emit_data(std::move(out_batch));
             }

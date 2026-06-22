@@ -342,6 +342,8 @@ private:
             Batch<std::pair<Key, Agg>> b;
             b.emplace(std::make_pair(k, std::move(merged_agg)), EventTime{merged_end - 1});
             out.emit_data(std::move(b));
+            clink::metrics::op::window_panes_fired_inc(
+                this->runtime() ? this->runtime()->metrics() : nullptr, this->id().value());
         }
 
         // Mirror the merged session set to the durable store (one atomic put of
@@ -378,6 +380,10 @@ private:
         }
 
         if (!emitted.empty()) {
+            clink::metrics::op::window_panes_fired_inc(
+                this->runtime() ? this->runtime()->metrics() : nullptr,
+                this->id().value(),
+                emitted.size());
             out.emit_data(std::move(emitted));
         }
     }
