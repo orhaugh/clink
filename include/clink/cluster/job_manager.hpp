@@ -299,6 +299,11 @@ public:
     // nullopt if job_id isn't a known job.
     std::optional<JobDetail> snapshot_job(JobId job_id) const;
 
+    // Logical DAG + subtask placement for GET /api/v1/jobs/:id/graph. nullopt
+    // if job_id isn't known; a detail with available=false when the job exists
+    // but no graph was retained (e.g. submitted before graph retention).
+    std::optional<JobGraphDetail> snapshot_job_graph(JobId job_id) const;
+
     // (data_host, http_port) for the TM with the given id, or nullopt
     // if the TM isn't registered, is lost, or didn't enable HTTP.
     // Used by the JM dashboard's proxy routes (/api/v1/tms/:id/*).

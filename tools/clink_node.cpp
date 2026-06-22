@@ -293,6 +293,46 @@ void write_job_detail(clink::http::JsonWriter& w, const clink::cluster::JobDetai
     w.end_object();
 }
 
+void write_job_graph(clink::http::JsonWriter& w, const clink::cluster::JobGraphDetail& g) {
+    w.begin_object();
+    w.kv("job_id", static_cast<std::int64_t>(g.id));
+    w.kv("topology_version", static_cast<std::int64_t>(g.topology_version));
+    w.kv("available", g.available);
+    w.key("nodes").begin_array();
+    for (const auto& n : g.nodes) {
+        w.begin_object();
+        w.kv("id", n.id);
+        w.kv("op_type", n.op_type);
+        w.kv("display_name", n.display_name);
+        w.kv("uid", n.uid);
+        w.kv("kind", n.kind);
+        w.kv("parallelism", static_cast<std::int64_t>(n.parallelism));
+        w.kv("out_channel", n.out_channel);
+        w.kv("keyed", n.keyed);
+        w.key("subtasks").begin_array();
+        for (const auto& s : n.subtasks) {
+            w.begin_object();
+            w.kv("subtask_idx", static_cast<std::int64_t>(s.subtask_idx));
+            w.kv("tm_id", s.tm_id);
+            w.end_object();
+        }
+        w.end_array();
+        w.end_object();
+    }
+    w.end_array();
+    w.key("edges").begin_array();
+    for (const auto& e : g.edges) {
+        w.begin_object();
+        w.kv("from", e.from);
+        w.kv("to", e.to);
+        w.kv("routing", e.routing);
+        w.kv("channel", e.channel);
+        w.end_object();
+    }
+    w.end_array();
+    w.end_object();
+}
+
 void write_tm_snapshot(clink::http::JsonWriter& w, const clink::cluster::TmSnapshot& t) {
     w.begin_object();
     w.kv("tm_id", t.tm_id);
@@ -977,6 +1017,31 @@ int run_jm(int argc, char** argv) {
             }
             clink::http::JsonWriter w;
             write_job_detail(w, *detail);
+            resp.body = w.str();
+            return resp;
+        });
+        // GET /api/v1/jobs/:id/graph - the logical operator DAG + subtask
+        // placement, for the console's graph view.
+        http_srv->get("/api/v1/jobs/:id/graph", [jm_ptr](const clink::http::HttpRequest& req) {
+            clink::http::HttpResponse resp;
+            clink::cluster::JobId job_id = 0;
+            if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
+                try {
+                    job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
+                } catch (...) {
+                    resp.status = 400;
+                    resp.body = R"({"error":"invalid job id"})";
+                    return resp;
+                }
+            }
+            auto g = jm_ptr->snapshot_job_graph(job_id);
+            if (!g.has_value()) {
+                resp.status = 404;
+                resp.body = R"({"error":"no such job"})";
+                return resp;
+            }
+            clink::http::JsonWriter w;
+            write_job_graph(w, *g);
             resp.body = w.str();
             return resp;
         });

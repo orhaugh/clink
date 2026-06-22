@@ -837,6 +837,105 @@ std::optional<JobDetail> JobManager::snapshot_job(JobId job_id) const {
     return d;
 }
 
+std::optional<JobGraphDetail> JobManager::snapshot_job_graph(JobId job_id) const {
+    std::lock_guard lock(mu_);
+    auto it = jobs_.find(job_id);
+    if (it == jobs_.end()) {
+        return std::nullopt;
+    }
+    const auto& job = *it->second;
+    JobGraphDetail d;
+    d.id = job_id;
+    d.topology_version = job.topology_version;
+    if (job.graph_json.empty()) {
+        d.available = false;  // job exists but no retained graph
+        return d;
+    }
+    JobGraphSpec spec;
+    try {
+        spec = JobGraphSpec::from_json(job.graph_json);
+    } catch (...) {
+        d.available = false;
+        return d;
+    }
+
+    // Strip a "::sideTag" suffix from an input ref to the upstream op id.
+    const auto base_id = [](const std::string& ref) {
+        const auto pos = ref.find("::");
+        return pos == std::string::npos ? ref : ref.substr(0, pos);
+    };
+
+    // Index ops by id, and collect every id used as an input so terminal ops
+    // (no downstream) can be classified as sinks.
+    std::unordered_map<std::string, const OperatorSpec*> by_id;
+    std::unordered_set<std::string> has_downstream;
+    by_id.reserve(spec.ops.size());
+    for (const auto& op : spec.ops) {
+        by_id.emplace(op.id, &op);
+    }
+    for (const auto& op : spec.ops) {
+        for (const auto& in : op.inputs) {
+            has_downstream.insert(base_id(in));
+        }
+    }
+
+    // Subtask placement: parse each deployed subtask's OperatorChainSpec and
+    // group (subtask_idx, tm_id) by the operator id(s) the chain hosts.
+    std::unordered_map<std::string, std::vector<GraphSubtaskPlacement>> placement;
+    for (const auto& [tm_id, tasks] : job.tasks_by_tm) {
+        for (const auto& t : tasks) {
+            if (t.extra_config.empty()) {
+                continue;
+            }
+            try {
+                const auto chain = OperatorChainSpec::from_json(t.extra_config);
+                for (const auto& cop : chain.ops) {
+                    placement[cop.id].push_back({t.subtask_idx, tm_id});
+                }
+            } catch (...) {
+                // Non-generic / unparseable task config: skip placement for it.
+            }
+        }
+    }
+
+    d.nodes.reserve(spec.ops.size());
+    for (const auto& op : spec.ops) {
+        GraphNode n;
+        n.id = op.id;
+        n.op_type = op.type;
+        n.display_name = op.display_name;
+        n.uid = op.uid;
+        n.parallelism = op.parallelism;
+        n.out_channel = op.out_channel;
+        n.keyed = !op.key_by.empty();
+        n.kind = op.inputs.empty()
+                     ? "source"
+                     : (has_downstream.find(op.id) == has_downstream.end() ? "sink" : "operator");
+        if (auto pit = placement.find(op.id); pit != placement.end()) {
+            n.subtasks = std::move(pit->second);
+        }
+        d.nodes.push_back(std::move(n));
+
+        for (const auto& in : op.inputs) {
+            const auto from = base_id(in);
+            GraphEdge e;
+            e.from = from;
+            e.to = op.id;
+            if (auto fit = by_id.find(from); fit != by_id.end()) {
+                e.channel = fit->second->out_channel;
+                e.routing = n.keyed                                        ? "hash"
+                            : (fit->second->parallelism != op.parallelism) ? "rebalance"
+                                                                           : "forward";
+            } else {
+                e.routing = n.keyed ? "hash" : "forward";
+            }
+            d.edges.push_back(std::move(e));
+        }
+    }
+    d.available = true;
+    return d;
+}
+
 std::optional<std::pair<std::string, std::uint16_t>> JobManager::tm_http_target(
     const std::string& tm_id) const {
     std::lock_guard lock(mu_);
@@ -1534,7 +1633,10 @@ JobId JobManager::submit_job(const JobGraphSpec& graph,
             }
         }
     }
-    if (!ha_dir_.empty()) {
+    // Retain the logical graph for EVERY job (not just HA) so
+    // GET /api/v1/jobs/:id/graph can serve the topology. HA additionally
+    // persists it to the on-disk manifest for takeover recovery.
+    {
         const auto graph_json = graph.to_json();
         {
             std::lock_guard lock(mu_);
@@ -1542,7 +1644,9 @@ JobId JobManager::submit_job(const JobGraphSpec& graph,
             if (it != jobs_.end())
                 it->second->graph_json = graph_json;
         }
-        persist_job_manifest_(ha_dir_, job_id, graph_json, plugins_copy, checkpoint_copy);
+        if (!ha_dir_.empty()) {
+            persist_job_manifest_(ha_dir_, job_id, graph_json, plugins_copy, checkpoint_copy);
+        }
     }
     return job_id;
 }

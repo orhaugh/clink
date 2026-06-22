@@ -80,6 +80,47 @@ struct JobDetail {
     std::vector<std::uint64_t> pending_checkpoint_ids;
 };
 
+// --- Job DAG (GET /api/v1/jobs/:id/graph) ----------------------------------
+// The logical operator graph plus physical subtask placement. Built from the
+// retained JobGraphSpec (nodes + input edges) and the per-subtask
+// OperatorChainSpec in tasks_by_tm (placement). Static topology; live metrics
+// are layered in by the console from the separate /metrics scrape.
+
+// One operator subtask's placement.
+struct GraphSubtaskPlacement {
+    std::uint32_t subtask_idx{0};
+    std::string tm_id;
+};
+
+// One operator (node).
+struct GraphNode {
+    std::string id;
+    std::string op_type;
+    std::string display_name;
+    std::string uid;
+    std::string kind;  // "source" | "operator" | "sink"
+    std::uint32_t parallelism{1};
+    std::string out_channel;
+    bool keyed{false};
+    std::vector<GraphSubtaskPlacement> subtasks;
+};
+
+// One data-flow edge.
+struct GraphEdge {
+    std::string from;
+    std::string to;
+    std::string routing;  // "forward" | "hash" | "rebalance"
+    std::string channel;  // element type on the wire
+};
+
+struct JobGraphDetail {
+    JobId id{0};
+    std::uint64_t topology_version{0};
+    bool available{false};  // false when the job exists but no graph was retained
+    std::vector<GraphNode> nodes;
+    std::vector<GraphEdge> edges;
+};
+
 // Cluster-wide rollup served by GET /api/v1/cluster. Per-TM detail
 // is also embedded so a single fetch fills the dashboard overview.
 struct ClusterSnapshot {
