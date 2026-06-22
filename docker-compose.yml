@@ -118,6 +118,30 @@ services:
     networks: [clink]
     restart: on-failure
 
+  # One-shot: once the JM is healthy and TaskManager slots are registered,
+  # submit the bundled rescale-test streaming job so the cluster shows a
+  # long-lived running job (busy slots, ticking checkpoints) for the console.
+  # Re-runs on every `up`; `docker compose down` clears submitted jobs.
+  job-submitter:
+    image: clink-runtime:latest
+    depends_on:
+      jm:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "waiting for TaskManager slots...";
+        for i in $$(seq 1 60); do
+          cap=$$(curl -sf http://jm:8081/api/v1/cluster | sed -n 's/.*"total_slot_capacity":\([0-9]*\).*/\1/p');
+          if [ "$${cap:-0}" -ge 6 ]; then break; fi;
+          sleep 1;
+        done;
+        echo "submitting rescale-stream job (slots=$${cap:-0})...";
+        curl -s -F job_so=@/opt/clink/jobs/rescale_test_job.so -F job_name=rescale-stream http://jm:8081/api/v1/jobs;
+        echo
+    networks: [clink]
+    restart: "no"
+
 networks:
   clink:
     driver: bridge

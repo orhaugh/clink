@@ -27,13 +27,25 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build --target clink_node \
     && cmake --build build --target clink \
     && cmake --build build --target clink_k8s_smoke_job \
+    && cmake --build build --target clink_rescale_test_job \
     && cp build/clink_node /usr/local/bin/clink_node \
     && cp build/clink     /usr/local/bin/clink \
     && mkdir -p /opt/clink/jobs \
     && cp build/examples/k8s_smoke_job.so /opt/clink/jobs/k8s_smoke_job.so \
+    && cp build/examples/rescale_test_job.so /opt/clink/jobs/rescale_test_job.so \
     && rm -rf build
 
 WORKDIR /var/lib/clink
+
+# Demo run knobs for the bundled rescale-test streaming job: a large record
+# count + a 100ms tick make it run effectively forever (a long-lived, gently
+# active streaming job), so a cluster shows a running job with busy slots and
+# ticking checkpoints. Read by the job's define_job on whichever node loads the
+# .so (JM at submit + TMs at deploy), hence set image-wide. Override per-service
+# in compose to change the rate. (CLINK_RESCALE_OUT_BASE defaults to /tmp.)
+ENV CLINK_RESCALE_COUNT=1000000000 \
+    CLINK_RESCALE_TICK_MS=100 \
+    CLINK_RESCALE_INITIAL_P=6
 
 # 6123: JM control plane (TMs connect here)
 # 8081: JM dashboard + HTTP API (also TM HTTP API when set)
