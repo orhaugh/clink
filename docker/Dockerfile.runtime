@@ -26,8 +26,11 @@ ENV CMAKE_BUILD_PARALLEL_LEVEL=4
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build --target clink_node \
     && cmake --build build --target clink \
+    && cmake --build build --target clink_k8s_smoke_job \
     && cp build/clink_node /usr/local/bin/clink_node \
     && cp build/clink     /usr/local/bin/clink \
+    && mkdir -p /opt/clink/jobs \
+    && cp build/examples/k8s_smoke_job.so /opt/clink/jobs/k8s_smoke_job.so \
     && rm -rf build
 
 WORKDIR /var/lib/clink

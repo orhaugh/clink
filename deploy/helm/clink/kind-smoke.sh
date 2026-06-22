@@ -74,5 +74,34 @@ restarts=$(kubectl --context "${CTX}" -n "${NAMESPACE}" get pods \
 echo "total TM restarts: ${restarts}"
 [[ "${restarts}" == "0" ]] || fail "expected 0 TM restarts on a clean cold start, got ${restarts}"
 
-printf '\nSMOKE PASSED: %s TMs Ready + registered, 0 restarts.\n' "${TM_REPLICAS}"
+step "verify: submit a job and confirm it runs end-to-end"
+# The k8s-smoke sample job (from_elements[1..5] -> *10 -> filter >20 -> FileSink)
+# is baked into the runtime image. Submit it to the JM over HTTP, then poll the
+# TM pods for the sink output (30,40,50 = the work-done proof that the submitted
+# job actually executed across the cluster).
+JOB_SO="/opt/clink/jobs/k8s_smoke_job.so"
+kx() { kubectl --context "${CTX}" -n "${NAMESPACE}" "$@"; }
+if ! kx exec "deploy/${RELEASE}-jobmanager" -- test -f "${JOB_SO}" 2>/dev/null; then
+  echo "SKIP: ${JOB_SO} not in image (rebuild clink-runtime at this commit to enable job submission)"
+else
+  resp=$(kx exec "deploy/${RELEASE}-jobmanager" -- \
+    curl -fsS -F "job_so=@${JOB_SO}" -F "job_name=k8s-smoke" \
+    "http://127.0.0.1:8081/api/v1/jobs")
+  echo "submit response: ${resp}"
+  echo "${resp}" | grep -q '"ok":true' || fail "job submit did not return ok: ${resp}"
+  got=0
+  for _ in $(seq 1 30); do
+    for pod in $(kx get pods -l app.kubernetes.io/component=taskmanager -o name); do
+      out=$(kx exec "${pod}" -- cat /tmp/clink_k8s_smoke_out.txt 2>/dev/null || true)
+      if grep -q 30 <<<"${out}" && grep -q 40 <<<"${out}" && grep -q 50 <<<"${out}"; then
+        echo "job output on ${pod}: $(tr '\n' ' ' <<<"${out}")"
+        got=1; break 2
+      fi
+    done
+    sleep 2
+  done
+  [[ "${got}" == "1" ]] || fail "job sink output (30,40,50) not found on any TaskManager"
+fi
+
+printf '\nSMOKE PASSED: %s TMs Ready + registered, 0 restarts, job ran end-to-end.\n' "${TM_REPLICAS}"
 printf 'Tear down with: %s --cleanup\n' "${BASH_SOURCE[0]}"

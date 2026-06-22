@@ -7,20 +7,23 @@ topology onto k8s primitives.
 ## Status
 
 Statically validated (`helm lint`, `helm template`, `kubeconform -strict` vs the
-k8s 1.29 API schemas - 5/5 valid) **and live-verified on a `kind` cluster** via
-`kind-smoke.sh`: the JobManager and TaskManagers come up Ready, every TM
-registers with the JM (its own pod IP + stable ordinal id), and a cold start is
-clean (0 restarts - the `wait-for-jobmanager` initContainer gates the JM race).
+k8s 1.29 API schemas - 5/5 valid) **and live-verified end-to-end on a `kind`
+cluster** via `kind-smoke.sh`: the JobManager and TaskManagers come up Ready,
+every TM registers with the JM (its own pod IP + stable ordinal id), a cold
+start is clean (0 restarts - the `wait-for-jobmanager` initContainer gates the
+JM race), AND a job submitted to the cluster runs across the TaskManagers and
+produces its sink output.
 
 ```sh
-deploy/helm/clink/kind-smoke.sh            # create kind cluster, deploy, assert
+deploy/helm/clink/kind-smoke.sh            # create kind cluster, deploy, submit a job, assert
 deploy/helm/clink/kind-smoke.sh --cleanup  # tear the cluster down
 ```
 
-The smoke validates the deployment surface (the chart). A job-submission
-end-to-end on k8s (build a `CLINK_REGISTER_JOB` `.so` matching the image's
-`clink_node` commit, submit via the control port, confirm output) is the
-remaining follow-on, along with true multi-JM HA (see below).
+The smoke submits the baked-in `k8s_smoke_job.so` (a bounded
+`from_elements -> map -> filter -> FileSink` pipeline) over HTTP and confirms
+the `30,40,50` sink output on a TaskManager - end-to-end proof that a submitted
+job executes on the deployed cluster. The remaining follow-on is true multi-JM
+HA (see below).
 
 ## Topology
 

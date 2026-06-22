@@ -14,6 +14,17 @@ add_executable(clink_clickstream_join clickstream_join.cpp)
 target_link_libraries(clink_clickstream_join PRIVATE clink::clink)
 clink_set_warnings(clink_clickstream_join)
 
+# k8s_smoke_job: a tiny bounded, stateless CLINK_REGISTER_JOB pipeline submitted
+# by deploy/helm/clink/kind-smoke.sh to prove job submission works on a
+# Kubernetes-deployed cluster. Baked into the runtime image at /opt/clink/jobs.
+add_library(clink_k8s_smoke_job MODULE k8s_smoke_job.cpp)
+target_link_libraries(clink_k8s_smoke_job PRIVATE clink::core)
+set_target_properties(clink_k8s_smoke_job PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "k8s_smoke_job"
+)
+clink_set_warnings(clink_k8s_smoke_job)
+
 # canonical_pipeline_job: a CLINK_REGISTER_JOB-wrapped pipeline built as a
 # shared library. The clink_submit_job CLI dlopens this and ships it
 # to the cluster. The .so links against clink::core so the inline
