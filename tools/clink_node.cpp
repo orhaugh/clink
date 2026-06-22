@@ -64,6 +64,7 @@
 #include "clink/metrics/process_metrics.hpp"
 #include "clink/metrics/prometheus.hpp"
 #endif
+#include "clink/config/json.hpp"
 #include "clink/plugin/abi_version.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/event_bus.hpp"
@@ -259,6 +260,18 @@ void write_job_detail(clink::http::JsonWriter& w, const clink::cluster::JobDetai
     w.key("errors").begin_array();
     for (const auto& e : j.errors) {
         w.string_value(e);
+    }
+    w.end_array();
+    w.key("subtask_errors").begin_array();
+    for (const auto& se : j.subtask_errors) {
+        w.begin_object();
+        w.kv("role", se.role);
+        w.kv("subtask_idx", se.subtask_idx);
+        w.kv("tm_id", se.tm_id);
+        w.kv("attempt", se.attempt);
+        w.kv("ts_ms", static_cast<std::int64_t>(se.ts_ms));
+        w.kv("message", se.message);
+        w.end_object();
     }
     w.end_array();
     w.key("tasks").begin_array();
@@ -893,6 +906,9 @@ int run_jm(int argc, char** argv) {
     const auto http_port = static_cast<std::uint16_t>(std::stoi(http_port_str));
     if (http_port != 0) {
         http_srv = std::make_unique<clink::http::HttpServer>();
+        if (const auto cors = get_arg(argc, argv, "http-cors-origin", ""); !cors.empty()) {
+            http_srv->enable_cors(cors);
+        }
         auto* jm_ptr = &jm;
         http_srv->get("/api/v1/health", [start_time, jm_ptr](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
@@ -1013,6 +1029,103 @@ int run_jm(int argc, char** argv) {
                     // conflict with current state.
                     resp.status = 409;
                 }
+            }
+            return resp;
+        });
+
+        // POST /api/v1/jobs/:id/savepoint - HTTP equivalent of clink_savepoint.
+        // Triggers a one-off synchronous checkpoint and returns the (dir, id)
+        // handle. ?timeout_ms bounds the wait (0/unset = 30s default).
+        http_srv->post("/api/v1/jobs/:id/savepoint", [jm_ptr](const clink::http::HttpRequest& req) {
+            clink::http::HttpResponse resp;
+            clink::cluster::JobId job_id = 0;
+            if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
+                try {
+                    job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
+                } catch (...) {
+                    resp.status = 400;
+                    resp.body = R"({"error":"invalid job id"})";
+                    return resp;
+                }
+            }
+            std::chrono::milliseconds timeout{};
+            if (auto it = req.query.find("timeout_ms"); it != req.query.end()) {
+                try {
+                    timeout = std::chrono::milliseconds{std::stoll(it->second)};
+                } catch (...) {
+                    // fall through to the JM default
+                }
+            }
+            const auto ack = jm_ptr->take_savepoint(job_id, timeout);
+            clink::http::JsonWriter w;
+            w.begin_object();
+            w.kv("job_id", static_cast<std::int64_t>(ack.job_id));
+            w.kv("ok", ack.ok);
+            w.kv("checkpoint_id", static_cast<std::int64_t>(ack.checkpoint_id));
+            w.kv("checkpoint_dir", ack.checkpoint_dir);
+            w.kv("message", ack.message);
+            w.end_object();
+            resp.body = w.str();
+            if (!ack.ok) {
+                resp.status = ack.message == "no such job" ? 404 : 409;
+            }
+            return resp;
+        });
+
+        // POST /api/v1/jobs/:id/rescale - HTTP equivalent of clink_rescale_job.
+        // Body is a JSON object mapping role -> new parallelism, e.g.
+        // {"map": 4, "sink": 2}. Roles omitted keep their current parallelism.
+        // Synchronous; the JM blocks until the checkpoint+drain+redeploy chain
+        // finishes or it rejects the request (bad parallelism, no slots, ...).
+        http_srv->post("/api/v1/jobs/:id/rescale", [jm_ptr](const clink::http::HttpRequest& req) {
+            clink::http::HttpResponse resp;
+            clink::cluster::JobId job_id = 0;
+            if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
+                try {
+                    job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
+                } catch (...) {
+                    resp.status = 400;
+                    resp.body = R"({"error":"invalid job id"})";
+                    return resp;
+                }
+            }
+            std::unordered_map<std::string, std::uint32_t> role_p;
+            try {
+                const auto v = clink::config::parse(req.body);
+                if (!v.is_object()) {
+                    resp.status = 400;
+                    resp.body = R"({"error":"body must be a JSON object of role -> parallelism"})";
+                    return resp;
+                }
+                for (const auto& [role, pv] : v.as_object()) {
+                    if (!pv.is_number() || pv.as_number() < 1) {
+                        resp.status = 400;
+                        resp.body = R"({"error":"each parallelism must be a positive number"})";
+                        return resp;
+                    }
+                    role_p[role] = static_cast<std::uint32_t>(pv.as_number());
+                }
+            } catch (const std::exception& e) {
+                resp.status = 400;
+                resp.body =
+                    std::string{R"({"error":"invalid JSON body: )"} + json_escape(e.what()) + "\"}";
+                return resp;
+            }
+            if (role_p.empty()) {
+                resp.status = 400;
+                resp.body = R"({"error":"no roles specified"})";
+                return resp;
+            }
+            const auto ack = jm_ptr->rescale_job(job_id, role_p);
+            clink::http::JsonWriter w;
+            w.begin_object();
+            w.kv("job_id", static_cast<std::int64_t>(ack.job_id));
+            w.kv("ok", ack.ok);
+            w.kv("message", ack.message);
+            w.end_object();
+            resp.body = w.str();
+            if (!ack.ok) {
+                resp.status = ack.message.find("no such job") != std::string::npos ? 404 : 409;
             }
             return resp;
         });
@@ -1247,6 +1360,9 @@ int run_tm(int argc, char** argv) {
     std::uint16_t http_bound{0};
     if (http_port_req != 0) {
         http_srv = std::make_unique<clink::http::HttpServer>();
+        if (const auto cors = get_arg(argc, argv, "http-cors-origin", ""); !cors.empty()) {
+            http_srv->enable_cors(cors);
+        }
         auto* tm_ptr = &tm;
         http_srv->get("/api/v1/health", [start_time, &http_bound](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
@@ -1380,37 +1496,45 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (has_flag(argc, argv, "help")) {
-            std::cout << "Usage: clink_node --role={jm|tm} [options]\n"
-                      << "\n"
-                      << "Roles:\n"
-                      << "  jm       Run a JobManager.   --port=<n>\n"
-                      << "  tm       Run a TaskManager.  --id=<name> --jm-host=<h> --jm-port=<n>\n"
-                      << "\n"
-                      << "Jobs are submitted programmatically via the C++ API\n"
-                      << "(StreamExecutionEnvironment + JobSubmitter); clink does\n"
-                      << "not accept JSON job configurations.\n"
-                      << "\n"
-                      << "JobManager flags:\n"
-                      << "  --heartbeat-timeout-ms=<n>   TM-loss detection window (default 5000).\n"
-                      << "  --watchdog-interval-ms=<n>   TM-liveness poll cadence (default 200).\n"
-                      << "\n"
-                      << "Logging flags:\n"
-                      << "  --log-level=<lvl>            trace|debug|info|warn|error|off "
-                         "(default info; CLINK_LOG_LEVEL env as fallback).\n"
-                      << "  --log-file=<path>            Enable the rolling file sink at "
-                         "<path> (default off: console + ring only).\n"
-                      << "  --log-max-size-mb=<n>        Rotate the log file at this size "
-                         "(default 50).\n"
-                      << "  --log-max-files=<n>          Rotated segments to keep (default 10).\n"
-                      << "  --log-compress=true|false    zstd-compress rotated segments "
-                         "(default true).\n"
-                      << "  --log-zstd-level=<1..19>     zstd compression level (default 3).\n"
-                      << "  --log-async=true|false       Async logging (default true).\n"
-                      << "  --log-no-console             Disable the console (stderr) sink.\n"
-                      << "\n"
-                      << "Global flags:\n"
-                      << "  --version    Print version + commit and exit.\n"
-                      << "  --help       Print this message and exit.\n";
+            std::cout
+                << "Usage: clink_node --role={jm|tm} [options]\n"
+                << "\n"
+                << "Roles:\n"
+                << "  jm       Run a JobManager.   --port=<n>\n"
+                << "  tm       Run a TaskManager.  --id=<name> --jm-host=<h> --jm-port=<n>\n"
+                << "\n"
+                << "Jobs are submitted programmatically via the C++ API\n"
+                << "(StreamExecutionEnvironment + JobSubmitter); clink does\n"
+                << "not accept JSON job configurations.\n"
+                << "\n"
+                << "JobManager flags:\n"
+                << "  --heartbeat-timeout-ms=<n>   TM-loss detection window (default 5000).\n"
+                << "  --watchdog-interval-ms=<n>   TM-liveness poll cadence (default 200).\n"
+                << "\n"
+                << "Logging flags:\n"
+                << "  --log-level=<lvl>            trace|debug|info|warn|error|off "
+                   "(default info; CLINK_LOG_LEVEL env as fallback).\n"
+                << "  --log-file=<path>            Enable the rolling file sink at "
+                   "<path> (default off: console + ring only).\n"
+                << "  --log-max-size-mb=<n>        Rotate the log file at this size "
+                   "(default 50).\n"
+                << "  --log-max-files=<n>          Rotated segments to keep (default 10).\n"
+                << "  --log-compress=true|false    zstd-compress rotated segments "
+                   "(default true).\n"
+                << "  --log-zstd-level=<1..19>     zstd compression level (default 3).\n"
+                << "  --log-async=true|false       Async logging (default true).\n"
+                << "  --log-no-console             Disable the console (stderr) sink.\n"
+                << "\n"
+                << "HTTP flags:\n"
+                << "  --http-port=<n>              Enable the HTTP API/console on this port "
+                   "(0/unset = off).\n"
+                << "  --http-cors-origin=<origin>  Send CORS headers for this origin "
+                   "(e.g. '*' or http://host:5181) so a standalone console can call the\n"
+                   "                               API cross-origin. Unset = same-origin only.\n"
+                << "\n"
+                << "Global flags:\n"
+                << "  --version    Print version + commit and exit.\n"
+                << "  --help       Print this message and exit.\n";
             return 0;
         }
         install_linked_impls();

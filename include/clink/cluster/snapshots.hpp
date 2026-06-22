@@ -51,6 +51,21 @@ struct JobTaskRecord {
     std::string tm_id;
 };
 
+// A structured per-subtask failure, surfaced by GET /api/v1/jobs/:id alongside
+// the flat `errors` list. The message carries the operator exception text and,
+// where the toolchain supports std::stacktrace, a capture-site trace appended
+// by the executor. `attempt` is the job restart generation at the time of the
+// failure (0 = first run). This is built JM-side from the SubtaskFinished
+// report, so it adds no new wire fields.
+struct SubtaskErrorRecord {
+    std::string role;
+    std::uint32_t subtask_idx{0};
+    std::string tm_id;
+    std::uint32_t attempt{0};
+    std::int64_t ts_ms{0};
+    std::string message;
+};
+
 // Heavy per-job detail returned by GET /api/v1/jobs/:id.
 struct JobDetail {
     JobId id{0};
@@ -59,6 +74,7 @@ struct JobDetail {
     bool completion_signalled{false};
     bool cancel_requested{false};
     std::vector<std::string> errors;
+    std::vector<SubtaskErrorRecord> subtask_errors;
     std::vector<JobTaskRecord> tasks;
     std::uint64_t latest_completed_checkpoint_id{0};
     std::vector<std::uint64_t> pending_checkpoint_ids;

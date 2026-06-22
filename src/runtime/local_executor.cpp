@@ -5,6 +5,9 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#if defined(CLINK_HAS_STACKTRACE)
+#include <stacktrace>
+#endif
 
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/runtime/cpu_affinity.hpp"
@@ -126,9 +129,18 @@ void LocalExecutor::start() {
                 try {
                     run_fn(*ctx_ptr, stop_predicate);
                 } catch (const std::exception& e) {
+                    std::string message = e.what();
+#if defined(CLINK_HAS_STACKTRACE)
+                    // Best-effort trace. This is the CAPTURE site (the runner
+                    // thread, post-unwind), not the throw site, so it shows the
+                    // runner -> operator call chain rather than the exact throw
+                    // frame; still useful for correlating the failure.
+                    message += "\n--- stack trace (capture site) ---\n";
+                    message += std::to_string(std::stacktrace::current());
+#endif
                     {
                         std::lock_guard lock(error_mu_);
-                        operator_errors_.emplace_back(op_name, e.what());
+                        operator_errors_.emplace_back(op_name, std::move(message));
                     }
                     cancel_.store(true, std::memory_order_release);
                     if (cancel_fn) {

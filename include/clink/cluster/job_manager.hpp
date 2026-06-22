@@ -459,6 +459,11 @@ private:
         // refetches.
         std::uint64_t topology_version{0};
         std::vector<std::string> errors;
+        // Structured counterpart to `errors`, built from each SubtaskFinished
+        // failure report (role/subtask/tm + message, with the executor's
+        // capture-site stack trace inside the message). Surfaced via
+        // JobDetail.subtask_errors. Kept alongside the flat list, not instead.
+        std::vector<SubtaskErrorRecord> subtask_errors;
         // Packed expected state-version map (schema evolution) for this
         // job, captured at deploy from the JobGraphSpec. Re-sent verbatim
         // on every Deploy (initial + rescale/recovery re-deploy) so each

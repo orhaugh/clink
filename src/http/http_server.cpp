@@ -207,6 +207,27 @@ void HttpServer::sse(const std::string& path, SseFactory factory) {
         });
 }
 
+void HttpServer::enable_cors(const std::string& allow_origin) {
+    // A pre-routing handler runs before every request is routed. We stamp
+    // Access-Control-Allow-Origin on the (shared) response object so it
+    // survives into whatever the matched handler produces, and short-circuit
+    // OPTIONS preflight with 204 before routing (no Get/Post handler matches
+    // OPTIONS otherwise, so it would 404).
+    impl_->server.set_pre_routing_handler(
+        [origin = allow_origin](const httplib::Request& req, httplib::Response& res) {
+            res.set_header("Access-Control-Allow-Origin", origin);
+            res.set_header("Vary", "Origin");
+            if (req.method == "OPTIONS") {
+                res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept");
+                res.set_header("Access-Control-Max-Age", "86400");
+                res.status = 204;
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+}
+
 std::uint16_t HttpServer::start(const std::string& host, std::uint16_t port) {
     if (running_.load(std::memory_order_acquire)) {
         return bound_port_;

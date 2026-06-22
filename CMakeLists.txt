@@ -286,6 +286,49 @@ else()
     message(STATUS "clink::core - zstd target not found directly; relying on Arrow transitive link")
 endif()
 
+# ---------------------------------------------------------------------------
+# C++23 std::stacktrace - optional. When available it lets the executor attach
+# a capture-site stack trace to an operator failure (surfaced in JobDetail's
+# subtask_errors). GCC 13/14 ship it behind a backtrace library; libc++
+# (macOS) generally lacks it, in which case failures simply carry no trace.
+# ---------------------------------------------------------------------------
+include(CheckCXXSourceCompiles)
+set(_st_code "#include <stacktrace>\nint main(){ return static_cast<int>(std::stacktrace::current().size()); }")
+set(_st_saved_flags "${CMAKE_REQUIRED_FLAGS}")
+set(CMAKE_REQUIRED_FLAGS "-std=c++23")
+set(_clink_stacktrace_lib "")
+set(_clink_have_stacktrace FALSE)
+set(CMAKE_REQUIRED_LIBRARIES "")
+check_cxx_source_compiles("${_st_code}" CLINK_STACKTRACE_NOLIB)
+if(CLINK_STACKTRACE_NOLIB)
+    set(_clink_have_stacktrace TRUE)
+else()
+    set(CMAKE_REQUIRED_LIBRARIES "stdc++exp")
+    check_cxx_source_compiles("${_st_code}" CLINK_STACKTRACE_EXP)
+    if(CLINK_STACKTRACE_EXP)
+        set(_clink_have_stacktrace TRUE)
+        set(_clink_stacktrace_lib "stdc++exp")
+    else()
+        set(CMAKE_REQUIRED_LIBRARIES "stdc++_libbacktrace")
+        check_cxx_source_compiles("${_st_code}" CLINK_STACKTRACE_BT)
+        if(CLINK_STACKTRACE_BT)
+            set(_clink_have_stacktrace TRUE)
+            set(_clink_stacktrace_lib "stdc++_libbacktrace")
+        endif()
+    endif()
+endif()
+set(CMAKE_REQUIRED_LIBRARIES "")
+set(CMAKE_REQUIRED_FLAGS "${_st_saved_flags}")
+if(_clink_have_stacktrace)
+    target_compile_definitions(clink_core PRIVATE CLINK_HAS_STACKTRACE=1)
+    if(_clink_stacktrace_lib)
+        target_link_libraries(clink_core PUBLIC ${_clink_stacktrace_lib})
+    endif()
+    message(STATUS "clink::core - std::stacktrace enabled (lib: ${_clink_stacktrace_lib})")
+else()
+    message(STATUS "clink::core - std::stacktrace not available; operator failure traces disabled")
+endif()
+
 # liburing - Linux-only optional. Provides the io_uring submission /
 # completion ring used by Phase 28e's IoUringReactor: a coroutine
 # scheduler that drives async I/O without per-request threads.

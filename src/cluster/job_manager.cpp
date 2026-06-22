@@ -820,6 +820,7 @@ std::optional<JobDetail> JobManager::snapshot_job(JobId job_id) const {
     d.completion_signalled = job.completion_signalled;
     d.cancel_requested = job.cancel_requested;
     d.errors = job.errors;
+    d.subtask_errors = job.subtask_errors;
     for (const auto& [tm_id, tasks] : job.tasks_by_tm) {
         for (const auto& t : tasks) {
             JobTaskRecord r;
@@ -2275,9 +2276,19 @@ std::vector<JobManager::PendingDeploy> JobManager::restart_job_locked_(JobState&
     if (survivors.empty() || total_free < tasks_to_redeploy.size()) {
         // No room to restart. Fall back: synthesise errors and signal
         // completion so the client sees the failure.
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
         for (const auto& [role, sub] : tasks_to_redeploy) {
             job.errors.push_back("restart: no slot available for " + role + "[" +
                                  std::to_string(sub) + "]");
+            SubtaskErrorRecord se;
+            se.role = role;
+            se.subtask_idx = sub;
+            se.attempt = job.restart_attempts;
+            se.ts_ms = now_ms;
+            se.message = "restart aborted: no free slot to redeploy this subtask after TM loss";
+            job.subtask_errors.push_back(std::move(se));
             ++job.completed_count;
         }
         job.awaiting_restart = false;
@@ -2866,6 +2877,16 @@ void JobManager::handle_subtask_finished_(MessageReader& r) {
             if (msg.had_error) {
                 job.errors.push_back(msg.tm_id + "/" + msg.role + "[" +
                                      std::to_string(msg.subtask_idx) + "]: " + msg.error_message);
+                SubtaskErrorRecord se;
+                se.role = msg.role;
+                se.subtask_idx = msg.subtask_idx;
+                se.tm_id = msg.tm_id;
+                se.attempt = job.restart_attempts;
+                se.ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+                se.message = msg.error_message;
+                job.subtask_errors.push_back(std::move(se));
             }
             // Free this subtask's slot on the owning TM.
             auto pending_it = job.pending_per_tm.find(msg.tm_id);

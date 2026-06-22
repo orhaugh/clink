@@ -122,6 +122,14 @@ public:
     // Sets Content-Type: text/event-stream and disables proxy buffering.
     void sse(const std::string& path, SseFactory factory);
 
+    // Enable CORS for browser clients on a different origin (e.g. a
+    // standalone console dev server). Adds Access-Control-Allow-Origin to
+    // every response and answers OPTIONS preflight with 204 + the allow
+    // headers. `allow_origin` is echoed verbatim ("*" for any origin, or a
+    // specific scheme://host:port). Call before start(). Off by default:
+    // same-origin deployments (the SPA served by the node) need no CORS.
+    void enable_cors(const std::string& allow_origin);
+
     // Start listening on `host`:`port`. Spawns a background thread to
     // run the accept loop. Returns the actually-bound port (matches
     // `port` if non-zero; OS-picked otherwise). Throws on bind failure.
