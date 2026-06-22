@@ -707,11 +707,23 @@ clink::logging::LoggingConfig make_logging_config(int argc, char** argv, std::st
     if (!level.empty()) {
         cfg.level = level;
     }
+    // Parse numeric flags defensively: a malformed value warns and falls back
+    // to the default rather than throwing an opaque "fatal: stoul" out of main.
+    const auto num = [&](std::string_view flag, long fallback) -> long {
+        const std::string v = get_arg(argc, argv, flag, std::to_string(fallback));
+        try {
+            return std::stol(v);
+        } catch (const std::exception&) {
+            std::cerr << "clink_node: invalid --" << flag << " value '" << v << "', using "
+                      << fallback << "\n";
+            return fallback;
+        }
+    };
     cfg.file_path = get_arg(argc, argv, "log-file", "");
-    cfg.max_file_size_mb = std::stoul(get_arg(argc, argv, "log-max-size-mb", "50"));
-    cfg.max_files = std::stoul(get_arg(argc, argv, "log-max-files", "10"));
+    cfg.max_file_size_mb = static_cast<std::size_t>(num("log-max-size-mb", 50));
+    cfg.max_files = static_cast<std::size_t>(num("log-max-files", 10));
     cfg.compress_rotated = get_arg(argc, argv, "log-compress", "true") != "false";
-    cfg.zstd_level = std::stoi(get_arg(argc, argv, "log-zstd-level", "3"));
+    cfg.zstd_level = static_cast<int>(num("log-zstd-level", 3));
     cfg.console = !has_flag(argc, argv, "log-no-console");
     cfg.async = get_arg(argc, argv, "log-async", "true") != "false";
     return cfg;

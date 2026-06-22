@@ -249,18 +249,26 @@ FetchContent_MakeAvailable(spdlog)
 # GCC-only: re-export the header-only template includes as SYSTEM so spdlog's
 # (and its bundled fmt's) header-only template warnings cannot trip -Werror.
 # NOT on macOS, where -isystem lets a Homebrew spdlog shadow the fetched one.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    if(TARGET spdlog::spdlog_header_only)
-        get_target_property(_inc spdlog::spdlog_header_only INTERFACE_INCLUDE_DIRECTORIES)
-        if(_inc)
-            set_property(TARGET spdlog::spdlog_header_only APPEND PROPERTY
-                INTERFACE_SYSTEM_INCLUDE_DIRECTORIES ${_inc})
-        endif()
+# Use the concrete target (spdlog_header_only), NOT the spdlog::spdlog_header_only
+# ALIAS: set_property rejects alias targets.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND TARGET spdlog_header_only)
+    get_target_property(_inc spdlog_header_only INTERFACE_INCLUDE_DIRECTORIES)
+    if(_inc)
+        set_property(TARGET spdlog_header_only APPEND PROPERTY
+            INTERFACE_SYSTEM_INCLUDE_DIRECTORIES ${_inc})
     endif()
 endif()
 
 target_link_libraries(clink_core PRIVATE $<BUILD_INTERFACE:spdlog::spdlog_header_only>)
 target_compile_definitions(clink_core PRIVATE CLINK_HAS_SPDLOG=1)
+# Force the pinned FetchContent spdlog ahead of any system copy. find_package(Arrow)
+# adds /opt/homebrew/include as an -isystem dir; a contributor with `brew install
+# spdlog` would otherwise have <spdlog/...> resolve to that (newer, FMT_EXTERNAL)
+# copy instead of the pinned 1.15.2 + bundled fmt. A plain -I (BEFORE) is searched
+# ahead of every -isystem dir, so this restores the version pin on macOS. Build
+# scope only; the header is never installed/exported.
+target_include_directories(clink_core PRIVATE BEFORE
+    $<BUILD_INTERFACE:${spdlog_SOURCE_DIR}/include>)
 
 # zstd for the compressing rotating file sink. Arrow already links zstd
 # transitively (zstd::libzstd_* is created under its static-build branch),

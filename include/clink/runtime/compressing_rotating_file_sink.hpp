@@ -175,8 +175,15 @@ private:
         bool ok = true;
         for (;;) {
             in.read(in_buf.data(), static_cast<std::streamsize>(in_cap));
+            if (in.bad()) {
+                // Genuine read error (not EOF): abort so the caller keeps the
+                // source segment via the plain-rename fallback rather than
+                // ending the frame cleanly and deleting an intact tail.
+                ok = false;
+                break;
+            }
             const auto read_n = static_cast<std::size_t>(in.gcount());
-            const bool last_chunk = !in.good();  // eof or error after this read
+            const bool last_chunk = in.eof();
             ZSTD_inBuffer input{.src = in_buf.data(), .size = read_n, .pos = 0};
             if (!drain_chunk(cctx, input, out, out_buf, last_chunk)) {
                 ok = false;
