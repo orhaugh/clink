@@ -127,6 +127,7 @@ add_library(clink_core STATIC
     src/checkpoint/checkpoint_coordinator.cpp
     src/metrics/metrics_registry.cpp
     src/metrics/prometheus.cpp
+    src/metrics/system_metrics.cpp
     src/application/job_submitter.cpp
     src/runtime/event_bus.cpp
     src/runtime/local_executor.cpp

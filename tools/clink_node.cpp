@@ -63,6 +63,7 @@
 #include "clink/metrics/checkpoint_metrics.hpp"
 #include "clink/metrics/process_metrics.hpp"
 #include "clink/metrics/prometheus.hpp"
+#include "clink/metrics/system_metrics.hpp"
 #endif
 #include "clink/config/json.hpp"
 #include "clink/plugin/abi_version.hpp"
@@ -577,6 +578,9 @@ clink::http::SseFactory make_event_bus_sse_factory() {
 // side has wired (process_metrics.hpp).
 clink::http::HttpResponse make_metrics_response() {
     clink::metrics::http::request_seen();
+    // Sample CPU/memory/disk/FD/thread gauges right before snapshotting so the
+    // exposition reflects the process state at scrape time.
+    clink::metrics::sample_system_metrics();
     clink::http::HttpResponse resp;
     auto snap = clink::MetricsRegistry::global().snapshot();
     resp.body = clink::metrics::render_prometheus(snap);
