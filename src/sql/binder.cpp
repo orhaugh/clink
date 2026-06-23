@@ -2789,7 +2789,16 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             // Nested multi-way join: build a left-deep INNER equi-join tree and
             // register its root as the synthetic __join derived table (mirroring
             // the 2-base path below), then fall through to the shared projection
-            // / WHERE / GROUP BY path.
+            // / WHERE / GROUP BY path. v1 supports nested sides only for INNER
+            // joins; surface the real limitation (an outer/full join with a
+            // nested-join side) rather than bind_join_rel's generic INNER-only
+            // message.
+            if (jt != JoinType::Inner) {
+                bind_error(
+                    "outer/full joins with a nested-join side are not supported yet (v1); "
+                    "only INNER joins may have a nested join on either side",
+                    jc.loc.pos);
+            }
             BoundRel root = bind_join_rel(stmt.from_items[0]);
             const std::string join_alias = "__join";
             if (cte_synth_tables_.count(join_alias) != 0) {

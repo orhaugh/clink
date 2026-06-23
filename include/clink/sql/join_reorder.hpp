@@ -19,6 +19,15 @@
 // reordered; any outer / interval / lookup / semi join makes the subtree opaque
 // and it is left as-is (still descended into for nested INNER subtrees).
 //
+// A sub-join's stored edge key is the flat output name of one of its leaves; it
+// is resolved through an EXACT flat-name -> (alias, col) map built from the real
+// leaf columns, never by re-parsing the flat string (which is not uniquely
+// invertible when one alias is a prefix of another, e.g. `s` vs `s_t`). If any
+// flat name is ambiguous or unresolvable the subtree is left un-reordered. The
+// whole decision (reorderable? cheaper?) is made non-destructively before any
+// subplan is moved, so a subtree that is not rewritten is a TRUE no-op: it is
+// neither reshaped nor at risk of a half-applied rewrite.
+//
 // Hand-rolled on clink's own IR (see project memory: no external optimizer fits
 // a JVM-free Arrow-native streaming engine). Algorithm borrowed from DuckDB's
 // join-order optimizer + the Selinger/Moerkotte literature.
@@ -43,11 +52,13 @@ namespace clink::sql {
 namespace reorder_detail {
 
 // A base relation (a single-alias leaf subplan) participating in a join graph.
+// `plan` is null during the non-destructive analyze/cost phase and is filled
+// (by move_leaves) only when a reorder is actually applied.
 struct JoinRel {
     std::unique_ptr<LogicalPlan> plan;
     std::string alias;
     std::vector<ColumnSpec> columns;  // the leaf's output (raw) columns
-    RelStats stats;                   // estimate_stats(*plan), raw-named columns
+    RelStats stats;                   // the leaf's estimated stats, raw-named columns
 };
 
 // One equi-join edge between two relation aliases on their raw key columns.
@@ -59,24 +70,6 @@ struct JoinEdge {
 inline bool is_inner_equi_join(const LogicalPlan& n) {
     return n.kind() == "EquiJoin" &&
            static_cast<const LogicalEquiJoin&>(n).join_type() == JoinType::Inner;
-}
-
-// Parse a flat "<alias>_<col>" name against a set of aliases (longest alias
-// prefix wins), returning (alias, col). Falls back to ("", name) if no alias
-// matches (caller treats that as un-reorderable).
-inline std::pair<std::string, std::string> parse_flat(const std::string& name,
-                                                      const std::set<std::string>& aliases) {
-    std::string best;
-    for (const auto& a : aliases) {
-        if (name.size() > a.size() + 1 && name.compare(0, a.size(), a) == 0 &&
-            name[a.size()] == '_' && a.size() > best.size()) {
-            best = a;
-        }
-    }
-    if (best.empty()) {
-        return {"", name};
-    }
-    return {best, name.substr(best.size() + 1)};
 }
 
 inline std::vector<ColumnSpec> columns_of(const LogicalPlan& n) {
@@ -91,74 +84,111 @@ inline std::vector<ColumnSpec> columns_of(const LogicalPlan& n) {
     return cols;
 }
 
-// Flatten a maximal INNER-equi-join subtree into relations + edges, MOVING the
-// leaf subplans out. Returns the alias set of `node`'s subtree; sets ok=false if
-// the subtree contains a non-INNER-join block (opaque, not reorderable).
-inline std::set<std::string> flatten(std::unique_ptr<LogicalPlan> node,
-                                     std::vector<JoinRel>& rels,
-                                     std::vector<JoinEdge>& edges,
-                                     bool& ok) {
-    auto& j = static_cast<LogicalEquiJoin&>(*node);  // caller guarantees INNER EquiJoin
+// Flat output column name a relation contributes to a join: "<alias>_<col>".
+inline std::string flat_name(const std::string& alias, const std::string& col) {
+    return alias + "_" + col;
+}
+
+// Non-destructively analyse the maximal INNER-equi-join subtree rooted at `node`
+// (an INNER EquiJoin). Collects the base relations (alias + columns + stats, with
+// a null plan), the equi-join edges, and an EXACT flat-name -> (alias, raw_col)
+// origin map built from the leaves' real columns. A sub-join side's stored edge
+// key is a flat "<alias>_<col>" name; it is resolved by looking it up in `origin`
+// rather than re-parsing (the flat encoding is not uniquely invertible when one
+// alias is a prefix of another, e.g. `s` vs `s_t`). Sets pure=false on any
+// non-INNER join block, and unambiguous=false if two distinct leaf columns
+// collapse to one flat name or a sub-join key cannot be resolved; either way the
+// caller leaves the subtree un-reordered. No plans are moved.
+inline void analyze(const LogicalPlan& node,
+                    std::vector<JoinRel>& rels,
+                    std::vector<JoinEdge>& edges,
+                    std::map<std::string, std::pair<std::string, std::string>>& origin,
+                    bool& pure,
+                    bool& unambiguous) {
+    const auto& j = static_cast<const LogicalEquiJoin&>(node);  // caller guarantees INNER EquiJoin
     const std::string l_alias = j.left_alias();
     const std::string r_alias = j.right_alias();
     const std::string l_key = j.left_key_column();
     const std::string r_key = j.right_key_column();
-    auto left = std::move(j.left_mut());
-    auto right = std::move(j.right_mut());
 
-    auto handle_side =
-        [&](std::unique_ptr<LogicalPlan> child,
-            const std::string& alias,
-            const std::string& key) -> std::pair<std::set<std::string>, std::string> {
-        // returns (alias_set, resolved-key-as "alias.col" via the endpoint below
-        // is handled by the caller); here we register leaves and recurse joins.
-        if (is_inner_equi_join(*child)) {
-            auto set = flatten(std::move(child), rels, edges, ok);
-            return {set, std::string{}};  // sub-join: key parsed by caller against `set`
+    // Process a side: recurse INNER joins, register single-alias leaves. Returns
+    // true if the side is itself a sub-join (its edge endpoint is a flat name to
+    // resolve via `origin`), false if it is a base leaf (endpoint is (alias,key)).
+    auto handle_side = [&](const LogicalPlan& child, const std::string& alias) -> bool {
+        if (is_inner_equi_join(child)) {
+            analyze(child, rels, edges, origin, pure, unambiguous);
+            return true;
         }
-        if (child->kind() == "EquiJoin" || child->kind() == "IntervalJoin" ||
-            child->kind() == "LookupJoin" || child->kind() == "SemiJoin") {
-            ok = false;  // opaque multi-relation block -> not reorderable
-            return {std::set<std::string>{}, std::string{}};
+        const auto k = child.kind();
+        if (k == "EquiJoin" || k == "IntervalJoin" || k == "LookupJoin" || k == "SemiJoin") {
+            pure = false;  // opaque multi-relation block -> not reorderable
+            return false;
         }
         // Single-alias leaf (Scan, or Filter/Project over a scan).
+        std::vector<ColumnSpec> cols = columns_of(child);
+        if (alias.empty()) {
+            unambiguous = false;  // a leaf with no alias cannot be re-qualified
+        }
+        for (const auto& c : cols) {
+            const auto entry = std::make_pair(alias, c.name);
+            auto [it, inserted] = origin.emplace(flat_name(alias, c.name), entry);
+            if (!inserted && it->second != entry) {
+                unambiguous = false;  // two distinct origins collapse to one flat name
+            }
+        }
         JoinRel rel;
-        rel.columns = columns_of(*child);
         rel.alias = alias;
-        rel.stats = estimate_stats(*child);
-        rel.plan = std::move(child);
+        rel.stats = estimate_stats(child);
+        rel.columns = std::move(cols);
         rels.push_back(std::move(rel));
-        return {std::set<std::string>{alias}, std::string{}};
+        return false;
     };
 
-    const bool left_is_join = is_inner_equi_join(*left);
-    const bool right_is_join = is_inner_equi_join(*right);
-    auto [l_set, _l] = handle_side(std::move(left), l_alias, l_key);
-    auto [r_set, _r] = handle_side(std::move(right), r_alias, r_key);
+    const bool left_is_join = handle_side(j.left(), l_alias);
+    const bool right_is_join = handle_side(j.right(), r_alias);
 
-    // Resolve this join's edge endpoints to (alias, raw_col).
+    // Resolve this join's edge endpoints to (alias, raw_col). A leaf endpoint is
+    // (alias, key) directly; a sub-join endpoint is the exact origin lookup.
     auto resolve = [&](bool is_join,
                        const std::string& alias,
-                       const std::string& key,
-                       const std::set<std::string>& set) -> std::pair<std::string, std::string> {
-        return is_join ? parse_flat(key, set) : std::pair<std::string, std::string>{alias, key};
+                       const std::string& key) -> std::pair<std::string, std::string> {
+        if (!is_join) {
+            return {alias, key};
+        }
+        auto it = origin.find(key);
+        if (it == origin.end()) {
+            unambiguous = false;  // unresolvable flat key -> leave un-reordered
+            return {std::string{}, std::string{}};
+        }
+        return it->second;
     };
-    auto [la, lc] = resolve(left_is_join, l_alias, l_key, l_set);
-    auto [ra, rc] = resolve(right_is_join, r_alias, r_key, r_set);
+    auto [la, lc] = resolve(left_is_join, l_alias, l_key);
+    auto [ra, rc] = resolve(right_is_join, r_alias, r_key);
     if (la.empty() || ra.empty()) {
-        ok = false;
+        unambiguous = false;
     } else {
         edges.push_back(JoinEdge{la, lc, ra, rc});
     }
-
-    std::set<std::string> all = l_set;
-    all.insert(r_set.begin(), r_set.end());
-    return all;
 }
 
-// Flat output column name a relation contributes to a join: "<alias>_<col>".
-inline std::string flat_name(const std::string& alias, const std::string& col) {
-    return alias + "_" + col;
+// Destructively move the single-alias leaf subplans of an INNER-equi-join subtree
+// out into `out`, in the SAME depth-first order analyze() collects them (left
+// side then right side, recursing INNER joins). Only called on a subtree analyze
+// confirmed pure, so every non-INNER-join child is a real leaf.
+inline void move_leaves(std::unique_ptr<LogicalPlan> node,
+                        std::vector<std::unique_ptr<LogicalPlan>>& out) {
+    auto& j = static_cast<LogicalEquiJoin&>(*node);
+    auto left = std::move(j.left_mut());
+    auto right = std::move(j.right_mut());
+    auto side = [&](std::unique_ptr<LogicalPlan> child) {
+        if (is_inner_equi_join(*child)) {
+            move_leaves(std::move(child), out);
+        } else {
+            out.push_back(std::move(child));
+        }
+    };
+    side(std::move(left));
+    side(std::move(right));
 }
 
 // Total intermediate cardinality of a left-deep join in the given relation
@@ -419,54 +449,37 @@ inline void reorder_joins(std::unique_ptr<LogicalPlan>& slot);
 
 namespace reorder_detail {
 
-// Count the leaf relations of the maximal INNER-equi-join subtree at `n`,
-// non-destructively. Sets pure=false if the subtree contains any non-INNER join
-// block (outer / interval / lookup / semi), which makes it not reorderable as a
-// pure inner-join tree.
-inline int count_relations(const LogicalPlan& n, bool& pure) {
-    if (is_inner_equi_join(n)) {
-        const auto& j = static_cast<const LogicalEquiJoin&>(n);
-        return count_relations(j.left(), pure) + count_relations(j.right(), pure);
-    }
-    const auto k = n.kind();
-    if (k == "EquiJoin" || k == "IntervalJoin" || k == "LookupJoin" || k == "SemiJoin") {
-        pure = false;  // an opaque multi-relation block inside the subtree
-    }
-    return 1;
-}
-
 // Reorder the maximal INNER-equi-join subtree rooted at `slot` (an INNER
-// EquiJoin). Only a pure inner-join tree of >=3 single-alias leaves is
-// reordered; otherwise the node is left structurally untouched and we descend
-// into its children for any nested reorderable subtrees.
+// EquiJoin). Only a pure, unambiguous inner-join tree of >=3 single-alias leaves
+// whose greedy order is strictly cheaper is rewritten; in every other case the
+// node is left structurally untouched (a true no-op) and we descend into its
+// children for any nested reorderable subtrees. The reorderability decision is
+// made non-destructively (analyze) BEFORE any subplan is moved, so an ambiguous
+// or declined subtree is never half-rewritten and can never throw.
 inline void reorder_subtree(std::unique_ptr<LogicalPlan>& slot) {
+    std::vector<JoinRel> rels;
+    std::vector<JoinEdge> edges;
+    std::map<std::string, std::pair<std::string, std::string>> origin;
     bool pure = true;
-    const int n = count_relations(*slot, pure);
-    if (!pure || n < 3) {
+    bool unambiguous = true;
+    analyze(*slot, rels, edges, origin, pure, unambiguous);
+
+    // Leave this node intact and recurse into its children for nested subtrees.
+    auto descend = [&]() {
         auto& j = static_cast<LogicalEquiJoin&>(*slot);
         clink::sql::reorder_joins(j.left_mut());
         clink::sql::reorder_joins(j.right_mut());
+    };
+
+    const std::size_t m = rels.size();
+    if (!pure || !unambiguous || m < 3) {
+        descend();
         return;
     }
 
-    std::vector<JoinRel> rels;
-    std::vector<JoinEdge> edges;
-    bool ok = true;
-    flatten(std::move(slot), rels, edges, ok);
-    // Recurse into each leaf relation for nested reorderable subtrees (e.g. a
-    // derived table containing its own joins).
-    for (auto& r : rels) {
-        clink::sql::reorder_joins(r.plan);
-    }
-
-    const std::size_t m = rels.size();
     std::vector<std::size_t> identity(m);
     for (std::size_t i = 0; i < m; ++i) {
         identity[i] = i;
-    }
-    if (!ok) {
-        slot = rebuild(identity, std::move(rels), edges);  // restore as-is
-        return;
     }
     bool orig_valid = false;
     const double orig_cost = order_cost(identity, rels, edges, orig_valid);
@@ -476,7 +489,21 @@ inline void reorder_subtree(std::unique_ptr<LogicalPlan>& slot) {
 
     const bool apply =
         greedy_valid && greedy != identity && (!orig_valid || greedy_cost < orig_cost);
-    slot = rebuild(apply ? greedy : identity, std::move(rels), edges);
+    if (!apply) {
+        descend();  // declined: a true structural no-op, recurse children instead
+        return;
+    }
+
+    // Apply: move the leaf subplans out (in analyze's DFS order, so they align
+    // with `rels`), reorder any nested subtrees inside each leaf, then rebuild a
+    // left-deep tree in the greedy order.
+    std::vector<std::unique_ptr<LogicalPlan>> plans;
+    move_leaves(std::move(slot), plans);
+    for (std::size_t i = 0; i < m && i < plans.size(); ++i) {
+        rels[i].plan = std::move(plans[i]);
+        clink::sql::reorder_joins(rels[i].plan);
+    }
+    slot = rebuild(greedy, std::move(rels), edges);
 }
 
 }  // namespace reorder_detail

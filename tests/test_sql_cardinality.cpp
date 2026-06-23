@@ -164,5 +164,69 @@ TEST(SqlCardinality, NoReorderWithoutStats) {
     EXPECT_EQ(driving_table(*opt), "big");
 }
 
+// Regression: with aliases where one is a prefix of the other up to '_' (`s` vs
+// `s_t`), the sub-join's flat output names are not uniquely invertible by a
+// longest-prefix parse. The reorderer must resolve edge endpoints through the
+// EXACT flat-name -> (alias, col) map (or bail to no-reorder), NEVER guess and
+// throw std::out_of_range (map::at) out of optimize() on an otherwise-valid query.
+TEST(SqlCardinality, AliasPrefixCollisionDoesNotThrowFromOptimize) {
+    Catalog cat;
+    reg(cat, "s", "(id BIGINT, t_x BIGINT)", "row_count='100', ndv_id='100', ndv_t_x='100'");
+    reg(cat, "s_t", "(id BIGINT)", "row_count='100', ndv_id='100'");
+    reg(cat, "c", "(k BIGINT)", "row_count='100', ndv_k='100'");
+    Binder b(cat);
+    // The root join key s.t_x flattens to "s_t_x"; a longest-prefix parse against
+    // {s, s_t} would mis-attribute it to alias s_t (which has no column x) and
+    // throw. The exact map resolves it to (s, t_x).
+    auto plan = b.bind_select(
+        as_select(parse("SELECT s_id FROM s JOIN s_t ON s.id = s_t.id JOIN c ON s.t_x = c.k")));
+    EXPECT_NO_THROW({
+        auto opt = optimize(std::move(plan));
+        EXPECT_NE(opt, nullptr);
+    });
+}
+
+// Regression: estimate_stats must read a LogicalIntervalJoin through its own type,
+// never via a LogicalEquiJoin& cross-cast (undefined behaviour; caught by UBSan
+// -fsanitize=vptr). A 2-table eq+BETWEEN join binds to a LogicalIntervalJoin and
+// exercises the IntervalJoin branch of the estimator directly.
+TEST(SqlCardinality, IntervalJoinEstimatesThroughCorrectType) {
+    Catalog cat;
+    reg(cat, "clicks", "(user_id BIGINT, click_ts BIGINT)", "row_count='1000', ndv_user_id='100'");
+    reg(cat, "imps", "(user_id BIGINT, imp_ts BIGINT)", "row_count='2000', ndv_user_id='100'");
+    Binder b(cat);
+    auto plan =
+        b.bind_select(as_select(parse("SELECT * FROM clicks c JOIN imps i ON c.user_id = i.user_id "
+                                      "AND c.click_ts BETWEEN i.imp_ts - INTERVAL '5' SECOND "
+                                      "                   AND i.imp_ts + INTERVAL '10' SECOND")));
+    EXPECT_NO_THROW({
+        auto s = estimate_stats(*plan);
+        EXPECT_GT(s.row_count, 0.0);
+    });
+}
+
+// Regression: a declined reorder must be a true STRUCTURAL no-op, not silently
+// reshape a parenthesised right-deep input `a JOIN (b JOIN c)` to left-deep.
+TEST(SqlCardinality, DeclinedReorderPreservesTreeShape) {
+    Catalog cat;
+    reg(cat, "a", "(k BIGINT, av BIGINT)", "");
+    reg(cat, "b", "(k BIGINT)", "");
+    reg(cat, "c", "(k BIGINT)", "");
+    Binder b(cat);
+    auto opt = optimize(b.bind_select(
+        as_select(parse("SELECT a_av FROM a JOIN (b JOIN c ON b.k = c.k) ON a.k = b.k"))));
+    // Descend to the first join node.
+    const LogicalPlan* p = opt.get();
+    while (p != nullptr && p->kind() != "EquiJoin") {
+        auto ins = p->inputs();
+        p = (ins.empty() || ins[0] == nullptr) ? nullptr : ins[0];
+    }
+    ASSERT_NE(p, nullptr);
+    // No stats -> reorder declined -> the right-deep shape is left intact, i.e.
+    // the root join's RIGHT child is still the (b JOIN c) sub-join.
+    EXPECT_EQ(static_cast<const LogicalEquiJoin&>(*p).right().kind(), "EquiJoin")
+        << "a declined reorder must not reshape right-deep input to left-deep";
+}
+
 }  // namespace
 }  // namespace clink::sql

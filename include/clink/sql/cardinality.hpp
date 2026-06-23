@@ -181,22 +181,48 @@ inline RelStats estimate_stats(const LogicalPlan& node) {
     }
     if (kind == "EquiJoin" || kind == "IntervalJoin") {
         // IntervalJoin shares the equi-key cardinality model (the band predicate
-        // only narrows it further; treated as the equi case for v1).
-        const auto& j = static_cast<const LogicalEquiJoin&>(node);
-        RelStats l = estimate_stats(j.left());
-        RelStats r = estimate_stats(j.right());
-        const double lk = ndv_or(l, j.left_key_column());
-        const double rk = ndv_or(r, j.right_key_column());
-        double divisor = std::max(lk, rk);
-        if (divisor <= 0.0) {
-            divisor = std::max({l.row_count, r.row_count, 1.0});
+        // only narrows it further; treated as the equi case for v1). The two are
+        // unrelated final classes with identical key/alias accessors, so resolve
+        // the endpoints through the correct concrete type (never cross-cast) and
+        // feed the shared formula. Casting an IntervalJoin via LogicalEquiJoin&
+        // would be undefined behaviour.
+        auto join_stats = [&](const LogicalPlan& left,
+                              const LogicalPlan& right,
+                              const std::string& l_key,
+                              const std::string& r_key,
+                              const std::string& l_alias,
+                              const std::string& r_alias) {
+            RelStats l = estimate_stats(left);
+            RelStats r = estimate_stats(right);
+            const double lk = ndv_or(l, l_key);
+            const double rk = ndv_or(r, r_key);
+            double divisor = std::max(lk, rk);
+            if (divisor <= 0.0) {
+                divisor = std::max({l.row_count, r.row_count, 1.0});
+            }
+            RelStats out;
+            out.row_count = (l.row_count * r.row_count) / divisor;
+            merge_join_side(out, l, l_alias);
+            merge_join_side(out, r, r_alias);
+            cap_ndv(out, out.row_count);
+            return out;
+        };
+        if (kind == "EquiJoin") {
+            const auto& j = static_cast<const LogicalEquiJoin&>(node);
+            return join_stats(j.left(),
+                              j.right(),
+                              j.left_key_column(),
+                              j.right_key_column(),
+                              j.left_alias(),
+                              j.right_alias());
         }
-        RelStats out;
-        out.row_count = (l.row_count * r.row_count) / divisor;
-        merge_join_side(out, l, j.left_alias());
-        merge_join_side(out, r, j.right_alias());
-        cap_ndv(out, out.row_count);
-        return out;
+        const auto& j = static_cast<const LogicalIntervalJoin&>(node);
+        return join_stats(j.left(),
+                          j.right(),
+                          j.left_key_column(),
+                          j.right_key_column(),
+                          j.left_alias(),
+                          j.right_alias());
     }
     if (kind == "Aggregate" || kind == "WindowAggregate") {
         const auto& a = static_cast<const LogicalAggregate&>(node);
