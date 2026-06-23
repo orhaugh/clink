@@ -328,6 +328,169 @@ inline ArrowBatcher<Row> make_row_columnar_arrow_batcher(std::vector<RowColumn> 
 }
 
 // ---------------------------------------------------------------------
+// Self-describing reader: RecordBatch -> Rows using the batch's OWN schema
+// ---------------------------------------------------------------------
+//
+// make_row_columnar_arrow_batcher above needs the table's column schema up
+// front. rows_from_record_batch instead reads the field names and types from
+// the RecordBatch itself, so it reconstructs Rows from ANY columnar Row batch
+// regardless of which table produced it. This is the materialization seam for
+// the columnar SQL operators (their output sidecar) and for the sidecar-
+// preserving Row wire batcher (received columnar frames). The layout is the
+// same one every columnar Row producer emits: {event_time:int64(nullable),
+// <named typed value column>...}. Returns nullopt when column 0 is not an
+// int64 event-time column or a value column carries a type outside the
+// supported set (so read_cell never mis-casts an Arrow array).
+// True iff a RecordBatch has the columnar Row layout rows_from_record_batch can
+// decode: column 0 is an int64 event-time column and every value column carries
+// a supported type. Lets the wire batcher reject an unexpected sidecar at recv
+// (a hard protocol error) instead of silently materializing zero rows.
+inline bool row_record_batch_supported(const arrow::RecordBatch& batch) {
+    if (batch.num_columns() < 1)
+        return false;
+    if (dynamic_cast<const arrow::Int64Array*>(batch.column(0).get()) == nullptr)
+        return false;
+    for (int ci = 1; ci < batch.num_columns(); ++ci) {
+        switch (batch.schema()->field(ci)->type()->id()) {
+            case arrow::Type::INT64:
+            case arrow::Type::INT32:
+            case arrow::Type::DOUBLE:
+            case arrow::Type::FLOAT:
+            case arrow::Type::BOOL:
+            case arrow::Type::DECIMAL128:
+            case arrow::Type::STRING:
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+inline std::optional<std::vector<Record<Row>>> rows_from_record_batch(
+    const arrow::RecordBatch& batch) {
+    if (batch.num_columns() < 1)
+        return std::nullopt;
+    const auto* t_arr = dynamic_cast<const arrow::Int64Array*>(batch.column(0).get());
+    if (t_arr == nullptr)
+        return std::nullopt;
+    const auto n = batch.num_rows();
+    const int ncol = batch.num_columns();
+
+    struct Col {
+        std::string name;
+        std::shared_ptr<arrow::DataType> type;
+        const arrow::Array* arr;
+    };
+    std::vector<Col> cols;
+    cols.reserve(static_cast<std::size_t>(ncol - 1));
+    for (int ci = 1; ci < ncol; ++ci) {
+        const auto& f = batch.schema()->field(ci);
+        switch (f->type()->id()) {
+            case arrow::Type::INT64:
+            case arrow::Type::INT32:
+            case arrow::Type::DOUBLE:
+            case arrow::Type::FLOAT:
+            case arrow::Type::BOOL:
+            case arrow::Type::DECIMAL128:
+            case arrow::Type::STRING:
+                break;
+            default:
+                return std::nullopt;  // unknown type: refuse rather than mis-cast
+        }
+        cols.push_back({f->name(), f->type(), batch.column(ci).get()});
+    }
+
+    std::vector<Record<Row>> out;
+    out.reserve(static_cast<std::size_t>(n));
+    for (std::int64_t i = 0; i < n; ++i) {
+        Row r;
+        for (const auto& c : cols) {
+            r.values[c.name] = row_columnar_detail::read_cell(c.type, *c.arr, i);
+        }
+        const auto ts = clink::detail::read_event_time(*t_arr, i);
+        if (ts.has_value())
+            out.emplace_back(std::move(r), *ts);
+        else
+            out.emplace_back(std::move(r));
+    }
+    return out;
+}
+
+// MaterializeFn (the closure a columnar Batch<Row> carries for lazy row
+// decode) wrapping rows_from_record_batch. An unsupported schema yields an
+// empty row vector; callers only attach this to batches with a supported
+// layout (operator outputs use the supported type set, and the wire batcher
+// validates via row_record_batch_supported and rejects an unexpected sidecar
+// at recv BEFORE attaching this), so the empty branch is defensive only.
+inline Batch<Row>::MaterializeFn row_materialize_fn() {
+    return [](const arrow::RecordBatch& b) -> std::vector<Record<Row>> {
+        auto rows = rows_from_record_batch(b);
+        return rows ? std::move(*rows) : std::vector<Record<Row>>{};
+    };
+}
+
+// ---------------------------------------------------------------------
+// Sidecar-preserving Row wire batcher
+// ---------------------------------------------------------------------
+//
+// The Row channel's default wire batcher (make_default_arrow_batcher<Row>) wraps
+// each row's JSON in a single value_bytes:binary column - it MATERIALIZES a
+// columnar batch to rows and re-encodes them as JSON to cross a TM boundary, so
+// columnar never survives a shuffle. This batcher instead keeps columnar data
+// columnar end-to-end:
+//
+//   build():  a columnar batch ships its typed Arrow RecordBatch verbatim (no
+//             materialization, no re-encode); a row-form batch falls back to the
+//             JSON binary layout (lossless for ARRAY/MAP/ROW and every JsonValue
+//             shape, unchanged from the default).
+//   parse():  a binary-fallback frame decodes to Rows via the codec (unchanged);
+//             a typed columnar frame is handed downstream AS a columnar
+//             Batch<Row> (Arrow sidecar set, rows lazily materialized) so the
+//             receiving operator chain - filter / project / aggregate / window -
+//             rides the columnar fast path after the shuffle.
+//   schema:   left empty so NetworkChannelSource skips its fixed-schema equality
+//             gate (the columnar schema varies per edge; frames are validated
+//             structurally by parse instead).
+inline ArrowBatcher<Row> make_row_wire_batcher(clink::Codec<Row> codec) {
+    auto fallback = clink::make_default_arrow_batcher<Row>(std::move(codec));
+    auto fb_build = fallback.build;
+    auto fb_parse = fallback.parse;
+
+    auto build = [fb_build](const Batch<Row>& batch) -> std::shared_ptr<arrow::RecordBatch> {
+        if (batch.is_columnar() && batch.arrow()) {
+            return batch.arrow();  // typed sidecar verbatim - no materialization
+        }
+        return fb_build(batch);  // row-form: per-record JSON in value_bytes
+    };
+
+    auto parse = [fb_parse](const arrow::RecordBatch& batch) -> std::optional<Batch<Row>> {
+        // Binary-fallback layout {event_time, value_bytes:binary} -> JSON decode.
+        if (batch.num_columns() == 2) {
+            const auto& f1 = batch.schema()->field(1);
+            if (f1->name() == "value_bytes" && f1->type()->id() == arrow::Type::BINARY) {
+                return fb_parse(batch);
+            }
+        }
+        // An unexpected sidecar schema (column 0 not int64, or a value column
+        // outside the supported set) is a hard protocol error: returning nullopt
+        // makes NetworkChannelSource treat it as a recv failure rather than
+        // silently materializing zero rows downstream.
+        if (!row_record_batch_supported(batch)) {
+            return std::nullopt;
+        }
+        // Typed columnar layout: keep it columnar. Rebuild a shared_ptr container
+        // over the SAME column arrays (zero data copy) so the Batch can own a
+        // sidecar; rows are reconstructed lazily by the self-describing reader.
+        auto shared = arrow::RecordBatch::Make(batch.schema(), batch.num_rows(), batch.columns());
+        return Batch<Row>{
+            std::move(shared), static_cast<std::size_t>(batch.num_rows()), row_materialize_fn()};
+    };
+
+    return ArrowBatcher<Row>{/*schema=*/{}, std::move(build), std::move(parse)};
+}
+
+// ---------------------------------------------------------------------
 // Schema (de)serialisation for the job-spec params channel
 // ---------------------------------------------------------------------
 //

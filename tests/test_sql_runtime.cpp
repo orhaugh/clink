@@ -5811,6 +5811,190 @@ TEST(SqlRuntime, ParquetTypedColumnarRoundTripEndToEnd) {
         std::filesystem::remove(p);
 }
 
+// Columnar keyed aggregation end-to-end: a typed-columnar Parquet source feeds
+// a GROUP BY, driving the columnar SQL path - parquet_row_source emits columnar
+// Batch<Row>, the columnar row_compute_key appends __key to the Arrow sidecar,
+// and the aggregate's columnar ingest reads the group key + agg inputs straight
+// from the buffers. The final per-group aggregates must be exactly correct,
+// proving the columnar keyed path is byte-identical to the row path.
+TEST(SqlRuntime, ColumnarParquetGroupByEndToEnd) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_cgb_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_cgb.parquet";
+    const auto out_path = tmp / "clink_sql_cgb_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    write_lines(in_path,
+                {
+                    R"({"region":"eu","amount":10})",
+                    R"({"region":"us","amount":60})",
+                    R"({"region":"eu","amount":50})",
+                    R"({"region":"us","amount":40})",
+                    R"({"region":"eu","amount":5})",
+                });
+    const std::string cols = "(region VARCHAR, amount BIGINT)";
+
+    // Job 1: NDJSON -> typed-columnar Parquet.
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT region, amount FROM ev");
+        InProcessCluster cluster("tm-cgb-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    // Job 2: columnar Parquet source -> GROUP BY region -> NDJSON.
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE pq_in "} + cols +
+                         " WITH (connector='parquet', path='" + pq_path.string() +
+                         "');"
+                         "CREATE TABLE agg_out (region VARCHAR, total BIGINT, n BIGINT)"
+                         " WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat,
+                            "INSERT INTO agg_out SELECT region, SUM(amount) AS total, "
+                            "COUNT(*) AS n FROM pq_in GROUP BY region");
+        InProcessCluster cluster("tm-cgb-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    // GROUP BY emits a running upsert per key; the last emission per region is
+    // the final aggregate.
+    auto lines = read_lines(out_path);
+    ASSERT_FALSE(lines.empty());
+    std::map<std::string, std::pair<std::int64_t, std::int64_t>> final_agg;
+    for (const auto& line : lines) {
+        auto js = clink::config::parse(line);
+        ASSERT_TRUE(js.is_object()) << "bad output line: " << line;
+        final_agg[js.at("region").as_string()] = {
+            static_cast<std::int64_t>(js.at("total").as_number()),
+            static_cast<std::int64_t>(js.at("n").as_number())};
+    }
+    ASSERT_EQ(final_agg.size(), 2u);
+    EXPECT_EQ(final_agg["eu"].first, 65);  // 10 + 50 + 5
+    EXPECT_EQ(final_agg["eu"].second, 3);
+    EXPECT_EQ(final_agg["us"].first, 100);  // 60 + 40
+    EXPECT_EQ(final_agg["us"].second, 2);
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
+// Columnar tumbling window end-to-end: a typed-columnar Parquet source feeds a
+// TUMBLE window aggregate, exercising the columnar window ingest (the window op
+// reads its time / group / agg-input columns straight from the Arrow sidecar).
+// The per-window totals must be exactly correct.
+TEST(SqlRuntime, ColumnarParquetTumbleWindowEndToEnd) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_ctw_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_ctw.parquet";
+    const auto out_path = tmp / "clink_sql_ctw_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    write_lines(in_path,
+                {
+                    R"({"user_id":1,"ts":100,"amount":10})",
+                    R"({"user_id":1,"ts":200,"amount":20})",
+                    R"({"user_id":1,"ts":300,"amount":30})",
+                    R"({"user_id":2,"ts":400,"amount":5})",
+                    R"({"user_id":1,"ts":1100,"amount":100})",
+                    R"({"user_id":1,"ts":1200,"amount":200})",
+                    R"({"user_id":2,"ts":1500,"amount":50})",
+                });
+    const std::string cols = "(user_id BIGINT, ts BIGINT, amount BIGINT)";
+
+    // Job 1: NDJSON -> typed-columnar Parquet.
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts, amount FROM ev");
+        InProcessCluster cluster("tm-ctw-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    // Job 2: columnar Parquet source (event-time on ts) -> TUMBLE(1000) window.
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE pq_in "} + cols +
+                         " WITH (connector='parquet', path='" + pq_path.string() +
+                         "', event_time_column='ts');"
+                         "CREATE TABLE per_window (user_id BIGINT, total BIGINT) "
+                         "WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat,
+                            "INSERT INTO per_window SELECT user_id, SUM(amount) AS total "
+                            "FROM pq_in GROUP BY TUMBLE(ts, 1000), user_id");
+        InProcessCluster cluster("tm-ctw-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    auto lines = read_lines(out_path);
+    std::multimap<std::int64_t, std::int64_t> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("user_id").as_number()),
+                    static_cast<std::int64_t>(js.at("total").as_number()));
+    }
+    auto contains = [&](std::int64_t uid, std::int64_t total) {
+        auto range = got.equal_range(uid);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second == total)
+                return true;
+        }
+        return false;
+    };
+    EXPECT_TRUE(contains(1, 60)) << "user=1 window=[0,1000) total=60 (10+20+30)";
+    EXPECT_TRUE(contains(1, 300)) << "user=1 window=[1000,2000) total=300 (100+200)";
+    EXPECT_TRUE(contains(2, 5)) << "user=2 window=[0,1000) total=5";
+    EXPECT_TRUE(contains(2, 50)) << "user=2 window=[1000,2000) total=50";
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // Async-state SQL GROUP BY: with the planner's async-state switch on, the
 // aggregate holds per-group state in KeyedState (serialising every AggBucket
 // through the codec on each record) instead of the in-memory map. Running the

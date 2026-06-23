@@ -155,6 +155,17 @@ public:
     // closure to reuse ArrowBatcher<T>::parse without an extra copy.
     std::vector<value_type> take_records() { return std::move(records_); }
 
+    // Create a sibling columnar batch over a DIFFERENT RecordBatch (e.g. a
+    // partition gather or a filter/project result) reusing THIS batch's lazy
+    // row-materialization closure. Lets the columnar shuffle split a columnar
+    // batch into per-subtask columnar sub-batches, and a columnar operator
+    // re-emit a derived batch, without knowing the row type's batcher. The
+    // closure is schema-self-describing for the Row channel, so it decodes the
+    // new (same-schema) RecordBatch correctly.
+    [[nodiscard]] Batch with_arrow(std::shared_ptr<arrow::RecordBatch> rb, std::size_t rows) const {
+        return Batch{std::move(rb), rows, materialize_};
+    }
+
 private:
     // Lazily decode the columnar sidecar into rows the first time a row
     // accessor is touched. A pure-row batch (arrow_ == null) is a no-op. The

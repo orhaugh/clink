@@ -495,12 +495,23 @@ inline std::vector<std::byte> arrow_batch_to_ipc(const arrow::RecordBatch& batch
 }
 
 // Read a single RecordBatch from an Arrow IPC stream blob.
+//
+// The bytes are copied into an Arrow-OWNED buffer first: the decoded
+// RecordBatch's column arrays are zero-copy slices of the reader's buffer, so a
+// consumer that RETAINS the batch (the sidecar-preserving Row wire keeps the
+// columnar batch lazily downstream) must not depend on the caller's transient
+// wire bytes outliving it. The copy is one memcpy per frame (a whole batch), so
+// it is amortized; eager-decode batchers that copy values out during parse are
+// unaffected by the extra owned buffer.
 inline std::shared_ptr<arrow::RecordBatch> arrow_batch_from_ipc(const std::byte* data,
                                                                 std::size_t size) {
     if (size == 0)
         return nullptr;
-    auto buffer = std::make_shared<arrow::Buffer>(reinterpret_cast<const uint8_t*>(data),
-                                                  static_cast<int64_t>(size));
+    auto buf_result = arrow::AllocateBuffer(static_cast<int64_t>(size));
+    if (!buf_result.ok())
+        return nullptr;
+    std::shared_ptr<arrow::Buffer> buffer = std::move(*buf_result);
+    std::memcpy(buffer->mutable_data(), data, size);
     auto input = std::make_shared<arrow::io::BufferReader>(buffer);
     auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
     if (!reader_result.ok())

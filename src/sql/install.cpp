@@ -27,6 +27,8 @@
 #include "clink/connectors/parquet_source.hpp"
 #include "clink/operators/agg_function_registry.hpp"
 #include "clink/operators/async_lookup_operator.hpp"
+#include "clink/operators/columnar_row_filter_operator.hpp"
+#include "clink/operators/columnar_row_project_operator.hpp"
 #include "clink/operators/filter_operator.hpp"
 #include "clink/operators/json_predicate.hpp"
 #include "clink/operators/json_value_expr.hpp"
@@ -870,6 +872,17 @@ public:
                 "window_row: CUMULATE needs step > 0 and size divisible "
                 "by step");
         }
+        // Columns the columnar ingest reads per record: the time column, the
+        // group keys, and each aggregate's input column.
+        columnar_needed_.push_back(time_column_);
+        for (const auto& k : group_keys_) {
+            columnar_needed_.push_back(k);
+        }
+        for (const auto& a : aggregates_) {
+            if (!a.input_column.empty()) {
+                columnar_needed_.push_back(a.input_column);
+            }
+        }
     }
 
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
@@ -886,6 +899,44 @@ public:
         } else {
             this->on_barrier(element.as_barrier(), out);
         }
+    }
+
+    // Columnar ingest: buffer columnar data by reading only the time / group /
+    // agg-input columns from the Arrow sidecar into a narrow row, then run the
+    // identical per-record windowing. Window emission still happens on the
+    // watermark via process(); the runner only routes columnar DATA here.
+    [[nodiscard]] bool supports_columnar() const noexcept override { return true; }
+
+    bool process_columnar(const StreamElement<Row>& element, Emitter<Row>& /*out*/) override {
+        if (!element.is_data() || !element.as_data().is_columnar()) {
+            return false;
+        }
+        const auto& rb = element.as_data().arrow();
+        if (!rb) {
+            return false;
+        }
+        const std::int64_t n = rb->num_rows();
+        struct Col {
+            const std::string* name;
+            int idx;
+            std::shared_ptr<arrow::DataType> type;
+        };
+        std::vector<Col> cols;
+        cols.reserve(columnar_needed_.size());
+        for (const auto& nm : columnar_needed_) {
+            const int idx = rb->schema()->GetFieldIndex(nm);
+            if (idx >= 0) {
+                cols.push_back({&nm, idx, rb->schema()->field(idx)->type()});
+            }
+        }
+        for (std::int64_t i = 0; i < n; ++i) {
+            Row row;
+            for (const auto& c : cols) {
+                row.values[*c.name] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
+            }
+            handle_record_(row);
+        }
+        return true;
     }
 
     std::string name() const override {
@@ -1006,6 +1057,7 @@ private:
     std::vector<AggSpec> aggregates_;
     std::vector<std::string> group_key_outputs_;
     std::unordered_map<std::string, std::map<std::int64_t, WindowBucket>> state_;
+    std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
 };
 
 // Session-window aggregate. Per-group state is an ordered map keyed
@@ -1030,6 +1082,15 @@ public:
         }
         if (gap_ms_ <= 0)
             throw std::runtime_error("session_window_row: gap_ms must be > 0");
+        columnar_needed_.push_back(time_column_);
+        for (const auto& k : group_keys_) {
+            columnar_needed_.push_back(k);
+        }
+        for (const auto& a : aggregates_) {
+            if (!a.input_column.empty()) {
+                columnar_needed_.push_back(a.input_column);
+            }
+        }
     }
 
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
@@ -1044,6 +1105,44 @@ public:
         } else {
             this->on_barrier(element.as_barrier(), out);
         }
+    }
+
+    // Columnar ingest: buffer columnar data via the time / group / agg-input
+    // columns read straight from the sidecar into a narrow row; session firing
+    // stays on the watermark via process(). The runner only routes columnar
+    // DATA here.
+    [[nodiscard]] bool supports_columnar() const noexcept override { return true; }
+
+    bool process_columnar(const StreamElement<Row>& element, Emitter<Row>& /*out*/) override {
+        if (!element.is_data() || !element.as_data().is_columnar()) {
+            return false;
+        }
+        const auto& rb = element.as_data().arrow();
+        if (!rb) {
+            return false;
+        }
+        const std::int64_t n = rb->num_rows();
+        struct Col {
+            const std::string* name;
+            int idx;
+            std::shared_ptr<arrow::DataType> type;
+        };
+        std::vector<Col> cols;
+        cols.reserve(columnar_needed_.size());
+        for (const auto& nm : columnar_needed_) {
+            const int idx = rb->schema()->GetFieldIndex(nm);
+            if (idx >= 0) {
+                cols.push_back({&nm, idx, rb->schema()->field(idx)->type()});
+            }
+        }
+        for (std::int64_t i = 0; i < n; ++i) {
+            Row row;
+            for (const auto& c : cols) {
+                row.values[*c.name] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
+            }
+            handle_record_(row);
+        }
+        return true;
     }
 
     std::string name() const override { return "session_window_row"; }
@@ -1260,6 +1359,7 @@ private:
     std::vector<AggSpec> aggregates_;
     std::vector<std::string> group_key_outputs_;
     std::unordered_map<std::string, std::map<std::int64_t, Session>> state_;
+    std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
 };
 
 // One OVER output column. fn is one of sum/count/avg/min/max (running
@@ -1546,6 +1646,19 @@ public:
         if (group_key_outputs_.size() != group_keys_.size()) {
             group_key_outputs_ = group_keys_;  // default: emit each key under its raw name
         }
+        // Columns this op actually reads from each input row: the group keys,
+        // each aggregate's input column, and the changelog marker. The columnar
+        // ingest reads ONLY these from the Arrow sidecar (a narrow row), so a
+        // wide table's unused columns are never decoded.
+        for (const auto& k : group_keys_) {
+            columnar_needed_.push_back(k);
+        }
+        for (const auto& a : aggregates_) {
+            if (!a.input_column.empty()) {
+                columnar_needed_.push_back(a.input_column);
+            }
+        }
+        columnar_needed_.push_back(std::string{kRowKindField});
     }
 
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
@@ -1577,6 +1690,56 @@ public:
         } else {
             this->on_barrier(element.as_barrier(), out);
         }
+    }
+
+    // Columnar ingest (in-memory path only). When the keyed shuffle delivers a
+    // columnar batch, read ONLY the columns this aggregate uses (group keys,
+    // agg inputs, __row_kind) straight from the Arrow buffers into a narrow row
+    // and fold it through the SAME in-memory state machine - so a wide table's
+    // unused columns are never decoded and the result is byte-identical to the
+    // row path. Disabled when the async/disaggregated KeyedState path is active
+    // (that path runs through process_async); on a row-only batch the runner
+    // calls process().
+    [[nodiscard]] bool supports_columnar() const noexcept override {
+        return !effective_async_state_;
+    }
+
+    bool process_columnar(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        if (!element.is_data() || !element.as_data().is_columnar()) {
+            return false;
+        }
+        const auto& rb = element.as_data().arrow();
+        if (!rb) {
+            return false;
+        }
+        const std::int64_t n = rb->num_rows();
+        // Resolve the needed columns to (name, index, type) once per batch.
+        struct Col {
+            const std::string* name;
+            int idx;
+            std::shared_ptr<arrow::DataType> type;
+        };
+        std::vector<Col> cols;
+        cols.reserve(columnar_needed_.size());
+        for (const auto& nm : columnar_needed_) {
+            const int idx = rb->schema()->GetFieldIndex(nm);
+            if (idx >= 0) {
+                cols.push_back({&nm, idx, rb->schema()->field(idx)->type()});
+            }
+        }
+        Batch<Row> emit_batch;
+        emit_batch.reserve(static_cast<std::size_t>(n));
+        for (std::int64_t i = 0; i < n; ++i) {
+            Row row;
+            for (const auto& c : cols) {
+                row.values[*c.name] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
+            }
+            emit_batch.push(Record<Row>{handle_record_inmem_(row)});
+        }
+        if (!emit_batch.empty()) {
+            out.emit_data(std::move(emit_batch));
+        }
+        return true;
     }
 
     // Auto-on: finalise the storage decision once the runtime + backend are
@@ -1705,6 +1868,9 @@ private:
     // supports_async() all agree on one storage choice (no split-brain).
     bool effective_async_state_ = false;
     std::unordered_map<std::string, AggBucket> state_;
+    // Columns the columnar ingest reads from each input row (group keys, agg
+    // inputs, __row_kind); precomputed in the ctor.
+    std::vector<std::string> columnar_needed_;
 };
 
 enum class EquiJoinKind { Inner, LeftOuter, RightOuter, FullOuter };
@@ -3238,9 +3404,129 @@ std::int64_t hash_json_value(const clink::config::JsonValue& v) {
 
 constexpr const char* kRowKeyField = "__key";
 
+// Columnar-native row_compute_key. Computes the synthetic __key column straight
+// from the named group columns' Arrow cells (FNV-1a over hash_json_value,
+// byte-identical to the row path) and appends it to the sidecar, so the keyed
+// shuffle downstream can partition the batch columnar (see SubtaskEmitter). The
+// output carries the schema-self-describing row materializer so the new __key
+// column round-trips. Row-only input falls back to the identical per-row map.
+// row_compute_key sits upstream of the shuffle and sees uniform input per
+// operator, so the columnar and row paths never split one group across subtasks.
+class ColumnarRowComputeKeyOp final : public Operator<Row, Row> {
+public:
+    explicit ColumnarRowComputeKeyOp(std::vector<std::string> columns)
+        : columns_(std::move(columns)) {}
+
+    [[nodiscard]] bool supports_columnar() const noexcept override { return true; }
+
+    bool process_columnar(const StreamElement<Row>& el, Emitter<Row>& out) override {
+        if (!el.is_data() || !el.as_data().is_columnar()) {
+            return false;
+        }
+        const auto& rb = el.as_data().arrow();
+        if (!rb) {
+            return false;
+        }
+        const std::int64_t n = rb->num_rows();
+        if (n == 0) {
+            return true;  // suppress empty emission, matching the row path
+        }
+        std::vector<int> idx;
+        idx.reserve(columns_.size());
+        for (const auto& c : columns_) {
+            idx.push_back(rb->schema()->GetFieldIndex(c));
+        }
+        arrow::Int64Builder kb;
+        if (!kb.Reserve(n).ok()) {
+            return false;
+        }
+        for (std::int64_t i = 0; i < n; ++i) {
+            std::uint64_t h = 0xcbf29ce484222325ULL;
+            for (std::size_t c = 0; c < columns_.size(); ++c) {
+                std::uint64_t v = 0;
+                if (idx[c] >= 0) {
+                    auto cell = clink::sql::row_columnar_detail::read_cell(
+                        rb->schema()->field(idx[c])->type(), *rb->column(idx[c]), i);
+                    if (!cell.is_null()) {
+                        v = static_cast<std::uint64_t>(hash_json_value(cell));
+                    }
+                }
+                h ^= v;
+                h *= 0x100000001b3ULL;
+            }
+            kb.UnsafeAppend(static_cast<std::int64_t>(h));
+        }
+        std::shared_ptr<arrow::Array> karr;
+        if (!kb.Finish(&karr).ok()) {
+            return false;
+        }
+        auto fields = rb->schema()->fields();
+        std::vector<std::shared_ptr<arrow::Array>> cols(rb->columns().begin(), rb->columns().end());
+        if (const int existing = rb->schema()->GetFieldIndex(kRowKeyField); existing >= 0) {
+            cols[static_cast<std::size_t>(existing)] = std::move(karr);
+        } else {
+            fields.push_back(arrow::field(kRowKeyField, arrow::int64(), /*nullable=*/true));
+            cols.push_back(std::move(karr));
+        }
+        auto new_rb = arrow::RecordBatch::Make(arrow::schema(fields), n, cols);
+        out.emit_data(Batch<Row>{
+            std::move(new_rb), static_cast<std::size_t>(n), clink::sql::row_materialize_fn()});
+        return true;
+    }
+
+    void process(const StreamElement<Row>& el, Emitter<Row>& out) override {
+        if (el.is_data()) {
+            Batch<Row> b;
+            b.reserve(el.as_data().size());
+            for (const auto& rec : el.as_data()) {
+                const Row& r = rec.value();
+                Row o = r;
+                std::uint64_t h = 0xcbf29ce484222325ULL;
+                for (const auto& col : columns_) {
+                    auto it = r.values.find(col);
+                    const std::uint64_t v =
+                        it != r.values.end()
+                            ? static_cast<std::uint64_t>(hash_json_value(it->second))
+                            : 0ULL;
+                    h ^= v;
+                    h *= 0x100000001b3ULL;
+                }
+                o.values[kRowKeyField] = clink::config::JsonValue{static_cast<std::int64_t>(h)};
+                Record<Row> out_rec(std::move(o));
+                if (const auto ts = rec.event_time(); ts.has_value()) {
+                    out_rec.set_event_time(*ts);
+                }
+                if (const auto p = rec.pane(); p.has_value()) {
+                    out_rec.set_pane(*p);
+                }
+                b.push(std::move(out_rec));
+            }
+            if (!b.empty()) {
+                out.emit_data(std::move(b));
+            }
+        } else if (el.is_watermark()) {
+            this->on_watermark(el.as_watermark(), out);
+        } else {
+            this->on_barrier(el.as_barrier(), out);
+        }
+    }
+
+    std::string name() const override { return "row_compute_key"; }
+
+private:
+    std::vector<std::string> columns_;
+};
+
 void install(clink::plugin::PluginRegistry& reg) {
     // ---- Channel type ----
-    reg.register_type<Row>(std::string{kChannelRow}, row_json_codec());
+    // The Row wire batcher preserves columnar data across TM boundaries: a
+    // columnar Batch<Row> ships its typed Arrow RecordBatch verbatim and is
+    // received as a columnar batch, so the post-shuffle operator chain keeps
+    // riding the columnar fast path; row-form batches fall back to the
+    // lossless per-record JSON layout. row_json_codec remains the per-record
+    // fallback codec.
+    reg.register_type<Row>(
+        std::string{kChannelRow}, row_json_codec(), make_row_wire_batcher(row_json_codec()));
 
     // Row key extractor for parallelism > 1. Reads the synthetic
     // __key field that row_compute_key wrote, hashes it as int64.
@@ -3562,29 +3848,9 @@ void install(clink::plugin::PluginRegistry& reg) {
                 throw std::runtime_error(
                     "row_compute_key: 'columns' (or 'column') param is required");
             }
-            return std::make_shared<MapOperator<Row, Row>>(
-                [columns](const Row& r) -> Row {
-                    Row out = r;
-                    // FNV-1a fold over the named columns so column order
-                    // matters. Accumulate in unsigned (defined wraparound);
-                    // a missing column folds in a 0 so a present-vs-missing
-                    // mismatch routes to a different slot. Final bits are
-                    // reinterpreted as int64 for routing.
-                    std::uint64_t h = 0xcbf29ce484222325ULL;
-                    for (const auto& col : columns) {
-                        auto it = r.values.find(col);
-                        std::uint64_t v =
-                            it != r.values.end()
-                                ? static_cast<std::uint64_t>(hash_json_value(it->second))
-                                : 0ULL;
-                        h ^= v;
-                        h *= 0x100000001b3ULL;
-                    }
-                    out.values[kRowKeyField] =
-                        clink::config::JsonValue{static_cast<std::int64_t>(h)};
-                    return out;
-                },
-                "row_compute_key");
+            // Columnar-native: appends __key to the Arrow sidecar so the keyed
+            // shuffle stays columnar; identical FNV-1a key on the row fallback.
+            return std::make_shared<ColumnarRowComputeKeyOp>(std::move(columns));
         });
 
     // identity_row: passthrough. SQL planner emits this for SELECT *
@@ -3768,20 +4034,13 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             auto pred_json =
                 std::make_shared<clink::config::JsonValue>(clink::config::parse(pred_text));
-            return std::make_shared<clink::FilterOperator<Row>>(
-                [pred_json](const Row& r) -> bool {
-                    // Row resolver returns the raw JsonValue from the row (or
-                    // JsonValue{nullptr} for missing/null columns) so the
-                    // evaluator can do type-aware comparisons.
-                    auto resolve = [&](const std::string& name) -> clink::config::JsonValue {
-                        auto it = r.values.find(name);
-                        if (it == r.values.end())
-                            return clink::config::JsonValue{nullptr};
-                        return it->second;
-                    };
-                    return clink::operators::evaluate_json_predicate(*pred_json, resolve);
-                },
-                "filter_row_predicate");
+            // Columnar-native filter: rides the Arrow RecordBatch sidecar when
+            // the input is columnar (Parquet source / upstream columnar op /
+            // sidecar-preserving Row wire), evaluating the predicate over the
+            // typed buffers with no Row materialization and keeping the output
+            // columnar. Falls back to the identical row predicate otherwise.
+            return std::make_shared<clink::ColumnarRowFilterOperator>(std::move(pred_json),
+                                                                      "filter_row_predicate");
         });
 
     // #61 phase 2: match_recognize_row - SQL MATCH_RECOGNIZE lowered onto the
@@ -4560,41 +4819,21 @@ void install(clink::plugin::PluginRegistry& reg) {
             if (!outputs_json->is_array()) {
                 throw std::runtime_error("project_row: 'outputs' must be a JSON array");
             }
-            // Pre-extract (name, expr) pairs into shared_ptr to avoid
-            // re-walking JSON on every record.
-            struct Plan {
-                std::vector<std::pair<std::string, clink::config::JsonValue>> outs;
-            };
-            auto plan = std::make_shared<Plan>();
+            // Pre-extract (name, expr) pairs once. Columnar-native projection:
+            // pure column-reference outputs assemble the output RecordBatch by
+            // zero-copy column selection when the input is columnar (column
+            // pruning / rename with no Row materialization), keeping the chain
+            // columnar; literal / computed outputs and row-only input fall back
+            // to the identical row evaluator (incl. __row_kind passthrough).
+            std::vector<clink::ColumnarRowProjectOperator::Output> outs;
             for (const auto& entry : outputs_json->as_array()) {
                 if (!entry.is_object() || !entry.contains("name") || !entry.contains("expr")) {
                     throw std::runtime_error("project_row: each output must be {name, expr}");
                 }
-                plan->outs.emplace_back(entry.at("name").as_string(), entry.at("expr"));
+                outs.emplace_back(entry.at("name").as_string(), entry.at("expr"));
             }
-            return std::make_shared<MapOperator<Row, Row>>(
-                [plan](const Row& r) -> Row {
-                    Row out;
-                    auto resolve = [&](const std::string& name) -> clink::config::JsonValue {
-                        auto it = r.values.find(name);
-                        if (it == r.values.end()) {
-                            return clink::config::JsonValue{nullptr};
-                        }
-                        return it->second;
-                    };
-                    for (const auto& [name, expr] : plan->outs) {
-                        out.values[name] =
-                            clink::operators::evaluate_json_value_expr(expr, resolve);
-                    }
-                    // Phase 21a: privileged synthetic fields ride through
-                    // project_row even when they aren't in the declared
-                    // outputs. __row_kind carries changelog semantics
-                    // (insert / delete); dropping it here would silently
-                    // turn a retract stream into an append stream.
-                    copy_row_kind(r, out);
-                    return out;
-                },
-                "project_row");
+            return std::make_shared<clink::ColumnarRowProjectOperator>(std::move(outs),
+                                                                       "project_row");
         });
 }
 

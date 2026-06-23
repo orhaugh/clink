@@ -11,14 +11,53 @@
 #include <utility>
 #include <vector>
 
+#include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "clink/core/arrow_batcher.hpp"
 #include "clink/runtime/bounded_channel.hpp"
 #include "clink/runtime/subtask_emitter.hpp"
 
 using namespace clink;
 
 namespace {
+
+// A columnar Batch<int64> (Arrow sidecar set, rows lazily materialized) for the
+// columnar-partition test.
+Batch<std::int64_t> make_columnar_i64(const std::vector<std::int64_t>& vals) {
+    auto batcher = int64_arrow_batcher();
+    arrow::Int64Builder tb;
+    arrow::Int64Builder vb;
+    for (auto v : vals) {
+        (void)tb.AppendNull();
+        (void)vb.Append(v);
+    }
+    std::shared_ptr<arrow::Array> ta;
+    std::shared_ptr<arrow::Array> va;
+    (void)tb.Finish(&ta);
+    (void)vb.Finish(&va);
+    auto rb = arrow::RecordBatch::Make(
+        batcher.schema(), static_cast<std::int64_t>(vals.size()), {ta, va});
+    auto parse = batcher.parse;
+    Batch<std::int64_t>::MaterializeFn mat =
+        [parse](const arrow::RecordBatch& b) -> std::vector<Record<std::int64_t>> {
+        auto x = parse(b);
+        return x ? x->take_records() : std::vector<Record<std::int64_t>>{};
+    };
+    return Batch<std::int64_t>{std::move(rb), vals.size(), std::move(mat)};
+}
+
+std::vector<std::int64_t> collect_values(const std::vector<StreamElement<std::int64_t>>& elems) {
+    std::vector<std::int64_t> v;
+    for (const auto& e : elems) {
+        if (e.is_data()) {
+            for (const auto& r : e.as_data()) {
+                v.push_back(r.value());
+            }
+        }
+    }
+    return v;
+}
 
 template <typename T>
 std::vector<std::shared_ptr<BoundedChannel<StreamElement<T>>>> make_outputs(std::size_t n,
@@ -218,4 +257,35 @@ TEST(SubtaskEmitter, WorksWithPairPayload) {
     em.emit_barrier(CheckpointBarrier{CheckpointId{1}});
     em.close_all();
     SUCCEED();
+}
+
+TEST(SubtaskEmitter, ColumnarHashPartitionKeepsColumnarAndRoutesIdentically) {
+    const std::vector<std::int64_t> vals = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+    auto partitioner = [](const std::int64_t& v) { return static_cast<std::size_t>(v); };
+
+    // Columnar input -> per-subtask columnar sub-batches.
+    auto col_out = make_outputs<std::int64_t>(3);
+    SubtaskEmitter<std::int64_t> col_em(col_out, partitioner);
+    EXPECT_TRUE(col_em.emit_data(make_columnar_i64(vals)));
+
+    // Row input through the same partitioner is the routing reference.
+    auto row_out = make_outputs<std::int64_t>(3);
+    SubtaskEmitter<std::int64_t> row_em(row_out, partitioner);
+    Batch<std::int64_t> rb;
+    for (auto v : vals) {
+        rb.emplace(v);
+    }
+    EXPECT_TRUE(row_em.emit_data(std::move(rb)));
+
+    for (std::size_t t = 0; t < 3; ++t) {
+        auto col_elems = drain(*col_out[t]);
+        for (const auto& e : col_elems) {
+            if (e.is_data()) {
+                EXPECT_TRUE(e.as_data().is_columnar())
+                    << "shuffle sub-batch must stay columnar for subtask " << t;
+            }
+        }
+        EXPECT_EQ(collect_values(col_elems), collect_values(drain(*row_out[t])))
+            << "columnar routing must match row routing for subtask " << t;
+    }
 }

@@ -127,6 +127,9 @@ add_executable(clink_core_tests
     test_durable_file_write.cpp
     test_columnar_filter.cpp
     test_columnar_string_filter.cpp
+    test_columnar_sql_filter.cpp
+    test_columnar_sql_project.cpp
+    test_row_wire_batcher.cpp
     test_columnar_keyed_aggregate.cpp
     test_columnar_keyed_string_aggregate.cpp
     test_columnar_window_agg.cpp
