@@ -340,3 +340,162 @@ TEST(RemoteReadBackend, RestoreClearsStaleHotTierAcrossCheckpoints) {
     b.restore(s2);                                     // re-restore a different checkpoint
     EXPECT_EQ(to_string(*b.get(op, sv("k"))), "cp2");  // hot cleared -> serves cp2, not stale cp1
 }
+
+// --- async-persist split (capture/persist): the durable pool commit moves off
+// the operator thread, the way the snapshot worker drives a disaggregated
+// checkpoint. These prove the split is a consistent cut and that the off-thread
+// commit window never serves a stale value.
+
+// Only a pool-backed backend can defer its durable commit; loader-only has no
+// pool to write to, so it keeps the plain synchronous hot-tier snapshot.
+TEST(RemoteReadBackend, SupportsAsyncPersistOnlyWithPool) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    RemoteReadBackend pooled(pool);
+    EXPECT_TRUE(pooled.supports_async_persist());
+
+    RemoteReadBackend loader_only(
+        [](OperatorId, std::string) -> std::optional<StateBackend::Value> { return std::nullopt; });
+    EXPECT_FALSE(loader_only.supports_async_persist());
+}
+
+// Driving capture() then persist() explicitly (the worker path) commits exactly
+// the delta the fused snapshot() would, and a fresh backend restores it.
+TEST(RemoteReadBackend, ExplicitCaptureThenPersistCommitsDelta) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    const OperatorId op{31};
+    RemoteReadBackend b(pool);
+    b.put(op, sv("a"), sv("v1"));
+    b.put(op, sv("b"), sv("v2"));
+
+    auto handle = b.capture(CheckpointId{1});  // operator-thread phase
+    auto snap = b.persist(std::move(handle));  // worker-thread durable phase
+    EXPECT_EQ(snap.checkpoint_id.value(), 1u);
+
+    RemoteReadBackend b2(pool);
+    Snapshot s;
+    s.checkpoint_id = CheckpointId{1};
+    b2.restore(s);
+    EXPECT_EQ(to_string(*b2.get(op, sv("a"))), "v1");
+    EXPECT_EQ(to_string(*b2.get(op, sv("b"))), "v2");
+}
+
+// The split is a consistent cut: a write landing BETWEEN capture() and persist()
+// is NOT in the committed checkpoint, but IS retained for the next one. This is
+// also what closes the concurrent-writer delta-loss window (capture detaches the
+// delta under the lock; persist commits a private copy).
+TEST(RemoteReadBackend, AsyncPersistConsistentCutExcludesPostCaptureWrites) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    const OperatorId op{32};
+    RemoteReadBackend b(pool);
+    b.put(op, sv("a"), sv("v1"));
+    b.put(op, sv("b"), sv("v2"));
+    auto handle = b.capture(CheckpointId{1});  // detach cp1's delta
+
+    // Writes after the cut belong to cp2, never cp1.
+    b.put(op, sv("a"), sv("v1-post"));  // re-write a captured key
+    b.put(op, sv("c"), sv("v3"));       // brand-new key
+    b.persist(std::move(handle));       // durably commit cp1
+
+    // cp1 reflects capture-time state.
+    RemoteReadBackend r1(pool);
+    Snapshot s1;
+    s1.checkpoint_id = CheckpointId{1};
+    r1.restore(s1);
+    EXPECT_EQ(to_string(*r1.get(op, sv("a"))), "v1");  // not v1-post
+    EXPECT_EQ(to_string(*r1.get(op, sv("b"))), "v2");
+    EXPECT_FALSE(r1.get(op, sv("c")).has_value());  // c written after the cut
+
+    // The post-capture writes carry into cp2.
+    b.snapshot(CheckpointId{2});
+    RemoteReadBackend r2(pool);
+    Snapshot s2;
+    s2.checkpoint_id = CheckpointId{2};
+    r2.restore(s2);
+    EXPECT_EQ(to_string(*r2.get(op, sv("a"))), "v1-post");
+    EXPECT_EQ(to_string(*r2.get(op, sv("c"))), "v3");
+}
+
+// During the off-thread persist window, an erased key must keep reading ABSENT,
+// even though capture() cleared deleted_ - otherwise a read would cold-load the
+// stale pre-erase value the pool still holds at the previous checkpoint.
+TEST(RemoteReadBackend, DeletedKeyReadsAbsentDuringPersistWindow) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    const OperatorId op{33};
+    RemoteReadBackend b(pool);
+    b.put(op, sv("k"), sv("v"));
+    b.snapshot(CheckpointId{1});  // k durable in the pool
+    b.erase(op, sv("k"));         // erased since cp1
+
+    auto handle = b.capture(CheckpointId{2});      // moves k -> persisting_deleted_
+    EXPECT_FALSE(b.get(op, sv("k")).has_value());  // still absent mid-window
+    EXPECT_EQ(b.remote_loads(), 0u);               // and did NOT cold-load the stale value
+    b.persist(std::move(handle));                  // commit the delete
+    EXPECT_FALSE(b.get(op, sv("k")).has_value());  // gone for good
+}
+
+// A key captured (so no longer in dirty_) but not yet durably persisted is
+// pinned in the hot tier: eviction pressure must not drop it. If it were
+// evicted, a read would cold-load from the pool - which has nothing committed
+// for it yet - and the value would be silently lost.
+TEST(RemoteReadBackend, CapturedKeyPinnedHotUntilPersist) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    const OperatorId op{34};
+    RemoteReadBackend b(pool, /*io_threads=*/1, /*hot_max_bytes=*/8);  // ~2 entries
+    b.put(op, sv("k0"), sv("v0"));
+    auto handle = b.capture(CheckpointId{1});  // k0 captured, not yet durable
+
+    // Blow the byte budget. k0 is out of dirty_ now; only its persisting pin
+    // keeps it hot. (k1..k3 are dirty, hence also pinned, so eviction has only
+    // k0 to consider - and must skip it.)
+    b.put(op, sv("k1"), sv("v1"));
+    b.put(op, sv("k2"), sv("v2"));
+    b.put(op, sv("k3"), sv("v3"));
+
+    const auto loads_before = b.remote_loads();
+    auto v = b.get(op, sv("k0"));
+    ASSERT_TRUE(v.has_value()) << "captured-but-unpersisted key was evicted and lost";
+    EXPECT_EQ(to_string(*v), "v0");
+    EXPECT_EQ(b.remote_loads(), loads_before);  // served from hot, never cold-loaded
+    b.persist(std::move(handle));
+}
+
+// The headline of the split: the durable commit runs on a SEPARATE thread (the
+// snapshot worker) while the operator thread keeps processing. Proves no data
+// race (run under TSan), read-your-writes holds during the commit window, and
+// the two-counter chain restores cp1 (capture-time) and cp2 (post-capture)
+// correctly.
+TEST(RemoteReadBackend, ConcurrentOffThreadPersistWithLiveWrites) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    const OperatorId op{35};
+    RemoteReadBackend b(pool);
+    constexpr int kN = 200;
+    for (int i = 0; i < kN; ++i) {
+        const std::string k = "k" + std::to_string(i);
+        b.put(op, std::string_view{k}, sv("base"));
+    }
+    auto h = b.capture(CheckpointId{1});  // detach cp1 = all "base"
+
+    // Worker thread does the durable commit; operator thread keeps writing the
+    // next checkpoint's delta and reading its own writes - all concurrent.
+    std::thread worker([&] { b.persist(std::move(h)); });
+    for (int i = 0; i < kN; ++i) {
+        const std::string k = "k" + std::to_string(i);
+        b.put(op, std::string_view{k}, sv("next"));
+        auto v = b.get(op, std::string_view{k});
+        ASSERT_TRUE(v.has_value());
+        EXPECT_EQ(to_string(*v), "next");  // read-your-writes mid-persist
+    }
+    worker.join();
+
+    b.snapshot(CheckpointId{2});  // commit the post-capture delta
+    RemoteReadBackend r1(pool);
+    Snapshot s1;
+    s1.checkpoint_id = CheckpointId{1};
+    r1.restore(s1);
+    EXPECT_EQ(to_string(*r1.get(op, sv("k0"))), "base");  // cp1 = capture-time state
+    RemoteReadBackend r2(pool);
+    Snapshot s2;
+    s2.checkpoint_id = CheckpointId{2};
+    r2.restore(s2);
+    EXPECT_EQ(to_string(*r2.get(op, sv("k0"))), "next");  // cp2 = post-capture writes
+}

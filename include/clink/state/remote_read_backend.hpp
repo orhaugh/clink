@@ -47,6 +47,7 @@
 #include <deque>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -210,40 +211,115 @@ public:
         hot_.scan(op, visit);
     }
 
-    Snapshot snapshot(CheckpointId id) override {
+    // Synchronous snapshot = capture (point-in-time delta on the operator
+    // thread) + persist (durable pool commit). The async path drives the two
+    // halves separately so the slow S3 commit lands on the snapshot worker
+    // instead of the checkpoint-barrier / operator thread.
+    Snapshot snapshot(CheckpointId id) override { return persist(capture(id)); }
+
+    // Pool-backed remote state moves its durable commit off the operator thread;
+    // loader-only (no pool) keeps the plain synchronous hot-tier snapshot.
+    [[nodiscard]] bool supports_async_persist() const noexcept override { return pool_ != nullptr; }
+
+    // Operator-thread phase: take a point-in-time copy of the delta since the
+    // last checkpoint WITHOUT touching the pool. The captured (op,key) keys are
+    // pinned (persisting_*) until persist() durably commits them, so during the
+    // off-thread commit window a read still sees THIS checkpoint's effect (an
+    // updated value stays hot + non-evictable; a deleted key keeps reading
+    // absent) instead of cold-loading the stale pre-delta value from the pool.
+    // dirty_/deleted_ are cleared so the NEXT checkpoint captures only writes
+    // after this point - the consistent cut that also closes the concurrent-
+    // writer window (a put landing after capture() lands in the fresh dirty_,
+    // never in this already-detached delta).
+    //
+    // last_captured_ (the next delta's base) advances HERE, but last_ckpt_ (the
+    // checkpoint cold reads load from) advances only in persist(): until the
+    // commit lands, cold reads must still target the previously COMMITTED
+    // checkpoint, never this id (which the pool does not have yet). The base
+    // chain stays correct because the snapshot worker persists FIFO, so by the
+    // time persist(id) commits with base=<prev id>, persist(<prev id>) has run.
+    CaptureHandle capture(CheckpointId id) override {
         std::lock_guard<std::mutex> lk(sync_mu_);
         if (!pool_) {
-            return hot_.snapshot(id);  // loader-only: hot tier only
+            auto snap = hot_.snapshot(id);  // loader-only: detached hot blob
+            return CaptureHandle{.checkpoint_id = id, .bytes = std::move(snap.bytes)};
         }
-        // Commit only the delta since the last checkpoint; unchanged keys are
-        // inherited from the base inside the pool. State stays off the
-        // checkpoint-barrier path, so the framework Snapshot is just a marker.
-        std::vector<RemotePoolEntry> changed;
-        changed.reserve(dirty_.size());
-        for (const auto& [opv, key] : dirty_) {
-            const OperatorId op{opv};
-            if (auto v = hot_.get(op, std::string_view{key})) {
-                changed.push_back(RemotePoolEntry{op, key, std::move(*v)});
+        if (id.value() <= last_captured_) {
+            // This id was already captured (a second runner of an in-process
+            // shared backend hitting the same barrier). The first capture took
+            // the delta into pending_; do not re-capture an empty one and clobber
+            // it. The worker still persists the stored pending_[id] exactly once
+            // (a duplicate persist for the same id is a no-op).
+            return CaptureHandle{.checkpoint_id = id, .bytes = {}};
+        }
+        PendingCommit pc;
+        pc.base = CheckpointId{last_captured_};  // inherit from the prior captured ckpt
+        pc.changed.reserve(dirty_.size());
+        for (const auto& k : dirty_) {
+            const OperatorId op{k.first};
+            if (auto v = hot_.get(op, std::string_view{k.second})) {
+                pc.changed.push_back(RemotePoolEntry{op, k.second, std::move(*v)});
             }
+            ++persisting_dirty_[k];  // pin hot until durable
         }
-        std::vector<RemotePoolKey> deleted;
-        deleted.reserve(deleted_.size());
-        for (const auto& [opv, key] : deleted_) {
-            deleted.push_back(RemotePoolKey{OperatorId{opv}, key});
+        pc.deleted.reserve(deleted_.size());
+        for (const auto& k : deleted_) {
+            pc.deleted.push_back(RemotePoolKey{OperatorId{k.first}, k.second});
+            ++persisting_deleted_[k];  // keep serving 'absent' until durable
         }
-        const CheckpointId base{last_ckpt_.load(std::memory_order_relaxed)};
-        pool_->commit(id, base, changed, deleted);
-        last_ckpt_.store(id.value(), std::memory_order_relaxed);
+        last_captured_ = id.value();
         dirty_.clear();
         deleted_.clear();
-        // Everything is now durable at `id`, so the keys that were pinned hot
-        // as dirty are eligible for eviction - run the budget down to size and
-        // publish the resident footprint.
-        maybe_evict_();
-        metrics::disagg::hot_resident_bytes_set(static_cast<std::int64_t>(hot_bytes_));
-        Snapshot s;
-        s.checkpoint_id = id;  // the authoritative bytes are in the pool
-        return s;
+        pending_[id.value()] = std::move(pc);
+        return CaptureHandle{.checkpoint_id = id, .bytes = {}};
+    }
+
+    // Worker-thread phase: durably commit the captured delta to the pool OFF the
+    // operator thread, then release the persisting_* pins (the keys are now
+    // durable, hence eligible for eviction). Safe to run concurrently with live
+    // put/get/erase: pool_->commit touches only the detached PendingCommit (never
+    // live hot_/dirty_), and only the brief pin-release + evict re-takes the
+    // lock. A failed commit propagates: the runner fails the checkpoint, which
+    // triggers whole-job rollback + source replay (the existing no-loss model).
+    Snapshot persist(CaptureHandle handle) override {
+        if (!pool_) {
+            return Snapshot{.checkpoint_id = handle.checkpoint_id,
+                            .bytes = std::move(handle.bytes)};  // loader-only hot blob
+        }
+        PendingCommit pc;
+        {
+            std::lock_guard<std::mutex> lk(sync_mu_);
+            auto it = pending_.find(handle.checkpoint_id.value());
+            if (it == pending_.end()) {
+                // No captured delta (already persisted, or a same-id duplicate
+                // capture the first call already drained): the pool holds this id.
+                return Snapshot{.checkpoint_id = handle.checkpoint_id};
+            }
+            pc = std::move(it->second);
+            pending_.erase(it);
+        }
+        pool_->commit(handle.checkpoint_id, pc.base, pc.changed, pc.deleted);
+        {
+            std::lock_guard<std::mutex> lk(sync_mu_);
+            // The pool now holds this id, so cold reads may target it. Advance
+            // last_ckpt_ (the loader's checkpoint) BEFORE releasing the pins, so a
+            // just-unpinned delta key cold-reads from this committed id, never the
+            // prior one. Monotonic: a stale (out-of-order) persist never rewinds.
+            if (handle.checkpoint_id.value() > last_ckpt_.load(std::memory_order_relaxed)) {
+                last_ckpt_.store(handle.checkpoint_id.value(), std::memory_order_relaxed);
+            }
+            for (const auto& e : pc.changed) {
+                unpin_(persisting_dirty_, std::make_pair(e.op.value(), e.key));
+            }
+            for (const auto& d : pc.deleted) {
+                unpin_(persisting_deleted_, std::make_pair(d.op.value(), d.key));
+            }
+            // Now durable at `id`: the keys pinned during the commit are eligible
+            // for eviction - run the budget down and publish the footprint.
+            maybe_evict_();
+            metrics::disagg::hot_resident_bytes_set(static_cast<std::int64_t>(hot_bytes_));
+        }
+        return Snapshot{.checkpoint_id = handle.checkpoint_id};  // bytes are in the pool
     }
 
     void restore(const Snapshot& snap, const KeyGroupRange& kg_filter = {}) override {
@@ -269,8 +345,15 @@ public:
         index_.clear();
         hot_bytes_ = 0;
         last_ckpt_.store(snap.checkpoint_id.value(), std::memory_order_relaxed);
+        last_captured_ = snap.checkpoint_id.value();  // next delta inherits from here
         dirty_.clear();
         deleted_.clear();
+        // Drop any in-flight async-persist bookkeeping: a restore reseeds the
+        // delta baseline, so a partially-captured checkpoint from a prior run of
+        // this instance must not leak pins or a stale pending commit.
+        pending_.clear();
+        persisting_dirty_.clear();
+        persisting_deleted_.clear();
     }
 
     void purge_checkpoint(CheckpointId id) override {
@@ -537,8 +620,25 @@ private:
     // empty-set fast path avoids building a std::string on the common cold-read
     // (e.g. an append-only SUM workload never erases).
     bool is_deleted_(OperatorId op, std::string_view key) const {
-        return !deleted_.empty() &&
-               deleted_.count(std::make_pair(op.value(), std::string(key))) != 0;
+        if (deleted_.empty() && persisting_deleted_.empty()) {
+            return false;
+        }
+        const auto k = std::make_pair(op.value(), std::string(key));
+        // deleted_ = erased-since-last-checkpoint; persisting_deleted_ = erased in
+        // a checkpoint whose durable commit is still in flight off-thread. Either
+        // way the pool's pre-erase value must NOT be served.
+        return deleted_.count(k) != 0 || persisting_deleted_.count(k) != 0;
+    }
+
+    // Decrement a persisting_* pin's ref-count; erase the entry at zero. A key
+    // may be captured by several overlapping in-flight checkpoints, so it stays
+    // pinned until the last one durably commits.
+    static void unpin_(std::map<std::pair<std::uint64_t, std::string>, int>& pins,
+                       const std::pair<std::uint64_t, std::string>& k) {
+        auto it = pins.find(k);
+        if (it != pins.end() && --it->second <= 0) {
+            pins.erase(it);
+        }
     }
 
     static std::string compose_(OperatorId op, std::string_view key) {
@@ -597,8 +697,10 @@ private:
         for (auto it = lru_.end(); hot_bytes_ > hot_max_bytes_ && it != lru_.begin();) {
             --it;
             const std::pair<std::uint64_t, std::string> ck{it->op, it->key};
-            if (dirty_.count(ck) != 0 || deleted_.count(ck) != 0) {
-                continue;  // not yet durable in the pool: must stay hot
+            if (dirty_.count(ck) != 0 || deleted_.count(ck) != 0 ||
+                persisting_dirty_.count(ck) != 0 || persisting_deleted_.count(ck) != 0) {
+                continue;  // not yet durable in the pool (delta or in-flight
+                           // persist): must stay hot
             }
             hot_.erase(OperatorId{it->op}, std::string_view{it->key});
             hot_bytes_ -= it->bytes;
@@ -659,9 +761,31 @@ private:
     // by put/erase (any runner of a fused subtask) and read+cleared by snapshot
     // (the owner runner), so all access is guarded by sync_mu_.
     std::shared_ptr<RemotePool> pool_;
+    // last_ckpt_ = last DURABLY-committed checkpoint (the loader cold-reads from
+    // it); advanced in persist(), read lock-free by the IO-thread loader.
+    // last_captured_ = last checkpoint capture() detached (the next delta's
+    // base); advanced in capture(), only ever touched under sync_mu_. They differ
+    // exactly during an in-flight async persist (capture done, commit pending).
     mutable std::atomic<std::uint64_t> last_ckpt_{0};
+    std::uint64_t last_captured_{0};
     std::set<std::pair<std::uint64_t, std::string>> dirty_;
     std::set<std::pair<std::uint64_t, std::string>> deleted_;
+
+    // Async-persist split (capture/persist). capture() detaches a checkpoint's
+    // delta into pending_ (keyed by checkpoint id) and pins its keys in
+    // persisting_* (ref-counted, so a key captured by several overlapping
+    // in-flight checkpoints stays pinned until the last commits); persist()
+    // commits the delta to the pool off-thread, then drops the pins. All guarded
+    // by sync_mu_ except the pool_->commit itself (it touches only the detached
+    // PendingCommit, so it runs lock-free off the operator thread).
+    struct PendingCommit {
+        CheckpointId base{};
+        std::vector<RemotePoolEntry> changed;
+        std::vector<RemotePoolKey> deleted;
+    };
+    std::map<std::uint64_t, PendingCommit> pending_;
+    std::map<std::pair<std::uint64_t, std::string>, int> persisting_dirty_;
+    std::map<std::pair<std::uint64_t, std::string>, int> persisting_deleted_;
 
     // Bounded hot tier (eviction). hot_max_bytes_ == 0 => unbounded (no
     // eviction, no bookkeeping). lru_ front = most-recently-used; index_ maps
