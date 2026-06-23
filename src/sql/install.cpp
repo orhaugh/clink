@@ -1928,6 +1928,43 @@ public:
             out.emit_data(std::move(batch));
     }
 
+    // Auto-on the async/disaggregated KeyedState path for INNER joins whenever
+    // the bound backend can genuinely defer reads (supports_async_get()), so a
+    // join over a disaggregated backend overlaps the opposite-side cold read for
+    // one key with progress on others - no manual flag, identical output. INNER
+    // only: the outer variants RETRACT a matched row's null padding by mutating
+    // the OTHER side's entries, a read-modify-write of both sides that the simple
+    // per-key read model does not cover yet (they keep the synchronous path).
+    void open() override {
+        effective_async_ = kind_ == EquiJoinKind::Inner && this->runtime() != nullptr &&
+                           this->runtime()->has_state_backend() &&
+                           this->runtime()->state_backend()->supports_async_get();
+    }
+
+    [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
+
+    // Each record issues one get_async for its join key (the opposite side's
+    // entry list), so a batch of records over many distinct keys collapses into
+    // one get_many_async on a disaggregated backend.
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
+
+    void process_async1(const StreamElement<Row>& element,
+                        Emitter<Row>& out,
+                        AsyncExecutionController& aec) override {
+        if (!element.is_data())
+            return;
+        for (const auto& rec : element.as_data())
+            handle_async_(rec.value(), /*is_left=*/true, out, aec);
+    }
+    void process_async2(const StreamElement<Row>& element,
+                        Emitter<Row>& out,
+                        AsyncExecutionController& aec) override {
+        if (!element.is_data())
+            return;
+        for (const auto& rec : element.as_data())
+            handle_async_(rec.value(), /*is_left=*/false, out, aec);
+    }
+
     std::string name() const override { return "equi_join_row"; }
 
 private:
@@ -2030,6 +2067,54 @@ private:
         }
     }
 
+    // Async INNER path: one record reads the opposite side's entry list by join
+    // key (async), appends itself to its own side, and emits one joined row per
+    // match. Submitted to the controller under gate-key=join-key, so same-key
+    // records from EITHER input serialise (the co-op shares one per-key gate) and
+    // observe each other's writes - the cross-product stays correct.
+    void handle_async_(Row row, bool is_left, Emitter<Row>& out, AsyncExecutionController& aec) {
+        const std::string& key_col = is_left ? left_key_column_ : right_key_column_;
+        auto key_opt = key_of_(row, key_col);
+        if (!key_opt) {
+            return;  // NULL join key never matches (INNER): drop, do not store
+        }
+        std::string key = std::move(*key_opt);
+        auto self = is_left ? kv_left_() : kv_right_();
+        auto other = is_left ? kv_right_() : kv_left_();
+        auto factory = [this, self, other, row = std::move(row), key, is_left, &out]() mutable
+            -> async::Task<void> {
+            // Append this row to its own side so future opposite-side rows match.
+            auto self_cur = co_await self.get_async(key);
+            std::vector<Row> self_rows =
+                self_cur.has_value() ? std::move(*self_cur) : std::vector<Row>{};
+            self_rows.push_back(row);
+            self.put(key, self_rows);
+            // Probe the opposite side; emit one joined row per match (INNER, so
+            // no __row_kind tag, matching emit_pair_'s Inner branch).
+            auto other_cur = co_await other.get_async(key);
+            if (other_cur.has_value() && !other_cur->empty()) {
+                Batch<Row> batch;
+                for (const auto& o : *other_cur) {
+                    batch.push(Record<Row>{is_left ? build_(&row, &o) : build_(&o, &row)});
+                }
+                out.emit_data(std::move(batch));
+            }
+            co_return;
+        };
+        while (!aec.submit(key, factory)) {
+            aec.poll();  // backpressure: drain completions then retry
+        }
+    }
+
+    KeyedState<std::string, std::vector<Row>> kv_left_() {
+        return this->runtime()->template keyed_state<std::string, std::vector<Row>>(
+            "ejL", clink::string_codec(), row_list_json_codec());
+    }
+    KeyedState<std::string, std::vector<Row>> kv_right_() {
+        return this->runtime()->template keyed_state<std::string, std::vector<Row>>(
+            "ejR", clink::string_codec(), row_list_json_codec());
+    }
+
     std::string left_key_column_;
     std::string right_key_column_;
     std::string left_alias_;
@@ -2037,6 +2122,9 @@ private:
     EquiJoinKind kind_;
     std::vector<std::string> left_columns_;
     std::vector<std::string> right_columns_;
+    // Finalised in open(): INNER + a deferring backend -> the async KeyedState
+    // path (process_async{1,2}); otherwise the sync in-memory path below.
+    bool effective_async_ = false;
     std::unordered_map<std::string, std::vector<Entry>> left_state_;
     std::unordered_map<std::string, std::vector<Entry>> right_state_;
 };

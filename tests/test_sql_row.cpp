@@ -21,6 +21,37 @@ TEST(SqlRow, JsonCodecRoundTripsScalars) {
     EXPECT_EQ(decoded->get_string("active"), std::optional<std::string>{"true"});
 }
 
+// The row-list codec backing the async/disaggregated INNER join: a per-key entry
+// list must round-trip through the remote pool (encode -> bytes -> decode) with
+// every row's fields intact, order preserved. A bug here silently corrupts joins.
+TEST(SqlRow, RowListJsonCodecRoundTrips) {
+    auto mk = [](std::int64_t id, std::int64_t v, const std::string& s) {
+        Row r;
+        r.values["id"] = clink::config::JsonValue{id};
+        r.values["v"] = clink::config::JsonValue{v};
+        r.values["s"] = clink::config::JsonValue{s};
+        return r;
+    };
+    std::vector<Row> rows = {mk(1, 10, "a"), mk(1, 11, "b"), mk(1, 12, "c")};
+
+    auto codec = row_list_json_codec();
+    auto bytes = codec.encode(rows);
+    auto decoded = codec.decode({bytes.data(), bytes.size()});
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_EQ(decoded->size(), rows.size());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        EXPECT_EQ((*decoded)[i].get_string("id"), rows[i].get_string("id")) << "row " << i;
+        EXPECT_EQ((*decoded)[i].get_string("v"), rows[i].get_string("v")) << "row " << i;
+        EXPECT_EQ((*decoded)[i].get_string("s"), rows[i].get_string("s")) << "row " << i;
+    }
+
+    // Empty list round-trips to an empty list (not nullopt).
+    auto empty_bytes = codec.encode({});
+    auto empty = codec.decode({empty_bytes.data(), empty_bytes.size()});
+    ASSERT_TRUE(empty.has_value());
+    EXPECT_TRUE(empty->empty());
+}
+
 TEST(SqlRow, GetStringStringifiesNumbersAndBools) {
     Row r;
     r.values["i"] = clink::config::JsonValue{static_cast<std::int64_t>(100)};

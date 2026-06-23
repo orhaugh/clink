@@ -354,6 +354,72 @@ TEST(SqlRuntime, GroupByAutoActivatesAsyncOnDeferringBackend) {
         << "auto-on did not route GROUP BY state through the deferring backend";
 }
 
+// Increment 5: a SQL stream-stream INNER join run over a deferring backend
+// (disagg-local://) auto-rides EquiJoinRowOp's async/disaggregated KeyedState
+// path (process_async{1,2} + the per-key row-list codec through the remote pool)
+// and produces the correct join, end-to-end. The codec itself is round-trip
+// tested in test_sql_row.cpp; this proves the join executes correctly when its
+// per-side state lives in the disaggregated pool. (Proving the async path was
+// taken vs a sync fallback needs a backend-level signal not reachable through
+// the cluster; the auto-on mechanism is the same one AsyncStateGroupByMatches
+// InMemory proves takes the async path.)
+TEST(SqlRuntime, AsyncStateInnerJoinOverDisaggProducesCorrectOutput) {
+    ensure_sql_installed_once();
+    const auto l_path = std::filesystem::temp_directory_path() / "clink_sql_join_left.ndjson";
+    const auto r_path = std::filesystem::temp_directory_path() / "clink_sql_join_right.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_join_out.ndjson";
+    std::filesystem::remove(l_path);
+    std::filesystem::remove(r_path);
+    std::filesystem::remove(out_path);
+    write_lines(l_path, {R"({"id":1,"lv":10})", R"({"id":2,"lv":20})", R"({"id":1,"lv":11})"});
+    write_lines(r_path, {R"({"id":1,"rv":100})", R"({"id":1,"rv":101})", R"({"id":3,"rv":300})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE lt (id BIGINT, lv BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     l_path.string() +
+                     "');"
+                     "CREATE TABLE rt (id BIGINT, rv BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     r_path.string() +
+                     "');"
+                     "CREATE TABLE jout (lv BIGINT, rv BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    for (int i = 0; i < 3; ++i) {
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[i]));
+    }
+    auto spec = compile(
+        cat, "INSERT INTO jout SELECT l_lv AS lv, r_rv AS rv FROM lt l JOIN rt r ON l.id = r.id");
+
+    InProcessCluster cluster("tm-sql-join-disagg", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    // A deferring backend: EquiJoinRowOp::open() auto-enables the async KeyedState
+    // path, so each side's per-key entry list lives in the disaggregated pool.
+    opts.checkpoint.state_backend_uri = "disagg-local://";
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    std::vector<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        ASSERT_TRUE(js.is_object());
+        got.emplace_back(static_cast<std::int64_t>(js.at("lv").as_number()),
+                         static_cast<std::int64_t>(js.at("rv").as_number()));
+    }
+    std::sort(got.begin(), got.end());
+    // id=1 matches: lv in {10,11} x rv in {100,101}; id=2 (left) / id=3 (right) unmatched.
+    const std::vector<std::pair<std::int64_t, std::int64_t>> want = {
+        {10, 100}, {10, 101}, {11, 100}, {11, 101}};
+    EXPECT_EQ(got, want);
+    std::filesystem::remove(l_path);
+    std::filesystem::remove(r_path);
+    std::filesystem::remove(out_path);
+}
+
 // #59: the same unbounded GROUP BY built through the programmatic Table API
 // instead of a SQL string. Proves the Table-API-built JobGraphSpec actually
 // executes end-to-end (the byte-identical-IR test in test_table_api.cpp proves

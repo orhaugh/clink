@@ -99,6 +99,53 @@ inline clink::Codec<Row> row_json_codec() {
     };
 }
 
+// JSON-encoded Codec for a LIST of Rows (a JSON array of the row objects).
+// Backs the async/disaggregated KeyedState path of the stream-stream INNER join,
+// where each join key's entry list (the rows seen on one side) round-trips
+// through the remote pool. Shares Codec<Row>'s per-row JSON shape.
+inline clink::Codec<std::vector<Row>> row_list_json_codec() {
+    using Bytes = clink::Codec<std::vector<Row>>::Bytes;
+    using BytesView = clink::Codec<std::vector<Row>>::BytesView;
+    return clink::Codec<std::vector<Row>>{
+        .encode = [](const std::vector<Row>& rows) -> Bytes {
+            clink::config::JsonArray arr;
+            arr.reserve(rows.size());
+            for (const auto& r : rows) {
+                arr.emplace_back(clink::config::JsonObject{r.values});
+            }
+            const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
+            Bytes out(s.size());
+            if (!s.empty()) {
+                std::memcpy(out.data(), s.data(), s.size());
+            }
+            return out;
+        },
+        .decode = [](BytesView b) -> std::optional<std::vector<Row>> {
+            std::string text(reinterpret_cast<const char*>(b.data()), b.size());
+            try {
+                auto j = clink::config::parse(text);
+                if (!j.is_array()) {
+                    return std::nullopt;
+                }
+                std::vector<Row> rows;
+                rows.reserve(j.as_array().size());
+                for (const auto& e : j.as_array()) {
+                    if (!e.is_object()) {
+                        return std::nullopt;
+                    }
+                    Row r;
+                    r.values = e.as_object();
+                    rows.push_back(std::move(r));
+                }
+                return rows;
+            } catch (...) {
+                return std::nullopt;
+            }
+        },
+        .encode_into = {},
+    };
+}
+
 // Channel-type identifier under which Row is registered with the
 // TypeRegistry. SQL multi-column tables flow through this channel.
 inline constexpr std::string_view kChannelRow = "row";
