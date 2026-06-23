@@ -11,6 +11,7 @@
 #include "clink/sql/binder.hpp"
 #include "clink/sql/cardinality.hpp"
 #include "clink/sql/catalog.hpp"
+#include "clink/sql/optimizer.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/statistics.hpp"
 
@@ -108,6 +109,59 @@ TEST(SqlCardinality, ThreeWayJoinProducesFiniteEstimate) {
     const double r = rows_of(cat, "SELECT a_av FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k");
     EXPECT_GT(r, 0.0);
     EXPECT_NEAR(r, 100.0, 1.0);
+}
+
+// ----- cost-based join reordering -----
+
+// The driving (bottom-left) base table of the join tree: descend through
+// wrapper nodes to the join, then down its left spine to the first scan.
+std::string driving_table(const LogicalPlan& root) {
+    const LogicalPlan* p = &root;
+    while (p != nullptr) {
+        const auto k = p->kind();
+        if (k == "EquiJoin") {
+            p = &static_cast<const LogicalEquiJoin&>(*p).left();
+            continue;
+        }
+        if (k == "Scan") {
+            return static_cast<const LogicalScan&>(*p).table().name;
+        }
+        auto ins = p->inputs();
+        if (ins.empty() || ins[0] == nullptr) {
+            return "";
+        }
+        p = ins[0];  // descend Project/Filter/etc to find the join
+    }
+    return "";
+}
+
+TEST(SqlCardinality, ReordersThreeWayJoinSmallestDrives) {
+    Catalog cat;
+    reg(cat, "big", "(k BIGINT, bv BIGINT)", "row_count='1000000', ndv_k='1000000'");
+    reg(cat, "mid", "(k BIGINT, mv BIGINT)", "row_count='1000', ndv_k='1000'");
+    reg(cat, "small", "(k BIGINT, sv BIGINT)", "row_count='10', ndv_k='10'");
+    Binder b(cat);
+    // Syntactic order drives with `big`; cost-based reorder should drive with
+    // `small` (start from the smallest relation).
+    auto plan = b.bind_select(as_select(
+        parse("SELECT big_bv FROM big JOIN mid ON big.k = mid.k JOIN small ON mid.k = small.k")));
+    EXPECT_EQ(driving_table(*plan), "big");  // pre-optimization (syntactic)
+    auto opt = optimize(std::move(plan));
+    EXPECT_EQ(driving_table(*opt), "small")
+        << "cost-based reorder should put the smallest relation at the bottom-left";
+}
+
+TEST(SqlCardinality, NoReorderWithoutStats) {
+    Catalog cat;
+    reg(cat, "big", "(k BIGINT, bv BIGINT)", "");
+    reg(cat, "mid", "(k BIGINT, mv BIGINT)", "");
+    reg(cat, "small", "(k BIGINT, sv BIGINT)", "");
+    Binder b(cat);
+    auto opt = optimize(b.bind_select(as_select(
+        parse("SELECT big_bv FROM big JOIN mid ON big.k = mid.k JOIN small ON mid.k = small.k"))));
+    // No declared stats -> every relation looks identical -> cost guard leaves
+    // the syntactic order (big drives) untouched.
+    EXPECT_EQ(driving_table(*opt), "big");
 }
 
 }  // namespace

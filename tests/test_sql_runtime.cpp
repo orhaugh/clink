@@ -6015,16 +6015,27 @@ TEST(SqlRuntime, ThreeWayInnerJoinEndToEnd) {
     write_lines(c_path, {R"({"id":1,"cv":1000})", R"({"id":2,"cv":2000})"});
 
     Catalog cat;
-    auto mk = [](const std::string& name, const std::string& cols, const std::string& path) {
+    auto mk = [](const std::string& name,
+                 const std::string& cols,
+                 const std::string& path,
+                 const std::string& stats) {
         return "CREATE TABLE " + name + " " + cols +
-               " WITH (connector='file', format='json', path='" + path + "');";
+               " WITH (connector='file', format='json', path='" + path + "', " + stats + ");";
     };
-    auto ddl = parse(mk("a", "(id BIGINT, av BIGINT)", a_path.string()) +
-                     mk("b", "(id BIGINT, bv BIGINT)", b_path.string()) +
-                     mk("c", "(id BIGINT, cv BIGINT)", c_path.string()) +
-                     "CREATE TABLE out_t (av BIGINT, bv BIGINT, cv BIGINT) "
-                     "WITH (connector='file', format='json', path='" +
-                     out_path.string() + "')");
+    // Skewed declared stats so cost-based reordering DOES fire (drive with the
+    // smallest, c): syntactic order is a,b,c. The actual data is tiny and the
+    // reorder must still produce identical results - this is the equivalence
+    // proof for the reordered nested-join tree.
+    auto ddl = parse(
+        mk("a",
+           "(id BIGINT, av BIGINT)",
+           a_path.string(),
+           "row_count='1000000', ndv_id='1000000'") +
+        mk("b", "(id BIGINT, bv BIGINT)", b_path.string(), "row_count='1000', ndv_id='1000'") +
+        mk("c", "(id BIGINT, cv BIGINT)", c_path.string(), "row_count='10', ndv_id='10'") +
+        "CREATE TABLE out_t (av BIGINT, bv BIGINT, cv BIGINT) "
+        "WITH (connector='file', format='json', path='" +
+        out_path.string() + "')");
     for (int i = 0; i < 4; ++i)
         cat.register_table(
             std::get<ast::CreateTableStmt>(ddl.statements[static_cast<std::size_t>(i)]));

@@ -7,6 +7,7 @@
 
 #include "clink/config/json.hpp"
 #include "clink/metrics/sql_metrics.hpp"
+#include "clink/sql/join_reorder.hpp"
 #include "clink/sql/logical_plan.hpp"
 
 namespace clink::sql {
@@ -507,8 +508,11 @@ std::unique_ptr<LogicalPlan> optimize(std::unique_ptr<LogicalPlan> plan) {
         return plan;
     const auto t0 = std::chrono::steady_clock::now();
     // Predicate pushdown first (it wraps INNER-equi-join scan children in
-    // Filters), then projection pushdown over the result.
+    // Filters, which the reorderer's per-relation cardinality then reflects),
+    // then cost-based join reordering, then projection pushdown over the
+    // resulting tree.
     push_predicates(*plan);
+    reorder_joins(plan);
     std::set<std::string> cumulative;
     apply_projection_pushdown(*plan, cumulative);
     const auto dt =

@@ -80,6 +80,7 @@ public:
     LogicalFilter(std::unique_ptr<LogicalPlan> input, std::string predicate_json);
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] const std::string& predicate_json() const noexcept { return predicate_json_; }
     // Replace the predicate, used by the optimizer's predicate pushdown to leave
     // the residual conjuncts (an empty `and` is the vacuously-true pass-through).
@@ -113,6 +114,7 @@ public:
                     const TableDef* output_table);
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] const std::string& function_name() const noexcept { return function_name_; }
 
     [[nodiscard]] std::string kind() const override { return "AsyncMap"; }
@@ -141,6 +143,7 @@ public:
     LogicalProject(std::unique_ptr<LogicalPlan> input, std::vector<ProjectOutput> outputs);
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] const std::vector<ProjectOutput>& outputs() const noexcept { return outputs_; }
 
     [[nodiscard]] std::string kind() const override { return "Project"; }
@@ -201,6 +204,7 @@ public:
                      std::vector<std::string> key_output_names = {});
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] const std::vector<std::string>& group_keys() const noexcept {
         return group_keys_;
     }
@@ -236,6 +240,7 @@ public:
                            std::vector<std::string> key_output_names = {});
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] const WindowSpec& window() const noexcept { return window_; }
     [[nodiscard]] const std::vector<std::string>& group_keys() const noexcept {
         return group_keys_;
@@ -302,6 +307,7 @@ public:
           schema_(std::move(schema)) {}
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] const std::vector<std::string>& partition_columns() const noexcept {
         return partition_columns_;
     }
@@ -340,6 +346,7 @@ public:
           schema_(std::move(schema)) {}
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] const std::vector<std::string>& partition_columns() const noexcept {
         return partition_columns_;
     }
@@ -452,6 +459,7 @@ public:
                       RankKind rank_kind = RankKind::RowNumber);
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] const std::vector<std::string>& partition_columns() const noexcept {
         return partition_columns_;
     }
@@ -499,6 +507,7 @@ public:
                      RankKind rank_kind = RankKind::RowNumber);
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] const std::vector<std::string>& partition_columns() const noexcept {
         return partition_columns_;
     }
@@ -647,6 +656,7 @@ public:
     explicit LogicalDistinct(std::unique_ptr<LogicalPlan> input);
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
 
     [[nodiscard]] std::string kind() const override { return "Distinct"; }
     [[nodiscard]] std::shared_ptr<arrow::Schema> schema() const override {
@@ -728,6 +738,7 @@ public:
                 std::int64_t offset = 0);
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] const std::vector<std::string>& sort_columns() const noexcept {
         return sort_columns_;
     }
@@ -760,6 +771,7 @@ public:
     LogicalLimit(std::unique_ptr<LogicalPlan> input, std::int64_t count, std::int64_t offset = 0);
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] std::int64_t count() const noexcept { return count_; }
     [[nodiscard]] std::int64_t offset() const noexcept { return offset_; }
 
@@ -805,6 +817,7 @@ public:
                          std::shared_ptr<arrow::Schema> schema);
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] const std::vector<std::string>& partition_columns() const noexcept {
         return partition_columns_;
     }
@@ -943,6 +956,7 @@ public:
     LogicalSink(std::unique_ptr<LogicalPlan> input, const TableDef* table);
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
     [[nodiscard]] const TableDef& table() const noexcept { return *table_; }
 
     [[nodiscard]] std::string kind() const override { return "Sink"; }
