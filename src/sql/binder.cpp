@@ -1658,6 +1658,123 @@ std::unique_ptr<LogicalPlan> Binder::make_table_plan(const std::string& table_na
     return std::make_unique<LogicalScan>(&resolved);
 }
 
+// Recursively bind a (possibly nested) FROM item into a BoundRel: a base table,
+// or a nested INNER equi-join of two sub-relations. Builds a left-deep tree of
+// binary LogicalEquiJoins. A base-table side contributes its raw scan columns
+// and is prefixed by its alias at the parent join (left_alias/right_alias); a
+// sub-join side contributes already-flat "<alias>_<col>" names and is passed
+// through unprefixed (empty alias) so they are not double-prefixed. Each join's
+// keys are resolved to the column name in the corresponding child's OUTPUT
+// stream. The 2-base-table top-level join (incl. interval / lookup / outer)
+// stays on the inline path in bind_select; this powers the nested case.
+Binder::BoundRel Binder::bind_join_rel(const ast::FromItem& item) const {
+    if (std::holds_alternative<ast::TableRef>(item)) {
+        const auto& ref = std::get<ast::TableRef>(item);
+        const auto& def = resolve_table(catalog_, ref, cte_synth_tables_);
+        if (def.is_lookup()) {
+            bind_error("lookup table '" + def.name +
+                           "' is not supported inside a multi-way join (v1); use it as the right "
+                           "side of a single JOIN",
+                       ref.loc.pos);
+        }
+        BoundRel r;
+        r.plan = make_table_plan(ref.name, def, ref.loc.pos);
+        r.is_base = true;
+        r.alias = ref.alias.value_or(def.name);
+        r.aliases.insert(r.alias);
+        for (const auto& c : def.columns) {
+            r.columns.push_back(c);  // a scan's output stream is the raw columns
+            r.qual_to_stream[r.alias + "." + c.name] = c.name;
+        }
+        return r;
+    }
+    if (std::holds_alternative<std::unique_ptr<ast::JoinClause>>(item)) {
+        const auto& jc = *std::get<std::unique_ptr<ast::JoinClause>>(item);
+        if (jc.kind != ast::JoinKind::Inner) {
+            bind_error("multi-way joins support INNER joins only (v1)", jc.loc.pos);
+        }
+        if (!jc.on_clause.has_value()) {
+            bind_error("JOIN requires an ON clause", jc.loc.pos);
+        }
+        BoundRel left = bind_join_rel(jc.left);
+        BoundRel right = bind_join_rel(jc.right);
+
+        // ON must be a single equality between one column from each joined side.
+        const auto& on = *jc.on_clause;
+        const ast::BinaryOp* bin = nullptr;
+        if (std::holds_alternative<std::unique_ptr<ast::BinaryOp>>(on)) {
+            bin = std::get<std::unique_ptr<ast::BinaryOp>>(on).get();
+        }
+        if (bin == nullptr || bin->op != ast::BinOp::Eq ||
+            !std::holds_alternative<ast::ColumnRef>(bin->left) ||
+            !std::holds_alternative<ast::ColumnRef>(bin->right)) {
+            bind_error("multi-way JOIN ON must be 'left.col = right.col' (v1)", jc.loc.pos);
+        }
+        const std::pair<std::string, std::string> a = qualified_column(bin->left);
+        const std::pair<std::string, std::string> b = qualified_column(bin->right);
+
+        const auto* lref = &a;
+        const auto* rref = &b;
+        const bool ab = left.aliases.count(a.first) != 0 && right.aliases.count(b.first) != 0;
+        const bool ba = left.aliases.count(b.first) != 0 && right.aliases.count(a.first) != 0;
+        if (ab) {
+            lref = &a;
+            rref = &b;
+        } else if (ba) {
+            lref = &b;
+            rref = &a;
+        } else {
+            bind_error(
+                "multi-way JOIN ON must equate one qualified column from each joined side "
+                "(e.g. a.k = b.k)",
+                jc.loc.pos);
+        }
+
+        auto lit = left.qual_to_stream.find(lref->first + "." + lref->second);
+        auto rit = right.qual_to_stream.find(rref->first + "." + rref->second);
+        if (lit == left.qual_to_stream.end() || rit == right.qual_to_stream.end()) {
+            bind_error("multi-way JOIN ON references a column not in scope", jc.loc.pos);
+        }
+        const std::string left_key = lit->second;
+        const std::string right_key = rit->second;
+
+        BoundRel out;
+        out.is_base = false;
+        out.aliases = left.aliases;
+        out.aliases.insert(right.aliases.begin(), right.aliases.end());
+        auto add_side = [&out](const BoundRel& side) {
+            for (const auto& c : side.columns) {
+                out.columns.push_back(side.is_base ? ColumnSpec{side.alias + "_" + c.name, c.type}
+                                                   : c);
+            }
+            for (const auto& [q, s] : side.qual_to_stream) {
+                out.qual_to_stream[q] = side.is_base ? (side.alias + "_" + s) : s;
+            }
+        };
+        add_side(left);
+        add_side(right);
+
+        arrow::FieldVector fields;
+        fields.reserve(out.columns.size());
+        for (const auto& c : out.columns) {
+            fields.push_back(arrow::field(c.name, c.type));
+        }
+        const std::string left_alias_param = left.is_base ? left.alias : std::string{};
+        const std::string right_alias_param = right.is_base ? right.alias : std::string{};
+        out.plan = std::make_unique<LogicalEquiJoin>(std::move(left.plan),
+                                                     std::move(right.plan),
+                                                     left_alias_param,
+                                                     right_alias_param,
+                                                     left_key,
+                                                     right_key,
+                                                     arrow::schema(std::move(fields)),
+                                                     JoinType::Inner);
+        return out;
+    }
+    bind_error("only base tables and nested INNER joins are supported inside a multi-way join (v1)",
+               0);
+}
+
 namespace {
 
 bool is_pattern_var(const std::vector<std::string>& vars, const std::string& name) {
@@ -2666,161 +2783,184 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
                 jt = JoinType::FullOuter;
                 break;
         }
-        if (!std::holds_alternative<ast::TableRef>(jc.left) ||
-            !std::holds_alternative<ast::TableRef>(jc.right)) {
-            bind_error("Phase 5.1 joins must reference base tables (no nested joins)", jc.loc.pos);
-        }
-        const auto& left_ref = std::get<ast::TableRef>(jc.left);
-        const auto& right_ref = std::get<ast::TableRef>(jc.right);
-        const auto& left_def = resolve_table(catalog_, left_ref, cte_synth_tables_);
-        const auto& right_def = resolve_table(catalog_, right_ref, cte_synth_tables_);
-        std::string left_alias = left_ref.alias.value_or(left_def.name);
-        std::string right_alias = right_ref.alias.value_or(right_def.name);
-        if (!jc.on_clause.has_value()) {
-            bind_error("JOIN requires an ON clause", jc.loc.pos);
-        }
-        // Phase 18: try the equi-join shape first (simpler, narrower).
-        // Falls through to the interval-join recognizer when the ON
-        // clause is the eq + BETWEEN AND-pair.
-        auto equi_shape = match_equi_join(*jc.on_clause, left_alias, right_alias);
-        auto interval_shape = match_interval_join(*jc.on_clause, left_alias, right_alias);
-        if (!equi_shape && !interval_shape) {
-            bind_error(
-                "JOIN ON must be either 'a.k = b.k' or "
-                "'a.k = b.k AND a.ts BETWEEN b.ts + low AND b.ts + high'",
-                jc.loc.pos);
-        }
-
-        // Output schema: every left column qualified by left_alias,
-        // then every right column qualified by right_alias. Aliases
-        // appear in the column names as "<alias>_<col>" so the sink
-        // can be a single flat schema without manual SELECT.
-        arrow::FieldVector fields;
-        for (const auto& c : left_def.columns) {
-            fields.push_back(arrow::field(left_alias + "_" + c.name, c.type));
-        }
-        for (const auto& c : right_def.columns) {
-            fields.push_back(arrow::field(right_alias + "_" + c.name, c.type));
-        }
-        // The join lowers to one of three plan nodes below; rather than return
-        // it directly (which silently bypassed WHERE / projection / GROUP BY -
-        // only `SELECT * FROM a JOIN b` worked), it is registered as a synthetic
-        // derived table so the outer SELECT applies over the join output, just
-        // like the MATCH_RECOGNIZE / PTF / subquery paths. Join output columns
-        // are the flat "<alias>_<col>" names; reference them by that flat name
-        // in the outer SELECT / WHERE (qualified `alias.col` is a follow-on, and
-        // is not supported by the derived-table wrapper today either).
-        std::unique_ptr<LogicalPlan> join_plan;
-        // Lookup (enrichment) join: one side is a connector='lookup'
-        // table. Lower to LogicalLookupJoin - the probe stream enriched
-        // per row against the dim's registered async function - rather
-        // than a stream-stream join. v1: lookup table on the right,
-        // INNER or LEFT only (RIGHT/FULL would require enumerating the
-        // dim, which a keyed lookup source cannot do).
-        if (left_def.is_lookup() || right_def.is_lookup()) {
-            if (left_def.is_lookup() && right_def.is_lookup()) {
-                bind_error("a lookup join needs exactly one lookup table, not two", jc.loc.pos);
+        const bool both_base = std::holds_alternative<ast::TableRef>(jc.left) &&
+                               std::holds_alternative<ast::TableRef>(jc.right);
+        if (!both_base) {
+            // Nested multi-way join: build a left-deep INNER equi-join tree and
+            // register its root as the synthetic __join derived table (mirroring
+            // the 2-base path below), then fall through to the shared projection
+            // / WHERE / GROUP BY path.
+            BoundRel root = bind_join_rel(stmt.from_items[0]);
+            const std::string join_alias = "__join";
+            if (cte_synth_tables_.count(join_alias) != 0) {
+                bind_error("reserved join alias '__join' collides with an in-scope name",
+                           jc.loc.pos);
             }
-            if (left_def.is_lookup()) {
+            TableDef synth;
+            synth.name = join_alias;
+            synth.columns = std::move(root.columns);
+            cte_synth_tables_.emplace(join_alias, std::move(synth));
+            cte_plans_.emplace(join_alias, std::move(root.plan));
+            ast::TableRef tr;
+            tr.name = join_alias;
+            tr.loc = jc.loc;
+            derived_table_ref = std::move(tr);
+        } else {
+            const auto& left_ref = std::get<ast::TableRef>(jc.left);
+            const auto& right_ref = std::get<ast::TableRef>(jc.right);
+            const auto& left_def = resolve_table(catalog_, left_ref, cte_synth_tables_);
+            const auto& right_def = resolve_table(catalog_, right_ref, cte_synth_tables_);
+            std::string left_alias = left_ref.alias.value_or(left_def.name);
+            std::string right_alias = right_ref.alias.value_or(right_def.name);
+            if (!jc.on_clause.has_value()) {
+                bind_error("JOIN requires an ON clause", jc.loc.pos);
+            }
+            // Phase 18: try the equi-join shape first (simpler, narrower).
+            // Falls through to the interval-join recognizer when the ON
+            // clause is the eq + BETWEEN AND-pair.
+            auto equi_shape = match_equi_join(*jc.on_clause, left_alias, right_alias);
+            auto interval_shape = match_interval_join(*jc.on_clause, left_alias, right_alias);
+            if (!equi_shape && !interval_shape) {
                 bind_error(
-                    "the lookup table must be on the right of the JOIN "
-                    "(stream JOIN lookup_table); move '" +
-                        left_def.name + "' to the right side",
+                    "JOIN ON must be either 'a.k = b.k' or "
+                    "'a.k = b.k AND a.ts BETWEEN b.ts + low AND b.ts + high'",
                     jc.loc.pos);
             }
-            if (!equi_shape) {
-                bind_error("a lookup join requires an equality ON clause 'stream.key = lookup.key'",
-                           jc.loc.pos);
-            }
-            if (jt == JoinType::RightOuter || jt == JoinType::FullOuter) {
-                bind_error("only INNER and LEFT joins are supported against a lookup table",
-                           jc.loc.pos);
-            }
-            const std::string fn = right_def.lookup_function();
-            if (fn.empty()) {
-                bind_error("lookup table '" + right_def.name +
-                               "' must set a function= property naming a registered async lookup",
-                           right_ref.loc.pos);
-            }
-            std::vector<std::string> probe_cols;
-            probe_cols.reserve(left_def.columns.size());
+
+            // Output schema: every left column qualified by left_alias,
+            // then every right column qualified by right_alias. Aliases
+            // appear in the column names as "<alias>_<col>" so the sink
+            // can be a single flat schema without manual SELECT.
+            arrow::FieldVector fields;
             for (const auto& c : left_def.columns) {
-                probe_cols.push_back(c.name);
+                fields.push_back(arrow::field(left_alias + "_" + c.name, c.type));
             }
-            std::vector<std::string> dim_cols;
-            dim_cols.reserve(right_def.columns.size());
             for (const auto& c : right_def.columns) {
-                dim_cols.push_back(c.name);
+                fields.push_back(arrow::field(right_alias + "_" + c.name, c.type));
             }
-            auto probe_scan = make_table_plan(left_ref.name, left_def, left_ref.loc.pos);
-            join_plan = std::make_unique<LogicalLookupJoin>(std::move(probe_scan),
-                                                            fn,
-                                                            left_alias,
-                                                            right_alias,
-                                                            std::move(probe_cols),
-                                                            std::move(dim_cols),
-                                                            equi_shape->right_key,
-                                                            jt == JoinType::LeftOuter,
-                                                            arrow::schema(std::move(fields)));
-        } else {
-            auto left_scan = make_table_plan(left_ref.name, left_def, left_ref.loc.pos);
-            auto right_scan = make_table_plan(right_ref.name, right_def, right_ref.loc.pos);
-            if (interval_shape) {
-                // OUTER interval joins (SQLOPT-1): the runtime IntervalJoinRowOp
-                // null-pads unmatched rows on the kept side at watermark eviction
-                // (the window is finite, so the verdict is final - no retraction).
-                join_plan =
-                    std::make_unique<LogicalIntervalJoin>(std::move(left_scan),
-                                                          std::move(right_scan),
-                                                          std::move(left_alias),
-                                                          std::move(right_alias),
-                                                          std::move(interval_shape->left_key),
-                                                          std::move(interval_shape->right_key),
-                                                          std::move(interval_shape->left_ts),
-                                                          std::move(interval_shape->right_ts),
-                                                          interval_shape->lower_offset_ms,
-                                                          interval_shape->upper_offset_ms,
-                                                          arrow::schema(std::move(fields)),
-                                                          jt);
+            // The join lowers to one of three plan nodes below; rather than return
+            // it directly (which silently bypassed WHERE / projection / GROUP BY -
+            // only `SELECT * FROM a JOIN b` worked), it is registered as a synthetic
+            // derived table so the outer SELECT applies over the join output, just
+            // like the MATCH_RECOGNIZE / PTF / subquery paths. Join output columns
+            // are the flat "<alias>_<col>" names; reference them by that flat name
+            // in the outer SELECT / WHERE (qualified `alias.col` is a follow-on, and
+            // is not supported by the derived-table wrapper today either).
+            std::unique_ptr<LogicalPlan> join_plan;
+            // Lookup (enrichment) join: one side is a connector='lookup'
+            // table. Lower to LogicalLookupJoin - the probe stream enriched
+            // per row against the dim's registered async function - rather
+            // than a stream-stream join. v1: lookup table on the right,
+            // INNER or LEFT only (RIGHT/FULL would require enumerating the
+            // dim, which a keyed lookup source cannot do).
+            if (left_def.is_lookup() || right_def.is_lookup()) {
+                if (left_def.is_lookup() && right_def.is_lookup()) {
+                    bind_error("a lookup join needs exactly one lookup table, not two", jc.loc.pos);
+                }
+                if (left_def.is_lookup()) {
+                    bind_error(
+                        "the lookup table must be on the right of the JOIN "
+                        "(stream JOIN lookup_table); move '" +
+                            left_def.name + "' to the right side",
+                        jc.loc.pos);
+                }
+                if (!equi_shape) {
+                    bind_error(
+                        "a lookup join requires an equality ON clause 'stream.key = lookup.key'",
+                        jc.loc.pos);
+                }
+                if (jt == JoinType::RightOuter || jt == JoinType::FullOuter) {
+                    bind_error("only INNER and LEFT joins are supported against a lookup table",
+                               jc.loc.pos);
+                }
+                const std::string fn = right_def.lookup_function();
+                if (fn.empty()) {
+                    bind_error(
+                        "lookup table '" + right_def.name +
+                            "' must set a function= property naming a registered async lookup",
+                        right_ref.loc.pos);
+                }
+                std::vector<std::string> probe_cols;
+                probe_cols.reserve(left_def.columns.size());
+                for (const auto& c : left_def.columns) {
+                    probe_cols.push_back(c.name);
+                }
+                std::vector<std::string> dim_cols;
+                dim_cols.reserve(right_def.columns.size());
+                for (const auto& c : right_def.columns) {
+                    dim_cols.push_back(c.name);
+                }
+                auto probe_scan = make_table_plan(left_ref.name, left_def, left_ref.loc.pos);
+                join_plan = std::make_unique<LogicalLookupJoin>(std::move(probe_scan),
+                                                                fn,
+                                                                left_alias,
+                                                                right_alias,
+                                                                std::move(probe_cols),
+                                                                std::move(dim_cols),
+                                                                equi_shape->right_key,
+                                                                jt == JoinType::LeftOuter,
+                                                                arrow::schema(std::move(fields)));
             } else {
-                join_plan = std::make_unique<LogicalEquiJoin>(std::move(left_scan),
+                auto left_scan = make_table_plan(left_ref.name, left_def, left_ref.loc.pos);
+                auto right_scan = make_table_plan(right_ref.name, right_def, right_ref.loc.pos);
+                if (interval_shape) {
+                    // OUTER interval joins (SQLOPT-1): the runtime IntervalJoinRowOp
+                    // null-pads unmatched rows on the kept side at watermark eviction
+                    // (the window is finite, so the verdict is final - no retraction).
+                    join_plan =
+                        std::make_unique<LogicalIntervalJoin>(std::move(left_scan),
                                                               std::move(right_scan),
                                                               std::move(left_alias),
                                                               std::move(right_alias),
-                                                              std::move(equi_shape->left_key),
-                                                              std::move(equi_shape->right_key),
+                                                              std::move(interval_shape->left_key),
+                                                              std::move(interval_shape->right_key),
+                                                              std::move(interval_shape->left_ts),
+                                                              std::move(interval_shape->right_ts),
+                                                              interval_shape->lower_offset_ms,
+                                                              interval_shape->upper_offset_ms,
                                                               arrow::schema(std::move(fields)),
                                                               jt);
+                } else {
+                    join_plan = std::make_unique<LogicalEquiJoin>(std::move(left_scan),
+                                                                  std::move(right_scan),
+                                                                  std::move(left_alias),
+                                                                  std::move(right_alias),
+                                                                  std::move(equi_shape->left_key),
+                                                                  std::move(equi_shape->right_key),
+                                                                  arrow::schema(std::move(fields)),
+                                                                  jt);
+                }
             }
-        }
 
-        // Register the join as a synthetic derived table and fall through to the
-        // shared projection / WHERE / GROUP BY path (mirrors MATCH_RECOGNIZE /
-        // PTF / subquery). Columns are the flat "<alias>_<col>" names. A query
-        // has at most one top-level join (nested joins reference base tables
-        // only), so a single reserved alias suffices; the CteScopeGuard erases it
-        // at bind exit so it never leaks to a later statement on a reused Binder.
-        // Guard against an in-scope name collision (e.g. a user CTE literally
-        // named __join), exactly as the subquery / MATCH_RECOGNIZE / PTF paths do.
-        const std::string join_alias = "__join";
-        if (cte_synth_tables_.count(join_alias) != 0) {
-            bind_error("reserved join alias '" + join_alias + "' collides with an in-scope name",
-                       jc.loc.pos);
-        }
-        auto join_schema = join_plan->schema();
-        TableDef synth;
-        synth.name = join_alias;
-        synth.columns.reserve(static_cast<std::size_t>(join_schema->num_fields()));
-        for (int i = 0; i < join_schema->num_fields(); ++i) {
-            synth.columns.push_back(
-                ColumnSpec{join_schema->field(i)->name(), join_schema->field(i)->type()});
-        }
-        cte_synth_tables_.emplace(join_alias, std::move(synth));
-        cte_plans_.emplace(join_alias, std::move(join_plan));
-        ast::TableRef tr;
-        tr.name = join_alias;
-        tr.loc = jc.loc;
-        derived_table_ref = std::move(tr);
+            // Register the join as a synthetic derived table and fall through to the
+            // shared projection / WHERE / GROUP BY path (mirrors MATCH_RECOGNIZE /
+            // PTF / subquery). Columns are the flat "<alias>_<col>" names. A query
+            // has at most one top-level join (nested joins reference base tables
+            // only), so a single reserved alias suffices; the CteScopeGuard erases it
+            // at bind exit so it never leaks to a later statement on a reused Binder.
+            // Guard against an in-scope name collision (e.g. a user CTE literally
+            // named __join), exactly as the subquery / MATCH_RECOGNIZE / PTF paths do.
+            const std::string join_alias = "__join";
+            if (cte_synth_tables_.count(join_alias) != 0) {
+                bind_error(
+                    "reserved join alias '" + join_alias + "' collides with an in-scope name",
+                    jc.loc.pos);
+            }
+            auto join_schema = join_plan->schema();
+            TableDef synth;
+            synth.name = join_alias;
+            synth.columns.reserve(static_cast<std::size_t>(join_schema->num_fields()));
+            for (int i = 0; i < join_schema->num_fields(); ++i) {
+                synth.columns.push_back(
+                    ColumnSpec{join_schema->field(i)->name(), join_schema->field(i)->type()});
+            }
+            cte_synth_tables_.emplace(join_alias, std::move(synth));
+            cte_plans_.emplace(join_alias, std::move(join_plan));
+            ast::TableRef tr;
+            tr.name = join_alias;
+            tr.loc = jc.loc;
+            derived_table_ref = std::move(tr);
+        }  // end else (2-base-table top-level join)
     }
 
     // Phase 20: FROM (SELECT ...) AS sub. When from_items carries a

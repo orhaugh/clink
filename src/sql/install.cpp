@@ -1941,7 +1941,11 @@ private:
         return kind_ == EquiJoinKind::RightOuter || kind_ == EquiJoinKind::FullOuter;
     }
 
-    // Build a joined Row from the column lists; nulls for the absent side.
+    // Build a joined Row from the column lists; nulls for the absent side. An
+    // EMPTY alias means passthrough: the column name is emitted unchanged rather
+    // than prefixed. This is what a nested join uses for its sub-join side,
+    // whose columns are already flat ("<alias>_<col>") from the inner join, so
+    // they are not double-prefixed. A base-table side keeps its non-empty alias.
     Row build_(const Row* left, const Row* right) const {
         Row out;
         auto fill =
@@ -1953,7 +1957,7 @@ private:
                         if (it != src->values.end())
                             v = it->second;
                     }
-                    out.values[alias + "_" + c] = std::move(v);
+                    out.values[alias.empty() ? c : alias + "_" + c] = std::move(v);
                 }
             };
         fill(left_columns_, left_alias_, left);
@@ -4435,10 +4439,15 @@ void install(clink::plugin::PluginRegistry& reg) {
                 kind = EquiJoinKind::FullOuter;
             else if (jt_str != "inner")
                 throw std::runtime_error("equi_join_row: unknown join_type '" + jt_str + "'");
+            // left_alias / right_alias may be EMPTY: an empty alias means the
+            // side passes its columns through unprefixed (EquiJoinRowOp::build_).
+            // The nested multi-way join uses this for its sub-join side, whose
+            // columns are already flat "<alias>_<col>". Only the key columns are
+            // strictly required.
             return std::make_shared<EquiJoinRowOp>(need("left_key_column"),
                                                    need("right_key_column"),
-                                                   need("left_alias"),
-                                                   need("right_alias"),
+                                                   ctx.param_or("left_alias", ""),
+                                                   ctx.param_or("right_alias", ""),
                                                    kind,
                                                    split_csv(ctx.param_or("left_columns", "")),
                                                    split_csv(ctx.param_or("right_columns", "")));

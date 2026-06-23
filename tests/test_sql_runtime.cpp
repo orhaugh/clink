@@ -5995,6 +5995,70 @@ TEST(SqlRuntime, ColumnarParquetTumbleWindowEndToEnd) {
         std::filesystem::remove(p);
 }
 
+// Multi-way (3-table) INNER equi-join: a JOIN b JOIN c binds to a left-deep
+// nested EquiJoin tree (the inner join's flat columns pass through the outer
+// join unprefixed) and executes end-to-end. The joined output uses the flat
+// <alias>_<col> names; aliased here to the sink's columns.
+TEST(SqlRuntime, ThreeWayInnerJoinEndToEnd) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto a_path = tmp / "clink_sql_3wj_a.ndjson";
+    const auto b_path = tmp / "clink_sql_3wj_b.ndjson";
+    const auto c_path = tmp / "clink_sql_3wj_c.ndjson";
+    const auto out_path = tmp / "clink_sql_3wj_out.ndjson";
+    for (const auto& p : {a_path, b_path, c_path, out_path})
+        std::filesystem::remove(p);
+
+    write_lines(a_path, {R"({"id":1,"av":10})", R"({"id":2,"av":20})"});
+    write_lines(b_path, {R"({"id":1,"bv":100})", R"({"id":2,"bv":200})"});
+    write_lines(c_path, {R"({"id":1,"cv":1000})", R"({"id":2,"cv":2000})"});
+
+    Catalog cat;
+    auto mk = [](const std::string& name, const std::string& cols, const std::string& path) {
+        return "CREATE TABLE " + name + " " + cols +
+               " WITH (connector='file', format='json', path='" + path + "');";
+    };
+    auto ddl = parse(mk("a", "(id BIGINT, av BIGINT)", a_path.string()) +
+                     mk("b", "(id BIGINT, bv BIGINT)", b_path.string()) +
+                     mk("c", "(id BIGINT, cv BIGINT)", c_path.string()) +
+                     "CREATE TABLE out_t (av BIGINT, bv BIGINT, cv BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    for (int i = 0; i < 4; ++i)
+        cat.register_table(
+            std::get<ast::CreateTableStmt>(ddl.statements[static_cast<std::size_t>(i)]));
+
+    // a JOIN b ON a.id=b.id JOIN c ON b.id=c.id; alias the flat join columns to
+    // the sink's declared column names.
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT a_av AS av, b_bv AS bv, c_cv AS cv FROM a "
+                        "JOIN b ON a.id = b.id JOIN c ON b.id = c.id");
+
+    InProcessCluster cluster("tm-3wj", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto r = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+    EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+
+    std::map<std::int64_t, std::pair<std::int64_t, std::int64_t>> got;  // av -> (bv, cv)
+    for (const auto& line : read_lines(out_path)) {
+        auto js = clink::config::parse(line);
+        ASSERT_TRUE(js.is_object()) << line;
+        got[static_cast<std::int64_t>(js.at("av").as_number())] = {
+            static_cast<std::int64_t>(js.at("bv").as_number()),
+            static_cast<std::int64_t>(js.at("cv").as_number())};
+    }
+    ASSERT_EQ(got.size(), 2u);
+    EXPECT_EQ(got[10], (std::pair<std::int64_t, std::int64_t>{100, 1000}));
+    EXPECT_EQ(got[20], (std::pair<std::int64_t, std::int64_t>{200, 2000}));
+
+    for (const auto& p : {a_path, b_path, c_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // Async-state SQL GROUP BY: with the planner's async-state switch on, the
 // aggregate holds per-group state in KeyedState (serialising every AggBucket
 // through the codec on each record) instead of the in-memory map. Running the

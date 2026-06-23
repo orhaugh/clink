@@ -1,8 +1,11 @@
 #pragma once
 
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "clink/sql/ast.hpp"
 #include "clink/sql/catalog.hpp"
@@ -99,6 +102,30 @@ private:
         std::shared_ptr<arrow::DataType> type;
     };
     ScalarSubplan bind_scalar_aggregate_subplan(const ast::SubLink& sl) const;
+
+    // A bound relation in a (possibly nested) JOIN tree: its plan, the output
+    // stream columns it produces, the base-table aliases it covers, and a map
+    // from a qualified column ref ("alias.col") to the name that column has in
+    // this relation's OUTPUT stream. Lets bind_join_rel build a left-deep tree
+    // of binary EquiJoins for a multi-way join, resolving each join's keys and
+    // output schema correctly across nested levels. A base table contributes
+    // raw column names (its scan stream) and is prefixed by its alias at the
+    // parent join; a sub-join contributes already-flat "<alias>_<col>" names and
+    // is passed through unprefixed (empty alias) at the parent join.
+    struct BoundRel {
+        std::unique_ptr<LogicalPlan> plan;
+        std::vector<ColumnSpec> columns;
+        std::set<std::string> aliases;
+        bool is_base = false;
+        std::string alias;  // base-table alias; empty for a join
+        std::map<std::string, std::string> qual_to_stream;
+    };
+
+    // Recursively bind a FROM item (base table or nested INNER equi-join) into a
+    // BoundRel. The 2-base-table top-level join (which also covers interval /
+    // lookup / outer joins) stays on the existing inline path in bind_select;
+    // this method powers the NESTED multi-way INNER equi-join case.
+    BoundRel bind_join_rel(const ast::FromItem& item) const;
 
     const Catalog& catalog_;
     // Phase 16: WITH clause. Synthetic TableDefs serve column
