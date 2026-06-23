@@ -28,6 +28,7 @@
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/job_config.hpp"
 #include "clink/runtime/local_executor.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/keyed_state.hpp"
 #include "clink/state/remote_read_backend.hpp"
@@ -379,7 +380,8 @@ private:
 // without coalescing on the same backend.
 class CoalescingCountOperator final : public Operator<int, std::int64_t> {
 public:
-    explicit CoalescingCountOperator(bool coalesce) : coalesce_(coalesce) {}
+    explicit CoalescingCountOperator(bool coalesce, bool deadline = false)
+        : coalesce_(coalesce), deadline_(deadline) {}
 
     void process(const StreamElement<int>& element, Emitter<std::int64_t>& out) override {
         if (element.is_data()) {
@@ -400,6 +402,7 @@ public:
 
     [[nodiscard]] bool supports_async() const noexcept override { return true; }
     [[nodiscard]] bool coalesce_reads() const noexcept override { return coalesce_; }
+    [[nodiscard]] bool deadline_aware() const noexcept override { return deadline_; }
 
     void process_async(const StreamElement<int>& element,
                        Emitter<std::int64_t>& out,
@@ -429,6 +432,7 @@ private:
             "c", int64_codec(), int64_codec());
     }
     bool coalesce_;
+    bool deadline_;
 };
 
 std::vector<std::int64_t> run_coalesce(const std::vector<int>& input,
@@ -555,6 +559,37 @@ TEST(AsyncOperatorRunner, AutoAsyncOperatorCoalescesDespiteSupportsAsyncFinalise
     EXPECT_EQ(out, (std::vector<std::int64_t>{1, 1, 1, 1}));
     EXPECT_EQ(backend->get_many_calls(), 1);   // coalesced despite the auto-async timing
     EXPECT_EQ(backend->get_async_calls(), 0);  // never the per-key path
+}
+
+// coalesce_reads() + deadline_aware() are mutually defeating: the coalescer
+// resumes a batched read inline, so the deadline (priority) reordering is inert.
+// The runner must surface that loudly (a warn) rather than letting the deadline
+// look effective. Coalescing still wins (one get_many).
+TEST(AsyncOperatorRunner, CoalesceWithDeadlineLogsLoudWarning) {
+    auto backend = std::make_shared<CountingAsyncBackend>();
+    Dag dag;
+    auto src = std::make_shared<VectorSource<int>>(records({10, 20, 30, 40}));
+    auto op = std::make_shared<CoalescingCountOperator>(/*coalesce=*/true, /*deadline=*/true);
+    auto sink = std::make_shared<CollectingSink<std::int64_t>>();
+    auto h0 = dag.add_source<int>(src);
+    auto h1 = dag.add_operator<int, std::int64_t>(h0, op);
+    dag.add_sink<std::int64_t>(h1, sink);
+    JobConfig cfg;
+    cfg.state_backend = backend;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    EXPECT_EQ(backend->get_many_calls(), 1);  // coalescing still wins
+
+    bool warned = false;
+    for (const auto& r : clink::LogBuffer::global().tail(2000, "warn")) {
+        if (r.message.find("coalesce_reads() and deadline_aware()") != std::string::npos) {
+            warned = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(warned)
+        << "the runner must loudly warn that deadline ordering is inert under coalescing";
 }
 
 namespace {

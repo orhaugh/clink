@@ -534,3 +534,40 @@ TEST(RemoteReadBackend, WriteBurstThenCheckpointEvictsWithinBudget) {
         EXPECT_EQ(to_string(*v), "v" + std::to_string(i));
     }
 }
+
+// ASYNC-12: a deadline-tagged cold read (the 3-arg get_async) must carry its
+// order_key all the way to the deadline-aware hand-back, so the controller can
+// resume most-urgent-first under ResumeOrder::Priority. Proves RemoteReadBackend's
+// order_key plumbing (get_async(op,key,order_key) -> RemoteLoad awaiter ->
+// post_resume_ -> deadline_scheduler_), the real-backend half of ASYNC-12.
+TEST(RemoteReadBackend, DeadlineReadCarriesOrderKeyToDeadlineScheduler) {
+    AsyncExecutionController aec;
+    RemoteReadBackend backend([](OperatorId, std::string k) -> std::optional<StateBackend::Value> {
+        return k == "cold" ? std::optional<StateBackend::Value>{to_value("v")} : std::nullopt;
+    });
+    std::optional<std::uint64_t> seen_order_key;
+    // The deadline scheduler (preferred over the plain one when set) records the
+    // order_key the read was tagged with, then hands the resume back to the AEC.
+    backend.set_deadline_resume_scheduler([&](std::coroutine_handle<> h, std::uint64_t ok) {
+        seen_order_key = ok;
+        aec.schedule_resume(h, ok);
+    });
+    backend.set_async_resume_scheduler([&](std::coroutine_handle<> h) { aec.schedule_resume(h); });
+
+    std::optional<std::string> resolved;
+    const bool accepted = aec.submit("cold", [&]() -> async::Task<void> {
+        auto v = co_await backend.get_async(OperatorId{1}, sv("cold"), /*order_key=*/77);
+        if (v) {
+            resolved = to_string(*v);
+        }
+        co_return;
+    });
+    ASSERT_TRUE(accepted);
+    aec.drain();
+
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(*resolved, "v");
+    ASSERT_TRUE(seen_order_key.has_value())
+        << "cold read did not route its completion through the deadline scheduler";
+    EXPECT_EQ(*seen_order_key, 77u);  // the order_key carried read -> hand-back
+}

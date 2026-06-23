@@ -561,6 +561,17 @@ public:
                 // hand-back, so a poll's ready completions resume most-urgent
                 // first. Off (default) leaves the byte-identical FIFO path.
                 if (op->deadline_aware()) {
+                    if (do_coalesce) {
+                        // Mutually defeating: the coalescer resumes a batched read
+                        // INLINE (not via schedule_resume's priority queue), so the
+                        // deadline order_key is never consulted. Coalescing wins;
+                        // the deadline ordering is silently inert. Surface it loudly
+                        // rather than letting it look effective.
+                        ctx.log_warn(
+                            "operator declares both coalesce_reads() and deadline_aware(): read "
+                            "coalescing resumes batches inline, so deadline (priority) reordering "
+                            "is inert and the order_key is ignored");
+                    }
                     aec->set_resume_order(AsyncExecutionController::ResumeOrder::Priority);
                     ctx.state_backend()->set_deadline_resume_scheduler(
                         [wk = std::weak_ptr<AsyncExecutionController>(aec)](
@@ -2709,6 +2720,17 @@ public:
                 // runner). process_async1/2 reads tagged via get_async(k,
                 // order_key) resume most-urgent-first; off leaves FIFO.
                 if (op->deadline_aware()) {
+                    if (do_coalesce) {
+                        // Mutually defeating: the coalescer resumes a batched read
+                        // INLINE (not via schedule_resume's priority queue), so the
+                        // deadline order_key is never consulted. Coalescing wins;
+                        // the deadline ordering is silently inert. Surface it loudly
+                        // rather than letting it look effective.
+                        ctx.log_warn(
+                            "operator declares both coalesce_reads() and deadline_aware(): read "
+                            "coalescing resumes batches inline, so deadline (priority) reordering "
+                            "is inert and the order_key is ignored");
+                    }
                     aec->set_resume_order(AsyncExecutionController::ResumeOrder::Priority);
                     ctx.state_backend()->set_deadline_resume_scheduler(
                         [wk = std::weak_ptr<AsyncExecutionController>(aec)](

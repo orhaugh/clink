@@ -448,6 +448,15 @@ private:
                 // CoalescingBackend forwards it through), same as the resume
                 // scheduler above.
                 if (async_io && sh.op->deadline_aware()) {
+                    if (do_coalesce) {
+                        // Coalescing resumes batched reads inline, not via the
+                        // priority queue, so the deadline order_key is inert.
+                        // Coalescing wins; surface the dead combination loudly.
+                        sh.ctx->log_warn(
+                            "operator declares both coalesce_reads() and deadline_aware(): read "
+                            "coalescing resumes batches inline, so deadline (priority) reordering "
+                            "is inert and the order_key is ignored");
+                    }
                     aec->set_resume_order(AsyncExecutionController::ResumeOrder::Priority);
                     sh.backend->set_deadline_resume_scheduler(
                         [wk = std::weak_ptr<AsyncExecutionController>(aec)](
