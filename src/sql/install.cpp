@@ -1928,16 +1928,16 @@ public:
             out.emit_data(std::move(batch));
     }
 
-    // Auto-on the async/disaggregated KeyedState path for INNER joins whenever
+    // Auto-on the async/disaggregated KeyedState path (all join kinds) whenever
     // the bound backend can genuinely defer reads (supports_async_get()), so a
     // join over a disaggregated backend overlaps the opposite-side cold read for
-    // one key with progress on others - no manual flag, identical output. INNER
-    // only: the outer variants RETRACT a matched row's null padding by mutating
-    // the OTHER side's entries, a read-modify-write of both sides that the simple
-    // per-key read model does not cover yet (they keep the synchronous path).
+    // one key with progress on others - no manual flag, identical output to the
+    // synchronous in-memory path. INNER reads the opposite side and appends its
+    // own; the OUTER variants additionally retract a matched row's null padding
+    // by mutating the OTHER side's entries (a read-modify-write of both sides,
+    // serialised under the per-key gate so it is consistent).
     void open() override {
-        effective_async_ = kind_ == EquiJoinKind::Inner && this->runtime() != nullptr &&
-                           this->runtime()->has_state_backend() &&
+        effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
     }
 
@@ -2067,36 +2067,84 @@ private:
         }
     }
 
-    // Async INNER path: one record reads the opposite side's entry list by join
-    // key (async), appends itself to its own side, and emits one joined row per
-    // match. Submitted to the controller under gate-key=join-key, so same-key
-    // records from EITHER input serialise (the co-op shares one per-key gate) and
-    // observe each other's writes - the cross-product stays correct.
+    // Async path (mirror of the synchronous handle_), covering INNER and the
+    // OUTER variants. One record: read its own side's entry list (append itself),
+    // read the opposite side, emit a joined row per match, and - for an outer
+    // join - emit/retract null-padded rows. Submitted under gate-key=join-key, so
+    // same-key records from EITHER input serialise (the co-op shares one per-key
+    // gate): each coroutine has exclusive read-modify-write of both sides' state
+    // for its key, so the cross-product and the null-padding retraction stay
+    // correct (no concurrent mutation of self[key]/other[key]).
     void handle_async_(Row row, bool is_left, Emitter<Row>& out, AsyncExecutionController& aec) {
         const std::string& key_col = is_left ? left_key_column_ : right_key_column_;
+        const bool this_outer = is_left ? left_keeps_unmatched_() : right_keeps_unmatched_();
+        const bool other_outer = is_left ? right_keeps_unmatched_() : left_keeps_unmatched_();
         auto key_opt = key_of_(row, key_col);
         if (!key_opt) {
-            return;  // NULL join key never matches (INNER): drop, do not store
+            // NULL join key never matches: emit a null-padded row if this side is
+            // kept, and don't store it. No async read needed.
+            if (this_outer) {
+                Batch<Row> batch;
+                emit_outer_(row, is_left, kRowKindInsert, batch);
+                out.emit_data(std::move(batch));
+            }
+            return;
         }
         std::string key = std::move(*key_opt);
         auto self = is_left ? kv_left_() : kv_right_();
         auto other = is_left ? kv_right_() : kv_left_();
-        auto factory = [this, self, other, row = std::move(row), key, is_left, &out]() mutable
-            -> async::Task<void> {
+        auto factory = [this,
+                        self,
+                        other,
+                        row = std::move(row),
+                        key,
+                        is_left,
+                        this_outer,
+                        other_outer,
+                        &out]() mutable -> async::Task<void> {
             // Append this row to its own side so future opposite-side rows match.
             auto self_cur = co_await self.get_async(key);
-            std::vector<Row> self_rows =
-                self_cur.has_value() ? std::move(*self_cur) : std::vector<Row>{};
-            self_rows.push_back(row);
-            self.put(key, self_rows);
-            // Probe the opposite side; emit one joined row per match (INNER, so
-            // no __row_kind tag, matching emit_pair_'s Inner branch).
+            std::vector<Entry> self_list =
+                self_cur.has_value() ? std::move(*self_cur) : std::vector<Entry>{};
+            self_list.push_back(Entry{row, false});
+            const std::size_t me = self_list.size() - 1;
+
             auto other_cur = co_await other.get_async(key);
-            if (other_cur.has_value() && !other_cur->empty()) {
-                Batch<Row> batch;
-                for (const auto& o : *other_cur) {
-                    batch.push(Record<Row>{is_left ? build_(&row, &o) : build_(&o, &row)});
+            Batch<Row> batch;
+            if (!other_cur.has_value() || other_cur->empty()) {
+                // No match yet. If this side is kept, emit its null-padded row
+                // and remember it (retracted when a match later arrives).
+                if (this_outer) {
+                    emit_outer_(row, is_left, kRowKindInsert, batch);
+                    self_list[me].null_emitted = true;
                 }
+                self.put(key, self_list);
+                if (!batch.empty()) {
+                    out.emit_data(std::move(batch));
+                }
+                co_return;
+            }
+            std::vector<Entry> other_list = std::move(*other_cur);
+            bool other_dirty = false;
+            for (auto& oe : other_list) {
+                if (other_outer && oe.null_emitted) {
+                    // A match cancels the matched row's live null padding: retract
+                    // it and clear the flag (write the other side back below).
+                    emit_outer_(oe.row, /*present_is_left=*/!is_left, kRowKindDelete, batch);
+                    oe.null_emitted = false;
+                    other_dirty = true;
+                }
+                if (is_left) {
+                    emit_pair_(row, oe.row, batch);
+                } else {
+                    emit_pair_(oe.row, row, batch);
+                }
+            }
+            self.put(key, self_list);
+            if (other_dirty) {
+                other.put(key, other_list);
+            }
+            if (!batch.empty()) {
                 out.emit_data(std::move(batch));
             }
             co_return;
@@ -2106,13 +2154,68 @@ private:
         }
     }
 
-    KeyedState<std::string, std::vector<Row>> kv_left_() {
-        return this->runtime()->template keyed_state<std::string, std::vector<Row>>(
-            "ejL", clink::string_codec(), row_list_json_codec());
+    // Codec for one join side's per-key entry list (rows + their live-null-padding
+    // flag) over the async/disaggregated KeyedState path: a JSON array of
+    // {"r": <row object>, "n": <null_emitted>}. INNER never sets "n".
+    static clink::Codec<std::vector<Entry>> entry_list_codec() {
+        using Bytes = clink::Codec<std::vector<Entry>>::Bytes;
+        using BytesView = clink::Codec<std::vector<Entry>>::BytesView;
+        return clink::Codec<std::vector<Entry>>{
+            .encode = [](const std::vector<Entry>& es) -> Bytes {
+                clink::config::JsonArray arr;
+                arr.reserve(es.size());
+                for (const auto& e : es) {
+                    clink::config::JsonObject o;
+                    o["r"] = clink::config::JsonValue{clink::config::JsonObject{e.row.values}};
+                    o["n"] = clink::config::JsonValue{e.null_emitted};
+                    arr.emplace_back(std::move(o));
+                }
+                const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
+                Bytes out(s.size());
+                if (!s.empty()) {
+                    std::memcpy(out.data(), s.data(), s.size());
+                }
+                return out;
+            },
+            .decode = [](BytesView b) -> std::optional<std::vector<Entry>> {
+                std::string text(reinterpret_cast<const char*>(b.data()), b.size());
+                try {
+                    auto j = clink::config::parse(text);
+                    if (!j.is_array()) {
+                        return std::nullopt;
+                    }
+                    std::vector<Entry> es;
+                    es.reserve(j.as_array().size());
+                    for (const auto& el : j.as_array()) {
+                        if (!el.is_object()) {
+                            return std::nullopt;
+                        }
+                        const auto& o = el.as_object();
+                        Entry e;
+                        if (auto it = o.find("r"); it != o.end() && it->second.is_object()) {
+                            e.row.values = it->second.as_object();
+                        }
+                        if (auto it = o.find("n"); it != o.end() && it->second.is_bool()) {
+                            e.null_emitted = it->second.as_bool();
+                        }
+                        es.push_back(std::move(e));
+                    }
+                    return es;
+                } catch (...) {
+                    return std::nullopt;
+                }
+            },
+            .encode_into = {},
+        };
     }
-    KeyedState<std::string, std::vector<Row>> kv_right_() {
-        return this->runtime()->template keyed_state<std::string, std::vector<Row>>(
-            "ejR", clink::string_codec(), row_list_json_codec());
+
+    KeyedState<std::string, std::vector<Entry>> kv_left_() {
+        return this->runtime()->template keyed_state<std::string, std::vector<Entry>>(
+            "ejL", clink::string_codec(), entry_list_codec());
+    }
+    KeyedState<std::string, std::vector<Entry>> kv_right_() {
+        return this->runtime()->template keyed_state<std::string, std::vector<Entry>>(
+            "ejR", clink::string_codec(), entry_list_codec());
     }
 
     std::string left_key_column_;

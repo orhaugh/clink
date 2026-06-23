@@ -484,6 +484,124 @@ TEST(SqlRuntime, AsyncStateInnerJoinRidesRemoteReadPath) {
         << "INNER join did not route its per-key state through the deferring backend (async path)";
 }
 
+namespace {
+
+// Build an equi-join of `join_type` via the registered Dag builder over
+// `backend`, run it cluster-free, and return every emitted record (changelog,
+// incl. __row_kind for outer Insert/Delete).
+std::vector<Record<Row>> run_equi_join(const std::string& join_type,
+                                       const std::vector<Record<Row>>& left,
+                                       const std::vector<Record<Row>>& right,
+                                       std::shared_ptr<StateBackend> backend) {
+    const auto* builder = cluster::DagBuilderRegistry::default_instance().find("equi_join_row");
+    Dag dag;
+    auto hl = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(left));
+    auto hr = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(right));
+    clink::plugin::BuildContext ctx;
+    ctx.params["left_key_column"] = "id";
+    ctx.params["right_key_column"] = "id";
+    ctx.params["left_alias"] = "l";
+    ctx.params["right_alias"] = "r";
+    ctx.params["join_type"] = join_type;
+    ctx.params["left_columns"] = "id,lv";
+    ctx.params["right_columns"] = "id,rv";
+    std::vector<std::any> upstream = {std::any{hl}, std::any{hr}};
+    auto out = (*builder)(dag, upstream, ctx);
+    auto h_join = std::any_cast<StageHandle<Row>>(out.main_handle);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_join, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return sink->collected_records();
+}
+
+// Collapse an outer-join changelog into its order-INDEPENDENT final relation:
+// per row identity (the row minus its __row_kind), net = +1 per insert-like and
+// -1 per delete-like; identities with net > 0 are live. The emission SEQUENCE of
+// an outer join depends on left/right arrival interleaving (which differs between
+// the sync and async runners), but the final relation does not - so this is the
+// right invariant to prove the async path matches the sync path.
+std::vector<std::string> join_live_set(const std::vector<Record<Row>>& emissions) {
+    std::map<std::string, int> net;
+    for (const auto& rec : emissions) {
+        Row r = rec.value();
+        const std::string kind = row_kind_of(r);
+        r.values.erase(std::string{kRowKindField});
+        const std::string id =
+            clink::config::JsonValue{clink::config::JsonObject{r.values}}.serialize(0);
+        net[id] += is_delete_like(kind) ? -1 : 1;
+    }
+    std::vector<std::string> live;
+    for (const auto& [id, n] : net) {
+        if (n > 0) {
+            live.push_back(id);
+        }
+    }
+    std::sort(live.begin(), live.end());
+    return live;
+}
+
+std::vector<Record<Row>> outer_join_rows(
+    const std::vector<std::pair<std::int64_t, std::int64_t>>& kv, const char* col) {
+    std::vector<Record<Row>> rows;
+    for (const auto& [id, v] : kv) {
+        Row r;
+        r.values["id"] = clink::config::JsonValue{static_cast<double>(id)};
+        r.values[col] = clink::config::JsonValue{static_cast<double>(v)};
+        rows.push_back(Record<Row>{std::move(r)});
+    }
+    return rows;
+}
+
+}  // namespace
+
+// OUTER joins ride the async/disaggregated path too (extends INNER): a match
+// RETRACTS the matched row's live null-padding by mutating the OTHER side's
+// entries - a read-modify-write of both sides, serialised under the per-key gate.
+// Proven by comparing the COLLAPSED final relation of the async (deferring
+// backend) path to the synchronous in-memory path: identical, and the async path
+// went through the backend (remote_loads > 0). LEFT OUTER: l1 joins r1, l2 is
+// null-padded (l1's earlier (l1,null) is retracted; l2's survives).
+TEST(SqlRuntime, AsyncStateLeftOuterJoinMatchesSyncPath) {
+    ensure_sql_installed_once();
+    const auto left = outer_join_rows({{1, 10}, {2, 20}}, "lv");
+    const auto right = outer_join_rows({{1, 100}}, "rv");
+
+    const auto sync_live = join_live_set(
+        run_equi_join("left_outer", left, right, std::make_shared<InMemoryStateBackend>()));
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    const auto async_live = join_live_set(run_equi_join("left_outer", left, right, rrb));
+
+    EXPECT_EQ(sync_live.size(), 2u) << "l1 joined + l2 null-padded";
+    EXPECT_EQ(async_live, sync_live)
+        << "async LEFT OUTER must produce the same final relation as the sync path";
+    EXPECT_GT(rrb->remote_loads(), 0u);
+}
+
+// FULL OUTER exercises retraction on BOTH sides: l1 joins r1; l2 null-padded (no
+// right 2); r3 null-padded (no left 3).
+TEST(SqlRuntime, AsyncStateFullOuterJoinMatchesSyncPath) {
+    ensure_sql_installed_once();
+    const auto left = outer_join_rows({{1, 10}, {2, 20}}, "lv");
+    const auto right = outer_join_rows({{1, 100}, {3, 300}}, "rv");
+
+    const auto sync_live = join_live_set(
+        run_equi_join("full_outer", left, right, std::make_shared<InMemoryStateBackend>()));
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    const auto async_live = join_live_set(run_equi_join("full_outer", left, right, rrb));
+
+    EXPECT_EQ(sync_live.size(), 3u) << "l1 joined + l2 null-padded + r3 null-padded";
+    EXPECT_EQ(async_live, sync_live)
+        << "async FULL OUTER must produce the same final relation as the sync path";
+    EXPECT_GT(rrb->remote_loads(), 0u);
+}
+
 // #59: the same unbounded GROUP BY built through the programmatic Table API
 // instead of a SQL string. Proves the Table-API-built JobGraphSpec actually
 // executes end-to-end (the byte-identical-IR test in test_table_api.cpp proves
