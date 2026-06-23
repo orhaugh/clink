@@ -30,9 +30,12 @@ namespace clink::sql {
 
 // Apply every optimizer rule in sequence. Returns the rewritten plan
 // (may return the same node if no rule fires). The optimizer never throws on a
-// valid bound plan: a pass that throws (a planner bug) is caught and the query
-// runs on the un-/partially-optimized plan (each pass leaves a valid plan on
-// throw), incrementing clink_sql_optimize_errors_total and logging a warning.
+// valid bound plan: a pass that throws (a planner bug) is caught,
+// clink_sql_optimize_errors_total is incremented, a warning is logged, and the
+// (un-/partially-optimized) plan is returned. For a logic throw the returned
+// plan is valid and runs; the one residual case (a std::bad_alloc raised
+// mid-reorder leaves a null child) is rejected downstream by the physical
+// planner's null-child check as a clean compile error - never a crash.
 std::unique_ptr<LogicalPlan> optimize(std::unique_ptr<LogicalPlan> plan);
 
 namespace detail {

@@ -36,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -70,6 +71,15 @@ struct JoinEdge {
 inline bool is_inner_equi_join(const LogicalPlan& n) {
     return n.kind() == "EquiJoin" &&
            static_cast<const LogicalEquiJoin&>(n).join_type() == JoinType::Inner;
+}
+
+// Test seam: when set, reorder_subtree throws right after move_leaves has moved a
+// join's leaves out (slot temporarily null), to exercise the mid-reorder throw
+// window the optimize() guard + physical-planner null-child backstop must absorb.
+// Never set in production.
+inline bool& force_throw_after_move_flag() {
+    static bool flag = false;
+    return flag;
 }
 
 inline std::vector<ColumnSpec> columns_of(const LogicalPlan& n) {
@@ -496,14 +506,29 @@ inline void reorder_subtree(std::unique_ptr<LogicalPlan>& slot) {
 
     // Apply: move the leaf subplans out (in analyze's DFS order, so they align
     // with `rels`), reorder any nested subtrees inside each leaf, then rebuild a
-    // left-deep tree in the greedy order.
+    // left-deep tree in the greedy order and commit with a single move-assign.
+    //
+    // Exception safety: rebuild() is LOGIC-throw-free here - analyze() verified
+    // every edge endpoint against the exact origin map and order_cost proved the
+    // greedy order fully connected, so join_build's map lookups and rebuild's
+    // edge search never miss. The only residual throw is std::bad_alloc (genuine
+    // OOM) from the allocations in the recursion below or in rebuild. Because the
+    // leaves are moved out of `slot` first, such a throw would leave `slot` null;
+    // that is then caught one level up by optimize()'s guard, and the resulting
+    // null child is rejected with a clean TranslationError by the physical
+    // planner's require_no_null_children backstop - a clean compile failure under
+    // OOM, never a crash or a corrupt executable plan.
     std::vector<std::unique_ptr<LogicalPlan>> plans;
     move_leaves(std::move(slot), plans);
+    if (force_throw_after_move_flag()) {
+        throw std::runtime_error("reorder_subtree: forced throw after move (test seam)");
+    }
     for (std::size_t i = 0; i < m && i < plans.size(); ++i) {
         rels[i].plan = std::move(plans[i]);
         clink::sql::reorder_joins(rels[i].plan);
     }
-    slot = rebuild(greedy, std::move(rels), edges);
+    auto rebuilt = rebuild(greedy, std::move(rels), edges);
+    slot = std::move(rebuilt);
 }
 
 }  // namespace reorder_detail

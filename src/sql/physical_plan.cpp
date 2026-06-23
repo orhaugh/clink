@@ -253,6 +253,26 @@ std::optional<std::string> maybe_emit_assign_timestamps(const TableDef& table,
     return id;
 }
 
+// Backstop: reject a plan that carries a null child anywhere in its tree before
+// compile_node walks it. compile_node dereferences children unconditionally (e.g.
+// EquiJoin::left() returns *left_), so a null child would be a null-this virtual
+// call (a crash), not a clean error. A well-formed bound + optimized plan never
+// has null children; this guards against an optimizer pass that throws mid-rewrite
+// and leaves a moved-out (null) slot (see join_reorder reorder_subtree + the
+// optimize() guard) - that path then surfaces here as a clean TranslationError
+// instead of a downstream crash. inputs() exposes children via unique_ptr::get(),
+// so inspecting it never dereferences a null.
+void require_no_null_children(const LogicalPlan& node) {
+    for (const auto* in : node.inputs()) {
+        if (in == nullptr) {
+            unsupported("internal planner error: '" + node.kind() +
+                        "' node has a null child (an optimizer pass likely failed mid-rewrite); "
+                        "the query cannot be compiled");
+        }
+        require_no_null_children(*in);
+    }
+}
+
 // Compile-node carries the active channel down the tree. Every node
 // in the chain emits ops on the same channel; root (Sink) decides it
 // when it first compiles the source-side scan.
@@ -1339,6 +1359,11 @@ cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
     const auto t0 = std::chrono::steady_clock::now();
     cluster::JobGraphSpec spec;
     int next_id = 0;
+    // Reject a malformed plan (a null child anywhere) before anything walks the
+    // tree - decide_channel/compile_node both dereference children unconditionally,
+    // so this must run first. A well-formed plan never trips it; it converts a
+    // mid-rewrite optimizer failure (null slot) into a clean error, not a crash.
+    require_no_null_children(root);
     // Determine the channel from the source side first; cross-check
     // against the sink so users get a clear error before deploy time.
     Channel ch = decide_channel(root);

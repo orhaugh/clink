@@ -5,6 +5,7 @@
 #include "clink/config/json.hpp"
 #include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
+#include "clink/sql/join_reorder.hpp"
 #include "clink/sql/optimizer.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/physical_plan.hpp"
@@ -26,6 +27,17 @@ void register_text(Catalog& cat,
 std::unique_ptr<LogicalPlan> bind_insert(const Catalog& cat, const char* sql) {
     Binder b(cat);
     return b.bind_insert(std::get<ast::InsertStmt>(parse(sql).statements[0]));
+}
+
+void register_json(Catalog& cat,
+                   const char* name,
+                   const std::string& cols,
+                   const std::string& opts) {
+    std::string sql = "CREATE TABLE " + std::string(name) + " " + cols +
+                      " WITH (connector='file', format='json', path='/tmp/" + name + ".ndjson'" +
+                      (opts.empty() ? "" : ", " + opts) + ")";
+    auto s = parse(sql);
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
 }
 
 const cluster::OperatorSpec* find_op(const cluster::JobGraphSpec& spec, const std::string& type) {
@@ -1723,6 +1735,34 @@ TEST(SqlPhysical, RejectsUnknownConnector) {
     auto plan = bind_insert(cat, "INSERT INTO dst_t SELECT line FROM weird_src");
     PhysicalPlanner pp;
     EXPECT_THROW(pp.compile(static_cast<const LogicalSink&>(*plan)), TranslationError);
+}
+
+// A plan carrying a null child (e.g. an optimizer pass that threw mid-rewrite and
+// left a moved-out slot) must be rejected by the planner with a clean
+// TranslationError, never dereferenced into a crash. Exercised end-to-end: a
+// forced throw inside reorder_subtree's commit window (after move_leaves nulls a
+// join's slot) is absorbed by optimize()'s guard, which returns the now-null-child
+// plan; compiling it must surface the null cleanly.
+TEST(SqlPhysical, MidReorderThrowYieldsNullChildRejectedCleanly) {
+    Catalog cat;
+    register_json(cat, "big", "(k BIGINT, bv BIGINT)", "row_count='1000000', ndv_k='1000000'");
+    register_json(cat, "mid", "(k BIGINT, mv BIGINT)", "row_count='1000', ndv_k='1000'");
+    register_json(cat, "small", "(k BIGINT, sv BIGINT)", "row_count='10', ndv_k='10'");
+    register_json(cat, "dst", "(bv BIGINT)", "");
+    auto plan = bind_insert(cat,
+                            "INSERT INTO dst SELECT big_bv FROM big JOIN mid ON big.k = mid.k "
+                            "JOIN small ON mid.k = small.k");
+
+    reorder_detail::force_throw_after_move_flag() = true;
+    std::unique_ptr<LogicalPlan> opt;
+    EXPECT_NO_THROW({ opt = optimize(std::move(plan)); });  // guard absorbs the mid-reorder throw
+    reorder_detail::force_throw_after_move_flag() = false;  // reset before any ASSERT can return
+
+    ASSERT_NE(opt, nullptr);
+    PhysicalPlanner pp;
+    // The mid-reorder throw left a null child; the planner backstop rejects it
+    // with a clean error instead of a null-deref crash.
+    EXPECT_THROW(pp.compile(static_cast<const LogicalSink&>(*opt)), TranslationError);
 }
 
 }  // namespace clink::sql

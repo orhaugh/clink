@@ -528,12 +528,23 @@ std::unique_ptr<LogicalPlan> optimize(std::unique_ptr<LogicalPlan> plan) {
     // The optimizer is a sound, semantics-preserving rewrite, so a throw from any
     // pass is a planner BUG, not a user error. Rather than let it escape and fail
     // an otherwise-valid query, catch it and fall back to the best plan we have.
-    // This is safe because every pass leaves a VALID (if less optimised) plan on
-    // throw: push_predicates serialises new predicates before mutating any slot
-    // (an AND filter is idempotent, so a partial push is correct), reorder_joins
-    // decides reorderability non-destructively and only ever commits a verified,
-    // throw-free rebuild, and apply_projection_pushdown only adds optional
-    // column hints. A caught pass simply does not run the passes after it.
+    //
+    // For a LOGIC throw (the realistic planner-bug class) every pass leaves a
+    // VALID, if less optimised, plan: push_predicates serialises new predicates
+    // before mutating any slot (an AND filter is idempotent, so a partial push is
+    // correct), reorder_joins decides reorderability non-destructively and its
+    // rebuild is logic-throw-free (analyze verifies every edge), and
+    // apply_projection_pushdown only adds optional column hints. A caught pass
+    // simply does not run the passes after it, and we run the resulting plan.
+    //
+    // The one case that does NOT leave a valid plan is std::bad_alloc (OOM)
+    // raised mid-reorder, after reorder_subtree has moved a join's leaves out and
+    // before it reassigns the slot: the slot is left null. We still catch it here
+    // and return; the null child is then rejected by the physical planner's
+    // require_no_null_children backstop as a clean TranslationError. So the
+    // guarantee is: a planner-pass throw never crashes the process and never
+    // yields a silently-wrong plan - it either falls back to a valid plan or
+    // fails compilation cleanly (only under genuine OOM).
     try {
         if (g_optimize_force_throw) {
             throw std::runtime_error("optimize: forced throw (test seam)");
