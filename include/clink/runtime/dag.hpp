@@ -83,6 +83,12 @@ struct OperatorRunner {
     // metrics scraper can map the numeric op_id back to a graph node.
     std::string spec_node_id;
     std::string spec_uid;
+    // For network-bridge runners: the op id of the chain's primary operator
+    // this bridge's bytes are attributed to (sink -> bytes_sent, source ->
+    // bytes_received). 0 for non-bridge runners (they ignore it). Set by the
+    // chain build via Dag::set_runner_attributed_op_id; the executor copies it
+    // onto the RuntimeContext.
+    std::uint64_t attributed_op_id{0};
     std::function<void(RuntimeContext& ctx, const std::function<bool()>& should_stop)> run;
     std::function<void()> cancel;
     // Channel introspection for metrics. nullopt for sources/sinks where it
@@ -204,6 +210,30 @@ public:
             runners_[runner_index].spec_node_id = std::move(spec_node_id);
             runners_[runner_index].spec_uid = std::move(uid);
         }
+    }
+
+    // Attribute every runner's network-bridge bytes to operator `op_id` (the
+    // chain's primary op). Called by the cluster chain build after the dag is
+    // assembled; only NetworkBridgeSink/Source runners read it (via the
+    // RuntimeContext), so setting it on all runners is harmless. Used when the
+    // whole subtask hosts one logical operator (the common case); the generic
+    // fused-chain path sets per-bridge attribution instead (head vs tail).
+    void set_all_runners_attributed_op_id(std::uint64_t op_id) noexcept {
+        for (auto& r : runners_) {
+            r.attributed_op_id = op_id;
+        }
+    }
+
+    void set_runner_attributed_op_id(std::size_t runner_index, std::uint64_t op_id) noexcept {
+        if (runner_index < runners_.size()) {
+            runners_[runner_index].attributed_op_id = op_id;
+        }
+    }
+
+    // Read a runner's OperatorId by index (e.g. to learn the primary op id from
+    // its StageHandle before attributing bridge bytes to it). 0 if OOR.
+    [[nodiscard]] std::uint64_t runner_id_at(std::size_t runner_index) const noexcept {
+        return runner_index < runners_.size() ? runners_[runner_index].id.value() : 0;
     }
 
     // ---- Source ----------------------------------------------------------

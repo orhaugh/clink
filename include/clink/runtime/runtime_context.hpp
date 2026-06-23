@@ -103,6 +103,15 @@ public:
         return Accumulator{metrics_, op_id_.value(), std::move(name)};
     }
 
+    // The op id a network bridge's bytes are attributed to: the primary
+    // operator of the bridge's chain (a bridge is an internal runner, not a
+    // graph node, so its own op id maps to nothing). Set by the executor from
+    // OperatorRunner::attributed_op_id; the NetworkBridgeSink/Source read it in
+    // open() to point their channel's per-op byte counters at the right
+    // operator. 0 (default) means "no attribution" (non-bridge runners ignore it).
+    void set_attributed_op_id(std::uint64_t id) noexcept { attributed_op_id_ = id; }
+    [[nodiscard]] std::uint64_t attributed_op_id() const noexcept { return attributed_op_id_; }
+
     // Logging seam. The executor sets the host-owned logger (threaded across
     // the plugin boundary by data); operators log via the log_* helpers, which
     // route through clink::logging::op_log so the record reaches the node's
@@ -364,6 +373,7 @@ private:
     std::string op_name_;
     StateBackend* backend_{nullptr};
     MetricsRegistry* metrics_{nullptr};
+    std::uint64_t attributed_op_id_{0};
     spdlog::logger* host_logger_{nullptr};
     TimerService timer_service_{};
     SideOutputChannelMap side_outputs_;

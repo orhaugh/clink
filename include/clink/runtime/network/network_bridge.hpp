@@ -44,6 +44,12 @@ public:
           name_(std::move(name)) {}
 
     void open() override {
+        // Point the channel's per-operator byte counter at the operator this
+        // bridge's output bytes belong to (the chain's primary op). Set before
+        // connect()/any send, on the runner thread.
+        if (auto* rt = this->runtime()) {
+            channel_.set_op_bytes_target(rt->metrics(), rt->attributed_op_id());
+        }
         clink::metrics::net::connect_attempt("sink");
         channel_.connect();
     }
@@ -120,7 +126,16 @@ public:
     // twice will throw the second time.
     std::uint16_t prepare_listen() { return channel_.listen(); }
 
-    void open() override { channel_.accept(); }
+    void open() override {
+        // Point the channel's per-operator byte counter at the operator this
+        // bridge's received bytes belong to (the chain's primary op). Set
+        // before accept() spawns the recv thread, so the assignment
+        // happens-before the thread reads it.
+        if (auto* rt = this->runtime()) {
+            channel_.set_op_bytes_target(rt->metrics(), rt->attributed_op_id());
+        }
+        channel_.accept();
+    }
 
     bool produce(Emitter<T>& out) override {
         if (this->cancelled() || channel_.closed()) {

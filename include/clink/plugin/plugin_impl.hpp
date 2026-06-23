@@ -279,6 +279,10 @@ void PluginRegistry::register_source(
                 chain.output_routing,
                 chain.output_selector_fn);
             clink::cluster::attach_side_output_groups(dag, h0.runner_index, rctx.output_groups);
+            // This subtask hosts one logical operator (the source); attribute
+            // every network-bridge runner's bytes to it (its output bridges ->
+            // bytes_sent). The source itself ignores the attribution.
+            dag.set_all_runners_attributed_op_id(dag.runner_id_at(h0.runner_index));
             // Hand the source's barrier injectors to the TM before we
             // hand the Dag off to LocalExecutor (which moves it).
             if (rctx.register_source_injectors) {
@@ -399,7 +403,10 @@ void PluginRegistry::register_sink(
         }
         clink::Dag dag;
         auto h0 = clink::cluster::build_typed_input_stage<T>(dag, rctx.in_bridges);
-        dag.template add_sink<T>(h0, sink);
+        auto hs = dag.template add_sink<T>(h0, sink);
+        // This subtask hosts one logical operator (the sink); its input network
+        // bridges' bytes are the sink's bytes_received.
+        dag.set_all_runners_attributed_op_id(dag.runner_id_at(hs.runner_index));
         clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
         detail::run_subtask_to_completion(exec, rctx.cancel_token);
     };
@@ -491,6 +498,10 @@ void PluginRegistry::register_operator(
                 chain.output_routing,
                 chain.output_selector_fn);
             clink::cluster::attach_side_output_groups(dag, h1.runner_index, rctx.output_groups);
+            // This subtask hosts one logical operator; attribute its input
+            // bridges' bytes to it (bytes_received) and its output bridges'
+            // bytes to it (bytes_sent).
+            dag.set_all_runners_attributed_op_id(dag.runner_id_at(h1.runner_index));
             clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
             detail::run_subtask_to_completion(exec, rctx.cancel_token);
         };
@@ -655,6 +666,10 @@ void PluginRegistry::register_co_operator(
             chain.output_routing,
             chain.output_selector_fn);
         clink::cluster::attach_side_output_groups(dag, h_out.runner_index, rctx.output_groups);
+        // This subtask hosts one logical (co-)operator; attribute both input
+        // bridges' bytes (bytes_received) and output bridges' bytes (bytes_sent)
+        // to it.
+        dag.set_all_runners_attributed_op_id(dag.runner_id_at(h_out.runner_index));
         clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
         detail::run_subtask_to_completion(exec, rctx.cancel_token);
     };

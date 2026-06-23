@@ -61,6 +61,9 @@ void LocalExecutor::start() {
         contexts_.push_back(std::make_unique<RuntimeContext>(
             runner.id, runner.name, config_.state_backend.get(), config_.metrics));
         contexts_.back()->set_side_output_channels(dag_.side_channels_for(i));
+        // Network-bridge byte attribution: a bridge's bytes belong to its
+        // chain's primary operator, not the bridge's own (internal) op id.
+        contexts_.back()->set_attributed_op_id(runner.attributed_op_id);
         if (config_.on_checkpoint_ack) {
             contexts_.back()->set_checkpoint_ack(config_.on_checkpoint_ack);
         }

@@ -417,3 +417,52 @@ TEST(NetworkChannel, BarrierModeRoundTripsAcrossWire) {
     EXPECT_FALSE(e_eof.has_value());
     sender.join();
 }
+
+// Per-operator byte attribution: when the bridge points the channel at an
+// operator id + the host registry (set_op_bytes_target), the serialised wire
+// bytes land on clink_op_bytes_sent_total{op_id} (sink) and
+// clink_op_bytes_received_total{op_id} (source), alongside the per-process
+// counters. This is what the per-operator overlay reads.
+TEST(NetworkChannel, PerOperatorBytesAttributed) {
+    using namespace clink::metrics;
+    auto& reg = MetricsRegistry::global();
+    const std::uint64_t op = 0xB17E5u;  // unique to this test
+    const auto sent_name = op_metric_name("bytes_sent_total", op);
+    const auto recv_name = op_metric_name("bytes_received_total", op);
+    const auto sent_before = reg.counter(sent_name).value();
+    const auto recv_before = reg.counter(recv_name).value();
+
+    // Force the cross-process socket+serde path; per-op bytes are only counted
+    // at the serialising boundary (same-process colocated subtasks take the
+    // LocalDataPlane fast path, where per-op bytes are correctly absent).
+    LocalDataPlane::instance().set_enabled(false);
+
+    NetworkChannelSource<std::int64_t> source(/*port*/ 0, int64_codec());
+    source.set_op_bytes_target(&reg, op);  // before accept() spawns the recv thread
+    const std::uint16_t port = source.listen();
+
+    std::thread sender([port, &reg, op] {
+        NetworkChannelSink<std::int64_t> sink("127.0.0.1", port, int64_codec());
+        sink.set_op_bytes_target(&reg, op);  // before any send
+        sink.connect();
+        Batch<std::int64_t> b;
+        for (std::int64_t i = 0; i < 100; ++i) {
+            b.emplace(i);
+        }
+        sink.push(StreamElement<std::int64_t>::data(std::move(b)));
+        sink.close_send();
+    });
+
+    source.accept();
+    while (source.pop().has_value()) {
+        // drain until the Close frame
+    }
+    sender.join();
+
+    LocalDataPlane::instance().set_enabled(true);  // restore for other tests
+
+    EXPECT_GT(reg.counter(sent_name).value() - sent_before, 0u)
+        << "sink should attribute serialised bytes to the operator";
+    EXPECT_GT(reg.counter(recv_name).value() - recv_before, 0u)
+        << "source should attribute received bytes to the operator";
+}

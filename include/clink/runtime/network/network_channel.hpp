@@ -16,6 +16,7 @@
 #include "clink/core/codec.hpp"
 #include "clink/core/stream_element.hpp"
 #include "clink/metrics/network_metrics.hpp"
+#include "clink/metrics/operator_metrics.hpp"
 #include "clink/runtime/bounded_channel.hpp"
 #include "clink/runtime/network/local_data_plane.hpp"
 #include "clink/runtime/network/network_socket.hpp"
@@ -185,6 +186,17 @@ public:
         NetworkSocket::shutdown_write(fd_);
     }
 
+    // Per-operator bytes attribution. The wrapping NetworkBridgeSink sets the
+    // HOST registry + the op id of the operator this bridge's bytes belong to
+    // (the chain's primary op) before connect()/the first send, so send_frame
+    // can emit clink_op_bytes_sent_total{op_id} alongside the per-process
+    // counter. Set on the runner thread before any send; read only in
+    // send_frame (also runner thread), so no synchronisation is needed.
+    void set_op_bytes_target(MetricsRegistry* reg, std::uint64_t op_id) noexcept {
+        op_reg_ = reg;
+        op_id_for_bytes_ = op_id;
+    }
+
     int fd() const noexcept { return fd_; }
     // Current send credit. Exposed for metrics / tests; the value can
     // race with concurrent acquire_credit_ / credit_reader_loop_, so
@@ -224,7 +236,9 @@ private:
             clink::metrics::net::send_error();
             return false;
         }
-        clink::metrics::net::bytes_sent_inc(header.size() + payload.size());
+        const auto frame_bytes = header.size() + payload.size();
+        clink::metrics::net::bytes_sent_inc(frame_bytes);
+        clink::metrics::op::bytes_sent_inc(op_reg_, op_id_for_bytes_, frame_bytes);
         return true;
     }
 
@@ -340,6 +354,9 @@ private:
     // typed channel instead of opening a socket. Mutually exclusive
     // with the fd_/reader_ socket path.
     std::shared_ptr<LocalEndpointChannel<T>> local_channel_;
+    // Per-operator bytes attribution (set by the bridge before any send).
+    MetricsRegistry* op_reg_{nullptr};
+    std::uint64_t op_id_for_bytes_{0};
 };
 
 // Receive half. Listens on a port, accepts a single connection, decodes
@@ -431,6 +448,16 @@ public:
         bound_port_ = p;
         LocalDataPlane::instance().register_endpoint<T>(bind_host_, bound_port_, local_channel_);
         return p;
+    }
+
+    // Per-operator bytes attribution. The wrapping NetworkBridgeSource sets the
+    // HOST registry + the op id of the operator this bridge's received bytes
+    // belong to (the chain's primary op) BEFORE accept() spawns the recv
+    // thread, so recv_loop_ can emit clink_op_bytes_received_total{op_id}. Set
+    // before the thread starts (happens-before), so no synchronisation needed.
+    void set_op_bytes_target(MetricsRegistry* reg, std::uint64_t op_id) noexcept {
+        op_reg_ = reg;
+        op_id_for_bytes_ = op_id;
     }
 
     // Spawn the recv-thread that does accept + frame parse + push into
@@ -539,7 +566,9 @@ private:
                 clink::metrics::net::recv_error();
                 break;
             }
-            clink::metrics::net::bytes_received_inc(header_buf.size() + body.size());
+            const auto frame_bytes = header_buf.size() + body.size();
+            clink::metrics::net::bytes_received_inc(frame_bytes);
+            clink::metrics::op::bytes_received_inc(op_reg_, op_id_for_bytes_, frame_bytes);
             const auto kind = static_cast<Kind>(body[0]);
             std::size_t pos = 1;
             switch (kind) {
@@ -677,6 +706,9 @@ private:
     // place regardless of how the records got in.
     std::shared_ptr<LocalEndpointChannel<T>> local_channel_;
     std::thread recv_thread_;
+    // Per-operator bytes attribution (set by the bridge before accept()).
+    MetricsRegistry* op_reg_{nullptr};
+    std::uint64_t op_id_for_bytes_{0};
 };
 
 }  // namespace clink::network

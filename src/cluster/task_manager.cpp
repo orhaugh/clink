@@ -1591,6 +1591,23 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             (*attach)(dag, owner_runner_idx, g.side_output_tag, g);
         }
 
+        // Per-operator network bytes attribution for this chain. Input-side
+        // runners (bridges + any union) carry the chain head's input bytes
+        // (bytes_received); output-side runners (bridges + any split/fork) carry
+        // the chain tail's output bytes (bytes_sent). The op runners themselves
+        // ignore the attribution. For a single-op chain (the common case) head
+        // == tail. The bridges read this via their RuntimeContext.
+        if (!runner_indexes.empty()) {
+            const auto head_id = dag.runner_id_at(runner_indexes.front());
+            const auto tail_id = dag.runner_id_at(runner_indexes.back());
+            for (std::size_t i = 0; i < runner_indexes.front(); ++i) {
+                dag.set_runner_attributed_op_id(i, head_id);
+            }
+            for (std::size_t i = runner_indexes.back() + 1; i < dag.runners().size(); ++i) {
+                dag.set_runner_attributed_op_id(i, tail_id);
+            }
+        }
+
         // Build a RunnerContext so make_subtask_job_config can wire
         // the state backend, restore directory, checkpoint-ack
         // callback, and cancel token onto the JobConfig. Without this
