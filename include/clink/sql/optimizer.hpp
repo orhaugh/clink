@@ -29,7 +29,16 @@
 namespace clink::sql {
 
 // Apply every optimizer rule in sequence. Returns the rewritten plan
-// (may return the same node if no rule fires).
+// (may return the same node if no rule fires). The optimizer never throws on a
+// valid bound plan: a pass that throws (a planner bug) is caught and the query
+// runs on the un-/partially-optimized plan (each pass leaves a valid plan on
+// throw), incrementing clink_sql_optimize_errors_total and logging a warning.
 std::unique_ptr<LogicalPlan> optimize(std::unique_ptr<LogicalPlan> plan);
+
+namespace detail {
+// Test seam: force optimize() to throw before any pass, to exercise the guard
+// above. Not used in production. Always reset to false after a test.
+void set_optimize_force_throw(bool on);
+}  // namespace detail
 
 }  // namespace clink::sql

@@ -29,6 +29,7 @@ inline constexpr const char* kSqlParseErrors = "clink_sql_parse_errors_total";
 inline constexpr const char* kSqlBinds = "clink_sql_binds_total";
 inline constexpr const char* kSqlBindErrors = "clink_sql_bind_errors_total";
 inline constexpr const char* kSqlOptimizes = "clink_sql_optimizes_total";
+inline constexpr const char* kSqlOptimizeErrors = "clink_sql_optimize_errors_total";
 inline constexpr const char* kSqlPhysicalPlans = "clink_sql_physical_plans_total";
 
 // Per-phase duration histogram bases (OBS-1b). Each exposes
@@ -57,6 +58,9 @@ inline void bind_failed() {
 inline void optimize_completed(std::uint64_t duration_ns) {
     MetricsRegistry::global().counter(kSqlOptimizes).increment();
     MetricsRegistry::global().histogram(kSqlOptimizeNs).observe(static_cast<double>(duration_ns));
+}
+inline void optimize_failed() {
+    MetricsRegistry::global().counter(kSqlOptimizeErrors).increment();
 }
 inline void physical_plan_completed(std::uint64_t duration_ns) {
     MetricsRegistry::global().counter(kSqlPhysicalPlans).increment();

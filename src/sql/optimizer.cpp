@@ -2,17 +2,24 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <set>
 #include <string>
 
 #include "clink/config/json.hpp"
 #include "clink/metrics/sql_metrics.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/sql/join_reorder.hpp"
 #include "clink/sql/logical_plan.hpp"
 
 namespace clink::sql {
 
 namespace {
+
+// Test seam: when set, optimize() throws before running any pass, to exercise
+// the optimizer's exception guard. Never set in production. (See
+// optimizer.hpp::detail::set_optimize_force_throw.)
+bool g_optimize_force_throw = false;
 
 // Walk a JSON expression tree (predicate or value) and collect every
 // {"col": "<name>"} reference. Used to compute the set of source columns the
@@ -438,15 +445,26 @@ void push_conjuncts(LogicalFilter& f, const PushSide& left, const PushSide& righ
     if (left_push.empty() && right_push.empty()) {
         return;  // nothing single-sided to push
     }
-    if (!left_push.empty()) {
-        *left.slot = std::make_unique<LogicalFilter>(std::move(*left.slot),
-                                                     make_and(std::move(left_push)).serialize(0));
+    // Serialise every new predicate string BEFORE mutating any slot, so a throw
+    // here (serialize/make_and) cannot leave a slot moved-out (null child). Once
+    // the strings exist, the only remaining steps are the unique_ptr moves +
+    // LogicalFilter construction over an already-valid child. The residual is
+    // updated last; should set_predicate_json throw after a side was wrapped, the
+    // pushed conjuncts simply remain in `f` too (an AND filter is idempotent, so
+    // the plan stays correct, just briefly redundant).
+    std::string left_pred =
+        left_push.empty() ? std::string{} : make_and(std::move(left_push)).serialize(0);
+    std::string right_pred =
+        right_push.empty() ? std::string{} : make_and(std::move(right_push)).serialize(0);
+    std::string residual_pred = make_and(std::move(residual)).serialize(0);
+    if (!left_pred.empty()) {
+        *left.slot = std::make_unique<LogicalFilter>(std::move(*left.slot), std::move(left_pred));
     }
-    if (!right_push.empty()) {
-        *right.slot = std::make_unique<LogicalFilter>(std::move(*right.slot),
-                                                      make_and(std::move(right_push)).serialize(0));
+    if (!right_pred.empty()) {
+        *right.slot =
+            std::make_unique<LogicalFilter>(std::move(*right.slot), std::move(right_pred));
     }
-    f.set_predicate_json(make_and(std::move(residual)).serialize(0));
+    f.set_predicate_json(std::move(residual_pred));
 }
 
 // Walk the plan; for a Filter directly over a join, push its single-side
@@ -507,19 +525,52 @@ std::unique_ptr<LogicalPlan> optimize(std::unique_ptr<LogicalPlan> plan) {
     if (plan == nullptr)
         return plan;
     const auto t0 = std::chrono::steady_clock::now();
-    // Predicate pushdown first (it wraps INNER-equi-join scan children in
-    // Filters, which the reorderer's per-relation cardinality then reflects),
-    // then cost-based join reordering, then projection pushdown over the
-    // resulting tree.
-    push_predicates(*plan);
-    reorder_joins(plan);
-    std::set<std::string> cumulative;
-    apply_projection_pushdown(*plan, cumulative);
+    // The optimizer is a sound, semantics-preserving rewrite, so a throw from any
+    // pass is a planner BUG, not a user error. Rather than let it escape and fail
+    // an otherwise-valid query, catch it and fall back to the best plan we have.
+    // This is safe because every pass leaves a VALID (if less optimised) plan on
+    // throw: push_predicates serialises new predicates before mutating any slot
+    // (an AND filter is idempotent, so a partial push is correct), reorder_joins
+    // decides reorderability non-destructively and only ever commits a verified,
+    // throw-free rebuild, and apply_projection_pushdown only adds optional
+    // column hints. A caught pass simply does not run the passes after it.
+    try {
+        if (g_optimize_force_throw) {
+            throw std::runtime_error("optimize: forced throw (test seam)");
+        }
+        // Predicate pushdown first (it wraps INNER-equi-join scan children in
+        // Filters, which the reorderer's per-relation cardinality then reflects),
+        // then cost-based join reordering, then projection pushdown over the
+        // resulting tree.
+        push_predicates(*plan);
+        reorder_joins(plan);
+        std::set<std::string> cumulative;
+        apply_projection_pushdown(*plan, cumulative);
+    } catch (const std::exception& e) {
+        clink::metrics::sql::optimize_failed();
+        clink::log::warn("sql.optimize",
+                         std::string("optimizer pass failed, running the query on the "
+                                     "un-/partially-optimized plan: ") +
+                             e.what());
+        return plan;
+    } catch (...) {
+        clink::metrics::sql::optimize_failed();
+        clink::log::warn("sql.optimize",
+                         "optimizer pass failed with a non-standard exception, running the "
+                         "query on the un-/partially-optimized plan");
+        return plan;
+    }
     const auto dt =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
             .count();
     clink::metrics::sql::optimize_completed(static_cast<std::uint64_t>(dt));
     return plan;
 }
+
+namespace detail {
+void set_optimize_force_throw(bool on) {
+    g_optimize_force_throw = on;
+}
+}  // namespace detail
 
 }  // namespace clink::sql

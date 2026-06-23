@@ -8,6 +8,8 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/metrics/metrics_registry.hpp"
+#include "clink/metrics/sql_metrics.hpp"
 #include "clink/sql/binder.hpp"
 #include "clink/sql/cardinality.hpp"
 #include "clink/sql/catalog.hpp"
@@ -226,6 +228,39 @@ TEST(SqlCardinality, DeclinedReorderPreservesTreeShape) {
     // the root join's RIGHT child is still the (b JOIN c) sub-join.
     EXPECT_EQ(static_cast<const LogicalEquiJoin&>(*p).right().kind(), "EquiJoin")
         << "a declined reorder must not reshape right-deep input to left-deep";
+}
+
+// A planner bug that throws from an optimizer pass must NOT escape and fail an
+// otherwise-valid query: optimize() catches it, records the failure, and returns
+// the un-optimized (but valid, executable) plan.
+TEST(SqlCardinality, OptimizeGuardFallsBackOnPassThrow) {
+    Catalog cat;
+    reg(cat, "big", "(k BIGINT, bv BIGINT)", "row_count='1000000', ndv_k='1000000'");
+    reg(cat, "mid", "(k BIGINT, mv BIGINT)", "row_count='1000', ndv_k='1000'");
+    reg(cat, "small", "(k BIGINT, sv BIGINT)", "row_count='10', ndv_k='10'");
+    const std::string q =
+        "SELECT big_bv FROM big JOIN mid ON big.k = mid.k JOIN small ON mid.k = small.k";
+
+    // Baseline: with the guard inactive the cost-based reorder fires (small drives).
+    Binder b1(cat);
+    auto normal = optimize(b1.bind_select(as_select(parse(q))));
+    EXPECT_EQ(driving_table(*normal), "small");
+
+    const std::uint64_t before =
+        MetricsRegistry::global().counter(clink::metrics::kSqlOptimizeErrors).value();
+    detail::set_optimize_force_throw(true);
+    Binder b2(cat);
+    std::unique_ptr<LogicalPlan> guarded;
+    EXPECT_NO_THROW({ guarded = optimize(b2.bind_select(as_select(parse(q)))); });
+    detail::set_optimize_force_throw(false);  // reset before any ASSERT can return early
+
+    ASSERT_NE(guarded, nullptr);
+    // The guard returned the un-optimized syntactic plan: big still drives.
+    EXPECT_EQ(driving_table(*guarded), "big")
+        << "a thrown optimizer pass must fall back to the un-optimized plan";
+    // ...and the failure was counted.
+    EXPECT_EQ(MetricsRegistry::global().counter(clink::metrics::kSqlOptimizeErrors).value(),
+              before + 1);
 }
 
 }  // namespace
