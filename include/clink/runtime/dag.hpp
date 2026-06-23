@@ -446,8 +446,14 @@ public:
             // so ctx never dangles past this runner.
             StateBackend* const original_backend =
                 ctx.has_state_backend() ? ctx.state_backend() : nullptr;
-            const bool do_coalesce = op->supports_async() && op->coalesce_reads() &&
-                                     original_backend != nullptr &&
+            // NB: gate on coalesce_reads() (the static opt-in) + a deferring
+            // backend, NOT op->supports_async(). supports_async() is only
+            // finalised in open() below for auto-async operators (e.g. the SQL
+            // GROUP BY, which rides async iff the backend defers), so it still
+            // reads false here. coalesce_reads()=true already implies the op is
+            // async, and supports_async_get() carries the async-relevance; if an
+            // op were sync the wrap is inert anyway (sync get() forwards through).
+            const bool do_coalesce = op->coalesce_reads() && original_backend != nullptr &&
                                      original_backend->supports_async_get();
             std::unique_ptr<CoalescingBackend> coalescer;
             if (do_coalesce) {
@@ -2639,8 +2645,14 @@ public:
             // restores it at teardown. Off = byte-identical.
             StateBackend* const original_backend =
                 ctx.has_state_backend() ? ctx.state_backend() : nullptr;
-            const bool do_coalesce = op->supports_async() && op->coalesce_reads() &&
-                                     original_backend != nullptr &&
+            // NB: gate on coalesce_reads() (the static opt-in) + a deferring
+            // backend, NOT op->supports_async(). supports_async() is only
+            // finalised in open() below for auto-async operators (e.g. the SQL
+            // GROUP BY, which rides async iff the backend defers), so it still
+            // reads false here. coalesce_reads()=true already implies the op is
+            // async, and supports_async_get() carries the async-relevance; if an
+            // op were sync the wrap is inert anyway (sync get() forwards through).
+            const bool do_coalesce = op->coalesce_reads() && original_backend != nullptr &&
                                      original_backend->supports_async_get();
             std::unique_ptr<CoalescingBackend> coalescer;
             if (do_coalesce) {

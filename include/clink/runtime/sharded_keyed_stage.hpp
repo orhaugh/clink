@@ -381,8 +381,11 @@ private:
             // shard_backend_factory is configured; off = byte-identical. The
             // worker's own sh.backend uses (snapshot, the resume scheduler) stay
             // on the inner backend, which the decorator forwards transparently.
-            const bool do_coalesce = sh.op->supports_async() && sh.op->coalesce_reads() &&
-                                     sh.backend->supports_async_get();
+            // Gate on coalesce_reads() (static opt-in) + a deferring backend, NOT
+            // sh.op->supports_async(): an auto-async op (e.g. SQL GROUP BY) only
+            // finalises supports_async() in open() below, so it reads false here.
+            // coalesce_reads()=true implies async; the wrap is inert on a sync op.
+            const bool do_coalesce = sh.op->coalesce_reads() && sh.backend->supports_async_get();
             std::unique_ptr<CoalescingBackend> coalescer;
             if (do_coalesce) {
                 coalescer = std::make_unique<CoalescingBackend>(*sh.backend);

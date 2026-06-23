@@ -474,6 +474,91 @@ TEST(AsyncOperatorRunner, NonCoalescingOperatorIssuesPerKeyReads) {
 
 namespace {
 
+// Mirrors the SQL GROUP BY operator's AUTO-async contract: supports_async() is
+// false until open() finalises it from the bound backend's supports_async_get().
+// The runner computes do_coalesce BEFORE open(), so coalescing must be gated on
+// coalesce_reads() + a deferring backend, NOT the not-yet-finalised
+// supports_async(). Same one-read-per-record body as CoalescingCountOperator.
+class AutoAsyncCoalescingOp final : public Operator<int, std::int64_t> {
+public:
+    void open() override {
+        effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
+                           this->runtime()->state_backend()->supports_async_get();
+    }
+    [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
+
+    void process(const StreamElement<int>& element, Emitter<std::int64_t>& out) override {
+        if (element.is_data()) {
+            Batch<std::int64_t> b;
+            for (const auto& r : element.as_data()) {
+                (void)r;
+                b.emplace(0);
+            }
+            out.emit_data(std::move(b));
+        } else if (element.is_watermark()) {
+            this->on_watermark(element.as_watermark(), out);
+        } else {
+            this->on_barrier(element.as_barrier(), out);
+        }
+    }
+
+    void process_async(const StreamElement<int>& element,
+                       Emitter<std::int64_t>& out,
+                       AsyncExecutionController& aec) override {
+        if (!element.is_data()) {
+            return;
+        }
+        for (const auto& rec : element.as_data()) {
+            const std::int64_t key = rec.value();
+            auto kv = this->runtime()->keyed_state<std::int64_t, std::int64_t>(
+                "c", int64_codec(), int64_codec());
+            aec.submit(std::to_string(key), [kv, key, &out]() mutable -> async::Task<void> {
+                const std::int64_t c = (co_await kv.get_async(key)).value_or(0) + 1;
+                kv.put(key, c);
+                Batch<std::int64_t> batch;
+                batch.emplace(c);
+                out.emit_data(std::move(batch));
+                co_return;
+            });
+        }
+    }
+
+    std::string name() const override { return "auto_async_coalescing"; }
+
+private:
+    bool effective_async_{false};
+};
+
+}  // namespace
+
+// Regression for the auto-async coalescing wiring: an operator whose
+// supports_async() is only finalised in open() (the SQL GROUP BY shape) must
+// still coalesce on a deferring backend. The runner gates do_coalesce on
+// coalesce_reads() + supports_async_get(), NOT the not-yet-finalised
+// supports_async(); before that fix this op fell back to per-key get_async.
+TEST(AsyncOperatorRunner, AutoAsyncOperatorCoalescesDespiteSupportsAsyncFinalisedInOpen) {
+    auto backend = std::make_shared<CountingAsyncBackend>();
+    Dag dag;
+    auto src = std::make_shared<VectorSource<int>>(records({10, 20, 30, 40}));
+    auto op = std::make_shared<AutoAsyncCoalescingOp>();
+    auto sink = std::make_shared<CollectingSink<std::int64_t>>();
+    auto h0 = dag.add_source<int>(src);
+    auto h1 = dag.add_operator<int, std::int64_t>(h0, op);
+    dag.add_sink<std::int64_t>(h1, sink);
+    JobConfig cfg;
+    cfg.state_backend = backend;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    auto out = sink->collected();
+    std::sort(out.begin(), out.end());
+    EXPECT_EQ(out, (std::vector<std::int64_t>{1, 1, 1, 1}));
+    EXPECT_EQ(backend->get_many_calls(), 1);   // coalesced despite the auto-async timing
+    EXPECT_EQ(backend->get_async_calls(), 0);  // never the per-key path
+}
+
+namespace {
+
 // Issues TWO sequential get_async per record (different slots), so a record's
 // SECOND read is a follow-on round after the first resumes. With coalescing +
 // the looped post-process flush, each round is one get_many; both rounds drain

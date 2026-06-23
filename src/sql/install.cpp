@@ -1758,6 +1758,15 @@ public:
 
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_state_; }
 
+    // Opt into ASYNC-10 read coalescing: each record's process_async issues one
+    // get_async for its group key, so a batch of records reading many distinct
+    // groups collapses into ONE get_many_async (and the S3 pool dedups identical
+    // objects), cutting remote round-trips on a high-cardinality GROUP BY. Static
+    // (no runtime needed); the runner only wraps the CoalescingBackend when the
+    // bound backend actually defers reads, so this is a no-op on a non-deferring
+    // (memory/file) backend.
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
+
     void process_async(const StreamElement<Row>& element,
                        Emitter<Row>& out,
                        AsyncExecutionController& aec) override {
