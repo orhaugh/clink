@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -170,6 +171,24 @@ std::string remote_read_uri(const std::string& prefix) {
     return "remote-read://" + bucket + "/" + prefix + "?endpoint=" + endpoint + "&region=us-east-1";
 }
 
+// Same, but pins a tiny hot-tier budget so the working set cannot fit in RAM:
+// committed keys are evicted LRU-first and cold-refetched from S3 on next read.
+std::string remote_read_uri_evict(const std::string& prefix, std::size_t hot_max_bytes) {
+    return remote_read_uri(prefix) + "&hot_max_bytes=" + std::to_string(hot_max_bytes);
+}
+
+// Bump the keyed aggregate operator to `p` subtasks so the GROUP BY runs sharded
+// across the cluster (the upstream key-by edge fans out to the p keyed subtasks
+// by key group). The file source/sink stay at 1. Returns the modified spec.
+cluster::JobGraphSpec with_parallelism(cluster::JobGraphSpec spec, std::uint32_t p) {
+    for (auto& op : spec.ops) {
+        if (op.type == "aggregate_row") {
+            op.parallelism = p;  // static (min/max stay 0 = no autoscaling)
+        }
+    }
+    return spec;
+}
+
 // Run one GROUP BY job to completion against the cluster, optionally restoring
 // from a prior checkpoint on the given S3 prefix. Returns the final total for
 // user_id=1 from the sink output.
@@ -196,7 +215,121 @@ std::int64_t run_groupby_job(const std::string& tm_id,
     return last_total_for_key(out_path, 1);
 }
 
+// The final (last-emitted) total for EVERY key in the sink output.
+std::map<std::int64_t, std::int64_t> all_totals(const std::filesystem::path& out_path) {
+    std::map<std::int64_t, std::int64_t> totals;
+    for (const auto& line : read_lines(out_path)) {
+        auto js = clink::config::parse(line);
+        if (!js.is_object())
+            continue;
+        totals[static_cast<std::int64_t>(js.at("user_id").as_number())] =
+            static_cast<std::int64_t>(js.at("total").as_number());
+    }
+    return totals;
+}
+
+// Run a GROUP BY job with an explicit (tiny) hot-tier budget + a sharded
+// aggregate parallelism, optionally restoring from a prior checkpoint. Returns
+// the per-key final totals.
+std::map<std::int64_t, std::int64_t> run_groupby_evict(const std::string& tm_id,
+                                                       const std::filesystem::path& in_path,
+                                                       const std::filesystem::path& out_path,
+                                                       const std::string& state_prefix,
+                                                       std::size_t hot_max_bytes,
+                                                       std::uint32_t parallelism,
+                                                       bool restore,
+                                                       std::uint64_t restore_ckpt) {
+    InProcessCluster cluster(tm_id, 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 90s;
+    opts.checkpoint.state_backend_uri = remote_read_uri_evict(state_prefix, hot_max_bytes);
+    if (restore) {
+        opts.checkpoint.restore_from_dir = remote_read_uri_evict(state_prefix, hot_max_bytes);
+        opts.checkpoint.restore_from_checkpoint_id = restore_ckpt;
+    }
+    auto spec = with_parallelism(compile_groupby(in_path, out_path), parallelism);
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    EXPECT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+    return all_totals(out_path);
+}
+
 }  // namespace
+
+// Cluster-scale disaggregation proof: a many-key GROUP BY runs SHARDED across
+// subtasks over S3, with a hot-tier budget far below the working set so keyed
+// state genuinely spills to S3 (committed keys evicted LRU-first, cold-refetched
+// on next read), and a fresh job restores all of it lazily. Correct per-key
+// totals through a tiny hot tier == state-exceeds-RAM works end-to-end at
+// parallelism over real object storage.
+TEST(SqlRemoteReadE2E, MultiKeyEvictionAndRestoreShardedOverS3) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    ensure_installed_once();
+
+    const auto pid = std::to_string(::getpid());
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in1 = tmp / ("clink-rr-mk-in1-" + pid + ".ndjson");
+    const auto out1 = tmp / ("clink-rr-mk-out1-" + pid + ".ndjson");
+    const auto in2 = tmp / ("clink-rr-mk-in2-" + pid + ".ndjson");
+    const auto out2 = tmp / ("clink-rr-mk-out2-" + pid + ".ndjson");
+    for (const auto& p : {in1, out1, in2, out2})
+        std::filesystem::remove(p);
+
+    constexpr std::int64_t kKeys = 20;
+    constexpr std::int64_t kB1PerKey = 10;
+    constexpr std::int64_t kB2PerKey = 3;
+    {
+        std::vector<std::string> r1;
+        std::vector<std::string> r2;
+        for (std::int64_t k = 1; k <= kKeys; ++k) {
+            const std::string row = R"({"user_id":)" + std::to_string(k) + R"(,"amount":1})";
+            for (int i = 0; i < kB1PerKey; ++i)
+                r1.push_back(row);
+            for (int i = 0; i < kB2PerKey; ++i)
+                r2.push_back(row);
+        }
+        write_lines(in1, r1);
+        write_lines(in2, r2);
+    }
+
+    const std::string prefix = "clink-sql-rr-mk/" + pid;
+    constexpr std::size_t kHot = 32;   // << the 20-key working set: forces eviction
+    constexpr std::uint32_t kPar = 4;  // sharded GROUP BY across 4 keyed subtasks
+
+    // Phase 1: build 20-key aggregate state, sharded, evicting under the budget.
+    auto built = run_groupby_evict("tm-rr-mk-build",
+                                   in1,
+                                   out1,
+                                   prefix,
+                                   kHot,
+                                   kPar,
+                                   /*restore=*/false,
+                                   0);
+    ASSERT_EQ(built.size(), static_cast<std::size_t>(kKeys));
+    for (std::int64_t k = 1; k <= kKeys; ++k)
+        EXPECT_EQ(built[k], kB1PerKey) << "build key " << k;
+
+    // Phase 2: fresh cluster restores all 20 keys lazily from S3 (hot tier empty)
+    // and folds batch 2 touching every key. Under the tiny budget each key is
+    // cold-read from S3, filled, then evicted as others arrive (heavy churn).
+    auto restored = run_groupby_evict("tm-rr-mk-restore",
+                                      in2,
+                                      out2,
+                                      prefix,
+                                      kHot,
+                                      kPar,
+                                      /*restore=*/true,
+                                      kEndOfStreamCheckpoint);
+    ASSERT_EQ(restored.size(), static_cast<std::size_t>(kKeys));
+    for (std::int64_t k = 1; k <= kKeys; ++k)
+        EXPECT_EQ(restored[k], kB1PerKey + kB2PerKey) << "restored key " << k;
+
+    for (const auto& p : {in1, out1, in2, out2})
+        std::filesystem::remove(p);
+}
 
 TEST(SqlRemoteReadE2E, GroupByAsyncCheckpointsToS3AndRestores) {
     if (!s3_available()) {
