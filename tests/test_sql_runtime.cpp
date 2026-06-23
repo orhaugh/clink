@@ -7,6 +7,7 @@
 // clink::sql::install at test start.
 
 #include <algorithm>
+#include <any>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -25,6 +26,7 @@
 #include "clink/application/job_submitter.hpp"
 #include "clink/async/task.hpp"
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/dag_builder_registry.hpp"
 #include "clink/cluster/job_manager.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/task_manager.hpp"
@@ -418,6 +420,68 @@ TEST(SqlRuntime, AsyncStateInnerJoinOverDisaggProducesCorrectOutput) {
     std::filesystem::remove(l_path);
     std::filesystem::remove(r_path);
     std::filesystem::remove(out_path);
+}
+
+// Stronger than the SQL-cluster join e2e above: build the real EquiJoinRowOp via
+// its registered Dag builder into a cluster-free Dag over an INJECTABLE deferring
+// backend, so we can read remote_loads() and prove the INNER join actually rode
+// the async / remote-read path (not just that the output was correct). SQL co-ops
+// can't be built via OperatorRegistry::find_co_operator (none exists); the
+// DagBuilderRegistry seam (populated by install()) is how a test reaches one.
+TEST(SqlRuntime, AsyncStateInnerJoinRidesRemoteReadPath) {
+    ensure_sql_installed_once();
+    const auto* builder = cluster::DagBuilderRegistry::default_instance().find("equi_join_row");
+    ASSERT_NE(builder, nullptr) << "equi_join_row Dag builder not registered";
+
+    auto mkrow = [](std::int64_t id, const char* col, std::int64_t v) {
+        Row r;
+        r.values["id"] = clink::config::JsonValue{static_cast<double>(id)};
+        r.values[col] = clink::config::JsonValue{static_cast<double>(v)};
+        return Record<Row>{std::move(r)};
+    };
+    const std::vector<Record<Row>> left = {
+        mkrow(1, "lv", 10), mkrow(2, "lv", 20), mkrow(1, "lv", 11)};
+    const std::vector<Record<Row>> right = {
+        mkrow(1, "rv", 100), mkrow(1, "rv", 101), mkrow(3, "rv", 300)};
+
+    Dag dag;
+    auto hl = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(left));
+    auto hr = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(right));
+    clink::plugin::BuildContext ctx;
+    ctx.params["left_key_column"] = "id";
+    ctx.params["right_key_column"] = "id";
+    ctx.params["left_alias"] = "l";
+    ctx.params["right_alias"] = "r";
+    ctx.params["join_type"] = "inner";
+    ctx.params["left_columns"] = "id,lv";
+    ctx.params["right_columns"] = "id,rv";
+    std::vector<std::any> upstream = {std::any{hl}, std::any{hr}};
+    auto built = (*builder)(dag, upstream, ctx);
+    auto h_join = std::any_cast<StageHandle<Row>>(built.main_handle);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_join, sink);
+
+    // Deferring backend: EquiJoinRowOp auto-enables the async KeyedState path.
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    JobConfig cfg;
+    cfg.state_backend = rrb;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    std::vector<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& rec : sink->collected_records()) {
+        const Row& r = rec.value();
+        got.emplace_back(static_cast<std::int64_t>(r.values.at("l_lv").as_number()),
+                         static_cast<std::int64_t>(r.values.at("r_rv").as_number()));
+    }
+    std::sort(got.begin(), got.end());
+    const std::vector<std::pair<std::int64_t, std::int64_t>> want = {
+        {10, 100}, {10, 101}, {11, 100}, {11, 101}};
+    EXPECT_EQ(got, want);
+    EXPECT_GT(rrb->remote_loads(), 0u)
+        << "INNER join did not route its per-key state through the deferring backend (async path)";
 }
 
 // #59: the same unbounded GROUP BY built through the programmatic Table API
