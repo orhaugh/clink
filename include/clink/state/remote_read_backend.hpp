@@ -54,6 +54,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unistd.h>  // sysconf, for the heap-fraction hot-tier default
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -66,6 +67,30 @@
 #include "clink/state/state_backend.hpp"
 
 namespace clink {
+
+// Default hot-tier byte budget for a pool-backed disaggregated backend when the
+// factory URI does not specify one: a fraction of physical RAM, so working-set-
+// exceeds-RAM (state spills to the pool, evicted LRU-first) is the DEFAULT rather
+// than an expert knob - the point of disaggregation. Returns a non-zero value
+// (0 is the sentinel for "explicitly unbounded", which a caller must pass
+// deliberately). Conservative when RAM can't be queried.
+//
+// CAVEAT: this is per-backend (per keyed operator subtask). A node running many
+// keyed operators with this default can oversubscribe RAM; per-operator / global
+// budgeting is a deferred follow-on (the factory caller can still pass an
+// explicit hot_max_bytes to bound it).
+inline std::size_t default_remote_hot_max_bytes() {
+    constexpr std::size_t kFloor = 64ull * 1024 * 1024;      // never below 64 MiB
+    constexpr std::size_t kFallback = 256ull * 1024 * 1024;  // can't query RAM -> 256 MiB
+    const long pages = ::sysconf(_SC_PHYS_PAGES);
+    const long page_size = ::sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_size <= 0) {
+        return kFallback;
+    }
+    const auto total = static_cast<std::size_t>(pages) * static_cast<std::size_t>(page_size);
+    const std::size_t quarter = total / 4;  // 25% of physical RAM
+    return quarter < kFloor ? kFloor : quarter;
+}
 
 class RemoteReadBackend final : public StateBackend {
 public:
@@ -476,6 +501,8 @@ public:
     }
     [[nodiscard]] std::size_t hot_resident_bytes() const noexcept { return hot_bytes_; }
     [[nodiscard]] std::size_t hot_resident_keys() const noexcept { return index_.size(); }
+    // The configured hot-tier byte budget (0 == unbounded). For factory tests.
+    [[nodiscard]] std::size_t hot_max_bytes() const noexcept { return hot_max_bytes_; }
 
 private:
     // Awaiter for a cold read: the IO thread fills `value` then posts the handle

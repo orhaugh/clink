@@ -11,6 +11,7 @@
 
 #include "clink/state/file_backed_state_backend.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+#include "clink/state/remote_read_backend.hpp"
 #include "clink/state/state_backend_factory.hpp"
 
 namespace {
@@ -262,6 +263,27 @@ TEST(StateBackendFactory, DisaggLocalParsesParamsAndStaysDeferring) {
         ASSERT_NE(built.backend, nullptr) << uri;
         EXPECT_TRUE(built.backend->supports_async_get()) << uri;
     }
+}
+
+// hot_max_bytes defaults to a non-zero heap fraction, so disaggregation-of-
+// working-set (LRU eviction to the pool) is ON by default. An explicit value
+// overrides it; an explicit 0 forces the unbounded tier; a malformed value keeps
+// the default.
+TEST(StateBackendFactory, DisaggLocalDefaultsHotBudgetToHeapFraction) {
+    auto& factory = clink::StateBackendFactory::default_instance();
+    auto budget = [&](const char* uri) -> std::size_t {
+        clink::StateBackendSpec spec;
+        spec.uri = uri;
+        auto built = factory.build(spec);
+        auto* rrb = dynamic_cast<clink::RemoteReadBackend*>(built.backend.get());
+        EXPECT_NE(rrb, nullptr) << uri;
+        return rrb != nullptr ? rrb->hot_max_bytes() : 0;
+    };
+    EXPECT_GT(budget("disagg-local://"), 0u);  // default = heap fraction (non-zero)
+    EXPECT_GE(budget("disagg-local://"), 64ull * 1024 * 1024);       // at least the floor
+    EXPECT_EQ(budget("disagg-local://?hot_max_bytes=4096"), 4096u);  // explicit overrides
+    EXPECT_EQ(budget("disagg-local://?hot_max_bytes=0"), 0u);        // explicit 0 = unbounded
+    EXPECT_GT(budget("disagg-local://?hot_max_bytes=oops"), 0u);     // malformed -> default
 }
 
 // The common backends are NOT deferring, so the async path must never

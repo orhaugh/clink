@@ -48,7 +48,10 @@ struct Cfg {
     std::string endpoint;
     std::string region;
     bool anonymous{false};
-    std::size_t hot_max_bytes{0};  // 0 = unbounded hot tier (no eviction)
+    // Default the hot-tier budget to a fraction of physical RAM so working-state-
+    // exceeds-RAM (LRU eviction back to S3) is ON by default; ?hot_max_bytes=N
+    // overrides, ?hot_max_bytes=0 forces the unbounded tier.
+    std::size_t hot_max_bytes{clink::default_remote_hot_max_bytes()};
     // IO concurrency for the completion executor (ASYNC-9). The cold-read load
     // is a blocking S3 GET; one thread serializes every in-flight read, so the
     // default is well above 1. Raise it for high remote-read fan-out.
@@ -89,7 +92,7 @@ Cfg parse_cfg(const std::string& base) {
                 try {
                     c.hot_max_bytes = static_cast<std::size_t>(std::stoull(v));
                 } catch (...) {
-                    c.hot_max_bytes = 0;  // malformed -> unbounded (safe default)
+                    // malformed -> keep the heap-fraction default (unchanged)
                 }
             } else if (k == "io_threads") {
                 try {

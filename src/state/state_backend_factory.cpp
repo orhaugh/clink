@@ -70,8 +70,11 @@ BuiltStateBackend build_memory_sharded(const StateBackendSpec& /*spec*/) {
 BuiltStateBackend build_disagg_local(const StateBackendSpec& spec) {
     auto [scheme, base] = split_uri(spec.uri);
     (void)scheme;
-    std::size_t io_threads = 1;     // connection-pool size (knob; no real IO here)
-    std::size_t hot_max_bytes = 0;  // 0 = unbounded hot tier (no eviction)
+    std::size_t io_threads = 1;  // connection-pool size (knob; no real IO here)
+    // Default the hot-tier budget to a fraction of physical RAM so working-state-
+    // exceeds-RAM (LRU eviction to the pool) is ON by default. An explicit
+    // ?hot_max_bytes=N overrides it; ?hot_max_bytes=0 forces the unbounded tier.
+    std::size_t hot_max_bytes = default_remote_hot_max_bytes();
     if (const auto q = base.find('?'); q != std::string::npos) {
         const std::string query = base.substr(q + 1);
         for (std::size_t start = 0; start < query.size();) {
