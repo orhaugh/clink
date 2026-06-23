@@ -721,11 +721,27 @@ private:
         if (hot_max_bytes_ == 0 || !pool_) {
             return;
         }
+        // Cap the PINNED (not-yet-durable) entries skipped while hunting for an
+        // evictable one. A write burst can leave a long run of dirty/persisting
+        // entries at the LRU tail; without a cap, skipping past them is O(hot
+        // keys) on EVERY put (the runner thread), so a burst that dirties more
+        // keys than the budget holds is O(n^2) on the hot path. The cap makes
+        // each put O(kMaxPinnedSkips). PRODUCTIVE evictions are not capped, so a
+        // tail of clean keys is still fully reclaimed in one call; only the futile
+        // skip-scan is bounded. The hot tier is a soft cache, so a transient
+        // overage when the tail is all-pinned (those keys are un-evictable until
+        // they commit anyway) is fine - the post-commit evict reclaims them once
+        // they turn clean, and the next put retries with a fresh skip budget.
+        constexpr std::size_t kMaxPinnedSkips = 256;
+        std::size_t skips = 0;
         for (auto it = lru_.end(); hot_bytes_ > hot_max_bytes_ && it != lru_.begin();) {
             --it;
             const std::pair<std::uint64_t, std::string> ck{it->op, it->key};
             if (dirty_.count(ck) != 0 || deleted_.count(ck) != 0 ||
                 persisting_dirty_.count(ck) != 0 || persisting_deleted_.count(ck) != 0) {
+                if (++skips > kMaxPinnedSkips) {
+                    break;  // long pinned run: stop hunting, retry on a later call
+                }
                 continue;  // not yet durable in the pool (delta or in-flight
                            // persist): must stay hot
             }

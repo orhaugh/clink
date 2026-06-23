@@ -499,3 +499,38 @@ TEST(RemoteReadBackend, ConcurrentOffThreadPersistWithLiveWrites) {
     r2.restore(s2);
     EXPECT_EQ(to_string(*r2.get(op, sv("k0"))), "next");  // cp2 = post-capture writes
 }
+
+// A write burst dirties many more keys than the hot budget holds before any
+// checkpoint commits them. Eviction must skip every (pinned) dirty key without
+// wrongly evicting one, and the per-put skip-scan is bounded (kMaxPinnedSkips) so
+// the burst is not O(n^2) on the runner thread. After a checkpoint turns them
+// clean, eviction reclaims down to the budget and every key stays readable. The
+// key count exceeds the internal skip cap (256) so the bounded-skip path runs.
+TEST(RemoteReadBackend, WriteBurstThenCheckpointEvictsWithinBudget) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    const OperatorId op{36};
+    RemoteReadBackend b(pool, /*io_threads=*/1, /*hot_max_bytes=*/64);
+    constexpr int kN = 300;  // > kMaxPinnedSkips (256): the burst run is all pinned
+    for (int i = 0; i < kN; ++i) {
+        const std::string k = "k" + std::to_string(i);
+        const std::string v = "v" + std::to_string(i);
+        b.put(op, std::string_view{k}, std::string_view{v});
+    }
+    // All dirty (uncommitted): none may be evicted, even far over budget.
+    EXPECT_EQ(b.hot_resident_keys(), static_cast<std::size_t>(kN));
+    EXPECT_GT(b.hot_resident_bytes(), 64u);
+    EXPECT_EQ(b.hot_evictions(), 0u);
+
+    b.snapshot(CheckpointId{1});  // commit -> all clean -> reclaim to budget
+    EXPECT_LE(b.hot_resident_bytes(), 64u);
+    EXPECT_LT(b.hot_resident_keys(), static_cast<std::size_t>(kN));
+    EXPECT_GT(b.hot_evictions(), 0u);
+
+    // Every key is still readable; evicted ones cold-fetch from the pool.
+    for (int i : {0, 1, 150, 298, 299}) {
+        const std::string k = "k" + std::to_string(i);
+        auto v = b.get(op, std::string_view{k});
+        ASSERT_TRUE(v.has_value()) << "key " << k << " lost after burst+evict";
+        EXPECT_EQ(to_string(*v), "v" + std::to_string(i));
+    }
+}
