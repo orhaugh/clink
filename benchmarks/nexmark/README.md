@@ -46,21 +46,20 @@ Flags: `--query qN`, `--events N` (total events), `--tps N` (dateTime spacing =
 | q12 | bids per window | per-bidder `COUNT(*)` over a 10s `TUMBLE` (event-time analogue of Nexmark's proctime q12) |
 | q7 | highest bid | per-window `MAX(price)` as a join side (equi on price) + a column-vs-column range residual `dateTime IN [window_start, window_end)` |
 | q8 | new users | two windowed aggregates joined on `seller = id` + a column-vs-column window-equality residual |
+| q5 | hot items | per-(auction,window) count joined to the per-window `MAX` of those counts (a non-windowed GROUP BY -> changelog) + a count-equals-max residual. Run with `--slots 16` (nested windowed counts + a join). |
 
 Enabling capabilities now in clink SQL: `window_start`/`window_end` projectable
 from any windowed GROUP BY (aliasable, BIGINT ms-since-epoch); a derived table
-(incl. a windowed aggregate) usable as a join input; and column-vs-column
-comparisons in WHERE (so a single-equi-key join + a residual predicate expresses
-range and composite-key joins). q8's per-window grouping carries a `COUNT(*)`
-(unused) because clink requires an aggregate in a GROUP BY SELECT.
+(incl. a windowed aggregate) usable as a join input; column-vs-column comparisons
+in WHERE (so a single-equi-key join + a residual predicate expresses range and
+composite-key joins); and RETRACTION/CHANGELOG streams - a non-windowed GROUP BY
+emits a changelog (opt-in, when it feeds a join/netting sink), the equi-join
+consumes those retractions, and a netting sink resolves the +/- to the final
+relation. q8's per-window grouping carries a `COUNT(*)` (unused) because clink
+requires an aggregate in a GROUP BY SELECT.
 
-Still out: q5 (hot-items) needs the per-window MAX of per-auction counts. Every
-piece exists in clink (the windowed counts, an aggregate over a derived windowed
-aggregate, the join, the residual), but that second-level MAX is a non-windowed
-GROUP BY running in upsert mode, and clink's append-only joins multiply against
-its updates - q5 needs dataflow RETRACTION/CHANGELOG streams, which clink does
-not have. See the DISABLED_HotItemsPerWindowMaxOverWindowedAggregate test. Then
-the analytics tier: OVER/Top-N + distinct/filter aggregates (q15/q17/q18/q19).
+All ten runnable queries now execute (q0/q1/q2/q3/q5/q7/q8/q11/q12/q20). Next:
+the analytics tier - OVER/Top-N + distinct/filter aggregates (q15/q17/q18/q19).
 See the feasibility scoping.
 
 Window queries: use a lower `--tps` (e.g. `--tps 50000`) so `datetime` spans many

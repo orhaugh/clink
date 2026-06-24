@@ -143,10 +143,24 @@ const std::map<std::string, Query>& queries() {
           "JOIN (SELECT seller, COUNT(*) AS ac, window_start AS astart, window_end AS aend "
           "FROM auction GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), seller) AS A "
           "ON P.id = A.seller WHERE P_starttime = A_astart AND P_endtime = A_aend"}},
-        // q5 (hot items) is NOT included: it needs the per-window MAX of per-auction
-        // counts, a non-windowed GROUP BY that runs in upsert mode, and clink's
-        // append-only joins multiply against its updates (no retraction streams).
-        // See the DISABLED_HotItemsPerWindowMaxOverWindowedAggregate runtime test.
+        // q5: hot items - per-window auction(s) with the most bids. D is the
+        // per-(auction,window) bid count; M is the per-window MAX of those counts
+        // (a non-windowed GROUP BY -> changelog). Join on the window + a
+        // column-vs-column residual (count == window max). The retracting M and
+        // the retraction-consuming join keep only the current hot items. Heavy
+        // topology (two windowed counts + a join): run with --slots 16.
+        {"q5",
+         {"CREATE TABLE sink_q5 (auction BIGINT, num BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q5 SELECT D_auction AS auction, D_num AS num FROM "
+          "(SELECT auction, COUNT(*) AS num, window_start AS ws, window_end AS we FROM bid "
+          "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), auction) AS D "
+          "JOIN (SELECT window_start AS ws, window_end AS we, MAX(num) AS maxnum FROM "
+          "(SELECT auction, COUNT(*) AS num, window_start AS window_start, window_end AS "
+          "window_end "
+          "FROM bid GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), auction) AS d2 "
+          "GROUP BY window_start, window_end) AS M ON D.ws = M.ws "
+          "WHERE D_we = M_we AND D_num = M_maxnum"}},
     };
     return q;
 }
