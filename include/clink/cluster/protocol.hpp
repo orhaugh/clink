@@ -362,6 +362,18 @@ enum class CheckpointAlignment : std::uint8_t {
     Unaligned = 1,
 };
 
+// Sentinel for max_restarts_on_tm_loss meaning "not set - use the recovery
+// default." Resolved at the JobManager: when checkpointing is enabled
+// (checkpoint_dir set) it becomes kDefaultSelfHealRestarts (self-heal by
+// default, Flink's exponential-delay-by-default model); without checkpointing it
+// becomes 0 (fail-fast, since there is no checkpoint to restore from). An
+// explicit 0 stays fail-fast; an explicit N stays N.
+inline constexpr std::uint32_t kRestartAuto = std::numeric_limits<std::uint32_t>::max();
+// Default bounded self-heal attempts for a checkpointed job that did not set a
+// restart count. After this many automatic restarts the job fails loudly rather
+// than looping forever.
+inline constexpr std::uint32_t kDefaultSelfHealRestarts = 10;
+
 // Distributed-checkpointing config the client attaches to a SubmitJob.
 // All fields are optional - omitted ones disable that piece of the
 // machinery and behaviour matches v1 (no persistence).
@@ -379,12 +391,15 @@ struct CheckpointConfig {
     // completed checkpoint.
     std::string restore_from_dir;
     std::uint64_t restore_from_checkpoint_id{0};
-    // Max times the JM will automatically re-deploy this job's subtasks
-    // onto surviving TMs after a TM goes lost. Each restart starts from
-    // latest_completed_checkpoint_id (so keyed state is preserved; source
-    // replay correctness depends on the source impl). 0 keeps the
-    // legacy fail-fast behavior. Has no effect without checkpoint_dir.
-    std::uint32_t max_restarts_on_tm_loss{0};
+    // Max times the JM will automatically re-deploy this job's subtasks after a
+    // TM goes lost or a subtask errors. Each restart starts from
+    // latest_completed_checkpoint_id (so keyed state is preserved; source replay
+    // correctness depends on the source impl). The default kRestartAuto resolves
+    // to self-heal (kDefaultSelfHealRestarts) when checkpoint_dir is set and
+    // fail-fast (0) otherwise; an explicit 0 forces fail-fast even with
+    // checkpointing; an explicit N caps the attempts. Resolved by
+    // effective_max_restarts() at the JM. Has no effect without checkpoint_dir.
+    std::uint32_t max_restarts_on_tm_loss{kRestartAuto};
 
     // Aligned vs unaligned barrier handling at multi-input operators.
     // Default Aligned - back-compat with every existing job.
@@ -401,6 +416,18 @@ struct CheckpointConfig {
     // without the JM writing markers to a non-filesystem path.
     std::string state_backend_uri;
 };
+
+// Resolve max_restarts_on_tm_loss to its effective value (see the field +
+// kRestartAuto). kRestartAuto -> self-heal default when checkpointing is enabled,
+// fail-fast otherwise; an explicit value is used verbatim. The JobManager calls
+// this at every restart decision, so the stored/persisted value keeps the user's
+// original intent (auto vs explicit) and HA recovery round-trips it.
+[[nodiscard]] inline std::uint32_t effective_max_restarts(const CheckpointConfig& c) noexcept {
+    if (c.max_restarts_on_tm_loss == kRestartAuto) {
+        return c.checkpoint_dir.empty() ? 0u : kDefaultSelfHealRestarts;
+    }
+    return c.max_restarts_on_tm_loss;
+}
 
 // Client → JM. Carries a JobGraphSpec serialized as JSON, plus any
 // plugin .so/.dylib files referenced by the graph, plus optional

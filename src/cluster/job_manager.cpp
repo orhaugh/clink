@@ -2226,7 +2226,7 @@ void JobManager::mark_tm_lost_locked_(TmConnection& tm) {
         const bool can_restart = !job->awaiting_restart && !job->completion_signalled &&
                                  !job->cancel_requested &&
                                  !job->checkpoint.checkpoint_dir.empty() &&
-                                 job->restart_attempts < job->checkpoint.max_restarts_on_tm_loss;
+                                 job->restart_attempts < effective_max_restarts(job->checkpoint);
         if (can_restart) {
             // Defer error synthesis. Capture the lost-TM subtasks for
             // re-deployment, plus the surviving-TM subtasks we need
@@ -2274,7 +2274,7 @@ void JobManager::mark_tm_lost_locked_(TmConnection& tm) {
             log::warn("jm.watchdog",
                       "job_id=" + std::to_string(job->id) + " awaiting_restart (attempt " +
                           std::to_string(job->restart_attempts + 1) + "/" +
-                          std::to_string(job->checkpoint.max_restarts_on_tm_loss) +
+                          std::to_string(effective_max_restarts(job->checkpoint)) +
                           ") drain_expected=" + std::to_string(job->restart_drain_expected.size()));
             // Bookkeeping: completed_count and errors may already include
             // entries for surviving-TM subtasks that finished before this
@@ -2961,7 +2961,7 @@ void JobManager::handle_subtask_finished_(MessageReader& r) {
             }
         } else if (!retry && msg.had_error && !job.completion_signalled && !job.cancel_requested &&
                    !job.checkpoint.checkpoint_dir.empty() &&
-                   job.restart_attempts < job.checkpoint.max_restarts_on_tm_loss) {
+                   job.restart_attempts < effective_max_restarts(job.checkpoint)) {
             // Checkpointed job + restart budget: a subtask error (e.g. a
             // source's EOS final-checkpoint timeout that threw) rolls the WHOLE
             // job back to its last completed checkpoint and replays - exactly as
@@ -3016,7 +3016,7 @@ void JobManager::handle_subtask_finished_(MessageReader& r) {
             log::warn("jm.restart",
                       "job_id=" + std::to_string(job.id) + " subtask error -> whole-job restart" +
                           " (attempt " + std::to_string(job.restart_attempts + 1) + "/" +
-                          std::to_string(job.checkpoint.max_restarts_on_tm_loss) +
+                          std::to_string(effective_max_restarts(job.checkpoint)) +
                           ") drain_expected=" + std::to_string(job.restart_drain_expected.size()) +
                           " cause=" + msg.error_message);
             if (job.restart_drain_expected.empty()) {

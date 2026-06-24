@@ -580,3 +580,29 @@ TEST(WireProtocol, RescaleOperatorAckRejectionCarriesReason) {
     EXPECT_FALSE(out.ok);
     EXPECT_NE(out.message.find("above max_parallelism"), std::string::npos);
 }
+
+// Recovery-default resolution: the default (kRestartAuto) self-heals when
+// checkpointing is enabled and fail-fasts otherwise; explicit values pass
+// through unchanged so a user can force fail-fast or a specific cap.
+TEST(RecoveryDefaults, EffectiveMaxRestartsResolution) {
+    CheckpointConfig def;  // default-constructed -> kRestartAuto
+    EXPECT_EQ(def.max_restarts_on_tm_loss, kRestartAuto);
+
+    // auto + checkpointing -> self-heal default.
+    CheckpointConfig ckpt = def;
+    ckpt.checkpoint_dir = "/tmp/ckpt";
+    EXPECT_EQ(effective_max_restarts(ckpt), kDefaultSelfHealRestarts);
+
+    // auto + no checkpointing -> fail-fast (nothing to restore from).
+    EXPECT_EQ(effective_max_restarts(def), 0u);
+
+    // explicit 0 -> fail-fast even with checkpointing.
+    CheckpointConfig off = ckpt;
+    off.max_restarts_on_tm_loss = 0;
+    EXPECT_EQ(effective_max_restarts(off), 0u);
+
+    // explicit N -> used verbatim.
+    CheckpointConfig fixed = ckpt;
+    fixed.max_restarts_on_tm_loss = 3;
+    EXPECT_EQ(effective_max_restarts(fixed), 3u);
+}
