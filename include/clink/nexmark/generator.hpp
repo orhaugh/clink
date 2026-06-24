@@ -57,7 +57,7 @@ public:
             const std::int64_t e = event_id_++;
             const std::int64_t dt = cfg_.base_time_ms + (cfg_.tps > 0 ? (e * 1000) / cfg_.tps : e);
             clink::sql::Row r;
-            put(r, "dateTime", dt);
+            put(r, "datetime", dt);
             const std::int64_t slot = e % kEventsPerEpoch;
             int type;
             if (slot < kPersonProportion) {
@@ -94,7 +94,7 @@ private:
         const std::int64_t id = person_count_++;
         put(r, "id", id);
         put(r, "name", "Person_" + std::to_string(id));
-        put(r, "emailAddress", "p" + std::to_string(id) + "@nexmark.dev");
+        put(r, "emailaddress", "p" + std::to_string(id) + "@nexmark.dev");
         put(r, "city", kCities[rng_() % kCities.size()]);
         put(r, "state", kStates[rng_() % kStates.size()]);
     }
@@ -102,8 +102,8 @@ private:
     void gen_auction(clink::sql::Row& r, std::int64_t dt) {
         const std::int64_t id = auction_count_++;
         put(r, "id", id);
-        put(r, "itemName", "Item_" + std::to_string(id));
-        put(r, "initialBid", static_cast<std::int64_t>(rng_() % 1000));
+        put(r, "itemname", "Item_" + std::to_string(id));
+        put(r, "initialbid", static_cast<std::int64_t>(rng_() % 1000));
         put(r, "reserve", static_cast<std::int64_t>(rng_() % 10000));
         put(r, "expires", dt + 10'000);  // 10s lifetime
         put(r, "seller", pick(person_count_));

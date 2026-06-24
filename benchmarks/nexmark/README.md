@@ -44,26 +44,22 @@ Flags: `--query qN`, `--events N` (total events), `--tps N` (dateTime spacing =
 | q20 | bid expansion | INNER `bid ⋈ auction` on `auction = id` + filter |
 | q11 | user sessions | per-bidder `COUNT(*)` over a 10s `SESSION`, emitting the session `window_start`/`window_end` |
 | q12 | bids per window | per-bidder `COUNT(*)` over a 10s `TUMBLE` (event-time analogue of Nexmark's proctime q12) |
+| q7 | highest bid | per-window `MAX(price)` as a join side (equi on price) + a column-vs-column range residual `dateTime IN [window_start, window_end)` |
+| q8 | new users | two windowed aggregates joined on `seller = id` + a column-vs-column window-equality residual |
 
-`window_start`/`window_end` are now projectable from a windowed GROUP BY (any
-window kind), aliasable, BIGINT ms-since-epoch.
+Enabling capabilities now in clink SQL: `window_start`/`window_end` projectable
+from any windowed GROUP BY (aliasable, BIGINT ms-since-epoch); a derived table
+(incl. a windowed aggregate) usable as a join input; and column-vs-column
+comparisons in WHERE (so a single-equi-key join + a residual predicate expresses
+range and composite-key joins). q8's per-window grouping carries a `COUNT(*)`
+(unused) because clink requires an aggregate in a GROUP BY SELECT.
 
-A derived table (including a windowed aggregate) can now be a JOIN input, so the
-join-shaped window queries are no longer wholly blocked. The remaining gaps are
-per-query, not the join-input restriction:
-- q7 (highest-bid): needs the per-window range match (`price = maxprice AND
-  dateTime IN [window_start, window_end)`); clink's join ON is a single equality
-  and WHERE compares a column to a literal, so the range half is not expressible.
-- q8 (new-users): needs a composite (multi-column) equi-join key
-  (`id = seller AND window_start = window_start`); clink's equi-join key is a
-  single column.
-- q5 (hot-items): a different shape (nested windowed aggregate feeding a
-  per-window MAX, then a composite IN-subquery), not a plain join.
+Still out: q5 (hot-items) is a different shape (a windowed COUNT feeding a
+per-window MAX, then a composite IN-subquery), not a plain join. Then the
+analytics tier: OVER/Top-N + distinct/filter aggregates (q15/q17/q18/q19). See
+the feasibility scoping.
 
-Then the analytics tier: OVER/Top-N + distinct/filter aggregates
-(q15/q17/q18/q19). See the feasibility scoping.
-
-Window queries: use a lower `--tps` (e.g. `--tps 50000`) so `dateTime` spans many
+Window queries: use a lower `--tps` (e.g. `--tps 50000`) so `datetime` spans many
 windows (spacing is `1000/tps` ms/event); at the default tps the run fits in one
 window and fires at end-of-stream.
 

@@ -40,21 +40,24 @@ namespace {
 // Per-type base tables, each a nexmark_source filtered to one event type. clink
 // joins require base tables; running the same seeded generator in each instance
 // (advancing over every event, emitting one type) keeps foreign keys consistent
-// across the three. dateTime is the event-time column; the planner's
+// across the three. datetime is the event-time column; the planner's
 // assign_timestamps_row generates watermarks from it (watermark_lag_ms).
 std::string base_tables_ddl(std::int64_t events, std::int64_t tps) {
+    // Column names are lower-case: the SQL parser lower-cases identifiers, so a
+    // camelCase column would not match a lower-cased reference (and the post-join
+    // residual in q7/q8 would silently see a null column).
     const std::string w =
-        " connector='nexmark', format='json', event_time_column='dateTime', "
+        " connector='nexmark', format='json', event_time_column='datetime', "
         "watermark_lag_ms='4000', events_num='" +
         std::to_string(events) + "', tps='" + std::to_string(tps) + "', ";
-    return "CREATE TABLE person (id BIGINT, name VARCHAR, emailAddress VARCHAR, city VARCHAR, "
-           "state VARCHAR, dateTime BIGINT) WITH (" +
+    return "CREATE TABLE person (id BIGINT, name VARCHAR, emailaddress VARCHAR, city VARCHAR, "
+           "state VARCHAR, datetime BIGINT) WITH (" +
            w + "nexmark_type='person');" +
-           "CREATE TABLE auction (id BIGINT, itemName VARCHAR, initialBid BIGINT, reserve BIGINT, "
-           "expires BIGINT, seller BIGINT, category BIGINT, dateTime BIGINT) WITH (" +
+           "CREATE TABLE auction (id BIGINT, itemname VARCHAR, initialbid BIGINT, reserve BIGINT, "
+           "expires BIGINT, seller BIGINT, category BIGINT, datetime BIGINT) WITH (" +
            w + "nexmark_type='auction');" +
            "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
-           "url VARCHAR, dateTime BIGINT) WITH (" +
+           "url VARCHAR, datetime BIGINT) WITH (" +
            w + "nexmark_type='bid');";
 }
 
@@ -67,14 +70,14 @@ const std::map<std::string, Query>& queries() {
     static const std::map<std::string, Query> q = {
         // q0: pass-through (projection only).
         {"q0",
-         {"CREATE TABLE sink_q0 (auction BIGINT, bidder BIGINT, price BIGINT, dateTime BIGINT) "
+         {"CREATE TABLE sink_q0 (auction BIGINT, bidder BIGINT, price BIGINT, datetime BIGINT) "
           "WITH (connector='blackhole', format='json')",
-          "INSERT INTO sink_q0 SELECT auction, bidder, price, dateTime FROM bid"}},
+          "INSERT INTO sink_q0 SELECT auction, bidder, price, datetime FROM bid"}},
         // q1: currency conversion (stateless arithmetic).
         {"q1",
-         {"CREATE TABLE sink_q1 (auction BIGINT, bidder BIGINT, price DECIMAL(18,3), dateTime "
+         {"CREATE TABLE sink_q1 (auction BIGINT, bidder BIGINT, price DECIMAL(18,3), datetime "
           "BIGINT) WITH (connector='blackhole', format='json')",
-          "INSERT INTO sink_q1 SELECT auction, bidder, price * 0.908 AS price, dateTime FROM bid"}},
+          "INSERT INTO sink_q1 SELECT auction, bidder, price * 0.908 AS price, datetime FROM bid"}},
         // q2: selection on a MOD predicate. clink's WHERE compares a column to a
         // literal, so mod() is computed as a projected column in a derived table
         // and filtered in the outer WHERE.
@@ -106,7 +109,7 @@ const std::map<std::string, Query>& queries() {
          {"CREATE TABLE sink_q11 (bidder BIGINT, bid_count BIGINT, starttime BIGINT, "
           "endtime BIGINT) WITH (connector='blackhole', format='json')",
           "INSERT INTO sink_q11 SELECT bidder, COUNT(*) AS bid_count, window_start AS starttime, "
-          "window_end AS endtime FROM bid GROUP BY SESSION(dateTime, INTERVAL '10' SECOND), "
+          "window_end AS endtime FROM bid GROUP BY SESSION(datetime, INTERVAL '10' SECOND), "
           "bidder"}},
         // q12: per-bidder bid count per 10s window. Nexmark uses PROCTIME; clink's
         // window TVFs are event-time, so this is the event-time analogue (same
@@ -115,7 +118,31 @@ const std::map<std::string, Query>& queries() {
          {"CREATE TABLE sink_q12 (bidder BIGINT, bid_count BIGINT) "
           "WITH (connector='blackhole', format='json')",
           "INSERT INTO sink_q12 SELECT bidder, COUNT(*) AS bid_count FROM bid "
-          "GROUP BY TUMBLE(dateTime, INTERVAL '10' SECOND), bidder"}},
+          "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), bidder"}},
+        // q7: highest bid per window. A per-window MAX(price) windowed aggregate
+        // is a join side (equi on price); the column-vs-column range residual
+        // binds each bid to its OWN window (rejecting cross-window false matches).
+        {"q7",
+         {"CREATE TABLE sink_q7 (auction BIGINT, price BIGINT, bidder BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q7 SELECT B_auction AS auction, B_price AS price, B_bidder AS bidder "
+          "FROM bid AS B JOIN (SELECT MAX(price) AS maxprice, window_start AS ws, window_end AS we "
+          "FROM bid GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND)) AS M ON B.price = M.maxprice "
+          "WHERE B_datetime >= M_ws AND B_datetime < M_we"}},
+        // q8: new users. Persons and auctions created in the SAME tumbling window,
+        // joined on seller=id - two windowed-aggregate join sides, equi on the key
+        // plus a column-vs-column window-equality residual. The per-window grouping
+        // carries a COUNT(*) (unused) because clink requires an aggregate in a
+        // GROUP BY SELECT; the grouping/dedup semantics are identical.
+        {"q8",
+         {"CREATE TABLE sink_q8 (id BIGINT, name VARCHAR, starttime BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q8 SELECT P_id AS id, P_name AS name, P_starttime AS starttime "
+          "FROM (SELECT id, name, COUNT(*) AS pc, window_start AS starttime, window_end AS endtime "
+          "FROM person GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), id, name) AS P "
+          "JOIN (SELECT seller, COUNT(*) AS ac, window_start AS astart, window_end AS aend "
+          "FROM auction GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), seller) AS A "
+          "ON P.id = A.seller WHERE P_starttime = A_astart AND P_endtime = A_aend"}},
     };
     return q;
 }
