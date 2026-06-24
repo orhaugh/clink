@@ -3105,11 +3105,11 @@ TEST(SqlRuntime, NonWindowedAggregateEmitsChangelogToNettingSink) {
 // M is a non-windowed GROUP BY (grouping by the window bounds as columns), so it
 // runs in upsert mode and emits an updated max row per input record; the
 // append-only INNER join then multiplies against each emission (each winner is
-// produced once per auction in its window). Every individual piece works (the
-// windowed counts, the aggregate-over-a-derived-windowed-aggregate, the join,
-// the residual) - the gap is dataflow retractions. The assertions below are the
-// CORRECT result, so this flips green if/when retraction streams land.
-TEST(SqlRuntime, DISABLED_HotItemsPerWindowMaxOverWindowedAggregate) {
+// produced once per auction in its window). The per-window MAX is a non-windowed
+// GROUP BY, so it runs in changelog mode (update_before/update_after); the join
+// consumes those retractions (retracting the prior joined pairs) and the
+// changelog-netting sink resolves the +/- to the final hot items per window.
+TEST(SqlRuntime, HotItemsPerWindowMaxOverWindowedAggregate) {
     ensure_sql_installed_once();
 
     const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q5_in.ndjson";
@@ -3136,7 +3136,7 @@ TEST(SqlRuntime, DISABLED_HotItemsPerWindowMaxOverWindowedAggregate) {
                      in_path.string() +
                      "', event_time_column='ts');"
                      "CREATE TABLE hot (auction BIGINT, num BIGINT) "
-                     "WITH (connector='file', format='json', path='" +
+                     "WITH (connector='changelog', format='json', path='" +
                      out_path.string() + "')");
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));

@@ -1396,8 +1396,7 @@ void mark_changelog_producers(cluster::JobGraphSpec& spec) {
         by_id[spec.ops[i].id] = i;
     }
     auto is_consumer = [](const std::string& t) {
-        // equi_join_row is added once the join consumes retractions (Phase B).
-        return t == "changelog_net_sink";
+        return t == "changelog_net_sink" || t == "equi_join_row";
     };
     auto is_passthrough = [](const std::string& t) {
         return t == "row_compute_key" || t == "filter_row_predicate" || t == "project_row" ||

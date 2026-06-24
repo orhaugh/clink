@@ -2310,11 +2310,33 @@ private:
         return out;
     }
 
-    void emit_pair_(const Row& left, const Row& right, Batch<Row>& batch) {
+    // Emit a joined pair. `kind` (when non-empty) tags the output - used to emit
+    // a retraction (delete) of a previously-joined pair when an input row is
+    // retracted. Otherwise an OUTER join's pair is tagged insert (so its later
+    // null-padding retraction nets) and an INNER pair is left untagged (an
+    // implicit insert).
+    void emit_pair_(const Row& left,
+                    const Row& right,
+                    Batch<Row>& batch,
+                    std::string_view kind = {}) {
         Row r = build_(&left, &right);
-        if (kind_ != EquiJoinKind::Inner)
+        if (!kind.empty()) {
+            set_row_kind(r, kind);
+        } else if (kind_ != EquiJoinKind::Inner) {
             set_row_kind(r, kRowKindInsert);
+        }
         batch.push(Record<Row>{std::move(r)});
+    }
+
+    // Canonical content of a row ignoring its __row_kind marker. Used to match a
+    // retraction (update_before / delete) against the buffered entry it cancels.
+    static std::string bare_row_key_(const Row& row) {
+        Row b = row;
+        b.values.erase(std::string{kRowKindField});
+        return clink::config::JsonValue{clink::config::JsonObject{b.values}}.serialize(0);
+    }
+    static bool entries_match_(const Entry& e, const Row& row) {
+        return bare_row_key_(e.row) == bare_row_key_(row);
     }
     // Emit / retract a null-padded row for `present` on its own side.
     void emit_outer_(const Row& present,
@@ -2331,16 +2353,58 @@ private:
         auto key = key_of_(row, key_col);
         const bool this_outer = is_left ? left_keeps_unmatched_() : right_keeps_unmatched_();
         const bool other_outer = is_left ? right_keeps_unmatched_() : left_keeps_unmatched_();
+        const bool retract = is_delete_like(row_kind_of(row));
 
         if (!key.has_value()) {
-            // NULL join key never matches; emit a null-padded row if this
-            // side is kept, and don't store it (it can never join).
+            // NULL join key never matches; emit (or, on a retraction, withdraw)
+            // a null-padded row if this side is kept. Never stored (can't join).
             if (this_outer)
-                emit_outer_(row, is_left, kRowKindInsert, batch);
+                emit_outer_(row, is_left, retract ? kRowKindDelete : kRowKindInsert, batch);
             return;
         }
         auto& self = is_left ? left_state_ : right_state_;
         auto& other = is_left ? right_state_ : left_state_;
+
+        if (retract) {
+            // Changelog retraction: remove the matching buffered entry and emit a
+            // delete of every joined pair it had produced with the opposite side.
+            auto sit = self.find(*key);
+            if (sit == self.end())
+                return;
+            auto& vec = sit->second;
+            auto eit = std::find_if(
+                vec.begin(), vec.end(), [&](const Entry& e) { return entries_match_(e, row); });
+            if (eit == vec.end())
+                return;  // retract with no matching insert: no-op
+            const bool was_null = eit->null_emitted;
+            const Row me_row = eit->row;
+            vec.erase(eit);
+            auto oit = other.find(*key);
+            if (oit == other.end() || oit->second.empty()) {
+                // Was unmatched; withdraw its outer null-pad if one is live.
+                if (this_outer && was_null)
+                    emit_outer_(me_row, is_left, kRowKindDelete, batch);
+                return;
+            }
+            for (auto& oe : oit->second) {
+                if (is_left)
+                    emit_pair_(me_row, oe.row, batch, kRowKindDelete);
+                else
+                    emit_pair_(oe.row, me_row, batch, kRowKindDelete);
+            }
+            // Outer: if this side has no more entries for the key, the opposite
+            // rows are unmatched again -> re-pad them.
+            if (other_outer && vec.empty()) {
+                for (auto& oe : oit->second) {
+                    if (!oe.null_emitted) {
+                        emit_outer_(oe.row, /*present_is_left=*/!is_left, kRowKindInsert, batch);
+                        oe.null_emitted = true;
+                    }
+                }
+            }
+            return;
+        }
+
         self[*key].push_back(Entry{row, false});
         Entry& me = self[*key].back();
 
@@ -2390,6 +2454,7 @@ private:
             return;
         }
         std::string key = std::move(*key_opt);
+        const bool retract = is_delete_like(row_kind_of(row));
         auto self = is_left ? kv_left_() : kv_right_();
         auto other = is_left ? kv_right_() : kv_left_();
         auto factory = [this,
@@ -2400,11 +2465,62 @@ private:
                         is_left,
                         this_outer,
                         other_outer,
+                        retract,
                         &out]() mutable -> async::Task<void> {
-            // Append this row to its own side so future opposite-side rows match.
             auto self_cur = co_await self.get_async(key);
             std::vector<Entry> self_list =
                 self_cur.has_value() ? std::move(*self_cur) : std::vector<Entry>{};
+
+            if (retract) {
+                // Changelog retraction: remove the matching buffered entry and
+                // emit a delete of every joined pair it produced. Mirror of the
+                // synchronous handle_ retract path.
+                Batch<Row> batch;
+                auto eit = std::find_if(self_list.begin(), self_list.end(), [&](const Entry& e) {
+                    return entries_match_(e, row);
+                });
+                if (eit == self_list.end()) {
+                    co_return;  // nothing matching to retract; state unchanged
+                }
+                const bool was_null = eit->null_emitted;
+                const Row me_row = eit->row;
+                self_list.erase(eit);
+                auto other_cur = co_await other.get_async(key);
+                if (!other_cur.has_value() || other_cur->empty()) {
+                    if (this_outer && was_null)
+                        emit_outer_(me_row, is_left, kRowKindDelete, batch);
+                    self.put(key, self_list);
+                    if (!batch.empty())
+                        out.emit_data(std::move(batch));
+                    co_return;
+                }
+                std::vector<Entry> other_list = std::move(*other_cur);
+                for (auto& oe : other_list) {
+                    if (is_left)
+                        emit_pair_(me_row, oe.row, batch, kRowKindDelete);
+                    else
+                        emit_pair_(oe.row, me_row, batch, kRowKindDelete);
+                }
+                bool other_dirty = false;
+                if (other_outer && self_list.empty()) {
+                    for (auto& oe : other_list) {
+                        if (!oe.null_emitted) {
+                            emit_outer_(
+                                oe.row, /*present_is_left=*/!is_left, kRowKindInsert, batch);
+                            oe.null_emitted = true;
+                            other_dirty = true;
+                        }
+                    }
+                }
+                self.put(key, self_list);
+                if (other_dirty)
+                    other.put(key, other_list);
+                if (!batch.empty())
+                    out.emit_data(std::move(batch));
+                co_return;
+            }
+
+            // Append this row to its own side so future opposite-side rows match.
             self_list.push_back(Entry{row, false});
             const std::size_t me = self_list.size() - 1;
 
