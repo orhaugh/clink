@@ -1724,6 +1724,14 @@ Binder::BoundRel Binder::bind_join_rel(const ast::FromItem& item) const {
             bind_error("derived-table alias collides with an in-scope table or CTE: " + sq.alias,
                        sq.loc.pos);
         }
+        // Reject an alias that collides with a base table: registering it in the
+        // cte overlay would shadow the base table, so another join side that
+        // references that base name would silently resolve to this derived table.
+        if (catalog_.get_table(sq.alias) != nullptr) {
+            bind_error("derived-table alias '" + sq.alias +
+                           "' collides with a base table of the same name; rename the alias",
+                       sq.loc.pos);
+        }
         auto body_plan = bind_select(*sq.body);
         auto body_schema = body_plan->schema();
         TableDef synth;
@@ -2848,8 +2856,8 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             // message.
             if (jt != JoinType::Inner) {
                 bind_error(
-                    "outer/full joins with a nested-join side are not supported yet (v1); "
-                    "only INNER joins may have a nested join on either side",
+                    "outer/full joins with a non-base side (a derived table or nested join) are "
+                    "not supported yet (v1); only INNER joins may have such a side",
                     jc.loc.pos);
             }
             BoundRel root = bind_join_rel(stmt.from_items[0]);

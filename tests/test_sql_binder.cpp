@@ -2297,6 +2297,24 @@ TEST(SqlBinder, DerivedWindowedAggregateAsJoinSideBinds) {
     EXPECT_EQ(ej.right().kind(), "WindowAggregate");  // the sub-plan is wired as the join child
 }
 
+TEST(SqlBinder, DerivedTableJoinAliasCollidingWithBaseTableRejected) {
+    Catalog cat;
+    auto regs = parse(
+        "CREATE TABLE a (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/a.ndjson');"
+        "CREATE TABLE m (k BIGINT, w BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/m.ndjson')");
+    cat.register_table(std::get<ast::CreateTableStmt>(regs.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(regs.statements[1]));
+    Binder bd(cat);
+    // Aliasing the derived join side 'm' collides with base table 'm': registering
+    // it in the cte overlay would shadow the base table, so reject at bind time.
+    EXPECT_THROW(bd.bind_select(as_select(
+                     parse("SELECT * FROM (SELECT k, SUM(v) AS total FROM a GROUP BY k) AS m "
+                           "JOIN a ON m.k = a.k"))),
+                 TranslationError);
+}
+
 TEST(SqlBinder, OuterEquiJoinsCarryJoinType) {
     Catalog cat;
     auto regs = parse(
