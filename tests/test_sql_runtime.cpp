@@ -3433,6 +3433,97 @@ TEST(SqlRuntime, PartitionedFileSinkByColumn) {
     std::filesystem::remove(base + ".2025");
 }
 
+// q10 partition sink, path-safety + collision-freedom: partition values that
+// carry filename-unsafe bytes ('/', '.') must (a) not escape the base directory
+// and (b) never alias onto one another. The two values "a/b" and "a.b" would
+// both collapse to "a_b" under a lossy map-to-underscore scheme - silent data
+// loss - so this asserts they land in DISTINCT percent-encoded files, each with
+// only its own rows. "a/b" must also not create a real subdirectory.
+TEST(SqlRuntime, PartitionedFileSinkPercentEncodesUnsafeKeys) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_q10enc_in.ndjson";
+    const auto base = (std::filesystem::temp_directory_path() / "clink_sql_q10enc_out").string();
+    // "a/b" -> "%2F" ('/' = 0x2F), "a.b" -> "%2E" ('.' = 0x2E).
+    const std::string f_slash = base + ".a%2Fb";
+    const std::string f_dot = base + ".a%2Eb";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(f_slash);
+    std::filesystem::remove(f_dot);
+
+    write_lines(in_path,
+                {
+                    R"({"id":1,"k":"a/b","v":10})",
+                    R"({"id":2,"k":"a.b","v":20})",
+                    R"({"id":3,"k":"a/b","v":30})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE src (id BIGINT, k VARCHAR, v BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE part (id BIGINT, k VARCHAR, v BIGINT) "
+                     "WITH (connector='file', format='json', partition_by='k', path='" +
+                     base + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat, "INSERT INTO part SELECT id, k, v FROM src");
+
+    InProcessCluster cluster("tm-sql-q10enc", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto ids_in = [](const std::filesystem::path& p) {
+        std::set<std::int64_t> ids;
+        for (const auto& l : read_lines(p))
+            ids.insert(static_cast<std::int64_t>(clink::config::parse(l).at("id").as_number()));
+        return ids;
+    };
+    // Distinct files for the two distinct keys - no collision, no data loss.
+    ASSERT_TRUE(std::filesystem::exists(f_slash)) << "a/b partition file missing";
+    ASSERT_TRUE(std::filesystem::exists(f_dot)) << "a.b partition file missing";
+    EXPECT_EQ(ids_in(f_slash), (std::set<std::int64_t>{1, 3}));
+    EXPECT_EQ(ids_in(f_dot), (std::set<std::int64_t>{2}));
+    // The '/' was encoded, not honoured: no "a" subdirectory under the temp dir.
+    EXPECT_FALSE(std::filesystem::is_directory(base + ".a"));
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(f_slash);
+    std::filesystem::remove(f_dot);
+}
+
+// q10 partition sink rejects append-only-incompatible modes at bind: a
+// partition_by sink writes one append-only file per key, so combining it with
+// mode='upsert' must be rejected rather than silently dropping the mode.
+TEST(SqlRuntime, PartitionedFileSinkRejectsUpsertMode) {
+    ensure_sql_installed_once();
+
+    Catalog cat;
+    auto ddl = parse(std::string{
+        "CREATE TABLE src (id BIGINT, k VARCHAR) "
+        "WITH (connector='file', format='json', path='/tmp/clink_sql_q10reject_in.ndjson');"
+        "CREATE TABLE part (id BIGINT, k VARCHAR) "
+        "WITH (connector='file', format='json', partition_by='k', mode='upsert', "
+        "key='id', path='/tmp/clink_sql_q10reject_out')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    bool threw = false;
+    try {
+        // Bind/compile should reject the partition_by + upsert combination.
+        auto spec = compile(cat, "INSERT INTO part SELECT id, k FROM src");
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw) << "partition_by + mode='upsert' should be rejected at bind";
+}
+
 // Nexmark-q14 shape: a calculation with user-defined scalar functions - one in
 // the projection (a custom fee) and one as a predicate (kept-bid test). clink
 // has no CREATE FUNCTION DDL, so the UDFs are registered programmatically via

@@ -174,8 +174,15 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     const bool exactly_once = table.is_exactly_once();
     if (connector == "file" || connector == "filesystem") {
         // A partition_by WITH-option routes to the partitioning sink (one file
-        // per distinct partition-key value). Append-only; no 2PC/upsert combo.
+        // per distinct partition-key value). It is append-only, so reject a
+        // combination with upsert / exactly-once rather than silently ignoring
+        // those modes.
         if (table.properties.find("partition_by") != table.properties.end()) {
+            if (upsert || exactly_once) {
+                unsupported(
+                    "connector='file' partition_by is append-only and cannot be combined "
+                    "with mode='upsert' or exactly-once delivery");
+            }
             return RowConnectorBinding{"partition_file_sink", kChannelRow, {}};
         }
         if (exactly_once) {
@@ -1411,7 +1418,8 @@ void mark_changelog_producers(cluster::JobGraphSpec& spec) {
         // Ops that forward __row_kind unchanged. union_row is multi-input, so the
         // walk below follows ALL inputs of a pass-through, not just the first.
         return t == "row_compute_key" || t == "filter_row_predicate" || t == "project_row" ||
-               t == "identity_row" || t == "assign_timestamps_row" || t == "union_row";
+               t == "identity_row" || t == "assign_timestamps_row" || t == "union_row" ||
+               t == "async_lookup_join_row";
     };
     // Walk back (breadth-first over all inputs) from each `start` through
     // pass-throughs, marking every aggregate_row reached. The graph is a DAG;

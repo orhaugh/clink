@@ -3417,56 +3417,74 @@ public:
     void on_data(const Batch<Row>& batch) override {
         for (const auto& rec : batch) {
             const auto& row = rec.value();
-            std::string raw = "__null__";
-            auto it = row.values.find(partition_col_);
-            if (it != row.values.end() && !it->second.is_null()) {
-                raw = it->second.is_string() ? it->second.as_string() : it->second.serialize(0);
-            }
-            // Sanitise the value into a safe filename component: a partition value
-            // carrying '/' or '..' (it can be source/user data) must not escape
-            // the base directory. Map anything outside [A-Za-z0-9.-] to '_'.
-            std::string key;
-            key.reserve(raw.size());
-            for (char c : raw) {
-                const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                                  (c >= '0' && c <= '9') || c == '.' || c == '-';
-                key.push_back(safe ? c : '_');
-            }
-            if (key.empty() || key == "." || key == "..") {
-                key = "_";
-            }
+            const std::string key = partition_key_(row);
             Row q = row;
             requantise_row_decimals(q, decimal_scales_);
-            partitions_[key].push_back(clink::config::serialize_output(
-                clink::config::JsonValue{clink::config::JsonObject{q.values}}));
+            const std::string line = clink::config::serialize_output(
+                clink::config::JsonValue{clink::config::JsonObject{q.values}});
+            // Write incrementally to a per-partition file handle (opened once,
+            // truncating; kept open until flush) rather than buffering all rows -
+            // so memory stays bounded by the number of distinct partitions.
+            auto [it, inserted] = files_.try_emplace(key);
+            if (inserted) {
+                const std::string path = base_path_ + "." + key;
+                it->second.open(path, std::ios::binary | std::ios::trunc);
+                if (!it->second) {
+                    throw std::runtime_error("partition_file_sink: cannot open " + path);
+                }
+            }
+            it->second.write(line.data(), static_cast<std::streamsize>(line.size()));
+            it->second.put('\n');
         }
     }
 
     void flush() override {
-        if (flushed_)
-            return;
-        flushed_ = true;
-        for (const auto& [key, rows] : partitions_) {
-            const std::string path = base_path_ + "." + key;
-            std::ofstream out(path, std::ios::binary | std::ios::trunc);
-            if (!out) {
-                throw std::runtime_error("partition_file_sink: cannot open " + path);
-            }
-            for (const auto& r : rows) {
-                out.write(r.data(), static_cast<std::streamsize>(r.size()));
-                out.put('\n');
-            }
+        for (auto& [_k, f] : files_) {
+            f.flush();
+            f.close();
         }
+        files_.clear();
     }
 
     std::string name() const override { return "partition_file_sink"; }
 
 private:
+    // Map a partition value to a collision-free, path-safe filename component:
+    // percent-encode every byte outside [A-Za-z0-9_-] (so '/' -> %2F can't escape
+    // the base dir, '.' -> %2E avoids '.'/'..', and the encoding is reversible so
+    // distinct values never share a file). NULL and empty map to sentinels that
+    // no real value can encode to (a '%' is always followed by two hex digits).
+    std::string partition_key_(const Row& row) const {
+        auto it = row.values.find(partition_col_);
+        if (it == row.values.end() || it->second.is_null()) {
+            return "%null";
+        }
+        const std::string raw =
+            it->second.is_string() ? it->second.as_string() : it->second.serialize(0);
+        if (raw.empty()) {
+            return "%empty";
+        }
+        static const char* kHex = "0123456789ABCDEF";
+        std::string key;
+        key.reserve(raw.size());
+        for (unsigned char c : raw) {
+            const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                              (c >= '0' && c <= '9') || c == '_' || c == '-';
+            if (safe) {
+                key.push_back(static_cast<char>(c));
+            } else {
+                key.push_back('%');
+                key.push_back(kHex[c >> 4]);
+                key.push_back(kHex[c & 0xF]);
+            }
+        }
+        return key;
+    }
+
     std::string base_path_;
     std::string partition_col_;
     std::map<std::string, int> decimal_scales_;
-    std::map<std::string, std::vector<std::string>> partitions_;
-    bool flushed_{false};
+    std::map<std::string, std::ofstream> files_;
 };
 
 // Phase 21c: TOP-N-per-partition. Single-input op that maintains a
@@ -4810,6 +4828,10 @@ void install(clink::plugin::PluginRegistry& reg) {
                     out.values[dim_alias + "_" + c] =
                         it != dim.values.end() ? it->second : clink::config::JsonValue{};
                 }
+                // Preserve the probe's changelog kind: a lookup join is a
+                // per-row enrichment, so a delete/update_before probe row must
+                // stay a delete/update_before downstream.
+                clink::sql::copy_row_kind(probe, out);
                 co_return out;
             };
             return std::make_shared<AsyncLookupOperator<Row, Row>>(

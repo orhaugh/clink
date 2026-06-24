@@ -842,6 +842,16 @@ clink::config::JsonValue evaluate_json_value_expr(const clink::config::JsonValue
     // regexp_extract(s, pattern, group?) - the `group`-th capture (default 0 =
     // the whole match) of the FIRST match of `pattern` in `s`. Returns null on no
     // match, an out-of-range group, a bad pattern, or any null arg.
+    //
+    // LIMITATION: this uses std::regex (ECMAScript), a backtracking engine, so a
+    // pathological pattern (nested quantifiers like (a+)+ against a long
+    // non-matching input) can backtrack super-linearly - i.e. it is open to
+    // catastrophic-backtracking ReDoS if the PATTERN is attacker-controlled. In
+    // SQL the pattern is a query literal written by the job author, not stream
+    // data, so this is a query-authoring concern, not a data-path one. A
+    // linear-time guarantee would need a non-backtracking engine (RE2), which is
+    // a deliberate non-dependency here. Keep patterns simple and avoid nested
+    // quantifiers over untrusted-length inputs.
     if (op == "regexp_extract") {
         if (args.size() < 2 || args.size() > 3) {
             throw std::runtime_error("json_value_expr: 'regexp_extract' takes 2 or 3 args");
