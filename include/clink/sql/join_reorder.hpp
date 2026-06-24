@@ -3,13 +3,14 @@
 // Cost-based join reordering over clink's LogicalPlan (clink::sql).
 //
 // Reorders a connected tree of INNER equi-joins to minimise total intermediate
-// cardinality, driven by the cardinality estimator (cardinality.hpp). Greedy
-// "minimum-intermediate-cardinality" ordering (start from the smallest
-// relation, repeatedly add the connected relation that yields the smallest
-// intermediate join), left-deep. The reorder is applied ONLY when its estimated
-// total cost is strictly lower than the original order's, so it can never make a
-// plan worse per the estimates; with no declared statistics every relation looks
-// identical and the order is left alone.
+// cardinality (a streaming-state proxy), driven by the cardinality estimator
+// (cardinality.hpp). The order is found by OPTIMAL dynamic programming (Selinger
+// DPsize: the provably cheapest connected left-deep order) for up to
+// kMaxDpRelations relations, falling back to the greedy
+// minimum-intermediate-cardinality heuristic above that. The reorder is applied
+// ONLY when its estimated total cost is strictly lower than the original
+// order's, so it can never make a plan worse per the estimates; with no declared
+// statistics every relation looks identical and the order is left alone.
 //
 // CORRECTNESS: INNER joins are commutative + associative, and reconstruction
 // re-derives every join's keys/aliases/schema (the same flat "<alias>_<col>"
@@ -355,6 +356,130 @@ inline std::vector<std::size_t> greedy_order(const std::vector<JoinRel>& rels,
     return order;
 }
 
+// Above this many relations the 2^n DP is skipped for the greedy heuristic. n=12
+// is 4096 subsets * O(n^2) transitions ~= sub-millisecond; join trees this wide
+// are rare and greedy is a fine fallback.
+inline constexpr std::size_t kMaxDpRelations = 12;
+
+// OPTIMAL left-deep join order by dynamic programming (Selinger DPsize): the
+// provably cheapest connected left-deep order under the same total-intermediate-
+// cardinality objective greedy approximates. best[S] = the min-cost way to join
+// exactly the relation set S (bitmask) as a left-deep prefix, plus the order that
+// achieved it and the accumulated stats of S. Transitions only extend S by a
+// relation CONNECTED to S by a join edge, so cross products are never formed.
+// Subsets are visited in increasing numeric order, which is a valid DP order
+// because S | (1<<j) > S. Falls back to the identity order if the graph is
+// disconnected (best[full] never reached) - the caller's cost guard then keeps
+// the original. Caller restricts n <= kMaxDpRelations.
+inline std::vector<std::size_t> dp_order(const std::vector<JoinRel>& rels,
+                                         const std::vector<JoinEdge>& edges) {
+    using namespace cardinality_detail;
+    const std::size_t n = rels.size();
+    auto rows_of = [&](std::size_t i) {
+        return rels[i].stats.row_count_known() ? rels[i].stats.row_count : kDefaultScanRows;
+    };
+    struct Entry {
+        bool set = false;
+        double cost = 0.0;
+        std::vector<std::size_t> order;
+        RelStats acc;
+        std::set<std::string> aliases;
+    };
+    const std::size_t full = (std::size_t{1} << n) - 1;
+    std::vector<Entry> best(std::size_t{1} << n);
+    for (std::size_t i = 0; i < n; ++i) {
+        Entry e;
+        e.set = true;
+        e.cost = 0.0;
+        e.order = {i};
+        e.acc.row_count = rows_of(i);
+        for (const auto& [name, cs] : rels[i].stats.columns) {
+            e.acc.columns[flat_name(rels[i].alias, name)] = cs;
+        }
+        e.aliases = {rels[i].alias};
+        best[std::size_t{1} << i] = std::move(e);
+    }
+    for (std::size_t S = 1; S <= full; ++S) {
+        if (!best[S].set) {
+            continue;
+        }
+        for (std::size_t j = 0; j < n; ++j) {
+            if ((S & (std::size_t{1} << j)) != 0) {
+                continue;
+            }
+            // Connected to S by an edge? (orientation: is j the b-endpoint?)
+            const JoinEdge* e = nullptr;
+            bool x_is_b = false;
+            for (const auto& cand : edges) {
+                if (best[S].aliases.count(cand.a_alias) != 0 && cand.b_alias == rels[j].alias) {
+                    e = &cand;
+                    x_is_b = true;
+                    break;
+                }
+                if (best[S].aliases.count(cand.b_alias) != 0 && cand.a_alias == rels[j].alias) {
+                    e = &cand;
+                    x_is_b = false;
+                    break;
+                }
+            }
+            if (e == nullptr) {
+                continue;  // not connected: never form a cross product here
+            }
+            const std::string acc_alias = x_is_b ? e->a_alias : e->b_alias;
+            const std::string acc_col = x_is_b ? e->a_col : e->b_col;
+            const std::string x_col = x_is_b ? e->b_col : e->a_col;
+            const double acc_ndv = ndv_or(best[S].acc, flat_name(acc_alias, acc_col));
+            const double x_rows = rows_of(j);
+            const double x_ndv =
+                rels[j].stats.column(x_col).ndv_known() ? rels[j].stats.column(x_col).ndv : x_rows;
+            const double card = (best[S].acc.row_count * x_rows) / std::max({acc_ndv, x_ndv, 1.0});
+            const double new_cost = best[S].cost + card;
+            const std::size_t s2 = S | (std::size_t{1} << j);
+            // Strictly cheaper wins; on a tie prefer the candidate whose DRIVING
+            // relation (order.front(), unchanged by appending j) is smaller (fewer
+            // rows, then lower index) - a stable "smallest-drives" tie-break so an
+            // optimal-but-arbitrary order does not flip plan-shape run to run.
+            bool better;
+            if (!best[s2].set) {
+                better = true;
+            } else if (new_cost < best[s2].cost - 1e-9) {
+                better = true;
+            } else if (new_cost > best[s2].cost + 1e-9) {
+                better = false;
+            } else {
+                const std::size_t cand_drv = best[S].order.front();
+                const std::size_t cur_drv = best[s2].order.front();
+                better = std::make_pair(rows_of(cand_drv), cand_drv) <
+                         std::make_pair(rows_of(cur_drv), cur_drv);
+            }
+            if (better) {
+                Entry e2;
+                e2.set = true;
+                e2.cost = new_cost;
+                e2.order = best[S].order;
+                e2.order.push_back(j);
+                e2.acc = best[S].acc;
+                e2.acc.row_count = card;
+                for (const auto& [name, cs] : rels[j].stats.columns) {
+                    e2.acc.columns[flat_name(rels[j].alias, name)] = cs;
+                }
+                cap_ndv(e2.acc, card);
+                e2.aliases = best[S].aliases;
+                e2.aliases.insert(rels[j].alias);
+                best[s2] = std::move(e2);
+            }
+        }
+    }
+    if (best[full].set) {
+        return best[full].order;
+    }
+    std::vector<std::size_t> identity(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        identity[i] = i;
+    }
+    return identity;
+}
+
 // A relation being accumulated during reconstruction (mirrors bind_join_rel's
 // BoundRel: tracks output stream columns + qualified-ref -> stream-name map).
 struct BuildRel {
@@ -493,12 +618,16 @@ inline void reorder_subtree(std::unique_ptr<LogicalPlan>& slot) {
     }
     bool orig_valid = false;
     const double orig_cost = order_cost(identity, rels, edges, orig_valid);
-    const std::vector<std::size_t> greedy = greedy_order(rels, edges);
-    bool greedy_valid = false;
-    const double greedy_cost = order_cost(greedy, rels, edges, greedy_valid);
+    // Optimal DP search for a tractable number of relations; greedy heuristic
+    // above the 2^n threshold. Both minimise the same intermediate-cardinality
+    // cost; DP is provably <= greedy, so it never picks a worse order.
+    const std::vector<std::size_t> candidate =
+        (m <= kMaxDpRelations) ? dp_order(rels, edges) : greedy_order(rels, edges);
+    bool cand_valid = false;
+    const double cand_cost = order_cost(candidate, rels, edges, cand_valid);
 
     const bool apply =
-        greedy_valid && greedy != identity && (!orig_valid || greedy_cost < orig_cost);
+        cand_valid && candidate != identity && (!orig_valid || cand_cost < orig_cost);
     if (!apply) {
         descend();  // declined: a true structural no-op, recurse children instead
         return;
@@ -527,7 +656,7 @@ inline void reorder_subtree(std::unique_ptr<LogicalPlan>& slot) {
         rels[i].plan = std::move(plans[i]);
         clink::sql::reorder_joins(rels[i].plan);
     }
-    auto rebuilt = rebuild(greedy, std::move(rels), edges);
+    auto rebuilt = rebuild(candidate, std::move(rels), edges);
     slot = std::move(rebuilt);
 }
 

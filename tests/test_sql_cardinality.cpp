@@ -14,6 +14,7 @@
 #include "clink/sql/binder.hpp"
 #include "clink/sql/cardinality.hpp"
 #include "clink/sql/catalog.hpp"
+#include "clink/sql/join_reorder.hpp"
 #include "clink/sql/optimizer.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/statistics.hpp"
@@ -393,6 +394,86 @@ TEST(SqlAnalyze, ComputedStatsRoundTripDriveSelectivity) {
                   .histogram.empty(),
               false)
         << "the analyzed amount histogram should survive the round trip";
+}
+
+// ----- optimal join-order search (dynamic programming) -----
+
+reorder_detail::JoinRel mk_rel(const std::string& alias,
+                               double rows,
+                               const std::map<std::string, double>& key_ndvs) {
+    reorder_detail::JoinRel r;
+    r.alias = alias;
+    r.stats.row_count = rows;
+    for (const auto& [col, ndv] : key_ndvs) {
+        ColumnStats cs;
+        cs.ndv = ndv;
+        r.stats.columns[col] = cs;
+        r.columns.push_back(ColumnSpec{col, arrow::int64()});
+    }
+    return r;
+}
+
+double order_cost_of(const std::vector<std::size_t>& order,
+                     const std::vector<reorder_detail::JoinRel>& rels,
+                     const std::vector<reorder_detail::JoinEdge>& edges) {
+    bool valid = false;
+    return reorder_detail::order_cost(order, rels, edges, valid);
+}
+
+// The DP search finds the PROVABLY optimal left-deep order (== the brute-force
+// minimum over all valid permutations), and beats greedy on a case it gets
+// wrong: greedy starts with the smallest relation `a`, which forces the
+// explosive a-b join (ndv 1) early and inflates the running cardinality through
+// the whole chain; DP starts from `d`, does the cheap joins first, and defers
+// a-b to last when the accumulator is small.
+TEST(SqlCardinality, DpFindsOptimalJoinOrderGreedyMisses) {
+    using namespace reorder_detail;
+    std::vector<JoinRel> rels;
+    rels.push_back(mk_rel("a", 10, {{"kb", 1}}));  // smallest -> greedy starts here
+    rels.push_back(
+        mk_rel("b", 100, {{"ka", 1}, {"kc", 100}}));  // a-b join key has ndv 1 (explodes)
+    rels.push_back(mk_rel("c", 100, {{"kb", 100}, {"kd", 100}}));
+    rels.push_back(mk_rel("d", 100, {{"kc", 100}}));
+    const std::vector<JoinEdge> edges = {
+        {"a", "kb", "b", "ka"}, {"b", "kc", "c", "kb"}, {"c", "kd", "d", "kc"}};
+
+    // Brute-force the true minimum over every valid (connected) permutation.
+    std::vector<std::size_t> perm = {0, 1, 2, 3};
+    double brute_min = std::numeric_limits<double>::infinity();
+    do {
+        bool v = false;
+        const double c = order_cost(perm, rels, edges, v);
+        if (v) {
+            brute_min = std::min(brute_min, c);
+        }
+    } while (std::next_permutation(perm.begin(), perm.end()));
+
+    const double dp_c = order_cost_of(dp_order(rels, edges), rels, edges);
+    const double greedy_c = order_cost_of(greedy_order(rels, edges), rels, edges);
+
+    EXPECT_DOUBLE_EQ(dp_c, brute_min) << "DP must find the optimal left-deep order";
+    EXPECT_LT(dp_c, greedy_c) << "greedy is suboptimal here; DP must beat it (dp=" << dp_c
+                              << ", greedy=" << greedy_c << ")";
+}
+
+// On a query where greedy is suboptimal, the optimizer now uses DP end to end:
+// the driving table is the DP-optimal one, not greedy's smallest-first pick.
+TEST(SqlCardinality, DpDrivesEndToEndOnGreedySuboptimalQuery) {
+    Catalog cat;
+    reg(cat, "a", "(kb BIGINT)", "row_count='10', ndv_kb='1'");
+    reg(cat, "b", "(ka BIGINT, kc BIGINT)", "row_count='100', ndv_ka='1', ndv_kc='100'");
+    reg(cat, "c", "(kb BIGINT, kd BIGINT)", "row_count='100', ndv_kb='100', ndv_kd='100'");
+    reg(cat, "d", "(kc BIGINT)", "row_count='100', ndv_kc='100'");
+    Binder b(cat);
+    auto opt = optimize(b.bind_select(
+        as_select(parse("SELECT a_kb FROM a JOIN b ON a.kb = b.ka JOIN c ON b.kc = c.kb "
+                        "JOIN d ON c.kd = d.kc"))));
+    // Greedy would drive with `a` (smallest), forcing the explosive a-b join
+    // early (cost 3000). DP defers a-b to last (cost 1200, the optimum); among
+    // the equal-cost optima it drives with `b` (the smallest-driving tie-break,
+    // b before d). The point: NOT greedy's a.
+    EXPECT_EQ(driving_table(*opt), "b") << "DP must avoid greedy's smallest-first a-driven order";
+    EXPECT_NE(driving_table(*opt), "a");
 }
 
 }  // namespace
