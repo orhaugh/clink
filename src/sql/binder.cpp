@@ -2480,16 +2480,17 @@ std::unique_ptr<LogicalPlan> Binder::bind_last_n_agg(
         if (fc.agg_distinct) {
             bind_error("DISTINCT is not supported inside a last-N window aggregate", fc.loc.pos);
         }
-        if (!is_aggregate_fn_name(fc.name)) {
+        // Allow-list exactly the running aggregates the operator recomputes
+        // correctly over a window slice. The broader built-in set (STRING_AGG /
+        // LISTAGG / ARRAY_AGG / PERCENTILE / STDDEV / VARIANCE) and UDAFs would
+        // bind but mis-aggregate here (no separator/percentile-fraction plumbed,
+        // list-into-changelog untested), so reject them at bind.
+        static const std::unordered_set<std::string> kLastNFns = {
+            "sum", "count", "avg", "min", "max"};
+        if (kLastNFns.find(fc.name) == kLastNFns.end()) {
             bind_error(
-                "last-N window function must be a running aggregate "
-                "(SUM/COUNT/AVG/MIN/MAX): " +
-                    fc.name,
+                "last-N window function must be one of SUM / COUNT / AVG / MIN / MAX: " + fc.name,
                 fc.loc.pos);
-        }
-        if (is_registered_udaf_name(fc.name)) {
-            bind_error("UDAF '" + fc.name + "' is not supported in a last-N window aggregate",
-                       fc.loc.pos);
         }
         OverOutput out;
         out.fn = fc.name;
@@ -2519,13 +2520,23 @@ std::unique_ptr<LogicalPlan> Binder::bind_last_n_agg(
     }
 
     // Output schema = the partition columns + the aggregate outputs (the
-    // materialised per-key view), in operator-emission order.
+    // materialised per-key view), in SELECT-target order (mirroring GROUP BY,
+    // so the positional INSERT type-check lines up with the sink DDL exactly as
+    // it does for a GROUP BY of the same shape). The runtime op emits by output
+    // name into a name-keyed Row, so schema order does not affect runtime data.
     arrow::FieldVector fields;
     fields.reserve(partition_cols.size() + outputs.size());
-    for (const auto& pc : partition_cols)
-        fields.push_back(arrow::field(pc, column_type(pc)));
-    for (const auto& o : outputs)
-        fields.push_back(arrow::field(o.output_name, o.type));
+    std::size_t out_idx = 0;
+    for (std::size_t i = 0; i < stmt.target_list.size(); ++i) {
+        if (is_window[i]) {
+            const auto& o = outputs[out_idx++];
+            fields.push_back(arrow::field(o.output_name, o.type));
+        } else {
+            const std::string c = resolve_value_column_name(
+                std::get<ast::ColumnRef>(stmt.target_list[i].expr), source, alias);
+            fields.push_back(arrow::field(c, column_type(c)));
+        }
+    }
     auto schema = arrow::schema(std::move(fields));
 
     return std::make_unique<LogicalLastNAgg>(std::move(inner),

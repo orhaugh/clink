@@ -1989,9 +1989,12 @@ private:
         return b;
     }
 
+    static std::string serialize_bare_(const Row& r) {
+        return clink::config::JsonValue{clink::config::JsonObject{r.values}}.serialize(0);
+    }
+
     static bool rows_equal_(const Row& a, const Row& b) {
-        return clink::config::JsonValue{clink::config::JsonObject{a.values}}.serialize(0) ==
-               clink::config::JsonValue{clink::config::JsonObject{b.values}}.serialize(0);
+        return serialize_bare_(a) == serialize_bare_(b);
     }
 
     void handle_(const Row& row, Batch<Row>& emit_batch) {
@@ -1999,8 +2002,11 @@ private:
         auto& st = state_[partition_key_(row)];
         const Row bare = bare_(row);
         if (retract) {
+            // Remove the first window element value-equal to the retracted row
+            // (serialise the incoming row once, then scan).
+            const std::string bare_key = serialize_bare_(bare);
             for (std::size_t i = 0; i < st.window.size(); ++i) {
-                if (rows_equal_(st.window[i], bare)) {
+                if (serialize_bare_(st.window[i]) == bare_key) {
                     st.window.erase(st.window.begin() + static_cast<std::ptrdiff_t>(i));
                     break;
                 }
@@ -2016,6 +2022,21 @@ private:
             // slides the frame forward.
             if (st.window.size() > static_cast<std::size_t>(capacity_))
                 st.window.erase(st.window.begin());
+        }
+
+        // Empty window: a retraction (or a delete that drained the last element)
+        // leaves no rows to aggregate. Do NOT emit a fabricated/stale null row.
+        // If the key had a prior emission, retract it (delete) so an upsert /
+        // netting sink erases the key; otherwise (a leading or unmatched delete
+        // for a never-seen key) emit nothing.
+        if (st.window.empty()) {
+            if (st.prior_emitted.has_value()) {
+                Row del = *st.prior_emitted;
+                set_row_kind(del, kRowKindDelete);
+                emit_batch.push(Record<Row>{std::move(del)});
+                st.prior_emitted.reset();
+            }
+            return;
         }
 
         // Recompute each aggregate over its frame slice (the last

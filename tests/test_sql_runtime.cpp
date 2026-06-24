@@ -3966,6 +3966,146 @@ TEST(SqlRuntime, WinningPriceAvgOverSellerLastNClosedAuctions) {
         std::filesystem::remove(f);
 }
 
+// last_n_agg must not emit a fabricated/stale row when a key's window is empty.
+// k=1: insert then delete the only element -> the window empties, so the key
+//   must be RETRACTED (a delete), not left as a stale {k:1, null} row.
+// k=2: a leading delete for a never-seen key -> emit nothing (no key fabricated
+//   from a bare delete).
+// k=3: a plain insert -> survives. Final upsert table: only k=3.
+TEST(SqlRuntime, LastNAggEmptyWindowRetractsKey) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_lastn_empty_in.ndjson";
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_sql_lastn_empty_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+    write_lines(in_path,
+                {
+                    R"({"k":1,"t":1,"v":10})",
+                    R"({"k":1,"t":1,"v":10,"__row_kind":"delete"})",
+                    R"({"k":2,"t":1,"v":5,"__row_kind":"delete"})",
+                    R"({"k":3,"t":1,"v":7})",
+                });
+
+    Catalog cat;
+    auto ddl =
+        parse(std::string{"CREATE TABLE src (k BIGINT, t BIGINT, v BIGINT) "
+                          "WITH (connector='file', format='json', path='"} +
+              in_path.string() +
+              "');"
+              "CREATE TABLE rollavg (k BIGINT, avgv DOUBLE) "
+              "WITH (connector='file', format='json', mode='upsert', primary_key='k', path='" +
+              out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat,
+                        "INSERT INTO rollavg SELECT k, AVG(v) OVER (PARTITION BY k ORDER BY t "
+                        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS avgv FROM src");
+
+    InProcessCluster cluster("tm-sql-lastn-empty", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 20s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::map<std::int64_t, double> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got[static_cast<std::int64_t>(js.at("k").as_number())] = js.at("avgv").as_number();
+    }
+    EXPECT_EQ(got.count(1), 0u) << "k=1 emptied -> key retracted, no stale null row";
+    EXPECT_EQ(got.count(2), 0u) << "k=2 leading delete -> no fabricated key";
+    ASSERT_TRUE(got.count(3));
+    EXPECT_NEAR(got[3], 7.0, 1e-9);
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
+// The last-N window gate accepts only the running aggregates it recomputes
+// correctly (SUM/COUNT/AVG/MIN/MAX). STRING_AGG (no separator plumbed on this
+// path) must be rejected at bind rather than silently producing a run-together
+// string.
+TEST(SqlRuntime, LastNAggRejectsNonRunningAggregate) {
+    ensure_sql_installed_once();
+
+    Catalog cat;
+    auto ddl = parse(std::string{
+        "CREATE TABLE src (k BIGINT, t BIGINT, v VARCHAR) "
+        "WITH (connector='file', format='json', path='/tmp/clink_sql_lastn_reject_in.ndjson');"
+        "CREATE TABLE out_t (k BIGINT, s VARCHAR) "
+        "WITH (connector='file', format='json', mode='upsert', primary_key='k', "
+        "path='/tmp/clink_sql_lastn_reject_out')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    bool threw = false;
+    try {
+        auto spec = compile(cat,
+                            "INSERT INTO out_t SELECT k, STRING_AGG(v) OVER (PARTITION BY k "
+                            "ORDER BY t ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM src");
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw) << "STRING_AGG over a last-N window must be rejected at bind";
+}
+
+// The bound output schema must follow SELECT-list order (like GROUP BY), so the
+// positional INSERT type-check lines up when the aggregate is projected BEFORE
+// the partition key. Previously the schema was always partition-cols-first,
+// which falsely rejected this shape against a sink declared (avgv, k).
+TEST(SqlRuntime, LastNAggSchemaFollowsSelectOrder) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_lastn_ord_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_lastn_ord_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+    write_lines(in_path, {R"({"k":1,"t":1,"v":10})", R"({"k":1,"t":2,"v":20})"});
+
+    Catalog cat;
+    auto ddl =
+        parse(std::string{"CREATE TABLE src (k BIGINT, t BIGINT, v BIGINT) "
+                          "WITH (connector='file', format='json', path='"} +
+              in_path.string() +
+              "');"
+              "CREATE TABLE out_t (avgv DOUBLE, k BIGINT) "
+              "WITH (connector='file', format='json', mode='upsert', primary_key='k', path='" +
+              out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    // Aggregate projected first, then the partition key.
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT AVG(v) OVER (PARTITION BY k ORDER BY t "
+                        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS avgv, k FROM src");
+
+    InProcessCluster cluster("tm-sql-lastn-ord", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 20s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::map<std::int64_t, double> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got[static_cast<std::int64_t>(js.at("k").as_number())] = js.at("avgv").as_number();
+    }
+    ASSERT_TRUE(got.count(1));
+    EXPECT_NEAR(got[1], 15.0, 1e-9) << "last-2 avg(10,20)=15";
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // Nexmark-q18 shape: latest bid per (auction, bidder) - a MULTI-COLUMN
 // PARTITION BY TOP-N-per-key (rn <= 1, ORDER BY time DESC) into a netting sink.
 TEST(SqlRuntime, LatestBidPerAuctionBidderMultiColPartition) {
