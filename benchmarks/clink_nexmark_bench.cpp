@@ -192,6 +192,21 @@ const std::map<std::string, Query>& queries() {
           "bidders, MIN(price) AS minp, MAX(price) AS maxp, AVG(price) AS avgp, SUM(price) AS sump "
           "FROM (SELECT auction, DATE_TRUNC('day', datetime) AS day, bidder, price FROM bid) AS t "
           "GROUP BY auction, day"}},
+        // q16: per-(channel,day) bid stats - count, distinct bidders/auctions, first/last
+        // bid time, and price-range bucket counts (SUM over CASE buckets computed in a
+        // derived table, since clink WHERE/aggregates take a column not an expression).
+        {"q16",
+         {"CREATE TABLE sink_q16 (channel VARCHAR, day BIGINT, total BIGINT, bidders BIGINT, "
+          "auctions BIGINT, minbid BIGINT, maxbid BIGINT, lt10k BIGINT, bet BIGINT, gt1m BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q16 SELECT channel, day, COUNT(*) AS total, "
+          "COUNT(DISTINCT bidder) AS bidders, COUNT(DISTINCT auction) AS auctions, "
+          "MIN(dt) AS minbid, MAX(dt) AS maxbid, SUM(r1) AS lt10k, SUM(r2) AS bet, "
+          "SUM(r3) AS gt1m FROM (SELECT channel, DATE_TRUNC('day', datetime) AS day, bidder, "
+          "auction, datetime AS dt, CASE WHEN price < 10000 THEN 1 ELSE 0 END AS r1, "
+          "CASE WHEN price >= 10000 AND price <= 1000000 THEN 1 ELSE 0 END AS r2, "
+          "CASE WHEN price > 1000000 THEN 1 ELSE 0 END AS r3 FROM bid) AS t "
+          "GROUP BY channel, day"}},
     };
     return q;
 }

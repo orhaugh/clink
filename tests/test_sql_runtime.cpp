@@ -3228,6 +3228,95 @@ TEST(SqlRuntime, PerDayBiddingStatsWithDistinctCounts) {
     std::filesystem::remove(out_path);
 }
 
+// Nexmark-q16 shape: per-(channel,day) stats - COUNT, COUNT(DISTINCT) bidders/
+// auctions, MIN/MAX bid time, and price-range bucket counts (SUM over CASE
+// buckets computed in a derived table) into an upsert sink.
+TEST(SqlRuntime, ChannelStatsPerDayWithBuckets) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q16_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q16_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    // channel A, day 0: prices {5000, 50000, 2000000}, bidders {1,2,1}, auctions {1,1,2}.
+    //   -> total 3, distinct bidders 2, distinct auctions 2, min/max bid time 100/300,
+    //      lt10k 1 (5000), bet 1 (50000), gt1m 1 (2000000). channel B day 0: one bid price 8000.
+    write_lines(in_path,
+                {
+                    R"({"channel":"A","bidder":1,"auction":1,"price":5000,"datetime":100})",
+                    R"({"channel":"A","bidder":2,"auction":1,"price":50000,"datetime":200})",
+                    R"({"channel":"A","bidder":1,"auction":2,"price":2000000,"datetime":300})",
+                    R"({"channel":"B","bidder":3,"auction":3,"price":8000,"datetime":400})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(
+        std::string{
+            "CREATE TABLE bid (channel VARCHAR, bidder BIGINT, auction BIGINT, price BIGINT, "
+            "datetime BIGINT) WITH (connector='file', format='json', path='"} +
+        in_path.string() +
+        "');"
+        "CREATE TABLE chstats (channel VARCHAR, day BIGINT, total BIGINT, bidders BIGINT, "
+        "auctions BIGINT, minbid BIGINT, maxbid BIGINT, lt10k BIGINT, bet BIGINT, gt1m BIGINT) "
+        "WITH (connector='file', format='json', mode='upsert', primary_key='channel,day', path='" +
+        out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(
+        cat,
+        "INSERT INTO chstats SELECT channel, day, COUNT(*) AS total, "
+        "COUNT(DISTINCT bidder) AS bidders, COUNT(DISTINCT auction) AS auctions, MIN(dt) AS "
+        "minbid, "
+        "MAX(dt) AS maxbid, SUM(r1) AS lt10k, SUM(r2) AS bet, SUM(r3) AS gt1m FROM "
+        "(SELECT channel, DATE_TRUNC('day', datetime) AS day, bidder, auction, datetime AS dt, "
+        "CASE WHEN price < 10000 THEN 1 ELSE 0 END AS r1, "
+        "CASE WHEN price >= 10000 AND price <= 1000000 THEN 1 ELSE 0 END AS r2, "
+        "CASE WHEN price > 1000000 THEN 1 ELSE 0 END AS r3 FROM bid) AS t GROUP BY channel, day");
+
+    InProcessCluster cluster("tm-sql-e2e-q16", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    struct S {
+        std::int64_t total, bidders, auctions, minbid, maxbid, lt10k, bet, gt1m;
+    };
+    std::map<std::string, S> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got[js.at("channel").as_string()] =
+            S{static_cast<std::int64_t>(js.at("total").as_number()),
+              static_cast<std::int64_t>(js.at("bidders").as_number()),
+              static_cast<std::int64_t>(js.at("auctions").as_number()),
+              static_cast<std::int64_t>(js.at("minbid").as_number()),
+              static_cast<std::int64_t>(js.at("maxbid").as_number()),
+              static_cast<std::int64_t>(js.at("lt10k").as_number()),
+              static_cast<std::int64_t>(js.at("bet").as_number()),
+              static_cast<std::int64_t>(js.at("gt1m").as_number())};
+    }
+    ASSERT_TRUE(got.count("A"));
+    EXPECT_EQ(got["A"].total, 3);
+    EXPECT_EQ(got["A"].bidders, 2);
+    EXPECT_EQ(got["A"].auctions, 2);
+    EXPECT_EQ(got["A"].minbid, 100);
+    EXPECT_EQ(got["A"].maxbid, 300);
+    EXPECT_EQ(got["A"].lt10k, 1);
+    EXPECT_EQ(got["A"].bet, 1);
+    EXPECT_EQ(got["A"].gt1m, 1);
+    ASSERT_TRUE(got.count("B"));
+    EXPECT_EQ(got["B"].total, 1);
+    EXPECT_EQ(got["B"].lt10k, 1);
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // Nexmark-q18 shape: latest bid per (auction, bidder) - a MULTI-COLUMN
 // PARTITION BY TOP-N-per-key (rn <= 1, ORDER BY time DESC) into a netting sink.
 TEST(SqlRuntime, LatestBidPerAuctionBidderMultiColPartition) {
