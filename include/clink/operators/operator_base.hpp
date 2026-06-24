@@ -981,6 +981,38 @@ public:
                                      const std::string& /*key*/,
                                      Emitter<Out>& /*out*/) {}
 
+    // Opt-in (default false, mirrors Operator<In,Out>): fire due EVENT-TIME
+    // timers as gate-routed async coroutines instead of synchronously inside the
+    // merged-watermark release, so a deferring backend OVERLAPS the reads of
+    // distinct due keys. The co-operator runner groups the due timers by key and
+    // submits ONE coroutine per due key via on_event_time_timers_async, then
+    // forwards the merged watermark via a second epoch-tied release once those
+    // fire coroutines drain. Returning false keeps the proven
+    // fire-inside-release path, byte-identical.
+    [[nodiscard]] virtual bool fires_async_event_time_timers() const noexcept { return false; }
+
+    // Async twin of on_event_time_timer (see fires_async_event_time_timers).
+    // Default delegates to the synchronous hook. `key` by value (coroutine
+    // parameter - a reference would dangle across the first suspension).
+    virtual async::Task<void> on_event_time_timer_async(std::int64_t timestamp_ms,
+                                                        std::string key,
+                                                        Emitter<Out>& out) {
+        on_event_time_timer(timestamp_ms, key, out);
+        co_return;
+    }
+
+    // Batched async event-time fire: fire ALL of `key`'s due timers in one shot
+    // (the co-op runner submits one coroutine per due key). An operator with a
+    // per-key collection overrides this to read it once, fire every due entry,
+    // and write back once; the default loops the singular form. By-value params.
+    virtual async::Task<void> on_event_time_timers_async(std::vector<std::int64_t> timestamps,
+                                                         std::string key,
+                                                         Emitter<Out>& out) {
+        for (std::int64_t ts : timestamps) {
+            co_await on_event_time_timer_async(ts, key, out);
+        }
+    }
+
     // Polls + fires every event-time timer due at watermark_ms.
     virtual void fire_due_event_time_timers(Emitter<Out>& out, std::int64_t watermark_ms) {
         if (runtime_ == nullptr) {

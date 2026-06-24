@@ -2849,15 +2849,59 @@ public:
             auto fire_due_async = [&] {
                 detail::gated_fire_processing_time_timers(*op, out_emitter, timers->now_ms(), *aec);
             };
+            // ASYNC event-time fire (opt-in via fires_async_event_time_timers),
+            // the two-input analogue of the single-input runner: the
+            // merged-watermark release only MARKS its epoch drained (push to
+            // drained_wms, off the controller's release path), and the runner
+            // fires the due timers as gate-routed coroutines (so a deferring
+            // backend overlaps the reads of distinct due keys) then forwards the
+            // merged watermark via a SECOND epoch-tied on_watermark. Never
+            // re-enters the controller from inside a release.
+            std::vector<Watermark> drained_wms;
+            auto flush_drained_watermarks = [&] {
+                if (drained_wms.empty()) {
+                    return;  // nothing released (or op not async-firing): a true no-op
+                }
+                bool fired = false;
+                while (!drained_wms.empty()) {
+                    std::vector<Watermark> batch;
+                    batch.swap(drained_wms);
+                    for (const Watermark& dwm : batch) {
+                        if (!dwm.is_idle()) {
+                            detail::gated_fire_event_time_timers(
+                                *op, out_emitter, dwm.timestamp().millis(), *aec);
+                            fired = true;
+                        }
+                        // Forward-only: the due timers were already consumed by
+                        // gated_fire (for an idle marker, base on_watermark fires
+                        // them synchronously - matching the prior path); this
+                        // release just emits the watermark, after the fire epoch.
+                        aec->on_watermark(
+                            [op, dwm, &out_emitter] { op->on_watermark(dwm, out_emitter); });
+                    }
+                }
+                if (fired && do_coalesce) {
+                    while (ctx.state_backend()->flush_pending_reads()) {
+                        aec->poll();
+                    }
+                }
+                aec->poll();
+            };
             // Forward the merged (min) watermark. Under async this is the ONLY
             // epoch boundary: the release (fire due event-time timers + forward)
             // runs after the closing epoch drains, so a timer at T fires only
             // once every pre-T record from BOTH inputs has applied its write.
             auto forward_watermark = [&](Watermark merged) {
                 if (aec) {
-                    aec->on_watermark(
-                        [op, merged, &out_emitter] { op->on_watermark(merged, out_emitter); });
+                    if (op->fires_async_event_time_timers()) {
+                        aec->on_watermark(
+                            [&drained_wms, merged] { drained_wms.push_back(merged); });
+                    } else {
+                        aec->on_watermark(
+                            [op, merged, &out_emitter] { op->on_watermark(merged, out_emitter); });
+                    }
                     aec->poll();
+                    flush_drained_watermarks();
                 } else {
                     op->on_watermark(merged, out_emitter);
                 }
@@ -3089,6 +3133,13 @@ public:
                         }
                     }
                 }
+                // A data completion (handle_left/handle_right poll) can drain a
+                // marked watermark's epoch; fire + forward any such markers
+                // before the next pop. No-op when none pending / op not
+                // async-firing (mirrors the single-input runner).
+                if (aec) {
+                    flush_drained_watermarks();
+                }
                 if (align.all_closed()) {
                     break;
                 }
@@ -3128,7 +3179,9 @@ public:
             // flush.
             if (aec) {
                 if (!should_stop()) {
-                    aec->drain();
+                    aec->drain();                // quiesce in-flight -> release any wm markers
+                    flush_drained_watermarks();  // fire + forward deferred event-time windows
+                    aec->drain();                // complete fire coroutines -> forward releases
                     fire_due_async();
                     aec->drain();
                     op->flush(out_emitter);

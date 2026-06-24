@@ -42,6 +42,8 @@
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/keyed_state.hpp"
+#include "clink/state/remote_pool.hpp"
+#include "clink/state/remote_read_backend.hpp"
 
 using namespace clink;
 
@@ -503,4 +505,154 @@ TEST(AsyncCoProcessFunction, CoalescesInputBatchIntoOneGetMany) {
     EXPECT_EQ(sink->collected().size(), 4u);  // every left record emitted
     EXPECT_EQ(many->load(), 1);               // one input batch -> one get_many
     EXPECT_EQ(single->load(), 0);             // never the per-key path
+}
+
+namespace {
+
+// Test-only async co-operator that opts into the async EVENT-TIME fire path:
+// both inputs accumulate their value into per-key state and register an
+// event-time timer; the merged watermark fires every due key through
+// on_event_time_timers_async (the co-op runner submits one fire coroutine per
+// due key, so a deferring backend coalesces the reads). The synchronous fallback
+// fires through the base on_watermark -> on_event_time_timer path. Proves the
+// co-op runner's async-fire wiring end to end. Key/gate/timer use one string so
+// ingest and fire address the same state slice.
+class AsyncFireCoOp : public CoOperator<std::int64_t, std::int64_t, std::int64_t> {
+public:
+    [[nodiscard]] bool supports_async() const noexcept override { return true; }
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
+    [[nodiscard]] bool fires_state_touching_timers() const noexcept override { return true; }
+    [[nodiscard]] bool fires_async_event_time_timers() const noexcept override { return true; }
+
+    void process_element1(const StreamElement<std::int64_t>& el,
+                          Emitter<std::int64_t>& /*out*/) override {
+        ingest_sync_(el);
+    }
+    void process_element2(const StreamElement<std::int64_t>& el,
+                          Emitter<std::int64_t>& /*out*/) override {
+        ingest_sync_(el);
+    }
+    void process_async1(const StreamElement<std::int64_t>& el,
+                        Emitter<std::int64_t>& /*out*/,
+                        AsyncExecutionController& aec) override {
+        ingest_async_(el, aec);
+    }
+    void process_async2(const StreamElement<std::int64_t>& el,
+                        Emitter<std::int64_t>& /*out*/,
+                        AsyncExecutionController& aec) override {
+        ingest_async_(el, aec);
+    }
+
+    // Synchronous fire (non-deferring backend, via base on_watermark).
+    void on_event_time_timer(std::int64_t /*ts*/,
+                             const std::string& key,
+                             Emitter<std::int64_t>& out) override {
+        emit_(state_().get(key).value_or(0), out);
+    }
+    // Async batched fire (deferring backend): one get_async per due key.
+    async::Task<void> on_event_time_timers_async(std::vector<std::int64_t> /*tss*/,
+                                                 std::string key,
+                                                 Emitter<std::int64_t>& out) override {
+        auto kv = state_();
+        auto cur = co_await kv.get_async(key);
+        emit_(cur.value_or(0), out);
+        co_return;
+    }
+
+private:
+    KeyedState<std::string, std::int64_t> state_() {
+        return this->runtime()->keyed_state<std::string, std::int64_t>(
+            "c", string_codec(), int64_codec());
+    }
+    static std::string key_of_(std::int64_t v) { return std::to_string(v); }
+    static void emit_(std::int64_t v, Emitter<std::int64_t>& out) {
+        Batch<std::int64_t> b;
+        b.push(Record<std::int64_t>{v});
+        out.emit_data(std::move(b));
+    }
+    void ingest_sync_(const StreamElement<std::int64_t>& el) {
+        if (!el.is_data()) {
+            return;
+        }
+        for (const auto& rec : el.as_data()) {
+            const std::int64_t v = rec.value();
+            const std::string key = key_of_(v);
+            auto kv = state_();
+            kv.put(key, kv.get(key).value_or(0) + v);
+            this->runtime()->timer_service()->register_event_time_timer(5, key);
+        }
+    }
+    void ingest_async_(const StreamElement<std::int64_t>& el, AsyncExecutionController& aec) {
+        if (!el.is_data()) {
+            return;
+        }
+        for (const auto& rec : el.as_data()) {
+            const std::int64_t v = rec.value();
+            const std::string key = key_of_(v);
+            auto kv = state_();
+            auto* rt = this->runtime();
+            auto factory = [kv, v, key, rt]() mutable -> async::Task<void> {
+                auto cur = co_await kv.get_async(key);
+                kv.put(key, cur.value_or(0) + v);
+                rt->timer_service()->register_event_time_timer(5, key);
+                co_return;
+            };
+            while (!aec.submit(key, factory)) {
+                aec.poll();
+            }
+        }
+    }
+};
+
+std::vector<std::int64_t> run_async_fire_co(const std::vector<std::int64_t>& left_vals,
+                                            const std::vector<std::int64_t>& right_vals,
+                                            std::shared_ptr<StateBackend> backend) {
+    Dag dag;
+    std::vector<Record<std::int64_t>> lrecs;
+    for (auto x : left_vals) {
+        lrecs.emplace_back(x);
+    }
+    std::vector<Record<std::int64_t>> rrecs;
+    for (auto x : right_vals) {
+        rrecs.emplace_back(x);
+    }
+    auto h_l = dag.add_source<std::int64_t>(std::make_shared<VectorSource<std::int64_t>>(lrecs));
+    auto h_r = dag.add_source<std::int64_t>(std::make_shared<VectorSource<std::int64_t>>(rrecs));
+    auto op = std::make_shared<AsyncFireCoOp>();
+    auto h_co = dag.add_co_operator<std::int64_t, std::int64_t, std::int64_t>(h_l, h_r, op);
+    auto sink = std::make_shared<CollectingSink<std::int64_t>>();
+    dag.add_sink<std::int64_t>(h_co, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    auto out = sink->collected();
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+}  // namespace
+
+// The co-op runner's async EVENT-TIME fire wiring, end to end. Four distinct
+// keys (left {1,2}, right {3,4}) each accumulate their value and register an
+// event-time timer; the merged max watermark at EOS fires all four. The
+// synchronous in-memory path (fire inside the merged-watermark release) and the
+// async deferring path (gate-routed coroutines forwarded by a second epoch-tied
+// release) produce identical output, and the async run routed every read through
+// the coalescer (no single-key get_async reached the backend).
+TEST(AsyncCoProcessFunction, EventTimeFireMatchesSyncAndCoalesces) {
+    const std::vector<std::int64_t> expected = {1, 2, 3, 4};
+
+    const auto sync_out =
+        run_async_fire_co({1, 2}, {3, 4}, std::make_shared<InMemoryStateBackend>());
+
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    auto rrb = std::make_shared<RemoteReadBackend>(pool, /*io_threads=*/1, /*hot_max_bytes=*/0);
+    const auto async_out = run_async_fire_co({1, 2}, {3, 4}, rrb);
+
+    EXPECT_EQ(sync_out, expected) << "synchronous co-op event-time fire";
+    EXPECT_EQ(async_out, expected) << "async co-op event-time fire (the runner wiring)";
+    EXPECT_EQ(async_out, sync_out);
+    EXPECT_EQ(rrb->get_async_calls(), 0u) << "a read bypassed the coalescer as a single-key read";
+    EXPECT_GT(rrb->get_many_async_calls(), 0u) << "no batched reads (async fire path inactive?)";
 }
