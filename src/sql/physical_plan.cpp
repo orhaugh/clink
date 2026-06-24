@@ -173,6 +173,11 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     const bool upsert = table.is_upsert();
     const bool exactly_once = table.is_exactly_once();
     if (connector == "file" || connector == "filesystem") {
+        // A partition_by WITH-option routes to the partitioning sink (one file
+        // per distinct partition-key value). Append-only; no 2PC/upsert combo.
+        if (table.properties.find("partition_by") != table.properties.end()) {
+            return RowConnectorBinding{"partition_file_sink", kChannelRow, {}};
+        }
         if (exactly_once) {
             // 2PC + upsert is rejected at bind time, so we know
             // we're routing an append stream into the 2PC sink.

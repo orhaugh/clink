@@ -3376,6 +3376,63 @@ TEST(SqlRuntime, RegexpExtractAndSplitIndexInProjection) {
     std::filesystem::remove(out_path);
 }
 
+// Nexmark-q10 shape: log to partitioned storage - write the stream to one file
+// per distinct partition-key value (connector='file' + partition_by). Verifies
+// records land in the right partition file.
+TEST(SqlRuntime, PartitionedFileSinkByColumn) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q10_in.ndjson";
+    const auto base = (std::filesystem::temp_directory_path() / "clink_sql_e2e_q10_out").string();
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(base + ".2024");
+    std::filesystem::remove(base + ".2025");
+
+    write_lines(in_path,
+                {
+                    R"({"id":1,"day":"2024","v":10})",
+                    R"({"id":2,"day":"2024","v":20})",
+                    R"({"id":3,"day":"2025","v":30})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE src (id BIGINT, day VARCHAR, v BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE part (id BIGINT, day VARCHAR, v BIGINT) "
+                     "WITH (connector='file', format='json', partition_by='day', path='" +
+                     base + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat, "INSERT INTO part SELECT id, day, v FROM src");
+
+    InProcessCluster cluster("tm-sql-e2e-q10", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    // One file per partition value; each carries only its partition's rows.
+    auto ids_in = [](const std::filesystem::path& p) {
+        std::set<std::int64_t> ids;
+        for (const auto& l : read_lines(p))
+            ids.insert(static_cast<std::int64_t>(clink::config::parse(l).at("id").as_number()));
+        return ids;
+    };
+    ASSERT_TRUE(std::filesystem::exists(base + ".2024")) << "partition 2024 file missing";
+    ASSERT_TRUE(std::filesystem::exists(base + ".2025")) << "partition 2025 file missing";
+    EXPECT_EQ(ids_in(base + ".2024"), (std::set<std::int64_t>{1, 2}));
+    EXPECT_EQ(ids_in(base + ".2025"), (std::set<std::int64_t>{3}));
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(base + ".2024");
+    std::filesystem::remove(base + ".2025");
+}
+
 // Nexmark-q14 shape: a calculation with user-defined scalar functions - one in
 // the projection (a custom fee) and one as a predicate (kept-bid test). clink
 // has no CREATE FUNCTION DDL, so the UDFs are registered programmatically via

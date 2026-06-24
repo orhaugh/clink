@@ -3396,6 +3396,66 @@ private:
     bool flushed_{false};
 };
 
+// A partitioning JSON sink: routes each row to a per-partition-key file (one
+// file per distinct value of the partition_by column), written on flush. For
+// "log to partitioned storage" outputs (Nexmark q10). Buffers per partition and
+// writes <base>.<key> files. At parallelism > 1 the factory appends the subtask
+// index to <base> so subtasks never collide on the same partition file.
+class PartitionedJsonSink final : public Sink<Row> {
+public:
+    PartitionedJsonSink(std::string base_path,
+                        std::string partition_col,
+                        std::map<std::string, int> decimal_scales = {})
+        : base_path_(std::move(base_path)),
+          partition_col_(std::move(partition_col)),
+          decimal_scales_(std::move(decimal_scales)) {
+        if (partition_col_.empty()) {
+            throw std::runtime_error("partition_file_sink: 'partition_by' is required");
+        }
+    }
+
+    void on_data(const Batch<Row>& batch) override {
+        for (const auto& rec : batch) {
+            const auto& row = rec.value();
+            std::string key = "__null__";
+            auto it = row.values.find(partition_col_);
+            if (it != row.values.end() && !it->second.is_null()) {
+                key = it->second.is_string() ? it->second.as_string() : it->second.serialize(0);
+            }
+            Row q = row;
+            requantise_row_decimals(q, decimal_scales_);
+            partitions_[key].push_back(clink::config::serialize_output(
+                clink::config::JsonValue{clink::config::JsonObject{q.values}}));
+        }
+    }
+
+    void flush() override {
+        if (flushed_)
+            return;
+        flushed_ = true;
+        for (const auto& [key, rows] : partitions_) {
+            const std::string path = base_path_ + "." + key;
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                throw std::runtime_error("partition_file_sink: cannot open " + path);
+            }
+            for (const auto& r : rows) {
+                out.write(r.data(), static_cast<std::streamsize>(r.size()));
+                out.put('\n');
+            }
+        }
+    }
+
+    std::string name() const override { return "partition_file_sink"; }
+
+private:
+    std::string base_path_;
+    std::string partition_col_;
+    std::map<std::string, int> decimal_scales_;
+    std::map<std::string, std::vector<std::string>> partitions_;
+    bool flushed_{false};
+};
+
 // Phase 21c: TOP-N-per-partition. Single-input op that maintains a
 // per-partition sorted buffer of at most `count_` records. On each
 // arriving record:
@@ -4433,6 +4493,27 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             return std::make_shared<ChangelogNetSink>(
                 std::move(path), parse_decimal_columns(ctx.param_or("decimal_columns")));
+        });
+
+    // partition_file_sink: writes one JSON file per distinct value of the
+    // partition_by column (<path>.<key>). Params: path, partition_by.
+    reg.register_sink<Row>(
+        "partition_file_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<Row>> {
+            auto path = ctx.param_or("path");
+            if (path.empty()) {
+                throw std::runtime_error("partition_file_sink: 'path' param is required");
+            }
+            auto partition_by = ctx.param_or("partition_by");
+            if (partition_by.empty()) {
+                throw std::runtime_error("partition_file_sink: 'partition_by' param is required");
+            }
+            if (ctx.parallelism > 1) {
+                path += "." + std::to_string(ctx.subtask_idx);
+            }
+            return std::make_shared<PartitionedJsonSink>(
+                std::move(path),
+                std::move(partition_by),
+                parse_decimal_columns(ctx.param_or("decimal_columns")));
         });
 
     // ---- Operators ----

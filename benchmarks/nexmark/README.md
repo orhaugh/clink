@@ -51,6 +51,18 @@ Flags: `--query qN`, `--events N` (total events), `--tps N` (dateTime spacing =
 | q17 | per-auction-day stats | `GROUP BY auction, day` + `COUNT(DISTINCT)`, `MIN`/`MAX`/`AVG`/`SUM(price)` |
 | q18 | latest bid per (auction, bidder) | `ROW_NUMBER() OVER (PARTITION BY auction, bidder ORDER BY datetime DESC)`, `rn <= 1` (TOP-N-per-key changelog) |
 | q19 | top-10 per auction | `ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC)`, `rn <= 10` (TOP-N-per-key changelog) |
+| q16 | channel stats | `GROUP BY channel, day` + `COUNT(DISTINCT)`, `MIN`/`MAX`, `SUM(CASE…)` price buckets |
+| q4 | avg price by category | winning bid (interval-join + per-auction `MAX`) -> `AVG` per category (stacked aggregate) |
+| q9 | winning bids | `bid ⋈ auction` + interval residual (`datetime IN [datetime, expires]`) + `ROW_NUMBER` top-1 by price |
+| q13 | side-input join | bid ⋈ a `connector='lookup'` side table keyed by `auction mod N` (clink's `FOR SYSTEM_TIME` equivalent) |
+| q14 | UDF calculation | scalar UDF in the projection + a UDF predicate (registered via `ScalarFunctionRegistry`; no `CREATE FUNCTION` DDL) |
+| q21 | add channel_id | `regexp_extract(url, …)` (new built-in scalar fn) |
+| q22 | url directories | `split_index(url, '/', n)` (new built-in scalar fn, 0-based) |
+
+q10 (log to partitioned storage) is also supported - a `partition_file_sink`
+(`connector='file'` + `partition_by=<col>`, one file per partition value). It is
+an IT-only query (it writes files; the bench measures throughput via blackhole),
+covered by the `PartitionedFileSinkByColumn` runtime test.
 
 Enabling capabilities now in clink SQL: `window_start`/`window_end` projectable
 from any windowed GROUP BY (aliasable, BIGINT ms-since-epoch); a derived table
@@ -65,8 +77,16 @@ accepted by `connector='changelog'` (netting), `mode='upsert'`, or a discard
 `connector='blackhole'` sink. q8's per-window grouping carries a `COUNT(*)`
 (unused) because clink requires an aggregate in a GROUP BY SELECT.
 
-Fourteen Nexmark queries now execute (q0/q1/q2/q3/q5/q7/q8/q11/q12/q15/q17/q18/
-q19/q20). The remaining queries are excluded by named gaps (below).
+Twenty-two of the 23 Nexmark queries run on clink (all of q0-q5, q7-q22). 21 are
+in the throughput bench (`--query qN`); q10 is IT-only (it writes partition
+files). Each is asserted by a runtime test or bench-verified.
+
+The one query NOT supported is **q6** (average selling price by seller, over the
+last 10 closed auctions). It needs a per-seller `ROWS BETWEEN 9 PRECEDING` window
+over a changelog (winning-bid) stream; clink's `OVER` operator handles bounded
+frames only on append-only streams, not changelog inputs. Flink itself ships q6
+only via its procedural DataStream API, not SQL - so this is a known-hard gap,
+not a clink-specific one. Closing it needs changelog-aware bounded `OVER` frames.
 
 Window queries: use a lower `--tps` (e.g. `--tps 50000`) so `datetime` spans many
 windows (spacing is `1000/tps` ms/event); at the default tps the run fits in one
@@ -79,6 +99,4 @@ window and fires at end-of-stream.
 - `events_per_sec` is the logical-stream rate (`events / wall`). Multi-table
   queries instantiate the generator per table, re-deriving the shared stream.
 - In-process single TaskManager; not a distributed-cluster number.
-- Excluded by named gaps (not silently): q6 (unsupported in Flink too), q10
-  (partitioned sink), q13 (`FOR SYSTEM_TIME`), q14 (`CREATE FUNCTION`), q21
-  (`regexp_extract`), q22 (`split_index`).
+- Only q6 is unsupported (see above); it is unsupported in Flink SQL too.
