@@ -5,6 +5,7 @@
 #include <cmath>
 #include <concepts>
 #include <optional>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -837,6 +838,69 @@ clink::config::JsonValue evaluate_json_value_expr(const clink::config::JsonValue
             s.resize(end);
         }
         return JsonValue{s};
+    }
+    // regexp_extract(s, pattern, group?) - the `group`-th capture (default 0 =
+    // the whole match) of the FIRST match of `pattern` in `s`. Returns null on no
+    // match, an out-of-range group, a bad pattern, or any null arg.
+    if (op == "regexp_extract") {
+        if (args.size() < 2 || args.size() > 3) {
+            throw std::runtime_error("json_value_expr: 'regexp_extract' takes 2 or 3 args");
+        }
+        for (const auto& a : args)
+            if (a.is_null())
+                return value_expr_detail::null_value();
+        const std::string s = value_expr_detail::to_text(args[0]);
+        const std::string pat = value_expr_detail::to_text(args[1]);
+        std::size_t group = 0;
+        if (args.size() == 3) {
+            if (!args[2].is_number())
+                return value_expr_detail::null_value();
+            const std::int64_t g = static_cast<std::int64_t>(args[2].as_number());
+            if (g < 0)
+                return value_expr_detail::null_value();
+            group = static_cast<std::size_t>(g);
+        }
+        try {
+            std::regex re(pat);
+            std::smatch m;
+            if (std::regex_search(s, m, re) && group < m.size()) {
+                return JsonValue{m[group].str()};
+            }
+        } catch (const std::regex_error&) {
+            return value_expr_detail::null_value();
+        }
+        return value_expr_detail::null_value();
+    }
+    // split_index(s, delim, idx) - the idx-th (0-based, Flink semantics) field of
+    // `s` split by the string `delim`. Returns null on an out-of-range index, an
+    // empty delimiter, or any null arg.
+    if (op == "split_index") {
+        if (args.size() != 3) {
+            throw std::runtime_error("json_value_expr: 'split_index' takes 3 args");
+        }
+        for (const auto& a : args)
+            if (a.is_null())
+                return value_expr_detail::null_value();
+        if (!args[2].is_number())
+            return value_expr_detail::null_value();
+        const std::string s = value_expr_detail::to_text(args[0]);
+        const std::string delim = value_expr_detail::to_text(args[1]);
+        const std::int64_t idx = static_cast<std::int64_t>(args[2].as_number());
+        if (idx < 0 || delim.empty())
+            return value_expr_detail::null_value();
+        std::size_t pos = 0;
+        std::int64_t cur = 0;
+        while (true) {
+            const std::size_t next = s.find(delim, pos);
+            if (cur == idx) {
+                return JsonValue{next == std::string::npos ? s.substr(pos)
+                                                           : s.substr(pos, next - pos)};
+            }
+            if (next == std::string::npos)
+                return value_expr_detail::null_value();  // idx past the last field
+            pos = next + delim.size();
+            ++cur;
+        }
     }
     // abs/floor/ceil/round accept a #56 dec-string operand via the double
     // value (the binder types these float64, so the result is a double).

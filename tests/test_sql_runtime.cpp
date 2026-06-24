@@ -3317,6 +3317,65 @@ TEST(SqlRuntime, ChannelStatsPerDayWithBuckets) {
     std::filesystem::remove(out_path);
 }
 
+// Nexmark q21/q22 shape: regexp_extract + split_index scalar functions in a
+// stateless projection (q21 extracts a channel id; q22 splits a url path).
+TEST(SqlRuntime, RegexpExtractAndSplitIndexInProjection) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_strfn_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_strfn_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    write_lines(in_path,
+                {
+                    R"({"id":1,"url":"https://site.com/foo/42"})",
+                    R"({"id":2,"url":"plain"})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE src (id BIGINT, url VARCHAR) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (id BIGINT, num VARCHAR, seg0 VARCHAR, seg2 VARCHAR) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT id, regexp_extract(url, '([0-9]+)', 1) AS num, "
+                        "split_index(url, '/', 0) AS seg0, split_index(url, '/', 2) AS seg2 "
+                        "FROM src");
+
+    InProcessCluster cluster("tm-sql-e2e-strfn", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::map<std::int64_t, clink::config::JsonValue> rows;
+    for (const auto& l : lines)
+        rows[static_cast<std::int64_t>(clink::config::parse(l).at("id").as_number())] =
+            clink::config::parse(l);
+    ASSERT_TRUE(rows.count(1) && rows.count(2));
+    // id 1: url 'https://site.com/foo/42' -> num 42, seg0 'https:', seg2 'site.com'.
+    EXPECT_EQ(rows[1].at("num").as_string(), "42");
+    EXPECT_EQ(rows[1].at("seg0").as_string(), "https:");
+    EXPECT_EQ(rows[1].at("seg2").as_string(), "site.com");
+    // id 2: 'plain' -> no digits (num null), seg0 whole string, seg2 out of range (null).
+    EXPECT_TRUE(rows[2].at("num").is_null());
+    EXPECT_EQ(rows[2].at("seg0").as_string(), "plain");
+    EXPECT_TRUE(rows[2].at("seg2").is_null());
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // Nexmark-q18 shape: latest bid per (auction, bidder) - a MULTI-COLUMN
 // PARTITION BY TOP-N-per-key (rn <= 1, ORDER BY time DESC) into a netting sink.
 TEST(SqlRuntime, LatestBidPerAuctionBidderMultiColPartition) {

@@ -207,6 +207,20 @@ const std::map<std::string, Query>& queries() {
           "CASE WHEN price >= 10000 AND price <= 1000000 THEN 1 ELSE 0 END AS r2, "
           "CASE WHEN price > 1000000 THEN 1 ELSE 0 END AS r3 FROM bid) AS t "
           "GROUP BY channel, day"}},
+        // q21: add channel_id - extract the numeric id from the bid url with
+        // regexp_extract (a new built-in scalar function).
+        {"q21",
+         {"CREATE TABLE sink_q21 (auction BIGINT, bidder BIGINT, chan_id VARCHAR) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q21 SELECT auction, bidder, regexp_extract(url, '([0-9]+)', 1) AS "
+          "chan_id FROM bid"}},
+        // q22: get url directories - split the url path into segments with
+        // split_index (a new built-in scalar function, 0-based like Flink).
+        {"q22",
+         {"CREATE TABLE sink_q22 (auction BIGINT, dir2 VARCHAR, dir3 VARCHAR) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q22 SELECT auction, split_index(url, '/', 2) AS dir2, "
+          "split_index(url, '/', 3) AS dir3 FROM bid"}},
     };
     return q;
 }

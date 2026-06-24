@@ -139,6 +139,48 @@ TEST(JsonValueExpr, TrimVariants) {
     EXPECT_EQ(eval(R"({"op":"btrim","args":[{"lit":"xxhixx"},{"lit":"x"}]})").as_string(), "hi");
 }
 
+TEST(JsonValueExpr, RegexpExtract) {
+    // 2 args -> the whole match (group 0).
+    EXPECT_EQ(eval(R"({"op":"regexp_extract","args":[{"lit":"abc123def"},{"lit":"[0-9]+"}]})")
+                  .as_string(),
+              "123");
+    // 3 args -> the given capture group. (Custom raw-string delimiter: the
+    // regex contains )" which would otherwise close a plain R"(...)".)
+    EXPECT_EQ(
+        eval(
+            R"j({"op":"regexp_extract","args":[{"lit":"id=42&x=9"},{"lit":"id=([0-9]+)"},{"lit":1}]})j")
+            .as_string(),
+        "42");
+    // No match -> null.
+    EXPECT_TRUE(
+        eval(R"({"op":"regexp_extract","args":[{"lit":"foo"},{"lit":"[0-9]+"}]})").is_null());
+    // Group out of range -> null.
+    EXPECT_TRUE(eval(R"({"op":"regexp_extract","args":[{"lit":"a1"},{"lit":"[0-9]+"},{"lit":5}]})")
+                    .is_null());
+    // Null arg -> null.
+    EXPECT_TRUE(eval(R"({"op":"regexp_extract","args":[{"col":"m"},{"lit":"x"}]})").is_null());
+}
+
+TEST(JsonValueExpr, SplitIndex) {
+    // 0-based (Flink semantics).
+    EXPECT_EQ(
+        eval(R"({"op":"split_index","args":[{"lit":"a/b/c"},{"lit":"/"},{"lit":0}]})").as_string(),
+        "a");
+    EXPECT_EQ(
+        eval(R"({"op":"split_index","args":[{"lit":"a/b/c"},{"lit":"/"},{"lit":2}]})").as_string(),
+        "c");
+    // Multi-character delimiter.
+    EXPECT_EQ(eval(R"({"op":"split_index","args":[{"lit":"a::b::c"},{"lit":"::"},{"lit":1}]})")
+                  .as_string(),
+              "b");
+    // Index past the last field -> null.
+    EXPECT_TRUE(
+        eval(R"({"op":"split_index","args":[{"lit":"a/b"},{"lit":"/"},{"lit":5}]})").is_null());
+    // Null arg -> null.
+    EXPECT_TRUE(
+        eval(R"({"op":"split_index","args":[{"col":"m"},{"lit":"/"},{"lit":0}]})").is_null());
+}
+
 TEST(JsonValueExpr, AbsFloorCeilRound) {
     EXPECT_EQ(eval(R"({"op":"abs","args":[{"lit":-3.5}]})").as_number(), 3.5);
     EXPECT_EQ(eval(R"({"op":"floor","args":[{"lit":3.7}]})").as_number(), 3.0);

@@ -538,7 +538,8 @@ std::shared_ptr<arrow::DataType> infer_expr_type(const ast::Expression& expr,
         if (fc.name == "starts_with")
             return arrow::boolean();
         if (fc.name == "substring" || fc.name == "replace" || fc.name == "btrim" ||
-            fc.name == "ltrim" || fc.name == "rtrim") {
+            fc.name == "ltrim" || fc.name == "rtrim" || fc.name == "regexp_extract" ||
+            fc.name == "split_index") {
             return arrow::utf8();
         }
         if ((fc.name == "nullif" || fc.name == "greatest" || fc.name == "least") &&
