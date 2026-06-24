@@ -832,6 +832,79 @@ struct WindowBucket {
     std::int64_t window_start = 0;
 };
 
+namespace window_codec_detail {
+// (de)serialise one WindowBucket: window_start + group_values (Row JSON) + the
+// agg states (reusing the exact AggState (de)serialisation the GROUP BY's
+// AggBucket codec proves).
+inline void encode_bucket(std::vector<std::byte>& o, const WindowBucket& b) {
+    agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(b.window_start));
+    clink::config::JsonValue gv{clink::config::JsonObject{b.group_values.values}};
+    agg_codec_detail::put_str(o, gv.serialize(0));
+    agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(b.agg_states.size()));
+    for (const auto& s : b.agg_states) {
+        agg_codec_detail::encode_agg_state(o, s);
+    }
+}
+inline bool decode_bucket(agg_codec_detail::Reader& r, WindowBucket& b) {
+    b.window_start = static_cast<std::int64_t>(r.u64());
+    const std::string gv_text = r.str();
+    if (!r.ok) {
+        return false;
+    }
+    try {
+        auto j = clink::config::parse(gv_text);
+        if (j.is_object()) {
+            b.group_values.values = j.as_object();
+        }
+    } catch (...) {
+        return false;
+    }
+    for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i) {
+        b.agg_states.push_back(agg_codec_detail::decode_agg_state(r));
+    }
+    return r.ok;
+}
+}  // namespace window_codec_detail
+
+// Codec for ONE group key's window map (window_end -> bucket) over the async /
+// disaggregated KeyedState path. The keyed state is keyed by the GROUP KEY (so
+// routing/key-group is identical to the sync keyer's), and the value holds all
+// of that group's live windows. Firing reads only the due group's map (its
+// event-time timer carries the group key), never a scan of all groups.
+inline clink::Codec<std::map<std::int64_t, WindowBucket>> window_map_codec() {
+    using Map = std::map<std::int64_t, WindowBucket>;
+    using Bytes = clink::Codec<Map>::Bytes;
+    using BytesView = clink::Codec<Map>::BytesView;
+    return clink::Codec<Map>{
+        .encode = [](const Map& m) -> Bytes {
+            Bytes o;
+            agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(m.size()));
+            for (const auto& [win_end, b] : m) {
+                agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(win_end));
+                window_codec_detail::encode_bucket(o, b);
+            }
+            return o;
+        },
+        .decode = [](BytesView buf) -> std::optional<Map> {
+            agg_codec_detail::Reader r{buf, 0, true};
+            Map m;
+            for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i) {
+                const auto win_end = static_cast<std::int64_t>(r.u64());
+                WindowBucket b;
+                if (!window_codec_detail::decode_bucket(r, b)) {
+                    return std::nullopt;
+                }
+                m.emplace(win_end, std::move(b));
+            }
+            if (!r.ok) {
+                return std::nullopt;
+            }
+            return m;
+        },
+        .encode_into = {},
+    };
+}
+
 // Tumbling / hopping / cumulate window aggregate over Row records.
 // State shape: group_key_string -> window_end_ms -> bucket (keyed by
 // end so CUMULATE's shared-start slices coexist).
@@ -905,7 +978,9 @@ public:
     // agg-input columns from the Arrow sidecar into a narrow row, then run the
     // identical per-record windowing. Window emission still happens on the
     // watermark via process(); the runner only routes columnar DATA here.
-    [[nodiscard]] bool supports_columnar() const noexcept override { return true; }
+    // Disabled on the async path (which ingests via process_async over
+    // KeyedState); the columnar fast path drives the sync in-memory state_.
+    [[nodiscard]] bool supports_columnar() const noexcept override { return !effective_async_; }
 
     bool process_columnar(const StreamElement<Row>& element, Emitter<Row>& /*out*/) override {
         if (!element.is_data() || !element.as_data().is_columnar()) {
@@ -951,14 +1026,90 @@ public:
         return "tumbling_window_row";
     }
 
-private:
-    void handle_record_(const Row& row) {
-        auto it = row.values.find(time_column_);
-        if (it == row.values.end() || !it->second.is_number())
-            return;
-        auto ts = static_cast<std::int64_t>(it->second.as_number());
+    // Auto-on the async/disaggregated path when the bound backend defers reads:
+    // per-group window maps live in KeyedState (the pool, evictable, lazy-restore)
+    // keyed by the GROUP KEY (so routing matches the keyer), and each window
+    // registers an event-time timer so firing point-reads only the due group's
+    // map - never scans all groups. Default (non-deferring backend) keeps the
+    // byte-identical in-memory state_ + watermark scan.
+    void open() override {
+        effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
+                           this->runtime()->state_backend()->supports_async_get();
+    }
+    [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
+    // The fire (on_event_time_timer) reads + writes the group's window map.
+    [[nodiscard]] bool fires_state_touching_timers() const noexcept override {
+        return effective_async_;
+    }
 
-        // Build group key.
+    // Async ingest: fold each record into its group's window map (one keyed read
+    // + write under gate-key = group key, so same-group records serialise), and
+    // register an event-time timer for each newly-created window. No emit here -
+    // windows emit when their timer fires.
+    void process_async(const StreamElement<Row>& element,
+                       Emitter<Row>& /*out*/,
+                       AsyncExecutionController& aec) override {
+        if (!element.is_data()) {
+            return;
+        }
+        for (const auto& rec : element.as_data()) {
+            Row row = rec.value();
+            auto tit = row.values.find(time_column_);
+            if (tit == row.values.end() || !tit->second.is_number()) {
+                continue;
+            }
+            std::string key = group_key_(row);
+            auto kv = keyed_state_();
+            auto* rt = this->runtime();
+            auto factory =
+                [this, kv, row = std::move(row), key, rt]() mutable -> async::Task<void> {
+                auto cur = co_await kv.get_async(key);
+                std::map<std::int64_t, WindowBucket> by_window =
+                    cur.has_value() ? std::move(*cur) : std::map<std::int64_t, WindowBucket>{};
+                std::vector<std::int64_t> new_win_ends;
+                this->fold_record_into_(by_window, row, &new_win_ends);
+                kv.put(key, by_window);
+                for (std::int64_t we : new_win_ends) {
+                    rt->timer_service()->register_event_time_timer(we, key);
+                }
+                co_return;
+            };
+            while (!aec.submit(key, factory)) {
+                aec.poll();
+            }
+        }
+    }
+
+    // Timer-indexed fire (async path): point-read ONLY this group's window map
+    // (the timer key IS the group key), emit + remove the due window. Sync read
+    // for now; the async-overlap variant follows. The async runner fires this
+    // after the epoch drains + through the per-key gate, so the keyed-state
+    // access is safe (no same-key in-flight read outstanding).
+    void on_event_time_timer(std::int64_t win_end,
+                             const std::string& key,
+                             Emitter<Row>& out) override {
+        auto kv = keyed_state_();
+        auto cur = kv.get(key);
+        if (!cur.has_value()) {
+            return;
+        }
+        auto by_window = std::move(*cur);
+        auto wit = by_window.find(win_end);
+        if (wit == by_window.end()) {
+            return;  // already fired / never existed
+        }
+        Batch<Row> batch;
+        batch.push(Record<Row>{finalize_window_(wit->second, win_end)});
+        by_window.erase(wit);
+        out.emit_data(std::move(batch));
+        kv.put(key, by_window);  // empty map is harmless; next get rebuilds
+    }
+
+private:
+    // --- shared windowing helpers (sync in-memory + async KeyedState paths) ---
+
+    // The concatenated group-key string (the keyer / KeyedState / timer key).
+    std::string group_key_(const Row& row) const {
         std::string key;
         for (std::size_t i = 0; i < group_keys_.size(); ++i) {
             if (i > 0)
@@ -968,18 +1119,16 @@ private:
                 key += vit->second.serialize(0);
             }
         }
+        return key;
+    }
 
-        // Compute the (window_start, window_end) slices this event
-        // belongs to. The inner state map is keyed by window_end.
+    // The (window_start, window_end) slices an event at `ts` belongs to.
+    std::vector<std::pair<std::int64_t, std::int64_t>> windows_for_(std::int64_t ts) const {
         std::vector<std::pair<std::int64_t, std::int64_t>> windows;
         if (kind_ == Kind::Tumble) {
             std::int64_t start = (ts / size_ms_) * size_ms_;
             windows.emplace_back(start, start + size_ms_);
         } else if (kind_ == Kind::Hop) {
-            // HOP: windows start at multiples of slide_ms. An event at
-            // ts is in windows starting from
-            //   first = floor((ts - size + slide) / slide) * slide
-            // up to floor(ts / slide) * slide.
             std::int64_t last = (ts / slide_ms_) * slide_ms_;
             std::int64_t first = ((ts - size_ms_ + slide_ms_) / slide_ms_) * slide_ms_;
             if (first < 0)
@@ -989,10 +1138,6 @@ private:
                     windows.emplace_back(s, s + size_ms_);
             }
         } else {
-            // CUMULATE: slices share the size-aligned anchor and grow by
-            // step (carried in slide_ms_) up to size. The event is in
-            // every slice [anchor, anchor + k*step) whose end exceeds ts,
-            // for k = 1 .. size/step.
             std::int64_t anchor = (ts / size_ms_) * size_ms_;
             for (std::int64_t end = anchor + slide_ms_; end <= anchor + size_ms_;
                  end += slide_ms_) {
@@ -1000,8 +1145,20 @@ private:
                     windows.emplace_back(anchor, end);
             }
         }
-        auto& by_window = state_[key];
-        for (auto [win_start, win_end] : windows) {
+        return windows;
+    }
+
+    // Fold `row` into one group's window map (keyed by window_end), creating
+    // buckets as needed. When new_win_ends != nullptr, appends the window_end of
+    // each window first created here (so the async path can register a timer).
+    void fold_record_into_(std::map<std::int64_t, WindowBucket>& by_window,
+                           const Row& row,
+                           std::vector<std::int64_t>* new_win_ends) const {
+        auto it = row.values.find(time_column_);
+        if (it == row.values.end() || !it->second.is_number())
+            return;
+        const auto ts = static_cast<std::int64_t>(it->second.as_number());
+        for (auto [win_start, win_end] : windows_for_(ts)) {
             auto wit = by_window.find(win_end);
             if (wit == by_window.end()) {
                 WindowBucket b;
@@ -1013,11 +1170,39 @@ private:
                         b.group_values.values[group_key_outputs_[i]] = v->second;
                 }
                 wit = by_window.emplace(win_end, std::move(b)).first;
+                if (new_win_ends != nullptr)
+                    new_win_ends->push_back(win_end);
             }
             for (std::size_t i = 0; i < aggregates_.size(); ++i) {
                 update_agg(wit->second.agg_states[i], aggregates_[i], row);
             }
         }
+    }
+
+    // Build the emit Row for a fired window.
+    Row finalize_window_(const WindowBucket& b, std::int64_t win_end) const {
+        Row out_row = b.group_values;
+        for (std::size_t i = 0; i < aggregates_.size(); ++i) {
+            out_row.values[aggregates_[i].output_name] =
+                finalize_agg(b.agg_states[i], aggregates_[i]);
+        }
+        out_row.values["window_start"] =
+            clink::config::JsonValue{static_cast<std::int64_t>(b.window_start)};
+        out_row.values["window_end"] = clink::config::JsonValue{static_cast<std::int64_t>(win_end)};
+        return out_row;
+    }
+
+    KeyedState<std::string, std::map<std::int64_t, WindowBucket>> keyed_state_() {
+        return this->runtime()
+            ->template keyed_state<std::string, std::map<std::int64_t, WindowBucket>>(
+                "win", clink::string_codec(), window_map_codec());
+    }
+
+    void handle_record_(const Row& row) {
+        auto it = row.values.find(time_column_);
+        if (it == row.values.end() || !it->second.is_number())
+            return;
+        fold_record_into_(state_[group_key_(row)], row, nullptr);
     }
 
     void fire_due_(EventTime wm, Emitter<Row>& out) {
@@ -1026,22 +1211,11 @@ private:
         for (auto& [k, by_window] : state_) {
             (void)k;
             for (auto it = by_window.begin(); it != by_window.end();) {
-                std::int64_t win_end = it->first;
-                std::int64_t win_start = it->second.window_start;
-                if (win_end > wm_value) {
+                if (it->first > wm_value) {
                     ++it;
                     continue;
                 }
-                Row out_row = it->second.group_values;
-                for (std::size_t i = 0; i < aggregates_.size(); ++i) {
-                    out_row.values[aggregates_[i].output_name] =
-                        finalize_agg(it->second.agg_states[i], aggregates_[i]);
-                }
-                out_row.values["window_start"] =
-                    clink::config::JsonValue{static_cast<std::int64_t>(win_start)};
-                out_row.values["window_end"] =
-                    clink::config::JsonValue{static_cast<std::int64_t>(win_end)};
-                emit_batch.push(Record<Row>{std::move(out_row)});
+                emit_batch.push(Record<Row>{finalize_window_(it->second, it->first)});
                 it = by_window.erase(it);
             }
         }
@@ -1049,6 +1223,7 @@ private:
             out.emit_data(std::move(emit_batch));
     }
 
+    bool effective_async_ = false;
     Kind kind_;
     std::string time_column_;
     std::int64_t size_ms_;

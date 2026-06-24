@@ -602,6 +602,92 @@ TEST(SqlRuntime, AsyncStateFullOuterJoinMatchesSyncPath) {
     EXPECT_GT(rrb->remote_loads(), 0u);
 }
 
+namespace {
+
+// Build a tumbling-window SUM (size 10, GROUP BY k) via the registered Dag
+// builder over `backend`, run it cluster-free, and return the emitted window
+// rows. A deferring backend auto-enables WindowRowOp's async path: each group's
+// window map lives in KeyedState (the pool, keyed by the group key) and every
+// new window registers an event-time timer, so firing point-reads only the due
+// group's map instead of the watermark scan the in-memory path uses.
+std::vector<Record<Row>> run_tumbling_window(const std::vector<Record<Row>>& input,
+                                             std::shared_ptr<StateBackend> backend) {
+    const auto* builder =
+        cluster::DagBuilderRegistry::default_instance().find("tumbling_window_row");
+    Dag dag;
+    auto h = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(input));
+    clink::plugin::BuildContext ctx;
+    ctx.params["time_column"] = "ts";
+    ctx.params["size_ms"] = "10";
+    ctx.params["group_keys"] = "k";
+    ctx.params["group_key_outputs"] = "k";
+    ctx.params["aggregates"] = R"([{"name":"s","fn":"sum","input_column":"amt"}])";
+    std::vector<std::any> upstream = {std::any{h}};
+    auto out = (*builder)(dag, upstream, ctx);
+    auto h_win = std::any_cast<StageHandle<Row>>(out.main_handle);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_win, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return sink->collected_records();
+}
+
+Record<Row> window_input_row(std::int64_t k, std::int64_t ts, std::int64_t amt) {
+    Row r;
+    r.values["k"] = clink::config::JsonValue{static_cast<double>(k)};
+    r.values["ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+    r.values["amt"] = clink::config::JsonValue{static_cast<double>(amt)};
+    return Record<Row>{std::move(r)};
+}
+
+// (k, window_start) -> sum: the order-independent window relation. The async
+// path fires windows from event-time timers and the sync path from a watermark
+// scan, so emission order can differ; the relation must not.
+std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> window_relation(
+    const std::vector<Record<Row>>& rows) {
+    std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> rel;
+    for (const auto& rec : rows) {
+        const Row& r = rec.value();
+        rel[{static_cast<std::int64_t>(r.values.at("k").as_number()),
+             static_cast<std::int64_t>(r.values.at("window_start").as_number())}] =
+            static_cast<std::int64_t>(r.values.at("s").as_number());
+    }
+    return rel;
+}
+
+}  // namespace
+
+// Window aggregation rides the async/disaggregated path: with a deferring
+// backend, WindowRowOp keeps each group's window map in KeyedState (the pool)
+// and fires per-window event-time timers, so a fire point-reads only the due
+// group rather than scanning every group at the watermark. Proven by comparing
+// the window relation to the synchronous in-memory path (identical) and showing
+// the async path actually went through the backend (remote_loads > 0).
+TEST(SqlRuntime, AsyncStateTumblingWindowMatchesSyncPath) {
+    ensure_sql_installed_once();
+    const std::vector<Record<Row>> input = {window_input_row(1, 1, 5),
+                                            window_input_row(1, 3, 7),
+                                            window_input_row(1, 12, 2),
+                                            window_input_row(2, 2, 100)};
+
+    const auto sync_rel =
+        window_relation(run_tumbling_window(input, std::make_shared<InMemoryStateBackend>()));
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    const auto async_rel = window_relation(run_tumbling_window(input, rrb));
+
+    const std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> want = {
+        {{1, 0}, 12}, {{1, 10}, 2}, {{2, 0}, 100}};
+    EXPECT_EQ(sync_rel, want) << "sync in-memory window relation";
+    EXPECT_EQ(async_rel, sync_rel)
+        << "async window path must produce the same window relation as the sync path";
+    EXPECT_GT(rrb->remote_loads(), 0u)
+        << "window op did not route its per-group state through the deferring backend (async path)";
+}
+
 // #59: the same unbounded GROUP BY built through the programmatic Table API
 // instead of a SQL string. Proves the Table-API-built JobGraphSpec actually
 // executes end-to-end (the byte-identical-IR test in test_table_api.cpp proves
