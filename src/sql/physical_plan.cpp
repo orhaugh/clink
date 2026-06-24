@@ -1399,31 +1399,45 @@ void mark_changelog_producers(cluster::JobGraphSpec& spec) {
         return t == "changelog_net_sink" || t == "equi_join_row";
     };
     auto is_passthrough = [](const std::string& t) {
+        // Ops that forward __row_kind unchanged. union_row is multi-input, so the
+        // walk below follows ALL inputs of a pass-through, not just the first.
         return t == "row_compute_key" || t == "filter_row_predicate" || t == "project_row" ||
-               t == "identity_row" || t == "assign_timestamps_row";
+               t == "identity_row" || t == "assign_timestamps_row" || t == "union_row";
+    };
+    // Walk back (breadth-first over all inputs) from each `start` through
+    // pass-throughs, marking every aggregate_row reached. The graph is a DAG;
+    // marking is idempotent, so a diamond merely re-marks. The iteration guard is
+    // a runaway backstop.
+    auto mark_from = [&](const std::string& start) {
+        std::vector<std::string> work{start};
+        std::size_t guard = 0;
+        const std::size_t cap = spec.ops.size() * 4 + 16;
+        while (!work.empty() && guard++ < cap) {
+            const std::string cur = work.back();
+            work.pop_back();
+            auto it = by_id.find(cur);
+            if (it == by_id.end()) {
+                continue;
+            }
+            auto& up = spec.ops[it->second];
+            if (up.type == "aggregate_row") {
+                up.params["emit_changelog"] = "true";
+                continue;
+            }
+            if (is_passthrough(up.type)) {
+                for (const auto& in : up.inputs) {
+                    work.push_back(in);
+                }
+            }
+            // else: not a pass-through and not an aggregate: stop this branch.
+        }
     };
     for (const auto& op : spec.ops) {
         if (!is_consumer(op.type)) {
             continue;
         }
         for (const auto& in_id : op.inputs) {
-            std::string cur = in_id;
-            for (int guard = 0; guard < 256; ++guard) {
-                auto it = by_id.find(cur);
-                if (it == by_id.end()) {
-                    break;
-                }
-                auto& up = spec.ops[it->second];
-                if (up.type == "aggregate_row") {
-                    up.params["emit_changelog"] = "true";
-                    break;
-                }
-                if (is_passthrough(up.type) && up.inputs.size() == 1) {
-                    cur = up.inputs[0];
-                    continue;
-                }
-                break;  // not a pass-through and not an aggregate: stop
-            }
+            mark_from(in_id);
         }
     }
 }

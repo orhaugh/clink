@@ -2442,19 +2442,19 @@ private:
         const std::string& key_col = is_left ? left_key_column_ : right_key_column_;
         const bool this_outer = is_left ? left_keeps_unmatched_() : right_keeps_unmatched_();
         const bool other_outer = is_left ? right_keeps_unmatched_() : left_keeps_unmatched_();
+        const bool retract = is_delete_like(row_kind_of(row));
         auto key_opt = key_of_(row, key_col);
         if (!key_opt) {
-            // NULL join key never matches: emit a null-padded row if this side is
-            // kept, and don't store it. No async read needed.
+            // NULL join key never matches: emit (or, on a retraction, withdraw) a
+            // null-padded row if this side is kept; never stored. No async read.
             if (this_outer) {
                 Batch<Row> batch;
-                emit_outer_(row, is_left, kRowKindInsert, batch);
+                emit_outer_(row, is_left, retract ? kRowKindDelete : kRowKindInsert, batch);
                 out.emit_data(std::move(batch));
             }
             return;
         }
         std::string key = std::move(*key_opt);
-        const bool retract = is_delete_like(row_kind_of(row));
         auto self = is_left ? kv_left_() : kv_right_();
         auto other = is_left ? kv_right_() : kv_left_();
         auto factory = [this,
@@ -3388,7 +3388,7 @@ public:
 private:
     struct Slot {
         Row row;
-        int count = 0;
+        std::int64_t count = 0;
     };
     std::string path_;
     std::map<std::string, int> decimal_scales_;
