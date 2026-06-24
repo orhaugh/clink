@@ -82,4 +82,60 @@ void gated_fire_processing_time_timers(Op& op,
     aec.poll();  // settle any timer that ran synchronously (free key) + surface throws
 }
 
+// Fire an async operator's due EVENT-TIME timers as gate-routed coroutines so a
+// deferring backend OVERLAPS the reads of distinct due keys (one coalesced
+// get_many instead of N sequential blocking get()s).
+//
+// The default event-time fire (base on_watermark -> fire_due_event_time_timers)
+// invokes on_event_time_timer() synchronously in a loop INSIDE the watermark
+// release, so each callback's keyed-state read is a separate blocking
+// round-trip. This routes each due timer through aec.submit() under its key,
+// calling the operator's async on_event_time_timer_async() (which co_awaits its
+// reads). The submitted fire coroutines suspend at their reads, the runner
+// flushes them through one coalesced batch, and each emits + writes back on the
+// runner thread under the gate. Distinct keys overlap; same-key due timers
+// serialise FIFO (correct - they touch the same state slice).
+//
+// SAFE without extra gating: the caller invokes this only after the watermark's
+// epoch has DRAINED (no record that arrived before the watermark is in flight),
+// so every due key is free when its fire coroutine starts. The caller is
+// responsible for forwarding the watermark only after these fire coroutines
+// complete (an epoch-tied release - see the single-input async runner), so a
+// downstream operator never sees the watermark before the windows it closed.
+//
+// COLLECT-THEN-SUBMIT, identical discipline to the processing-time variant:
+// poll_due_event_time() erases due timers as it snapshots them, so collect the
+// due (ts, key) set first (firing nothing), then submit each - a timer stays
+// owned by the local vector until its submit succeeds, so nothing is dropped at
+// the in-flight cap.
+template <typename Op, typename Out>
+void gated_fire_event_time_timers(Op& op,
+                                  Emitter<Out>& out,
+                                  std::int64_t watermark_ms,
+                                  AsyncExecutionController& aec) {
+    auto* rt = op.runtime();
+    if (rt == nullptr) {
+        return;
+    }
+    std::vector<std::pair<std::int64_t, std::string>> to_fire;
+    rt->timer_service()->poll_due_event_time(
+        watermark_ms,
+        [&to_fire](std::int64_t ts, const std::string& key) { to_fire.emplace_back(ts, key); });
+    if (to_fire.empty()) {
+        return;  // common case (watermark with no due windows): a pure no-op
+    }
+    for (const auto& entry : to_fire) {
+        const std::int64_t ts = entry.first;
+        const std::string key = entry.second;
+        AsyncExecutionController::CoroFactory factory =
+            [&op, &out, ts, key]() -> async::Task<void> {
+            co_await op.on_event_time_timer_async(ts, key, out);
+        };
+        while (!aec.submit(key, factory)) {
+            aec.poll();  // free capacity, then retry (the timer is still owned here)
+        }
+    }
+    aec.poll();  // kick any fire coroutine that completed synchronously + surface throws
+}
+
 }  // namespace clink::detail

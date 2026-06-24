@@ -339,6 +339,19 @@ public:
         return fires_state_touching_timers();
     }
 
+    // Opt-in (default false): fire this operator's due EVENT-TIME timers as
+    // gate-routed async coroutines (on_event_time_timer_async) instead of the
+    // default synchronous fire inside the watermark release. The single-input
+    // async runner then submits one fire coroutine per due (timer, key) through
+    // the per-key gate, so a deferring backend OVERLAPS the reads of distinct
+    // due keys (one coalesced get_many) and forwards the watermark only once
+    // those fire coroutines drain (a second epoch-tied release - no blocking
+    // drain on the fire path). Returning false keeps the proven
+    // fire-inside-release path, byte-identical. Only meaningful when the bound
+    // backend defers reads (a non-deferring backend never enters the async
+    // runner, so this is inert there).
+    [[nodiscard]] virtual bool fires_async_event_time_timers() const noexcept { return false; }
+
     // Hooks for time and checkpointing. Default behaviour for watermarks
     // is to fire any event-time timers whose timestamp ≤ the watermark
     // and then forward the watermark unchanged. Operators that override
@@ -378,6 +391,26 @@ public:
     virtual void on_event_time_timer(std::int64_t /*timestamp_ms*/,
                                      const std::string& /*key*/,
                                      Emitter<Out>& /*out*/) {}
+
+    // Async twin of on_event_time_timer (see fires_async_event_time_timers).
+    // Fires one due event-time timer, driving any keyed-state reads through the
+    // backend's async surface (co_await get_async) so the runner can overlap
+    // the reads of a whole batch of due timers. Default delegates to the
+    // synchronous on_event_time_timer, so an operator that implements only the
+    // sync hook still works when routed through the async-fire path (it simply
+    // does not overlap). Called only by the async runner, only for operators
+    // that return true from fires_async_event_time_timers(), on the runner
+    // thread under the per-key gate (no same-key async read is outstanding).
+    //
+    // `key` is taken BY VALUE on purpose: this is a coroutine, so a by-reference
+    // parameter would store a dangling reference into the coroutine frame across
+    // the first suspension. The frame owns its own copy.
+    virtual async::Task<void> on_event_time_timer_async(std::int64_t timestamp_ms,
+                                                        std::string key,
+                                                        Emitter<Out>& out) {
+        on_event_time_timer(timestamp_ms, key, out);
+        co_return;
+    }
 
     // Drive any event-time timers whose deadline ≤ watermark_ms. The
     // default polls the operator's own RuntimeContext::timer_service().

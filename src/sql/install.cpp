@@ -1041,6 +1041,19 @@ public:
     [[nodiscard]] bool fires_state_touching_timers() const noexcept override {
         return effective_async_;
     }
+    // Fire due windows as gate-routed async coroutines so the per-group reads of
+    // distinct due groups OVERLAP (one coalesced get_many) at a watermark,
+    // instead of one blocking point read per group inside the release.
+    [[nodiscard]] bool fires_async_event_time_timers() const noexcept override {
+        return effective_async_;
+    }
+    // Coalesce both the ingest reads and the fire reads into batched get_many
+    // round-trips (the runner wraps the backend in a CoalescingBackend). Static
+    // true like the join/aggregate ops: the runner gates the wrap on a deferring
+    // backend (supports_async_get()), and this is evaluated BEFORE open() sets
+    // effective_async_, so it must not depend on it (a sync backend makes the
+    // wrap inert anyway).
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
 
     // Async ingest: fold each record into its group's window map (one keyed read
     // + write under gate-key = group key, so same-group records serialise), and
@@ -1103,6 +1116,32 @@ public:
         by_window.erase(wit);
         out.emit_data(std::move(batch));
         kv.put(key, by_window);  // empty map is harmless; next get rebuilds
+    }
+
+    // Async fire (the overlap path): a co_await get_async point-read of the due
+    // group's window map so the runner can flush the reads of every due group
+    // at this watermark into ONE coalesced get_many. Same effect as the sync
+    // on_event_time_timer above, but non-blocking. Runs on the runner thread
+    // under the per-key gate, after the epoch drained (no in-flight same-key
+    // read), so the put is safe.
+    async::Task<void> on_event_time_timer_async(std::int64_t win_end,
+                                                std::string key,
+                                                Emitter<Row>& out) override {
+        auto kv = keyed_state_();
+        auto cur = co_await kv.get_async(key);
+        if (!cur.has_value()) {
+            co_return;
+        }
+        auto by_window = std::move(*cur);
+        auto wit = by_window.find(win_end);
+        if (wit == by_window.end()) {
+            co_return;  // already fired / never existed
+        }
+        Batch<Row> batch;
+        batch.push(Record<Row>{finalize_window_(wit->second, win_end)});
+        by_window.erase(wit);
+        out.emit_data(std::move(batch));
+        kv.put(key, by_window);
     }
 
 private:

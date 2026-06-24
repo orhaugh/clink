@@ -688,6 +688,40 @@ TEST(SqlRuntime, AsyncStateTumblingWindowMatchesSyncPath) {
         << "window op did not route its per-group state through the deferring backend (async path)";
 }
 
+// Proves the OVERLAP (not just correctness): when many groups' windows fall due
+// at one watermark, WindowRowOp fires them as gate-routed async coroutines whose
+// per-group reads COALESCE into batched get_many round-trips, instead of one
+// blocking single-key read per group inside the watermark release. Observed at
+// the backend: no per-key read reached it (get_async_calls()==0 - the coalescer
+// absorbed them) and the whole run (8 groups ingested + 8 windows fired) issued
+// only a small handful of batched reads, far below one per group.
+TEST(SqlRuntime, AsyncStateWindowFireCoalescesReadsAcrossGroups) {
+    ensure_sql_installed_once();
+    constexpr int kGroups = 8;
+    std::vector<Record<Row>> input;
+    for (int k = 1; k <= kGroups; ++k) {
+        input.push_back(window_input_row(k, /*ts=*/1, /*amt=*/k * 10));  // all in window [0,10)
+    }
+
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    auto rrb = std::make_shared<RemoteReadBackend>(pool, /*io_threads=*/1, /*hot_max_bytes=*/0);
+    const auto rel = window_relation(run_tumbling_window(input, rrb));
+
+    std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> want;
+    for (int k = 1; k <= kGroups; ++k) {
+        want[{k, 0}] = k * 10;
+    }
+    EXPECT_EQ(rel, want) << "all " << kGroups << " per-group windows must be correct";
+    // Backend level: every per-key read was coalesced into a batched round-trip.
+    EXPECT_EQ(rrb->get_async_calls(), 0u)
+        << "a read bypassed the coalescer as a single-key round-trip";
+    EXPECT_GT(rrb->get_many_async_calls(), 0u) << "no batched reads (async fire path inactive?)";
+    EXPECT_LT(rrb->get_many_async_calls(), static_cast<std::uint64_t>(kGroups))
+        << "reads were not coalesced across groups: ~one batched round-trip per group";
+    // Pool level: the cold reads that reached the pool were batched too.
+    EXPECT_EQ(pool->read_calls(), 0u) << "a cold read hit the pool as a single-key round-trip";
+}
+
 // #59: the same unbounded GROUP BY built through the programmatic Table API
 // instead of a SQL string. Proves the Table-API-built JobGraphSpec actually
 // executes end-to-end (the byte-identical-IR test in test_table_api.cpp proves

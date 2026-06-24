@@ -595,6 +595,53 @@ public:
             auto fire_due_async = [&] {
                 detail::gated_fire_processing_time_timers(*op, emitter, timers->now_ms(), *aec);
             };
+            // ASYNC event-time fire (opt-in via fires_async_event_time_timers):
+            // watermarks whose epoch has drained land here (the watermark
+            // release just MARKS them, off the controller's release path), and
+            // the runner fires their due event-time timers as gate-routed
+            // coroutines so a deferring backend overlaps the reads of distinct
+            // due keys. The watermark then forwards via a SECOND on_watermark
+            // tied to the fire coroutines' epoch, so the forward waits for the
+            // fire to complete with no blocking drain on the steady-state path.
+            std::vector<Watermark> drained_wms;
+            auto flush_drained_watermarks = [&] {
+                if (drained_wms.empty()) {
+                    return;  // nothing released (or op not async-firing): a true no-op
+                }
+                bool fired = false;
+                // gated_fire / the forward release can themselves drain a later
+                // epoch and append more markers, so loop until it stays empty;
+                // swap the current batch out first so those appends (which land
+                // in drained_wms via the marking release) are picked up next
+                // round, after this batch, preserving watermark order.
+                while (!drained_wms.empty()) {
+                    std::vector<Watermark> batch;
+                    batch.swap(drained_wms);
+                    for (const Watermark& dwm : batch) {
+                        if (!dwm.is_idle()) {
+                            detail::gated_fire_event_time_timers(
+                                *op, emitter, dwm.timestamp().millis(), *aec);
+                            fired = true;
+                        }
+                        // Forward-only: the due timers were already consumed by
+                        // gated_fire (or, for an idle marker, base on_watermark
+                        // fires them synchronously - matching the prior path),
+                        // so this release just emits the watermark downstream,
+                        // and runs only once the fire epoch has drained.
+                        aec->on_watermark([op, dwm, &emitter] { op->on_watermark(dwm, emitter); });
+                    }
+                }
+                // Issue the fire coroutines' parked reads NOW as one coalesced
+                // get_many (mirrors the data branch) so the windows emit and the
+                // watermark forwards promptly, instead of stalling in the
+                // coalescer until the next input flushes it.
+                if (fired && do_coalesce) {
+                    while (ctx.state_backend()->flush_pending_reads()) {
+                        aec->poll();
+                    }
+                }
+                aec->poll();
+            };
             while (!should_stop()) {
                 // Fire any timers whose deadline has passed before
                 // waiting on input.
@@ -716,8 +763,21 @@ public:
                         // event-time timers) only after its epoch has drained,
                         // so it never overtakes a record that arrived before it.
                         const Watermark wm = maybe->as_watermark();
-                        aec->on_watermark([op, wm, &emitter] { op->on_watermark(wm, emitter); });
+                        if (op->fires_async_event_time_timers()) {
+                            // The release only MARKS the epoch drained; the
+                            // runner fires the due timers as overlapping
+                            // coroutines and forwards the watermark afterwards
+                            // (flush_drained_watermarks), never re-entering the
+                            // controller from inside a release closure.
+                            aec->on_watermark([&drained_wms, wm] { drained_wms.push_back(wm); });
+                        } else {
+                            // Default: fire (synchronously) + forward inside the
+                            // release, byte-identical to the prior path.
+                            aec->on_watermark(
+                                [op, wm, &emitter] { op->on_watermark(wm, emitter); });
+                        }
                         aec->poll();
+                        flush_drained_watermarks();
                     } else if (aec && maybe->is_data()) {
                         // Async mode: the operator submits one coroutine per
                         // record to the controller; poll services any that
@@ -765,6 +825,13 @@ public:
                 } else if (in_channel->closed()) {
                     break;
                 }
+                // A record completing in the data branch (or the idle
+                // processing-time fire) can drain a watermark's epoch and mark
+                // it ready; fire + forward any such markers before the next pop.
+                // No-op when none are pending or the op is not async-firing.
+                if (aec) {
+                    flush_drained_watermarks();
+                }
             }
             // Wind down the async snapshot worker. On a clean end-of-stream
             // (not cancelled) drain the backlog so any in-flight checkpoint
@@ -784,10 +851,14 @@ public:
             // emissions aren't silently dropped.
             if (!should_stop()) {
                 if (aec) {
-                    // drain (quiesce in-flight reads so no key is held) -> fire
-                    // due processing-time timers through the gate (each finds its
-                    // key free) -> drain again so every timer coroutine has run
-                    // before flush.
+                    // drain (quiesce in-flight reads so no key is held, releasing
+                    // any watermark markers) -> fire + forward those event-time
+                    // windows (gated_fire submits, drain completes them and runs
+                    // the forward releases) -> fire due processing-time timers
+                    // through the gate (each finds its key free) -> drain again
+                    // so every timer coroutine has run before flush.
+                    aec->drain();
+                    flush_drained_watermarks();
                     aec->drain();
                     fire_due_async();
                     aec->drain();

@@ -406,6 +406,7 @@ public:
     async::Task<std::optional<Value>> get_async(OperatorId op,
                                                 KeyView key,
                                                 std::uint64_t order_key) const override {
+        get_async_calls_.fetch_add(1, std::memory_order_relaxed);  // single-key read requests
         std::string owned(key);  // own the bytes across the suspension
         {
             std::lock_guard<std::mutex> lk(sync_mu_);
@@ -443,6 +444,7 @@ public:
     // single-writer. Results scatter back positionally.
     async::Task<std::vector<std::optional<Value>>> get_many_async(
         OperatorId op, const std::vector<std::string>& keys) const override {
+        get_many_async_calls_.fetch_add(1, std::memory_order_relaxed);  // batched read requests
         std::vector<std::optional<Value>> out(keys.size());
         std::vector<std::size_t> cold_idx;
         std::vector<std::string> cold_keys;
@@ -491,6 +493,19 @@ public:
 
     [[nodiscard]] std::uint64_t remote_loads() const noexcept {
         return remote_loads_.load(std::memory_order_relaxed);
+    }
+    // Read REQUESTS seen by the backend (distinct from remote_loads(), which
+    // counts keys actually fetched from the pool): single-key get_async() vs
+    // batched get_many_async(). When a read coalescer wraps this backend, the
+    // operator's per-key get_async()s are absorbed into ONE get_many_async() per
+    // flush, so get_async_calls() stays 0 and get_many_async_calls() counts the
+    // coalesced batches - the signal that reads overlapped instead of
+    // serialising one round-trip per key.
+    [[nodiscard]] std::uint64_t get_async_calls() const noexcept {
+        return get_async_calls_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t get_many_async_calls() const noexcept {
+        return get_many_async_calls_.load(std::memory_order_relaxed);
     }
     [[nodiscard]] std::uint64_t hot_hits() const noexcept {
         return hot_hits_.load(std::memory_order_relaxed);
@@ -795,6 +810,8 @@ private:
 
     mutable std::atomic<std::uint64_t> remote_loads_{0};
     mutable std::atomic<std::uint64_t> hot_hits_{0};
+    mutable std::atomic<std::uint64_t> get_async_calls_{0};       // single-key read requests
+    mutable std::atomic<std::uint64_t> get_many_async_calls_{0};  // batched read requests
 
     // Pool-backed (production) state. pool_ is null for the loader-only ctor.
     // last_ckpt_ is the checkpoint cold reads serve and the base for the next

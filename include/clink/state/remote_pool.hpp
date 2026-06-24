@@ -16,6 +16,7 @@
 // checkpoint id); the authoritative bytes are in the pool. read() runs on the
 // backend's IO threads, so a RemotePool MUST be thread-safe.
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -124,7 +125,51 @@ public:
     [[nodiscard]] std::optional<StateBackend::Value> read(CheckpointId id,
                                                           OperatorId op,
                                                           const std::string& key) const override {
+        read_calls_.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(mu_);
+        return lookup_(id, op, key);
+    }
+
+    // Batched read (one round-trip for the whole key set). Counted separately
+    // from read() so a test can prove the runner coalesced N keys into one
+    // batched call (read_calls()==0, read_many_calls() small) rather than N
+    // single-key round-trips.
+    [[nodiscard]] std::vector<std::optional<StateBackend::Value>> read_many(
+        CheckpointId id, OperatorId op, const std::vector<std::string>& keys) const override {
+        read_many_calls_.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<std::optional<StateBackend::Value>> out;
+        out.reserve(keys.size());
+        for (const auto& k : keys) {
+            out.push_back(lookup_(id, op, k));
+        }
+        return out;
+    }
+
+    void purge(CheckpointId id) override {
+        std::lock_guard<std::mutex> lk(mu_);
+        ckpts_.erase(id.value());
+    }
+
+    // Test instrumentation: pool round-trips. read_calls() counts single-key
+    // read()s (the non-coalesced path); read_many_calls() counts batched
+    // read_many()s (the coalesced path).
+    [[nodiscard]] std::uint64_t read_calls() const noexcept {
+        return read_calls_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t read_many_calls() const noexcept {
+        return read_many_calls_.load(std::memory_order_relaxed);
+    }
+
+private:
+    using Map = std::unordered_map<std::string, StateBackend::Value>;
+    static std::string compose_(OperatorId op, const std::string& key) {
+        return std::to_string(op.value()) + '\x1f' + key;
+    }
+    // Caller holds mu_.
+    std::optional<StateBackend::Value> lookup_(CheckpointId id,
+                                               OperatorId op,
+                                               const std::string& key) const {
         auto cit = ckpts_.find(id.value());
         if (cit == ckpts_.end()) {
             return std::nullopt;
@@ -136,19 +181,10 @@ public:
         return vit->second;
     }
 
-    void purge(CheckpointId id) override {
-        std::lock_guard<std::mutex> lk(mu_);
-        ckpts_.erase(id.value());
-    }
-
-private:
-    using Map = std::unordered_map<std::string, StateBackend::Value>;
-    static std::string compose_(OperatorId op, const std::string& key) {
-        return std::to_string(op.value()) + '\x1f' + key;
-    }
-
     mutable std::mutex mu_;
     std::map<std::uint64_t, Map> ckpts_;
+    mutable std::atomic<std::uint64_t> read_calls_{0};
+    mutable std::atomic<std::uint64_t> read_many_calls_{0};
 };
 
 }  // namespace clink
