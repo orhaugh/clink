@@ -2923,6 +2923,81 @@ TEST(SqlRuntime, TumbleWindowSelectsWindowBounds) {
     std::filesystem::remove(out_path);
 }
 
+// SESSION window bounds: a session that grows by merging buckets must emit the
+// earliest start and (end + gap) as window_start / window_end.
+TEST(SqlRuntime, SessionWindowSelectsMergedBounds) {
+    ensure_sql_installed_once();
+
+    const auto in_path =
+        std::filesystem::temp_directory_path() / "clink_sql_e2e_sessbounds_in.ndjson";
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_sql_e2e_sessbounds_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    // gap=500. user=1: ts 100, 550, 1000 all chain (each within 500 of the
+    // prior) into ONE session [100, 1000]; emitted window_end = 1000 + 500.
+    // user=2: a lone event at ts 100 -> session [100, 100], end = 600.
+    write_lines(in_path,
+                {
+                    R"({"user_id":1,"ts":100,"amount":1})",
+                    R"({"user_id":1,"ts":550,"amount":1})",
+                    R"({"user_id":1,"ts":1000,"amount":1})",
+                    R"({"user_id":2,"ts":100,"amount":1})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE events (user_id BIGINT, ts BIGINT, amount BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "', event_time_column='ts');"
+                     "CREATE TABLE per_session (user_id BIGINT, cnt BIGINT, wstart BIGINT, "
+                     "wend BIGINT) WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat,
+                        "INSERT INTO per_session "
+                        "SELECT user_id, COUNT(*) AS cnt, window_start AS wstart, "
+                        "window_end AS wend FROM events GROUP BY SESSION(ts, 500), user_id");
+
+    InProcessCluster cluster("tm-sql-e2e-sessbounds", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    struct Row {
+        std::int64_t cnt, ws, we;
+    };
+    std::multimap<std::int64_t, Row> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("user_id").as_number()),
+                    Row{static_cast<std::int64_t>(js.at("cnt").as_number()),
+                        static_cast<std::int64_t>(js.at("wstart").as_number()),
+                        static_cast<std::int64_t>(js.at("wend").as_number())});
+    }
+    auto contains = [&](std::int64_t uid, std::int64_t cnt, std::int64_t ws, std::int64_t we) {
+        auto range = got.equal_range(uid);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second.cnt == cnt && it->second.ws == ws && it->second.we == we)
+                return true;
+        }
+        return false;
+    };
+    // Merged session keeps the earliest start (100) across the 3 merges.
+    EXPECT_TRUE(contains(1, 3, 100, 1500)) << "user=1 merged session [100,1000]+gap missing";
+    EXPECT_TRUE(contains(2, 1, 100, 600)) << "user=2 lone session missing";
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // SQLOPT-4 (arm the projection hint): the same TUMBLE query over an OVER-WIDE
 // source (extra columns the query never references) must produce identical
 // windows. This proves the source actually drops the unreferenced columns

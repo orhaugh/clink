@@ -149,6 +149,25 @@ std::string resolve_value_column_name(const ast::ColumnRef& ref,
     return col_name;
 }
 
+// Non-throwing column lookup (find_column throws on a miss). Used to decide
+// whether window_start / window_end name a real source column or the synthetic
+// window bound a windowed GROUP BY projects.
+bool source_has_column(const TableDef& source, const std::string& name) {
+    for (const auto& c : source.columns) {
+        if (c.name == name)
+            return true;
+    }
+    return false;
+}
+
+// True when a bare ColumnRef is window_start / window_end AND the source has no
+// real column of that name (so it must be the synthetic windowed-GROUP-BY bound).
+bool is_synthetic_window_bound(const ast::ColumnRef& cr, const TableDef& source) {
+    return cr.parts.size() == 1 && !cr.is_star &&
+           (cr.parts[0] == "window_start" || cr.parts[0] == "window_end") &&
+           !source_has_column(source, cr.parts[0]);
+}
+
 // Derive the name of the i-th field of a ROW(...) constructor: an
 // explicit alias (`ROW(a AS x)`) wins; else the field's own column name
 // (`ROW(amount)` -> "amount"); else a positional `fN` (1-based, matching
@@ -3287,12 +3306,11 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
         } else if (std::holds_alternative<ast::ColumnRef>(item.expr) &&
                    !std::get<ast::ColumnRef>(item.expr).is_star) {
             const auto& cr = std::get<ast::ColumnRef>(item.expr);
-            // window_start / window_end are synthetic columns a windowed GROUP BY
-            // emits; they are not source columns, so don't resolve them here (the
-            // resolver would throw "column not found"). Carry the literal name and
-            // let the validation below gate them on a window TVF being present.
-            if (cr.parts.size() == 1 &&
-                (cr.parts[0] == "window_start" || cr.parts[0] == "window_end")) {
+            // window_start / window_end with no real same-named source column are
+            // synthetic columns a windowed GROUP BY emits; don't resolve them here
+            // (the resolver would throw "column not found"). Carry the literal name
+            // and let the validation below gate them on a window TVF being present.
+            if (is_synthetic_window_bound(cr, source)) {
                 key_target_indices.emplace_back(i, cr.parts[0]);
             } else {
                 key_target_indices.emplace_back(i, resolve_value_column_name(cr, source, alias));
@@ -3363,6 +3381,24 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
         }
         group_keys.push_back(resolve_value_column_name(std::get<ast::ColumnRef>(g), source, alias));
     }
+    // A windowed GROUP BY emits synthetic window_start / window_end columns, so
+    // those names are reserved here: a real source column of that name would be
+    // overwritten by the synthetic bound at runtime (silent wrong result).
+    // Reject the collision at bind time with a clear, actionable error rather
+    // than letting the projection resolve ambiguously.
+    if (window.has_value()) {
+        for (const char* reserved : {"window_start", "window_end"}) {
+            for (const auto& sc : source.columns) {
+                if (sc.name == reserved) {
+                    bind_error(std::string{"column '"} + reserved +
+                                   "' collides with the synthetic window bound a windowed GROUP BY "
+                                   "emits; rename the source column or use a non-windowed GROUP BY",
+                               stmt.loc.pos);
+                }
+            }
+        }
+    }
+
     // Phase 8: GROUP BY without a window TVF is now allowed. The
     // runtime maintains per-group state forever and emits the latest
     // aggregate Row per input record (upsert mode). The output below
@@ -3372,7 +3408,9 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
     // in a windowed GROUP BY, one of the synthetic window bounds window_start /
     // window_end.
     for (auto& [idx, col] : key_target_indices) {
-        if (col == "window_start" || col == "window_end") {
+        // A synthetic window bound (window_start / window_end with no real
+        // same-named source column) is valid only with a window TVF present.
+        if ((col == "window_start" || col == "window_end") && !source_has_column(source, col)) {
             if (!window.has_value()) {
                 bind_error("column " + col +
                                " is only available with a window TVF in GROUP BY "
@@ -3416,8 +3454,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             c.agg_index = *agg_idx;
         } else {
             const auto& cr = std::get<ast::ColumnRef>(item.expr);
-            if (cr.parts.size() == 1 &&
-                (cr.parts[0] == "window_start" || cr.parts[0] == "window_end")) {
+            if (is_synthetic_window_bound(cr, source)) {
                 c.is_window_bound = true;
                 c.window_is_end = (cr.parts[0] == "window_end");
                 c.key_source_column = cr.parts[0];  // literal runtime column name

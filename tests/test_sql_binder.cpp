@@ -719,6 +719,23 @@ TEST(SqlBinder, WindowBoundProjectedTwiceRejected) {
         TranslationError);
 }
 
+TEST(SqlBinder, RealColumnNamedWindowStartCollidesWithBound) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE evts (window_start BIGINT, ts TIMESTAMP(3), amount BIGINT) "
+        "WITH (connector='kafka', topic='e', bootstrap='localhost:9092')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    Binder b(cat);
+    // A windowed GROUP BY emits a synthetic window_start, which would overwrite
+    // the real same-named column -> reject the collision at bind time.
+    EXPECT_THROW(b.bind_select(as_select(parse("SELECT window_start, COUNT(*) AS n FROM evts "
+                                               "GROUP BY TUMBLE(ts, 1000), window_start"))),
+                 TranslationError);
+    // The same column is fine in a NON-windowed GROUP BY (no synthetic bound).
+    EXPECT_NO_THROW(b.bind_select(
+        as_select(parse("SELECT window_start, COUNT(*) AS n FROM evts GROUP BY window_start"))));
+}
+
 TEST(SqlBinder, TumbleAcceptsIntervalSyntax) {
     Catalog cat;
     register_clicks(cat);
