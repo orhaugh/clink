@@ -3045,6 +3045,57 @@ TEST(SqlRuntime, HighestBidPerWindowJoinWithRangeResidual) {
     std::filesystem::remove(out_path);
 }
 
+// A non-windowed GROUP BY feeding a changelog-netting sink emits update_before/
+// update_after on each group change; the sink nets them to the final aggregate
+// per group. Distinguishes changelog from append: without retraction the
+// intermediate (k=1,total=10) row would survive (3 rows), with it only the final
+// (k=1,total=30) does (2 rows).
+TEST(SqlRuntime, NonWindowedAggregateEmitsChangelogToNettingSink) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_clog_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_clog_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    write_lines(in_path, {R"({"k":1,"v":10})", R"({"k":1,"v":20})", R"({"k":2,"v":5})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE events (k BIGINT, v BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE agg (k BIGINT, total BIGINT) "
+                     "WITH (connector='changelog', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat, "INSERT INTO agg SELECT k, SUM(v) AS total FROM events GROUP BY k");
+
+    InProcessCluster cluster("tm-sql-e2e-clog", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::map<std::int64_t, std::int64_t> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got[static_cast<std::int64_t>(js.at("k").as_number())] =
+            static_cast<std::int64_t>(js.at("total").as_number());
+    }
+    EXPECT_EQ(lines.size(), 2u) << "intermediate aggregate not retracted (changelog off?)";
+    EXPECT_EQ(got[1], 30) << "k=1 final total";
+    EXPECT_EQ(got[2], 5) << "k=2 final total";
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // Nexmark-q5 shape: hot items - the auction(s) with the most bids per window.
 // D = per-(auction,window) bid count; M = per-window MAX of those counts (an
 // aggregate OVER a derived windowed aggregate); join on the window + a

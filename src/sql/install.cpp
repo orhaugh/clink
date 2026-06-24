@@ -175,6 +175,10 @@ struct AggState {
 struct AggBucket {
     Row group_values;
     std::vector<AggState> agg_states;
+    // The last aggregate row this group emitted (bare, no __row_kind). Only
+    // populated when the operator emits a changelog (emit_changelog), so it can
+    // retract the prior value (update_before) before emitting the new one.
+    std::optional<Row> prior_emitted;
 };
 
 // Exact, round-trip serialisation of AggBucket so the SQL GROUP BY operator
@@ -354,6 +358,12 @@ inline clink::Codec<AggBucket> agg_bucket_codec() {
             agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(b.agg_states.size()));
             for (const auto& s : b.agg_states)
                 agg_codec_detail::encode_agg_state(o, s);
+            // prior_emitted (changelog path only): a flag + the bare row JSON.
+            agg_codec_detail::put_u32(o, b.prior_emitted.has_value() ? 1u : 0u);
+            if (b.prior_emitted.has_value()) {
+                clink::config::JsonValue pe{clink::config::JsonObject{b.prior_emitted->values}};
+                agg_codec_detail::put_str(o, pe.serialize(0));
+            }
             return o;
         },
         .decode = [](BytesView buf) -> std::optional<AggBucket> {
@@ -375,6 +385,20 @@ inline clink::Codec<AggBucket> agg_bucket_codec() {
                 b.agg_states.push_back(agg_codec_detail::decode_agg_state(r));
             if (!r.ok)
                 return std::nullopt;
+            if (r.u32() == 1) {
+                const std::string pe_text = r.str();
+                if (!r.ok)
+                    return std::nullopt;
+                try {
+                    auto j = clink::config::parse(pe_text);
+                    Row pr;
+                    if (j.is_object())
+                        pr.values = j.as_object();
+                    b.prior_emitted = std::move(pr);
+                } catch (...) {
+                    return std::nullopt;
+                }
+            }
             return b;
         },
         .encode_into = {},
@@ -1874,12 +1898,14 @@ public:
     AggregateRowOp(std::vector<std::string> group_keys,
                    std::vector<AggSpec> aggregates,
                    std::vector<std::string> group_key_outputs = {},
-                   bool async_state = false)
+                   bool async_state = false,
+                   bool emit_changelog = false)
         : group_keys_(std::move(group_keys)),
           aggregates_(std::move(aggregates)),
           group_key_outputs_(std::move(group_key_outputs)),
           async_state_(async_state),
-          effective_async_state_(async_state) {
+          effective_async_state_(async_state),
+          emit_changelog_(emit_changelog) {
         if (group_key_outputs_.size() != group_keys_.size()) {
             group_key_outputs_ = group_keys_;  // default: emit each key under its raw name
         }
@@ -1911,13 +1937,12 @@ public:
                     const std::string key = group_key_(row);
                     auto cur = kv.get(key);
                     AggBucket bucket = cur.has_value() ? std::move(*cur) : init_bucket_(row);
-                    Row out_row = fold_into_(bucket, row);
+                    fold_into_(bucket, row, emit_batch);
                     kv.put(key, bucket);
-                    emit_batch.push(Record<Row>{std::move(out_row)});
                 }
             } else {
                 for (const auto& rec : element.as_data()) {
-                    emit_batch.push(Record<Row>{handle_record_inmem_(rec.value())});
+                    handle_record_inmem_(rec.value(), emit_batch);
                 }
             }
             if (!emit_batch.empty())
@@ -1971,7 +1996,7 @@ public:
             for (const auto& c : cols) {
                 row.values[*c.name] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
             }
-            emit_batch.push(Record<Row>{handle_record_inmem_(row)});
+            handle_record_inmem_(row, emit_batch);
         }
         if (!emit_batch.empty()) {
             out.emit_data(std::move(emit_batch));
@@ -2018,11 +2043,11 @@ public:
                 [this, kv, row = std::move(row), key, &out]() mutable -> async::Task<void> {
                 auto cur = co_await kv.get_async(key);
                 AggBucket bucket = cur.has_value() ? std::move(*cur) : init_bucket_(row);
-                Row out_row = fold_into_(bucket, row);
-                kv.put(key, bucket);
                 Batch<Row> b;
-                b.push(Record<Row>{std::move(out_row)});
-                out.emit_data(std::move(b));
+                fold_into_(bucket, row, b);
+                kv.put(key, bucket);
+                if (!b.empty())
+                    out.emit_data(std::move(b));
                 co_return;
             };
             // Backpressure: at the in-flight cap submit() refuses without
@@ -2062,12 +2087,22 @@ private:
         return b;
     }
 
-    // Fold one input row into the bucket and produce the upsert output row.
-    // Phase 24b: retraction-aware. Input rows tagged delete / update_before
-    // subtract; insert / update_after / untagged add. A changelog input
-    // (any __row_kind) tags the output update_after so upsert sinks treat
-    // each emission as the latest snapshot of the group key.
-    Row fold_into_(AggBucket& b, const Row& row) const {
+    // Fold one input row into the bucket and emit the output row(s) into `out`.
+    // Phase 24b: retraction-aware INPUT. Input rows tagged delete / update_before
+    // subtract; insert / update_after / untagged add.
+    //
+    // Two emission modes:
+    //   - append (emit_changelog_ == false, default): emit ONE row - the new
+    //     aggregate snapshot - tagged update_after iff the input was changelog,
+    //     else untagged. Byte-identical to the prior behaviour; every existing
+    //     append pipeline is unchanged.
+    //   - changelog (emit_changelog_ == true): emit a proper changelog of the
+    //     group's own value change, regardless of input kind. First emission for
+    //     a group is an insert; a later change emits update_before(prior) +
+    //     update_after(new); an unchanged value emits nothing. A downstream
+    //     retraction-aware join / netting sink nets these to the final relation
+    //     (so e.g. a join does not multiply against intermediate updates).
+    void fold_into_(AggBucket& b, const Row& row, Batch<Row>& out) const {
         const bool input_has_kind = has_row_kind(row);
         const auto kind = input_has_kind ? row_kind_of(row) : std::string{};
         const bool retract = input_has_kind && is_delete_like(kind);
@@ -2078,25 +2113,48 @@ private:
                 update_agg(b.agg_states[i], aggregates_[i], row);
             }
         }
-        Row out_row = b.group_values;
+        Row result = b.group_values;  // bare aggregate row (no __row_kind yet)
         for (std::size_t i = 0; i < aggregates_.size(); ++i) {
-            out_row.values[aggregates_[i].output_name] =
+            result.values[aggregates_[i].output_name] =
                 finalize_agg(b.agg_states[i], aggregates_[i]);
         }
-        if (input_has_kind) {
-            set_row_kind(out_row, kRowKindUpdateAfter);
+        if (!emit_changelog_) {
+            if (input_has_kind) {
+                set_row_kind(result, kRowKindUpdateAfter);
+            }
+            out.push(Record<Row>{std::move(result)});
+            return;
         }
-        return out_row;
+        // Changelog mode: retract the prior value (if it changed) then emit the new.
+        const bool had_prior = b.prior_emitted.has_value();
+        if (had_prior && rows_equal_(*b.prior_emitted, result)) {
+            return;  // value unchanged -> no changelog entry
+        }
+        if (had_prior) {
+            Row before = *b.prior_emitted;
+            set_row_kind(before, kRowKindUpdateBefore);
+            out.push(Record<Row>{std::move(before)});
+        }
+        b.prior_emitted = result;  // remember the bare row for the next retraction
+        set_row_kind(result, had_prior ? kRowKindUpdateAfter : kRowKindInsert);
+        out.push(Record<Row>{std::move(result)});
+    }
+
+    // Deep value equality of two bare aggregate rows (no __row_kind on either),
+    // via canonical JSON. JsonObject is an ordered map so the text is stable.
+    static bool rows_equal_(const Row& a, const Row& b) {
+        return clink::config::JsonValue{clink::config::JsonObject{a.values}}.serialize(0) ==
+               clink::config::JsonValue{clink::config::JsonObject{b.values}}.serialize(0);
     }
 
     // In-memory (default) per-record path.
-    Row handle_record_inmem_(const Row& row) {
+    void handle_record_inmem_(const Row& row, Batch<Row>& out) {
         const std::string key = group_key_(row);
         auto it = state_.find(key);
         if (it == state_.end()) {
             it = state_.emplace(key, init_bucket_(row)).first;
         }
-        return fold_into_(it->second, row);
+        fold_into_(it->second, row, out);
     }
 
     KeyedState<std::string, AggBucket> keyed_state_() {
@@ -2113,6 +2171,10 @@ private:
     // runtime + backend are attached, so process()/process_async()/
     // supports_async() all agree on one storage choice (no split-brain).
     bool effective_async_state_ = false;
+    // Emit a changelog (update_before/update_after) of the group's value change
+    // instead of an append snapshot. Opt-in; the planner sets it when this
+    // aggregate feeds a retraction-aware consumer (a join / netting sink).
+    bool emit_changelog_ = false;
     std::unordered_map<std::string, AggBucket> state_;
     // Columns the columnar ingest reads from each input row (group keys, agg
     // inputs, __row_kind); precomputed in the ctor.
@@ -3153,6 +3215,71 @@ private:
     bool flushed_{false};
 };
 
+// A changelog-netting sink: nets an insert/delete/update_before/update_after
+// stream into its final relation by FULL-ROW multiplicity (no primary key
+// required), then writes the surviving rows on flush. Used for changelog
+// outputs that have no natural key - e.g. the result of a retracting aggregate
+// joined to another stream (Nexmark q5). insert / update_after add one
+// occurrence of the row; delete / update_before remove one; a row survives
+// while its net count stays positive.
+class ChangelogNetSink final : public Sink<Row> {
+public:
+    ChangelogNetSink(std::string path, std::map<std::string, int> decimal_scales = {})
+        : path_(std::move(path)), decimal_scales_(std::move(decimal_scales)) {}
+
+    void on_data(const Batch<Row>& batch) override {
+        for (const auto& rec : batch) {
+            const auto& row = rec.value();
+            const bool del = is_delete_like(row_kind_of(row));
+            Row bare = row;
+            bare.values.erase(std::string{kRowKindField});
+            const std::string key =
+                clink::config::JsonValue{clink::config::JsonObject{bare.values}}.serialize(0);
+            auto& slot = state_[key];
+            slot.count += del ? -1 : 1;
+            if (slot.count <= 0) {
+                state_.erase(key);
+            } else {
+                slot.row = std::move(bare);
+            }
+        }
+    }
+
+    void flush() override {
+        if (flushed_)
+            return;
+        flushed_ = true;
+        const std::string tmp_path = path_ + ".tmp";
+        {
+            std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                throw std::runtime_error("changelog_net_sink: cannot open " + tmp_path);
+            }
+            for (const auto& [_k, slot] : state_) {
+                Row q = slot.row;
+                requantise_row_decimals(q, decimal_scales_);
+                clink::config::JsonValue v{clink::config::JsonObject{q.values}};
+                auto s = clink::config::serialize_output(v);
+                out.write(s.data(), static_cast<std::streamsize>(s.size()));
+                out.put('\n');
+            }
+        }
+        std::filesystem::rename(tmp_path, path_);
+    }
+
+    std::string name() const override { return "changelog_net_sink"; }
+
+private:
+    struct Slot {
+        Row row;
+        int count = 0;
+    };
+    std::string path_;
+    std::map<std::string, int> decimal_scales_;
+    std::unordered_map<std::string, Slot> state_;
+    bool flushed_{false};
+};
+
 // Phase 21c: TOP-N-per-partition. Single-input op that maintains a
 // per-partition sorted buffer of at most `count_` records. On each
 // arriving record:
@@ -4173,6 +4300,23 @@ void install(clink::plugin::PluginRegistry& reg) {
                 std::move(path),
                 std::move(pk),
                 parse_decimal_columns(ctx.param_or("decimal_columns")));
+        });
+
+    // changelog_net_sink: nets a changelog stream (insert/delete/update_*) into
+    // its final relation by full-row multiplicity (no primary key), then writes
+    // the survivors on flush. For changelog outputs with no natural key.
+    //   path (required)
+    reg.register_sink<Row>(
+        "changelog_net_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<Row>> {
+            auto path = ctx.param_or("path");
+            if (path.empty()) {
+                throw std::runtime_error("changelog_net_sink: 'path' param is required");
+            }
+            if (ctx.parallelism > 1) {
+                path += "." + std::to_string(ctx.subtask_idx);
+            }
+            return std::make_shared<ChangelogNetSink>(
+                std::move(path), parse_decimal_columns(ctx.param_or("decimal_columns")));
         });
 
     // ---- Operators ----
@@ -5250,10 +5394,15 @@ void install(clink::plugin::PluginRegistry& reg) {
                 aggregates.push_back(std::move(spec));
             }
             const bool async_state = ctx.param_or("async_state", "false") == "true";
+            // emit_changelog: emit update_before/update_after on each value change
+            // (set by the planner when this aggregate feeds a retraction-aware
+            // consumer) instead of an append snapshot. Default off.
+            const bool emit_changelog = ctx.param_or("emit_changelog", "false") == "true";
             return std::make_shared<AggregateRowOp>(std::move(group_keys),
                                                     std::move(aggregates),
                                                     std::move(group_key_outputs),
-                                                    async_state);
+                                                    async_state,
+                                                    emit_changelog);
         });
 
     // project_row: per-row expression evaluation. The 'outputs' param

@@ -217,8 +217,17 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         // harness); here we map the connector name to the Row-channel sink op.
         return RowConnectorBinding{"blackhole_sink_row", kChannelRow, {}};
     }
-    unsupported("format='json' sink requires connector='file', 'kafka' or 'parquet' (got '" +
-                connector + "')");
+    if (connector == "changelog") {
+        // Nets a changelog stream (insert/delete/update_*) into its final
+        // relation by full-row multiplicity (no primary key), writing survivors
+        // on flush. For keyless changelog outputs (e.g. a retracting aggregate
+        // joined to another stream).
+        return RowConnectorBinding{"changelog_net_sink", kChannelRow, {}};
+    }
+    unsupported(
+        "format='json' sink requires connector='file', 'kafka', 'parquet', 'blackhole' or "
+        "'changelog' (got '" +
+        connector + "')");
 }
 
 // Copy properties from a TableDef to an OperatorSpec's params,
@@ -1375,6 +1384,51 @@ Channel decide_channel(const LogicalPlan& node) {
     return decide_channel(*inputs[0]);
 }
 
+// Post-pass over the built operator graph: mark every aggregate_row that feeds a
+// changelog-CONSUMING op (a netting/upsert sink, or a retraction-aware join) so
+// it emits update_before/update_after instead of an append snapshot. Walks back
+// from each consumer through changelog-preserving pass-through ops to the first
+// aggregate_row on that input. Opt-in by construction: an aggregate whose output
+// only reaches append sinks is never marked, so append pipelines are unchanged.
+void mark_changelog_producers(cluster::JobGraphSpec& spec) {
+    std::unordered_map<std::string, std::size_t> by_id;
+    for (std::size_t i = 0; i < spec.ops.size(); ++i) {
+        by_id[spec.ops[i].id] = i;
+    }
+    auto is_consumer = [](const std::string& t) {
+        // equi_join_row is added once the join consumes retractions (Phase B).
+        return t == "changelog_net_sink";
+    };
+    auto is_passthrough = [](const std::string& t) {
+        return t == "row_compute_key" || t == "filter_row_predicate" || t == "project_row" ||
+               t == "identity_row" || t == "assign_timestamps_row";
+    };
+    for (const auto& op : spec.ops) {
+        if (!is_consumer(op.type)) {
+            continue;
+        }
+        for (const auto& in_id : op.inputs) {
+            std::string cur = in_id;
+            for (int guard = 0; guard < 256; ++guard) {
+                auto it = by_id.find(cur);
+                if (it == by_id.end()) {
+                    break;
+                }
+                auto& up = spec.ops[it->second];
+                if (up.type == "aggregate_row") {
+                    up.params["emit_changelog"] = "true";
+                    break;
+                }
+                if (is_passthrough(up.type) && up.inputs.size() == 1) {
+                    cur = up.inputs[0];
+                    continue;
+                }
+                break;  // not a pass-through and not an aggregate: stop
+            }
+        }
+    }
+}
+
 }  // namespace
 
 cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
@@ -1396,6 +1450,7 @@ cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
             "either both single-TEXT-column or both format='json'");
     }
     compile_node(root, ch, spec, next_id, async_state_for_aggregation_);
+    mark_changelog_producers(spec);
     spec.validate();
     const auto dt =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
