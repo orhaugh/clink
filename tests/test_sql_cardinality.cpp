@@ -263,5 +263,71 @@ TEST(SqlCardinality, OptimizeGuardFallsBackOnPassThrow) {
               before + 1);
 }
 
+// ----- histograms (range selectivity) + MCV (equality skew) -----
+
+TEST(SqlCardinality, HistogramDrivesRangeSelectivity) {
+    Catalog cat;
+    // Equi-depth single bucket [0,100]: amount < 25 -> 25% (NOT the 1/3 default).
+    reg(cat, "orders", "(amount BIGINT)", "row_count='1000', hist_amount='0,100'");
+    EXPECT_DOUBLE_EQ(rows_of(cat, "SELECT * FROM orders WHERE amount < 25"), 250.0);
+    EXPECT_DOUBLE_EQ(rows_of(cat, "SELECT * FROM orders WHERE amount > 75"), 250.0);
+    // Out-of-range literals clamp to 0% / 100%.
+    EXPECT_DOUBLE_EQ(rows_of(cat, "SELECT * FROM orders WHERE amount < 0"), 0.0);
+    EXPECT_DOUBLE_EQ(rows_of(cat, "SELECT * FROM orders WHERE amount > 200"), 0.0);
+}
+
+TEST(SqlCardinality, MultiBucketHistogramInterpolates) {
+    Catalog cat;
+    // 3 equal-mass buckets [0,10] [10,20] [20,100]; x < 5 -> half of bucket 0 ->
+    // (0 + 0.5)/3 ~= 16.67%, well away from the flat 1/3.
+    reg(cat, "t", "(x BIGINT)", "row_count='3000', hist_x='0,10,20,100'");
+    EXPECT_NEAR(rows_of(cat, "SELECT * FROM t WHERE x < 5"), 500.0, 1.0);
+}
+
+TEST(SqlCardinality, MalformedHistogramFallsBackToDefault) {
+    Catalog cat;
+    // A single boundary is no bucket -> ignored -> range uses the 1/3 default.
+    reg(cat, "orders", "(amount BIGINT)", "row_count='999', hist_amount='50'");
+    EXPECT_DOUBLE_EQ(rows_of(cat, "SELECT * FROM orders WHERE amount > 50"), 333.0);
+}
+
+TEST(SqlCardinality, McvDrivesEqualitySelectivityUnderSkew) {
+    Catalog cat;
+    reg(cat, "events", "(status BIGINT)", "row_count='1000', ndv_status='5', mcv_status='200:0.8'");
+    // Hot value 200 -> 80% (NOT the uniform 1/ndv = 20%).
+    EXPECT_DOUBLE_EQ(rows_of(cat, "SELECT * FROM events WHERE status = 200"), 800.0);
+    // Cold value -> residual mass over residual ndv = (1-0.8)/(5-1) = 0.05 -> 50.
+    EXPECT_DOUBLE_EQ(rows_of(cat, "SELECT * FROM events WHERE status = 404"), 50.0);
+    // != hot value -> 1 - 0.8 -> 200.
+    EXPECT_DOUBLE_EQ(rows_of(cat, "SELECT * FROM events WHERE status <> 200"), 200.0);
+}
+
+TEST(SqlCardinality, McvDrivesInListSelectivity) {
+    Catalog cat;
+    reg(cat,
+        "events",
+        "(status BIGINT)",
+        "row_count='1000', ndv_status='5', mcv_status='200:0.8,404:0.1'");
+    // IN (200, 404) -> 0.8 + 0.1 = 0.9 -> 900.
+    EXPECT_DOUBLE_EQ(rows_of(cat, "SELECT * FROM events WHERE status IN (200, 404)"), 900.0);
+}
+
+// The histogram changes the optimizer's DECISION, not just the estimate: a range
+// filter whose histogram selectivity (1%) makes `a` tiny enough to beat `b`,
+// whereas the flat 1/3 default (333 > 100) would leave `b` driving.
+TEST(SqlCardinality, HistogramSelectivityFlipsJoinDriver) {
+    Catalog cat;
+    reg(cat, "a", "(k BIGINT, x BIGINT)", "row_count='1000', ndv_k='1000', hist_x='0,1000'");
+    reg(cat, "b", "(k BIGINT)", "row_count='100', ndv_k='100'");
+    Binder bd(cat);
+    // a_x < 10 -> hist 1% -> ~10 rows < b's 100 -> a drives. (Without the
+    // histogram, 1/3 -> ~333 > 100 -> b would drive.) Post-join columns are flat
+    // (<alias>_<col>); predicate pushdown de-aliases a_x -> x into a's scan.
+    auto opt = optimize(
+        bd.bind_select(as_select(parse("SELECT a_k FROM a JOIN b ON a.k = b.k WHERE a_x < 10"))));
+    EXPECT_EQ(driving_table(*opt), "a")
+        << "the histogram-estimated tiny filtered relation should drive the join";
+}
+
 }  // namespace
 }  // namespace clink::sql

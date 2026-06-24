@@ -18,8 +18,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <optional>
 #include <string>
+#include <vector>
 
+#include "clink/config/decimal.hpp"
 #include "clink/config/json.hpp"
 #include "clink/sql/logical_plan.hpp"
 #include "clink/sql/statistics.hpp"
@@ -48,6 +52,87 @@ inline double ndv_or(const RelStats& r, const std::string& col) {
     return r.row_count_known() ? r.row_count : kDefaultScanRows;
 }
 
+// A predicate literal as a double, for histogram range comparison. Numbers and
+// sentinel-tagged decimals only; nullopt for strings/bools/null.
+inline std::optional<double> lit_as_double(const clink::config::JsonValue& v) {
+    if (v.is_number()) {
+        return v.as_number();
+    }
+    if (clink::config::is_dec_string(v)) {
+        if (auto d = clink::config::dec_parse(v.as_string())) {
+            return clink::config::dec_to_double(*d);
+        }
+    }
+    return std::nullopt;
+}
+
+// A predicate literal as its canonical-string MCV key (the same form the
+// declared mcv_<col> values use): integral numbers as "<n>", other numbers
+// minimally formatted, decimals as their canonical text, strings verbatim,
+// bools "true"/"false". nullopt for null.
+inline std::optional<std::string> lit_canonical(const clink::config::JsonValue& v) {
+    if (v.is_bool()) {
+        return std::string(v.as_bool() ? "true" : "false");
+    }
+    if (clink::config::is_dec_string(v)) {
+        return v.as_string().substr(1);  // strip the 0x01 decimal sentinel
+    }
+    if (v.is_string()) {
+        return v.as_string();
+    }
+    if (v.is_number()) {
+        const double d = v.as_number();
+        if (std::isfinite(d) && d == std::floor(d) && std::abs(d) < 9e15) {
+            return std::to_string(static_cast<std::int64_t>(d));
+        }
+        std::string s = std::to_string(d);  // trim trailing zeros so "9.99" matches
+        if (auto dot = s.find('.'); dot != std::string::npos) {
+            auto last = s.find_last_not_of('0');
+            if (last == dot) {
+                --last;
+            }
+            s.erase(last + 1);
+        }
+        return s;
+    }
+    return std::nullopt;
+}
+
+// Equi-depth CDF: estimated fraction of values strictly below `v`. The B =
+// size-1 buckets each carry ~1/B of the mass; linear interpolation within the
+// containing bucket.
+inline double hist_cdf(const std::vector<double>& bounds, double v) {
+    const double B = static_cast<double>(bounds.size() - 1);
+    if (v <= bounds.front()) {
+        return 0.0;
+    }
+    if (v >= bounds.back()) {
+        return 1.0;
+    }
+    auto it = std::upper_bound(bounds.begin(), bounds.end(), v);  // first boundary > v
+    const std::size_t hi = static_cast<std::size_t>(std::distance(bounds.begin(), it));
+    const std::size_t i = hi - 1;  // bucket index, bounds[i] <= v < bounds[i+1]
+    const double width = bounds[i + 1] - bounds[i];
+    const double frac_in = width > 0.0 ? (v - bounds[i]) / width : 0.0;
+    return (static_cast<double>(i) + frac_in) / B;
+}
+
+// Equality selectivity for `key` against a column's MCV list + NDV: the MCV
+// frequency if `key` is a common value, else the residual mass spread over the
+// residual NDV (PostgreSQL's model). Falls back to 1/NDV / Selinger when no MCV.
+inline double eq_selectivity(const ColumnStats& cs, const std::string& key) {
+    if (auto f = cs.mcv_frequency(key)) {
+        return std::clamp(*f, 0.0, 1.0);
+    }
+    const double residual_mass = std::max(0.0, 1.0 - cs.mcv_frequency_sum());
+    if (cs.ndv_known()) {
+        const double residual_ndv = std::max(1.0, cs.ndv - static_cast<double>(cs.mcv.size()));
+        return std::clamp(residual_mass / residual_ndv, 0.0, 1.0);
+    }
+    // NDV unknown: Selinger default, scaled down by any MCV mass already claimed.
+    return std::clamp(cs.mcv.empty() ? kEqSelectivity : residual_mass * kEqSelectivity, 0.0, 1.0);
+}
+
 // Estimate the selectivity of a json_predicate against a relation's stats.
 inline double selectivity(const clink::config::JsonValue& pred, const RelStats& in) {
     if (!pred.is_object() || !pred.contains("op")) {
@@ -74,15 +159,28 @@ inline double selectivity(const clink::config::JsonValue& pred, const RelStats& 
     auto col_of = [&]() -> std::string {
         return pred.contains("col") ? pred.at("col").as_string() : std::string{};
     };
-    if (op == "eq") {
+    // `lower_predicate` emits a flat comparison {op, col, literal}; IN carries a
+    // {op, col, values:[...]} list. The literal/values were previously ignored;
+    // now they drive MCV (equality) and histogram (range) selectivity.
+    if (op == "eq" || op == "ne") {
         const auto cs = in.column(col_of());
-        return cs.ndv_known() ? std::min(1.0, 1.0 / cs.ndv) : kEqSelectivity;
-    }
-    if (op == "ne") {
-        const auto cs = in.column(col_of());
-        return cs.ndv_known() ? std::max(0.0, 1.0 - 1.0 / cs.ndv) : (1.0 - kEqSelectivity);
+        double eq = cs.ndv_known() ? std::min(1.0, 1.0 / cs.ndv) : kEqSelectivity;
+        if (pred.contains("literal")) {
+            if (auto key = lit_canonical(pred.at("literal"))) {
+                eq = eq_selectivity(cs, *key);
+            }
+        }
+        return op == "eq" ? eq : std::max(0.0, 1.0 - eq);
     }
     if (op == "lt" || op == "le" || op == "gt" || op == "ge") {
+        const auto cs = in.column(col_of());
+        if (cs.has_histogram() && pred.contains("literal")) {
+            if (auto v = lit_as_double(pred.at("literal"))) {
+                const double below = hist_cdf(cs.histogram, *v);
+                // continuous approximation: le~lt, ge~gt for cost purposes.
+                return std::clamp((op == "lt" || op == "le") ? below : (1.0 - below), 0.0, 1.0);
+            }
+        }
         return kRangeSelectivity;
     }
     if (op == "is_null") {
@@ -96,11 +194,19 @@ inline double selectivity(const clink::config::JsonValue& pred, const RelStats& 
     }
     if (op == "in") {
         const auto cs = in.column(col_of());
+        if (pred.contains("values") && pred.at("values").is_array()) {
+            double s = 0.0;
+            for (const auto& val : pred.at("values").as_array()) {
+                if (auto key = lit_canonical(val)) {
+                    s += eq_selectivity(cs, *key);
+                } else {
+                    s += cs.ndv_known() ? (1.0 / cs.ndv) : kEqSelectivity;
+                }
+            }
+            return std::min(1.0, s);
+        }
         const double per = cs.ndv_known() ? (1.0 / cs.ndv) : kEqSelectivity;
-        const double n = pred.contains("values")
-                             ? static_cast<double>(pred.at("values").as_array().size())
-                             : 1.0;
-        return std::min(1.0, per * n);
+        return std::min(1.0, per);
     }
     return kDefaultSelectivity;
 }
@@ -112,6 +218,18 @@ inline void cap_ndv(RelStats& s, double rows) {
         if (cs.ndv_known() && cs.ndv > rows) {
             cs.ndv = rows;
         }
+    }
+}
+
+// Drop per-column histograms + MCVs (keep NDV + null_fraction). A node that
+// changes the row set (Filter/Join/Aggregate) invalidates the distribution
+// summaries: a histogram/MCV describes the INPUT rows, and propagating it past a
+// row-changing node would compound error. Row-preserving nodes (Scan, Project)
+// keep them, so a Filter directly above a Scan still reads the scan's histogram.
+inline void clear_distributions(RelStats& s) {
+    for (auto& [_, cs] : s.columns) {
+        cs.histogram.clear();
+        cs.mcv.clear();
     }
 }
 
@@ -159,6 +277,7 @@ inline RelStats estimate_stats(const LogicalPlan& node) {
         sel = std::clamp(sel, 0.0, 1.0);
         RelStats out = in;
         out.row_count = in.row_count * sel;
+        clear_distributions(out);  // the row subset invalidates per-column hist/mcv
         cap_ndv(out, out.row_count);
         return out;
     }
@@ -204,6 +323,7 @@ inline RelStats estimate_stats(const LogicalPlan& node) {
             out.row_count = (l.row_count * r.row_count) / divisor;
             merge_join_side(out, l, l_alias);
             merge_join_side(out, r, r_alias);
+            clear_distributions(out);  // join cardinality invalidates per-column hist/mcv
             cap_ndv(out, out.row_count);
             return out;
         };
@@ -243,6 +363,7 @@ inline RelStats estimate_stats(const LogicalPlan& node) {
         for (std::size_t i = 0; i < a.group_keys().size() && i < outs.size(); ++i) {
             out.columns[outs[i]] = in.column(a.group_keys()[i]);
         }
+        clear_distributions(out);  // grouping changes the row set: hist/mcv stale
         cap_ndv(out, out.row_count);
         return out;
     }
