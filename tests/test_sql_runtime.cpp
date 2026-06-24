@@ -3096,6 +3096,138 @@ TEST(SqlRuntime, NonWindowedAggregateEmitsChangelogToNettingSink) {
     std::filesystem::remove(out_path);
 }
 
+// Nexmark-q19 shape: per-auction top-N bids by price. ROW_NUMBER() OVER
+// (PARTITION BY auction ORDER BY price DESC) with rn <= N is a TOP-N-per-key
+// changelog; the netting sink resolves it to the final top-N set per auction.
+TEST(SqlRuntime, TopNBidsPerAuctionToNettingSink) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q19_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q19_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    // auction 1 prices {30,10,20} -> top-2 {30,20}; auction 2 {5,15} -> {15,5}.
+    write_lines(in_path,
+                {
+                    R"({"auction":1,"price":30})",
+                    R"({"auction":1,"price":10})",
+                    R"({"auction":1,"price":20})",
+                    R"({"auction":2,"price":5})",
+                    R"({"auction":2,"price":15})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE bids (auction BIGINT, price BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE topn (auction BIGINT, price BIGINT) "
+                     "WITH (connector='changelog', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat,
+                        "INSERT INTO topn SELECT auction, price FROM "
+                        "(SELECT *, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) "
+                        "AS rn FROM bids) AS t WHERE rn <= 2");
+
+    InProcessCluster cluster("tm-sql-e2e-q19", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::set<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("auction").as_number()),
+                    static_cast<std::int64_t>(js.at("price").as_number()));
+    }
+    EXPECT_EQ(got.size(), 4u) << "expected top-2 per auction (4 rows), the rest retracted";
+    EXPECT_TRUE(got.count({1, 30}) && got.count({1, 20})) << "auction 1 top-2 {30,20}";
+    EXPECT_TRUE(got.count({2, 15}) && got.count({2, 5})) << "auction 2 top-2 {15,5}";
+    EXPECT_FALSE(got.count({1, 10})) << "auction 1 price 10 should be retracted (not top-2)";
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
+// Nexmark-q15 shape: per-day bidding stats. DATE_TRUNC('day', <ms>) buckets the
+// event time; the non-windowed GROUP BY computes COUNT(*) + COUNT(DISTINCT) per
+// day; an upsert sink keyed by day keeps the final aggregate per day.
+TEST(SqlRuntime, PerDayBiddingStatsWithDistinctCounts) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q15_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q15_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    // day 0 (ts < 86400000): 3 bids, bidders {1,2,2}, auctions {1,1,2}.
+    // day 1 (ts >= 86400000): 1 bid.
+    write_lines(in_path,
+                {
+                    R"({"auction":1,"bidder":1,"datetime":100})",
+                    R"({"auction":1,"bidder":2,"datetime":200})",
+                    R"({"auction":2,"bidder":2,"datetime":300})",
+                    R"({"auction":1,"bidder":1,"datetime":86400100})",
+                });
+
+    Catalog cat;
+    auto ddl =
+        parse(std::string{"CREATE TABLE bids (auction BIGINT, bidder BIGINT, datetime BIGINT) "
+                          "WITH (connector='file', format='json', path='"} +
+              in_path.string() +
+              "');"
+              "CREATE TABLE stats (day BIGINT, total BIGINT, bidders BIGINT, auctions BIGINT) "
+              "WITH (connector='file', format='json', mode='upsert', primary_key='day', "
+              "path='" +
+              out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat,
+                        "INSERT INTO stats SELECT day, COUNT(*) AS total, "
+                        "COUNT(DISTINCT bidder) AS bidders, COUNT(DISTINCT auction) AS auctions "
+                        "FROM (SELECT DATE_TRUNC('day', datetime) AS day, bidder, auction "
+                        "FROM bids) AS t GROUP BY day");
+
+    InProcessCluster cluster("tm-sql-e2e-q15", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    struct S {
+        std::int64_t total, bidders, auctions;
+    };
+    std::map<std::int64_t, S> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got[static_cast<std::int64_t>(js.at("day").as_number())] =
+            S{static_cast<std::int64_t>(js.at("total").as_number()),
+              static_cast<std::int64_t>(js.at("bidders").as_number()),
+              static_cast<std::int64_t>(js.at("auctions").as_number())};
+    }
+    ASSERT_TRUE(got.count(0)) << "day 0 bucket missing";
+    EXPECT_EQ(got[0].total, 3);
+    EXPECT_EQ(got[0].bidders, 2) << "distinct bidders {1,2}";
+    EXPECT_EQ(got[0].auctions, 2) << "distinct auctions {1,2}";
+    ASSERT_TRUE(got.count(86400000)) << "day 1 bucket missing";
+    EXPECT_EQ(got[86400000].total, 1);
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // Nexmark-q5 shape: hot items - the auction(s) with the most bids per window.
 // D = per-(auction,window) bid count; M = per-window MAX of those counts (an
 // aggregate OVER a derived windowed aggregate); join on the window + a

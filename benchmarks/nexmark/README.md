@@ -33,7 +33,7 @@ Flags: `--query qN`, `--events N` (total events), `--tps N` (dateTime spacing =
 - **Runner**: the in-process cluster from the SQL runtime tests; the bounded
   source drains and the harness times the job round-trip.
 
-## Query coverage (first tier)
+## Query coverage
 
 | query | shape | notes |
 |---|---|---|
@@ -47,20 +47,26 @@ Flags: `--query qN`, `--events N` (total events), `--tps N` (dateTime spacing =
 | q7 | highest bid | per-window `MAX(price)` as a join side (equi on price) + a column-vs-column range residual `dateTime IN [window_start, window_end)` |
 | q8 | new users | two windowed aggregates joined on `seller = id` + a column-vs-column window-equality residual |
 | q5 | hot items | per-(auction,window) count joined to the per-window `MAX` of those counts (a non-windowed GROUP BY -> changelog) + a count-equals-max residual. Run with `--slots 16` (nested windowed counts + a join). |
+| q15 | per-day stats | `DATE_TRUNC('day', datetime)` bucket + `COUNT(*)` / `COUNT(DISTINCT bidder)` / `COUNT(DISTINCT auction)` |
+| q17 | per-auction-day stats | `GROUP BY auction, day` + `COUNT(DISTINCT)`, `MIN`/`MAX`/`AVG`/`SUM(price)` |
+| q18 | latest bid per user | `ROW_NUMBER() OVER (PARTITION BY auction, bidder ORDER BY datetime DESC)`, `rn <= 1` (TOP-N-per-key changelog) |
+| q19 | top-10 per auction | `ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC)`, `rn <= 10` (TOP-N-per-key changelog) |
 
 Enabling capabilities now in clink SQL: `window_start`/`window_end` projectable
 from any windowed GROUP BY (aliasable, BIGINT ms-since-epoch); a derived table
 (incl. a windowed aggregate) usable as a join input; column-vs-column comparisons
 in WHERE (so a single-equi-key join + a residual predicate expresses range and
-composite-key joins); and RETRACTION/CHANGELOG streams - a non-windowed GROUP BY
+composite-key joins); RETRACTION/CHANGELOG streams - a non-windowed GROUP BY
 emits a changelog (opt-in, when it feeds a join/netting sink), the equi-join
 consumes those retractions, and a netting sink resolves the +/- to the final
-relation. q8's per-window grouping carries a `COUNT(*)` (unused) because clink
-requires an aggregate in a GROUP BY SELECT.
+relation; and the analytics tier rides existing features (`ROW_NUMBER` TOP-N-per
+-key, `COUNT(DISTINCT)`, `DATE_TRUNC`). A changelog stream (TOP-N output) is
+accepted by `connector='changelog'` (netting), `mode='upsert'`, or a discard
+`connector='blackhole'` sink. q8's per-window grouping carries a `COUNT(*)`
+(unused) because clink requires an aggregate in a GROUP BY SELECT.
 
-All ten runnable queries now execute (q0/q1/q2/q3/q5/q7/q8/q11/q12/q20). Next:
-the analytics tier - OVER/Top-N + distinct/filter aggregates (q15/q17/q18/q19).
-See the feasibility scoping.
+Fourteen Nexmark queries now execute (q0/q1/q2/q3/q5/q7/q8/q11/q12/q15/q17/q18/
+q19/q20). The remaining queries are excluded by named gaps (below).
 
 Window queries: use a lower `--tps` (e.g. `--tps 50000`) so `datetime` spans many
 windows (spacing is `1000/tps` ms/event); at the default tps the run fits in one

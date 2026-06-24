@@ -3778,10 +3778,18 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
             }
         }
     } else if (produces_changelog) {
-        bind_error("sink " + sink.name +
-                       " is append-only but the SELECT produces a changelog stream; "
-                       "declare mode='upsert' (and primary_key='...') on the sink",
-                   stmt.loc.pos);
+        // A changelog SELECT also lands in a sink that natively consumes a
+        // changelog: the netting sink (connector='changelog', nets +/- by full
+        // row) or a discard sink (connector='blackhole', counts and drops). Any
+        // other append-only sink rejects.
+        auto cit = sink.properties.find("connector");
+        const std::string conn = cit != sink.properties.end() ? cit->second : std::string{};
+        if (conn != "changelog" && conn != "blackhole") {
+            bind_error("sink " + sink.name +
+                           " is append-only but the SELECT produces a changelog stream; declare "
+                           "mode='upsert' (and primary_key='...'), or use connector='changelog'",
+                       stmt.loc.pos);
+        }
     }
 
     return std::make_unique<LogicalSink>(std::move(select_plan), &sink);

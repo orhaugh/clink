@@ -161,6 +161,37 @@ const std::map<std::string, Query>& queries() {
           "FROM bid GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), auction) AS d2 "
           "GROUP BY window_start, window_end) AS M ON D.ws = M.ws "
           "WHERE D_we = M_we AND D_num = M_maxnum"}},
+        // q19: per-auction top-10 bids by price (TOP-N-per-key changelog).
+        {"q19",
+         {"CREATE TABLE sink_q19 (auction BIGINT, bidder BIGINT, price BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q19 SELECT auction, bidder, price FROM "
+          "(SELECT *, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) "
+          "AS t WHERE rn <= 10"}},
+        // q18: latest bid per (auction, bidder) (TOP-N-per-key, rn=1).
+        {"q18",
+         {"CREATE TABLE sink_q18 (auction BIGINT, bidder BIGINT, price BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q18 SELECT auction, bidder, price FROM "
+          "(SELECT *, ROW_NUMBER() OVER (PARTITION BY auction, bidder ORDER BY datetime DESC) AS "
+          "rn "
+          "FROM bid) AS t WHERE rn <= 1"}},
+        // q15: per-day bidding stats (count + distinct bidders/auctions).
+        {"q15",
+         {"CREATE TABLE sink_q15 (day BIGINT, total BIGINT, bidders BIGINT, auctions BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q15 SELECT day, COUNT(*) AS total, COUNT(DISTINCT bidder) AS bidders, "
+          "COUNT(DISTINCT auction) AS auctions FROM (SELECT DATE_TRUNC('day', datetime) AS day, "
+          "bidder, auction FROM bid) AS t GROUP BY day"}},
+        // q17: per-(auction,day) bid stats (count, distinct bidders, min/max/avg/sum price).
+        {"q17",
+         {"CREATE TABLE sink_q17 (auction BIGINT, day BIGINT, total BIGINT, bidders BIGINT, "
+          "minp BIGINT, maxp BIGINT, avgp DOUBLE, sump BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q17 SELECT auction, day, COUNT(*) AS total, COUNT(DISTINCT bidder) AS "
+          "bidders, MIN(price) AS minp, MAX(price) AS maxp, AVG(price) AS avgp, SUM(price) AS sump "
+          "FROM (SELECT auction, DATE_TRUNC('day', datetime) AS day, bidder, price FROM bid) AS t "
+          "GROUP BY auction, day"}},
     };
     return q;
 }
