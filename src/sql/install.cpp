@@ -923,14 +923,18 @@ public:
                 std::int64_t slide_ms,
                 std::vector<std::string> group_keys,
                 std::vector<AggSpec> aggregates,
-                std::vector<std::string> group_key_outputs = {})
+                std::vector<std::string> group_key_outputs = {},
+                std::string window_start_output = "window_start",
+                std::string window_end_output = "window_end")
         : kind_(kind),
           time_column_(std::move(time_column)),
           size_ms_(size_ms),
           slide_ms_(slide_ms),
           group_keys_(std::move(group_keys)),
           aggregates_(std::move(aggregates)),
-          group_key_outputs_(std::move(group_key_outputs)) {
+          group_key_outputs_(std::move(group_key_outputs)),
+          window_start_output_(std::move(window_start_output)),
+          window_end_output_(std::move(window_end_output)) {
         if (group_key_outputs_.size() != group_keys_.size()) {
             group_key_outputs_ = group_keys_;  // default: emit each key under its raw name
         }
@@ -1235,9 +1239,10 @@ private:
             out_row.values[aggregates_[i].output_name] =
                 finalize_agg(b.agg_states[i], aggregates_[i]);
         }
-        out_row.values["window_start"] =
+        out_row.values[window_start_output_] =
             clink::config::JsonValue{static_cast<std::int64_t>(b.window_start)};
-        out_row.values["window_end"] = clink::config::JsonValue{static_cast<std::int64_t>(win_end)};
+        out_row.values[window_end_output_] =
+            clink::config::JsonValue{static_cast<std::int64_t>(win_end)};
         return out_row;
     }
 
@@ -1280,6 +1285,8 @@ private:
     std::vector<std::string> group_keys_;
     std::vector<AggSpec> aggregates_;
     std::vector<std::string> group_key_outputs_;
+    std::string window_start_output_;
+    std::string window_end_output_;
     std::unordered_map<std::string, std::map<std::int64_t, WindowBucket>> state_;
     std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
 };
@@ -1295,12 +1302,16 @@ public:
                        std::int64_t gap_ms,
                        std::vector<std::string> group_keys,
                        std::vector<AggSpec> aggregates,
-                       std::vector<std::string> group_key_outputs = {})
+                       std::vector<std::string> group_key_outputs = {},
+                       std::string window_start_output = "window_start",
+                       std::string window_end_output = "window_end")
         : time_column_(std::move(time_column)),
           gap_ms_(gap_ms),
           group_keys_(std::move(group_keys)),
           aggregates_(std::move(aggregates)),
-          group_key_outputs_(std::move(group_key_outputs)) {
+          group_key_outputs_(std::move(group_key_outputs)),
+          window_start_output_(std::move(window_start_output)),
+          window_end_output_(std::move(window_end_output)) {
         if (group_key_outputs_.size() != group_keys_.size()) {
             group_key_outputs_ = group_keys_;  // default: emit each key under its raw name
         }
@@ -1565,9 +1576,9 @@ private:
                     out_row.values[aggregates_[i].output_name] =
                         finalize_agg(it->second.agg_states[i], aggregates_[i]);
                 }
-                out_row.values["window_start"] =
+                out_row.values[window_start_output_] =
                     clink::config::JsonValue{static_cast<std::int64_t>(it->second.start)};
-                out_row.values["window_end"] =
+                out_row.values[window_end_output_] =
                     clink::config::JsonValue{static_cast<std::int64_t>(it->second.end + gap_ms_)};
                 emit_batch.push(Record<Row>{std::move(out_row)});
                 it = by_session.erase(it);
@@ -1582,6 +1593,8 @@ private:
     std::vector<std::string> group_keys_;
     std::vector<AggSpec> aggregates_;
     std::vector<std::string> group_key_outputs_;
+    std::string window_start_output_;
+    std::string window_end_output_;
     std::unordered_map<std::string, std::map<std::int64_t, Session>> state_;
     std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
 };
@@ -4661,6 +4674,8 @@ void install(clink::plugin::PluginRegistry& reg) {
         std::vector<std::string> group_keys = split_csv(ctx.param_or("group_keys", ""));
         std::vector<std::string> group_key_outputs =
             split_csv(ctx.param_or("group_key_outputs", ""));
+        auto window_start_output = ctx.param_or("window_start_output", "window_start");
+        auto window_end_output = ctx.param_or("window_end_output", "window_end");
 
         const auto aggregates_text = ctx.param_or("aggregates", "");
         if (aggregates_text.empty()) {
@@ -4690,7 +4705,9 @@ void install(clink::plugin::PluginRegistry& reg) {
                                              slide_ms,
                                              std::move(group_keys),
                                              std::move(aggregates),
-                                             std::move(group_key_outputs));
+                                             std::move(group_key_outputs),
+                                             std::move(window_start_output),
+                                             std::move(window_end_output));
     };
 
     reg.register_operator<Row, Row>(
@@ -5020,6 +5037,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             std::vector<std::string> group_keys = split_csv(ctx.param_or("group_keys", ""));
             std::vector<std::string> group_key_outputs =
                 split_csv(ctx.param_or("group_key_outputs", ""));
+            auto window_start_output = ctx.param_or("window_start_output", "window_start");
+            auto window_end_output = ctx.param_or("window_end_output", "window_end");
             const auto aggregates_text = ctx.param_or("aggregates", "");
             if (aggregates_text.empty()) {
                 throw std::runtime_error("session_window_row: 'aggregates' param is required");
@@ -5043,7 +5062,9 @@ void install(clink::plugin::PluginRegistry& reg) {
                                                         gap_ms,
                                                         std::move(group_keys),
                                                         std::move(aggregates),
-                                                        std::move(group_key_outputs));
+                                                        std::move(group_key_outputs),
+                                                        std::move(window_start_output),
+                                                        std::move(window_end_output));
         });
 
     // union_row: identity Map for UNION ALL. The OperatorSpec wires

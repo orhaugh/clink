@@ -2842,6 +2842,87 @@ TEST(SqlRuntime, TumbleWindowAggregatesByUserPerSecond) {
     std::filesystem::remove(out_path);
 }
 
+// A windowed GROUP BY can project the synthetic window bounds (window_start /
+// window_end) into the output, honouring a SELECT alias and landing the bounds
+// at the right sink position alongside keys and aggregates.
+TEST(SqlRuntime, TumbleWindowSelectsWindowBounds) {
+    ensure_sql_installed_once();
+
+    const auto in_path =
+        std::filesystem::temp_directory_path() / "clink_sql_e2e_winbounds_in.ndjson";
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_sql_e2e_winbounds_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    // user=1: 3 events in [0,1000) sum=60, 2 events in [1000,2000) sum=300.
+    // user=2: 1 event in each (5, 50).
+    write_lines(in_path,
+                {
+                    R"({"user_id":1,"ts":100,"amount":10})",
+                    R"({"user_id":1,"ts":200,"amount":20})",
+                    R"({"user_id":1,"ts":300,"amount":30})",
+                    R"({"user_id":2,"ts":400,"amount":5})",
+                    R"({"user_id":1,"ts":1100,"amount":100})",
+                    R"({"user_id":1,"ts":1200,"amount":200})",
+                    R"({"user_id":2,"ts":1500,"amount":50})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE events (user_id BIGINT, ts BIGINT, amount BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "', event_time_column='ts');"
+                     "CREATE TABLE per_window (user_id BIGINT, total BIGINT, wstart BIGINT, "
+                     "wend BIGINT) WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    // window_start/window_end are aliased and interleaved with the aggregate.
+    auto spec = compile(cat,
+                        "INSERT INTO per_window "
+                        "SELECT user_id, SUM(amount) AS total, window_start AS wstart, "
+                        "window_end AS wend FROM events GROUP BY TUMBLE(ts, 1000), user_id");
+
+    InProcessCluster cluster("tm-sql-e2e-winbounds", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    // Each output row carries (user_id, total, wstart, wend) under the aliases.
+    auto lines = read_lines(out_path);
+    struct Row {
+        std::int64_t total, ws, we;
+    };
+    std::multimap<std::int64_t, Row> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("user_id").as_number()),
+                    Row{static_cast<std::int64_t>(js.at("total").as_number()),
+                        static_cast<std::int64_t>(js.at("wstart").as_number()),
+                        static_cast<std::int64_t>(js.at("wend").as_number())});
+    }
+    auto contains = [&](std::int64_t uid, std::int64_t total, std::int64_t ws, std::int64_t we) {
+        auto range = got.equal_range(uid);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second.total == total && it->second.ws == ws && it->second.we == we)
+                return true;
+        }
+        return false;
+    };
+    EXPECT_TRUE(contains(1, 60, 0, 1000)) << "user=1 [0,1000) total=60 missing";
+    EXPECT_TRUE(contains(1, 300, 1000, 2000)) << "user=1 [1000,2000) total=300 missing";
+    EXPECT_TRUE(contains(2, 5, 0, 1000)) << "user=2 [0,1000) total=5 missing";
+    EXPECT_TRUE(contains(2, 50, 1000, 2000)) << "user=2 [1000,2000) total=50 missing";
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // SQLOPT-4 (arm the projection hint): the same TUMBLE query over an OVER-WIDE
 // source (extra columns the query never references) must produce identical
 // windows. This proves the source actually drops the unreferenced columns

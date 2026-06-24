@@ -95,13 +95,17 @@ LogicalWindowAggregate::LogicalWindowAggregate(std::unique_ptr<LogicalPlan> inpu
                                                std::vector<std::string> group_keys,
                                                std::vector<AggregateOutput> aggregates,
                                                std::shared_ptr<arrow::Schema> schema,
-                                               std::vector<std::string> key_output_names)
+                                               std::vector<std::string> key_output_names,
+                                               std::string window_start_output,
+                                               std::string window_end_output)
     : input_(std::move(input)),
       window_(std::move(window)),
       group_keys_(std::move(group_keys)),
       aggregates_(std::move(aggregates)),
       schema_(std::move(schema)),
-      key_output_names_(std::move(key_output_names)) {}
+      key_output_names_(std::move(key_output_names)),
+      window_start_output_(std::move(window_start_output)),
+      window_end_output_(std::move(window_end_output)) {}
 
 // --- LogicalIntervalJoin -------------------------------------------
 

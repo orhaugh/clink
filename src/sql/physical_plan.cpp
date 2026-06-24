@@ -912,6 +912,14 @@ std::string compile_node(const LogicalPlan& node,
             op.params["group_key_outputs"] = std::move(key_outs_csv);
         }
 
+        // window_start_output / window_end_output: the output column name for
+        // each projected window bound (so SELECT window_start AS st emits "st").
+        // Absent => the runtime emits the bound under its literal name.
+        if (!agg.window_start_output().empty())
+            op.params["window_start_output"] = agg.window_start_output();
+        if (!agg.window_end_output().empty())
+            op.params["window_end_output"] = agg.window_end_output();
+
         // aggregates: JSON array of {name, fn, input_column}.
         clink::config::JsonArray arr;
         for (const auto& a : agg.aggregates()) {

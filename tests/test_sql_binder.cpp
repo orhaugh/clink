@@ -660,6 +660,65 @@ TEST(SqlBinder, NonGroupedColumnInSelectRejected) {
                  TranslationError);
 }
 
+TEST(SqlBinder, WindowBoundsSelectableInWindowedAggregate) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    auto plan = b.bind_select(
+        as_select(parse("SELECT url, COUNT(*) AS n, window_start AS ws, window_end AS we "
+                        "FROM clicks GROUP BY TUMBLE(ts, 1000), url")));
+    const auto& agg = static_cast<const LogicalWindowAggregate&>(*plan);
+    // The output schema carries the two bounds as BIGINT under their SELECT
+    // aliases, interleaved in SELECT order.
+    auto schema = agg.schema();
+    ASSERT_EQ(schema->num_fields(), 4);
+    EXPECT_EQ(schema->field(0)->name(), "url");
+    EXPECT_EQ(schema->field(1)->name(), "n");
+    EXPECT_EQ(schema->field(2)->name(), "ws");
+    EXPECT_EQ(schema->field(3)->name(), "we");
+    EXPECT_TRUE(schema->field(2)->type()->Equals(*arrow::int64()));
+    EXPECT_TRUE(schema->field(3)->type()->Equals(*arrow::int64()));
+    // The runtime op is told to emit each bound under its alias.
+    EXPECT_EQ(agg.window_start_output(), "ws");
+    EXPECT_EQ(agg.window_end_output(), "we");
+}
+
+TEST(SqlBinder, WindowBoundsSelectableBareName) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    auto plan =
+        b.bind_select(as_select(parse("SELECT window_start, window_end, COUNT(*) AS n "
+                                      "FROM clicks GROUP BY SESSION(ts, 500), url")));
+    const auto& agg = static_cast<const LogicalWindowAggregate&>(*plan);
+    auto schema = agg.schema();
+    ASSERT_EQ(schema->num_fields(), 3);
+    EXPECT_EQ(schema->field(0)->name(), "window_start");
+    EXPECT_EQ(schema->field(1)->name(), "window_end");
+    EXPECT_EQ(agg.window_start_output(), "window_start");
+    EXPECT_EQ(agg.window_end_output(), "window_end");
+}
+
+TEST(SqlBinder, WindowBoundsRejectedWithoutWindowTVF) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    // A plain (non-windowed) GROUP BY has no window bounds to project.
+    EXPECT_THROW(b.bind_select(as_select(
+                     parse("SELECT url, window_start, COUNT(*) AS n FROM clicks GROUP BY url"))),
+                 TranslationError);
+}
+
+TEST(SqlBinder, WindowBoundProjectedTwiceRejected) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    EXPECT_THROW(
+        b.bind_select(as_select(parse("SELECT window_start AS a, window_start AS b, COUNT(*) AS n "
+                                      "FROM clicks GROUP BY TUMBLE(ts, 1000), url"))),
+        TranslationError);
+}
+
 TEST(SqlBinder, TumbleAcceptsIntervalSyntax) {
     Catalog cat;
     register_clicks(cat);

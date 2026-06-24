@@ -60,6 +60,13 @@ struct GroupOutputColumn {
     std::size_t agg_index = 0;      // when is_aggregate: index into `aggregates`
     std::string key_source_column;  // when !is_aggregate: column name in `source`
     std::string key_output_name;    // when !is_aggregate: output field name
+    // A windowed GROUP BY may also project the synthetic window bounds. When
+    // is_window_bound, this column is window_start (window_is_end=false) or
+    // window_end (window_is_end=true), emitted as BIGINT under key_output_name
+    // (honouring a SELECT alias). key_source_column carries the literal runtime
+    // column name ("window_start"/"window_end").
+    bool is_window_bound = false;
+    bool window_is_end = false;
 };
 
 // Assemble the Arrow output schema of a GROUP BY / aggregate in `columns`

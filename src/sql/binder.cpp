@@ -3286,8 +3286,17 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             agg_target_indices.emplace_back(i, aggregates.back().output_name);
         } else if (std::holds_alternative<ast::ColumnRef>(item.expr) &&
                    !std::get<ast::ColumnRef>(item.expr).is_star) {
-            key_target_indices.emplace_back(
-                i, resolve_value_column_name(std::get<ast::ColumnRef>(item.expr), source, alias));
+            const auto& cr = std::get<ast::ColumnRef>(item.expr);
+            // window_start / window_end are synthetic columns a windowed GROUP BY
+            // emits; they are not source columns, so don't resolve them here (the
+            // resolver would throw "column not found"). Carry the literal name and
+            // let the validation below gate them on a window TVF being present.
+            if (cr.parts.size() == 1 &&
+                (cr.parts[0] == "window_start" || cr.parts[0] == "window_end")) {
+                key_target_indices.emplace_back(i, cr.parts[0]);
+            } else {
+                key_target_indices.emplace_back(i, resolve_value_column_name(cr, source, alias));
+            }
         }
     }
 
@@ -3359,10 +3368,19 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
     // aggregate Row per input record (upsert mode). The output below
     // branches on whether a window was supplied.
 
-    // Validate: every non-aggregate SELECT item must be either a
-    // group key or window_start / window_end (the latter two land in
-    // a follow-up; reject for now).
+    // Validate: every non-aggregate SELECT item must be either a group key or,
+    // in a windowed GROUP BY, one of the synthetic window bounds window_start /
+    // window_end.
     for (auto& [idx, col] : key_target_indices) {
+        if (col == "window_start" || col == "window_end") {
+            if (!window.has_value()) {
+                bind_error("column " + col +
+                               " is only available with a window TVF in GROUP BY "
+                               "(TUMBLE / HOP / SESSION / CUMULATE)",
+                           stmt.target_list[idx].loc.pos);
+            }
+            continue;
+        }
         bool ok = false;
         for (const auto& gk : group_keys) {
             if (gk == col) {
@@ -3398,10 +3416,32 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             c.agg_index = *agg_idx;
         } else {
             const auto& cr = std::get<ast::ColumnRef>(item.expr);
-            c.key_source_column = resolve_value_column_name(cr, source, alias);
-            c.key_output_name = item.alias.value_or(c.key_source_column);
+            if (cr.parts.size() == 1 &&
+                (cr.parts[0] == "window_start" || cr.parts[0] == "window_end")) {
+                c.is_window_bound = true;
+                c.window_is_end = (cr.parts[0] == "window_end");
+                c.key_source_column = cr.parts[0];  // literal runtime column name
+                c.key_output_name = item.alias.value_or(cr.parts[0]);
+            } else {
+                c.key_source_column = resolve_value_column_name(cr, source, alias);
+                c.key_output_name = item.alias.value_or(c.key_source_column);
+            }
         }
         out_columns.push_back(std::move(c));
+    }
+    // The runtime emits exactly one window_start and one window_end column, so
+    // each bound can be projected at most once (a second alias would have no
+    // backing value in the emitted Row).
+    {
+        int n_start = 0, n_end = 0;
+        for (const auto& c : out_columns) {
+            if (c.is_window_bound)
+                (c.window_is_end ? n_end : n_start)++;
+        }
+        if (n_start > 1 || n_end > 1) {
+            bind_error("window_start / window_end may each be projected at most once",
+                       stmt.loc.pos);
+        }
     }
 
     std::unique_ptr<LogicalPlan> scan_or_filter = make_table_plan(ref.name, source, ref.loc.pos);
@@ -3437,12 +3477,20 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
     for (const auto& gk : group_keys) {
         std::string out_name = gk;
         for (const auto& c : out_columns) {
-            if (!c.is_aggregate && c.key_source_column == gk) {
+            if (!c.is_aggregate && !c.is_window_bound && c.key_source_column == gk) {
                 out_name = c.key_output_name;
                 break;
             }
         }
         key_output_names.push_back(std::move(out_name));
+    }
+    // Output names for the projected window bounds (empty when not selected), so
+    // the runtime op emits each bound under its SELECT alias.
+    std::string window_start_output, window_end_output;
+    for (const auto& c : out_columns) {
+        if (c.is_window_bound) {
+            (c.window_is_end ? window_end_output : window_start_output) = c.key_output_name;
+        }
     }
     std::unique_ptr<LogicalPlan> agg_plan;
     if (window.has_value()) {
@@ -3451,7 +3499,9 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
                                                             group_keys,
                                                             aggregates,
                                                             out_schema,
-                                                            key_output_names);
+                                                            key_output_names,
+                                                            window_start_output,
+                                                            window_end_output);
     } else {
         agg_plan = std::make_unique<LogicalAggregate>(
             std::move(scan_or_filter), group_keys, aggregates, out_schema, key_output_names);
@@ -3698,6 +3748,10 @@ std::shared_ptr<arrow::Schema> build_group_output_schema(
         if (c.is_aggregate) {
             const auto& agg = aggregates.at(c.agg_index);
             fields.push_back(arrow::field(agg.output_name, agg.type));
+        } else if (c.is_window_bound) {
+            // Synthetic window bounds (window_start / window_end) are ms-since-
+            // epoch BIGINT, emitted by the runtime window op under key_output_name.
+            fields.push_back(arrow::field(c.key_output_name, arrow::int64()));
         } else {
             std::shared_ptr<arrow::DataType> col_type;
             for (const auto& sc : source.columns) {

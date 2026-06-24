@@ -237,7 +237,9 @@ public:
                            std::vector<std::string> group_keys,
                            std::vector<AggregateOutput> aggregates,
                            std::shared_ptr<arrow::Schema> schema,
-                           std::vector<std::string> key_output_names = {});
+                           std::vector<std::string> key_output_names = {},
+                           std::string window_start_output = {},
+                           std::string window_end_output = {});
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
     [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
@@ -249,6 +251,15 @@ public:
     // LogicalAggregate::key_output_names().
     [[nodiscard]] const std::vector<std::string>& key_output_names() const noexcept {
         return key_output_names_;
+    }
+    // Output column names for the projected window bounds (empty when the
+    // SELECT does not project that bound). The runtime window op emits the
+    // bound under this name so a SELECT alias is honoured.
+    [[nodiscard]] const std::string& window_start_output() const noexcept {
+        return window_start_output_;
+    }
+    [[nodiscard]] const std::string& window_end_output() const noexcept {
+        return window_end_output_;
     }
     [[nodiscard]] const std::vector<AggregateOutput>& aggregates() const noexcept {
         return aggregates_;
@@ -265,6 +276,8 @@ private:
     std::vector<AggregateOutput> aggregates_;
     std::shared_ptr<arrow::Schema> schema_;
     std::vector<std::string> key_output_names_;
+    std::string window_start_output_;
+    std::string window_end_output_;
 };
 
 // #61 phase 2: MATCH_RECOGNIZE row-pattern matching, lowered onto the CEP
