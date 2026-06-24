@@ -835,7 +835,13 @@ clink::config::JsonValue lower_predicate(const ast::Expression& expr, const Tabl
         JsonObject obj;
         obj["op"] = JsonValue{std::string{bin_op_to_predicate_op(bin.op)}};
         obj["col"] = JsonValue{resolve_column_name(bin.left, source)};
-        obj["literal"] = literal_to_json(bin.right);
+        // The RHS is a literal, or another column of the same row
+        // (column-vs-column, e.g. a post-join residual a.x >= b.y).
+        if (std::holds_alternative<ast::ColumnRef>(bin.right)) {
+            obj["rhs_col"] = JsonValue{resolve_column_name(bin.right, source)};
+        } else {
+            obj["literal"] = literal_to_json(bin.right);
+        }
         return JsonValue{std::move(obj)};
     }
     if (std::holds_alternative<std::unique_ptr<ast::LogicalOp>>(expr)) {

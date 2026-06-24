@@ -23,6 +23,8 @@
 //
 //   {"op": "eq"|"ne"|"lt"|"le"|"gt"|"ge", "col": "<name>",
 //    "literal": <JsonValue>}             literal carries its type
+//   {"op": "eq"|"ne"|"lt"|"le"|"gt"|"ge", "col": "<name>",
+//    "rhs_col": "<name>"}                compare two columns of the same row
 //   {"op": "like", "col": "<name>", "pattern": "<sql-like>"}
 //   {"op": "is_null"|"is_not_null", "col": "<name>"}      always 2-val
 //   {"op": "and"|"or", "args": [<pred>, ...]}
@@ -268,15 +270,21 @@ TriBool evaluate_json_predicate_tri(const clink::config::JsonValue& pred, Resolv
         }
         return saw_null ? TriBool::Unknown : TriBool::False;
     }
-    // Comparison: typed-aware. NULL on either side -> Unknown.
-    if (!pred.contains("literal")) {
-        throw std::runtime_error("json_predicate: '" + op + "' needs 'literal'");
-    }
+    // Comparison: typed-aware. The RHS is a literal value or another column of
+    // the same row (column-vs-column, e.g. a post-join residual a.x >= b.y).
+    // NULL on either side -> Unknown.
     auto col_val = resolve(pred.at("col").as_string());
-    const auto& lit_val = pred.at("literal");
-    if (col_val.is_null() || lit_val.is_null())
+    clink::config::JsonValue rhs_val;
+    if (pred.contains("rhs_col")) {
+        rhs_val = resolve(pred.at("rhs_col").as_string());
+    } else if (pred.contains("literal")) {
+        rhs_val = pred.at("literal");
+    } else {
+        throw std::runtime_error("json_predicate: '" + op + "' needs 'literal' or 'rhs_col'");
+    }
+    if (col_val.is_null() || rhs_val.is_null())
         return TriBool::Unknown;
-    auto cmp = detail::compare(col_val, lit_val);
+    auto cmp = detail::compare(col_val, rhs_val);
     if (!cmp.has_value())
         return TriBool::Unknown;
     if (op == "eq")

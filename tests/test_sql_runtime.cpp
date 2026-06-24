@@ -2923,6 +2923,193 @@ TEST(SqlRuntime, TumbleWindowSelectsWindowBounds) {
     std::filesystem::remove(out_path);
 }
 
+// A WHERE predicate can compare two columns of the same row (not just a column
+// to a literal).
+TEST(SqlRuntime, WhereComparesTwoColumns) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_colcmp_in.ndjson";
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_sql_e2e_colcmp_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    // Keep rows where a >= b: (5,3) and (4,4); drop (1,2) and (2,8).
+    write_lines(in_path,
+                {
+                    R"({"a":1,"b":2})",
+                    R"({"a":5,"b":3})",
+                    R"({"a":4,"b":4})",
+                    R"({"a":2,"b":8})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE pairs (a BIGINT, b BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE kept (a BIGINT, b BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat, "INSERT INTO kept SELECT a, b FROM pairs WHERE a >= b");
+
+    InProcessCluster cluster("tm-sql-e2e-colcmp", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::set<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("a").as_number()),
+                    static_cast<std::int64_t>(js.at("b").as_number()));
+    }
+    EXPECT_EQ(got.size(), 2u);
+    EXPECT_TRUE(got.count({5, 3}) == 1) << "(5,3) a>=b missing";
+    EXPECT_TRUE(got.count({4, 4}) == 1) << "(4,4) a>=b (eq) missing";
+    EXPECT_TRUE(got.count({1, 2}) == 0) << "(1,2) a<b wrongly kept";
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
+// Nexmark-q7 shape: the highest-priced bid(s) per window. A windowed MAX is a
+// join side (equi on price), and a column-vs-column range residual keeps only the
+// bid whose time falls in that window - rejecting cross-window false matches
+// (two windows share max price 70; each bid must bind to its OWN window).
+TEST(SqlRuntime, HighestBidPerWindowJoinWithRangeResidual) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q7_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q7_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    // win [0,1000): max price 70 (bidder 6 @ ts 400). win [1000,2000): max 70 (bidder 4 @ ts 1100).
+    write_lines(in_path,
+                {
+                    R"({"price":10,"bidder":1,"ts":100})",
+                    R"({"price":50,"bidder":2,"ts":200})",
+                    R"({"price":70,"bidder":6,"ts":400})",
+                    R"({"price":70,"bidder":4,"ts":1100})",
+                    R"({"price":20,"bidder":5,"ts":1200})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE bids (price BIGINT, bidder BIGINT, ts BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "', event_time_column='ts');"
+                     "CREATE TABLE hot (price BIGINT, bidder BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(
+        cat,
+        "INSERT INTO hot SELECT b_price AS price, b_bidder AS bidder FROM bids AS B "
+        "JOIN (SELECT MAX(price) AS maxprice, window_start AS ws, window_end AS we FROM bids "
+        "GROUP BY TUMBLE(ts, 1000)) AS M ON B.price = M.maxprice "
+        "WHERE b_ts >= m_ws AND b_ts < m_we");
+
+    InProcessCluster cluster("tm-sql-e2e-q7", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 20s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::multiset<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("price").as_number()),
+                    static_cast<std::int64_t>(js.at("bidder").as_number()));
+    }
+    // Exactly the two per-window winners; the range residual rejects the 2
+    // cross-window false matches that the equi-join alone would produce.
+    EXPECT_EQ(got.size(), 2u);
+    EXPECT_EQ(got.count({70, 6}), 1u) << "window [0,1000) winner bidder 6 missing";
+    EXPECT_EQ(got.count({70, 4}), 1u) << "window [1000,2000) winner bidder 4 missing";
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
+// Nexmark-q8 shape: persons + auctions created in the SAME tumbling window,
+// joined on seller=id. TWO windowed-aggregate join sides, equi on the key plus a
+// column-vs-column window-equality residual that matches same-window pairs and
+// rejects cross-window ones.
+TEST(SqlRuntime, NewUsersTwoWindowedAggregateJoinSides) {
+    ensure_sql_installed_once();
+
+    const auto p_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q8_p.ndjson";
+    const auto a_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q8_a.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q8_out.ndjson";
+    for (const auto& f : {p_path, a_path, out_path})
+        std::filesystem::remove(f);
+
+    // person 1 created in win[0,1000); person 2 in win[1000,2000).
+    write_lines(p_path, {R"({"id":1,"ts":100})", R"({"id":2,"ts":1100})"});
+    // seller 1 has auctions in BOTH windows; seller 2's auction is in win[0,1000)
+    // (a different window than person 2). So only person 1 matches (same window).
+    write_lines(
+        a_path,
+        {R"({"seller":1,"ts":200})", R"({"seller":1,"ts":1200})", R"({"seller":2,"ts":300})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE persons (id BIGINT, ts BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     p_path.string() +
+                     "', event_time_column='ts');"
+                     "CREATE TABLE auctions (seller BIGINT, ts BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     a_path.string() +
+                     "', event_time_column='ts');"
+                     "CREATE TABLE newusers (id BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    for (int i = 0; i < 3; ++i)
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[i]));
+
+    auto spec = compile(
+        cat,
+        "INSERT INTO newusers SELECT P_id AS id FROM "
+        "(SELECT id, COUNT(*) AS pc, window_start AS ps, window_end AS pe FROM persons "
+        "GROUP BY TUMBLE(ts, 1000), id) AS P "
+        "JOIN (SELECT seller, COUNT(*) AS ac, window_start AS as_, window_end AS ae FROM auctions "
+        "GROUP BY TUMBLE(ts, 1000), seller) AS A ON P.id = A.seller "
+        "WHERE P_ps = A_as_ AND P_pe = A_ae");
+
+    InProcessCluster cluster("tm-sql-e2e-q8", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 20s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::multiset<std::int64_t> got;
+    for (const auto& l : lines)
+        got.insert(static_cast<std::int64_t>(clink::config::parse(l).at("id").as_number()));
+    // Only person 1 created an auction in their OWN window; person 2 did not.
+    EXPECT_EQ(got.count(1), 1u) << "person 1 (same-window auction) missing";
+    EXPECT_EQ(got.count(2), 0u) << "person 2 (cross-window only) wrongly present";
+
+    for (const auto& f : {p_path, a_path, out_path})
+        std::filesystem::remove(f);
+}
+
 // A derived table (here a windowed aggregate) can be a JOIN side: enrich a base
 // stream with a per-key windowed total. Proves the binder accepts a subquery as a
 // multi-way-join input and the runtime joins it like a base table.

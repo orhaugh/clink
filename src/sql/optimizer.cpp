@@ -42,9 +42,13 @@ void collect_columns(const clink::config::JsonValue& expr, std::set<std::string>
     if (auto it = obj.find("col"); it != obj.end() && it->second.is_string()) {
         out.insert(it->second.as_string());
     }
+    // A column-vs-column comparison carries its RHS column under "rhs_col".
+    if (auto it = obj.find("rhs_col"); it != obj.end() && it->second.is_string()) {
+        out.insert(it->second.as_string());
+    }
     for (const auto& [key, value] : obj) {
-        if (key == "col") {
-            continue;  // a leaf column name, already captured above
+        if (key == "col" || key == "rhs_col") {
+            continue;  // leaf column names, already captured above
         }
         collect_columns(value, out);
     }
@@ -333,7 +337,7 @@ clink::config::JsonValue rewrite_cols(const clink::config::JsonValue& node,
     }
     clink::config::JsonObject out;
     for (const auto& [k, v] : node.as_object()) {
-        if (k == "col" && v.is_string()) {
+        if ((k == "col" || k == "rhs_col") && v.is_string()) {
             const auto& s = v.as_string();
             out[k] = (s.size() > prefix.size() && s.compare(0, prefix.size(), prefix) == 0)
                          ? clink::config::JsonValue{s.substr(prefix.size())}
