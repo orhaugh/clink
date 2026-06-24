@@ -141,6 +141,14 @@ public:
     // persistence dir is set, removes <dir>/<name>.json too.
     bool drop_table(const std::string& name);
 
+    // ANALYZE write-back: merge computed statistics (the row_count / ndv_<col> /
+    // nulls_<col> / hist_<col> / mcv_<col> WITH-option keys) into table `name`'s
+    // properties, overwriting any prior value for those keys (last-write-wins,
+    // matching the WITH-clause semantics). Returns false if the table is
+    // unknown. Re-persists the table when a persistence dir is set.
+    bool merge_table_stats(const std::string& name,
+                           const std::map<std::string, std::string>& stats);
+
     // Lookup. Returns nullptr if not found.
     [[nodiscard]] const TableDef* get_table(const std::string& name) const;
 

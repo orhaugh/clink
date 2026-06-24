@@ -23,9 +23,13 @@
 #include <string_view>
 #include <variant>
 
+#include "clink/cluster/built_in_factories.hpp"
 #include "clink/http/http_client.hpp"
+#include "clink/plugin/plugin.hpp"
+#include "clink/sql/analyze.hpp"
 #include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
+#include "clink/sql/install.hpp"
 #include "clink/sql/materialized_view.hpp"
 #include "clink/sql/optimizer.hpp"
 #include "clink/sql/parser.hpp"
@@ -155,6 +159,19 @@ int main(int argc, char** argv) {
     try {
         auto script = clink::sql::parse(sql);
         bool produced_spec = false;
+        // Lazily register the SQL operator/source factories into the host
+        // registry (default_instance) so ANALYZE's in-process scan can build the
+        // table's Row source. Once per process; the registrations outlive the
+        // temporary PluginRegistry (which binds to OperatorRegistry::default).
+        auto ensure_local_ops_installed = [installed = false]() mutable {
+            if (installed) {
+                return;
+            }
+            installed = true;
+            clink::cluster::ensure_built_ins_registered();
+            clink::plugin::PluginRegistry reg;
+            clink::sql::install(reg);
+        };
         // Submit a compiled JobGraphSpec to the JM (or print it when no JM host
         // is configured). Shared by the INSERT and CREATE MATERIALIZED VIEW
         // paths. Returns 0 on success, non-zero on a transport / JM error.
@@ -245,6 +262,21 @@ int main(int argc, char** argv) {
                 for (const auto& name : names) {
                     std::cout << name << "\n";
                 }
+                continue;
+            }
+            if (std::holds_alternative<clink::sql::ast::AnalyzeStmt>(stmt)) {
+                // ANALYZE runs a local in-process bounded scan, so the SQL source
+                // factories must be registered here (the submit tool otherwise
+                // only builds specs for the JM). Install once, lazily.
+                ensure_local_ops_installed();
+                const auto& an = std::get<clink::sql::ast::AnalyzeStmt>(stmt);
+                try {
+                    clink::sql::analyze_table(catalog, an.table, an.columns);
+                } catch (const std::exception& e) {
+                    std::cerr << "error: ANALYZE " << an.table << ": " << e.what() << "\n";
+                    return 1;
+                }
+                std::cout << "analyzed " << an.table << "\n";
                 continue;
             }
             if (std::holds_alternative<clink::sql::ast::InsertStmt>(stmt)) {

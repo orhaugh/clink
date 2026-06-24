@@ -431,6 +431,7 @@ if(CLINK_BUILD_SQL)
         src/sql/physical_plan.cpp
         src/sql/materialized_view.cpp
         src/sql/optimizer.cpp
+        src/sql/analyze.cpp
         src/sql/install.cpp
         src/sql/async_function_registry.cpp
         src/sql/table_api.cpp

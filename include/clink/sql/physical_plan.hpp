@@ -1,8 +1,10 @@
 #pragma once
 
+#include <map>
 #include <string>
 
 #include "clink/cluster/job_graph.hpp"
+#include "clink/sql/catalog.hpp"
 #include "clink/sql/logical_plan.hpp"
 
 // Physical planner: LogicalPlan -> clink::cluster::JobGraphSpec.
@@ -57,5 +59,16 @@ public:
 private:
     bool async_state_for_aggregation_ = false;
 };
+
+// The Row-channel source factory + build params to scan `table` in process (for
+// ANALYZE, via the SourceFactory registry + LocalExecutor). Mirrors the scan
+// source the planner emits for a Row-channel table. Throws TranslationError if
+// the table is not a direct bounded Row source - e.g. a kafka/string-channel
+// source that needs a string->row bridge (and is unbounded).
+struct ScanSourceSpec {
+    std::string type;                           // source factory name
+    std::map<std::string, std::string> params;  // OperatorBuildContext params
+};
+[[nodiscard]] ScanSourceSpec row_scan_source_spec(const TableDef& table);
 
 }  // namespace clink::sql

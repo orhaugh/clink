@@ -1458,6 +1458,45 @@ ast::CreateMaterializedViewStmt translate_matview_stmt(const JsonValue& body) {
     return stmt;
 }
 
+// ANALYZE [<col>...] <table> parses as a PG VacuumStmt. We support the ANALYZE
+// form on a single table; VACUUM has no clink meaning and is rejected. The
+// optional `TABLE` keyword in the Flink-style spelling is stripped by the
+// pre-parser before this point.
+ast::AnalyzeStmt translate_vacuum_stmt(const JsonValue& body) {
+    ast::AnalyzeStmt stmt;
+    stmt.loc = loc_from(body);
+    if (body.contains("is_vacuumcmd") && body.at("is_vacuumcmd").is_bool() &&
+        body.at("is_vacuumcmd").as_bool()) {
+        unsupported("VACUUM is not supported; use ANALYZE <table>", stmt.loc.pos);
+    }
+    if (!body.contains("rels") || !body.at("rels").is_array() ||
+        body.at("rels").as_array().empty()) {
+        unsupported("ANALYZE requires a table name", stmt.loc.pos);
+    }
+    const auto& rels = body.at("rels").as_array();
+    if (rels.size() != 1) {
+        unsupported("ANALYZE supports a single table in v1", stmt.loc.pos);
+    }
+    auto [vk, vbody] = node_wrapper(rels[0]);
+    if (vk != "VacuumRelation" || vbody == nullptr) {
+        unsupported("ANALYZE: expected a VacuumRelation, got " + vk, stmt.loc.pos);
+    }
+    if (!vbody->contains("relation") || !vbody->at("relation").is_object()) {
+        unsupported("ANALYZE: missing relation", stmt.loc.pos);
+    }
+    const auto& rel = vbody->at("relation");
+    if (!rel.contains("relname") || !rel.at("relname").is_string()) {
+        unsupported("ANALYZE: relation missing relname", stmt.loc.pos);
+    }
+    stmt.table = rel.at("relname").as_string();
+    if (vbody->contains("va_cols") && vbody->at("va_cols").is_array()) {
+        for (const auto& c : vbody->at("va_cols").as_array()) {
+            stmt.columns.push_back(string_atom(c));
+        }
+    }
+    return stmt;
+}
+
 ast::Statement translate_statement(const JsonValue& outer_stmt) {
     if (!outer_stmt.is_object() || !outer_stmt.contains("stmt")) {
         unsupported("missing stmt wrapper", 0);
@@ -1480,6 +1519,9 @@ ast::Statement translate_statement(const JsonValue& outer_stmt) {
     }
     if (kind == "VariableShowStmt") {
         return ast::Statement{translate_show_stmt(*body)};
+    }
+    if (kind == "VacuumStmt") {
+        return ast::Statement{translate_vacuum_stmt(*body)};
     }
     if (kind == "ExplainStmt") {
         if (!body->contains("query")) {

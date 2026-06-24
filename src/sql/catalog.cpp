@@ -91,6 +91,22 @@ void Catalog::register_table(TableDef def) {
     order_.push_back(std::move(name));
 }
 
+bool Catalog::merge_table_stats(const std::string& name,
+                                const std::map<std::string, std::string>& stats) {
+    auto it = tables_.find(name);
+    if (it == tables_.end()) {
+        return false;
+    }
+    for (const auto& [k, v] : stats) {
+        it->second.properties[k] = v;  // overwrite any prior stat value
+    }
+    if (!persistence_dir_.empty()) {
+        fs::create_directories(persistence_dir_);
+        write_file_atomic(table_json_path(persistence_dir_, name), to_json(it->second));
+    }
+    return true;
+}
+
 void Catalog::register_table(const ast::CreateTableStmt& stmt) {
     // CREATE TABLE IF NOT EXISTS: a no-op when the table is already
     // registered (matches PG - the existing definition is kept).

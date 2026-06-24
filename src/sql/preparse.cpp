@@ -1033,12 +1033,61 @@ std::string rewrite_composite_types(std::string_view sql,
 
 }  // namespace
 
+// The Flink/Spark spelling `ANALYZE TABLE <name>` is not PG-grammatical (PG is
+// `ANALYZE <name>`), so drop the optional `TABLE` keyword right after a
+// statement-leading `ANALYZE`. Statement-boundary-aware (only at input start or
+// after a top-level ';') and string/comment-safe, so a literal containing
+// "ANALYZE TABLE" is untouched.
+std::string strip_analyze_table_keyword(std::string_view sql) {
+    std::string out;
+    out.reserve(sql.size());
+    std::size_t i = 0;
+    bool stmt_start = true;
+    while (i < sql.size()) {
+        if (stmt_start) {
+            const std::size_t k = skip_ws(sql, i);  // leading ws + comments
+            out.append(sql.substr(i, k - i));
+            i = k;
+            if (i >= sql.size()) {
+                break;
+            }
+            if (word_at(sql, i, "analyze")) {
+                out.append(sql.substr(i, 7));  // copy "analyze" verbatim (any case)
+                i += 7;
+                const std::size_t a = skip_ws(sql, i);
+                if (word_at(sql, a, "table")) {
+                    out.append(sql.substr(i, a - i));  // ws/comments between the keywords
+                    out.push_back(' ');                // keep a name separator
+                    i = a + 5;                         // drop "table"
+                }
+            }
+            stmt_start = false;
+            continue;
+        }
+        const std::size_t q = skip_quote_or_comment(sql, i);
+        if (q != i) {  // a string/comment: copy verbatim
+            out.append(sql.substr(i, q - i));
+            i = q;
+            continue;
+        }
+        const char c = sql[i];
+        out.push_back(c);
+        ++i;
+        if (c == ';') {
+            stmt_start = true;
+        }
+    }
+    return out;
+}
+
 PreparseResult preparse(std::string_view sql) {
     PreparseResult res;
     // Rewrite the FROM-clause islands PG cannot grammar-parse to placeholder
     // table refs (MATCH_RECOGNIZE, then process-table-function), then rewrite
-    // composite-type islands on the result. The three are independent.
-    const std::string mr_sql = rewrite_match_recognize(sql, res.match_recognize);
+    // composite-type islands on the result. The three are independent. The
+    // ANALYZE-TABLE keyword strip runs first (a leading-statement rewrite).
+    const std::string an_sql = strip_analyze_table_keyword(sql);
+    const std::string mr_sql = rewrite_match_recognize(an_sql, res.match_recognize);
     const std::string ptf_sql = rewrite_table_functions(mr_sql, res.table_functions);
     res.rewritten_sql = rewrite_composite_types(ptf_sql, res.composite_types);
     return res;

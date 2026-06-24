@@ -187,4 +187,17 @@ private:
     std::vector<Col> per_;
 };
 
+class Catalog;
+
+// Execute ANALYZE: scan the bounded table `name` (its Row source, built in
+// process via OperatorRegistry::default_instance() + LocalExecutor), compute
+// exact column statistics with a StatsCollector, and write them into `catalog`
+// so the optimizer's selectivity estimator picks them up. `columns` empty means
+// all of the table's columns. Throws TranslationError when the table is unknown,
+// is not a bounded Row source (e.g. a Kafka string stream), or its source
+// factory is not registered (connector impl not linked).
+void analyze_table(Catalog& catalog,
+                   const std::string& name,
+                   const std::vector<std::string>& columns = {});
+
 }  // namespace clink::sql

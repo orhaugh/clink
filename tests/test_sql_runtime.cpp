@@ -40,8 +40,10 @@
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/job_config.hpp"
 #include "clink/runtime/local_executor.hpp"
+#include "clink/sql/analyze.hpp"
 #include "clink/sql/async_function_registry.hpp"
 #include "clink/sql/binder.hpp"
+#include "clink/sql/cardinality.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/install.hpp"
 #include "clink/sql/materialized_view.hpp"
@@ -6644,6 +6646,77 @@ TEST(SqlRuntime, AsyncStateGroupByMatchesInMemory) {
 
     for (const auto& p : {in_path, sync_out, async_out})
         std::filesystem::remove(p);
+}
+
+// ANALYZE parses (both the PG `ANALYZE t` and the Flink-style `ANALYZE TABLE t`,
+// the latter via the pre-parser strip), carrying the table + optional columns.
+TEST(SqlAnalyzeStmt, ParsesTableAndColumns) {
+    auto s1 = parse("ANALYZE TABLE orders");
+    ASSERT_EQ(s1.statements.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<ast::AnalyzeStmt>(s1.statements[0]));
+    EXPECT_EQ(std::get<ast::AnalyzeStmt>(s1.statements[0]).table, "orders");
+    EXPECT_TRUE(std::get<ast::AnalyzeStmt>(s1.statements[0]).columns.empty());
+
+    auto s2 = parse("ANALYZE orders (amount)");  // PG spelling + a column list
+    ASSERT_TRUE(std::holds_alternative<ast::AnalyzeStmt>(s2.statements[0]));
+    const auto& a = std::get<ast::AnalyzeStmt>(s2.statements[0]);
+    EXPECT_EQ(a.table, "orders");
+    ASSERT_EQ(a.columns.size(), 1u);
+    EXPECT_EQ(a.columns[0], "amount");
+}
+
+// End to end: ANALYZE scans a bounded file/json table, writes exact statistics
+// into the catalog, and those stats drive the optimizer's selectivity estimate.
+TEST(SqlAnalyzeStmt, ScansBoundedTableAndStatsDriveSelectivity) {
+    ensure_sql_installed_once();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_analyze_orders.ndjson";
+    std::vector<std::string> rows;
+    for (int i = 0; i < 8; ++i) {  // status skewed: 8x200, 2x404
+        rows.push_back(R"({"status":200,"amount":)" + std::to_string(i) + "}");
+    }
+    for (int i = 8; i < 10; ++i) {
+        rows.push_back(R"({"status":404,"amount":)" + std::to_string(i) + "}");
+    }
+    write_lines(in_path, rows);
+
+    Catalog cat;
+    cat.register_table(std::get<ast::CreateTableStmt>(
+        parse(std::string("CREATE TABLE orders (status BIGINT, amount BIGINT) "
+                          "WITH (connector='file', format='json', path='") +
+              in_path.string() + "')")
+            .statements[0]));
+
+    EXPECT_FALSE(cat.get_table("orders")->properties.count("row_count"))
+        << "no stats before ANALYZE";
+
+    analyze_table(cat, "orders");
+
+    const auto& props = cat.get_table("orders")->properties;
+    EXPECT_EQ(props.at("row_count"), "10");
+    EXPECT_EQ(props.at("ndv_status"), "2");
+    EXPECT_NE(props.at("mcv_status").find("200:0.8"), std::string::npos)
+        << "got mcv_status=" << props.at("mcv_status");
+    EXPECT_FALSE(props.at("hist_amount").empty());
+
+    // The analyzed stats drive selectivity: status=200 -> MCV 0.8 -> 10*0.8 = 8.
+    Binder b(cat);
+    auto plan = b.bind_select(
+        std::get<ast::SelectStmt>(parse("SELECT * FROM orders WHERE status = 200").statements[0]));
+    EXPECT_DOUBLE_EQ(estimate_rows(*plan), 8.0);
+
+    std::filesystem::remove(in_path);
+}
+
+// ANALYZE rejects an unbounded source (a Kafka string stream needs a bridge and
+// never terminates) rather than hanging on the scan.
+TEST(SqlAnalyzeStmt, RejectsUnboundedSource) {
+    ensure_sql_installed_once();
+    Catalog cat;
+    cat.register_table(std::get<ast::CreateTableStmt>(
+        parse("CREATE TABLE s (k BIGINT) WITH (connector='kafka', format='json', topic='t')")
+            .statements[0]));
+    EXPECT_THROW(analyze_table(cat, "s"), TranslationError);
+    EXPECT_THROW(analyze_table(cat, "no_such_table"), TranslationError);
 }
 
 }  // namespace clink::sql

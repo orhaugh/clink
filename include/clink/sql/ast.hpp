@@ -491,6 +491,17 @@ struct ShowTablesStmt {
     Loc loc;
 };
 
+// ANALYZE [TABLE] <name> [(col, ...)] - scan a bounded table and compute its
+// column statistics (row_count / NDV / histogram / MCV), writing them into the
+// catalog so the optimizer's selectivity estimator uses them. libpg_query parses
+// it as a VacuumStmt (the optional `TABLE` keyword is stripped by the
+// pre-parser); `columns` empty means all columns. Driver/binder executes it.
+struct AnalyzeStmt {
+    std::string table;
+    std::vector<std::string> columns;  // empty = all columns
+    Loc loc;
+};
+
 // MATTBL: CREATE MATERIALIZED VIEW <name> WITH (freshness='...', connector=...,
 // ...) AS <SELECT>. libpg_query parses this as a CreateTableAsStmt with
 // objtype=OBJECT_MATVIEW; the WITH-options reuse StorageOption verbatim. The
@@ -513,6 +524,7 @@ using Statement = std::variant<CreateTableStmt,
                                DropTableStmt,
                                ShowTablesStmt,
                                CreateMaterializedViewStmt,
+                               AnalyzeStmt,
                                std::unique_ptr<ExplainStmt>>;
 
 // EXPLAIN <query> - emits the bound LogicalPlan tree rather than

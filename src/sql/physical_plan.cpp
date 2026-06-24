@@ -1382,4 +1382,32 @@ cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
     return spec;
 }
 
+ScanSourceSpec row_scan_source_spec(const TableDef& table) {
+    auto binding = row_source_binding_for(table);  // throws for unsupported connectors
+    if (!binding.bridge_op.empty()) {
+        unsupported("ANALYZE: table " + table.name + " uses connector '" +
+                    require_property(table, "connector") +
+                    "', a string-channel source that needs a string->row bridge and is not a "
+                    "bounded scan; ANALYZE supports bounded Row sources (file/json, parquet)");
+    }
+    ScanSourceSpec spec;
+    spec.type = binding.source_or_sink_op;
+    spec.params = build_params(table);
+    std::string dec_csv;
+    for (const auto& c : table.columns) {
+        if (c.type && c.type->id() == arrow::Type::DECIMAL128) {
+            const auto& d = static_cast<const arrow::Decimal128Type&>(*c.type);
+            if (!dec_csv.empty()) {
+                dec_csv += ',';
+            }
+            dec_csv += c.name + ':' + std::to_string(d.scale());
+        }
+    }
+    if (!dec_csv.empty()) {
+        spec.params["decimal_columns"] = std::move(dec_csv);
+    }
+    spec.params["schema_columns"] = serialize_row_schema(row_columns_of(table));
+    return spec;
+}
+
 }  // namespace clink::sql
