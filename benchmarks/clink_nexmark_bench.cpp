@@ -1,0 +1,197 @@
+// Nexmark-on-clink benchmark harness.
+//
+// Generates a Nexmark event stream (connector='nexmark') and runs a Nexmark
+// query as a clink SQL job on an in-process JobManager+TaskManager cluster,
+// discarding output through a blackhole sink, and reports input-event
+// throughput. Mirrors the SQL runtime tests' InProcessCluster + the
+// failover/cold-start bench shape.
+//
+//   clink_nexmark_bench --query q0 --events 5000000 --tps 1000000 --slots 8
+//
+// Output: one JSON line {query, events, slots, wall_ms, events_per_sec,
+// events_per_sec_per_core}. wall_ms includes job deploy/round-trip overhead, so
+// use a large --events; a steady-state (warm-up-subtracted) mode is a follow-on.
+
+#include <chrono>
+#include <cstdint>
+#include <iostream>
+#include <map>
+#include <string>
+#include <thread>
+
+#include "clink/application/job_submitter.hpp"
+#include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/job_manager.hpp"
+#include "clink/cluster/task_manager.hpp"
+#include "clink/nexmark/register.hpp"
+#include "clink/plugin/plugin.hpp"
+#include "clink/sql/binder.hpp"
+#include "clink/sql/catalog.hpp"
+#include "clink/sql/install.hpp"
+#include "clink/sql/optimizer.hpp"
+#include "clink/sql/parser.hpp"
+#include "clink/sql/physical_plan.hpp"
+
+using namespace clink;
+using namespace std::chrono_literals;
+
+namespace {
+
+// Per-type base tables, each a nexmark_source filtered to one event type. clink
+// joins require base tables; running the same seeded generator in each instance
+// (advancing over every event, emitting one type) keeps foreign keys consistent
+// across the three. dateTime is the event-time column; the planner's
+// assign_timestamps_row generates watermarks from it (watermark_lag_ms).
+std::string base_tables_ddl(std::int64_t events, std::int64_t tps) {
+    const std::string w =
+        " connector='nexmark', format='json', event_time_column='dateTime', "
+        "watermark_lag_ms='4000', events_num='" +
+        std::to_string(events) + "', tps='" + std::to_string(tps) + "', ";
+    return "CREATE TABLE person (id BIGINT, name VARCHAR, emailAddress VARCHAR, city VARCHAR, "
+           "state VARCHAR, dateTime BIGINT) WITH (" +
+           w + "nexmark_type='person');" +
+           "CREATE TABLE auction (id BIGINT, itemName VARCHAR, initialBid BIGINT, reserve BIGINT, "
+           "expires BIGINT, seller BIGINT, category BIGINT, dateTime BIGINT) WITH (" +
+           w + "nexmark_type='auction');" +
+           "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
+           "url VARCHAR, dateTime BIGINT) WITH (" +
+           w + "nexmark_type='bid');";
+}
+
+struct Query {
+    std::string sink_ddl;
+    std::string insert_sql;
+};
+
+const std::map<std::string, Query>& queries() {
+    static const std::map<std::string, Query> q = {
+        // q0: pass-through (projection only).
+        {"q0",
+         {"CREATE TABLE sink_q0 (auction BIGINT, bidder BIGINT, price BIGINT, dateTime BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q0 SELECT auction, bidder, price, dateTime FROM bid"}},
+        // q1: currency conversion (stateless arithmetic).
+        {"q1",
+         {"CREATE TABLE sink_q1 (auction BIGINT, bidder BIGINT, price DECIMAL(18,3), dateTime "
+          "BIGINT) WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q1 SELECT auction, bidder, price * 0.908 AS price, dateTime FROM bid"}},
+        // q2: selection on a MOD predicate. clink's WHERE compares a column to a
+        // literal, so mod() is computed as a projected column in a derived table
+        // and filtered in the outer WHERE.
+        {"q2",
+         {"CREATE TABLE sink_q2 (auction BIGINT, price BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q2 SELECT auction, price FROM ("
+          "SELECT auction, price, mod(auction, 123) AS m FROM bid) AS t WHERE m = 0"}},
+        // q3: local item suggestion - INNER join auction/person on seller=id.
+        // Post-join columns are flat <alias>_<col>; the outer SELECT/WHERE use
+        // them (qualified alias.col in a join projection is rejected).
+        {"q3",
+         {"CREATE TABLE sink_q3 (id BIGINT, name VARCHAR, city VARCHAR, state VARCHAR) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q3 SELECT A_id AS id, P_name AS name, P_city AS city, P_state AS state "
+          "FROM auction AS A JOIN person AS P ON A.seller = P.id "
+          "WHERE A_category = 10 AND P_state IN ('OR', 'ID', 'CA')"}},
+        // q20: expand bid with its auction - INNER join bid/auction on auction=id.
+        {"q20",
+         {"CREATE TABLE sink_q20 (auction BIGINT, bidder BIGINT, price BIGINT, category BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q20 SELECT B_auction AS auction, B_bidder AS bidder, B_price AS price, "
+          "A_category AS category FROM bid AS B JOIN auction AS A ON B.auction = A.id "
+          "WHERE A_category = 10"}},
+    };
+    return q;
+}
+
+cluster::JobGraphSpec build_spec(std::int64_t events, std::int64_t tps, const Query& q) {
+    sql::Catalog cat;
+    for (auto& stmt : sql::parse(base_tables_ddl(events, tps)).statements) {
+        cat.register_table(std::get<sql::ast::CreateTableStmt>(stmt));
+    }
+    cat.register_table(std::get<sql::ast::CreateTableStmt>(sql::parse(q.sink_ddl).statements[0]));
+    sql::Binder b(cat);
+    auto plan =
+        b.bind_insert(std::get<sql::ast::InsertStmt>(sql::parse(q.insert_sql).statements[0]));
+    plan = sql::optimize(std::move(plan));
+    sql::PhysicalPlanner pp;
+    return pp.compile(static_cast<const sql::LogicalSink&>(*plan));
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    std::string query_id = "q0";
+    std::int64_t events = 5'000'000;
+    std::int64_t tps = 1'000'000;
+    std::size_t slots = 8;  // joins (q3/q20) need >= 7
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto next = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
+        if (a == "--query")
+            query_id = next();
+        else if (a == "--events")
+            events = std::stoll(next());
+        else if (a == "--tps")
+            tps = std::stoll(next());
+        else if (a == "--slots")
+            slots = static_cast<std::size_t>(std::stoul(next()));
+    }
+    auto it = queries().find(query_id);
+    if (it == queries().end()) {
+        std::cerr << "unknown query '" << query_id << "'\n";
+        return 1;
+    }
+
+    // Install SQL ops + the Nexmark source/blackhole-sink factories into the host
+    // registry (default_instance), so the in-process TM can build them.
+    cluster::ensure_built_ins_registered();
+    plugin::PluginRegistry reg;
+    sql::install(reg);
+    nexmark::register_nexmark_factories(reg);
+
+    cluster::JobManager jm;
+    const std::uint16_t jm_port = jm.start();
+    jm.expect_tms({"tm-nexmark"});
+    cluster::TaskManager::Config tcfg;
+    tcfg.slot_count = slots;
+    cluster::TaskManager tm("tm-nexmark", "127.0.0.1", tcfg);
+    tm.connect_to_jm("127.0.0.1", jm_port);
+    std::this_thread::sleep_for(150ms);
+
+    cluster::JobGraphSpec spec;
+    try {
+        spec = build_spec(events, tps, it->second);
+    } catch (const std::exception& e) {
+        std::cerr << "compile failed for " << query_id << ": " << e.what() << "\n";
+        tm.stop();
+        jm.stop();
+        return 1;
+    }
+
+    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::SubmitOptions opts;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    const auto wall = std::chrono::steady_clock::now() - t0;
+
+    tm.stop();
+    jm.stop();
+
+    if (!result.completed || !result.ok) {
+        std::cerr << "job did not complete cleanly: "
+                  << (result.completed ? (result.errors.empty() ? "(error)" : result.errors[0])
+                                       : result.reject_message)
+                  << "\n";
+        return 1;
+    }
+
+    const double wall_ms =
+        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(wall).count();
+    const double eps = wall_ms > 0 ? (static_cast<double>(events) / (wall_ms / 1000.0)) : 0.0;
+    std::cout << "{\"query\":\"" << query_id << "\",\"events\":" << events << ",\"slots\":" << slots
+              << ",\"wall_ms\":" << static_cast<std::int64_t>(wall_ms)
+              << ",\"events_per_sec\":" << static_cast<std::int64_t>(eps)
+              << ",\"events_per_sec_per_core\":"
+              << static_cast<std::int64_t>(eps / static_cast<double>(slots)) << "}\n";
+    return 0;
+}

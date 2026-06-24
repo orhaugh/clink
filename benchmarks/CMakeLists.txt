@@ -37,6 +37,16 @@ add_executable(clink_serde_bench clink_serde_bench.cpp)
 target_link_libraries(clink_serde_bench PRIVATE clink::core)
 clink_set_warnings(clink_serde_bench)
 
+# Nexmark benchmark - the Nexmark streaming benchmark
+# (github.com/nexmark/nexmark) as clink SQL jobs over a generated event stream
+# (connector='nexmark') on an in-process JM/TM cluster, output discarded through
+# a blackhole sink. Reports input-event throughput. Needs the SQL frontend.
+if(TARGET clink::sql)
+    add_executable(clink_nexmark_bench clink_nexmark_bench.cpp)
+    target_link_libraries(clink_nexmark_bench PRIVATE clink::sql)
+    clink_set_warnings(clink_nexmark_bench)
+endif()
+
 # flink_compare/clink-job: CLINK_REGISTER_JOB .so for the
 # clink-vs-Flink head-to-head harness. Requires the kafka impl
 # headers for the message_source / message_sink helpers.

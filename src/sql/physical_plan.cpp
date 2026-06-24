@@ -157,8 +157,15 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // column. The Row batcher is built from the schema_columns param.
         return RowConnectorBinding{"parquet_row_source", kChannelRow, {}};
     }
-    unsupported("format='json' source requires connector='file', 'kafka' or 'parquet' (got '" +
-                connector + "')");
+    if (connector == "nexmark") {
+        // Synthetic Nexmark event generator (benchmark). The factory is
+        // registered out-of-tree by the Nexmark harness; here we only map the
+        // connector name to the Row-channel source op the planner emits.
+        return RowConnectorBinding{"nexmark_source", kChannelRow, {}};
+    }
+    unsupported(
+        "format='json' source requires connector='file', 'kafka', 'parquet' or 'nexmark' (got '" +
+        connector + "')");
 }
 
 RowConnectorBinding row_sink_binding_for(const TableDef& table) {
@@ -202,6 +209,13 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
             return RowConnectorBinding{"parquet_row_2pc_sink", kChannelRow, {}};
         }
         return RowConnectorBinding{"parquet_row_sink", kChannelRow, {}};
+    }
+    if (connector == "blackhole") {
+        // Discard sink: counts + drops every row (the runner's records_in
+        // metric still tallies them). For benchmarks where sink I/O must not
+        // distort throughput. Factory registered out-of-tree (e.g. the Nexmark
+        // harness); here we map the connector name to the Row-channel sink op.
+        return RowConnectorBinding{"blackhole_sink_row", kChannelRow, {}};
     }
     unsupported("format='json' sink requires connector='file', 'kafka' or 'parquet' (got '" +
                 connector + "')");
