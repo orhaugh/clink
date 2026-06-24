@@ -78,6 +78,11 @@ public:
         return std::nullopt;
     }
 
+    // Logical events scanned so far (advances per event regardless of type, so it
+    // is the same monotonic counter across per-type instances). Used by the
+    // benchmark to locate the steady-state warm-up boundary.
+    [[nodiscard]] std::int64_t event_id() const { return event_id_; }
+
 private:
     static void put(clink::sql::Row& r, const char* k, std::int64_t v) {
         r.values[k] = clink::config::JsonValue{v};

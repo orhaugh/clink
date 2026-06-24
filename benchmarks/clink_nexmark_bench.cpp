@@ -9,8 +9,11 @@
 //   clink_nexmark_bench --query q0 --events 5000000 --tps 1000000 --slots 8
 //
 // Output: one JSON line {query, events, slots, wall_ms, events_per_sec,
-// events_per_sec_per_core}. wall_ms includes job deploy/round-trip overhead, so
-// use a large --events; a steady-state (warm-up-subtracted) mode is a follow-on.
+// events_per_sec_per_core, warmup_events, steady_ms, steady_events_per_sec,
+// steady_events_per_sec_per_core}. wall_ms/events_per_sec are the COLD whole-job
+// numbers (deploy included); the steady_* fields are warm-up-subtracted (the
+// source stamps wall-clock at the warmup_events-th logical event and at drain).
+// A clink-only number; not comparable across engines (see benchmarks/nexmark).
 
 #include <chrono>
 #include <cstdint>
@@ -311,7 +314,9 @@ int main(int argc, char** argv) {
     std::string query_id = "q0";
     std::int64_t events = 5'000'000;
     std::int64_t tps = 1'000'000;
-    std::size_t slots = 8;  // joins (q3/q20) need >= 7
+    std::size_t slots = 8;            // joins (q3/q20) need >= 7
+    std::int64_t warmup_events = -1;  // <0 => default to 10% of events
+    double warmup_frac = 0.1;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
@@ -323,7 +328,17 @@ int main(int argc, char** argv) {
             tps = std::stoll(next());
         else if (a == "--slots")
             slots = static_cast<std::size_t>(std::stoul(next()));
+        else if (a == "--warmup-events")
+            warmup_events = std::stoll(next());
+        else if (a == "--warmup-frac")
+            warmup_frac = std::stod(next());
     }
+    // Steady-state warm-up boundary: the wall clock from the warmup_events-th
+    // logical event to source drain excludes job deploy + the initial ramp.
+    if (warmup_events < 0)
+        warmup_events = static_cast<std::int64_t>(static_cast<double>(events) * warmup_frac);
+    if (warmup_events >= events)
+        warmup_events = 0;  // degenerate: measure from the first event
     auto it = queries().find(query_id);
     if (it == queries().end()) {
         std::cerr << "unknown query '" << query_id << "'\n";
@@ -335,7 +350,9 @@ int main(int argc, char** argv) {
     cluster::ensure_built_ins_registered();
     plugin::PluginRegistry reg;
     sql::install(reg);
-    nexmark::register_nexmark_factories(reg);
+    auto marks = std::make_shared<nexmark::SteadyMarks>();
+    marks->warmup_events = warmup_events;
+    nexmark::register_nexmark_factories(reg, marks);
     // q13's bounded side input: a lookup function mapping a bid to a label by
     // (auction mod 4). Registered globally so the lookup-join op can resolve it.
     sql::AsyncFunctionRegistry::global().register_function(
@@ -404,10 +421,32 @@ int main(int argc, char** argv) {
     const double wall_ms =
         std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(wall).count();
     const double eps = wall_ms > 0 ? (static_cast<double>(events) / (wall_ms / 1000.0)) : 0.0;
+
+    // Steady-state: ingest rate over [warm-up boundary, source drain], which
+    // excludes job deploy + the initial ramp. Body-rate for windowed queries
+    // (the pane-fire tail is after source drain; the cold wall covers the full
+    // job). Reported as -1 if the marks were not both set (degenerate run).
+    const std::int64_t warm_ns = marks->warm_ns.load();
+    const std::int64_t end_ns = marks->end_ns.load();
+    double steady_ms = -1.0, steady_eps = -1.0;
+    if (warm_ns > 0 && end_ns > warm_ns) {
+        steady_ms = static_cast<double>(end_ns - warm_ns) / 1e6;
+        const double steady_events = static_cast<double>(events - warmup_events);
+        steady_eps = steady_events / (steady_ms / 1000.0);
+    }
     std::cout << "{\"query\":\"" << query_id << "\",\"events\":" << events << ",\"slots\":" << slots
               << ",\"wall_ms\":" << static_cast<std::int64_t>(wall_ms)
               << ",\"events_per_sec\":" << static_cast<std::int64_t>(eps)
               << ",\"events_per_sec_per_core\":"
-              << static_cast<std::int64_t>(eps / static_cast<double>(slots)) << "}\n";
+              << static_cast<std::int64_t>(eps / static_cast<double>(slots))
+              << ",\"warmup_events\":" << warmup_events
+              << ",\"steady_ms\":" << (steady_ms >= 0 ? static_cast<std::int64_t>(steady_ms) : -1)
+              << ",\"steady_events_per_sec\":"
+              << (steady_eps >= 0 ? static_cast<std::int64_t>(steady_eps) : -1)
+              << ",\"steady_events_per_sec_per_core\":"
+              << (steady_eps >= 0
+                      ? static_cast<std::int64_t>(steady_eps / static_cast<double>(slots))
+                      : -1)
+              << "}\n";
     return 0;
 }

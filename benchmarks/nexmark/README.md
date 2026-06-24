@@ -12,11 +12,38 @@ cmake --build build --target clink_nexmark_bench -j
 
 ./build/benchmarks/clink_nexmark_bench --query q0 --events 5000000 --slots 8
 # {"query":"q0","events":5000000,"slots":8,"wall_ms":...,"events_per_sec":...,
-#  "events_per_sec_per_core":...}
+#  "events_per_sec_per_core":...,"warmup_events":...,"steady_ms":...,
+#  "steady_events_per_sec":...,"steady_events_per_sec_per_core":...}
 ```
 
 Flags: `--query qN`, `--events N` (total events), `--tps N` (dateTime spacing =
-1000/tps ms/event), `--slots N` (TaskManager slots = parallelism; joins need >= 7).
+1000/tps ms/event), `--slots N` (TaskManager slots = parallelism; joins need >= 7),
+`--warmup-events N` / `--warmup-frac F` (steady-state warm-up boundary, default
+10% of events).
+
+## Steady-state vs cold throughput
+
+`events_per_sec` is the COLD whole-job rate (`events / wall`) and `wall_ms`
+includes job deploy and round-trip, so it understates the engine. The
+`steady_events_per_sec` fields report a warm-up-subtracted rate: each
+`nexmark_source` instance stamps a wall clock once when it has generated
+`warmup_events` logical events and once at drain, and the steady rate is
+`(events - warmup_events) / (latest_drain - earliest_warm)`. This excludes job
+deploy and the initial ramp (clink is native, so there is no JIT warm-up; deploy
+is the pollutant the steady number removes). On a small run where deploy
+dominates the steady rate is visibly higher than the cold rate; on a large run
+they converge.
+
+This is a clink-only number for tracking clink against itself. It is NOT a
+cross-engine figure, and the in-process single-TaskManager shape here must never
+be compared against a clustered engine. A separate, premise-pinned cross-engine
+harness is the follow-on.
+
+Caveat for WINDOWED queries (q5/q7/q8/q11/q12/q15-q19): the bounded source
+stamps its drain BEFORE the terminal watermark fires all panes, so the steady
+interval measures the streaming-ingest body, not the pane-fire tail. The cold
+`wall_ms` covers the full job including the window fire. Lower `--tps` so windows
+fire mid-stream if you want the window compute inside the measured body.
 
 ## How it works
 
@@ -105,10 +132,13 @@ window and fires at end-of-stream.
 
 ## Caveats (v1)
 
-- `wall_ms` includes job deploy/round-trip overhead, so use a large `--events`;
-  a steady-state (warm-up-subtracted) mode is a follow-on.
+- `wall_ms` and `events_per_sec` are the COLD whole-job numbers (deploy included).
+  `steady_events_per_sec` is the warm-up-subtracted rate (see above); use it for
+  clink-vs-clink tracking and a large `--events`.
 - `events_per_sec` is the logical-stream rate (`events / wall`). Multi-table
-  queries instantiate the generator per table, re-deriving the shared stream.
-- In-process single TaskManager; not a distributed-cluster number.
+  queries instantiate the generator per table, re-deriving the shared stream, so
+  the denominator is logical events, not physically-generated events.
+- In-process single TaskManager; not a distributed-cluster number, and not
+  comparable to any other engine.
 - All 23 queries run; q10 is IT-only (it writes partition files, not a
   throughput query).
