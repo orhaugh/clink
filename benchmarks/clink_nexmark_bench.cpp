@@ -99,6 +99,22 @@ const std::map<std::string, Query>& queries() {
           "INSERT INTO sink_q20 SELECT B_auction AS auction, B_bidder AS bidder, B_price AS price, "
           "A_category AS category FROM bid AS B JOIN auction AS A ON B.auction = A.id "
           "WHERE A_category = 10"}},
+        // q11: user sessions - per-bidder COUNT over a 10s session-gap window.
+        // (Nexmark also emits the session start/end; selecting window bounds is a
+        // separate clink gap, so v1 omits them - the SESSION aggregate is the work.)
+        {"q11",
+         {"CREATE TABLE sink_q11 (bidder BIGINT, bid_count BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q11 SELECT bidder, COUNT(*) AS bid_count FROM bid "
+          "GROUP BY SESSION(dateTime, INTERVAL '10' SECOND), bidder"}},
+        // q12: per-bidder bid count per 10s window. Nexmark uses PROCTIME; clink's
+        // window TVFs are event-time, so this is the event-time analogue (same
+        // count-per-user-per-10s shape).
+        {"q12",
+         {"CREATE TABLE sink_q12 (bidder BIGINT, bid_count BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q12 SELECT bidder, COUNT(*) AS bid_count FROM bid "
+          "GROUP BY TUMBLE(dateTime, INTERVAL '10' SECOND), bidder"}},
     };
     return q;
 }
