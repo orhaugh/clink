@@ -3376,6 +3376,160 @@ TEST(SqlRuntime, RegexpExtractAndSplitIndexInProjection) {
     std::filesystem::remove(out_path);
 }
 
+// Nexmark-q9 shape: winning bid per auction = the MAX-price bid during the
+// auction's open period [datetime, expires]. bid INNER JOIN auction on
+// auction=id + a column-vs-column interval residual, then ROW_NUMBER top-1 by
+// price (a TOP-N-per-key changelog) into a netting sink. The residual must
+// EXCLUDE an out-of-window higher bid.
+TEST(SqlRuntime, WinningBidPerAuctionIntervalJoinTopN) {
+    ensure_sql_installed_once();
+
+    const auto au_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q9_au.ndjson";
+    const auto bd_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q9_bd.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q9_out.ndjson";
+    for (const auto& f : {au_path, bd_path, out_path})
+        std::filesystem::remove(f);
+
+    write_lines(
+        au_path,
+        {R"({"id":1,"datetime":0,"expires":1000})", R"({"id":2,"datetime":0,"expires":1000})"});
+    // auction 1: 50@100, 80@200 (both in window), 90@2000 (OUT of window -> excluded).
+    // auction 2: 30@300. Winners: a1 -> bidder 11 price 80; a2 -> bidder 20 price 30.
+    write_lines(bd_path,
+                {
+                    R"({"auction":1,"bidder":10,"price":50,"datetime":100})",
+                    R"({"auction":1,"bidder":11,"price":80,"datetime":200})",
+                    R"({"auction":1,"bidder":12,"price":90,"datetime":2000})",
+                    R"({"auction":2,"bidder":20,"price":30,"datetime":300})",
+                });
+
+    Catalog cat;
+    auto ddl =
+        parse(std::string{"CREATE TABLE auction (id BIGINT, datetime BIGINT, expires BIGINT) "
+                          "WITH (connector='file', format='json', path='"} +
+              au_path.string() +
+              "');"
+              "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, datetime BIGINT) "
+              "WITH (connector='file', format='json', path='" +
+              bd_path.string() +
+              "');"
+              "CREATE TABLE winners (auction BIGINT, bidder BIGINT, price BIGINT) "
+              "WITH (connector='changelog', format='json', path='" +
+              out_path.string() + "')");
+    for (int i = 0; i < 3; ++i)
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[i]));
+
+    auto spec = compile(
+        cat,
+        "INSERT INTO winners SELECT b_auction AS auction, b_bidder AS bidder, b_price AS price "
+        "FROM "
+        "(SELECT *, ROW_NUMBER() OVER (PARTITION BY b_auction ORDER BY b_price DESC) AS rn FROM "
+        "(SELECT b_auction, b_bidder, b_price FROM bid AS B JOIN auction AS A ON B.auction = A.id "
+        "WHERE b_datetime >= a_datetime AND b_datetime <= a_expires) AS j) AS r WHERE rn <= 1");
+
+    InProcessCluster cluster("tm-sql-e2e-q9", 16);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 25s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::map<std::int64_t, std::pair<std::int64_t, std::int64_t>>
+        got;  // auction -> (bidder, price)
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got[static_cast<std::int64_t>(js.at("auction").as_number())] = {
+            static_cast<std::int64_t>(js.at("bidder").as_number()),
+            static_cast<std::int64_t>(js.at("price").as_number())};
+    }
+    EXPECT_EQ(got.size(), 2u) << "one winner per auction";
+    EXPECT_EQ(got[1].first, 11)
+        << "auction 1 winner is the in-window max (80), not the 90 out of window";
+    EXPECT_EQ(got[1].second, 80);
+    EXPECT_EQ(got[2].first, 20);
+    EXPECT_EQ(got[2].second, 30);
+
+    for (const auto& f : {au_path, bd_path, out_path})
+        std::filesystem::remove(f);
+}
+
+// Nexmark-q4 shape: average winning price per category. Winning price = MAX bid
+// per auction during its open period (the q9 interval join + per-auction MAX);
+// then AVG over categories - a STACKED aggregate (AVG over a per-auction MAX),
+// which needs the inner MAX to emit a changelog the outer AVG retracts.
+TEST(SqlRuntime, AvgWinningPriceByCategoryStackedAggregate) {
+    ensure_sql_installed_once();
+
+    const auto au_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q4_au.ndjson";
+    const auto bd_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q4_bd.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q4_out.ndjson";
+    for (const auto& f : {au_path, bd_path, out_path})
+        std::filesystem::remove(f);
+
+    write_lines(au_path,
+                {
+                    R"({"id":1,"category":10,"datetime":0,"expires":1000})",
+                    R"({"id":2,"category":10,"datetime":0,"expires":1000})",
+                    R"({"id":3,"category":20,"datetime":0,"expires":1000})",
+                });
+    // a1 (cat10) max 80, a2 (cat10) max 40, a3 (cat20) max 100. (All in window.)
+    // AVG by category: cat10 = (80+40)/2 = 60; cat20 = 100.
+    write_lines(bd_path,
+                {
+                    R"({"auction":1,"price":50,"datetime":100})",
+                    R"({"auction":1,"price":80,"datetime":200})",
+                    R"({"auction":2,"price":40,"datetime":150})",
+                    R"({"auction":3,"price":100,"datetime":250})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(
+        std::string{"CREATE TABLE auction (id BIGINT, category BIGINT, datetime BIGINT, "
+                    "expires BIGINT) WITH (connector='file', format='json', path='"} +
+        au_path.string() +
+        "');"
+        "CREATE TABLE bid (auction BIGINT, price BIGINT, datetime BIGINT) "
+        "WITH (connector='file', format='json', path='" +
+        bd_path.string() +
+        "');"
+        "CREATE TABLE avg_by_cat (category BIGINT, avgp DOUBLE) "
+        "WITH (connector='file', format='json', mode='upsert', primary_key='category', path='" +
+        out_path.string() + "')");
+    for (int i = 0; i < 3; ++i)
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[i]));
+
+    auto spec = compile(cat,
+                        "INSERT INTO avg_by_cat SELECT category, AVG(maxp) AS avgp FROM "
+                        "(SELECT a_category AS category, MAX(b_price) AS maxp FROM "
+                        "(SELECT b_auction, b_price, a_category FROM bid AS B JOIN auction AS A ON "
+                        "B.auction = A.id "
+                        "WHERE b_datetime >= a_datetime AND b_datetime <= a_expires) AS j "
+                        "GROUP BY b_auction, a_category) AS wins GROUP BY category");
+
+    InProcessCluster cluster("tm-sql-e2e-q4", 16);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 25s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::map<std::int64_t, double> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got[static_cast<std::int64_t>(js.at("category").as_number())] = js.at("avgp").as_number();
+    }
+    ASSERT_TRUE(got.count(10) && got.count(20));
+    EXPECT_NEAR(got[10], 60.0, 1e-9) << "cat10 = avg(80,40); inner MAX must not double-count";
+    EXPECT_NEAR(got[20], 100.0, 1e-9);
+
+    for (const auto& f : {au_path, bd_path, out_path})
+        std::filesystem::remove(f);
+}
+
 // Nexmark-q18 shape: latest bid per (auction, bidder) - a MULTI-COLUMN
 // PARTITION BY TOP-N-per-key (rn <= 1, ORDER BY time DESC) into a netting sink.
 TEST(SqlRuntime, LatestBidPerAuctionBidderMultiColPartition) {

@@ -1396,7 +1396,11 @@ void mark_changelog_producers(cluster::JobGraphSpec& spec) {
         by_id[spec.ops[i].id] = i;
     }
     auto is_consumer = [](const std::string& t) {
-        return t == "changelog_net_sink" || t == "equi_join_row";
+        // aggregate_row consumes a changelog (fold_into_ is retraction-aware), so a
+        // STACKED aggregate (an aggregate over another aggregate, e.g. AVG over a
+        // per-key MAX) needs the inner one to emit a changelog - else the outer
+        // double-counts the inner's intermediate upsert values.
+        return t == "changelog_net_sink" || t == "equi_join_row" || t == "aggregate_row";
     };
     auto is_passthrough = [](const std::string& t) {
         // Ops that forward __row_kind unchanged. union_row is multi-input, so the

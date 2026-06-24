@@ -221,6 +221,30 @@ const std::map<std::string, Query>& queries() {
           "WITH (connector='blackhole', format='json')",
           "INSERT INTO sink_q22 SELECT auction, split_index(url, '/', 2) AS dir2, "
           "split_index(url, '/', 3) AS dir3 FROM bid"}},
+        // q9: winning bids - for each auction the bid with MAX price during the
+        // auction's open period [datetime, expires]. bid INNER JOIN auction (equi
+        // on auction=id) + a column-vs-column interval residual, then ROW_NUMBER
+        // top-1 per auction by price (a TOP-N-per-key changelog).
+        {"q9",
+         {"CREATE TABLE sink_q9 (auction BIGINT, bidder BIGINT, price BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q9 SELECT b_auction AS auction, b_bidder AS bidder, b_price AS price "
+          "FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY b_auction ORDER BY b_price DESC) AS rn "
+          "FROM (SELECT b_auction, b_bidder, b_price FROM bid AS B JOIN auction AS A "
+          "ON B.auction = A.id WHERE b_datetime >= a_datetime AND b_datetime <= a_expires) AS j) "
+          "AS r WHERE rn <= 1"}},
+        // q4: average winning price per category. Winning price = MAX bid per
+        // auction during its open period (the q9 interval join + per-auction MAX),
+        // then AVG over categories (a second, stacked GROUP BY).
+        {"q4",
+         {"CREATE TABLE sink_q4 (category BIGINT, avgp DOUBLE) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q4 SELECT category, AVG(maxp) AS avgp FROM (SELECT a_category AS "
+          "category, MAX(b_price) AS maxp FROM (SELECT b_auction, b_price, a_category FROM bid AS "
+          "B "
+          "JOIN auction AS A ON B.auction = A.id WHERE b_datetime >= a_datetime AND "
+          "b_datetime <= a_expires) AS j GROUP BY b_auction, a_category) AS wins GROUP BY "
+          "category"}},
     };
     return q;
 }
