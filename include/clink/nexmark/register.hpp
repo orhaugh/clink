@@ -6,9 +6,10 @@
 // dependency; the Nexmark harness calls this after clink::sql::install().
 //
 // WITH-option params (all optional): events_num (total events, 0=unbounded),
-// tps (event rate -> dateTime spacing), seed, base_time_ms. The table DDL should
-// also set event_time_column='dateTime' and watermark_lag_ms so the planner's
-// assign_timestamps_row op generates watermarks from the generated dateTime.
+// tps (event rate -> datetime spacing), seed, base_time_ms. The table DDL should
+// also set event_time_column='datetime' and watermark_lag_ms so the planner's
+// assign_timestamps_row op generates watermarks from the generated datetime.
+// (Column names are lower-case: the SQL parser lower-cases identifiers.)
 
 #include <memory>
 #include <string>
