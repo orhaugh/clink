@@ -49,7 +49,7 @@ Flags: `--query qN`, `--events N` (total events), `--tps N` (dateTime spacing =
 | q5 | hot items | per-(auction,window) count joined to the per-window `MAX` of those counts (a non-windowed GROUP BY -> changelog) + a count-equals-max residual. Run with `--slots 16` (nested windowed counts + a join). |
 | q15 | per-day stats | `DATE_TRUNC('day', datetime)` bucket + `COUNT(*)` / `COUNT(DISTINCT bidder)` / `COUNT(DISTINCT auction)` |
 | q17 | per-auction-day stats | `GROUP BY auction, day` + `COUNT(DISTINCT)`, `MIN`/`MAX`/`AVG`/`SUM(price)` |
-| q18 | latest bid per user | `ROW_NUMBER() OVER (PARTITION BY auction, bidder ORDER BY datetime DESC)`, `rn <= 1` (TOP-N-per-key changelog) |
+| q18 | latest bid per (auction, bidder) | `ROW_NUMBER() OVER (PARTITION BY auction, bidder ORDER BY datetime DESC)`, `rn <= 1` (TOP-N-per-key changelog) |
 | q19 | top-10 per auction | `ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC)`, `rn <= 10` (TOP-N-per-key changelog) |
 
 Enabling capabilities now in clink SQL: `window_start`/`window_end` projectable
