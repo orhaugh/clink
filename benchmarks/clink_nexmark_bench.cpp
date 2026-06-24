@@ -143,6 +143,10 @@ const std::map<std::string, Query>& queries() {
           "JOIN (SELECT seller, COUNT(*) AS ac, window_start AS astart, window_end AS aend "
           "FROM auction GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), seller) AS A "
           "ON P.id = A.seller WHERE P_starttime = A_astart AND P_endtime = A_aend"}},
+        // q5 (hot items) is NOT included: it needs the per-window MAX of per-auction
+        // counts, a non-windowed GROUP BY that runs in upsert mode, and clink's
+        // append-only joins multiply against its updates (no retraction streams).
+        // See the DISABLED_HotItemsPerWindowMaxOverWindowedAggregate runtime test.
     };
     return q;
 }

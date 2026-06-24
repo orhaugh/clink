@@ -54,10 +54,14 @@ comparisons in WHERE (so a single-equi-key join + a residual predicate expresses
 range and composite-key joins). q8's per-window grouping carries a `COUNT(*)`
 (unused) because clink requires an aggregate in a GROUP BY SELECT.
 
-Still out: q5 (hot-items) is a different shape (a windowed COUNT feeding a
-per-window MAX, then a composite IN-subquery), not a plain join. Then the
-analytics tier: OVER/Top-N + distinct/filter aggregates (q15/q17/q18/q19). See
-the feasibility scoping.
+Still out: q5 (hot-items) needs the per-window MAX of per-auction counts. Every
+piece exists in clink (the windowed counts, an aggregate over a derived windowed
+aggregate, the join, the residual), but that second-level MAX is a non-windowed
+GROUP BY running in upsert mode, and clink's append-only joins multiply against
+its updates - q5 needs dataflow RETRACTION/CHANGELOG streams, which clink does
+not have. See the DISABLED_HotItemsPerWindowMaxOverWindowedAggregate test. Then
+the analytics tier: OVER/Top-N + distinct/filter aggregates (q15/q17/q18/q19).
+See the feasibility scoping.
 
 Window queries: use a lower `--tps` (e.g. `--tps 50000`) so `datetime` spans many
 windows (spacing is `1000/tps` ms/event); at the default tps the run fits in one

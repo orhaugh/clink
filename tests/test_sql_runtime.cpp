@@ -3045,6 +3045,86 @@ TEST(SqlRuntime, HighestBidPerWindowJoinWithRangeResidual) {
     std::filesystem::remove(out_path);
 }
 
+// Nexmark-q5 shape: hot items - the auction(s) with the most bids per window.
+// D = per-(auction,window) bid count; M = per-window MAX of those counts (an
+// aggregate OVER a derived windowed aggregate); join on the window + a
+// column-vs-column residual keeping rows whose count equals the window max.
+//
+// DISABLED: this needs RETRACTION/CHANGELOG streams, which clink does not have.
+// M is a non-windowed GROUP BY (grouping by the window bounds as columns), so it
+// runs in upsert mode and emits an updated max row per input record; the
+// append-only INNER join then multiplies against each emission (each winner is
+// produced once per auction in its window). Every individual piece works (the
+// windowed counts, the aggregate-over-a-derived-windowed-aggregate, the join,
+// the residual) - the gap is dataflow retractions. The assertions below are the
+// CORRECT result, so this flips green if/when retraction streams land.
+TEST(SqlRuntime, DISABLED_HotItemsPerWindowMaxOverWindowedAggregate) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q5_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q5_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    // win[0,1000): auction 1 has 3 bids (max), auction 2 has 1.
+    // win[1000,2000): auction 2 has 2 bids (max), auction 1 has 1.
+    write_lines(in_path,
+                {
+                    R"({"auction":1,"ts":100})",
+                    R"({"auction":1,"ts":200})",
+                    R"({"auction":1,"ts":300})",
+                    R"({"auction":2,"ts":400})",
+                    R"({"auction":2,"ts":1100})",
+                    R"({"auction":2,"ts":1200})",
+                    R"({"auction":1,"ts":1300})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE bids (auction BIGINT, ts BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "', event_time_column='ts');"
+                     "CREATE TABLE hot (auction BIGINT, num BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(
+        cat,
+        "INSERT INTO hot SELECT D_auction AS auction, D_num AS num FROM "
+        "(SELECT auction, COUNT(*) AS num, window_start AS ws, window_end AS we FROM bids "
+        "GROUP BY TUMBLE(ts, 1000), auction) AS D "
+        "JOIN (SELECT window_start AS ws, window_end AS we, MAX(num) AS maxnum FROM "
+        "(SELECT auction, COUNT(*) AS num, window_start AS window_start, window_end AS window_end "
+        "FROM bids GROUP BY TUMBLE(ts, 1000), auction) AS d2 GROUP BY window_start, window_end) AS "
+        "M "
+        "ON D.ws = M.ws WHERE D_we = M_we AND D_num = M_maxnum");
+
+    InProcessCluster cluster("tm-sql-e2e-q5", 16);  // nested windowed-agg + join: many operators
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 25s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::multiset<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("auction").as_number()),
+                    static_cast<std::int64_t>(js.at("num").as_number()));
+    }
+    // One hot auction per window: auction 1 (3 bids) in win1, auction 2 (2) in win2.
+    EXPECT_EQ(got.count({1, 3}), 1u) << "win[0,1000) hot auction 1 (num=3) missing";
+    EXPECT_EQ(got.count({2, 2}), 1u) << "win[1000,2000) hot auction 2 (num=2) missing";
+    EXPECT_EQ(got.size(), 2u) << "expected exactly one hot auction per window";
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // Nexmark-q8 shape: persons + auctions created in the SAME tumbling window,
 // joined on seller=id. TWO windowed-aggregate join sides, equi on the key plus a
 // column-vs-column window-equality residual that matches same-window pairs and
