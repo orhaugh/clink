@@ -3417,10 +3417,23 @@ public:
     void on_data(const Batch<Row>& batch) override {
         for (const auto& rec : batch) {
             const auto& row = rec.value();
-            std::string key = "__null__";
+            std::string raw = "__null__";
             auto it = row.values.find(partition_col_);
             if (it != row.values.end() && !it->second.is_null()) {
-                key = it->second.is_string() ? it->second.as_string() : it->second.serialize(0);
+                raw = it->second.is_string() ? it->second.as_string() : it->second.serialize(0);
+            }
+            // Sanitise the value into a safe filename component: a partition value
+            // carrying '/' or '..' (it can be source/user data) must not escape
+            // the base directory. Map anything outside [A-Za-z0-9.-] to '_'.
+            std::string key;
+            key.reserve(raw.size());
+            for (char c : raw) {
+                const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                  (c >= '0' && c <= '9') || c == '.' || c == '-';
+                key.push_back(safe ? c : '_');
+            }
+            if (key.empty() || key == "." || key == "..") {
+                key = "_";
             }
             Row q = row;
             requantise_row_decimals(q, decimal_scales_);
