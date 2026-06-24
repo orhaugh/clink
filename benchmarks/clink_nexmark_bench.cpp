@@ -19,12 +19,16 @@
 #include <string>
 #include <thread>
 
+#include <arrow/type.h>
+
 #include "clink/application/job_submitter.hpp"
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/job_manager.hpp"
 #include "clink/cluster/task_manager.hpp"
 #include "clink/nexmark/register.hpp"
+#include "clink/operators/scalar_function_registry.hpp"
 #include "clink/plugin/plugin.hpp"
+#include "clink/sql/async_function_registry.hpp"
 #include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/install.hpp"
@@ -245,6 +249,24 @@ const std::map<std::string, Query>& queries() {
           "JOIN auction AS A ON B.auction = A.id WHERE b_datetime >= a_datetime AND "
           "b_datetime <= a_expires) AS j GROUP BY b_auction, a_category) AS wins GROUP BY "
           "category"}},
+        // q13: bounded side-input join - enrich each bid with a label from a
+        // static side table keyed by (auction mod N), via clink's lookup join
+        // (connector='lookup' + the side_lookup function registered in main).
+        {"q13",
+         {"CREATE TABLE side (key BIGINT, label VARCHAR) "
+          "WITH (connector='lookup', function='side_lookup');"
+          "CREATE TABLE sink_q13 (auction BIGINT, bidder BIGINT, label VARCHAR) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q13 SELECT B_auction AS auction, B_bidder AS bidder, S_label AS label "
+          "FROM bid AS B JOIN side AS S ON B.auction = S.key"}},
+        // q14: calculation with user-defined scalar functions - bid_fee in the
+        // projection + bid_keep as a predicate (via the derived-table pattern,
+        // since WHERE compares a column to a literal). UDFs registered in main.
+        {"q14",
+         {"CREATE TABLE sink_q14 (auction BIGINT, bidder BIGINT, fee BIGINT) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q14 SELECT auction, bidder, fee FROM (SELECT auction, bidder, "
+          "bid_fee(price) AS fee, bid_keep(price) AS k FROM bid) AS t WHERE k = true"}},
     };
     return q;
 }
@@ -254,7 +276,11 @@ cluster::JobGraphSpec build_spec(std::int64_t events, std::int64_t tps, const Qu
     for (auto& stmt : sql::parse(base_tables_ddl(events, tps)).statements) {
         cat.register_table(std::get<sql::ast::CreateTableStmt>(stmt));
     }
-    cat.register_table(std::get<sql::ast::CreateTableStmt>(sql::parse(q.sink_ddl).statements[0]));
+    // sink_ddl may declare more than one table (e.g. q13's lookup side table
+    // plus the sink), so register every CREATE TABLE it contains.
+    for (auto& stmt : sql::parse(q.sink_ddl).statements) {
+        cat.register_table(std::get<sql::ast::CreateTableStmt>(stmt));
+    }
     sql::Binder b(cat);
     auto plan =
         b.bind_insert(std::get<sql::ast::InsertStmt>(sql::parse(q.insert_sql).statements[0]));
@@ -294,6 +320,34 @@ int main(int argc, char** argv) {
     plugin::PluginRegistry reg;
     sql::install(reg);
     nexmark::register_nexmark_factories(reg);
+    // q13's bounded side input: a lookup function mapping a bid to a label by
+    // (auction mod 4). Registered globally so the lookup-join op can resolve it.
+    sql::AsyncFunctionRegistry::global().register_function(
+        "side_lookup", [](const sql::Row& probe) -> async::Task<sql::Row> {
+            sql::Row dim;
+            if (auto s = probe.get_string("auction")) {
+                const std::int64_t k = std::stoll(*s);
+                dim.values["key"] = config::JsonValue{static_cast<double>(k)};
+                dim.values["label"] = config::JsonValue{std::string{"L"} + std::to_string(k % 4)};
+            }
+            co_return dim;
+        });
+    // q14's user-defined scalar functions (clink has no CREATE FUNCTION DDL, so
+    // they are registered programmatically): a fee transform + a kept-bid test.
+    ScalarFunctionRegistry::global().register_function(
+        "bid_fee",
+        arrow::int64(),
+        [](const std::vector<config::JsonValue>& a) -> config::JsonValue {
+            if (a.empty() || a[0].is_null())
+                return config::JsonValue{nullptr};
+            return config::JsonValue{static_cast<std::int64_t>(a[0].as_number()) + 100};
+        });
+    ScalarFunctionRegistry::global().register_function(
+        "bid_keep",
+        arrow::boolean(),
+        [](const std::vector<config::JsonValue>& a) -> config::JsonValue {
+            return config::JsonValue{!a.empty() && !a[0].is_null() && a[0].as_number() >= 50.0};
+        });
 
     cluster::JobManager jm;
     const std::uint16_t jm_port = jm.start();

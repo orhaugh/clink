@@ -3376,6 +3376,148 @@ TEST(SqlRuntime, RegexpExtractAndSplitIndexInProjection) {
     std::filesystem::remove(out_path);
 }
 
+// Nexmark-q14 shape: a calculation with user-defined scalar functions - one in
+// the projection (a custom fee) and one as a predicate (kept-bid test). clink
+// has no CREATE FUNCTION DDL, so the UDFs are registered programmatically via
+// ScalarFunctionRegistry; the predicate UDF runs via the derived-table pattern
+// (WHERE compares a column - here the UDF-computed flag - to a literal).
+TEST(SqlRuntime, ScalarUdfInProjectionAndPredicate) {
+    ensure_sql_installed_once();
+
+    ScalarFunctionRegistry::global().register_function(
+        "bid_fee",
+        arrow::int64(),
+        [](const std::vector<clink::config::JsonValue>& args) -> clink::config::JsonValue {
+            if (args.empty() || args[0].is_null())
+                return clink::config::JsonValue{nullptr};
+            return clink::config::JsonValue{static_cast<std::int64_t>(args[0].as_number()) + 100};
+        });
+    ScalarFunctionRegistry::global().register_function(
+        "bid_keep",
+        arrow::boolean(),
+        [](const std::vector<clink::config::JsonValue>& args) -> clink::config::JsonValue {
+            if (args.empty() || args[0].is_null())
+                return clink::config::JsonValue{false};
+            return clink::config::JsonValue{args[0].as_number() >= 50.0};
+        });
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q14_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q14_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+    write_lines(in_path,
+                {R"({"id":1,"price":30})", R"({"id":2,"price":80})", R"({"id":3,"price":100})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE bid (id BIGINT, price BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (id BIGINT, fee BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    // fee = bid_fee(price); keep rows where bid_keep(price) (price >= 50).
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT id, fee FROM "
+                        "(SELECT id, bid_fee(price) AS fee, bid_keep(price) AS k FROM bid) AS t "
+                        "WHERE k = true");
+
+    InProcessCluster cluster("tm-sql-e2e-q14", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::map<std::int64_t, std::int64_t> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got[static_cast<std::int64_t>(js.at("id").as_number())] =
+            static_cast<std::int64_t>(js.at("fee").as_number());
+    }
+    EXPECT_EQ(got.size(), 2u) << "id 1 (price 30 < 50) filtered out by the predicate UDF";
+    EXPECT_EQ(got[2], 180) << "bid_fee(80) = 180";
+    EXPECT_EQ(got[3], 200) << "bid_fee(100) = 200";
+    EXPECT_FALSE(got.count(1));
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
+// Nexmark-q13 shape: bounded side-input join - enrich each bid with a label
+// from a static side table keyed by (auction mod N). Expressed via clink's
+// lookup join (connector='lookup' + a registered side function), the engine's
+// equivalent of Flink's FOR SYSTEM_TIME side-input join.
+TEST(SqlRuntime, BoundedSideInputLookupJoin) {
+    ensure_sql_installed_once();
+
+    // Side input: label = "L" + (auction mod 3). Bounded, deterministic.
+    AsyncFunctionRegistry::global().register_function(
+        "side_lookup", [](const Row& probe) -> clink::async::Task<Row> {
+            Row dim;
+            if (auto s = probe.get_string("auction")) {
+                const std::int64_t k = std::stoll(*s);
+                dim.values["key"] = clink::config::JsonValue{static_cast<double>(k)};
+                dim.values["label"] =
+                    clink::config::JsonValue{std::string{"L"} + std::to_string(k % 3)};
+            }
+            co_return dim;
+        });
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q13_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_q13_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+    write_lines(in_path,
+                {R"({"auction":1,"bidder":10})",
+                 R"({"auction":2,"bidder":20})",
+                 R"({"auction":5,"bidder":50})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE bid (auction BIGINT, bidder BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE side (key BIGINT, label TEXT) "
+                     "WITH (connector='lookup', function='side_lookup');"
+                     "CREATE TABLE out_t (auction BIGINT, bidder BIGINT, label TEXT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    for (const auto& st : ddl.statements)
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT B_auction AS auction, B_bidder AS bidder, "
+                        "S_label AS label FROM bid AS B JOIN side AS S ON B.auction = S.key");
+
+    InProcessCluster cluster("tm-sql-e2e-q13", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::map<std::int64_t, std::string> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got[static_cast<std::int64_t>(js.at("auction").as_number())] = js.at("label").as_string();
+    }
+    EXPECT_EQ(got.size(), 3u);
+    EXPECT_EQ(got[1], "L1");  // 1 % 3
+    EXPECT_EQ(got[2], "L2");  // 2 % 3
+    EXPECT_EQ(got[5], "L2");  // 5 % 3
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // Nexmark-q9 shape: winning bid per auction = the MAX-price bid during the
 // auction's open period [datetime, expires]. bid INNER JOIN auction on
 // auction=id + a column-vs-column interval residual, then ROW_NUMBER top-1 by
