@@ -1878,6 +1878,185 @@ private:
     std::unordered_map<std::string, PartState> state_;
 };
 
+// Last-N-per-key aggregate. For each partition key it keeps the most-recent
+// N elements ordered by an ORDER BY column and emits a running aggregate
+// (SUM/COUNT/AVG/MIN/MAX) over exactly those N as a CHANGELOG keyed on the
+// partition columns: a per-key materialised view that re-emits
+// update_before/update_after as the window slides, and CONSUMES upstream
+// retractions. This is the engine primitive behind "metric over the last N
+// events per key" (rolling averages, recent-window KPIs per entity) and
+// Nexmark q6 (average winning price over a seller's last-10 closed auctions).
+//
+// Unlike OverAggregateRowOp this is per-arrival, not watermark-driven: it
+// has no event-time/lateness model, so the ORDER BY column is an ordinary
+// recency key (e.g. an auction's close time) rather than a declared event
+// time. The aggregate is recomputed from scratch over the kept window slice
+// on every change (O(N) per event), which is exact and needs no incremental
+// retract arithmetic.
+//
+// Retraction model. An insert/update_after row is added to the window at its
+// sorted position; a delete/update_before row removes the first window
+// element equal to it (by full bare-row value, ignoring __row_kind). For the
+// aggregate functions supported here, value-identical rows are
+// interchangeable, so a value match is correct without a separate primary
+// key. The window is capped at the widest frame reach (max frame_start + 1);
+// a brand-new element past the cap evicts the oldest, which correctly slides
+// the frame. LIMITATION: because only the capped window is retained, a PURE
+// delete of a kept element (with no paired re-insert of the same key)
+// under-counts by one until a later insert refills - it cannot promote a
+// previously-evicted older element back in. q6 never hits this (every
+// upstream delete is paired with a same-close-time re-insert when a winning
+// bid changes); document it for other changelog inputs.
+//
+// DURABILITY: the per-key window lives in a plain in-RAM map with no
+// snapshot/restore (same as TopNPerKeyRowOp / OverAggregateRowOp), so
+// exactly-once across failover relies on deterministic source replay, not
+// checkpointed operator state.
+class LastNAggRowOp final : public Operator<Row, Row> {
+public:
+    LastNAggRowOp(std::vector<std::string> partition_columns,
+                  std::string order_column,
+                  std::vector<OverSpec> specs)
+        : partition_columns_(std::move(partition_columns)),
+          order_column_(std::move(order_column)),
+          specs_(std::move(specs)) {
+        for (const auto& s : specs_) {
+            AggSpec a;
+            a.output_name = s.output_name;
+            a.fn = s.fn;
+            a.input_column = s.input_column;
+            agg_specs_.push_back(std::move(a));
+            capacity_ = std::max(capacity_, s.frame_start + 1);
+        }
+        if (capacity_ < 1)
+            capacity_ = 1;
+    }
+
+    void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        if (element.is_data()) {
+            Batch<Row> emit_batch;
+            for (const auto& rec : element.as_data()) {
+                handle_(rec.value(), emit_batch);
+            }
+            if (!emit_batch.empty())
+                out.emit_data(std::move(emit_batch));
+        } else if (element.is_watermark()) {
+            this->on_watermark(element.as_watermark(), out);
+        } else {
+            this->on_barrier(element.as_barrier(), out);
+        }
+    }
+
+    std::string name() const override { return "last_n_agg_row"; }
+
+private:
+    struct PartState {
+        std::vector<Row> window;           // ascending by order_column_, bare rows
+        std::optional<Row> prior_emitted;  // last bare aggregate row emitted for this key
+    };
+
+    std::string partition_key_(const Row& row) const {
+        std::string key;
+        for (std::size_t i = 0; i < partition_columns_.size(); ++i) {
+            if (i > 0)
+                key += '\x1f';
+            auto it = row.values.find(partition_columns_[i]);
+            if (it != row.values.end() && !it->second.is_null())
+                key += it->second.serialize(0);
+        }
+        return key;
+    }
+
+    // a sorts strictly before b under the ascending order column. NULLs sort
+    // first. Numbers compare numerically, strings lexically, else by serialise.
+    bool order_before_(const Row& a, const Row& b) const {
+        const auto ait = a.values.find(order_column_);
+        const auto bit = b.values.find(order_column_);
+        const auto& av = ait != a.values.end() ? ait->second : clink::config::JsonValue{nullptr};
+        const auto& bv = bit != b.values.end() ? bit->second : clink::config::JsonValue{nullptr};
+        if (av.is_null() || bv.is_null())
+            return av.is_null() && !bv.is_null();
+        if (av.is_number() && bv.is_number())
+            return av.as_number() < bv.as_number();
+        if (av.is_string() && bv.is_string())
+            return av.as_string() < bv.as_string();
+        return av.serialize(0) < bv.serialize(0);
+    }
+
+    static Row bare_(const Row& row) {
+        Row b = row;
+        b.values.erase(std::string{kRowKindField});
+        return b;
+    }
+
+    static bool rows_equal_(const Row& a, const Row& b) {
+        return clink::config::JsonValue{clink::config::JsonObject{a.values}}.serialize(0) ==
+               clink::config::JsonValue{clink::config::JsonObject{b.values}}.serialize(0);
+    }
+
+    void handle_(const Row& row, Batch<Row>& emit_batch) {
+        const bool retract = has_row_kind(row) && is_delete_like(row_kind_of(row));
+        auto& st = state_[partition_key_(row)];
+        const Row bare = bare_(row);
+        if (retract) {
+            for (std::size_t i = 0; i < st.window.size(); ++i) {
+                if (rows_equal_(st.window[i], bare)) {
+                    st.window.erase(st.window.begin() + static_cast<std::ptrdiff_t>(i));
+                    break;
+                }
+            }
+        } else {
+            // Insert after every element that is <= bare (so equal-order-key
+            // rows order by arrival, most recent last).
+            std::size_t pos = 0;
+            while (pos < st.window.size() && !order_before_(bare, st.window[pos]))
+                ++pos;
+            st.window.insert(st.window.begin() + static_cast<std::ptrdiff_t>(pos), bare);
+            // A brand-new element past the cap evicts the oldest (front), which
+            // slides the frame forward.
+            if (st.window.size() > static_cast<std::size_t>(capacity_))
+                st.window.erase(st.window.begin());
+        }
+
+        // Recompute each aggregate over its frame slice (the last
+        // frame_start+1 elements of the window) and build the bare output row.
+        Row result;
+        for (const auto& pc : partition_columns_) {
+            auto it = row.values.find(pc);
+            result.values[pc] = it != row.values.end() ? it->second : clink::config::JsonValue{};
+        }
+        for (std::size_t i = 0; i < specs_.size(); ++i) {
+            const std::size_t span = static_cast<std::size_t>(specs_[i].frame_start) + 1;
+            const std::size_t start = st.window.size() > span ? st.window.size() - span : 0;
+            AggState acc;
+            for (std::size_t k = start; k < st.window.size(); ++k)
+                update_agg(acc, agg_specs_[i], st.window[k]);
+            result.values[specs_[i].output_name] = finalize_agg(acc, agg_specs_[i]);
+        }
+
+        // Emit the per-key changelog: update_before(prior)+update_after(new) on
+        // a value change, insert on first emission, nothing if unchanged.
+        const bool had_prior = st.prior_emitted.has_value();
+        if (had_prior && rows_equal_(*st.prior_emitted, result))
+            return;
+        if (had_prior) {
+            Row before = *st.prior_emitted;
+            set_row_kind(before, kRowKindUpdateBefore);
+            emit_batch.push(Record<Row>{std::move(before)});
+        }
+        st.prior_emitted = result;
+        set_row_kind(result, had_prior ? kRowKindUpdateAfter : kRowKindInsert);
+        emit_batch.push(Record<Row>{std::move(result)});
+    }
+
+    std::vector<std::string> partition_columns_;
+    std::string order_column_;
+    std::vector<OverSpec> specs_;
+    std::vector<AggSpec> agg_specs_;  // parallel to specs_
+    std::int64_t capacity_ = 1;       // widest frame reach + 1
+    std::unordered_map<std::string, PartState> state_;
+};
+
 // Phase 8: unbounded GROUP BY aggregator (no window TVF).
 //
 // Per-group running state kept in an unordered_map keyed by the
@@ -5156,6 +5335,57 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             return std::make_shared<OverAggregateRowOp>(
                 std::move(time_column), std::move(partition_columns), std::move(specs));
+        });
+
+    // last_n_agg_row: last-N-per-key rolling aggregate, emitting a per-key
+    // changelog. Required params:
+    //   order_column       - the recency ORDER BY column
+    //   partition_columns  - CSV of PARTITION BY columns (may be empty)
+    //   outputs            - JSON array of {name, fn, input_column, frame_start}
+    //                        where frame_start is the ROWS <n> PRECEDING count
+    reg.register_operator<Row, Row>(
+        "last_n_agg_row", [](const BuildContext& ctx) -> std::shared_ptr<Operator<Row, Row>> {
+            auto order_column = ctx.param_or("order_column", "");
+            if (order_column.empty())
+                throw std::runtime_error("last_n_agg_row: 'order_column' param is required");
+            auto split_csv = [](const std::string& csv) {
+                std::vector<std::string> out;
+                std::size_t pos = 0;
+                while (pos <= csv.size()) {
+                    auto end = csv.find(',', pos);
+                    if (end == std::string::npos)
+                        end = csv.size();
+                    auto k = csv.substr(pos, end - pos);
+                    if (!k.empty())
+                        out.push_back(std::move(k));
+                    if (end == csv.size())
+                        break;
+                    pos = end + 1;
+                }
+                return out;
+            };
+            auto partition_columns = split_csv(ctx.param_or("partition_columns", ""));
+            const auto outputs_text = ctx.param_or("outputs", "");
+            if (outputs_text.empty())
+                throw std::runtime_error("last_n_agg_row: 'outputs' param is required");
+            auto outs_json = clink::config::parse(outputs_text);
+            if (!outs_json.is_array())
+                throw std::runtime_error("last_n_agg_row: 'outputs' must be a JSON array");
+            std::vector<OverSpec> specs;
+            for (const auto& entry : outs_json.as_array()) {
+                if (!entry.is_object())
+                    throw std::runtime_error("last_n_agg_row: output entry must be an object");
+                OverSpec s;
+                s.output_name = entry.at("name").as_string();
+                s.fn = entry.at("fn").as_string();
+                if (entry.contains("input_column") && entry.at("input_column").is_string())
+                    s.input_column = entry.at("input_column").as_string();
+                if (entry.contains("frame_start") && entry.at("frame_start").is_number())
+                    s.frame_start = static_cast<std::int64_t>(entry.at("frame_start").as_number());
+                specs.push_back(std::move(s));
+            }
+            return std::make_shared<LastNAggRowOp>(
+                std::move(partition_columns), std::move(order_column), std::move(specs));
         });
 
     // interval_join_row: stream-stream interval join. Required params:

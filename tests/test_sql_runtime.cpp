@@ -3820,6 +3820,152 @@ TEST(SqlRuntime, AvgWinningPriceByCategoryStackedAggregate) {
         std::filesystem::remove(f);
 }
 
+// last_n_agg: a rolling aggregate over the most-recent N elements per key. A
+// bounded ROWS frame over a source with NO declared event_time_column lowers to
+// the changelog-emitting last_n_agg operator (the engine primitive behind
+// "metric over the last N events per key"). Here AVG over the last 2 per key:
+// for k=1 the values 10,20,60 arrive and the final last-2 average is
+// avg(20,60)=40 (the 10 has slid out; avg-of-all would be 30), proving the
+// window slides. Materialised via an upsert sink keyed on k.
+TEST(SqlRuntime, LastNAggRollingAverageSlidesPerKey) {
+    ensure_sql_installed_once();
+
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_lastn_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_lastn_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+    write_lines(in_path,
+                {
+                    R"({"k":1,"t":1,"v":10})",
+                    R"({"k":1,"t":2,"v":20})",
+                    R"({"k":1,"t":3,"v":60})",
+                    R"({"k":2,"t":1,"v":100})",
+                });
+
+    Catalog cat;
+    auto ddl =
+        parse(std::string{"CREATE TABLE src (k BIGINT, t BIGINT, v BIGINT) "
+                          "WITH (connector='file', format='json', path='"} +
+              in_path.string() +
+              "');"
+              "CREATE TABLE rollavg (k BIGINT, avgv DOUBLE) "
+              "WITH (connector='file', format='json', mode='upsert', primary_key='k', path='" +
+              out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat,
+                        "INSERT INTO rollavg SELECT k, AVG(v) OVER (PARTITION BY k ORDER BY t "
+                        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS avgv FROM src");
+
+    InProcessCluster cluster("tm-sql-lastn", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 20s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::map<std::int64_t, double> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got[static_cast<std::int64_t>(js.at("k").as_number())] = js.at("avgv").as_number();
+    }
+    ASSERT_TRUE(got.count(1) && got.count(2));
+    EXPECT_NEAR(got[1], 40.0, 1e-9) << "last-2 avg(20,60)=40; the 10 slid out of the window";
+    EXPECT_NEAR(got[2], 100.0, 1e-9);
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
+// Nexmark-q6: average winning price per seller over that seller's last-N closed
+// auctions. Winning price = MAX in-window bid per auction (the q9 TOP-1 changelog
+// producer); then a last-N-per-seller AVG ordered by close time (a_expires).
+// Two engine paths are exercised at once:
+//   - SLIDING eviction: seller 1 closes 3 auctions, so with N=2 the oldest
+//     (a1) slides out of the average.
+//   - RETRACTION CONSUMPTION: auction a3's winning bid changes (60 -> 70) within
+//     its window, so the upstream TOP-1 emits delete(a3,60)+insert(a3,70); the
+//     last_n_agg must drop the old 60 (not fold it as a second insert), else
+//     seller 1's last-2 would be avg(60,70)=65 with a2 evicted, not avg(30,70)=50.
+TEST(SqlRuntime, WinningPriceAvgOverSellerLastNClosedAuctions) {
+    ensure_sql_installed_once();
+
+    const auto au_path = std::filesystem::temp_directory_path() / "clink_sql_q6_au.ndjson";
+    const auto bd_path = std::filesystem::temp_directory_path() / "clink_sql_q6_bd.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_q6_out.ndjson";
+    for (const auto& f : {au_path, bd_path, out_path})
+        std::filesystem::remove(f);
+
+    // seller 1: a1 (close 100), a2 (close 200), a3 (close 300). seller 2: a4.
+    write_lines(au_path,
+                {
+                    R"({"id":1,"seller":1,"datetime":0,"expires":100})",
+                    R"({"id":2,"seller":1,"datetime":0,"expires":200})",
+                    R"({"id":3,"seller":1,"datetime":0,"expires":300})",
+                    R"({"id":4,"seller":2,"datetime":0,"expires":100})",
+                });
+    // Winning prices: a1=50, a2=30, a3=70 (60 then a higher 70 within window), a4=99.
+    write_lines(bd_path,
+                {
+                    R"({"auction":1,"price":50,"datetime":10})",
+                    R"({"auction":2,"price":30,"datetime":20})",
+                    R"({"auction":3,"price":60,"datetime":30})",
+                    R"({"auction":3,"price":70,"datetime":40})",
+                    R"({"auction":4,"price":99,"datetime":10})",
+                });
+
+    Catalog cat;
+    auto ddl =
+        parse(std::string{"CREATE TABLE auction (id BIGINT, seller BIGINT, datetime BIGINT, "
+                          "expires BIGINT) WITH (connector='file', format='json', path='"} +
+              au_path.string() +
+              "');"
+              "CREATE TABLE bid (auction BIGINT, price BIGINT, datetime BIGINT) "
+              "WITH (connector='file', format='json', path='" +
+              bd_path.string() +
+              "');"
+              "CREATE TABLE q6 (seller BIGINT, avgp DOUBLE) "
+              "WITH (connector='file', format='json', mode='upsert', primary_key='seller', path='" +
+              out_path.string() + "')");
+    for (int i = 0; i < 3; ++i)
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[i]));
+
+    auto spec = compile(
+        cat,
+        "INSERT INTO q6 SELECT seller, AVG(price) OVER (PARTITION BY seller ORDER BY close_dt "
+        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS avgp FROM "
+        "(SELECT a_seller AS seller, b_price AS price, a_expires AS close_dt FROM "
+        "(SELECT *, ROW_NUMBER() OVER (PARTITION BY b_auction ORDER BY b_price DESC) AS rn FROM "
+        "(SELECT b_auction, b_price, a_seller, a_expires FROM bid AS B JOIN auction AS A ON "
+        "B.auction = A.id WHERE b_datetime >= a_datetime AND b_datetime <= a_expires) AS j) AS r "
+        "WHERE rn <= 1) AS wins");
+
+    InProcessCluster cluster("tm-sql-q6", 16);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 25s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::map<std::int64_t, double> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got[static_cast<std::int64_t>(js.at("seller").as_number())] = js.at("avgp").as_number();
+    }
+    ASSERT_TRUE(got.count(1) && got.count(2));
+    EXPECT_NEAR(got[1], 50.0, 1e-9)
+        << "seller 1 last-2 closed = avg(a2=30, a3=70); a1 slid out and a3's old 60 was retracted";
+    EXPECT_NEAR(got[2], 99.0, 1e-9);
+
+    for (const auto& f : {au_path, bd_path, out_path})
+        std::filesystem::remove(f);
+}
+
 // Nexmark-q18 shape: latest bid per (auction, bidder) - a MULTI-COLUMN
 // PARTITION BY TOP-N-per-key (rn <= 1, ORDER BY time DESC) into a netting sink.
 TEST(SqlRuntime, LatestBidPerAuctionBidderMultiColPartition) {

@@ -72,6 +72,19 @@ private:
         const ast::TableRef& ref,
         const std::vector<std::size_t>& window_targets) const;
 
+    // Last-N-per-key rolling aggregate, the lowering target of a bounded
+    // ROWS frame over a source with NO declared event_time_column:
+    //   SELECT k, agg() OVER (PARTITION BY k ORDER BY oc ROWS BETWEEN n
+    //                         PRECEDING AND CURRENT ROW)
+    // Emits a per-key changelog (LogicalLastNAgg). Non-window SELECT items
+    // must be the PARTITION BY columns (GROUP-BY-like shape).
+    std::unique_ptr<LogicalPlan> bind_last_n_agg(
+        const ast::SelectStmt& stmt,
+        const TableDef& source,
+        const std::string& alias,
+        const ast::TableRef& ref,
+        const std::vector<std::size_t>& window_targets) const;
+
     // Inc 4: bind a simple SELECT whose WHERE carries a subquery
     // predicate (IN / NOT IN / EXISTS / NOT EXISTS / scalar). Rewrites
     // it to a LogicalSemiJoin or LogicalScalarBroadcast over the outer

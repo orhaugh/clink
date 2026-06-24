@@ -1301,6 +1301,54 @@ std::string compile_node(const LogicalPlan& node,
         spec.ops.push_back(std::move(op));
         return id;
     }
+    if (node.kind() == "LastNAgg") {
+        // Last-N-per-key rolling aggregate: key by the partition columns (so
+        // par>1 keeps a key on one subtask) then a last_n_agg_row op that
+        // emits a per-key changelog over the most-recent N elements.
+        const auto& ln = static_cast<const LogicalLastNAgg&>(node);
+        if (ch != Channel::Row) {
+            unsupported("last-N window aggregates require format='json' Row channel");
+        }
+        std::string input_id = compile_node(ln.input(), ch, spec, next_id, async_agg);
+        std::string part_csv;
+        for (std::size_t i = 0; i < ln.partition_columns().size(); ++i) {
+            if (i > 0)
+                part_csv += ',';
+            part_csv += ln.partition_columns()[i];
+        }
+        if (!ln.partition_columns().empty()) {
+            cluster::OperatorSpec keyer;
+            keyer.id = "key_" + std::to_string(next_id++);
+            keyer.type = "row_compute_key";
+            keyer.inputs = {std::move(input_id)};
+            keyer.out_channel = std::string{kChannelRow};
+            keyer.params["columns"] = part_csv;
+            input_id = keyer.id;
+            spec.ops.push_back(std::move(keyer));
+        }
+        cluster::OperatorSpec op;
+        op.id = "lastn_" + std::to_string(next_id++);
+        op.type = "last_n_agg_row";
+        op.inputs = {std::move(input_id)};
+        op.out_channel = std::string{kChannelRow};
+        if (!ln.partition_columns().empty())
+            op.key_by = "row_key";
+        op.params["partition_columns"] = part_csv;
+        op.params["order_column"] = ln.order_column();
+        clink::config::JsonArray arr;
+        for (const auto& o : ln.outputs()) {
+            clink::config::JsonObject obj;
+            obj["name"] = clink::config::JsonValue{o.output_name};
+            obj["fn"] = clink::config::JsonValue{o.fn};
+            obj["input_column"] = clink::config::JsonValue{o.input_column};
+            obj["frame_start"] = clink::config::JsonValue{static_cast<std::int64_t>(o.frame_start)};
+            arr.emplace_back(std::move(obj));
+        }
+        op.params["outputs"] = clink::config::JsonValue{std::move(arr)}.serialize(0);
+        std::string id = op.id;
+        spec.ops.push_back(std::move(op));
+        return id;
+    }
     if (node.kind() == "TopNPerKey") {
         // Phase 21c: row_compute_key over the partition columns
         // (Hash routing keeps a partition's records on one subtask),
@@ -1412,7 +1460,8 @@ void mark_changelog_producers(cluster::JobGraphSpec& spec) {
         // STACKED aggregate (an aggregate over another aggregate, e.g. AVG over a
         // per-key MAX) needs the inner one to emit a changelog - else the outer
         // double-counts the inner's intermediate upsert values.
-        return t == "changelog_net_sink" || t == "equi_join_row" || t == "aggregate_row";
+        return t == "changelog_net_sink" || t == "equi_join_row" || t == "aggregate_row" ||
+               t == "last_n_agg_row";
     };
     auto is_passthrough = [](const std::string& t) {
         // Ops that forward __row_kind unchanged. union_row is multi-input, so the

@@ -1649,7 +1649,7 @@ std::optional<EquiJoinShape> match_equi_join(const ast::Expression& on,
 // a TopN still classifies as changelog. Multi-input nodes inherit
 // from any child being changelog.
 bool is_changelog_plan(const LogicalPlan& node) {
-    if (node.kind() == "TopNPerKey") {
+    if (node.kind() == "TopNPerKey" || node.kind() == "LastNAgg") {
         return true;
     }
     for (const auto* in : node.inputs()) {
@@ -2352,6 +2352,187 @@ std::unique_ptr<LogicalPlan> Binder::bind_over_aggregate(
                                                   order_col,
                                                   std::move(outputs),
                                                   std::move(schema));
+}
+
+std::unique_ptr<LogicalPlan> Binder::bind_last_n_agg(
+    const ast::SelectStmt& stmt,
+    const TableDef& source,
+    const std::string& alias,
+    const ast::TableRef& ref,
+    const std::vector<std::size_t>& window_targets) const {
+    // Shape: `SELECT <partition cols>, agg() OVER (PARTITION BY ... ORDER BY oc
+    // ROWS BETWEEN n PRECEDING AND CURRENT ROW)`. GROUP BY / HAVING / DISTINCT /
+    // ORDER BY / LIMIT do not combine with this shape (same as OVER).
+    if (!stmt.group_clause.empty() || stmt.having_clause.has_value()) {
+        bind_error("last-N window aggregates are incompatible with GROUP BY / HAVING",
+                   stmt.loc.pos);
+    }
+    if (stmt.distinct || !stmt.sort_clause.empty() || stmt.limit_count.has_value() ||
+        stmt.offset_count.has_value()) {
+        bind_error("last-N window aggregates may not carry DISTINCT / ORDER BY / LIMIT",
+                   stmt.loc.pos);
+    }
+
+    // The shared window spec, taken from the first windowed target.
+    const auto& first =
+        *std::get<std::unique_ptr<ast::FunctionCall>>(stmt.target_list[window_targets[0]].expr);
+    const auto& over0 = *first.over_clause;
+    if (over0.partition_by.empty()) {
+        bind_error("last-N window aggregate requires a PARTITION BY (the per-key view key)",
+                   first.loc.pos);
+    }
+    if (over0.order_by.size() != 1) {
+        bind_error("last-N window aggregate requires ORDER BY on a single recency column",
+                   first.loc.pos);
+    }
+    if (over0.order_by[0].descending) {
+        bind_error(
+            "last-N window aggregate ORDER BY must be ascending (the frame keeps the most-recent "
+            "N)",
+            first.loc.pos);
+    }
+    if (!std::holds_alternative<ast::ColumnRef>(over0.order_by[0].expr)) {
+        bind_error("last-N window aggregate ORDER BY must be a column reference", first.loc.pos);
+    }
+    const std::string order_col =
+        resolve_value_column_name(std::get<ast::ColumnRef>(over0.order_by[0].expr), source, alias);
+
+    std::vector<std::string> partition_cols;
+    for (const auto& e : over0.partition_by) {
+        if (!std::holds_alternative<ast::ColumnRef>(e)) {
+            bind_error("PARTITION BY entry must be a column reference", first.loc.pos);
+        }
+        partition_cols.push_back(
+            resolve_value_column_name(std::get<ast::ColumnRef>(e), source, alias));
+    }
+    std::unordered_set<std::string> partition_set(partition_cols.begin(), partition_cols.end());
+
+    // True when two windows resolve to the same partition + order spec.
+    auto same_spec = [&](const ast::OverClause& a, const ast::OverClause& b) -> bool {
+        if (a.partition_by.size() != b.partition_by.size() ||
+            a.order_by.size() != b.order_by.size())
+            return false;
+        auto col_name = [&](const ast::Expression& e) -> std::string {
+            return std::holds_alternative<ast::ColumnRef>(e)
+                       ? resolve_value_column_name(std::get<ast::ColumnRef>(e), source, alias)
+                       : std::string{"\x01"};
+        };
+        for (std::size_t i = 0; i < a.partition_by.size(); ++i)
+            if (col_name(a.partition_by[i]) != col_name(b.partition_by[i]))
+                return false;
+        for (std::size_t i = 0; i < a.order_by.size(); ++i)
+            if (a.order_by[i].descending != b.order_by[i].descending ||
+                col_name(a.order_by[i].expr) != col_name(b.order_by[i].expr))
+                return false;
+        return true;
+    };
+
+    auto column_type = [&](const std::string& col) -> std::shared_ptr<arrow::DataType> {
+        for (const auto& c : source.columns)
+            if (c.name == col)
+                return c.type;
+        return arrow::utf8();
+    };
+
+    // Non-window SELECT items must be the PARTITION BY columns (GROUP-BY-like).
+    std::vector<bool> is_window(stmt.target_list.size(), false);
+    for (auto idx : window_targets)
+        is_window[idx] = true;
+    for (std::size_t i = 0; i < stmt.target_list.size(); ++i) {
+        if (is_window[i])
+            continue;
+        const auto& item = stmt.target_list[i];
+        if (!std::holds_alternative<ast::ColumnRef>(item.expr) ||
+            std::get<ast::ColumnRef>(item.expr).is_star) {
+            bind_error(
+                "last-N window aggregate: non-aggregate SELECT items must be the PARTITION BY "
+                "columns",
+                item.loc.pos);
+        }
+        const std::string c =
+            resolve_value_column_name(std::get<ast::ColumnRef>(item.expr), source, alias);
+        if (partition_set.find(c) == partition_set.end()) {
+            bind_error(
+                "last-N window aggregate: SELECT column '" + c + "' is not a PARTITION BY column",
+                item.loc.pos);
+        }
+        if (item.alias.has_value() && *item.alias != c) {
+            bind_error("last-N window aggregate: aliasing a PARTITION BY column is not supported",
+                       item.loc.pos);
+        }
+    }
+
+    // Resolve the aggregate outputs (bounded ROWS only, running aggregates only).
+    std::vector<OverOutput> outputs;
+    for (auto idx : window_targets) {
+        const auto& item = stmt.target_list[idx];
+        const auto& fc = *std::get<std::unique_ptr<ast::FunctionCall>>(item.expr);
+        if (!same_spec(*fc.over_clause, over0)) {
+            bind_error("all last-N window aggregates must share one PARTITION BY / ORDER BY window",
+                       fc.loc.pos);
+        }
+        if (fc.over_clause->frame_mode != ast::FrameMode::Rows) {
+            bind_error(
+                "last-N window aggregate requires a ROWS frame (ROWS BETWEEN n PRECEDING "
+                "AND CURRENT ROW)",
+                fc.loc.pos);
+        }
+        if (fc.agg_distinct) {
+            bind_error("DISTINCT is not supported inside a last-N window aggregate", fc.loc.pos);
+        }
+        if (!is_aggregate_fn_name(fc.name)) {
+            bind_error(
+                "last-N window function must be a running aggregate "
+                "(SUM/COUNT/AVG/MIN/MAX): " +
+                    fc.name,
+                fc.loc.pos);
+        }
+        if (is_registered_udaf_name(fc.name)) {
+            bind_error("UDAF '" + fc.name + "' is not supported in a last-N window aggregate",
+                       fc.loc.pos);
+        }
+        OverOutput out;
+        out.fn = fc.name;
+        out.frame_mode = 1;  // ROWS
+        out.frame_start = fc.over_clause->frame_start_preceding;
+        if (fc.name == "count" && fc.args.empty()) {
+            out.input_column = "";  // COUNT(*)
+        } else {
+            if (fc.args.size() != 1 || !std::holds_alternative<ast::ColumnRef>(fc.args[0])) {
+                bind_error(fc.name + " over a last-N window requires a single column argument",
+                           fc.loc.pos);
+            }
+            out.input_column =
+                resolve_value_column_name(std::get<ast::ColumnRef>(fc.args[0]), source, alias);
+        }
+        out.output_name = item.alias.value_or(
+            fc.name + (out.input_column.empty() ? std::string{"_star"} : "_" + out.input_column));
+        out.type = aggregate_output_type(fc.name, source, out.input_column);
+        outputs.push_back(std::move(out));
+    }
+
+    // Inner base: scan + optional WHERE filter (mirrors the OVER path).
+    std::unique_ptr<LogicalPlan> inner = make_table_plan(ref.name, source, ref.loc.pos);
+    if (stmt.where_clause.has_value()) {
+        auto predicate_json = lower_predicate(*stmt.where_clause, source).serialize(0);
+        inner = std::make_unique<LogicalFilter>(std::move(inner), std::move(predicate_json));
+    }
+
+    // Output schema = the partition columns + the aggregate outputs (the
+    // materialised per-key view), in operator-emission order.
+    arrow::FieldVector fields;
+    fields.reserve(partition_cols.size() + outputs.size());
+    for (const auto& pc : partition_cols)
+        fields.push_back(arrow::field(pc, column_type(pc)));
+    for (const auto& o : outputs)
+        fields.push_back(arrow::field(o.output_name, o.type));
+    auto schema = arrow::schema(std::move(fields));
+
+    return std::make_unique<LogicalLastNAgg>(std::move(inner),
+                                             std::move(partition_cols),
+                                             order_col,
+                                             std::move(outputs),
+                                             std::move(schema));
 }
 
 std::unique_ptr<LogicalPlan> Binder::bind_subquery_select(const ast::SelectStmt& stmt,
@@ -3238,6 +3419,19 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
                 }
                 window_idx = window_targets[0];
             } else {
+                // A BOUNDED ROWS frame over a source with NO declared
+                // event_time_column is a last-N-per-key rolling aggregate: it
+                // cannot use the watermark-driven append-only OVER op (which
+                // requires event_time_column), so lower it to the changelog-
+                // emitting last_n_agg operator. Everything else (running frame,
+                // RANGE, or a declared-event-time source) stays on the
+                // append-only OVER path.
+                const auto& oc = *first_wfc.over_clause;
+                const auto etc = source.properties.find("event_time_column");
+                const bool has_etc = etc != source.properties.end() && !etc->second.empty();
+                if (oc.frame_mode == ast::FrameMode::Rows && !has_etc) {
+                    return bind_last_n_agg(stmt, source, alias, ref, window_targets);
+                }
                 // OVER (running) aggregate path: SUM/COUNT/AVG/MIN/MAX,
                 // FIRST_VALUE/LAST_VALUE, LAG over the event-time order.
                 return bind_over_aggregate(stmt, source, alias, ref, window_targets);

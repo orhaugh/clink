@@ -53,6 +53,7 @@ Flags: `--query qN`, `--events N` (total events), `--tps N` (dateTime spacing =
 | q19 | top-10 per auction | `ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC)`, `rn <= 10` (TOP-N-per-key changelog) |
 | q16 | channel stats | `GROUP BY channel, day` + `COUNT(DISTINCT)`, `MIN`/`MAX`, `SUM(CASE…)` price buckets |
 | q4 | avg price by category | winning bid (interval-join + per-auction `MAX`) -> `AVG` per category (stacked aggregate) |
+| q6 | avg price per seller, last 10 | winning bid -> per-seller `AVG(price) OVER (PARTITION BY seller ORDER BY close_dt ROWS BETWEEN 9 PRECEDING AND CURRENT ROW)`; the bounded ROWS frame over a non-event-time source lowers to the changelog-emitting `last_n_agg` operator. Run with `--slots 16`. |
 | q9 | winning bids | `bid ⋈ auction` + interval residual (`datetime IN [datetime, expires]`) + `ROW_NUMBER` top-1 by price |
 | q13 | side-input join | bid ⋈ a `connector='lookup'` side table keyed by `auction mod N` (clink's `FOR SYSTEM_TIME` equivalent) |
 | q14 | UDF calculation | scalar UDF in the projection + a UDF predicate (registered via `ScalarFunctionRegistry`; no `CREATE FUNCTION` DDL) |
@@ -77,16 +78,26 @@ accepted by `connector='changelog'` (netting), `mode='upsert'`, or a discard
 `connector='blackhole'` sink. q8's per-window grouping carries a `COUNT(*)`
 (unused) because clink requires an aggregate in a GROUP BY SELECT.
 
-Twenty-two of the 23 Nexmark queries run on clink (all of q0-q5, q7-q22). 21 are
-in the throughput bench (`--query qN`); q10 is IT-only (it writes partition
-files). Each is asserted by a runtime test or bench-verified.
+q6 rides a new general engine primitive, the **last-N-per-key aggregate**: a
+bounded `agg() OVER (PARTITION BY k ORDER BY oc ROWS BETWEEN n PRECEDING AND
+CURRENT ROW)` over a source with no declared `event_time_column` lowers to the
+`last_n_agg` operator, which keeps each key's most-recent N elements, recomputes
+the aggregate over them, and emits a per-key changelog (`update_before`/
+`update_after`) as the window slides - consuming upstream retractions (so a
+changed winning bid corrects the average) and producing a materialised view into
+a `mode='upsert'` / `connector='changelog'` sink. This answers the broad class
+"metric over the last N events per key" (rolling averages, recent-window KPIs per
+entity), not just q6. Limitation: the per-key window is capped at N, so a pure
+delete of a kept element with no paired re-insert under-counts by one until a
+later insert (q6 never hits this - a changed winner deletes and re-inserts the
+same auction); operator state is in-RAM (exactly-once via source replay).
 
-The one query NOT supported is **q6** (average selling price by seller, over the
-last 10 closed auctions). It needs a per-seller `ROWS BETWEEN 9 PRECEDING` window
-over a changelog (winning-bid) stream; clink's `OVER` operator handles bounded
-frames only on append-only streams, not changelog inputs. Flink itself ships q6
-only via its procedural DataStream API, not SQL - so this is a known-hard gap,
-not a clink-specific one. Closing it needs changelog-aware bounded `OVER` frames.
+All 23 Nexmark queries run on clink (q0-q22). 22 are in the throughput bench
+(`--query qN`); q10 is IT-only (it writes partition files). Each is asserted by a
+runtime test or bench-verified. q6 (average selling price by seller over the last
+10 closed auctions) is itself unsupported in Flink SQL - Flink ships it only via
+its procedural DataStream API because its `OVER` operator does not consume
+retractions; clink's `last_n_agg` does.
 
 Window queries: use a lower `--tps` (e.g. `--tps 50000`) so `datetime` spans many
 windows (spacing is `1000/tps` ms/event); at the default tps the run fits in one
@@ -99,4 +110,5 @@ window and fires at end-of-stream.
 - `events_per_sec` is the logical-stream rate (`events / wall`). Multi-table
   queries instantiate the generator per table, re-deriving the shared stream.
 - In-process single TaskManager; not a distributed-cluster number.
-- Only q6 is unsupported (see above); it is unsupported in Flink SQL too.
+- All 23 queries run; q10 is IT-only (it writes partition files, not a
+  throughput query).

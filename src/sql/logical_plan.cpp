@@ -186,6 +186,17 @@ LogicalOverAggregate::LogicalOverAggregate(std::unique_ptr<LogicalPlan> input,
       outputs_(std::move(outputs)),
       schema_(std::move(schema)) {}
 
+LogicalLastNAgg::LogicalLastNAgg(std::unique_ptr<LogicalPlan> input,
+                                 std::vector<std::string> partition_columns,
+                                 std::string order_column,
+                                 std::vector<OverOutput> outputs,
+                                 std::shared_ptr<arrow::Schema> schema)
+    : input_(std::move(input)),
+      partition_columns_(std::move(partition_columns)),
+      order_column_(std::move(order_column)),
+      outputs_(std::move(outputs)),
+      schema_(std::move(schema)) {}
+
 // --- LogicalSemiJoin -----------------------------------------------
 
 LogicalSemiJoin::LogicalSemiJoin(std::unique_ptr<LogicalPlan> left,

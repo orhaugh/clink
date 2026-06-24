@@ -249,6 +249,22 @@ const std::map<std::string, Query>& queries() {
           "JOIN auction AS A ON B.auction = A.id WHERE b_datetime >= a_datetime AND "
           "b_datetime <= a_expires) AS j GROUP BY b_auction, a_category) AS wins GROUP BY "
           "category"}},
+        // q6: average selling price per seller over that seller's last 10 closed
+        // auctions. Winning price = MAX in-window bid per auction (the q9 TOP-1
+        // changelog), then a LAST-N-per-seller AVG ordered by close time
+        // (a_expires) via a bounded ROWS frame over a non-event-time source,
+        // which lowers to the changelog-emitting last_n_agg operator. Run with
+        // --slots 16 (join + nested ranking + last-N).
+        {"q6",
+         {"CREATE TABLE sink_q6 (seller BIGINT, avgp DOUBLE) "
+          "WITH (connector='blackhole', format='json')",
+          "INSERT INTO sink_q6 SELECT seller, AVG(price) OVER (PARTITION BY seller ORDER BY "
+          "close_dt ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS avgp FROM "
+          "(SELECT a_seller AS seller, b_price AS price, a_expires AS close_dt FROM "
+          "(SELECT *, ROW_NUMBER() OVER (PARTITION BY b_auction ORDER BY b_price DESC) AS rn FROM "
+          "(SELECT b_auction, b_price, a_seller, a_expires FROM bid AS B JOIN auction AS A "
+          "ON B.auction = A.id WHERE b_datetime >= a_datetime AND b_datetime <= a_expires) AS j) "
+          "AS r WHERE rn <= 1) AS wins"}},
         // q13: bounded side-input join - enrich each bid with a label from a
         // static side table keyed by (auction mod N), via clink's lookup join
         // (connector='lookup' + the side_lookup function registered in main).

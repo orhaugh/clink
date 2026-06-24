@@ -851,6 +851,47 @@ private:
     std::shared_ptr<arrow::Schema> schema_;
 };
 
+// Last-N-per-key aggregate: per partition key, maintain the most-recent N
+// elements (by an ORDER BY column) and emit a running aggregate over exactly
+// those N as a CHANGELOG keyed on the partition columns. Unlike
+// LogicalOverAggregate (append-only, one row per input, watermark-driven over
+// a declared event-time column), this is a materialised per-key view that
+// re-emits update_before/update_after as the window slides, and it consumes
+// upstream retractions. It is the lowering target of
+//   SELECT k, agg() OVER (PARTITION BY k ORDER BY oc ROWS BETWEEN n PRECEDING
+//                         AND CURRENT ROW)
+// when the input is NOT a declared-event-time append source (so the
+// watermark-driven OVER op does not apply). Output schema = the partition
+// columns + the aggregate output columns. The frame_start on each OverOutput
+// is the ROWS preceding count (so the kept window is max(frame_start)+1).
+class LogicalLastNAgg final : public LogicalPlan {
+public:
+    LogicalLastNAgg(std::unique_ptr<LogicalPlan> input,
+                    std::vector<std::string> partition_columns,
+                    std::string order_column,
+                    std::vector<OverOutput> outputs,
+                    std::shared_ptr<arrow::Schema> schema);
+
+    [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
+    [[nodiscard]] const std::vector<std::string>& partition_columns() const noexcept {
+        return partition_columns_;
+    }
+    [[nodiscard]] const std::string& order_column() const noexcept { return order_column_; }
+    [[nodiscard]] const std::vector<OverOutput>& outputs() const noexcept { return outputs_; }
+
+    [[nodiscard]] std::string kind() const override { return "LastNAgg"; }
+    [[nodiscard]] std::shared_ptr<arrow::Schema> schema() const override { return schema_; }
+    [[nodiscard]] std::vector<const LogicalPlan*> inputs() const override { return {input_.get()}; }
+
+private:
+    std::unique_ptr<LogicalPlan> input_;
+    std::vector<std::string> partition_columns_;
+    std::string order_column_;
+    std::vector<OverOutput> outputs_;
+    std::shared_ptr<arrow::Schema> schema_;
+};
+
 // Inc 4: semi / anti join, the lowering target of IN / NOT IN and
 // (correlated, equality) EXISTS / NOT EXISTS. Unlike LogicalEquiJoin
 // (which emits both sides' columns), a semi/anti join is a filter on
