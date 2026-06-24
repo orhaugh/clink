@@ -10,6 +10,7 @@
 
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/metrics/sql_metrics.hpp"
+#include "clink/sql/analyze.hpp"
 #include "clink/sql/binder.hpp"
 #include "clink/sql/cardinality.hpp"
 #include "clink/sql/catalog.hpp"
@@ -327,6 +328,71 @@ TEST(SqlCardinality, HistogramSelectivityFlipsJoinDriver) {
         bd.bind_select(as_select(parse("SELECT a_k FROM a JOIN b ON a.k = b.k WHERE a_x < 10"))));
     EXPECT_EQ(driving_table(*opt), "a")
         << "the histogram-estimated tiny filtered relation should drive the join";
+}
+
+// ----- ANALYZE: stats computed by scanning rows (StatsCollector) -----
+
+Row stat_row(std::int64_t status, std::int64_t amount) {
+    Row r;
+    r.values["status"] = clink::config::JsonValue{status};
+    r.values["amount"] = clink::config::JsonValue{amount};
+    return r;
+}
+
+TEST(SqlAnalyze, StatsCollectorComputesExactStats) {
+    StatsCollector c({"status", "amount"}, /*hist_buckets=*/4, /*max_mcv=*/8);
+    // 100 rows: status skewed (80x200, 15x404, 5x500); amount = 0..99 (uniform).
+    for (int i = 0; i < 80; ++i) {
+        c.observe(stat_row(200, i));
+    }
+    for (int i = 80; i < 95; ++i) {
+        c.observe(stat_row(404, i));
+    }
+    for (int i = 95; i < 100; ++i) {
+        c.observe(stat_row(500, i));
+    }
+    EXPECT_EQ(c.row_count(), 100u);
+    auto opts = c.to_with_options();
+    EXPECT_EQ(opts["row_count"], "100");
+    EXPECT_EQ(opts["ndv_status"], "3");
+    EXPECT_EQ(opts["ndv_amount"], "100");
+    // 200 is the hot value at 80/100 = 0.8, and sorts first (frequency-descending).
+    EXPECT_EQ(opts["mcv_status"].rfind("200:0.8", 0), 0u) << "got: " << opts["mcv_status"];
+    EXPECT_FALSE(opts["hist_amount"].empty());  // numeric column -> histogram
+    EXPECT_TRUE(opts.find("hist_status") == opts.end() || !opts["hist_status"].empty());
+}
+
+// The full compute -> WITH-option -> parse -> selectivity round trip: stats
+// computed by a scan, serialised the way ANALYZE writes them back, drive the
+// estimator exactly as declared stats do.
+TEST(SqlAnalyze, ComputedStatsRoundTripDriveSelectivity) {
+    StatsCollector c({"status", "amount"}, /*hist_buckets=*/4, /*max_mcv=*/8);
+    for (int i = 0; i < 80; ++i) {
+        c.observe(stat_row(200, i));
+    }
+    for (int i = 80; i < 95; ++i) {
+        c.observe(stat_row(404, i));
+    }
+    for (int i = 95; i < 100; ++i) {
+        c.observe(stat_row(500, i));
+    }
+    std::string opts;
+    for (const auto& [k, v] : c.to_with_options()) {
+        if (!opts.empty()) {
+            opts += ", ";
+        }
+        opts += k + "='" + v + "'";
+    }
+    Catalog cat;
+    reg(cat, "t", "(status BIGINT, amount BIGINT)", opts);
+    // The analyzed MCV puts status=200 at 0.8 -> 100 * 0.8 = 80 rows (NOT the
+    // uniform 1/ndv=1/3 the un-analyzed table would have given).
+    EXPECT_DOUBLE_EQ(rows_of(cat, "SELECT * FROM t WHERE status = 200"), 80.0);
+    EXPECT_EQ(estimate_stats(*Binder(cat).bind_select(as_select(parse("SELECT * FROM t"))))
+                  .column("amount")
+                  .histogram.empty(),
+              false)
+        << "the analyzed amount histogram should survive the round trip";
 }
 
 }  // namespace
