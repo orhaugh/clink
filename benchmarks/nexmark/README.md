@@ -42,14 +42,17 @@ Flags: `--query qN`, `--events N` (total events), `--tps N` (dateTime spacing =
 | q2 | selection | `mod()` computed in a derived table, filtered in the outer WHERE (clink WHERE compares a column to a literal) |
 | q3 | local-item join | INNER `auction ⋈ person` on `seller = id` + filter |
 | q20 | bid expansion | INNER `bid ⋈ auction` on `auction = id` + filter |
-| q11 | user sessions | per-bidder `COUNT(*)` over a 10s `SESSION` window |
+| q11 | user sessions | per-bidder `COUNT(*)` over a 10s `SESSION`, emitting the session `window_start`/`window_end` |
 | q12 | bids per window | per-bidder `COUNT(*)` over a 10s `TUMBLE` (event-time analogue of Nexmark's proctime q12) |
 
-Window-tier queries that need window BOUNDS in the output/join (q5 hot-items,
-q7 highest-bid, q8 new-users) are blocked on a clink SQL gap: `window_start` /
-`window_end` are not yet selectable from a windowed GROUP BY (the runtime window
-op emits them, but the binder/output-schema does not expose them). Closing that
-unblocks them. Then the analytics tier: OVER/Top-N + distinct/filter aggregates
+`window_start`/`window_end` are now projectable from a windowed GROUP BY (any
+window kind), aliasable, BIGINT ms-since-epoch.
+
+q5 (hot-items), q7 (highest-bid) and q8 (new-users) remain blocked, but NOT on
+window bounds: each joins a windowed aggregate as one side of a join, and clink
+only allows base tables (and nested INNER joins) as join inputs, not derived
+tables. Unblocking them needs a windowed-aggregate (subquery) usable as a join
+side. Then the analytics tier: OVER/Top-N + distinct/filter aggregates
 (q15/q17/q18/q19). See the feasibility scoping.
 
 Window queries: use a lower `--tps` (e.g. `--tps 50000`) so `dateTime` spans many
