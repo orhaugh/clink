@@ -121,11 +121,17 @@ private:
         std::map<std::string, std::string> qual_to_stream;
     };
 
-    // Recursively bind a FROM item (base table or nested INNER equi-join) into a
-    // BoundRel. The 2-base-table top-level join (which also covers interval /
-    // lookup / outer joins) stays on the existing inline path in bind_select;
-    // this method powers the NESTED multi-way INNER equi-join case.
+    // Recursively bind a FROM item (base table, derived table, or nested INNER
+    // equi-join) into a BoundRel. The 2-base-table top-level join (which also
+    // covers interval / lookup / outer joins) stays on the existing inline path
+    // in bind_select; this method powers the NESTED multi-way INNER equi-join
+    // case, including a derived table / windowed aggregate as a join side.
     BoundRel bind_join_rel(const ast::FromItem& item) const;
+
+    // Bind a base-table (or synthetic derived-table) reference into a BoundRel:
+    // its plan, alias, and qualified-name -> stream-name map. Shared by the
+    // TableRef and the derived-table (SubqueryItem) paths of bind_join_rel.
+    BoundRel bind_base_table_rel(const ast::TableRef& ref) const;
 
     const Catalog& catalog_;
     // Phase 16: WITH clause. Synthetic TableDefs serve column

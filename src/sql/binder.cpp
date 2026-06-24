@@ -1686,26 +1686,60 @@ std::unique_ptr<LogicalPlan> Binder::make_table_plan(const std::string& table_na
 // keys are resolved to the column name in the corresponding child's OUTPUT
 // stream. The 2-base-table top-level join (incl. interval / lookup / outer)
 // stays on the inline path in bind_select; this powers the nested case.
+Binder::BoundRel Binder::bind_base_table_rel(const ast::TableRef& ref) const {
+    const auto& def = resolve_table(catalog_, ref, cte_synth_tables_);
+    if (def.is_lookup()) {
+        bind_error("lookup table '" + def.name +
+                       "' is not supported inside a multi-way join (v1); use it as the right "
+                       "side of a single JOIN",
+                   ref.loc.pos);
+    }
+    BoundRel r;
+    r.plan = make_table_plan(ref.name, def, ref.loc.pos);
+    r.is_base = true;
+    r.alias = ref.alias.value_or(def.name);
+    r.aliases.insert(r.alias);
+    for (const auto& c : def.columns) {
+        r.columns.push_back(c);  // a scan's output stream is the raw columns
+        r.qual_to_stream[r.alias + "." + c.name] = c.name;
+    }
+    return r;
+}
+
 Binder::BoundRel Binder::bind_join_rel(const ast::FromItem& item) const {
     if (std::holds_alternative<ast::TableRef>(item)) {
-        const auto& ref = std::get<ast::TableRef>(item);
-        const auto& def = resolve_table(catalog_, ref, cte_synth_tables_);
-        if (def.is_lookup()) {
-            bind_error("lookup table '" + def.name +
-                           "' is not supported inside a multi-way join (v1); use it as the right "
-                           "side of a single JOIN",
-                       ref.loc.pos);
+        return bind_base_table_rel(std::get<ast::TableRef>(item));
+    }
+    if (std::holds_alternative<std::unique_ptr<ast::SubqueryItem>>(item)) {
+        // A derived table (subquery, e.g. a windowed aggregate) as a join side.
+        // Pre-bind its body and register it as a synthetic table exactly like a
+        // single-FROM derived table, so make_table_plan returns the sub-plan and
+        // the base-table path prefixes its columns as <alias>_<col> in the join
+        // output - identical naming to a base-table side.
+        const auto& sq = *std::get<std::unique_ptr<ast::SubqueryItem>>(item);
+        if (sq.alias.empty()) {
+            bind_error("derived table requires an alias", sq.loc.pos);
         }
-        BoundRel r;
-        r.plan = make_table_plan(ref.name, def, ref.loc.pos);
-        r.is_base = true;
-        r.alias = ref.alias.value_or(def.name);
-        r.aliases.insert(r.alias);
-        for (const auto& c : def.columns) {
-            r.columns.push_back(c);  // a scan's output stream is the raw columns
-            r.qual_to_stream[r.alias + "." + c.name] = c.name;
+        if (cte_synth_tables_.count(sq.alias) != 0) {
+            bind_error("derived-table alias collides with an in-scope table or CTE: " + sq.alias,
+                       sq.loc.pos);
         }
-        return r;
+        auto body_plan = bind_select(*sq.body);
+        auto body_schema = body_plan->schema();
+        TableDef synth;
+        synth.name = sq.alias;
+        synth.columns.reserve(static_cast<std::size_t>(body_schema->num_fields()));
+        for (int i = 0; i < body_schema->num_fields(); ++i) {
+            synth.columns.push_back(
+                ColumnSpec{body_schema->field(i)->name(), body_schema->field(i)->type()});
+        }
+        cte_synth_tables_.emplace(sq.alias, std::move(synth));
+        cte_plans_.emplace(sq.alias, std::move(body_plan));
+        ast::TableRef tr;
+        tr.name = sq.alias;
+        tr.alias = sq.alias;
+        tr.loc = sq.loc;
+        return bind_base_table_rel(tr);
     }
     if (std::holds_alternative<std::unique_ptr<ast::JoinClause>>(item)) {
         const auto& jc = *std::get<std::unique_ptr<ast::JoinClause>>(item);

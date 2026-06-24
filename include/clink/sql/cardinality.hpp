@@ -345,23 +345,42 @@ inline RelStats estimate_stats(const LogicalPlan& node) {
                           j.right_alias());
     }
     if (kind == "Aggregate" || kind == "WindowAggregate") {
-        const auto& a = static_cast<const LogicalAggregate&>(node);
-        RelStats in = estimate_stats(a.input());
+        // LogicalAggregate and LogicalWindowAggregate are distinct LogicalPlan
+        // subclasses (no inheritance between them) that expose the same group-by
+        // accessors. Casting a WindowAggregate to LogicalAggregate is UB - it
+        // reads group_keys() off the wrong offset (garbage), which spins here -
+        // so select the matching concrete type. (Reachable since a windowed
+        // aggregate can be a join input, which join-reorder feeds to estimate.)
+        const LogicalPlan* in_node = nullptr;
+        const std::vector<std::string>* group_keys = nullptr;
+        const std::vector<std::string>* key_outputs = nullptr;
+        if (kind == "WindowAggregate") {
+            const auto& a = static_cast<const LogicalWindowAggregate&>(node);
+            in_node = &a.input();
+            group_keys = &a.group_keys();
+            key_outputs = &a.key_output_names();
+        } else {
+            const auto& a = static_cast<const LogicalAggregate&>(node);
+            in_node = &a.input();
+            group_keys = &a.group_keys();
+            key_outputs = &a.key_output_names();
+        }
+        RelStats in = estimate_stats(*in_node);
         RelStats out;
-        if (a.group_keys().empty()) {
+        if (group_keys->empty()) {
             out.row_count = 1.0;
         } else {
             double groups = 1.0;
-            for (const auto& k : a.group_keys()) {
+            for (const auto& k : *group_keys) {
                 groups *= ndv_or(in, k);
             }
             out.row_count = std::min(groups, in.row_count_known() ? in.row_count : groups);
         }
         // Group-key output columns keep their NDV (capped at the group count);
         // aggregate outputs have unknown stats.
-        const auto& outs = a.key_output_names().empty() ? a.group_keys() : a.key_output_names();
-        for (std::size_t i = 0; i < a.group_keys().size() && i < outs.size(); ++i) {
-            out.columns[outs[i]] = in.column(a.group_keys()[i]);
+        const auto& outs = key_outputs->empty() ? *group_keys : *key_outputs;
+        for (std::size_t i = 0; i < group_keys->size() && i < outs.size(); ++i) {
+            out.columns[outs[i]] = in.column((*group_keys)[i]);
         }
         clear_distributions(out);  // grouping changes the row set: hist/mcv stale
         cap_ndv(out, out.row_count);

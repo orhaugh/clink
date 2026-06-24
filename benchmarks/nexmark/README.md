@@ -48,11 +48,19 @@ Flags: `--query qN`, `--events N` (total events), `--tps N` (dateTime spacing =
 `window_start`/`window_end` are now projectable from a windowed GROUP BY (any
 window kind), aliasable, BIGINT ms-since-epoch.
 
-q5 (hot-items), q7 (highest-bid) and q8 (new-users) remain blocked, but NOT on
-window bounds: each joins a windowed aggregate as one side of a join, and clink
-only allows base tables (and nested INNER joins) as join inputs, not derived
-tables. Unblocking them needs a windowed-aggregate (subquery) usable as a join
-side. Then the analytics tier: OVER/Top-N + distinct/filter aggregates
+A derived table (including a windowed aggregate) can now be a JOIN input, so the
+join-shaped window queries are no longer wholly blocked. The remaining gaps are
+per-query, not the join-input restriction:
+- q7 (highest-bid): needs the per-window range match (`price = maxprice AND
+  dateTime IN [window_start, window_end)`); clink's join ON is a single equality
+  and WHERE compares a column to a literal, so the range half is not expressible.
+- q8 (new-users): needs a composite (multi-column) equi-join key
+  (`id = seller AND window_start = window_start`); clink's equi-join key is a
+  single column.
+- q5 (hot-items): a different shape (nested windowed aggregate feeding a
+  per-window MAX, then a composite IN-subquery), not a plain join.
+
+Then the analytics tier: OVER/Top-N + distinct/filter aggregates
 (q15/q17/q18/q19). See the feasibility scoping.
 
 Window queries: use a lower `--tps` (e.g. `--tps 50000`) so `dateTime` spans many

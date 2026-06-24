@@ -2923,6 +2923,82 @@ TEST(SqlRuntime, TumbleWindowSelectsWindowBounds) {
     std::filesystem::remove(out_path);
 }
 
+// A derived table (here a windowed aggregate) can be a JOIN side: enrich a base
+// stream with a per-key windowed total. Proves the binder accepts a subquery as a
+// multi-way-join input and the runtime joins it like a base table.
+TEST(SqlRuntime, WindowedAggregateAsJoinSide) {
+    ensure_sql_installed_once();
+
+    const auto ev_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_wjoin_ev.ndjson";
+    const auto pr_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_wjoin_pr.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_e2e_wjoin_out.ndjson";
+    for (const auto& p : {ev_path, pr_path, out_path})
+        std::filesystem::remove(p);
+
+    // events -> one TUMBLE(1000) window: k=1 total=30, k=2 total=5.
+    write_lines(ev_path,
+                {
+                    R"({"k":1,"v":10,"ts":100})",
+                    R"({"k":1,"v":20,"ts":200})",
+                    R"({"k":2,"v":5,"ts":300})",
+                });
+    // probe rows to enrich with the per-key windowed total.
+    write_lines(pr_path,
+                {
+                    R"({"k":1,"label":100})",
+                    R"({"k":2,"label":200})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE events (k BIGINT, v BIGINT, ts BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     ev_path.string() +
+                     "', event_time_column='ts');"
+                     "CREATE TABLE probe (k BIGINT, label BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     pr_path.string() +
+                     "');"
+                     "CREATE TABLE enriched (label BIGINT, total BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    for (int i = 0; i < 3; ++i)
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[i]));
+
+    // The windowed aggregate M is a JOIN side, joined to base table probe on key.
+    auto spec = compile(cat,
+                        "INSERT INTO enriched SELECT P_label AS label, M_total AS total "
+                        "FROM probe AS P JOIN (SELECT k AS mk, SUM(v) AS total FROM events "
+                        "GROUP BY TUMBLE(ts, 1000), k) AS M ON P.k = M.mk");
+
+    InProcessCluster cluster("tm-sql-e2e-wjoin", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 20s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    std::multimap<std::int64_t, std::int64_t> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("label").as_number()),
+                    static_cast<std::int64_t>(js.at("total").as_number()));
+    }
+    auto contains = [&](std::int64_t label, std::int64_t total) {
+        auto range = got.equal_range(label);
+        for (auto it = range.first; it != range.second; ++it)
+            if (it->second == total)
+                return true;
+        return false;
+    };
+    EXPECT_TRUE(contains(100, 30)) << "label=100 enriched with k=1 windowed total 30 missing";
+    EXPECT_TRUE(contains(200, 5)) << "label=200 enriched with k=2 windowed total 5 missing";
+
+    for (const auto& p : {ev_path, pr_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // SESSION window bounds: a session that grows by merging buckets must emit the
 // earliest start and (end + gap) as window_start / window_end.
 TEST(SqlRuntime, SessionWindowSelectsMergedBounds) {

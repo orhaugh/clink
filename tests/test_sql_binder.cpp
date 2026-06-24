@@ -2271,6 +2271,32 @@ TEST(SqlBinder, EquiJoinBuildsLogicalEquiJoin) {
     EXPECT_EQ(ej.join_type(), JoinType::Inner);
 }
 
+TEST(SqlBinder, DerivedWindowedAggregateAsJoinSideBinds) {
+    Catalog cat;
+    auto regs = parse(
+        "CREATE TABLE a (k BIGINT, label BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/a.ndjson');"
+        "CREATE TABLE b (k BIGINT, w BIGINT, ts BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/b.ndjson', event_time_column='ts')");
+    cat.register_table(std::get<ast::CreateTableStmt>(regs.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(regs.statements[1]));
+    Binder bd(cat);
+    // A windowed aggregate (derived table M) as a join side, joined to base table a.
+    auto plan = bd.bind_select(as_select(
+        parse("SELECT a_label AS label, M_total AS total FROM a "
+              "JOIN (SELECT k AS mk, SUM(w) AS total FROM b GROUP BY TUMBLE(ts, 1000), k) AS M "
+              "ON a.k = M.mk")));
+    const auto* jn = join_node(plan.get());
+    ASSERT_NE(jn, nullptr);
+    ASSERT_EQ(jn->kind(), "EquiJoin");
+    const auto& ej = static_cast<const LogicalEquiJoin&>(*jn);
+    EXPECT_EQ(ej.left_alias(), "a");   // base table
+    EXPECT_EQ(ej.right_alias(), "m");  // derived windowed aggregate (alias lower-cased), base-like
+    EXPECT_EQ(ej.left_key_column(), "k");
+    EXPECT_EQ(ej.right_key_column(), "mk");
+    EXPECT_EQ(ej.right().kind(), "WindowAggregate");  // the sub-plan is wired as the join child
+}
+
 TEST(SqlBinder, OuterEquiJoinsCarryJoinType) {
     Catalog cat;
     auto regs = parse(
