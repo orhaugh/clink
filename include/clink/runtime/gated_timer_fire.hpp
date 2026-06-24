@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -103,11 +104,14 @@ void gated_fire_processing_time_timers(Op& op,
 // complete (an epoch-tied release - see the single-input async runner), so a
 // downstream operator never sees the watermark before the windows it closed.
 //
-// COLLECT-THEN-SUBMIT, identical discipline to the processing-time variant:
-// poll_due_event_time() erases due timers as it snapshots them, so collect the
-// due (ts, key) set first (firing nothing), then submit each - a timer stays
-// owned by the local vector until its submit succeeds, so nothing is dropped at
-// the in-flight cap.
+// COLLECT-(GROUP-BY-KEY)-THEN-SUBMIT, the discipline of the processing-time
+// variant plus per-key batching: poll_due_event_time() erases due timers as it
+// snapshots them, so collect the due timers first (firing nothing), GROUPED by
+// key. One coroutine per KEY fires all that key's due timers via
+// on_event_time_timers_async, so a key with several due timers at one watermark
+// (hopping / cumulate windows) does ONE state read instead of N serial same-key
+// reads - while distinct keys still overlap. poll_due_event_time yields in
+// (ts, key) order, so each key's timestamp list is already ascending.
 template <typename Op, typename Out>
 void gated_fire_event_time_timers(Op& op,
                                   Emitter<Out>& out,
@@ -117,22 +121,32 @@ void gated_fire_event_time_timers(Op& op,
     if (rt == nullptr) {
         return;
     }
-    std::vector<std::pair<std::int64_t, std::string>> to_fire;
+    // Preserve first-seen key order (and ascending ts within a key) so firing is
+    // deterministic; the index map only dedups keys.
+    std::vector<std::pair<std::string, std::vector<std::int64_t>>> by_key;
+    std::unordered_map<std::string, std::size_t> key_index;
     rt->timer_service()->poll_due_event_time(
-        watermark_ms,
-        [&to_fire](std::int64_t ts, const std::string& key) { to_fire.emplace_back(ts, key); });
-    if (to_fire.empty()) {
+        watermark_ms, [&by_key, &key_index](std::int64_t ts, const std::string& key) {
+            auto it = key_index.find(key);
+            if (it == key_index.end()) {
+                key_index.emplace(key, by_key.size());
+                by_key.emplace_back(key, std::vector<std::int64_t>{ts});
+            } else {
+                by_key[it->second].second.push_back(ts);
+            }
+        });
+    if (by_key.empty()) {
         return;  // common case (watermark with no due windows): a pure no-op
     }
-    for (const auto& entry : to_fire) {
-        const std::int64_t ts = entry.first;
-        const std::string key = entry.second;
+    for (const auto& entry : by_key) {
+        const std::string& key = entry.first;
+        const std::vector<std::int64_t>& timestamps = entry.second;
         AsyncExecutionController::CoroFactory factory =
-            [&op, &out, ts, key]() -> async::Task<void> {
-            co_await op.on_event_time_timer_async(ts, key, out);
+            [&op, &out, key, timestamps]() -> async::Task<void> {
+            co_await op.on_event_time_timers_async(timestamps, key, out);
         };
         while (!aec.submit(key, factory)) {
-            aec.poll();  // free capacity, then retry (the timer is still owned here)
+            aec.poll();  // free capacity, then retry (the timer set is still owned here)
         }
     }
     aec.poll();  // kick any fire coroutine that completed synchronously + surface throws

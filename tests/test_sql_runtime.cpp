@@ -634,6 +634,64 @@ std::vector<Record<Row>> run_tumbling_window(const std::vector<Record<Row>>& inp
     return sink->collected_records();
 }
 
+// Build a hopping-window SUM (size 30, slide 10, GROUP BY k) via the registered
+// Dag builder over `backend`. Overlapping windows mean one record lands in
+// several windows, so a group can have multiple due win_ends at one watermark -
+// the case the per-key fire-batching targets.
+std::vector<Record<Row>> run_hopping_window(const std::vector<Record<Row>>& input,
+                                            std::shared_ptr<StateBackend> backend) {
+    const auto* builder =
+        cluster::DagBuilderRegistry::default_instance().find("hopping_window_row");
+    Dag dag;
+    auto h = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(input));
+    clink::plugin::BuildContext ctx;
+    ctx.params["time_column"] = "ts";
+    ctx.params["size_ms"] = "30";
+    ctx.params["slide_ms"] = "10";
+    ctx.params["group_keys"] = "k";
+    ctx.params["group_key_outputs"] = "k";
+    ctx.params["aggregates"] = R"([{"name":"s","fn":"sum","input_column":"amt"}])";
+    std::vector<std::any> upstream = {std::any{h}};
+    auto out = (*builder)(dag, upstream, ctx);
+    auto h_win = std::any_cast<StageHandle<Row>>(out.main_handle);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_win, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return sink->collected_records();
+}
+
+// Build a cumulate-window SUM (size 30, step 10, GROUP BY k) via the registered
+// Dag builder over `backend`. Cumulate slices SHARE a window_start and grow by
+// step, so one record lands in every slice up to size - another multiple-due-
+// windows-per-group case, distinct from hop in that the slices share a start.
+std::vector<Record<Row>> run_cumulate_window(const std::vector<Record<Row>>& input,
+                                             std::shared_ptr<StateBackend> backend) {
+    const auto* builder =
+        cluster::DagBuilderRegistry::default_instance().find("cumulate_window_row");
+    Dag dag;
+    auto h = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(input));
+    clink::plugin::BuildContext ctx;
+    ctx.params["time_column"] = "ts";
+    ctx.params["size_ms"] = "30";
+    ctx.params["step_ms"] = "10";  // cumulate carries the step in the slide slot
+    ctx.params["group_keys"] = "k";
+    ctx.params["group_key_outputs"] = "k";
+    ctx.params["aggregates"] = R"([{"name":"s","fn":"sum","input_column":"amt"}])";
+    std::vector<std::any> upstream = {std::any{h}};
+    auto out = (*builder)(dag, upstream, ctx);
+    auto h_win = std::any_cast<StageHandle<Row>>(out.main_handle);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_win, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return sink->collected_records();
+}
+
 Record<Row> window_input_row(std::int64_t k, std::int64_t ts, std::int64_t amt) {
     Row r;
     r.values["k"] = clink::config::JsonValue{static_cast<double>(k)};
@@ -720,6 +778,55 @@ TEST(SqlRuntime, AsyncStateWindowFireCoalescesReadsAcrossGroups) {
         << "reads were not coalesced across groups: ~one batched round-trip per group";
     // Pool level: the cold reads that reached the pool were batched too.
     EXPECT_EQ(pool->read_calls(), 0u) << "a cold read hit the pool as a single-key round-trip";
+}
+
+// Per-key fire-batching: a HOP window where one record lands in 3 overlapping
+// windows (size 30, slide 10 -> [0,30) [10,40) [20,50)) gives group k=1 THREE
+// due windows at the max watermark. They fire from ONE state read, not three:
+// the whole run is exactly 2 batched backend reads (one ingest, one fire), so
+// the group's three due windows did not serialise into three same-key reads.
+TEST(SqlRuntime, AsyncStateHopWindowFiresMultiplePerGroupInOneRead) {
+    ensure_sql_installed_once();
+    const std::vector<Record<Row>> input = {window_input_row(1, /*ts=*/25, /*amt=*/7)};
+
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    auto rrb = std::make_shared<RemoteReadBackend>(pool, /*io_threads=*/1, /*hot_max_bytes=*/0);
+    const auto rel = window_relation(run_hopping_window(input, rrb));
+
+    const std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> want = {
+        {{1, 0}, 7}, {{1, 10}, 7}, {{1, 20}, 7}};
+    EXPECT_EQ(rel, want) << "the record's 3 overlapping hop windows each sum 7";
+    EXPECT_EQ(rrb->get_async_calls(), 0u) << "a read bypassed the coalescer as a single-key read";
+    EXPECT_EQ(rrb->get_many_async_calls(), 2u)
+        << "the group's 3 due windows did not batch into a single fire read (expected 1 ingest + "
+           "1 fire)";
+}
+
+// Cumulate variant of the per-key fire-batching proof. Cumulate slices SHARE a
+// window_start (so they're keyed here by window_end, not window_start): size 30,
+// step 10 -> [0,10) [0,20) [0,30); one record at ts=5 lands in all three growing
+// slices. Group k=1 has 3 due windows at the max watermark and fires them in one
+// batched read (2 backend reads total: one ingest, one fire).
+TEST(SqlRuntime, AsyncStateCumulateWindowFiresMultiplePerGroupInOneRead) {
+    ensure_sql_installed_once();
+    const std::vector<Record<Row>> input = {window_input_row(1, /*ts=*/5, /*amt=*/7)};
+
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    auto rrb = std::make_shared<RemoteReadBackend>(pool, /*io_threads=*/1, /*hot_max_bytes=*/0);
+
+    std::map<std::int64_t, std::int64_t> by_end;  // window_end -> sum (slices share start=0)
+    for (const auto& rec : run_cumulate_window(input, rrb)) {
+        const Row& r = rec.value();
+        EXPECT_EQ(static_cast<std::int64_t>(r.values.at("window_start").as_number()), 0)
+            << "cumulate slices share window_start=0";
+        by_end[static_cast<std::int64_t>(r.values.at("window_end").as_number())] =
+            static_cast<std::int64_t>(r.values.at("s").as_number());
+    }
+    const std::map<std::int64_t, std::int64_t> want = {{10, 7}, {20, 7}, {30, 7}};
+    EXPECT_EQ(by_end, want) << "all 3 cumulate slices contain the record and sum 7";
+    EXPECT_EQ(rrb->get_async_calls(), 0u) << "a read bypassed the coalescer as a single-key read";
+    EXPECT_EQ(rrb->get_many_async_calls(), 2u)
+        << "the group's 3 cumulate slices did not batch into a single fire read";
 }
 
 // #59: the same unbounded GROUP BY built through the programmatic Table API

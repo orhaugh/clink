@@ -11,6 +11,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "clink/core/stream_element.hpp"
 #include "clink/core/types.hpp"
@@ -340,16 +341,17 @@ public:
     }
 
     // Opt-in (default false): fire this operator's due EVENT-TIME timers as
-    // gate-routed async coroutines (on_event_time_timer_async) instead of the
+    // gate-routed async coroutines (on_event_time_timers_async) instead of the
     // default synchronous fire inside the watermark release. The single-input
-    // async runner then submits one fire coroutine per due (timer, key) through
-    // the per-key gate, so a deferring backend OVERLAPS the reads of distinct
-    // due keys (one coalesced get_many) and forwards the watermark only once
-    // those fire coroutines drain (a second epoch-tied release - no blocking
-    // drain on the fire path). Returning false keeps the proven
-    // fire-inside-release path, byte-identical. Only meaningful when the bound
-    // backend defers reads (a non-deferring backend never enters the async
-    // runner, so this is inert there).
+    // async runner groups the due timers by key and submits ONE fire coroutine
+    // per due key through the per-key gate, so a deferring backend OVERLAPS the
+    // reads of distinct due keys (one coalesced get_many) and a key's several
+    // due timers share a single read; the watermark forwards only once those
+    // fire coroutines drain (a second epoch-tied release - no blocking drain on
+    // the fire path). Returning false keeps the proven fire-inside-release path,
+    // byte-identical. Only meaningful when the bound backend defers reads (a
+    // non-deferring backend never enters the async runner, so this is inert
+    // there).
     [[nodiscard]] virtual bool fires_async_event_time_timers() const noexcept { return false; }
 
     // Hooks for time and checkpointing. Default behaviour for watermarks
@@ -410,6 +412,26 @@ public:
                                                         Emitter<Out>& out) {
         on_event_time_timer(timestamp_ms, key, out);
         co_return;
+    }
+
+    // Batched async event-time fire: fire ALL of `key`'s due timers
+    // (`timestamps`, ascending, non-empty) in one shot. An operator that keeps a
+    // per-key collection (e.g. a window map) overrides this to read it ONCE,
+    // fire every due entry, and write back once - so a key with several due
+    // timers at one watermark (hopping / cumulate windows, where one record
+    // lands in multiple overlapping windows) does ONE state read instead of one
+    // per due timer. Default loops on_event_time_timer_async (per-timer
+    // semantics, no batching) so an operator that implements only the singular
+    // form is unaffected. The async runner fires through THIS entry, one
+    // coroutine per key under the per-key gate, so distinct keys still overlap.
+    // `key` and `timestamps` are by value (coroutine parameters - a by-reference
+    // parameter would dangle in the frame across the first suspension).
+    virtual async::Task<void> on_event_time_timers_async(std::vector<std::int64_t> timestamps,
+                                                         std::string key,
+                                                         Emitter<Out>& out) {
+        for (std::int64_t ts : timestamps) {
+            co_await on_event_time_timer_async(ts, key, out);
+        }
     }
 
     // Drive any event-time timers whose deadline ≤ watermark_ms. The
