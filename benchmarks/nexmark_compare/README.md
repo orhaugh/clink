@@ -47,95 +47,83 @@ out of v1. See `pipeline.md` for the rationale.
 - [ ] **INC 8** - scoreboard: per-query Time/Cores/Cores*Time/ratio + SQL-only
   geomean + banner; optional durable-mode matrix.
 
-## Preliminary result (q0, parallelism 1)
+## Results (parallelism 1, 1-partition, hot-path)
 
-First apples-to-apples number. q0 (stateless pass-through), both engines reading
-the same pre-generated `nx-bid` Kafka topic (JSON), hot-path durability
-(checkpoints off, in-memory state), steady-state throughput measured identically
-from each output record's broker append timestamp (`message.timestamp.type=
-LogAppendTime`) over the middle 80%:
+Apples-to-apples, both engines reading the same pre-generated 1-partition Kafka
+topic (JSON), hot-path durability (checkpoints off, in-memory state), steady-state
+measured identically from each output record's broker append timestamp
+(`message.timestamp.type=LogAppendTime`) over the middle 80%, both gate-verified
+(identical output-row counts -> same relation):
 
-| engine | q0 steady events/sec | output rows (gate) |
+| query | class | clink steady | Flink 2.2.0 steady | ratio | gate |
+|---|---|---|---|---|---|
+| q0 | stateless pass-through | ~497,000 ev/s | ~170,000 ev/s | 2.9x | 460,000 ✓ |
+| q12 | windowed aggregate (10s tumbling per-bidder COUNT) | ~262,000 panes/s | ~96,000 panes/s | 2.7x | 184,767 ✓ |
+
+clink leads on both, and on q0 it wins despite paying the heavier `JsonValue`
+row-materialisation cost the JSON-input premise disclosed (which favours Flink on
+stateless queries). q12's metric is steady output-pane rate (the same metric on
+both engines, so the ratio is fair).
+
+Caveats (so these are not yet the full `pipeline.md` headline): parallelism is 1
+on BOTH (matched, the cleanest per-core comparison; **1-partition input topics**
+are the correct config at parallelism 1 - see the multi-partition note below).
+No CPU normalisation yet (events/sec, not events/sec/core). Two of the three
+headline classes so far (stateless, windowed-agg); windowed-join (q8) next.
+
+## A real clink bug the gate caught: multi-partition watermarks
+
+The correctness gate first failed q12 (per-bidder COUNT per 10s tumbling window):
+clink emitted ~276k panes vs the data-true 184,767. That gate-fail is the harness
+earning its keep - it blocked a meaningless "clink 6.7x" that compared different
+relations. The root cause, established by a controlled partition-count matrix
+(same ordered data, parallelism 1, partition counts verified):
+
+| input | clink q12 panes | correct? |
 |---|---|---|
-| clink | ~497,000 | 460,000 ✓ |
-| Flink 2.2.0 | ~170,000 | 460,000 ✓ |
+| 1 partition (ordered) | 184,767 | yes |
+| 4 partitions, single-producer (contiguous ranges) | 184,767 | yes |
+| 4 partitions, **keyed by auction** (each partition spans the full time range) | 274,608 | **no** |
 
-clink ≈ 2.9x on this query, and notably it wins despite paying the heavier
-`JsonValue` row-materialisation cost the JSON-input premise disclosed (which
-favours Flink on stateless queries). Both produced exactly 460,000 rows, so the
-correctness gate passes.
+So the bug is clink's **single global watermark over a multi-partition Kafka
+source**. clink's Kafka source emits no per-partition watermarks; one downstream
+`assign_timestamps` computes one global max-seen watermark over the merged,
+interleaved stream. When data is key-distributed across partitions (each
+partition spans the whole time range), one subtask reading all partitions sees a
+badly out-of-order stream, the global watermark races to the fastest partition's
+time, windows finalise before slower partitions deliver their in-window records,
+and late folds re-create + re-fire windows (over-emit) while stranded bids miss
+the canonical pane (under-count). This is exactly Flink's per-split watermark
+case: Flink tracks a watermark per Kafka partition and emits the min across them,
+so no in-window record is falsely late.
 
-Caveats this number still carries (so it is NOT yet the full headline of
-`pipeline.md`): parallelism is 1 on BOTH (matched, the cleanest per-core
-comparison; parallel scaling needs a clink SQL parallelism flag, a follow-on
-engine feature - clink SQL ops default to parallelism 1 today). No CPU
-normalisation yet (events/sec, not events/sec/core). q0 only - the stateless
-floor.
+(An earlier intermediate conclusion in this investigation - "1-partition also
+fails, so it's the keyed path not the partitions" - was wrong: that "1-partition"
+topic had silently been recreated at the default 4 partitions by a Kafka
+auto-create race. Verified partition counts settle it: 1-partition is correct.)
 
-## The correctness gate's first finding: a clink windowed-aggregate bug (q12)
+`WindowRowOp` itself is correct (an ordered bounded file source is byte-exact:
+190,729 panes, sum 460,000). The defect is purely the multi-partition watermark.
 
-Running the windowed-aggregate query q12 (per-bidder COUNT per 10s tumbling
-window) over a low-tps dataset (event-time spanning ~50 windows) the per-query
-output-row gate FAILED, and that is a genuine result, not a hiccup:
+What this means here:
+- **Parallelism-1 benchmark: use 1-partition input topics** (the correct config
+  at parallelism 1 - one subtask reads one ordered partition). q12 is then exact
+  on both engines, which is how the q12 ratio above was obtained.
+- **The engine fix = per-partition (per-split) watermarks in the Kafka source,
+  emitting the min across the subtask's partitions, with idle-partition
+  exclusion** (Flink's behaviour). It is real, now precisely root-caused with a
+  clean reproduction (4-partition keyed) and control (1-partition), but it is a
+  multi-day ABI-touching change (event time is a parsed JSON column, so the
+  partition must be threaded from the source through the `json_string_to_row`
+  bridge into a partition-aware watermark strategy). It is the prerequisite for
+  **parallelism>1** scaled runs (which need multiple partitions). The
+  late-record-drop guard (`allowed_lateness=0`) is NOT the fix - it would worsen
+  the under-count, since the records are not genuinely late, the global watermark
+  is just wrong.
 
-| engine | q12 panes | sum(bid_count) | correct? |
-|---|---|---|---|
-| Flink 2.2.0 | 184,767 | 450,800 | yes |
-| clink | 280,729 | 420,933 | no (over-emits) |
-
-The true answer, computed directly from the source data, is **184,767** distinct
-`(window, bidder)` pairs over the 49 watermark-closed windows (the last window
-never closes on an unbounded Kafka source). Flink matches it exactly. clink
-over-emits and under-counts. Per `pipeline.md` a gate mismatch HALTS: q12 is NOT
-quotable as a ratio until the clink bug is fixed. The gate did exactly its job -
-it stopped a meaningless "clink 6.7x" (clink 326k vs Flink 49k panes/sec) that
-was comparing different relations.
-
-### Where the bug is (localised by controlled tests)
-
-A root-cause investigation first blamed multi-partition watermark merging, but
-controlled isolation tests sharpened (and partly corrected) that:
-
-- clink q12 over an **ordered, bounded FILE source**: **exactly correct** -
-  190,729 panes (all 50 windows; bounded source fires the last via a terminal
-  watermark), sum(bid_count) = 460,000. So `WindowRowOp` and the windowing /
-  watermark-assigner logic are sound.
-- clink q12 over **Kafka, 1 partition** (globally ordered): still wrong (276,078
-  panes). So it is NOT only the multi-partition interleave - the bug reproduces
-  on a single ordered partition.
-
-Further controlled tests narrowed it precisely (all over the same streaming
-Kafka source, parallelism 1):
-
-| query shape | result |
-|---|---|
-| per-bidder COUNT (keyed window, `GROUP BY ..., bidder`) | WRONG (276,078) |
-| global COUNT per window (no key, `GROUP BY TUMBLE` only) | **correct** (49 windows, sum 450,800) |
-| per-bidder COUNT over an ordered FILE source (keyed) | **correct** (190,729) |
-
-So the defect is the **keyed-window path under a streaming source** specifically:
-keyed+Kafka is wrong, but no-key+Kafka is correct AND keyed+file is correct. The
-Kafka source itself delivers all 460,000 records, distinct and essentially
-ordered (a clean passthru confirmed this); `WindowRowOp` is correct; the no-key
-streaming path is correct. The fault is in how data and watermarks are delivered
-to the window operator **across the `key_by` edge under incremental (small-batch)
-streaming** - the watermark effectively advances relative to the keyed data so
-windows finalise before all their data is folded, then late folds re-create and
-re-fire the window (extra panes) while some bids miss the canonical pane
-(under-count).
-
-Why the late-record-drop guard is NOT the fix: the no-key path proves the
-watermark is correct (sum 450,800), so in the keyed path the records are not
-genuinely late - dropping them (Flink's `allowed_lateness=0`) would make the
-under-count worse, not fix it. The correct fix preserves watermark-after-data
-ordering through the keyed edge/keyed-window path under streaming. That is
-load-bearing runtime code (the keyed / async-state path), so it warrants a
-careful dedicated change, not a rushed one.
-
-Remaining: the keyed-window-over-streaming fix (prerequisite for any windowed
-cross-engine ratio q12/q5/q8 and for parallelism>1 runs); then q8/q6, CPU
-normalisation, the clink SQL parallelism flag, and a reproducible run.sh +
-scoreboard.
+Remaining: the per-partition-watermark engine fix (gates parallelism>1); q8
+(windowed join), q6 (SQL-vs-DataStream); CPU normalisation; the clink SQL
+parallelism flag; and a reproducible run.sh + scoreboard.
 
 ## Producer (INC 2)
 
