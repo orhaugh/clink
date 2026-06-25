@@ -222,4 +222,41 @@ TEST(ColumnarPredicateProgram, UnsupportedShapesFallBack) {
     nullopt_compile(cmp("eq", "price", JsonValue{nullptr}), "null literal");
 }
 
+// A utf8 column can carry a dec-string (0x01-sentinel) cell, which the row
+// interpreter reads as a DECIMAL (detail::compare's coercion branch), not a
+// lexicographic string. The typed Str kernel cannot reproduce that, so it must
+// defer the whole batch to the row interpreter (evaluate -> nullopt). Found by
+// the WS1 inc1 adversarial parity review.
+TEST(ColumnarPredicateProgram, SentinelStringCellDefersToRowPath) {
+    auto schema = arrow::schema({arrow::field("s", arrow::utf8())});
+    arrow::StringBuilder sb;
+    std::string sentinel;
+    sentinel.push_back(clink::config::kDecimalSentinel);
+    sentinel += "9.99";  // a dec-string cell in a utf8 column
+    (void)sb.Append("foo");
+    (void)sb.Append(sentinel);
+    std::shared_ptr<arrow::Array> sa;
+    (void)sb.Finish(&sa);
+    auto rb = arrow::RecordBatch::Make(schema, 2, {sa});
+
+    // Compiles (string column vs a plain string literal)...
+    auto prog = ColumnarPredicateProgram::compile(cmp("ne", "s", JsonValue{"foo"}), *schema);
+    ASSERT_TRUE(prog.has_value());
+    // ...but bails at eval when it meets the sentinel cell, so the operator
+    // falls back to the (correct) row interpreter for this batch.
+    EXPECT_FALSE(prog->evaluate(*rb).has_value())
+        << "a sentinel-bearing string column must defer to the row interpreter";
+
+    // A clean string column with no sentinel still evaluates on the fast path.
+    arrow::StringBuilder clean;
+    (void)clean.Append("foo");
+    (void)clean.Append("bar");
+    std::shared_ptr<arrow::Array> ca;
+    (void)clean.Finish(&ca);
+    auto rb_clean = arrow::RecordBatch::Make(schema, 2, {ca});
+    auto res = prog->evaluate(*rb_clean);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->kept, 1);  // "bar" != "foo" keeps; "foo" drops
+}
+
 }  // namespace

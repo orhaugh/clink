@@ -98,7 +98,17 @@ public:
     // caller can fall back without having emitted anything.
     [[nodiscard]] std::optional<Result> evaluate(const arrow::RecordBatch& rb) const {
         const std::int64_t n = rb.num_rows();
-        const TriVec r = eval_node_(root_, rb);
+        // A string column can carry a dec-string (0x01-sentinel) cell, which the
+        // row interpreter routes through detail::compare's decimal/coercion
+        // branch rather than a lexicographic compare. The Str kernel cannot
+        // reproduce that, so it sets bail and we defer the whole batch to the
+        // row interpreter (correct, just un-accelerated). The common no-sentinel
+        // case never trips it.
+        bool bail = false;
+        const TriVec r = eval_node_(root_, rb, bail);
+        if (bail) {
+            return std::nullopt;
+        }
         arrow::BooleanBuilder b;
         if (!b.Reserve(n).ok()) {
             return std::nullopt;
@@ -294,7 +304,7 @@ private:
         return schema.GetFieldIndex(pred.at("col").as_string());
     }
 
-    TriVec eval_node_(int idx, const arrow::RecordBatch& rb) const {
+    TriVec eval_node_(int idx, const arrow::RecordBatch& rb, bool& bail) const {
         const Node& node = nodes_[static_cast<std::size_t>(idx)];
         const auto n = static_cast<std::size_t>(rb.num_rows());
         TriVec r{std::vector<std::uint8_t>(n, 0), std::vector<std::uint8_t>(n, 0)};
@@ -311,7 +321,7 @@ private:
                 return r;
             }
             case NOp::Not: {
-                r = eval_node_(node.children[0], rb);
+                r = eval_node_(node.children[0], rb, bail);
                 for (std::size_t i = 0; i < n; ++i) {
                     if (r.known[i] != 0) {
                         r.val[i] = r.val[i] != 0 ? 0 : 1;  // NOT Unknown stays Unknown
@@ -326,7 +336,7 @@ private:
                     r.known[i] = 1;
                 }
                 for (const int c : node.children) {
-                    const TriVec cv = eval_node_(c, rb);
+                    const TriVec cv = eval_node_(c, rb, bail);
                     for (std::size_t i = 0; i < n; ++i) {
                         const bool a_false = (r.known[i] != 0) && (r.val[i] == 0);
                         const bool b_false = (cv.known[i] != 0) && (cv.val[i] == 0);
@@ -351,7 +361,7 @@ private:
                     r.known[i] = 1;
                 }
                 for (const int c : node.children) {
-                    const TriVec cv = eval_node_(c, rb);
+                    const TriVec cv = eval_node_(c, rb, bail);
                     for (std::size_t i = 0; i < n; ++i) {
                         const bool a_true = (r.known[i] != 0) && (r.val[i] != 0);
                         const bool b_true = (cv.known[i] != 0) && (cv.val[i] != 0);
@@ -370,13 +380,13 @@ private:
                 return r;
             }
             case NOp::Cmp:
-                eval_cmp_(node, rb, r);
+                eval_cmp_(node, rb, r, bail);
                 return r;
         }
         return r;
     }
 
-    void eval_cmp_(const Node& node, const arrow::RecordBatch& rb, TriVec& r) const {
+    void eval_cmp_(const Node& node, const arrow::RecordBatch& rb, TriVec& r, bool& bail) const {
         const auto& arr = *rb.column(node.col_idx);
         const auto n = static_cast<std::size_t>(rb.num_rows());
         const expr_detail::CmpOp op = node.cmp;
@@ -435,6 +445,14 @@ private:
                         continue;
                     }
                     const std::string_view sv = a.GetView(ii);
+                    // A dec-string (0x01-sentinel) cell is read by the row path
+                    // as a decimal (detail::compare's decimal/coercion branch),
+                    // not a lexicographic string. The Str kernel cannot match
+                    // that, so defer the whole batch to the row interpreter.
+                    if (!sv.empty() && sv.front() == clink::config::kDecimalSentinel) {
+                        bail = true;
+                        return;
+                    }
                     const int c = sv.compare(node.lit_str);
                     r.known[i] = 1;
                     r.val[i] = expr_detail::apply_cmp(op, (c < 0) ? -1 : (c > 0 ? 1 : 0)) ? 1 : 0;
