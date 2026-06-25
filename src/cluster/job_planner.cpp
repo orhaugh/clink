@@ -185,6 +185,8 @@ std::string OperatorChainSpec::to_json() const {
         out += std::to_string(e.peer_subtask_idx);
         out += ",\"channel_type\":";
         out += escape_json_string(channel_type_name(e.channel_type));
+        out += ",\"input_index\":";
+        out += std::to_string(e.input_index);
         out += '}';
     }
     out += "],\"output_routing\":";
@@ -267,6 +269,7 @@ SubtaskEdge edge_from_json(const config::JsonValue& v, const std::string& ctx) {
     }
     e.peer_subtask_idx = static_cast<std::uint32_t>(v.int_or("peer_subtask_idx", 0));
     e.channel_type = decode_channel_type(v.string_or("channel_type", "int64"), ctx);
+    e.input_index = static_cast<std::uint32_t>(v.int_or("input_index", 0));
     return e;
 }
 
@@ -1117,7 +1120,9 @@ JobPlan plan_job(const JobGraphSpec& graph,
             // input_edges loop entirely so the TM-side dispatch goes
             // through the fused_source path.
             if (!head_is_source && fused_source_spec == nullptr) {
+                std::uint32_t in_ord = 0;  // logical input position (In1=0, In2=1, ...)
                 for (const auto& raw : head.inputs) {
+                    const std::uint32_t logical_in_idx = in_ord++;
                     const auto ref = parse_input_ref(raw);
                     auto up_it = by_id.find(ref.id);
                     if (up_it == by_id.end()) {
@@ -1153,6 +1158,7 @@ JobPlan plan_job(const JobGraphSpec& graph,
                             .peer_role = kGenericSubtaskRole,
                             .peer_subtask_idx = up_subs[sub_i],
                             .channel_type = edge_ct,
+                            .input_index = logical_in_idx,
                         });
                     } else {
                         // Rebalance or Hash: this downstream subtask
@@ -1162,6 +1168,7 @@ JobPlan plan_job(const JobGraphSpec& graph,
                                 .peer_role = kGenericSubtaskRole,
                                 .peer_subtask_idx = up_sub,
                                 .channel_type = edge_ct,
+                                .input_index = logical_in_idx,
                             });
                         }
                     }

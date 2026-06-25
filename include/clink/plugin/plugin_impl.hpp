@@ -628,12 +628,23 @@ void PluginRegistry::register_co_operator(
         std::vector<std::shared_ptr<void>> in2_bridges;
         const std::size_t n_inputs = std::min(chain.input_edges.size(), rctx.in_bridges.size());
         if (in1_channel == in2_channel) {
-            if (n_inputs != 2) {
-                throw std::runtime_error(
-                    "co_operator runner: same-type In1/In2 require exactly 2 input edges");
+            // Same-type In1/In2 (e.g. SQL Row,Row equi/interval joins): channel
+            // type can't tell the sides apart, so split by the planner's per-edge
+            // input_index (0 = In1/first input, 1 = In2/second). This handles
+            // parallelism > 1, where each side contributes one input bridge per
+            // upstream subtask (so the co-op may have many bridges per side, not
+            // the two-edge par=1 case the old code hard-assumed).
+            for (std::size_t i = 0; i < n_inputs; ++i) {
+                const auto idx = chain.input_edges[i].input_index;
+                if (idx == 0) {
+                    in1_bridges.push_back(rctx.in_bridges[i]);
+                } else if (idx == 1) {
+                    in2_bridges.push_back(rctx.in_bridges[i]);
+                } else {
+                    throw std::runtime_error(
+                        "co_operator runner: same-type input_index out of range (expected 0/1)");
+                }
             }
-            in1_bridges.push_back(rctx.in_bridges[0]);
-            in2_bridges.push_back(rctx.in_bridges[1]);
         } else {
             for (std::size_t i = 0; i < n_inputs; ++i) {
                 const auto& ct = chain.input_edges[i].channel_type;

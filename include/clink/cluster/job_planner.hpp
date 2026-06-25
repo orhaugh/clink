@@ -78,6 +78,13 @@ struct SubtaskEdge {
     std::string peer_role;  // always kGenericSubtaskRole in v1
     std::uint32_t peer_subtask_idx{};
     ChannelType channel_type{std::string{clink::cluster::kChannelInt64}};
+    // Which of the consuming op's logical inputs this edge feeds (0 = first
+    // input, 1 = second, ...). For a two-input co-operator whose In1 and In2
+    // share a channel type (e.g. SQL Row,Row equi/interval joins), channel_type
+    // cannot disambiguate the sides; this ordinal does, so each side's bridges
+    // are grouped correctly even at parallelism > 1 (where every side
+    // contributes one bridge per upstream subtask, not just one total).
+    std::uint32_t input_index{0};
 };
 
 // RoutingMode moved to runner_registry.hpp (alongside ResolvedOutputGroup

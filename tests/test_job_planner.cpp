@@ -545,6 +545,73 @@ TEST(JobPlanner, JoinOpIsKindJoin) {
     EXPECT_TRUE(found_join);
 }
 
+TEST(JobPlanner, TwoInputOpStampsInputIndexPerSideAtParallelism) {
+    // Regression for the distributed two-input co-operator/join bug: at par>1
+    // each side contributes one input edge per upstream subtask, so the runner
+    // must know which edges belong to In1 vs In2. The planner stamps each edge
+    // with input_index (0 = first input, 1 = second). Two par=2 sources -> a
+    // par=2 two-input op: its input_edges must carry index 0 for the first
+    // upstream's edges and index 1 for the second's (2 each, fanned in).
+    JobGraphSpec g;
+    g.ops.push_back(OperatorSpec{
+        .type = "int64_range_source",
+        .id = "left",
+        .parallelism = 2,
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"count", "4"}},
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "int64_range_source",
+        .id = "right",
+        .parallelism = 2,
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"count", "4"}, {"start", "2"}},
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "int64_int64_match_join",
+        .id = "j",
+        .inputs = {"left", "right"},
+        .parallelism =
+            3,  // != upstream par -> fan-in (each side's 2 subtasks -> every join subtask)
+        .out_channel = std::string{clink::cluster::kChannelString},
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "file_line_sink",
+        .id = "snk",
+        .inputs = {"j"},
+        .parallelism = 1,
+        .out_channel = std::string{clink::cluster::kChannelString},
+        .params = {{"path", "/tmp/j"}},
+    });
+    auto plan = plan_job(g, OperatorRegistry::default_instance());
+
+    bool checked_a_join_subtask = false;
+    for (const auto& t : plan.tasks) {
+        auto chain = OperatorChainSpec::from_json(t.extra_config);
+        const bool is_join =
+            !chain.ops.empty() && chain.ops.front().type == "int64_int64_match_join";
+        if (!is_join) {
+            continue;
+        }
+        checked_a_join_subtask = true;
+        // Survives a JSON round-trip (input_index is serialized).
+        chain = OperatorChainSpec::from_json(chain.to_json());
+        std::size_t n0 = 0, n1 = 0;
+        for (const auto& e : chain.input_edges) {
+            EXPECT_LT(e.input_index, 2u) << "input_index must be 0 (In1) or 1 (In2)";
+            if (e.input_index == 0) {
+                ++n0;
+            } else if (e.input_index == 1) {
+                ++n1;
+            }
+        }
+        // Each side fans in from its 2 upstream subtasks.
+        EXPECT_EQ(n0, 2u) << "In1 (left) should contribute 2 edges at par 2";
+        EXPECT_EQ(n1, 2u) << "In2 (right) should contribute 2 edges at par 2";
+    }
+    EXPECT_TRUE(checked_a_join_subtask) << "no join subtask found in the plan";
+}
+
 TEST(JobPlanner, SplitOpWithoutSelectorFnIsRejected) {
     JobGraphSpec g;
     g.ops.push_back(OperatorSpec{
