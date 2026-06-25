@@ -77,7 +77,11 @@ public:
             // Bare column reference: zero-copy reuse (and rename), preserving the
             // source column type.
             if (expr.is_object() && expr.contains("col")) {
-                const int idx = rb->schema()->GetFieldIndex(expr.at("col").as_string());
+                // Skip the position-0 event-time column, matching process()'s
+                // Row.values; a name colliding with "event_time" must resolve the
+                // same (NULL) on both paths, so defer it to the row path.
+                const int idx = clink::operators::expr_detail::value_field_index(
+                    *rb->schema(), expr.at("col").as_string());
                 if (idx < 0) {
                     return false;  // referenced column absent: defer to the row path
                 }

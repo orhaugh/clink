@@ -60,7 +60,10 @@ JsonValue lnot(JsonValue arg) {
 // --- a batch with nulls across every supported physical type -------------
 std::shared_ptr<arrow::RecordBatch> make_batch() {
     auto dec_t = arrow::decimal128(10, 2);
+    // event_time at column 0 is the production columnar Row layout; value columns
+    // start at index 1 (the row path never exposes column 0 in Row.values).
     auto schema = arrow::schema({
+        arrow::field("event_time", arrow::int64()),
         arrow::field("price", arrow::int64()),
         arrow::field("ratio", arrow::float64()),
         arrow::field("name", arrow::utf8()),
@@ -68,6 +71,7 @@ std::shared_ptr<arrow::RecordBatch> make_batch() {
         arrow::field("amt", dec_t),
     });
 
+    arrow::Int64Builder et;
     arrow::Int64Builder price;
     arrow::DoubleBuilder ratio;
     arrow::StringBuilder name;
@@ -107,13 +111,17 @@ std::shared_ptr<arrow::RecordBatch> make_batch() {
     (void)flag.Append(true);
     (void)amt.Append(dec(2000));
 
-    std::shared_ptr<arrow::Array> a_price, a_ratio, a_name, a_flag, a_amt;
+    for (std::int64_t t : {1000, 2000, 3000, 4000, 5000, 6000}) {
+        (void)et.Append(t);
+    }
+    std::shared_ptr<arrow::Array> a_et, a_price, a_ratio, a_name, a_flag, a_amt;
+    (void)et.Finish(&a_et);
     (void)price.Finish(&a_price);
     (void)ratio.Finish(&a_ratio);
     (void)name.Finish(&a_name);
     (void)flag.Finish(&a_flag);
     (void)amt.Finish(&a_amt);
-    return arrow::RecordBatch::Make(schema, 6, {a_price, a_ratio, a_name, a_flag, a_amt});
+    return arrow::RecordBatch::Make(schema, 6, {a_et, a_price, a_ratio, a_name, a_flag, a_amt});
 }
 
 // The row interpreter's keep decision for row i (the parity oracle).
@@ -308,7 +316,17 @@ TEST(ColumnarValueProgram, NonNumericOperandsFallBack) {
 // defer the whole batch to the row interpreter (evaluate -> nullopt). Found by
 // the WS1 inc1 adversarial parity review.
 TEST(ColumnarPredicateProgram, SentinelStringCellDefersToRowPath) {
-    auto schema = arrow::schema({arrow::field("s", arrow::utf8())});
+    // event_time at column 0 (production layout); the string value column is at 1.
+    auto schema = arrow::schema(
+        {arrow::field("event_time", arrow::int64()), arrow::field("s", arrow::utf8())});
+    auto et_col = [] {
+        arrow::Int64Builder b;
+        (void)b.Append(1);
+        (void)b.Append(2);
+        std::shared_ptr<arrow::Array> a;
+        (void)b.Finish(&a);
+        return a;
+    };
     arrow::StringBuilder sb;
     std::string sentinel;
     sentinel.push_back(clink::config::kDecimalSentinel);
@@ -317,7 +335,7 @@ TEST(ColumnarPredicateProgram, SentinelStringCellDefersToRowPath) {
     (void)sb.Append(sentinel);
     std::shared_ptr<arrow::Array> sa;
     (void)sb.Finish(&sa);
-    auto rb = arrow::RecordBatch::Make(schema, 2, {sa});
+    auto rb = arrow::RecordBatch::Make(schema, 2, {et_col(), sa});
 
     // Compiles (string column vs a plain string literal)...
     auto prog = ColumnarPredicateProgram::compile(cmp("ne", "s", JsonValue{"foo"}), *schema);
@@ -333,10 +351,35 @@ TEST(ColumnarPredicateProgram, SentinelStringCellDefersToRowPath) {
     (void)clean.Append("bar");
     std::shared_ptr<arrow::Array> ca;
     (void)clean.Finish(&ca);
-    auto rb_clean = arrow::RecordBatch::Make(schema, 2, {ca});
+    auto rb_clean = arrow::RecordBatch::Make(schema, 2, {et_col(), ca});
     auto res = prog->evaluate(*rb_clean);
     ASSERT_TRUE(res.has_value());
     EXPECT_EQ(res->kept, 1);  // "bar" != "foo" keeps; "foo" drops
+}
+
+// Columnar Row batches carry the event-time column at position 0 (named
+// "event_time"); the row path (Row.values) never exposes it. So neither program
+// may resolve a {col:"event_time"} reference - it must decline (and the operator
+// defers to the row path, which yields NULL), or the columnar path would read
+// the timestamp while the row path reads NULL. Found by the inc2 parity review.
+TEST(ColumnarExprProgram, EventTimeColumnZeroNotResolvedAsValue) {
+    auto schema = arrow::schema(
+        {arrow::field("event_time", arrow::int64()), arrow::field("v", arrow::int64())});
+
+    // A genuine value column (index 1) resolves on both programs.
+    EXPECT_TRUE(
+        ColumnarPredicateProgram::compile(cmp("gt", "v", JsonValue{std::int64_t{0}}), *schema)
+            .has_value());
+    EXPECT_TRUE(ColumnarValueProgram::compile(vop("add", JsonArray{vcol("v"), vcol("v")}), *schema)
+                    .has_value());
+
+    // The position-0 event-time column never resolves as a value column.
+    EXPECT_FALSE(ColumnarPredicateProgram::compile(
+                     cmp("gt", "event_time", JsonValue{std::int64_t{0}}), *schema)
+                     .has_value());
+    EXPECT_FALSE(
+        ColumnarValueProgram::compile(vop("add", JsonArray{vcol("event_time"), vcol("v")}), *schema)
+            .has_value());
 }
 
 }  // namespace

@@ -93,7 +93,11 @@ public:
             kept = 0;
             for (std::int64_t i = 0; i < n; ++i) {
                 auto resolve = [&](const std::string& nm) -> clink::config::JsonValue {
-                    const int idx = rb->schema()->GetFieldIndex(nm);
+                    // Skip the position-0 event-time column, matching process()'s
+                    // Row.values (which never carries it). Otherwise "event_time"
+                    // would resolve to the timestamp here but NULL on the row path.
+                    const int idx =
+                        clink::operators::expr_detail::value_field_index(*rb->schema(), nm);
                     if (idx < 0) {
                         return clink::config::JsonValue{nullptr};
                     }

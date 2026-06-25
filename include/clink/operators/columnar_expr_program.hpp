@@ -72,6 +72,22 @@ inline int cmp3_d(double a, double b) noexcept {
     return (a < b) ? -1 : (a > b ? 1 : 0);
 }
 
+// Resolve a Row VALUE column by name the way the row path (Row.values) does:
+// EXCLUDING the position-0 event-time column that every columnar Row batch
+// carries. schema.GetFieldIndex would return 0 for a name colliding with the
+// engine's "event_time" field, which process() never exposes in Row.values, so
+// a columnar path using GetFieldIndex would read the timestamp while the row
+// path resolves NULL. Searching from index 1 keeps the columnar and row paths
+// byte-identical (a genuine value column still resolves at index >= 1).
+inline int value_field_index(const arrow::Schema& schema, const std::string& name) {
+    for (int i = 1; i < schema.num_fields(); ++i) {
+        if (schema.field(i)->name() == name) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 }  // namespace expr_detail
 
 class ColumnarPredicateProgram {
@@ -302,7 +318,7 @@ private:
         if (!pred.contains("col")) {
             return -1;
         }
-        return schema.GetFieldIndex(pred.at("col").as_string());
+        return expr_detail::value_field_index(schema, pred.at("col").as_string());
     }
 
     TriVec eval_node_(int idx, const arrow::RecordBatch& rb, bool& bail) const {
@@ -554,7 +570,7 @@ private:
             return -1;
         }
         if (e.contains("col")) {
-            const int idx = schema.GetFieldIndex(e.at("col").as_string());
+            const int idx = expr_detail::value_field_index(schema, e.at("col").as_string());
             if (idx < 0) {
                 return -1;
             }
