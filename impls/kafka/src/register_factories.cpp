@@ -317,39 +317,47 @@ void install(clink::plugin::PluginRegistry& reg) {
     // back-compat with pipelines that only need the payload. Plugins
     // wanting key/header/partition should prefer the typed
     // kafka_message_* variants above.
-    reg.register_source<std::string>(
-        "kafka_text_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
-            KafkaSource::Options opts;
-            opts.brokers = ctx.param_or("brokers");
-            opts.topic = ctx.param_or("topic");
-            opts.group_id = ctx.param_or("group_id", "clink");
-            opts.client_id = ctx.param_or("client_id", "clink-source");
-            opts.auto_offset_reset = ctx.param_or("auto_offset_reset", "earliest");
-            if (opts.brokers.empty()) {
-                throw std::runtime_error("kafka_text_source: 'brokers' is required");
-            }
-            if (opts.topic.empty()) {
-                throw std::runtime_error("kafka_text_source: 'topic' is required");
-            }
-            return std::make_shared<StringKafkaSource>(std::move(opts));
-        });
+    //
+    // The SQL physical planner emits op.type 'kafka_source_string' /
+    // 'kafka_sink_string' for connector='kafka' (plain, at-least-once), so the
+    // same builders are registered under those names too - otherwise the SQL
+    // Kafka path compiles but fails at runtime with "unknown operator". (The
+    // 2pc / upsert SQL sink variants are registered separately below.)
+    auto text_source_builder = [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
+        KafkaSource::Options opts;
+        opts.brokers = ctx.param_or("brokers");
+        opts.topic = ctx.param_or("topic");
+        opts.group_id = ctx.param_or("group_id", "clink");
+        opts.client_id = ctx.param_or("client_id", "clink-source");
+        opts.auto_offset_reset = ctx.param_or("auto_offset_reset", "earliest");
+        if (opts.brokers.empty()) {
+            throw std::runtime_error("kafka source: 'brokers' is required");
+        }
+        if (opts.topic.empty()) {
+            throw std::runtime_error("kafka source: 'topic' is required");
+        }
+        return std::make_shared<StringKafkaSource>(std::move(opts));
+    };
+    reg.register_source<std::string>("kafka_text_source", text_source_builder);
+    reg.register_source<std::string>("kafka_source_string", text_source_builder);
 
-    reg.register_sink<std::string>(
-        "kafka_text_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
-            KafkaSink::Options opts;
-            opts.brokers = ctx.param_or("brokers");
-            opts.topic = ctx.param_or("topic");
-            opts.client_id = ctx.param_or("client_id", "clink-sink");
-            opts.acks = ctx.param_or("acks", "all");
-            opts.compression_type = ctx.param_or("compression", "none");
-            if (opts.brokers.empty()) {
-                throw std::runtime_error("kafka_text_sink: 'brokers' is required");
-            }
-            if (opts.topic.empty()) {
-                throw std::runtime_error("kafka_text_sink: 'topic' is required");
-            }
-            return std::make_shared<StringKafkaSink>(std::move(opts));
-        });
+    auto text_sink_builder = [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+        KafkaSink::Options opts;
+        opts.brokers = ctx.param_or("brokers");
+        opts.topic = ctx.param_or("topic");
+        opts.client_id = ctx.param_or("client_id", "clink-sink");
+        opts.acks = ctx.param_or("acks", "all");
+        opts.compression_type = ctx.param_or("compression", "none");
+        if (opts.brokers.empty()) {
+            throw std::runtime_error("kafka sink: 'brokers' is required");
+        }
+        if (opts.topic.empty()) {
+            throw std::runtime_error("kafka sink: 'topic' is required");
+        }
+        return std::make_shared<StringKafkaSink>(std::move(opts));
+    };
+    reg.register_sink<std::string>("kafka_text_sink", text_sink_builder);
+    reg.register_sink<std::string>("kafka_sink_string", text_sink_builder);
 
     // Phase 23c: kafka_2pc_sink_string. Transactional producer mode;
     // records are produced inside an open transaction. Barriers
