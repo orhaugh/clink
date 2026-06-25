@@ -86,16 +86,36 @@ output-row gate FAILED, and that is a genuine result, not a hiccup:
 The true answer, computed directly from the source data, is **184,767** distinct
 `(window, bidder)` pairs over the 49 watermark-closed windows (the last window
 never closes on an unbounded Kafka source). Flink matches it exactly. clink
-over-emits ~96k panes and under-counts the total - a real bug in clink's
-windowed-aggregate + multi-partition-Kafka-source watermark interaction (the
-in-process generator path, `clink_nexmark_bench` q12, is correct, so it is
-specific to the Kafka-source watermark/early-firing path). Per `pipeline.md` a
-gate mismatch HALTS: q12 is NOT quotable as a ratio until the clink bug is fixed.
+over-emits and under-counts. Per `pipeline.md` a gate mismatch HALTS: q12 is NOT
+quotable as a ratio until the clink bug is fixed. The gate did exactly its job -
+it stopped a meaningless "clink 6.7x" (clink 326k vs Flink 49k panes/sec) that
+was comparing different relations.
 
-This is exactly what the gate is for - it stopped a meaningless "clink 6.7x"
-number (clink 326k vs Flink 49k panes/sec) that was comparing different relations.
-Fixing the clink windowed-Kafka bug, then q8/q6, CPU normalisation, the clink SQL
-parallelism flag, and a reproducible run.sh + scoreboard are the remaining work.
+### Where the bug is (localised by controlled tests)
+
+A root-cause investigation first blamed multi-partition watermark merging, but
+controlled isolation tests sharpened (and partly corrected) that:
+
+- clink q12 over an **ordered, bounded FILE source**: **exactly correct** -
+  190,729 panes (all 50 windows; bounded source fires the last via a terminal
+  watermark), sum(bid_count) = 460,000. So `WindowRowOp` and the windowing /
+  watermark-assigner logic are sound.
+- clink q12 over **Kafka, 1 partition** (globally ordered): still wrong (276,078
+  panes). So it is NOT only the multi-partition interleave - the bug reproduces
+  on a single ordered partition.
+
+Conclusion: the defect is in the **Kafka-source -> windowing path**, not
+`WindowRowOp`. The in-process generator bench (`clink_nexmark_bench` q12) never
+caught it because it blackholes output (the count was never checked); this
+cross-engine harness is the first thing to verify clink's windowed output count
+against ground truth. The exact Kafka-source mechanism (record/watermark
+delivery timing under an unbounded stream) needs clean debugging - a focused
+clink engine task, and the prerequisite for any windowed cross-engine ratio
+(q12/q5) and for parallelism>1 scaled runs.
+
+Remaining: fix the clink Kafka-source windowing bug; then q8/q6, CPU
+normalisation, the clink SQL parallelism flag, and a reproducible run.sh +
+scoreboard.
 
 ## Producer (INC 2)
 
