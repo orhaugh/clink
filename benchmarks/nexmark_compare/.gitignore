@@ -1,0 +1,5 @@
+.venv/
+target/
+results/
+*.ndjson
+Testing/

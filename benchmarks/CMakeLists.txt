@@ -45,6 +45,13 @@ if(TARGET clink::sql)
     add_executable(clink_nexmark_bench clink_nexmark_bench.cpp)
     target_link_libraries(clink_nexmark_bench PRIVATE clink::sql)
     clink_set_warnings(clink_nexmark_bench)
+
+    # nexmark_compare/INC 2: shared-input producer. Runs the Nexmark generator
+    # once and dumps the canonical dataset as per-type NDJSON for the
+    # cross-engine harness to load into Kafka (both engines read identical bytes).
+    add_executable(nexmark_dump nexmark_compare/nexmark_dump.cpp)
+    target_link_libraries(nexmark_dump PRIVATE clink::sql)
+    clink_set_warnings(nexmark_dump)
 endif()
 
 # flink_compare/clink-job: CLINK_REGISTER_JOB .so for the
