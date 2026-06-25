@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,6 +29,7 @@
 #include "clink/config/json.hpp"
 #include "clink/core/record.hpp"
 #include "clink/metrics/operator_metrics.hpp"
+#include "clink/operators/columnar_expr_program.hpp"
 #include "clink/operators/json_predicate.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/sql/row.hpp"
@@ -55,32 +57,56 @@ public:
         }
         const std::int64_t n = rb->num_rows();
 
-        // Build the boolean selection mask by evaluating the predicate per row
-        // against the Arrow cells. read_cell yields the exact same JsonValue the
-        // row path sees, so the predicate semantics are identical - we just skip
-        // materializing the Row map and re-parsing JSON. The gather below is the
-        // vectorized part (Arrow's registered "filter" kernel).
-        arrow::BooleanBuilder mask_b;
-        if (!mask_b.Reserve(n).ok()) {
-            return false;
-        }
-        std::int64_t kept = 0;
-        for (std::int64_t i = 0; i < n; ++i) {
-            auto resolve = [&](const std::string& nm) -> clink::config::JsonValue {
-                const int idx = rb->schema()->GetFieldIndex(nm);
-                if (idx < 0) {
-                    return clink::config::JsonValue{nullptr};
-                }
-                return sql::row_columnar_detail::read_cell(
-                    rb->schema()->field(idx)->type(), *rb->column(idx), i);
-            };
-            const bool keep = clink::operators::evaluate_json_predicate(*predicate_, resolve);
-            mask_b.UnsafeAppend(keep);
-            kept += keep ? 1 : 0;
-        }
+        // Build the boolean selection mask. The gather below is the vectorized
+        // part (Arrow's registered "filter" kernel); the mask is built one of
+        // two ways, both producing byte-identical results:
         std::shared_ptr<arrow::Array> mask;
-        if (!mask_b.Finish(&mask).ok()) {
-            return false;
+        std::int64_t kept = 0;
+
+        // Fast path: a compiled, typed predicate program evaluates the whole
+        // batch column-at-a-time - no per-row read_cell -> JsonValue box, no
+        // std::map probe, no op-name string dispatch. Compiled once and cached
+        // per input schema; compile() returns nullopt for any predicate shape it
+        // cannot reproduce exactly, leaving program_ empty so the row loop runs.
+        if (!program_schema_ || !program_schema_->Equals(*rb->schema())) {
+            program_ =
+                clink::operators::ColumnarPredicateProgram::compile(*predicate_, *rb->schema());
+            program_schema_ = rb->schema();
+        }
+        if (program_) {
+            if (auto res = program_->evaluate(*rb)) {
+                mask = res->mask;
+                kept = res->kept;
+            }
+        }
+
+        // Row-interpreter fallback: read each referenced cell as the exact same
+        // JsonValue the row path sees and walk the predicate. Byte-identical to
+        // process(), just skipping the Row-map materialization. Runs when the
+        // predicate is not fully representable as a typed program (or evaluate
+        // hit an unexpected Arrow error before emitting).
+        if (!mask) {
+            arrow::BooleanBuilder mask_b;
+            if (!mask_b.Reserve(n).ok()) {
+                return false;
+            }
+            kept = 0;
+            for (std::int64_t i = 0; i < n; ++i) {
+                auto resolve = [&](const std::string& nm) -> clink::config::JsonValue {
+                    const int idx = rb->schema()->GetFieldIndex(nm);
+                    if (idx < 0) {
+                        return clink::config::JsonValue{nullptr};
+                    }
+                    return sql::row_columnar_detail::read_cell(
+                        rb->schema()->field(idx)->type(), *rb->column(idx), i);
+                };
+                const bool keep = clink::operators::evaluate_json_predicate(*predicate_, resolve);
+                mask_b.UnsafeAppend(keep);
+                kept += keep ? 1 : 0;
+            }
+            if (!mask_b.Finish(&mask).ok()) {
+                return false;
+            }
         }
 
         const std::int64_t dropped = n - kept;
@@ -148,6 +174,11 @@ public:
 private:
     std::shared_ptr<clink::config::JsonValue> predicate_;
     std::string name_;
+    // WS1 typed predicate program, compiled and cached per input schema. An
+    // empty optional means the predicate is not fully representable as a typed
+    // program, so process_columnar uses the row-interpreter fallback.
+    std::optional<clink::operators::ColumnarPredicateProgram> program_;
+    std::shared_ptr<arrow::Schema> program_schema_;
 };
 
 }  // namespace clink
