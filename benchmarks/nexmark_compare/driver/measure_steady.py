@@ -31,6 +31,9 @@ def main():
     ap.add_argument("--expected", type=int, required=True)
     ap.add_argument("--warmup-frac", type=float, default=0.1)
     ap.add_argument("--quiet-timeout", type=float, default=40.0)
+    ap.add_argument("--query", default="", help="query id tag for the scoreboard (e.g. q0)")
+    ap.add_argument("--engine", default="", help="engine tag for the scoreboard (clink|flink)")
+    ap.add_argument("--out", default="", help="also write the result JSON to this path")
     args = ap.parse_args()
 
     consumer = Consumer(
@@ -61,6 +64,8 @@ def main():
     n = len(ts)
     ts.sort()
     result = {
+        "query": args.query,
+        "engine": args.engine,
         "topic": args.topic,
         "count": n,
         "expected": args.expected,
@@ -78,6 +83,9 @@ def main():
             steady_count = hi_i - lo_i
             result["steady_eps"] = round(steady_count / ((ts[hi_i] - ts[lo_i]) / 1000.0), 1)
     print(json.dumps(result))
+    if args.out:
+        with open(args.out, "w") as fh:
+            json.dump(result, fh)
 
 
 if __name__ == "__main__":
