@@ -21,6 +21,7 @@
 #include "clink/config/json.hpp"
 #include "clink/operators/columnar_expr_program.hpp"
 #include "clink/operators/json_predicate.hpp"
+#include "clink/operators/json_value_expr.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 
 namespace {
@@ -29,6 +30,7 @@ using clink::config::JsonArray;
 using clink::config::JsonObject;
 using clink::config::JsonValue;
 using clink::operators::ColumnarPredicateProgram;
+using clink::operators::ColumnarValueProgram;
 
 // --- IR builders ---------------------------------------------------------
 JsonValue cmp(const std::string& op, const std::string& col, JsonValue lit) {
@@ -220,6 +222,84 @@ TEST(ColumnarPredicateProgram, UnsupportedShapesFallBack) {
     nullopt_compile(cmp("eq", "missing", JsonValue{std::int64_t{1}}), "missing column");
     // NULL literal.
     nullopt_compile(cmp("eq", "price", JsonValue{nullptr}), "null literal");
+}
+
+// --- value-expression IR builders (op + args:[operands], operands are
+//     {col}/{lit}/nested {op}) ---
+JsonValue vcol(const std::string& c) {
+    return JsonValue{JsonObject{{"col", JsonValue{c}}}};
+}
+JsonValue vlit(JsonValue x) {
+    return JsonValue{JsonObject{{"lit", std::move(x)}}};
+}
+JsonValue vop(const std::string& op, JsonArray args) {
+    return JsonValue{JsonObject{{"op", JsonValue{op}}, {"args", JsonValue{std::move(args)}}}};
+}
+
+// Parity oracle for the value program: read_cell of the float64 output column
+// must equal evaluate_json_value_expr over read_cell of the input row, compared
+// via canonical serialize(0) (covers null, NaN, and int-as-double identically).
+void expect_value_parity(const JsonValue& expr, const arrow::RecordBatch& rb) {
+    auto vp = ColumnarValueProgram::compile(expr, *rb.schema());
+    ASSERT_TRUE(vp.has_value()) << "value expr should compile: " << expr.serialize(0);
+    auto col = vp->evaluate(rb);
+    ASSERT_NE(col, nullptr);
+    for (std::int64_t i = 0; i < rb.num_rows(); ++i) {
+        auto resolve = [&](const std::string& nm) -> JsonValue {
+            const int idx = rb.schema()->GetFieldIndex(nm);
+            if (idx < 0) {
+                return JsonValue{nullptr};
+            }
+            return clink::sql::row_columnar_detail::read_cell(
+                rb.schema()->field(idx)->type(), *rb.column(idx), i);
+        };
+        const JsonValue prog_cell =
+            clink::sql::row_columnar_detail::read_cell(arrow::float64(), *col, i);
+        const JsonValue row_cell = clink::operators::evaluate_json_value_expr(expr, resolve);
+        EXPECT_EQ(prog_cell.serialize(0), row_cell.serialize(0))
+            << "row " << i << " diverges for " << expr.serialize(0);
+    }
+}
+
+TEST(ColumnarValueProgram, ArithmeticParity) {
+    auto rb = make_batch();  // price int64 (null at row 2), ratio float64
+
+    expect_value_parity(vop("add", JsonArray{vcol("price"), vcol("price")}), *rb);
+    expect_value_parity(vop("mul", JsonArray{vcol("ratio"), vlit(JsonValue{2.0})}), *rb);
+    expect_value_parity(vop("sub", JsonArray{vcol("price"), vlit(JsonValue{std::int64_t{10}})}),
+                        *rb);
+    expect_value_parity(vop("neg", JsonArray{vcol("ratio")}), *rb);
+    // div / mod by zero -> NaN on both paths; null operand (row 2) -> null.
+    expect_value_parity(vop("div", JsonArray{vcol("price"), vlit(JsonValue{std::int64_t{0}})}),
+                        *rb);
+    expect_value_parity(vop("mod", JsonArray{vcol("price"), vlit(JsonValue{std::int64_t{7}})}),
+                        *rb);
+    // Nested: (price * 2) + ratio.
+    expect_value_parity(
+        vop("add",
+            JsonArray{vop("mul", JsonArray{vcol("price"), vlit(JsonValue{2.0})}), vcol("ratio")}),
+        *rb);
+}
+
+TEST(ColumnarValueProgram, NonNumericOperandsFallBack) {
+    auto rb = make_batch();
+    // decimal column operand -> row fallback (exact decimal arithmetic).
+    EXPECT_FALSE(ColumnarValueProgram::compile(
+                     vop("add", JsonArray{vcol("amt"), vlit(JsonValue{1.0})}), *rb->schema())
+                     .has_value());
+    // string column operand -> row fallback.
+    EXPECT_FALSE(ColumnarValueProgram::compile(vop("add", JsonArray{vcol("name"), vcol("name")}),
+                                               *rb->schema())
+                     .has_value());
+    // dec-string literal operand -> row fallback.
+    auto lit_dec = clink::config::make_dec_value(clink::config::Decimal{arrow::Decimal128(150), 2});
+    EXPECT_FALSE(ColumnarValueProgram::compile(vop("add", JsonArray{vcol("price"), vlit(lit_dec)}),
+                                               *rb->schema())
+                     .has_value());
+    // unsupported op (concat) -> row fallback.
+    EXPECT_FALSE(ColumnarValueProgram::compile(vop("concat", JsonArray{vcol("name"), vcol("name")}),
+                                               *rb->schema())
+                     .has_value());
 }
 
 // A utf8 column can carry a dec-string (0x01-sentinel) cell, which the row

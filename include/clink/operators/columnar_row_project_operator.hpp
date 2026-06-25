@@ -28,6 +28,7 @@
 
 #include "clink/config/json.hpp"
 #include "clink/core/record.hpp"
+#include "clink/operators/columnar_expr_program.hpp"
 #include "clink/operators/json_value_expr.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/sql/row.hpp"
@@ -73,18 +74,39 @@ public:
         arrays.push_back(rb->column(0));
 
         for (const auto& [out_name, expr] : outputs_) {
-            // Only a bare column reference is eligible. Literals / computed
-            // expressions fall back to the row path (we have not emitted yet).
-            if (!expr.is_object() || !expr.contains("col")) {
-                return false;
+            // Bare column reference: zero-copy reuse (and rename), preserving the
+            // source column type.
+            if (expr.is_object() && expr.contains("col")) {
+                const int idx = rb->schema()->GetFieldIndex(expr.at("col").as_string());
+                if (idx < 0) {
+                    return false;  // referenced column absent: defer to the row path
+                }
+                fields.push_back(
+                    arrow::field(out_name, rb->schema()->field(idx)->type(), /*nullable=*/true));
+                arrays.push_back(rb->column(idx));
+                continue;
             }
-            const int idx = rb->schema()->GetFieldIndex(expr.at("col").as_string());
-            if (idx < 0) {
-                return false;  // referenced column absent: defer to the row path
+            // Computed numeric expression: a typed value program produces a
+            // float64 column byte-identical to evaluate_json_value_expr
+            // (numeric_binop), matching the binder's declared arithmetic type.
+            // compile() declines anything it cannot model (decimal/string/bool
+            // operands, casts, concat, CASE, functions, a bare literal), so the
+            // WHOLE projection defers to the row path - we have not emitted yet.
+            if (expr.is_object() && expr.contains("op")) {
+                auto vp = clink::operators::ColumnarValueProgram::compile(expr, *rb->schema());
+                if (!vp) {
+                    return false;
+                }
+                auto col = vp->evaluate(*rb);
+                if (!col) {
+                    return false;
+                }
+                fields.push_back(arrow::field(out_name, arrow::float64(), /*nullable=*/true));
+                arrays.push_back(std::move(col));
+                continue;
             }
-            fields.push_back(
-                arrow::field(out_name, rb->schema()->field(idx)->type(), /*nullable=*/true));
-            arrays.push_back(rb->column(idx));
+            // A bare literal or anything else: defer to the row path.
+            return false;
         }
 
         // Carry a changelog marker column through unchanged (columnar

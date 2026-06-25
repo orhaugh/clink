@@ -135,17 +135,40 @@ TEST(ColumnarRowProject, ColumnPruningDropsUnreferenced) {
     EXPECT_FALSE(rows[0].has_column("region")) << "pruned column must be gone";
 }
 
-TEST(ColumnarRowProject, ComputedOutputFallsBackAndMatches) {
-    // amt2 = amount * 2 is computed -> the columnar path must decline.
+TEST(ColumnarRowProject, ComputedArithmeticRunsColumnar) {
+    // amt2 = amount * 2 over a numeric (int64) column: WS1 inc2 evaluates this
+    // column-at-a-time via the typed value program (float64 output), so it stays
+    // on the columnar fast path with no row decode and byte-identical results.
     auto outs = std::vector<Output>{
         {"amt2", clink::config::parse(R"({"op":"mul","args":[{"col":"amount"},{"lit":2}]})")}};
+    ColumnarRowProjectOperator op(outs);
+    Capture cap;
+    auto em = cap.emitter();
+    const auto before = materialize_count();
+    EXPECT_TRUE(
+        op.process_columnar(StreamElement<Row>::data(make_columnar(sample(), schema2())), em))
+        << "numeric arithmetic projection runs on the columnar fast path";
+    EXPECT_EQ(materialize_count() - before, 0u) << "columnar arithmetic must not decode rows";
+    EXPECT_TRUE(cap.any_columnar()) << "output stays columnar";
+    auto rows = cap.rows();  // materializing here is the test reading, not the op
+    ASSERT_EQ(rows.size(), 3u);
+    EXPECT_EQ(static_cast<std::int64_t>(rows[0].values.at("amt2").as_number()), 20);   // 10*2
+    EXPECT_EQ(static_cast<std::int64_t>(rows[1].values.at("amt2").as_number()), 120);  // 60*2
+    EXPECT_EQ(static_cast<std::int64_t>(rows[2].values.at("amt2").as_number()), 100);  // 50*2
+}
+
+TEST(ColumnarRowProject, UnsupportedComputedOutputFallsBack) {
+    // concat is not a typed value kernel -> the columnar path declines and the
+    // operator falls back to the identical row evaluator.
+    auto outs = std::vector<Output>{
+        {"tag", clink::config::parse(R"({"op":"concat","args":[{"col":"region"},{"lit":"!"}]})")}};
     {
         ColumnarRowProjectOperator op(outs);
         Capture cap;
         auto em = cap.emitter();
         EXPECT_FALSE(
             op.process_columnar(StreamElement<Row>::data(make_columnar(sample(), schema2())), em))
-            << "computed projection must signal row fallback";
+            << "unsupported computed projection must signal row fallback";
         EXPECT_TRUE(cap.elems.empty());
     }
     {
@@ -159,7 +182,7 @@ TEST(ColumnarRowProject, ComputedOutputFallsBackAndMatches) {
         op.process(StreamElement<Row>::data(std::move(b)), em);
         auto rows = cap.rows();
         ASSERT_EQ(rows.size(), 3u);
-        EXPECT_EQ(static_cast<std::int64_t>(rows[1].values.at("amt2").as_number()), 120);  // 60*2
+        EXPECT_EQ(rows[1].values.at("tag").as_string(), "us!");
     }
 }
 

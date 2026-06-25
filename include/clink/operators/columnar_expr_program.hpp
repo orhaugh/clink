@@ -26,6 +26,7 @@
 
 #ifdef CLINK_HAS_ARROW
 
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -474,6 +475,236 @@ private:
                 return;
             }
         }
+    }
+
+    std::vector<Node> nodes_;
+    int root_{-1};
+};
+
+// Typed columnar VALUE program (WS1 inc2): compiles a numeric SQL scalar
+// expression - arithmetic add/sub/mul/div/mod/neg over numeric columns
+// (int64/int32/double/float) and plain numeric literals - into a program that
+// produces a float64 output column byte-identical to evaluate_json_value_expr
+// (numeric_binop): a double result, NULL when any operand is null, NaN on
+// div/mod by zero. The binder already declares arithmetic outputs as float64,
+// so the produced column type matches the row path's downstream type too.
+// compile() returns nullopt for anything else (a decimal/string/bool operand, a
+// dec-string literal, casts, concat, CASE, functions, a bare column or literal
+// top-level), so the projection operator defers that output to the row path.
+class ColumnarValueProgram {
+public:
+    static std::optional<ColumnarValueProgram> compile(const clink::config::JsonValue& expr,
+                                                       const arrow::Schema& schema) {
+        ColumnarValueProgram p;
+        const int root = p.compile_node_(expr, schema);
+        if (root < 0) {
+            return std::nullopt;
+        }
+        p.root_ = root;
+        return p;
+    }
+
+    // A float64 array of length rb.num_rows(), NULL where any operand is null.
+    // nullptr on an unexpected Arrow build error (caller falls back).
+    [[nodiscard]] std::shared_ptr<arrow::Array> evaluate(const arrow::RecordBatch& rb) const {
+        const DVec r = eval_node_(root_, rb);
+        const auto n = static_cast<std::size_t>(rb.num_rows());
+        arrow::DoubleBuilder b;
+        if (!b.Reserve(rb.num_rows()).ok()) {
+            return nullptr;
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            if (r.valid[i] != 0) {
+                b.UnsafeAppend(r.val[i]);
+            } else {
+                b.UnsafeAppendNull();
+            }
+        }
+        std::shared_ptr<arrow::Array> out;
+        if (!b.Finish(&out).ok()) {
+            return nullptr;
+        }
+        return out;
+    }
+
+private:
+    enum class VOp { Col, Lit, Add, Sub, Mul, Div, Mod, Neg };
+
+    struct Node {
+        VOp op{};
+        int col_idx{-1};
+        arrow::Type::type arrow_type{};
+        double lit{0.0};
+        std::vector<int> children;
+    };
+
+    // Per-row double value + validity (false == any contributing operand null).
+    struct DVec {
+        std::vector<double> val;
+        std::vector<std::uint8_t> valid;
+    };
+
+    int add_(Node n) {
+        nodes_.push_back(std::move(n));
+        return static_cast<int>(nodes_.size()) - 1;
+    }
+
+    int compile_node_(const clink::config::JsonValue& e, const arrow::Schema& schema) {
+        if (!e.is_object()) {
+            return -1;
+        }
+        if (e.contains("col")) {
+            const int idx = schema.GetFieldIndex(e.at("col").as_string());
+            if (idx < 0) {
+                return -1;
+            }
+            const auto t = schema.field(idx)->type()->id();
+            if (t != arrow::Type::INT64 && t != arrow::Type::INT32 && t != arrow::Type::DOUBLE &&
+                t != arrow::Type::FLOAT) {
+                return -1;  // decimal/string/bool operand -> row fallback
+            }
+            Node n;
+            n.op = VOp::Col;
+            n.col_idx = idx;
+            n.arrow_type = t;
+            return add_(std::move(n));
+        }
+        if (e.contains("lit")) {
+            const auto& lit = e.at("lit");
+            if (!lit.is_number() || clink::config::is_dec_string(lit)) {
+                return -1;
+            }
+            Node n;
+            n.op = VOp::Lit;
+            n.lit = lit.as_number();
+            return add_(std::move(n));
+        }
+        if (!e.contains("op")) {
+            return -1;
+        }
+        const auto& op = e.at("op").as_string();
+        const auto& args = e.contains("args") ? e.at("args") : clink::config::JsonValue{};
+        if (op == "neg") {
+            if (!args.is_array() || args.as_array().size() != 1) {
+                return -1;
+            }
+            const int c = compile_node_(args.as_array()[0], schema);
+            if (c < 0) {
+                return -1;
+            }
+            Node n;
+            n.op = VOp::Neg;
+            n.children.push_back(c);
+            return add_(std::move(n));
+        }
+        VOp vop{};
+        if (op == "add") {
+            vop = VOp::Add;
+        } else if (op == "sub") {
+            vop = VOp::Sub;
+        } else if (op == "mul") {
+            vop = VOp::Mul;
+        } else if (op == "div") {
+            vop = VOp::Div;
+        } else if (op == "mod") {
+            vop = VOp::Mod;
+        } else {
+            return -1;
+        }
+        if (!args.is_array() || args.as_array().size() != 2) {
+            return -1;
+        }
+        const int a = compile_node_(args.as_array()[0], schema);
+        const int b = compile_node_(args.as_array()[1], schema);
+        if (a < 0 || b < 0) {
+            return -1;
+        }
+        Node n;
+        n.op = vop;
+        n.children.push_back(a);
+        n.children.push_back(b);
+        return add_(std::move(n));
+    }
+
+    DVec eval_node_(int idx, const arrow::RecordBatch& rb) const {
+        const Node& node = nodes_[static_cast<std::size_t>(idx)];
+        const auto n = static_cast<std::size_t>(rb.num_rows());
+        DVec r{std::vector<double>(n, 0.0), std::vector<std::uint8_t>(n, 1)};
+
+        if (node.op == VOp::Lit) {
+            for (std::size_t i = 0; i < n; ++i) {
+                r.val[i] = node.lit;
+            }
+            return r;
+        }
+        if (node.op == VOp::Col) {
+            const auto& arr = *rb.column(node.col_idx);
+            auto run = [&](auto&& read) {
+                for (std::size_t i = 0; i < n; ++i) {
+                    const auto ii = static_cast<std::int64_t>(i);
+                    if (arr.IsNull(ii)) {
+                        r.valid[i] = 0;
+                    } else {
+                        r.val[i] = read(ii);
+                    }
+                }
+            };
+            if (node.arrow_type == arrow::Type::INT64) {
+                const auto& a = static_cast<const arrow::Int64Array&>(arr);
+                run([&](std::int64_t ii) { return static_cast<double>(a.Value(ii)); });
+            } else if (node.arrow_type == arrow::Type::INT32) {
+                const auto& a = static_cast<const arrow::Int32Array&>(arr);
+                run([&](std::int64_t ii) { return static_cast<double>(a.Value(ii)); });
+            } else if (node.arrow_type == arrow::Type::DOUBLE) {
+                const auto& a = static_cast<const arrow::DoubleArray&>(arr);
+                run([&](std::int64_t ii) { return a.Value(ii); });
+            } else {  // FLOAT
+                const auto& a = static_cast<const arrow::FloatArray&>(arr);
+                run([&](std::int64_t ii) { return static_cast<double>(a.Value(ii)); });
+            }
+            return r;
+        }
+        if (node.op == VOp::Neg) {
+            r = eval_node_(node.children[0], rb);
+            for (std::size_t i = 0; i < n; ++i) {
+                if (r.valid[i] != 0) {
+                    r.val[i] = -r.val[i];
+                }
+            }
+            return r;
+        }
+        // Binary arithmetic: null if either operand null; NaN on div/mod by 0
+        // (byte-identical to numeric_binop's lambdas).
+        const DVec a = eval_node_(node.children[0], rb);
+        const DVec b = eval_node_(node.children[1], rb);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (a.valid[i] == 0 || b.valid[i] == 0) {
+                r.valid[i] = 0;
+                continue;
+            }
+            const double x = a.val[i];
+            const double y = b.val[i];
+            switch (node.op) {
+                case VOp::Add:
+                    r.val[i] = x + y;
+                    break;
+                case VOp::Sub:
+                    r.val[i] = x - y;
+                    break;
+                case VOp::Mul:
+                    r.val[i] = x * y;
+                    break;
+                case VOp::Div:
+                    r.val[i] = (y == 0.0) ? std::nan("") : x / y;
+                    break;
+                case VOp::Mod:
+                    r.val[i] = (y == 0.0) ? std::nan("") : std::fmod(x, y);
+                    break;
+                default:
+                    break;
+            }
+        }
+        return r;
     }
 
     std::vector<Node> nodes_;
