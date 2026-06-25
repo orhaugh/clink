@@ -104,16 +104,36 @@ controlled isolation tests sharpened (and partly corrected) that:
   panes). So it is NOT only the multi-partition interleave - the bug reproduces
   on a single ordered partition.
 
-Conclusion: the defect is in the **Kafka-source -> windowing path**, not
-`WindowRowOp`. The in-process generator bench (`clink_nexmark_bench` q12) never
-caught it because it blackholes output (the count was never checked); this
-cross-engine harness is the first thing to verify clink's windowed output count
-against ground truth. The exact Kafka-source mechanism (record/watermark
-delivery timing under an unbounded stream) needs clean debugging - a focused
-clink engine task, and the prerequisite for any windowed cross-engine ratio
-(q12/q5) and for parallelism>1 scaled runs.
+Further controlled tests narrowed it precisely (all over the same streaming
+Kafka source, parallelism 1):
 
-Remaining: fix the clink Kafka-source windowing bug; then q8/q6, CPU
+| query shape | result |
+|---|---|
+| per-bidder COUNT (keyed window, `GROUP BY ..., bidder`) | WRONG (276,078) |
+| global COUNT per window (no key, `GROUP BY TUMBLE` only) | **correct** (49 windows, sum 450,800) |
+| per-bidder COUNT over an ordered FILE source (keyed) | **correct** (190,729) |
+
+So the defect is the **keyed-window path under a streaming source** specifically:
+keyed+Kafka is wrong, but no-key+Kafka is correct AND keyed+file is correct. The
+Kafka source itself delivers all 460,000 records, distinct and essentially
+ordered (a clean passthru confirmed this); `WindowRowOp` is correct; the no-key
+streaming path is correct. The fault is in how data and watermarks are delivered
+to the window operator **across the `key_by` edge under incremental (small-batch)
+streaming** - the watermark effectively advances relative to the keyed data so
+windows finalise before all their data is folded, then late folds re-create and
+re-fire the window (extra panes) while some bids miss the canonical pane
+(under-count).
+
+Why the late-record-drop guard is NOT the fix: the no-key path proves the
+watermark is correct (sum 450,800), so in the keyed path the records are not
+genuinely late - dropping them (Flink's `allowed_lateness=0`) would make the
+under-count worse, not fix it. The correct fix preserves watermark-after-data
+ordering through the keyed edge/keyed-window path under streaming. That is
+load-bearing runtime code (the keyed / async-state path), so it warrants a
+careful dedicated change, not a rushed one.
+
+Remaining: the keyed-window-over-streaming fix (prerequisite for any windowed
+cross-engine ratio q12/q5/q8 and for parallelism>1 runs); then q8/q6, CPU
 normalisation, the clink SQL parallelism flag, and a reproducible run.sh +
 scoreboard.
 
