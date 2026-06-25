@@ -20,6 +20,8 @@
 #   ./throughput_sampled.sh                          # q0 q12, par 4, 5M events
 #   EVENTS=10000000 PARALLELISM=4 ./throughput_sampled.sh
 #   QUERIES="q0" KEEP_UP=1 ./throughput_sampled.sh   # leave cluster up after
+#   SINK=blackhole EVENTS=10000000 ./throughput_sampled.sh  # discard output to
+#       remove the shared Kafka broker as a write ceiling (engine-rate only)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,8 +40,16 @@ EVENTS="${EVENTS:-5000000}"
 TPS="${TPS:-1000}"
 PAR="${PARALLELISM:-4}"
 QUERIES="${QUERIES:-q0 q12}"
+# SINK=kafka (default): write output to a Kafka topic + gate on row count.
+# SINK=blackhole: discard output (clink connector='blackhole' / Flink built-in
+# 'blackhole') so the engine's read+process rate is measured WITHOUT the shared
+# Kafka broker as a write ceiling. No output topic, no row-count gate; the
+# completeness check is that each engine's own counter drained the full input
+# (reached_target). Uses the q*_bh.tmpl.sql variants.
+SINK="${SINK:-kafka}"
 DATA_DIR="${DATA_DIR:-/tmp/nxcompare-sampled}"
 RESULTS="$ROOT/results-sampled"
+QSUFFIX=""; [ "$SINK" = "blackhole" ] && QSUFFIX="_bh"
 
 now_s() { python3 -c 'import time;print(time.time())'; }
 step() { printf '\n=== %s ===\n' "$*"; }
@@ -109,8 +119,8 @@ for l in sys.stdin:
 
 run_clink() {  # query
     local q=$1 out="nx-out-$q-clink"
-    recreate_topic "$out" "$PAR" append
-    sed -e "s#__OUT__#$out#" -e "s#__BROKERS__#kafka:29092#" "$ROOT/queries/clink/$q.tmpl.sql" > "$DATA_DIR/$q-clink.sql"
+    [ "$SINK" = "kafka" ] && recreate_topic "$out" "$PAR" append
+    sed -e "s#__OUT__#$out#" -e "s#__BROKERS__#kafka:29092#" "$ROOT/queries/clink/$q$QSUFFIX.tmpl.sql" > "$DATA_DIR/$q-clink.sql"
     local cpu_pre wall_pre; cpu_pre=$("$PY" "$ROOT/driver/cpu.py" read-flink $CLINK_CTRS); wall_pre=$(now_s)
     local jid; jid=$(../../build/clink_submit_sql --file "$DATA_DIR/$q-clink.sql" \
         --jm-host 127.0.0.1 --jm-port "$CLINK_JM_HTTP" --name "ts_$q" --parallelism "$PAR" 2>/dev/null | extract_job_id)
@@ -118,17 +128,17 @@ run_clink() {  # query
     local s; s=$("$PY" "$ROOT/driver/sample_rate.py" clink --base "http://127.0.0.1:$CLINK_JM_HTTP" \
         --job "$jid" --target "$BIDS" --interval 0.08 --window 0.5)
     local cpu_post wall_post; cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-flink $CLINK_CTRS); wall_post=$(now_s)
-    local off; off=$(wait_stable_offset "$out")
+    local off=-1; [ "$SINK" = "kafka" ] && off=$(wait_stable_offset "$out")
     echo "$s" | python3 -c "import json,sys
-d=json.load(sys.stdin); d.update({'query':'$q','cpu_seconds':round($cpu_post-$cpu_pre,2),'wall_seconds':round($wall_post-$wall_pre,2),'out_rows':$off}); open('$RESULTS/$q-clink.json','w').write(json.dumps(d)); print('  clink drain',d['drain_rate'],'rec/s (',d.get('drain_seconds'),'s),','whole-run',d['whole_run_rate'],', out_rows',$off)"
+d=json.load(sys.stdin); d.update({'query':'$q','sink':'$SINK','cpu_seconds':round($cpu_post-$cpu_pre,2),'wall_seconds':round($wall_post-$wall_pre,2),'out_rows':$off}); open('$RESULTS/$q-clink.json','w').write(json.dumps(d)); print('  clink drain',d['drain_rate'],'rec/s (',d.get('drain_seconds'),'s), reached',d['reached_target'],', out_rows',($off if $off>=0 else 'n/a(blackhole)'))"
     curl -fsS -X POST "http://127.0.0.1:$CLINK_JM_HTTP/api/v1/jobs/$jid/cancel" >/dev/null 2>&1
     sleep 2
 }
 
 run_flink() {  # query
     local q=$1 out="nx-out-$q-flink"
-    recreate_topic "$out" "$PAR" append
-    sed "s#__OUT__#$out#" "$ROOT/flink-job/queries/$q.tmpl.sql" > "$DATA_DIR/$q-flink.sql"
+    [ "$SINK" = "kafka" ] && recreate_topic "$out" "$PAR" append
+    sed "s#__OUT__#$out#" "$ROOT/flink-job/queries/$q$QSUFFIX.tmpl.sql" > "$DATA_DIR/$q-flink.sql"
     docker cp "$DATA_DIR/$q-flink.sql" "$FLINK_JM:/tmp/$q-flink.sql" >/dev/null 2>&1
     local cpu_pre wall_pre; cpu_pre=$("$PY" "$ROOT/driver/cpu.py" read-flink $FLINK_CTRS); wall_pre=$(now_s)
     local jid; jid=$(docker exec "$FLINK_JM" flink run -d -p "$PAR" /tmp/nexmark-sql.jar "/tmp/$q-flink.sql" 2>&1 \
@@ -141,9 +151,9 @@ run_flink() {  # query
     local s; s=$("$PY" "$ROOT/driver/sample_rate.py" flink --base "http://127.0.0.1:$FLINK_REST" \
         --job "$jid" --target "$BIDS" --interval 0.2 --window 2.5 --quiet-timeout 18 --max-runtime 360)
     local cpu_post wall_post; cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-flink $FLINK_CTRS); wall_post=$(now_s)
-    local off; off=$(wait_stable_offset "$out")
+    local off=-1; [ "$SINK" = "kafka" ] && off=$(wait_stable_offset "$out")
     echo "$s" | python3 -c "import json,sys
-d=json.load(sys.stdin); d.update({'query':'$q','cpu_seconds':round($cpu_post-$cpu_pre,2),'wall_seconds':round($wall_post-$wall_pre,2),'out_rows':$off}); open('$RESULTS/$q-flink.json','w').write(json.dumps(d)); print('  flink drain',d['drain_rate'],'rec/s (',d.get('drain_seconds'),'s),','whole-run',d['whole_run_rate'],', out_rows',$off)"
+d=json.load(sys.stdin); d.update({'query':'$q','sink':'$SINK','cpu_seconds':round($cpu_post-$cpu_pre,2),'wall_seconds':round($wall_post-$wall_pre,2),'out_rows':$off}); open('$RESULTS/$q-flink.json','w').write(json.dumps(d)); print('  flink drain',d['drain_rate'],'rec/s (',d.get('drain_seconds'),'s), reached',d['reached_target'],', out_rows',($off if $off>=0 else 'n/a(blackhole)'))"
     docker exec "$FLINK_JM" flink cancel "$jid" >/dev/null 2>&1
     sleep 2
 }
@@ -153,7 +163,7 @@ for q in $QUERIES; do
     step "5. $q on Flink (containers, par=$PAR)"; run_flink "$q"
 done
 
-step "6. Sustained-throughput summary (engine-side metrics, par=$PAR, $EVENTS events)"
+step "6. Sustained-throughput summary (engine-side metrics, par=$PAR, $EVENTS events, sink=$SINK)"
 "$PY" "$ROOT/driver/summarize_sampled.py" --results-dir "$RESULTS" --par "$PAR" --events "$EVENTS"
 RC=$?
 

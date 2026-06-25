@@ -358,11 +358,46 @@ separate hosts (not both clusters on one box), a warmed Flink (discard the first
 seconds), an isolated or rate-limited sink (remove the shared-Kafka ceiling), and
 multiple trials. The sampler is the right instrument; the rig is the limit.
 
-Remaining: a true multi-machine (multi-host) run with the sampler; warmed-Flink +
-isolated-sink trials for a precise ratio; the niche par=1-reading-many-partitions
-residual. (q12 is sampled-comparable only at par=1: at par>1 its output diverges
-because the multi-partition watermark refinement is not yet on the SQL Kafka-source
-path - a documented gap, see the q12 template.)
+## Isolating the sink (`SINK=blackhole`)
+
+`SINK=blackhole ./throughput_sampled.sh` swaps the Kafka output for a discard sink
+(clink `connector='blackhole'`, Flink's built-in `blackhole`; the `q*_bh.tmpl.sql`
+variants) so the engine's read+process rate is measured with NO output connector -
+removing the shared single Kafka broker as a write ceiling. Output is discarded so
+there is no row-count gate; the completeness check is that each engine's own
+counter drained the full input (correctness is established separately by the
+Kafka-sink gate). A larger input (10M) keeps the now-faster drain samplable.
+
+A clean same-session A/B, q0 at 10M / par=4, both measured by each engine's own
+counter (only the sink differs):
+
+| sink | clink | Flink | ratio |
+|---|---|---|---|
+| kafka | 682k/s | 68k/s | 10.07x |
+| blackhole | 881k/s | 426k/s | 2.07x |
+
+The result is the opposite of the naive expectation, and it is the honest one. The
+Kafka sink throttles BOTH engines, but Flink **catastrophically** (426k -> 68k, ~6x)
+versus clink **modestly** (881k -> 682k, ~1.3x) - because the shared single broker
+contends on the output path and hits Flink's sink far harder. So removing the sink
+SHRINKS the ratio (10x -> ~2x). Across runs, Flink's Kafka-sink rate swings wildly
+(68k-442k) while its blackhole rate is stable (~426k, matching its good Kafka runs);
+clink is steady throughout (682-881k).
+
+**The sink-isolated, pure-engine ratio is ~2x on q0 and ~2.5x on q12 (clink 457k /
+Flink 179k).** That is the most apples-to-apples engine-vs-engine number on this
+rig: clink is a clear ~2-2.5x faster, and the larger 5-10x Kafka-sink ratios seen
+elsewhere were substantially inflated by the shared broker throttling Flink's output
+path, not by a 5-10x compute-kernel gap. (Containerized clink is itself ~8x slower
+than the same binary run native - the Docker-Desktop VM tax on Mac - so even the
+~2x is measured under a heavy shared overhead, not clink's native ceiling.)
+
+Remaining: a true multi-machine (multi-host) run with the sampler; separate-host +
+warmed-Flink trials to pin the pure-engine ratio tighter; the niche
+par=1-reading-many-partitions residual. (q12 is Kafka-sink-comparable only at par=1:
+at par>1 its output diverges because the multi-partition watermark refinement is not
+yet on the SQL Kafka-source path - a documented gap, see the q12 template. The
+blackhole path sidesteps the output gate, so it compares at any par.)
 
 ## Producer (INC 2)
 
