@@ -25,27 +25,37 @@ SQL-vs-SQL on {q0 stateless, q5 windowed-agg, q8 windowed-join}; q6 reported
 separately as clink-SQL-vs-Flink-DataStream (excluded from the geomean); q13/q14/q10
 out of v1. See `pipeline.md` for the rationale.
 
-## Build increments (each independently verifiable)
+## Run it
 
-- [x] **INC 0** - premise doc (`pipeline.md`) + scaffold. The contract, written
-  first.
-- [x] **INC 2 (core)** - shared-input producer: `nexmark_dump` runs clink's
-  `NexmarkGenerator` ONCE (all types) and writes `nx-person/auction/bid` NDJSON,
-  the same JSON both engines decode. Verified Docker-free for determinism
-  (byte-identical on replay) and the 1:3:46 ratio. Kafka load is the next step.
-- [ ] **INC 3** - clink Nexmark Kafka SQL job: re-point the existing query SQL onto
-  `connector='kafka'` over the shared topics; clustered submit; count + steady-state
-  via the consumer. q0 first.
-- [ ] **INC 4** - Flink Nexmark SQL job (q0 canary): extend the pom with
-  flink-table + flink-sql-connector-kafka; run the upstream nexmark-flink q0 SQL on
-  the pinned Flink image reading the same topics. First real ratio. RISK: upstream
-  nexmark-flink SQL targeted Flink 1.x; 2.2.0 compatibility is unverified - q0 is
-  the canary.
-- [ ] **INC 5/6** - q5 (windowed agg), q8 (windowed join), each gated on per-query
-  output-row agreement.
-- [ ] **INC 7** - q6 as SQL-vs-DataStream, its own row.
-- [ ] **INC 8** - scoreboard: per-query Time/Cores/Cores*Time/ratio + SQL-only
-  geomean + banner; optional durable-mode matrix.
+One command (Docker + the `../flink_compare/.venv` Python venv + Maven):
+
+```bash
+./run.sh                  # q0 + q12, 500k events, then tears down
+EVENTS=1000000 ./run.sh   # more events
+QUERIES="q0" ./run.sh     # a subset
+KEEP_UP=1 ./run.sh        # leave Kafka + Flink up afterwards
+```
+
+It builds both engines, brings up Kafka + Flink, generates ONE canonical dataset,
+loads it to a single-partition `nx-bid` both engines read, runs each query on both
+at parallelism 1, measures steady-state by broker append-time, gates on identical
+output-row counts (a mismatch HALTS that query, no ratio), and prints the
+scoreboard under the matched-premise banner.
+
+## Build increments (all done for the v1 deliverable)
+
+- [x] **INC 0** - premise doc (`pipeline.md`) + scaffold.
+- [x] **INC 2** - shared-input producer (`nexmark_dump`): one canonical dataset,
+  deterministic (byte-identical on replay), 1:3:46 ratio.
+- [x] **INC 3** - clink Nexmark Kafka SQL job (also fixed the SQL Kafka
+  source/sink runtime wiring).
+- [x] **INC 4** - Flink Nexmark SQL job on the pinned Flink 2.2.0 image
+  (Table-API jar, Kafka SQL connector shaded in).
+- [x] **INC 8** - one-command `run.sh` + `scoreboard.py` (steady-state table +
+  geomean + banner + correctness gate).
+- [ ] q8 (windowed join), q6 (SQL-vs-DataStream) - more queries.
+- [ ] CPU normalisation (Cores*Time); clink SQL parallelism flag + the
+  start-of-stream partition-watermark refinement for parallelism>1 runs.
 
 ## Results (parallelism 1, 1-partition, hot-path)
 
@@ -55,12 +65,16 @@ measured identically from each output record's broker append timestamp
 (`message.timestamp.type=LogAppendTime`) over the middle 80%, both gate-verified
 (identical output-row counts -> same relation):
 
+A representative `./run.sh` (500k events, tps=1000), both gate-passing:
+
 | query | class | clink steady | Flink 2.2.0 steady | ratio | gate |
 |---|---|---|---|---|---|
-| q0 | stateless pass-through | ~497,000 ev/s | ~170,000 ev/s | 2.9x | 460,000 ✓ |
-| q12 | windowed aggregate (10s tumbling per-bidder COUNT) | ~262,000 panes/s | ~96,000 panes/s | 2.7x | 184,767 ✓ |
+| q0 | stateless pass-through | 593,546 ev/s | 197,955 ev/s | 3.00x | 460,000 ✓ |
+| q12 | windowed aggregate (10s tumbling per-bidder COUNT) | 388,981 panes/s | 122,260 panes/s | 3.18x | 184,767 ✓ |
+| | | | | **geomean 3.09x** | |
 
-clink leads on both, and on q0 it wins despite paying the heavier `JsonValue`
+clink leads on both (run-to-run the ratios sit around 2.7-3.2x; absolute rates
+vary with machine warmth). On q0 it wins despite paying the heavier `JsonValue`
 row-materialisation cost the JSON-input premise disclosed (which favours Flink on
 stateless queries). q12's metric is steady output-pane rate (the same metric on
 both engines, so the ratio is fair).
