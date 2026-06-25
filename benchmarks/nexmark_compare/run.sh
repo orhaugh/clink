@@ -18,6 +18,13 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLINK_ROOT="$(cd "$ROOT/../.." && pwd)"
+# Which clink build to run. Default is the dev build/ (RelWithDebInfo). For the
+# fully-optimised comparison, point at a Release+LTO tree:
+#   cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \
+#         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DCLINK_BUILD_SQL=ON -DCLINK_BUILD_BENCH=ON
+#   cmake --build build-release --target clink_node clink_submit_sql nexmark_dump --parallel 10
+#   BUILD_DIR="$PWD/build-release" PARALLELISM=4 ./run.sh
+BUILD_DIR="${BUILD_DIR:-$CLINK_ROOT/build}"
 PROJECT=nxcompare
 BROKERS_HOST=localhost:9092
 PY="$ROOT/../flink_compare/.venv/bin/python"
@@ -73,7 +80,7 @@ mkdir -p "$RESULTS" "$DATA_DIR"
 rm -f "$RESULTS"/*.json
 
 step "1. Build clink (node, submit_sql, nexmark_dump)"
-cmake --build "$CLINK_ROOT/build" --target clink_node clink_submit_sql nexmark_dump --parallel 10 \
+cmake --build "$BUILD_DIR" --target clink_node clink_submit_sql nexmark_dump --parallel 10 \
     >/dev/null 2>&1 || { echo "clink build failed"; exit 1; }
 
 step "2. Build Flink SQL jar"
@@ -91,7 +98,7 @@ for i in $(seq 1 30); do docker exec "$JM_CONTAINER" flink list >/dev/null 2>&1 
 docker cp "$ROOT/flink-job/target/nexmark-sql.jar" "$JM_CONTAINER:/tmp/nexmark-sql.jar" >/dev/null 2>&1
 
 step "4. Generate dataset ($EVENTS events, tps=$TPS) + load nx-{person,auction,bid} ($PAR partition(s) each)"
-"$CLINK_ROOT/build/benchmarks/nexmark_dump" --events "$EVENTS" --tps "$TPS" --out-dir "$DATA_DIR" | tail -1
+"$BUILD_DIR/benchmarks/nexmark_dump" --events "$EVENTS" --tps "$TPS" --out-dir "$DATA_DIR" | tail -1
 # PAR partitions each: one ordered partition per source subtask at parallelism
 # PAR (the loader keys by id/auction so partitions span the full time range; the
 # runtime min-merges per-partition watermarks across the shuffle -> gate-exact).
@@ -107,14 +114,14 @@ run_clink() {  # query
     recreate_topic "$out" "$PAR" append
     sed -e "s#__OUT__#$out#" -e "s#__BROKERS__#localhost:9092#" \
         "$ROOT/queries/clink/$q.tmpl.sql" > "$DATA_DIR/$q-clink.sql"
-    "$CLINK_ROOT/build/clink_node" --role=jm --port=7100 --http-port=8081 >"$RESULTS/clink-jm.log" 2>&1 &
+    "$BUILD_DIR/clink_node" --role=jm --port=7100 --http-port=8081 >"$RESULTS/clink-jm.log" 2>&1 &
     local jm=$!; sleep 2
     # clink needs ONE slot per subtask (no slot-sharing like Flink), so total
     # slots must cover (#ops * PAR). Scale slots-per-TM with PAR (>=8) so deeper
     # plans (q8's 9 ops -> 36 subtasks at PAR=4) still deploy across 4 TMs.
     local slots=$(( PAR * 12 )); [ "$slots" -lt 8 ] && slots=8
     local tms=(); for i in 1 2 3 4; do
-        "$CLINK_ROOT/build/clink_node" --role=tm --jm-host=127.0.0.1 --jm-port=7100 --id=tm-$i --slots="$slots" \
+        "$BUILD_DIR/clink_node" --role=tm --jm-host=127.0.0.1 --jm-port=7100 --id=tm-$i --slots="$slots" \
             >"$RESULTS/clink-tm-$i.log" 2>&1 & tms+=($!)
     done
     sleep 3
@@ -124,7 +131,7 @@ run_clink() {  # query
     local cpu_pre wall_pre
     cpu_pre=$("$PY" "$ROOT/driver/cpu.py" read-clink "$jm" "${tms[@]}")
     wall_pre=$(now_s)
-    "$CLINK_ROOT/build/clink_submit_sql" --file "$DATA_DIR/$q-clink.sql" \
+    "$BUILD_DIR/clink_submit_sql" --file "$DATA_DIR/$q-clink.sql" \
         --jm-host 127.0.0.1 --jm-port 8081 --name "nx_$q" --parallelism "$PAR" >/dev/null 2>&1
     "$PY" "$ROOT/driver/measure_steady.py" --brokers "$BROKERS_HOST" --topic "$out" \
         --expected "$(expected_for "$q")" --query "$q" --engine clink --out "$RESULTS/$q-clink.json" \
