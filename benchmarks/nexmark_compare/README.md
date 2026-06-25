@@ -70,8 +70,32 @@ Caveats this number still carries (so it is NOT yet the full headline of
 comparison; parallel scaling needs a clink SQL parallelism flag, a follow-on
 engine feature - clink SQL ops default to parallelism 1 today). No CPU
 normalisation yet (events/sec, not events/sec/core). q0 only - the stateless
-floor. q5/q8 (windowed) need the mid-stream-firing measurement and matched SQL
-(next increment).
+floor.
+
+## The correctness gate's first finding: a clink windowed-aggregate bug (q12)
+
+Running the windowed-aggregate query q12 (per-bidder COUNT per 10s tumbling
+window) over a low-tps dataset (event-time spanning ~50 windows) the per-query
+output-row gate FAILED, and that is a genuine result, not a hiccup:
+
+| engine | q12 panes | sum(bid_count) | correct? |
+|---|---|---|---|
+| Flink 2.2.0 | 184,767 | 450,800 | yes |
+| clink | 280,729 | 420,933 | no (over-emits) |
+
+The true answer, computed directly from the source data, is **184,767** distinct
+`(window, bidder)` pairs over the 49 watermark-closed windows (the last window
+never closes on an unbounded Kafka source). Flink matches it exactly. clink
+over-emits ~96k panes and under-counts the total - a real bug in clink's
+windowed-aggregate + multi-partition-Kafka-source watermark interaction (the
+in-process generator path, `clink_nexmark_bench` q12, is correct, so it is
+specific to the Kafka-source watermark/early-firing path). Per `pipeline.md` a
+gate mismatch HALTS: q12 is NOT quotable as a ratio until the clink bug is fixed.
+
+This is exactly what the gate is for - it stopped a meaningless "clink 6.7x"
+number (clink 326k vs Flink 49k panes/sec) that was comparing different relations.
+Fixing the clink windowed-Kafka bug, then q8/q6, CPU normalisation, the clink SQL
+parallelism flag, and a reproducible run.sh + scoreboard are the remaining work.
 
 ## Producer (INC 2)
 
