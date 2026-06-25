@@ -301,10 +301,53 @@ is materially more CPU-efficient, consistent with the par=1 host run (~3x wall,
 ~13x CPU-footprint). A precise SUSTAINED-throughput ratio needs engine-side
 metrics sampling (each engine's records-out/sec mid-run) plus a much larger or
 rate-limited input so warmup amortizes and no downstream consumer is the
-bottleneck - a methodology increment, not a number to fabricate now.
+bottleneck - which is exactly what `throughput_sampled.sh` does (next section).
 
-Remaining: a true multi-machine (multi-host) run; the sustained-throughput
-measurement rework above; the niche par=1-reading-many-partitions residual.
+## Engine-side metrics sampling (`throughput_sampled.sh`)
+
+The methodology fix for the caveat above. Instead of timing broker append
+(burst-fooled) or a downstream consumer (consumer-capped), it polls **each
+engine's own records-processed counter** over time and reports the **drain rate**
+(input events / time from first record to fully drained):
+
+- clink: `GET /api/v1/jobs/<id>/operators`, max `records_in` across operators.
+  The counter is fine-grained (~80ms), so the drain is measured first-record to
+  last-record (excludes the deploy gap). clink's per-op counters are cumulative
+  across job submissions on a persistent TM, so the sampler anchors a baseline at
+  the first positive reading and measures the delta.
+- Flink: `GET /jobs/<jid>`, max `read/write-records` across vertices. Flink's
+  aggregated metrics lag the metric-fetcher interval (~10s) and arrive as a step,
+  so wall-time is useless; instead the sampler uses Flink's own job clock
+  (`duration`, ms since RUNNING) - `target / duration_at_completion` is immune to
+  the fetch lag. Each Flink job is fresh, so its counts are absolute (no baseline).
+
+This removed the bogus ~52x burst artifact. But the run surfaced a harder truth:
+
+- **clink is stable and fast.** Across 5M/10M, fresh and warm hosts, its drain rate
+  sits ~0.8-1.1M rec/s with a peak slope ~1.5-2.0M rec/s. Output is gate-identical
+  (4.6M / 9.2M for q0) whenever both engines finish.
+- **Flink is highly variable on this rig.** Same query, same input: ~215k rec/s
+  (5M, warmup-deflated), ~442k rec/s (10M warm, warmup amortized - its most
+  representative point), down to ~38k rec/s (10M cold JVM, did not even drain the
+  full input inside the cap). That is a ~10x spread driven by JVM warmth and
+  cold-start, plus the single shared Kafka broker becoming a write bottleneck for
+  q0 (a passthrough that writes every input row back to Kafka - clink hits that
+  ceiling sooner, which compresses the apparent ratio at volume).
+
+**Honest conclusion: a precise single cross-engine ratio is not establishable on
+this one-laptop rig.** clink is faster in every run (the warmup-fair 10M point is
+~1.8x; smaller scales read higher only because Flink is warmup-deflated there) and
+far more stable, with byte-identical output - but Flink's 10x variance and the
+shared-broker sink dominate any headline number. A defensible figure needs:
+separate hosts (not both clusters on one box), a warmed Flink (discard the first N
+seconds), an isolated or rate-limited sink (remove the shared-Kafka ceiling), and
+multiple trials. The sampler is the right instrument; the rig is the limit.
+
+Remaining: a true multi-machine (multi-host) run with the sampler; warmed-Flink +
+isolated-sink trials for a precise ratio; the niche par=1-reading-many-partitions
+residual. (q12 is sampled-comparable only at par=1: at par>1 its output diverges
+because the multi-partition watermark refinement is not yet on the SQL Kafka-source
+path - a documented gap, see the q12 template.)
 
 ## Producer (INC 2)
 
