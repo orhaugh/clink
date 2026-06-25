@@ -8312,6 +8312,100 @@ TEST(SqlRuntime, ColumnarParquetTumbleWindowEndToEnd) {
         std::filesystem::remove(p);
 }
 
+// WS3 within-batch group-by on the SESSION window: a columnar Parquet source
+// feeds a SESSION window, so each group's events fold into its session map
+// behind ONE state_ probe (SessionWindowRowOp::process_columnar). Session merges
+// are order-sensitive; within-group arrival order is preserved, so the merged
+// sessions are exactly correct - parity with the per-record path's fold_session_.
+TEST(SqlRuntime, ColumnarParquetSessionWindowEndToEnd) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_csw_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_csw.parquet";
+    const auto out_path = tmp / "clink_sql_csw_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    // user=1: {100,200,300} one session + {1000} a separate session (gap > 500).
+    // user=2: {400,500} one session.
+    write_lines(in_path,
+                {
+                    R"({"user_id":1,"ts":100})",
+                    R"({"user_id":1,"ts":200})",
+                    R"({"user_id":1,"ts":300})",
+                    R"({"user_id":2,"ts":400})",
+                    R"({"user_id":2,"ts":500})",
+                    R"({"user_id":1,"ts":1000})",
+                });
+    const std::string cols = "(user_id BIGINT, ts BIGINT)";
+
+    // Job 1: NDJSON -> typed-columnar Parquet.
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts FROM ev");
+        InProcessCluster cluster("tm-csw-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    // Job 2: columnar Parquet source (event-time on ts) -> SESSION(500) window.
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE pq_in "} + cols +
+                         " WITH (connector='parquet', path='" + pq_path.string() +
+                         "', event_time_column='ts');"
+                         "CREATE TABLE per_session (user_id BIGINT, hits BIGINT) "
+                         "WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat,
+                            "INSERT INTO per_session SELECT user_id, COUNT(*) AS hits "
+                            "FROM pq_in GROUP BY SESSION(ts, 500), user_id");
+        InProcessCluster cluster("tm-csw-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    auto lines = read_lines(out_path);
+    std::multimap<std::int64_t, std::int64_t> got;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("user_id").as_number()),
+                    static_cast<std::int64_t>(js.at("hits").as_number()));
+    }
+    auto contains = [&](std::int64_t uid, std::int64_t hits) {
+        auto range = got.equal_range(uid);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second == hits)
+                return true;
+        }
+        return false;
+    };
+    EXPECT_TRUE(contains(1, 3)) << "user=1 burst session of 3";
+    EXPECT_TRUE(contains(1, 1)) << "user=1 late single-event session";
+    EXPECT_TRUE(contains(2, 2)) << "user=2 session of 2";
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // Multi-way (3-table) INNER equi-join: a JOIN b JOIN c binds to a left-deep
 // nested EquiJoin tree (the inner join's flat columns pass through the outer
 // join unprefixed) and executes end-to-end. The joined output uses the flat

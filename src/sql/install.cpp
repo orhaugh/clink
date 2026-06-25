@@ -1460,12 +1460,51 @@ public:
                 cols.push_back({&nm, idx, rb->schema()->field(idx)->type()});
             }
         }
+        // WS3 within-batch group-by: amortise the per-record state_[group_key]
+        // hash probe. Group the batch's rows by group key (first-seen order) and
+        // fold each group's events into its session map behind ONE state_ probe.
+        // fold_session_ runs per row in arrival order exactly as handle_record_
+        // does; session merges within a key are order-sensitive, but within-group
+        // order is preserved and cross-group folds touch disjoint session maps,
+        // so the result is byte-identical for every aggregate. Bad-time rows are
+        // skipped before grouping (matching handle_record_'s guard), so no empty
+        // state_ entry is created.
+        std::vector<Row> rows;
+        rows.reserve(static_cast<std::size_t>(n));
         for (std::int64_t i = 0; i < n; ++i) {
             Row row;
             for (const auto& c : cols) {
                 row.values[*c.name] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
             }
-            handle_record_(row);
+            rows.push_back(std::move(row));
+        }
+        clink::FlatMap<std::string, std::size_t> group_of;
+        std::vector<std::vector<std::int64_t>> groups;
+        std::vector<std::string> group_keys;
+        for (std::int64_t i = 0; i < n; ++i) {
+            const Row& r = rows[static_cast<std::size_t>(i)];
+            const auto tit = r.values.find(time_column_);
+            if (tit == r.values.end() || !tit->second.is_number()) {
+                continue;  // bad time: handle_record_ would return early, no state_ entry
+            }
+            std::string key = group_key_(r);
+            auto git = group_of.find(key);
+            if (git == group_of.end()) {
+                group_of.emplace(key, groups.size());
+                groups.push_back({i});
+                group_keys.push_back(std::move(key));
+            } else {
+                groups[git->second].push_back(i);
+            }
+        }
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            auto& by_session = state_[group_keys[g]];
+            for (const std::int64_t idx : groups[g]) {
+                const Row& r = rows[static_cast<std::size_t>(idx)];
+                const auto ts =
+                    static_cast<std::int64_t>(r.values.find(time_column_)->second.as_number());
+                fold_session_(by_session, r, ts);
+            }
         }
         return true;
     }
@@ -1581,12 +1620,9 @@ private:
         }
     }
 
-    void handle_record_(const Row& row) {
-        auto tit = row.values.find(time_column_);
-        if (tit == row.values.end() || !tit->second.is_number())
-            return;
-        auto ts = static_cast<std::int64_t>(tit->second.as_number());
-
+    // Concatenated group-key values (0x1f separator; null/missing skipped). The
+    // state_ key and the within-batch grouping key.
+    std::string group_key_(const Row& row) const {
         std::string key;
         for (std::size_t i = 0; i < group_keys_.size(); ++i) {
             if (i > 0)
@@ -1596,9 +1632,17 @@ private:
                 key += vit->second.serialize(0);
             }
         }
+        return key;
+    }
 
-        auto& by_session = state_[key];
-
+    // Merge one event (at `ts`) into a group's session map WITHOUT touching
+    // state_ - the inner body of handle_record_. The within-batch group-by
+    // reuses this so a group's rows fold behind ONE state_ probe in arrival
+    // order, byte-identical to the per-record path (session merges within a key
+    // are order-sensitive, so input order is preserved).
+    void fold_session_(std::map<std::int64_t, Session>& by_session,
+                       const Row& row,
+                       std::int64_t ts) const {
         // Find sessions that the new event extends or merges. Iterate
         // upper-bound back: any session with end + gap >= ts and
         // start - gap <= ts overlaps.
@@ -1649,6 +1693,14 @@ private:
         // group_values stay the same (group key unchanged within group).
         std::int64_t new_start = merged.start;
         by_session.emplace(new_start, std::move(merged));
+    }
+
+    void handle_record_(const Row& row) {
+        auto tit = row.values.find(time_column_);
+        if (tit == row.values.end() || !tit->second.is_number())
+            return;
+        const auto ts = static_cast<std::int64_t>(tit->second.as_number());
+        fold_session_(state_[group_key_(row)], row, ts);
     }
 
     void fire_due_(EventTime wm, Emitter<Row>& out) {
