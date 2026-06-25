@@ -23,7 +23,11 @@ COPY . /src
 # container's nproc anyway, but being explicit here keeps the build
 # polite on hosts that haven't tuned Docker's resource allocation.
 ENV CMAKE_BUILD_PARALLEL_LEVEL=4
-RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+# CLINK_BUILD_SQL=ON so clink_node registers the SQL operator factories
+# (json_string_to_row, window_row, equi_join_row, ...) - required to run SQL
+# jobs (e.g. the Nexmark queries) against a containerized cluster; without it the
+# JM planner rejects the spec with "no operator factory registered".
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCLINK_BUILD_SQL=ON \
     && cmake --build build --target clink_node \
     && cmake --build build --target clink \
     && cmake --build build --target clink_k8s_smoke_job \

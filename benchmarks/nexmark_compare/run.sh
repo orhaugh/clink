@@ -105,7 +105,8 @@ recreate_topic nx-bid "$PAR"
 run_clink() {  # query
     local q=$1 out="nx-out-$1-clink"
     recreate_topic "$out" "$PAR" append
-    sed "s#__OUT__#$out#" "$ROOT/queries/clink/$q.tmpl.sql" > "$DATA_DIR/$q-clink.sql"
+    sed -e "s#__OUT__#$out#" -e "s#__BROKERS__#localhost:9092#" \
+        "$ROOT/queries/clink/$q.tmpl.sql" > "$DATA_DIR/$q-clink.sql"
     "$CLINK_ROOT/build/clink_node" --role=jm --port=7100 --http-port=8081 >"$RESULTS/clink-jm.log" 2>&1 &
     local jm=$!; sleep 2
     # clink needs ONE slot per subtask (no slot-sharing like Flink), so total

@@ -73,3 +73,92 @@ services:
         taskmanager.numberOfTaskSlots: 4
         parallelism.default: 4
         state.backend.type: hashmap
+
+  # Containerized clink cluster (profile "clink") for distributed functional
+  # verification: 1 JM + 4 TM, each its own container/hostname on this project
+  # network, so subtasks shuffle over real container-to-container TCP (separate
+  # network namespaces) and reach Kafka via the in-network listener kafka:29092.
+  # Image built by verify_distributed.sh from docker/Dockerfile.runtime. JM HTTP
+  # maps to host 8095 (8081 is taken by flink-jobmanager). 4 TM x 16 slots = 64,
+  # enough for q8 at par=4 (~36 subtasks).
+  clink-jm:
+    image: clink-runtime:latest
+    profiles: ["clink"]
+    hostname: clink-jm
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - --role=jm
+      - --port=6123
+      - --bind-host=0.0.0.0
+      - --advertise-host=clink-jm
+      - --http-port=8081
+      - --http-bind=0.0.0.0
+    ports:
+      - "8095:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/api/v1/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 40
+      start_period: 2s
+
+  clink-tm1: &clink-tm
+    image: clink-runtime:latest
+    profiles: ["clink"]
+    hostname: clink-tm1
+    depends_on:
+      clink-jm:
+        condition: service_healthy
+    command:
+      - --role=tm
+      - --id=tm-1
+      - --jm-host=clink-jm
+      - --jm-port=6123
+      - --data-host=clink-tm1
+      - --slots=16
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+    environment:
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+    restart: on-failure
+
+  clink-tm2:
+    <<: *clink-tm
+    hostname: clink-tm2
+    command:
+      - --role=tm
+      - --id=tm-2
+      - --jm-host=clink-jm
+      - --jm-port=6123
+      - --data-host=clink-tm2
+      - --slots=16
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+
+  clink-tm3:
+    <<: *clink-tm
+    hostname: clink-tm3
+    command:
+      - --role=tm
+      - --id=tm-3
+      - --jm-host=clink-jm
+      - --jm-port=6123
+      - --data-host=clink-tm3
+      - --slots=16
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+
+  clink-tm4:
+    <<: *clink-tm
+    hostname: clink-tm4
+    command:
+      - --role=tm
+      - --id=tm-4
+      - --jm-host=clink-jm
+      - --jm-port=6123
+      - --data-host=clink-tm4
+      - --slots=16
+      - --http-port=8082
+      - --http-bind=0.0.0.0

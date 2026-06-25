@@ -17,15 +17,15 @@
 -- Run it (clink only):
 --   clink_submit_sql --file q6-clink.sql --jm-host 127.0.0.1 --jm-port 8081
 CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
-  WITH (connector='kafka', format='json', brokers='localhost:9092', topic='nx-bid',
+  WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-bid',
         group_id='clink-q6-b', auto_offset_reset='earliest',
         event_time_column='datetime', watermark_lag_ms='4000');
 CREATE TABLE auction (id BIGINT, itemname VARCHAR, initialbid BIGINT, reserve BIGINT, expires BIGINT, seller BIGINT, category BIGINT, datetime BIGINT)
-  WITH (connector='kafka', format='json', brokers='localhost:9092', topic='nx-auction',
+  WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-auction',
         group_id='clink-q6-a', auto_offset_reset='earliest',
         event_time_column='datetime', watermark_lag_ms='4000');
 CREATE TABLE sink_q6 (seller BIGINT, avgp DOUBLE)
-  WITH (connector='kafka', format='json', brokers='localhost:9092', topic='__OUT__',
+  WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='__OUT__',
         mode='upsert', primary_key='seller');
 INSERT INTO sink_q6
 SELECT seller, AVG(price) OVER (PARTITION BY seller ORDER BY close_dt
