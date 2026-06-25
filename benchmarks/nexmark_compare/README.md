@@ -47,6 +47,32 @@ out of v1. See `pipeline.md` for the rationale.
 - [ ] **INC 8** - scoreboard: per-query Time/Cores/Cores*Time/ratio + SQL-only
   geomean + banner; optional durable-mode matrix.
 
+## Preliminary result (q0, parallelism 1)
+
+First apples-to-apples number. q0 (stateless pass-through), both engines reading
+the same pre-generated `nx-bid` Kafka topic (JSON), hot-path durability
+(checkpoints off, in-memory state), steady-state throughput measured identically
+from each output record's broker append timestamp (`message.timestamp.type=
+LogAppendTime`) over the middle 80%:
+
+| engine | q0 steady events/sec | output rows (gate) |
+|---|---|---|
+| clink | ~497,000 | 460,000 ✓ |
+| Flink 2.2.0 | ~170,000 | 460,000 ✓ |
+
+clink ≈ 2.9x on this query, and notably it wins despite paying the heavier
+`JsonValue` row-materialisation cost the JSON-input premise disclosed (which
+favours Flink on stateless queries). Both produced exactly 460,000 rows, so the
+correctness gate passes.
+
+Caveats this number still carries (so it is NOT yet the full headline of
+`pipeline.md`): parallelism is 1 on BOTH (matched, the cleanest per-core
+comparison; parallel scaling needs a clink SQL parallelism flag, a follow-on
+engine feature - clink SQL ops default to parallelism 1 today). No CPU
+normalisation yet (events/sec, not events/sec/core). q0 only - the stateless
+floor. q5/q8 (windowed) need the mid-stream-firing measurement and matched SQL
+(next increment).
+
 ## Producer (INC 2)
 
 ```bash
