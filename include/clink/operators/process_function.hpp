@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "clink/core/codec.hpp"
+#include "clink/core/hash_map.hpp"
 #include "clink/core/types.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/output_tag.hpp"
@@ -1002,7 +1003,7 @@ private:
     std::optional<Codec<Key>> key_codec_;
     std::optional<Codec<In>> in_codec_;
     std::unique_ptr<KeyedState<StateKey, Bucket>> keyed_;
-    std::unordered_map<StateKey, Bucket, PairHash> mem_;
+    clink::FlatMap<StateKey, Bucket, PairHash> mem_;
 };
 
 // Sliding-window variant of the same adapter. Each input record
@@ -1251,7 +1252,7 @@ private:
     std::optional<Codec<Key>> key_codec_;
     std::optional<Codec<In>> in_codec_;
     std::unique_ptr<KeyedState<StateKey, Bucket>> keyed_;
-    std::unordered_map<StateKey, Bucket, PairHash> mem_;
+    clink::FlatMap<StateKey, Bucket, PairHash> mem_;
 };
 
 // Session window variant. A session window groups records that are
@@ -1513,7 +1514,7 @@ private:
     std::optional<Codec<Key>> key_codec_;
     std::optional<Codec<In>> in_codec_;
     std::unique_ptr<KeyedState<Key, std::vector<Session>>> keyed_;
-    std::unordered_map<Key, std::vector<Session>> mem_;
+    clink::FlatMap<Key, std::vector<Session>> mem_;
 };
 
 }  // namespace detail

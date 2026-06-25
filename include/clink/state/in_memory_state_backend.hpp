@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "clink/core/hash_map.hpp"
 #include "clink/state/state_backend.hpp"
 
 namespace clink {
@@ -187,8 +188,8 @@ private:
     // Transparent hash + comparator give heterogeneous (string_view) lookup so
     // the hot path never builds a std::string just to probe.
     using PerOp =
-        std::unordered_map<std::string, Value, detail::TransparentStringHash, std::equal_to<>>;
-    using State = std::unordered_map<OperatorId, PerOp>;
+        clink::FlatMap<std::string, Value, detail::TransparentStringHash, std::equal_to<>>;
+    using State = clink::FlatMap<OperatorId, PerOp>;
 
     mutable std::mutex mu_;
     State state_;

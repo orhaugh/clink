@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "clink/core/codec.hpp"
+#include "clink/core/hash_map.hpp"
 #include "clink/core/pane_info.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/operators/tumbling_window_operator.hpp"  // PairKeyHash, OperatorTriggerContext, now_processing_time_ms
@@ -415,7 +416,7 @@ private:
     std::string name_;
     detail::OperatorTriggerContext ctx_;
 
-    std::unordered_map<StateKey, Buffer, detail::PairKeyHash<Key>> buffers_;
+    clink::FlatMap<StateKey, Buffer, detail::PairKeyHash<Key>> buffers_;
 
     std::optional<Codec<Key>> key_codec_;
     std::optional<Codec<Value>> value_codec_;

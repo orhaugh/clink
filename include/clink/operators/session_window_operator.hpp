@@ -20,6 +20,7 @@
 #endif
 
 #include "clink/core/codec.hpp"
+#include "clink/core/hash_map.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/operators/window_state.hpp"
 #include "clink/runtime/output_tag.hpp"
@@ -251,7 +252,7 @@ private:
     // sorted so we can iterate near a record's provisional window in
     // O(log n) followed by a small linear sweep over overlapping
     // entries.
-    std::unordered_map<Key, std::map<std::int64_t, Session>> by_key_;
+    clink::FlatMap<Key, std::map<std::int64_t, Session>> by_key_;
 
     // Per-record ingest: late-data side-output routing + dispatch to
     // handle_record_ (which owns the session merge/create logic). Shared

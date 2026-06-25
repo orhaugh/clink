@@ -19,6 +19,7 @@
 #endif
 
 #include "clink/core/codec.hpp"
+#include "clink/core/hash_map.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/operators/window_state.hpp"
 #include "clink/operators/window_trigger.hpp"
@@ -707,7 +708,7 @@ private:
 #endif
 
     // In-memory path
-    std::unordered_map<StateKey, Entry, detail::PairKeyHash<Key>> mem_;
+    clink::FlatMap<StateKey, Entry, detail::PairKeyHash<Key>> mem_;
 
     // Earliest still-active window.end seen across all entries. When
     // current_watermark < earliest_window_end_, no entry can fire or

@@ -45,6 +45,7 @@
 
 #include "clink/cep/pattern.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/core/hash_map.hpp"
 #include "clink/core/types.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/runtime_context.hpp"
@@ -844,7 +845,7 @@ private:
     FlatSelectFn flat_select_fn_;
     std::string name_;
 
-    std::unordered_map<std::int64_t, std::vector<detail::PartialMatch<T>>> shadow_;
+    clink::FlatMap<std::int64_t, std::vector<detail::PartialMatch<T>>> shadow_;
     std::unique_ptr<KeyedState<std::int64_t, std::vector<detail::PartialMatch<T>>>> state_;
 
     // Optional timed-out side output. timed_out_tag_id_ is just for

@@ -10,6 +10,7 @@
 
 #include <arrow/api.h>
 
+#include "clink/core/hash_map.hpp"
 #include "clink/core/record.hpp"
 #include "clink/operators/columnar_keyed_aggregate_operator.hpp"  // AggKind
 #include "clink/operators/operator_base.hpp"
@@ -132,7 +133,7 @@ private:
     AggKind kind_;
     std::string name_;
     bool enable_columnar_;
-    std::unordered_map<std::string, std::int64_t, TransparentStringHash, std::equal_to<>> acc_;
+    clink::FlatMap<std::string, std::int64_t, TransparentStringHash, std::equal_to<>> acc_;
 };
 
 }  // namespace clink

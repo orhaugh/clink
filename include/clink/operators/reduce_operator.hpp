@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "clink/core/hash_map.hpp"
 #include "clink/operators/operator_base.hpp"
 
 namespace clink {
@@ -87,7 +88,7 @@ private:
     Combiner combiner_;
     std::string name_;
     ReduceEmitMode mode_;
-    std::unordered_map<K, Agg> state_;
+    clink::FlatMap<K, Agg> state_;
 };
 
 }  // namespace clink

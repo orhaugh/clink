@@ -17,6 +17,7 @@
 #endif
 
 #include "clink/core/codec.hpp"
+#include "clink/core/hash_map.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/operators/tumbling_window_operator.hpp"  // PairKeyHash, OperatorTriggerContext, now_processing_time_ms
 #include "clink/operators/window_state.hpp"
@@ -525,7 +526,7 @@ private:
 #endif
 
     // In-memory path
-    std::unordered_map<StateKey, Entry, detail::PairKeyHash<Key>> mem_;
+    clink::FlatMap<StateKey, Entry, detail::PairKeyHash<Key>> mem_;
 };
 
 }  // namespace clink

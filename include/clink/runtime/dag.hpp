@@ -98,6 +98,19 @@ struct OperatorRunner {
     std::function<std::size_t()> input_high_water;
 };
 
+// Columnar fast-path attempt, shared by every operator runner so the serial
+// (single-input) and parallel (wire_stage_) paths cannot drift. Returns true
+// iff the operator consumed the Arrow sidecar directly (vectorized, no row
+// decode); false otherwise, and per the operator contract (operator_base.hpp
+// no-double-emit) a false return happens BEFORE any emit, so the caller falls
+// back to op->process(). Templated on the operator pointer so it deduces In/Out
+// without the runner needing to name them.
+template <class OpPtr, class Elem, class Em>
+inline bool try_process_columnar(const OpPtr& op, const Elem& element, Em& out) {
+    return op->supports_columnar() && element.is_data() && element.as_data().is_columnar() &&
+           op->process_columnar(element, out);
+}
+
 }  // namespace detail
 
 // SourceHandle, OpHandle, and SinkHandle are tag types returned by the
@@ -799,9 +812,7 @@ public:
                             }
                         }
                         aec->poll();
-                    } else if (op->supports_columnar() && maybe->is_data() &&
-                               maybe->as_data().is_columnar() &&
-                               op->process_columnar(*maybe, emitter)) {
+                    } else if (detail::try_process_columnar(op, *maybe, emitter)) {
                         // Columnar-native fast path: the operator consumed the
                         // Arrow sidecar directly (vectorized), no row decode.
                         // A false return falls through to the row path below.
@@ -4003,8 +4014,13 @@ private:
                         any_progress = true;
                         if (m->is_data()) {
                             // For data, dispatch directly to the operator's
-                            // process - alignment buffering doesn't apply.
-                            op->process(*m, out_emitter);
+                            // process - alignment buffering doesn't apply. Try
+                            // the columnar fast path first (same contract as the
+                            // single-input runner); without this the parallel
+                            // path silently re-rowified every batch.
+                            if (!detail::try_process_columnar(op, *m, out_emitter)) {
+                                op->process(*m, out_emitter);
+                            }
                         } else if (m->is_watermark()) {
                             if (auto adv = align.on_watermark(k, m->as_watermark()); adv.forward) {
                                 op->on_watermark(adv.watermark, out_emitter);

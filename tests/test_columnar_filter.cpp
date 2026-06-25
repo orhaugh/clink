@@ -13,6 +13,7 @@
 //     columnar sink pipeline runs through the real runner with zero row
 //     materialization anywhere.
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -211,6 +212,62 @@ TEST(ColumnarFilter, EndToEndColumnarPipelineDecodesZeroRows) {
     EXPECT_EQ(sink->received.back(), 999);
     EXPECT_EQ(materialize_count() - before, 0u)
         << "columnar source -> columnar filter -> columnar sink must decode zero rows";
+}
+
+// WS2 regression guard: at parallelism>1 an operator runs in the parallel
+// runner (Dag::wire_stage_), which previously had NO columnar dispatch branch
+// and silently fell back to process() - row-decoding every batch. With
+// detail::try_process_columnar wired into wire_stage_, a forward (1:1) edge
+// keeps the Arrow sidecar columnar end-to-end, so the operator's
+// process_columnar fires and NOTHING decodes rows. Without the fix this test
+// fails: each subtask's batch is materialized once by the row fallback.
+TEST(ColumnarFilter, ParallelRunnerUsesColumnarPathAndDecodesZeroRows) {
+    const std::vector<V> slice0{10, 60, 50, 99, 3};
+    const std::vector<V> slice1{200, 5, 75};
+
+    std::vector<std::shared_ptr<ColumnarCollectingSink>> sinks(2);
+
+    Dag dag;
+    auto src = dag.add_parallel_source<V>(
+        [&](std::size_t subtask) -> std::shared_ptr<Source<V>> {
+            return std::make_shared<ColumnarVectorSource>(subtask == 0 ? slice0 : slice1,
+                                                          /*batch_size=*/64);
+        },
+        /*parallelism=*/2);
+
+    // Forward (1:1) edge: the sidecar is preserved into wire_stage_ (a shuffle
+    // would force-materialize in the partitioner, so this MUST be forward).
+    auto filt = dag.add_parallel_operator<V, V>(
+        src,
+        [](std::size_t /*subtask*/) -> std::shared_ptr<Operator<V, V>> {
+            return std::make_shared<ColumnarFilterOperator>(50);
+        },
+        /*parallelism=*/2);
+
+    dag.add_parallel_sink<V>(
+        filt,
+        [&](std::size_t subtask) -> std::shared_ptr<Sink<V>> {
+            sinks[subtask] = std::make_shared<ColumnarCollectingSink>();
+            return sinks[subtask];
+        },
+        /*parallelism=*/2);
+
+    const auto before = materialize_count();
+    LocalExecutor exec(std::move(dag));
+    exec.run();
+    const auto decoded = materialize_count() - before;
+
+    std::vector<V> got;
+    for (auto& s : sinks) {
+        ASSERT_TRUE(s) << "every sink subtask factory must have run";
+        got.insert(got.end(), s->received.begin(), s->received.end());
+    }
+    std::sort(got.begin(), got.end());
+
+    EXPECT_EQ(got, (std::vector<V>{50, 60, 75, 99, 200}))
+        << "forward parallel columnar filter must keep values >= 50 across both subtasks";
+    EXPECT_EQ(decoded, 0u)
+        << "the parallel (wire_stage_) columnar path must not row-decode any batch";
 }
 
 }  // namespace

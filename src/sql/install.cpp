@@ -25,6 +25,7 @@
 #include "clink/connectors/parquet_2pc_sink.hpp"
 #include "clink/connectors/parquet_sink.hpp"
 #include "clink/connectors/parquet_source.hpp"
+#include "clink/core/hash_map.hpp"
 #include "clink/operators/agg_function_registry.hpp"
 #include "clink/operators/async_lookup_operator.hpp"
 #include "clink/operators/columnar_row_filter_operator.hpp"
@@ -1312,7 +1313,7 @@ private:
     std::vector<std::string> group_key_outputs_;
     std::string window_start_output_;
     std::string window_end_output_;
-    std::unordered_map<std::string, std::map<std::int64_t, WindowBucket>> state_;
+    clink::FlatMap<std::string, std::map<std::int64_t, WindowBucket>> state_;
     std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
 };
 
@@ -1620,7 +1621,7 @@ private:
     std::vector<std::string> group_key_outputs_;
     std::string window_start_output_;
     std::string window_end_output_;
-    std::unordered_map<std::string, std::map<std::int64_t, Session>> state_;
+    clink::FlatMap<std::string, std::map<std::int64_t, Session>> state_;
     std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
 };
 
@@ -1876,7 +1877,7 @@ private:
     bool needs_buffer_ = false;
     std::int64_t max_rows_back_ = 0;   // widest ROWS <n> PRECEDING
     std::int64_t max_range_back_ = 0;  // widest RANGE <n> PRECEDING (ms)
-    std::unordered_map<std::string, PartState> state_;
+    clink::FlatMap<std::string, PartState> state_;
 };
 
 // Last-N-per-key aggregate. For each partition key it keeps the most-recent
@@ -2076,7 +2077,7 @@ private:
     std::vector<OverSpec> specs_;
     std::vector<AggSpec> agg_specs_;  // parallel to specs_
     std::int64_t capacity_ = 1;       // widest frame reach + 1
-    std::unordered_map<std::string, PartState> state_;
+    clink::FlatMap<std::string, PartState> state_;
 };
 
 // Phase 8: unbounded GROUP BY aggregator (no window TVF).
@@ -2376,7 +2377,7 @@ private:
     // instead of an append snapshot. Opt-in; the planner sets it when this
     // aggregate feeds a retraction-aware consumer (a join / netting sink).
     bool emit_changelog_ = false;
-    std::unordered_map<std::string, AggBucket> state_;
+    clink::FlatMap<std::string, AggBucket> state_;
     // Columns the columnar ingest reads from each input row (group keys, agg
     // inputs, __row_kind); precomputed in the ctor.
     std::vector<std::string> columnar_needed_;
@@ -2844,8 +2845,8 @@ private:
     // Finalised in open(): INNER + a deferring backend -> the async KeyedState
     // path (process_async{1,2}); otherwise the sync in-memory path below.
     bool effective_async_ = false;
-    std::unordered_map<std::string, std::vector<Entry>> left_state_;
-    std::unordered_map<std::string, std::vector<Entry>> right_state_;
+    clink::FlatMap<std::string, std::vector<Entry>> left_state_;
+    clink::FlatMap<std::string, std::vector<Entry>> right_state_;
 };
 
 // Inc 4: semi / anti join over Row - the runtime for IN / NOT IN and
@@ -3132,8 +3133,8 @@ private:
     std::vector<std::string> right_key_columns_;
     bool anti_;
     bool null_aware_;
-    std::unordered_map<std::string, std::vector<LeftEntry>> left_state_;
-    std::unordered_map<std::string, int> right_count_;
+    clink::FlatMap<std::string, std::vector<LeftEntry>> left_state_;
+    clink::FlatMap<std::string, int> right_count_;
     // #49 null-aware NOT IN only: probes with >= 1 NULL key component (never
     // entered left_state_), and the distinct null-bearing right tuples that
     // poison probes position-wise. Empty unless NULLs actually appear, so the
@@ -3295,11 +3296,11 @@ private:
     std::vector<std::string> right_columns_;
     bool is_except_;
     bool all_;
-    std::unordered_map<std::string, int> left_count_;   // key -> live left multiplicity
-    std::unordered_map<std::string, int> right_count_;  // key -> live right multiplicity
-    std::unordered_map<std::string, Row> left_rep_;     // key -> representative left row
-    std::unordered_map<std::string, Row> right_rep_;    // key -> representative right row
-    std::unordered_map<std::string, int> emitted_;      // key -> currently emitted multiplicity
+    clink::FlatMap<std::string, int> left_count_;   // key -> live left multiplicity
+    clink::FlatMap<std::string, int> right_count_;  // key -> live right multiplicity
+    clink::FlatMap<std::string, Row> left_rep_;     // key -> representative left row
+    clink::FlatMap<std::string, Row> right_rep_;    // key -> representative right row
+    clink::FlatMap<std::string, int> emitted_;      // key -> currently emitted multiplicity
 };
 
 // Inc 4: uncorrelated scalar-subquery filter. The scalar (right) side is
@@ -3528,7 +3529,7 @@ private:
     std::string path_;
     std::vector<std::string> primary_key_;
     std::map<std::string, int> decimal_scales_;  // #56: column -> declared scale
-    std::unordered_map<std::string, Row> state_;
+    clink::FlatMap<std::string, Row> state_;
     bool flushed_{false};
 };
 
@@ -3593,7 +3594,7 @@ private:
     };
     std::string path_;
     std::map<std::string, int> decimal_scales_;
-    std::unordered_map<std::string, Slot> state_;
+    clink::FlatMap<std::string, Slot> state_;
     bool flushed_{false};
 };
 
@@ -3873,7 +3874,7 @@ private:
     std::vector<bool> sort_descending_;
     std::int64_t count_;
     RankKind rank_kind_;
-    std::unordered_map<std::string, std::vector<Row>> state_;
+    clink::FlatMap<std::string, std::vector<Row>> state_;
 };
 
 // Phase 13: UNION ALL. Single-input identity map; the OperatorSpec
@@ -4093,7 +4094,7 @@ private:
         return clink::config::JsonValue{std::move(obj)}.serialize(0);
     }
 
-    std::unordered_set<std::string> seen_;
+    clink::FlatSet<std::string> seen_;
 };
 
 // Stream-stream interval join over Row records.
@@ -4307,7 +4308,7 @@ private:
     // For an OUTER kept side, a row evicted while still unmatched gets a final
     // null-padded emission into `null_pads` - the window is closed, so the
     // unmatched verdict is final and needs no later retraction.
-    void prune_(std::unordered_map<std::string, std::vector<Buffered>>& side,
+    void prune_(clink::FlatMap<std::string, std::vector<Buffered>>& side,
                 std::int64_t cutoff,
                 bool emit_unmatched,
                 bool present_is_left,
@@ -4346,8 +4347,8 @@ private:
     EquiJoinKind kind_;
     std::vector<std::string> left_columns_;
     std::vector<std::string> right_columns_;
-    std::unordered_map<std::string, std::vector<Buffered>> left_state_;
-    std::unordered_map<std::string, std::vector<Buffered>> right_state_;
+    clink::FlatMap<std::string, std::vector<Buffered>> left_state_;
+    clink::FlatMap<std::string, std::vector<Buffered>> right_state_;
 };
 
 }  // namespace
