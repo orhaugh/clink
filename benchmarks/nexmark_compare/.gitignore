@@ -3,3 +3,4 @@ target/
 results/
 *.ndjson
 Testing/
+__pycache__/

@@ -21,6 +21,7 @@ BROKERS_HOST=localhost:9092
 PY="$ROOT/../flink_compare/.venv/bin/python"
 KEX="docker exec ${PROJECT}-kafka-1 kafka-topics --bootstrap-server localhost:9092"
 JM_CONTAINER="${PROJECT}-flink-jobmanager-1"
+TM_CONTAINER="${PROJECT}-flink-taskmanager-1"
 
 EVENTS="${EVENTS:-500000}"
 TPS="${TPS:-1000}"        # low tps -> datetime spans many 10s windows (windowed queries fire mid-stream)
@@ -40,6 +41,18 @@ expected_for() {
         *) echo 0 ;;
     esac
 }
+
+# INPUT Nexmark events a query processes - the denominator for CPU normalisation
+# (events_per_cpu_sec), independent of how many output rows it emits. q0/q12 read
+# the 460k bids; q8 reads person + auction (10k + 30k).
+input_events_for() {
+    case "$1" in
+        q0|q12) echo 460000 ;;
+        q8) echo 40000 ;;
+        *) echo 0 ;;
+    esac
+}
+now_s() { python3 -c 'import time;print(time.time())'; }
 
 step() { printf '\n=== %s ===\n' "$*"; }
 recreate_topic() {  # name partitions [log-append-time]
@@ -96,11 +109,23 @@ run_clink() {  # query
             >"$RESULTS/clink-tm-$i.log" 2>&1 & tms+=($!)
     done
     sleep 3
+    # CPU + wall sampled tight around the active window: just before submit (JM/TM
+    # idle-settled) and right after the drain (measure_steady returns at the last
+    # output record for a gate-passing query, so no quiet-wait pollutes the delta).
+    local cpu_pre wall_pre
+    cpu_pre=$("$PY" "$ROOT/driver/cpu.py" read-clink "$jm" "${tms[@]}")
+    wall_pre=$(now_s)
     "$CLINK_ROOT/build/clink_submit_sql" --file "$DATA_DIR/$q-clink.sql" \
         --jm-host 127.0.0.1 --jm-port 8081 --name "nx_$q" >/dev/null 2>&1
     "$PY" "$ROOT/driver/measure_steady.py" --brokers "$BROKERS_HOST" --topic "$out" \
         --expected "$(expected_for "$q")" --query "$q" --engine clink --out "$RESULTS/$q-clink.json" \
         --quiet-timeout 12 2>/dev/null | tail -1
+    local cpu_post wall_post
+    cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-clink "$jm" "${tms[@]}")
+    wall_post=$(now_s)
+    "$PY" "$ROOT/driver/cpu.py" merge "$RESULTS/$q-clink.json" --cpu-pre "$cpu_pre" \
+        --cpu-post "$cpu_post" --wall-pre "$wall_pre" --wall-post "$wall_post" \
+        --input-events "$(input_events_for "$q")" >/dev/null
     kill "${tms[@]}" "$jm" 2>/dev/null; sleep 1; kill -9 "${tms[@]}" "$jm" 2>/dev/null; sleep 1
 }
 
@@ -109,10 +134,19 @@ run_flink() {  # query
     recreate_topic "$out" 1 append
     sed "s#__OUT__#$out#" "$ROOT/flink-job/queries/$q.tmpl.sql" > "$DATA_DIR/$q-flink.sql"
     docker cp "$DATA_DIR/$q-flink.sql" "$JM_CONTAINER:/tmp/$q-flink.sql" >/dev/null 2>&1
+    local cpu_pre wall_pre
+    cpu_pre=$("$PY" "$ROOT/driver/cpu.py" read-flink "$JM_CONTAINER" "$TM_CONTAINER")
+    wall_pre=$(now_s)
     docker exec "$JM_CONTAINER" flink run -d -p 1 /tmp/nexmark-sql.jar "/tmp/$q-flink.sql" >/dev/null 2>&1
     "$PY" "$ROOT/driver/measure_steady.py" --brokers "$BROKERS_HOST" --topic "$out" \
         --expected "$(expected_for "$q")" --query "$q" --engine flink --out "$RESULTS/$q-flink.json" \
         --quiet-timeout 15 2>/dev/null | tail -1
+    local cpu_post wall_post
+    cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-flink "$JM_CONTAINER" "$TM_CONTAINER")
+    wall_post=$(now_s)
+    "$PY" "$ROOT/driver/cpu.py" merge "$RESULTS/$q-flink.json" --cpu-pre "$cpu_pre" \
+        --cpu-post "$cpu_post" --wall-pre "$wall_pre" --wall-post "$wall_post" \
+        --input-events "$(input_events_for "$q")" >/dev/null
     local jid; jid=$(docker exec "$JM_CONTAINER" flink list 2>/dev/null | grep -i running | grep -oE '[0-9a-f]{32}' | head -1)
     [ -n "$jid" ] && docker exec "$JM_CONTAINER" flink cancel "$jid" >/dev/null 2>&1
 }

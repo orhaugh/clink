@@ -45,17 +45,19 @@ def main():
         print(f"no result files in {args.results_dir}", file=sys.stderr)
         return 1
 
-    print("\n" + "=" * 78)
+    print("\n" + "=" * 92)
     print("  clink vs Flink - Nexmark (apples-to-apples)")
     if args.premise:
         print(f"  premise: {args.premise}")
-    print("  steady-state events|panes/sec by broker append-time, middle 80%")
-    print("=" * 78)
-    hdr = f"  {'query':<6} {'clink/s':>14} {'flink/s':>14} {'ratio':>8}  {'gate (rows)':>22}"
-    print(hdr)
-    print("  " + "-" * 74)
+    print("  rate = steady events|panes/sec (broker append-time, middle 80%);")
+    print("  eff  = input events / measured CPU-second (Cores*Time normalised, parallelism-independent)")
+    print("=" * 92)
+    print(f"  {'query':<6} {'clink/s':>11} {'flink/s':>11} {'rate':>7}   "
+          f"{'clk ev/cpus':>11} {'flk ev/cpus':>11} {'eff':>7}  {'gate':>16}")
+    print("  " + "-" * 88)
 
-    ratios = []
+    rate_ratios = []
+    eff_ratios = []
     gate_failures = []
     for q in sorted(by_query):
         pair = by_query[q]
@@ -65,38 +67,50 @@ def main():
             have = ",".join(sorted(pair))
             print(f"  {q:<6} INCOMPLETE (have: {have})")
             continue
-        # Correctness gate: identical output-row counts = same relation.
         gate_ok = c["count"] == f["count"]
         gate_str = f"{c['count']:,}={f['count']:,}" if gate_ok else f"{c['count']:,}!={f['count']:,}"
         if not gate_ok:
             gate_failures.append(q)
-            print(f"  {q:<6} {'-':>14} {'-':>14} {'HALT':>8}  {gate_str:>22}  <- GATE FAIL")
+            print(f"  {q:<6} {'-':>11} {'-':>11} {'HALT':>7}   "
+                  f"{'-':>11} {'-':>11} {'-':>7}  {gate_str:>16}  GATE FAIL")
             continue
         ce, fe = c["steady_eps"], f["steady_eps"]
-        ratio = (ce / fe) if fe > 0 else float("nan")
-        # A query counts toward the geomean only if its rate is a comparable
-        # throughput proxy (output ~ input scale). Low-output queries (e.g. a
-        # windowed join emitting a handful of rows) measure emission-burst
-        # dynamics, not processing throughput, so they are indicative only.
+        rate = (ce / fe) if fe > 0 else float("nan")
+        # CPU-normalised efficiency: input events per measured CPU-second. This is
+        # parallelism-independent (the canonical Nexmark Cores*Time basis), so it
+        # is comparable for ALL gate-passing queries - including q8, whose CPU
+        # reflects the join work over all input, not its tiny output.
+        cev = c.get("events_per_cpu_sec", 0.0)
+        fev = f.get("events_per_cpu_sec", 0.0)
+        eff = (cev / fev) if fev > 0 else float("nan")
+        # Both rate AND eff geomeans are over the SAME throughput set (output ~
+        # input scale, job CPU-bound over a short window). A low-input/long-wall
+        # query like q8 is excluded from BOTH: its rate is output-burst-bound and
+        # its eff is baseline-CPU-bound (the engine's idle/runtime overhead over a
+        # long watermark-gated wall dominates the per-event CPU). Both shown,
+        # marked *, excluded from the aggregates.
         comparable = geomean_set is None or q in geomean_set
-        mark = "" if comparable else " (indic.)"
+        mark = "" if comparable else "*"
         if comparable:
-            ratios.append(ratio)
-        print(f"  {q:<6} {int(ce):>14,} {int(fe):>14,} {ratio:>6.2f}x{mark:<8}  {gate_str:>22}")
+            rate_ratios.append(rate)
+            if eff == eff and eff > 0:  # not nan
+                eff_ratios.append(eff)
+        print(f"  {q:<6} {int(ce):>11,} {int(fe):>11,} {rate:>5.2f}x{mark:<1}  "
+              f"{int(cev):>11,} {int(fev):>11,} {eff:>5.2f}x{mark:<1} {gate_str:>16}")
 
-    print("  " + "-" * 74)
-    if ratios:
-        geo = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
-        print(f"  geomean over {len(ratios)} throughput quer{'y' if len(ratios)==1 else 'ies'}:"
-              f" clink {geo:.2f}x")
-    if geomean_set is not None:
-        indic = sorted(q for q in by_query if q not in geomean_set and "clink" in by_query[q]
-                       and "flink" in by_query[q] and by_query[q]["clink"]["count"] == by_query[q]["flink"]["count"])
-        if indic:
-            print(f"  indicative-only (gate PASS, output-bound rate, not in geomean): {', '.join(indic)}")
+    print("  " + "-" * 88)
+    if rate_ratios:
+        geo = math.exp(sum(math.log(r) for r in rate_ratios) / len(rate_ratios))
+        print(f"  rate geomean over {len(rate_ratios)} throughput quer"
+              f"{'y' if len(rate_ratios)==1 else 'ies'} (* = excluded, output-bound): clink {geo:.2f}x")
+    if eff_ratios:
+        geo = math.exp(sum(math.log(r) for r in eff_ratios) / len(eff_ratios))
+        print(f"  eff  geomean over {len(eff_ratios)} throughput quer"
+              f"{'y' if len(eff_ratios)==1 else 'ies'}: clink {geo:.2f}x  "
+              f"(CPU footprint incl. engine/JVM baseline; * excluded = baseline-bound)")
     if gate_failures:
         print(f"  GATE FAILURES (no ratio quoted): {', '.join(gate_failures)}")
-    print("=" * 78 + "\n")
+    print("=" * 92 + "\n")
     # Non-zero exit if any query had a gate failure (a correctness divergence).
     return 1 if gate_failures else 0
 

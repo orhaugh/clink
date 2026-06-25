@@ -59,8 +59,12 @@ scoreboard under the matched-premise banner.
   two-source-windowed-join-over-Kafka correctness milestone.
 - [x] **q6** (SQL-only capability) - clink runs it in SQL over Kafka (5,223
   sellers); Flink has no SQL form (DataStream-only). Documented, not gated.
-- [ ] CPU normalisation (Cores*Time); clink SQL parallelism flag + the
-  start-of-stream partition-watermark refinement for parallelism>1 runs.
+- [x] **CPU normalisation** (Cores*Time): measured CPU per query (clink host
+  procs via `ps`, Flink containers via cgroup v2 `cpu.stat`); scoreboard adds an
+  events-per-CPU-second efficiency column (parallelism-independent), with the
+  baseline-overhead caveat below.
+- [ ] clink SQL parallelism flag + the start-of-stream partition-watermark
+  refinement for parallelism>1 runs.
 
 ## Results (parallelism 1, 1-partition, hot-path)
 
@@ -70,14 +74,29 @@ measured identically from each output record's broker append timestamp
 (`message.timestamp.type=LogAppendTime`) over the middle 80%, both gate-verified
 (identical output-row counts -> same relation):
 
-A representative `./run.sh` (500k events, tps=1000), all gate-passing:
+A representative `./run.sh` (500k events, tps=1000), all gate-passing. Two
+metrics: **rate** = steady wall-clock throughput (the primary headline), **eff** =
+input events per measured CPU-second (Cores*Time normalised, parallelism-
+independent):
 
-| query | class | clink steady | Flink 2.2.0 steady | ratio | gate (rows) |
-|---|---|---|---|---|---|
-| q0 | stateless pass-through | 607,259 ev/s | 198,382 ev/s | 3.06x | 460,000 ✓ |
-| q12 | windowed aggregate (10s tumbling per-bidder COUNT) | 393,119 panes/s | 137,500 panes/s | 2.86x | 184,767 ✓ |
-| q8 | windowed stream-stream join (new users) | 33,760/s | 11,105/s | 3.04x (indic.) | 1,056 ✓ |
-| | | | | **geomean (q0,q12) 2.96x** | |
+| query | class | rate (clink/flink) | eff (clink/flink ev per CPU-s) | gate (rows) |
+|---|---|---|---|---|
+| q0 | stateless pass-through | 575k / 195k = **2.95x** | 199k / 15k = 13.1x | 460,000 ✓ |
+| q12 | windowed aggregate (10s tumbling per-bidder COUNT) | 403k / 135k = **2.97x** | 215k / 15k = 14.0x | 184,767 ✓ |
+| q8 | windowed stream-stream join (new users) | 28k / 4k = 7.1x* | 111k / 1.5k = 72x* | 1,056 ✓ |
+| | | **rate geomean (q0,q12) 2.96x** | **eff geomean (q0,q12) 13.6x** | |
+
+The wall-clock **rate ratio (~3x)** is the primary, cleanest result. The
+CPU-efficiency **eff ratio (~13.6x)** is a secondary *total-CPU-footprint* number:
+it is real (native clink vs a JVM Flink cluster) but it INCLUDES each engine's
+baseline/runtime overhead during the run (Flink's JVM GC/JIT/heartbeat/idle-thread
+CPU is much heavier than clink's), so it is larger than the compute-kernel
+difference and should be read as "total CPU to run the workload," not "kernel is
+13x faster." q8 is excluded from BOTH aggregates (marked *): its rate is
+output-burst-bound and its eff is baseline-bound (a low-input, long watermark-gated
+wall means the engine's idle CPU dominates the per-event number - the 72x is a
+measurement artifact, not a real efficiency claim). q8 remains a gate-PASS
+correctness result.
 
 clink leads on all three (run-to-run the throughput ratios sit around 2.7-3.2x;
 absolute rates vary with machine warmth). On q0 it wins despite paying the heavier
@@ -116,8 +135,10 @@ query class Flink SQL cannot.
 Caveats (so these are not yet the full `pipeline.md` headline): parallelism is 1
 on BOTH (matched, the cleanest per-core comparison; **1-partition input topics**
 are the correct config at parallelism 1 - see the multi-partition note below).
-No CPU normalisation yet (events/sec, not events/sec/core). The throughput geomean
-covers the two input-scale queries (q0 stateless, q12 windowed-agg); q8
+CPU is now measured (the eff column), but the eff ratio is a total-CPU-footprint
+number incl. each engine's baseline overhead, not a compute-kernel ratio (see the
+results note). The throughput geomean covers the two input-scale queries (q0
+stateless, q12 windowed-agg); q8
 (windowed-join) is a correctness gate; q6 is a SQL-only capability.
 
 ## A real clink bug the gate caught: multi-partition watermarks
