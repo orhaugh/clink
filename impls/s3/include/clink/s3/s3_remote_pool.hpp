@@ -20,7 +20,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
+#include <latch>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -31,6 +34,7 @@
 
 #include <arrow/filesystem/s3fs.h>
 
+#include "clink/async/completion_executor.hpp"   // ThreadPoolCompletionExecutor (read fan-out)
 #include "clink/connectors/parquet_s3_sink.hpp"  // clink::detail::ensure_arrow_s3_initialised
 #include "clink/core/sha256.hpp"
 #include "clink/core/types.hpp"
@@ -48,6 +52,13 @@ public:
         std::optional<std::string> region;             // explicit region
         std::optional<std::string> endpoint_override;  // MinIO / LocalStack
         bool allow_anonymous{false};
+        // WS5: width of the per-pool read fan-out. read_many fetches its D
+        // distinct-content-hash objects concurrently on a SEPARATE bounded pool
+        // (never the backend's IO executor) so their GET round-trips overlap.
+        // Kept <= the AWS SDK connection-pool floor (25) so reads do not just
+        // queue behind connections; lazily created, so a pool that never does a
+        // multi-hash read spawns no fan threads.
+        std::size_t fan_width{clink::async::kDefaultIoThreads};
     };
 
     explicit S3RemotePool(Options opts) : opts_(std::move(opts)) {
@@ -124,24 +135,100 @@ public:
         CheckpointId id, OperatorId op, const std::vector<std::string>& keys) const override {
         const Manifest& m = manifest_for_(id);  // one manifest load (cached)
         std::vector<std::optional<StateBackend::Value>> out(keys.size());
-        std::map<std::string, StateBackend::Value> by_hash;  // hash -> fetched bytes
-        auto fs = fs_();
+
+        // Phase A (single-threaded): resolve each key to its content hash and
+        // dedup to the DISTINCT hashes, recording each key's distinct-ordinal.
+        // object_gets_ counts EXACTLY the distinct hashes here (the coalescing
+        // contract is preserved - parallelism changes wall-clock, never the GET
+        // count or the result).
+        std::vector<std::string> distinct_hashes;
+        std::map<std::string, std::size_t> hash_ordinal;
+        std::vector<std::optional<std::size_t>> key_ordinal(keys.size());
         for (std::size_t i = 0; i < keys.size(); ++i) {
             auto it = m.find({op.value(), keys[i]});
             if (it == m.end()) {
                 continue;  // absent -> nullopt (default-constructed slot)
             }
             const std::string& hash = it->second.first;
-            auto hit = by_hash.find(hash);
-            if (hit == by_hash.end()) {
-                object_gets_.fetch_add(1, std::memory_order_relaxed);  // one GET per distinct hash
-                const std::string bytes = read_object_(*fs, object_path_(hash));
-                StateBackend::Value v{
-                    reinterpret_cast<const std::byte*>(bytes.data()),
-                    reinterpret_cast<const std::byte*>(bytes.data() + bytes.size())};
-                hit = by_hash.emplace(hash, std::move(v)).first;
+            auto ho = hash_ordinal.find(hash);
+            if (ho == hash_ordinal.end()) {
+                ho = hash_ordinal.emplace(hash, distinct_hashes.size()).first;
+                distinct_hashes.push_back(hash);
             }
-            out[i] = hit->second;  // scatter the (coalesced) object to this key's slot
+            key_ordinal[i] = ho->second;
+        }
+        const std::size_t d = distinct_hashes.size();
+        if (d == 0) {
+            return out;  // every key absent
+        }
+        object_gets_.fetch_add(d, std::memory_order_relaxed);
+
+        // Capture the cached filesystem ONCE (fs_() locks fs_mu_; never call it
+        // per task). arrow::fs::S3FileSystem is thread-safe for concurrent reads
+        // off one shared instance.
+        auto fs = fs_();
+        std::vector<StateBackend::Value> results(d);
+
+        auto fetch = [&](std::size_t k) {
+            const std::string bytes = read_object_(*fs, object_path_(distinct_hashes[k]));
+            results[k] = StateBackend::Value{
+                reinterpret_cast<const std::byte*>(bytes.data()),
+                reinterpret_cast<const std::byte*>(bytes.data() + bytes.size())};
+        };
+
+        if (d == 1) {
+            fetch(0);  // floor: a single object, no fan-out overhead
+        } else {
+            // Phase B (parallel): one job per distinct hash on a SEPARATE bounded
+            // pool. NOT the backend's IO executor: read_many already runs on one
+            // of its workers, so re-submitting there and blocking would
+            // self-deadlock (the pool is one-job-per-worker, no nesting). Each
+            // job writes ONLY its own results[k] slot, so the fan is lock-free; a
+            // latch joins. A read that throws still counts down (its exception is
+            // captured and re-thrown after the join, matching the serial path's
+            // surfacing of a read failure) so the latch never hangs.
+            auto& fan = fan_executor_();
+            std::vector<std::exception_ptr> errs(d);
+            std::latch done(static_cast<std::ptrdiff_t>(d));
+            std::size_t submitted = 0;
+            try {
+                for (std::size_t k = 0; k < d; ++k) {
+                    fan.submit_blocking([&, k] {
+                        try {
+                            fetch(k);
+                        } catch (...) {
+                            errs[k] = std::current_exception();
+                        }
+                        done.count_down();
+                    });
+                    ++submitted;  // count only after the submit succeeds
+                }
+            } catch (...) {
+                // A submit threw (e.g. bad_alloc constructing the job): the jobs
+                // already enqueued still reference this frame (done/results/errs/
+                // fs), so we must NOT unwind past done.wait(). Count down for
+                // every job that will never run, let the enqueued ones finish
+                // touching the frame, then propagate.
+                for (std::size_t k = submitted; k < d; ++k) {
+                    done.count_down();
+                }
+                done.wait();
+                throw;
+            }
+            done.wait();
+            for (const auto& e : errs) {
+                if (e) {
+                    std::rethrow_exception(e);
+                }
+            }
+        }
+
+        // Phase C (single-threaded): scatter the deduped objects to each key's
+        // slot by its distinct-ordinal. Absent keys stay nullopt.
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (key_ordinal[i].has_value()) {
+                out[i] = results[*key_ordinal[i]];
+            }
         }
         return out;
     }
@@ -592,9 +679,24 @@ private:
         return fs_cached_;
     }
 
+    // Lazily-created read fan-out pool (WS5). Separate from the backend's IO
+    // executor by design: read_many runs on a backend IO worker, so its D
+    // sub-reads must NOT re-enter that pool (one-job-per-worker, no nesting ->
+    // self-deadlock at >= pool-size concurrent batches). Lazily built, so a pool
+    // that never does a multi-hash read spawns no fan threads.
+    async::ThreadPoolCompletionExecutor& fan_executor_() const {
+        std::lock_guard<std::mutex> lk(fan_mu_);
+        if (!fan_pool_) {
+            fan_pool_ = std::make_shared<async::ThreadPoolCompletionExecutor>(opts_.fan_width);
+        }
+        return *fan_pool_;
+    }
+
     Options opts_;
     mutable std::mutex fs_mu_;
     mutable std::shared_ptr<arrow::fs::S3FileSystem> fs_cached_;
+    mutable std::mutex fan_mu_;
+    mutable std::shared_ptr<async::ThreadPoolCompletionExecutor> fan_pool_;
     mutable std::mutex cache_mu_;
     mutable std::map<std::uint64_t, Manifest> cache_;
     mutable std::atomic<std::uint64_t> object_gets_{0};  // value-object GETs (ASYNC-10 diag)

@@ -137,6 +137,66 @@ TEST(S3RemotePool, ReadManyCoalescesSameContentHashIntoOneGet) {
     pool->purge(CheckpointId{1});
 }
 
+// WS5: read_many fetches its D distinct-content-hash objects in PARALLEL on a
+// separate fan pool. Parallelism must change ONLY wall-clock - never the result
+// or the GET count. Many keys (N) collapse to few distinct payloads (D), with
+// NON-ADJACENT repeats (so a buggy parallel scatter assuming contiguous hashes
+// would land an object in the wrong slot) and absent keys sprinkled among the
+// present ones. Looped to shake out data races in the fan.
+TEST(S3RemotePool, ReadManyParallelFanIsCorrectAndCoalesces) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    const std::string prefix = unique_prefix() + "/fan";
+    const OperatorId op{11};
+    auto pool = std::make_shared<S3RemotePool>(pool_opts(prefix));
+
+    auto val = [](const std::string& s) {
+        return StateBackend::Value{reinterpret_cast<const std::byte*>(s.data()),
+                                   reinterpret_cast<const std::byte*>(s.data() + s.size())};
+    };
+
+    constexpr int kDistinct = 8;
+    constexpr int kKeys = 64;
+    // key i -> payload (i % kDistinct): identical payloads are NON-ADJACENT
+    // (k0, k8, ... share payload 0), so D=8 distinct objects across N=64 keys.
+    std::vector<clink::RemotePoolEntry> changed;
+    std::vector<std::string> read_keys;
+    std::vector<std::string> expected;  // expected bytes per read_key ("" == absent)
+    for (int i = 0; i < kKeys; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        const std::string payload = "payload-" + std::to_string(i % kDistinct);
+        changed.push_back({op, key, val(payload)});
+        read_keys.push_back(key);
+        expected.push_back(payload);
+        if (i % 13 == 5) {  // sprinkle absent keys among the present ones
+            read_keys.push_back("absent-" + std::to_string(i));
+            expected.emplace_back();
+        }
+    }
+    pool->commit(CheckpointId{1}, CheckpointId{0}, changed, {});
+
+    for (int iter = 0; iter < 20; ++iter) {
+        const std::uint64_t before = pool->object_gets();
+        auto out = pool->read_many(CheckpointId{1}, op, read_keys);
+        const std::uint64_t gets = pool->object_gets() - before;
+        ASSERT_EQ(out.size(), read_keys.size());
+        for (std::size_t i = 0; i < read_keys.size(); ++i) {
+            if (expected[i].empty()) {
+                EXPECT_FALSE(out[i].has_value()) << "iter " << iter << " key " << read_keys[i];
+            } else {
+                EXPECT_EQ(str(out[i]), expected[i])
+                    << "iter " << iter << " key " << read_keys[i] << " (positional scatter)";
+            }
+        }
+        // Exactly D distinct-hash GETs, regardless of N keys or the parallelism.
+        EXPECT_EQ(gets, static_cast<std::uint64_t>(kDistinct))
+            << "iter " << iter << ": the parallel fan must still issue exactly D GETs";
+    }
+
+    pool->purge(CheckpointId{1});
+}
+
 // 2c-1: bounded hot tier over real S3. A small byte budget forces eviction of
 // clean (committed) keys, and a later read transparently re-fetches them from
 // S3 - working state genuinely exceeds the hot budget yet every key is correct.
