@@ -105,25 +105,34 @@ auto-create race. Verified partition counts settle it: 1-partition is correct.)
 `WindowRowOp` itself is correct (an ordered bounded file source is byte-exact:
 190,729 panes, sum 460,000). The defect is purely the multi-partition watermark.
 
-What this means here:
-- **Parallelism-1 benchmark: use 1-partition input topics** (the correct config
-  at parallelism 1 - one subtask reads one ordered partition). q12 is then exact
-  on both engines, which is how the q12 ratio above was obtained.
-- **The engine fix = per-partition (per-split) watermarks in the Kafka source,
-  emitting the min across the subtask's partitions, with idle-partition
-  exclusion** (Flink's behaviour). It is real, now precisely root-caused with a
-  clean reproduction (4-partition keyed) and control (1-partition), but it is a
-  multi-day ABI-touching change (event time is a parsed JSON column, so the
-  partition must be threaded from the source through the `json_string_to_row`
-  bridge into a partition-aware watermark strategy). It is the prerequisite for
-  **parallelism>1** scaled runs (which need multiple partitions). The
-  late-record-drop guard (`allowed_lateness=0`) is NOT the fix - it would worsen
-  the under-count, since the records are not genuinely late, the global watermark
-  is just wrong.
+### The fix (commit `34819d4`)
 
-Remaining: the per-partition-watermark engine fix (gates parallelism>1); q8
-(windowed join), q6 (SQL-vs-DataStream); CPU normalisation; the clink SQL
-parallelism flag; and a reproducible run.sh + scoreboard.
+Per-partition watermarks, the Flink per-split + min-across-splits model:
+`Record` carries an engine-only `source_partition` (set by the Kafka source,
+preserved through the `json_string_to_row` map), and a new
+`PartitionAwareBoundedOutOfOrdernessStrategy` tracks max event-time PER partition
+and emits `watermark = (min over partitions) - bound`, so the watermark advances
+only as fast as the slowest partition. Records with no partition (file /
+generator) fold into one global bucket, so those sources are unchanged
+(core 1379/1379 + SQL 546/546 green).
+
+Result: the non-deterministic race is **eliminated** (4-partition keyed q12 is
+now deterministic), and single-partition is **exact** (184,767). So the
+parallelism-1 benchmark (single-partition topics) is fully correct - the q0/q12
+ratios above stand.
+
+**Known residual (~1.4%, multi-partition only):** at start-of-stream, before
+every partition has delivered its first record, the min is taken over the
+partitions seen so far, so the earliest window can fire slightly early
+(4-partition keyed q12: 187,432 vs 184,767). Flink blocks the watermark until
+every split has data (an empty split sits at -inf); replicating that needs the
+source to convey its live partition assignment to the assigner so unseen
+partitions block. That is the remaining step for **parallelism>1 gate-exact**
+runs; it does not affect the parallelism-1 ratios.
+
+Remaining: the start-of-stream partition-blocking refinement (gates par>1
+gate-exactness); q8 (windowed join), q6 (SQL-vs-DataStream); CPU normalisation;
+the clink SQL parallelism flag; and a reproducible run.sh + scoreboard.
 
 ## Producer (INC 2)
 
