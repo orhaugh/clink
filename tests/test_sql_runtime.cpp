@@ -8118,6 +8118,107 @@ TEST(SqlRuntime, ColumnarParquetGroupByEndToEnd) {
         std::filesystem::remove(p);
 }
 
+// WS3 within-batch group-by: a columnar Parquet source feeds a GROUP BY whose
+// aggregates are ALL batch-foldable (SUM / COUNT / AVG), so each distinct
+// group's rows fold in a single pass behind ONE state probe - the
+// AggregateRowOp::process_columnar within-batch path. (MIN/MAX are deliberately
+// excluded: the SQL GROUP BY factory marks every aggregate retractable, so
+// is_batch_foldable rejects them and they take the per-row path - including
+// MIN/MAX here would disable the batch fold for the whole op.) The final
+// aggregates must be exactly correct: parity with the per-row fold, which
+// reuses the same update_agg/finalize_agg.
+TEST(SqlRuntime, ColumnarParquetGroupByMultiAggregateBatchFold) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_ws3_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_ws3.parquet";
+    const auto out_path = tmp / "clink_sql_ws3_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    write_lines(in_path,
+                {
+                    R"({"region":"eu","amount":10})",
+                    R"({"region":"us","amount":60})",
+                    R"({"region":"eu","amount":50})",
+                    R"({"region":"us","amount":40})",
+                    R"({"region":"eu","amount":5})",
+                });
+    const std::string cols = "(region VARCHAR, amount BIGINT)";
+
+    // Job 1: NDJSON -> typed-columnar Parquet.
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT region, amount FROM ev");
+        InProcessCluster cluster("tm-ws3-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    // Job 2: columnar Parquet source -> GROUP BY with three batch-foldable
+    // aggregates (all fold within the batch behind one probe per group).
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE pq_in "} + cols +
+                         " WITH (connector='parquet', path='" + pq_path.string() +
+                         "');"
+                         "CREATE TABLE agg_out (region VARCHAR, total BIGINT, n BIGINT, av DOUBLE)"
+                         " WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat,
+                            "INSERT INTO agg_out SELECT region, SUM(amount) AS total, "
+                            "COUNT(*) AS n, AVG(amount) AS av FROM pq_in GROUP BY region");
+        InProcessCluster cluster("tm-ws3-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    auto lines = read_lines(out_path);
+    ASSERT_FALSE(lines.empty());
+    struct Agg {
+        std::int64_t total, n;
+        double av;
+    };
+    std::map<std::string, Agg> fa;
+    for (const auto& line : lines) {
+        auto js = clink::config::parse(line);
+        ASSERT_TRUE(js.is_object()) << "bad output line: " << line;
+        fa[js.at("region").as_string()] = {static_cast<std::int64_t>(js.at("total").as_number()),
+                                           static_cast<std::int64_t>(js.at("n").as_number()),
+                                           js.at("av").as_number()};
+    }
+    ASSERT_EQ(fa.size(), 2u);
+    // eu: 10,50,5 -> sum 65, n 3, avg 65/3 (3 rows folded behind one probe).
+    EXPECT_EQ(fa["eu"].total, 65);
+    EXPECT_EQ(fa["eu"].n, 3);
+    EXPECT_NEAR(fa["eu"].av, 65.0 / 3.0, 1e-3);  // JSON round-trip rounds the double
+    // us: 60,40 -> sum 100, n 2, avg 50.
+    EXPECT_EQ(fa["us"].total, 100);
+    EXPECT_EQ(fa["us"].n, 2);
+    EXPECT_NEAR(fa["us"].av, 50.0, 1e-3);
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // Columnar tumbling window end-to-end: a typed-columnar Parquet source feeds a
 // TUMBLE window aggregate, exercising the columnar window ingest (the window op
 // reads its time / group / agg-input columns straight from the Arrow sidecar).

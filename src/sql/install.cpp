@@ -503,6 +503,29 @@ inline bool is_variance_fn(const std::string& fn) {
            fn == "var_pop" || fn == "var_samp";
 }
 
+// WS3 (within-batch group-by): a batch-foldable aggregate is commutative,
+// associative, and order-insensitive with no per-value memory, so folding a
+// group's rows in any order and emitting once equals N sequential update_agg
+// calls. Explicit allowlist: SUM / COUNT / AVG / the variance family /
+// non-retractable MIN/MAX. The unsafe class keeps per-value state or is
+// order/identity-sensitive and MUST stay per-row: STRING_AGG / LISTAGG /
+// ARRAY_AGG (arrival order + text), PERCENTILE (value set), DISTINCT (value
+// set), retractable MIN/MAX (multiset for deletes), and UDAFs (opaque, no
+// associativity guarantee).
+inline bool is_batch_foldable(const AggSpec& spec) {
+    if (spec.is_udaf || spec.distinct) {
+        return false;
+    }
+    const std::string& fn = spec.fn;
+    if (fn == "sum" || fn == "count" || fn == "avg") {
+        return true;
+    }
+    if (is_variance_fn(fn)) {
+        return true;
+    }
+    return (fn == "min" || fn == "max") && !spec.retractable;
+}
+
 // Phase 24b: subtract one input row's column value from the running
 // accumulator. Mirrors update_agg but inverted for SUM / COUNT / AVG.
 // MIN and MAX retraction needs a multiset of seen values, which we
@@ -2191,13 +2214,86 @@ public:
                 cols.push_back({&nm, idx, rb->schema()->field(idx)->type()});
             }
         }
-        Batch<Row> emit_batch;
-        emit_batch.reserve(static_cast<std::size_t>(n));
-        for (std::int64_t i = 0; i < n; ++i) {
+        auto read_row = [&](std::int64_t i) {
             Row row;
             for (const auto& c : cols) {
                 row.values[*c.name] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
             }
+            return row;
+        };
+        Batch<Row> emit_batch;
+        emit_batch.reserve(static_cast<std::size_t>(n));
+
+        // WS3 within-batch group-by: when every aggregate is batch-foldable and
+        // the batch is insert-only, probe the state map ONCE per distinct group
+        // (not once per row) and emit one running-aggregate row per group. The
+        // fold reuses update_agg/finalize_agg verbatim (parity by construction);
+        // the only observable change is the coarser one-row-per-group-per-batch
+        // emission in append mode (signed off; same final state). Changelog mode,
+        // any unsafe aggregate, or a batch carrying a retraction take the per-row
+        // path unchanged.
+        if (batch_fold_eligible_) {
+            std::vector<Row> rows;
+            rows.reserve(static_cast<std::size_t>(n));
+            bool insert_only = true;
+            for (std::int64_t i = 0; i < n; ++i) {
+                rows.push_back(read_row(i));
+                if (has_row_kind(rows.back()) && is_delete_like(row_kind_of(rows.back()))) {
+                    insert_only = false;
+                }
+            }
+            if (insert_only) {
+                // Group row indices by key in FIRST-SEEN order (stable emit order
+                // close to the per-row path's input order).
+                clink::FlatMap<std::string, std::size_t> group_of;
+                std::vector<std::vector<std::int64_t>> groups;
+                std::vector<std::string> group_keys;
+                for (std::int64_t i = 0; i < n; ++i) {
+                    std::string key = group_key_(rows[static_cast<std::size_t>(i)]);
+                    auto git = group_of.find(key);
+                    if (git == group_of.end()) {
+                        group_of.emplace(key, groups.size());
+                        groups.push_back({i});
+                        group_keys.push_back(std::move(key));
+                    } else {
+                        groups[git->second].push_back(i);
+                    }
+                }
+                for (std::size_t g = 0; g < groups.size(); ++g) {
+                    const auto& idxs = groups[g];
+                    auto sit = state_.find(group_keys[g]);
+                    if (sit == state_.end()) {
+                        sit = state_
+                                  .emplace(group_keys[g],
+                                           init_bucket_(rows[static_cast<std::size_t>(idxs[0])]))
+                                  .first;
+                    }
+                    // Fold every row of the group; emit the running aggregate once
+                    // (fold_into_ folds the last row and emits).
+                    for (std::size_t j = 0; j + 1 < idxs.size(); ++j) {
+                        fold_step_(sit->second, rows[static_cast<std::size_t>(idxs[j])]);
+                    }
+                    fold_into_(
+                        sit->second, rows[static_cast<std::size_t>(idxs.back())], emit_batch);
+                }
+                if (!emit_batch.empty()) {
+                    out.emit_data(std::move(emit_batch));
+                }
+                return true;
+            }
+            // A retraction in the batch: fall back to per-row over the built rows.
+            for (auto& row : rows) {
+                handle_record_inmem_(row, emit_batch);
+            }
+            if (!emit_batch.empty()) {
+                out.emit_data(std::move(emit_batch));
+            }
+            return true;
+        }
+
+        // Per-row path (changelog mode or an unsafe aggregate): unchanged.
+        for (std::int64_t i = 0; i < n; ++i) {
+            Row row = read_row(i);
             handle_record_inmem_(row, emit_batch);
         }
         if (!emit_batch.empty()) {
@@ -2218,6 +2314,17 @@ public:
         effective_async_state_ =
             async_state_ || (this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                              this->runtime()->state_backend()->supports_async_get());
+        // WS3: within-batch group-by is eligible only for append-mode GROUP BY
+        // whose every aggregate is batch-foldable (commutative, no per-value
+        // memory). Static decision; the per-batch insert-only check is in
+        // process_columnar. Changelog mode keeps the per-record netting path.
+        batch_fold_eligible_ = !emit_changelog_;
+        for (const auto& a : aggregates_) {
+            if (!is_batch_foldable(a)) {
+                batch_fold_eligible_ = false;
+                break;
+            }
+        }
     }
 
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_state_; }
@@ -2304,10 +2411,12 @@ private:
     //     update_after(new); an unchanged value emits nothing. A downstream
     //     retraction-aware join / netting sink nets these to the final relation
     //     (so e.g. a join does not multiply against intermediate updates).
-    void fold_into_(AggBucket& b, const Row& row, Batch<Row>& out) const {
-        const bool input_has_kind = has_row_kind(row);
-        const auto kind = input_has_kind ? row_kind_of(row) : std::string{};
-        const bool retract = input_has_kind && is_delete_like(kind);
+    // WS3: fold one row's contribution into the bucket's aggregate states
+    // WITHOUT emitting - the inner loop of fold_into_. The within-batch group-by
+    // folds all but the last row of a group with this, then fold_into_ folds the
+    // last row and emits the group once.
+    void fold_step_(AggBucket& b, const Row& row) const {
+        const bool retract = has_row_kind(row) && is_delete_like(row_kind_of(row));
         for (std::size_t i = 0; i < aggregates_.size(); ++i) {
             if (retract) {
                 retract_agg(b.agg_states[i], aggregates_[i], row);
@@ -2315,13 +2424,20 @@ private:
                 update_agg(b.agg_states[i], aggregates_[i], row);
             }
         }
+    }
+
+    // WS3: finalize the bucket and emit. `input_was_changelog` = whether the
+    // triggering input row carried a __row_kind tag (uniform across a batch).
+    // Append mode emits one snapshot row (tagged update_after iff the input was a
+    // changelog row); changelog mode nets update_before/update_after.
+    void emit_group_(AggBucket& b, bool input_was_changelog, Batch<Row>& out) const {
         Row result = b.group_values;  // bare aggregate row (no __row_kind yet)
         for (std::size_t i = 0; i < aggregates_.size(); ++i) {
             result.values[aggregates_[i].output_name] =
                 finalize_agg(b.agg_states[i], aggregates_[i]);
         }
         if (!emit_changelog_) {
-            if (input_has_kind) {
+            if (input_was_changelog) {
                 set_row_kind(result, kRowKindUpdateAfter);
             }
             out.push(Record<Row>{std::move(result)});
@@ -2340,6 +2456,11 @@ private:
         b.prior_emitted = result;  // remember the bare row for the next retraction
         set_row_kind(result, had_prior ? kRowKindUpdateAfter : kRowKindInsert);
         out.push(Record<Row>{std::move(result)});
+    }
+
+    void fold_into_(AggBucket& b, const Row& row, Batch<Row>& out) const {
+        fold_step_(b, row);
+        emit_group_(b, has_row_kind(row), out);
     }
 
     // Deep value equality of two bare aggregate rows (no __row_kind on either),
@@ -2377,6 +2498,10 @@ private:
     // instead of an append snapshot. Opt-in; the planner sets it when this
     // aggregate feeds a retraction-aware consumer (a join / netting sink).
     bool emit_changelog_ = false;
+    // WS3: set in open() - true iff append mode and every aggregate is
+    // batch-foldable, so process_columnar can probe state once per distinct
+    // group per (insert-only) batch instead of once per row.
+    bool batch_fold_eligible_ = false;
     clink::FlatMap<std::string, AggBucket> state_;
     // Columns the columnar ingest reads from each input row (group keys, agg
     // inputs, __row_kind); precomputed in the ctor.
