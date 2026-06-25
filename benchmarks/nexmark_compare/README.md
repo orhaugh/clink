@@ -69,7 +69,12 @@ default par=1; see the Parallelism>1 section for the par=4 run.
   ./run.sh`; verified gate-exact at par=4 over 4-partition topics on both engines
   (q0 460,000, q12 184,767). Single-box, so it shows scale-out correctness, not
   true distributed throughput scaling.
-- [ ] A true multi-machine distributed run; q8/q6 at par>1.
+- [~] **q8/q6 at par>1**: investigated - exposes a real clink limitation (the
+  distributed stream-stream equi-join does not co-partition at par>1, emits 0;
+  see the Parallelism section). Slot provisioning fixed; the join co-partitioning
+  is a scoped engine follow-on.
+- [ ] Fix distributed equi-join co-partitioning at par>1; a true multi-machine
+  distributed run.
 
 ## Results (parallelism 1, 1-partition, hot-path)
 
@@ -232,10 +237,37 @@ shuffle for the same input - parallelism trades CPU for wall-time). A real
 multi-machine cluster is what would show linear scale-out; that is out of scope
 for this single-host harness.
 
-Remaining: a true multi-machine distributed run (out of scope here); q8/q6 at
-par>1 (untested - q8's two-source windowed join, q6's changelog); and closing the
-par=1-multi-partition start-of-stream residual (a niche edge case now that par>1
-is the scaled path).
+### q8 / q6 at par>1: a found limitation (distributed equi-join)
+
+q0 and q12 are gate-exact at par>1 (above). q8 and q6 are NOT, for two reasons
+the harness surfaced:
+
+1. **Slots** (fixed): clink needs one slot per subtask (no Flink-style slot
+   sharing), so q8's ~9 ops at par=4 = 36 subtasks exceeded the old 32-slot pool
+   and the job did not deploy. `run.sh` now scales slots-per-TM with `PAR`.
+
+2. **Distributed equi-join emits 0 (real engine limitation, NOT fixed):** with
+   enough slots q8 deploys (36 tasks) but produces 0 rows. Root-caused: the
+   stream-stream equi-join is a two-input co-operator with two SAME-type (Row,Row)
+   inputs; `EquiJoinRowOp` emits matches immediately on arrival (no watermark
+   gate), and both inputs are planned as Hash-by-`row_key` with aligned keys
+   (`id=5` and `seller=5` hash identically) - yet at par>1 the matching pairs do
+   not co-locate on the same join subtask, so nothing matches. The single
+   windowed aggregates (q12, and q8's person/auction aggregates in isolation -
+   verified 9,800 panes at par=4) are correct; the defect is specifically the
+   runtime co-partitioning of a two-same-type-input keyed co-operator at par>1. q6
+   contains the same `bid ⋈ auction` equi-join, so it shares the limitation.
+
+This is a genuine clink engine bug (distributed two-input join co-partitioning),
+well-localized but a deep runtime change - scoped as a follow-on, not rushed.
+clink's joins are correct at par=1; the scaled-out join is the gap. So the par>1
+deliverable covers the embarrassingly-parallel (q0) and keyed-windowed-aggregate
+(q12) classes; distributed joins (q8/q6) are documented as not-yet-correct at
+par>1.
+
+Remaining: fix distributed equi-join co-partitioning at par>1 (the engine bug
+above); a true multi-machine distributed run (out of scope on one host); and the
+niche par=1-multi-partition start-of-stream residual.
 
 ## Producer (INC 2)
 

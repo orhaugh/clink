@@ -108,8 +108,12 @@ run_clink() {  # query
     sed "s#__OUT__#$out#" "$ROOT/queries/clink/$q.tmpl.sql" > "$DATA_DIR/$q-clink.sql"
     "$CLINK_ROOT/build/clink_node" --role=jm --port=7100 --http-port=8081 >"$RESULTS/clink-jm.log" 2>&1 &
     local jm=$!; sleep 2
+    # clink needs ONE slot per subtask (no slot-sharing like Flink), so total
+    # slots must cover (#ops * PAR). Scale slots-per-TM with PAR (>=8) so deeper
+    # plans (q8's 9 ops -> 36 subtasks at PAR=4) still deploy across 4 TMs.
+    local slots=$(( PAR * 12 )); [ "$slots" -lt 8 ] && slots=8
     local tms=(); for i in 1 2 3 4; do
-        "$CLINK_ROOT/build/clink_node" --role=tm --jm-host=127.0.0.1 --jm-port=7100 --id=tm-$i --slots=8 \
+        "$CLINK_ROOT/build/clink_node" --role=tm --jm-host=127.0.0.1 --jm-port=7100 --id=tm-$i --slots="$slots" \
             >"$RESULTS/clink-tm-$i.log" 2>&1 & tms+=($!)
     done
     sleep 3
