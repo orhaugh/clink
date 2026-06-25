@@ -22,6 +22,12 @@ option(CLINK_BUILD_HTTP     "Build the HTTP subsystem (cluster dashboard + JSON 
 # Table API. Off during initial development to keep the default build
 # fast; flip ON to opt in.
 option(CLINK_BUILD_SQL      "Build the SQL frontend (libpg_query + planner)" OFF)
+# WS4: route the clink::FlatMap state seam through ankerl::unordered_dense
+# (open-addressing, metadata-byte probing). OFF aliases std::unordered_map (the
+# behaviour-preserving default). The define and include must be GLOBAL because
+# FlatMap appears in public headers (InMemoryStateBackend::State), so every TU
+# (core, tests, plugins) must agree on the container type or the ABI mismatches.
+option(CLINK_USE_FLAT_HASH_MAP "Use ankerl::unordered_dense for the clink::FlatMap state seam" OFF)
 # Apache Arrow is REQUIRED. It is the canonical snapshot byte format,
 # the wire format for every operator-to-operator data frame, and the
 # substrate for ParquetSink/Source. There is no "Arrow OFF" build
@@ -114,6 +120,25 @@ configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/clink/plugin/abi_version.hpp.in"
     "${CMAKE_CURRENT_BINARY_DIR}/include/clink/plugin/abi_version.hpp"
     @ONLY)
+
+# WS4 open-addressing state container. Fetched + made global BEFORE any target
+# so the CLINK_USE_FLAT_HASH_MAP define and the ankerl include reach every TU
+# uniformly (clink::FlatMap is in public headers; a per-target define would let
+# the container type differ across the ABI boundary). ankerl/unordered_dense is
+# a single MIT header; the std::unordered_map fallback (flag OFF) needs nothing.
+if(CLINK_USE_FLAT_HASH_MAP)
+    include(FetchContent)
+    FetchContent_Declare(
+        unordered_dense
+        GIT_REPOSITORY https://github.com/martinus/unordered_dense.git
+        GIT_TAG v4.4.0
+        GIT_SHALLOW TRUE
+        SYSTEM
+    )
+    FetchContent_MakeAvailable(unordered_dense)
+    add_compile_definitions(CLINK_USE_FLAT_HASH_MAP=1)
+    include_directories(SYSTEM ${unordered_dense_SOURCE_DIR}/include)
+endif()
 
 # ---------------------------------------------------------------------------
 # Core library - no external connector/state-backend deps.
