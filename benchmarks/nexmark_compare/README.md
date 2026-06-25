@@ -270,8 +270,41 @@ So all four queries are now correct at par>1: q0 (stateless), q12 (windowed agg,
 gate-exact), q8 (windowed join, gate-exact), q6 (interval join, matches par=1).
 SQL suite 546/546 green (the equi-join at par=1 is unchanged).
 
-Remaining: a true multi-machine distributed run (out of scope on one host); the
-niche par=1-reading-many-partitions start-of-stream residual.
+## Distributed (containerized) verification + the throughput-measurement caveat
+
+`verify_distributed.sh` runs clink as a real multi-container cluster (1 JM + 4 TM,
+separate network namespaces, shuffle over container-to-container TCP, in-network
+Kafka) and gate-checks q0/q12/q8 at par=4 - all gate-exact (460000 / 184767 /
+1056), confirming correctness when distributed across containers, not just over
+loopback. The runtime image (`docker/Dockerfile.runtime`) is Release + LTO +
+stripped.
+
+`throughput_containers.sh` runs BOTH engines containerized for a throughput
+comparison. It is built and gate-passes, but a throughput run at this scale
+EXPOSED A MEASUREMENT-VALIDITY PROBLEM, and the honest conclusion is that the
+rate numbers are NOT a clean sustained-throughput ratio:
+
+- clink **burst-drains** the pre-loaded Kafka topic - the engine finishes q0 in
+  ~0.1s and flushes output in a burst (460000 records, broker-append span 0.11s),
+  so the append-time "rate" measures the sink flush, not sustained processing
+  (it reads as an absurd ~50x and must not be quoted).
+- Flink is **JVM-warmup-dominated** on a 500k-event job (wall ~28s, much of it
+  warmup), understating its rate.
+- **events/wall is consumer-capped**: the Python driver reads ~50-60k rec/s, which
+  bounds the FAST engine, so clink's wall-rate (~3x) understates it.
+
+The least-confounded signal is **CPU consumed**: for q0 clink used ~3.8 CPU-s vs
+Flink's ~50.7 (a ~13x total-CPU-footprint gap), q12 ~6x - but even this is
+inflated by Flink's JVM warmup/baseline over its longer run at this scale. So the
+robust takeaways are (a) correctness holds containerized at par>1, and (b) clink
+is materially more CPU-efficient, consistent with the par=1 host run (~3x wall,
+~13x CPU-footprint). A precise SUSTAINED-throughput ratio needs engine-side
+metrics sampling (each engine's records-out/sec mid-run) plus a much larger or
+rate-limited input so warmup amortizes and no downstream consumer is the
+bottleneck - a methodology increment, not a number to fabricate now.
+
+Remaining: a true multi-machine (multi-host) run; the sustained-throughput
+measurement rework above; the niche par=1-reading-many-partitions residual.
 
 ## Producer (INC 2)
 

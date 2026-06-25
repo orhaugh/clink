@@ -27,13 +27,17 @@ ENV CMAKE_BUILD_PARALLEL_LEVEL=4
 # (json_string_to_row, window_row, equi_join_row, ...) - required to run SQL
 # jobs (e.g. the Nexmark queries) against a containerized cluster; without it the
 # JM planner rejects the spec with "no operator factory registered".
+# Release + LTO (interprocedural optimisation) for a maximally-optimised runtime,
+# then strip the binaries (perf-neutral, smaller image). Throughput-grade build.
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCLINK_BUILD_SQL=ON \
+        -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
     && cmake --build build --target clink_node \
     && cmake --build build --target clink \
     && cmake --build build --target clink_k8s_smoke_job \
     && cmake --build build --target clink_rescale_test_job \
     && cp build/clink_node /usr/local/bin/clink_node \
     && cp build/clink     /usr/local/bin/clink \
+    && strip /usr/local/bin/clink_node /usr/local/bin/clink \
     && mkdir -p /opt/clink/jobs \
     && cp build/examples/k8s_smoke_job.so /opt/clink/jobs/k8s_smoke_job.so \
     && cp build/examples/rescale_test_job.so /opt/clink/jobs/rescale_test_job.so \
