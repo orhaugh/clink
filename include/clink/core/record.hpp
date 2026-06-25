@@ -64,10 +64,22 @@ public:
     std::optional<PaneInfo> pane() const noexcept { return pane_; }
     void set_pane(PaneInfo p) noexcept { pane_ = p; }
 
+    // Source split (Kafka partition) the record came from, when a partitioned
+    // source set it. Engine-only metadata (not serialized, like event_time /
+    // pane): a single source reading multiple partitions interleaves them into
+    // one stream, so the watermark assigner uses this to track event time PER
+    // partition and emit the MIN across them - without it, one global watermark
+    // races to the fastest partition and marks slower partitions' records late.
+    // Consumed by the assigner immediately after the source (same subtask), so
+    // it never needs to cross a network boundary.
+    std::optional<std::int32_t> source_partition() const noexcept { return source_partition_; }
+    void set_source_partition(std::int32_t p) noexcept { source_partition_ = p; }
+
 private:
     T value_{};
     std::optional<EventTime> event_time_{};
     std::optional<PaneInfo> pane_{};
+    std::optional<std::int32_t> source_partition_{};
 };
 
 // A Batch is the operator-boundary unit. We pass batches rather than singletons

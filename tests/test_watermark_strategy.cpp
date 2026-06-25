@@ -96,6 +96,55 @@ TEST(WatermarkStrategy, MonotonicIsDirtyOnlyOnceUntilNewMax) {
     EXPECT_FALSE(s.current_watermark().has_value());
 }
 
+// --- PartitionAwareBoundedOutOfOrdernessStrategy ---------------------------
+
+// Helper: a Record carrying both an event time and a source partition.
+static Record<int> part_rec(int v, std::int64_t ts, std::int32_t partition) {
+    Record<int> r{v, EventTime{ts}};
+    r.set_source_partition(partition);
+    return r;
+}
+
+TEST(WatermarkStrategy, PartitionAwareEmitsMinAcrossPartitionsMinusBound) {
+    PartitionAwareBoundedOutOfOrdernessStrategy<int> s(std::chrono::milliseconds{50});
+    // Partition 0 races ahead to 1000, partition 1 only at 200. The watermark
+    // must follow the SLOWEST partition (min = 200), not the fastest.
+    s.on_record(part_rec(1, 1000, /*partition=*/0));
+    s.on_record(part_rec(2, 200, /*partition=*/1));
+    auto wm = s.current_watermark();
+    ASSERT_TRUE(wm.has_value());
+    EXPECT_EQ(wm->timestamp(), EventTime{150});  // min(1000,200) - 50
+}
+
+TEST(WatermarkStrategy, PartitionAwareAdvancesOnlyWhenTheSlowestPartitionAdvances) {
+    PartitionAwareBoundedOutOfOrdernessStrategy<int> s(std::chrono::milliseconds{0});
+    s.on_record(part_rec(1, 1000, 0));
+    s.on_record(part_rec(2, 200, 1));
+    ASSERT_EQ(s.current_watermark()->timestamp(), EventTime{200});  // min
+    // Fastest partition races further - the min (slowest) is unchanged, so no
+    // new watermark. This is the whole point: one fast partition cannot drag the
+    // watermark past a slow one and strand the slow partition's in-window data.
+    s.on_record(part_rec(3, 5000, 0));
+    EXPECT_FALSE(s.current_watermark().has_value());
+    // The slowest partition catches up - now the min advances.
+    s.on_record(part_rec(4, 900, 1));
+    auto wm = s.current_watermark();
+    ASSERT_TRUE(wm.has_value());
+    EXPECT_EQ(wm->timestamp(), EventTime{900});  // min(5000, 900)
+}
+
+TEST(WatermarkStrategy, PartitionAwareDegradesToGlobalWithoutPartition) {
+    // Records with no source_partition (file / generator sources) fold into one
+    // global bucket, so behaviour matches BoundedOutOfOrdernessStrategy exactly.
+    PartitionAwareBoundedOutOfOrdernessStrategy<int> s(std::chrono::milliseconds{50});
+    s.on_record(Record<int>{1, EventTime{1000}});  // no partition
+    ASSERT_EQ(s.current_watermark()->timestamp(), EventTime{950});
+    s.on_record(Record<int>{2, EventTime{500}});  // out of order, no regress
+    EXPECT_FALSE(s.current_watermark().has_value());
+    s.on_record(Record<int>{3, EventTime{2000}});
+    ASSERT_EQ(s.current_watermark()->timestamp(), EventTime{1950});
+}
+
 TEST(WatermarkAssigner, EmitsProgressingWatermarkInline) {
     using KV = std::pair<std::string, int>;
     Dag dag;

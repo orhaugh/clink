@@ -25,11 +25,16 @@ public:
             const Batch<In>& in_batch = element.as_data();
             Batch<Out> out_batch;
             for (const auto& record : in_batch) {
-                if (record.event_time().has_value()) {
-                    out_batch.emplace(fn_(record.value()), *record.event_time());
-                } else {
-                    out_batch.emplace(fn_(record.value()));
+                Record<Out> out_rec = record.event_time().has_value()
+                                          ? Record<Out>(fn_(record.value()), *record.event_time())
+                                          : Record<Out>(fn_(record.value()));
+                // Preserve engine-only source-split metadata so a partitioned
+                // source's partition survives a value-mapping bridge (e.g.
+                // json_string_to_row) and reaches the watermark assigner.
+                if (auto p = record.source_partition(); p.has_value()) {
+                    out_rec.set_source_partition(*p);
                 }
+                out_batch.push(std::move(out_rec));
             }
             out.emit_data(std::move(out_batch));
         } else if (element.is_watermark()) {

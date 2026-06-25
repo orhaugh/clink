@@ -54,7 +54,15 @@ public:
                 if (e.is_data()) {
                     Batch<std::string> b;
                     for (const auto& r : e.as_data()) {
-                        b.emplace(r.value().payload);
+                        Record<std::string> rec(r.value().payload);
+                        // Carry the Kafka partition as engine-only metadata so a
+                        // downstream watermark assigner can track event time per
+                        // partition (min across partitions) instead of one global
+                        // watermark that races to the fastest partition.
+                        if (r.value().partition >= 0) {
+                            rec.set_source_partition(r.value().partition);
+                        }
+                        b.push(std::move(rec));
                     }
                     return out.emit_data(std::move(b));
                 }

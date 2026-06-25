@@ -4786,13 +4786,17 @@ void install(clink::plugin::PluginRegistry& reg) {
                 }
                 return EventTime::min();
             };
-            std::unique_ptr<WatermarkStrategy<Row>> strategy;
-            if (bound_ms <= 0) {
-                strategy = std::make_unique<MonotonicWatermarkStrategy<Row>>();
-            } else {
-                strategy = std::make_unique<BoundedOutOfOrdernessStrategy<Row>>(
-                    std::chrono::milliseconds(bound_ms));
-            }
+            // Per-partition (per-source-split) watermarking: tracks event time
+            // PER Kafka partition (Record::source_partition, set by the source)
+            // and emits the MIN across partitions, so one subtask reading
+            // several interleaved partitions does not race its watermark to the
+            // fastest partition (which would mark slower partitions' in-window
+            // records late -> wrong windowed results). Degrades to a single
+            // global max for non-partitioned sources (file / generator), so
+            // their behaviour is unchanged. Handles bound==0 (min, no lateness)
+            // and bound>0 (min - lateness) uniformly.
+            auto strategy = std::make_unique<PartitionAwareBoundedOutOfOrdernessStrategy<Row>>(
+                std::chrono::milliseconds(bound_ms < 0 ? 0 : bound_ms));
             return std::make_shared<WatermarkAssignerOperator<Row>>(
                 std::move(extractor), std::move(strategy), "assign_timestamps_row");
         });
