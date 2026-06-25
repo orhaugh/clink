@@ -21,8 +21,10 @@ workload. This harness produces the first defensible clink-vs-Flink Nexmark numb
 
 ## Headline scope
 
-SQL-vs-SQL on {q0 stateless, q5 windowed-agg, q8 windowed-join}; q6 reported
-separately as clink-SQL-vs-Flink-DataStream (excluded from the geomean); q13/q14/q10
+Implemented: q0 (stateless) and q12 (windowed-agg) as gated SQL-vs-SQL throughput
+ratios (geomean); q8 (windowed stream-stream join) as a gated correctness result
+(row count, throughput indicative); q6 as a SQL-only capability (clink runs it in
+SQL, Flink cannot - DataStream-only - so it is documented, not gated). q13/q14/q10
 out of v1. See `pipeline.md` for the rationale.
 
 ## Run it
@@ -55,7 +57,8 @@ scoreboard under the matched-premise banner.
   geomean + banner + correctness gate).
 - [x] **q8** (windowed stream-stream join) - gate PASS (1,056=1,056), the
   two-source-windowed-join-over-Kafka correctness milestone.
-- [ ] q6 (SQL-vs-DataStream) - more queries.
+- [x] **q6** (SQL-only capability) - clink runs it in SQL over Kafka (5,223
+  sellers); Flink has no SQL form (DataStream-only). Documented, not gated.
 - [ ] CPU normalisation (Cores*Time); clink SQL parallelism flag + the
   start-of-stream partition-watermark refinement for parallelism>1 runs.
 
@@ -94,11 +97,28 @@ processing throughput (it swings run-to-run, e.g. 3-10x, while the 1,056=1,056
 gate is rock-solid). The geomean is over the two throughput-comparable queries
 (q0, q12) where output is input-scale.
 
+**q6 is a SQL-only capability, not a measured comparison.** q6 (average selling
+price per seller over their last 10 closed auctions) is the query Flink itself
+does NOT express in SQL - its `OVER` operator does not consume retractions, so the
+canonical Nexmark q6 ships only via Flink's DataStream API. clink runs it in SQL
+(`queries/clink/q6.tmpl.sql`): winning bid per auction (bid INNER JOIN auction +
+interval residual + ROW_NUMBER top-1) feeding a last-10-per-seller `AVG ... OVER
+(... ROWS BETWEEN 9 PRECEDING AND CURRENT ROW)`, which lowers to clink's
+`last_n_agg` operator (consumes the winning-bid changelog, re-emits the per-seller
+avg as the last-10 set slides). Verified over Kafka: 30,845 changelog records
+netting to a final upsert state of 5,223 distinct sellers. It is NOT in the gated
+`run.sh` suite - there is no Flink SQL counterpart to gate against, and its
+changelog output (vs a clean append/pane count) does not fit the row-count gate; a
+faithful gate-matched Flink DataStream job was judged disproportionate effort for
+a fragile final-state gate. q6 stands as the demonstration that clink covers a
+query class Flink SQL cannot.
+
 Caveats (so these are not yet the full `pipeline.md` headline): parallelism is 1
 on BOTH (matched, the cleanest per-core comparison; **1-partition input topics**
 are the correct config at parallelism 1 - see the multi-partition note below).
-No CPU normalisation yet (events/sec, not events/sec/core). Two of the three
-headline classes so far (stateless, windowed-agg); windowed-join (q8) next.
+No CPU normalisation yet (events/sec, not events/sec/core). The throughput geomean
+covers the two input-scale queries (q0 stateless, q12 windowed-agg); q8
+(windowed-join) is a correctness gate; q6 is a SQL-only capability.
 
 ## A real clink bug the gate caught: multi-partition watermarks
 
