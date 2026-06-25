@@ -1057,12 +1057,53 @@ public:
                 cols.push_back({&nm, idx, rb->schema()->field(idx)->type()});
             }
         }
+        // WS3 within-batch group-by: amortise the per-record state_[group_key]
+        // hash probe. Group the batch's rows by group key (first-seen order) and
+        // fold each group's rows into its window map behind ONE state_ probe.
+        // fold_record_into_ runs per row in input order exactly as handle_record_
+        // does, so the result is byte-identical to the per-record path for EVERY
+        // aggregate: cross-group folds touch disjoint window maps, and
+        // within-group arrival order is preserved. Window emission is
+        // watermark-driven and unchanged, so there is no cadence change and no
+        // aggregate-safety restriction (unlike the GROUP BY case).
+        std::vector<Row> rows;
+        rows.reserve(static_cast<std::size_t>(n));
         for (std::int64_t i = 0; i < n; ++i) {
             Row row;
             for (const auto& c : cols) {
                 row.values[*c.name] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
             }
-            handle_record_(row);
+            rows.push_back(std::move(row));
+        }
+        clink::FlatMap<std::string, std::size_t> group_of;
+        std::vector<std::vector<std::int64_t>> groups;
+        std::vector<std::string> group_keys;
+        for (std::int64_t i = 0; i < n; ++i) {
+            // Match handle_record_'s pre-probe guard: a row whose time column is
+            // missing or non-numeric folds nothing and creates no state_ entry,
+            // so skip it before grouping. This keeps the state_ footprint
+            // byte-identical to the per-record path (incl. leaving NO entry for a
+            // group all of whose rows have a bad time column).
+            const Row& r = rows[static_cast<std::size_t>(i)];
+            const auto tit = r.values.find(time_column_);
+            if (tit == r.values.end() || !tit->second.is_number()) {
+                continue;
+            }
+            std::string key = group_key_(r);
+            auto git = group_of.find(key);
+            if (git == group_of.end()) {
+                group_of.emplace(key, groups.size());
+                groups.push_back({i});
+                group_keys.push_back(std::move(key));
+            } else {
+                groups[git->second].push_back(i);
+            }
+        }
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            auto& by_window = state_[group_keys[g]];
+            for (const std::int64_t idx : groups[g]) {
+                fold_record_into_(by_window, rows[static_cast<std::size_t>(idx)], nullptr);
+            }
         }
         return true;
     }
