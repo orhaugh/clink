@@ -34,6 +34,7 @@
 #include "clink/operators/json_value_expr.hpp"
 #include "clink/operators/map_operator.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/operators/sink_operator.hpp"
 #include "clink/operators/watermark_assigner_operator.hpp"
 #include "clink/runtime/async_execution_controller.hpp"
 #include "clink/runtime/runtime_context.hpp"
@@ -4745,6 +4746,16 @@ void install(clink::plugin::PluginRegistry& reg) {
                 std::move(path),
                 std::move(partition_by),
                 parse_decimal_columns(ctx.param_or("decimal_columns")));
+        });
+
+    // blackhole_sink_row: discard sink - counts then drops every row (the
+    // runner's records_in metric still tallies them). connector='blackhole' maps
+    // here (row_sink_binding_for). Lets a pipeline run without sink I/O so a
+    // benchmark measures the engine, not the output connector; also handy for
+    // driving a job whose output is irrelevant. No params.
+    reg.register_sink<Row>(
+        "blackhole_sink_row", [](const BuildContext& /*ctx*/) -> std::shared_ptr<Sink<Row>> {
+            return std::make_shared<FunctionSink<Row>>([](const Row&) {}, "blackhole_sink_row");
         });
 
     // ---- Operators ----

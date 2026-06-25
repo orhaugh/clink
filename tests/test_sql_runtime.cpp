@@ -180,6 +180,42 @@ TEST(SqlRuntime, GroupByKeyAliasHonouredInOutput) {
     std::filesystem::remove(out_path);
 }
 
+// connector='blackhole' binds to the discard-sink factory registered by
+// install() (blackhole_sink_row): a bounded file source -> blackhole runs to
+// completion, the sink counting then dropping every row. Guards the core discard
+// connector used to measure engine throughput without sink I/O distorting it -
+// the job would fail to build if the factory were not registered.
+TEST(SqlRuntime, BlackholeSinkRunsToCompletion) {
+    ensure_sql_installed_once();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_bh_in.ndjson";
+    std::filesystem::remove(in_path);
+    write_lines(in_path, {R"({"a":1,"b":10})", R"({"a":2,"b":20})", R"({"a":3,"b":30})"});
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE src_bh (a BIGINT, b BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE sink_bh (a BIGINT, b BIGINT) WITH (connector='blackhole')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat, "INSERT INTO sink_bh SELECT a, b FROM src_bh");
+
+    bool has_bh = false;
+    for (const auto& op : spec.ops)
+        if (op.type == "blackhole_sink_row")
+            has_bh = true;
+    EXPECT_TRUE(has_bh) << "connector='blackhole' did not map to blackhole_sink_row";
+
+    InProcessCluster cluster("tm-sql-bh", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+    std::filesystem::remove(in_path);
+}
+
 TEST(SqlRuntime, UnboundedGroupBySumRunsEndToEnd) {
     ensure_sql_installed_once();
 
