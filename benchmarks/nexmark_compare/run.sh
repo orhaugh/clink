@@ -36,6 +36,7 @@ expected_for() {
     case "$1" in
         q0) echo 460000 ;;
         q12) echo 184767 ;;
+        q8) echo 1056 ;;
         *) echo 0 ;;
     esac
 }
@@ -73,8 +74,13 @@ done
 for i in $(seq 1 30); do docker exec "$JM_CONTAINER" flink list >/dev/null 2>&1 && break; sleep 2; done
 docker cp "$ROOT/flink-job/target/nexmark-sql.jar" "$JM_CONTAINER:/tmp/nexmark-sql.jar" >/dev/null 2>&1
 
-step "4. Generate ONE canonical dataset ($EVENTS events, tps=$TPS) + load nx-bid (1 partition)"
+step "4. Generate ONE canonical dataset ($EVENTS events, tps=$TPS) + load nx-{person,auction,bid} (1 partition each)"
 "$CLINK_ROOT/build/benchmarks/nexmark_dump" --events "$EVENTS" --tps "$TPS" --out-dir "$DATA_DIR" | tail -1
+# Single-partition each: at parallelism 1 one subtask reads one ordered partition
+# (the correct config). Create them explicitly so the loader does not auto-create
+# them at the broker default (4 partitions), which would break windowed queries.
+recreate_topic nx-person 1
+recreate_topic nx-auction 1
 recreate_topic nx-bid 1
 "$PY" "$ROOT/driver/load_ndjson.py" --dir "$DATA_DIR" --bootstrap "$BROKERS_HOST" --prefix nx- \
     2>/dev/null | tail -1
@@ -117,7 +123,11 @@ for q in $QUERIES; do
 done
 
 step "7. Scoreboard"
+# q0/q12 outputs are input-scale, so their rate is a throughput proxy and counts
+# toward the geomean. q8 (windowed join) emits few rows relative to input, so its
+# rate is emission-bound (indicative only) - it still gates on row count.
 "$PY" "$ROOT/driver/scoreboard.py" --results-dir "$RESULTS" \
+    --geomean-queries "q0 q12" \
     --premise "par=1, 1-partition, hot-path (ckpt off, in-mem state), $EVENTS events tps=$TPS"
 RC=$?
 

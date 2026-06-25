@@ -30,7 +30,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results-dir", required=True)
     ap.add_argument("--premise", default="")
+    ap.add_argument(
+        "--geomean-queries",
+        default="",
+        help="space-separated queries whose rate is a comparable throughput proxy "
+        "(output ~ input scale). Others still gate + print but their rate is marked "
+        "indicative and excluded from the geomean. Empty = all.",
+    )
     args = ap.parse_args()
+    geomean_set = set(args.geomean_queries.split()) if args.geomean_queries else None
 
     by_query = load(args.results_dir)
     if not by_query:
@@ -66,14 +74,26 @@ def main():
             continue
         ce, fe = c["steady_eps"], f["steady_eps"]
         ratio = (ce / fe) if fe > 0 else float("nan")
-        ratios.append(ratio)
-        print(f"  {q:<6} {int(ce):>14,} {int(fe):>14,} {ratio:>7.2f}x  {gate_str:>22}")
+        # A query counts toward the geomean only if its rate is a comparable
+        # throughput proxy (output ~ input scale). Low-output queries (e.g. a
+        # windowed join emitting a handful of rows) measure emission-burst
+        # dynamics, not processing throughput, so they are indicative only.
+        comparable = geomean_set is None or q in geomean_set
+        mark = "" if comparable else " (indic.)"
+        if comparable:
+            ratios.append(ratio)
+        print(f"  {q:<6} {int(ce):>14,} {int(fe):>14,} {ratio:>6.2f}x{mark:<8}  {gate_str:>22}")
 
     print("  " + "-" * 74)
     if ratios:
         geo = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
-        print(f"  geomean over {len(ratios)} gate-passing quer{'y' if len(ratios)==1 else 'ies'}:"
+        print(f"  geomean over {len(ratios)} throughput quer{'y' if len(ratios)==1 else 'ies'}:"
               f" clink {geo:.2f}x")
+    if geomean_set is not None:
+        indic = sorted(q for q in by_query if q not in geomean_set and "clink" in by_query[q]
+                       and "flink" in by_query[q] and by_query[q]["clink"]["count"] == by_query[q]["flink"]["count"])
+        if indic:
+            print(f"  indicative-only (gate PASS, output-bound rate, not in geomean): {', '.join(indic)}")
     if gate_failures:
         print(f"  GATE FAILURES (no ratio quoted): {', '.join(gate_failures)}")
     print("=" * 78 + "\n")

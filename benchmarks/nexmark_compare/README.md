@@ -53,7 +53,9 @@ scoreboard under the matched-premise banner.
   (Table-API jar, Kafka SQL connector shaded in).
 - [x] **INC 8** - one-command `run.sh` + `scoreboard.py` (steady-state table +
   geomean + banner + correctness gate).
-- [ ] q8 (windowed join), q6 (SQL-vs-DataStream) - more queries.
+- [x] **q8** (windowed stream-stream join) - gate PASS (1,056=1,056), the
+  two-source-windowed-join-over-Kafka correctness milestone.
+- [ ] q6 (SQL-vs-DataStream) - more queries.
 - [ ] CPU normalisation (Cores*Time); clink SQL parallelism flag + the
   start-of-stream partition-watermark refinement for parallelism>1 runs.
 
@@ -65,19 +67,32 @@ measured identically from each output record's broker append timestamp
 (`message.timestamp.type=LogAppendTime`) over the middle 80%, both gate-verified
 (identical output-row counts -> same relation):
 
-A representative `./run.sh` (500k events, tps=1000), both gate-passing:
+A representative `./run.sh` (500k events, tps=1000), all gate-passing:
 
-| query | class | clink steady | Flink 2.2.0 steady | ratio | gate |
+| query | class | clink steady | Flink 2.2.0 steady | ratio | gate (rows) |
 |---|---|---|---|---|---|
-| q0 | stateless pass-through | 593,546 ev/s | 197,955 ev/s | 3.00x | 460,000 ✓ |
-| q12 | windowed aggregate (10s tumbling per-bidder COUNT) | 388,981 panes/s | 122,260 panes/s | 3.18x | 184,767 ✓ |
-| | | | | **geomean 3.09x** | |
+| q0 | stateless pass-through | 607,259 ev/s | 198,382 ev/s | 3.06x | 460,000 ✓ |
+| q12 | windowed aggregate (10s tumbling per-bidder COUNT) | 393,119 panes/s | 137,500 panes/s | 2.86x | 184,767 ✓ |
+| q8 | windowed stream-stream join (new users) | 33,760/s | 11,105/s | 3.04x (indic.) | 1,056 ✓ |
+| | | | | **geomean (q0,q12) 2.96x** | |
 
-clink leads on both (run-to-run the ratios sit around 2.7-3.2x; absolute rates
-vary with machine warmth). On q0 it wins despite paying the heavier `JsonValue`
-row-materialisation cost the JSON-input premise disclosed (which favours Flink on
-stateless queries). q12's metric is steady output-pane rate (the same metric on
-both engines, so the ratio is fair).
+clink leads on all three (run-to-run the throughput ratios sit around 2.7-3.2x;
+absolute rates vary with machine warmth). On q0 it wins despite paying the heavier
+`JsonValue` row-materialisation cost the JSON-input premise disclosed (which
+favours Flink on stateless queries). q12's metric is steady output-pane rate (the
+same metric on both engines, so the ratio is fair).
+
+**q8 is a correctness milestone, not a throughput data point.** It proves clink's
+two-source windowed join over Kafka (person-window aggregate JOIN auction-window
+aggregate on `id=seller` + same window) computes the SAME relation as Flink -
+both emit exactly 1,056 rows (the data-derived count of distinct persons created
+in a window who also sold an auction in that window, over the 49 watermark-closed
+windows). Its throughput rate is **indicative only and excluded from the
+geomean**: q8 emits few rows relative to input (1,056 vs ~40k person+auction
+events), so the output-row-append rate measures emission-burst dynamics, not
+processing throughput (it swings run-to-run, e.g. 3-10x, while the 1,056=1,056
+gate is rock-solid). The geomean is over the two throughput-comparable queries
+(q0, q12) where output is input-scale.
 
 Caveats (so these are not yet the full `pipeline.md` headline): parallelism is 1
 on BOTH (matched, the cleanest per-core comparison; **1-partition input topics**
