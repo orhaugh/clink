@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Reproducible clink-vs-Flink Nexmark comparison (parallelism 1, single-partition,
-# hot-path). One command: build, bring up Kafka + Flink, generate ONE canonical
-# dataset, load it to single-partition topics both engines read, run each query on
-# both engines, measure steady-state by broker append-time, gate on identical
-# output-row counts, and print the scoreboard. See pipeline.md for the premise.
+# Reproducible clink-vs-Flink Nexmark comparison (hot-path). One command: build,
+# bring up Kafka + Flink, generate ONE canonical dataset, load it to PAR-partition
+# topics both engines read, run each query on both engines at parallelism PAR,
+# measure steady-state by broker append-time, gate on identical output-row counts,
+# and print the scoreboard. See pipeline.md for the premise.
 #
-#   ./run.sh                 # q0 + q12, default 500k events
-#   EVENTS=1000000 ./run.sh  # more events
-#   QUERIES="q0" ./run.sh    # a subset
+#   ./run.sh                      # q0 + q12, par 1, 500k events
+#   EVENTS=1000000 ./run.sh       # more events
+#   QUERIES="q0" ./run.sh         # a subset
+#   PARALLELISM=4 ./run.sh        # par 4: PAR-partition topics, both engines at -p 4
 #
-# Single-partition topics are the correct config at parallelism 1 (one subtask,
-# one ordered partition); multi-partition needs parallelism>1 (a follow-on, and
-# the start-of-stream watermark refinement noted in the README).
+# Each source subtask reads one ordered partition (PAR partitions / PAR subtasks),
+# so the runtime min-merges per-partition watermarks across the keyed shuffle and
+# windowed queries stay gate-exact at any PAR. Single-box, so par>1 measures
+# scale-out coordination, not true distributed scaling.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,6 +27,7 @@ TM_CONTAINER="${PROJECT}-flink-taskmanager-1"
 
 EVENTS="${EVENTS:-500000}"
 TPS="${TPS:-1000}"        # low tps -> datetime spans many 10s windows (windowed queries fire mid-stream)
+PAR="${PARALLELISM:-1}"  # uniform parallelism on both engines; input topics get PAR partitions
 QUERIES="${QUERIES:-q0 q12}"
 DATA_DIR="${DATA_DIR:-/tmp/nxcompare-data}"
 RESULTS="$ROOT/results"
@@ -87,20 +90,21 @@ done
 for i in $(seq 1 30); do docker exec "$JM_CONTAINER" flink list >/dev/null 2>&1 && break; sleep 2; done
 docker cp "$ROOT/flink-job/target/nexmark-sql.jar" "$JM_CONTAINER:/tmp/nexmark-sql.jar" >/dev/null 2>&1
 
-step "4. Generate ONE canonical dataset ($EVENTS events, tps=$TPS) + load nx-{person,auction,bid} (1 partition each)"
+step "4. Generate dataset ($EVENTS events, tps=$TPS) + load nx-{person,auction,bid} ($PAR partition(s) each)"
 "$CLINK_ROOT/build/benchmarks/nexmark_dump" --events "$EVENTS" --tps "$TPS" --out-dir "$DATA_DIR" | tail -1
-# Single-partition each: at parallelism 1 one subtask reads one ordered partition
-# (the correct config). Create them explicitly so the loader does not auto-create
-# them at the broker default (4 partitions), which would break windowed queries.
-recreate_topic nx-person 1
-recreate_topic nx-auction 1
-recreate_topic nx-bid 1
+# PAR partitions each: one ordered partition per source subtask at parallelism
+# PAR (the loader keys by id/auction so partitions span the full time range; the
+# runtime min-merges per-partition watermarks across the shuffle -> gate-exact).
+# Create them explicitly so the loader does not auto-create at the broker default.
+recreate_topic nx-person "$PAR"
+recreate_topic nx-auction "$PAR"
+recreate_topic nx-bid "$PAR"
 "$PY" "$ROOT/driver/load_ndjson.py" --dir "$DATA_DIR" --bootstrap "$BROKERS_HOST" --prefix nx- \
     2>/dev/null | tail -1
 
 run_clink() {  # query
     local q=$1 out="nx-out-$1-clink"
-    recreate_topic "$out" 1 append
+    recreate_topic "$out" "$PAR" append
     sed "s#__OUT__#$out#" "$ROOT/queries/clink/$q.tmpl.sql" > "$DATA_DIR/$q-clink.sql"
     "$CLINK_ROOT/build/clink_node" --role=jm --port=7100 --http-port=8081 >"$RESULTS/clink-jm.log" 2>&1 &
     local jm=$!; sleep 2
@@ -116,7 +120,7 @@ run_clink() {  # query
     cpu_pre=$("$PY" "$ROOT/driver/cpu.py" read-clink "$jm" "${tms[@]}")
     wall_pre=$(now_s)
     "$CLINK_ROOT/build/clink_submit_sql" --file "$DATA_DIR/$q-clink.sql" \
-        --jm-host 127.0.0.1 --jm-port 8081 --name "nx_$q" >/dev/null 2>&1
+        --jm-host 127.0.0.1 --jm-port 8081 --name "nx_$q" --parallelism "$PAR" >/dev/null 2>&1
     "$PY" "$ROOT/driver/measure_steady.py" --brokers "$BROKERS_HOST" --topic "$out" \
         --expected "$(expected_for "$q")" --query "$q" --engine clink --out "$RESULTS/$q-clink.json" \
         --quiet-timeout 12 2>/dev/null | tail -1
@@ -131,13 +135,13 @@ run_clink() {  # query
 
 run_flink() {  # query
     local q=$1 out="nx-out-$1-flink"
-    recreate_topic "$out" 1 append
+    recreate_topic "$out" "$PAR" append
     sed "s#__OUT__#$out#" "$ROOT/flink-job/queries/$q.tmpl.sql" > "$DATA_DIR/$q-flink.sql"
     docker cp "$DATA_DIR/$q-flink.sql" "$JM_CONTAINER:/tmp/$q-flink.sql" >/dev/null 2>&1
     local cpu_pre wall_pre
     cpu_pre=$("$PY" "$ROOT/driver/cpu.py" read-flink "$JM_CONTAINER" "$TM_CONTAINER")
     wall_pre=$(now_s)
-    docker exec "$JM_CONTAINER" flink run -d -p 1 /tmp/nexmark-sql.jar "/tmp/$q-flink.sql" >/dev/null 2>&1
+    docker exec "$JM_CONTAINER" flink run -d -p "$PAR" /tmp/nexmark-sql.jar "/tmp/$q-flink.sql" >/dev/null 2>&1
     "$PY" "$ROOT/driver/measure_steady.py" --brokers "$BROKERS_HOST" --topic "$out" \
         --expected "$(expected_for "$q")" --query "$q" --engine flink --out "$RESULTS/$q-flink.json" \
         --quiet-timeout 15 2>/dev/null | tail -1
@@ -162,7 +166,7 @@ step "7. Scoreboard"
 # rate is emission-bound (indicative only) - it still gates on row count.
 "$PY" "$ROOT/driver/scoreboard.py" --results-dir "$RESULTS" \
     --geomean-queries "q0 q12" \
-    --premise "par=1, 1-partition, hot-path (ckpt off, in-mem state), $EVENTS events tps=$TPS"
+    --premise "par=$PAR, $PAR-partition, hot-path (ckpt off, in-mem state), $EVENTS events tps=$TPS"
 RC=$?
 
 if [[ "${KEEP_UP:-}" != "1" ]]; then

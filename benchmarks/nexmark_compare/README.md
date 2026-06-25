@@ -32,17 +32,19 @@ out of v1. See `pipeline.md` for the rationale.
 One command (Docker + the `../flink_compare/.venv` Python venv + Maven):
 
 ```bash
-./run.sh                  # q0 + q12, 500k events, then tears down
+./run.sh                  # q0 + q12, par 1, 500k events, then tears down
 EVENTS=1000000 ./run.sh   # more events
 QUERIES="q0" ./run.sh     # a subset
+PARALLELISM=4 ./run.sh    # par 4: 4-partition topics, both engines at -p 4
 KEEP_UP=1 ./run.sh        # leave Kafka + Flink up afterwards
 ```
 
 It builds both engines, brings up Kafka + Flink, generates ONE canonical dataset,
-loads it to a single-partition `nx-bid` both engines read, runs each query on both
-at parallelism 1, measures steady-state by broker append-time, gates on identical
+loads it to PAR-partition topics both engines read, runs each query on both at
+parallelism PAR, measures steady-state by broker append-time, gates on identical
 output-row counts (a mismatch HALTS that query, no ratio), and prints the
-scoreboard under the matched-premise banner.
+scoreboard under the matched-premise banner. The results table below is the
+default par=1; see the Parallelism>1 section for the par=4 run.
 
 ## Build increments (all done for the v1 deliverable)
 
@@ -63,8 +65,11 @@ scoreboard under the matched-premise banner.
   procs via `ps`, Flink containers via cgroup v2 `cpu.stat`); scoreboard adds an
   events-per-CPU-second efficiency column (parallelism-independent), with the
   baseline-overhead caveat below.
-- [ ] clink SQL parallelism flag + the start-of-stream partition-watermark
-  refinement for parallelism>1 runs.
+- [x] **parallelism>1**: `clink_submit_sql --parallelism N` / `PARALLELISM=N
+  ./run.sh`; verified gate-exact at par=4 over 4-partition topics on both engines
+  (q0 460,000, q12 184,767). Single-box, so it shows scale-out correctness, not
+  true distributed throughput scaling.
+- [ ] A true multi-machine distributed run; q8/q6 at par>1.
 
 ## Results (parallelism 1, 1-partition, hot-path)
 
@@ -191,18 +196,46 @@ now deterministic), and single-partition is **exact** (184,767). So the
 parallelism-1 benchmark (single-partition topics) is fully correct - the q0/q12
 ratios above stand.
 
-**Known residual (~1.4%, multi-partition only):** at start-of-stream, before
-every partition has delivered its first record, the min is taken over the
-partitions seen so far, so the earliest window can fire slightly early
-(4-partition keyed q12: 187,432 vs 184,767). Flink blocks the watermark until
-every split has data (an empty split sits at -inf); replicating that needs the
-source to convey its live partition assignment to the assigner so unseen
-partitions block. That is the remaining step for **parallelism>1 gate-exact**
-runs; it does not affect the parallelism-1 ratios.
+**Residual (~1.4%) is confined to par=1 reading MANY partitions:** when ONE
+subtask reads 4 interleaved partitions, at start-of-stream (before every
+partition has delivered its first record) the min is over the seen subset, so the
+earliest window can fire slightly early (par=1 over 4-partition keyed q12:
+187,432 vs 184,767). This does NOT occur at par>1 (next section): there each
+subtask reads ONE ordered partition, so there is no within-subtask interleave -
+the cross-partition min happens at the keyed shuffle, which the runtime does
+exactly. So the residual is a par=1-multi-partition edge case, not a correctness
+limit on scaled runs.
 
-Remaining: the start-of-stream partition-blocking refinement (gates par>1
-gate-exactness); q8 (windowed join), q6 (SQL-vs-DataStream); CPU normalisation;
-the clink SQL parallelism flag; and a reproducible run.sh + scoreboard.
+## Parallelism > 1
+
+`clink_submit_sql --parallelism N` (and `PARALLELISM=N ./run.sh`) fans every op
+out to N subtasks: keyed ops hash-partition by key, and a Kafka source's N
+subtasks share a consumer group so Kafka assigns them disjoint partitions (N
+partitions / N subtasks -> one ordered partition each). The runtime min-merges
+each source subtask's watermark across the keyed shuffle into the window op.
+
+Verified at PARALLELISM=4 over 4-partition topics, both engines **gate-exact**:
+
+| query | par | clink rate | flink rate | rate | gate |
+|---|---|---|---|---|---|
+| q0 | 4 | 776,369/s | 196,370/s | 3.95x | 460,000 ✓ |
+| q12 | 4 | 363,176/s | 119,880/s | 3.03x | 184,767 ✓ |
+
+So clink's windowed SQL is correct when distributed (the watermark-at-scale path
+works). Honest reading of the THROUGHPUT: this is a SINGLE box, so par>1 measures
+scale-out coordination overhead, not true distributed scaling. clink's stateless
+q0 does scale (776k at par 4 vs ~575k at par 1 - parallel JSON decode); the
+windowed q12 stays flat (~360-400k, shuffle / single-broker bound). Flink stays
+flat-to-lower (heavier per-subtask JVM cost under single-box contention). The eff
+(CPU) ratio narrows at par 4 (clink spends more total CPU across 4 subtasks +
+shuffle for the same input - parallelism trades CPU for wall-time). A real
+multi-machine cluster is what would show linear scale-out; that is out of scope
+for this single-host harness.
+
+Remaining: a true multi-machine distributed run (out of scope here); q8/q6 at
+par>1 (untested - q8's two-source windowed join, q6's changelog); and closing the
+par=1-multi-partition start-of-stream residual (a niche edge case now that par>1
+is the scaled path).
 
 ## Producer (INC 2)
 

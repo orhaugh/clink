@@ -45,6 +45,7 @@ struct Args {
     std::uint16_t jm_port = 0;
     std::string job_name;
     bool explain = false;
+    std::uint32_t parallelism = 1;  // uniform op parallelism (>1 fans the plan out)
 };
 
 void print_usage() {
@@ -63,6 +64,10 @@ void print_usage() {
         << "                      printing JSON. The JM runs the job and replies with a\n"
         << "                      job id.\n"
         << "  --name <job>        Job name (default 'sql_job'). Only used with --jm-host.\n"
+        << "  --parallelism <n>   Uniform op parallelism (default 1). >1 fans every op out to\n"
+        << "  -p <n>              n subtasks; keyed ops hash-partition by key, sources split\n"
+        << "                      partitions across subtasks (Kafka needs >= n partitions).\n"
+        << "                      Assumes a parallelizable plan (the common SQL shapes).\n"
         << "  --explain           Print the LogicalPlan tree instead of the JobGraphSpec JSON.\n";
 }
 
@@ -106,6 +111,16 @@ Args parse_args(int argc, char** argv) {
                 std::exit(2);
             }
             a.job_name = argv[i];
+        } else if (arg == "--parallelism" || arg == "-p") {
+            if (++i >= argc) {
+                std::cerr << "error: --parallelism requires a number\n";
+                std::exit(2);
+            }
+            a.parallelism = static_cast<std::uint32_t>(std::stoul(argv[i]));
+            if (a.parallelism < 1) {
+                std::cerr << "error: --parallelism must be >= 1\n";
+                std::exit(2);
+            }
         } else if (arg == "--explain") {
             a.explain = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -175,6 +190,19 @@ int main(int argc, char** argv) {
         // Submit a compiled JobGraphSpec to the JM (or print it when no JM host
         // is configured). Shared by the INSERT and CREATE MATERIALIZED VIEW
         // paths. Returns 0 on success, non-zero on a transport / JM error.
+        // Fan the compiled plan out to `args.parallelism` subtasks per op. The
+        // planner emits everything at parallelism 1; setting it uniformly here
+        // lets the runtime hash-partition keyed ops by key and split Kafka
+        // partitions across source subtasks. Assumes a parallelizable plan (no
+        // forced-singleton op); the common Nexmark/SQL shapes qualify.
+        auto apply_parallelism = [&](clink::cluster::JobGraphSpec& spec) {
+            if (args.parallelism <= 1) {
+                return;
+            }
+            for (auto& op : spec.ops) {
+                op.parallelism = args.parallelism;
+            }
+        };
         auto submit_or_print = [&](const std::string& json, const std::string& name) -> int {
             if (!args.jm_host.empty() && args.jm_port != 0) {
                 clink::http::HttpClient client(args.jm_host, args.jm_port);
@@ -234,6 +262,7 @@ int main(int argc, char** argv) {
                 } else {
                     const auto& sink = static_cast<const clink::sql::LogicalSink&>(*plan);
                     auto spec = planner.compile(sink);
+                    apply_parallelism(spec);
                     const std::string name =
                         args.job_name.empty() ? ("mv_" + view_name) : args.job_name;
                     if (int rc = submit_or_print(spec.to_json(), name); rc != 0) {
@@ -287,6 +316,7 @@ int main(int argc, char** argv) {
                 } else {
                     const auto& sink = static_cast<const clink::sql::LogicalSink&>(*plan);
                     auto spec = planner.compile(sink);
+                    apply_parallelism(spec);
                     auto json = spec.to_json();
                     if (!args.jm_host.empty() && args.jm_port != 0) {
                         clink::http::HttpClient client(args.jm_host, args.jm_port);
