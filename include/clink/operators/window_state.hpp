@@ -73,7 +73,16 @@ inline Codec<WindowEntry<Agg>> window_entry_codec(Codec<Agg> agg_codec) {
             }
             we.agg = std::move(*agg);
             return we;
-        }};
+        },
+        .encode_into =
+            [agg_codec](const WindowEntry<Agg>& we, typename Codec<WindowEntry<Agg>>::Bytes& out) {
+                out.push_back(static_cast<std::byte>(we.fired ? 1 : 0));
+                const auto pi = static_cast<std::uint64_t>(we.next_pane_index);
+                for (int i = 7; i >= 0; --i) {
+                    out.push_back(static_cast<std::byte>((pi >> (i * 8)) & 0xFF));
+                }
+                encode_append(agg_codec, we.agg, out);
+            }};
 }
 
 // --- Durable session windows (FOUND-2) ----------------------------------
@@ -139,7 +148,21 @@ inline Codec<SessionRow<Agg>> session_row_codec(Codec<Agg> agg_codec) {
             }
             sr.agg = std::move(*agg);
             return sr;
-        }};
+        },
+        .encode_into =
+            [agg_codec](const SessionRow<Agg>& sr, typename Codec<SessionRow<Agg>>::Bytes& out) {
+                out.push_back(static_cast<std::byte>(1));  // version
+                const auto put_be = [&out](std::int64_t v) {
+                    const auto u = static_cast<std::uint64_t>(v);
+                    for (int i = 7; i >= 0; --i) {
+                        out.push_back(static_cast<std::byte>((u >> (i * 8)) & 0xFF));
+                    }
+                };
+                put_be(sr.start);
+                put_be(sr.end);
+                out.push_back(static_cast<std::byte>(sr.fired ? 1 : 0));
+                encode_append(agg_codec, sr.agg, out);
+            }};
 }
 
 // --- Durable evicting windows (FOUND-2) ---------------------------------

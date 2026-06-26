@@ -88,6 +88,7 @@ public:
         thread_local std::vector<std::byte> value_scratch;
         encode_key_into(k, key_scratch);
         if (value_codec_.encode_into) {
+            value_scratch.clear();  // append contract: encode_into appends to a cleared buffer
             value_codec_.encode_into(v, value_scratch);
         } else {
             value_scratch = value_codec_.encode(v);
@@ -339,20 +340,22 @@ private:
 
     void encode_key_into(const K& k, std::string& out) const {
         // Allocation-free key encode for the hot put/get/erase path:
-        // callers (KeyedState::put) hand us a thread_local string and
-        // we overwrite it in place. The key codec still allocates its
-        // own buffer per call - a follow-up could thread an
-        // encode_into through Codec<K> as well, but the key bytes are
-        // tiny (16B for the common pair<int64,int64>) compared to
-        // value bytes, so the win there is marginal.
-        const auto bytes = key_codec_.encode(k);
-        const auto kg = key_group_for_key(std::span<const std::byte>{bytes.data(), bytes.size()});
+        // callers (KeyedState::put) hand us a thread_local string and we
+        // overwrite it in place. The key bytes go through encode_append into a
+        // thread_local scratch buffer, so a key codec with encode_into (the
+        // built-in int/pair/etc.) pays zero heap allocations after warm-up; a
+        // codec without it falls back to encode() + a copy.
+        thread_local std::vector<std::byte> key_bytes;
+        key_bytes.clear();
+        encode_append(key_codec_, k, key_bytes);
+        const auto kg =
+            key_group_for_key(std::span<const std::byte>{key_bytes.data(), key_bytes.size()});
         out.clear();
-        out.reserve(1 + slot_name_.size() + 1 + bytes.size());
+        out.reserve(1 + slot_name_.size() + 1 + key_bytes.size());
         out.push_back(static_cast<char>(kg & 0xFF));
         out.append(slot_name_);
         out.push_back('|');
-        out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        out.append(reinterpret_cast<const char*>(key_bytes.data()), key_bytes.size());
     }
 
     static std::int64_t now_ms_() {

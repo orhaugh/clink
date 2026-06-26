@@ -213,15 +213,14 @@ inline clink::Codec<EventStats> event_stats_codec() {
             return s;
         },
         .encode_into = [write_payload](const EventStats& s, std::vector<std::byte>& out) {
-            // Zero-alloc on the hot path after warm-up: caller-owned
-            // (thread_local in KeyedState::put) buffer is resized in
-            // place, then written into. The 1.5KB payload memcpy is
-            // unavoidable; the std::vector allocation that the
-            // returning-by-value encode() shape forced isn't.
+            // APPEND contract (Codec::encode_into): append to the caller-cleared
+            // buffer so window_entry_codec can compose this after its header.
+            // Zero-alloc after warm-up; the 1.5KB payload memcpy is unavoidable.
             const std::string& payload = s.latest_payload ? *s.latest_payload : std::string{};
             const std::size_t total = 8 + 8 + 4 + payload.size();
-            out.resize(total);
-            write_payload(s, out.data());
+            const std::size_t off = out.size();
+            out.resize(off + total);
+            write_payload(s, out.data() + off);
         }};
 }
 

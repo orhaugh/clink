@@ -34,17 +34,58 @@ struct Codec {
 
     // Optional encode-into-buffer variant. When set, callers on the hot
     // path can pass a caller-owned (thread_local) scratch buffer and
-    // avoid the per-record allocation that the returning-by-value
-    // Encoder shape forces. KeyedState::put preferentially uses this
-    // over encode() when populated. Implementations should clear() or
-    // resize() the buffer as appropriate; whatever bytes remain in
-    // `out` after the call are the encoding.
+    // avoid the per-record allocation that the returning-by-value Encoder
+    // shape forces. KeyedState::put preferentially uses this over encode()
+    // when populated.
+    //
+    // CONTRACT: encode_into APPENDS exactly encode(v)'s bytes to `out` (it
+    // does NOT clear out). The caller clears once before the top-level call
+    // (KeyedState::put does); combinators then append inner codecs into the
+    // SAME buffer with no temporaries (see encode_append / encode_append_lp).
+    // The appended bytes MUST be identical to encode(v) - a divergence
+    // silently corrupts state on restore. (KeyedState::put clears first, so a
+    // legacy overwrite-style impl still works standalone, but it would clobber
+    // a prefix if composed - new impls must append.)
     using EncoderInto = std::function<void(const T&, Bytes&)>;
 
     Encoder encode;
     Decoder decode;
     EncoderInto encode_into;
 };
+
+// Append v's encoding to `out` (does NOT clear out - the APPEND contract that
+// lets combinators compose without temp buffers). Zero-alloc when the codec
+// populates encode_into; otherwise falls back to encode() + a copy. The
+// produced bytes are byte-identical to encode(v) either way.
+template <typename T>
+inline void encode_append(const Codec<T>& c, const T& v, typename Codec<T>::Bytes& out) {
+    if (c.encode_into) {
+        c.encode_into(v, out);
+    } else {
+        auto bytes = c.encode(v);
+        out.insert(out.end(), bytes.begin(), bytes.end());
+    }
+}
+
+// Append a 4-byte-little-endian length prefix followed by v's encoding,
+// matching the [u32 len][bytes] element framing the container codecs use.
+// The length is back-patched after the inner encoding is appended, so this
+// stays alloc-free even for variable-length inner codecs.
+template <typename T>
+inline void encode_append_lp(const Codec<T>& c, const T& v, typename Codec<T>::Bytes& out) {
+    const std::size_t len_off = out.size();
+    out.push_back(std::byte{0});
+    out.push_back(std::byte{0});
+    out.push_back(std::byte{0});
+    out.push_back(std::byte{0});
+    const std::size_t start = out.size();
+    encode_append(c, v, out);
+    const auto len = static_cast<std::uint32_t>(out.size() - start);
+    for (int i = 0; i < 4; ++i) {
+        out[len_off + static_cast<std::size_t>(i)] =
+            static_cast<std::byte>((len >> (i * 8)) & 0xFF);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Built-in codecs for common types
@@ -66,10 +107,37 @@ inline Codec<std::string> string_codec() {
                 std::memcpy(out.data(), b.data(), b.size());
             }
             return out;
-        }};
+        },
+        .encode_into =
+            [](const std::string& s, Codec<std::string>::Bytes& out) {
+                const auto* p = reinterpret_cast<const std::byte*>(s.data());
+                out.insert(out.end(), p, p + s.size());
+            }};
 }
 
 namespace detail {
+
+// Shared 4-byte little-endian count/length-prefix helpers for the container
+// codecs (vector, set, map, unordered_*). Defined here (before the container
+// codecs) so both their encode/decode and encode_into can use them.
+template <typename Bytes>
+inline void append_u32_le(Bytes& out, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) {
+        out.push_back(static_cast<std::byte>((v >> (i * 8)) & 0xFF));
+    }
+}
+
+template <typename BytesView>
+inline std::optional<std::uint32_t> read_u32_le(BytesView buf, std::size_t pos) {
+    if (pos + 4 > buf.size()) {
+        return std::nullopt;
+    }
+    std::uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) {
+        v |= static_cast<std::uint32_t>(static_cast<unsigned char>(buf[pos + i])) << (i * 8);
+    }
+    return v;
+}
 
 // Little-endian fixed-width integer codec. Stable across platforms because
 // we encode/decode byte-by-byte rather than relying on host endianness.
@@ -92,7 +160,13 @@ inline Codec<UInt> le_uint_codec() {
                                v |= static_cast<UInt>(static_cast<unsigned char>(b[i])) << (i * 8);
                            }
                            return v;
-                       }};
+                       },
+                       .encode_into =
+                           [](const UInt& v, typename Codec<UInt>::Bytes& out) {
+                               for (std::size_t i = 0; i < sizeof(UInt); ++i) {
+                                   out.push_back(static_cast<std::byte>((v >> (i * 8)) & 0xFF));
+                               }
+                           }};
 }
 
 }  // namespace detail
@@ -115,7 +189,11 @@ inline Codec<std::int64_t> int64_codec() {
                 return std::nullopt;
             }
             return static_cast<std::int64_t>(*x);
-        }};
+        },
+        .encode_into =
+            [u = uint64_codec()](const std::int64_t& v, Codec<std::int64_t>::Bytes& out) {
+                encode_append(u, static_cast<std::uint64_t>(v), out);
+            }};
 }
 
 // Reflection-light fallback codec for trivially-copyable structs.
@@ -150,7 +228,13 @@ inline Codec<T> trivial_codec() {
                         T v;
                         std::memcpy(&v, b.data(), sizeof(T));
                         return v;
-                    }};
+                    },
+                    .encode_into =
+                        [](const T& v, typename Codec<T>::Bytes& out) {
+                            const auto off = out.size();
+                            out.resize(off + sizeof(T));
+                            std::memcpy(out.data() + off, &v, sizeof(T));
+                        }};
 }
 
 // Vector codec: 4-byte count, then per element a 4-byte length followed by
@@ -209,7 +293,14 @@ inline Codec<std::vector<T>> vector_codec(Codec<T> elem) {
                 pos += len;
             }
             return out;
-        }};
+        },
+        .encode_into =
+            [elem](const std::vector<T>& v, typename Codec<std::vector<T>>::Bytes& out) {
+                detail::append_u32_le(out, static_cast<std::uint32_t>(v.size()));
+                for (const auto& e : v) {
+                    encode_append_lp(elem, e, out);
+                }
+            }};
 }
 
 // Pair codec: 4-byte length-prefix on the first component, then the second.
@@ -251,7 +342,12 @@ inline Codec<std::pair<A, B>> pair_codec(Codec<A> a, Codec<B> b) {
                 return std::nullopt;
             }
             return std::make_pair(std::move(*a_val), std::move(*b_val));
-        }};
+        },
+        .encode_into =
+            [a, b](const std::pair<A, B>& p, typename Codec<std::pair<A, B>>::Bytes& out) {
+                encode_append_lp(a, p.first, out);  // 4-byte len prefix + first
+                encode_append(b, p.second, out);    // second (unprefixed, as in encode)
+            }};
 }
 
 // Optional codec: 1-byte presence flag, then the element's bytes when
@@ -262,68 +358,48 @@ inline Codec<std::pair<A, B>> pair_codec(Codec<A> a, Codec<B> b) {
 // codec success/failure; the inner is the user's nullability.
 template <typename T>
 inline Codec<std::optional<T>> optional_codec(Codec<T> elem) {
-    return Codec<std::optional<T>>{.encode =
-                                       [elem](const std::optional<T>& v) {
-                                           typename Codec<std::optional<T>>::Bytes out;
-                                           if (!v.has_value()) {
-                                               out.push_back(std::byte{0});
-                                               return out;
-                                           }
-                                           auto inner = elem.encode(*v);
-                                           out.reserve(1 + inner.size());
-                                           out.push_back(std::byte{1});
-                                           out.insert(out.end(), inner.begin(), inner.end());
-                                           return out;
-                                       },
-                                   .decode = [elem](typename Codec<std::optional<T>>::BytesView buf)
-                                       -> std::optional<std::optional<T>> {
-                                       if (buf.empty()) {
-                                           return std::nullopt;
-                                       }
-                                       const auto flag = static_cast<unsigned char>(buf[0]);
-                                       if (flag == 0) {
-                                           return std::optional<T>{};
-                                       }
-                                       if (flag != 1) {
-                                           return std::nullopt;
-                                       }
-                                       auto inner = elem.decode(buf.subspan(1));
-                                       if (!inner.has_value()) {
-                                           return std::nullopt;
-                                       }
-                                       return std::optional<T>{std::move(*inner)};
-                                   }};
+    return Codec<std::optional<T>>{
+        .encode =
+            [elem](const std::optional<T>& v) {
+                typename Codec<std::optional<T>>::Bytes out;
+                if (!v.has_value()) {
+                    out.push_back(std::byte{0});
+                    return out;
+                }
+                auto inner = elem.encode(*v);
+                out.reserve(1 + inner.size());
+                out.push_back(std::byte{1});
+                out.insert(out.end(), inner.begin(), inner.end());
+                return out;
+            },
+        .decode = [elem](typename Codec<std::optional<T>>::BytesView buf)
+            -> std::optional<std::optional<T>> {
+            if (buf.empty()) {
+                return std::nullopt;
+            }
+            const auto flag = static_cast<unsigned char>(buf[0]);
+            if (flag == 0) {
+                return std::optional<T>{};
+            }
+            if (flag != 1) {
+                return std::nullopt;
+            }
+            auto inner = elem.decode(buf.subspan(1));
+            if (!inner.has_value()) {
+                return std::nullopt;
+            }
+            return std::optional<T>{std::move(*inner)};
+        },
+        .encode_into =
+            [elem](const std::optional<T>& v, typename Codec<std::optional<T>>::Bytes& out) {
+                if (!v.has_value()) {
+                    out.push_back(std::byte{0});
+                    return;
+                }
+                out.push_back(std::byte{1});
+                encode_append(elem, *v, out);
+            }};
 }
-
-namespace detail {
-
-// Shared encode body for the four "container of T" codecs (set, map,
-// unordered_set, unordered_map). Mirrors vector_codec's 4-byte count
-// prefix + 4-byte length prefix per element layout, so cross-container
-// migrations are wire-compatible with vector_codec at the element list
-// level (an ordered map's wire bytes also decode as a vector<pair<K,V>>
-// would, if a user chooses to refactor a state slot from one shape to
-// the other).
-template <typename Bytes>
-inline void append_u32_le(Bytes& out, std::uint32_t v) {
-    for (int i = 0; i < 4; ++i) {
-        out.push_back(static_cast<std::byte>((v >> (i * 8)) & 0xFF));
-    }
-}
-
-template <typename BytesView>
-inline std::optional<std::uint32_t> read_u32_le(BytesView buf, std::size_t pos) {
-    if (pos + 4 > buf.size()) {
-        return std::nullopt;
-    }
-    std::uint32_t v = 0;
-    for (int i = 0; i < 4; ++i) {
-        v |= static_cast<std::uint32_t>(static_cast<unsigned char>(buf[pos + i])) << (i * 8);
-    }
-    return v;
-}
-
-}  // namespace detail
 
 // Set codec: 4-byte count, then per element a 4-byte length followed by
 // the element's bytes. Wire-identical to vector_codec; the only
@@ -370,7 +446,15 @@ inline Codec<std::set<T, Compare>> set_codec(Codec<T> elem) {
                 pos += *len;
             }
             return out;
-        }};
+        },
+        .encode_into =
+            [elem](const std::set<T, Compare>& v,
+                   typename Codec<std::set<T, Compare>>::Bytes& out) {
+                detail::append_u32_le(out, static_cast<std::uint32_t>(v.size()));
+                for (const auto& e : v) {
+                    encode_append_lp(elem, e, out);
+                }
+            }};
 }
 
 // Unordered set codec: same wire shape as `set_codec`. Iteration order
@@ -418,7 +502,15 @@ inline Codec<std::unordered_set<T, Hash, KeyEq>> unordered_set_codec(Codec<T> el
                 pos += *len;
             }
             return out;
-        }};
+        },
+        .encode_into =
+            [elem](const std::unordered_set<T, Hash, KeyEq>& v,
+                   typename Codec<std::unordered_set<T, Hash, KeyEq>>::Bytes& out) {
+                detail::append_u32_le(out, static_cast<std::uint32_t>(v.size()));
+                for (const auto& e : v) {
+                    encode_append_lp(elem, e, out);
+                }
+            }};
 }
 
 // Map codec: 4-byte count, then per entry a (4-byte K-length, K bytes,
@@ -481,7 +573,16 @@ inline Codec<std::map<K, V, Compare>> map_codec(Codec<K> kc, Codec<V> vc) {
                 pos += *vlen;
             }
             return out;
-        }};
+        },
+        .encode_into =
+            [kc, vc](const std::map<K, V, Compare>& m,
+                     typename Codec<std::map<K, V, Compare>>::Bytes& out) {
+                detail::append_u32_le(out, static_cast<std::uint32_t>(m.size()));
+                for (const auto& [k, v] : m) {
+                    encode_append_lp(kc, k, out);
+                    encode_append_lp(vc, v, out);
+                }
+            }};
 }
 
 // Unordered map codec: same wire shape as `map_codec`. Iteration order
@@ -543,7 +644,16 @@ inline Codec<std::unordered_map<K, V, Hash, KeyEq>> unordered_map_codec(Codec<K>
                 pos += *vlen;
             }
             return out;
-        }};
+        },
+        .encode_into =
+            [kc, vc](const std::unordered_map<K, V, Hash, KeyEq>& m,
+                     typename Codec<std::unordered_map<K, V, Hash, KeyEq>>::Bytes& out) {
+                detail::append_u32_le(out, static_cast<std::uint32_t>(m.size()));
+                for (const auto& [k, v] : m) {
+                    encode_append_lp(kc, k, out);
+                    encode_append_lp(vc, v, out);
+                }
+            }};
 }
 
 }  // namespace clink

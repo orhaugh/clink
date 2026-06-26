@@ -9,11 +9,13 @@
 //     buffers, never read past the end.
 //   - Composition: nested vector<pair<...>> codecs round-trip.
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -23,6 +25,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/core/codec.hpp"
+#include "clink/operators/window_state.hpp"
 
 using namespace clink;
 
@@ -34,6 +37,40 @@ T expect_round_trip(const Codec<T>& c, const T& value) {
     const auto result = c.decode(bytes);
     EXPECT_TRUE(result.has_value());
     return result.value_or(T{});
+}
+
+// Asserts the encode_into (append) path is byte-IDENTICAL to encode() and that
+// the append + reuse semantics hold. This is the safety net for the hot-path
+// zero-alloc codec change: any divergence here = silent state corruption on
+// restore (a value written via encode_into would decode wrong).
+template <typename T>
+void expect_encode_into_matches(const Codec<T>& c, const T& value) {
+    ASSERT_TRUE(static_cast<bool>(c.encode_into)) << "codec has no encode_into";
+    const auto canonical = c.encode(value);
+
+    // (1) into an empty buffer == encode().
+    std::vector<std::byte> buf;
+    c.encode_into(value, buf);
+    EXPECT_EQ(buf, canonical) << "encode_into(empty) != encode";
+
+    // (2) APPENDS to a non-empty buffer (prefix preserved, then == encode).
+    std::vector<std::byte> pref{std::byte{0xAB}, std::byte{0xCD}};
+    c.encode_into(value, pref);
+    ASSERT_EQ(pref.size(), 2 + canonical.size());
+    EXPECT_EQ(pref[0], std::byte{0xAB});
+    EXPECT_EQ(pref[1], std::byte{0xCD});
+    EXPECT_TRUE(std::equal(canonical.begin(), canonical.end(), pref.begin() + 2));
+
+    // (3) reuse: clear + encode_into twice yields the canonical bytes each time
+    //     (no stale residue), and the bytes still decode back to `value`.
+    std::vector<std::byte> reuse;
+    for (int i = 0; i < 2; ++i) {
+        reuse.clear();
+        c.encode_into(value, reuse);
+        EXPECT_EQ(reuse, canonical) << "encode_into reuse iteration " << i;
+    }
+    auto decoded = c.decode(std::span<const std::byte>{reuse.data(), reuse.size()});
+    ASSERT_TRUE(decoded.has_value());
 }
 
 }  // namespace
@@ -461,4 +498,103 @@ TEST(Codec, VectorOfOptionalStringRoundTrips) {
         std::optional<std::string>{""},
     };
     EXPECT_EQ(expect_round_trip(c, v), v);
+}
+
+// ===== encode_into (zero-alloc append path) byte-identity =====
+// Every codec's encode_into MUST produce bytes identical to encode(), append to
+// the buffer, and survive reuse - else KeyedState::put (which prefers
+// encode_into) would write state that decodes differently than the row written
+// via encode(), silently corrupting on restore.
+
+TEST(CodecEncodeInto, String) {
+    expect_encode_into_matches(string_codec(), std::string{"hello world"});
+    expect_encode_into_matches(string_codec(), std::string{});
+    std::string bin;
+    bin.push_back('\0');
+    bin.push_back('\xFF');
+    expect_encode_into_matches(string_codec(), bin);
+}
+
+TEST(CodecEncodeInto, Integers) {
+    expect_encode_into_matches(uint64_codec(), std::uint64_t{0});
+    expect_encode_into_matches(uint64_codec(), std::numeric_limits<std::uint64_t>::max());
+    expect_encode_into_matches(uint32_codec(), std::uint32_t{0xDEADBEEF});
+    expect_encode_into_matches(int64_codec(), std::int64_t{-1});
+    expect_encode_into_matches(int64_codec(), std::numeric_limits<std::int64_t>::min());
+    expect_encode_into_matches(int64_codec(), std::int64_t{1234567890});
+}
+
+TEST(CodecEncodeInto, Trivial) {
+    struct Pod {
+        std::int32_t a;
+        std::int32_t b;
+    };
+    auto c = trivial_codec<Pod>();
+    // trivial_codec is host-native memcpy; compare encode vs encode_into bytes.
+    Pod p{7, -3};
+    ASSERT_TRUE(static_cast<bool>(c.encode_into));
+    std::vector<std::byte> buf;
+    c.encode_into(p, buf);
+    EXPECT_EQ(buf, c.encode(p));
+}
+
+TEST(CodecEncodeInto, Vector) {
+    expect_encode_into_matches(vector_codec(int64_codec()),
+                               std::vector<std::int64_t>{1, -2, 3, 0, 999});
+    expect_encode_into_matches(vector_codec(int64_codec()), std::vector<std::int64_t>{});
+    expect_encode_into_matches(vector_codec(string_codec()),
+                               std::vector<std::string>{"a", "", "longer-element", "z"});
+}
+
+TEST(CodecEncodeInto, Pair) {
+    // The bench's keyed-state key shape.
+    expect_encode_into_matches(pair_codec(int64_codec(), int64_codec()),
+                               std::pair<std::int64_t, std::int64_t>{42, -7});
+    expect_encode_into_matches(pair_codec(string_codec(), int64_codec()),
+                               std::pair<std::string, std::int64_t>{"key", 99});
+}
+
+TEST(CodecEncodeInto, Optional) {
+    expect_encode_into_matches(optional_codec(int64_codec()), std::optional<std::int64_t>{55});
+    expect_encode_into_matches(optional_codec(int64_codec()), std::optional<std::int64_t>{});
+    expect_encode_into_matches(optional_codec(string_codec()),
+                               std::optional<std::string>{"present"});
+}
+
+TEST(CodecEncodeInto, SetsAndMaps) {
+    expect_encode_into_matches(set_codec(int64_codec()), std::set<std::int64_t>{3, 1, 2});
+    expect_encode_into_matches(unordered_set_codec(int64_codec()),
+                               std::unordered_set<std::int64_t>{7});
+    expect_encode_into_matches(map_codec(int64_codec(), string_codec()),
+                               std::map<std::int64_t, std::string>{{1, "one"}, {2, "two"}});
+    expect_encode_into_matches(unordered_map_codec(int64_codec(), string_codec()),
+                               std::unordered_map<std::int64_t, std::string>{{9, "nine"}});
+}
+
+TEST(CodecEncodeInto, Nested) {
+    // Composition through encode_into: vector<pair<int64,string>>.
+    expect_encode_into_matches(
+        vector_codec(pair_codec(int64_codec(), string_codec())),
+        std::vector<std::pair<std::int64_t, std::string>>{{1, "a"}, {2, "bb"}, {3, ""}});
+    expect_encode_into_matches(optional_codec(vector_codec(int64_codec())),
+                               std::optional<std::vector<std::int64_t>>{{1, 2, 3}});
+}
+
+TEST(CodecEncodeInto, WindowEntry) {
+    // The bench's keyed-state VALUE shape: window_entry_codec over an agg codec
+    // that itself has encode_into (int64) - exercises composite append.
+    auto c = window_entry_codec<std::int64_t>(int64_codec());
+    WindowEntry<std::int64_t> we;
+    we.agg = 123456;
+    we.fired = true;
+    we.next_pane_index = 9;
+    expect_encode_into_matches(c, we);
+
+    auto sr_codec = session_row_codec<std::int64_t>(int64_codec());
+    SessionRow<std::int64_t> sr;
+    sr.start = 100;
+    sr.end = 200;
+    sr.fired = false;
+    sr.agg = -42;
+    expect_encode_into_matches(sr_codec, sr);
 }
