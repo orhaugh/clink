@@ -125,8 +125,11 @@ run_clink() {  # query
     local jid; jid=$(../../build/clink_submit_sql --file "$DATA_DIR/$q-clink.sql" \
         --jm-host 127.0.0.1 --jm-port "$CLINK_JM_HTTP" --name "ts_$q" --parallelism "$PAR" 2>/dev/null | extract_job_id)
     [ -z "$jid" ] && { echo "  clink submit failed"; return 1; }
+    # Generous quiet-timeout/max-runtime (like the Flink side) so a momentary
+    # metric-refresh plateau does not trip an early "drained" before the full
+    # input is consumed - otherwise the run is INCOMPLETE and not comparable.
     local s; s=$("$PY" "$ROOT/driver/sample_rate.py" clink --base "http://127.0.0.1:$CLINK_JM_HTTP" \
-        --job "$jid" --target "$BIDS" --interval 0.08 --window 0.5)
+        --job "$jid" --target "$BIDS" --interval 0.08 --window 0.5 --quiet-timeout 20 --max-runtime 300)
     local cpu_post wall_post; cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-flink $CLINK_CTRS); wall_post=$(now_s)
     local off=-1; [ "$SINK" = "kafka" ] && off=$(wait_stable_offset "$out")
     echo "$s" | python3 -c "import json,sys
