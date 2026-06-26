@@ -104,6 +104,49 @@ TEST(SqlPhysical, KafkaConnectorMapsToKafkaFactories) {
     EXPECT_EQ(src->params.at("bootstrap"), "localhost:9092");
 }
 
+// Wave 2 inc1: a kafka json table with columnar_decode='true' swaps the
+// row-form JSON bridge for the columnar one, and the columnar bridge must
+// carry the declared schema so it can build typed Arrow columns.
+TEST(SqlPhysical, KafkaColumnarDecodeOptionEmitsColumnarBridgeWithSchema) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE k_in (a BIGINT, b DOUBLE, c VARCHAR) "
+        "WITH (connector='kafka', format='json', topic='t', bootstrap='localhost:9092', "
+        "columnar_decode='true');"
+        "CREATE TABLE f_out (a BIGINT, b DOUBLE, c VARCHAR) "
+        "WITH (connector='file', format='json', path='/tmp/o.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO f_out SELECT a, b, c FROM k_in");
+
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+
+    const auto* bridge = find_op(spec, "json_string_to_row_columnar");
+    ASSERT_NE(bridge, nullptr);
+    EXPECT_EQ(find_op(spec, "json_string_to_row"), nullptr);
+    ASSERT_EQ(bridge->params.count("schema_columns"), 1u);
+    EXPECT_FALSE(bridge->params.at("schema_columns").empty());
+}
+
+// Without the option, the kafka json table keeps the plain row-form bridge.
+TEST(SqlPhysical, KafkaJsonDefaultUsesRowFormBridge) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE k_in (a BIGINT, b DOUBLE, c VARCHAR) "
+        "WITH (connector='kafka', format='json', topic='t', bootstrap='localhost:9092');"
+        "CREATE TABLE f_out (a BIGINT, b DOUBLE, c VARCHAR) "
+        "WITH (connector='file', format='json', path='/tmp/o.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO f_out SELECT a, b, c FROM k_in");
+
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);
+    EXPECT_EQ(find_op(spec, "json_string_to_row_columnar"), nullptr);
+}
+
 TEST(SqlPhysical, JsonRoundTripPreservesSpec) {
     Catalog cat;
     register_text(cat, "src_t", "file", "/tmp/a");

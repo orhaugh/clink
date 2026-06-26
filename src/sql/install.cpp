@@ -40,6 +40,7 @@
 #include "clink/runtime/async_execution_controller.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/async_function_registry.hpp"
+#include "clink/sql/json_string_to_row_columnar.hpp"
 #include "clink/sql/ptf_registry.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
@@ -5664,6 +5665,21 @@ void install(clink::plugin::PluginRegistry& reg) {
                     return decoded.value_or(Row{});
                 },
                 "json_string_to_row");
+        });
+
+    // json_string_to_row_columnar: Wave 2 increment 1. Same decode as
+    // json_string_to_row, but attaches a typed Arrow sidecar (built from the
+    // schema_columns param) so the columnar fast paths fire on the Kafka path
+    // instead of staying dormant. Emits a columnar batch only when every record
+    // round-trips exactly; otherwise falls back to the row-form decode, so it
+    // is byte-equivalent to json_string_to_row in every case. The SQL planner
+    // emits this in place of json_string_to_row when a kafka table sets the
+    // columnar_decode WITH-option.
+    reg.register_operator<std::string, Row>(
+        "json_string_to_row_columnar",
+        [](const BuildContext& ctx) -> std::shared_ptr<Operator<std::string, Row>> {
+            return std::make_shared<JsonStringToRowColumnarOperator>(
+                parse_row_schema(ctx.param_or("schema_columns")));
         });
 
     // row_to_json_string: bridge from the Row channel back to the

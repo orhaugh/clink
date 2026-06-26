@@ -150,7 +150,15 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         return RowConnectorBinding{"file_json_source", kChannelRow, {}};
     }
     if (connector == "kafka") {
-        return RowConnectorBinding{"kafka_source_string", kChannelString, "json_string_to_row"};
+        // Wave 2 inc1: an opt-in WITH-option swaps the row-form JSON bridge for
+        // the columnar one, which attaches an Arrow sidecar so the downstream
+        // columnar fast paths fire on the Kafka path. Default stays row-form.
+        const auto it = table.properties.find("columnar_decode");
+        const bool columnar =
+            it != table.properties.end() && (it->second == "true" || it->second == "1");
+        return RowConnectorBinding{"kafka_source_string",
+                                   kChannelString,
+                                   columnar ? "json_string_to_row_columnar" : "json_string_to_row"};
     }
     if (connector == "parquet") {
         // Typed-columnar Parquet: each declared column is its own Arrow
@@ -369,6 +377,11 @@ std::string compile_node(const LogicalPlan& node,
                 bridge.type = binding.bridge_op;
                 bridge.inputs = {src_id};
                 bridge.out_channel = std::string{kChannelRow};
+                // The columnar JSON bridge builds its Arrow sidecar from the
+                // declared column schema; the plain row bridge ignores it.
+                if (binding.bridge_op == "json_string_to_row_columnar") {
+                    bridge.params["schema_columns"] = serialize_row_schema(row_columns_of(table));
+                }
                 after_src = bridge.id;
                 spec.ops.push_back(std::move(bridge));
             }
