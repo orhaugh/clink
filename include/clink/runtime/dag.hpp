@@ -107,6 +107,19 @@ struct OperatorRunner {
 // without the runner needing to name them.
 template <class OpPtr, class Elem, class Em>
 inline bool try_process_columnar(const OpPtr& op, const Elem& element, Em& out) {
+    // Diagnostic / benchmark lever: CLINK_DISABLE_COLUMNAR=1 forces the row path
+    // (op->process()) even when a columnar fast path is available, so an A/B can
+    // isolate the columnar-execution win on byte-identical input. Read once and
+    // cached; the branch is free when unset. Not a production tuning knob - it
+    // only ever makes the engine slower (no correctness effect: process() is the
+    // authoritative path the columnar fast path must already match).
+    static const bool columnar_disabled = [] {
+        const char* e = std::getenv("CLINK_DISABLE_COLUMNAR");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (columnar_disabled) {
+        return false;
+    }
     return op->supports_columnar() && element.is_data() && element.as_data().is_columnar() &&
            op->process_columnar(element, out);
 }

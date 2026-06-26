@@ -52,6 +52,16 @@ if(TARGET clink::sql)
     add_executable(nexmark_dump nexmark_compare/nexmark_dump.cpp)
     target_link_libraries(nexmark_dump PRIVATE clink::sql)
     clink_set_warnings(nexmark_dump)
+
+    # Columnar windowed-GROUP-BY benchmark - isolates the columnar-execution wave
+    # (WS3 within-batch group-by + WS4 open-addressing state map) on a Parquet
+    # (columnar-native) source that actually fires WindowRowOp::process_columnar,
+    # which the JSON-sourced Nexmark harness does not. A/B via CLINK_DISABLE_COLUMNAR
+    # (env) and -DCLINK_USE_FLAT_HASH_MAP (build); self-validating via the
+    # batch_materialize_counter zero-decode proof.
+    add_executable(clink_columnar_groupby_bench clink_columnar_groupby_bench.cpp)
+    target_link_libraries(clink_columnar_groupby_bench PRIVATE clink::sql)
+    clink_set_warnings(clink_columnar_groupby_bench)
 endif()
 
 # flink_compare/clink-job: CLINK_REGISTER_JOB .so for the
