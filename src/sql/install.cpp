@@ -353,20 +353,26 @@ inline AggState decode_agg_state(Reader& r) {
 inline clink::Codec<AggBucket> agg_bucket_codec() {
     using Bytes = clink::Codec<AggBucket>::Bytes;
     using BytesView = clink::Codec<AggBucket>::BytesView;
+    // Single append-body shared by encode (wrap) and encode_into (direct), so
+    // the zero-alloc keyed-state path is byte-identical to encode by
+    // construction. encode_into appends to the caller-cleared scratch buffer.
+    auto body = [](const AggBucket& b, Bytes& o) {
+        clink::config::JsonValue gv{clink::config::JsonObject{b.group_values.values}};
+        agg_codec_detail::put_str(o, gv.serialize(0));
+        agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(b.agg_states.size()));
+        for (const auto& s : b.agg_states)
+            agg_codec_detail::encode_agg_state(o, s);
+        // prior_emitted (changelog path only): a flag + the bare row JSON.
+        agg_codec_detail::put_u32(o, b.prior_emitted.has_value() ? 1u : 0u);
+        if (b.prior_emitted.has_value()) {
+            clink::config::JsonValue pe{clink::config::JsonObject{b.prior_emitted->values}};
+            agg_codec_detail::put_str(o, pe.serialize(0));
+        }
+    };
     return clink::Codec<AggBucket>{
-        .encode = [](const AggBucket& b) -> Bytes {
+        .encode = [body](const AggBucket& b) -> Bytes {
             Bytes o;
-            clink::config::JsonValue gv{clink::config::JsonObject{b.group_values.values}};
-            agg_codec_detail::put_str(o, gv.serialize(0));
-            agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(b.agg_states.size()));
-            for (const auto& s : b.agg_states)
-                agg_codec_detail::encode_agg_state(o, s);
-            // prior_emitted (changelog path only): a flag + the bare row JSON.
-            agg_codec_detail::put_u32(o, b.prior_emitted.has_value() ? 1u : 0u);
-            if (b.prior_emitted.has_value()) {
-                clink::config::JsonValue pe{clink::config::JsonObject{b.prior_emitted->values}};
-                agg_codec_detail::put_str(o, pe.serialize(0));
-            }
+            body(b, o);
             return o;
         },
         .decode = [](BytesView buf) -> std::optional<AggBucket> {
@@ -404,7 +410,7 @@ inline clink::Codec<AggBucket> agg_bucket_codec() {
             }
             return b;
         },
-        .encode_into = {},
+        .encode_into = body,
     };
 }
 
@@ -1169,14 +1175,19 @@ inline clink::Codec<std::map<std::int64_t, WindowBucket>> window_map_codec() {
     using Map = std::map<std::int64_t, WindowBucket>;
     using Bytes = clink::Codec<Map>::Bytes;
     using BytesView = clink::Codec<Map>::BytesView;
+    // Single append-body shared by encode (wrap) and encode_into (direct) - the
+    // zero-alloc keyed-state path is byte-identical to encode by construction.
+    auto body = [](const Map& m, Bytes& o) {
+        agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(m.size()));
+        for (const auto& [win_end, b] : m) {
+            agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(win_end));
+            window_codec_detail::encode_bucket(o, b);
+        }
+    };
     return clink::Codec<Map>{
-        .encode = [](const Map& m) -> Bytes {
+        .encode = [body](const Map& m) -> Bytes {
             Bytes o;
-            agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(m.size()));
-            for (const auto& [win_end, b] : m) {
-                agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(win_end));
-                window_codec_detail::encode_bucket(o, b);
-            }
+            body(m, o);
             return o;
         },
         .decode = [](BytesView buf) -> std::optional<Map> {
@@ -1195,7 +1206,7 @@ inline clink::Codec<std::map<std::int64_t, WindowBucket>> window_map_codec() {
             }
             return m;
         },
-        .encode_into = {},
+        .encode_into = body,
     };
 }
 
@@ -3558,21 +3569,26 @@ private:
     static clink::Codec<std::vector<Entry>> entry_list_codec() {
         using Bytes = clink::Codec<std::vector<Entry>>::Bytes;
         using BytesView = clink::Codec<std::vector<Entry>>::BytesView;
+        // Shared append-body: encode (wrap) and encode_into (direct) serialise
+        // the same JSON array; encode_into appends to the caller-cleared buffer,
+        // avoiding the per-put Bytes allocation. Byte-identical by construction.
+        auto body = [](const std::vector<Entry>& es, Bytes& out) {
+            clink::config::JsonArray arr;
+            arr.reserve(es.size());
+            for (const auto& e : es) {
+                clink::config::JsonObject o;
+                o["r"] = clink::config::JsonValue{clink::config::JsonObject{e.row.values}};
+                o["n"] = clink::config::JsonValue{e.null_emitted};
+                arr.emplace_back(std::move(o));
+            }
+            const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
+            const auto* p = reinterpret_cast<const std::byte*>(s.data());
+            out.insert(out.end(), p, p + s.size());
+        };
         return clink::Codec<std::vector<Entry>>{
-            .encode = [](const std::vector<Entry>& es) -> Bytes {
-                clink::config::JsonArray arr;
-                arr.reserve(es.size());
-                for (const auto& e : es) {
-                    clink::config::JsonObject o;
-                    o["r"] = clink::config::JsonValue{clink::config::JsonObject{e.row.values}};
-                    o["n"] = clink::config::JsonValue{e.null_emitted};
-                    arr.emplace_back(std::move(o));
-                }
-                const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
-                Bytes out(s.size());
-                if (!s.empty()) {
-                    std::memcpy(out.data(), s.data(), s.size());
-                }
+            .encode = [body](const std::vector<Entry>& es) -> Bytes {
+                Bytes out;
+                body(es, out);
                 return out;
             },
             .decode = [](BytesView b) -> std::optional<std::vector<Entry>> {
@@ -3603,7 +3619,7 @@ private:
                     return std::nullopt;
                 }
             },
-            .encode_into = {},
+            .encode_into = body,
         };
     }
 

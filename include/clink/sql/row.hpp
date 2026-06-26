@@ -72,14 +72,19 @@ struct Row {
 inline clink::Codec<Row> row_json_codec() {
     using Bytes = clink::Codec<Row>::Bytes;
     using BytesView = clink::Codec<Row>::BytesView;
+    // Shared append-body: encode (wrap) and encode_into (direct) serialise the
+    // same JSON object; encode_into appends to the caller-cleared buffer,
+    // avoiding the per-put Bytes allocation. Byte-identical by construction.
+    auto body = [](const Row& r, Bytes& out) {
+        clink::config::JsonValue v{clink::config::JsonObject{r.values}};
+        std::string s = v.serialize(0);
+        const auto* p = reinterpret_cast<const std::byte*>(s.data());
+        out.insert(out.end(), p, p + s.size());
+    };
     return clink::Codec<Row>{
-        .encode = [](const Row& r) -> Bytes {
-            clink::config::JsonValue v{clink::config::JsonObject{r.values}};
-            std::string s = v.serialize(0);
-            Bytes out(s.size());
-            if (!s.empty()) {
-                std::memcpy(out.data(), s.data(), s.size());
-            }
+        .encode = [body](const Row& r) -> Bytes {
+            Bytes out;
+            body(r, out);
             return out;
         },
         .decode = [](BytesView b) -> std::optional<Row> {
@@ -95,7 +100,7 @@ inline clink::Codec<Row> row_json_codec() {
                 return std::nullopt;
             }
         },
-        .encode_into = {},
+        .encode_into = body,
     };
 }
 
@@ -106,18 +111,22 @@ inline clink::Codec<Row> row_json_codec() {
 inline clink::Codec<std::vector<Row>> row_list_json_codec() {
     using Bytes = clink::Codec<std::vector<Row>>::Bytes;
     using BytesView = clink::Codec<std::vector<Row>>::BytesView;
+    // Shared append-body (see row_json_codec): encode wraps, encode_into appends
+    // to the caller-cleared buffer. Byte-identical by construction.
+    auto body = [](const std::vector<Row>& rows, Bytes& out) {
+        clink::config::JsonArray arr;
+        arr.reserve(rows.size());
+        for (const auto& r : rows) {
+            arr.emplace_back(clink::config::JsonObject{r.values});
+        }
+        const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
+        const auto* p = reinterpret_cast<const std::byte*>(s.data());
+        out.insert(out.end(), p, p + s.size());
+    };
     return clink::Codec<std::vector<Row>>{
-        .encode = [](const std::vector<Row>& rows) -> Bytes {
-            clink::config::JsonArray arr;
-            arr.reserve(rows.size());
-            for (const auto& r : rows) {
-                arr.emplace_back(clink::config::JsonObject{r.values});
-            }
-            const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
-            Bytes out(s.size());
-            if (!s.empty()) {
-                std::memcpy(out.data(), s.data(), s.size());
-            }
+        .encode = [body](const std::vector<Row>& rows) -> Bytes {
+            Bytes out;
+            body(rows, out);
             return out;
         },
         .decode = [](BytesView b) -> std::optional<std::vector<Row>> {
@@ -142,7 +151,7 @@ inline clink::Codec<std::vector<Row>> row_list_json_codec() {
                 return std::nullopt;
             }
         },
-        .encode_into = {},
+        .encode_into = body,
     };
 }
 

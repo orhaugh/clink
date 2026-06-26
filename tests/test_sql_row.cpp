@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <vector>
+
 #include <gtest/gtest.h>
 
 #include "clink/sql/row.hpp"
@@ -50,6 +53,42 @@ TEST(SqlRow, RowListJsonCodecRoundTrips) {
     auto empty = codec.decode({empty_bytes.data(), empty_bytes.size()});
     ASSERT_TRUE(empty.has_value());
     EXPECT_TRUE(empty->empty());
+}
+
+// The Row codecs now populate encode_into (the zero-alloc keyed-state path).
+// It MUST append bytes byte-identical to encode() to a caller-cleared buffer -
+// a divergence would silently corrupt SQL keyed state on restore. (Both share
+// one body, so this is byte-identical by construction; the test guards the
+// append contract against a future refactor.)
+TEST(SqlRow, RowCodecsEncodeIntoMatchesEncodeAndAppends) {
+    Row r;
+    r.values["user_id"] = clink::config::JsonValue{static_cast<std::int64_t>(42)};
+    r.values["url"] = clink::config::JsonValue{std::string{"http://x"}};
+    r.values["active"] = clink::config::JsonValue{true};
+
+    auto check = [](const auto& codec, const auto& value) {
+        ASSERT_TRUE(static_cast<bool>(codec.encode_into)) << "encode_into not populated";
+        const auto canonical = codec.encode(value);
+        // (1) into empty buffer == encode().
+        std::vector<std::byte> buf;
+        codec.encode_into(value, buf);
+        EXPECT_EQ(buf, canonical);
+        // (2) APPENDS to a non-empty buffer.
+        std::vector<std::byte> pref{std::byte{0xAB}};
+        codec.encode_into(value, pref);
+        ASSERT_EQ(pref.size(), 1 + canonical.size());
+        EXPECT_EQ(pref[0], std::byte{0xAB});
+        EXPECT_TRUE(std::equal(canonical.begin(), canonical.end(), pref.begin() + 1));
+        // (3) reuse + still decodes back.
+        buf.clear();
+        codec.encode_into(value, buf);
+        EXPECT_EQ(buf, canonical);
+        EXPECT_TRUE(codec.decode({buf.data(), buf.size()}).has_value());
+    };
+
+    check(row_json_codec(), r);
+    std::vector<Row> rows = {r, r};
+    check(row_list_json_codec(), rows);
 }
 
 TEST(SqlRow, GetStringStringifiesNumbersAndBools) {
