@@ -907,6 +907,15 @@ struct VecAggCol {
 // MIN/MAX, string_agg, array_agg, percentile, distinct, udaf -> false (row path).
 inline bool aggs_vectorisable(const std::vector<AggSpec>& aggs, const arrow::RecordBatch& rb) {
     for (const auto& a : aggs) {
+        // DISTINCT and UDAF are never column-foldable (the kernel drives only the
+        // scalar accumulators, not value_counts / the udaf accumulator), matching
+        // is_batch_foldable's first check. Critical for the WINDOW path, which
+        // gates ONLY on this (the GROUP BY path is also gated on
+        // batch_fold_eligible_): without this, a windowed COUNT(DISTINCT) would
+        // fold via running_count and finalize to 0.
+        if (a.distinct || a.is_udaf) {
+            return false;
+        }
         if (a.fn == "count") {
             continue;
         }
@@ -5423,9 +5432,27 @@ void install(clink::plugin::PluginRegistry& reg) {
                     }
                     const auto type = rb.schema()->field(idx)->type();
                     const auto& arr = *rb.column(idx);
+                    // Precedence MUST match process(): a record's own inline
+                    // event_time (the sidecar "event_time" column 0, what
+                    // materialize sets) wins; the declared event_time_column is
+                    // only the fallback when the inline value is unset. Otherwise
+                    // a batch whose column-0 sidecar is populated AND differs from
+                    // the named column would watermark differently on the two
+                    // paths (the row path's all-timestamped fast path reads the
+                    // inline value). Column 0 is the int64 arrow_event_time_field.
+                    const arrow::Int64Array* et0 =
+                        rb.num_columns() > 0
+                            ? dynamic_cast<const arrow::Int64Array*>(rb.column(0).get())
+                            : nullptr;
                     const std::int64_t n = rb.num_rows();
                     out.resize(static_cast<std::size_t>(n));
                     for (std::int64_t i = 0; i < n; ++i) {
+                        if (et0 != nullptr) {
+                            if (auto et = clink::detail::read_event_time(*et0, i); et.has_value()) {
+                                out[static_cast<std::size_t>(i)] = *et;  // inline event_time wins
+                                continue;
+                            }
+                        }
                         const auto v = row_columnar_detail::read_cell(type, arr, i);
                         if (v.is_number()) {
                             out[static_cast<std::size_t>(i)] =

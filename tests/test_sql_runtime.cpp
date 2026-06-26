@@ -8606,6 +8606,84 @@ TEST(SqlRuntime, ColumnarParquetHopWindowVectorised) {
         std::filesystem::remove(p);
 }
 
+// WS6 regression guard: a windowed COUNT(DISTINCT) over a columnar source must
+// fall back to the row path (DISTINCT is not column-foldable) and return the true
+// per-window distinct cardinality - NOT 0. Guards aggs_vectorisable rejecting
+// DISTINCT: the window op gates its vectorised fold ONLY on aggs_vectorisable, so
+// without the guard COUNT(DISTINCT) would fold via running_count and finalize to 0.
+TEST(SqlRuntime, ColumnarParquetWindowedCountDistinctRowFallback) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_wcd_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_wcd.parquet";
+    const auto out_path = tmp / "clink_sql_wcd_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    // user 1, window [0,1000): bidders {5,5,7} -> distinct 2.
+    //         window [1000,2000): bidders {9,9} -> distinct 1.
+    write_lines(in_path,
+                {
+                    R"({"user_id":1,"ts":100,"bidder":5})",
+                    R"({"user_id":1,"ts":200,"bidder":5})",
+                    R"({"user_id":1,"ts":300,"bidder":7})",
+                    R"({"user_id":1,"ts":1100,"bidder":9})",
+                    R"({"user_id":1,"ts":1200,"bidder":9})",
+                });
+    const std::string cols = "(user_id BIGINT, ts BIGINT, bidder BIGINT)";
+
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts, bidder FROM ev");
+        InProcessCluster cluster("tm-wcd-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE pq_in "} + cols +
+                         " WITH (connector='parquet', path='" + pq_path.string() +
+                         "', event_time_column='ts');"
+                         "CREATE TABLE per_window (user_id BIGINT, d BIGINT) "
+                         "WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat,
+                            "INSERT INTO per_window SELECT user_id, COUNT(DISTINCT bidder) AS d "
+                            "FROM pq_in GROUP BY TUMBLE(ts, 1000), user_id");
+        InProcessCluster cluster("tm-wcd-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    std::multiset<std::int64_t> got;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        got.insert(static_cast<std::int64_t>(js.at("d").as_number()));
+    }
+    const std::multiset<std::int64_t> want{2, 1};  // would be {0,0} if DISTINCT slipped through
+    EXPECT_EQ(got, want);
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // WS3 within-batch group-by on the SESSION window: a columnar Parquet source
 // feeds a SESSION window, so each group's events fold into its session map
 // behind ONE state_ probe (SessionWindowRowOp::process_columnar). Session merges
