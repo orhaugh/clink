@@ -872,6 +872,180 @@ clink::config::JsonValue finalize_agg(const AggState& st, const AggSpec& spec) {
     return clink::config::JsonValue{nullptr};
 }
 
+// --- WS6 columnar aggregate kernel (shared by GROUP BY + window ops) ---------
+// One aggregate's input column resolved to its typed Arrow array(s) once per
+// batch. value() reads a numeric cell as a double, matching read_cell's widening
+// (int32->int64, float->double) and the row path's double accumulation. The
+// decimal path is handled separately in vectorised_fold_slice (exact Decimal128).
+struct VecAggCol {
+    const arrow::Array* base = nullptr;
+    const arrow::Int64Array* i64 = nullptr;
+    const arrow::Int32Array* i32 = nullptr;
+    const arrow::DoubleArray* f64 = nullptr;
+    const arrow::FloatArray* f32 = nullptr;
+    const arrow::Decimal128Array* dec = nullptr;
+    int dec_scale = 0;
+    double value(std::int64_t i) const {
+        if (i64 != nullptr) {
+            return static_cast<double>(i64->Value(i));
+        }
+        if (i32 != nullptr) {
+            return static_cast<double>(i32->Value(i));
+        }
+        if (f64 != nullptr) {
+            return f64->Value(i);
+        }
+        if (f32 != nullptr) {
+            return static_cast<double>(f32->Value(i));
+        }
+        return 0.0;  // unreachable: aggs_vectorisable validated the type
+    }
+};
+
+// True iff EVERY aggregate folds column-at-a-time for this batch's column types:
+// COUNT (any input), SUM/AVG/variance over int64/int32/double/float/decimal128.
+// MIN/MAX, string_agg, array_agg, percentile, distinct, udaf -> false (row path).
+inline bool aggs_vectorisable(const std::vector<AggSpec>& aggs, const arrow::RecordBatch& rb) {
+    for (const auto& a : aggs) {
+        if (a.fn == "count") {
+            continue;
+        }
+        if (a.fn == "sum" || a.fn == "avg" || is_variance_fn(a.fn)) {
+            if (a.input_column.empty()) {
+                return false;
+            }
+            const int idx = rb.schema()->GetFieldIndex(a.input_column);
+            if (idx < 0) {
+                return false;
+            }
+            const auto id = rb.schema()->field(idx)->type()->id();
+            if (id != arrow::Type::INT64 && id != arrow::Type::INT32 && id != arrow::Type::DOUBLE &&
+                id != arrow::Type::FLOAT && id != arrow::Type::DECIMAL128) {
+                return false;
+            }
+            continue;
+        }
+        return false;  // min/max (retractable), string_agg, array_agg, percentile, udaf
+    }
+    return true;
+}
+
+// Resolve each aggregate's input column to typed Arrow arrays once per batch.
+inline std::vector<VecAggCol> resolve_vec_agg_cols(const std::vector<AggSpec>& aggs,
+                                                   const arrow::RecordBatch& rb) {
+    std::vector<VecAggCol> cols(aggs.size());
+    for (std::size_t ai = 0; ai < aggs.size(); ++ai) {
+        if (aggs[ai].input_column.empty()) {
+            continue;  // COUNT(*)
+        }
+        const int idx = rb.schema()->GetFieldIndex(aggs[ai].input_column);
+        if (idx < 0) {
+            continue;
+        }
+        VecAggCol& c = cols[ai];
+        c.base = rb.column(idx).get();
+        c.i64 = dynamic_cast<const arrow::Int64Array*>(c.base);
+        c.i32 = dynamic_cast<const arrow::Int32Array*>(c.base);
+        c.f64 = dynamic_cast<const arrow::DoubleArray*>(c.base);
+        c.f32 = dynamic_cast<const arrow::FloatArray*>(c.base);
+        c.dec = dynamic_cast<const arrow::Decimal128Array*>(c.base);
+        if (c.dec != nullptr) {
+            c.dec_scale = static_cast<const arrow::Decimal128Type&>(*c.base->type()).scale();
+        }
+    }
+    return cols;
+}
+
+// Fold the records at `idxs` into `states` (one AggState per aggregate)
+// column-at-a-time, byte-identical to update_agg over the vectorisable set:
+// COUNT(*) = slice size, COUNT(col) = non-null count, SUM/AVG/variance skip nulls
+// and accumulate the double (and, for decimal SUM/AVG, the exact running_sum_dec).
+inline void vectorised_fold_slice(const std::vector<AggSpec>& aggs,
+                                  const std::vector<VecAggCol>& cols,
+                                  const std::vector<std::int64_t>& idxs,
+                                  std::vector<AggState>& states) {
+    for (std::size_t ai = 0; ai < aggs.size(); ++ai) {
+        const auto& a = aggs[ai];
+        AggState& st = states[ai];
+        const VecAggCol& ac = cols[ai];
+        if (a.fn == "count" && a.input_column.empty()) {
+            st.running_count += static_cast<std::int64_t>(idxs.size());
+        } else if (a.fn == "count") {
+            for (const std::int64_t i : idxs) {
+                if (ac.base != nullptr && !ac.base->IsNull(i)) {
+                    ++st.running_count;
+                }
+            }
+        } else if (ac.dec != nullptr) {
+            const bool variance = is_variance_fn(a.fn);
+            for (const std::int64_t i : idxs) {
+                if (ac.dec->IsNull(i)) {
+                    continue;
+                }
+                const clink::config::Decimal dv{arrow::Decimal128(ac.dec->GetValue(i)),
+                                                ac.dec_scale};
+                const double d = clink::config::dec_to_double(dv);
+                if (variance) {
+                    st.running_sum += d;
+                    st.running_sum_sq += d * d;
+                } else {
+                    if (!st.sum_dec_started) {
+                        st.running_sum_dec = dv;
+                        st.sum_dec_started = true;
+                    } else if (auto s = clink::config::dec_add(st.running_sum_dec, dv)) {
+                        st.running_sum_dec = *s;
+                    } else {
+                        st.sum_dec_complete = false;
+                    }
+                    st.sum_saw_decimal = true;
+                    st.running_sum += d;
+                }
+                ++st.running_count;
+            }
+        } else {
+            const bool variance = is_variance_fn(a.fn);
+            if (ac.base != nullptr) {
+                for (const std::int64_t i : idxs) {
+                    if (!ac.base->IsNull(i)) {
+                        const double d = ac.value(i);
+                        st.running_sum += d;
+                        if (variance) {
+                            st.running_sum_sq += d * d;
+                        }
+                        ++st.running_count;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A group-key column resolved to (index, type) for columnar key building.
+using KeyCol = std::pair<int, std::shared_ptr<arrow::DataType>>;
+
+// Build the group key directly from the key columns' Arrow cells, byte-for-byte
+// identical to group_key_(a row read via read_cell): the SAME read_cell, the SAME
+// serialize(0) join on '\x1f', null keys contributing the empty string. Shared by
+// the GROUP BY and window vectorised folds (their group_key_ are character-identical).
+inline std::string columnar_group_key(const arrow::RecordBatch& rb,
+                                      const std::vector<KeyCol>& key_cols,
+                                      std::int64_t i) {
+    std::string key;
+    for (std::size_t k = 0; k < key_cols.size(); ++k) {
+        if (k > 0) {
+            key += '\x1f';
+        }
+        const int idx = key_cols[k].first;
+        if (idx >= 0) {
+            const auto& arr = *rb.column(idx);
+            if (!arr.IsNull(i)) {
+                key += row_columnar_detail::read_cell(key_cols[k].second, arr, i).serialize(0);
+            }
+        }
+    }
+    return key;
+}
+
 // Per-record state for one (group_key, window) bucket.
 struct WindowBucket {
     std::vector<AggState> agg_states;
@@ -2454,63 +2628,7 @@ public:
     // string aggregates all return false and take the row path, which is already
     // correct. batch_fold_eligible_ has already excluded distinct/udaf/retractable.
     bool batch_vectorisable_(const arrow::RecordBatch& rb) const {
-        for (const auto& a : aggregates_) {
-            if (a.fn == "count") {
-                continue;  // COUNT(*) or COUNT(col): a pure null-count, any type
-            }
-            if (a.fn == "sum" || a.fn == "avg" || is_variance_fn(a.fn)) {
-                if (a.input_column.empty()) {
-                    return false;
-                }
-                const int idx = rb.schema()->GetFieldIndex(a.input_column);
-                if (idx < 0) {
-                    return false;
-                }
-                const auto id = rb.schema()->field(idx)->type()->id();
-                // int64/int32/double/float fold byte-identically through double
-                // (as_decimal is exact-or-fails: an integral value -> exact decimal
-                // whose dec_to_double is the value, a non-integral double -> the raw
-                // double, so running_sum += (double)Value(i) matches the row path).
-                // DECIMAL128 folds through a dedicated exact path (increment 3):
-                // reads the Decimal128 directly and reproduces update_agg's exact
-                // running_sum_dec accumulation, no dec-string round-trip.
-                if (id != arrow::Type::INT64 && id != arrow::Type::INT32 &&
-                    id != arrow::Type::DOUBLE && id != arrow::Type::FLOAT &&
-                    id != arrow::Type::DECIMAL128) {
-                    return false;
-                }
-                continue;
-            }
-            // MIN/MAX are excluded here because the aggregate_row factory marks
-            // every aggregate retractable (a GROUP BY input may be a changelog), so
-            // is_batch_foldable already rejects them - they never reach a batch
-            // fold. string_agg/array_agg/percentile/distinct/udaf likewise.
-            return false;
-        }
-        return true;
-    }
-
-    // Build the group key directly from the key columns' Arrow cells, byte-for-byte
-    // identical to group_key_(read_row(i)): the SAME read_cell, the SAME
-    // serialize(0) join on '\x1f', null keys contributing the empty string.
-    std::string columnar_group_key_(
-        const arrow::RecordBatch& rb,
-        const std::vector<std::pair<int, std::shared_ptr<arrow::DataType>>>& key_cols,
-        std::int64_t i) const {
-        std::string key;
-        for (std::size_t k = 0; k < key_cols.size(); ++k) {
-            if (k > 0) {
-                key += '\x1f';
-            }
-            const int idx = key_cols[k].first;
-            if (idx >= 0) {
-                const auto& arr = *rb.column(idx);
-                if (!arr.IsNull(i)) {
-                    key += row_columnar_detail::read_cell(key_cols[k].second, arr, i).serialize(0);
-                }
-            }
-        }
-        return key;
+        return aggs_vectorisable(aggregates_, rb);
     }
 
     // WS6 Increment 1: fully-columnar group-by + aggregate fold. No per-record Row
@@ -2534,7 +2652,7 @@ public:
         std::vector<std::vector<std::int64_t>> groups;
         std::vector<std::string> group_keys;
         for (std::int64_t i = 0; i < n; ++i) {
-            std::string key = columnar_group_key_(rb, key_cols, i);
+            std::string key = columnar_group_key(rb, key_cols, i);
             auto git = group_of.find(key);
             if (git == group_of.end()) {
                 group_of.emplace(key, groups.size());
@@ -2544,55 +2662,7 @@ public:
                 groups[git->second].push_back(i);
             }
         }
-        // Resolve each aggregate's input column once (base array for the null
-        // check + the typed array for the sum/avg numeric read).
-        struct AggCol {
-            const arrow::Array* base = nullptr;
-            const arrow::Int64Array* i64 = nullptr;
-            const arrow::Int32Array* i32 = nullptr;
-            const arrow::DoubleArray* f64 = nullptr;
-            const arrow::FloatArray* f32 = nullptr;
-            const arrow::Decimal128Array* dec = nullptr;
-            int dec_scale = 0;
-            // Read row i as a double, matching read_cell's widening (int32->int64,
-            // float->double) and the row path's double accumulation. Caller checks
-            // IsNull first; the type is one of these four (batch_vectorisable_).
-            double value(std::int64_t i) const {
-                if (i64 != nullptr) {
-                    return static_cast<double>(i64->Value(i));
-                }
-                if (i32 != nullptr) {
-                    return static_cast<double>(i32->Value(i));
-                }
-                if (f64 != nullptr) {
-                    return f64->Value(i);
-                }
-                if (f32 != nullptr) {
-                    return static_cast<double>(f32->Value(i));
-                }
-                return 0.0;  // unreachable
-            }
-        };
-        std::vector<AggCol> agg_cols(aggregates_.size());
-        for (std::size_t ai = 0; ai < aggregates_.size(); ++ai) {
-            if (aggregates_[ai].input_column.empty()) {
-                continue;  // COUNT(*)
-            }
-            const int idx = rb.schema()->GetFieldIndex(aggregates_[ai].input_column);
-            if (idx < 0) {
-                continue;
-            }
-            agg_cols[ai].base = rb.column(idx).get();
-            agg_cols[ai].i64 = dynamic_cast<const arrow::Int64Array*>(agg_cols[ai].base);
-            agg_cols[ai].i32 = dynamic_cast<const arrow::Int32Array*>(agg_cols[ai].base);
-            agg_cols[ai].f64 = dynamic_cast<const arrow::DoubleArray*>(agg_cols[ai].base);
-            agg_cols[ai].f32 = dynamic_cast<const arrow::FloatArray*>(agg_cols[ai].base);
-            agg_cols[ai].dec = dynamic_cast<const arrow::Decimal128Array*>(agg_cols[ai].base);
-            if (agg_cols[ai].dec != nullptr) {
-                agg_cols[ai].dec_scale =
-                    static_cast<const arrow::Decimal128Type&>(*agg_cols[ai].base->type()).scale();
-            }
-        }
+        const std::vector<VecAggCol> agg_cols = resolve_vec_agg_cols(aggregates_, rb);
         Batch<Row> emit_batch;
         emit_batch.reserve(groups.size());
         for (std::size_t g = 0; g < groups.size(); ++g) {
@@ -2615,69 +2685,7 @@ public:
                 }
                 sit = state_.emplace(group_keys[g], std::move(b)).first;
             }
-            for (std::size_t ai = 0; ai < aggregates_.size(); ++ai) {
-                const auto& a = aggregates_[ai];
-                AggState& st = sit->second.agg_states[ai];
-                const AggCol& ac = agg_cols[ai];
-                if (a.fn == "count" && a.input_column.empty()) {
-                    st.running_count += static_cast<std::int64_t>(idxs.size());
-                } else if (a.fn == "count") {
-                    for (const std::int64_t i : idxs) {
-                        if (ac.base != nullptr && !ac.base->IsNull(i)) {
-                            ++st.running_count;
-                        }
-                    }
-                } else if (ac.dec != nullptr) {
-                    // DECIMAL128 (increment 3): read the Decimal128 directly and
-                    // reproduce update_agg's exact branch byte-for-byte - no
-                    // dec-string serialise/parse round-trip. SUM/AVG accumulate the
-                    // exact running_sum_dec (with overflow -> sum_dec_complete=false)
-                    // alongside the parallel double running_sum; variance folds the
-                    // dec_to_double value as agg_numeric_double does.
-                    const bool variance = is_variance_fn(a.fn);
-                    for (const std::int64_t i : idxs) {
-                        if (ac.dec->IsNull(i)) {
-                            continue;
-                        }
-                        const clink::config::Decimal dv{arrow::Decimal128(ac.dec->GetValue(i)),
-                                                        ac.dec_scale};
-                        const double d = clink::config::dec_to_double(dv);
-                        if (variance) {
-                            st.running_sum += d;
-                            st.running_sum_sq += d * d;
-                        } else {
-                            if (!st.sum_dec_started) {
-                                st.running_sum_dec = dv;
-                                st.sum_dec_started = true;
-                            } else if (auto s = clink::config::dec_add(st.running_sum_dec, dv)) {
-                                st.running_sum_dec = *s;
-                            } else {
-                                st.sum_dec_complete = false;
-                            }
-                            st.sum_saw_decimal = true;
-                            st.running_sum += d;
-                        }
-                        ++st.running_count;
-                    }
-                } else {  // sum / avg / variance over int64/int32/double/float
-                    // Matches update_agg + the variance branch exactly for a
-                    // numeric column: skip nulls, running_sum += (double)value,
-                    // ++running_count, and (variance family) running_sum_sq += d*d.
-                    const bool variance = is_variance_fn(a.fn);
-                    if (ac.base != nullptr) {
-                        for (const std::int64_t i : idxs) {
-                            if (!ac.base->IsNull(i)) {
-                                const double d = ac.value(i);
-                                st.running_sum += d;
-                                if (variance) {
-                                    st.running_sum_sq += d * d;
-                                }
-                                ++st.running_count;
-                            }
-                        }
-                    }
-                }
-            }
+            vectorised_fold_slice(aggregates_, agg_cols, idxs, sit->second.agg_states);
             emit_group_(sit->second, /*input_was_changelog=*/false, emit_batch);
         }
         if (!emit_batch.empty()) {
