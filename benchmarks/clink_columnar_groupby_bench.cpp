@@ -100,6 +100,10 @@ int main(int argc, char** argv) {
     // the sidecar. --narrow (default) writes only (bidder, datetime), so both
     // paths touch the same 2 columns and only the row-vs-columnar fold differs.
     bool wide = false;
+    // --agg: non-windowed GROUP BY (AggregateRowOp, the WS6 Increment 1 target)
+    // instead of the default windowed q12 (WindowRowOp). COUNT(*) + SUM(datetime),
+    // both int-foldable, grouped by bidder.
+    bool agg_mode = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
@@ -113,6 +117,8 @@ int main(int argc, char** argv) {
             repeat = std::stoi(next());
         else if (a == "--wide")
             wide = true;
+        else if (a == "--agg")
+            agg_mode = true;
         else if (a == "--parquet")
             pq_path = next();
         else if (a == "--reuse")
@@ -192,15 +198,20 @@ int main(int argc, char** argv) {
     }
 
     // Job 2 (measured, --repeat times): columnar Parquet source -> per-bidder
-    // count per 10s tumbling window -> blackhole. Fires WindowRowOp on a columnar
-    // batch unless CLINK_DISABLE_COLUMNAR forces the row path.
+    // aggregate -> blackhole. Default fires WindowRowOp (windowed q12); --agg
+    // fires AggregateRowOp (non-windowed GROUP BY, the WS6 Increment 1 target).
+    // CLINK_DISABLE_COLUMNAR forces the row path on either.
     const std::string agg_ddl =
         "CREATE TABLE pq_in " + pq_cols + " WITH (connector='parquet', path='" + pq_path + "');" +
-        "CREATE TABLE sink_q12 (bidder BIGINT, bid_count BIGINT) WITH (connector='blackhole', "
-        "format='json')";
+        (agg_mode ? "CREATE TABLE sink_agg (bidder BIGINT, c BIGINT, s BIGINT) WITH "
+                    "(connector='blackhole', format='json')"
+                  : "CREATE TABLE sink_q12 (bidder BIGINT, bid_count BIGINT) WITH "
+                    "(connector='blackhole', format='json')");
     const std::string agg_sql =
-        "INSERT INTO sink_q12 SELECT bidder, COUNT(*) AS bid_count FROM pq_in "
-        "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), bidder";
+        agg_mode ? "INSERT INTO sink_agg SELECT bidder, COUNT(*) AS c, SUM(datetime) AS s "
+                   "FROM pq_in GROUP BY bidder"
+                 : "INSERT INTO sink_q12 SELECT bidder, COUNT(*) AS bid_count FROM pq_in "
+                   "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), bidder";
 
     cluster::JobGraphSpec agg_spec;
     try {
@@ -244,6 +255,7 @@ int main(int argc, char** argv) {
               << ",\"columnar\":" << (columnar_disabled ? "false" : "true")
               << ",\"flat_hash\":" << (flat_hash ? "true" : "false")
               << ",\"wide\":" << (wide ? "true" : "false")
+              << ",\"agg\":" << (agg_mode ? "true" : "false")
               << ",\"best_ms\":" << static_cast<std::int64_t>(best)
               << ",\"median_ms\":" << static_cast<std::int64_t>(median)
               << ",\"rows_per_sec_best\":" << static_cast<std::int64_t>(rate)

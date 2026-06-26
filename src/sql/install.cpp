@@ -2328,8 +2328,18 @@ public:
             return false;
         }
         const std::int64_t n = rb->num_rows();
+        // WS6 Increment 1: the fully-columnar vectorised fold (COUNT / SUM-int /
+        // AVG-int over a pure-append batch) builds NO per-record Row, so it beats
+        // the row path regardless of projection width - it is NOT subject to the
+        // projection-benefit gate (which only guards the per-record-Row columnar
+        // ingest below). Take it whenever eligible.
+        if (batch_fold_eligible_ && batch_vectorisable_(*rb) &&
+            rb->schema()->GetFieldIndex(std::string{kRowKindField}) < 0) {
+            vectorised_group_fold_(*rb, out);
+            return true;
+        }
         if (!ws3_columnar_projection_benefit(columnar_needed_.size(), *rb)) {
-            return false;  // no projection benefit: the row path is faster here
+            return false;  // no projection benefit: the per-record-Row ingest is slower
         }
         // Resolve the needed columns to (name, index, type) once per batch.
         struct Col {
@@ -2431,6 +2441,169 @@ public:
             out.emit_data(std::move(emit_batch));
         }
         return true;
+    }
+
+    // WS6 Increment 1: is every aggregate foldable column-at-a-time for THIS
+    // batch's column types? COUNT (any input column) yes; SUM/AVG only over
+    // int64/int32 columns. For an integer column the row path's SUM result
+    // reduces to running_sum (a double) + running_count - the exact-decimal SUM
+    // machinery never engages (an int column never carries a dec-string, so
+    // sum_saw_decimal stays false and finalize_agg returns running_sum) - so
+    // `running_sum += (double)Value(i)` is byte-identical. DOUBLE/FLOAT SUM
+    // (where as_decimal-on-double could diverge), DECIMAL, MIN/MAX, variance and
+    // string aggregates all return false and take the row path, which is already
+    // correct. batch_fold_eligible_ has already excluded distinct/udaf/retractable.
+    bool batch_vectorisable_(const arrow::RecordBatch& rb) const {
+        for (const auto& a : aggregates_) {
+            if (a.fn == "count") {
+                continue;  // COUNT(*) or COUNT(col): a pure null-count, any type
+            }
+            if (a.fn == "sum" || a.fn == "avg") {
+                if (a.input_column.empty()) {
+                    return false;
+                }
+                const int idx = rb.schema()->GetFieldIndex(a.input_column);
+                if (idx < 0) {
+                    return false;
+                }
+                const auto id = rb.schema()->field(idx)->type()->id();
+                if (id != arrow::Type::INT64 && id != arrow::Type::INT32) {
+                    return false;  // double/float/decimal SUM stays on the row path
+                }
+                continue;
+            }
+            return false;  // min/max, variance: not yet vectorised
+        }
+        return true;
+    }
+
+    // Build the group key directly from the key columns' Arrow cells, byte-for-byte
+    // identical to group_key_(read_row(i)): the SAME read_cell, the SAME
+    // serialize(0) join on '\x1f', null keys contributing the empty string.
+    std::string columnar_group_key_(
+        const arrow::RecordBatch& rb,
+        const std::vector<std::pair<int, std::shared_ptr<arrow::DataType>>>& key_cols,
+        std::int64_t i) const {
+        std::string key;
+        for (std::size_t k = 0; k < key_cols.size(); ++k) {
+            if (k > 0) {
+                key += '\x1f';
+            }
+            const int idx = key_cols[k].first;
+            if (idx >= 0) {
+                const auto& arr = *rb.column(idx);
+                if (!arr.IsNull(i)) {
+                    key += row_columnar_detail::read_cell(key_cols[k].second, arr, i).serialize(0);
+                }
+            }
+        }
+        return key;
+    }
+
+    // WS6 Increment 1: fully-columnar group-by + aggregate fold. No per-record Row
+    // is built; group keys come straight from the key columns and each aggregate
+    // folds its column directly into the AggState. Parity with the per-row fold is
+    // by construction: COUNT(*) = slice size, COUNT(col) = non-null count,
+    // SUM/AVG accumulate (double)Value(i) over non-null cells exactly as the row
+    // path does for an integer column (which finalises to running_sum). Caller
+    // guarantees batch_vectorisable_ AND no __row_kind column (pure append), so
+    // emit_group_ is called with input_was_changelog=false.
+    void vectorised_group_fold_(const arrow::RecordBatch& rb, Emitter<Row>& out) {
+        const std::int64_t n = rb.num_rows();
+        std::vector<std::pair<int, std::shared_ptr<arrow::DataType>>> key_cols;
+        key_cols.reserve(group_keys_.size());
+        for (const auto& k : group_keys_) {
+            const int idx = rb.schema()->GetFieldIndex(k);
+            key_cols.emplace_back(idx, idx >= 0 ? rb.schema()->field(idx)->type() : nullptr);
+        }
+        // Group row indices by key in first-seen order (matches the row path).
+        clink::FlatMap<std::string, std::size_t> group_of;
+        std::vector<std::vector<std::int64_t>> groups;
+        std::vector<std::string> group_keys;
+        for (std::int64_t i = 0; i < n; ++i) {
+            std::string key = columnar_group_key_(rb, key_cols, i);
+            auto git = group_of.find(key);
+            if (git == group_of.end()) {
+                group_of.emplace(key, groups.size());
+                groups.push_back({i});
+                group_keys.push_back(std::move(key));
+            } else {
+                groups[git->second].push_back(i);
+            }
+        }
+        // Resolve each aggregate's input column once (base array for the null
+        // check + the typed array for the sum/avg numeric read).
+        struct AggCol {
+            const arrow::Array* base = nullptr;
+            const arrow::Int64Array* i64 = nullptr;
+            const arrow::Int32Array* i32 = nullptr;
+        };
+        std::vector<AggCol> agg_cols(aggregates_.size());
+        for (std::size_t ai = 0; ai < aggregates_.size(); ++ai) {
+            if (aggregates_[ai].input_column.empty()) {
+                continue;  // COUNT(*)
+            }
+            const int idx = rb.schema()->GetFieldIndex(aggregates_[ai].input_column);
+            if (idx < 0) {
+                continue;
+            }
+            agg_cols[ai].base = rb.column(idx).get();
+            agg_cols[ai].i64 = dynamic_cast<const arrow::Int64Array*>(agg_cols[ai].base);
+            agg_cols[ai].i32 = dynamic_cast<const arrow::Int32Array*>(agg_cols[ai].base);
+        }
+        Batch<Row> emit_batch;
+        emit_batch.reserve(groups.size());
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            const auto& idxs = groups[g];
+            auto sit = state_.find(group_keys[g]);
+            if (sit == state_.end()) {
+                // New group: seed group_values from the first index's key cells,
+                // reusing init_bucket_ so group_values is byte-identical.
+                Row key_row;
+                for (std::size_t k = 0; k < key_cols.size(); ++k) {
+                    const int idx = key_cols[k].first;
+                    if (idx >= 0) {
+                        key_row.values[group_keys_[k]] = row_columnar_detail::read_cell(
+                            key_cols[k].second, *rb.column(idx), idxs[0]);
+                    }
+                }
+                sit = state_.emplace(group_keys[g], init_bucket_(key_row)).first;
+            }
+            for (std::size_t ai = 0; ai < aggregates_.size(); ++ai) {
+                const auto& a = aggregates_[ai];
+                AggState& st = sit->second.agg_states[ai];
+                const AggCol& ac = agg_cols[ai];
+                if (a.fn == "count" && a.input_column.empty()) {
+                    st.running_count += static_cast<std::int64_t>(idxs.size());
+                } else if (a.fn == "count") {
+                    for (const std::int64_t i : idxs) {
+                        if (ac.base != nullptr && !ac.base->IsNull(i)) {
+                            ++st.running_count;
+                        }
+                    }
+                } else {  // sum / avg over int64 / int32 (validated by batch_vectorisable_)
+                    if (ac.i64 != nullptr) {
+                        for (const std::int64_t i : idxs) {
+                            if (!ac.i64->IsNull(i)) {
+                                st.running_sum += static_cast<double>(ac.i64->Value(i));
+                                ++st.running_count;
+                            }
+                        }
+                    } else if (ac.i32 != nullptr) {
+                        for (const std::int64_t i : idxs) {
+                            if (!ac.i32->IsNull(i)) {
+                                st.running_sum += static_cast<double>(ac.i32->Value(i));
+                                ++st.running_count;
+                            }
+                        }
+                    }
+                }
+            }
+            emit_group_(sit->second, /*input_was_changelog=*/false, emit_batch);
+        }
+        if (!emit_batch.empty()) {
+            out.emit_data(std::move(emit_batch));
+        }
     }
 
     // Auto-on: finalise the storage decision once the runtime + backend are
