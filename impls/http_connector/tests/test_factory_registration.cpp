@@ -14,4 +14,10 @@ TEST(HttpConnectorFactoryRegistration, HttpSinkIsRegistered) {
     EXPECT_NE(rr.find_sink("http_sink", "string"), nullptr);
 }
 
+TEST(HttpConnectorFactoryRegistration, ElasticsearchAndOpensearchSinksRegistered) {
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("elasticsearch_sink", "string"), nullptr);
+    EXPECT_NE(rr.find_sink("opensearch_sink", "string"), nullptr);
+}
+
 }  // namespace

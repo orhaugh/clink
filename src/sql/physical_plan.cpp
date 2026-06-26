@@ -230,6 +230,22 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{"http_sink", kChannelString, "row_to_json_string"};
     }
+    if (connector == "elasticsearch" || connector == "opensearch") {
+        // Bulk-index into Elasticsearch / OpenSearch (identical _bulk API).
+        // At-least-once; set document_id for idempotent (effectively-once)
+        // writes. Each row -> JSON object string -> NDJSON action+doc bulk body.
+        if (exactly_once) {
+            unsupported("connector='" + connector +
+                        "' sink is at-least-once (use document_id for idempotent writes); "
+                        "exactly-once delivery is not supported");
+        }
+        if (upsert) {
+            unsupported("connector='" + connector + "' sink does not support mode='upsert'");
+        }
+        const std::string sink =
+            connector == "opensearch" ? "opensearch_sink" : "elasticsearch_sink";
+        return RowConnectorBinding{sink, kChannelString, "row_to_json_string"};
+    }
     if (connector == "parquet") {
         // Typed-columnar Parquet. exactly_once routes to the 2PC variant
         // (staging/ + atomic commit on checkpoint); else one file/subtask.

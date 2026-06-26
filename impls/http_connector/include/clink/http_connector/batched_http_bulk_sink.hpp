@@ -36,6 +36,16 @@ enum class BulkFraming {
 template <typename In>
 class BatchedHttpBulkSink : public Sink<In> {
 public:
+    // Render ONE record into `out` (no framing separators - the base adds
+    // those). Must append, not overwrite.
+    using Renderer = std::function<void(std::string& out, const In& rec)>;
+
+    // Decides whether a response counts as a successful delivery. Default
+    // (empty) = any 2xx. Some APIs return 2xx with a per-item error report in
+    // the body (Elasticsearch _bulk returns 200 with "errors":true on partial
+    // failure), so those sinks supply a validator that also inspects the body.
+    using ResponseValidator = std::function<bool(const HttpResponse&)>;
+
     struct Options {
         HttpRequest::Options http;  // base_url + headers + timeouts + verify_tls
         std::string path{"/"};      // request path
@@ -45,13 +55,10 @@ public:
         std::size_t max_bytes{4 * 1024 * 1024};
         int max_retries{4};  // attempts beyond the first
         std::chrono::milliseconds retry_base_backoff{200};
-        bool flush_on_barrier{true};  // align delivery to checkpoints (at-least-once)
+        bool flush_on_barrier{true};      // align delivery to checkpoints (at-least-once)
+        ResponseValidator response_ok{};  // empty -> 2xx is success
         std::string name{"http_bulk_sink"};
     };
-
-    // Render ONE record into `out` (no framing separators - the base adds
-    // those). Must append, not overwrite.
-    using Renderer = std::function<void(std::string& out, const In& rec)>;
 
     // Upper bound on retry attempts. Caps both the attempt count and the
     // backoff exponent (1 << (attempt-1)) so a misconfigured max_retries can
@@ -138,16 +145,23 @@ private:
                 std::this_thread::sleep_for(backoff);
             }
             res = client_->post(opts_.path, body, opts_.content_type);
-            if (res.status >= 200 && res.status < 300) {
+            const bool ok = opts_.response_ok ? opts_.response_ok(res)
+                                              : (res.status >= 200 && res.status < 300);
+            if (ok) {
                 return;  // delivered
             }
         }
         // Retries exhausted: fail loudly so the job restarts and replays from
         // the last checkpoint (at-least-once), rather than dropping the batch.
-        throw std::runtime_error(
-            opts_.name + ": POST " + opts_.http.base_url + opts_.path + " failed after " +
-            std::to_string(opts_.max_retries + 1) + " attempts (" +
-            (res.status == 0 ? res.error : "HTTP " + std::to_string(res.status)) + ")");
+        // A 2xx that the validator rejected (e.g. ES _bulk "errors":true) keeps
+        // a body snippet so the failure is diagnosable.
+        std::string detail = res.status == 0 ? res.error : "HTTP " + std::to_string(res.status);
+        if (res.status >= 200 && res.status < 300 && !res.body.empty()) {
+            detail += " body: " + res.body.substr(0, 256);
+        }
+        throw std::runtime_error(opts_.name + ": POST " + opts_.http.base_url + opts_.path +
+                                 " failed after " + std::to_string(opts_.max_retries + 1) +
+                                 " attempts (" + detail + ")");
     }
 
     Options opts_;

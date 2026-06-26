@@ -156,6 +156,38 @@ TEST(SqlPhysical, HttpConnectorSinkLowersToHttpSink) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);  // Row -> JSON string bridge
 }
 
+// connector='elasticsearch'/'opensearch' lower to their bulk sinks (string
+// channel) via the row_to_json_string bridge, carrying index/url/document_id.
+TEST(SqlPhysical, ElasticsearchConnectorSinkLowersToBulkSink) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE es_out (a BIGINT) WITH (connector='elasticsearch', format='json', "
+        "url='http://es:9200', index='logs', document_id='a');"
+        "CREATE TABLE os_out (a BIGINT) WITH (connector='opensearch', format='json', "
+        "url='http://os:9200', index='logs');");
+    for (int i = 0; i < 3; ++i) {
+        cat.register_table(
+            std::get<ast::CreateTableStmt>(s.statements[static_cast<std::size_t>(i)]));
+    }
+
+    auto es_plan = bind_insert(cat, "INSERT INTO es_out SELECT a FROM src_t");
+    PhysicalPlanner pp;
+    auto es_spec = pp.compile(static_cast<const LogicalSink&>(*es_plan));
+    const auto* es = find_op(es_spec, "elasticsearch_sink");
+    ASSERT_NE(es, nullptr);
+    EXPECT_EQ(es->params.at("url"), "http://es:9200");
+    EXPECT_EQ(es->params.at("index"), "logs");
+    EXPECT_EQ(es->params.at("document_id"), "a");
+    EXPECT_NE(find_op(es_spec, "row_to_json_string"), nullptr);
+
+    auto os_plan = bind_insert(cat, "INSERT INTO os_out SELECT a FROM src_t");
+    PhysicalPlanner pp2;
+    auto os_spec = pp2.compile(static_cast<const LogicalSink&>(*os_plan));
+    EXPECT_NE(find_op(os_spec, "opensearch_sink"), nullptr);
+}
+
 // exactly-once on connector='http' is rejected (http is at-least-once only).
 // The rejection fires at table-registration / bind time (the connector
 // allowlist), before physical planning - so assert the whole flow throws.
