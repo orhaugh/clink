@@ -119,8 +119,33 @@ public:
     // place of the credit grants the socket path uses.
     bool push(const StreamElement<T>& el) {
         if (local_channel_) {
+            // Const-ref caller (cannot move): the BoundedChannel copies the
+            // element. Move-capable callers should reach the && overload below.
             return local_channel_->push(el);
         }
+        return push_remote_(el);
+    }
+
+    // Move overload. Every push site builds a fresh StreamElement rvalue
+    // (SubtaskEmitter / NetworkBridgeSink / dag all pass
+    // `StreamElement<T>::data(std::move(batch))` etc.), so this is the path
+    // they actually bind to. On the LocalDataPlane fast path it moves the whole
+    // batch straight into the receiver's BoundedChannel - eliminating the
+    // per-batch copy the const-ref path pays (a 2 KB-per-record batch copy on
+    // every co-located shuffle hop). The remote path serializes the bytes
+    // regardless, so the move is immaterial there and it shares push_remote_.
+    bool push(StreamElement<T>&& el) {
+        if (local_channel_) {
+            return local_channel_->push(std::move(el));
+        }
+        return push_remote_(el);
+    }
+
+private:
+    // Serialize and send a StreamElement frame over the socket (the non-local
+    // path). Reads `el` by const-ref - moving would not help since the bytes
+    // are copied into the IPC payload either way.
+    bool push_remote_(const StreamElement<T>& el) {
         if (el.is_data()) {
             const auto needed = static_cast<std::uint32_t>(el.as_data().size());
             if (!acquire_credit_(needed)) {
@@ -167,6 +192,7 @@ public:
         return send_frame(payload);
     }
 
+public:
     // Send a Close frame and shut down the send side of the socket. The
     // peer's pop() will return nullopt once it consumes the queued frames
     // and reads the Close marker. On the local fast path, closing the
