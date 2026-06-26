@@ -1247,6 +1247,17 @@ public:
             return false;
         }
         const std::int64_t n = rb->num_rows();
+        // WS6: fully-columnar window fold when every aggregate is vectorisable
+        // (COUNT / SUM-AVG-variance over numeric/decimal). Builds no per-record Row
+        // - reads time / group / agg cells straight from Arrow - so it beats the
+        // row path regardless of projection width and is NOT subject to the
+        // projection-benefit gate below (which guards the per-record-Row ingest).
+        // Reachable now that assign_timestamps_row forwards columnar batches. A
+        // window with min/max / string_agg / array_agg / percentile falls through.
+        if (aggs_vectorisable(aggregates_, *rb)) {
+            vectorised_window_fold_(*rb);
+            return true;
+        }
         if (!ws3_columnar_projection_benefit(columnar_needed_.size(), *rb)) {
             return false;  // no projection benefit: the row path is faster here
         }
@@ -1524,6 +1535,75 @@ private:
             }
             for (std::size_t i = 0; i < aggregates_.size(); ++i) {
                 update_agg(wit->second.agg_states[i], aggregates_[i], row);
+            }
+        }
+    }
+
+    // WS6: fully-columnar window fold. Slices the batch's records by
+    // (group_key, window_end) - computing windows_for_ per record from the time
+    // column read straight from Arrow - then folds each slice's agg columns into
+    // its WindowBucket via the shared kernel. No per-record Row. Byte-identical to
+    // the per-record fold_record_into_ for the vectorisable (commutative) set:
+    // window membership is identical (same windows_for_), group_values come from
+    // the first record (group cols are equal across a group), and COUNT / SUM /
+    // AVG / variance are order-independent. Emission stays watermark-driven.
+    void vectorised_window_fold_(const arrow::RecordBatch& rb) {
+        const std::int64_t n = rb.num_rows();
+        const int time_idx = rb.schema()->GetFieldIndex(time_column_);
+        const auto time_type = time_idx >= 0 ? rb.schema()->field(time_idx)->type() : nullptr;
+        std::vector<KeyCol> key_cols;
+        key_cols.reserve(group_keys_.size());
+        for (const auto& k : group_keys_) {
+            const int idx = rb.schema()->GetFieldIndex(k);
+            key_cols.emplace_back(idx, idx >= 0 ? rb.schema()->field(idx)->type() : nullptr);
+        }
+        const std::vector<VecAggCol> agg_cols = resolve_vec_agg_cols(aggregates_, rb);
+
+        // Slice: group_key -> window_end -> {window_start, record indices}.
+        struct Slice {
+            std::int64_t window_start = 0;
+            std::vector<std::int64_t> idxs;
+        };
+        clink::FlatMap<std::string, std::map<std::int64_t, Slice>> by_group;
+        for (std::int64_t i = 0; i < n; ++i) {
+            if (time_idx < 0) {
+                continue;  // no time column -> nothing folds (matches the row guard)
+            }
+            // Match fold_record_into_'s guard: skip a missing/non-numeric time cell.
+            const clink::config::JsonValue tv =
+                row_columnar_detail::read_cell(time_type, *rb.column(time_idx), i);
+            if (!tv.is_number()) {
+                continue;
+            }
+            const auto ts = static_cast<std::int64_t>(tv.as_number());
+            const std::string key = columnar_group_key(rb, key_cols, i);
+            for (auto [win_start, win_end] : windows_for_(ts)) {
+                auto& slice = by_group[key][win_end];
+                slice.window_start = win_start;
+                slice.idxs.push_back(i);
+            }
+        }
+        // Fold each (group_key, window_end) slice into its bucket.
+        for (auto& [key, windows] : by_group) {
+            auto& by_window = state_[key];
+            for (auto& [win_end, slice] : windows) {
+                auto wit = by_window.find(win_end);
+                if (wit == by_window.end()) {
+                    WindowBucket b;
+                    b.window_start = slice.window_start;
+                    b.agg_states.resize(aggregates_.size());
+                    const std::int64_t first = slice.idxs.front();
+                    for (std::size_t k = 0; k < key_cols.size(); ++k) {
+                        const int idx = key_cols[k].first;
+                        if (idx >= 0) {
+                            b.group_values.values[group_key_outputs_[k]] =
+                                row_columnar_detail::read_cell(
+                                    key_cols[k].second, *rb.column(idx), first);
+                        }
+                    }
+                    wit = by_window.emplace(win_end, std::move(b)).first;
+                }
+                vectorised_fold_slice(aggregates_, agg_cols, slice.idxs, wit->second.agg_states);
             }
         }
     }
@@ -5325,8 +5405,45 @@ void install(clink::plugin::PluginRegistry& reg) {
             // and bound>0 (min - lateness) uniformly.
             auto strategy = std::make_unique<PartitionAwareBoundedOutOfOrdernessStrategy<Row>>(
                 std::chrono::milliseconds(bound_ms < 0 ? 0 : bound_ms));
-            return std::make_shared<WatermarkAssignerOperator<Row>>(
+            auto op = std::make_shared<WatermarkAssignerOperator<Row>>(
                 std::move(extractor), std::move(strategy), "assign_timestamps_row");
+            // Columnar fast path: read the event-time column straight from the
+            // Arrow sidecar so a Parquet/file-sourced windowed query keeps the
+            // stream columnar through the assigner (the window op then folds it
+            // column-at-a-time). Mirrors the row `extractor` byte-for-byte:
+            // number -> ms, numeric string -> ms, null/other -> EventTime::min().
+            // Only triggers on columnar batches, which today come only from
+            // non-partitioned sources, so the loss of source_partition matches
+            // those sources' row-path behaviour (single global watermark).
+            op->with_columnar_event_times(
+                [column](const arrow::RecordBatch& rb, std::vector<EventTime>& out) -> bool {
+                    const int idx = rb.schema()->GetFieldIndex(column);
+                    if (idx < 0) {
+                        return false;  // column absent -> fall back to the row path
+                    }
+                    const auto type = rb.schema()->field(idx)->type();
+                    const auto& arr = *rb.column(idx);
+                    const std::int64_t n = rb.num_rows();
+                    out.resize(static_cast<std::size_t>(n));
+                    for (std::int64_t i = 0; i < n; ++i) {
+                        const auto v = row_columnar_detail::read_cell(type, arr, i);
+                        if (v.is_number()) {
+                            out[static_cast<std::size_t>(i)] =
+                                EventTime{static_cast<std::int64_t>(v.as_number())};
+                        } else if (v.is_string()) {
+                            try {
+                                out[static_cast<std::size_t>(i)] =
+                                    EventTime{static_cast<std::int64_t>(std::stoll(v.as_string()))};
+                            } catch (...) {
+                                out[static_cast<std::size_t>(i)] = EventTime::min();
+                            }
+                        } else {
+                            out[static_cast<std::size_t>(i)] = EventTime::min();  // null / other
+                        }
+                    }
+                    return true;
+                });
+            return op;
         });
 
     // json_string_to_row: bridge from the string channel (raw NDJSON

@@ -201,8 +201,14 @@ int main(int argc, char** argv) {
     // aggregate -> blackhole. Default fires WindowRowOp (windowed q12); --agg
     // fires AggregateRowOp (non-windowed GROUP BY, the WS6 Increment 1 target).
     // CLINK_DISABLE_COLUMNAR forces the row path on either.
+    // Windowed mode declares event_time_column so the planner inserts the
+    // (now columnar-preserving) assign_timestamps_row op - the realistic
+    // event-time windowed pipeline. --agg (non-windowed) needs no event time.
+    const std::string pq_with =
+        agg_mode ? "" : ", event_time_column='datetime', watermark_lag_ms='0'";
     const std::string agg_ddl =
-        "CREATE TABLE pq_in " + pq_cols + " WITH (connector='parquet', path='" + pq_path + "');" +
+        "CREATE TABLE pq_in " + pq_cols + " WITH (connector='parquet', path='" + pq_path + "'" +
+        pq_with + ");" +
         (agg_mode ? "CREATE TABLE sink_agg (bidder BIGINT, c BIGINT, s BIGINT) WITH "
                     "(connector='blackhole', format='json')"
                   : "CREATE TABLE sink_q12 (bidder BIGINT, bid_count BIGINT) WITH "

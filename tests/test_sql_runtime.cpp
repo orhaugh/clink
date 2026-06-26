@@ -8513,6 +8513,99 @@ TEST(SqlRuntime, ColumnarParquetTumbleWindowEndToEnd) {
         std::filesystem::remove(p);
 }
 
+// WS6 window family (end-to-end, with the columnar event-time assigner): a
+// Parquet source feeds a HOP window (each record fans into multiple overlapping
+// windows) with SUM + COUNT. assign_timestamps_row now forwards the columnar
+// batch through (reading event time from the sidecar), so WindowRowOp takes the
+// column-at-a-time fold. Exercises the multi-window slicing that distinguishes
+// the window fold from the GROUP BY one. Per-window (total, count) must be
+// exactly the row path's, AND batch_materialize_counter must NOT move - proving
+// the WHOLE pipeline (source -> assigner -> window) stays columnar, zero decode.
+TEST(SqlRuntime, ColumnarParquetHopWindowVectorised) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_chw_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_chw.parquet";
+    const auto out_path = tmp / "clink_sql_chw_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    // HOP(ts, size=2000, slide=1000): ts 500 -> [0,2000); 1500 -> [0,2000)+[1000,3000);
+    // 2500 -> [1000,3000)+[2000,4000). So windows (by end): 2000 {10+20=30, n2},
+    // 3000 {20+30=50, n2}, 4000 {30, n1}.
+    write_lines(in_path,
+                {
+                    R"({"user_id":1,"ts":500,"amount":10})",
+                    R"({"user_id":1,"ts":1500,"amount":20})",
+                    R"({"user_id":1,"ts":2500,"amount":30})",
+                });
+    const std::string cols = "(user_id BIGINT, ts BIGINT, amount BIGINT)";
+
+    // Job 1: NDJSON -> typed-columnar Parquet.
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts, amount FROM ev");
+        InProcessCluster cluster("tm-chw-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    // Job 2: columnar Parquet source -> HOP(2000,1000) window, SUM + COUNT.
+    const std::uint64_t mat_before =
+        clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE pq_in "} + cols +
+                         " WITH (connector='parquet', path='" + pq_path.string() +
+                         "', event_time_column='ts');"
+                         "CREATE TABLE per_window (user_id BIGINT, total BIGINT, cnt BIGINT) "
+                         "WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat,
+                            "INSERT INTO per_window SELECT user_id, SUM(amount) AS total, "
+                            "COUNT(*) AS cnt FROM pq_in GROUP BY HOP(ts, 2000, 1000), user_id");
+        InProcessCluster cluster("tm-chw-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    // Whole pipeline stays columnar: the assigner forwards the sidecar and the
+    // window op folds it column-at-a-time - no row decode anywhere.
+    EXPECT_EQ(clink::detail::batch_materialize_counter().load(std::memory_order_relaxed),
+              mat_before);
+
+    // Collect (total, count) pairs; the three overlapping windows are
+    // {30,2}, {50,2}, {30,1} (count distinguishes the two total=30 windows).
+    std::multiset<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("total").as_number()),
+                    static_cast<std::int64_t>(js.at("cnt").as_number()));
+    }
+    const std::multiset<std::pair<std::int64_t, std::int64_t>> want{{30, 2}, {50, 2}, {30, 1}};
+    EXPECT_EQ(got, want);
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // WS3 within-batch group-by on the SESSION window: a columnar Parquet source
 // feeds a SESSION window, so each group's events fold into its session map
 // behind ONE state_ probe (SessionWindowRowOp::process_columnar). Session merges

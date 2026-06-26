@@ -40,6 +40,13 @@ template <typename T>
 class WatermarkAssignerOperator final : public Operator<T, T> {
 public:
     using TimeExtractor = std::function<EventTime(const T&)>;
+    // Optional columnar event-time reader: fills `out[i]` with row i's event
+    // time read straight from the Arrow sidecar (no row materialisation),
+    // returning false if it cannot (e.g. the column is absent), so the row
+    // process() path takes over. When set, process_columnar can forward a
+    // columnar batch through unchanged while still advancing the watermark.
+    using ColumnarEventTimes =
+        std::function<bool(const arrow::RecordBatch&, std::vector<EventTime>&)>;
 
     WatermarkAssignerOperator(TimeExtractor extractor,
                               std::unique_ptr<WatermarkStrategy<T>> strategy,
@@ -102,6 +109,74 @@ public:
         alignment_max_drift_ms_ = max_drift.count();
         alignment_max_wait_ = max_wait;
         return *this;
+    }
+
+    // Enable the columnar fast path: when a columnar batch arrives, read its
+    // event times via `reader` and forward the batch unchanged instead of
+    // materialising rows. Only safe for non-partitioned sources (the Arrow
+    // sidecar carries no source_partition, so per-partition watermarking
+    // degrades to a single global watermark - which is exactly what a
+    // non-partitioned source's records produce on the row path too, so it is
+    // byte-identical for them). Columnar batches only originate from
+    // non-partitioned columnar sources (Parquet/file), so this never triggers
+    // for a partitioned (Kafka) source, whose batches are row-form.
+    WatermarkAssignerOperator& with_columnar_event_times(ColumnarEventTimes reader) {
+        columnar_event_times_ = std::move(reader);
+        return *this;
+    }
+
+    [[nodiscard]] bool supports_columnar() const noexcept override {
+        return static_cast<bool>(columnar_event_times_);
+    }
+
+    // Columnar fast path: advance the watermark from the event-time column read
+    // straight from the Arrow sidecar, then forward the SAME batch downstream
+    // unchanged (sidecar preserved, zero row materialisation). Mirrors process()'s
+    // data-element side effects exactly (alignment wait, strategy feed,
+    // last_record_time_/is_idle_, watermark emission); the idleness timer is
+    // self-driving and untouched. Returns false BEFORE any emit on a surprise so
+    // process() takes over (no double-emit, no strategy double-count).
+    bool process_columnar(const StreamElement<T>& element, Emitter<T>& out) override {
+        if (!columnar_event_times_ || !element.is_data() || !element.as_data().is_columnar()) {
+            return false;
+        }
+        const auto& batch = element.as_data();
+        const auto& rb = batch.arrow();
+        if (!rb) {
+            return false;
+        }
+        std::vector<EventTime> times;
+        if (!columnar_event_times_(*rb, times)) {
+            return false;  // cannot read columnar (e.g. column absent) -> row path
+        }
+        // Alignment wait, identical to process() (does not depend on rows).
+        if (alignment_group_ && last_emitted_wm_.timestamp() > EventTime::min()) {
+            alignment_group_->wait_until_within_drift(alignment_member_id_,
+                                                      last_emitted_wm_,
+                                                      alignment_max_drift_ms_,
+                                                      alignment_max_wait_);
+        }
+        // Feed the strategy once per record. The value is irrelevant (the
+        // strategy reads only event_time + source_partition); source_partition is
+        // unset, matching a non-partitioned source's records on the row path.
+        Record<T> probe;
+        for (const EventTime et : times) {
+            probe.set_event_time(et);
+            strategy_->on_record(probe);
+        }
+        last_record_time_ms_ = now_ms_();
+        is_idle_ = false;
+        // Forward the SAME batch unchanged - the sidecar (a shared_ptr member)
+        // moves with it, so the stream stays columnar with zero row decode.
+        out.emit_data(std::move(const_cast<Batch<T>&>(batch)));
+        if (auto wm = strategy_->current_watermark(); wm.has_value()) {
+            last_emitted_wm_ = *wm;
+            if (alignment_group_) {
+                alignment_group_->update_watermark(alignment_member_id_, *wm);
+            }
+            out.emit_watermark(*wm);
+        }
+        return true;
     }
 
     void open() override {
@@ -250,6 +325,7 @@ private:
     }
 
     TimeExtractor extractor_;
+    ColumnarEventTimes columnar_event_times_;  // optional; enables process_columnar
     std::unique_ptr<WatermarkStrategy<T>> strategy_;
     std::string name_;
     std::chrono::milliseconds idleness_{0};
