@@ -2458,7 +2458,7 @@ public:
             if (a.fn == "count") {
                 continue;  // COUNT(*) or COUNT(col): a pure null-count, any type
             }
-            if (a.fn == "sum" || a.fn == "avg") {
+            if (a.fn == "sum" || a.fn == "avg" || is_variance_fn(a.fn)) {
                 if (a.input_column.empty()) {
                     return false;
                 }
@@ -2467,12 +2467,22 @@ public:
                     return false;
                 }
                 const auto id = rb.schema()->field(idx)->type()->id();
-                if (id != arrow::Type::INT64 && id != arrow::Type::INT32) {
-                    return false;  // double/float/decimal SUM stays on the row path
+                // int64/int32/double/float fold byte-identically through double
+                // (as_decimal is exact-or-fails: an integral value -> exact decimal
+                // whose dec_to_double is the value, a non-integral double -> the raw
+                // double, so running_sum += (double)Value(i) matches the row path).
+                // DECIMAL128 (exact-sum) stays on the row path - that is increment 3.
+                if (id != arrow::Type::INT64 && id != arrow::Type::INT32 &&
+                    id != arrow::Type::DOUBLE && id != arrow::Type::FLOAT) {
+                    return false;
                 }
                 continue;
             }
-            return false;  // min/max, variance: not yet vectorised
+            // MIN/MAX are excluded here because the aggregate_row factory marks
+            // every aggregate retractable (a GROUP BY input may be a changelog), so
+            // is_batch_foldable already rejects them - they never reach a batch
+            // fold. string_agg/array_agg/percentile/distinct/udaf likewise.
+            return false;
         }
         return true;
     }
@@ -2537,6 +2547,26 @@ public:
             const arrow::Array* base = nullptr;
             const arrow::Int64Array* i64 = nullptr;
             const arrow::Int32Array* i32 = nullptr;
+            const arrow::DoubleArray* f64 = nullptr;
+            const arrow::FloatArray* f32 = nullptr;
+            // Read row i as a double, matching read_cell's widening (int32->int64,
+            // float->double) and the row path's double accumulation. Caller checks
+            // IsNull first; the type is one of these four (batch_vectorisable_).
+            double value(std::int64_t i) const {
+                if (i64 != nullptr) {
+                    return static_cast<double>(i64->Value(i));
+                }
+                if (i32 != nullptr) {
+                    return static_cast<double>(i32->Value(i));
+                }
+                if (f64 != nullptr) {
+                    return f64->Value(i);
+                }
+                if (f32 != nullptr) {
+                    return static_cast<double>(f32->Value(i));
+                }
+                return 0.0;  // unreachable
+            }
         };
         std::vector<AggCol> agg_cols(aggregates_.size());
         for (std::size_t ai = 0; ai < aggregates_.size(); ++ai) {
@@ -2550,6 +2580,8 @@ public:
             agg_cols[ai].base = rb.column(idx).get();
             agg_cols[ai].i64 = dynamic_cast<const arrow::Int64Array*>(agg_cols[ai].base);
             agg_cols[ai].i32 = dynamic_cast<const arrow::Int32Array*>(agg_cols[ai].base);
+            agg_cols[ai].f64 = dynamic_cast<const arrow::DoubleArray*>(agg_cols[ai].base);
+            agg_cols[ai].f32 = dynamic_cast<const arrow::FloatArray*>(agg_cols[ai].base);
         }
         Batch<Row> emit_batch;
         emit_batch.reserve(groups.size());
@@ -2581,18 +2613,19 @@ public:
                             ++st.running_count;
                         }
                     }
-                } else {  // sum / avg over int64 / int32 (validated by batch_vectorisable_)
-                    if (ac.i64 != nullptr) {
+                } else {  // sum / avg / variance over int64/int32/double/float
+                    // Matches update_agg + the variance branch exactly for a
+                    // numeric column: skip nulls, running_sum += (double)value,
+                    // ++running_count, and (variance family) running_sum_sq += d*d.
+                    const bool variance = is_variance_fn(a.fn);
+                    if (ac.base != nullptr) {
                         for (const std::int64_t i : idxs) {
-                            if (!ac.i64->IsNull(i)) {
-                                st.running_sum += static_cast<double>(ac.i64->Value(i));
-                                ++st.running_count;
-                            }
-                        }
-                    } else if (ac.i32 != nullptr) {
-                        for (const std::int64_t i : idxs) {
-                            if (!ac.i32->IsNull(i)) {
-                                st.running_sum += static_cast<double>(ac.i32->Value(i));
+                            if (!ac.base->IsNull(i)) {
+                                const double d = ac.value(i);
+                                st.running_sum += d;
+                                if (variance) {
+                                    st.running_sum_sq += d * d;
+                                }
                                 ++st.running_count;
                             }
                         }

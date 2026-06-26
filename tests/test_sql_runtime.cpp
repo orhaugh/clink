@@ -8219,6 +8219,116 @@ TEST(SqlRuntime, ColumnarParquetGroupByMultiAggregateBatchFold) {
         std::filesystem::remove(p);
 }
 
+// WS6 increment 2: a columnar Parquet source feeds a GROUP BY whose aggregates
+// are SUM / AVG / VAR_POP / STDDEV_POP over a DOUBLE column plus COUNT(*) - all
+// vectorisable, so AggregateRowOp::process_columnar takes the column-at-a-time
+// fold (no per-record Row). Parity oracle for the double + variance kernels: the
+// values must equal the row path's, AND batch_materialize_counter must not move
+// (proving the vectorised fold ran, not a row-decoding fallback).
+TEST(SqlRuntime, ColumnarParquetDoubleVarianceBatchFold) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_ws6v_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_ws6v.parquet";
+    const auto out_path = tmp / "clink_sql_ws6v_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    // eu: [2.5, 6.5] -> sum 9, avg 4.5, var_pop 4, stddev_pop 2, n 2.
+    // us: [10, 10, 10] -> sum 30, avg 10, var_pop 0, stddev_pop 0, n 3.
+    write_lines(in_path,
+                {
+                    R"({"region":"eu","amount":2.5})",
+                    R"({"region":"us","amount":10})",
+                    R"({"region":"eu","amount":6.5})",
+                    R"({"region":"us","amount":10})",
+                    R"({"region":"us","amount":10})",
+                });
+    const std::string cols = "(region VARCHAR, amount DOUBLE)";
+
+    // Job 1: NDJSON -> typed-columnar Parquet (amount as a DOUBLE column).
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT region, amount FROM ev");
+        InProcessCluster cluster("tm-ws6v-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    // Job 2: columnar Parquet source -> GROUP BY region with double SUM/AVG +
+    // VAR_POP + STDDEV_POP + COUNT(*) (all vectorisable -> column-at-a-time fold).
+    const std::uint64_t mat_before =
+        clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
+    {
+        Catalog cat;
+        auto ddl =
+            parse(std::string{"CREATE TABLE pq_in "} + cols + " WITH (connector='parquet', path='" +
+                  pq_path.string() +
+                  "');"
+                  "CREATE TABLE agg_out (region VARCHAR, total DOUBLE, av DOUBLE, vp DOUBLE, "
+                  "sd DOUBLE, n BIGINT) WITH (connector='file', format='json', path='" +
+                  out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat,
+                            "INSERT INTO agg_out SELECT region, SUM(amount) AS total, "
+                            "AVG(amount) AS av, VAR_POP(amount) AS vp, STDDEV_POP(amount) AS sd, "
+                            "COUNT(*) AS n FROM pq_in GROUP BY region");
+        InProcessCluster cluster("tm-ws6v-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    // Zero row decode: the vectorised fold reads Arrow cells directly, so the
+    // columnar batch is never materialised to Rows.
+    EXPECT_EQ(clink::detail::batch_materialize_counter().load(std::memory_order_relaxed),
+              mat_before);
+
+    struct Agg {
+        double total, av, vp, sd;
+        std::int64_t n;
+    };
+    std::map<std::string, Agg> fa;
+    for (const auto& line : read_lines(out_path)) {
+        auto js = clink::config::parse(line);
+        ASSERT_TRUE(js.is_object()) << "bad output line: " << line;
+        fa[js.at("region").as_string()] = {js.at("total").as_number(),
+                                           js.at("av").as_number(),
+                                           js.at("vp").as_number(),
+                                           js.at("sd").as_number(),
+                                           static_cast<std::int64_t>(js.at("n").as_number())};
+    }
+    ASSERT_EQ(fa.size(), 2u);
+    EXPECT_NEAR(fa["eu"].total, 9.0, 1e-9);
+    EXPECT_NEAR(fa["eu"].av, 4.5, 1e-9);
+    EXPECT_NEAR(fa["eu"].vp, 4.0, 1e-9);
+    EXPECT_NEAR(fa["eu"].sd, 2.0, 1e-9);
+    EXPECT_EQ(fa["eu"].n, 2);
+    EXPECT_NEAR(fa["us"].total, 30.0, 1e-9);
+    EXPECT_NEAR(fa["us"].av, 10.0, 1e-9);
+    EXPECT_NEAR(fa["us"].vp, 0.0, 1e-9);
+    EXPECT_NEAR(fa["us"].sd, 0.0, 1e-9);
+    EXPECT_EQ(fa["us"].n, 3);
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // Columnar tumbling window end-to-end: a typed-columnar Parquet source feeds a
 // TUMBLE window aggregate, exercising the columnar window ingest (the window op
 // reads its time / group / agg-input columns straight from the Arrow sidecar).
