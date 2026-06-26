@@ -8606,6 +8606,106 @@ TEST(SqlRuntime, ColumnarParquetHopWindowVectorised) {
         std::filesystem::remove(p);
 }
 
+// Wave 2: columnar JSON decode FIRES ON THE PRODUCTION (Kafka) PATH end-to-end.
+// We compile the real planner-emitted chain for a kafka columnar_decode='true'
+// windowed GROUP BY (q12 shape), then swap the kafka source op for a
+// file_text_source reading an NDJSON file - the SAME string channel feeding the
+// SAME json_string_to_row_columnar bridge - so the test needs no broker. The
+// whole chain (bridge -> assign_timestamps_row -> row_compute_key -> windowed
+// aggregate) must stay columnar: batch_materialize_counter must NOT move (zero
+// row decode anywhere), and the windowed counts must be correct. This is the
+// "fires-on-production" proof: before Wave 2 the Kafka path was row-form and the
+// columnar agg fold was dormant.
+TEST(SqlRuntime, ColumnarKafkaDecodeFiresOnProductionPath) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_ckd_in.ndjson";
+    const auto out_path = tmp / "clink_sql_ckd_out.ndjson";
+    for (const auto& p : {in_path, out_path})
+        std::filesystem::remove(p);
+
+    // bid-shaped records (q12 subset). Two 10s tumbling windows by datetime(ms):
+    // [0,10000): bidder1 x2, bidder2 x1 ; [10000,20000): bidder1 x1, bidder2 x1.
+    write_lines(in_path,
+                {
+                    R"({"bidder":1,"datetime":1000})",
+                    R"({"bidder":1,"datetime":2000})",
+                    R"({"bidder":2,"datetime":3000})",
+                    R"({"bidder":1,"datetime":11000})",
+                    R"({"bidder":2,"datetime":12000})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(
+        "CREATE TABLE bid (bidder BIGINT, datetime BIGINT) "
+        "WITH (connector='kafka', format='json', brokers='localhost:9092', topic='nx-bid', "
+        "group_id='g', auto_offset_reset='earliest', event_time_column='datetime', "
+        "columnar_decode='true');"
+        "CREATE TABLE out_q (bidder BIGINT, cnt BIGINT) WITH (connector='file', format='json', "
+        "path='" +
+        out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO out_q SELECT bidder, COUNT(*) AS cnt FROM bid "
+                        "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), bidder");
+
+    // Sanity: columnar_decode='true' routed the kafka source through the
+    // columnar bridge (not the plain row-form json_string_to_row).
+    bool has_columnar_bridge = false;
+    for (const auto& op : spec.ops) {
+        if (op.type == "json_string_to_row_columnar")
+            has_columnar_bridge = true;
+        EXPECT_NE(op.type, "json_string_to_row") << "row-form bridge emitted, not columnar";
+    }
+    ASSERT_TRUE(has_columnar_bridge) << "columnar_decode did not emit the columnar bridge";
+
+    // Swap the kafka source for a file_text_source over the NDJSON file (same
+    // string channel, same bridge, same id/inputs) so no broker is needed.
+    bool swapped = false;
+    for (auto& op : spec.ops) {
+        if (op.type == "kafka_source_string") {
+            op.type = "file_text_source";
+            op.params.clear();
+            op.params["path"] = in_path.string();
+            swapped = true;
+        }
+    }
+    ASSERT_TRUE(swapped) << "no kafka_source_string op to swap";
+
+    const std::uint64_t mat_before =
+        clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
+    {
+        InProcessCluster cluster("tm-ckd", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    // FIRES ON PRODUCTION: the columnar bridge emitted a sidecar and the whole
+    // chain (assigner -> row_compute_key -> windowed aggregate) folded it
+    // column-at-a-time - zero row materialisation anywhere.
+    EXPECT_EQ(clink::detail::batch_materialize_counter().load(std::memory_order_relaxed),
+              mat_before);
+
+    // ...and the windowed counts are correct: (bidder, cnt) per fired window.
+    std::multiset<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("bidder").as_number()),
+                    static_cast<std::int64_t>(js.at("cnt").as_number()));
+    }
+    const std::multiset<std::pair<std::int64_t, std::int64_t>> want{{1, 2}, {2, 1}, {1, 1}, {2, 1}};
+    EXPECT_EQ(got, want);
+
+    for (const auto& p : {in_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // WS6 increment 5: windowed MAX/MIN over a numeric columnar source vectorises.
 // Window aggregates are non-retractable (only GROUP BY marks MIN/MAX retractable),
 // so MAX(price)/MIN(price) per window now fold column-at-a-time (no per-record Row)
