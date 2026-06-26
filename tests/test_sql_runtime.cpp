@@ -8329,6 +8329,97 @@ TEST(SqlRuntime, ColumnarParquetDoubleVarianceBatchFold) {
         std::filesystem::remove(p);
 }
 
+// WS6 increment 3: a columnar Parquet source feeds a GROUP BY with SUM over a
+// DECIMAL(18,2) column. The vectorised fold reads the Decimal128 directly and
+// reproduces update_agg's EXACT running_sum_dec accumulation (no dec-string
+// round-trip), so the output must be the exact, clean decimal the row path
+// produces (DecimalGroupBySumExactAndClean is the row-path twin), with no
+// sentinel leak, AND batch_materialize_counter must not move.
+TEST(SqlRuntime, ColumnarParquetDecimalSumExact) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_ws6d_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_ws6d.parquet";
+    const auto out_path = tmp / "clink_sql_ws6d_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    // eu: 0.10 + 0.20 -> 0.30 (not 0.300...). us: 10.01 + 0.02 -> 10.03.
+    write_lines(in_path,
+                {
+                    R"({"region":"eu","amount":0.10})",
+                    R"({"region":"us","amount":10.01})",
+                    R"({"region":"eu","amount":0.20})",
+                    R"({"region":"us","amount":0.02})",
+                });
+    const std::string cols = "(region VARCHAR, amount DECIMAL(18,2))";
+
+    // Job 1: NDJSON -> typed-columnar Parquet (amount as a DECIMAL128(18,2) column).
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT region, amount FROM ev");
+        InProcessCluster cluster("tm-ws6d-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    // Job 2: columnar Parquet source -> GROUP BY region, SUM(amount) (append).
+    const std::uint64_t mat_before =
+        clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE pq_in "} + cols +
+                         " WITH (connector='parquet', path='" + pq_path.string() +
+                         "');"
+                         "CREATE TABLE agg_out (region VARCHAR, total DECIMAL(18,2))"
+                         " WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat,
+                            "INSERT INTO agg_out SELECT region, SUM(amount) AS total "
+                            "FROM pq_in GROUP BY region");
+        InProcessCluster cluster("tm-ws6d-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    EXPECT_EQ(clink::detail::batch_materialize_counter().load(std::memory_order_relaxed),
+              mat_before);
+
+    // Append mode emits a running snapshot per group per batch; keep the LAST
+    // raw line per region (the final aggregate) and assert the exact text.
+    std::map<std::string, std::string> raw;
+    for (const auto& l : read_lines(out_path)) {
+        EXPECT_EQ(l.find('\x01'), std::string::npos) << "decimal sentinel leaked: " << l;
+        auto js = clink::config::parse(l);
+        ASSERT_TRUE(js.is_object()) << "bad output line: " << l;
+        raw[js.at("region").as_string()] = l;
+    }
+    ASSERT_EQ(raw.size(), 2u);
+    EXPECT_NE(raw["eu"].find("\"total\":0.30"), std::string::npos) << raw["eu"];
+    EXPECT_EQ(raw["eu"].find("0.300"), std::string::npos) << "over-precision: " << raw["eu"];
+    EXPECT_NE(raw["us"].find("\"total\":10.03"), std::string::npos) << raw["us"];
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // Columnar tumbling window end-to-end: a typed-columnar Parquet source feeds a
 // TUMBLE window aggregate, exercising the columnar window ingest (the window op
 // reads its time / group / agg-input columns straight from the Arrow sidecar).

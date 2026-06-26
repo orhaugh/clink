@@ -2471,9 +2471,12 @@ public:
                 // (as_decimal is exact-or-fails: an integral value -> exact decimal
                 // whose dec_to_double is the value, a non-integral double -> the raw
                 // double, so running_sum += (double)Value(i) matches the row path).
-                // DECIMAL128 (exact-sum) stays on the row path - that is increment 3.
+                // DECIMAL128 folds through a dedicated exact path (increment 3):
+                // reads the Decimal128 directly and reproduces update_agg's exact
+                // running_sum_dec accumulation, no dec-string round-trip.
                 if (id != arrow::Type::INT64 && id != arrow::Type::INT32 &&
-                    id != arrow::Type::DOUBLE && id != arrow::Type::FLOAT) {
+                    id != arrow::Type::DOUBLE && id != arrow::Type::FLOAT &&
+                    id != arrow::Type::DECIMAL128) {
                     return false;
                 }
                 continue;
@@ -2549,6 +2552,8 @@ public:
             const arrow::Int32Array* i32 = nullptr;
             const arrow::DoubleArray* f64 = nullptr;
             const arrow::FloatArray* f32 = nullptr;
+            const arrow::Decimal128Array* dec = nullptr;
+            int dec_scale = 0;
             // Read row i as a double, matching read_cell's widening (int32->int64,
             // float->double) and the row path's double accumulation. Caller checks
             // IsNull first; the type is one of these four (batch_vectorisable_).
@@ -2582,6 +2587,11 @@ public:
             agg_cols[ai].i32 = dynamic_cast<const arrow::Int32Array*>(agg_cols[ai].base);
             agg_cols[ai].f64 = dynamic_cast<const arrow::DoubleArray*>(agg_cols[ai].base);
             agg_cols[ai].f32 = dynamic_cast<const arrow::FloatArray*>(agg_cols[ai].base);
+            agg_cols[ai].dec = dynamic_cast<const arrow::Decimal128Array*>(agg_cols[ai].base);
+            if (agg_cols[ai].dec != nullptr) {
+                agg_cols[ai].dec_scale =
+                    static_cast<const arrow::Decimal128Type&>(*agg_cols[ai].base->type()).scale();
+            }
         }
         Batch<Row> emit_batch;
         emit_batch.reserve(groups.size());
@@ -2612,6 +2622,38 @@ public:
                         if (ac.base != nullptr && !ac.base->IsNull(i)) {
                             ++st.running_count;
                         }
+                    }
+                } else if (ac.dec != nullptr) {
+                    // DECIMAL128 (increment 3): read the Decimal128 directly and
+                    // reproduce update_agg's exact branch byte-for-byte - no
+                    // dec-string serialise/parse round-trip. SUM/AVG accumulate the
+                    // exact running_sum_dec (with overflow -> sum_dec_complete=false)
+                    // alongside the parallel double running_sum; variance folds the
+                    // dec_to_double value as agg_numeric_double does.
+                    const bool variance = is_variance_fn(a.fn);
+                    for (const std::int64_t i : idxs) {
+                        if (ac.dec->IsNull(i)) {
+                            continue;
+                        }
+                        const clink::config::Decimal dv{arrow::Decimal128(ac.dec->GetValue(i)),
+                                                        ac.dec_scale};
+                        const double d = clink::config::dec_to_double(dv);
+                        if (variance) {
+                            st.running_sum += d;
+                            st.running_sum_sq += d * d;
+                        } else {
+                            if (!st.sum_dec_started) {
+                                st.running_sum_dec = dv;
+                                st.sum_dec_started = true;
+                            } else if (auto s = clink::config::dec_add(st.running_sum_dec, dv)) {
+                                st.running_sum_dec = *s;
+                            } else {
+                                st.sum_dec_complete = false;
+                            }
+                            st.sum_saw_decimal = true;
+                            st.running_sum += d;
+                        }
+                        ++st.running_count;
                     }
                 } else {  // sum / avg / variance over int64/int32/double/float
                     // Matches update_agg + the variance branch exactly for a
