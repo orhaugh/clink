@@ -97,6 +97,9 @@
 #ifdef CLINK_LINKED_S3
 #include "clink/s3/install.hpp"
 #endif
+#ifdef CLINK_LINKED_HTTP_CONNECTOR
+#include "clink/http_connector/install.hpp"
+#endif
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/rocksdb/install.hpp"
 #endif
@@ -1949,6 +1952,9 @@ void install_linked_impls() {
 #ifdef CLINK_LINKED_S3
     clink::s3::install(reg);
     clink::s3::install_state_backend();  // remote-read:// disaggregated state backend
+#endif
+#ifdef CLINK_LINKED_HTTP_CONNECTOR
+    clink::http_connector::install(reg);
 #endif
     // RocksDB is unconditionally linked into clink_node (matches
     // bundled rocksdb-jni model). install() registers the

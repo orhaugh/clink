@@ -57,9 +57,10 @@ set(CLINK_WITH_POSTGRES   "AUTO" CACHE STRING "Postgres impl (AUTO/ON/OFF)")
 set(CLINK_WITH_TLS        "AUTO" CACHE STRING "TLS impl (AUTO/ON/OFF)")
 set(CLINK_WITH_ETCD       "AUTO" CACHE STRING "etcd HA coordinator (AUTO/ON/OFF)")
 set(CLINK_WITH_AVRO       "AUTO" CACHE STRING "Avro codec impl (AUTO/ON/OFF)")
+set(CLINK_WITH_HTTP       "AUTO" CACHE STRING "HTTP connector impl (AUTO/ON/OFF)")
 foreach(_opt CLINK_WITH_ROCKSDB CLINK_WITH_KAFKA CLINK_WITH_AWS_S3
              CLINK_WITH_CLICKHOUSE CLINK_WITH_POSTGRES CLINK_WITH_TLS
-             CLINK_WITH_ETCD CLINK_WITH_AVRO)
+             CLINK_WITH_ETCD CLINK_WITH_AVRO CLINK_WITH_HTTP)
     set_property(CACHE ${_opt} PROPERTY STRINGS AUTO ON OFF)
 endforeach()
 if(CLINK_WITH_ROCKSDB STREQUAL "OFF")
@@ -515,7 +516,7 @@ clink_set_warnings(clink_node)
 # up clink::<x>::install() calls without #ifdef on macros that
 # leaked from libclink's old build. Each impl sets a CLINK_LINKED_<X>
 # define at the consumer-link boundary.
-foreach(_impl kafka postgres clickhouse s3 rocksdb tls etcd)
+foreach(_impl kafka postgres clickhouse s3 rocksdb tls etcd http_connector)
     if(TARGET clink::${_impl})
         string(TOUPPER ${_impl} _IMPL_UC)
         target_compile_definitions(clink_node PRIVATE CLINK_LINKED_${_IMPL_UC})

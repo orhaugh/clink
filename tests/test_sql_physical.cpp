@@ -129,6 +129,52 @@ TEST(SqlPhysical, KafkaColumnarDecodeOptionEmitsColumnarBridgeWithSchema) {
     EXPECT_FALSE(bridge->params.at("schema_columns").empty());
 }
 
+// connector='http' sink lowers to the http_sink (string channel) via the
+// row_to_json_string bridge, carrying the WITH params (url/path). The http
+// table is format='json' (Row channel) so it bridges to the string sink.
+TEST(SqlPhysical, HttpConnectorSinkLowersToHttpSink) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE out_h (a BIGINT) "
+        "WITH (connector='http', format='json', url='http://collector:8080', path='/ingest', "
+        "bulk_format='ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO out_h SELECT a FROM src_t");
+
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* snk = find_op(spec, "http_sink");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("url"), "http://collector:8080");
+    EXPECT_EQ(snk->params.at("path"), "/ingest");
+    // The framing key is "bulk_format" (NOT "format", which is the channel
+    // selector and is stripped by build_params); it must reach the factory.
+    EXPECT_EQ(snk->params.at("bulk_format"), "ndjson");
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);  // Row -> JSON string bridge
+}
+
+// exactly-once on connector='http' is rejected (http is at-least-once only).
+// The rejection fires at table-registration / bind time (the connector
+// allowlist), before physical planning - so assert the whole flow throws.
+TEST(SqlPhysical, HttpConnectorSinkRejectsExactlyOnce) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE out_h (a BIGINT) WITH (connector='http', format='json', url='http://x:1', "
+        "delivery_guarantee='exactly_once');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    EXPECT_ANY_THROW({
+        cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+        auto plan = bind_insert(cat, "INSERT INTO out_h SELECT a FROM src_t");
+        PhysicalPlanner pp;
+        pp.compile(static_cast<const LogicalSink&>(*plan));
+    });
+}
+
 // Without the option, the kafka json table keeps the plain row-form bridge.
 TEST(SqlPhysical, KafkaJsonDefaultUsesRowFormBridge) {
     Catalog cat;

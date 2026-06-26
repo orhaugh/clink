@@ -45,6 +45,7 @@ add_subdirectory(rocksdb)
 add_subdirectory(tls)
 add_subdirectory(etcd)
 add_subdirectory(avro)
+add_subdirectory(http_connector)
 # rocksdb-s3 needs both clink::rocksdb and clink::s3, so it is added after them.
 add_subdirectory(rocksdb-s3)
 
@@ -52,7 +53,7 @@ add_subdirectory(rocksdb-s3)
 # Linking clink::impls_all is equivalent to the legacy
 # clink::clink behaviour (kitchen-sink dep on every available impl).
 add_library(clink_impls_all INTERFACE)
-foreach(_impl kafka postgres clickhouse s3 rocksdb tls etcd avro rocksdb_s3)
+foreach(_impl kafka postgres clickhouse s3 rocksdb tls etcd avro http_connector rocksdb_s3)
     if(TARGET clink::${_impl})
         target_link_libraries(clink_impls_all INTERFACE clink::${_impl})
     endif()

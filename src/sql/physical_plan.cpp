@@ -218,6 +218,18 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{"kafka_sink_string", kChannelString, "row_to_json_string"};
     }
+    if (connector == "http") {
+        // HTTP(S) bulk / webhook sink (at-least-once; no 2PC). Each row is
+        // rendered to a JSON object string then POSTed in batches by http_sink.
+        if (exactly_once) {
+            unsupported(
+                "connector='http' sink is at-least-once; exactly-once delivery is not supported");
+        }
+        if (upsert) {
+            unsupported("connector='http' sink does not support mode='upsert'");
+        }
+        return RowConnectorBinding{"http_sink", kChannelString, "row_to_json_string"};
+    }
     if (connector == "parquet") {
         // Typed-columnar Parquet. exactly_once routes to the 2PC variant
         // (staging/ + atomic commit on checkpoint); else one file/subtask.
