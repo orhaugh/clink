@@ -1742,6 +1742,16 @@ public:
             return false;
         }
         const std::int64_t n = rb->num_rows();
+        // WS6: fully-columnar session fold when every aggregate is vectorisable.
+        // Sessions are sequential (merge-on-gap) so this is not a slice fold, but
+        // it still reads cells straight from Arrow with no per-record Row, and is
+        // reachable now that assign_timestamps_row forwards columnar batches. Not
+        // subject to the projection-benefit gate (it builds no Row regardless of
+        // width). A session with min/max / string_agg / percentile falls through.
+        if (aggs_vectorisable(aggregates_, *rb)) {
+            vectorised_session_fold_(*rb);
+            return true;
+        }
         if (!ws3_columnar_projection_benefit(columnar_needed_.size(), *rb)) {
             return false;  // no projection benefit: the row path is faster here
         }
@@ -1999,6 +2009,110 @@ private:
             return;
         const auto ts = static_cast<std::int64_t>(tit->second.as_number());
         fold_session_(state_[group_key_(row)], row, ts);
+    }
+
+    // WS6 cell-based session fold: the byte-identical twin of fold_session_ that
+    // reads the agg input + group-key columns straight from the Arrow sidecar
+    // (one_idx = {the current record's row index}) instead of a per-record Row.
+    // The session merge logic is unchanged (order-sensitive, sequential); only the
+    // agg update + group_values init are sourced from columns - the agg fold reuses
+    // the shared kernel, byte-identical to update_agg for the vectorisable set.
+    void fold_session_columnar_(std::map<std::int64_t, Session>& by_session,
+                                const arrow::RecordBatch& rb,
+                                std::int64_t ts,
+                                const std::vector<KeyCol>& key_cols,
+                                const std::vector<VecAggCol>& agg_cols,
+                                const std::vector<std::int64_t>& one_idx) const {
+        std::vector<std::int64_t> overlap_starts;
+        for (auto it = by_session.begin(); it != by_session.end(); ++it) {
+            const auto& s = it->second;
+            if (s.end + gap_ms_ < ts)
+                continue;
+            if (s.start > ts + gap_ms_)
+                break;
+            overlap_starts.push_back(it->first);
+        }
+        if (overlap_starts.empty()) {
+            Session s;
+            s.start = ts;
+            s.end = ts;
+            s.agg_states.resize(aggregates_.size());
+            for (std::size_t k = 0; k < key_cols.size(); ++k) {
+                const int idx = key_cols[k].first;
+                if (idx >= 0) {
+                    s.group_values.values[group_key_outputs_[k]] = row_columnar_detail::read_cell(
+                        key_cols[k].second, *rb.column(idx), one_idx[0]);
+                }
+            }
+            vectorised_fold_slice(aggregates_, agg_cols, one_idx, s.agg_states);
+            by_session.emplace(ts, std::move(s));
+            return;
+        }
+        Session merged = std::move(by_session[overlap_starts.front()]);
+        for (std::size_t i = 1; i < overlap_starts.size(); ++i) {
+            auto& s = by_session[overlap_starts[i]];
+            merge_into(merged, s, aggregates_);
+            by_session.erase(overlap_starts[i]);
+        }
+        by_session.erase(overlap_starts.front());
+        merged.start = std::min(merged.start, ts);
+        merged.end = std::max(merged.end, ts);
+        vectorised_fold_slice(aggregates_, agg_cols, one_idx, merged.agg_states);
+        const std::int64_t new_start = merged.start;
+        by_session.emplace(new_start, std::move(merged));
+    }
+
+    // WS6: fully-columnar session fold. Reads time + group + agg cells straight
+    // from Arrow (no per-record Row). Sessions are sequential (merge-on-gap), so
+    // this is NOT a slice fold - it folds each record in arrival order via the
+    // cell-based fold_session_columnar_, byte-identical to the per-record path for
+    // the vectorisable aggregate set. Caller guarantees aggs_vectorisable.
+    void vectorised_session_fold_(const arrow::RecordBatch& rb) {
+        const std::int64_t n = rb.num_rows();
+        const int time_idx = rb.schema()->GetFieldIndex(time_column_);
+        const auto time_type = time_idx >= 0 ? rb.schema()->field(time_idx)->type() : nullptr;
+        std::vector<KeyCol> key_cols;
+        key_cols.reserve(group_keys_.size());
+        for (const auto& k : group_keys_) {
+            const int idx = rb.schema()->GetFieldIndex(k);
+            key_cols.emplace_back(idx, idx >= 0 ? rb.schema()->field(idx)->type() : nullptr);
+        }
+        const std::vector<VecAggCol> agg_cols = resolve_vec_agg_cols(aggregates_, rb);
+
+        // Group record indices by key in first-seen order; skip bad-time rows
+        // (matching handle_record_'s guard) so no empty state_ entry is created.
+        clink::FlatMap<std::string, std::size_t> group_of;
+        std::vector<std::vector<std::int64_t>> groups;
+        std::vector<std::string> group_keys;
+        for (std::int64_t i = 0; i < n; ++i) {
+            if (time_idx < 0) {
+                continue;
+            }
+            const auto tv = row_columnar_detail::read_cell(time_type, *rb.column(time_idx), i);
+            if (!tv.is_number()) {
+                continue;
+            }
+            std::string key = columnar_group_key(rb, key_cols, i);
+            auto git = group_of.find(key);
+            if (git == group_of.end()) {
+                group_of.emplace(key, groups.size());
+                groups.push_back({i});
+                group_keys.push_back(std::move(key));
+            } else {
+                groups[git->second].push_back(i);
+            }
+        }
+        std::vector<std::int64_t> one_idx(1);
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+            auto& by_session = state_[group_keys[g]];
+            for (const std::int64_t idx : groups[g]) {
+                const auto ts = static_cast<std::int64_t>(
+                    row_columnar_detail::read_cell(time_type, *rb.column(time_idx), idx)
+                        .as_number());
+                one_idx[0] = idx;
+                fold_session_columnar_(by_session, rb, ts, key_cols, agg_cols, one_idx);
+            }
+        }
     }
 
     void fire_due_(EventTime wm, Emitter<Row>& out) {

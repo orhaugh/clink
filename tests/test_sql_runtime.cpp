@@ -8778,6 +8778,90 @@ TEST(SqlRuntime, ColumnarParquetSessionWindowEndToEnd) {
         std::filesystem::remove(p);
 }
 
+// WS6 columnar session fold: a Parquet source feeds a SESSION window with
+// COUNT + SUM (both vectorisable). Now that assign_timestamps_row forwards the
+// columnar batch, SessionWindowRowOp takes the cell-based fold_session_columnar_
+// (no per-record Row). Sessions are sequential (merge-on-gap); this asserts the
+// merged per-session aggregates are exactly the row path's AND
+// batch_materialize_counter does not move (whole source->assigner->session
+// pipeline columnar, zero decode).
+TEST(SqlRuntime, ColumnarParquetSessionSumVectorised) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_css_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_css.parquet";
+    const auto out_path = tmp / "clink_sql_css_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    // gap 500. user 1: ts 100(10), 300(20) -> one session [100,300] (gap 200<=500):
+    // count 2, sum 30. ts 1500(5) -> 1500-300=1200>500 -> new session: count 1, sum 5.
+    write_lines(in_path,
+                {
+                    R"({"user_id":1,"ts":100,"amount":10})",
+                    R"({"user_id":1,"ts":300,"amount":20})",
+                    R"({"user_id":1,"ts":1500,"amount":5})",
+                });
+    const std::string cols = "(user_id BIGINT, ts BIGINT, amount BIGINT)";
+
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts, amount FROM ev");
+        InProcessCluster cluster("tm-css-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    const std::uint64_t mat_before =
+        clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE pq_in "} + cols +
+                         " WITH (connector='parquet', path='" + pq_path.string() +
+                         "', event_time_column='ts');"
+                         "CREATE TABLE per_session (user_id BIGINT, hits BIGINT, total BIGINT) "
+                         "WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat,
+                            "INSERT INTO per_session SELECT user_id, COUNT(*) AS hits, "
+                            "SUM(amount) AS total FROM pq_in GROUP BY SESSION(ts, 500), user_id");
+        InProcessCluster cluster("tm-css-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    EXPECT_EQ(clink::detail::batch_materialize_counter().load(std::memory_order_relaxed),
+              mat_before);
+
+    std::multiset<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("hits").as_number()),
+                    static_cast<std::int64_t>(js.at("total").as_number()));
+    }
+    const std::multiset<std::pair<std::int64_t, std::int64_t>> want{{2, 30}, {1, 5}};
+    EXPECT_EQ(got, want);
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // Multi-way (3-table) INNER equi-join: a JOIN b JOIN c binds to a left-deep
 // nested EquiJoin tree (the inner join's flat columns pass through the outer
 // join unprefixed) and executes end-to-end. The joined output uses the flat
