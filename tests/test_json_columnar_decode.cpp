@@ -341,6 +341,25 @@ TEST(JsonColumnarDecode, ReservedDunderColumnForcesRowPath) {
     EXPECT_FALSE(col_el.as_data().is_columnar());  // forced row fallback, no collision
 }
 
+// A schema with DUPLICATE declared column names defeats the count+per-key-find
+// faithfulness gate (a line with an extra undeclared field has the same size as
+// the inflated column count and the duplicate key is found twice, so the extra
+// field would be silently dropped while the batch still went columnar). The
+// catalog does not reject duplicate names, so the operator must force the row
+// path for such a schema.
+TEST(JsonColumnarDecode, DuplicateColumnNameForcesRowPath) {
+    std::vector<RowColumn> schema = {{"a", arrow::int64()}, {"a", arrow::int64()}};
+    JsonStringToRowColumnarOperator col_op(schema);
+    // size==2 line matches the inflated resolved_.size()==2 - the gap the guard closes.
+    auto col_el = run_one(col_op, lines_batch({R"({"a":1,"b":2})"}));
+    ASSERT_TRUE(col_el.is_data());
+    EXPECT_FALSE(col_el.as_data().is_columnar());  // forced row fallback, no silent drop
+    // Row fallback preserves the full object (both a and b), like json_string_to_row.
+    const auto& vals = col_el.as_data().records()[0].value().values;
+    EXPECT_EQ(vals.count("a"), 1u);
+    EXPECT_EQ(vals.count("b"), 1u);
+}
+
 // A present-null value for a declared column round-trips faithfully (null cell
 // -> null), so the batch still fires columnar.
 TEST(JsonColumnarDecode, ExplicitNullValueStaysColumnar) {
