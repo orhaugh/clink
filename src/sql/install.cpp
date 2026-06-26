@@ -2599,17 +2599,21 @@ public:
             const auto& idxs = groups[g];
             auto sit = state_.find(group_keys[g]);
             if (sit == state_.end()) {
-                // New group: seed group_values from the first index's key cells,
-                // reusing init_bucket_ so group_values is byte-identical.
-                Row key_row;
+                // New group: build the bucket directly from the first index's key
+                // cells - no intermediate Row. group_values is byte-identical to
+                // init_bucket_ (key column read_cell -> group_key_outputs_ name);
+                // group_key_outputs_.size() == group_keys_.size() (ctor invariant).
+                AggBucket b;
+                b.agg_states.resize(aggregates_.size());
                 for (std::size_t k = 0; k < key_cols.size(); ++k) {
                     const int idx = key_cols[k].first;
                     if (idx >= 0) {
-                        key_row.values[group_keys_[k]] = row_columnar_detail::read_cell(
-                            key_cols[k].second, *rb.column(idx), idxs[0]);
+                        b.group_values.values[group_key_outputs_[k]] =
+                            row_columnar_detail::read_cell(
+                                key_cols[k].second, *rb.column(idx), idxs[0]);
                     }
                 }
-                sit = state_.emplace(group_keys[g], init_bucket_(key_row)).first;
+                sit = state_.emplace(group_keys[g], std::move(b)).first;
             }
             for (std::size_t ai = 0; ai < aggregates_.size(); ++ai) {
                 const auto& a = aggregates_[ai];
