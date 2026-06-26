@@ -1,11 +1,16 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <arrow/array.h>
+#include <arrow/builder.h>
+#include <arrow/record_batch.h>
 #include <arrow/type.h>
 
 #include "clink/config/json.hpp"
@@ -16,6 +21,12 @@
 #include "clink/sql/row_columnar_batcher.hpp"
 
 namespace clink::sql {
+
+// kSourcePartitionColumn (the engine-only partition sidecar column) is defined
+// in row_columnar_batcher.hpp so the self-describing row reader there can drop
+// it on materialisation. The assigner reads it columnar via
+// with_columnar_partitions; this operator's materialize restores it onto the
+// row records, so a row consumer (or the assigner's row fallback) is unchanged.
 
 // Columnar variant of json_string_to_row (Wave 2, increment 1).
 //
@@ -48,15 +59,15 @@ namespace clink::sql {
 //   increment adds a direct typed decoder for them.
 //
 //   A PARTITIONED record (Record::source_partition set - every record from a
-//   Kafka topic) also forces the row fallback: the Arrow sidecar carries no
-//   partition column, so a columnar batch would lose source_partition and the
-//   downstream partition-aware watermark assigner would collapse per-partition
-//   watermarking to a single global watermark (wrong windowed results). This
-//   means that on a real (partitioned) Kafka source the columnar path currently
-//   falls back to row form; carrying partition through the columnar watermark
-//   path is a later increment, after which windowed/keyed Kafka queries go
-//   columnar end-to-end. The columnar emit here is exercised by non-partitioned
-//   inputs (and proves the seam + gating + fallback).
+//   Kafka topic) is carried through the columnar path via the engine-only
+//   kSourcePartitionColumn sidecar column, which the downstream partition-aware
+//   watermark assigner reads (with_columnar_partitions) to keep per-partition
+//   watermarking without materialising. The lazy materialize closure restores
+//   source_partition onto the row records too, so the assigner's row fallback
+//   (or any row consumer) stays byte- and metadata-equivalent to
+//   json_string_to_row. (Before this was added, going columnar dropped
+//   source_partition and collapsed per-partition watermarking to a single
+//   global watermark - wrong windowed results.)
 class JsonStringToRowColumnarOperator final : public Operator<std::string, Row> {
 public:
     explicit JsonStringToRowColumnarOperator(std::vector<RowColumn> columns,
@@ -70,6 +81,15 @@ public:
             if (!columnar_capable_type_(eff->id())) {
                 schema_capable_ = false;
             }
+            // A declared column in the engine-reserved "__" namespace would
+            // collide with the partition sidecar column this operator appends
+            // (a duplicate name makes GetFieldIndex ambiguous -> the partition
+            // reader silently yields nothing -> per-partition watermarking
+            // collapses to a global watermark). Refuse the columnar path for
+            // such a schema; the row fallback is always correct.
+            if (c.name.rfind("__", 0) == 0) {
+                schema_capable_ = false;
+            }
             resolved_.push_back({c.name, std::move(eff)});
         }
     }
@@ -81,9 +101,14 @@ public:
             // (1) Decode to a row-form Batch<Row>, byte-identical to
             //     json_string_to_row. A decode miss yields an empty Row (it is
             //     not faithfully columnar, so it forces the row fallback).
+            //     source_partition is carried alongside (parts) for the sidecar
+            //     and preserved on every record for the row fallback.
             Batch<Row> rows;
             rows.reserve(in.size());
+            std::vector<std::optional<std::int32_t>> parts;
+            parts.reserve(in.size());
             bool faithful = schema_capable_;
+            bool any_partition = false;
             for (const auto& rec : in) {
                 auto decoded = fmt_.decode(rec.value());
                 if (!decoded.has_value()) {
@@ -96,33 +121,23 @@ public:
                 Record<Row> out_rec = rec.event_time().has_value()
                                           ? Record<Row>(std::move(row), *rec.event_time())
                                           : Record<Row>(std::move(row));
-                if (auto p = rec.source_partition(); p.has_value()) {
+                auto p = rec.source_partition();
+                if (p.has_value()) {
                     out_rec.set_source_partition(*p);
-                    // A partitioned record (every record from a Kafka topic) is
-                    // NOT columnar-representable: the Arrow sidecar carries no
-                    // source_partition column, so the downstream partition-aware
-                    // watermark assigner's columnar fast path would feed the
-                    // strategy partition-unset and collapse per-partition
-                    // watermarking to a single global watermark (racing to the
-                    // fastest partition -> slow-partition records marked late ->
-                    // wrong windowed results). Force the row fallback, which
-                    // preserves source_partition (set above) and keeps
-                    // per-partition watermarking correct. Carrying partition
-                    // through the columnar path is a later increment.
-                    faithful = false;
+                    any_partition = true;
                 }
+                parts.push_back(p);
                 rows.push(std::move(out_rec));
             }
 
             // (2) Go columnar only when every record round-trips exactly.
             //     Otherwise emit the row-form batch (the permanent fallback,
-            //     identical to json_string_to_row).
+            //     identical to json_string_to_row - source_partition preserved).
             if (faithful) {
-                if (auto rb = batcher_.build(rows); rb != nullptr) {
-                    if (auto columnar = batcher_.parse(*rb); columnar.has_value()) {
-                        out.emit_data(std::move(*columnar));
-                        return;
-                    }
+                if (auto columnar = build_columnar_(rows, parts, any_partition);
+                    columnar.has_value()) {
+                    out.emit_data(std::move(*columnar));
+                    return;
                 }
             }
             out.emit_data(std::move(rows));
@@ -140,6 +155,86 @@ private:
         std::string name;
         std::shared_ptr<arrow::DataType> eff;
     };
+
+    // Build the columnar Batch<Row>: the shared typed sidecar (event_time +
+    // declared columns) from batcher_.build, plus an engine-only
+    // kSourcePartitionColumn int32 column when any record is partitioned. The
+    // lazy materialize restores the declared columns (byte-identical to
+    // make_row_columnar_arrow_batcher's own materialize) AND source_partition,
+    // so a row consumer or the assigner's row fallback sees the same records as
+    // json_string_to_row. Returns nullopt if the sidecar cannot be built (then
+    // the caller emits the row form).
+    std::optional<Batch<Row>> build_columnar_(const Batch<Row>& rows,
+                                              const std::vector<std::optional<std::int32_t>>& parts,
+                                              bool any_partition) const {
+        auto rb = batcher_.build(rows);
+        if (rb == nullptr) {
+            return std::nullopt;
+        }
+        if (any_partition) {
+            arrow::Int32Builder pb;
+            if (!pb.Reserve(static_cast<std::int64_t>(parts.size())).ok()) {
+                return std::nullopt;
+            }
+            for (const auto& p : parts) {
+                if (p.has_value()) {
+                    if (!pb.Append(*p).ok()) {
+                        return std::nullopt;
+                    }
+                } else if (!pb.AppendNull().ok()) {
+                    return std::nullopt;
+                }
+            }
+            std::shared_ptr<arrow::Array> p_arr;
+            if (!pb.Finish(&p_arr).ok()) {
+                return std::nullopt;
+            }
+            auto added = rb->AddColumn(
+                rb->num_columns(), arrow::field(kSourcePartitionColumn, arrow::int32()), p_arr);
+            if (!added.ok()) {
+                return std::nullopt;
+            }
+            rb = *added;
+        }
+
+        const auto n = static_cast<std::size_t>(rb->num_rows());
+        auto resolved = resolved_;  // capture by value for lifetime safety
+        auto materialize = [resolved](const arrow::RecordBatch& b) -> std::vector<Record<Row>> {
+            const auto* t_arr = dynamic_cast<const arrow::Int64Array*>(b.column(0).get());
+            const int part_idx = b.schema()->GetFieldIndex(kSourcePartitionColumn);
+            const arrow::Int32Array* p_arr =
+                part_idx >= 0 ? dynamic_cast<const arrow::Int32Array*>(b.column(part_idx).get())
+                              : nullptr;
+            const auto rn = b.num_rows();
+            std::vector<Row> decoded(static_cast<std::size_t>(rn));
+            for (std::size_t ci = 0; ci < resolved.size(); ++ci) {
+                const auto& c = resolved[ci];
+                const auto& col = *b.column(static_cast<int>(ci) + 1);
+                for (std::int64_t i = 0; i < rn; ++i) {
+                    decoded[static_cast<std::size_t>(i)].values[c.name] =
+                        row_columnar_detail::read_cell(c.eff, col, i);
+                }
+            }
+            std::vector<Record<Row>> recs;
+            recs.reserve(static_cast<std::size_t>(rn));
+            for (std::int64_t i = 0; i < rn; ++i) {
+                std::optional<EventTime> ts;
+                if (t_arr != nullptr) {
+                    ts = clink::detail::read_event_time(*t_arr, i);
+                }
+                Record<Row> rec =
+                    ts.has_value()
+                        ? Record<Row>(std::move(decoded[static_cast<std::size_t>(i)]), *ts)
+                        : Record<Row>(std::move(decoded[static_cast<std::size_t>(i)]));
+                if (p_arr != nullptr && !p_arr->IsNull(i)) {
+                    rec.set_source_partition(p_arr->Value(i));
+                }
+                recs.push_back(std::move(rec));
+            }
+            return recs;
+        };
+        return Batch<Row>{std::move(rb), n, std::move(materialize)};
+    }
 
     // Types whose build_column / read_cell round-trip is an exact identity for
     // a conforming value. FLOAT is lossy (double->float->double) and DECIMAL128

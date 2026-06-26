@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include <arrow/array.h>
+#include <arrow/record_batch.h>
 #include <arrow/type.h>
 #include <gtest/gtest.h>
 
@@ -202,20 +204,19 @@ TEST(JsonColumnarDecode, FloatSchemaTakesRowPath) {
     EXPECT_EQ(encoded_rows(col_el.as_data()), encoded_rows(row_el.as_data()));
 }
 
-// A partitioned source (every Kafka record carries source_partition) must take
-// the row path: the Arrow sidecar has no partition column, so going columnar
-// would drop source_partition and break the downstream partition-aware
-// watermark assigner. The fallback batch must be row-form AND preserve every
-// record's source_partition (and event_time) - the metadata the value-only
-// oracle does not see.
-TEST(JsonColumnarDecode, PartitionedRecordsFallBackAndPreservePartition) {
+// A partitioned source (every Kafka record carries source_partition) goes
+// columnar, carrying source_partition through the engine-only
+// __source_partition sidecar column so the downstream partition-aware watermark
+// assigner can read it. The lazy materialize must restore source_partition (and
+// event_time) onto the rows - the metadata the value-only oracle does not see.
+TEST(JsonColumnarDecode, PartitionedFaithfulRecordsGoColumnarCarryingPartition) {
     const std::vector<std::string> lines = {
         R"({"a":1,"b":1.5,"c":"x","d":true})",
         R"({"a":2,"b":2.5,"c":"y","d":false})",
     };
 
-    // Build a partitioned input batch the way the Kafka string source does:
-    // each record carries a source_partition and an inline event_time.
+    // Build a partitioned input the way the Kafka string source does: each
+    // record carries a source_partition and an inline event_time.
     Batch<std::string> in;
     {
         Record<std::string> r0(lines[0], clink::EventTime{100});
@@ -227,15 +228,26 @@ TEST(JsonColumnarDecode, PartitionedRecordsFallBackAndPreservePartition) {
     }
 
     JsonStringToRowColumnarOperator col_op(demo_schema());
+    const auto mat_before =
+        clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
     auto col_el = run_one(col_op, std::move(in));
     ASSERT_TRUE(col_el.is_data());
     const Batch<Row>& out = col_el.as_data();
 
-    // Row-form fallback (NOT columnar), so the partition-aware assigner stays on
-    // its correct per-partition row path.
-    EXPECT_FALSE(out.is_columnar());
+    // Fires columnar, with the partition carried as a sidecar column (read
+    // without materialising rows).
+    EXPECT_TRUE(out.is_columnar());
+    EXPECT_EQ(clink::detail::batch_materialize_counter().load(std::memory_order_relaxed),
+              mat_before);
+    ASSERT_NE(out.arrow(), nullptr);
+    auto pcol = out.arrow()->GetColumnByName(clink::sql::kSourcePartitionColumn);
+    ASSERT_NE(pcol, nullptr);
+    const auto& parr = static_cast<const arrow::Int32Array&>(*pcol);
+    ASSERT_EQ(parr.length(), 2);
+    EXPECT_EQ(parr.Value(0), 0);
+    EXPECT_EQ(parr.Value(1), 3);
 
-    // Values still byte-equivalent to the row oracle...
+    // Values byte-equivalent to the row oracle...
     auto oracle = make_row_oracle();
     Batch<std::string> in2;
     in2.emplace(std::string(lines[0]));
@@ -243,8 +255,8 @@ TEST(JsonColumnarDecode, PartitionedRecordsFallBackAndPreservePartition) {
     auto row_el = run_one(oracle, std::move(in2));
     EXPECT_EQ(encoded_rows(out), encoded_rows(row_el.as_data()));
 
-    // ...and the record-level metadata the columnar path would have dropped is
-    // preserved verbatim.
+    // ...and the lazy materialize restores source_partition + event_time, so a
+    // row consumer (or the assigner's row fallback) is metadata-equivalent.
     const auto& recs = out.records();
     ASSERT_EQ(recs.size(), 2u);
     ASSERT_TRUE(recs[0].source_partition().has_value());
@@ -254,6 +266,79 @@ TEST(JsonColumnarDecode, PartitionedRecordsFallBackAndPreservePartition) {
     ASSERT_TRUE(recs[0].event_time().has_value());
     EXPECT_EQ(recs[0].event_time()->millis(), 100);
     EXPECT_EQ(recs[1].event_time()->millis(), 200);
+}
+
+// A partitioned batch that is NOT value-faithful (here a wrong-type value in an
+// int column) still falls back to the row form, and the fallback preserves
+// source_partition (set on every record before the faithful check).
+TEST(JsonColumnarDecode, PartitionedNonFaithfulFallsBackPreservingPartition) {
+    Batch<std::string> in;
+    {
+        Record<std::string> r0(R"({"a":"oops","b":1.5,"c":"x","d":true})", clink::EventTime{100});
+        r0.set_source_partition(2);
+        in.push(std::move(r0));
+    }
+
+    JsonStringToRowColumnarOperator col_op(demo_schema());
+    auto col_el = run_one(col_op, std::move(in));
+    ASSERT_TRUE(col_el.is_data());
+    const Batch<Row>& out = col_el.as_data();
+
+    EXPECT_FALSE(out.is_columnar());  // wrong-type value forces the row fallback
+    const auto& recs = out.records();
+    ASSERT_EQ(recs.size(), 1u);
+    ASSERT_TRUE(recs[0].source_partition().has_value());
+    EXPECT_EQ(*recs[0].source_partition(), 2);
+}
+
+// The engine partition sidecar column must NEVER leak into a materialised Row
+// value. The self-describing reader (rows_from_record_batch) is what a row-only
+// downstream op (OVER / semi-join / top-N-per-key, none columnar) uses to
+// materialise a columnar batch that still carries __source_partition - it must
+// drop the column, or it surfaces as a spurious field in the output JSON.
+TEST(JsonColumnarDecode, SourcePartitionColumnDoesNotLeakIntoMaterialisedRows) {
+    Batch<std::string> in;
+    {
+        Record<std::string> r0(R"({"a":1,"b":1.5,"c":"x","d":true})", clink::EventTime{100});
+        r0.set_source_partition(7);
+        in.push(std::move(r0));
+    }
+    JsonStringToRowColumnarOperator col_op(demo_schema());
+    auto col_el = run_one(col_op, std::move(in));
+    ASSERT_TRUE(col_el.is_data());
+    const Batch<Row>& out = col_el.as_data();
+    ASSERT_TRUE(out.is_columnar());
+    ASSERT_NE(out.arrow(), nullptr);
+    // The sidecar carries the partition column (for the assigner)...
+    ASSERT_NE(out.arrow()->GetColumnByName(clink::sql::kSourcePartitionColumn), nullptr);
+
+    // ...but the self-describing reader must not inject it into Row.values.
+    auto rows = clink::sql::rows_from_record_batch(*out.arrow());
+    ASSERT_TRUE(rows.has_value());
+    ASSERT_EQ(rows->size(), 1u);
+    const auto& vals = (*rows)[0].value().values;
+    EXPECT_EQ(vals.count(clink::sql::kSourcePartitionColumn), 0u);  // no leak
+    EXPECT_EQ(vals.count("a"), 1u);
+    EXPECT_EQ(vals.count("b"), 1u);
+    EXPECT_EQ(vals.count("c"), 1u);
+    EXPECT_EQ(vals.count("d"), 1u);
+}
+
+// A declared column in the engine-reserved "__" namespace would collide with
+// the appended partition sidecar column (ambiguous name -> partition silently
+// lost -> global-watermark collapse). Such a schema must take the row path.
+TEST(JsonColumnarDecode, ReservedDunderColumnForcesRowPath) {
+    std::vector<RowColumn> schema = {{"__source_partition", arrow::int64()}, {"a", arrow::int64()}};
+    Batch<std::string> in;
+    {
+        Record<std::string> r0(R"({"__source_partition":5,"a":1})", clink::EventTime{1});
+        r0.set_source_partition(2);
+        in.push(std::move(r0));
+    }
+    JsonStringToRowColumnarOperator col_op(schema);
+    auto col_el = run_one(col_op, std::move(in));
+    ASSERT_TRUE(col_el.is_data());
+    EXPECT_FALSE(col_el.as_data().is_columnar());  // forced row fallback, no collision
 }
 
 // A present-null value for a declared column round-trips faithfully (null cell

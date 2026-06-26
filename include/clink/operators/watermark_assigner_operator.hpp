@@ -48,6 +48,19 @@ public:
     using ColumnarEventTimes =
         std::function<bool(const arrow::RecordBatch&, std::vector<EventTime>&)>;
 
+    // Optional companion to ColumnarEventTimes: reads each row's source
+    // partition straight from the Arrow sidecar so the columnar fast path can
+    // feed a PARTITION-AWARE watermark strategy without materialising rows. Per
+    // row it yields the partition or nullopt (no partition / null cell). When
+    // the reader is unset, or yields a size mismatch, the columnar path feeds
+    // partition-unset records - i.e. a single global watermark, which is the
+    // correct behaviour for a non-partitioned source. This is what lets a
+    // partitioned (Kafka) columnar source keep per-partition watermarking
+    // through the assigner instead of racing the watermark to the fastest
+    // partition (see json_string_to_row_columnar).
+    using ColumnarPartitions =
+        std::function<bool(const arrow::RecordBatch&, std::vector<std::optional<std::int32_t>>&)>;
+
     WatermarkAssignerOperator(TimeExtractor extractor,
                               std::unique_ptr<WatermarkStrategy<T>> strategy,
                               std::string name = "watermark_assigner")
@@ -125,6 +138,13 @@ public:
         return *this;
     }
 
+    // Enable per-partition watermarking on the columnar fast path. Only useful
+    // alongside with_columnar_event_times and a partition-aware strategy.
+    WatermarkAssignerOperator& with_columnar_partitions(ColumnarPartitions reader) {
+        columnar_partitions_ = std::move(reader);
+        return *this;
+    }
+
     [[nodiscard]] bool supports_columnar() const noexcept override {
         return static_cast<bool>(columnar_event_times_);
     }
@@ -156,12 +176,26 @@ public:
                                                       alignment_max_drift_ms_,
                                                       alignment_max_wait_);
         }
+        // Per-partition watermarking on the columnar path: if a partition reader
+        // is set, read each row's source partition from the sidecar and stamp it
+        // on the probe so a partition-aware strategy tracks per partition (min
+        // across partitions). Without it (or on a size mismatch), the probe is
+        // partition-unset = a single global watermark, matching a non-partitioned
+        // source's row path. read_partitions returns false when the column is
+        // absent (e.g. a Parquet source), which is the global-watermark case.
+        std::vector<std::optional<std::int32_t>> parts;
+        const bool have_parts = columnar_partitions_ && columnar_partitions_(*rb, parts) &&
+                                parts.size() == times.size();
         // Feed the strategy once per record. The value is irrelevant (the
-        // strategy reads only event_time + source_partition); source_partition is
-        // unset, matching a non-partitioned source's records on the row path.
+        // strategy reads only event_time + source_partition).
         Record<T> probe;
-        for (const EventTime et : times) {
-            probe.set_event_time(et);
+        for (std::size_t i = 0; i < times.size(); ++i) {
+            probe.set_event_time(times[i]);
+            if (have_parts && parts[i].has_value()) {
+                probe.set_source_partition(*parts[i]);
+            } else {
+                probe.clear_source_partition();
+            }
             strategy_->on_record(probe);
         }
         last_record_time_ms_ = now_ms_();
@@ -326,6 +360,7 @@ private:
 
     TimeExtractor extractor_;
     ColumnarEventTimes columnar_event_times_;  // optional; enables process_columnar
+    ColumnarPartitions columnar_partitions_;   // optional; per-partition columnar watermarking
     std::unique_ptr<WatermarkStrategy<T>> strategy_;
     std::string name_;
     std::chrono::milliseconds idleness_{0};

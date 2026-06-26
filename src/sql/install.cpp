@@ -5646,6 +5646,32 @@ void install(clink::plugin::PluginRegistry& reg) {
                     }
                     return true;
                 });
+            // Per-partition columnar watermarking: read the engine-only
+            // __source_partition sidecar column (attached by
+            // json_string_to_row_columnar for a partitioned Kafka source) so the
+            // partition-aware strategy tracks per partition on the columnar fast
+            // path, matching the row path. Absent (e.g. a Parquet source) -> all
+            // unset -> a single global watermark, which is correct for a
+            // non-partitioned source.
+            op->with_columnar_partitions([](const arrow::RecordBatch& rb,
+                                            std::vector<std::optional<std::int32_t>>& out) -> bool {
+                const int idx = rb.schema()->GetFieldIndex(kSourcePartitionColumn);
+                const std::int64_t n = rb.num_rows();
+                out.assign(static_cast<std::size_t>(n), std::nullopt);
+                if (idx < 0) {
+                    return true;  // no partition column -> global watermark
+                }
+                const auto* p_arr = dynamic_cast<const arrow::Int32Array*>(rb.column(idx).get());
+                if (p_arr == nullptr) {
+                    return true;
+                }
+                for (std::int64_t i = 0; i < n; ++i) {
+                    if (!p_arr->IsNull(i)) {
+                        out[static_cast<std::size_t>(i)] = p_arr->Value(i);
+                    }
+                }
+                return true;
+            });
             return op;
         });
 

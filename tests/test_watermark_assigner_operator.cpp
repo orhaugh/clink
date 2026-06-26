@@ -8,11 +8,17 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
+#include <arrow/array.h>
+#include <arrow/builder.h>
+#include <arrow/record_batch.h>
+#include <arrow/type.h>
 #include <gtest/gtest.h>
 
+#include "clink/core/record.hpp"
 #include "clink/operators/watermark_assigner_operator.hpp"
 #include "clink/runtime/bounded_channel.hpp"
 #include "clink/time/watermark_strategy.hpp"
@@ -29,6 +35,70 @@ std::vector<StreamElement<T>> drain(BoundedChannel<StreamElement<T>>& ch) {
         out.push_back(std::move(*e));
     }
     return out;
+}
+
+// A columnar Batch<int> with an event_time (int64) sidecar column 0 and a
+// __source_partition (int32) column 1, mirroring what
+// json_string_to_row_columnar emits for a partitioned source. The materialize
+// closure is provided but must NOT run on the columnar fast path.
+Batch<int> make_partitioned_columnar_batch(
+    const std::vector<std::pair<std::int64_t, std::int32_t>>& ts_part) {
+    arrow::Int64Builder tb;
+    arrow::Int32Builder pb;
+    for (const auto& [t, p] : ts_part) {
+        (void)tb.Append(t);
+        (void)pb.Append(p);
+    }
+    std::shared_ptr<arrow::Array> ta, pa;
+    (void)tb.Finish(&ta);
+    (void)pb.Finish(&pa);
+    auto schema = arrow::schema({arrow::field("event_time", arrow::int64()),
+                                 arrow::field("__source_partition", arrow::int32())});
+    auto rb = arrow::RecordBatch::Make(schema, static_cast<std::int64_t>(ts_part.size()), {ta, pa});
+    auto materialize = [](const arrow::RecordBatch& b) -> std::vector<Record<int>> {
+        const auto* t = static_cast<const arrow::Int64Array*>(b.column(0).get());
+        std::vector<Record<int>> recs;
+        for (std::int64_t i = 0; i < b.num_rows(); ++i) {
+            recs.emplace_back(0, EventTime{t->Value(i)});
+        }
+        return recs;
+    };
+    return Batch<int>{rb, ts_part.size(), std::move(materialize)};
+}
+
+bool read_columnar_event_times(const arrow::RecordBatch& rb, std::vector<EventTime>& out) {
+    const auto* t = static_cast<const arrow::Int64Array*>(rb.column(0).get());
+    out.resize(static_cast<std::size_t>(rb.num_rows()));
+    for (std::int64_t i = 0; i < rb.num_rows(); ++i) {
+        out[static_cast<std::size_t>(i)] = EventTime{t->Value(i)};
+    }
+    return true;
+}
+
+bool read_columnar_partitions(const arrow::RecordBatch& rb,
+                              std::vector<std::optional<std::int32_t>>& out) {
+    const int idx = rb.schema()->GetFieldIndex("__source_partition");
+    out.assign(static_cast<std::size_t>(rb.num_rows()), std::nullopt);
+    if (idx < 0) {
+        return true;
+    }
+    const auto* p = static_cast<const arrow::Int32Array*>(rb.column(idx).get());
+    for (std::int64_t i = 0; i < rb.num_rows(); ++i) {
+        if (!p->IsNull(i)) {
+            out[static_cast<std::size_t>(i)] = p->Value(i);
+        }
+    }
+    return true;
+}
+
+std::optional<std::int64_t> last_watermark(const std::vector<StreamElement<int>>& els) {
+    std::optional<std::int64_t> wm;
+    for (const auto& e : els) {
+        if (e.is_watermark()) {
+            wm = e.as_watermark().timestamp().millis();
+        }
+    }
+    return wm;
 }
 
 }  // namespace
@@ -217,4 +287,63 @@ TEST(WatermarkAssignerOperator, NoEventTimeAndExtractorReturnsZeroStillValid) {
         }
     }
     EXPECT_TRUE(saw_wm_at_zero);
+}
+
+// Per-partition watermarking on the COLUMNAR fast path. A partitioned columnar
+// batch (slow partition 0, fast partition 1) must emit watermark = min across
+// partitions (200), NOT the global max (2000) - otherwise the watermark races
+// to the fastest partition and the slow partition's in-window records are
+// dropped as late (the exact silent-wrong-answer the inc1 review caught). The
+// batch must stay columnar (zero materialisation) through the assigner.
+TEST(WatermarkAssignerOperator, ColumnarPerPartitionWatermarkIsMinAcrossPartitions) {
+    BoundedChannel<StreamElement<int>> ch(64);
+    Emitter<int> em(&ch);
+
+    WatermarkAssignerOperator<int> op(
+        [](const int&) { return EventTime{0}; },
+        std::make_unique<PartitionAwareBoundedOutOfOrdernessStrategy<int>>(0ms));
+    op.with_columnar_event_times(read_columnar_event_times)
+        .with_columnar_partitions(read_columnar_partitions);
+
+    // part 0: 100, 200 (slow) ; part 1: 1000, 2000 (fast), interleaved.
+    auto batch = make_partitioned_columnar_batch({{100, 0}, {1000, 1}, {200, 0}, {2000, 1}});
+
+    const auto mat_before =
+        clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
+    const bool handled = op.process_columnar(StreamElement<int>::data(std::move(batch)), em);
+    ASSERT_TRUE(handled);
+
+    auto elements = drain(ch);
+    auto wm = last_watermark(elements);
+    ASSERT_TRUE(wm.has_value());
+    EXPECT_EQ(*wm, 200);  // min(part0 max=200, part1 max=2000), not 2000
+
+    // The forwarded batch stayed columnar and was never materialised.
+    ASSERT_FALSE(elements.empty());
+    ASSERT_TRUE(elements[0].is_data());
+    EXPECT_TRUE(elements[0].as_data().is_columnar());
+    EXPECT_EQ(clink::detail::batch_materialize_counter().load(std::memory_order_relaxed),
+              mat_before);
+}
+
+// Control: without the partition reader, the same columnar batch collapses to a
+// single global watermark (the fastest partition wins) - confirming the
+// partition reader is what keeps per-partition semantics, and that a
+// non-partitioned columnar source (Parquet, no reader) is unaffected.
+TEST(WatermarkAssignerOperator, ColumnarWithoutPartitionReaderIsGlobalWatermark) {
+    BoundedChannel<StreamElement<int>> ch(64);
+    Emitter<int> em(&ch);
+
+    WatermarkAssignerOperator<int> op(
+        [](const int&) { return EventTime{0}; },
+        std::make_unique<PartitionAwareBoundedOutOfOrdernessStrategy<int>>(0ms));
+    op.with_columnar_event_times(read_columnar_event_times);  // no partition reader
+
+    auto batch = make_partitioned_columnar_batch({{100, 0}, {1000, 1}, {200, 0}, {2000, 1}});
+    const bool handled = op.process_columnar(StreamElement<int>::data(std::move(batch)), em);
+    ASSERT_TRUE(handled);
+
+    auto wm = last_watermark(drain(ch));
+    ASSERT_TRUE(wm.has_value());
+    EXPECT_EQ(*wm, 2000);  // global max - no per-partition tracking
 }

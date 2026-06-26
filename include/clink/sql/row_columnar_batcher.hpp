@@ -47,6 +47,15 @@ struct RowColumn {
     std::shared_ptr<arrow::DataType> type;
 };
 
+// Engine-only sidecar column carrying Record::source_partition through the
+// columnar path (attached by json_string_to_row_columnar). It is consumed
+// columnar by the watermark assigner only and must NEVER materialise into a
+// Row value, so the self-describing reader below drops it. Defined here (not in
+// json_string_to_row_columnar.hpp) so rows_from_record_batch can see it without
+// a circular include. Unlike "__key" / "__row_kind", which are real routing /
+// changelog fields that must reach Row.values, this is pure watermark metadata.
+inline constexpr const char* kSourcePartitionColumn = "__source_partition";
+
 namespace row_columnar_detail {
 
 // The Arrow type a column is actually stored as: the declared type when
@@ -403,6 +412,14 @@ inline std::optional<std::vector<Record<Row>>> rows_from_record_batch(
     cols.reserve(static_cast<std::size_t>(ncol - 1));
     for (int ci = 1; ci < ncol; ++ci) {
         const auto& f = batch.schema()->field(ci);
+        // The engine partition column is watermark metadata, not a Row value -
+        // dropping it here keeps it from leaking into output rows (and the sink
+        // JSON) when a row-only op materialises a columnar batch that still
+        // carries it (e.g. an OVER / semi-join / top-N-per-key op downstream of
+        // the columnar row_compute_key, which has no columnar fast path).
+        if (f->name() == kSourcePartitionColumn) {
+            continue;
+        }
         switch (f->type()->id()) {
             case arrow::Type::INT64:
             case arrow::Type::INT32:

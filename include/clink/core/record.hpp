@@ -74,6 +74,7 @@ public:
     // it never needs to cross a network boundary.
     std::optional<std::int32_t> source_partition() const noexcept { return source_partition_; }
     void set_source_partition(std::int32_t p) noexcept { source_partition_ = p; }
+    void clear_source_partition() noexcept { source_partition_.reset(); }
 
 private:
     T value_{};
