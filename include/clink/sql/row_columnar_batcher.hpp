@@ -294,34 +294,51 @@ inline ArrowBatcher<Row> make_row_columnar_arrow_batcher(std::vector<RowColumn> 
         return arrow::RecordBatch::Make(schema_fn(), n, arrays);
     };
 
-    auto parse = [resolved](const arrow::RecordBatch& batch) -> std::optional<Batch<Row>> {
-        if (batch.num_columns() < static_cast<int>(resolved->size()) + 1)
-            return std::nullopt;
-        const auto* t_arr = dynamic_cast<const arrow::Int64Array*>(batch.column(0).get());
-        if (t_arr == nullptr)
-            return std::nullopt;
-        const auto n = batch.num_rows();
-
+    // Eager row decode of a typed RecordBatch into Records - the byte-identical
+    // reconstruction a row consumer sees. Used as the columnar Batch's lazy
+    // materialize fn below, so it runs ONLY if something actually iterates rows.
+    auto materialize = [resolved](const arrow::RecordBatch& b) -> std::vector<Record<Row>> {
+        const auto* t_arr = dynamic_cast<const arrow::Int64Array*>(b.column(0).get());
+        const auto n = b.num_rows();
         std::vector<Row> rows(static_cast<std::size_t>(n));
         for (std::size_t ci = 0; ci < resolved->size(); ++ci) {
             const auto& c = (*resolved)[ci];
-            const auto& col = *batch.column(static_cast<int>(ci) + 1);
+            const auto& col = *b.column(static_cast<int>(ci) + 1);
             for (std::int64_t i = 0; i < n; ++i) {
                 rows[static_cast<std::size_t>(i)].values[c.name] =
                     row_columnar_detail::read_cell(c.eff, col, i);
             }
         }
-
-        Batch<Row> out;
-        out.reserve(static_cast<std::size_t>(n));
+        std::vector<Record<Row>> recs;
+        recs.reserve(static_cast<std::size_t>(n));
         for (std::int64_t i = 0; i < n; ++i) {
-            const auto ts = clink::detail::read_event_time(*t_arr, i);
+            std::optional<EventTime> ts;
+            if (t_arr != nullptr)
+                ts = clink::detail::read_event_time(*t_arr, i);
             if (ts.has_value())
-                out.emplace(std::move(rows[static_cast<std::size_t>(i)]), *ts);
+                recs.emplace_back(std::move(rows[static_cast<std::size_t>(i)]), *ts);
             else
-                out.emplace(std::move(rows[static_cast<std::size_t>(i)]));
+                recs.emplace_back(std::move(rows[static_cast<std::size_t>(i)]));
         }
-        return out;
+        return recs;
+    };
+
+    auto parse = [resolved,
+                  materialize](const arrow::RecordBatch& batch) -> std::optional<Batch<Row>> {
+        if (batch.num_columns() < static_cast<int>(resolved->size()) + 1)
+            return std::nullopt;
+        if (dynamic_cast<const arrow::Int64Array*>(batch.column(0).get()) == nullptr)
+            return std::nullopt;
+        // Keep the data COLUMNAR: hand the typed RecordBatch downstream AS a
+        // columnar Batch<Row> (Arrow sidecar set, rows materialised lazily by the
+        // fn above only if a row consumer touches them). This is what lets a
+        // Parquet-sourced query ride the columnar operator fast paths (filter /
+        // project / aggregate / window) instead of decoding every row at the
+        // source. Zero data copy: the shared container reuses the SAME column
+        // arrays.
+        auto shared = arrow::RecordBatch::Make(batch.schema(), batch.num_rows(), batch.columns());
+        return Batch<Row>{
+            std::move(shared), static_cast<std::size_t>(batch.num_rows()), materialize};
     };
 
     return ArrowBatcher<Row>{std::move(schema_fn), std::move(build), std::move(parse)};

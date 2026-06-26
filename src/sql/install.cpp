@@ -954,6 +954,35 @@ inline clink::Codec<std::map<std::int64_t, WindowBucket>> window_map_codec() {
     };
 }
 
+// Projection-benefit gate for the WS3 columnar ingest (window / session /
+// group-by). That ingest still builds a per-record narrow Row from the Arrow
+// sidecar and adds a group pass, so it only pays off when it SKIPS value columns
+// the row path would otherwise materialise. When an op needs as many value
+// columns as the batch carries, the row path is faster (measured ~12-22% on a
+// narrow source), so callers return false and fall back to process(). The
+// wide-source projection-pushdown win is preserved. rb column 0 is the
+// event_time sidecar column; the remaining columns are values.
+inline bool ws3_columnar_projection_benefit(std::size_t needed_value_cols,
+                                            const arrow::RecordBatch& rb) {
+    // Count real DATA columns only. The batch also carries engine bookkeeping
+    // columns - the "event_time" sidecar and the "__key" / "__row_kind" routing
+    // columns - which are present regardless of the query's projection and carry
+    // no skippable payload, so they must not count toward "columns available to
+    // skip". With those excluded: a query that reads as many data columns as the
+    // batch has gets no projection benefit (needed >= data -> row path, which is
+    // measurably faster for the WS3 ingest); a query reading fewer rides columnar
+    // and skips materialising the rest (the wide-source win).
+    std::size_t data_cols = 0;
+    for (const auto& f : rb.schema()->fields()) {
+        const auto& nm = f->name();
+        if (nm == "event_time" || (nm.size() >= 2 && nm[0] == '_' && nm[1] == '_')) {
+            continue;
+        }
+        ++data_cols;
+    }
+    return needed_value_cols < data_cols;
+}
+
 // Tumbling / hopping / cumulate window aggregate over Row records.
 // State shape: group_key_string -> window_end_ms -> bucket (keyed by
 // end so CUMULATE's shared-start slices coexist).
@@ -1044,6 +1073,9 @@ public:
             return false;
         }
         const std::int64_t n = rb->num_rows();
+        if (!ws3_columnar_projection_benefit(columnar_needed_.size(), *rb)) {
+            return false;  // no projection benefit: the row path is faster here
+        }
         struct Col {
             const std::string* name;
             int idx;
@@ -1447,6 +1479,9 @@ public:
             return false;
         }
         const std::int64_t n = rb->num_rows();
+        if (!ws3_columnar_projection_benefit(columnar_needed_.size(), *rb)) {
+            return false;  // no projection benefit: the row path is faster here
+        }
         struct Col {
             const std::string* name;
             int idx;
@@ -2293,6 +2328,9 @@ public:
             return false;
         }
         const std::int64_t n = rb->num_rows();
+        if (!ws3_columnar_projection_benefit(columnar_needed_.size(), *rb)) {
+            return false;  // no projection benefit: the row path is faster here
+        }
         // Resolve the needed columns to (name, index, type) once per batch.
         struct Col {
             const std::string* name;
