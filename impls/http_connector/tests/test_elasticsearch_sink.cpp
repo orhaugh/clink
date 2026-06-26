@@ -133,6 +133,32 @@ TEST(ElasticsearchSink, DocumentIdGoesIntoActionLine) {
     EXPECT_TRUE(contains(got[0], R"({"id":"k1","a":1})")) << got[0];  // source doc verbatim
 }
 
+TEST(ElasticsearchSink, LargeNumericDocumentIdDoesNotCollapseOrTrapUb) {
+    // A numeric document_id beyond int64 range must NOT be cast to int64 (UB,
+    // and on saturation every such id would collapse onto INT64_MAX, silently
+    // overwriting distinct documents). Two distinct > 9.2e18 ids must stay
+    // distinct in the action metadata.
+    EsStub srv;
+    EsBulkOptions o;
+    o.url = srv.url();
+    o.index = "logs";
+    o.document_id = "id";
+    o.batch_records = 100;
+    auto sink = make_es_bulk_sink(o);
+    sink->open();
+    sink->on_data(batch_of({R"({"id":1e19,"a":1})", R"({"id":2e19,"a":2})"}));
+    sink->flush();
+    auto got = srv.bodies();
+    ASSERT_EQ(got.size(), 1u);
+    // Both ids are present and DIFFERENT (no INT64_MAX collapse).
+    EXPECT_FALSE(contains(got[0], R"("_id":"9223372036854775807")")) << got[0];
+    const auto first = got[0].find(R"("_id":)");
+    ASSERT_NE(first, std::string::npos) << got[0];
+    const auto second = got[0].find(R"("_id":)", first + 1);
+    ASSERT_NE(second, std::string::npos) << got[0];
+    EXPECT_NE(got[0].substr(first, 30), got[0].substr(second, 30)) << got[0];
+}
+
 TEST(ElasticsearchSink, ErrorsFalseResponseSucceeds) {
     EsStub srv;
     EsBulkOptions o;

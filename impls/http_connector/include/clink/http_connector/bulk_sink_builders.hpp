@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -60,9 +61,19 @@ inline std::string es_id_to_string(const clink::config::JsonValue& v) {
     }
     if (v.is_number()) {
         const double d = v.as_number();
-        if (d == static_cast<double>(static_cast<std::int64_t>(d))) {
+        // Integral AND within int64 range -> plain integer. The range guard is
+        // load-bearing: the float->int64 cast is UB outside int64, and on
+        // saturation would collapse distinct large ids (e.g. > 9.2e18) onto
+        // INT64_MAX, silently overwriting different documents. 2^63 is exactly
+        // representable as a double, so the upper bound is a strict '<'.
+        constexpr double kInt64Lo = -9223372036854775808.0;          // -2^63
+        constexpr double kInt64HiExclusive = 9223372036854775808.0;  //  2^63
+        if (std::isfinite(d) && d >= kInt64Lo && d < kInt64HiExclusive &&
+            d == static_cast<double>(static_cast<std::int64_t>(d))) {
             return std::to_string(static_cast<std::int64_t>(d));
         }
+        // Fractional or out-of-int64-range: format the double with no cast.
+        // Deterministic, so idempotency on re-delivery still holds.
         return std::to_string(d);
     }
     return v.serialize(0);
