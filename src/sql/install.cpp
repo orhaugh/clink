@@ -900,11 +900,37 @@ struct VecAggCol {
         }
         return 0.0;  // unreachable: aggs_vectorisable validated the type
     }
+    // Typed JsonValue for row i, byte-identical to read_cell for the numeric
+    // types - used by MIN/MAX so finalize_agg returns the input's type (an int64
+    // column's MAX is an int64, not a double). Caller checks IsNull first.
+    clink::config::JsonValue read_json(std::int64_t i) const {
+        if (i64 != nullptr) {
+            return clink::config::JsonValue{i64->Value(i)};
+        }
+        if (i32 != nullptr) {
+            return clink::config::JsonValue{static_cast<std::int64_t>(i32->Value(i))};
+        }
+        if (f64 != nullptr) {
+            return clink::config::JsonValue{f64->Value(i)};
+        }
+        if (f32 != nullptr) {
+            return clink::config::JsonValue{static_cast<double>(f32->Value(i))};
+        }
+        return clink::config::JsonValue{};  // unreachable for MIN/MAX (numeric only)
+    }
 };
 
+// Is `id` a numeric Arrow type the kernel can fold (excludes decimal/string/bool)?
+inline bool is_vectorisable_numeric(arrow::Type::type id) {
+    return id == arrow::Type::INT64 || id == arrow::Type::INT32 || id == arrow::Type::DOUBLE ||
+           id == arrow::Type::FLOAT;
+}
+
 // True iff EVERY aggregate folds column-at-a-time for this batch's column types:
-// COUNT (any input), SUM/AVG/variance over int64/int32/double/float/decimal128.
-// MIN/MAX, string_agg, array_agg, percentile, distinct, udaf -> false (row path).
+// COUNT (any input), SUM/AVG/variance over int64/int32/double/float/decimal128,
+// and NON-retractable MIN/MAX over int64/int32/double/float. string_agg,
+// array_agg, percentile, distinct, udaf, retractable MIN/MAX, decimal MIN/MAX
+// -> false (row path).
 inline bool aggs_vectorisable(const std::vector<AggSpec>& aggs, const arrow::RecordBatch& rb) {
     for (const auto& a : aggs) {
         // DISTINCT and UDAF are never column-foldable (the kernel drives only the
@@ -928,13 +954,27 @@ inline bool aggs_vectorisable(const std::vector<AggSpec>& aggs, const arrow::Rec
                 return false;
             }
             const auto id = rb.schema()->field(idx)->type()->id();
-            if (id != arrow::Type::INT64 && id != arrow::Type::INT32 && id != arrow::Type::DOUBLE &&
-                id != arrow::Type::FLOAT && id != arrow::Type::DECIMAL128) {
+            // SUM/AVG/variance also fold an exact-decimal column (increment 3).
+            if (!is_vectorisable_numeric(id) && id != arrow::Type::DECIMAL128) {
                 return false;
             }
             continue;
         }
-        return false;  // min/max (retractable), string_agg, array_agg, percentile, udaf
+        if (a.fn == "min" || a.fn == "max") {
+            // Non-retractable numeric MIN/MAX only. GROUP BY marks MIN/MAX
+            // retractable (multiset-for-deletes path), so it stays row-path there;
+            // window/session MIN/MAX are non-retractable and fold here. DECIMAL /
+            // string MIN/MAX keep the row path (type-aware compare).
+            if (a.retractable || a.input_column.empty()) {
+                return false;
+            }
+            const int idx = rb.schema()->GetFieldIndex(a.input_column);
+            if (idx < 0 || !is_vectorisable_numeric(rb.schema()->field(idx)->type()->id())) {
+                return false;
+            }
+            continue;
+        }
+        return false;  // string_agg, array_agg, percentile, listagg
     }
     return true;
 }
@@ -983,6 +1023,27 @@ inline void vectorised_fold_slice(const std::vector<AggSpec>& aggs,
             for (const std::int64_t i : idxs) {
                 if (ac.base != nullptr && !ac.base->IsNull(i)) {
                     ++st.running_count;
+                }
+            }
+        } else if (a.fn == "min" || a.fn == "max") {
+            // Non-retractable numeric MIN/MAX (aggs_vectorisable admits only those):
+            // numeric compare, store the typed JsonValue so finalize_agg returns the
+            // input's type. Mirrors update_agg's non-retractable numeric branch.
+            const bool is_min = (a.fn == "min");
+            clink::config::JsonValue& running = is_min ? st.running_min : st.running_max;
+            for (const std::int64_t i : idxs) {
+                if (ac.base == nullptr || ac.base->IsNull(i)) {
+                    continue;
+                }
+                const auto v = ac.read_json(i);
+                bool replace = !st.initialised;
+                if (!replace && v.is_number() && running.is_number()) {
+                    replace = is_min ? v.as_number() < running.as_number()
+                                     : v.as_number() > running.as_number();
+                }
+                if (replace) {
+                    running = v;
+                    st.initialised = true;
                 }
             }
         } else if (ac.dec != nullptr) {

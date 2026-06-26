@@ -8606,6 +8606,90 @@ TEST(SqlRuntime, ColumnarParquetHopWindowVectorised) {
         std::filesystem::remove(p);
 }
 
+// WS6 increment 5: windowed MAX/MIN over a numeric columnar source vectorises.
+// Window aggregates are non-retractable (only GROUP BY marks MIN/MAX retractable),
+// so MAX(price)/MIN(price) per window now fold column-at-a-time (no per-record Row)
+// instead of the gated per-record-Row ingest. Per-window extremes must be exactly
+// the row path's AND batch_materialize_counter must not move.
+TEST(SqlRuntime, ColumnarParquetWindowMinMaxVectorised) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_wmm_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_wmm.parquet";
+    const auto out_path = tmp / "clink_sql_wmm_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    // user 1, window [0,1000): price 10,30,20 -> max 30, min 10.
+    //         window [1000,2000): price 5,50 -> max 50, min 5.
+    write_lines(in_path,
+                {
+                    R"({"user_id":1,"ts":100,"price":10})",
+                    R"({"user_id":1,"ts":200,"price":30})",
+                    R"({"user_id":1,"ts":300,"price":20})",
+                    R"({"user_id":1,"ts":1100,"price":5})",
+                    R"({"user_id":1,"ts":1200,"price":50})",
+                });
+    const std::string cols = "(user_id BIGINT, ts BIGINT, price BIGINT)";
+
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts, price FROM ev");
+        InProcessCluster cluster("tm-wmm-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    const std::uint64_t mat_before =
+        clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE pq_in "} + cols +
+                         " WITH (connector='parquet', path='" + pq_path.string() +
+                         "', event_time_column='ts');"
+                         "CREATE TABLE per_window (user_id BIGINT, mx BIGINT, mn BIGINT) "
+                         "WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat,
+                            "INSERT INTO per_window SELECT user_id, MAX(price) AS mx, "
+                            "MIN(price) AS mn FROM pq_in GROUP BY TUMBLE(ts, 1000), user_id");
+        InProcessCluster cluster("tm-wmm-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    EXPECT_EQ(clink::detail::batch_materialize_counter().load(std::memory_order_relaxed),
+              mat_before);
+
+    std::multiset<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("mx").as_number()),
+                    static_cast<std::int64_t>(js.at("mn").as_number()));
+    }
+    const std::multiset<std::pair<std::int64_t, std::int64_t>> want{{30, 10}, {50, 5}};
+    EXPECT_EQ(got, want);
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // WS6 regression guard: a windowed COUNT(DISTINCT) over a columnar source must
 // fall back to the row path (DISTINCT is not column-foldable) and return the true
 // per-window distinct cardinality - NOT 0. Guards aggs_vectorisable rejecting
@@ -8857,6 +8941,93 @@ TEST(SqlRuntime, ColumnarParquetSessionSumVectorised) {
     }
     const std::multiset<std::pair<std::int64_t, std::int64_t>> want{{2, 30}, {1, 5}};
     EXPECT_EQ(got, want);
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
+// WS6 increment 5: vectorised session MIN/MAX across a 3-way merge. An
+// out-of-order arrival bridges two sessions; the merged session's MIN/MAX must
+// combine all three values via merge_into (which the kernel-built running_min/max
+// feed identically to the row path). Exercises the vectorised-fold + merge_into
+// interaction for non-additive aggregates, with zero row decode.
+TEST(SqlRuntime, ColumnarParquetSessionMinMaxMergeVectorised) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_smm_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_smm.parquet";
+    const auto out_path = tmp / "clink_sql_smm_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    // gap 500. Arrivals (in file order): ts 100(price 10), 1000(price 50),
+    // 550(price 5). 100 -> session A; 1000 -> session B (gap 900>500); 550 bridges
+    // A and B (within gap of both) -> ONE merged session [100,1000] over {10,50,5}:
+    // max 50, min 5.
+    write_lines(in_path,
+                {
+                    R"({"user_id":1,"ts":100,"price":10})",
+                    R"({"user_id":1,"ts":1000,"price":50})",
+                    R"({"user_id":1,"ts":550,"price":5})",
+                });
+    const std::string cols = "(user_id BIGINT, ts BIGINT, price BIGINT)";
+
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts, price FROM ev");
+        InProcessCluster cluster("tm-smm-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    const std::uint64_t mat_before =
+        clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE pq_in "} + cols +
+                         " WITH (connector='parquet', path='" + pq_path.string() +
+                         "', event_time_column='ts');"
+                         "CREATE TABLE per_session (user_id BIGINT, mx BIGINT, mn BIGINT) "
+                         "WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat,
+                            "INSERT INTO per_session SELECT user_id, MAX(price) AS mx, "
+                            "MIN(price) AS mn FROM pq_in GROUP BY SESSION(ts, 500), user_id");
+        InProcessCluster cluster("tm-smm-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    EXPECT_EQ(clink::detail::batch_materialize_counter().load(std::memory_order_relaxed),
+              mat_before);
+
+    auto lines = read_lines(out_path);
+    // One merged session for user 1: max 50, min 5 (last emission is final).
+    ASSERT_FALSE(lines.empty());
+    std::pair<std::int64_t, std::int64_t> last{-1, -1};
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        last = {static_cast<std::int64_t>(js.at("mx").as_number()),
+                static_cast<std::int64_t>(js.at("mn").as_number())};
+    }
+    EXPECT_EQ(last.first, 50);
+    EXPECT_EQ(last.second, 5);
 
     for (const auto& p : {in_path, pq_path, out_path})
         std::filesystem::remove(p);
