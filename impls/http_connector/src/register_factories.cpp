@@ -11,6 +11,7 @@
 #include "clink/http_connector/bulk_sink_builders.hpp"
 #include "clink/http_connector/http_request.hpp"
 #include "clink/http_connector/install.hpp"
+#include "clink/http_connector/prometheus_push_sink.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
@@ -95,6 +96,70 @@ void install(clink::plugin::PluginRegistry& reg) {
     };
     reg.register_sink<std::string>("elasticsearch_sink", es_factory("elasticsearch_sink"));
     reg.register_sink<std::string>("opensearch_sink", es_factory("opensearch_sink"));
+
+    // splunk_hec_sink: POST batched JSON events to a Splunk HTTP Event Collector
+    // (/services/collector/event) with `Authorization: Splunk <token>`. Each row
+    // is wrapped in the HEC event envelope. At-least-once. Params:
+    //   url (required)        - scheme://host[:port], e.g. https://splunk:8088
+    //   token (required)      - HEC token (sets the Authorization header)
+    //   path (default "/services/collector/event")
+    //   sourcetype            - e.g. "_json" to auto-extract the event fields
+    //   source, host, index   - optional event metadata (index must be writable)
+    //   headers               - extra "K: V; ..." (rarely needed)
+    //   batch_records (default 500), batch_bytes (default 4194304)
+    //   max_retries (default 4; clamped to [0, 20])
+    //   verify_tls ("true" [default] | "false")
+    reg.register_sink<std::string>(
+        "splunk_hec_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            SplunkHecOptions o;
+            o.url = ctx.param_or("url");
+            o.token = ctx.param_or("token", "");
+            o.path = ctx.param_or("path", "/services/collector/event");
+            o.sourcetype = ctx.param_or("sourcetype", "");
+            o.source = ctx.param_or("source", "");
+            o.host = ctx.param_or("host", "");
+            o.index = ctx.param_or("index", "");
+            o.headers = ctx.param_or("headers", "");
+            o.verify_tls = ctx.param_or("verify_tls", "true") != "false";
+            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
+            o.batch_bytes =
+                static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 4 * 1024 * 1024));
+            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            o.name = "splunk_hec_sink";
+            return make_splunk_hec_sink(std::move(o));
+        });
+
+    // prometheus_sink: push batched records as gauge samples to a Prometheus
+    // Pushgateway (POST /metrics/job/<job>{/<label>/<value>}). One gauge metric
+    // name per sink; each row's value_field is the float and the other scalar
+    // fields become labels. Dedup is last-write-wins per label set (the gateway
+    // rejects duplicate series in one push). At-least-once. Params:
+    //   url (required)        - pushgateway base, e.g. http://pushgateway:9091
+    //   job (required)        - grouping job (first path segment)
+    //   grouping              - extra static path labels "k=v,k2=v2"
+    //   metric_name (default "clink_value")
+    //   value_field (default "value") - the record field holding the gauge value
+    //   help                  - optional # HELP text
+    //   headers               - optional "K: V; ..." (fronting-proxy auth)
+    //   batch_records (default 500; max DISTINCT series per push)
+    //   max_retries (default 4; clamped to [0, 20])
+    //   verify_tls ("true" [default] | "false")
+    reg.register_sink<std::string>(
+        "prometheus_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            PromPushOptions o;
+            o.url = ctx.param_or("url");
+            o.job = ctx.param_or("job", "");
+            o.grouping = ctx.param_or("grouping", "");
+            o.metric_name = ctx.param_or("metric_name", "clink_value");
+            o.value_field = ctx.param_or("value_field", "value");
+            o.help = ctx.param_or("help", "");
+            o.headers = ctx.param_or("headers", "");
+            o.verify_tls = ctx.param_or("verify_tls", "true") != "false";
+            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
+            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            o.name = "prometheus_sink";
+            return make_prometheus_pushgateway_sink(std::move(o));
+        });
 }
 
 }  // namespace clink::http_connector

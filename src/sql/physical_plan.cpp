@@ -246,6 +246,34 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
             connector == "opensearch" ? "opensearch_sink" : "elasticsearch_sink";
         return RowConnectorBinding{sink, kChannelString, "row_to_json_string"};
     }
+    if (connector == "splunk_hec" || connector == "splunk") {
+        // Splunk HTTP Event Collector. At-least-once; HEC ingestion is append
+        // (re-delivery on replay indexes the event again). Each row -> JSON
+        // object string -> wrapped in the HEC {"event":...} envelope.
+        if (exactly_once) {
+            unsupported("connector='" + connector +
+                        "' (Splunk HEC) sink is at-least-once; exactly-once delivery is not "
+                        "supported");
+        }
+        if (upsert) {
+            unsupported("connector='" + connector + "' sink does not support mode='upsert'");
+        }
+        return RowConnectorBinding{"splunk_hec_sink", kChannelString, "row_to_json_string"};
+    }
+    if (connector == "prometheus") {
+        // Prometheus Pushgateway. At-least-once; the gateway stores the latest
+        // value per series. Each row -> JSON object string; the sink extracts
+        // value_field as the gauge value and the other scalar fields as labels.
+        if (exactly_once) {
+            unsupported(
+                "connector='prometheus' (Pushgateway) sink is at-least-once; exactly-once "
+                "delivery is not supported");
+        }
+        if (upsert) {
+            unsupported("connector='prometheus' sink does not support mode='upsert'");
+        }
+        return RowConnectorBinding{"prometheus_sink", kChannelString, "row_to_json_string"};
+    }
     if (connector == "parquet") {
         // Typed-columnar Parquet. exactly_once routes to the 2PC variant
         // (staging/ + atomic commit on checkpoint); else one file/subtask.
@@ -273,8 +301,9 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         return RowConnectorBinding{"changelog_net_sink", kChannelRow, {}};
     }
     unsupported(
-        "format='json' sink requires connector='file', 'kafka', 'parquet', 'blackhole' or "
-        "'changelog' (got '" +
+        "format='json' sink requires connector='file', 'kafka', 'parquet', 'http', "
+        "'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'blackhole' or 'changelog' "
+        "(got '" +
         connector + "')");
 }
 

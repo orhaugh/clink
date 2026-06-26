@@ -9,6 +9,7 @@
 #include <thread>
 #include <utility>
 
+#include "clink/http_connector/http_bulk_post.hpp"
 #include "clink/http_connector/http_request.hpp"
 #include "clink/operators/operator_base.hpp"
 
@@ -40,11 +41,9 @@ public:
     // those). Must append, not overwrite.
     using Renderer = std::function<void(std::string& out, const In& rec)>;
 
-    // Decides whether a response counts as a successful delivery. Default
-    // (empty) = any 2xx. Some APIs return 2xx with a per-item error report in
-    // the body (Elasticsearch _bulk returns 200 with "errors":true on partial
-    // failure), so those sinks supply a validator that also inspects the body.
-    using ResponseValidator = std::function<bool(const HttpResponse&)>;
+    // Decides whether a response counts as a successful delivery (shared alias;
+    // see http_bulk_post.hpp). Default (empty) = any 2xx.
+    using ResponseValidator = clink::http_connector::ResponseValidator;
 
     struct Options {
         HttpRequest::Options http;  // base_url + headers + timeouts + verify_tls
@@ -60,10 +59,8 @@ public:
         std::string name{"http_bulk_sink"};
     };
 
-    // Upper bound on retry attempts. Caps both the attempt count and the
-    // backoff exponent (1 << (attempt-1)) so a misconfigured max_retries can
-    // neither overflow the shift nor schedule an absurd sleep on the runner.
-    static constexpr int kMaxRetries = 20;
+    // Upper bound on retry attempts (see RetryPolicy::kMaxRetries).
+    static constexpr int kMaxRetries = RetryPolicy::kMaxRetries;
 
     BatchedHttpBulkSink(Options opts, Renderer render)
         : opts_(std::move(opts)), render_(std::move(render)) {
@@ -130,38 +127,17 @@ private:
     }
 
     void post_with_retry_(const std::string& body) {
-        HttpResponse res;
-        for (int attempt = 0; attempt <= opts_.max_retries; ++attempt) {
-            if (attempt > 0) {
-                // Exponential backoff base * 2^(attempt-1), bounded. attempt is
-                // capped by kMaxRetries so the (unsigned) shift cannot overflow;
-                // the duration is additionally capped at 30s so a high
-                // max_retries never schedules a runaway sleep on the runner.
-                auto backoff = opts_.retry_base_backoff * (1u << (attempt - 1));
-                constexpr std::chrono::milliseconds kMaxBackoff{30000};
-                if (backoff > kMaxBackoff) {
-                    backoff = kMaxBackoff;
-                }
-                std::this_thread::sleep_for(backoff);
-            }
-            res = client_->post(opts_.path, body, opts_.content_type);
-            const bool ok = opts_.response_ok ? opts_.response_ok(res)
-                                              : (res.status >= 200 && res.status < 300);
-            if (ok) {
-                return;  // delivered
-            }
-        }
-        // Retries exhausted: fail loudly so the job restarts and replays from
-        // the last checkpoint (at-least-once), rather than dropping the batch.
-        // A 2xx that the validator rejected (e.g. ES _bulk "errors":true) keeps
-        // a body snippet so the failure is diagnosable.
-        std::string detail = res.status == 0 ? res.error : "HTTP " + std::to_string(res.status);
-        if (res.status >= 200 && res.status < 300 && !res.body.empty()) {
-            detail += " body: " + res.body.substr(0, 256);
-        }
-        throw std::runtime_error(opts_.name + ": POST " + opts_.http.base_url + opts_.path +
-                                 " failed after " + std::to_string(opts_.max_retries + 1) +
-                                 " attempts (" + detail + ")");
+        // opts_.max_retries was clamped in the ctor; the shared helper owns the
+        // backoff + throw-on-exhaustion (at-least-once) semantics.
+        RetryPolicy policy{opts_.max_retries, opts_.retry_base_backoff};
+        clink::http_connector::post_with_retry(*client_,
+                                               opts_.path,
+                                               body,
+                                               opts_.content_type,
+                                               policy,
+                                               opts_.response_ok,
+                                               opts_.name,
+                                               opts_.http.base_url);
     }
 
     Options opts_;

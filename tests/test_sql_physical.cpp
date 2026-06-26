@@ -188,6 +188,50 @@ TEST(SqlPhysical, ElasticsearchConnectorSinkLowersToBulkSink) {
     EXPECT_NE(find_op(os_spec, "opensearch_sink"), nullptr);
 }
 
+// connector='splunk_hec' lowers to the splunk_hec_sink (string channel) via the
+// row_to_json_string bridge, carrying url/token/index.
+TEST(SqlPhysical, SplunkHecConnectorSinkLowersToHecSink) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE sp_out (a BIGINT) WITH (connector='splunk_hec', format='json', "
+        "url='https://splunk:8088', token='abc', index='main');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO sp_out SELECT a FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* snk = find_op(spec, "splunk_hec_sink");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("url"), "https://splunk:8088");
+    EXPECT_EQ(snk->params.at("token"), "abc");
+    EXPECT_EQ(snk->params.at("index"), "main");
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+}
+
+// connector='prometheus' lowers to the prometheus_sink (string channel),
+// carrying url/job/value_field.
+TEST(SqlPhysical, PrometheusConnectorSinkLowersToPushSink) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE pm_out (a BIGINT) WITH (connector='prometheus', format='json', "
+        "url='http://pushgateway:9091', job='clink', value_field='a');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO pm_out SELECT a FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* snk = find_op(spec, "prometheus_sink");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("url"), "http://pushgateway:9091");
+    EXPECT_EQ(snk->params.at("job"), "clink");
+    EXPECT_EQ(snk->params.at("value_field"), "a");
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+}
+
 // exactly-once on connector='http' is rejected (http is at-least-once only).
 // The rejection fires at table-registration / bind time (the connector
 // allowlist), before physical planning - so assert the whole flow throws.

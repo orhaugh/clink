@@ -19,35 +19,8 @@
 // BuildContext onto these.
 namespace clink::http_connector {
 
-// Parse a "K1: V1; K2: V2" header string into a map. Empty -> no headers.
-// Splits each pair on the FIRST ':', so a value may itself contain ':' (e.g.
-// "Authorization: Bearer a:b"). Whitespace around key/value is trimmed.
-inline std::map<std::string, std::string> parse_headers(const std::string& spec) {
-    std::map<std::string, std::string> out;
-    auto trim = [](std::string s) {
-        const auto b = s.find_first_not_of(" \t");
-        const auto e = s.find_last_not_of(" \t");
-        return b == std::string::npos ? std::string{} : s.substr(b, e - b + 1);
-    };
-    std::size_t pos = 0;
-    while (pos < spec.size()) {
-        auto semi = spec.find(';', pos);
-        if (semi == std::string::npos) {
-            semi = spec.size();
-        }
-        const std::string pair = spec.substr(pos, semi - pos);
-        const auto colon = pair.find(':');
-        if (colon != std::string::npos) {
-            auto k = trim(pair.substr(0, colon));
-            auto v = trim(pair.substr(colon + 1));
-            if (!k.empty()) {
-                out.emplace(std::move(k), std::move(v));
-            }
-        }
-        pos = semi + 1;
-    }
-    return out;
-}
+// parse_headers lives in http_bulk_post.hpp (a generic HTTP utility shared with
+// the Prometheus sink); it is in scope here transitively.
 
 // Scalar string form of a JsonValue for an Elasticsearch document _id (string
 // as-is; number/bool stringified; nested -> JSON text). It is JSON-escaped when
@@ -159,6 +132,89 @@ inline std::shared_ptr<Sink<std::string>> make_es_bulk_sink(EsBulkOptions o) {
         out += clink::config::JsonValue{std::move(action)}.serialize(0);
         out += '\n';
         out += rec;  // source doc; the Ndjson framing appends the trailing '\n'
+    };
+    return std::make_shared<BatchedHttpBulkSink<std::string>>(std::move(opts), std::move(render));
+}
+
+struct SplunkHecOptions {
+    std::string url;    // scheme://host[:port]   (required)
+    std::string token;  // HEC token              (required)
+    std::string path{"/services/collector/event"};
+    std::string sourcetype;  // optional (e.g. "_json" to auto-extract event fields)
+    std::string source;      // optional
+    std::string host;        // optional
+    std::string index;       // optional (must be writable by the token)
+    std::string headers;     // extra "K: V; ..." (the token already sets auth)
+    bool verify_tls{true};
+    std::size_t batch_records{500};
+    std::size_t batch_bytes{4 * 1024 * 1024};
+    int max_retries{4};
+    std::string name{"splunk_hec_sink"};
+};
+
+// Build a Splunk HTTP Event Collector (HEC) sink. Each input record is a JSON
+// object string (e.g. SQL row_to_json_string); the sink wraps it in the HEC
+// event envelope {"event":<doc>[,"sourcetype":...,"index":...]} and POSTs a
+// batch of concatenated event objects (NDJSON form) to /services/collector/event
+// with `Authorization: Splunk <token>`. At-least-once (HEC ingestion is append:
+// re-delivery on replay indexes the event twice).
+inline std::shared_ptr<Sink<std::string>> make_splunk_hec_sink(SplunkHecOptions o) {
+    if (o.url.empty()) {
+        throw std::runtime_error(o.name + ": 'url' is required");
+    }
+    if (o.token.empty()) {
+        throw std::runtime_error(o.name + ": 'token' is required");
+    }
+
+    BatchedHttpBulkSink<std::string>::Options opts;
+    opts.http.base_url = o.url;
+    opts.http.headers = parse_headers(o.headers);
+    // HEC auth is the literal keyword "Splunk" (NOT "Bearer") then the token.
+    opts.http.headers["Authorization"] = "Splunk " + o.token;
+    opts.http.verify_tls = o.verify_tls;
+    opts.path = o.path;
+    opts.content_type = "application/json";
+    // A batch is concatenated JSON event objects; NDJSON (one object per line)
+    // is the readable form HEC accepts. NOT a JSON array.
+    opts.framing = BulkFraming::Ndjson;
+    opts.max_records = o.batch_records;
+    opts.max_bytes = o.batch_bytes;
+    opts.max_retries = o.max_retries;
+    opts.name = o.name;
+    // Unlike ES _bulk, HEC never returns HTTP 200 with a failure code - the
+    // body "code" tracks the HTTP status (200 => accepted, including the health
+    // codes 17/24/25). So a plain 2xx check is correct; no custom validator.
+
+    // Precompute the static event-metadata suffix once, escaped via the JSON
+    // serializer: ,"sourcetype":"...","index":"..." etc. Empty if none set.
+    clink::config::JsonObject meta;
+    if (!o.sourcetype.empty()) {
+        meta["sourcetype"] = clink::config::JsonValue{o.sourcetype};
+    }
+    if (!o.source.empty()) {
+        meta["source"] = clink::config::JsonValue{o.source};
+    }
+    if (!o.host.empty()) {
+        meta["host"] = clink::config::JsonValue{o.host};
+    }
+    if (!o.index.empty()) {
+        meta["index"] = clink::config::JsonValue{o.index};
+    }
+    std::string meta_suffix;
+    if (!meta.empty()) {
+        const std::string m = clink::config::JsonValue{std::move(meta)}.serialize(0);
+        meta_suffix = "," + m.substr(1, m.size() - 2);  // strip the {} braces, lead with ','
+    }
+
+    auto render = [meta_suffix = std::move(meta_suffix)](std::string& out, const std::string& rec) {
+        // The HEC event envelope. `rec` is a single-line JSON object (SQL
+        // path), embedded verbatim as the "event" value (Splunk extracts its
+        // fields when sourcetype=_json). The Ndjson framing adds the trailing
+        // newline that separates events.
+        out += "{\"event\":";
+        out += rec;
+        out += meta_suffix;
+        out += '}';
     };
     return std::make_shared<BatchedHttpBulkSink<std::string>>(std::move(opts), std::move(render));
 }

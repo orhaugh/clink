@@ -20,4 +20,10 @@ TEST(HttpConnectorFactoryRegistration, ElasticsearchAndOpensearchSinksRegistered
     EXPECT_NE(rr.find_sink("opensearch_sink", "string"), nullptr);
 }
 
+TEST(HttpConnectorFactoryRegistration, SplunkAndPrometheusSinksRegistered) {
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("splunk_hec_sink", "string"), nullptr);
+    EXPECT_NE(rr.find_sink("prometheus_sink", "string"), nullptr);
+}
+
 }  // namespace
