@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -152,11 +153,21 @@ private:
             if (k == value_field_) {
                 continue;
             }
+            const std::string ln = sanitize_name(k);
+            // 'job' and the grouping labels are the gateway's grouping key and
+            // live in the URL path. The gateway 400s a push body that ALSO
+            // carries any of them, which would wedge the pipeline (400 -> retry
+            // exhaustion -> throw -> replay -> same poisoned record). So a
+            // record field colliding with a path label name is dropped from the
+            // body, mirroring build_push_path's exclusion.
+            if (reserved_labels_.count(ln)) {
+                continue;
+            }
             auto lv = to_label_value(v);
             if (!lv) {
                 continue;  // null / object / array: not a label
             }
-            labels[sanitize_name(k)] = escape_label_value(*lv);
+            labels[ln] = escape_label_value(*lv);
         }
         series_[render_label_block(labels)] = *value;  // dedup
     }
@@ -344,7 +355,12 @@ private:
         return "/" + label + "@base64/" + base64url_nopad(value);
     }
 
+    // Builds the push path AND records every label name that lives in the path
+    // (job + each grouping label) into reserved_labels_, so ingest() can keep
+    // those out of the push body (a body that repeats a grouping-key label is a
+    // gateway 400).
     std::string build_push_path(const std::string& job, const std::string& grouping) {
+        reserved_labels_.insert("job");
         std::string p = "/metrics";
         p += encode_path_segment("job", job);
         // grouping = "name=value,name2=value2"; each becomes a path label pair.
@@ -361,6 +377,7 @@ private:
                 const std::string value = trim(pair.substr(eq + 1));
                 if (!name.empty() && name != "job") {  // 'job' already in the path
                     p += encode_path_segment(name, value);
+                    reserved_labels_.insert(name);
                 }
             }
             pos = comma + 1;
@@ -385,7 +402,8 @@ private:
     int max_retries_;
     bool verify_tls_;
     std::unique_ptr<HttpRequest> client_;
-    std::map<std::string, double> series_;  // rendered label block -> latest value
+    std::map<std::string, double> series_;   // rendered label block -> latest value
+    std::set<std::string> reserved_labels_;  // path label names kept out of the body
 };
 
 inline std::shared_ptr<Sink<std::string>> make_prometheus_pushgateway_sink(PromPushOptions o) {

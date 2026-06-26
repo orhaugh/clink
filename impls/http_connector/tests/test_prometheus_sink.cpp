@@ -211,6 +211,32 @@ TEST(PrometheusSink, PathLabelWithSlashIsBase64Encoded) {
     EXPECT_EQ(srv.paths()[0], "/metrics/job/j/path@base64/L3Zhci90bXA");
 }
 
+TEST(PrometheusSink, ReservedPathLabelsAreKeptOutOfTheBody) {
+    // 'job' and the grouping labels live in the URL path; the gateway 400s a
+    // body that ALSO carries them. A record field colliding with a path label
+    // name must be dropped from the body (not leaked as a body label).
+    PgwStub srv;
+    PromPushOptions o;
+    o.url = srv.url();
+    o.job = "j";
+    o.grouping = "instance=host1";
+    o.metric_name = "g";
+    o.batch_records = 100;
+    auto sink = make_prometheus_pushgateway_sink(o);
+    sink->open();
+    // Record carries both a 'job' field and an 'instance' field that collide
+    // with the path grouping key; only 'sensor' should survive as a body label.
+    sink->on_data(batch_of({R"({"value":1,"job":"leak","instance":"other","sensor":"a"})"}));
+    sink->flush();
+    auto got = srv.bodies();
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_FALSE(contains(got[0], "job=\"")) << got[0];
+    EXPECT_FALSE(contains(got[0], "instance=\"")) << got[0];
+    EXPECT_TRUE(contains(got[0], "g{sensor=\"a\"} 1\n")) << got[0];
+    // Path still carries job + grouping.
+    EXPECT_EQ(srv.paths()[0], "/metrics/job/j/instance/host1");
+}
+
 TEST(PrometheusSink, AcceptsHttp202AsSuccess) {
     PgwStub srv(202);  // pushgateway returns 202 under --push.disable-consistency-check
     PromPushOptions o;
