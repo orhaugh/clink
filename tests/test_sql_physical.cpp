@@ -345,6 +345,28 @@ TEST(SqlPhysical, RedisConnectorSinkLowersToXaddSink) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
 }
 
+// M1: connector='clickhouse' SINK lowers to clickhouse_sink (string channel) via
+// the row_to_json_string bridge, with format=jsoneachrow FORCED by the binding
+// (the SQL format='json' channel selector is stripped before the factory).
+TEST(SqlPhysical, ClickHouseConnectorSinkLowersWithJsonEachRow) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT, b VARCHAR) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE ch_out (a BIGINT, b VARCHAR) WITH (connector='clickhouse', format='json', "
+        "table='events', host='ch', port='9000');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO ch_out SELECT a, b FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* snk = find_op(spec, "clickhouse_sink");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("table"), "events");
+    EXPECT_EQ(snk->params.at("format"), "jsoneachrow") << "Row path must force JSONEachRow";
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);  // Row -> JSON bridge
+}
+
 // connector='mysql' source lowers to the mysql_source (string channel) bridged
 // to Row via json_string_to_row, carrying table/cursor_column.
 TEST(SqlPhysical, MysqlConnectorSourceLowers) {

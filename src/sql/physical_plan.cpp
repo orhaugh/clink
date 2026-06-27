@@ -149,6 +149,11 @@ struct RowConnectorBinding {
     std::string source_or_sink_op;       // factory name for the connector op
     std::string source_or_sink_channel;  // out_channel of that op (string or row)
     std::string bridge_op;               // optional Map op converting between string and Row
+    // Connector params the binding forces onto the op, merged AFTER build_params
+    // (so they override / supply keys the channel selector stripped). E.g. the
+    // clickhouse Row sink forces format=jsoneachrow because the SQL format='json'
+    // channel selector is consumed+stripped before it reaches the sink factory.
+    std::map<std::string, std::string> extra_params{};
 };
 
 // Convert a table's declared columns to the RowColumn list the
@@ -260,6 +265,24 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
                 "kafka_upsert_sink_string", kChannelString, "row_to_json_string"};
         }
         return RowConnectorBinding{"kafka_sink_string", kChannelString, "row_to_json_string"};
+    }
+    if (connector == "clickhouse") {
+        // ClickHouse sink (M1). Each row -> JSON object string -> the sink's
+        // FORMAT JSONEachRow body. At-least-once (INSERT replay re-inserts;
+        // ClickHouse has no row dedup). format=jsoneachrow is FORCED via the
+        // binding because the SQL format='json' channel selector is stripped
+        // before it reaches the sink factory (which would otherwise default to
+        // TSV). exactly_once / upsert are not supported.
+        if (exactly_once) {
+            unsupported(
+                "connector='clickhouse' sink is at-least-once; exactly-once delivery is not "
+                "supported");
+        }
+        if (upsert) {
+            unsupported("connector='clickhouse' sink does not support mode='upsert'");
+        }
+        return RowConnectorBinding{
+            "clickhouse_sink", kChannelString, "row_to_json_string", {{"format", "jsoneachrow"}}};
     }
     if (connector == "http") {
         // HTTP(S) bulk / webhook sink (at-least-once; no 2PC). Each row is
@@ -426,7 +449,7 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         return RowConnectorBinding{"changelog_net_sink", kChannelRow, {}};
     }
     unsupported(
-        "format='json' sink requires connector='file', 'kafka', 'parquet', 'http', "
+        "format='json' sink requires connector='file', 'kafka', 'clickhouse', 'parquet', 'http', "
         "'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'kinesis', 'redis', 'mysql', "
         "'firehose', 'dynamodb', 'blackhole' or 'changelog' (got '" +
         connector + "')");
@@ -1415,6 +1438,9 @@ std::string compile_node(const LogicalPlan& node,
             op.inputs = {std::move(before_sink)};
             op.out_channel = binding.source_or_sink_channel;
             op.params = build_params(table);
+            for (const auto& [k, v] : binding.extra_params) {
+                op.params[k] = v;  // binding-forced params override passed-through WITH-options
+            }
             // #56: tell the sink which columns are DECIMAL(p,s) so it quantises
             // the value to the column scale on assignment and renders clean.
             std::string dec_csv;
