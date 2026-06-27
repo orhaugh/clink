@@ -1,0 +1,217 @@
+#pragma once
+
+// Kinesis Data Streams sink (PutRecords). SDK-dependent; compiled only with the
+// AWS SDK.
+//
+// Each input record is a string (e.g. SQL row_to_json_string JSON) sent as one
+// Kinesis record's Data. The PartitionKey is the configured field's value when
+// present, else a rotating counter (Kinesis hashes the key to pick a shard, so a
+// counter spreads load). Delivery is AT-LEAST-ONCE: Kinesis has no producer
+// dedup key, so a retry of throttled records can duplicate. PutRecords is
+// partial-success - on FailedRecordCount > 0 ONLY the failed entries (by
+// response index) are resent, never the whole batch (which would duplicate the
+// already-committed records).
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <aws/core/utils/memory/stl/AWSString.h>
+#include <aws/kinesis/KinesisClient.h>
+#include <aws/kinesis/model/PutRecordsRequest.h>
+#include <aws/kinesis/model/PutRecordsRequestEntry.h>
+#include <aws/kinesis/model/PutRecordsResultEntry.h>
+
+#include "clink/aws/aws_client.hpp"
+#include "clink/config/json.hpp"
+#include "clink/operators/operator_base.hpp"
+
+namespace clink::aws {
+
+// Indices of the response entries that FAILED (non-empty ErrorCode). The
+// PutRecords response is index-aligned with the request, so these map straight
+// back to the request entries that must be resent. Pure: unit-testable without
+// a live stream.
+inline std::vector<std::size_t> kinesis_failed_indices(
+    const Aws::Vector<Aws::Kinesis::Model::PutRecordsResultEntry>& results) {
+    std::vector<std::size_t> failed;
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].GetErrorCode().empty()) {
+            failed.push_back(i);
+        }
+    }
+    return failed;
+}
+
+struct KinesisSinkOptions {
+    std::string stream;         // stream name or ARN (required)
+    std::string partition_key;  // record field used as the Kinesis PartitionKey (optional)
+    AwsClientOptions client;
+    std::size_t batch_records{500};  // PutRecords hard max is 500
+    int max_retries{8};              // failed-subset resend attempts
+    std::chrono::milliseconds retry_base_backoff{100};
+    std::string name{"kinesis_sink"};
+};
+
+class KinesisSink : public Sink<std::string> {
+public:
+    explicit KinesisSink(KinesisSinkOptions opts) : opts_(std::move(opts)) {
+        if (opts_.stream.empty()) {
+            throw std::runtime_error(opts_.name + ": 'stream' is required");
+        }
+        if (opts_.batch_records == 0 || opts_.batch_records > 500) {
+            opts_.batch_records = 500;  // PutRecords ceiling
+        }
+    }
+
+    void open() override {
+        ensure_aws_initialized();
+        client_ = std::make_unique<Aws::Kinesis::KinesisClient>(make_client_config(opts_.client));
+        pending_.clear();
+    }
+
+    void on_data(const Batch<std::string>& batch) override {
+        for (const auto& rec : batch) {
+            pending_.push_back(make_entry_(rec.value()));
+            if (pending_.size() >= opts_.batch_records) {
+                flush();
+            }
+        }
+    }
+
+    void on_barrier(CheckpointBarrier /*b*/) override { flush(); }
+
+    void flush() override {
+        if (pending_.empty()) {
+            return;
+        }
+        put_with_retry_(std::move(pending_));
+        pending_.clear();
+    }
+
+    std::string name() const override { return opts_.name; }
+
+private:
+    Aws::Kinesis::Model::PutRecordsRequestEntry make_entry_(const std::string& rec) {
+        Aws::Kinesis::Model::PutRecordsRequestEntry e;
+        e.SetData(
+            Aws::Utils::ByteBuffer(reinterpret_cast<const unsigned char*>(rec.data()), rec.size()));
+        e.SetPartitionKey(partition_key_for_(rec));
+        return e;
+    }
+
+    // The Kinesis PartitionKey: the configured field's scalar value when present
+    // and non-empty, else a rotating counter (keeps writes spread across shards
+    // without forcing the user to nominate a key). Max 256 chars per the API; a
+    // field value over that is truncated.
+    std::string partition_key_for_(const std::string& rec) {
+        if (!opts_.partition_key.empty()) {
+            try {
+                auto j = clink::config::parse(rec);
+                if (j.is_object()) {
+                    const auto& obj = j.as_object();
+                    if (auto it = obj.find(opts_.partition_key);
+                        it != obj.end() && !it->second.is_null()) {
+                        std::string pk = scalar_text_(it->second);
+                        if (!pk.empty()) {
+                            return pk.size() > 256 ? pk.substr(0, 256) : pk;
+                        }
+                    }
+                }
+            } catch (...) {
+                // fall through to the counter
+            }
+        }
+        return std::to_string(counter_++);
+    }
+
+    static std::string scalar_text_(const clink::config::JsonValue& v) {
+        if (v.is_string()) {
+            return v.as_string();
+        }
+        if (v.is_bool()) {
+            return v.as_bool() ? "true" : "false";
+        }
+        if (v.is_number()) {
+            const double d = v.as_number();
+            constexpr double kInt64Lo = -9223372036854775808.0;
+            constexpr double kInt64HiExclusive = 9223372036854775808.0;
+            if (d >= kInt64Lo && d < kInt64HiExclusive &&
+                d == static_cast<double>(static_cast<std::int64_t>(d))) {
+                return std::to_string(static_cast<std::int64_t>(d));
+            }
+            return std::to_string(d);
+        }
+        return {};  // object/array/null: no usable scalar key -> caller falls back
+    }
+
+    void set_stream_(Aws::Kinesis::Model::PutRecordsRequest& req) const {
+        if (opts_.stream.rfind("arn:", 0) == 0) {
+            req.SetStreamARN(opts_.stream);
+        } else {
+            req.SetStreamName(opts_.stream);
+        }
+    }
+
+    // PutRecords + failed-subset resend. On partial failure resend ONLY the
+    // entries whose response index carries an ErrorCode; the successful ones are
+    // already committed, so resending them would duplicate. Throw on exhaustion
+    // (job replays from the last checkpoint - at-least-once, no silent drop).
+    void put_with_retry_(std::vector<Aws::Kinesis::Model::PutRecordsRequestEntry> entries) {
+        for (int attempt = 0; attempt <= opts_.max_retries; ++attempt) {
+            if (attempt > 0) {
+                sleep_backoff_(attempt);
+            }
+            Aws::Kinesis::Model::PutRecordsRequest req;
+            set_stream_(req);
+            req.SetRecords(Aws::Vector<Aws::Kinesis::Model::PutRecordsRequestEntry>(entries));
+            auto outcome = client_->PutRecords(req);
+            if (!outcome.IsSuccess()) {
+                // Whole-call failure (the SDK already retried transient errors).
+                // None can be assumed written; retry the whole batch.
+                if (attempt == opts_.max_retries) {
+                    throw std::runtime_error(opts_.name + ": PutRecords failed: " +
+                                             std::string(outcome.GetError().GetMessage().c_str()));
+                }
+                continue;
+            }
+            if (outcome.GetResult().GetFailedRecordCount() == 0) {
+                return;  // all records written
+            }
+            const auto failed = kinesis_failed_indices(outcome.GetResult().GetRecords());
+            if (failed.empty()) {
+                return;  // count>0 but no per-entry error code: treat as done
+            }
+            std::vector<Aws::Kinesis::Model::PutRecordsRequestEntry> retry;
+            retry.reserve(failed.size());
+            for (std::size_t idx : failed) {
+                retry.push_back(entries[idx]);
+            }
+            entries = std::move(retry);
+        }
+        throw std::runtime_error(opts_.name + ": PutRecords left records unwritten after " +
+                                 std::to_string(opts_.max_retries + 1) + " attempts");
+    }
+
+    void sleep_backoff_(int attempt) {
+        auto backoff = opts_.retry_base_backoff * (1u << (attempt - 1));
+        constexpr std::chrono::milliseconds kMaxBackoff{30000};
+        if (backoff > kMaxBackoff) {
+            backoff = kMaxBackoff;
+        }
+        std::this_thread::sleep_for(backoff);
+    }
+
+    KinesisSinkOptions opts_;
+    std::unique_ptr<Aws::Kinesis::KinesisClient> client_;
+    std::vector<Aws::Kinesis::Model::PutRecordsRequestEntry> pending_;
+    std::uint64_t counter_{0};
+};
+
+}  // namespace clink::aws

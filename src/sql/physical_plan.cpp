@@ -274,6 +274,35 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{"prometheus_sink", kChannelString, "row_to_json_string"};
     }
+    if (connector == "kinesis") {
+        // Kinesis Data Streams sink (PutRecords). At-least-once; no producer
+        // dedup key (a retry of throttled records may duplicate). Each row -> JSON
+        // object string -> record Data; partition_key names the field used as the
+        // Kinesis PartitionKey (shard routing).
+        if (exactly_once) {
+            unsupported(
+                "connector='kinesis' sink is at-least-once (Kinesis has no producer dedup "
+                "key); exactly-once delivery is not supported");
+        }
+        if (upsert) {
+            unsupported("connector='kinesis' sink does not support mode='upsert'");
+        }
+        return RowConnectorBinding{"kinesis_sink", kChannelString, "row_to_json_string"};
+    }
+    if (connector == "firehose") {
+        // Amazon Data Firehose sink (PutRecordBatch). At-least-once; no partition
+        // key and no ordering guarantee. Each row -> JSON object string -> record
+        // Data (a newline is appended so the destination can split records).
+        if (exactly_once) {
+            unsupported(
+                "connector='firehose' sink is at-least-once; exactly-once delivery is not "
+                "supported");
+        }
+        if (upsert) {
+            unsupported("connector='firehose' sink does not support mode='upsert'");
+        }
+        return RowConnectorBinding{"firehose_sink", kChannelString, "row_to_json_string"};
+    }
     if (connector == "dynamodb") {
         // DynamoDB sink (BatchWriteItem). At-least-once; EFFECTIVELY-once when the
         // primary key is stable (PutItem upserts). Each row -> JSON object string
@@ -323,8 +352,8 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     }
     unsupported(
         "format='json' sink requires connector='file', 'kafka', 'parquet', 'http', "
-        "'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'dynamodb', 'blackhole' or "
-        "'changelog' (got '" +
+        "'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'kinesis', 'firehose', "
+        "'dynamodb', 'blackhole' or 'changelog' (got '" +
         connector + "')");
 }
 

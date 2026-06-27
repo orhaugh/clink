@@ -14,4 +14,10 @@ TEST(AwsFactoryRegistration, DynamoDbSinkIsRegistered) {
     EXPECT_NE(rr.find_sink("dynamodb_sink", "string"), nullptr);
 }
 
+TEST(AwsFactoryRegistration, KinesisAndFirehoseSinksRegistered) {
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("kinesis_sink", "string"), nullptr);
+    EXPECT_NE(rr.find_sink("firehose_sink", "string"), nullptr);
+}
+
 }  // namespace

@@ -210,6 +210,38 @@ TEST(SqlPhysical, SplunkHecConnectorSinkLowersToHecSink) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
 }
 
+// connector='kinesis' / 'firehose' lower to their sinks (string channel) via the
+// row_to_json_string bridge, carrying stream/delivery_stream + partition_key.
+TEST(SqlPhysical, KinesisAndFirehoseConnectorSinksLower) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE kin_out (a BIGINT) WITH (connector='kinesis', format='json', "
+        "stream='events', partition_key='a');"
+        "CREATE TABLE fh_out (a BIGINT) WITH (connector='firehose', format='json', "
+        "delivery_stream='dstream');");
+    for (int i = 0; i < 3; ++i) {
+        cat.register_table(
+            std::get<ast::CreateTableStmt>(s.statements[static_cast<std::size_t>(i)]));
+    }
+    PhysicalPlanner pp;
+    auto kin = pp.compile(static_cast<const LogicalSink&>(
+        *bind_insert(cat, "INSERT INTO kin_out SELECT a FROM src_t")));
+    const auto* ks = find_op(kin, "kinesis_sink");
+    ASSERT_NE(ks, nullptr);
+    EXPECT_EQ(ks->params.at("stream"), "events");
+    EXPECT_EQ(ks->params.at("partition_key"), "a");
+    EXPECT_NE(find_op(kin, "row_to_json_string"), nullptr);
+
+    PhysicalPlanner pp2;
+    auto fh = pp2.compile(static_cast<const LogicalSink&>(
+        *bind_insert(cat, "INSERT INTO fh_out SELECT a FROM src_t")));
+    const auto* fs = find_op(fh, "firehose_sink");
+    ASSERT_NE(fs, nullptr);
+    EXPECT_EQ(fs->params.at("delivery_stream"), "dstream");
+}
+
 // connector='dynamodb' lowers to the dynamodb_sink (string channel) via the
 // row_to_json_string bridge, carrying table/partition_key/sort_key.
 TEST(SqlPhysical, DynamoDbConnectorSinkLowersToBatchWriteSink) {

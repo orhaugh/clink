@@ -8,7 +8,9 @@
 
 #include "clink/aws/aws_client.hpp"
 #include "clink/aws/dynamodb_sink.hpp"
+#include "clink/aws/firehose_sink.hpp"
 #include "clink/aws/install.hpp"
+#include "clink/aws/kinesis_sink.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
@@ -56,6 +58,45 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 8));
             o.name = "dynamodb_sink";
             return std::make_shared<DynamoDbSink>(std::move(o));
+        });
+
+    // kinesis_sink: PutRecords into a Kinesis Data Stream. At-least-once (no
+    // producer dedup key). Params:
+    //   stream (required)         - stream name or ARN
+    //   partition_key             - record field used as the Kinesis PartitionKey
+    //                               (else a rotating counter spreads load)
+    //   region, endpoint_override
+    //   batch_records (default 500; clamped to [1, 500])
+    //   max_retries (default 8)   - failed-subset resend attempts
+    reg.register_sink<std::string>(
+        "kinesis_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            KinesisSinkOptions o;
+            o.stream = ctx.param_or("stream");
+            o.partition_key = ctx.param_or("partition_key", "");
+            o.client = client_options_from(ctx);
+            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
+            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 8));
+            o.name = "kinesis_sink";
+            return std::make_shared<KinesisSink>(std::move(o));
+        });
+
+    // firehose_sink: PutRecordBatch into an Amazon Data Firehose delivery
+    // stream. At-least-once; no partition key, no ordering. Params:
+    //   delivery_stream (required)
+    //   delimiter (default "\n")  - appended to each record's Data (empty = none)
+    //   region, endpoint_override
+    //   batch_records (default 500; clamped to [1, 500])
+    //   max_retries (default 8)   - failed-subset resend attempts
+    reg.register_sink<std::string>(
+        "firehose_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            FirehoseSinkOptions o;
+            o.delivery_stream = ctx.param_or("delivery_stream");
+            o.delimiter = ctx.param_or("delimiter", "\n");
+            o.client = client_options_from(ctx);
+            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
+            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 8));
+            o.name = "firehose_sink";
+            return std::make_shared<FirehoseSink>(std::move(o));
         });
 }
 
