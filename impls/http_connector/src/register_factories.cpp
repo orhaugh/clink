@@ -3,6 +3,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -14,6 +16,7 @@
 #include "clink/http_connector/http_request.hpp"
 #include "clink/http_connector/install.hpp"
 #include "clink/http_connector/prometheus_push_sink.hpp"
+#include "clink/http_connector/pubsub.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
@@ -25,6 +28,33 @@ namespace {
 // fail-and-replay default.
 DlqPolicy parse_dlq(const clink::plugin::BuildContext& ctx) {
     return ctx.param_or("dlq", "fail") == "drop" ? DlqPolicy::Drop : DlqPolicy::Fail;
+}
+
+// Build the HTTP transport options shared by the Pub/Sub sink and source. The
+// base URL resolves in priority order: the `endpoint` option, else the
+// PUBSUB_EMULATOR_HOST env var ("host:port" -> http://host:port), else the real
+// service. Auth: `auth_token` -> "Authorization: Bearer <token>"; arbitrary
+// `headers` are merged too (and a header-supplied Authorization wins). The
+// emulator needs no auth.
+HttpRequest::Options pubsub_http_options(const clink::plugin::BuildContext& ctx) {
+    HttpRequest::Options http;
+    std::string endpoint = ctx.param_or("endpoint", "");
+    if (endpoint.empty()) {
+        if (const char* env = std::getenv("PUBSUB_EMULATOR_HOST"); env != nullptr && *env != '\0') {
+            endpoint = std::string("http://") + env;
+        }
+    }
+    http.base_url = endpoint.empty() ? "https://pubsub.googleapis.com" : endpoint;
+    http.verify_tls = ctx.param_or("verify_tls", "true") != "false";
+    std::map<std::string, std::string> headers;
+    if (const std::string token = ctx.param_or("auth_token", ""); !token.empty()) {
+        headers["Authorization"] = "Bearer " + token;
+    }
+    for (auto& kv : parse_headers(ctx.param_or("headers", ""))) {
+        headers[kv.first] = kv.second;  // explicit headers override the token-built one
+    }
+    http.headers = std::move(headers);
+    return http;
 }
 }  // namespace
 
@@ -212,6 +242,65 @@ void install(clink::plugin::PluginRegistry& reg) {
                 std::chrono::milliseconds{ctx.param_int64_or("retry_base_backoff_ms", 200)};
             o.name = "http_poll_source";
             return make_http_poll_source(std::move(o));
+        });
+
+    // pubsub_sink: publish batched records to a Google Cloud Pub/Sub topic via the
+    // REST :publish API ({"messages":[{"data":"<base64>"}]}). At-least-once;
+    // Pub/Sub publish has no producer dedup key so a replay re-publishes. Each
+    // record is one std::string (a JSON object on the SQL path). Params:
+    //   project (required), topic (required)
+    //   endpoint              - override base URL (e.g. http://emulator:8085).
+    //                           Else PUBSUB_EMULATOR_HOST, else the real service.
+    //   auth_token            - bearer token -> "Authorization: Bearer <token>"
+    //   headers               - extra "K: V; ..." (merged; overrides auth_token)
+    //   batch_records (default 1000; capped at the 1000-message publish limit)
+    //   batch_bytes (default 9437184; stay under the ~10MB request limit)
+    //   max_retries (default 4; clamped to [0, 20])
+    //   verify_tls ("true" [default] | "false")
+    reg.register_sink<std::string>(
+        "pubsub_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            PubSubSinkOptions o;
+            o.http = pubsub_http_options(ctx);
+            o.project = ctx.param_or("project");
+            o.topic = ctx.param_or("topic");
+            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 1000));
+            o.batch_bytes =
+                static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 9 * 1024 * 1024));
+            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            o.dlq_policy = parse_dlq(ctx);
+            o.linger = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
+            o.name = "pubsub_sink";
+            return make_pubsub_publish_sink(std::move(o));
+        });
+
+    // pubsub_source: pull from a Google Cloud Pub/Sub subscription via the REST
+    // :pull API, emit each message's base64-decoded data, and :acknowledge on
+    // each checkpoint (the ack is the offset commit). At-least-once: unacked
+    // messages are redelivered by the server after the subscription ackDeadline,
+    // which is also crash recovery. Multiple subtasks pull the SAME subscription;
+    // Pub/Sub load-balances messages across them (no client-side sharding).
+    // Params:
+    //   project (required), subscription (required)
+    //   endpoint / auth_token / headers / verify_tls - as pubsub_sink
+    //   max_messages (default 1000; capped at 1000) - Pull maxMessages
+    //   return_immediately ("true" [default] | "false")
+    //   poll_interval_ms (default 500) - sleep after an empty pull
+    //   max_retries (default 4; clamped to [0, 20]) - transient-pull retries
+    reg.register_source<std::string>(
+        "pubsub_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
+            PubSubSourceOptions o;
+            o.http = pubsub_http_options(ctx);
+            o.project = ctx.param_or("project");
+            o.subscription = ctx.param_or("subscription");
+            o.max_messages = static_cast<int>(ctx.param_int64_or("max_messages", 1000));
+            o.return_immediately = ctx.param_or("return_immediately", "true") != "false";
+            o.poll_interval =
+                std::chrono::milliseconds{ctx.param_int64_or("poll_interval_ms", 500)};
+            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            o.retry_base_backoff =
+                std::chrono::milliseconds{ctx.param_int64_or("retry_base_backoff_ms", 200)};
+            o.name = "pubsub_source";
+            return std::make_shared<PubSubPullSource>(std::move(o));
         });
 }
 

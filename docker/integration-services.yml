@@ -98,3 +98,18 @@ services:
       timeout: 3s
       retries: 30
       start_period: 5s
+
+  # Google Cloud Pub/Sub emulator for the Pub/Sub connector live IT. Speaks the
+  # same REST API as the service; the test creates its own topic + subscription.
+  # CLINK_PUBSUB_EMULATOR_HOST: "localhost:8085"
+  pubsub:
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk:emulators
+    command:
+      - gcloud
+      - beta
+      - emulators
+      - pubsub
+      - start
+      - --host-port=0.0.0.0:8085
+    ports:
+      - "8085:8085"

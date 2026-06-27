@@ -20,9 +20,11 @@ namespace clink::http_connector {
 
 // How a batch of rendered records is framed into one request body.
 enum class BulkFraming {
-    JsonArray,  // [rec0,rec1,...]  (records are JSON values)
-    Ndjson,     // rec0\nrec1\n...  (newline-delimited; records may be multi-line,
-                // e.g. the Elasticsearch _bulk action+doc pair)
+    JsonArray,       // [rec0,rec1,...]  (records are JSON values)
+    Ndjson,          // rec0\nrec1\n...  (newline-delimited; records may be multi-line,
+                     // e.g. the Elasticsearch _bulk action+doc pair)
+    PubSubMessages,  // {"messages":[rec0,rec1,...]}  (each record is a Pub/Sub
+                     // PubsubMessage JSON object, e.g. {"data":"<base64>"})
 };
 
 // Reusable base for at-least-once HTTP bulk sinks. A subclass (or a factory)
@@ -230,6 +232,17 @@ private:
                 body += fragments_[idx];
             }
             body.push_back(']');
+        } else if (opts_.framing == BulkFraming::PubSubMessages) {
+            body += "{\"messages\":[";
+            bool first = true;
+            for (std::size_t idx : active) {
+                if (!first) {
+                    body.push_back(',');
+                }
+                first = false;
+                body += fragments_[idx];
+            }
+            body += "]}";
         } else {  // Ndjson: every record (incl. the last) is newline-terminated.
             for (std::size_t idx : active) {
                 body += fragments_[idx];

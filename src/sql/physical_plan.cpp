@@ -95,6 +95,9 @@ std::string string_source_factory_for(const TableDef& table) {
     if (connector == "http_poll") {
         return "http_poll_source";
     }
+    if (connector == "pubsub") {
+        return "pubsub_source";
+    }
     if (connector == "redis") {
         return "redis_source";
     }
@@ -132,6 +135,9 @@ std::string string_sink_factory_for(const TableDef& table) {
     }
     if (connector == "postgres") {
         return "postgres_sink";
+    }
+    if (connector == "pubsub") {
+        return "pubsub_sink";
     }
     unsupported("unsupported sink connector '" + connector + "' for table " + table.name);
 }
@@ -204,6 +210,12 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // At-least-once (cursor checkpoint).
         return RowConnectorBinding{"http_poll_source", kChannelString, "json_string_to_row"};
     }
+    if (connector == "pubsub") {
+        // Google Cloud Pub/Sub source (REST Pull): each message's base64-decoded
+        // data is a JSON object string (string channel) bridged to Row.
+        // At-least-once (ack-on-checkpoint + server redelivery after ackDeadline).
+        return RowConnectorBinding{"pubsub_source", kChannelString, "json_string_to_row"};
+    }
     if (connector == "redis") {
         // Redis Streams source (XREADGROUP consumer group): each entry is a JSON
         // object string (string channel) bridged to Row. At-least-once (PEL
@@ -234,7 +246,7 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
     }
     unsupported(
         "format='json' source requires connector='file', 'kafka', 'parquet', 'nexmark', "
-        "'kinesis', 'http_poll', 'redis', 'mysql', 'clickhouse' or 'postgres' (got '" +
+        "'kinesis', 'http_poll', 'pubsub', 'redis', 'mysql', 'clickhouse' or 'postgres' (got '" +
         connector + "')");
 }
 
@@ -327,6 +339,20 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
             unsupported("connector='http' sink does not support mode='upsert'");
         }
         return RowConnectorBinding{"http_sink", kChannelString, "row_to_json_string"};
+    }
+    if (connector == "pubsub") {
+        // Google Cloud Pub/Sub publish sink (REST :publish). At-least-once;
+        // Pub/Sub publish has no producer dedup key (a replay re-publishes). Each
+        // row -> JSON object string -> base64 in a {"data":...} message.
+        if (exactly_once) {
+            unsupported(
+                "connector='pubsub' sink is at-least-once (Pub/Sub publish has no producer "
+                "dedup key); exactly-once delivery is not supported");
+        }
+        if (upsert) {
+            unsupported("connector='pubsub' sink does not support mode='upsert'");
+        }
+        return RowConnectorBinding{"pubsub_sink", kChannelString, "row_to_json_string"};
     }
     if (connector == "elasticsearch" || connector == "opensearch") {
         // Bulk-index into Elasticsearch / OpenSearch (identical _bulk API).
@@ -482,8 +508,8 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     }
     unsupported(
         "format='json' sink requires connector='file', 'kafka', 'clickhouse', 'postgres', "
-        "'parquet', 'http', 'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'kinesis', "
-        "'redis', 'mysql', 'firehose', 'dynamodb', 'blackhole' or 'changelog' (got '" +
+        "'parquet', 'http', 'pubsub', 'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', "
+        "'kinesis', 'redis', 'mysql', 'firehose', 'dynamodb', 'blackhole' or 'changelog' (got '" +
         connector + "')");
 }
 

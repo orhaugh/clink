@@ -31,4 +31,10 @@ TEST(HttpConnectorFactoryRegistration, HttpPollSourceIsRegistered) {
     EXPECT_NE(rr.find_source("http_poll_source", "string"), nullptr);
 }
 
+TEST(HttpConnectorFactoryRegistration, PubSubSinkAndSourceRegistered) {
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("pubsub_sink", "string"), nullptr);
+    EXPECT_NE(rr.find_source("pubsub_source", "string"), nullptr);
+}
+
 }  // namespace

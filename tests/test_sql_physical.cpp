@@ -345,6 +345,48 @@ TEST(SqlPhysical, RedisConnectorSinkLowersToXaddSink) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
 }
 
+// connector='pubsub' source lowers to the pubsub_source (string channel) bridged
+// to Row via json_string_to_row, carrying project/subscription.
+TEST(SqlPhysical, PubSubConnectorSourceLowers) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE ps_in (a BIGINT) WITH (connector='pubsub', format='json', "
+        "project='p', subscription='sub1');"
+        "CREATE TABLE out_f (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/o.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO out_f SELECT a FROM ps_in");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* src = find_op(spec, "pubsub_source");
+    ASSERT_NE(src, nullptr);
+    EXPECT_EQ(src->params.at("project"), "p");
+    EXPECT_EQ(src->params.at("subscription"), "sub1");
+    EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);  // string -> Row bridge
+}
+
+// connector='pubsub' sink lowers to the pubsub_sink (string channel) via the
+// row_to_json_string bridge, carrying project/topic. exactly-once is rejected.
+TEST(SqlPhysical, PubSubConnectorSinkLowersToPublishSink) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE ps_out (a BIGINT) WITH (connector='pubsub', format='json', "
+        "project='p', topic='t1');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO ps_out SELECT a FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* snk = find_op(spec, "pubsub_sink");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("project"), "p");
+    EXPECT_EQ(snk->params.at("topic"), "t1");
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+}
+
 // M4: connector='postgres' SINK lowers to postgres_sink (string channel) via the
 // row_to_json_string bridge, carrying the on_conflict knob; columns derive from
 // the declared schema (no columns= needed). The "Phase 3" rejection is gone.
