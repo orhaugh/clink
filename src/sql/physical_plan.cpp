@@ -274,6 +274,27 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{"prometheus_sink", kChannelString, "row_to_json_string"};
     }
+    if (connector == "dynamodb") {
+        // DynamoDB sink (BatchWriteItem). At-least-once; EFFECTIVELY-once when the
+        // primary key is stable (PutItem upserts). Each row -> JSON object string
+        // -> a DynamoDB item; partition_key (+ optional sort_key) name the key
+        // attributes. exactly_once (2PC) is not offered, but the idempotent
+        // overwrite is the effectively-once path - so reject exactly_once loudly.
+        if (exactly_once) {
+            unsupported(
+                "connector='dynamodb' sink is at-least-once with idempotent overwrite "
+                "(effectively-once via a stable primary key); 2PC exactly-once is not supported");
+        }
+        if (upsert) {
+            // A DynamoDB put IS an upsert; mode='upsert' would be redundant, and
+            // the engine's upsert path expects a primary_key/changelog contract
+            // this sink does not implement. Reject rather than half-honour it.
+            unsupported(
+                "connector='dynamodb' sink already upserts by primary key; do not set "
+                "mode='upsert' (set partition_key/sort_key instead)");
+        }
+        return RowConnectorBinding{"dynamodb_sink", kChannelString, "row_to_json_string"};
+    }
     if (connector == "parquet") {
         // Typed-columnar Parquet. exactly_once routes to the 2PC variant
         // (staging/ + atomic commit on checkpoint); else one file/subtask.
@@ -302,8 +323,8 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     }
     unsupported(
         "format='json' sink requires connector='file', 'kafka', 'parquet', 'http', "
-        "'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'blackhole' or 'changelog' "
-        "(got '" +
+        "'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'dynamodb', 'blackhole' or "
+        "'changelog' (got '" +
         connector + "')");
 }
 

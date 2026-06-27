@@ -97,6 +97,9 @@
 #ifdef CLINK_LINKED_S3
 #include "clink/s3/install.hpp"
 #endif
+#ifdef CLINK_LINKED_AWS
+#include "clink/aws/install.hpp"
+#endif
 #ifdef CLINK_LINKED_HTTP_CONNECTOR
 #include "clink/http_connector/install.hpp"
 #endif
@@ -1952,6 +1955,9 @@ void install_linked_impls() {
 #ifdef CLINK_LINKED_S3
     clink::s3::install(reg);
     clink::s3::install_state_backend();  // remote-read:// disaggregated state backend
+#endif
+#ifdef CLINK_LINKED_AWS
+    clink::aws::install(reg);  // kinesis / firehose / dynamodb connectors
 #endif
 #ifdef CLINK_LINKED_HTTP_CONNECTOR
     clink::http_connector::install(reg);

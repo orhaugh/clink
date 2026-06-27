@@ -210,6 +210,27 @@ TEST(SqlPhysical, SplunkHecConnectorSinkLowersToHecSink) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
 }
 
+// connector='dynamodb' lowers to the dynamodb_sink (string channel) via the
+// row_to_json_string bridge, carrying table/partition_key/sort_key.
+TEST(SqlPhysical, DynamoDbConnectorSinkLowersToBatchWriteSink) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE dd_out (a BIGINT) WITH (connector='dynamodb', format='json', "
+        "table='events', partition_key='a', region='eu-west-1');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO dd_out SELECT a FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* snk = find_op(spec, "dynamodb_sink");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("table"), "events");
+    EXPECT_EQ(snk->params.at("partition_key"), "a");
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+}
+
 // connector='prometheus' lowers to the prometheus_sink (string channel),
 // carrying url/job/value_field.
 TEST(SqlPhysical, PrometheusConnectorSinkLowersToPushSink) {
