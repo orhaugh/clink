@@ -59,4 +59,24 @@ TEST(CdcJson, TransactionMarkersAreSkipped) {
     EXPECT_FALSE(cdc_event_to_json_row(make_change(CdcEvent::Op::Unknown)).has_value());
 }
 
+TEST(CdcJson, DataColumnNamedLikeReservedKeyWinsOverMetadata) {
+    // A (pathological) column literally named __op keeps its data value; the op
+    // metadata is omitted for that row rather than silently overwriting the data.
+    CdcEvent ev;
+    ev.op = CdcEvent::Op::Insert;
+    ev.table = "t";
+    ev.lsn = "0/1";
+    ev.xid = 7;
+    ev.values.push_back({.name = "__op", .value = "payload", .type = "text", .is_null = false});
+    ev.values.push_back({.name = "id", .value = "5", .type = "int4", .is_null = false});
+
+    auto out = cdc_event_to_json_row(ev);
+    ASSERT_TRUE(out.has_value());
+    auto j = clink::config::parse(*out);
+    const auto& o = j.as_object();
+    EXPECT_EQ(o.at("__op").as_string(), "payload") << "data column must win over metadata";
+    EXPECT_EQ(o.at("id").as_string(), "5");
+    EXPECT_EQ(o.at("__table").as_string(), "t");  // non-colliding metadata still present
+}
+
 }  // namespace

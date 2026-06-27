@@ -7,6 +7,15 @@
 // metadata under reserved __op / __table / __lsn / __xid keys, so json_string_to_
 // row maps the data columns by name. Transaction markers (begin/commit/truncate/
 // unknown) carry no row to map and return std::nullopt (the caller skips them).
+//
+// RESERVED-KEY PRECEDENCE: data columns are written first, then the __-prefixed
+// metadata is added only if that key is free (no-overwrite emplace). So a
+// (pathological) data column literally named __op / __table / __lsn / __xid keeps
+// its data value and the corresponding metadata is omitted for that row - data is
+// never silently overwritten.
+// CAVEAT (inherited from the CDC layer): an unchanged-TOASTed column has an empty
+// value with is_null=false, so it emits "" - it cannot be distinguished here from
+// a real empty string (see cdc_event.hpp).
 
 #include <cstdint>
 #include <optional>
@@ -46,10 +55,11 @@ inline std::optional<std::string> cdc_event_to_json_row(const CdcEvent& ev) {
     for (const auto& f : ev.values) {
         obj[f.name] = f.is_null ? clink::config::JsonValue{} : clink::config::JsonValue{f.value};
     }
-    obj["__op"] = clink::config::JsonValue{cdc_op_name(ev.op)};
-    obj["__table"] = clink::config::JsonValue{ev.table};
-    obj["__lsn"] = clink::config::JsonValue{ev.lsn};
-    obj["__xid"] = clink::config::JsonValue{static_cast<std::int64_t>(ev.xid)};
+    // emplace = no-overwrite: a data column already holding one of these keys wins.
+    obj.emplace("__op", clink::config::JsonValue{cdc_op_name(ev.op)});
+    obj.emplace("__table", clink::config::JsonValue{ev.table});
+    obj.emplace("__lsn", clink::config::JsonValue{ev.lsn});
+    obj.emplace("__xid", clink::config::JsonValue{static_cast<std::int64_t>(ev.xid)});
     return clink::config::JsonValue{std::move(obj)}.serialize(0);
 }
 

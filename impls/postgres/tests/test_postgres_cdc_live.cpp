@@ -20,7 +20,9 @@
 #include <libpq-fe.h>
 #endif
 
+#include "clink/config/json.hpp"
 #include "clink/connectors/cdc_event.hpp"
+#include "clink/connectors/cdc_json.hpp"
 #include "clink/connectors/postgres_cdc_source.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/operators/operator_base.hpp"
@@ -181,6 +183,53 @@ TEST(PostgresCdcLive, PgoutputDecodesInsertUpdateDelete) {
     // Metrics fired (delta-asserted against the shared registry).
     EXPECT_GT(counter_value(recs) - recs0, 0u);
     EXPECT_GT(counter_value(bytes) - bytes0, 0u);
+}
+
+// M5: the CdcEvent -> flat-JSON-row transform (postgres_cdc_source's Row path)
+// applied to a REAL pgoutput stream. Proves the composed path: data columns flat,
+// __op/__table metadata, a SQL NULL column -> JSON null, markers -> nullopt.
+TEST(PostgresCdcLive, CdcEventToJsonRowOnLiveStream) {
+    if (!pg_configured()) {
+        GTEST_SKIP() << "set CLINK_POSTGRES_CDC_TEST_DSN";
+    }
+    const std::string dsn = pg_dsn();
+    const std::string tbl = "cdc_json_" + uniq();
+    const std::string pub = "pubj_" + uniq();
+    const std::string slot = "slotj_" + uniq();
+    run_sql(dsn, "DROP TABLE IF EXISTS " + tbl);
+    run_sql(dsn, "CREATE TABLE " + tbl + " (id int primary key, val text)");
+    run_sql(dsn, "DROP PUBLICATION IF EXISTS " + pub);
+    run_sql(dsn, "CREATE PUBLICATION " + pub + " FOR TABLE " + tbl);
+
+    auto o = cdc_opts(slot, pub);
+    o.drop_slot_on_close = true;
+    PostgresCdcSource src(o);
+    src.open();
+    run_sql(dsn, "INSERT INTO " + tbl + " VALUES (1, NULL)");  // NULL column
+
+    Captured cap;
+    drain_until(src, cap, /*want_changes=*/1, /*timeout_ms=*/30000);
+    src.close();
+    run_sql(dsn, "DROP TABLE IF EXISTS " + tbl);
+    run_sql(dsn, "DROP PUBLICATION IF EXISTS " + pub);
+
+    bool saw_insert = false;
+    for (const auto& e : cap.events) {
+        auto row = clink::pgcdc::cdc_event_to_json_row(e);
+        if (e.op == CdcEvent::Op::Insert) {
+            ASSERT_TRUE(row.has_value());
+            auto j = clink::config::parse(*row);
+            const auto& obj = j.as_object();
+            EXPECT_EQ(obj.at("__op").as_string(), "insert");
+            EXPECT_EQ(obj.at("__table").as_string(), "public." + tbl);
+            EXPECT_EQ(obj.at("id").as_string(), "1");
+            EXPECT_TRUE(obj.at("val").is_null()) << "a SQL NULL column must emit JSON null";
+            saw_insert = true;
+        } else if (e.op == CdcEvent::Op::Begin || e.op == CdcEvent::Op::Commit) {
+            EXPECT_FALSE(row.has_value()) << "transaction markers must be dropped";
+        }
+    }
+    EXPECT_TRUE(saw_insert) << "should have decoded the insert";
 }
 
 TEST(PostgresCdcLive, LsnCheckpointResumesWithoutGap) {

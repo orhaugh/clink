@@ -142,8 +142,11 @@ inline Codec<ClickHouseRow> clickhouse_row_codec() {
             if (!detail::clickhouse_row_read_string_vec(buf, pos, values)) {
                 return std::nullopt;
             }
-            // Null mask (M5). Tolerant: a buffer written before the mask existed
-            // simply ends here, leaving nulls empty (= all non-null).
+            // Null mask (M5). The trailing-section read assumes `buf` is the EXACT
+            // bytes of one encoded row (the wire/state framing guarantees this - do
+            // not compose this codec inside a container/pair codec that would hand
+            // it a trailing tail). Tolerant: a buffer written before the mask
+            // existed simply ends here, leaving nulls empty (= all non-null).
             std::vector<char> nulls;
             std::uint32_t nulls_count = 0;
             if (detail::clickhouse_row_read_u32(buf, pos, nulls_count)) {
@@ -155,6 +158,11 @@ inline Codec<ClickHouseRow> clickhouse_row_codec() {
                     nulls[i] = static_cast<char>(buf[pos + i]);
                 }
                 pos += nulls_count;
+            }
+            // Corrupt/foreign buffer whose mask arity disagrees with values: drop
+            // the mask (all-non-null) rather than mis-report NULLs.
+            if (nulls.size() != values.size()) {
+                nulls.clear();
             }
 
             ClickHouseRow::Names typed_names;

@@ -131,8 +131,11 @@ inline Codec<PostgresRow> postgres_row_codec() {
                 }
                 values.push_back(std::move(v));
             }
-            // Null mask (M5). Tolerant: a buffer written before the mask existed
-            // simply ends here, leaving nulls empty (= all non-null).
+            // Null mask (M5). The trailing-section read assumes `buf` is the EXACT
+            // bytes of one encoded row (the wire/state framing guarantees this -
+            // do not compose this codec inside a container/pair codec that would
+            // hand it a trailing tail). Tolerant: a buffer written before the mask
+            // existed simply ends here, leaving nulls empty (= all non-null).
             std::vector<char> nulls;
             std::uint32_t nulls_count = 0;
             if (detail::postgres_row_read_u32(buf, pos, nulls_count)) {
@@ -144,6 +147,12 @@ inline Codec<PostgresRow> postgres_row_codec() {
                     nulls[i] = static_cast<char>(buf[pos + i]);
                 }
                 pos += nulls_count;
+            }
+            // Defend against a corrupt/foreign buffer whose mask arity disagrees
+            // with the values: drop the mask (treat as all-non-null) rather than
+            // mis-report NULLs.
+            if (nulls.size() != values.size()) {
+                nulls.clear();
             }
             // Drop empty names list - a default-constructed PostgresRow
             // has names_ == nullptr, and we don't want to fake an empty

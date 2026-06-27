@@ -160,30 +160,10 @@ private:
         return out;
     }
 
-    static std::string op_name(CdcEvent::Op op) {
-        switch (op) {
-            case CdcEvent::Op::Begin:
-                return "begin";
-            case CdcEvent::Op::Insert:
-                return "insert";
-            case CdcEvent::Op::Update:
-                return "update";
-            case CdcEvent::Op::Delete:
-                return "delete";
-            case CdcEvent::Op::Truncate:
-                return "truncate";
-            case CdcEvent::Op::Commit:
-                return "commit";
-            case CdcEvent::Op::Unknown:
-                return "unknown";
-        }
-        return "unknown";
-    }
-
     static std::string serialize(const CdcEvent& ev) {
         std::string out;
         out += "{\"op\":";
-        out += escape(op_name(ev.op));
+        out += escape(clink::pgcdc::cdc_op_name(ev.op));
         out += ",\"table\":";
         out += escape(ev.table);
         out += ",\"lsn\":";
