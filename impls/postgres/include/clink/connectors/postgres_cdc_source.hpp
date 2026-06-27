@@ -123,15 +123,33 @@ public:
     // #60: source replay. The cursor is the received WAL LSN; persisting it
     // lets a restart resume the logical-replication stream from the checkpointed
     // position via START_REPLICATION rather than the slot's default. This is
-    // exactly-once at the source boundary provided the replication slot still
-    // retains WAL from that LSN (its restart_lsn has not advanced past it);
-    // records between the last checkpoint and a crash are replayed, which the
-    // downstream changelog/2PC sink reconciles. open() uses a restored LSN as
-    // the START_REPLICATION start position when present.
+    // exactly-once at the source boundary for the DECODABLE change stream,
+    // provided the replication slot still retains WAL from that LSN (its
+    // restart_lsn has not advanced past it); records between the last checkpoint
+    // and a crash are replayed, which the downstream changelog/2PC sink
+    // reconciles. open() uses a restored LSN as the START_REPLICATION start
+    // position when present.
+    //
+    // Carve-out: an I/U/D change event that the pgoutput decoder cannot decode
+    // (unknown relation from a missed Relation message, or a truncated tuple) is
+    // DROPPED, not replayed - the checkpointed LSN advances past it regardless of
+    // decode success, so it is at-most-once. Such drops are counted + flagged via
+    // dropped_events_total{connector="postgres_cdc"} + errors_total rather than
+    // lost silently. Granularity note: the cursor is the received WAL LSN
+    // (max dataStart/walEnd seen), not the commit LSN of the last decoded row, so
+    // a resume can re-read from the start of an in-flight transaction; the
+    // downstream 2PC sink dedupes the overlap.
     void snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId ckpt) override;
     bool restore_offset(StateBackend& backend, OperatorId op_id) override;
 
     std::string name() const override { return "postgres_cdc_source"; }
+
+    // Observability/test accessor: the LSN passed to the last START_REPLICATION -
+    // the restored checkpoint LSN when resuming, the slot consistent_point on a
+    // fresh create, or "0/0" for the slot default. Lets a test prove a checkpoint
+    // restore (not the slot default) actually drove the resume position. Empty
+    // until open() has run.
+    [[nodiscard]] std::string start_position() const;
 
     static bool is_real_implementation();
 

@@ -226,6 +226,15 @@ TEST(PostgresCdcLive, LsnCheckpointResumesWithoutGap) {
         PostgresCdcSource s2(cdc_opts(slot, pub));
         ASSERT_TRUE(s2.restore_offset(backend, op_id));
         s2.open();
+        // Negative control (review H3): prove the RESTORED checkpoint LSN, not
+        // the slot default, drove START_REPLICATION. s2 reuses the existing slot
+        // (create_slot hits "already exists" -> slot_was_created=false), so if
+        // restore_offset had been a no-op the start position would be "0/0" (the
+        // slot default). A concrete restored LSN here means the disjointness
+        // assertion below is attributable to the restore, not to the slot's
+        // server-side confirmed_flush position (which is non-deterministic here).
+        EXPECT_NE(s2.start_position(), "0/0") << "resume used the slot default, not the checkpoint";
+        EXPECT_FALSE(s2.start_position().empty());
         for (int i = 6; i <= 10; ++i) {
             run_sql(dsn, "INSERT INTO " + tbl + " VALUES (" + std::to_string(i) + ", 'y')");
         }

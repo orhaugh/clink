@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "clink/connectors/pg_cdc_test_seam.hpp"
 #include "clink/connectors/postgres_decoder.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 
@@ -350,6 +351,14 @@ private:
             if (rel_it != relations_.end()) {
                 bool old_trunc = false;
                 (void)parse_tuple(rest, rel_it->second, old_trunc);  // discard old image
+                if (old_trunc) {
+                    // A truncated OLD image leaves the cursor at an arbitrary
+                    // offset, so the NEW image can no longer be located: a stray
+                    // 'N' byte would let a structurally-valid-but-WRONG NEW tuple
+                    // be emitted uncounted. Treat it as unrecoverable framing loss
+                    // and drop rather than emit corruption.
+                    return drop_();
+                }
             } else {
                 return drop_();
             }
@@ -403,6 +412,27 @@ private:
 
 }  // namespace
 
+// Test-only seam (declared in pg_cdc_test_seam.hpp). Defined here so it can reach
+// the anonymous-namespace PgOutputState. Drives the decoder over raw pgoutput
+// message payloads and reports the decoded events + the drop count, so the F1
+// silent-data-loss accounting is unit-testable without a live Postgres.
+namespace pg_cdc_testing {
+
+PgDecodeResult decode_pgoutput_messages(const std::vector<std::string>& messages) {
+    PgOutputState state;
+    PgDecodeResult result;
+    for (const auto& msg : messages) {
+        std::optional<CdcEvent> ev = state.on_message(msg, "0/0");
+        if (ev.has_value()) {
+            result.events.push_back(std::move(*ev));
+        }
+    }
+    result.dropped = state.dropped_data_events;
+    return result;
+}
+
+}  // namespace pg_cdc_testing
+
 // =====================================================================
 // PostgresCdcSource implementation
 // =====================================================================
@@ -423,6 +453,11 @@ struct PostgresCdcSource::Impl {
     // #60: set by restore_offset() when a checkpointed LSN is loaded, so open()
     // resumes START_REPLICATION from received_lsn instead of the slot default.
     bool restored_from_checkpoint{false};
+    // The LSN actually passed to the last START_REPLICATION: the restored
+    // checkpoint LSN when resuming, the slot consistent_point on a fresh create,
+    // or "0/0" for the slot default. Surfaced via start_position() so a test can
+    // prove a checkpoint restore (not the slot default) drove the resume.
+    std::string start_position_lsn;
 };
 
 bool PostgresCdcSource::is_real_implementation() {
@@ -607,6 +642,7 @@ void PostgresCdcSource::open() {
     } else {
         start_lsn = "0/0";
     }
+    impl_->start_position_lsn = start_lsn;
     std::string start_sql =
         "START_REPLICATION SLOT \"" + impl_->opts.slot_name + "\" LOGICAL " + start_lsn;
     if (impl_->opts.plugin == "pgoutput") {
@@ -648,6 +684,28 @@ bool PostgresCdcSource::produce(Emitter<CdcEvent>& out) {
     // Drain whatever is currently available on the replication stream
     // without blocking.
     std::uint64_t bytes = 0;
+    // Surface whatever we decoded THIS call (emitted batch + byte/drop counters).
+    // Used both on the normal loop exit and before an EOF/connection-drop early
+    // return, so a partially-drained batch and its metrics are never discarded.
+    auto surface_decoded = [&]() {
+        if (!batch.empty()) {
+            const auto sz = batch.size();
+            out.emit_data(std::move(batch));
+            clink::metrics::connector::records_in_inc("postgres_cdc", sz);
+        }
+        if (bytes > 0) {
+            clink::metrics::connector::bytes_in_inc("postgres_cdc", bytes);
+        }
+        // Surface any change events the decoder had to DROP (unknown relation /
+        // truncated tuple) - otherwise-silent data loss is now counted + flagged.
+        if (impl_->pgoutput_state.dropped_data_events > impl_->last_dropped) {
+            const std::uint64_t delta =
+                impl_->pgoutput_state.dropped_data_events - impl_->last_dropped;
+            impl_->last_dropped = impl_->pgoutput_state.dropped_data_events;
+            clink::metrics::connector::dropped_events_inc("postgres_cdc", delta);
+            clink::metrics::connector::error_inc("postgres_cdc", "source");
+        }
+    };
     while (true) {
         if (this->cancelled() || impl_->cancel.load()) {
             break;
@@ -656,6 +714,7 @@ bool PostgresCdcSource::produce(Emitter<CdcEvent>& out) {
         const int n = PQgetCopyData(impl_->conn, &buffer, /*async*/ 1);
         if (n == 0) {
             if (PQconsumeInput(impl_->conn) == 0) {
+                surface_decoded();  // flush what we decoded before the EOF
                 return false;
             }
             break;
@@ -664,6 +723,7 @@ bool PostgresCdcSource::produce(Emitter<CdcEvent>& out) {
             if (buffer != nullptr) {
                 PQfreemem(buffer);
             }
+            surface_decoded();  // flush what we decoded before the stream end
             return false;
         }
         if (n == -2) {
@@ -709,22 +769,7 @@ bool PostgresCdcSource::produce(Emitter<CdcEvent>& out) {
         PQfreemem(buffer);
     }
 
-    if (!batch.empty()) {
-        const auto sz = batch.size();
-        out.emit_data(std::move(batch));
-        clink::metrics::connector::records_in_inc("postgres_cdc", sz);
-    }
-    if (bytes > 0) {
-        clink::metrics::connector::bytes_in_inc("postgres_cdc", bytes);
-    }
-    // Surface any change events the decoder had to DROP (unknown relation /
-    // truncated tuple) - otherwise-silent data loss is now counted + flagged.
-    if (impl_->pgoutput_state.dropped_data_events > impl_->last_dropped) {
-        const std::uint64_t delta = impl_->pgoutput_state.dropped_data_events - impl_->last_dropped;
-        impl_->last_dropped = impl_->pgoutput_state.dropped_data_events;
-        clink::metrics::connector::dropped_events_inc("postgres_cdc", delta);
-        clink::metrics::connector::error_inc("postgres_cdc", "source");
-    }
+    surface_decoded();
     // received_lsn doubles as a consumer-lag-proxy: how far behind WAL
     // the source is. There's no server-side current LSN cheaply
     // available from libpq's replication protocol, so we publish the
@@ -752,6 +797,10 @@ bool PostgresCdcSource::produce(Emitter<CdcEvent>& out) {
 void PostgresCdcSource::cancel() {
     Source<CdcEvent>::cancel();
     impl_->cancel.store(true);
+}
+
+std::string PostgresCdcSource::start_position() const {
+    return impl_ != nullptr ? impl_->start_position_lsn : std::string{};
 }
 
 void PostgresCdcSource::close() {
@@ -865,6 +914,9 @@ bool PostgresCdcSource::produce(Emitter<CdcEvent>& /*out*/) {
 }
 void PostgresCdcSource::cancel() {
     Source<CdcEvent>::cancel();
+}
+std::string PostgresCdcSource::start_position() const {
+    return {};
 }
 void PostgresCdcSource::close() {}
 void PostgresCdcSource::drop_slot() {}
