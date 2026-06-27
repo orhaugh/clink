@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/config/json.hpp"
 #include "clink/core/record.hpp"
 #include "clink/operators/operator_base.hpp"
 
@@ -22,12 +23,15 @@
 #include "clink/redis/redis_client.hpp"
 #include "clink/redis/redis_sink.hpp"
 #include "clink/redis/redis_source.hpp"
+#include "clink/state/in_memory_state_backend.hpp"
 #endif
 
 #ifdef CLINK_HAS_REDIS
 
 using clink::Batch;
 using clink::Emitter;
+using clink::InMemoryStateBackend;
+using clink::OperatorId;
 using clink::StreamElement;
 using clink::redis::Connection;
 using clink::redis::ConnectOptions;
@@ -139,11 +143,73 @@ TEST(RedisLive, SinkThenSourceRoundTrip) {
     src.close();
     cleanup(stream);
 
+    EXPECT_EQ(cap.values.size(), kN) << "no over-emission / duplicate delivery";
     std::set<std::string> got(cap.values.begin(), cap.values.end());
     EXPECT_EQ(got.size(), kN) << "every sunk record should round-trip back verbatim";
     for (std::size_t i = 0; i < kN; ++i) {
         EXPECT_EQ(got.count(R"({"i":)" + std::to_string(i) + "}"), 1u) << "missing record " << i;
     }
+}
+
+// XACK at snapshot_offset is the offset commit: after acking, a restart of the
+// SAME consumer must NOT replay them (the complement of the PEL-replay test).
+TEST(RedisLive, AckedEntriesAreNotReplayed) {
+    if (!redis_configured()) {
+        GTEST_SKIP() << "set CLINK_REDIS_TEST_URL";
+    }
+    const std::string stream = unique_stream();
+    constexpr std::size_t kM = 8;
+    write_records(stream, kM);
+
+    InMemoryStateBackend backend;
+    const OperatorId op{1};
+    {
+        RedisSource s1(source_opts(stream, "ga"));
+        s1.open();
+        Captured cap;
+        drain(s1, cap, kM, /*timeout_ms=*/15000);
+        s1.snapshot_offset(backend, op, clink::CheckpointId{1});  // XACK all delivered
+        s1.close();
+        ASSERT_EQ(std::set<std::string>(cap.values.begin(), cap.values.end()).size(), kM);
+    }
+    std::size_t replayed = 0;
+    {
+        RedisSource s2(source_opts(stream, "ga"));
+        s2.open();
+        Captured cap;
+        // PEL is empty (acked) and there are no new entries, so this drains
+        // nothing and times out with zero records.
+        drain(s2, cap, /*want=*/1, /*timeout_ms=*/1500);
+        s2.close();
+        replayed = cap.values.size();
+    }
+    cleanup(stream);
+    EXPECT_EQ(replayed, 0u) << "acked entries must not be replayed";
+}
+
+// An entry with multiple fields (not the sink's single "v") renders as a JSON
+// object of all field/value pairs (the non-round-trip producer path).
+TEST(RedisLive, MultiFieldEntryRendersJsonObject) {
+    if (!redis_configured()) {
+        GTEST_SKIP() << "set CLINK_REDIS_TEST_URL";
+    }
+    const std::string stream = unique_stream();
+    {
+        Connection c{redis_conn()};
+        c.command({"XADD", stream, "*", "a", "1", "b", "two"});  // two fields, no "v"
+    }
+    RedisSource src(source_opts(stream, "gm"));
+    src.open();
+    Captured cap;
+    drain(src, cap, 1, /*timeout_ms=*/15000);
+    src.close();
+    cleanup(stream);
+
+    ASSERT_EQ(cap.values.size(), 1u);
+    auto j = clink::config::parse(cap.values[0]);
+    ASSERT_TRUE(j.is_object());
+    EXPECT_EQ(j.as_object().at("a").as_string(), "1");
+    EXPECT_EQ(j.as_object().at("b").as_string(), "two");
 }
 
 TEST(RedisLive, UnackedConsumerReplaysPelOnRestart) {

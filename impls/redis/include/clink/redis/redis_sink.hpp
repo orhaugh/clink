@@ -97,6 +97,11 @@ public:
             clink::metrics::connector::error_inc("redis", "sink");
             pending_.clear();
             pending_bytes_ = 0;
+            // Drop the connection: on a per-item error reply the remaining
+            // pipelined replies are still unread in hiredis' reader buffer, so a
+            // reused context would return stale replies. Forcing a reconnect on
+            // re-open avoids that desync (and a dead connection is gone anyway).
+            conn_.reset();
             throw;  // job replays from the last checkpoint (at-least-once)
         }
         const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(

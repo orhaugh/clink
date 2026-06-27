@@ -21,6 +21,14 @@
 // checkpoint's snapshot_offset XACKs a batch and the GLOBAL checkpoint then fails,
 // those entries are gone from the PEL and not replayed - at-most-once for that
 // one batch. Strict exactly-once would need a source on_commit hook (deferred).
+//
+// RESCALE CAVEAT: a consumer is named "<prefix>-<subtask_idx>" and a restart only
+// re-drains its OWN PEL. On a scale-DOWN (e.g. parallelism 4 -> 2) the removed
+// subtasks' consumers (clink-2, clink-3) are never re-created, so their pending
+// (un-acked) entries are orphaned in the group and not redelivered. Reclaiming
+// them would need XAUTOCLAIM over the dropped consumers; not done (op-level
+// rescale is not currently reachable from the SQL path). Same-parallelism and
+// scale-up restarts are unaffected.
 
 #include <chrono>
 #include <cstddef>
@@ -66,12 +74,21 @@ public:
         if (opts_.count < 1) {
             opts_.count = 1;
         }
+        // A non-positive block is normalised to the default rather than issued as
+        // BLOCK 0: the server would then block FOREVER, which both trips the
+        // finite client command timeout (a crash-loop on any idle stream) AND
+        // wedges the runner thread inside produce() so cancel/shutdown can never
+        // be observed. A finite block keeps produce() returning so cancel works.
+        if (opts_.block.count() <= 0) {
+            opts_.block = std::chrono::milliseconds{500};
+        }
     }
 
     void open() override {
         consumer_ = opts_.consumer_prefix + "-" + std::to_string(opts_.subtask_idx);
         // The socket command timeout must exceed BLOCK so a legitimate long-poll
-        // (server returns NIL after BLOCK ms) never trips the client timeout.
+        // (server returns NIL after BLOCK ms) never trips the client timeout. With
+        // block normalised to >0 in the ctor this invariant always holds.
         opts_.conn.command_timeout = opts_.block * 2 + std::chrono::milliseconds{2000};
         conn_ = std::make_unique<Connection>(opts_.conn);
         ensure_group_();
@@ -121,13 +138,19 @@ public:
                     continue;
                 }
                 std::string entry_id(id->str, id->len);
-                std::string payload = render_entry_(fields);
-                bytes += payload.size();
-                batch.emplace(std::move(payload));
+                // An entry that has been XDEL'd while still pending comes back with
+                // NIL fields: ack + page past it, but do NOT emit a phantom record.
+                const bool tombstone = (fields == nullptr || fields->type == REDIS_REPLY_NIL);
                 unacked_ids_.push_back(entry_id);
                 last_id_this_call = entry_id;
                 last_delivered_id_ = entry_id;
                 ++entries_seen;
+                if (tombstone) {
+                    continue;
+                }
+                std::string payload = render_entry_(fields);
+                bytes += payload.size();
+                batch.emplace(std::move(payload));
             }
         }
         if (!pel_drained_) {
@@ -165,13 +188,21 @@ public:
             for (const auto& id : unacked_ids_) {
                 args.push_back(id);
             }
+            Reply r;
             try {
-                conn_->command(args);
+                r = conn_->command(args);
             } catch (...) {
                 clink::metrics::connector::error_inc("redis", "source");
-                throw;
+                throw;  // dead connection: job restarts, the PEL replays
             }
-            unacked_ids_.clear();
+            if (r.is_error()) {
+                // A reply-level XACK error (does not throw): surface it but KEEP
+                // unacked_ids_ so the next checkpoint retries. The entries remain
+                // in the PEL meanwhile, so at-least-once is preserved either way.
+                clink::metrics::connector::error_inc("redis", "source");
+            } else {
+                unacked_ids_.clear();
+            }
         }
         if (!last_delivered_id_.empty()) {
             const std::string key = std::string(kIdPrefix) + opts_.stream;
@@ -186,15 +217,15 @@ public:
         bool found = false;
         const std::string_view prefix{kIdPrefix};
         backend.scan_operator_state(
-            op_id, [&](StateBackend::KeyView key, StateBackend::ValueView value) {
+            op_id, [&](StateBackend::KeyView key, StateBackend::ValueView /*value*/) {
                 if (key.size() <= prefix.size() || key.substr(0, prefix.size()) != prefix) {
                     return;
                 }
-                restored_last_id_ = std::string{value};
                 found = true;
             });
         // The PEL (re-drained in open()) is the real recovery mechanism; the
-        // persisted id is a checkpoint marker / observability handle.
+        // persisted id is a checkpoint marker so this returns true iff a prior
+        // checkpoint recorded progress for this stream.
         return found;
     }
 
@@ -271,7 +302,6 @@ private:
     bool pel_drained_{false};
     std::vector<std::string> unacked_ids_;  // delivered since the last checkpoint
     std::string last_delivered_id_;
-    std::string restored_last_id_;
 };
 
 }  // namespace clink::redis
