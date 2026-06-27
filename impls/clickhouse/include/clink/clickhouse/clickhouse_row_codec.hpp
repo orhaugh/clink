@@ -119,6 +119,12 @@ inline Codec<ClickHouseRow> clickhouse_row_codec() {
                 for (const auto& v : values) {
                     detail::clickhouse_row_append_string(out, v);
                 }
+                // Null mask (M5): [u32 count][count bytes]. Empty => all non-null.
+                const auto& nulls = row.nulls();
+                detail::clickhouse_row_append_u32(out, static_cast<std::uint32_t>(nulls.size()));
+                for (char c : nulls) {
+                    out.push_back(static_cast<std::byte>(c));
+                }
                 return out;
             },
         .decode = [](Codec<ClickHouseRow>::BytesView buf) -> std::optional<ClickHouseRow> {
@@ -136,6 +142,20 @@ inline Codec<ClickHouseRow> clickhouse_row_codec() {
             if (!detail::clickhouse_row_read_string_vec(buf, pos, values)) {
                 return std::nullopt;
             }
+            // Null mask (M5). Tolerant: a buffer written before the mask existed
+            // simply ends here, leaving nulls empty (= all non-null).
+            std::vector<char> nulls;
+            std::uint32_t nulls_count = 0;
+            if (detail::clickhouse_row_read_u32(buf, pos, nulls_count)) {
+                if (pos + nulls_count > buf.size()) {
+                    return std::nullopt;
+                }
+                nulls.resize(nulls_count);
+                for (std::uint32_t i = 0; i < nulls_count; ++i) {
+                    nulls[i] = static_cast<char>(buf[pos + i]);
+                }
+                pos += nulls_count;
+            }
 
             ClickHouseRow::Names typed_names;
             ClickHouseRow::Types typed_types;
@@ -145,7 +165,10 @@ inline Codec<ClickHouseRow> clickhouse_row_codec() {
             if (!types->empty()) {
                 typed_types = std::shared_ptr<const std::vector<std::string>>{std::move(types)};
             }
-            return ClickHouseRow{std::move(typed_names), std::move(typed_types), std::move(values)};
+            return ClickHouseRow{std::move(typed_names),
+                                 std::move(typed_types),
+                                 std::move(values),
+                                 std::move(nulls)};
         }};
 }
 

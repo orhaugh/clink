@@ -213,13 +213,11 @@ private:
 
 // Render a PostgresRow as a single-line JSON object keyed by column name (M3),
 // so json_string_to_row can map it to a multi-column Row table. Values are text
-// (the bridge coerces per the declared column types).
-// LIMITATION: PostgresRow carries no null indicator, so a NULL cell arrives as ""
-// and is emitted as an empty JSON string, NOT JSON null (the bridge then coerces
-// "" per the column type). Threading a null bit through PostgresRow is the M5
-// follow-up. Column names are always populated by the source (PQfname); if they
-// are ever absent we fail loud rather than emit positional keys that the by-name
-// bridge would silently map to all-NULL.
+// (the bridge coerces per the declared column types); a SQL NULL cell emits JSON
+// null (M5: PostgresRow::is_null, populated from PQgetisnull). Column names are
+// always populated by the source (PQfname); if they are ever absent we fail loud
+// rather than emit positional keys that the by-name bridge would silently map to
+// all-NULL.
 std::string postgres_row_to_json(const PostgresRow& r) {
     const auto& vs = r.values();
     const auto names = r.column_names();
@@ -228,7 +226,8 @@ std::string postgres_row_to_json(const PostgresRow& r) {
     }
     clink::config::JsonObject obj;
     for (std::size_t i = 0; i < vs.size(); ++i) {
-        obj[(*names)[i]] = clink::config::JsonValue{vs[i]};
+        obj[(*names)[i]] =
+            r.is_null(i) ? clink::config::JsonValue{} : clink::config::JsonValue{vs[i]};
     }
     return clink::config::JsonValue{std::move(obj)}.serialize(0);
 }

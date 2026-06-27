@@ -23,12 +23,21 @@ public:
     PostgresRow() = default;
     PostgresRow(Names names, std::vector<std::string> values)
         : names_(std::move(names)), values_(std::move(values)) {}
+    // Overload carrying a per-cell null mask (1 = SQL NULL). Empty mask => every
+    // cell non-null (back-compat: the text protocol renders a NULL cell as "",
+    // indistinguishable without this bit - M5).
+    PostgresRow(Names names, std::vector<std::string> values, std::vector<char> nulls)
+        : names_(std::move(names)), values_(std::move(values)), nulls_(std::move(nulls)) {}
 
     std::size_t size() const noexcept { return values_.size(); }
     bool empty() const noexcept { return values_.empty(); }
 
     const std::string& at(std::size_t i) const { return values_.at(i); }
     const std::string& operator[](std::size_t i) const { return values_[i]; }
+
+    // True iff cell i is SQL NULL (vs an empty-string value).
+    bool is_null(std::size_t i) const noexcept { return i < nulls_.size() && nulls_[i] != 0; }
+    const std::vector<char>& nulls() const noexcept { return nulls_; }
 
     const std::string& at(std::string_view name) const {
         if (!names_) {
@@ -48,6 +57,7 @@ public:
 private:
     Names names_;
     std::vector<std::string> values_;
+    std::vector<char> nulls_;  // per-cell SQL-NULL mask; empty => all non-null
 };
 
 }  // namespace clink

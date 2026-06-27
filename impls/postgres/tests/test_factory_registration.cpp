@@ -72,6 +72,34 @@ TEST(PostgresRowCodec, RoundTripsColumnNamesAndValues) {
     EXPECT_EQ(round->at("email"), "alice@example.com");
 }
 
+TEST(PostgresRowCodec, RoundTripsNullMask) {
+    // M5: the per-cell null mask must survive the codec (else a typed-channel
+    // round-trip would silently lose NULLs - the construction-path-symmetry trap).
+    auto names =
+        std::make_shared<std::vector<std::string>>(std::vector<std::string>{"id", "val", "note"});
+    clink::PostgresRow in{names,
+                          std::vector<std::string>{"1", "", ""},
+                          std::vector<char>{0, 1, 0}};  // val IS NULL; note is empty-string
+
+    const auto codec = clink::postgres_row_codec();
+    auto round = codec.decode(codec.encode(in));
+    ASSERT_TRUE(round.has_value());
+    EXPECT_FALSE(round->is_null(0));
+    EXPECT_TRUE(round->is_null(1)) << "NULL must survive the codec";
+    EXPECT_FALSE(round->is_null(2)) << "empty-string is NOT null";
+    EXPECT_EQ(round->values(), (std::vector<std::string>{"1", "", ""}));
+}
+
+TEST(PostgresRowCodec, LegacyTwoArgRowHasNoNulls) {
+    // The 2-arg ctor (no mask) round-trips as all-non-null.
+    clink::PostgresRow in{nullptr, std::vector<std::string>{"a", "b"}};
+    const auto codec = clink::postgres_row_codec();
+    auto round = codec.decode(codec.encode(in));
+    ASSERT_TRUE(round.has_value());
+    EXPECT_FALSE(round->is_null(0));
+    EXPECT_FALSE(round->is_null(1));
+}
+
 TEST(PostgresRowCodec, RoundTripsRowWithoutColumnNames) {
     // A default-constructed PostgresRow has names_ == nullptr; some
     // sources (e.g. simple SELECT without column metadata) may produce

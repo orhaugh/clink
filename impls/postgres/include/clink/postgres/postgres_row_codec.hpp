@@ -95,6 +95,12 @@ inline Codec<PostgresRow> postgres_row_codec() {
                 for (const auto& v : values) {
                     detail::postgres_row_append_string(out, v);
                 }
+                // Null mask (M5): [u32 count][count bytes]. Empty => all non-null.
+                const auto& nulls = row.nulls();
+                detail::postgres_row_append_u32(out, static_cast<std::uint32_t>(nulls.size()));
+                for (char c : nulls) {
+                    out.push_back(static_cast<std::byte>(c));
+                }
                 return out;
             },
         .decode = [](Codec<PostgresRow>::BytesView buf) -> std::optional<PostgresRow> {
@@ -125,6 +131,20 @@ inline Codec<PostgresRow> postgres_row_codec() {
                 }
                 values.push_back(std::move(v));
             }
+            // Null mask (M5). Tolerant: a buffer written before the mask existed
+            // simply ends here, leaving nulls empty (= all non-null).
+            std::vector<char> nulls;
+            std::uint32_t nulls_count = 0;
+            if (detail::postgres_row_read_u32(buf, pos, nulls_count)) {
+                if (pos + nulls_count > buf.size()) {
+                    return std::nullopt;
+                }
+                nulls.resize(nulls_count);
+                for (std::uint32_t i = 0; i < nulls_count; ++i) {
+                    nulls[i] = static_cast<char>(buf[pos + i]);
+                }
+                pos += nulls_count;
+            }
             // Drop empty names list - a default-constructed PostgresRow
             // has names_ == nullptr, and we don't want to fake an empty
             // shared list that .at("name") would treat as "no match".
@@ -132,7 +152,7 @@ inline Codec<PostgresRow> postgres_row_codec() {
             if (!names->empty()) {
                 typed_names = std::shared_ptr<const std::vector<std::string>>{std::move(names)};
             }
-            return PostgresRow{std::move(typed_names), std::move(values)};
+            return PostgresRow{std::move(typed_names), std::move(values), std::move(nulls)};
         }};
 }
 

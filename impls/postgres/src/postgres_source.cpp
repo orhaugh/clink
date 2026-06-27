@@ -97,16 +97,20 @@ bool PostgresSource::produce(Emitter<PostgresRow>& out) {
     Batch<PostgresRow> batch;
     for (int r = impl_->next_row; r < end_row; ++r) {
         std::vector<std::string> values;
+        std::vector<char> nulls;
         values.reserve(static_cast<std::size_t>(ncols));
+        nulls.reserve(static_cast<std::size_t>(ncols));
         for (int c = 0; c < ncols; ++c) {
             if (PQgetisnull(impl_->result, r, c) != 0) {
                 values.emplace_back();
+                nulls.push_back(1);  // SQL NULL (distinct from an empty-string value)
             } else {
                 values.emplace_back(PQgetvalue(impl_->result, r, c),
                                     static_cast<std::size_t>(PQgetlength(impl_->result, r, c)));
+                nulls.push_back(0);
             }
         }
-        batch.emplace(PostgresRow{impl_->column_names, std::move(values)});
+        batch.emplace(PostgresRow{impl_->column_names, std::move(values), std::move(nulls)});
     }
     if (!batch.empty()) {
         clink::metrics::connector::records_in_inc("postgres", batch.size());

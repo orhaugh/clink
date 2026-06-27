@@ -16,6 +16,8 @@
 #include <libpq-fe.h>
 
 #include "clink/connectors/postgres_json_sink.hpp"
+#include "clink/connectors/postgres_row.hpp"
+#include "clink/connectors/postgres_source.hpp"
 #include "clink/core/record.hpp"
 #include "clink/operators/operator_base.hpp"
 #endif
@@ -23,8 +25,12 @@
 #ifdef CLINK_HAS_POSTGRES
 
 using clink::Batch;
+using clink::Emitter;
 using clink::PostgresJsonSink;
 using clink::PostgresJsonSinkOptions;
+using clink::PostgresRow;
+using clink::PostgresSource;
+using clink::StreamElement;
 
 namespace {
 
@@ -125,6 +131,46 @@ TEST(PostgresJsonSinkLive, OnConflictUpdateIsIdempotentByKey) {
     EXPECT_EQ(scalar("SELECT val FROM " + tbl + " WHERE id=1"), "second")
         << "on_conflict update must overwrite";
     run_sql("DROP TABLE IF EXISTS " + tbl);
+}
+
+// M5b: PostgresSource must populate the per-cell null mask (PQgetisnull) so a SQL
+// NULL is distinguishable from an empty string - the basis for the JSON source
+// emitting JSON null rather than "".
+TEST(PostgresJsonSinkLive, SourcePopulatesNullMask) {
+    if (!pg_configured()) {
+        GTEST_SKIP() << "set CLINK_POSTGRES_CDC_TEST_DSN";
+    }
+    const std::string tbl = "pjs_srcnull_" + uniq();
+    run_sql("DROP TABLE IF EXISTS " + tbl);
+    run_sql("CREATE TABLE " + tbl + " (id int primary key, val text)");
+    run_sql("INSERT INTO " + tbl + " VALUES (1, NULL), (2, '')");  // NULL vs empty-string
+
+    PostgresSource::Options o;
+    o.conninfo = pg_dsn();
+    o.query = "SELECT id, val FROM " + tbl + " ORDER BY id";
+    o.batch_size = 10;
+    PostgresSource src(o);
+    src.open();
+    std::vector<PostgresRow> rows;
+    Emitter<PostgresRow> cap{[&rows](StreamElement<PostgresRow> e) {
+        if (e.is_data()) {
+            for (const auto& r : e.as_data()) {
+                rows.push_back(r.value());
+            }
+        }
+        return true;
+    }};
+    for (int i = 0; i < 10 && rows.size() < 2; ++i) {
+        src.produce(cap);
+    }
+    src.close();
+    run_sql("DROP TABLE IF EXISTS " + tbl);
+
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_FALSE(rows[0].is_null(0)) << "id is not null";
+    EXPECT_TRUE(rows[0].is_null(1)) << "val IS NULL for id=1";
+    EXPECT_FALSE(rows[1].is_null(1)) << "empty-string is NOT null for id=2";
+    EXPECT_EQ(rows[1].at(1), "");
 }
 
 TEST(PostgresJsonSinkLive, NullAndMissingFieldsBecomeSqlNull) {

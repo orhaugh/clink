@@ -85,6 +85,15 @@ std::string stringify_cell(const clickhouse::ColumnRef& col, std::size_t row) {
     }
 }
 
+// Whether a cell is SQL NULL (only a Nullable column can be). Companion to
+// stringify_cell, which returns "" for a NULL and so cannot itself report it.
+bool cell_is_null(const clickhouse::ColumnRef& col, std::size_t row) {
+    if (col->Type()->GetCode() == clickhouse::Type::Nullable) {
+        return col->As<clickhouse::ColumnNullable>()->IsNull(row);
+    }
+    return false;
+}
+
 }  // namespace
 
 struct ClickHouseSource::Impl {
@@ -154,12 +163,15 @@ void ClickHouseSource::open() {
 
         for (std::size_t r = 0; r < nrows; ++r) {
             std::vector<std::string> values;
+            std::vector<char> nulls;
             values.reserve(ncols);
+            nulls.reserve(ncols);
             for (std::size_t c = 0; c < ncols; ++c) {
                 values.emplace_back(stringify_cell(block[c], r));
+                nulls.push_back(cell_is_null(block[c], r) ? 1 : 0);
             }
-            impl_->rows.emplace_back(
-                ClickHouseRow{impl_->column_names, impl_->column_types, std::move(values)});
+            impl_->rows.emplace_back(ClickHouseRow{
+                impl_->column_names, impl_->column_types, std::move(values), std::move(nulls)});
         }
     });
 
