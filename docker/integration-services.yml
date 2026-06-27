@@ -7,8 +7,10 @@
 #   export CLINK_ELASTICSEARCH_TEST_ENDPOINT=http://localhost:9200
 #   export CLINK_KINESIS_TEST_ENDPOINT=http://localhost:4566
 #   export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1
+#   export CLINK_REDIS_TEST_URL=redis://localhost:6379
 #   ctest --test-dir build -L http_connector -R Live --output-on-failure
 #   ctest --test-dir build -L aws          -R Live --output-on-failure
+#   ctest --test-dir build -L redis        -R Live --output-on-failure
 #   docker compose -f docker/integration-services.yml down -v
 #
 # (LocalStack accepts any credentials; the dummy test/test keys above just let
@@ -42,6 +44,19 @@ services:
       timeout: 5s
       retries: 30
       start_period: 10s
+
+  # Redis for the Redis Streams connector live IT.
+  # URL: redis://localhost:6379
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
 
   # Postgres with logical replication for the CDC source live IT.
   # DSN: "host=localhost port=5432 user=postgres password=postgres dbname=postgres"

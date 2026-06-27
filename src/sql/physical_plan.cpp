@@ -95,6 +95,9 @@ std::string string_source_factory_for(const TableDef& table) {
     if (connector == "http_poll") {
         return "http_poll_source";
     }
+    if (connector == "redis") {
+        return "redis_source";
+    }
     unsupported("unsupported source connector '" + connector + "' for table " + table.name);
 }
 
@@ -117,6 +120,9 @@ std::string string_sink_factory_for(const TableDef& table) {
     }
     if (connector == "s3_parquet") {
         return "s3_parquet_string_sink";
+    }
+    if (connector == "redis") {
+        return "redis_sink";
     }
     if (connector == "postgres") {
         unsupported(
@@ -189,9 +195,15 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // At-least-once (cursor checkpoint).
         return RowConnectorBinding{"http_poll_source", kChannelString, "json_string_to_row"};
     }
+    if (connector == "redis") {
+        // Redis Streams source (XREADGROUP consumer group): each entry is a JSON
+        // object string (string channel) bridged to Row. At-least-once (PEL
+        // replay + XACK-on-checkpoint).
+        return RowConnectorBinding{"redis_source", kChannelString, "json_string_to_row"};
+    }
     unsupported(
         "format='json' source requires connector='file', 'kafka', 'parquet', 'nexmark', "
-        "'kinesis' or 'http_poll' (got '" +
+        "'kinesis', 'http_poll' or 'redis' (got '" +
         connector + "')");
 }
 
@@ -308,6 +320,20 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{"kinesis_sink", kChannelString, "row_to_json_string"};
     }
+    if (connector == "redis") {
+        // Redis Streams sink (XADD). At-least-once; XADD is append-only with no
+        // producer dedup key (a replay re-appends). Each row -> JSON object string
+        // -> stored under one stream field (default "v").
+        if (exactly_once) {
+            unsupported(
+                "connector='redis' sink is at-least-once (Redis Streams XADD has no producer "
+                "dedup key); exactly-once delivery is not supported");
+        }
+        if (upsert) {
+            unsupported("connector='redis' sink does not support mode='upsert'");
+        }
+        return RowConnectorBinding{"redis_sink", kChannelString, "row_to_json_string"};
+    }
     if (connector == "firehose") {
         // Amazon Data Firehose sink (PutRecordBatch). At-least-once; no partition
         // key and no ordering guarantee. Each row -> JSON object string -> record
@@ -371,8 +397,8 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     }
     unsupported(
         "format='json' sink requires connector='file', 'kafka', 'parquet', 'http', "
-        "'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'kinesis', 'firehose', "
-        "'dynamodb', 'blackhole' or 'changelog' (got '" +
+        "'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'kinesis', 'redis', "
+        "'firehose', 'dynamodb', 'blackhole' or 'changelog' (got '" +
         connector + "')");
 }
 

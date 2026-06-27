@@ -304,6 +304,47 @@ TEST(SqlPhysical, DynamoDbConnectorSinkLowersToBatchWriteSink) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
 }
 
+// connector='redis' source lowers to the redis_source (string channel) bridged
+// to Row via json_string_to_row, carrying stream/group.
+TEST(SqlPhysical, RedisConnectorSourceLowers) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE rds_in (a BIGINT) WITH (connector='redis', format='json', "
+        "stream='events', group='g');"
+        "CREATE TABLE out_f (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/o.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO out_f SELECT a FROM rds_in");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* src = find_op(spec, "redis_source");
+    ASSERT_NE(src, nullptr);
+    EXPECT_EQ(src->params.at("stream"), "events");
+    EXPECT_EQ(src->params.at("group"), "g");
+    EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);  // string -> Row bridge
+}
+
+// connector='redis' sink lowers to the redis_sink (string channel) via the
+// row_to_json_string bridge, carrying stream.
+TEST(SqlPhysical, RedisConnectorSinkLowersToXaddSink) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE rds_out (a BIGINT) WITH (connector='redis', format='json', "
+        "stream='events');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO rds_out SELECT a FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* snk = find_op(spec, "redis_sink");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("stream"), "events");
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+}
+
 // connector='prometheus' lowers to the prometheus_sink (string channel),
 // carrying url/job/value_field.
 TEST(SqlPhysical, PrometheusConnectorSinkLowersToPushSink) {

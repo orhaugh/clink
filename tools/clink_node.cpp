@@ -103,6 +103,9 @@
 #ifdef CLINK_LINKED_HTTP_CONNECTOR
 #include "clink/http_connector/install.hpp"
 #endif
+#ifdef CLINK_LINKED_REDIS
+#include "clink/redis/install.hpp"
+#endif
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/rocksdb/install.hpp"
 #endif
@@ -1961,6 +1964,9 @@ void install_linked_impls() {
 #endif
 #ifdef CLINK_LINKED_HTTP_CONNECTOR
     clink::http_connector::install(reg);
+#endif
+#ifdef CLINK_LINKED_REDIS
+    clink::redis::install(reg);  // Redis Streams source + sink
 #endif
     // RocksDB is unconditionally linked into clink_node (matches
     // bundled rocksdb-jni model). install() registers the
