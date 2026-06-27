@@ -168,6 +168,7 @@ public:
 
 private:
     static constexpr const char* kSeqPrefix = "__kinesis_seq__:";
+    static constexpr std::size_t kMaxPendingPrune = 4096;  // bound the erase queue
 
     struct ShardState {
         std::string shard_id;
@@ -250,7 +251,13 @@ private:
         std::unordered_set<std::string> live(all_ids.begin(), all_ids.end());
         for (auto it = shards_.begin(); it != shards_.end();) {
             if (it->finished && live.find(it->shard_id) == live.end()) {
-                pending_prune_.push_back(it->shard_id);
+                // Cap the pending-erase queue: if checkpointing is disabled,
+                // snapshot_offset never drains it, so bound its in-memory growth.
+                // Overflow just leaves a stale row unreclaimed (the pre-fix slow
+                // leak) - still bounded, never a correctness issue.
+                if (pending_prune_.size() < kMaxPendingPrune) {
+                    pending_prune_.push_back(it->shard_id);
+                }
                 restored_seqs_.erase(it->shard_id);
                 it = shards_.erase(it);
             } else {

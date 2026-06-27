@@ -38,7 +38,10 @@ public:
     // truncated tuple). Drop (default) = count it + continue (at-most-once for
     // that event, the existing behaviour). Fail = throw so the job restarts and
     // replays from the slot rather than losing the event - choose this when no
-    // silent loss is acceptable and a poison event should halt+retry instead.
+    // silent loss is acceptable. WARNING: Fail is a hard fail-stop - a
+    // PERMANENTLY-undecodable event re-drops and re-throws on every restart (a
+    // crash-loop with no backoff or poison-quarantine), so use it only where
+    // halting the pipeline is preferable to dropping a change.
     enum class DecodeErrorPolicy { Drop, Fail };
 
     struct Options {
