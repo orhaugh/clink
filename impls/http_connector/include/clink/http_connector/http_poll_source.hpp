@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -61,6 +62,7 @@ struct HttpPollOptions {
     std::string records_field;   // response field holding the array (else response is the array)
     std::string initial_cursor;  // starting cursor
     std::chrono::milliseconds interval{1000};
+    double jitter_frac{0.0};                            // +/- fraction on the poll interval
     int max_retries{4};                                 // transient-GET retries within one poll
     std::chrono::milliseconds retry_base_backoff{200};  // backoff between transient retries
     std::string name{"http_poll_source"};
@@ -81,6 +83,7 @@ struct HttpPollState {
     std::chrono::milliseconds retry_base_backoff{200};
     std::string name;
     std::unique_ptr<HttpRequest> client;  // created lazily on the first poll
+    std::string last_etag;                // last response ETag, for If-None-Match
 };
 
 inline std::string scalar_cursor_text(const clink::config::JsonValue& v) {
@@ -127,6 +130,7 @@ inline std::shared_ptr<Source<std::string>> make_http_poll_source(HttpPollOption
 
     PollingSource<std::string>::Options popts;
     popts.interval = o.interval;
+    popts.jitter_frac = o.jitter_frac;
     popts.initial_cursor = o.initial_cursor;
     popts.name = o.name;
 
@@ -140,17 +144,23 @@ inline std::shared_ptr<Source<std::string>> make_http_poll_source(HttpPollOption
             req_path += state->cursor_param + "=" + url_encode(cursor);
         }
 
-        // GET with bounded EXPONENTIAL-BACKOFF retry on transport / 5xx / 429
-        // (transient). A 4xx is a permanent request error - throw immediately
-        // rather than spin. The backoff (shared with the sinks) keeps a retry
-        // burst from hammering a struggling endpoint within one poll.
+        // Conditional GET: send If-None-Match with the last ETag so an unchanged
+        // resource returns 304 (no body re-download). Bounded EXPONENTIAL-BACKOFF
+        // retry on transport / 5xx / 429 (transient); a 4xx is a permanent
+        // request error - throw immediately rather than spin.
+        std::map<std::string, std::string> req_headers;
+        if (!state->last_etag.empty()) {
+            req_headers["If-None-Match"] = state->last_etag;
+        }
         HttpResponse res;
         for (int attempt = 0; attempt <= state->max_retries; ++attempt) {
             if (attempt > 0) {
                 std::this_thread::sleep_for(backoff_delay(attempt, state->retry_base_backoff));
             }
-            res = state->client->get(req_path);
-            if (res.status >= 200 && res.status < 300) {
+            res = state->client->get(req_path, req_headers);
+            // 304 Not Modified is a successful conditional-GET outcome, not a
+            // failure - stop retrying.
+            if ((res.status >= 200 && res.status < 300) || res.status == 304) {
                 break;
             }
             const bool transient = classify_http_status(res.status) == HttpFailureClass::Transient;
@@ -161,6 +171,13 @@ inline std::shared_ptr<Source<std::string>> make_http_poll_source(HttpPollOption
                 throw std::runtime_error(state->name + ": GET " + state->http.base_url + req_path +
                                          " failed (" + detail + ")");
             }
+        }
+        if (res.status == 304) {
+            return {};  // not modified: no new records, cursor unchanged
+        }
+        // Capture the ETag for the next conditional GET.
+        if (auto et = res.headers.find("etag"); et != res.headers.end()) {
+            state->last_etag = et->second;
         }
 
         clink::config::JsonValue body;

@@ -57,6 +57,12 @@ public:
         std::size_t max_bytes{4 * 1024 * 1024};
         int max_retries{4};  // attempts beyond the first
         std::chrono::milliseconds retry_base_backoff{200};
+        // Linger: flush a partial batch once its OLDEST record is this old, even
+        // below max_records/max_bytes - bounds latency on a sparse stream that
+        // would otherwise wait for the checkpoint barrier. 0 = disabled. Only
+        // evaluated when a record arrives (no timer thread), so a fully-idle
+        // buffer still waits for the barrier.
+        std::chrono::milliseconds max_age{0};
         bool flush_on_barrier{true};      // align delivery to checkpoints (at-least-once)
         ResponseValidator response_ok{};  // empty -> 2xx is success (whole-batch)
         // Per-item response handler (e.g. Elasticsearch _bulk items[] parsing).
@@ -98,7 +104,8 @@ public:
     void on_data(const Batch<In>& batch) override {
         for (const auto& rec : batch) {
             append_(rec.value());
-            if (fragments_.size() >= opts_.max_records || pending_bytes_ >= opts_.max_bytes) {
+            if (fragments_.size() >= opts_.max_records || pending_bytes_ >= opts_.max_bytes ||
+                linger_elapsed_()) {
                 flush();
             }
         }
@@ -195,10 +202,18 @@ public:
 
 private:
     void append_(const In& rec) {
+        if (fragments_.empty()) {
+            first_buffered_at_ = std::chrono::steady_clock::now();  // age clock for linger
+        }
         std::string frag;
         render_(frag, rec);
         pending_bytes_ += frag.size();
         fragments_.push_back(std::move(frag));
+    }
+
+    bool linger_elapsed_() const {
+        return opts_.max_age.count() > 0 && !fragments_.empty() &&
+               std::chrono::steady_clock::now() - first_buffered_at_ >= opts_.max_age;
     }
 
     // Frame the active fragments into one request body.
@@ -255,6 +270,8 @@ private:
     std::unique_ptr<HttpRequest> client_;
     std::vector<std::string> fragments_;  // per-record rendered bodies (for subset resend)
     std::size_t pending_bytes_{0};        // sum of fragment sizes (flush trigger + bytes metric)
+    std::chrono::steady_clock::time_point
+        first_buffered_at_{};  // age of the oldest buffered record
 };
 
 }  // namespace clink::http_connector

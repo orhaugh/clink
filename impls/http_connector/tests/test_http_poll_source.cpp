@@ -54,6 +54,15 @@ public:
             get_count_.fetch_add(1);
             res.status = 400;  // permanent -> throw immediately, no retry
         });
+        // Conditional GET: returns ETag "v1"; a matching If-None-Match -> 304.
+        svr_.Get("/etag", [](const httplib::Request& req, httplib::Response& res) {
+            if (req.get_header_value("If-None-Match") == "\"v1\"") {
+                res.status = 304;
+                return;
+            }
+            res.set_header("ETag", "\"v1\"");
+            res.set_content(R"([{"id":1},{"id":2}])", "application/json");
+        });
         port_ = svr_.bind_to_any_port("127.0.0.1");
         thread_ = std::thread([this] { svr_.listen_after_bind(); });
         while (!svr_.is_running()) {
@@ -174,6 +183,19 @@ TEST(HttpPollSource, PermanentFailureThrowsWithoutRetry) {
     auto em = capturing(cap);
     EXPECT_THROW(src->produce(em), std::runtime_error);
     EXPECT_EQ(srv.get_count(), 1);  // a 4xx is not retried
+}
+
+TEST(HttpPollSource, ConditionalGetReturns304NotModified) {
+    PollStub srv;
+    auto o = base_opts(srv.url());
+    o.path = "/etag";
+    auto src = make_http_poll_source(std::move(o));
+    Captured cap;
+    auto em = capturing(cap);
+    src->produce(em);  // 200 -> 2 records, stores the ETag
+    ASSERT_EQ(cap.values.size(), 2u);
+    src->produce(em);  // sends If-None-Match -> 304 -> emits nothing more
+    EXPECT_EQ(cap.values.size(), 2u) << "304 not-modified must emit no new records";
 }
 
 TEST(HttpPollSource, UrlEncodesCursorValue) {

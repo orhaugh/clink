@@ -117,3 +117,17 @@ TEST(PollingSource, IsUnbounded) {
     PollingSource<std::string> src(fast_opts(), counting_poll());
     EXPECT_FALSE(src.is_bounded());
 }
+
+TEST(PollingSource, JitteredIntervalBounds) {
+    using P = PollingSource<std::string>;
+    const std::chrono::milliseconds base{1000};
+    // frac 0 -> unchanged regardless of the draw.
+    EXPECT_EQ(P::jittered_interval(base, 0.0, 0.0).count(), 1000);
+    EXPECT_EQ(P::jittered_interval(base, 0.0, 1.0).count(), 1000);
+    // frac 0.5 -> [500, 1500] at the extremes, base at the midpoint.
+    EXPECT_EQ(P::jittered_interval(base, 0.5, 0.0).count(), 500);
+    EXPECT_EQ(P::jittered_interval(base, 0.5, 1.0).count(), 1500);
+    EXPECT_EQ(P::jittered_interval(base, 0.5, 0.5).count(), 1000);
+    // frac clamps to 1.0 so the interval never goes negative.
+    EXPECT_EQ(P::jittered_interval(base, 5.0, 0.0).count(), 0);
+}

@@ -89,6 +89,7 @@ struct KinesisSinkOptions {
     std::size_t max_record_bytes{1024 * 1024};             // Kinesis per-record limit (1 MiB)
     int max_retries{8};                                    // failed-subset resend attempts
     std::chrono::milliseconds retry_base_backoff{100};
+    std::chrono::milliseconds max_age{0};   // linger: flush a partial batch this old (0 = off)
     DlqPolicy dlq_policy{DlqPolicy::Fail};  // oversized record: throw (Fail) vs drop
     std::string name{"kinesis_sink"};
 };
@@ -130,12 +131,16 @@ public:
                 clink::metrics::connector::permanent_failures_inc("kinesis");
                 continue;
             }
+            if (pending_.empty()) {
+                first_buffered_at_ = std::chrono::steady_clock::now();  // linger age clock
+            }
             pending_.push_back(make_entry_(rec.value()));
             // ~partition key (<=256) + framing overhead; flush on count OR bytes
             // so a batch of large records never exceeds the 5 MiB request cap
             // (which would be rejected on every retry -> a wedged job).
             pending_bytes_ += rec.value().size() + 320;
-            if (pending_.size() >= opts_.batch_records || pending_bytes_ >= opts_.max_bytes) {
+            if (pending_.size() >= opts_.batch_records || pending_bytes_ >= opts_.max_bytes ||
+                linger_elapsed_()) {
                 flush();
             }
         }
@@ -288,11 +293,17 @@ private:
         std::this_thread::sleep_for(backoff);
     }
 
+    bool linger_elapsed_() const {
+        return opts_.max_age.count() > 0 && !pending_.empty() &&
+               std::chrono::steady_clock::now() - first_buffered_at_ >= opts_.max_age;
+    }
+
     KinesisSinkOptions opts_;
     std::unique_ptr<Aws::Kinesis::KinesisClient> client_;
     std::vector<Aws::Kinesis::Model::PutRecordsRequestEntry> pending_;
     std::size_t pending_bytes_{0};
     std::uint64_t counter_{0};
+    std::chrono::steady_clock::time_point first_buffered_at_{};
 };
 
 }  // namespace clink::aws

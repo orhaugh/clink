@@ -128,6 +128,7 @@ struct EsBulkOptions {
     std::size_t batch_records{500};
     std::size_t batch_bytes{4 * 1024 * 1024};
     int max_retries{4};
+    std::chrono::milliseconds max_age{0};  // linger: flush a partial batch this old
     DlqPolicy dlq_policy{DlqPolicy::Fail};
     std::string name{"elasticsearch_sink"};
 };
@@ -156,6 +157,7 @@ inline std::shared_ptr<Sink<std::string>> make_es_bulk_sink(EsBulkOptions o) {
     opts.max_records = o.batch_records;
     opts.max_bytes = o.batch_bytes;
     opts.max_retries = o.max_retries;
+    opts.max_age = o.max_age;
     opts.dlq_policy = o.dlq_policy;
     opts.name = o.name;
 
@@ -206,6 +208,7 @@ struct SplunkHecOptions {
     std::size_t batch_records{500};
     std::size_t batch_bytes{4 * 1024 * 1024};
     int max_retries{4};
+    std::chrono::milliseconds max_age{0};  // linger: flush a partial batch this old
     DlqPolicy dlq_policy{DlqPolicy::Fail};
     std::string name{"splunk_hec_sink"};
 };
@@ -238,6 +241,7 @@ inline std::shared_ptr<Sink<std::string>> make_splunk_hec_sink(SplunkHecOptions 
     opts.max_records = o.batch_records;
     opts.max_bytes = o.batch_bytes;
     opts.max_retries = o.max_retries;
+    opts.max_age = o.max_age;
     opts.dlq_policy = o.dlq_policy;
     opts.name = o.name;
     // Unlike ES _bulk, HEC never returns HTTP 200 with a failure code - the

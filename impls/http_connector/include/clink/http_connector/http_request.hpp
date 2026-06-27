@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 
 // A small blocking HTTP/1.1 request client for connector sinks. Unlike the
 // minimal control-plane client in clink/http/http_client.hpp, this one
@@ -18,6 +19,9 @@ struct HttpResponse {
     int status{0};      // 0 on transport error (connect/read/timeout/tls)
     std::string body;   // raw response body
     std::string error;  // human-readable, populated when status == 0
+    // Response headers with LOWER-CASED names (HTTP header names are
+    // case-insensitive), e.g. headers["etag"]. Populated by get().
+    std::map<std::string, std::string> headers;
 };
 
 // Reusable POST client bound to one base URL (scheme://host[:port]). Holds a
@@ -48,9 +52,13 @@ public:
                       const std::string& body,
                       const std::string& content_type);
 
-    // Blocking GET (for polling sources). `path` may carry a query string. Same
-    // transport-error convention as post().
+    // Blocking GET (for polling sources). `path` may carry a query string;
+    // `extra_headers` are sent on this request only (e.g. If-None-Match). The
+    // returned HttpResponse carries the response headers. Same transport-error
+    // convention as post().
     HttpResponse get(const std::string& path);
+    HttpResponse get(const std::string& path,
+                     const std::map<std::string, std::string>& extra_headers);
 
     // Blocking PUT (e.g. creating a resource / an index mapping). Same
     // transport-error convention as post().

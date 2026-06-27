@@ -105,6 +105,7 @@ struct DynamoDbSinkOptions {
     std::size_t batch_records{25};  // BatchWriteItem hard max is 25
     int max_retries{8};             // UnprocessedItems resubmit attempts
     std::chrono::milliseconds retry_base_backoff{100};
+    std::chrono::milliseconds max_age{0};  // linger: flush a partial batch this old (0 = off)
     std::string name{"dynamodb_sink"};
 };
 
@@ -138,7 +139,7 @@ public:
     void on_data(const Batch<std::string>& batch) override {
         for (const auto& rec : batch) {
             ingest_(rec.value());
-            if (pending_.size() >= opts_.batch_records) {
+            if (pending_.size() >= opts_.batch_records || linger_elapsed_()) {
                 flush();
             }
         }
@@ -204,6 +205,9 @@ private:
         if (!opts_.sort_key.empty()) {
             key.push_back('\x00');
             key += scalar_key_(obj, opts_.sort_key);
+        }
+        if (pending_.empty()) {
+            first_buffered_at_ = std::chrono::steady_clock::now();  // linger age clock
         }
         pending_[key] = json_object_to_item(obj);  // dedup: last write wins
     }
@@ -273,11 +277,17 @@ private:
                                  std::to_string(opts_.max_retries + 1) + " attempts");
     }
 
+    bool linger_elapsed_() const {
+        return opts_.max_age.count() > 0 && !pending_.empty() &&
+               std::chrono::steady_clock::now() - first_buffered_at_ >= opts_.max_age;
+    }
+
     DynamoDbSinkOptions opts_;
     std::unique_ptr<Aws::DynamoDB::DynamoDBClient> client_;
     // primary-key string -> item; dedups a batch (DynamoDB rejects duplicate
     // keys in one BatchWriteItem) last-write-wins.
     std::map<std::string, Aws::Map<Aws::String, Aws::DynamoDB::Model::AttributeValue>> pending_;
+    std::chrono::steady_clock::time_point first_buffered_at_{};
 };
 
 }  // namespace clink::aws

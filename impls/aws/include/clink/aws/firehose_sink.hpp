@@ -52,6 +52,7 @@ struct FirehoseSinkOptions {
     std::size_t max_bytes{3u * 1024 * 1024 + 512 * 1024};  // flush under the 4 MiB request cap
     int max_retries{8};                                    // failed-subset resend attempts
     std::chrono::milliseconds retry_base_backoff{100};
+    std::chrono::milliseconds max_age{0};  // linger: flush a partial batch this old (0 = off)
     std::string name{"firehose_sink"};
 };
 
@@ -81,11 +82,15 @@ public:
 
     void on_data(const Batch<std::string>& batch) override {
         for (const auto& rec : batch) {
+            if (pending_.empty()) {
+                first_buffered_at_ = std::chrono::steady_clock::now();  // linger age clock
+            }
             pending_.push_back(make_record_(rec.value()));
             // Flush on count OR bytes so a batch of large records never exceeds
             // the 4 MiB request cap (rejected on every retry -> a wedged job).
             pending_bytes_ += rec.value().size() + opts_.delimiter.size() + 16;
-            if (pending_.size() >= opts_.batch_records || pending_bytes_ >= opts_.max_bytes) {
+            if (pending_.size() >= opts_.batch_records || pending_bytes_ >= opts_.max_bytes ||
+                linger_elapsed_()) {
                 flush();
             }
         }
@@ -181,10 +186,16 @@ private:
         std::this_thread::sleep_for(backoff);
     }
 
+    bool linger_elapsed_() const {
+        return opts_.max_age.count() > 0 && !pending_.empty() &&
+               std::chrono::steady_clock::now() - first_buffered_at_ >= opts_.max_age;
+    }
+
     FirehoseSinkOptions opts_;
     std::unique_ptr<Aws::Firehose::FirehoseClient> client_;
     std::vector<Aws::Firehose::Model::Record> pending_;
     std::size_t pending_bytes_{0};
+    std::chrono::steady_clock::time_point first_buffered_at_{};
 };
 
 }  // namespace clink::aws

@@ -67,6 +67,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 4 * 1024 * 1024));
             opts.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
             opts.dlq_policy = parse_dlq(ctx);
+            opts.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
             opts.name = "http_sink";
 
             // The record is already a serialized JSON object string (SQL path)
@@ -103,6 +104,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 4 * 1024 * 1024));
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
             o.dlq_policy = parse_dlq(ctx);
+            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
             o.name = name;
             return make_es_bulk_sink(std::move(o));
         };
@@ -139,6 +141,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 4 * 1024 * 1024));
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
             o.dlq_policy = parse_dlq(ctx);
+            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
             o.name = "splunk_hec_sink";
             return make_splunk_hec_sink(std::move(o));
         });
@@ -171,6 +174,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.verify_tls = ctx.param_or("verify_tls", "true") != "false";
             o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
             o.name = "prometheus_sink";
             return make_prometheus_pushgateway_sink(std::move(o));
         });
@@ -202,6 +206,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.records_field = ctx.param_or("records_field", "");
             o.initial_cursor = ctx.param_or("initial_cursor", "");
             o.interval = std::chrono::milliseconds{ctx.param_int64_or("poll_interval_ms", 1000)};
+            o.jitter_frac = std::stod(ctx.param_or("jitter_frac", "0"));
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
             o.retry_base_backoff =
                 std::chrono::milliseconds{ctx.param_int64_or("retry_base_backoff_ms", 200)};

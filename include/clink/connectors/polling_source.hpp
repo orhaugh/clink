@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <functional>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -39,11 +40,34 @@ public:
     struct Options {
         std::chrono::milliseconds interval{1000};  // minimum time between polls
         std::string initial_cursor;                // starting cursor on a fresh run
+        // Random +/- fraction applied to each poll interval (0 = none, 0.2 =
+        // +/-20%). De-synchronises many pollers so they do not all hit the
+        // endpoint on the same tick (a thundering herd).
+        double jitter_frac{0.0};
         std::string name{"polling_source"};
     };
 
     PollingSource(Options opts, PollFn poll)
-        : opts_(std::move(opts)), poll_(std::move(poll)), cursor_(opts_.initial_cursor) {}
+        : opts_(std::move(opts)),
+          poll_(std::move(poll)),
+          cursor_(opts_.initial_cursor),
+          rng_(std::random_device{}()) {}
+
+    // The interval after applying +/- jitter_frac, given a uniform u in [0,1).
+    // Pure (the RNG draw is the caller's); unit-testable without timing.
+    static std::chrono::milliseconds jittered_interval(std::chrono::milliseconds base,
+                                                       double frac,
+                                                       double u01) {
+        if (frac <= 0.0) {
+            return base;
+        }
+        if (frac > 1.0) {
+            frac = 1.0;
+        }
+        const double factor = 1.0 + frac * (2.0 * u01 - 1.0);  // [1-frac, 1+frac]
+        auto ms = static_cast<long long>(static_cast<double>(base.count()) * factor);
+        return std::chrono::milliseconds{ms < 0 ? 0 : ms};
+    }
 
     bool produce(Emitter<T>& out) override {
         if (this->cancelled()) {
@@ -96,9 +120,13 @@ private:
     void throttle_() {
         const auto now = std::chrono::steady_clock::now();
         if (polled_once_) {
+            const auto target =
+                jittered_interval(opts_.interval,
+                                  opts_.jitter_frac,
+                                  std::uniform_real_distribution<double>{0.0, 1.0}(rng_));
             const auto elapsed = now - last_poll_;
-            if (elapsed < opts_.interval) {
-                std::this_thread::sleep_for(opts_.interval - elapsed);
+            if (elapsed < target) {
+                std::this_thread::sleep_for(target - elapsed);
             }
         }
         last_poll_ = std::chrono::steady_clock::now();
@@ -112,6 +140,7 @@ private:
     std::string cursor_;
     std::chrono::steady_clock::time_point last_poll_{};
     bool polled_once_{false};
+    std::mt19937 rng_;
 };
 
 }  // namespace clink

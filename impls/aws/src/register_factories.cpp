@@ -58,6 +58,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.client = client_options_from(ctx);
             o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 25));
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 8));
+            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
             o.name = "dynamodb_sink";
             return std::make_shared<DynamoDbSink>(std::move(o));
         });
@@ -80,6 +81,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 8));
             o.dlq_policy =
                 ctx.param_or("dlq", "fail") == "drop" ? DlqPolicy::Drop : DlqPolicy::Fail;
+            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
             o.name = "kinesis_sink";
             return std::make_shared<KinesisSink>(std::move(o));
         });
@@ -99,6 +101,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.client = client_options_from(ctx);
             o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 8));
+            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
             o.name = "firehose_sink";
             return std::make_shared<FirehoseSink>(std::move(o));
         });

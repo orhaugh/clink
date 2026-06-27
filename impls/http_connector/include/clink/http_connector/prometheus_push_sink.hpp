@@ -38,6 +38,7 @@ struct PromPushOptions {
     bool verify_tls{true};
     std::size_t batch_records{500};  // flush when this many DISTINCT series buffer
     int max_retries{4};
+    std::chrono::milliseconds max_age{0};  // linger: flush a partial batch this old (0 = off)
     std::string name{"prometheus_sink"};
 };
 
@@ -63,6 +64,7 @@ public:
           value_field_(o.value_field.empty() ? "value" : std::move(o.value_field)),
           max_records_(o.batch_records ? o.batch_records : 500),
           max_retries_(o.max_retries),
+          max_age_(o.max_age),
           verify_tls_(o.verify_tls) {
         if (base_url_.empty()) {
             throw std::runtime_error(name_ + ": 'url' is required");
@@ -97,7 +99,7 @@ public:
     void on_data(const Batch<std::string>& batch) override {
         for (const auto& rec : batch) {
             ingest(rec.value());
-            if (series_.size() >= max_records_) {
+            if (series_.size() >= max_records_ || linger_elapsed_()) {
                 flush();
             }
         }
@@ -192,7 +194,15 @@ private:
             }
             labels[ln] = escape_label_value(*lv);
         }
+        if (series_.empty()) {
+            first_buffered_at_ = std::chrono::steady_clock::now();  // linger age clock
+        }
         series_[render_label_block(labels)] = *value;  // dedup
+    }
+
+    bool linger_elapsed_() const {
+        return max_age_.count() > 0 && !series_.empty() &&
+               std::chrono::steady_clock::now() - first_buffered_at_ >= max_age_;
     }
 
     // ----- value/label rendering -----
@@ -423,7 +433,9 @@ private:
     std::string type_prefix_;
     std::size_t max_records_;
     int max_retries_;
+    std::chrono::milliseconds max_age_{0};
     bool verify_tls_;
+    std::chrono::steady_clock::time_point first_buffered_at_{};
     std::unique_ptr<HttpRequest> client_;
     std::map<std::string, double> series_;   // rendered label block -> latest value
     std::set<std::string> reserved_labels_;  // path label names kept out of the body

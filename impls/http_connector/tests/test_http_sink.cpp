@@ -311,3 +311,17 @@ TEST(HttpBulkSink, ResponseHandlerOutOfRangeIndexIsIgnoredNotUB) {
     sink.on_data(b);
     EXPECT_NO_THROW(sink.flush());  // OOB index skipped -> no survivors -> success, no UB
 }
+
+TEST(HttpBulkSink, LingerFlushesAfterMaxAge) {
+    StubServer srv;
+    auto opts = base_opts(srv.url(), /*max_records=*/100);  // well above the batch
+    opts.framing = BulkFraming::Ndjson;
+    opts.max_age = std::chrono::milliseconds{40};  // linger
+    BatchedHttpBulkSink<std::string> sink(opts, verbatim());
+    sink.open();
+    sink.on_data(batch_of({R"({"a":1})"}));
+    EXPECT_TRUE(srv.bodies().empty()) << "below count/bytes + within linger: not yet flushed";
+    std::this_thread::sleep_for(std::chrono::milliseconds{60});  // exceed max_age
+    sink.on_data(batch_of({R"({"a":2})"}));  // arrival after max_age -> linger flush
+    EXPECT_EQ(srv.bodies().size(), 1u) << "linger flushed the buffered batch";
+}
