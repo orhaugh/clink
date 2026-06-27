@@ -63,6 +63,25 @@ public:
             res.set_header("ETag", "\"v1\"");
             res.set_content(R"([{"id":1},{"id":2}])", "application/json");
         });
+        // A server with a collection-wide ETag that 304s on ANY If-None-Match,
+        // but whose data advances by the `since` cursor. The source must NOT send
+        // If-None-Match on the (new) cursor URL, or it would 304 and skip records.
+        svr_.Get("/etag_cursor", [](const httplib::Request& req, httplib::Response& res) {
+            if (!req.get_header_value("If-None-Match").empty()) {
+                res.status = 304;  // a broken collection-wide validator
+                return;
+            }
+            res.set_header("ETag", "\"vc\"");
+            const std::string since =
+                req.has_param("since") ? req.get_param_value("since") : std::string{};
+            if (since.empty()) {
+                res.set_content(R"([{"id":1}])", "application/json");
+            } else if (since == "1") {
+                res.set_content(R"([{"id":2}])", "application/json");
+            } else {
+                res.set_content("[]", "application/json");
+            }
+        });
         port_ = svr_.bind_to_any_port("127.0.0.1");
         thread_ = std::thread([this] { svr_.listen_after_bind(); });
         while (!svr_.is_running()) {
@@ -196,6 +215,21 @@ TEST(HttpPollSource, ConditionalGetReturns304NotModified) {
     ASSERT_EQ(cap.values.size(), 2u);
     src->produce(em);  // sends If-None-Match -> 304 -> emits nothing more
     EXPECT_EQ(cap.values.size(), 2u) << "304 not-modified must emit no new records";
+}
+
+TEST(HttpPollSource, EtagNotReusedAcrossAdvancingCursorUrls) {
+    PollStub srv;
+    auto o = base_opts(srv.url());
+    o.path = "/etag_cursor";
+    o.cursor_param = "since";
+    o.cursor_field = "id";
+    auto src = make_http_poll_source(std::move(o));
+    Captured cap;
+    auto em = capturing(cap);
+    src->produce(em);  // no cursor, no INM -> id 1 + ETag; cursor -> 1
+    src->produce(em);  // cursor=1 -> DIFFERENT url -> no INM -> id 2 (not a false 304)
+    ASSERT_EQ(cap.values.size(), 2u) << "advancing cursor must not reuse the prior URL's ETag";
+    EXPECT_TRUE(contains(cap.values[1], "\"id\":2")) << cap.values[1];
 }
 
 TEST(HttpPollSource, UrlEncodesCursorValue) {

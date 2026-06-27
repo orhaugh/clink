@@ -83,7 +83,12 @@ struct HttpPollState {
     std::chrono::milliseconds retry_base_backoff{200};
     std::string name;
     std::unique_ptr<HttpRequest> client;  // created lazily on the first poll
-    std::string last_etag;                // last response ETag, for If-None-Match
+    // The last request URL and its response ETag. If-None-Match is only sent
+    // when the NEXT poll requests the IDENTICAL URL (an ETag is bound to its URI;
+    // with cursor pagination the URL changes every poll, so revalidating a
+    // different URL with a stale ETag could wrongly get a 304 and skip records).
+    std::string last_url;
+    std::string last_etag;
 };
 
 inline std::string scalar_cursor_text(const clink::config::JsonValue& v) {
@@ -149,7 +154,11 @@ inline std::shared_ptr<Source<std::string>> make_http_poll_source(HttpPollOption
         // retry on transport / 5xx / 429 (transient); a 4xx is a permanent
         // request error - throw immediately rather than spin.
         std::map<std::string, std::string> req_headers;
-        if (!state->last_etag.empty()) {
+        // Revalidate ONLY when re-requesting the exact same URL (e.g. a poll that
+        // re-checks the same cursor position for new data). A different URL (the
+        // cursor advanced) must do a full GET - a stale ETag there could wrongly
+        // 304 and skip records.
+        if (!state->last_etag.empty() && req_path == state->last_url) {
             req_headers["If-None-Match"] = state->last_etag;
         }
         HttpResponse res;
@@ -173,12 +182,13 @@ inline std::shared_ptr<Source<std::string>> make_http_poll_source(HttpPollOption
             }
         }
         if (res.status == 304) {
-            return {};  // not modified: no new records, cursor unchanged
+            return {};  // same URL, not modified: no new records, cursor unchanged
         }
-        // Capture the ETag for the next conditional GET.
-        if (auto et = res.headers.find("etag"); et != res.headers.end()) {
-            state->last_etag = et->second;
-        }
+        // Remember this URL + its ETag so an IDENTICAL next poll can revalidate.
+        // A 2xx without an ETag clears it (no revalidation -> a full GET next time).
+        state->last_url = req_path;
+        auto et = res.headers.find("etag");
+        state->last_etag = et != res.headers.end() ? et->second : std::string{};
 
         clink::config::JsonValue body;
         try {
