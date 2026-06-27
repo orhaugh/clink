@@ -68,7 +68,8 @@ inline std::optional<std::string> base64_decode(std::string_view in) {
     out.reserve((in.size() / 4) * 3 + 3);
     int acc = 0;
     int bits = 0;
-    for (unsigned char c : in) {
+    for (char ch : in) {
+        const auto c = static_cast<unsigned char>(ch);
         if (c == '=') {
             break;  // padding: end of data
         }

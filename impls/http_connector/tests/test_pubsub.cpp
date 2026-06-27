@@ -38,13 +38,13 @@ namespace {
 // --- pure helpers ---
 
 TEST(PubSubBase64, RoundTripsAllRemainders) {
-    for (const std::string s : {std::string{},
-                                std::string{"f"},
-                                std::string{"fo"},
-                                std::string{"foo"},
-                                std::string{"foob"},
-                                std::string{"fooba"},
-                                std::string{"foobar"}}) {
+    for (const std::string& s : {std::string{},
+                                 std::string{"f"},
+                                 std::string{"fo"},
+                                 std::string{"foo"},
+                                 std::string{"foob"},
+                                 std::string{"fooba"},
+                                 std::string{"foobar"}}) {
         const std::string enc = base64_encode(s);
         auto dec = base64_decode(enc);
         ASSERT_TRUE(dec.has_value()) << s;
@@ -72,6 +72,9 @@ TEST(PubSubIds, RejectInjectionAndEmpty) {
     EXPECT_THROW(pubsub_check_id("topic", "a/b"), std::runtime_error);
     EXPECT_THROW(pubsub_check_id("topic", "a:b"), std::runtime_error);
     EXPECT_THROW(pubsub_check_id("topic", "a b"), std::runtime_error);
+    // Allowlist also rejects non-injecting-but-illegal chars up front.
+    EXPECT_THROW(pubsub_check_id("topic", "a\"b"), std::runtime_error);
+    EXPECT_THROW(pubsub_check_id("topic", "a{b}"), std::runtime_error);
     EXPECT_NO_THROW(pubsub_check_id("topic", "good-name_1.2~plus+ok"));
 }
 

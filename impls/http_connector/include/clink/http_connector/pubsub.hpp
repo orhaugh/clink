@@ -26,6 +26,14 @@
 // subscription ackDeadline, which is ALSO the crash-recovery mechanism (no local
 // data cursor needed) - so a checkpoint interval longer than the ackDeadline
 // yields duplicates (at-least-once).
+//
+// CAVEAT (honest, same class as the Redis Streams source): :acknowledge is an
+// external side effect not transactional with the global checkpoint. If a
+// checkpoint's snapshot_offset acks a batch and the GLOBAL checkpoint then fails,
+// those messages will not redeliver - at-most-once for that one batch. Strict
+// exactly-once would need a source on_commit hook (deferred). One further
+// at-most-once exception: a message whose `data` is not valid base64 is acked +
+// dropped (with an error metric) rather than redelivered forever in a crash-loop.
 
 #include <algorithm>
 #include <chrono>
@@ -52,17 +60,23 @@ namespace clink::http_connector {
 
 // --- Resource-id validation + REST path builders (pure, unit-tested) ---
 
-// A Pub/Sub project / topic / subscription id is a single path segment. Reject
-// the characters that would break the "<...>:publish" verb suffix or inject a
-// path ('/', ':', '?', '#'), whitespace and control bytes. The remaining valid
-// id chars (letters, digits, '-', '.', '_', '~', '+', '%') are inserted verbatim
-// so a name with '+'/'%' is NOT mangled by percent-encoding.
+// A Pub/Sub project / topic / subscription id is a single path segment, inserted
+// verbatim (NOT percent-encoded, so a legal '+'/'%' is not mangled). Enforce the
+// GCP-legal id charset as an ALLOWLIST - letters, digits and '-._~%+' - which
+// both excludes the path/verb-breaking characters ('/', ':', '?', '#') and
+// rejects odd-but-not-injecting bytes ('"', '\\', '{', space, control) up front
+// with a clear client-side error instead of an opaque server 4xx.
 inline void pubsub_check_id(const std::string& kind, const std::string& id) {
     if (id.empty()) {
         throw std::runtime_error("pubsub: '" + kind + "' is required");
     }
-    for (unsigned char c : id) {
-        if (c <= 0x20 || c == 0x7F || c == '/' || c == ':' || c == '?' || c == '#') {
+    for (char c : id) {
+        // ASCII allowlist; a high-bit byte (negative char) matches none and is
+        // rejected, so no unsigned conversion is needed.
+        const bool legal = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                           (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' ||
+                           c == '%' || c == '+';
+        if (!legal) {
             throw std::runtime_error("pubsub: invalid " + kind + " '" + id + "'");
         }
     }
@@ -259,15 +273,16 @@ public:
             return false;
         }
         const std::string body = pubsub_pull_body(opts_.max_messages, opts_.return_immediately);
+        // Each iteration either breaks on a 2xx or throws (transient + last
+        // attempt, or any permanent status), so control always leaves the loop
+        // with a 2xx in `res`.
         HttpResponse res;
-        bool delivered = false;
         for (int attempt = 0; attempt <= opts_.max_retries; ++attempt) {
             if (attempt > 0) {
                 std::this_thread::sleep_for(backoff_delay(attempt, opts_.retry_base_backoff));
             }
             res = client_->post(pull_path_, body, "application/json");
             if (res.status >= 200 && res.status < 300) {
-                delivered = true;
                 break;
             }
             const bool transient = classify_http_status(res.status) == HttpFailureClass::Transient;
@@ -279,9 +294,6 @@ public:
                                          " failed (" + detail + ")");
             }
         }
-        if (!delivered) {
-            return !this->cancelled();
-        }
 
         std::vector<PulledMessage> msgs = pubsub_parse_pull_response(res.body);
         Batch<std::string> batch;
@@ -290,8 +302,12 @@ public:
         for (auto& m : msgs) {
             unacked_ids_.push_back(std::move(m.ack_id));
             if (!m.data_ok) {
+                // Poison message (data present but not valid base64): the ackId
+                // stays in unacked_ids_ so it is acked + DROPPED on the next
+                // checkpoint, rather than redelivered forever in a crash-loop.
+                // This is the one at-most-once exception (see the header note).
                 ++undecodable;
-                continue;  // count + ack (it stays in unacked_ids_) but do not emit garbage
+                continue;
             }
             bytes += m.payload.size();
             batch.emplace(std::move(m.payload));
