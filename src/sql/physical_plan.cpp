@@ -98,6 +98,9 @@ std::string string_source_factory_for(const TableDef& table) {
     if (connector == "redis") {
         return "redis_source";
     }
+    if (connector == "mysql") {
+        return "mysql_source";
+    }
     unsupported("unsupported source connector '" + connector + "' for table " + table.name);
 }
 
@@ -123,6 +126,9 @@ std::string string_sink_factory_for(const TableDef& table) {
     }
     if (connector == "redis") {
         return "redis_sink";
+    }
+    if (connector == "mysql") {
+        return "mysql_sink";
     }
     if (connector == "postgres") {
         unsupported(
@@ -201,9 +207,15 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // replay + XACK-on-checkpoint).
         return RowConnectorBinding{"redis_source", kChannelString, "json_string_to_row"};
     }
+    if (connector == "mysql") {
+        // MySQL incremental cursor source: SELECT WHERE cursor_col > <cursor>, each
+        // row a JSON object string (string channel) bridged to Row. At-least-once
+        // (cursor checkpoint). Not CDC.
+        return RowConnectorBinding{"mysql_source", kChannelString, "json_string_to_row"};
+    }
     unsupported(
         "format='json' source requires connector='file', 'kafka', 'parquet', 'nexmark', "
-        "'kinesis', 'http_poll' or 'redis' (got '" +
+        "'kinesis', 'http_poll', 'redis' or 'mysql' (got '" +
         connector + "')");
 }
 
@@ -334,6 +346,24 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{"redis_sink", kChannelString, "row_to_json_string"};
     }
+    if (connector == "mysql") {
+        // MySQL sink (batched INSERT). At-least-once. Each row -> JSON object
+        // string -> columns by name. exactly_once (XA 2PC) is not supported.
+        if (exactly_once) {
+            unsupported(
+                "connector='mysql' sink is at-least-once; exactly-once delivery is not supported");
+        }
+        if (upsert) {
+            // clink mode='upsert' is a changelog contract (delete tombstones via
+            // __row_kind) this append sink does not implement. For idempotent
+            // insert-or-update by primary key on replay, use the WITH-option
+            // on_duplicate='update' instead (INSERT ... ON DUPLICATE KEY UPDATE).
+            unsupported(
+                "connector='mysql' sink does not implement mode='upsert' (changelog deletes); "
+                "use on_duplicate='update' for idempotent insert-or-update by primary key");
+        }
+        return RowConnectorBinding{"mysql_sink", kChannelString, "row_to_json_string"};
+    }
     if (connector == "firehose") {
         // Amazon Data Firehose sink (PutRecordBatch). At-least-once; no partition
         // key and no ordering guarantee. Each row -> JSON object string -> record
@@ -397,7 +427,7 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     }
     unsupported(
         "format='json' sink requires connector='file', 'kafka', 'parquet', 'http', "
-        "'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'kinesis', 'redis', "
+        "'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'kinesis', 'redis', 'mysql', "
         "'firehose', 'dynamodb', 'blackhole' or 'changelog' (got '" +
         connector + "')");
 }

@@ -41,6 +41,7 @@ apt-get install -y --no-install-recommends \
     librdkafka++1 \
     libpq-dev \
     libhiredis-dev \
+    libmariadb-dev \
     liburing-dev
 
 # -- Apache Arrow + Parquet --
