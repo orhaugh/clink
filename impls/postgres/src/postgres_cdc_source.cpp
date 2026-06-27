@@ -55,6 +55,13 @@ using pg::write_be64;
 // this MVP does not.
 class PgOutputState {
 public:
+    // Count of I/U/D change events that could NOT be decoded and were dropped
+    // (unknown relation, missing/truncated tuple). Surfaced by the source as
+    // dropped_events_total so this otherwise-silent data loss is observable.
+    // Benign skips (begin/commit/relation metadata, stream/2pc control messages)
+    // are NOT counted.
+    std::uint64_t dropped_data_events{0};
+
     std::optional<CdcEvent> on_message(std::string_view payload, std::string lsn) {
         if (payload.empty()) {
             return std::nullopt;
@@ -96,6 +103,12 @@ public:
     }
 
 private:
+    // Record a dropped data change (returns nullopt for the caller's convenience).
+    std::optional<CdcEvent> drop_() {
+        ++dropped_data_events;
+        return std::nullopt;
+    }
+
     struct Column {
         std::uint8_t flags{};  // bit 0 = part of replica identity key
         std::string name;
@@ -234,9 +247,16 @@ private:
     // Decode a TupleData block. Each column produces one CdcField with
     // name, value, type, and is_null populated using the relation's
     // cached schema and the surrounding parser's type cache.
-    std::vector<CdcField> parse_tuple(std::string_view& cursor, const Relation& rel) const {
+    // `truncated` is set if the tuple ran short of its declared column count or a
+    // column value overran the buffer - the caller must then DROP the change
+    // rather than emit a partial (column-missing) event, which would be silent
+    // data corruption.
+    std::vector<CdcField> parse_tuple(std::string_view& cursor,
+                                      const Relation& rel,
+                                      bool& truncated) const {
         std::vector<CdcField> out;
         if (cursor.size() < 2) {
+            truncated = true;
             return out;
         }
         const std::uint16_t ncols = read_be16(cursor.data());
@@ -244,6 +264,7 @@ private:
         out.reserve(ncols);
         for (std::uint16_t i = 0; i < ncols; ++i) {
             if (cursor.empty()) {
+                truncated = true;  // fewer columns present than declared
                 break;
             }
             const char kind = cursor[0];
@@ -266,11 +287,13 @@ private:
                 case 't':
                 case 'b': {
                     if (cursor.size() < 4) {
+                        truncated = true;
                         return out;
                     }
                     const std::uint32_t len = read_be32(cursor.data());
                     cursor.remove_prefix(4);
                     if (cursor.size() < len) {
+                        truncated = true;
                         return out;
                     }
                     field.value = std::string{cursor.substr(0, len)};
@@ -280,6 +303,7 @@ private:
                 default:
                     // Unknown column-kind byte - bail out to avoid running
                     // off the end of the buffer.
+                    truncated = true;
                     return out;
             }
             out.push_back(std::move(field));
@@ -289,29 +313,33 @@ private:
 
     std::optional<CdcEvent> on_insert(std::string_view rest, std::string lsn) {
         if (rest.size() < 5) {
-            return std::nullopt;
+            return drop_();
         }
         const std::uint32_t rel_id = read_be32(rest.data());
         rest.remove_prefix(4);
         if (rest[0] != 'N') {
-            return std::nullopt;  // INSERT must have an N (new) tuple
+            return drop_();  // INSERT must have an N (new) tuple
         }
         rest.remove_prefix(1);
         auto it = relations_.find(rel_id);
         if (it == relations_.end()) {
-            return std::nullopt;  // unknown relation; can happen if R was missed
+            return drop_();  // unknown relation; can happen if R was missed
         }
         CdcEvent ev;
         ev.op = CdcEvent::Op::Insert;
         ev.lsn = std::move(lsn);
         ev.table = it->second.ns + "." + it->second.name;
-        ev.values = parse_tuple(rest, it->second);
+        bool truncated = false;
+        ev.values = parse_tuple(rest, it->second, truncated);
+        if (truncated) {
+            return drop_();  // partial tuple: drop rather than emit a corrupt row
+        }
         return ev;
     }
 
     std::optional<CdcEvent> on_update(std::string_view rest, std::string lsn) {
         if (rest.size() < 5) {
-            return std::nullopt;
+            return drop_();
         }
         const std::uint32_t rel_id = read_be32(rest.data());
         rest.remove_prefix(4);
@@ -320,46 +348,55 @@ private:
             rest.remove_prefix(1);
             auto rel_it = relations_.find(rel_id);
             if (rel_it != relations_.end()) {
-                (void)parse_tuple(rest, rel_it->second);  // discard old image
+                bool old_trunc = false;
+                (void)parse_tuple(rest, rel_it->second, old_trunc);  // discard old image
             } else {
-                return std::nullopt;
+                return drop_();
             }
         }
         if (rest.empty() || rest[0] != 'N') {
-            return std::nullopt;
+            return drop_();
         }
         rest.remove_prefix(1);
         auto it = relations_.find(rel_id);
         if (it == relations_.end()) {
-            return std::nullopt;
+            return drop_();
         }
         CdcEvent ev;
         ev.op = CdcEvent::Op::Update;
         ev.lsn = std::move(lsn);
         ev.table = it->second.ns + "." + it->second.name;
-        ev.values = parse_tuple(rest, it->second);
+        bool truncated = false;
+        ev.values = parse_tuple(rest, it->second, truncated);
+        if (truncated) {
+            return drop_();
+        }
         return ev;
     }
 
     std::optional<CdcEvent> on_delete(std::string_view rest, std::string lsn) {
         if (rest.size() < 5) {
-            return std::nullopt;
+            return drop_();
         }
         const std::uint32_t rel_id = read_be32(rest.data());
         rest.remove_prefix(4);
         if (rest.empty() || (rest[0] != 'K' && rest[0] != 'O')) {
-            return std::nullopt;
+            return drop_();
         }
         rest.remove_prefix(1);
         auto it = relations_.find(rel_id);
         if (it == relations_.end()) {
-            return std::nullopt;
+            return drop_();
         }
         CdcEvent ev;
         ev.op = CdcEvent::Op::Delete;
         ev.lsn = std::move(lsn);
         ev.table = it->second.ns + "." + it->second.name;
-        ev.values = parse_tuple(rest, it->second);
+        bool truncated = false;
+        ev.values = parse_tuple(rest, it->second, truncated);
+        if (truncated) {
+            return drop_();
+        }
         return ev;
     }
 };
@@ -378,6 +415,7 @@ struct PostgresCdcSource::Impl {
     std::uint64_t received_lsn{0};
     std::chrono::steady_clock::time_point last_status_send{std::chrono::steady_clock::now()};
     PgOutputState pgoutput_state;
+    std::uint64_t last_dropped{0};  // pgoutput_state.dropped_data_events at last surfacing
     // Snapshot rows queued before streaming begins. Drained from produce()
     // before any libpq replication reads.
     std::deque<CdcEvent> snapshot_backlog;
@@ -609,6 +647,7 @@ bool PostgresCdcSource::produce(Emitter<CdcEvent>& out) {
 
     // Drain whatever is currently available on the replication stream
     // without blocking.
+    std::uint64_t bytes = 0;
     while (true) {
         if (this->cancelled() || impl_->cancel.load()) {
             break;
@@ -642,6 +681,7 @@ bool PostgresCdcSource::produce(Emitter<CdcEvent>& out) {
                 const std::uint64_t data_start = read_be64(buffer + 1);
                 impl_->received_lsn = std::max(impl_->received_lsn, data_start);
                 const std::string_view payload(buffer + 25, static_cast<std::size_t>(n) - 25);
+                bytes += payload.size();
                 std::optional<CdcEvent> ev;
                 if (impl_->opts.plugin == "test_decoding") {
                     ev = parse_test_decoding(payload, format_lsn(data_start));
@@ -658,9 +698,9 @@ bool PostgresCdcSource::produce(Emitter<CdcEvent>& out) {
                 const bool reply_requested = buffer[17] != 0;
                 if (reply_requested) {
                     if (!send_standby_status_update(impl_->conn, impl_->received_lsn, false)) {
-                        // Report through whatever channel - for now swallow,
-                        // drop will be observable via WAL bloat metrics on
-                        // the server.
+                        // A failed feedback stalls confirmed_flush_lsn and bloats
+                        // server WAL - make it observable rather than swallow it.
+                        clink::metrics::connector::error_inc("postgres_cdc", "source");
                     }
                     impl_->last_status_send = std::chrono::steady_clock::now();
                 }
@@ -673,6 +713,17 @@ bool PostgresCdcSource::produce(Emitter<CdcEvent>& out) {
         const auto sz = batch.size();
         out.emit_data(std::move(batch));
         clink::metrics::connector::records_in_inc("postgres_cdc", sz);
+    }
+    if (bytes > 0) {
+        clink::metrics::connector::bytes_in_inc("postgres_cdc", bytes);
+    }
+    // Surface any change events the decoder had to DROP (unknown relation /
+    // truncated tuple) - otherwise-silent data loss is now counted + flagged.
+    if (impl_->pgoutput_state.dropped_data_events > impl_->last_dropped) {
+        const std::uint64_t delta = impl_->pgoutput_state.dropped_data_events - impl_->last_dropped;
+        impl_->last_dropped = impl_->pgoutput_state.dropped_data_events;
+        clink::metrics::connector::dropped_events_inc("postgres_cdc", delta);
+        clink::metrics::connector::error_inc("postgres_cdc", "source");
     }
     // received_lsn doubles as a consumer-lag-proxy: how far behind WAL
     // the source is. There's no server-side current LSN cheaply
@@ -687,7 +738,9 @@ bool PostgresCdcSource::produce(Emitter<CdcEvent>& out) {
     if (impl_->opts.standby_status_interval.count() > 0) {
         const auto now = std::chrono::steady_clock::now();
         if (now - impl_->last_status_send >= impl_->opts.standby_status_interval) {
-            send_standby_status_update(impl_->conn, impl_->received_lsn, false);
+            if (!send_standby_status_update(impl_->conn, impl_->received_lsn, false)) {
+                clink::metrics::connector::error_inc("postgres_cdc", "source");
+            }
             impl_->last_status_send = now;
         }
     }

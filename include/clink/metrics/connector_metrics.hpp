@@ -96,6 +96,15 @@ inline void permanent_failures_inc(const std::string& connector) {
         .counter(connector_metric_name("permanent_failures_total", connector, "sink"))
         .increment();
 }
+// Source-side data loss: a change event that could not be decoded and was
+// dropped (e.g. a CDC message for an unknown relation, or a truncated tuple).
+// Distinct name + direction from the sink-side dropped_records_total so a
+// dashboard does not conflate decode loss with DLQ drops.
+inline void dropped_events_inc(const std::string& connector, std::uint64_t n = 1) {
+    MetricsRegistry::global()
+        .counter(connector_metric_name("dropped_events_total", connector, "source"))
+        .increment(n);
+}
 
 }  // namespace connector
 
