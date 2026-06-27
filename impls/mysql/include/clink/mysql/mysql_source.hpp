@@ -10,9 +10,20 @@
 //
 // TYPE NOTE: the text protocol returns every cell as a string, so emitted JSON
 // values are strings; the downstream Row bridge coerces them per the declared
-// column types. Requires an ascending, monotonic cursor_column (e.g. an
-// AUTO_INCREMENT id or an updated_at) - out-of-order inserts below the cursor are
-// skipped.
+// column types. A string cursor literal compared to a NUMERIC cursor_column is
+// coerced to a number by MySQL, so WHERE and ORDER BY stay consistent; a VARCHAR
+// cursor_column orders LEXICALLY (so '10' < '9') - pick a numeric or zero-padded
+// key.
+//
+// CURSOR CONTRACT (data-loss avoidance): cursor_column must be NOT NULL and
+// ascending. It must ALSO be UNIQUE unless `id_column` is set - with a non-unique
+// cursor (e.g. a coarse updated_at with ties), the exclusive '>' would drop rows
+// sharing the boundary value at a page (LIMIT) boundary. Set `id_column` to a
+// unique tie-breaker (e.g. the primary key) to make the keyset deterministic
+// (WHERE (cursor_column, id_column) > (cv, idv)); then a non-unique cursor is
+// safe. A NULL cursor/id value in a delivered row is fatal (throws) rather than
+// silently stalling the cursor. Cold start (empty initial_cursor) re-scans from
+// the beginning until the first checkpoint.
 
 #include <chrono>
 #include <cstdint>
@@ -33,7 +44,8 @@ namespace clink::mysql {
 struct MysqlPollOptions {
     ConnectOptions conn;
     std::string table;          // required
-    std::string cursor_column;  // required; ascending + monotonic
+    std::string cursor_column;  // required; ascending, NOT NULL, unique unless id_column set
+    std::string id_column;      // optional UNIQUE tie-breaker (keyset pagination)
     std::string initial_cursor;
     int batch_size{1000};
     std::chrono::milliseconds interval{1000};
@@ -46,7 +58,9 @@ struct MysqlPollState {
     ConnectOptions conn;
     std::string table;
     std::string cursor_column;
+    std::string id_column;
     int batch_size{1000};
+    std::string name;
     std::unique_ptr<Connection> client;  // lazily connected on first poll
 };
 }  // namespace detail
@@ -63,12 +77,17 @@ inline std::shared_ptr<PollingSource<std::string>> make_mysql_poll_source(
     }
     (void)quote_ident(o.table);  // validate identifiers early
     (void)quote_ident(o.cursor_column);
+    if (!o.id_column.empty()) {
+        (void)quote_ident(o.id_column);
+    }
 
     auto state = std::make_shared<detail::MysqlPollState>();
     state->conn = o.conn;
     state->table = o.table;
     state->cursor_column = o.cursor_column;
+    state->id_column = o.id_column;
     state->batch_size = o.batch_size > 0 ? o.batch_size : 1000;
+    state->name = o.name;
 
     PollingSource<std::string>::Options popts;
     popts.interval = o.interval;
@@ -85,6 +104,7 @@ inline std::shared_ptr<PollingSource<std::string>> make_mysql_poll_source(
             const std::string sql =
                 build_select_sql(state->table,
                                  state->cursor_column,
+                                 state->id_column,
                                  cursor,
                                  state->batch_size,
                                  [&](std::string_view s) { return state->client->escape(s); });
@@ -95,10 +115,13 @@ inline std::shared_ptr<PollingSource<std::string>> make_mysql_poll_source(
             const unsigned int nf = res.num_fields();
             MYSQL_FIELD* fields = res.fields();
             int cursor_idx = -1;
+            int id_idx = -1;
             for (unsigned int i = 0; i < nf; ++i) {
-                if (state->cursor_column == fields[i].name) {
+                if (cursor_idx < 0 && state->cursor_column == fields[i].name) {
                     cursor_idx = static_cast<int>(i);
-                    break;
+                }
+                if (!state->id_column.empty() && id_idx < 0 && state->id_column == fields[i].name) {
+                    id_idx = static_cast<int>(i);
                 }
             }
             std::string last_cursor;
@@ -118,16 +141,35 @@ inline std::shared_ptr<PollingSource<std::string>> make_mysql_poll_source(
                 std::string json = clink::config::JsonValue{std::move(obj)}.serialize(0);
                 bytes += json.size();
                 out.records.push_back(std::move(json));
-                if (cursor_idx >= 0 && row[cursor_idx] != nullptr) {
-                    last_cursor.assign(row[cursor_idx],
-                                       lens[static_cast<unsigned int>(cursor_idx)]);
+
+                // Advance the (composite) cursor from this row. A NULL cursor/id
+                // value can never advance the cursor -> fail loudly rather than
+                // silently re-emit forever.
+                if (cursor_idx < 0 || row[cursor_idx] == nullptr) {
+                    throw std::runtime_error(state->name + ": cursor_column '" +
+                                             state->cursor_column +
+                                             "' is NULL/absent in a row; it must be NOT NULL");
+                }
+                std::string cv(row[cursor_idx], lens[static_cast<unsigned int>(cursor_idx)]);
+                if (state->id_column.empty()) {
+                    last_cursor = std::move(cv);
+                } else {
+                    if (id_idx < 0 || row[id_idx] == nullptr) {
+                        throw std::runtime_error(state->name + ": id_column '" + state->id_column +
+                                                 "' is NULL/absent in a row; it must be NOT NULL");
+                    }
+                    last_cursor = cv + kCompositeCursorSep +
+                                  std::string(row[id_idx], lens[static_cast<unsigned int>(id_idx)]);
                 }
             }
             if (!out.records.empty()) {
                 clink::metrics::connector::records_in_inc("mysql", out.records.size());
                 clink::metrics::connector::bytes_in_inc("mysql", bytes);
-            }
-            if (!last_cursor.empty()) {
+                if (last_cursor.empty()) {
+                    throw std::runtime_error(state->name +
+                                             ": cursor value was empty; cursor_column must be NOT "
+                                             "NULL and non-empty so the cursor can advance");
+                }
                 out.next_cursor = std::move(last_cursor);
             }
             return out;

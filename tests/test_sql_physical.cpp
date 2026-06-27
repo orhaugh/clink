@@ -387,6 +387,26 @@ TEST(SqlPhysical, MysqlConnectorSinkLowersWithOnDuplicate) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
 }
 
+// A mysql sink WITHOUT an explicit columns= still lowers; the planner injects the
+// table schema as schema_columns, from which the factory derives the projection.
+TEST(SqlPhysical, MysqlConnectorSinkDerivesColumnsFromSchema) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT, b VARCHAR) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE my_out (a BIGINT, b VARCHAR) WITH (connector='mysql', format='json', "
+        "table='events', database='db');");  // no columns=
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO my_out SELECT a, b FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* snk = find_op(spec, "mysql_sink");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_FALSE(snk->params.at("schema_columns").empty())
+        << "the sink op must carry schema_columns for the factory to derive columns";
+}
+
 // clink mode='upsert' (changelog contract) is NOT silently accepted for mysql -
 // the sink does not implement delete tombstones; on_duplicate='update' is the
 // supported path. Rejected at bind or compile; assert it does not pass through.

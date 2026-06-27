@@ -76,9 +76,13 @@ public:
         if (h_ == nullptr) {
             throw std::runtime_error("mysql: mysql_init returned null (out of memory)");
         }
-        const unsigned int timeout_s =
-            static_cast<unsigned int>((o.connect_timeout.count() + 999) / 1000);
-        mysql_options(h_, MYSQL_OPT_CONNECT_TIMEOUT, &timeout_s);
+        // Only set a finite connect timeout; a 0s value means "no timeout"
+        // (infinite block), which we never want. <=0 falls back to the lib default.
+        if (o.connect_timeout.count() > 0) {
+            const unsigned int timeout_s =
+                static_cast<unsigned int>((o.connect_timeout.count() + 999) / 1000);
+            mysql_options(h_, MYSQL_OPT_CONNECT_TIMEOUT, &timeout_s);
+        }
         mysql_options(h_, MYSQL_SET_CHARSET_NAME, "utf8mb4");
         if (mysql_real_connect(h_,
                                o.host.c_str(),

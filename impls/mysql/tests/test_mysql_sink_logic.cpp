@@ -14,6 +14,7 @@
 namespace {
 
 using clink::mysql::build_insert_sql;
+using clink::mysql::columns_from_schema;
 using clink::mysql::MysqlSink;
 using clink::mysql::MysqlSinkOptions;
 using clink::mysql::quote_ident;
@@ -104,6 +105,14 @@ TEST(MysqlSinkLogic, UpsertUpdateColumnsLimitsSetList) {
 
 TEST(MysqlSinkLogic, EmptyColumnsBuilderThrows) {
     EXPECT_THROW(build_insert_sql("t", {}, false, {}, {R"({"a":1})"}, esc), std::runtime_error);
+}
+
+TEST(MysqlSinkLogic, ColumnsDerivedFromSchemaColumns) {
+    // The SQL Row path injects "name:typecode;name:typecode"; the sink derives its
+    // projection from it when no explicit columns= is given.
+    EXPECT_EQ(columns_from_schema("a:i;b:s;c:d"), (std::vector<std::string>{"a", "b", "c"}));
+    EXPECT_EQ(columns_from_schema("only:i"), (std::vector<std::string>{"only"}));
+    EXPECT_TRUE(columns_from_schema("").empty());
 }
 
 TEST(MysqlSinkLogic, QuoteIdentRejectsInjection) {

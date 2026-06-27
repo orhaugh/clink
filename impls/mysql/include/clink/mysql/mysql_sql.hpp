@@ -41,6 +41,29 @@ inline std::string quote_ident(std::string_view name) {
     return "`" + std::string(name) + "`";
 }
 
+// Extract column names from a serialize_row_schema string
+// ("name:typecode;name:typecode") - the schema the SQL Row path injects as the
+// schema_columns param. Lets the sink use the declared table schema as its
+// projection when an explicit columns= is not supplied.
+inline std::vector<std::string> columns_from_schema(const std::string& schema) {
+    std::vector<std::string> out;
+    std::size_t i = 0;
+    while (i < schema.size()) {
+        std::size_t semi = schema.find(';', i);
+        if (semi == std::string::npos) {
+            semi = schema.size();
+        }
+        const std::string entry = schema.substr(i, semi - i);
+        const std::size_t colon = entry.find(':');
+        const std::string name = colon == std::string::npos ? entry : entry.substr(0, colon);
+        if (!name.empty()) {
+            out.push_back(name);
+        }
+        i = semi + 1;
+    }
+    return out;
+}
+
 // Map a JSON value to a SQL literal. null -> NULL; bool -> 1/0; integral number ->
 // integer text; other number -> %.17g (round-trippable double); string -> escaped
 // + quoted; object/array -> their JSON text, escaped + quoted.
@@ -129,21 +152,48 @@ inline std::string build_insert_sql(const std::string& table,
     return sql;
 }
 
+// Separator joining the two halves of a composite (cursor, id) checkpoint string.
+// A non-printing control byte that never appears in a real key value.
+inline constexpr char kCompositeCursorSep = '\x1f';
+
 // Build the incremental cursor SELECT: every column (SELECT *) so the downstream
 // json_string_to_row bridge can pick what it needs by name, rows strictly AFTER
 // the cursor (exclusive, so the boundary row is never re-emitted), ordered
 // ascending, capped at batch_size. An empty cursor omits the WHERE (cold start
 // reads from the beginning).
+//
+// When `id_column` is non-empty it is a UNIQUE tie-breaker and the SELECT uses
+// keyset pagination over the (cursor_column, id_column) tuple - WHERE
+// (cursor_column, id_column) > (cv, idv) ORDER BY both. This is the robust form:
+// rows sharing a cursor_column value are no longer dropped at a page boundary
+// (the data-loss hazard of a non-unique cursor). `cursor` is then the composite
+// "cv<sep>idv". With `id_column` empty the cursor_column itself must be unique.
 inline std::string build_select_sql(const std::string& table,
                                     const std::string& cursor_column,
+                                    const std::string& id_column,
                                     const std::string& cursor,
                                     int batch_size,
                                     const EscapeFn& esc) {
     std::string sql = "SELECT * FROM " + quote_ident(table);
-    if (!cursor.empty()) {
-        sql += " WHERE " + quote_ident(cursor_column) + " > '" + esc(cursor) + "'";
+    const std::string qc = quote_ident(cursor_column);
+    if (id_column.empty()) {
+        if (!cursor.empty()) {
+            sql += " WHERE " + qc + " > '" + esc(cursor) + "'";
+        }
+        sql += " ORDER BY " + qc + " ASC LIMIT " + std::to_string(batch_size);
+        return sql;
     }
-    sql += " ORDER BY " + quote_ident(cursor_column) + " ASC LIMIT " + std::to_string(batch_size);
+    const std::string qi = quote_ident(id_column);
+    if (!cursor.empty()) {
+        std::string cv = cursor;
+        std::string idv;
+        if (const auto sep = cursor.find(kCompositeCursorSep); sep != std::string::npos) {
+            cv = cursor.substr(0, sep);
+            idv = cursor.substr(sep + 1);
+        }
+        sql += " WHERE (" + qc + "," + qi + ") > ('" + esc(cv) + "','" + esc(idv) + "')";
+    }
+    sql += " ORDER BY " + qc + " ASC," + qi + " ASC LIMIT " + std::to_string(batch_size);
     return sql;
 }
 

@@ -62,18 +62,32 @@ TEST(MysqlSourceLogic, ValidConstructsUnboundedSource) {
 }
 
 TEST(MysqlSourceLogic, SelectWithCursorIsExclusiveOrderedLimited) {
-    EXPECT_EQ(build_select_sql("events", "id", "100", 500, esc),
+    EXPECT_EQ(build_select_sql("events", "id", /*id_column=*/"", "100", 500, esc),
               "SELECT * FROM `events` WHERE `id` > '100' ORDER BY `id` ASC LIMIT 500");
 }
 
 TEST(MysqlSourceLogic, EmptyCursorOmitsWhere) {
-    EXPECT_EQ(build_select_sql("events", "id", "", 500, esc),
+    EXPECT_EQ(build_select_sql("events", "id", "", "", 500, esc),
               "SELECT * FROM `events` ORDER BY `id` ASC LIMIT 500");
 }
 
 TEST(MysqlSourceLogic, CursorValueIsEscaped) {
-    EXPECT_EQ(build_select_sql("events", "id", "x'y", 10, esc),
+    EXPECT_EQ(build_select_sql("events", "id", "", "x'y", 10, esc),
               "SELECT * FROM `events` WHERE `id` > 'x\\'y' ORDER BY `id` ASC LIMIT 10");
+}
+
+// With id_column set the SELECT uses keyset pagination over the (cursor, id)
+// tuple, so rows sharing a cursor value are not dropped at a page boundary.
+TEST(MysqlSourceLogic, IdColumnUsesCompositeKeyset) {
+    const std::string composite = std::string("100") + clink::mysql::kCompositeCursorSep + "5";
+    EXPECT_EQ(build_select_sql("events", "ts", "id", composite, 500, esc),
+              "SELECT * FROM `events` WHERE (`ts`,`id`) > ('100','5') "
+              "ORDER BY `ts` ASC,`id` ASC LIMIT 500");
+}
+
+TEST(MysqlSourceLogic, IdColumnEmptyCursorOmitsWhereButOrdersByBoth) {
+    EXPECT_EQ(build_select_sql("events", "ts", "id", "", 500, esc),
+              "SELECT * FROM `events` ORDER BY `ts` ASC,`id` ASC LIMIT 500");
 }
 
 }  // namespace

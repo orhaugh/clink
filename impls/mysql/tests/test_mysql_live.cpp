@@ -211,6 +211,46 @@ TEST(MysqlLive, UpsertIsIdempotentByPrimaryKey) {
     EXPECT_EQ(val, "second_1") << "upsert must overwrite the value";
 }
 
+// HIGH #5 regression: a NON-UNIQUE cursor (ties on `ts`) with an id_column
+// tie-breaker must deliver every row, even when a page (LIMIT) boundary falls in
+// the middle of a tie group. Without the composite keyset the single-column '>'
+// would drop the tie members beyond the page.
+TEST(MysqlLive, CompositeCursorHandlesNonUniqueCursor) {
+    if (!mysql_configured()) {
+        GTEST_SKIP() << "set CLINK_MYSQL_TEST_DSN";
+    }
+    const std::string tbl = unique_table();
+    {
+        Connection c{parse_dsn()};
+        c.exec("DROP TABLE IF EXISTS `" + tbl + "`");
+        c.exec("CREATE TABLE `" + tbl + "` (id INT PRIMARY KEY, ts INT NOT NULL, val VARCHAR(16))");
+        // ties on ts (10 x3, 20 x2) so a LIMIT-2 page boundary splits a tie group.
+        c.exec("INSERT INTO `" + tbl +
+               "` VALUES (1,10,'a'),(2,10,'b'),(3,10,'c'),(4,20,'d'),(5,20,'e'),(6,30,'f')");
+    }
+    MysqlPollOptions o;
+    o.conn = parse_dsn();
+    o.table = tbl;
+    o.cursor_column = "ts";  // non-unique
+    o.id_column = "id";      // unique tie-breaker
+    o.batch_size = 2;        // force page boundaries inside the tie groups
+    o.interval = std::chrono::milliseconds{50};
+    auto source = clink::mysql::make_mysql_poll_source(o);
+    Captured cap;
+    drain(*source, cap, 6, /*timeout_ms=*/15000);
+    source.reset();
+    drop_table(tbl);
+
+    EXPECT_EQ(cap.values.size(), 6u) << "no rows dropped at a non-unique-cursor page boundary";
+    std::set<int> ids;
+    for (const auto& v : cap.values) {
+        ids.insert(id_of(v));
+    }
+    for (int i = 1; i <= 6; ++i) {
+        EXPECT_EQ(ids.count(i), 1u) << "missing id " << i;
+    }
+}
+
 TEST(MysqlLive, CursorSourceDoesNotReemitBoundaryRow) {
     if (!mysql_configured()) {
         GTEST_SKIP() << "set CLINK_MYSQL_TEST_DSN";
