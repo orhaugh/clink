@@ -24,15 +24,22 @@ namespace {
 
 // Render a ClickHouseRow as a single-line JSON object keyed by column name (M2),
 // so json_string_to_row can map it to a multi-column Row table. Values are text
-// (the bridge coerces per the declared column types). Falls back to positional
-// keys ("0","1",...) if column names are unavailable or mismatched.
+// (the bridge coerces per the declared column types).
+// LIMITATION: ClickHouseRow carries no null indicator, so a NULL cell arrives as
+// "" and is emitted as an empty JSON string, NOT JSON null (the bridge then
+// coerces "" per the column type). Threading a null bit through ClickHouseRow is
+// the M5 follow-up. Column names are always populated by the source
+// (block.GetColumnName); if they are ever absent we fail loud rather than emit
+// positional keys that the by-name bridge would silently map to all-NULL.
 std::string clickhouse_row_to_json(const ClickHouseRow& r) {
     const auto& vs = r.values();
     const auto names = r.column_names();
+    if (!names || names->size() != vs.size()) {
+        throw std::runtime_error("clickhouse_source: column names unavailable for row->JSON");
+    }
     clink::config::JsonObject obj;
     for (std::size_t i = 0; i < vs.size(); ++i) {
-        const std::string key = (names && i < names->size()) ? (*names)[i] : std::to_string(i);
-        obj[key] = clink::config::JsonValue{vs[i]};
+        obj[(*names)[i]] = clink::config::JsonValue{vs[i]};
     }
     return clink::config::JsonValue{std::move(obj)}.serialize(0);
 }
