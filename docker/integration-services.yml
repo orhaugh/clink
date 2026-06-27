@@ -1,0 +1,44 @@
+# Sidecar services for the connector LIVE integration tests (Elasticsearch +
+# Kinesis-over-LocalStack). These tests are SKIPPED unless their endpoint env var
+# is set, so the normal build/test run never needs this.
+#
+# Usage:
+#   docker compose -f docker/integration-services.yml up -d
+#   export CLINK_ELASTICSEARCH_TEST_ENDPOINT=http://localhost:9200
+#   export CLINK_KINESIS_TEST_ENDPOINT=http://localhost:4566
+#   export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1
+#   ctest --test-dir build -L http_connector -R Live --output-on-failure
+#   ctest --test-dir build -L aws          -R Live --output-on-failure
+#   docker compose -f docker/integration-services.yml down -v
+#
+# (LocalStack accepts any credentials; the dummy test/test keys above just let
+#  the AWS SDK sign requests.)
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false   # plain http on 9200 for the test
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  localstack:
+    image: localstack/localstack:3
+    environment:
+      - SERVICES=kinesis
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/_localstack/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s

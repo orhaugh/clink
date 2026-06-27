@@ -52,6 +52,12 @@ public:
     // transport-error convention as post().
     HttpResponse get(const std::string& path);
 
+    // Blocking PUT (e.g. creating a resource / an index mapping). Same
+    // transport-error convention as post().
+    HttpResponse put(const std::string& path,
+                     const std::string& body,
+                     const std::string& content_type);
+
     // True iff this build can talk https (CPPHTTPLIB_OPENSSL_SUPPORT). Lets a
     // sink reject an https URL up front with a clear message.
     static bool tls_supported() noexcept;

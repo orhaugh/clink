@@ -61,6 +61,21 @@ HttpResponse HttpRequest::get(const std::string& path) {
     return out;
 }
 
+HttpResponse HttpRequest::put(const std::string& path,
+                              const std::string& body,
+                              const std::string& content_type) {
+    HttpResponse out;
+    auto res = impl_->client.Put(path, body, content_type);
+    if (!res) {
+        out.status = 0;
+        out.error = httplib::to_string(res.error());
+        return out;
+    }
+    out.status = res->status;
+    out.body = std::move(res->body);
+    return out;
+}
+
 bool HttpRequest::tls_supported() noexcept {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
     return true;
