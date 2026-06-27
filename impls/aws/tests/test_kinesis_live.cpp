@@ -114,6 +114,10 @@ KinesisSourceOptions source_opts(const std::string& stream) {
     o.client = client_opts();
     o.initial_position = "trim_horizon";
     o.poll_interval = std::chrono::milliseconds{50};  // drain fast in the test
+    // Small GetRecords Limit so the checkpoint test can read a bounded PREFIX
+    // (one GetRecords would otherwise return the whole stream at once, leaving
+    // nothing for the resumed reader and hollowing out the resume assertion).
+    o.max_records_per_poll = 5;
     return o;
 }
 
@@ -182,9 +186,10 @@ TEST(KinesisLive, SequenceCheckpointResumesWithoutGaps) {
 
     InMemoryStateBackend backend;
     const OperatorId op_id{1};
-    std::set<std::string> seen;
+    std::set<std::string> first;   // records read BEFORE the checkpoint
+    std::set<std::string> second;  // records read by the RESUMED reader
 
-    // Read part of the stream, then checkpoint the per-shard sequence number.
+    // Read a bounded PREFIX, then checkpoint the per-shard sequence number.
     {
         KinesisSource s1(source_opts(stream));
         s1.open();
@@ -193,9 +198,13 @@ TEST(KinesisLive, SequenceCheckpointResumesWithoutGaps) {
         s1.snapshot_offset(backend, op_id, clink::CheckpointId{1});
         s1.close();
         for (auto& v : cap.values) {
-            seen.insert(v);
+            first.insert(v);
         }
-        ASSERT_GE(seen.size(), 10u) << "should have read at least the first chunk";
+        ASSERT_GE(first.size(), 10u) << "should have read the first chunk";
+        // Load-bearing: s1 must read only a PREFIX. If it drained the whole
+        // stream the resume below would have nothing to do and the test would be
+        // vacuous (it would pass even if restore_offset were broken).
+        ASSERT_LT(first.size(), kN) << "s1 read the whole stream; resume is unverifiable";
     }
     // Resume from the checkpoint: a fresh reader restores and reads the REST.
     {
@@ -203,14 +212,22 @@ TEST(KinesisLive, SequenceCheckpointResumesWithoutGaps) {
         ASSERT_TRUE(s2.restore_offset(backend, op_id));
         s2.open();
         Captured cap;
-        drain(s2, cap, /*want=*/kN - seen.size(), /*timeout_ms=*/30000);
+        drain(s2, cap, /*want=*/kN - first.size(), /*timeout_ms=*/30000);
         s2.close();
         for (auto& v : cap.values) {
-            seen.insert(v);
+            second.insert(v);
         }
     }
     delete_stream(admin, stream);
 
-    // The union across the checkpoint covers all kN distinct records (no gap).
-    EXPECT_EQ(seen.size(), kN);
+    // RESUME PROOF: the resumed reader read strictly AFTER the checkpoint - it
+    // must NOT re-read any record the first reader already consumed (a broken
+    // restore would replay from TRIM_HORIZON and overlap here).
+    for (const auto& v : second) {
+        EXPECT_EQ(first.count(v), 0u) << "resumed reader re-read a checkpointed record: " << v;
+    }
+    // And together they cover every record with no gap.
+    std::set<std::string> all = first;
+    all.insert(second.begin(), second.end());
+    EXPECT_EQ(all.size(), kN);
 }
