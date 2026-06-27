@@ -2,12 +2,14 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "clink/http_connector/http_bulk_post.hpp"
 #include "clink/http_connector/http_request.hpp"
@@ -55,8 +57,14 @@ public:
         std::size_t max_bytes{4 * 1024 * 1024};
         int max_retries{4};  // attempts beyond the first
         std::chrono::milliseconds retry_base_backoff{200};
-        bool flush_on_barrier{true};            // align delivery to checkpoints (at-least-once)
-        ResponseValidator response_ok{};        // empty -> 2xx is success
+        bool flush_on_barrier{true};      // align delivery to checkpoints (at-least-once)
+        ResponseValidator response_ok{};  // empty -> 2xx is success (whole-batch)
+        // Per-item response handler (e.g. Elasticsearch _bulk items[] parsing).
+        // When set it takes precedence over response_ok: a partial failure resends
+        // ONLY the failed-transient records and DLQs/throws the failed-permanent
+        // ones, instead of re-sending the whole batch (which re-indexes the
+        // already-written records). Empty -> whole-batch via response_ok.
+        ResponseHandler response_handler{};
         DlqPolicy dlq_policy{DlqPolicy::Fail};  // permanent (4xx) failure: throw vs drop
         std::string name{"http_bulk_sink"};
     };
@@ -83,14 +91,14 @@ public:
 
     void open() override {
         client_ = std::make_unique<HttpRequest>(opts_.http);
-        buffer_.clear();
-        count_ = 0;
+        fragments_.clear();
+        pending_bytes_ = 0;
     }
 
     void on_data(const Batch<In>& batch) override {
         for (const auto& rec : batch) {
             append_(rec.value());
-            if (count_ >= opts_.max_records || buffer_.size() >= opts_.max_bytes) {
+            if (fragments_.size() >= opts_.max_records || pending_bytes_ >= opts_.max_bytes) {
                 flush();
             }
         }
@@ -103,81 +111,139 @@ public:
     }
 
     void flush() override {
-        if (count_ == 0) {
+        if (fragments_.empty()) {
             return;
         }
-        std::string body = opts_.framing == BulkFraming::JsonArray ? "[" + buffer_ + "]" : buffer_;
-        const std::size_t n = count_;
-        const std::size_t bytes = body.size();
+        const std::size_t n = fragments_.size();
+        // Indices into fragments_ still to deliver this flush. Each POST sends the
+        // active set; the response handler reports which of THOSE records failed,
+        // and only the transient failures stay active for the next attempt - the
+        // succeeded records are never re-sent.
+        std::vector<std::size_t> active(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            active[i] = i;
+        }
+        std::size_t dropped = 0;
+        std::size_t dropped_bytes = 0;
         const auto t0 = std::chrono::steady_clock::now();
-        try {
-            post_with_retry_(body);
-        } catch (const HttpDeliveryError& e) {
-            // Only a genuine 4xx CLIENT error (a poison request the server
-            // rejects identically on every replay) is droppable under
-            // DlqPolicy::Drop. Deliberately NOT dropped: a transient exhaustion
-            // (0/429/5xx outage -> replay), a 3xx redirect (operator-fixable
-            // misconfiguration -> surface loudly), and a 2xx-but-validator-
-            // rejected response (e.g. ES bulk errors:true -> per-item handling's
-            // job). 429 is excluded as it is rate-limit backpressure, not poison.
-            const int st = e.response.status;
-            const bool droppable_client_error = st >= 400 && st < 500 && st != 429;
-            if (opts_.dlq_policy == DlqPolicy::Drop && droppable_client_error) {
-                clink::metrics::connector::dropped_records_inc(opts_.name, n);
-                clink::metrics::connector::permanent_failures_inc(opts_.name);
-                buffer_.clear();
-                count_ = 0;
+        HttpResponse last;
+        for (int attempt = 0; attempt <= opts_.max_retries; ++attempt) {
+            if (attempt > 0) {
+                std::this_thread::sleep_for(backoff_delay(attempt, opts_.retry_base_backoff));
+            }
+            last = client_->post(opts_.path, build_body_(active), opts_.content_type);
+            BulkResult r = opts_.response_handler
+                               ? opts_.response_handler(last, active.size())
+                               : whole_batch_result(last, active.size(), opts_.response_ok);
+            if (r.ok) {
+                finish_success_(n, dropped, dropped_bytes, t0);
                 return;
             }
-            clink::metrics::connector::error_inc(opts_.name, "sink");
-            throw;
+            // Permanent (poison) records: DLQ under Drop, throw under Fail.
+            if (!r.failed_permanent.empty()) {
+                if (opts_.dlq_policy == DlqPolicy::Drop) {
+                    for (std::size_t rel : r.failed_permanent) {
+                        dropped_bytes += fragments_[active[rel]].size();
+                    }
+                    dropped += r.failed_permanent.size();
+                    clink::metrics::connector::dropped_records_inc(opts_.name,
+                                                                   r.failed_permanent.size());
+                    clink::metrics::connector::permanent_failures_inc(opts_.name);
+                } else {
+                    clink::metrics::connector::error_inc(opts_.name, "sink");
+                    throw HttpDeliveryError(
+                        opts_.name + ": " + std::to_string(r.failed_permanent.size()) +
+                            " record(s) permanently rejected by " + opts_.http.base_url +
+                            opts_.path + " (" + delivery_detail_(last) + ")",
+                        last);
+                }
+            }
+            // Everything else this round either succeeded or was dropped; only the
+            // transient failures get resent.
+            if (r.failed_transient.empty()) {
+                finish_success_(n, dropped, dropped_bytes, t0);
+                return;
+            }
+            std::vector<std::size_t> next;
+            next.reserve(r.failed_transient.size());
+            for (std::size_t rel : r.failed_transient) {
+                next.push_back(active[rel]);
+            }
+            active = std::move(next);
         }
-        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count();
-        clink::metrics::connector::records_out_inc(opts_.name, n);
-        clink::metrics::connector::bytes_out_inc(opts_.name, bytes);
-        clink::metrics::connector::commit_latency_observe(opts_.name,
-                                                          static_cast<std::uint64_t>(dt));
-        buffer_.clear();
-        count_ = 0;
+        // Retries exhausted with transient survivors: an outage -> throw so the
+        // job replays from the last checkpoint (at-least-once, never silent drop).
+        clink::metrics::connector::error_inc(opts_.name, "sink");
+        throw HttpDeliveryError(opts_.name + ": POST " + opts_.http.base_url + opts_.path +
+                                    " failed after " + std::to_string(opts_.max_retries + 1) +
+                                    " attempts (" + delivery_detail_(last) + ")",
+                                last);
     }
 
     std::string name() const override { return opts_.name; }
 
 private:
     void append_(const In& rec) {
-        if (opts_.framing == BulkFraming::JsonArray) {
-            if (count_ > 0) {
-                buffer_.push_back(',');
-            }
-            render_(buffer_, rec);
-        } else {  // Ndjson
-            render_(buffer_, rec);
-            buffer_.push_back('\n');
-        }
-        ++count_;
+        std::string frag;
+        render_(frag, rec);
+        pending_bytes_ += frag.size();
+        fragments_.push_back(std::move(frag));
     }
 
-    void post_with_retry_(const std::string& body) {
-        // opts_.max_retries was clamped in the ctor; the shared helper owns the
-        // backoff + throw-on-exhaustion (at-least-once) semantics.
-        RetryPolicy policy{opts_.max_retries, opts_.retry_base_backoff};
-        clink::http_connector::post_with_retry(*client_,
-                                               opts_.path,
-                                               body,
-                                               opts_.content_type,
-                                               policy,
-                                               opts_.response_ok,
-                                               opts_.name,
-                                               opts_.http.base_url);
+    // Frame the active fragments into one request body.
+    std::string build_body_(const std::vector<std::size_t>& active) const {
+        std::string body;
+        if (opts_.framing == BulkFraming::JsonArray) {
+            body.push_back('[');
+            bool first = true;
+            for (std::size_t idx : active) {
+                if (!first) {
+                    body.push_back(',');
+                }
+                first = false;
+                body += fragments_[idx];
+            }
+            body.push_back(']');
+        } else {  // Ndjson: every record (incl. the last) is newline-terminated.
+            for (std::size_t idx : active) {
+                body += fragments_[idx];
+                body.push_back('\n');
+            }
+        }
+        return body;
+    }
+
+    void finish_success_(std::size_t n,
+                         std::size_t dropped,
+                         std::size_t dropped_bytes,
+                         std::chrono::steady_clock::time_point t0) {
+        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        const std::size_t delivered = n - dropped;
+        if (delivered > 0) {
+            clink::metrics::connector::records_out_inc(opts_.name, delivered);
+            clink::metrics::connector::bytes_out_inc(opts_.name, pending_bytes_ - dropped_bytes);
+            clink::metrics::connector::commit_latency_observe(opts_.name,
+                                                              static_cast<std::uint64_t>(dt));
+        }
+        fragments_.clear();
+        pending_bytes_ = 0;
+    }
+
+    static std::string delivery_detail_(const HttpResponse& res) {
+        std::string detail = res.status == 0 ? res.error : "HTTP " + std::to_string(res.status);
+        if (res.status >= 200 && res.status < 300 && !res.body.empty()) {
+            detail += " body: " + res.body.substr(0, 256);
+        }
+        return detail;
     }
 
     Options opts_;
     Renderer render_;
     std::unique_ptr<HttpRequest> client_;
-    std::string buffer_;
-    std::size_t count_{0};
+    std::vector<std::string> fragments_;  // per-record rendered bodies (for subset resend)
+    std::size_t pending_bytes_{0};        // sum of fragment sizes (flush trigger + bytes metric)
 };
 
 }  // namespace clink::http_connector

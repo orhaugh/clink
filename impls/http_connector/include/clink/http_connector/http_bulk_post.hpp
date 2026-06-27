@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "clink/http_connector/http_request.hpp"
 
@@ -45,6 +46,47 @@ inline HttpFailureClass classify_http_status(int status) {
 // route to the dead-letter path (count + metric) and continue, so one poison
 // batch does not wedge the pipeline. Transient failures always replay regardless.
 enum class DlqPolicy { Fail, Drop };
+
+// Per-record verdict on a bulk response. The indices are positions in the batch
+// that was POSTed (0-based, in send order). A bulk API that reports per-item
+// status (Elasticsearch _bulk) returns the FAILED subset so only those records
+// are resent / dead-lettered - the succeeded records are never re-sent. ok=true
+// (with empty vectors) means the whole batch was accepted.
+struct BulkResult {
+    bool ok{false};
+    std::vector<std::size_t> failed_transient;  // resend (429/503/outage)
+    std::vector<std::size_t> failed_permanent;  // DLQ under Drop / throw under Fail (4xx)
+};
+
+// Inspects a bulk response and returns the per-record verdict. `record_count` is
+// the number of records in the POSTed body so a handler can map item indices.
+using ResponseHandler = std::function<BulkResult(const HttpResponse&, std::size_t record_count)>;
+
+// Whole-batch verdict from a bool validator: the batch is all-or-nothing. Used
+// when a sink supplies no per-item ResponseHandler (http_sink, Splunk). A
+// rejected response classifies ALL records the same way by HTTP status: a
+// droppable 4xx (poison) -> failed_permanent; anything else (0/3xx/429/5xx
+// outage, or a 2xx the validator rejected) -> failed_transient (resend/replay).
+inline BulkResult whole_batch_result(const HttpResponse& res,
+                                     std::size_t record_count,
+                                     const ResponseValidator& validator) {
+    const bool ok = validator ? validator(res) : (res.status >= 200 && res.status < 300);
+    if (ok) {
+        return BulkResult{true, {}, {}};
+    }
+    std::vector<std::size_t> all(record_count);
+    for (std::size_t i = 0; i < record_count; ++i) {
+        all[i] = i;
+    }
+    BulkResult br;
+    const bool droppable_client_error = res.status >= 400 && res.status < 500 && res.status != 429;
+    if (droppable_client_error) {
+        br.failed_permanent = std::move(all);
+    } else {
+        br.failed_transient = std::move(all);
+    }
+    return br;
+}
 
 // Thrown by post_with_retry on exhausted retries. Derives from runtime_error so
 // existing catch(const std::runtime_error&) sites + the message are preserved,

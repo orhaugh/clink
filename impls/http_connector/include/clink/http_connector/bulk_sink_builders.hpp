@@ -52,6 +52,72 @@ inline std::string es_id_to_string(const clink::config::JsonValue& v) {
     return v.serialize(0);
 }
 
+// The HTTP-like status of one Elasticsearch _bulk response item. An item is
+// {"<action>": {"status": N, ...}} (action = index/create/update/delete). A
+// missing/odd shape returns 500 so the record is RETRIED (the safe direction),
+// never silently dropped.
+inline int es_item_status(const clink::config::JsonValue& item) {
+    if (!item.is_object() || item.as_object().empty()) {
+        return 500;
+    }
+    const auto& action = item.as_object().begin()->second;  // the single action result
+    if (!action.is_object()) {
+        return 500;
+    }
+    auto it = action.as_object().find("status");
+    if (it != action.as_object().end() && it->second.is_number()) {
+        return static_cast<int>(it->second.as_number());
+    }
+    return 500;
+}
+
+// Parse an Elasticsearch _bulk response into a per-record verdict. `count` is the
+// number of records POSTed (== items[] length). Each item's status: 2xx success,
+// 429/5xx transient (resend that item), other 4xx (400 mapping / 409 version)
+// permanent (DLQ that item). A non-2xx HTTP status, a parse failure, or an
+// items[] whose length does not match the batch falls back to whole-batch
+// classification so the whole batch is retried/DLQ'd rather than mis-attributed.
+inline BulkResult es_bulk_result(const HttpResponse& res, std::size_t count) {
+    if (res.status < 200 || res.status >= 300) {
+        return whole_batch_result(res, count, {});  // HTTP-level failure, no per-item info
+    }
+    clink::config::JsonValue body;
+    try {
+        body = clink::config::parse(res.body);
+    } catch (...) {
+        return whole_batch_result(res, count, [](const HttpResponse&) { return false; });
+    }
+    if (!body.is_object()) {
+        return BulkResult{true, {}, {}};  // unexpected 2xx shape: accept (do not wedge)
+    }
+    const auto& obj = body.as_object();
+    if (auto e = obj.find("errors");
+        e != obj.end() && e->second.is_bool() && !e->second.as_bool()) {
+        return BulkResult{true, {}, {}};  // errors:false fast path
+    }
+    auto items_it = obj.find("items");
+    if (items_it == obj.end() || !items_it->second.is_array() ||
+        items_it->second.as_array().size() != count) {
+        // errors:true but no usable per-item array: retry the whole batch.
+        return whole_batch_result(res, count, [](const HttpResponse&) { return false; });
+    }
+    const auto& items = items_it->second.as_array();
+    BulkResult br;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        const int st = es_item_status(items[i]);
+        if (st >= 200 && st < 300) {
+            continue;  // this item indexed
+        }
+        if (st == 429 || st >= 500) {
+            br.failed_transient.push_back(i);
+        } else {
+            br.failed_permanent.push_back(i);  // 400 mapping / 409 version: poison
+        }
+    }
+    br.ok = br.failed_transient.empty() && br.failed_permanent.empty();
+    return br;
+}
+
 struct EsBulkOptions {
     std::string url;          // scheme://host[:port]   (required)
     std::string index;        // target index           (required)
@@ -93,24 +159,13 @@ inline std::shared_ptr<Sink<std::string>> make_es_bulk_sink(EsBulkOptions o) {
     opts.dlq_policy = o.dlq_policy;
     opts.name = o.name;
 
-    // _bulk returns HTTP 200 even when individual items fail; success requires
-    // 2xx AND "errors":false in the body. A 2xx whose body has no "errors"
-    // field (unexpected) is accepted rather than wedging the pipeline.
-    opts.response_ok = [](const HttpResponse& r) -> bool {
-        if (r.status < 200 || r.status >= 300) {
-            return false;
-        }
-        try {
-            auto j = clink::config::parse(r.body);
-            if (j.is_object()) {
-                const auto& obj = j.as_object();
-                if (auto it = obj.find("errors"); it != obj.end() && it->second.is_bool()) {
-                    return !it->second.as_bool();
-                }
-            }
-        } catch (...) {
-        }
-        return true;
+    // _bulk returns HTTP 200 even when individual items fail ("errors":true with a
+    // per-item items[]). The per-item handler resends ONLY the transient (429/5xx)
+    // items and DLQs/throws the permanent (4xx mapping/version) ones, so a partial
+    // failure never re-indexes the already-written documents (the whole-batch
+    // retry did, duplicating them when there is no document_id).
+    opts.response_handler = [](const HttpResponse& r, std::size_t count) {
+        return es_bulk_result(r, count);
     };
 
     auto render = [index = o.index, id_field = o.document_id](std::string& out,
