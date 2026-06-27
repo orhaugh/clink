@@ -48,6 +48,10 @@ public:
                       const std::string& body,
                       const std::string& content_type);
 
+    // Blocking GET (for polling sources). `path` may carry a query string. Same
+    // transport-error convention as post().
+    HttpResponse get(const std::string& path);
+
     // True iff this build can talk https (CPPHTTPLIB_OPENSSL_SUPPORT). Lets a
     // sink reject an https URL up front with a clear message.
     static bool tls_supported() noexcept;

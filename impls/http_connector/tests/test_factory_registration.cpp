@@ -26,4 +26,9 @@ TEST(HttpConnectorFactoryRegistration, SplunkAndPrometheusSinksRegistered) {
     EXPECT_NE(rr.find_sink("prometheus_sink", "string"), nullptr);
 }
 
+TEST(HttpConnectorFactoryRegistration, HttpPollSourceIsRegistered) {
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_source("http_poll_source", "string"), nullptr);
+}
+
 }  // namespace

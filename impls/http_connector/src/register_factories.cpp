@@ -1,5 +1,6 @@
 // HTTP connector factory registration.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -9,6 +10,7 @@
 
 #include "clink/http_connector/batched_http_bulk_sink.hpp"
 #include "clink/http_connector/bulk_sink_builders.hpp"
+#include "clink/http_connector/http_poll_source.hpp"
 #include "clink/http_connector/http_request.hpp"
 #include "clink/http_connector/install.hpp"
 #include "clink/http_connector/prometheus_push_sink.hpp"
@@ -159,6 +161,38 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
             o.name = "prometheus_sink";
             return make_prometheus_pushgateway_sink(std::move(o));
+        });
+
+    // http_poll_source: GET a JSON REST endpoint on an interval, emit the array
+    // elements, cursor on a record field. At-least-once (the cursor is
+    // checkpointed). Params:
+    //   url (required)        - scheme://host[:port]
+    //   path (default "/")    - request path (may carry a fixed query string)
+    //   headers               - "K: V; ..." (auth)
+    //   cursor_param          - query-param name to send the cursor as
+    //   cursor_field          - record field holding the next cursor (API must
+    //                           return records ascending by it)
+    //   records_field         - response field holding the array (else the
+    //                           response itself is the array)
+    //   initial_cursor        - starting cursor on a fresh run
+    //   poll_interval_ms (default 1000)
+    //   max_retries (default 4; clamped to [0, 20]) - transient-GET retries
+    //   verify_tls ("true" [default] | "false")
+    reg.register_source<std::string>(
+        "http_poll_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
+            HttpPollOptions o;
+            o.url = ctx.param_or("url");
+            o.path = ctx.param_or("path", "/");
+            o.headers = ctx.param_or("headers", "");
+            o.verify_tls = ctx.param_or("verify_tls", "true") != "false";
+            o.cursor_param = ctx.param_or("cursor_param", "");
+            o.cursor_field = ctx.param_or("cursor_field", "");
+            o.records_field = ctx.param_or("records_field", "");
+            o.initial_cursor = ctx.param_or("initial_cursor", "");
+            o.interval = std::chrono::milliseconds{ctx.param_int64_or("poll_interval_ms", 1000)};
+            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            o.name = "http_poll_source";
+            return make_http_poll_source(std::move(o));
         });
 }
 

@@ -9,6 +9,7 @@ add_executable(clink_http_connector_tests
     test_elasticsearch_sink.cpp
     test_splunk_sink.cpp
     test_prometheus_sink.cpp
+    test_http_poll_source.cpp
 )
 target_link_libraries(clink_http_connector_tests PRIVATE
     clink::core

@@ -92,6 +92,9 @@ std::string string_source_factory_for(const TableDef& table) {
     if (connector == "kinesis") {
         return "kinesis_source";
     }
+    if (connector == "http_poll") {
+        return "http_poll_source";
+    }
     unsupported("unsupported source connector '" + connector + "' for table " + table.name);
 }
 
@@ -180,9 +183,15 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // number checkpoint).
         return RowConnectorBinding{"kinesis_source", kChannelString, "json_string_to_row"};
     }
+    if (connector == "http_poll") {
+        // HTTP polling source: GET a JSON endpoint on an interval, each array
+        // element is a JSON object string (string channel) bridged to Row.
+        // At-least-once (cursor checkpoint).
+        return RowConnectorBinding{"http_poll_source", kChannelString, "json_string_to_row"};
+    }
     unsupported(
-        "format='json' source requires connector='file', 'kafka', 'parquet', 'nexmark' or "
-        "'kinesis' (got '" +
+        "format='json' source requires connector='file', 'kafka', 'parquet', 'nexmark', "
+        "'kinesis' or 'http_poll' (got '" +
         connector + "')");
 }
 

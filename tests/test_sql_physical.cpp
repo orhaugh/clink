@@ -210,6 +210,27 @@ TEST(SqlPhysical, SplunkHecConnectorSinkLowersToHecSink) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
 }
 
+// connector='http_poll' source lowers to the http_poll_source (string channel)
+// bridged to Row via json_string_to_row, carrying url/cursor_field.
+TEST(SqlPhysical, HttpPollConnectorSourceLowers) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE api_in (a BIGINT) WITH (connector='http_poll', format='json', "
+        "url='http://api:8080', path='/items', cursor_field='a');"
+        "CREATE TABLE out_f (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/o.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO out_f SELECT a FROM api_in");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* src = find_op(spec, "http_poll_source");
+    ASSERT_NE(src, nullptr);
+    EXPECT_EQ(src->params.at("url"), "http://api:8080");
+    EXPECT_EQ(src->params.at("cursor_field"), "a");
+    EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);  // string -> Row bridge
+}
+
 // connector='kinesis' source lowers to the kinesis_source (string channel)
 // bridged to Row via json_string_to_row.
 TEST(SqlPhysical, KinesisConnectorSourceLowers) {
