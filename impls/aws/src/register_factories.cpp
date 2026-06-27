@@ -1,5 +1,6 @@
 // AWS-family connector factory registration (Kinesis, Firehose, DynamoDB).
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
@@ -11,6 +12,7 @@
 #include "clink/aws/firehose_sink.hpp"
 #include "clink/aws/install.hpp"
 #include "clink/aws/kinesis_sink.hpp"
+#include "clink/aws/kinesis_source.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
@@ -97,6 +99,30 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 8));
             o.name = "firehose_sink";
             return std::make_shared<FirehoseSink>(std::move(o));
+        });
+
+    // kinesis_source: read a Kinesis Data Stream (ListShards + GetRecords). Each
+    // subtask owns a modulo-slice of the shards; per-shard SequenceNumber is
+    // checkpointed (at-least-once). Params:
+    //   stream (required)         - stream name or ARN
+    //   initial_position ("trim_horizon" [default] | "latest")
+    //   region, endpoint_override
+    //   max_records_per_poll (default 1000; GetRecords Limit)
+    //   poll_interval_ms (default 250) - idle backoff
+    reg.register_source<std::string>(
+        "kinesis_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
+            KinesisSourceOptions o;
+            o.stream = ctx.param_or("stream");
+            o.initial_position = ctx.param_or("initial_position", "trim_horizon");
+            o.subtask_idx = ctx.subtask_idx;
+            o.parallelism = ctx.parallelism;
+            o.client = client_options_from(ctx);
+            o.max_records_per_poll =
+                static_cast<int>(ctx.param_int64_or("max_records_per_poll", 1000));
+            o.poll_interval =
+                std::chrono::milliseconds{ctx.param_int64_or("poll_interval_ms", 250)};
+            o.name = "kinesis_source";
+            return std::make_shared<KinesisSource>(std::move(o));
         });
 }
 

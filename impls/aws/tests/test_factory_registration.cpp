@@ -20,4 +20,9 @@ TEST(AwsFactoryRegistration, KinesisAndFirehoseSinksRegistered) {
     EXPECT_NE(rr.find_sink("firehose_sink", "string"), nullptr);
 }
 
+TEST(AwsFactoryRegistration, KinesisSourceIsRegistered) {
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_source("kinesis_source", "string"), nullptr);
+}
+
 }  // namespace

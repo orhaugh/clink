@@ -12,6 +12,7 @@ add_executable(clink_aws_tests
     test_factory_registration.cpp
     test_dynamodb_item.cpp
     test_kinesis_firehose_sink.cpp
+    test_kinesis_source.cpp
 )
 target_link_libraries(clink_aws_tests PRIVATE
     clink::core

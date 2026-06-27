@@ -89,6 +89,9 @@ std::string string_source_factory_for(const TableDef& table) {
     if (connector == "s3_parquet") {
         return "s3_parquet_string_source";
     }
+    if (connector == "kinesis") {
+        return "kinesis_source";
+    }
     unsupported("unsupported source connector '" + connector + "' for table " + table.name);
 }
 
@@ -171,8 +174,15 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // connector name to the Row-channel source op the planner emits.
         return RowConnectorBinding{"nexmark_source", kChannelRow, {}};
     }
+    if (connector == "kinesis") {
+        // Kinesis Data Streams source: each record's Data is a JSON object string
+        // (string channel), bridged to Row. At-least-once (per-shard sequence
+        // number checkpoint).
+        return RowConnectorBinding{"kinesis_source", kChannelString, "json_string_to_row"};
+    }
     unsupported(
-        "format='json' source requires connector='file', 'kafka', 'parquet' or 'nexmark' (got '" +
+        "format='json' source requires connector='file', 'kafka', 'parquet', 'nexmark' or "
+        "'kinesis' (got '" +
         connector + "')");
 }
 

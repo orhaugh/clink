@@ -210,6 +210,26 @@ TEST(SqlPhysical, SplunkHecConnectorSinkLowersToHecSink) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
 }
 
+// connector='kinesis' source lowers to the kinesis_source (string channel)
+// bridged to Row via json_string_to_row.
+TEST(SqlPhysical, KinesisConnectorSourceLowers) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE kin_in (a BIGINT) WITH (connector='kinesis', format='json', "
+        "stream='events');"
+        "CREATE TABLE out_f (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/o.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO out_f SELECT a FROM kin_in");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* src = find_op(spec, "kinesis_source");
+    ASSERT_NE(src, nullptr);
+    EXPECT_EQ(src->params.at("stream"), "events");
+    EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);  // string -> Row bridge
+}
+
 // connector='kinesis' / 'firehose' lower to their sinks (string channel) via the
 // row_to_json_string bridge, carrying stream/delivery_stream + partition_key.
 TEST(SqlPhysical, KinesisAndFirehoseConnectorSinksLower) {
