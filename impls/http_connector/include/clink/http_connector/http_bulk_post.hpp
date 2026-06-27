@@ -24,6 +24,21 @@ namespace clink::http_connector {
 // failure), so those sinks supply a validator that also inspects the body.
 using ResponseValidator = std::function<bool(const HttpResponse&)>;
 
+// Whether an HTTP failure is worth retrying (a transient outage / backpressure)
+// or is a permanent request error (a poison record that will fail identically
+// on replay). Drives retry-vs-DLQ.
+enum class HttpFailureClass { Transient, Permanent };
+
+// status 0 (transport error: connect/timeout/tls), 429 (rate limited) and 5xx
+// are transient; any other non-2xx (4xx except 429) is permanent. A 2xx is not a
+// failure and should not be classified.
+inline HttpFailureClass classify_http_status(int status) {
+    if (status == 0 || status == 429 || status >= 500) {
+        return HttpFailureClass::Transient;
+    }
+    return HttpFailureClass::Permanent;
+}
+
 // Parse a "K1: V1; K2: V2" header string into a map. Empty -> no headers.
 // Splits each pair on the FIRST ':', so a value may itself contain ':' (e.g.
 // "Authorization: Bearer a:b"). Whitespace around key/value is trimmed.

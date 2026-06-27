@@ -14,6 +14,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -25,6 +26,7 @@
 #include "clink/connectors/polling_source.hpp"
 #include "clink/http_connector/http_bulk_post.hpp"  // parse_headers
 #include "clink/http_connector/http_request.hpp"
+#include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 
 namespace clink::http_connector {
@@ -151,8 +153,9 @@ inline std::shared_ptr<Source<std::string>> make_http_poll_source(HttpPollOption
             if (res.status >= 200 && res.status < 300) {
                 break;
             }
-            const bool transient = res.status == 0 || res.status == 429 || res.status >= 500;
+            const bool transient = classify_http_status(res.status) == HttpFailureClass::Transient;
             if (!transient || attempt == state->max_retries) {
+                clink::metrics::connector::error_inc("http", "source");
                 std::string detail =
                     res.status == 0 ? res.error : "HTTP " + std::to_string(res.status);
                 throw std::runtime_error(state->name + ": GET " + state->http.base_url + req_path +
@@ -185,8 +188,10 @@ inline std::shared_ptr<Source<std::string>> make_http_poll_source(HttpPollOption
         if (arr == nullptr) {
             return out;  // no array (e.g. empty/{} response): nothing this poll
         }
+        std::uint64_t bytes = 0;
         for (const auto& elem : arr->as_array()) {
             out.records.push_back(elem.serialize(0));  // single-line JSON
+            bytes += out.records.back().size();
             if (!state->cursor_field.empty() && elem.is_object()) {
                 const auto& obj = elem.as_object();
                 if (auto it = obj.find(state->cursor_field); it != obj.end()) {
@@ -196,6 +201,10 @@ inline std::shared_ptr<Source<std::string>> make_http_poll_source(HttpPollOption
                     }
                 }
             }
+        }
+        if (!out.records.empty()) {
+            clink::metrics::connector::records_in_inc("http", out.records.size());
+            clink::metrics::connector::bytes_in_inc("http", bytes);
         }
         return out;
     };

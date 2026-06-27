@@ -200,3 +200,17 @@ TEST(HttpBulkSink, RejectsHttpsWhenTlsUnsupported) {
     auto opts = base_opts("https://example.invalid", 100);
     EXPECT_THROW(BatchedHttpBulkSink<std::string>(opts, verbatim()), std::runtime_error);
 }
+
+TEST(HttpFailureClassify, TransientVsPermanent) {
+    using clink::http_connector::classify_http_status;
+    using clink::http_connector::HttpFailureClass;
+    // Transient: transport error, rate limit, 5xx.
+    EXPECT_EQ(classify_http_status(0), HttpFailureClass::Transient);
+    EXPECT_EQ(classify_http_status(429), HttpFailureClass::Transient);
+    EXPECT_EQ(classify_http_status(500), HttpFailureClass::Transient);
+    EXPECT_EQ(classify_http_status(503), HttpFailureClass::Transient);
+    // Permanent: 4xx (except 429) - a poison request that replays identically.
+    EXPECT_EQ(classify_http_status(400), HttpFailureClass::Permanent);
+    EXPECT_EQ(classify_http_status(403), HttpFailureClass::Permanent);
+    EXPECT_EQ(classify_http_status(404), HttpFailureClass::Permanent);
+}

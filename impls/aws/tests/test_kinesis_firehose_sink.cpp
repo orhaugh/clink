@@ -68,3 +68,19 @@ TEST(FirehoseSinkCtor, RequiresDeliveryStreamAndClampsBatch) {
     o2.batch_records = 0;  // clamps to 500
     EXPECT_NO_THROW(FirehoseSink{std::move(o2)});
 }
+
+TEST(KinesisErrorClassify, TransientVsPermanent) {
+    using clink::aws::classify_kinesis_error;
+    using clink::aws::FailureClass;
+    using E = Aws::Kinesis::KinesisErrors;
+    // Permanent: a malformed request (oversized record, bad stream) replays the same.
+    EXPECT_EQ(classify_kinesis_error(E::VALIDATION), FailureClass::Permanent);
+    EXPECT_EQ(classify_kinesis_error(E::INVALID_ARGUMENT), FailureClass::Permanent);
+    EXPECT_EQ(classify_kinesis_error(E::ACCESS_DENIED), FailureClass::Permanent);
+    EXPECT_EQ(classify_kinesis_error(E::RESOURCE_NOT_FOUND), FailureClass::Permanent);
+    // Transient: throttle / outage / internal -> retry (replay).
+    EXPECT_EQ(classify_kinesis_error(E::PROVISIONED_THROUGHPUT_EXCEEDED), FailureClass::Transient);
+    EXPECT_EQ(classify_kinesis_error(E::THROTTLING), FailureClass::Transient);
+    EXPECT_EQ(classify_kinesis_error(E::SERVICE_UNAVAILABLE), FailureClass::Transient);
+    EXPECT_EQ(classify_kinesis_error(E::INTERNAL_FAILURE), FailureClass::Transient);
+}

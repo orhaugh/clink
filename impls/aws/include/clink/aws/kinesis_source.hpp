@@ -294,6 +294,9 @@ private:
             return false;
         }
         const auto& result = outcome.GetResult();
+        // Consumer lag (ms behind the stream tip): the headline SLA signal for a
+        // Kinesis reader. 0 = caught up.
+        clink::metrics::connector::consumer_lag_set("kinesis", result.GetMillisBehindLatest());
         Batch<std::string> batch;
         std::uint64_t bytes = 0;
         for (const auto& rec : result.GetRecords()) {

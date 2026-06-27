@@ -24,15 +24,40 @@
 
 #include <aws/core/utils/memory/stl/AWSString.h>
 #include <aws/kinesis/KinesisClient.h>
+#include <aws/kinesis/KinesisErrors.h>
 #include <aws/kinesis/model/PutRecordsRequest.h>
 #include <aws/kinesis/model/PutRecordsRequestEntry.h>
 #include <aws/kinesis/model/PutRecordsResultEntry.h>
 
 #include "clink/aws/aws_client.hpp"
 #include "clink/config/json.hpp"
+#include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 
 namespace clink::aws {
+
+// Whether an AWS failure is worth retrying (transient outage / throttle) or is a
+// permanent request error (a poison batch that will fail identically on replay).
+enum class FailureClass { Transient, Permanent };
+
+// Classify a WHOLE-CALL Kinesis error (outcome.GetError()). Throttle /
+// service-unavailable / internal / slow-down are transient (retry); validation /
+// bad-argument / access / not-found are permanent (a malformed request, e.g. an
+// oversized record or a bad stream -> DLQ rather than crash-loop). Unknown
+// defaults to Transient: replay is the safe direction (never silently drop).
+inline FailureClass classify_kinesis_error(Aws::Kinesis::KinesisErrors err) {
+    using E = Aws::Kinesis::KinesisErrors;
+    switch (err) {
+        case E::VALIDATION:
+        case E::INVALID_ARGUMENT:
+        case E::ACCESS_DENIED:
+        case E::RESOURCE_NOT_FOUND:
+        case E::RESOURCE_IN_USE:
+            return FailureClass::Permanent;
+        default:
+            return FailureClass::Transient;
+    }
+}
 
 // Indices of the response entries that FAILED (non-empty ErrorCode). The
 // PutRecords response is index-aligned with the request, so these map straight
@@ -103,7 +128,24 @@ public:
         if (pending_.empty()) {
             return;
         }
-        put_with_retry_(std::move(pending_));
+        const std::size_t n = pending_.size();
+        const std::size_t bytes = pending_bytes_;
+        const auto t0 = std::chrono::steady_clock::now();
+        try {
+            put_with_retry_(std::move(pending_));
+        } catch (...) {
+            clink::metrics::connector::error_inc("kinesis", "sink");
+            pending_.clear();
+            pending_bytes_ = 0;
+            throw;
+        }
+        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        clink::metrics::connector::records_out_inc("kinesis", n);
+        clink::metrics::connector::bytes_out_inc("kinesis", bytes);
+        clink::metrics::connector::commit_latency_observe("kinesis",
+                                                          static_cast<std::uint64_t>(dt));
         pending_.clear();
         pending_bytes_ = 0;
     }

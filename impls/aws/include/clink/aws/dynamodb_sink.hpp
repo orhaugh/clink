@@ -30,6 +30,7 @@
 
 #include "clink/aws/aws_client.hpp"
 #include "clink/config/json.hpp"
+#include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 
 namespace clink::aws {
@@ -149,25 +150,39 @@ public:
         if (pending_.empty()) {
             return;
         }
+        const std::size_t n = pending_.size();
+        const auto t0 = std::chrono::steady_clock::now();
         // Emit in chunks of <= batch_records; pending_ is already key-deduped so
         // no chunk carries two items with the same primary key.
         std::vector<Aws::DynamoDB::Model::WriteRequest> chunk;
         chunk.reserve(opts_.batch_records);
-        for (auto& [key, item] : pending_) {
-            Aws::DynamoDB::Model::PutRequest put;
-            put.SetItem(std::move(item));
-            Aws::DynamoDB::Model::WriteRequest wr;
-            wr.SetPutRequest(std::move(put));
-            chunk.push_back(std::move(wr));
-            if (chunk.size() >= opts_.batch_records) {
-                write_with_retry_(std::move(chunk));
-                chunk.clear();
-                chunk.reserve(opts_.batch_records);
+        try {
+            for (auto& [key, item] : pending_) {
+                Aws::DynamoDB::Model::PutRequest put;
+                put.SetItem(std::move(item));
+                Aws::DynamoDB::Model::WriteRequest wr;
+                wr.SetPutRequest(std::move(put));
+                chunk.push_back(std::move(wr));
+                if (chunk.size() >= opts_.batch_records) {
+                    write_with_retry_(std::move(chunk));
+                    chunk.clear();
+                    chunk.reserve(opts_.batch_records);
+                }
             }
+            if (!chunk.empty()) {
+                write_with_retry_(std::move(chunk));
+            }
+        } catch (...) {
+            clink::metrics::connector::error_inc("dynamodb", "sink");
+            pending_.clear();
+            throw;
         }
-        if (!chunk.empty()) {
-            write_with_retry_(std::move(chunk));
-        }
+        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        clink::metrics::connector::records_out_inc("dynamodb", n);
+        clink::metrics::connector::commit_latency_observe("dynamodb",
+                                                          static_cast<std::uint64_t>(dt));
         pending_.clear();
     }
 

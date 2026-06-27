@@ -11,6 +11,7 @@
 
 #include "clink/http_connector/http_bulk_post.hpp"
 #include "clink/http_connector/http_request.hpp"
+#include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 
 namespace clink::http_connector {
@@ -105,7 +106,22 @@ public:
             return;
         }
         std::string body = opts_.framing == BulkFraming::JsonArray ? "[" + buffer_ + "]" : buffer_;
-        post_with_retry_(body);
+        const std::size_t n = count_;
+        const std::size_t bytes = body.size();
+        const auto t0 = std::chrono::steady_clock::now();
+        try {
+            post_with_retry_(body);
+        } catch (...) {
+            clink::metrics::connector::error_inc(opts_.name, "sink");
+            throw;
+        }
+        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        clink::metrics::connector::records_out_inc(opts_.name, n);
+        clink::metrics::connector::bytes_out_inc(opts_.name, bytes);
+        clink::metrics::connector::commit_latency_observe(opts_.name,
+                                                          static_cast<std::uint64_t>(dt));
         buffer_.clear();
         count_ = 0;
     }

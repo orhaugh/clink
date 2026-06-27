@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -16,6 +17,7 @@
 #include "clink/config/json.hpp"
 #include "clink/http_connector/http_bulk_post.hpp"
 #include "clink/http_connector/http_request.hpp"
+#include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 
 namespace clink::http_connector {
@@ -118,8 +120,29 @@ public:
         // 200 and 202 both mean success; 400 is the only documented rejection
         // and there is no "200-but-failed" case, so the default 2xx check fits.
         RetryPolicy policy{max_retries_, std::chrono::milliseconds{200}};
-        post_with_retry(
-            *client_, push_path_, body, kContentType, policy, /*response_ok=*/{}, name_, base_url_);
+        const std::size_t n = series_.size();
+        const std::size_t bytes = body.size();
+        const auto t0 = std::chrono::steady_clock::now();
+        try {
+            post_with_retry(*client_,
+                            push_path_,
+                            body,
+                            kContentType,
+                            policy,
+                            /*response_ok=*/{},
+                            name_,
+                            base_url_);
+        } catch (...) {
+            clink::metrics::connector::error_inc(name_, "sink");
+            series_.clear();
+            throw;
+        }
+        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        clink::metrics::connector::records_out_inc(name_, n);
+        clink::metrics::connector::bytes_out_inc(name_, bytes);
+        clink::metrics::connector::commit_latency_observe(name_, static_cast<std::uint64_t>(dt));
         series_.clear();
     }
 

@@ -83,6 +83,19 @@ inline void consumer_lag_set(const std::string& connector, std::int64_t lag) {
         .gauge(connector_metric_name("consumer_lag", connector, "source"))
         .set(lag);
 }
+// Records a sink routed to the dead-letter path (dropped after a PERMANENT
+// failure under DlqPolicy::Drop) rather than retried. dropped_records counts the
+// records; permanent_failures counts the drop events (batches/items).
+inline void dropped_records_inc(const std::string& connector, std::uint64_t n = 1) {
+    MetricsRegistry::global()
+        .counter(connector_metric_name("dropped_records_total", connector, "sink"))
+        .increment(n);
+}
+inline void permanent_failures_inc(const std::string& connector) {
+    MetricsRegistry::global()
+        .counter(connector_metric_name("permanent_failures_total", connector, "sink"))
+        .increment();
+}
 
 }  // namespace connector
 

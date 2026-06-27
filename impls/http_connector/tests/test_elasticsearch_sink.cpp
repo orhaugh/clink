@@ -15,6 +15,7 @@
 
 #include "clink/core/record.hpp"
 #include "clink/http_connector/bulk_sink_builders.hpp"
+#include "clink/metrics/metrics_registry.hpp"
 
 using clink::Batch;
 using clink::http_connector::EsBulkOptions;
@@ -87,6 +88,15 @@ Batch<std::string> batch_of(std::vector<std::string> recs) {
 
 bool contains(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
+}
+
+std::uint64_t counter_value(const std::string& name) {
+    for (const auto& [k, v] : clink::MetricsRegistry::global().snapshot().counters) {
+        if (k == name) {
+            return v;
+        }
+    }
+    return 0;
 }
 
 }  // namespace
@@ -190,6 +200,23 @@ TEST(ElasticsearchSink, PartialFailureErrorsTrueIsTreatedAsFailure) {
         // 2xx-but-rejected keeps a body snippet for diagnosis.
         EXPECT_TRUE(contains(e.what(), "errors") || contains(e.what(), "HTTP 200")) << e.what();
     }
+}
+
+TEST(ElasticsearchSink, EmitsConnectorMetricsOnFlush) {
+    EsStub srv;
+    EsBulkOptions o;
+    o.url = srv.url();
+    o.index = "logs";
+    o.batch_records = 100;
+    auto sink = make_es_bulk_sink(o);
+    sink->open();
+    // Delta-based so the test is robust to the shared global registry.
+    const std::string records =
+        R"(clink_connector_records_total{connector="elasticsearch_sink",direction="sink"})";
+    const auto before = counter_value(records);
+    sink->on_data(batch_of({R"({"a":1})", R"({"a":2})", R"({"a":3})"}));
+    sink->flush();
+    EXPECT_EQ(counter_value(records) - before, 3u);
 }
 
 TEST(ElasticsearchSink, RequiresUrlAndIndex) {

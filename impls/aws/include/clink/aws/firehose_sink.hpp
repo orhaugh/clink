@@ -25,6 +25,7 @@
 #include <aws/firehose/model/Record.h>
 
 #include "clink/aws/aws_client.hpp"
+#include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 
 namespace clink::aws {
@@ -96,7 +97,24 @@ public:
         if (pending_.empty()) {
             return;
         }
-        put_with_retry_(std::move(pending_));
+        const std::size_t n = pending_.size();
+        const std::size_t bytes = pending_bytes_;
+        const auto t0 = std::chrono::steady_clock::now();
+        try {
+            put_with_retry_(std::move(pending_));
+        } catch (...) {
+            clink::metrics::connector::error_inc("firehose", "sink");
+            pending_.clear();
+            pending_bytes_ = 0;
+            throw;
+        }
+        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        clink::metrics::connector::records_out_inc("firehose", n);
+        clink::metrics::connector::bytes_out_inc("firehose", bytes);
+        clink::metrics::connector::commit_latency_observe("firehose",
+                                                          static_cast<std::uint64_t>(dt));
         pending_.clear();
         pending_bytes_ = 0;
     }
