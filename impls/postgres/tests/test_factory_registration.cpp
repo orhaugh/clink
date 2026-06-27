@@ -22,6 +22,12 @@ TEST(PostgresFactoryRegistration, PostgresTextSourceIsRegistered) {
     EXPECT_NE(rr.find_source("postgres_cdc_text_source", "string"), nullptr);
 }
 
+TEST(PostgresFactoryRegistration, PostgresJsonSinkIsRegistered) {
+    // M4: the JSON sink on the string channel (the newer Row-bridge pattern).
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("postgres_sink", "string"), nullptr);
+}
+
 TEST(PostgresFactoryRegistration, PostgresRowAndCdcEventTypedChannelsAndOpsAreRegistered) {
     const auto& tr = TypeRegistry::default_instance();
     ASSERT_NE(tr.find(clink::kChannelPostgresRow), nullptr);

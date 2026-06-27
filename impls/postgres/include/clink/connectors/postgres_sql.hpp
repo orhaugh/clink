@@ -110,7 +110,7 @@ inline bool in_set(const std::vector<std::string>& set, const std::string& c) {
 // or "nothing" (ON CONFLICT (...) DO NOTHING). When non-empty, conflict_columns
 // (the unique/PK target) is required. For "update", update_columns limits the SET
 // list (empty = all columns except the conflict target); a degenerate empty SET
-// collapses to DO NOTHING. Throws (via parse) on a row that is not a JSON object.
+// collapses to DO NOTHING. Throws on a row that is not a JSON object.
 inline std::string build_insert_sql(const std::string& table,
                                     const std::vector<std::string>& columns,
                                     const std::string& on_conflict,
@@ -141,16 +141,20 @@ inline std::string build_insert_sql(const std::string& table,
     sql += ") VALUES ";
     for (std::size_t r = 0; r < json_rows.size(); ++r) {
         const auto j = clink::config::parse(json_rows[r]);
-        const bool is_obj = j.is_object();
+        if (!j.is_object()) {
+            // A well-formed non-object JSON (e.g. "5", "[1,2]") would otherwise map
+            // every column to NULL silently. Fail loudly - a row to a multi-column
+            // sink must be a JSON object. (Unreachable on the SQL Row path, where
+            // row_to_json_string always emits an object.)
+            throw std::runtime_error("postgres: sink row is not a JSON object: " + json_rows[r]);
+        }
         sql += "(";
         for (std::size_t i = 0; i < columns.size(); ++i) {
             const clink::config::JsonValue* val = nullptr;
-            if (is_obj) {
-                const auto& obj = j.as_object();
-                auto it = obj.find(columns[i]);
-                if (it != obj.end()) {
-                    val = &it->second;
-                }
+            const auto& obj = j.as_object();
+            auto it = obj.find(columns[i]);
+            if (it != obj.end()) {
+                val = &it->second;
             }
             sql += (val != nullptr) ? json_value_to_sql_literal(*val, esc) : "NULL";
             if (i + 1 < columns.size()) {

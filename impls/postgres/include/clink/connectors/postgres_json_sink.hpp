@@ -30,6 +30,16 @@
 
 namespace clink {
 
+// Owning deleter so the PGconn is freed by RAII (not by every error path
+// remembering to null a raw pointer) - matches mysql_sink's unique_ptr<Connection>.
+struct PgconnDeleter {
+    void operator()(PGconn* c) const noexcept {
+        if (c != nullptr) {
+            PQfinish(c);
+        }
+    }
+};
+
 struct PostgresJsonSinkOptions {
     std::string conninfo;                       // libpq conninfo (required)
     std::string table;                          // target table (required)
@@ -80,13 +90,13 @@ public:
     }
 
     void open() override {
-        conn_ = PQconnectdb(opts_.conninfo.c_str());
-        if (PQstatus(conn_) != CONNECTION_OK) {
-            const std::string err = PQerrorMessage(conn_);
-            PQfinish(conn_);
-            conn_ = nullptr;
+        PGconn* c = PQconnectdb(opts_.conninfo.c_str());
+        if (PQstatus(c) != CONNECTION_OK) {
+            const std::string err = PQerrorMessage(c);
+            PQfinish(c);
             throw std::runtime_error(opts_.name + ": connect failed: " + err);
         }
+        conn_.reset(c);
     }
 
     void on_data(const Batch<std::string>& batch) override {
@@ -109,7 +119,7 @@ public:
         if (pending_.empty()) {
             return;
         }
-        if (conn_ == nullptr) {
+        if (!conn_) {
             throw std::runtime_error(opts_.name + ": flush() before open()");
         }
         const std::size_t n = pending_.size();
@@ -124,11 +134,11 @@ public:
                                         opts_.update_columns,
                                         pending_,
                                         [this](std::string_view s) { return escape_(s); });
-            PGresult* res = PQexec(conn_, sql.c_str());
+            PGresult* res = PQexec(conn_.get(), sql.c_str());
             const bool ok = res != nullptr && PQresultStatus(res) == PGRES_COMMAND_OK;
             if (!ok) {
-                const std::string err =
-                    res != nullptr ? PQresultErrorMessage(res) : std::string(PQerrorMessage(conn_));
+                const std::string err = res != nullptr ? PQresultErrorMessage(res)
+                                                       : std::string(PQerrorMessage(conn_.get()));
                 PQclear(res);
                 throw std::runtime_error(opts_.name + ": INSERT failed: " + err);
             }
@@ -137,9 +147,8 @@ public:
             clink::metrics::connector::error_inc("postgres", "sink");
             pending_.clear();
             pending_bytes_ = 0;
-            PQfinish(conn_);  // drop a possibly-broken connection; re-open reconnects
-            conn_ = nullptr;
-            throw;  // job replays from the last checkpoint (at-least-once)
+            conn_.reset();  // drop a possibly-broken connection; re-open reconnects
+            throw;          // job replays from the last checkpoint (at-least-once)
         }
         const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - t0)
@@ -153,10 +162,9 @@ public:
     }
 
     void close() override {
-        if (conn_ != nullptr) {
+        if (conn_) {
             flush();
-            PQfinish(conn_);
-            conn_ = nullptr;
+            conn_.reset();
         }
     }
 
@@ -168,7 +176,8 @@ private:
     std::string escape_(std::string_view in) {
         std::string out(in.size() * 2 + 1, '\0');
         int err = 0;
-        const std::size_t len = PQescapeStringConn(conn_, out.data(), in.data(), in.size(), &err);
+        const std::size_t len =
+            PQescapeStringConn(conn_.get(), out.data(), in.data(), in.size(), &err);
         out.resize(len);
         return out;  // even on err the output is a safe escaped string (per libpq)
     }
@@ -179,7 +188,7 @@ private:
     }
 
     PostgresJsonSinkOptions opts_;
-    PGconn* conn_{nullptr};
+    std::unique_ptr<PGconn, PgconnDeleter> conn_;
     std::vector<std::string> pending_;
     std::size_t pending_bytes_{0};
     std::chrono::steady_clock::time_point first_buffered_at_{};

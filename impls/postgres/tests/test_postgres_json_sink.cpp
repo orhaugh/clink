@@ -97,6 +97,20 @@ TEST(PostgresJsonSinkLogic, OnConflictUpdateDefaultsToNonKeyColumns) {
               "\"b\"=EXCLUDED.\"b\"");
 }
 
+TEST(PostgresJsonSinkLogic, OnConflictUpdateColumnsSubsetLimitsSetList) {
+    // An explicit update_columns subset SETs only those columns (not all non-key).
+    EXPECT_EQ(build_insert_sql(
+                  "t", {"a", "b", "c"}, "update", {"a"}, {"b"}, {R"({"a":1,"b":2,"c":3})"}, esc),
+              "INSERT INTO \"t\" (\"a\",\"b\",\"c\") VALUES (1,2,3) ON CONFLICT (\"a\") DO UPDATE "
+              "SET \"b\"=EXCLUDED.\"b\"");
+}
+
+TEST(PostgresJsonSinkLogic, NonObjectRowThrows) {
+    // A well-formed but non-object JSON row must fail loudly (not silently NULL).
+    EXPECT_THROW(build_insert_sql("t", {"a"}, "", {}, {}, {"5"}, esc), std::runtime_error);
+    EXPECT_THROW(build_insert_sql("t", {"a"}, "", {}, {}, {"[1,2]"}, esc), std::runtime_error);
+}
+
 TEST(PostgresJsonSinkLogic, OnConflictNothing) {
     EXPECT_EQ(build_insert_sql("t", {"a", "b"}, "nothing", {"a"}, {}, {R"({"a":1,"b":2})"}, esc),
               "INSERT INTO \"t\" (\"a\",\"b\") VALUES (1,2) ON CONFLICT (\"a\") DO NOTHING");
