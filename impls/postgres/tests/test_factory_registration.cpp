@@ -36,6 +36,14 @@ TEST(PostgresFactoryRegistration, PostgresJsonSourceIsRegistered) {
     EXPECT_NE(rr.find_source("postgres_text_source", "string"), nullptr);  // back-compat preserved
 }
 
+TEST(PostgresFactoryRegistration, PostgresCdcJsonSourceIsRegistered) {
+    // M5: the flat-JSON CDC source for the Row path (nested-format
+    // postgres_cdc_text_source kept for back-compat).
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_source("postgres_cdc_source", "string"), nullptr);
+    EXPECT_NE(rr.find_source("postgres_cdc_text_source", "string"), nullptr);  // back-compat
+}
+
 TEST(PostgresFactoryRegistration, PostgresRowAndCdcEventTypedChannelsAndOpsAreRegistered) {
     const auto& tr = TypeRegistry::default_instance();
     ASSERT_NE(tr.find(clink::kChannelPostgresRow), nullptr);

@@ -21,6 +21,7 @@
 
 #include "clink/config/json.hpp"
 #include "clink/connectors/cdc_event.hpp"
+#include "clink/connectors/cdc_json.hpp"
 #include "clink/connectors/postgres_cdc_source.hpp"
 #include "clink/connectors/postgres_json_sink.hpp"
 #include "clink/connectors/postgres_row.hpp"
@@ -72,7 +73,15 @@ std::vector<std::string> split_csv(const std::string& s) {
 // string-channel submission path as kafka_text / file_text.
 class StringPostgresCdcSource final : public Source<std::string> {
 public:
-    explicit StringPostgresCdcSource(PostgresCdcSource::Options opts) : inner_(std::move(opts)) {}
+    // json=false: the nested {"op","table","lsn","xid","values":{...}} line
+    //   (postgres_cdc_text_source) - back-compat.
+    // json=true:  M5 Row-path emission - one FLAT JSON object per data-change
+    //   event (insert/update/delete) with the changed columns at the top level
+    //   (so json_string_to_row maps them by name) plus CDC metadata under reserved
+    //   __op / __table / __lsn / __xid keys. begin/commit/truncate/unknown are
+    //   skipped (transaction markers carry no row to map).
+    explicit StringPostgresCdcSource(PostgresCdcSource::Options opts, bool json = false)
+        : inner_(std::move(opts)), json_(json) {}
 
     void open() override { inner_.open(); }
     void close() override { inner_.close(); }
@@ -82,12 +91,20 @@ public:
     }
 
     bool produce(Emitter<std::string>& out) override {
+        const bool json = json_;
         Emitter<CdcEvent> forwarder(
-            Emitter<CdcEvent>::Forward([&out](StreamElement<CdcEvent> e) -> bool {
+            Emitter<CdcEvent>::Forward([&out, json](StreamElement<CdcEvent> e) -> bool {
                 if (e.is_data()) {
                     Batch<std::string> b;
                     for (const auto& r : e.as_data()) {
-                        b.emplace(serialize(r.value()));
+                        if (!json) {
+                            b.emplace(serialize(r.value()));
+                            continue;
+                        }
+                        // Row path: flat JSON per data-change event; skip markers.
+                        if (auto row = clink::pgcdc::cdc_event_to_json_row(r.value())) {
+                            b.emplace(std::move(*row));
+                        }
                     }
                     return out.emit_data(std::move(b));
                 }
@@ -109,7 +126,9 @@ public:
         return inner_.restore_offset(backend, op_id);
     }
 
-    std::string name() const override { return "postgres_cdc_text_source"; }
+    std::string name() const override {
+        return json_ ? "postgres_cdc_source" : "postgres_cdc_text_source";
+    }
 
 private:
     static std::string escape(std::string_view s) {
@@ -189,6 +208,7 @@ private:
     }
 
     PostgresCdcSource inner_;
+    bool json_{false};
 };
 
 // Render a PostgresRow as a single-line JSON object keyed by column name (M3),
@@ -365,6 +385,33 @@ void install(clink::plugin::PluginRegistry& reg) {
                     "plugin='pgoutput'");
             }
             return std::make_shared<StringPostgresCdcSource>(std::move(opts));
+        });
+
+    // postgres_cdc_source (M5): the same logical-replication CDC stream, but each
+    // insert/update/delete is a FLAT JSON object - the changed columns at the top
+    // level (NULL cells -> JSON null) plus __op/__table/__lsn/__xid metadata - so
+    // json_string_to_row drives a multi-column Row pipeline. Transaction markers
+    // (begin/commit/truncate) are skipped. Same params as postgres_cdc_text_source.
+    reg.register_source<std::string>(
+        "postgres_cdc_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
+            PostgresCdcSource::Options opts;
+            opts.conninfo = ctx.param_or("conninfo");
+            opts.slot_name = ctx.param_or("slot_name");
+            opts.plugin = ctx.param_or("plugin", "test_decoding");
+            opts.publication_names = ctx.param_or("publication_names");
+            opts.create_slot = ctx.param_or("create_slot", "true") == "true";
+            opts.drop_slot_on_close = ctx.param_or("drop_slot_on_close", "false") == "true";
+            if (opts.conninfo.empty()) {
+                throw std::runtime_error("postgres_cdc_source: 'conninfo' is required");
+            }
+            if (opts.slot_name.empty()) {
+                throw std::runtime_error("postgres_cdc_source: 'slot_name' is required");
+            }
+            if (opts.plugin == "pgoutput" && opts.publication_names.empty()) {
+                throw std::runtime_error(
+                    "postgres_cdc_source: 'publication_names' is required when plugin='pgoutput'");
+            }
+            return std::make_shared<StringPostgresCdcSource>(std::move(opts), /*json=*/true);
         });
 
     // postgres_text_source: SELECT rows joined with `delim` (default "|").

@@ -222,16 +222,13 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         return RowConnectorBinding{"clickhouse_source", kChannelString, "json_string_to_row"};
     }
     if (connector == "postgres") {
-        // Postgres JDBC source (M3): SELECT rows as JSON objects keyed by column
-        // name (string channel) bridged to Row. CDC on the Row path is not yet
-        // wired (it would silently fall through to a plain SELECT) - reject it
-        // loudly until the CDC JSON source lands (migration M5); CDC remains
-        // available on the string channel (postgres_cdc_text_source).
+        // Postgres source on the Row path. mode='cdc' (M5): logical-replication
+        // change events as flat JSON objects (changed columns + __op/__table/__lsn
+        // metadata) bridged to Row. Otherwise (M3): a plain SELECT cursor source,
+        // each row a JSON object keyed by column name.
         auto it = table.properties.find("mode");
         if (it != table.properties.end() && it->second == "cdc") {
-            unsupported(
-                "connector='postgres' mode='cdc' with format='json' is not yet supported; use the "
-                "string channel (a single TEXT column) for postgres_cdc_text_source");
+            return RowConnectorBinding{"postgres_cdc_source", kChannelString, "json_string_to_row"};
         }
         return RowConnectorBinding{"postgres_source", kChannelString, "json_string_to_row"};
     }

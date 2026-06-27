@@ -422,22 +422,22 @@ TEST(SqlPhysical, PostgresConnectorSourceLowers) {
     EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);
 }
 
-// CDC on the Row path is not yet wired (M5) - it must be rejected, not silently
-// routed to the plain SELECT source.
-TEST(SqlPhysical, PostgresCdcOnRowPathRejected) {
+// M5: connector='postgres' mode='cdc' + format='json' lowers to the CDC JSON
+// source (flat change events) bridged to Row.
+TEST(SqlPhysical, PostgresCdcOnRowPathLowers) {
     Catalog cat;
     auto s = parse(
-        "CREATE TABLE pg_in (a BIGINT) WITH (connector='postgres', format='json', mode='cdc', "
-        "conninfo='host=pg', slot_name='s');"
-        "CREATE TABLE out_f (a BIGINT) WITH (connector='file', format='json', "
+        "CREATE TABLE pg_in (id BIGINT, name VARCHAR) WITH (connector='postgres', format='json', "
+        "mode='cdc', conninfo='host=pg', slot_name='s');"
+        "CREATE TABLE out_f (id BIGINT, name VARCHAR) WITH (connector='file', format='json', "
         "path='/tmp/o.ndjson');");
     cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
     cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
-    EXPECT_ANY_THROW({
-        auto plan = bind_insert(cat, "INSERT INTO out_f SELECT a FROM pg_in");
-        PhysicalPlanner pp;
-        pp.compile(static_cast<const LogicalSink&>(*plan));
-    });
+    auto plan = bind_insert(cat, "INSERT INTO out_f SELECT id, name FROM pg_in");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    ASSERT_NE(find_op(spec, "postgres_cdc_source"), nullptr);
+    EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);
 }
 
 // M1: connector='clickhouse' SINK lowers to clickhouse_sink (string channel) via
