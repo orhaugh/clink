@@ -20,6 +20,12 @@ TEST(ClickHouseFactoryRegistration, ClickHouseTextSourceIsRegistered) {
     EXPECT_NE(rr.find_source("clickhouse_text_source", "string"), nullptr);
 }
 
+TEST(ClickHouseFactoryRegistration, ClickHouseJsonSourceIsRegistered) {
+    // M2: the JSON source on the string channel (delimited text source kept).
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_source("clickhouse_source", "string"), nullptr);
+}
+
 TEST(ClickHouseFactoryRegistration, ClickHouseRowSourceIsRegistered) {
     const auto& rr = RunnerRegistry::default_instance();
     EXPECT_NE(rr.find_source("clickhouse_row_source", "clickhouse.row"), nullptr);

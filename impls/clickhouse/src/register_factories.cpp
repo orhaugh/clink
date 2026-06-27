@@ -10,6 +10,7 @@
 
 #include "clink/clickhouse/clickhouse_row_codec.hpp"
 #include "clink/clickhouse/install.hpp"
+#include "clink/config/json.hpp"
 #include "clink/connectors/clickhouse_row.hpp"
 #include "clink/connectors/clickhouse_sink.hpp"
 #include "clink/connectors/clickhouse_source.hpp"
@@ -21,14 +22,32 @@ namespace clink::clickhouse {
 
 namespace {
 
+// Render a ClickHouseRow as a single-line JSON object keyed by column name (M2),
+// so json_string_to_row can map it to a multi-column Row table. Values are text
+// (the bridge coerces per the declared column types). Falls back to positional
+// keys ("0","1",...) if column names are unavailable or mismatched.
+std::string clickhouse_row_to_json(const ClickHouseRow& r) {
+    const auto& vs = r.values();
+    const auto names = r.column_names();
+    clink::config::JsonObject obj;
+    for (std::size_t i = 0; i < vs.size(); ++i) {
+        const std::string key = (names && i < names->size()) ? (*names)[i] : std::to_string(i);
+        obj[key] = clink::config::JsonValue{vs[i]};
+    }
+    return clink::config::JsonValue{std::move(obj)}.serialize(0);
+}
+
 // StringClickHouseSource adapts a ClickHouseSource<ClickHouseRow> onto
 // the "string" channel for pipelines submitted through the legacy
 // text-only submission path. Each row's cell values are joined with a
 // configurable delimiter (default '|', matching postgres_text_source).
 class StringClickHouseSource final : public Source<std::string> {
 public:
-    StringClickHouseSource(ClickHouseSource::Options opts, std::string delim)
-        : inner_(std::move(opts)), delim_(std::move(delim)) {}
+    // json=false: legacy delimiter-joined string (clickhouse_text_source).
+    // json=true:  a JSON object keyed by column name (clickhouse_source, M2) for
+    //             the Row path via json_string_to_row.
+    StringClickHouseSource(ClickHouseSource::Options opts, std::string delim, bool json = false)
+        : inner_(std::move(opts)), delim_(std::move(delim)), json_(json) {}
 
     void open() override { inner_.open(); }
     void close() override { inner_.close(); }
@@ -36,11 +55,16 @@ public:
 
     bool produce(Emitter<std::string>& out) override {
         const auto& delim = delim_;
-        Emitter<ClickHouseRow> forwarder(
-            Emitter<ClickHouseRow>::Forward([&out, &delim](StreamElement<ClickHouseRow> e) -> bool {
+        const bool json = json_;
+        Emitter<ClickHouseRow> forwarder(Emitter<ClickHouseRow>::Forward(
+            [&out, &delim, json](StreamElement<ClickHouseRow> e) -> bool {
                 if (e.is_data()) {
                     Batch<std::string> b;
                     for (const auto& r : e.as_data()) {
+                        if (json) {
+                            b.emplace(clickhouse_row_to_json(r.value()));
+                            continue;
+                        }
                         std::string joined;
                         const auto& vs = r.value().values();
                         for (std::size_t i = 0; i < vs.size(); ++i) {
@@ -70,11 +94,14 @@ public:
         return inner_.restore_offset(backend, op_id);
     }
 
-    std::string name() const override { return "clickhouse_text_source"; }
+    std::string name() const override {
+        return json_ ? "clickhouse_source" : "clickhouse_text_source";
+    }
 
 private:
     ClickHouseSource inner_;
     std::string delim_;
+    bool json_{false};
 };
 
 // Shared options parser used by every source factory below. Centralised
@@ -165,6 +192,16 @@ void install(clink::plugin::PluginRegistry& reg) {
             auto opts = parse_source_options(ctx, "clickhouse_text_source");
             const auto delim = ctx.param_or("delim", "|");
             return std::make_shared<StringClickHouseSource>(std::move(opts), delim);
+        });
+
+    // clickhouse_source (M2): the same SELECT, but each row is a JSON object keyed
+    // by column name on the string channel - bridged to a multi-column Row table
+    // via json_string_to_row. The newer pattern (cf. mysql_source); the delimited
+    // clickhouse_text_source is kept for back-compat.
+    reg.register_source<std::string>(
+        "clickhouse_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
+            auto opts = parse_source_options(ctx, "clickhouse_source");
+            return std::make_shared<StringClickHouseSource>(std::move(opts), "|", /*json=*/true);
         });
 }
 

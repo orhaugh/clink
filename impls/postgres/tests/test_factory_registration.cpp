@@ -28,6 +28,14 @@ TEST(PostgresFactoryRegistration, PostgresJsonSinkIsRegistered) {
     EXPECT_NE(rr.find_sink("postgres_sink", "string"), nullptr);
 }
 
+TEST(PostgresFactoryRegistration, PostgresJsonSourceIsRegistered) {
+    // M3: the JSON source on the string channel (delimited postgres_text_source
+    // kept for back-compat).
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_source("postgres_source", "string"), nullptr);
+    EXPECT_NE(rr.find_source("postgres_text_source", "string"), nullptr);  // back-compat preserved
+}
+
 TEST(PostgresFactoryRegistration, PostgresRowAndCdcEventTypedChannelsAndOpsAreRegistered) {
     const auto& tr = TypeRegistry::default_instance();
     ASSERT_NE(tr.find(clink::kChannelPostgresRow), nullptr);

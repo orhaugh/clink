@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/config/json.hpp"
 #include "clink/connectors/cdc_event.hpp"
 #include "clink/connectors/postgres_cdc_source.hpp"
 #include "clink/connectors/postgres_json_sink.hpp"
@@ -190,13 +191,28 @@ private:
     PostgresCdcSource inner_;
 };
 
-// Adapter that turns a PostgresSource into a Source<std::string>,
-// joining each row's column values with a configurable delimiter.
-// Caller controls the delimiter to avoid collisions with payload text.
+// Render a PostgresRow as a single-line JSON object keyed by column name (M3),
+// so json_string_to_row can map it to a multi-column Row table. Values are text
+// (the bridge coerces per the declared column types). Falls back to positional
+// keys if column names are unavailable.
+std::string postgres_row_to_json(const PostgresRow& r) {
+    const auto& vs = r.values();
+    const auto names = r.column_names();
+    clink::config::JsonObject obj;
+    for (std::size_t i = 0; i < vs.size(); ++i) {
+        const std::string key = (names && i < names->size()) ? (*names)[i] : std::to_string(i);
+        obj[key] = clink::config::JsonValue{vs[i]};
+    }
+    return clink::config::JsonValue{std::move(obj)}.serialize(0);
+}
+
+// Adapter that turns a PostgresSource into a Source<std::string>. json=false:
+// legacy delimiter-joined string (postgres_text_source). json=true: a JSON object
+// keyed by column name (postgres_source, M3) for the Row path.
 class StringPostgresSource final : public Source<std::string> {
 public:
-    StringPostgresSource(PostgresSource::Options opts, std::string delim)
-        : inner_(std::move(opts)), delim_(std::move(delim)) {}
+    StringPostgresSource(PostgresSource::Options opts, std::string delim, bool json = false)
+        : inner_(std::move(opts)), delim_(std::move(delim)), json_(json) {}
 
     void open() override { inner_.open(); }
     void close() override { inner_.close(); }
@@ -204,11 +220,16 @@ public:
 
     bool produce(Emitter<std::string>& out) override {
         const auto& delim = delim_;
-        Emitter<PostgresRow> forwarder(
-            Emitter<PostgresRow>::Forward([&out, &delim](StreamElement<PostgresRow> e) -> bool {
+        const bool json = json_;
+        Emitter<PostgresRow> forwarder(Emitter<PostgresRow>::Forward(
+            [&out, &delim, json](StreamElement<PostgresRow> e) -> bool {
                 if (e.is_data()) {
                     Batch<std::string> b;
                     for (const auto& r : e.as_data()) {
+                        if (json) {
+                            b.emplace(postgres_row_to_json(r.value()));
+                            continue;
+                        }
                         std::string joined;
                         const auto& vs = r.value().values();
                         for (std::size_t i = 0; i < vs.size(); ++i) {
@@ -238,11 +259,12 @@ public:
         return inner_.restore_offset(backend, op_id);
     }
 
-    std::string name() const override { return "postgres_text_source"; }
+    std::string name() const override { return json_ ? "postgres_source" : "postgres_text_source"; }
 
 private:
     PostgresSource inner_;
     std::string delim_;
+    bool json_{false};
 };
 
 }  // namespace
@@ -359,6 +381,25 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             return std::make_shared<StringPostgresSource>(std::move(opts),
                                                           ctx.param_or("delim", "|"));
+        });
+
+    // postgres_source (M3): the same SELECT, but each row is a JSON object keyed by
+    // column name on the string channel - bridged to a multi-column Row table via
+    // json_string_to_row. The newer pattern (cf. mysql_source); the delimited
+    // postgres_text_source is kept for back-compat.
+    reg.register_source<std::string>(
+        "postgres_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
+            PostgresSource::Options opts;
+            opts.conninfo = ctx.param_or("conninfo");
+            opts.query = ctx.param_or("query");
+            opts.batch_size = static_cast<std::size_t>(ctx.param_int64_or("batch_size", 256));
+            if (opts.conninfo.empty()) {
+                throw std::runtime_error("postgres_source: 'conninfo' is required");
+            }
+            if (opts.query.empty()) {
+                throw std::runtime_error("postgres_source: 'query' is required");
+            }
+            return std::make_shared<StringPostgresSource>(std::move(opts), "|", /*json=*/true);
         });
 
     // postgres_sink (M4): batched multi-row INSERT of JSON-object rows. At-least-

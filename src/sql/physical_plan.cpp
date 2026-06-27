@@ -216,9 +216,28 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // (cursor checkpoint). Not CDC.
         return RowConnectorBinding{"mysql_source", kChannelString, "json_string_to_row"};
     }
+    if (connector == "clickhouse") {
+        // ClickHouse source (M2): SELECT rows as JSON objects keyed by column name
+        // (string channel) bridged to Row. Bounded query (no cursor checkpoint).
+        return RowConnectorBinding{"clickhouse_source", kChannelString, "json_string_to_row"};
+    }
+    if (connector == "postgres") {
+        // Postgres JDBC source (M3): SELECT rows as JSON objects keyed by column
+        // name (string channel) bridged to Row. CDC on the Row path is not yet
+        // wired (it would silently fall through to a plain SELECT) - reject it
+        // loudly until the CDC JSON source lands (migration M5); CDC remains
+        // available on the string channel (postgres_cdc_text_source).
+        auto it = table.properties.find("mode");
+        if (it != table.properties.end() && it->second == "cdc") {
+            unsupported(
+                "connector='postgres' mode='cdc' with format='json' is not yet supported; use the "
+                "string channel (a single TEXT column) for postgres_cdc_text_source");
+        }
+        return RowConnectorBinding{"postgres_source", kChannelString, "json_string_to_row"};
+    }
     unsupported(
         "format='json' source requires connector='file', 'kafka', 'parquet', 'nexmark', "
-        "'kinesis', 'http_poll', 'redis' or 'mysql' (got '" +
+        "'kinesis', 'http_poll', 'redis', 'mysql', 'clickhouse' or 'postgres' (got '" +
         connector + "')");
 }
 

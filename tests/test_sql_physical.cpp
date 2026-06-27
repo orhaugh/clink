@@ -386,6 +386,60 @@ TEST(SqlPhysical, PostgresConnectorSinkRejectsChangelogUpsert) {
     });
 }
 
+// M2: connector='clickhouse' SOURCE lowers to clickhouse_source (JSON objects on
+// the string channel) bridged to Row via json_string_to_row.
+TEST(SqlPhysical, ClickHouseConnectorSourceLowers) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE ch_in (a BIGINT, b VARCHAR) WITH (connector='clickhouse', format='json', "
+        "query='SELECT a, b FROM events', host='ch');"
+        "CREATE TABLE out_f (a BIGINT, b VARCHAR) WITH (connector='file', format='json', "
+        "path='/tmp/o.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO out_f SELECT a, b FROM ch_in");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    ASSERT_NE(find_op(spec, "clickhouse_source"), nullptr);
+    EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);
+}
+
+// M3: connector='postgres' SOURCE lowers to postgres_source (JSON objects on the
+// string channel) bridged to Row via json_string_to_row.
+TEST(SqlPhysical, PostgresConnectorSourceLowers) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE pg_in (a BIGINT, b VARCHAR) WITH (connector='postgres', format='json', "
+        "conninfo='host=pg', query='SELECT a, b FROM events');"
+        "CREATE TABLE out_f (a BIGINT, b VARCHAR) WITH (connector='file', format='json', "
+        "path='/tmp/o.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO out_f SELECT a, b FROM pg_in");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    ASSERT_NE(find_op(spec, "postgres_source"), nullptr);
+    EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);
+}
+
+// CDC on the Row path is not yet wired (M5) - it must be rejected, not silently
+// routed to the plain SELECT source.
+TEST(SqlPhysical, PostgresCdcOnRowPathRejected) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE pg_in (a BIGINT) WITH (connector='postgres', format='json', mode='cdc', "
+        "conninfo='host=pg', slot_name='s');"
+        "CREATE TABLE out_f (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/o.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    EXPECT_ANY_THROW({
+        auto plan = bind_insert(cat, "INSERT INTO out_f SELECT a FROM pg_in");
+        PhysicalPlanner pp;
+        pp.compile(static_cast<const LogicalSink&>(*plan));
+    });
+}
+
 // M1: connector='clickhouse' SINK lowers to clickhouse_sink (string channel) via
 // the row_to_json_string bridge, with format=jsoneachrow FORCED by the binding
 // (the SQL format='json' channel selector is stripped before the factory).
