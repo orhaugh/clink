@@ -163,6 +163,25 @@ TEST(Json, EscapesControlCharsOnSerialize) {
     EXPECT_NE(serialized.find("\\u0001"), std::string::npos);
 }
 
+TEST(Json, SerializeOutOfRangeDoubleAvoidsInt64CastUB) {
+    // > 2^63: integer-valued but out of int64 range. Must render as a double
+    // (not via the UB int64 cast). In-range integer-valued doubles still render
+    // without a trailing ".0".
+    EXPECT_EQ(JsonValue{42.0}.serialize(), "42");
+    const std::string big = JsonValue{1e19}.serialize();
+    EXPECT_NE(big.find('e'), std::string::npos) << big;  // scientific/float form
+    EXPECT_NO_FATAL_FAILURE((void)JsonValue{9223372036854775808.0}.serialize());  // exactly 2^63
+}
+
+TEST(Json, IntOrOutOfRangeReturnsFallback) {
+    JsonObject o;
+    o["big"] = JsonValue{1e19};  // out of int64 range
+    o["ok"] = JsonValue{static_cast<std::int64_t>(123)};
+    JsonValue v{std::move(o)};
+    EXPECT_EQ(v.int_or("big", -1), -1);  // unrepresentable as int64 -> fallback
+    EXPECT_EQ(v.int_or("ok", -7), 123);
+}
+
 TEST(Json, ConfigStyleDocumentRoundTrips) {
     // A representative pipeline-config document, to make sure the parser
     // handles the exact shape we'll see in test_pipeline_config.cpp.

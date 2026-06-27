@@ -75,6 +75,13 @@ public:
         if (opts_.max_records_per_poll < 1 || opts_.max_records_per_poll > 10000) {
             opts_.max_records_per_poll = 1000;
         }
+        // Fail fast on a bad initial_position rather than silently coercing a typo
+        // (e.g. "lastest") to TRIM_HORIZON, which would replay the whole stream.
+        if (opts_.initial_position != "trim_horizon" && opts_.initial_position != "latest") {
+            throw std::runtime_error(opts_.name + ": invalid initial_position '" +
+                                     opts_.initial_position +
+                                     "' (expected 'trim_horizon' or 'latest')");
+        }
     }
 
     void open() override {

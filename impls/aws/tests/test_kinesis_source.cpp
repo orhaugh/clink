@@ -47,3 +47,17 @@ TEST(KinesisSourceCtor, IsUnbounded) {
     KinesisSource src{std::move(o)};
     EXPECT_FALSE(src.is_bounded());
 }
+
+TEST(KinesisSourceCtor, RejectsInvalidInitialPosition) {
+    KinesisSourceOptions o;
+    o.stream = "s";
+    o.initial_position = "lastest";  // typo: must not silently coerce to TRIM_HORIZON
+    EXPECT_THROW(KinesisSource{std::move(o)}, std::runtime_error);
+
+    for (const char* ok : {"trim_horizon", "latest"}) {
+        KinesisSourceOptions g;
+        g.stream = "s";
+        g.initial_position = ok;
+        EXPECT_NO_THROW(KinesisSource{std::move(g)});
+    }
+}

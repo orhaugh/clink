@@ -352,8 +352,14 @@ void serialize_to(std::ostringstream& out, const JsonValue& v, int indent_width,
             return;
         case JsonValue::Type::Number: {
             const double d = v.as_number();
-            // Render integers without trailing ".0" for nicer output.
-            if (std::isfinite(d) && d == static_cast<double>(static_cast<std::int64_t>(d))) {
+            // Render integers without trailing ".0" for nicer output. The range
+            // guard is load-bearing: a double->int64 cast is UB outside int64, and
+            // the magnitude check must short-circuit BEFORE the equality cast.
+            // 2^63 is exactly representable as a double, so the upper bound is '<'.
+            constexpr double kInt64Lo = -9223372036854775808.0;          // -2^63
+            constexpr double kInt64HiExclusive = 9223372036854775808.0;  //  2^63
+            if (std::isfinite(d) && d >= kInt64Lo && d < kInt64HiExclusive &&
+                d == static_cast<double>(static_cast<std::int64_t>(d))) {
                 out << static_cast<std::int64_t>(d);
             } else {
                 out << d;
@@ -464,7 +470,15 @@ std::int64_t JsonValue::int_or(std::string_view key, std::int64_t fallback) cons
     if (!v.is_number()) {
         throw std::runtime_error("JsonValue::int_or: '" + std::string{key} + "' is not a number");
     }
-    return static_cast<std::int64_t>(v.as_number());
+    // A double->int64 cast is UB for NaN/Inf or a magnitude >= 2^63; such a value
+    // cannot be represented as int64, so return the fallback rather than risk UB.
+    const double d = v.as_number();
+    constexpr double kInt64Lo = -9223372036854775808.0;          // -2^63
+    constexpr double kInt64HiExclusive = 9223372036854775808.0;  //  2^63
+    if (!std::isfinite(d) || d < kInt64Lo || d >= kInt64HiExclusive) {
+        return fallback;
+    }
+    return static_cast<std::int64_t>(d);
 }
 
 bool JsonValue::bool_or(std::string_view key, bool fallback) const {
