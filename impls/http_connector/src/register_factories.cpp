@@ -237,6 +237,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.initial_cursor = ctx.param_or("initial_cursor", "");
             o.interval = std::chrono::milliseconds{ctx.param_int64_or("poll_interval_ms", 1000)};
             o.jitter_frac = std::stod(ctx.param_or("jitter_frac", "0"));
+            o.bounded = ctx.param_or("bounded", "") == "true";  // one-shot poll
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
             o.retry_base_backoff =
                 std::chrono::milliseconds{ctx.param_int64_or("retry_base_backoff_ms", 200)};

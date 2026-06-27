@@ -704,6 +704,12 @@ bool PostgresCdcSource::produce(Emitter<CdcEvent>& out) {
             impl_->last_dropped = impl_->pgoutput_state.dropped_data_events;
             clink::metrics::connector::dropped_events_inc("postgres_cdc", delta);
             clink::metrics::connector::error_inc("postgres_cdc", "source");
+            // Fail policy: do not silently drop - throw so the subtask restarts and
+            // replays from the slot (the undecodable event is retried, not lost).
+            if (impl_->opts.decode_error_policy == DecodeErrorPolicy::Fail) {
+                throw std::runtime_error("postgres_cdc: " + std::to_string(delta) +
+                                         " undecodable change event(s) and on_decode_error=fail");
+            }
         }
     };
     while (true) {

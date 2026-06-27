@@ -118,6 +118,42 @@ TEST(PollingSource, IsUnbounded) {
     EXPECT_FALSE(src.is_bounded());
 }
 
+TEST(PollingSource, BoundedModeFinishesWhenAPollDrains) {
+    // Two pages of rows, then an empty page. Bounded mode must emit both pages
+    // and then signal end-of-input (produce -> false); is_bounded() is true.
+    PollingSource<std::string>::Options o = fast_opts();
+    o.bounded = true;
+    int call = 0;
+    PollingSource<std::string> src(o, [&call](const std::string&) {
+        ++call;
+        if (call == 1) {
+            return PollingSource<std::string>::PollResult{{"a", "b"}, "1"};
+        }
+        if (call == 2) {
+            return PollingSource<std::string>::PollResult{{"c"}, "2"};
+        }
+        return PollingSource<std::string>::PollResult{{}, ""};  // drained
+    });
+    EXPECT_TRUE(src.is_bounded());
+    Captured<std::string> cap;
+    auto em = capturing(cap);
+    EXPECT_TRUE(src.produce(em));   // page 1
+    EXPECT_TRUE(src.produce(em));   // page 2
+    EXPECT_FALSE(src.produce(em));  // empty poll -> end of one-shot snapshot
+    EXPECT_EQ(cap.values, (std::vector<std::string>{"a", "b", "c"}));
+}
+
+TEST(PollingSource, BoundedEmptyTableFinishesImmediately) {
+    PollingSource<std::string>::Options o = fast_opts();
+    o.bounded = true;
+    PollingSource<std::string> src(
+        o, [](const std::string&) { return PollingSource<std::string>::PollResult{{}, ""}; });
+    Captured<std::string> cap;
+    auto em = capturing(cap);
+    EXPECT_FALSE(src.produce(em));  // nothing to read -> done
+    EXPECT_TRUE(cap.values.empty());
+}
+
 TEST(PollingSource, JitteredIntervalBounds) {
     using P = PollingSource<std::string>;
     const std::chrono::milliseconds base{1000};

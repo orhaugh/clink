@@ -321,6 +321,9 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.publication_names = ctx.param_or("publication_names");
             opts.create_slot = ctx.param_or("create_slot", "true") == "true";
             opts.drop_slot_on_close = ctx.param_or("drop_slot_on_close", "false") == "true";
+            opts.decode_error_policy = ctx.param_or("on_decode_error", "drop") == "fail"
+                                           ? PostgresCdcSource::DecodeErrorPolicy::Fail
+                                           : PostgresCdcSource::DecodeErrorPolicy::Drop;
             if (opts.conninfo.empty()) {
                 throw std::runtime_error("postgres_cdc_event_source: 'conninfo' is required");
             }
@@ -352,6 +355,9 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.publication_names = ctx.param_or("publication_names");
             opts.create_slot = ctx.param_or("create_slot", "true") == "true";
             opts.drop_slot_on_close = ctx.param_or("drop_slot_on_close", "false") == "true";
+            opts.decode_error_policy = ctx.param_or("on_decode_error", "drop") == "fail"
+                                           ? PostgresCdcSource::DecodeErrorPolicy::Fail
+                                           : PostgresCdcSource::DecodeErrorPolicy::Drop;
             if (opts.conninfo.empty()) {
                 throw std::runtime_error("postgres_cdc_text_source: 'conninfo' is required");
             }
@@ -380,6 +386,9 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.publication_names = ctx.param_or("publication_names");
             opts.create_slot = ctx.param_or("create_slot", "true") == "true";
             opts.drop_slot_on_close = ctx.param_or("drop_slot_on_close", "false") == "true";
+            opts.decode_error_policy = ctx.param_or("on_decode_error", "drop") == "fail"
+                                           ? PostgresCdcSource::DecodeErrorPolicy::Fail
+                                           : PostgresCdcSource::DecodeErrorPolicy::Drop;
             if (opts.conninfo.empty()) {
                 throw std::runtime_error("postgres_cdc_source: 'conninfo' is required");
             }

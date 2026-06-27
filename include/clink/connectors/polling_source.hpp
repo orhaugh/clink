@@ -5,7 +5,8 @@
 // supplies a `poll(cursor) -> {records, next_cursor}` callback and the base owns
 // the produce loop, the interval throttle, and the cursor checkpoint.
 //
-// Unbounded, AT-LEAST-ONCE: the cursor is persisted as operator state, so on
+// Unbounded by default (opt-in one-shot bounded mode via Options::bounded),
+// AT-LEAST-ONCE: the cursor is persisted as operator state, so on
 // restart the source re-polls from the last checkpointed cursor. The poll
 // callback owns the cursor's inclusive/exclusive semantics - use an EXCLUSIVE
 // cursor (fetch strictly AFTER it) to avoid re-emitting the boundary record on
@@ -44,6 +45,13 @@ public:
         // +/-20%). De-synchronises many pollers so they do not all hit the
         // endpoint on the same tick (a thundering herd).
         double jitter_frac{0.0};
+        // One-shot snapshot mode: read until a poll returns zero records, then
+        // finish (produce() returns false, is_bounded() is true). The default
+        // (false) is an endless tail. In bounded mode a zero-record poll is taken
+        // as end-of-input, so the cursor query must return all currently-available
+        // rows across pages before it drains (a row arriving AFTER the drain is not
+        // picked up - that is the one-shot contract; use the unbounded tail for CDC).
+        bool bounded{false};
         std::string name{"polling_source"};
     };
 
@@ -88,12 +96,15 @@ public:
         if (!r.next_cursor.empty()) {
             cursor_ = std::move(r.next_cursor);
         }
+        if (opts_.bounded && r.records.empty()) {
+            return false;  // one-shot snapshot drained: no more rows
+        }
         return !this->cancelled();
     }
 
     void cancel() override { Source<T>::cancel(); }
 
-    [[nodiscard]] bool is_bounded() const noexcept override { return false; }
+    [[nodiscard]] bool is_bounded() const noexcept override { return opts_.bounded; }
 
     std::string name() const override { return opts_.name; }
 

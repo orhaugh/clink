@@ -62,8 +62,9 @@ struct HttpPollOptions {
     std::string records_field;   // response field holding the array (else response is the array)
     std::string initial_cursor;  // starting cursor
     std::chrono::milliseconds interval{1000};
-    double jitter_frac{0.0};                            // +/- fraction on the poll interval
-    int max_retries{4};                                 // transient-GET retries within one poll
+    double jitter_frac{0.0};  // +/- fraction on the poll interval
+    bool bounded{false};      // one-shot: stop when a poll returns nothing
+    int max_retries{4};       // transient-GET retries within one poll
     std::chrono::milliseconds retry_base_backoff{200};  // backoff between transient retries
     std::string name{"http_poll_source"};
 };
@@ -137,6 +138,7 @@ inline std::shared_ptr<Source<std::string>> make_http_poll_source(HttpPollOption
     popts.interval = o.interval;
     popts.jitter_frac = o.jitter_frac;
     popts.initial_cursor = o.initial_cursor;
+    popts.bounded = o.bounded;
     popts.name = o.name;
 
     auto poll = [state](const std::string& cursor) -> PollingSource<std::string>::PollResult {

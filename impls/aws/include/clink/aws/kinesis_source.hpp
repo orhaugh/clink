@@ -132,6 +132,14 @@ public:
     void snapshot_offset(StateBackend& backend,
                          OperatorId op_id,
                          CheckpointId /*ckpt_id*/) override {
+        // First reclaim rows for shards pruned since the last checkpoint (finished
+        // + expired from the stream), so the per-shard state does not grow without
+        // bound across reshards.
+        for (const auto& id : pending_prune_) {
+            const std::string key = kSeqPrefix + id;
+            backend.erase_operator_state(op_id, StateBackend::KeyView{key.data(), key.size()});
+        }
+        pending_prune_.clear();
         // One operator-state row per owned shard, keyed by ShardId so the
         // checkpoint survives a rescale. Value = the last SequenceNumber string
         // (or the restored resume point if the shard has not been read yet).
@@ -230,6 +238,24 @@ private:
             st.from_reshard = from_reshard;
             shards_.push_back(std::move(st));
             have.insert(id);
+        }
+
+        // Prune shards that have FINISHED (closed + fully drained) AND are no
+        // longer listed - they have expired from the stream's retention window, so
+        // their per-shard checkpoint row is dead weight (an unbounded leak over many
+        // reshards). Queue the persisted row for deletion at the next checkpoint.
+        // Safe: a non-existent shard cannot be re-read; in the rare case a transient
+        // ListShards omits a still-present finished shard, at-least-once tolerates
+        // the duplicate re-read (the engine dedupes downstream).
+        std::unordered_set<std::string> live(all_ids.begin(), all_ids.end());
+        for (auto it = shards_.begin(); it != shards_.end();) {
+            if (it->finished && live.find(it->shard_id) == live.end()) {
+                pending_prune_.push_back(it->shard_id);
+                restored_seqs_.erase(it->shard_id);
+                it = shards_.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 
@@ -332,6 +358,7 @@ private:
     std::unique_ptr<Aws::Kinesis::KinesisClient> client_;
     std::vector<ShardState> shards_;
     std::unordered_map<std::string, std::string> restored_seqs_;  // shard_id -> resume seq
+    std::vector<std::string> pending_prune_;  // finished+expired shard ids awaiting row deletion
     std::size_t rr_{0};
     std::size_t empty_streak_{0};
 };

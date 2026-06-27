@@ -116,6 +116,10 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.batch_size = static_cast<int>(ctx.param_int64_or("batch_size", 1000));
             o.interval = std::chrono::milliseconds{ctx.param_int64_or("poll_ms", 1000)};
             o.jitter_frac = std::stod(ctx.param_or("jitter_frac", "0"));
+            // bounded='true' (or mode='snapshot') = one-shot: read the table once
+            // then finish, instead of tailing it forever.
+            o.bounded =
+                ctx.param_or("bounded", "") == "true" || ctx.param_or("mode", "") == "snapshot";
             o.name = "mysql_source";
             return make_mysql_poll_source(o);
         });

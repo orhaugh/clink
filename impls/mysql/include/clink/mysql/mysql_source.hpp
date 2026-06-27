@@ -50,6 +50,7 @@ struct MysqlPollOptions {
     int batch_size{1000};
     std::chrono::milliseconds interval{1000};
     double jitter_frac{0.0};
+    bool bounded{false};  // one-shot snapshot: read the table once, then finish
     std::string name{"mysql_source"};
 };
 
@@ -93,6 +94,7 @@ inline std::shared_ptr<PollingSource<std::string>> make_mysql_poll_source(
     popts.interval = o.interval;
     popts.initial_cursor = o.initial_cursor;
     popts.jitter_frac = o.jitter_frac;
+    popts.bounded = o.bounded;
     popts.name = o.name;
 
     auto poll = [state](const std::string& cursor) -> PollingSource<std::string>::PollResult {

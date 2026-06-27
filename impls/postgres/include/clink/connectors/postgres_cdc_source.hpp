@@ -34,6 +34,13 @@ struct PostgresCdcSnapshotQuery {
 // is observed within ~50ms.
 class PostgresCdcSource final : public Source<CdcEvent> {
 public:
+    // What to do when the decoder cannot decode a change event (unknown relation,
+    // truncated tuple). Drop (default) = count it + continue (at-most-once for
+    // that event, the existing behaviour). Fail = throw so the job restarts and
+    // replays from the slot rather than losing the event - choose this when no
+    // silent loss is acceptable and a poison event should halt+retry instead.
+    enum class DecodeErrorPolicy { Drop, Fail };
+
     struct Options {
         // libpq connection string. The class adds `replication=database`
         // automatically; the user supplies host/port/user/password/dbname.
@@ -90,6 +97,9 @@ public:
         // ephemeral / per-job slots (CI, integration tests). Default false
         // because production slots are typically long-lived and shared.
         bool drop_slot_on_close{false};
+
+        // Behaviour when a change event cannot be decoded (see DecodeErrorPolicy).
+        DecodeErrorPolicy decode_error_policy{DecodeErrorPolicy::Drop};
     };
 
     explicit PostgresCdcSource(Options opts);
