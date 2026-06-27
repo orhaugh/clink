@@ -139,16 +139,25 @@ public:
                 finish_success_(n, dropped, dropped_bytes, t0);
                 return;
             }
-            // Permanent (poison) records: DLQ under Drop, throw under Fail.
+            // Permanent (poison) records: DLQ under Drop, throw under Fail. The
+            // rel < active.size() guards defend the public response_handler seam:
+            // the in-tree handlers only ever return in-range indices, but a
+            // misbehaving custom handler must not index out of bounds (UB).
             if (!r.failed_permanent.empty()) {
                 if (opts_.dlq_policy == DlqPolicy::Drop) {
+                    std::size_t valid = 0;
                     for (std::size_t rel : r.failed_permanent) {
+                        if (rel >= active.size()) {
+                            continue;
+                        }
                         dropped_bytes += fragments_[active[rel]].size();
+                        ++valid;
                     }
-                    dropped += r.failed_permanent.size();
-                    clink::metrics::connector::dropped_records_inc(opts_.name,
-                                                                   r.failed_permanent.size());
-                    clink::metrics::connector::permanent_failures_inc(opts_.name);
+                    dropped += valid;
+                    if (valid > 0) {
+                        clink::metrics::connector::dropped_records_inc(opts_.name, valid);
+                        clink::metrics::connector::permanent_failures_inc(opts_.name);
+                    }
                 } else {
                     clink::metrics::connector::error_inc(opts_.name, "sink");
                     throw HttpDeliveryError(
@@ -160,14 +169,16 @@ public:
             }
             // Everything else this round either succeeded or was dropped; only the
             // transient failures get resent.
-            if (r.failed_transient.empty()) {
-                finish_success_(n, dropped, dropped_bytes, t0);
-                return;
-            }
             std::vector<std::size_t> next;
             next.reserve(r.failed_transient.size());
             for (std::size_t rel : r.failed_transient) {
-                next.push_back(active[rel]);
+                if (rel < active.size()) {
+                    next.push_back(active[rel]);
+                }
+            }
+            if (next.empty()) {
+                finish_success_(n, dropped, dropped_bytes, t0);
+                return;
             }
             active = std::move(next);
         }

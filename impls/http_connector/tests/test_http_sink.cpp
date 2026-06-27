@@ -291,3 +291,23 @@ TEST(HttpDlq, DefaultFailPolicyThrowsOnPermanent) {
     sink.on_data(b);
     EXPECT_THROW(sink.flush(), std::runtime_error);
 }
+
+TEST(HttpBulkSink, ResponseHandlerOutOfRangeIndexIsIgnoredNotUB) {
+    // The response_handler is a public extension seam; a misbehaving custom
+    // handler returning an out-of-range index must be skipped, not indexed OOB.
+    StubServer srv;
+    auto opts = base_opts(srv.url(), 100);
+    opts.response_handler = [](const clink::http_connector::HttpResponse&, std::size_t) {
+        clink::http_connector::BulkResult r;
+        r.ok = false;
+        r.failed_transient = {99};  // out of range for a 1-record batch
+        return r;
+    };
+    opts.max_retries = 0;
+    BatchedHttpBulkSink<std::string> sink(opts, verbatim());
+    sink.open();
+    Batch<std::string> b;
+    b.emplace(std::string{R"({"a":1})"});
+    sink.on_data(b);
+    EXPECT_NO_THROW(sink.flush());  // OOB index skipped -> no survivors -> success, no UB
+}
