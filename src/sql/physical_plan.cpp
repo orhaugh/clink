@@ -131,9 +131,7 @@ std::string string_sink_factory_for(const TableDef& table) {
         return "mysql_sink";
     }
     if (connector == "postgres") {
-        unsupported(
-            "postgres sink requires multi-column rows (Phase 3); use connector='kafka' or "
-            "'file' for single-string ingest of postgres data");
+        return "postgres_sink";
     }
     unsupported("unsupported sink connector '" + connector + "' for table " + table.name);
 }
@@ -283,6 +281,24 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{
             "clickhouse_sink", kChannelString, "row_to_json_string", {{"format", "jsoneachrow"}}};
+    }
+    if (connector == "postgres") {
+        // Postgres sink (M4). Each row -> JSON object string -> batched INSERT.
+        // At-least-once. exactly_once (2PC) not supported. clink mode='upsert' is a
+        // changelog contract (delete tombstones) this append sink does not
+        // implement; use the WITH-option on_conflict='update' (+ conflict_columns)
+        // for idempotent insert-or-update by key.
+        if (exactly_once) {
+            unsupported(
+                "connector='postgres' sink is at-least-once; exactly-once delivery is not "
+                "supported");
+        }
+        if (upsert) {
+            unsupported(
+                "connector='postgres' sink does not implement mode='upsert' (changelog deletes); "
+                "use on_conflict='update' with conflict_columns for idempotent upsert by key");
+        }
+        return RowConnectorBinding{"postgres_sink", kChannelString, "row_to_json_string"};
     }
     if (connector == "http") {
         // HTTP(S) bulk / webhook sink (at-least-once; no 2PC). Each row is
@@ -449,9 +465,9 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         return RowConnectorBinding{"changelog_net_sink", kChannelRow, {}};
     }
     unsupported(
-        "format='json' sink requires connector='file', 'kafka', 'clickhouse', 'parquet', 'http', "
-        "'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'kinesis', 'redis', 'mysql', "
-        "'firehose', 'dynamodb', 'blackhole' or 'changelog' (got '" +
+        "format='json' sink requires connector='file', 'kafka', 'clickhouse', 'postgres', "
+        "'parquet', 'http', 'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', 'kinesis', "
+        "'redis', 'mysql', 'firehose', 'dynamodb', 'blackhole' or 'changelog' (got '" +
         connector + "')");
 }
 

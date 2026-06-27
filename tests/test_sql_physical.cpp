@@ -345,6 +345,47 @@ TEST(SqlPhysical, RedisConnectorSinkLowersToXaddSink) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
 }
 
+// M4: connector='postgres' SINK lowers to postgres_sink (string channel) via the
+// row_to_json_string bridge, carrying the on_conflict knob; columns derive from
+// the declared schema (no columns= needed). The "Phase 3" rejection is gone.
+TEST(SqlPhysical, PostgresConnectorSinkLowers) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT, b VARCHAR) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE pg_out (a BIGINT, b VARCHAR) WITH (connector='postgres', format='json', "
+        "conninfo='host=pg', table='events', on_conflict='update', conflict_columns='a');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO pg_out SELECT a, b FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* snk = find_op(spec, "postgres_sink");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("table"), "events");
+    EXPECT_EQ(snk->params.at("on_conflict"), "update");
+    EXPECT_FALSE(snk->params.at("schema_columns").empty());  // factory derives columns
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+}
+
+// clink mode='upsert' (changelog) is NOT silently accepted for postgres - use the
+// on_conflict='update' WITH-option instead.
+TEST(SqlPhysical, PostgresConnectorSinkRejectsChangelogUpsert) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE pg_out (a BIGINT) WITH (connector='postgres', format='json', "
+        "conninfo='host=pg', table='events', mode='upsert');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    EXPECT_ANY_THROW({
+        auto plan = bind_insert(cat, "INSERT INTO pg_out SELECT a FROM src_t");
+        PhysicalPlanner pp;
+        pp.compile(static_cast<const LogicalSink&>(*plan));
+    });
+}
+
 // M1: connector='clickhouse' SINK lowers to clickhouse_sink (string channel) via
 // the row_to_json_string bridge, with format=jsoneachrow FORCED by the binding
 // (the SQL format='json' channel selector is stripped before the factory).
@@ -708,21 +749,22 @@ TEST(SqlPhysical, S3TextSinkMaps) {
     EXPECT_NE(find_op(spec, "s3_text_sink"), nullptr);
 }
 
-TEST(SqlPhysical, PostgresSinkRejectedWithUsefulMessage) {
+// M4: the postgres sink is now implemented, so a postgres sink table lowers to
+// postgres_sink instead of the old "Phase 3" rejection. (The multi-column JSON
+// path is covered by PostgresConnectorSinkLowers; this is the string-channel
+// lowering.)
+TEST(SqlPhysical, PostgresSinkLowersToPostgresSink) {
     Catalog cat;
     auto s = parse(
         "CREATE TABLE src (line TEXT) WITH (connector='file', path='/tmp/in');"
-        "CREATE TABLE pg_sink (line TEXT) WITH (connector='postgres', dsn='postgresql://...')");
+        "CREATE TABLE pg_sink (line TEXT) WITH (connector='postgres', conninfo='host=pg', "
+        "table='t')");
     cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
     cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
     auto plan = bind_insert(cat, "INSERT INTO pg_sink SELECT line FROM src");
     PhysicalPlanner pp;
-    try {
-        pp.compile(static_cast<const LogicalSink&>(*plan));
-        FAIL() << "expected TranslationError";
-    } catch (const TranslationError& e) {
-        EXPECT_NE(std::string(e.what()).find("Phase 3"), std::string::npos);
-    }
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    EXPECT_NE(find_op(spec, "postgres_sink"), nullptr);
 }
 
 TEST(SqlPhysical, MultiColumnJsonFlowUsesRowFactories) {

@@ -9,18 +9,24 @@
 //     and postgres_cdc_text_source with the supplied PluginRegistry.
 //     Callers invoke explicitly after ensure_built_ins_registered().
 
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "clink/connectors/cdc_event.hpp"
 #include "clink/connectors/postgres_cdc_source.hpp"
+#include "clink/connectors/postgres_json_sink.hpp"
 #include "clink/connectors/postgres_row.hpp"
 #include "clink/connectors/postgres_source.hpp"
+#include "clink/connectors/postgres_sql.hpp"
 #include "clink/core/record.hpp"
+#include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/postgres/cdc_event_codec.hpp"
@@ -30,6 +36,31 @@
 namespace clink::postgres {
 
 namespace {
+
+// Split a comma-separated option value, trimming spaces, dropping empties.
+std::vector<std::string> split_csv(const std::string& s) {
+    std::vector<std::string> out;
+    std::size_t i = 0;
+    while (i < s.size()) {
+        std::size_t j = s.find(',', i);
+        if (j == std::string::npos) {
+            j = s.size();
+        }
+        std::size_t b = i;
+        std::size_t e = j;
+        while (b < e && s[b] == ' ') {
+            ++b;
+        }
+        while (e > b && s[e - 1] == ' ') {
+            --e;
+        }
+        if (e > b) {
+            out.push_back(s.substr(b, e - b));
+        }
+        i = j + 1;
+    }
+    return out;
+}
 
 // Adapter that turns a PostgresCdcSource into a Source<std::string>,
 // serialising each CdcEvent as a JSON-shaped line:
@@ -328,6 +359,41 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             return std::make_shared<StringPostgresSource>(std::move(opts),
                                                           ctx.param_or("delim", "|"));
+        });
+
+    // postgres_sink (M4): batched multi-row INSERT of JSON-object rows. At-least-
+    // once (effectively-once with on_conflict='update' + conflict_columns). The
+    // newer string-channel + JSON pattern (cf. mysql_sink), distinct from the
+    // older vector<string>+$N PostgresSink. params:
+    //   conninfo (required)
+    //   table (required)
+    //   columns                   - comma-separated projection; on the SQL path it
+    //       defaults to the table's declared schema (schema_columns).
+    //   on_conflict ("" [plain] | "update" | "nothing")
+    //   conflict_columns          - comma-separated ON CONFLICT target (required
+    //       when on_conflict is set)
+    //   update_columns            - comma-separated DO UPDATE SET list (empty = all
+    //       non-conflict columns)
+    //   batch_records (default 1000), max_bytes (0=off), linger_ms (0=off)
+    reg.register_sink<std::string>(
+        "postgres_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            PostgresJsonSinkOptions o;
+            o.conninfo = ctx.param_or("conninfo");
+            o.table = ctx.param_or("table");
+            o.columns = split_csv(ctx.param_or("columns", ""));
+            if (o.columns.empty()) {
+                // SQL Row path: fall back to the declared table schema so the user
+                // need not repeat columns= matching the DDL.
+                o.columns = pgsql::columns_from_schema(ctx.param_or("schema_columns", ""));
+            }
+            o.on_conflict = ctx.param_or("on_conflict", "");
+            o.conflict_columns = split_csv(ctx.param_or("conflict_columns", ""));
+            o.update_columns = split_csv(ctx.param_or("update_columns", ""));
+            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 1000));
+            o.max_bytes = static_cast<std::size_t>(ctx.param_int64_or("max_bytes", 0));
+            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
+            o.name = "postgres_sink";
+            return std::make_shared<PostgresJsonSink>(std::move(o));
         });
 }
 
