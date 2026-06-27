@@ -39,6 +39,23 @@ inline HttpFailureClass classify_http_status(int status) {
     return HttpFailureClass::Permanent;
 }
 
+// What a sink does with a record batch that fails PERMANENTLY (a 4xx poison
+// request that will fail identically on replay). Fail (default) = throw, the job
+// replays = at-least-once but a crash-loop on a genuinely-poison batch. Drop =
+// route to the dead-letter path (count + metric) and continue, so one poison
+// batch does not wedge the pipeline. Transient failures always replay regardless.
+enum class DlqPolicy { Fail, Drop };
+
+// Thrown by post_with_retry on exhausted retries. Derives from runtime_error so
+// existing catch(const std::runtime_error&) sites + the message are preserved,
+// but also carries the final HttpResponse so a caller can classify the failure
+// (transient vs permanent) for a DLQ decision.
+struct HttpDeliveryError : std::runtime_error {
+    HttpResponse response;
+    HttpDeliveryError(const std::string& msg, HttpResponse r)
+        : std::runtime_error(msg), response(std::move(r)) {}
+};
+
 // Parse a "K1: V1; K2: V2" header string into a map. Empty -> no headers.
 // Splits each pair on the FIRST ':', so a value may itself contain ':' (e.g.
 // "Authorization: Bearer a:b"). Whitespace around key/value is trimmed.
@@ -135,8 +152,9 @@ inline void post_with_retry(HttpRequest& client,
     if (res.status >= 200 && res.status < 300 && !res.body.empty()) {
         detail += " body: " + res.body.substr(0, 256);
     }
-    throw std::runtime_error(sink_name + ": POST " + base_url + path + " failed after " +
-                             std::to_string(max_retries + 1) + " attempts (" + detail + ")");
+    throw HttpDeliveryError(sink_name + ": POST " + base_url + path + " failed after " +
+                                std::to_string(max_retries + 1) + " attempts (" + detail + ")",
+                            res);
 }
 
 }  // namespace clink::http_connector

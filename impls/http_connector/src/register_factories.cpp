@@ -19,6 +19,15 @@
 
 namespace clink::http_connector {
 
+namespace {
+// dlq="drop" routes a permanently-failed (4xx) batch to the dead-letter path
+// (count + metric) instead of failing the job; anything else keeps the
+// fail-and-replay default.
+DlqPolicy parse_dlq(const clink::plugin::BuildContext& ctx) {
+    return ctx.param_or("dlq", "fail") == "drop" ? DlqPolicy::Drop : DlqPolicy::Fail;
+}
+}  // namespace
+
 void install(clink::plugin::PluginRegistry& reg) {
     using clink::plugin::BuildContext;
 
@@ -57,6 +66,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.max_bytes =
                 static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 4 * 1024 * 1024));
             opts.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            opts.dlq_policy = parse_dlq(ctx);
             opts.name = "http_sink";
 
             // The record is already a serialized JSON object string (SQL path)
@@ -92,6 +102,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.batch_bytes =
                 static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 4 * 1024 * 1024));
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            o.dlq_policy = parse_dlq(ctx);
             o.name = name;
             return make_es_bulk_sink(std::move(o));
         };
@@ -127,6 +138,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.batch_bytes =
                 static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 4 * 1024 * 1024));
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            o.dlq_policy = parse_dlq(ctx);
             o.name = "splunk_hec_sink";
             return make_splunk_hec_sink(std::move(o));
         });

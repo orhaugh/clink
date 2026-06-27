@@ -55,8 +55,9 @@ public:
         std::size_t max_bytes{4 * 1024 * 1024};
         int max_retries{4};  // attempts beyond the first
         std::chrono::milliseconds retry_base_backoff{200};
-        bool flush_on_barrier{true};      // align delivery to checkpoints (at-least-once)
-        ResponseValidator response_ok{};  // empty -> 2xx is success
+        bool flush_on_barrier{true};            // align delivery to checkpoints (at-least-once)
+        ResponseValidator response_ok{};        // empty -> 2xx is success
+        DlqPolicy dlq_policy{DlqPolicy::Fail};  // permanent (4xx) failure: throw vs drop
         std::string name{"http_bulk_sink"};
     };
 
@@ -111,7 +112,22 @@ public:
         const auto t0 = std::chrono::steady_clock::now();
         try {
             post_with_retry_(body);
-        } catch (...) {
+        } catch (const HttpDeliveryError& e) {
+            // Permanent HTTP failure (a 4xx poison request) under DlqPolicy::Drop:
+            // route to the dead-letter path (count + metric) instead of crash-
+            // looping. A 2xx-but-validator-rejected response (e.g. ES bulk
+            // errors:true) is NOT dropped here - that is per-item handling's job;
+            // and a transient exhaustion (outage) always replays.
+            const int st = e.response.status;
+            const bool non_2xx = st < 200 || st >= 300;
+            if (opts_.dlq_policy == DlqPolicy::Drop && non_2xx &&
+                classify_http_status(st) == HttpFailureClass::Permanent) {
+                clink::metrics::connector::dropped_records_inc(opts_.name, n);
+                clink::metrics::connector::permanent_failures_inc(opts_.name);
+                buffer_.clear();
+                count_ = 0;
+                return;
+            }
             clink::metrics::connector::error_inc(opts_.name, "sink");
             throw;
         }

@@ -15,14 +15,25 @@
 #include "clink/core/record.hpp"
 #include "clink/core/stream_element.hpp"
 #include "clink/http_connector/batched_http_bulk_sink.hpp"
+#include "clink/metrics/metrics_registry.hpp"
 
 using clink::Batch;
 using clink::CheckpointBarrier;
 using clink::CheckpointId;
 using clink::http_connector::BatchedHttpBulkSink;
 using clink::http_connector::BulkFraming;
+using clink::http_connector::DlqPolicy;
 
 namespace {
+
+std::uint64_t counter_value(const std::string& name) {
+    for (const auto& [k, v] : clink::MetricsRegistry::global().snapshot().counters) {
+        if (k == name) {
+            return v;
+        }
+    }
+    return 0;
+}
 
 // A local HTTP server that captures POST bodies and can be told to fail the
 // first N requests with 503 (for the retry path).
@@ -42,6 +53,8 @@ public:
         });
         svr_.Post("/always500",
                   [](const httplib::Request&, httplib::Response& res) { res.status = 500; });
+        svr_.Post("/always400",  // permanent (poison) request
+                  [](const httplib::Request&, httplib::Response& res) { res.status = 400; });
         port_ = svr_.bind_to_any_port("127.0.0.1");
         thread_ = std::thread([this] { svr_.listen_after_bind(); });
         while (!svr_.is_running()) {
@@ -213,4 +226,52 @@ TEST(HttpFailureClassify, TransientVsPermanent) {
     EXPECT_EQ(classify_http_status(400), HttpFailureClass::Permanent);
     EXPECT_EQ(classify_http_status(403), HttpFailureClass::Permanent);
     EXPECT_EQ(classify_http_status(404), HttpFailureClass::Permanent);
+}
+
+TEST(HttpDlq, DropPolicyDropsPermanentFailureInsteadOfThrowing) {
+    StubServer srv;
+    auto opts = base_opts(srv.url(), 100);
+    opts.path = "/always400";  // permanent (poison) request
+    opts.max_retries = 1;
+    opts.dlq_policy = DlqPolicy::Drop;
+    opts.name = "dlq_http_sink";
+    BatchedHttpBulkSink<std::string> sink(opts, verbatim());
+    sink.open();
+    Batch<std::string> b;
+    b.emplace(std::string{R"({"a":1})"});
+    b.emplace(std::string{R"({"a":2})"});
+    sink.on_data(b);
+    const std::string dropped =
+        R"(clink_connector_dropped_records_total{connector="dlq_http_sink",direction="sink"})";
+    const auto before = counter_value(dropped);
+    EXPECT_NO_THROW(sink.flush());  // poison batch dropped, not crash-looped
+    EXPECT_EQ(counter_value(dropped) - before, 2u);
+}
+
+TEST(HttpDlq, DropPolicyStillThrowsOnTransientExhaustion) {
+    StubServer srv;
+    auto opts = base_opts(srv.url(), 100);
+    opts.path = "/always500";  // transient (outage) - must replay, not drop
+    opts.max_retries = 1;
+    opts.dlq_policy = DlqPolicy::Drop;
+    BatchedHttpBulkSink<std::string> sink(opts, verbatim());
+    sink.open();
+    Batch<std::string> b;
+    b.emplace(std::string{R"({"a":1})"});
+    sink.on_data(b);
+    EXPECT_THROW(sink.flush(), std::runtime_error);  // transient -> replay, never silent drop
+}
+
+TEST(HttpDlq, DefaultFailPolicyThrowsOnPermanent) {
+    StubServer srv;
+    auto opts = base_opts(srv.url(), 100);
+    opts.path = "/always400";
+    opts.max_retries = 1;
+    // default dlq_policy == Fail
+    BatchedHttpBulkSink<std::string> sink(opts, verbatim());
+    sink.open();
+    Batch<std::string> b;
+    b.emplace(std::string{R"({"a":1})"});
+    sink.on_data(b);
+    EXPECT_THROW(sink.flush(), std::runtime_error);
 }

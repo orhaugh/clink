@@ -62,6 +62,7 @@ struct EsBulkOptions {
     std::size_t batch_records{500};
     std::size_t batch_bytes{4 * 1024 * 1024};
     int max_retries{4};
+    DlqPolicy dlq_policy{DlqPolicy::Fail};
     std::string name{"elasticsearch_sink"};
 };
 
@@ -89,6 +90,7 @@ inline std::shared_ptr<Sink<std::string>> make_es_bulk_sink(EsBulkOptions o) {
     opts.max_records = o.batch_records;
     opts.max_bytes = o.batch_bytes;
     opts.max_retries = o.max_retries;
+    opts.dlq_policy = o.dlq_policy;
     opts.name = o.name;
 
     // _bulk returns HTTP 200 even when individual items fail; success requires
@@ -149,6 +151,7 @@ struct SplunkHecOptions {
     std::size_t batch_records{500};
     std::size_t batch_bytes{4 * 1024 * 1024};
     int max_retries{4};
+    DlqPolicy dlq_policy{DlqPolicy::Fail};
     std::string name{"splunk_hec_sink"};
 };
 
@@ -180,6 +183,7 @@ inline std::shared_ptr<Sink<std::string>> make_splunk_hec_sink(SplunkHecOptions 
     opts.max_records = o.batch_records;
     opts.max_bytes = o.batch_bytes;
     opts.max_retries = o.max_retries;
+    opts.dlq_policy = o.dlq_policy;
     opts.name = o.name;
     // Unlike ES _bulk, HEC never returns HTTP 200 with a failure code - the
     // body "code" tracks the HTTP status (200 => accepted, including the health

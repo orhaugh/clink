@@ -40,6 +40,12 @@ namespace clink::aws {
 // permanent request error (a poison batch that will fail identically on replay).
 enum class FailureClass { Transient, Permanent };
 
+// What a sink does with a permanently-poison record (one that fails identically
+// on replay, e.g. a Kinesis record over the 1 MiB per-record limit). Fail
+// (default) = let it through / throw so the job replays (crash-loops on true
+// poison); Drop = route to the dead-letter path (count + metric) and continue.
+enum class DlqPolicy { Fail, Drop };
+
 // Classify a WHOLE-CALL Kinesis error (outcome.GetError()). Throttle /
 // service-unavailable / internal / slow-down are transient (retry); validation /
 // bad-argument / access / not-found are permanent (a malformed request, e.g. an
@@ -80,8 +86,10 @@ struct KinesisSinkOptions {
     AwsClientOptions client;
     std::size_t batch_records{500};                        // PutRecords hard max is 500
     std::size_t max_bytes{4u * 1024 * 1024 + 512 * 1024};  // flush under the 5 MiB request cap
+    std::size_t max_record_bytes{1024 * 1024};             // Kinesis per-record limit (1 MiB)
     int max_retries{8};                                    // failed-subset resend attempts
     std::chrono::milliseconds retry_base_backoff{100};
+    DlqPolicy dlq_policy{DlqPolicy::Fail};  // oversized record: throw (Fail) vs drop
     std::string name{"kinesis_sink"};
 };
 
@@ -111,6 +119,17 @@ public:
 
     void on_data(const Batch<std::string>& batch) override {
         for (const auto& rec : batch) {
+            // A single record over the Kinesis per-record limit (1 MiB) poisons
+            // the WHOLE PutRecords batch (ValidationException on every retry -> a
+            // wedged job). Under DlqPolicy::Drop, route just that record to the
+            // dead-letter path so the rest of the batch still flows. Under Fail,
+            // let it through and PutRecords rejects the batch loudly.
+            if (rec.value().size() > opts_.max_record_bytes &&
+                opts_.dlq_policy == DlqPolicy::Drop) {
+                clink::metrics::connector::dropped_records_inc("kinesis", 1);
+                clink::metrics::connector::permanent_failures_inc("kinesis");
+                continue;
+            }
             pending_.push_back(make_entry_(rec.value()));
             // ~partition key (<=256) + framing overhead; flush on count OR bytes
             // so a batch of large records never exceeds the 5 MiB request cap
@@ -228,9 +247,13 @@ private:
             req.SetRecords(Aws::Vector<Aws::Kinesis::Model::PutRecordsRequestEntry>(entries));
             auto outcome = client_->PutRecords(req);
             if (!outcome.IsSuccess()) {
-                // Whole-call failure (the SDK already retried transient errors).
-                // None can be assumed written; retry the whole batch.
-                if (attempt == opts_.max_retries) {
+                // A permanent whole-call error (validation / access / bad stream)
+                // fails identically on retry - surface it immediately rather than
+                // burning the retry budget. Transient errors retry the whole
+                // batch (none can be assumed written) until exhausted.
+                const bool permanent = classify_kinesis_error(outcome.GetError().GetErrorType()) ==
+                                       FailureClass::Permanent;
+                if (permanent || attempt == opts_.max_retries) {
                     throw std::runtime_error(opts_.name + ": PutRecords failed: " +
                                              std::string(outcome.GetError().GetMessage().c_str()));
                 }

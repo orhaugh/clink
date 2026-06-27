@@ -3,6 +3,7 @@
 // the construction-time validation. These need the AWS SDK linked but NO live
 // stream.
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -12,13 +13,28 @@
 
 #include "clink/aws/firehose_sink.hpp"
 #include "clink/aws/kinesis_sink.hpp"
+#include "clink/core/record.hpp"
+#include "clink/metrics/metrics_registry.hpp"
 
+using clink::Batch;
+using clink::aws::DlqPolicy;
 using clink::aws::firehose_failed_indices;
 using clink::aws::FirehoseSink;
 using clink::aws::FirehoseSinkOptions;
 using clink::aws::kinesis_failed_indices;
 using clink::aws::KinesisSink;
 using clink::aws::KinesisSinkOptions;
+
+namespace {
+std::uint64_t counter_value(const std::string& name) {
+    for (const auto& [k, v] : clink::MetricsRegistry::global().snapshot().counters) {
+        if (k == name) {
+            return v;
+        }
+    }
+    return 0;
+}
+}  // namespace
 
 TEST(KinesisFailedIndices, PicksOnlyEntriesWithAnErrorCode) {
     Aws::Vector<Aws::Kinesis::Model::PutRecordsResultEntry> results(4);
@@ -83,4 +99,20 @@ TEST(KinesisErrorClassify, TransientVsPermanent) {
     EXPECT_EQ(classify_kinesis_error(E::THROTTLING), FailureClass::Transient);
     EXPECT_EQ(classify_kinesis_error(E::SERVICE_UNAVAILABLE), FailureClass::Transient);
     EXPECT_EQ(classify_kinesis_error(E::INTERNAL_FAILURE), FailureClass::Transient);
+}
+
+TEST(KinesisDlq, DropPolicyDropsOversizedRecordBeforeBatching) {
+    KinesisSinkOptions o;
+    o.stream = "s";
+    o.max_record_bytes = 8;  // tiny so a normal record is "oversized"
+    o.dlq_policy = DlqPolicy::Drop;
+    KinesisSink sink{std::move(o)};
+    sink.open();  // builds a client; no network until flush (which we never reach)
+    const std::string dropped =
+        R"(clink_connector_dropped_records_total{connector="kinesis",direction="sink"})";
+    const auto before = counter_value(dropped);
+    Batch<std::string> b;
+    b.emplace(std::string(64, 'x'));  // 64 bytes > 8 -> oversized -> dropped
+    EXPECT_NO_THROW(sink.on_data(b));
+    EXPECT_EQ(counter_value(dropped) - before, 1u);
 }
