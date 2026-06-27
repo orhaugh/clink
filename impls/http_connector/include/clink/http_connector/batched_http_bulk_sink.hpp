@@ -113,15 +113,16 @@ public:
         try {
             post_with_retry_(body);
         } catch (const HttpDeliveryError& e) {
-            // Permanent HTTP failure (a 4xx poison request) under DlqPolicy::Drop:
-            // route to the dead-letter path (count + metric) instead of crash-
-            // looping. A 2xx-but-validator-rejected response (e.g. ES bulk
-            // errors:true) is NOT dropped here - that is per-item handling's job;
-            // and a transient exhaustion (outage) always replays.
+            // Only a genuine 4xx CLIENT error (a poison request the server
+            // rejects identically on every replay) is droppable under
+            // DlqPolicy::Drop. Deliberately NOT dropped: a transient exhaustion
+            // (0/429/5xx outage -> replay), a 3xx redirect (operator-fixable
+            // misconfiguration -> surface loudly), and a 2xx-but-validator-
+            // rejected response (e.g. ES bulk errors:true -> per-item handling's
+            // job). 429 is excluded as it is rate-limit backpressure, not poison.
             const int st = e.response.status;
-            const bool non_2xx = st < 200 || st >= 300;
-            if (opts_.dlq_policy == DlqPolicy::Drop && non_2xx &&
-                classify_http_status(st) == HttpFailureClass::Permanent) {
+            const bool droppable_client_error = st >= 400 && st < 500 && st != 429;
+            if (opts_.dlq_policy == DlqPolicy::Drop && droppable_client_error) {
                 clink::metrics::connector::dropped_records_inc(opts_.name, n);
                 clink::metrics::connector::permanent_failures_inc(opts_.name);
                 buffer_.clear();

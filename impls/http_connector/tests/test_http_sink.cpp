@@ -55,6 +55,8 @@ public:
                   [](const httplib::Request&, httplib::Response& res) { res.status = 500; });
         svr_.Post("/always400",  // permanent (poison) request
                   [](const httplib::Request&, httplib::Response& res) { res.status = 400; });
+        svr_.Post("/redirect",  // 3xx: operator-fixable misconfig, must NOT be dropped
+                  [](const httplib::Request&, httplib::Response& res) { res.status = 301; });
         port_ = svr_.bind_to_any_port("127.0.0.1");
         thread_ = std::thread([this] { svr_.listen_after_bind(); });
         while (!svr_.is_running()) {
@@ -260,6 +262,20 @@ TEST(HttpDlq, DropPolicyStillThrowsOnTransientExhaustion) {
     b.emplace(std::string{R"({"a":1})"});
     sink.on_data(b);
     EXPECT_THROW(sink.flush(), std::runtime_error);  // transient -> replay, never silent drop
+}
+
+TEST(HttpDlq, DropPolicyDoesNotDrop3xxRedirect) {
+    StubServer srv;
+    auto opts = base_opts(srv.url(), 100);
+    opts.path = "/redirect";  // 301 - a misconfig, not poison data
+    opts.max_retries = 1;
+    opts.dlq_policy = DlqPolicy::Drop;
+    BatchedHttpBulkSink<std::string> sink(opts, verbatim());
+    sink.open();
+    Batch<std::string> b;
+    b.emplace(std::string{R"({"a":1})"});
+    sink.on_data(b);
+    EXPECT_THROW(sink.flush(), std::runtime_error);  // surfaces, not silently dropped
 }
 
 TEST(HttpDlq, DefaultFailPolicyThrowsOnPermanent) {
