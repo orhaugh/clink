@@ -191,6 +191,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.initial_cursor = ctx.param_or("initial_cursor", "");
             o.interval = std::chrono::milliseconds{ctx.param_int64_or("poll_interval_ms", 1000)};
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            o.retry_base_backoff =
+                std::chrono::milliseconds{ctx.param_int64_or("retry_base_backoff_ms", 200)};
             o.name = "http_poll_source";
             return make_http_poll_source(std::move(o));
         });

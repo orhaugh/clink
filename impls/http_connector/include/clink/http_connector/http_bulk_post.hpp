@@ -78,6 +78,15 @@ struct RetryPolicy {
     }
 };
 
+// Bounded exponential backoff delay before retry attempt N (1-based): base *
+// 2^(N-1), capped at 30s. The caller must keep `attempt` bounded (RetryPolicy
+// clamps max_retries to kMaxRetries=20) so the unsigned shift cannot overflow.
+inline std::chrono::milliseconds backoff_delay(int attempt, std::chrono::milliseconds base) {
+    auto d = base * (1u << (attempt - 1));
+    constexpr std::chrono::milliseconds kMaxBackoff{30000};
+    return d > kMaxBackoff ? kMaxBackoff : d;
+}
+
 // POST `body` to `client` at `path`, retrying on failure with bounded
 // exponential backoff. Returns on the first delivery the validator accepts;
 // THROWS std::runtime_error when retries are exhausted, so the runner fails the
@@ -95,16 +104,7 @@ inline void post_with_retry(HttpRequest& client,
     HttpResponse res;
     for (int attempt = 0; attempt <= max_retries; ++attempt) {
         if (attempt > 0) {
-            // Exponential backoff base * 2^(attempt-1), bounded. attempt is
-            // capped by kMaxRetries so the (unsigned) shift cannot overflow;
-            // the duration is additionally capped at 30s so a high max_retries
-            // never schedules a runaway sleep on the runner.
-            auto backoff = policy.base_backoff * (1u << (attempt - 1));
-            constexpr std::chrono::milliseconds kMaxBackoff{30000};
-            if (backoff > kMaxBackoff) {
-                backoff = kMaxBackoff;
-            }
-            std::this_thread::sleep_for(backoff);
+            std::this_thread::sleep_for(backoff_delay(attempt, policy.base_backoff));
         }
         res = client.post(path, body, content_type);
         const bool ok = response_ok ? response_ok(res) : (res.status >= 200 && res.status < 300);

@@ -46,6 +46,14 @@ public:
         svr_.Get("/wrapped", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"data":[{"id":1},{"id":2}],"page":1})", "application/json");
         });
+        svr_.Get("/down", [this](const httplib::Request&, httplib::Response& res) {
+            get_count_.fetch_add(1);
+            res.status = 503;  // transient -> retried
+        });
+        svr_.Get("/bad", [this](const httplib::Request&, httplib::Response& res) {
+            get_count_.fetch_add(1);
+            res.status = 400;  // permanent -> throw immediately, no retry
+        });
         port_ = svr_.bind_to_any_port("127.0.0.1");
         thread_ = std::thread([this] { svr_.listen_after_bind(); });
         while (!svr_.is_running()) {
@@ -63,6 +71,7 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         return since_seen_;
     }
+    int get_count() const { return get_count_.load(); }
 
 private:
     httplib::Server svr_;
@@ -70,6 +79,7 @@ private:
     std::thread thread_;
     std::mutex mu_;
     std::vector<std::string> since_seen_;
+    std::atomic<int> get_count_{0};
 };
 
 struct Captured {
@@ -138,6 +148,32 @@ TEST(HttpPollSource, RecordsFieldUnwrapsNestedArray) {
 TEST(HttpPollSource, RequiresUrl) {
     HttpPollOptions o;  // no url
     EXPECT_THROW(make_http_poll_source(std::move(o)), std::runtime_error);
+}
+
+TEST(HttpPollSource, TransientFailureRetriesThenThrows) {
+    PollStub srv;
+    auto o = base_opts(srv.url());
+    o.path = "/down";  // always 503
+    o.max_retries = 2;
+    o.retry_base_backoff = std::chrono::milliseconds{1};  // keep the test fast
+    auto src = make_http_poll_source(std::move(o));
+    Captured cap;
+    auto em = capturing(cap);
+    EXPECT_THROW(src->produce(em), std::runtime_error);  // exhausts retries
+    EXPECT_EQ(srv.get_count(), 3);                       // initial + 2 retries (all attempted)
+    EXPECT_TRUE(cap.values.empty());
+}
+
+TEST(HttpPollSource, PermanentFailureThrowsWithoutRetry) {
+    PollStub srv;
+    auto o = base_opts(srv.url());
+    o.path = "/bad";  // 400
+    o.max_retries = 5;
+    auto src = make_http_poll_source(std::move(o));
+    Captured cap;
+    auto em = capturing(cap);
+    EXPECT_THROW(src->produce(em), std::runtime_error);
+    EXPECT_EQ(srv.get_count(), 1);  // a 4xx is not retried
 }
 
 TEST(HttpPollSource, UrlEncodesCursorValue) {

@@ -17,6 +17,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -58,7 +59,8 @@ struct HttpPollOptions {
     std::string records_field;   // response field holding the array (else response is the array)
     std::string initial_cursor;  // starting cursor
     std::chrono::milliseconds interval{1000};
-    int max_retries{4};  // transient-GET retries within one poll
+    int max_retries{4};                                 // transient-GET retries within one poll
+    std::chrono::milliseconds retry_base_backoff{200};  // backoff between transient retries
     std::string name{"http_poll_source"};
 };
 
@@ -74,6 +76,7 @@ struct HttpPollState {
     std::string cursor_field;
     std::string records_field;
     int max_retries{4};
+    std::chrono::milliseconds retry_base_backoff{200};
     std::string name;
     std::unique_ptr<HttpRequest> client;  // created lazily on the first poll
 };
@@ -117,6 +120,7 @@ inline std::shared_ptr<Source<std::string>> make_http_poll_source(HttpPollOption
     state->cursor_field = o.cursor_field;
     state->records_field = o.records_field;
     state->max_retries = o.max_retries;
+    state->retry_base_backoff = o.retry_base_backoff;
     state->name = o.name;
 
     PollingSource<std::string>::Options popts;
@@ -134,10 +138,15 @@ inline std::shared_ptr<Source<std::string>> make_http_poll_source(HttpPollOption
             req_path += state->cursor_param + "=" + url_encode(cursor);
         }
 
-        // GET with bounded retry on transport / 5xx / 429 (transient). A 4xx is
-        // a permanent request error - throw immediately rather than spin.
+        // GET with bounded EXPONENTIAL-BACKOFF retry on transport / 5xx / 429
+        // (transient). A 4xx is a permanent request error - throw immediately
+        // rather than spin. The backoff (shared with the sinks) keeps a retry
+        // burst from hammering a struggling endpoint within one poll.
         HttpResponse res;
         for (int attempt = 0; attempt <= state->max_retries; ++attempt) {
+            if (attempt > 0) {
+                std::this_thread::sleep_for(backoff_delay(attempt, state->retry_base_backoff));
+            }
             res = state->client->get(req_path);
             if (res.status >= 200 && res.status < 300) {
                 break;
