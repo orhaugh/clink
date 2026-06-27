@@ -64,3 +64,11 @@ inline std::optional<std::string> cdc_event_to_json_row(const CdcEvent& ev) {
 }
 
 }  // namespace clink::pgcdc
+
+namespace clink {
+// Connector-neutral alias: this CdcEvent -> flat-JSON helper is shared by every
+// CDC source (Postgres, MySQL binlog, ...). New callers should use clink::cdc;
+// the historical clink::pgcdc name is retained for the Postgres source's
+// existing references.
+namespace cdc = pgcdc;
+}  // namespace clink

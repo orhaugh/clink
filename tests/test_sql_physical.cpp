@@ -525,6 +525,28 @@ TEST(SqlPhysical, MysqlConnectorSourceLowers) {
     EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);  // string -> Row bridge
 }
 
+// connector='mysql' mode='cdc' lowers to the mysql_cdc_source (binlog CDC) on the
+// string channel, bridged to Row, carrying server_id - distinct from the cursor
+// source.
+TEST(SqlPhysical, MysqlCdcModeLowersToCdcSource) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE my_cdc (a BIGINT) WITH (connector='mysql', format='json', mode='cdc', "
+        "database='db', server_id='100');"
+        "CREATE TABLE out_f (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/o.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO out_f SELECT a FROM my_cdc");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* src = find_op(spec, "mysql_cdc_source");
+    ASSERT_NE(src, nullptr);
+    EXPECT_EQ(src->params.at("server_id"), "100");
+    EXPECT_EQ(find_op(spec, "mysql_source"), nullptr);  // not the cursor source
+    EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);
+}
+
 // connector='mysql' sink lowers to the mysql_sink (string channel) via the
 // row_to_json_string bridge; the on_duplicate='update' WITH-option passes through.
 TEST(SqlPhysical, MysqlConnectorSinkLowersWithOnDuplicate) {

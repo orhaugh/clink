@@ -60,13 +60,20 @@ services:
       retries: 30
       start_period: 3s
 
-  # MySQL for the MySQL connector live IT.
+  # MySQL for the MySQL connector live ITs (both the cursor source/sink and the
+  # binlog CDC source). The binlog flags enable replication: ROW format with full
+  # before/after images and a server-id, so mysql_cdc_source can stream changes.
   # DSN: "host=localhost port=3306 user=root password=mysql database=test"
   mysql:
     image: mysql:8.0
     environment:
       MYSQL_ROOT_PASSWORD: mysql
       MYSQL_DATABASE: test
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
     ports:
       - "3306:3306"
     healthcheck:

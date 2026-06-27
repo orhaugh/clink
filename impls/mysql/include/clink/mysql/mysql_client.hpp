@@ -156,6 +156,11 @@ public:
 
     bool ok() const noexcept { return h_ != nullptr; }
 
+    // The raw MYSQL* for APIs the wrapper does not cover - notably
+    // mariadb_rpl_init_ex(MYSQL*) for the binlog CDC source. The Connection
+    // retains ownership; the caller must not close it. Returns null after a move.
+    MYSQL* native() noexcept { return h_; }
+
 private:
     void free_() {
         if (h_ != nullptr) {

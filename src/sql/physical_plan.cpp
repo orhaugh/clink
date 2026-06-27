@@ -102,6 +102,10 @@ std::string string_source_factory_for(const TableDef& table) {
         return "redis_source";
     }
     if (connector == "mysql") {
+        auto it = table.properties.find("mode");
+        if (it != table.properties.end() && it->second == "cdc") {
+            return "mysql_cdc_source";
+        }
         return "mysql_source";
     }
     unsupported("unsupported source connector '" + connector + "' for table " + table.name);
@@ -223,9 +227,14 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         return RowConnectorBinding{"redis_source", kChannelString, "json_string_to_row"};
     }
     if (connector == "mysql") {
-        // MySQL incremental cursor source: SELECT WHERE cursor_col > <cursor>, each
-        // row a JSON object string (string channel) bridged to Row. At-least-once
-        // (cursor checkpoint). Not CDC.
+        // MySQL source on the Row path. mode='cdc': binlog CDC change events as
+        // flat JSON (changed columns + __op/__table/__lsn/__xid) bridged to Row.
+        // Otherwise: an incremental cursor source (SELECT WHERE cursor_col >
+        // <cursor>). Both at-least-once.
+        auto it = table.properties.find("mode");
+        if (it != table.properties.end() && it->second == "cdc") {
+            return RowConnectorBinding{"mysql_cdc_source", kChannelString, "json_string_to_row"};
+        }
         return RowConnectorBinding{"mysql_source", kChannelString, "json_string_to_row"};
     }
     if (connector == "clickhouse") {

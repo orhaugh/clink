@@ -19,4 +19,9 @@ TEST(MysqlFactoryRegistration, SourceIsRegistered) {
     EXPECT_NE(rr.find_source("mysql_source", "string"), nullptr);
 }
 
+TEST(MysqlFactoryRegistration, CdcSourceIsRegistered) {
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_source("mysql_cdc_source", "string"), nullptr);
+}
+
 }  // namespace

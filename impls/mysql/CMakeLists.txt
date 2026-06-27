@@ -36,6 +36,13 @@ if(NOT _mysql_target)
     if(_mysql_inc AND _mysql_lib)
         add_library(clink_mariadb_external INTERFACE)
         target_include_directories(clink_mariadb_external INTERFACE ${_mysql_inc})
+        # Homebrew's mariadb-connector-c nests ma_io.h (which mariadb_rpl.h pulls
+        # in via <mariadb/ma_io.h>) under include/mariadb/mariadb/, so the binlog
+        # CDC header only resolves with include/mariadb also on the search path.
+        # Harmless where the layout is flat (apt); the dir always exists.
+        if(EXISTS "${_mysql_inc}/mariadb")
+            target_include_directories(clink_mariadb_external INTERFACE ${_mysql_inc}/mariadb)
+        endif()
         target_link_libraries(clink_mariadb_external INTERFACE ${_mysql_lib})
         set(_mysql_target clink_mariadb_external)
     endif()
@@ -50,6 +57,7 @@ endif()
 
 add_library(clink_mysql STATIC
     src/register_factories.cpp
+    src/mysql_cdc_source.cpp
 )
 add_library(clink::mysql ALIAS clink_mysql)
 

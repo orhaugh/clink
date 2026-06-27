@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "clink/mysql/install.hpp"
+#include "clink/mysql/mysql_cdc_source.hpp"
 #include "clink/mysql/mysql_client.hpp"
 #include "clink/mysql/mysql_sink.hpp"
 #include "clink/mysql/mysql_source.hpp"
@@ -117,6 +118,31 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.jitter_frac = std::stod(ctx.param_or("jitter_frac", "0"));
             o.name = "mysql_source";
             return make_mysql_poll_source(o);
+        });
+
+    // mysql_cdc_source: binlog CDC. Streams row-level changes from the master's
+    // binary log (mariadb_rpl) as flat JSON objects with __op/__table/__lsn/__xid.
+    // At-least-once ((file,position) checkpoint). The master must run
+    // binlog_format=ROW + binlog_row_image=FULL and the user must hold
+    // REPLICATION SLAVE + REPLICATION CLIENT. Params:
+    //   host/port/user/password/database
+    //   server_id (REQUIRED, non-zero, unique vs the master)
+    //   tables                  - comma-separated "db.table" allowlist (empty = all)
+    //   start_file / start_pos  - cold-start coordinate ("" => current master head)
+    //   heartbeat_ms (default 1000) - bounds cancel/checkpoint latency on idle
+    reg.register_source<std::string>(
+        "mysql_cdc_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
+            MysqlCdcOptions o;
+            o.conn = conn_options_from(ctx);
+            o.server_id = static_cast<std::uint32_t>(ctx.param_int64_or("server_id", 0));
+            o.tables = split_csv(ctx.param_or("tables", ""));
+            o.start_file = ctx.param_or("start_file", "");
+            o.start_pos = static_cast<std::uint64_t>(ctx.param_int64_or("start_pos", 4));
+            o.heartbeat_ms = ctx.param_int64_or("heartbeat_ms", 1000);
+            o.subtask_idx = ctx.subtask_idx;
+            o.parallelism = ctx.parallelism;
+            o.name = "mysql_cdc_source";
+            return make_mysql_cdc_source(o);
         });
 }
 

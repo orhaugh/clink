@@ -9,7 +9,9 @@ add_executable(clink_mysql_tests
     test_factory_registration.cpp
     test_mysql_sink_logic.cpp
     test_mysql_source_logic.cpp
+    test_mysql_cdc_decode.cpp
     test_mysql_live.cpp
+    test_mysql_cdc_live.cpp
 )
 target_link_libraries(clink_mysql_tests PRIVATE
     clink::core
