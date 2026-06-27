@@ -17,6 +17,7 @@
 // cross-subtask parent fully drains (records out of sequence-number order across
 // the split). Steady-state (no active resharding) is unaffected.
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -80,7 +81,7 @@ public:
         ensure_aws_initialized();
         client_ = std::make_unique<Aws::Kinesis::KinesisClient>(make_client_config(opts_.client));
         shards_.clear();
-        discover_assigned_shards_();
+        discover_assigned_shards_(/*from_reshard=*/false);
     }
 
     bool produce(Emitter<std::string>& out) override {
@@ -155,9 +156,10 @@ private:
 
     struct ShardState {
         std::string shard_id;
-        std::string iterator;  // empty => needs (re-)minting
-        std::string last_seq;  // last sequence number read (checkpoint token)
-        bool finished{false};  // shard closed and fully drained
+        std::string iterator;      // empty => needs (re-)minting
+        std::string last_seq;      // last sequence number read (checkpoint token)
+        bool finished{false};      // shard closed and fully drained
+        bool from_reshard{false};  // discovered after open() as a reshard child
     };
 
     bool is_arn_() const { return opts_.stream.rfind("arn:", 0) == 0; }
@@ -167,14 +169,16 @@ private:
         return it == restored_seqs_.end() ? std::string{} : it->second;
     }
 
-    // ListShards (paginated) -> keep the shards this subtask owns by modulo.
-    void discover_assigned_shards_() {
-        std::unordered_set<std::string> have;
-        for (const auto& s : shards_) {
-            have.insert(s.shard_id);
-        }
+    // ListShards (paginated), then assign this subtask's modulo-slice. The shard
+    // list is SORTED by ShardId before the modulo so every subtask agrees on the
+    // index regardless of ListShards page/call order (the API gives no ordering
+    // guarantee); an unsorted modulo could double-own or orphan a shard within a
+    // single run. `from_reshard` marks newly-discovered child shards so their
+    // iterator starts at TRIM_HORIZON (not LATEST) and does not skip records
+    // written between the split and discovery.
+    void discover_assigned_shards_(bool from_reshard) {
+        std::vector<std::string> all_ids;
         std::string next_token;
-        std::size_t global_index = 0;
         do {
             Aws::Kinesis::Model::ListShardsRequest req;
             if (next_token.empty()) {
@@ -194,22 +198,32 @@ private:
                                          std::string(outcome.GetError().GetMessage().c_str()));
             }
             for (const auto& shard : outcome.GetResult().GetShards()) {
-                const std::size_t idx = global_index++;
-                if (!kinesis_shard_assigned(idx, opts_.subtask_idx, opts_.parallelism)) {
-                    continue;
-                }
-                const std::string id = shard.GetShardId();
-                if (have.count(id)) {
-                    continue;  // already tracking
-                }
-                ShardState st;
-                st.shard_id = id;
-                st.last_seq = restored_seq_(id);
-                shards_.push_back(std::move(st));
-                have.insert(id);
+                all_ids.push_back(shard.GetShardId());
             }
             next_token = outcome.GetResult().GetNextToken();
         } while (!next_token.empty());
+
+        std::sort(all_ids.begin(), all_ids.end());
+
+        std::unordered_set<std::string> have;
+        for (const auto& s : shards_) {
+            have.insert(s.shard_id);
+        }
+        for (std::size_t i = 0; i < all_ids.size(); ++i) {
+            if (!kinesis_shard_assigned(i, opts_.subtask_idx, opts_.parallelism)) {
+                continue;
+            }
+            const std::string& id = all_ids[i];
+            if (have.count(id)) {
+                continue;  // already tracking
+            }
+            ShardState st;
+            st.shard_id = id;
+            st.last_seq = restored_seq_(id);
+            st.from_reshard = from_reshard;
+            shards_.push_back(std::move(st));
+            have.insert(id);
+        }
     }
 
     // Re-ListShards to pick up child shards after a reshard. Cheap-guarded: only
@@ -223,7 +237,7 @@ private:
             }
         }
         if (any_finished) {
-            discover_assigned_shards_();  // adds newly-owned shards, keeps existing
+            discover_assigned_shards_(/*from_reshard=*/true);  // adds child shards, keeps existing
         }
     }
 
@@ -239,7 +253,10 @@ private:
         if (!seq.empty()) {
             req.SetShardIteratorType(Aws::Kinesis::Model::ShardIteratorType::AFTER_SEQUENCE_NUMBER);
             req.SetStartingSequenceNumber(seq);
-        } else if (opts_.initial_position == "latest") {
+        } else if (opts_.initial_position == "latest" && !s.from_reshard) {
+            // 'latest' tails only the shards present at open(); a reshard child
+            // must read from TRIM_HORIZON or it skips records written between the
+            // split and its discovery.
             req.SetShardIteratorType(Aws::Kinesis::Model::ShardIteratorType::LATEST);
         } else {
             req.SetShardIteratorType(Aws::Kinesis::Model::ShardIteratorType::TRIM_HORIZON);

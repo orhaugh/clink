@@ -13,6 +13,8 @@
 #include <aws/core/utils/memory/stl/AWSStringStream.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/model/PutObjectRequest.h>
+
+#include "clink/connectors/aws_sdk_init.hpp"
 #endif
 
 namespace clink {
@@ -21,8 +23,6 @@ namespace clink {
 
 struct S3Sink::Impl {
     Options opts;
-    Aws::SDKOptions sdk_options;
-    bool sdk_initialized{false};
     std::unique_ptr<Aws::S3::S3Client> client;
     std::string buffer;
     std::size_t next_part_index{0};
@@ -36,15 +36,12 @@ S3Sink::S3Sink(Options opts) : impl_(std::make_unique<Impl>()) {
     impl_->opts = std::move(opts);
 }
 
-S3Sink::~S3Sink() {
-    if (impl_ && impl_->sdk_initialized) {
-        Aws::ShutdownAPI(impl_->sdk_options);
-    }
-}
+// No ShutdownAPI: the SDK is init-once / never-shutdown via the shared guard, so
+// closing one connector never tears the SDK down under another's live client.
+S3Sink::~S3Sink() = default;
 
 void S3Sink::open() {
-    Aws::InitAPI(impl_->sdk_options);
-    impl_->sdk_initialized = true;
+    clink::aws_sdk::ensure_initialized();
     Aws::Client::ClientConfiguration cfg;
     if (impl_->opts.region.has_value()) {
         cfg.region = *impl_->opts.region;
@@ -126,10 +123,6 @@ void S3Sink::close() {
     flush();
     if (impl_) {
         impl_->client.reset();
-        if (impl_->sdk_initialized) {
-            Aws::ShutdownAPI(impl_->sdk_options);
-            impl_->sdk_initialized = false;
-        }
     }
 }
 

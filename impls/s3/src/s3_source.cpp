@@ -19,6 +19,8 @@
 #include <aws/s3/S3Client.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
+
+#include "clink/connectors/aws_sdk_init.hpp"
 #endif
 
 namespace clink {
@@ -27,8 +29,6 @@ namespace clink {
 
 struct S3Source::Impl {
     Options opts;
-    Aws::SDKOptions sdk_options;
-    bool sdk_initialized{false};
     std::unique_ptr<Aws::S3::S3Client> client;
     std::vector<std::string> keys;
     std::size_t next_key{0};
@@ -42,15 +42,11 @@ S3Source::S3Source(Options opts) : impl_(std::make_unique<Impl>()) {
     impl_->opts = std::move(opts);
 }
 
-S3Source::~S3Source() {
-    if (impl_ && impl_->sdk_initialized) {
-        Aws::ShutdownAPI(impl_->sdk_options);
-    }
-}
+// No ShutdownAPI: the SDK is init-once / never-shutdown via the shared guard.
+S3Source::~S3Source() = default;
 
 void S3Source::open() {
-    Aws::InitAPI(impl_->sdk_options);
-    impl_->sdk_initialized = true;
+    clink::aws_sdk::ensure_initialized();
 
     Aws::Client::ClientConfiguration cfg;
     if (impl_->opts.region.has_value()) {
@@ -125,10 +121,6 @@ bool S3Source::produce(Emitter<std::string>& out) {
 void S3Source::close() {
     if (impl_) {
         impl_->client.reset();
-        if (impl_->sdk_initialized) {
-            Aws::ShutdownAPI(impl_->sdk_options);
-            impl_->sdk_initialized = false;
-        }
     }
 }
 

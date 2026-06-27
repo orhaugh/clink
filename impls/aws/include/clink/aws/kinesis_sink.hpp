@@ -53,20 +53,28 @@ struct KinesisSinkOptions {
     std::string stream;         // stream name or ARN (required)
     std::string partition_key;  // record field used as the Kinesis PartitionKey (optional)
     AwsClientOptions client;
-    std::size_t batch_records{500};  // PutRecords hard max is 500
-    int max_retries{8};              // failed-subset resend attempts
+    std::size_t batch_records{500};                        // PutRecords hard max is 500
+    std::size_t max_bytes{4u * 1024 * 1024 + 512 * 1024};  // flush under the 5 MiB request cap
+    int max_retries{8};                                    // failed-subset resend attempts
     std::chrono::milliseconds retry_base_backoff{100};
     std::string name{"kinesis_sink"};
 };
 
 class KinesisSink : public Sink<std::string> {
 public:
+    static constexpr int kMaxRetries = 20;  // bound the backoff shift + attempt loop
+
     explicit KinesisSink(KinesisSinkOptions opts) : opts_(std::move(opts)) {
         if (opts_.stream.empty()) {
             throw std::runtime_error(opts_.name + ": 'stream' is required");
         }
         if (opts_.batch_records == 0 || opts_.batch_records > 500) {
             opts_.batch_records = 500;  // PutRecords ceiling
+        }
+        if (opts_.max_retries < 0) {
+            opts_.max_retries = 0;
+        } else if (opts_.max_retries > kMaxRetries) {
+            opts_.max_retries = kMaxRetries;  // else 1u<<(attempt-1) overflows
         }
     }
 
@@ -79,7 +87,11 @@ public:
     void on_data(const Batch<std::string>& batch) override {
         for (const auto& rec : batch) {
             pending_.push_back(make_entry_(rec.value()));
-            if (pending_.size() >= opts_.batch_records) {
+            // ~partition key (<=256) + framing overhead; flush on count OR bytes
+            // so a batch of large records never exceeds the 5 MiB request cap
+            // (which would be rejected on every retry -> a wedged job).
+            pending_bytes_ += rec.value().size() + 320;
+            if (pending_.size() >= opts_.batch_records || pending_bytes_ >= opts_.max_bytes) {
                 flush();
             }
         }
@@ -93,6 +105,7 @@ public:
         }
         put_with_retry_(std::move(pending_));
         pending_.clear();
+        pending_bytes_ = 0;
     }
 
     std::string name() const override { return opts_.name; }
@@ -185,15 +198,17 @@ private:
                 return;  // all records written
             }
             const auto failed = kinesis_failed_indices(outcome.GetResult().GetRecords());
-            if (failed.empty()) {
-                return;  // count>0 but no per-entry error code: treat as done
+            if (!failed.empty()) {
+                std::vector<Aws::Kinesis::Model::PutRecordsRequestEntry> retry;
+                retry.reserve(failed.size());
+                for (std::size_t idx : failed) {
+                    retry.push_back(entries[idx]);
+                }
+                entries = std::move(retry);
             }
-            std::vector<Aws::Kinesis::Model::PutRecordsRequestEntry> retry;
-            retry.reserve(failed.size());
-            for (std::size_t idx : failed) {
-                retry.push_back(entries[idx]);
-            }
-            entries = std::move(retry);
+            // else: FailedRecordCount>0 but no per-entry ErrorCode (anomalous /
+            // short response). Do NOT treat as done - retry the WHOLE batch
+            // (entries unchanged) rather than silently dropping records.
         }
         throw std::runtime_error(opts_.name + ": PutRecords left records unwritten after " +
                                  std::to_string(opts_.max_retries + 1) + " attempts");
@@ -211,6 +226,7 @@ private:
     KinesisSinkOptions opts_;
     std::unique_ptr<Aws::Kinesis::KinesisClient> client_;
     std::vector<Aws::Kinesis::Model::PutRecordsRequestEntry> pending_;
+    std::size_t pending_bytes_{0};
     std::uint64_t counter_{0};
 };
 

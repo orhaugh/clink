@@ -109,6 +109,8 @@ struct DynamoDbSinkOptions {
 
 class DynamoDbSink : public Sink<std::string> {
 public:
+    static constexpr int kMaxRetries = 20;  // bound the backoff shift + attempt loop
+
     explicit DynamoDbSink(DynamoDbSinkOptions opts) : opts_(std::move(opts)) {
         if (opts_.table.empty()) {
             throw std::runtime_error(opts_.name + ": 'table' is required");
@@ -118,6 +120,11 @@ public:
         }
         if (opts_.batch_records == 0 || opts_.batch_records > 25) {
             opts_.batch_records = 25;  // DynamoDB BatchWriteItem ceiling
+        }
+        if (opts_.max_retries < 0) {
+            opts_.max_retries = 0;
+        } else if (opts_.max_retries > kMaxRetries) {
+            opts_.max_retries = kMaxRetries;  // else 1u<<(attempt-1) overflows
         }
     }
 

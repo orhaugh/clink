@@ -5,32 +5,22 @@
 // when the AWS SDK is found, so it may include the SDK headers directly.
 
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 
-#include <aws/core/Aws.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/client/DefaultRetryStrategy.h>
 
+#include "clink/connectors/aws_sdk_init.hpp"
+
 namespace clink::aws {
 
-// Initialise the AWS C++ SDK exactly once per process and NEVER shut it down.
-// Aws::InitAPI / Aws::ShutdownAPI manage GLOBAL, non-ref-counted state; calling
-// ShutdownAPI while another connector still holds a client races its
-// destructors (the documented FinalizeS3 hazard the s3 Parquet path also
-// avoids). call_once-init + no-shutdown is the safe unilateral choice: the OS
-// reclaims everything at process exit.
-//
-// CAVEAT: the legacy clink::s3 (AWS-SDK) sink/source call InitAPI in open() and
-// ShutdownAPI in close(); mixing connector='s3' with the aws-family connectors
-// in ONE job can therefore have s3's close() tear the SDK down under a live aws
-// client. The s3_parquet path (Arrow S3FileSystem) and all non-AWS connectors
-// are unaffected. Documented as a baseline limitation.
+// Initialise the AWS C++ SDK once per process (never shut down). Delegates to
+// the SHARED guard so clink::s3 and clink::aws init exactly once between them -
+// no module ever calls ShutdownAPI, so a job mixing s3 and aws connectors
+// cannot tear the SDK down under a live client. See aws_sdk_init.hpp.
 inline void ensure_aws_initialized() {
-    static std::once_flag flag;
-    static Aws::SDKOptions options;  // static lifetime: must outlive InitAPI
-    std::call_once(flag, [] { Aws::InitAPI(options); });
+    clink::aws_sdk::ensure_initialized();
 }
 
 // Common client config for the AWS-family connectors: region + endpoint

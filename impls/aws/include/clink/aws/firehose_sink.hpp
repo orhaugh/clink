@@ -47,20 +47,28 @@ struct FirehoseSinkOptions {
     std::string delivery_stream;  // required
     std::string delimiter{"\n"};  // appended to each record's Data (empty = none)
     AwsClientOptions client;
-    std::size_t batch_records{500};  // PutRecordBatch hard max is 500
-    int max_retries{8};              // failed-subset resend attempts
+    std::size_t batch_records{500};                        // PutRecordBatch hard max is 500
+    std::size_t max_bytes{3u * 1024 * 1024 + 512 * 1024};  // flush under the 4 MiB request cap
+    int max_retries{8};                                    // failed-subset resend attempts
     std::chrono::milliseconds retry_base_backoff{100};
     std::string name{"firehose_sink"};
 };
 
 class FirehoseSink : public Sink<std::string> {
 public:
+    static constexpr int kMaxRetries = 20;  // bound the backoff shift + attempt loop
+
     explicit FirehoseSink(FirehoseSinkOptions opts) : opts_(std::move(opts)) {
         if (opts_.delivery_stream.empty()) {
             throw std::runtime_error(opts_.name + ": 'delivery_stream' is required");
         }
         if (opts_.batch_records == 0 || opts_.batch_records > 500) {
             opts_.batch_records = 500;  // PutRecordBatch ceiling
+        }
+        if (opts_.max_retries < 0) {
+            opts_.max_retries = 0;
+        } else if (opts_.max_retries > kMaxRetries) {
+            opts_.max_retries = kMaxRetries;  // else 1u<<(attempt-1) overflows
         }
     }
 
@@ -73,7 +81,10 @@ public:
     void on_data(const Batch<std::string>& batch) override {
         for (const auto& rec : batch) {
             pending_.push_back(make_record_(rec.value()));
-            if (pending_.size() >= opts_.batch_records) {
+            // Flush on count OR bytes so a batch of large records never exceeds
+            // the 4 MiB request cap (rejected on every retry -> a wedged job).
+            pending_bytes_ += rec.value().size() + opts_.delimiter.size() + 16;
+            if (pending_.size() >= opts_.batch_records || pending_bytes_ >= opts_.max_bytes) {
                 flush();
             }
         }
@@ -87,6 +98,7 @@ public:
         }
         put_with_retry_(std::move(pending_));
         pending_.clear();
+        pending_bytes_ = 0;
     }
 
     std::string name() const override { return opts_.name; }
@@ -126,15 +138,17 @@ private:
                 return;  // all records delivered
             }
             const auto failed = firehose_failed_indices(outcome.GetResult().GetRequestResponses());
-            if (failed.empty()) {
-                return;
+            if (!failed.empty()) {
+                std::vector<Aws::Firehose::Model::Record> retry;
+                retry.reserve(failed.size());
+                for (std::size_t idx : failed) {
+                    retry.push_back(records[idx]);
+                }
+                records = std::move(retry);
             }
-            std::vector<Aws::Firehose::Model::Record> retry;
-            retry.reserve(failed.size());
-            for (std::size_t idx : failed) {
-                retry.push_back(records[idx]);
-            }
-            records = std::move(retry);
+            // else: FailedPutCount>0 but no per-entry ErrorCode (anomalous /
+            // short response). Retry the WHOLE batch (records unchanged) rather
+            // than silently dropping records.
         }
         throw std::runtime_error(opts_.name + ": PutRecordBatch left records undelivered after " +
                                  std::to_string(opts_.max_retries + 1) + " attempts");
@@ -152,6 +166,7 @@ private:
     FirehoseSinkOptions opts_;
     std::unique_ptr<Aws::Firehose::FirehoseClient> client_;
     std::vector<Aws::Firehose::Model::Record> pending_;
+    std::size_t pending_bytes_{0};
 };
 
 }  // namespace clink::aws
