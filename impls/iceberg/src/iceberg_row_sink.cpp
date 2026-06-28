@@ -23,6 +23,7 @@
 #include <arrow/c/bridge.h>  // ExportRecordBatch (defines the shared ArrowArray first)
 
 #include "clink/config/json.hpp"
+#include "clink/connectors/arrow_s3_lifecycle.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/row_kind.hpp"
@@ -61,8 +62,9 @@
 // factory registration (it is explicit, not static-init that survives a static-lib link).
 namespace iceberg::arrow {
 std::unique_ptr<::iceberg::FileIO> MakeLocalFileIO();
-// MakeS3FileIO self-initialises Arrow's S3 subsystem (EnsureS3Initialized) on first
-// use; clink never calls arrow::fs::InitializeS3 elsewhere, so there is no double-init.
+// MakeS3FileIO self-initialises Arrow's S3 subsystem (EnsureS3Initialized) on first use.
+// We init through clink's single S3 lifecycle owner just before calling it, so this lazy
+// init no-ops and there is exactly one InitializeS3 / one atexit FinalizeS3 per process.
 std::unique_ptr<::iceberg::FileIO> MakeS3FileIO(
     const std::unordered_map<std::string, std::string>& properties);
 // Registers the arrow-fs-local + arrow-fs-s3 FileIO factories in the FileIORegistry. The
@@ -92,6 +94,12 @@ void ensure_registered() {
         ice::parquet::RegisterAll();
         ice::avro::RegisterAll();
         ice::arrow::RegisterAll();  // arrow-fs-local + arrow-fs-s3 FileIO factories (REST catalog)
+        // Arrow 24 aborts at process exit if its S3 subsystem was initialised but not
+        // finalised. The iceberg S3 FileIO (explicit s3:// warehouse) and an S3-backed
+        // REST catalog both lazily EnsureS3Initialized via Arrow under the hood, so pair
+        // it with an atexit finalise here. EnsureS3Finalized is a no-op when S3 was never
+        // initialised, so registering this on the local-only path too is harmless.
+        clink::connectors::ensure_arrow_s3_finalize_registered();
     });
 }
 
@@ -280,6 +288,10 @@ public:
                     ": an s3:// warehouse requires an explicit local catalog_uri (the SQLite "
                     "catalog cannot live on S3; or use a REST catalog)");
             }
+            // Init Arrow S3 through the single engine-wide owner first (sets a quiet log
+            // level + registers the atexit FinalizeS3); MakeS3FileIO's own lazy
+            // EnsureS3Initialized then sees it is already up and no-ops.
+            clink::connectors::ensure_arrow_s3_initialised();
             file_io_ = std::shared_ptr<ice::FileIO>(
                 ice::arrow::MakeS3FileIO(opts_.file_io_props).release());
         } else {

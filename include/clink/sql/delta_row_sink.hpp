@@ -44,6 +44,7 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/properties.h>
 
+#include "clink/connectors/arrow_s3_lifecycle.hpp"
 #include "clink/connectors/delta_log.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/operator_base.hpp"
@@ -140,7 +141,7 @@ private:
         if (opts_.table_root.find("://") != std::string::npos) {
             object_store_ = true;
             if (opts_.table_root.rfind("s3://", 0) == 0) {
-                ensure_ok_(arrow::fs::EnsureS3Initialized(), "EnsureS3Initialized");
+                clink::connectors::ensure_arrow_s3_initialised();
             }
             fs_ = value_or_throw_(arrow::fs::FileSystemFromUri(opts_.table_root, &base_path_),
                                   "FileSystemFromUri");

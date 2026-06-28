@@ -1,35 +1,25 @@
 #pragma once
 
-// Shared AWS C++ SDK init guard for ALL AWS-backed connectors (clink::s3 and
-// clink::aws). It initialises the SDK exactly ONCE per process via call_once and
-// NEVER shuts it down.
+// Shared AWS C++ SDK init guard for ALL AWS-backed connectors that talk to the AWS SDK
+// directly (clink::s3's raw S3Source/S3Sink and clink::aws's Kinesis client).
 //
-// Aws::InitAPI / Aws::ShutdownAPI manage GLOBAL, non-ref-counted state. If one
-// connector called ShutdownAPI (in close()/dtor) while another still held a
-// client, the next SDK call would touch torn-down global state and crash - a
-// real hazard for a job that mixes connectors (e.g. read connector='kinesis',
-// write connector='s3'). A single shared call_once init + no shutdown removes
-// that hazard entirely; the OS reclaims everything at process exit (the same
-// "do not FinalizeS3" stance the s3 Parquet path already takes).
-//
-// This header pulls in the AWS SDK, so it is included ONLY by the .cpp files of
-// SDK-linked modules (which carry the SDK include path). It deliberately lives
-// in the core include tree (not a per-impl tree) so both clink::s3 and
-// clink::aws can include it without depending on each other; the `inline`
-// function + variables collapse to ONE instance across the final link, so
-// InitAPI runs exactly once no matter how many connector instances or modules
-// are present.
+// It does NOT call Aws::InitAPI itself. The engine has a SINGLE owner of the AWS SDK
+// lifecycle - arrow::fs's S3 init - and this routes through it (see arrow_s3_lifecycle.hpp
+// for the full rationale). The short version: Arrow's S3FileSystem already initialises the
+// AWS SDK via Aws::InitAPI, and from the pinned Arrow 24 that init MUST be paired with a
+// FinalizeS3 at exit. If this guard also called Aws::InitAPI, a process using both an Arrow
+// S3 path and a raw connector would init the SDK twice and then corrupt the heap when the
+// single FinalizeS3 tore it down. Deferring to the one owner gives exactly one InitAPI and
+// one FinalizeS3. arrow::fs::InitializeS3 brings up the whole AWS SDK (memory system, HTTP
+// factory, crypto, logging), so a raw Aws::S3 / Aws::Kinesis client constructed afterwards
+// works against that same global SDK state.
 
-#include <mutex>
-
-#include <aws/core/Aws.h>
+#include "clink/connectors/arrow_s3_lifecycle.hpp"
 
 namespace clink::aws_sdk {
 
 inline void ensure_initialized() {
-    static std::once_flag flag;
-    static Aws::SDKOptions options;  // static lifetime: must outlive InitAPI + all clients
-    std::call_once(flag, [] { Aws::InitAPI(options); });
+    clink::connectors::ensure_arrow_s3_initialised();
 }
 
 }  // namespace clink::aws_sdk

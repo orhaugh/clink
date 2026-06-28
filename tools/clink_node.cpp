@@ -45,6 +45,7 @@
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/ha_coordinator.hpp"
+#include "clink/connectors/openssl_atexit_guard.hpp"
 #ifdef CLINK_LINKED_ETCD
 #include "clink/etcd/etcd_ha_coordinator.hpp"
 #endif
@@ -2007,6 +2008,11 @@ void install_linked_impls() {
 }
 
 int main(int argc, char** argv) {
+    // Force-link the clink_core TU whose before-main constructor suppresses OpenSSL's atexit
+    // cleanup (see src/connectors/openssl_atexit_guard.cpp). Without referencing this anchor the
+    // static linker would drop the otherwise-unreferenced object file, and the constructor with
+    // it, re-exposing the from-source-Arrow-24 + OpenSSL-3 heap-corruption-at-exit on Linux.
+    clink::connectors::clink_force_openssl_atexit_guard = 1;
     try {
         if (has_flag(argc, argv, "version")) {
             std::cout << "clink " << clink::plugin::kClinkVersion << " (commit "

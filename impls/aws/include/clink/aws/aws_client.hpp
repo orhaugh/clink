@@ -15,10 +15,10 @@
 
 namespace clink::aws {
 
-// Initialise the AWS C++ SDK once per process (never shut down). Delegates to
-// the SHARED guard so clink::s3 and clink::aws init exactly once between them -
-// no module ever calls ShutdownAPI, so a job mixing s3 and aws connectors
-// cannot tear the SDK down under a live client. See aws_sdk_init.hpp.
+// Initialise the AWS C++ SDK once per process. Delegates to the SHARED guard, which routes
+// through the engine's single Arrow/AWS S3 lifecycle owner, so clink::s3 and clink::aws init
+// the SDK exactly once between them (one Aws::InitAPI) and a single atexit FinalizeS3 tears
+// it down once - after every connector client is destroyed. See aws_sdk_init.hpp.
 inline void ensure_aws_initialized() {
     clink::aws_sdk::ensure_initialized();
 }

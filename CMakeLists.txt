@@ -195,6 +195,7 @@ add_library(clink_core STATIC
     src/cluster/plugin_loader.cpp
     src/cluster/plugin_cache.cpp
     src/config/json.cpp
+    src/connectors/openssl_atexit_guard.cpp
 )
 if(CLINK_BUILD_HTTP)
     target_sources(clink_core PRIVATE

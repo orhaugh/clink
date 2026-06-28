@@ -63,6 +63,7 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/properties.h>
 
+#include "clink/connectors/arrow_s3_lifecycle.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/operator_base.hpp"
 
@@ -70,23 +71,12 @@ namespace clink {
 
 namespace detail {
 
-// Process-wide Arrow S3 initialisation. arrow::fs::InitializeS3 must
-// be called exactly once per process before any S3FileSystem is built.
-// We intentionally do NOT register an atexit FinalizeS3 hook: it races
-// with S3FileSystem destructors during process shutdown and triggers
-// "mutex lock failed: Invalid argument" aborts when an open()-then-
-// throw test path leaves a live S3FileSystem reference. Arrow's docs
-// declare FinalizeS3 optional; the OS reclaims everything at exit.
+// Process-wide Arrow S3 initialisation. Delegates to the single engine-wide owner of the
+// Arrow/AWS-SDK S3 lifecycle (clink::connectors::ensure_arrow_s3_initialised), which inits
+// S3 exactly once and registers the atexit FinalizeS3 the pinned Arrow 24 requires. Kept as
+// a thin alias so the existing impls/s3 call sites do not all have to change.
 inline void ensure_arrow_s3_initialised() {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        auto opts = arrow::fs::S3GlobalOptions::Defaults();
-        opts.log_level = arrow::fs::S3LogLevel::Fatal;  // quiet by default
-        auto s = arrow::fs::InitializeS3(opts);
-        if (!s.ok()) {
-            throw std::runtime_error("Arrow S3 init failed: " + s.ToString());
-        }
-    });
+    clink::connectors::ensure_arrow_s3_initialised();
 }
 
 }  // namespace detail
