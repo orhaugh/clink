@@ -234,14 +234,47 @@ if(CLINK_BUILD_HTTP)
     target_compile_definitions(clink_core PUBLIC CLINK_HAS_HTTP=1)
 endif()
 
-# Apache Arrow - optional; required for the Arrow-path serde bench
-# and any future Arrow-native operators/codecs. Surfaces via the
-# CLINK_HAS_ARROW preprocessor define and the Arrow::arrow_shared
-# imported target.
+# ---------------------------------------------------------------------------
+# Pinned, from-source third-party toolchain (scripts/versions.env). Arrow,
+# Parquet and iceberg-cpp are compiled from source at exact versions into
+# CLINK_DEPS_PREFIX (scripts/build-arrow.sh / build-iceberg-cpp.sh) on BOTH the
+# macOS host and the Debian image, so every environment links byte-for-byte the
+# same libraries. Prepend that prefix so find_package() resolves it ahead of any
+# system/Homebrew copy, and read the pinned Arrow version to assert against drift.
+# ---------------------------------------------------------------------------
+set(_clink_versions_env "${CMAKE_CURRENT_SOURCE_DIR}/scripts/versions.env")
+if(EXISTS "${_clink_versions_env}")
+    file(STRINGS "${_clink_versions_env}" _clink_ver_lines REGEX "^ARROW_VERSION=")
+    foreach(_l IN LISTS _clink_ver_lines)
+        if(_l MATCHES "^ARROW_VERSION=(.+)$")
+            set(CLINK_PINNED_ARROW_VERSION "${CMAKE_MATCH_1}")
+        endif()
+    endforeach()
+endif()
+if(DEFINED ENV{CLINK_DEPS_PREFIX})
+    set(_clink_deps_prefix "$ENV{CLINK_DEPS_PREFIX}")
+elseif(DEFINED ENV{HOME})
+    set(_clink_deps_prefix "$ENV{HOME}/.clink-deps")
+endif()
+if(_clink_deps_prefix AND IS_DIRECTORY "${_clink_deps_prefix}")
+    list(PREPEND CMAKE_PREFIX_PATH "${_clink_deps_prefix}")
+    message(STATUS "clink::core - pinned toolchain prefix: ${_clink_deps_prefix}")
+endif()
+
+# Apache Arrow - required (the wire format, state snapshots and the Parquet/
+# Iceberg connectors are all Arrow-native). Surfaces via the CLINK_HAS_ARROW
+# preprocessor define and the Arrow::arrow_shared imported target.
 find_package(Arrow REQUIRED)
+if(CLINK_PINNED_ARROW_VERSION AND NOT ARROW_VERSION VERSION_EQUAL "${CLINK_PINNED_ARROW_VERSION}")
+    message(FATAL_ERROR
+        "Arrow ${ARROW_VERSION} resolved, but scripts/versions.env pins "
+        "${CLINK_PINNED_ARROW_VERSION}. Build the pinned toolchain "
+        "(scripts/build-arrow.sh) and put CLINK_DEPS_PREFIX on the search path, "
+        "or update scripts/versions.env if the bump is intentional.")
+endif()
 target_link_libraries(clink_core PUBLIC Arrow::arrow_shared)
 target_compile_definitions(clink_core PUBLIC CLINK_HAS_ARROW=1)
-message(STATUS "clink::core - Arrow v${ARROW_VERSION}")
+message(STATUS "clink::core - Arrow v${ARROW_VERSION} (pinned ${CLINK_PINNED_ARROW_VERSION})")
 
 # Parquet ships alongside Arrow in every standard distribution
 # (Homebrew, apt, conda). Required by the ParquetSink/Source built-ins
@@ -321,6 +354,23 @@ elseif(TARGET zstd::libzstd_static)
     message(STATUS "clink::core - zstd via zstd::libzstd_static")
 else()
     message(STATUS "clink::core - zstd target not found directly; relying on Arrow transitive link")
+endif()
+# The zstd HEADER must be reachable: compressing_rotating_file_sink.hpp is a PUBLIC
+# header that #includes <zstd.h>, so every consumer (clink_core_tests, impls, clink_node)
+# needs it on its include path. With the from-source Arrow this is no longer implicit
+# (the prior Homebrew Arrow added /opt/homebrew/include globally; the bundled-zstd target
+# our Arrow exposes has no usable include dir). Locate the system header explicitly and
+# add it PUBLIC (BUILD_INTERFACE - a host path, not part of the installed contract).
+find_path(CLINK_ZSTD_INCLUDE_DIR NAMES zstd.h
+    HINTS /opt/homebrew/include /usr/local/include /usr/include)
+if(CLINK_ZSTD_INCLUDE_DIR)
+    # SYSTEM (= -isystem, low search priority) so it cannot shadow the pinned FetchContent
+    # spdlog with a Homebrew spdlog (which links an external fmt). This mirrors how the
+    # prior Homebrew find_package(Arrow) added /opt/homebrew/include - as a system dir.
+    target_include_directories(clink_core SYSTEM PUBLIC "$<BUILD_INTERFACE:${CLINK_ZSTD_INCLUDE_DIR}>")
+    message(STATUS "clink::core - zstd.h at ${CLINK_ZSTD_INCLUDE_DIR}")
+else()
+    message(WARNING "clink::core - zstd.h not found; the compressing log sink will not compile")
 endif()
 
 # ---------------------------------------------------------------------------

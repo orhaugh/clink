@@ -303,6 +303,23 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   declare -a failed_steps=()
   overall_start=$(date +%s)
 
+  # Pinned from-source toolchain (Arrow/Parquet/iceberg-cpp). CMakeLists prepends
+  # CLINK_DEPS_PREFIX so find_package resolves the version-pinned build. In Docker the
+  # image already compiled it to /usr/local (setup-build-env.sh); on the host, ensure
+  # it exists (idempotent - the build scripts skip instantly once installed). The first
+  # host run compiles Arrow from source and is slow by design (see scripts/versions.env).
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck disable=SC1091
+  . "${here}/scripts/versions.env"
+  if [[ -n "${IN_DOCKER:-}" ]]; then
+    export CLINK_DEPS_PREFIX=/usr/local
+  else
+    export CLINK_DEPS_PREFIX
+    echo "▶ Ensuring pinned toolchain (Arrow ${ARROW_VERSION}, iceberg-cpp ${ICEBERG_CPP_TAG}) at ${CLINK_DEPS_PREFIX}"
+    "${here}/scripts/build-arrow.sh"
+    "${here}/scripts/build-iceberg-cpp.sh"
+  fi
+
   run_step() {
     local label="$1"
     shift

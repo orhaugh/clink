@@ -1,5 +1,25 @@
 # clink - agent notes
 No emdashes!!!
+
+## Pinned toolchain (one-time bootstrap)
+
+Arrow/Parquet + iceberg-cpp are COMPILED FROM SOURCE at exact versions
+(`scripts/versions.env`) into `CLINK_DEPS_PREFIX` (host default `~/.clink-deps`)
+so the host and the Debian image link byte-for-byte the same libraries. CMake
+auto-prepends that prefix and asserts the Arrow version, so any `cmake` invocation
+finds it once it exists. Bootstrap it once on a fresh checkout (slow - builds Arrow
+from source; idempotent after):
+
+```bash
+scripts/build-arrow.sh && scripts/build-iceberg-cpp.sh   # -> ~/.clink-deps
+```
+
+`./build_and_test.sh` does this automatically. In Docker it is baked into the
+image at `/usr/local` (`scripts/setup-build-env.sh`). Bump a version in
+`scripts/versions.env`, delete the prefix, and re-bootstrap to change it. Arrow's
+S3 uses the SYSTEM aws-sdk (Homebrew on host / built in the image), not Arrow 24's
+broken bundled CRT; the data-path deps stay bundled + pinned.
+
 ## Build & test
 
 The reproducible path is `./build_and_test.sh`, optionally inside the

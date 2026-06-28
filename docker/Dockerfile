@@ -7,9 +7,11 @@ ARG USERNAME=clink
 ARG USER_UID=1000
 ARG USER_GID=${USER_UID}
 
-# Install build dependencies via the shared setup script.
-COPY scripts/setup-build-env.sh /tmp/setup-build-env.sh
-RUN chmod +x /tmp/setup-build-env.sh && /tmp/setup-build-env.sh Debug && rm /tmp/setup-build-env.sh
+# Install build dependencies via the shared setup script. It sources versions.env and
+# calls build-arrow.sh + build-iceberg-cpp.sh (the from-source, version-pinned toolchain
+# shared with the host), so copy the whole scripts/ dir, not just the entrypoint.
+COPY scripts/ /tmp/clink-scripts/
+RUN chmod +x /tmp/clink-scripts/*.sh && /tmp/clink-scripts/setup-build-env.sh Debug && rm -rf /tmp/clink-scripts
 
 # Additional debugging tools, useful when shelling into the image to
 # diagnose CI failures.

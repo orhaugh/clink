@@ -14,6 +14,14 @@ set -euo pipefail
 BUILD_TYPE="${1:-Release}"
 echo "▶ Setting up clink build env (BUILD_TYPE=$BUILD_TYPE)"
 
+# Pinned from-source toolchain: install to /usr/local (on the default search path) and
+# read the pinned versions (single source of truth). The host equivalent lives in
+# build_and_test.sh (installs to ~/.clink-deps).
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export CLINK_DEPS_PREFIX=/usr/local
+# shellcheck disable=SC1091
+. "${SCRIPT_DIR}/versions.env"
+
 export DEBIAN_FRONTEND=noninteractive
 
 # -- Base toolchain --
@@ -22,6 +30,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     git \
+    curl \
     build-essential \
     ca-certificates \
     pkg-config \
@@ -42,26 +51,46 @@ apt-get install -y --no-install-recommends \
     libpq-dev \
     libhiredis-dev \
     libmariadb-dev \
-    liburing-dev
+    liburing-dev \
+    libsqlite3-dev \
+    libcurl4-openssl-dev \
+    libzstd-dev
 
-# -- Apache Arrow + Parquet --
-# clink fundamentally requires Arrow: the wire format is Arrow IPC,
-# state-backend snapshots are Arrow IPC streams, and ParquetSink/Source
-# share the same ArrowBatcher seam. Installed from Apache's official
-# APT repo so the version matches the macOS-host Homebrew Arrow (24+);
-# Debian trixie's bundled libarrow is too old for the current
-# Parquet API surface we use (parquet::arrow::OpenFile-returning-Result
-# was added in Arrow 21).
-apt-get install -y --no-install-recommends ca-certificates lsb-release wget
-arrow_codename=$(lsb_release --codename --short)
-arrow_distro=$(lsb_release --id --short | tr 'A-Z' 'a-z')
-arrow_deb="/tmp/apache-arrow-apt-source.deb"
-wget -q -O "${arrow_deb}" \
-    "https://apache.jfrog.io/artifactory/arrow/${arrow_distro}/apache-arrow-apt-source-latest-${arrow_codename}.deb"
-apt-get install -y --no-install-recommends "${arrow_deb}"
-apt-get update
-apt-get install -y --no-install-recommends libarrow-dev libparquet-dev
-rm -f "${arrow_deb}"
+# -- AWS SDK for C++ (S3 transport for Arrow's S3FileSystem) --
+# MUST be built BEFORE Arrow: Arrow's S3 uses the SYSTEM aws-sdk (Arrow 24's OWN bundled
+# aws-c-* CRT is a mutually-inconsistent version set that does not compile - also why
+# Homebrew builds Arrow against the system SDK). Build exactly the components Arrow's S3
+# resolves (config, s3, transfer, identity-management -> pulls cognito-identity, sts,
+# core), pinned to AWS_SDK_CPP_TAG so it tracks the host's Homebrew aws-sdk. impls/s3 and
+# the Iceberg S3 FileIO ride the same SDK. ~15-25 min first build, Docker-layer-cached.
+if [ ! -f "/usr/local/lib/libaws-cpp-sdk-s3.so" ] && \
+   [ ! -f "/usr/local/lib/libaws-cpp-sdk-s3.a" ]; then
+    echo "▶ Building aws-sdk-cpp ${AWS_SDK_CPP_TAG} (Arrow S3 components) from source..."
+    apt-get install -y --no-install-recommends zlib1g-dev
+    WORK_DIR=$(mktemp -d)
+    git clone --depth 1 --branch "${AWS_SDK_CPP_TAG}" --recursive \
+        https://github.com/aws/aws-sdk-cpp.git "$WORK_DIR/aws-sdk-cpp"
+    cmake -S "$WORK_DIR/aws-sdk-cpp" -B "$WORK_DIR/aws-sdk-cpp/build" \
+          -DCMAKE_INSTALL_PREFIX=/usr/local \
+          -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+          -DBUILD_ONLY="config;s3;transfer;identity-management;sts" \
+          -DBUILD_SHARED_LIBS=ON \
+          -DENABLE_TESTING=OFF \
+          -DAUTORUN_UNIT_TESTS=OFF
+    cmake --build "$WORK_DIR/aws-sdk-cpp/build" --target install -- -j"$(nproc)"
+    cd /
+    rm -rf "$WORK_DIR"
+    ldconfig
+fi
+
+# -- Apache Arrow + Parquet (compiled from source, pinned) --
+# clink fundamentally requires Arrow: the wire format is Arrow IPC, state-backend
+# snapshots are Arrow IPC streams, and the Parquet/Iceberg connectors share the
+# ArrowBatcher seam. Built FROM SOURCE at the exact version in scripts/versions.env
+# (NOT the rolling APT repo) so the Debian image and the macOS host link byte-for-byte
+# the same Arrow + transitive deps. Single source of truth: scripts/build-arrow.sh,
+# shared with the host. Finds the system aws-sdk built just above. Docker-layer-cached.
+"${SCRIPT_DIR}/build-arrow.sh"
 
 # Kafka mock-broker tests rely on rdkafka_mock.h, which ships with
 # librdkafka >= 1.3. Debian trixie has 2.x - verify so future image
@@ -92,62 +121,14 @@ if [ ! -f "/usr/local/lib/libclickhouse-cpp-lib.a" ] && \
     ldconfig
 fi
 
-# -- AWS SDK for C++ (S3 component only) --
-# The SDK is not in Debian; build only the s3 component to keep the
-# layer reasonable (~15-25 min on first build, cached after). We also
-# need its aws-c-* dependencies which the SDK's CMake fetches as
-# subprojects when --recursive is used.
-if [ ! -f "/usr/local/lib/libaws-cpp-sdk-s3.so" ] && \
-   [ ! -f "/usr/local/lib/libaws-cpp-sdk-s3.a" ]; then
-    echo "▶ Building aws-sdk-cpp (s3 component) from source..."
-    apt-get install -y --no-install-recommends \
-        libcurl4-openssl-dev zlib1g-dev
-    WORK_DIR=$(mktemp -d)
-    git clone --depth 1 --branch 1.11.428 --recursive \
-        https://github.com/aws/aws-sdk-cpp.git "$WORK_DIR/aws-sdk-cpp"
-    mkdir "$WORK_DIR/aws-sdk-cpp/build"
-    cd "$WORK_DIR/aws-sdk-cpp/build"
-    cmake -DCMAKE_INSTALL_PREFIX=/usr/local \
-          -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-          -DBUILD_ONLY="s3" \
-          -DBUILD_SHARED_LIBS=ON \
-          -DENABLE_TESTING=OFF \
-          -DAUTORUN_UNIT_TESTS=OFF \
-          ..
-    cmake --build . --target install -- -j"$(nproc)"
-    cd /
-    rm -rf "$WORK_DIR"
-    ldconfig
-fi
-
 # -- Apache iceberg-cpp (Iceberg table-format sink) --
-# Not packaged by Debian. The clink::iceberg module links the "battery-included"
-# bundle (Arrow/Parquet/Avro write backend) + the SQLite SQL catalog, so build with
-# ICEBERG_BUILD_BUNDLE=ON + ICEBERG_BUILD_SQL_CATALOG=ON + ICEBERG_SQL_SQLITE=ON.
-# iceberg-cpp 0.3.0's Avro backend does not compile against newer system avro-cpp
-# (1.12 changed the codec API), so force the pinned, vendored Avro by disabling the
-# system find_package for it only - Arrow + Parquet stay system so the ABI matches
-# clink's Arrow. Built against the same Apache Arrow installed above.
-if [ ! -f "/usr/local/lib/libiceberg_bundle.a" ]; then
-    echo "▶ Building apache/iceberg-cpp (bundle + sqlite catalog) from source..."
-    apt-get install -y --no-install-recommends libsqlite3-dev
-    WORK_DIR=$(mktemp -d)
-    git clone --depth 1 --branch v0.3.0 \
-        https://github.com/apache/iceberg-cpp.git "$WORK_DIR/iceberg-cpp"
-    cmake -S "$WORK_DIR/iceberg-cpp" -B "$WORK_DIR/iceberg-cpp/build" \
-          -DCMAKE_INSTALL_PREFIX=/usr/local \
-          -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-          -DICEBERG_BUILD_STATIC=ON \
-          -DICEBERG_BUILD_BUNDLE=ON \
-          -DICEBERG_BUILD_SQL_CATALOG=ON \
-          -DICEBERG_SQL_SQLITE=ON \
-          -DICEBERG_BUILD_TESTS=OFF \
-          -DCMAKE_DISABLE_FIND_PACKAGE_avro-cpp=ON
-    cmake --build "$WORK_DIR/iceberg-cpp/build" --target install -- -j"$(nproc)"
-    cd /
-    rm -rf "$WORK_DIR"
-    ldconfig
-fi
+# Not packaged by Debian. Built FROM SOURCE at the pinned tag (scripts/versions.env)
+# against the from-source Arrow installed above, via the SAME recipe the host uses
+# (scripts/build-iceberg-cpp.sh): the bundle (Arrow/Parquet/Avro write backend +
+# MakeS3FileIO), the SQLite catalog, the REST catalog, ICEBERG_S3=ON, and the pinned
+# vendored Avro (iceberg-cpp 0.3.0 does not compile against avro-cpp 1.12+).
+"${SCRIPT_DIR}/build-iceberg-cpp.sh"
+ldconfig
 
 rm -rf /var/lib/apt/lists/*
 

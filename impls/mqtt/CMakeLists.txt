@@ -50,6 +50,16 @@ if(NOT _mqtt_target)
     return()
 endif()
 
+# mosquitto 2.1's umbrella <mosquitto.h> pulls libcommon.h -> libcommon_cjson.h, which
+# #includes <cjson/cJSON.h>. On Homebrew, cJSON is a SEPARATE keg (/opt/homebrew/include)
+# from the mosquitto keg, and clink no longer links Homebrew Arrow (which used to add
+# /opt/homebrew/include to the global -isystem path as a side-effect), so discover cJSON
+# explicitly and add it to the mqtt include path. Best-effort: older mosquitto (e.g.
+# Debian's 2.0) does not split out cjson, so a miss is not fatal. Only the HEADER is
+# needed (type decls); libmosquitto links cjson itself, so no extra link dependency.
+find_path(_mqtt_cjson_inc NAMES cjson/cJSON.h
+    HINTS /opt/homebrew/include /usr/local/include /usr/include)
+
 add_library(clink_mqtt STATIC
     src/register_factories.cpp
 )
@@ -59,6 +69,13 @@ target_include_directories(clink_mqtt PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+# PUBLIC so the mqtt tests + clink_node (which transitively include <mosquitto.h>) also
+# resolve the cJSON header the mosquitto umbrella drags in. SYSTEM (= -isystem, low
+# priority) so adding the Homebrew include dir cannot shadow pinned headers (e.g. the
+# FetchContent spdlog); BUILD_INTERFACE only - a host path, not the installed contract.
+if(_mqtt_cjson_inc)
+    target_include_directories(clink_mqtt SYSTEM PUBLIC "$<BUILD_INTERFACE:${_mqtt_cjson_inc}>")
+endif()
 target_compile_features(clink_mqtt PUBLIC cxx_std_23)
 target_compile_definitions(clink_mqtt PUBLIC CLINK_HAS_MQTT)
 target_link_libraries(clink_mqtt
