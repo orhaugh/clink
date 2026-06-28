@@ -15,9 +15,13 @@
 // snapshot summary property, so a redelivered commit or recovery replay never
 // double-commits). Append-only, SINGLE-WRITER (only subtask 0 active). Falls back to
 // AT-LEAST-ONCE in standalone use (no state backend / no JM): the barrier commits
-// immediately. NOT in v1: UPDATE/DELETE/MERGE, partitioning. v1 catalog = SQLite SQL
-// catalog (server-less, offline-testable); REST catalog is a follow-on; S3 FileIO is
-// supported (s3:// warehouse).
+// immediately. IDENTITY partitioning is supported (partition_by, on INT/LONG/BOOL/STRING
+// columns); one data file per (partition, interval) - a HIGH-CARDINALITY partition column
+// means many open writers + small files per interval, so prefer bounded-cardinality keys
+// and run Iceberg compaction. NOT in v1: UPDATE/DELETE/MERGE, bucket/truncate/temporal
+// partition transforms, float/double partition columns. v1 catalog = SQLite SQL catalog
+// (server-less, offline-testable); REST catalog is a follow-on; S3 FileIO is supported
+// (s3:// warehouse).
 //
 // RESIDUALS: a data file staged before a crash but whose checkpoint never completed is an
 // orphan until the engine's abort deletes it, or until Iceberg orphan-file maintenance

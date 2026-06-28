@@ -282,8 +282,11 @@ public:
             std::string key;
             for (const auto& pc : part_cols_) {
                 std::string v = part_value_string_(row, pc);
+                // Length-prefix each component so distinct tuples cannot alias on a
+                // separator even when a string partition value contains control bytes.
+                key += std::to_string(v.size());
+                key.push_back(':');
                 key.append(v);
-                key.push_back('\x1f');
                 pv.push_back(std::move(v));
             }
             groups[key].push_back(i);
@@ -292,7 +295,15 @@ public:
         for (const auto& [key, idxs] : groups) {
             Batch<clink::sql::Row> sub;
             for (std::size_t i : idxs) {
-                sub.emplace(batch[i].value());
+                const auto& rec = batch[i];
+                // Preserve the engine-prepended event_time column (single-arg emplace would
+                // write null), so a partitioned table keeps the same event_time an
+                // unpartitioned one would.
+                if (rec.event_time()) {
+                    sub.emplace(rec.value(), *rec.event_time());
+                } else {
+                    sub.emplace(rec.value());
+                }
             }
             write_group_(key, group_pv[key], sub);
         }
@@ -465,10 +476,13 @@ private:
 
     static bool partition_type_supported_(arrow::Type::type t) {
         switch (t) {
+            // Exact, lossless string round-trip only. FLOAT/DOUBLE are excluded: their
+            // textual form would be lossy, so the recorded partition value could diverge
+            // from the data (and two near-equal doubles could collide into one file),
+            // violating Iceberg's "all rows in a file share the partition value" contract.
+            // Partitioning on a float is unusual anyway.
             case arrow::Type::INT64:
             case arrow::Type::INT32:
-            case arrow::Type::DOUBLE:
-            case arrow::Type::FLOAT:
             case arrow::Type::BOOL:
             case arrow::Type::STRING:
             case arrow::Type::LARGE_STRING:
