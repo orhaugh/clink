@@ -135,6 +135,24 @@ int id_of(const clink::config::JsonValue& row) {
     return -1;
 }
 
+bool has_id(const Captured& cap, int want) {
+    for (const auto& ch : cap.changes) {
+        if (id_of(ch.row) == want) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<int> sorted_ids_local(const Captured& cap) {
+    std::vector<int> ids;
+    for (const auto& ch : cap.changes) {
+        ids.push_back(id_of(ch.row));
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
 }  // namespace
 
 TEST(MysqlCdcLive, InsertUpdateDeleteProduceOps) {
@@ -277,6 +295,160 @@ TEST(MysqlCdcLive, CheckpointResumesWithoutGap) {
     for (int id : ids2) {
         EXPECT_GE(id, 6) << "reader 2 must not re-see a pre-checkpoint row";
     }
+}
+
+// Initial snapshot bootstraps the rows that EXISTED before the source started (as
+// insert events), then seamlessly streams later changes - the asymmetry-vs-Postgres
+// this feature closes (without the snapshot, pre-existing rows are never captured).
+TEST(MysqlCdcLive, InitialSnapshotBootstrapsThenStreams) {
+    if (!mysql_configured()) {
+        GTEST_SKIP() << "set CLINK_MYSQL_TEST_DSN against a ROW-binlog master";
+    }
+    const std::string tbl = unique_table();
+    {
+        Connection c{parse_dsn()};
+        c.exec("DROP TABLE IF EXISTS `" + tbl + "`");
+        c.exec("CREATE TABLE `" + tbl + "` (id INT PRIMARY KEY, val VARCHAR(32))");
+        for (int i = 1; i <= 3; ++i) {  // EXISTING rows, before the source opens
+            c.exec("INSERT INTO `" + tbl + "` VALUES (" + std::to_string(i) + ", 'pre')");
+        }
+    }
+
+    auto opts = cdc_opts(tbl, 1004);
+    opts.enable_initial_snapshot = true;             // bootstrap the 3 pre-existing rows first
+    opts.tables = {opts.conn.database + "." + tbl};  // snapshot requires qualified db.table
+    auto source = make_mysql_cdc_source(opts);
+    source->open();
+
+    // Drain the snapshot: 3 inserts for the pre-existing rows.
+    Captured snap;
+    drain(*source, snap, 3, /*timeout_ms=*/20000);
+    ASSERT_EQ(snap.changes.size(), 3u) << "snapshot must bootstrap every pre-existing row";
+    EXPECT_EQ(sorted_ids_local(snap), (std::vector<int>{1, 2, 3}));
+    for (const auto& ch : snap.changes) {
+        EXPECT_EQ(ch.op, "insert") << "snapshot rows are emitted as inserts";
+    }
+
+    // A change made AFTER the snapshot point must arrive via the stream (gap-free
+    // handoff), proving the source transitioned snapshot -> stream.
+    {
+        Connection c{parse_dsn()};
+        c.exec("INSERT INTO `" + tbl + "` VALUES (4, 'post')");
+        c.exec("UPDATE `" + tbl + "` SET val='upd' WHERE id=1");
+    }
+    Captured stream;
+    drain(*source, stream, 2, /*timeout_ms=*/20000);
+    source->close();
+    {
+        Connection c{parse_dsn()};
+        c.exec("DROP TABLE IF EXISTS `" + tbl + "`");
+    }
+
+    ASSERT_GE(stream.changes.size(), 2u) << "post-snapshot changes must stream";
+    EXPECT_TRUE(has_id(stream, 4)) << "the insert after the snapshot must stream";
+    bool saw_update = false;
+    for (const auto& ch : stream.changes) {
+        if (ch.op == "update" && id_of(ch.row) == 1) {
+            saw_update = true;
+            EXPECT_EQ(ch.row.as_object().at("val").as_string(), "upd");
+        }
+    }
+    EXPECT_TRUE(saw_update) << "the update after the snapshot must stream";
+}
+
+// snapshot_lock=false (no FLUSH TABLES WITH READ LOCK, no RELOAD privilege needed)
+// still bootstraps the existing rows.
+TEST(MysqlCdcLive, InitialSnapshotLockFreeBootstraps) {
+    if (!mysql_configured()) {
+        GTEST_SKIP() << "set CLINK_MYSQL_TEST_DSN against a ROW-binlog master";
+    }
+    const std::string tbl = unique_table();
+    {
+        Connection c{parse_dsn()};
+        c.exec("DROP TABLE IF EXISTS `" + tbl + "`");
+        c.exec("CREATE TABLE `" + tbl + "` (id INT PRIMARY KEY, val VARCHAR(32))");
+        c.exec("INSERT INTO `" + tbl + "` VALUES (1,'a'),(2,'b')");
+    }
+    auto opts = cdc_opts(tbl, 1005);
+    opts.enable_initial_snapshot = true;
+    opts.snapshot_lock = false;                      // lock-free snapshot path
+    opts.tables = {opts.conn.database + "." + tbl};  // snapshot requires qualified db.table
+    auto source = make_mysql_cdc_source(opts);
+    source->open();
+    Captured snap;
+    drain(*source, snap, 2, /*timeout_ms=*/20000);
+    source->close();
+    {
+        Connection c{parse_dsn()};
+        c.exec("DROP TABLE IF EXISTS `" + tbl + "`");
+    }
+    ASSERT_EQ(snap.changes.size(), 2u);
+    EXPECT_EQ(sorted_ids_local(snap), (std::vector<int>{1, 2}));
+}
+
+// A restored checkpoint SKIPS the snapshot: reader 2 must not re-bootstrap the
+// pre-existing rows, only stream post-checkpoint changes (no duplicate snapshot).
+TEST(MysqlCdcLive, InitialSnapshotSkippedOnRestoredCheckpoint) {
+    if (!mysql_configured()) {
+        GTEST_SKIP() << "set CLINK_MYSQL_TEST_DSN against a ROW-binlog master";
+    }
+    const std::string tbl = unique_table();
+    {
+        Connection c{parse_dsn()};
+        c.exec("DROP TABLE IF EXISTS `" + tbl + "`");
+        c.exec("CREATE TABLE `" + tbl + "` (id INT PRIMARY KEY, val VARCHAR(32))");
+        c.exec("INSERT INTO `" + tbl + "` VALUES (1,'a'),(2,'b'),(3,'c')");  // pre-existing
+    }
+    InMemoryStateBackend backend;
+    const OperatorId op{1};
+
+    // Reader 1: snapshot the 3 rows, then stream one more change (id=4). Receiving
+    // id=4 from the stream proves we left the snapshot phase, so the checkpoint is a
+    // streaming (file,pos) - the snapshot phase itself never checkpoints.
+    auto opts1 = cdc_opts(tbl, 1006);
+    opts1.enable_initial_snapshot = true;
+    opts1.tables = {opts1.conn.database + "." + tbl};  // snapshot requires qualified db.table
+    auto src1 = make_mysql_cdc_source(opts1);
+    src1->open();
+    Captured snap;
+    drain(*src1, snap, 3, /*timeout_ms=*/20000);
+    ASSERT_EQ(snap.changes.size(), 3u);
+    {
+        Connection c{parse_dsn()};
+        c.exec("INSERT INTO `" + tbl + "` VALUES (4,'d')");
+    }
+    Captured s1stream;
+    drain(*src1, s1stream, 1, /*timeout_ms=*/20000);
+    ASSERT_TRUE(has_id(s1stream, 4)) << "must be streaming (snapshot handed off)";
+    src1->snapshot_offset(backend, op, CheckpointId{1});
+    src1->close();
+
+    // A change while detached.
+    {
+        Connection c{parse_dsn()};
+        c.exec("INSERT INTO `" + tbl + "` VALUES (5,'e')");
+    }
+
+    // Reader 2: restore + open WITH snapshot enabled. The restored checkpoint must
+    // suppress the snapshot - it must NOT re-bootstrap ids 1..3; it streams id=5.
+    auto opts2 = cdc_opts(tbl, 1006);
+    opts2.enable_initial_snapshot = true;
+    opts2.tables = {opts2.conn.database + "." + tbl};  // snapshot requires qualified db.table
+    auto src2 = make_mysql_cdc_source(opts2);
+    ASSERT_TRUE(src2->restore_offset(backend, op)) << "checkpoint must restore";
+    src2->open();
+    Captured cap2;
+    drain(*src2, cap2, 1, /*timeout_ms=*/15000);
+    src2->close();
+    {
+        Connection c{parse_dsn()};
+        c.exec("DROP TABLE IF EXISTS `" + tbl + "`");
+    }
+
+    EXPECT_TRUE(has_id(cap2, 5)) << "must stream the post-checkpoint insert";
+    EXPECT_FALSE(has_id(cap2, 1)) << "snapshot must be skipped (no re-bootstrap of id 1)";
+    EXPECT_FALSE(has_id(cap2, 2)) << "snapshot must be skipped (no re-bootstrap of id 2)";
+    EXPECT_FALSE(has_id(cap2, 3)) << "snapshot must be skipped (no re-bootstrap of id 3)";
 }
 
 #endif  // CLINK_HAS_MYSQL

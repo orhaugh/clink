@@ -166,6 +166,33 @@ public:
         return Result{res};
     }
 
+    // Run a SELECT and stream the result row-by-row (mysql_use_result) rather than
+    // buffering it all (mysql_store_result). For a large snapshot scan this keeps
+    // memory bounded, but the connection is then BUSY until every row is fetched
+    // (or the Result is freed) - issue no other query on it meanwhile. Throws on
+    // error. Note: with use_result, mysql_num_rows is unavailable and a mid-stream
+    // network error surfaces as a later fetch_row()==NULL with mysql_errno() set.
+    Result query_unbuffered(std::string_view sql) {
+        if (h_ == nullptr) {
+            throw std::runtime_error("mysql: query on a closed connection");
+        }
+        if (mysql_real_query(h_, sql.data(), sql.size()) != 0) {
+            throw std::runtime_error("mysql: query failed (errno " +
+                                     std::to_string(mysql_errno(h_)) + "): " + mysql_error(h_));
+        }
+        MYSQL_RES* res = mysql_use_result(h_);
+        if (res == nullptr) {
+            throw std::runtime_error("mysql: use_result failed (errno " +
+                                     std::to_string(mysql_errno(h_)) + "): " + mysql_error(h_));
+        }
+        return Result{res};
+    }
+
+    // After a use_result stream ends (fetch_row()==NULL), distinguish a clean end
+    // of rows from a mid-stream error: non-zero here means the scan was truncated.
+    unsigned int last_errno() const noexcept { return h_ != nullptr ? mysql_errno(h_) : 0; }
+    std::string last_error() const { return h_ != nullptr ? mysql_error(h_) : std::string{}; }
+
     // Charset-correct escaping of a string VALUE (needs the live handle). NOT for
     // identifiers (use quote_ident in mysql_sql.hpp for those).
     std::string escape(std::string_view in) {

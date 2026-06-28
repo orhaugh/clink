@@ -140,6 +140,13 @@ void install(clink::plugin::PluginRegistry& reg) {
     //   server_id (REQUIRED, non-zero, unique vs the master)
     //   tables                  - comma-separated "db.table" allowlist (empty = all)
     //   start_file / start_pos  - cold-start coordinate ("" => current master head)
+    //   initial_snapshot ('true') - bootstrap existing rows of `tables` before
+    //       streaming; captures a consistent binlog point and reads each table as-of
+    //       it, then streams from there (gap-free). `tables` must then be non-empty
+    //       and fully-qualified 'db.table' (so snapshot scope == stream scope).
+    //   snapshot_lock ('false')   - skip FLUSH TABLES WITH READ LOCK during the
+    //       snapshot (no RELOAD privilege needed; snapshot/stream boundary becomes
+    //       at-least-once instead of exact). Default locked.
     //   heartbeat_ms (default 1000) - bounds cancel/checkpoint latency on idle
     reg.register_source<std::string>(
         "mysql_cdc_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
@@ -149,6 +156,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.tables = split_csv(ctx.param_or("tables", ""));
             o.start_file = ctx.param_or("start_file", "");
             o.start_pos = static_cast<std::uint64_t>(ctx.param_int64_or("start_pos", 4));
+            o.enable_initial_snapshot = ctx.param_or("initial_snapshot", "") == "true";
+            o.snapshot_lock = ctx.param_or("snapshot_lock", "true") != "false";
             o.heartbeat_ms = ctx.param_int64_or("heartbeat_ms", 1000);
             o.subtask_idx = ctx.subtask_idx;
             o.parallelism = ctx.parallelism;

@@ -10,6 +10,7 @@ add_executable(clink_mysql_tests
     test_mysql_sink_logic.cpp
     test_mysql_source_logic.cpp
     test_mysql_cdc_decode.cpp
+    test_mysql_snapshot.cpp
     test_mysql_live.cpp
     test_mysql_cdc_live.cpp
 )
