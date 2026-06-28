@@ -53,6 +53,13 @@ ConnectOptions conn_options_from(const clink::plugin::BuildContext& ctx) {
     o.user = ctx.param_or("user", "");
     o.password = ctx.param_or("password", "");
     o.database = ctx.param_or("database", "");
+    // TLS: ssl='true' encrypts the connection; ssl_ca/cert/key are optional PEM
+    // paths; ssl_verify='false' skips server-cert verification (dev/self-signed).
+    o.ssl = ctx.param_or("ssl", "") == "true";
+    o.ssl_ca = ctx.param_or("ssl_ca", "");
+    o.ssl_cert = ctx.param_or("ssl_cert", "");
+    o.ssl_key = ctx.param_or("ssl_key", "");
+    o.ssl_verify = ctx.param_or("ssl_verify", "true") != "false";
     return o;
 }
 

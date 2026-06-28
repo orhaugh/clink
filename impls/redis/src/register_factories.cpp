@@ -26,6 +26,15 @@ ConnectOptions conn_options_from(const clink::plugin::BuildContext& ctx) {
     o.username = ctx.param_or("username", "");
     o.password = ctx.param_or("password", "");
     o.db = static_cast<int>(ctx.param_int64_or("db", 0));
+    // TLS (requires a build with libhiredis_ssl). tls='true' encrypts the
+    // connection; tls_ca/cert/key are optional PEM paths; tls_sni overrides the
+    // verify hostname; tls_verify='false' skips server-cert verification.
+    o.tls = ctx.param_or("tls", "") == "true";
+    o.tls_ca = ctx.param_or("tls_ca", "");
+    o.tls_cert = ctx.param_or("tls_cert", "");
+    o.tls_key = ctx.param_or("tls_key", "");
+    o.tls_sni = ctx.param_or("tls_sni", "");
+    o.tls_verify = ctx.param_or("tls_verify", "true") != "false";
     return o;
 }
 

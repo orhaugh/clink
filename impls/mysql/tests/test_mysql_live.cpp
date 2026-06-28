@@ -251,6 +251,25 @@ TEST(MysqlLive, CompositeCursorHandlesNonUniqueCursor) {
     }
 }
 
+TEST(MysqlLive, TlsConnectionIsEncrypted) {
+    if (!mysql_configured()) {
+        GTEST_SKIP() << "set CLINK_MYSQL_TEST_DSN";
+    }
+    // mysql:8.0 has TLS enabled by default with a self-signed cert, so connect
+    // with ssl + ssl_verify=false (encrypted, cert not authenticated) and confirm
+    // the session is actually using a cipher.
+    ConnectOptions o = parse_dsn();
+    o.ssl = true;
+    o.ssl_verify = false;
+    Connection c{o};
+    Result r = c.query("SHOW SESSION STATUS LIKE 'Ssl_cipher'");
+    std::string cipher;
+    if (MYSQL_ROW row = r.fetch_row()) {
+        cipher = row[1] != nullptr ? row[1] : "";
+    }
+    EXPECT_FALSE(cipher.empty()) << "ssl=true must yield an encrypted session (Ssl_cipher set)";
+}
+
 TEST(MysqlLive, CursorSourceDoesNotReemitBoundaryRow) {
     if (!mysql_configured()) {
         GTEST_SKIP() << "set CLINK_MYSQL_TEST_DSN";

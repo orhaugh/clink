@@ -29,6 +29,16 @@ struct ConnectOptions {
     std::string password;
     std::string database;  // selected in-band at connect
     std::chrono::milliseconds connect_timeout{5000};
+    // TLS (mariadb-connector-c has SSL built in; no extra dependency). When ssl is
+    // true the connection is encrypted (MYSQL_OPT_SSL_ENFORCE) and a non-TLS server
+    // is refused. ssl_ca/cert/key are optional PEM paths (CA for server verify,
+    // cert+key for mutual TLS). ssl_verify=false skips server-cert verification
+    // (e.g. a self-signed dev cert) - encrypted but not authenticated.
+    bool ssl{false};
+    std::string ssl_ca;
+    std::string ssl_cert;
+    std::string ssl_key;
+    bool ssl_verify{true};
 };
 
 // Owns a MYSQL_RES*. Move-only; frees exactly once. Row access is by the
@@ -84,6 +94,21 @@ public:
             mysql_options(h_, MYSQL_OPT_CONNECT_TIMEOUT, &timeout_s);
         }
         mysql_options(h_, MYSQL_SET_CHARSET_NAME, "utf8mb4");
+        if (o.ssl) {
+            if (!o.ssl_ca.empty()) {
+                mysql_options(h_, MYSQL_OPT_SSL_CA, o.ssl_ca.c_str());
+            }
+            if (!o.ssl_cert.empty()) {
+                mysql_options(h_, MYSQL_OPT_SSL_CERT, o.ssl_cert.c_str());
+            }
+            if (!o.ssl_key.empty()) {
+                mysql_options(h_, MYSQL_OPT_SSL_KEY, o.ssl_key.c_str());
+            }
+            my_bool verify = o.ssl_verify ? 1 : 0;
+            mysql_options(h_, MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &verify);
+            my_bool enforce = 1;  // require an encrypted connection; refuse plaintext
+            mysql_options(h_, MYSQL_OPT_SSL_ENFORCE, &enforce);
+        }
         if (mysql_real_connect(h_,
                                o.host.c_str(),
                                o.user.c_str(),

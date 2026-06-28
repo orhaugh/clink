@@ -22,6 +22,12 @@
 
 #include <hiredis/hiredis.h>
 
+#ifdef CLINK_REDIS_TLS
+#include <mutex>
+
+#include <hiredis/hiredis_ssl.h>
+#endif
+
 namespace clink::redis {
 
 // Owns a redisReply*. Move-only; frees exactly once.
@@ -71,6 +77,17 @@ struct ConnectOptions {
     int db{0};             // SELECT <db>; 0 = default, no SELECT
     std::chrono::milliseconds connect_timeout{5000};
     std::chrono::milliseconds command_timeout{0};  // 0 = block (set > BLOCK ms for the source)
+    // TLS (requires the build to find libhiredis_ssl, i.e. CLINK_REDIS_TLS). When
+    // tls is true the connection is wrapped in TLS before AUTH (credentials are
+    // encrypted). tls_ca/cert/key are optional PEM paths (CA for server verify,
+    // cert+key for mutual TLS). tls_sni overrides the SNI/verify hostname (default
+    // = host). tls_verify=false skips server-cert verification (self-signed dev).
+    bool tls{false};
+    std::string tls_ca;
+    std::string tls_cert;
+    std::string tls_key;
+    std::string tls_sni;
+    bool tls_verify{true};
 };
 
 // Owns a redisContext. Move-only. Connects (+ AUTH/SELECT) in the ctor and
@@ -94,6 +111,9 @@ public:
             const timeval cmdt = to_timeval_(o.command_timeout);
             redisSetTimeout(ctx_, cmdt);
         }
+        if (o.tls) {
+            secure_(o);  // wrap in TLS before AUTH so credentials are encrypted
+        }
         if (!o.password.empty()) {
             Reply r = o.username.empty() ? command({"AUTH", o.password})
                                          : command({"AUTH", o.username, o.password});
@@ -107,12 +127,17 @@ public:
 
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
-    Connection(Connection&& o) noexcept : ctx_(o.ctx_) { o.ctx_ = nullptr; }
+    Connection(Connection&& o) noexcept : ctx_(o.ctx_), ssl_ctx_(o.ssl_ctx_) {
+        o.ctx_ = nullptr;
+        o.ssl_ctx_ = nullptr;
+    }
     Connection& operator=(Connection&& o) noexcept {
         if (this != &o) {
             free_();
             ctx_ = o.ctx_;
+            ssl_ctx_ = o.ssl_ctx_;
             o.ctx_ = nullptr;
+            o.ssl_ctx_ = nullptr;
         }
         return *this;
     }
@@ -188,14 +213,57 @@ private:
             throw std::runtime_error(std::string("redis: ") + what + " failed: " + r.error_text());
         }
     }
+    // Wrap the (already TCP-connected) context in TLS before any command runs.
+    void secure_(const ConnectOptions& o) {
+#ifdef CLINK_REDIS_TLS
+        static std::once_flag init_once;
+        std::call_once(init_once, [] { redisInitOpenSSL(); });
+        redisSSLOptions sopt{};
+        sopt.cacert_filename = o.tls_ca.empty() ? nullptr : o.tls_ca.c_str();
+        sopt.capath = nullptr;
+        sopt.cert_filename = o.tls_cert.empty() ? nullptr : o.tls_cert.c_str();
+        sopt.private_key_filename = o.tls_key.empty() ? nullptr : o.tls_key.c_str();
+        const std::string& sni = o.tls_sni.empty() ? o.host : o.tls_sni;
+        sopt.server_name = sni.empty() ? nullptr : sni.c_str();
+        sopt.verify_mode = o.tls_verify ? REDIS_SSL_VERIFY_PEER : REDIS_SSL_VERIFY_NONE;
+        redisSSLContextError ssl_err = REDIS_SSL_CTX_NONE;
+        redisSSLContext* sctx = redisCreateSSLContextWithOptions(&sopt, &ssl_err);
+        if (sctx == nullptr) {
+            const std::string e = redisSSLContextGetError(ssl_err);
+            redisFree(ctx_);
+            ctx_ = nullptr;
+            throw std::runtime_error("redis: TLS context init failed: " + e);
+        }
+        ssl_ctx_ = sctx;
+        if (redisInitiateSSLWithContext(ctx_, sctx) != REDIS_OK) {
+            const std::string e = ctx_->errstr;
+            free_();  // frees ctx_ + ssl_ctx_
+            throw std::runtime_error("redis: TLS handshake failed: " + e);
+        }
+#else
+        (void)o;
+        redisFree(ctx_);
+        ctx_ = nullptr;
+        throw std::runtime_error(
+            "redis: tls=true but this build has no TLS support (rebuild with libhiredis_ssl)");
+#endif
+    }
+
     void free_() {
         if (ctx_ != nullptr) {
             redisFree(ctx_);
             ctx_ = nullptr;
         }
+#ifdef CLINK_REDIS_TLS
+        if (ssl_ctx_ != nullptr) {
+            redisFreeSSLContext(static_cast<redisSSLContext*>(ssl_ctx_));
+            ssl_ctx_ = nullptr;
+        }
+#endif
     }
 
     redisContext* ctx_{nullptr};
+    void* ssl_ctx_{nullptr};  // redisSSLContext* (type-erased to avoid the TLS header here)
 };
 
 }  // namespace clink::redis

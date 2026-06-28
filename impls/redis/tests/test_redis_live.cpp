@@ -264,4 +264,35 @@ TEST(RedisLive, GroupCreateIsIdempotent) {
     cleanup(stream);
 }
 
+#ifdef CLINK_REDIS_TLS
+// TLS round-trip. SKIPPED unless CLINK_REDIS_TLS_TEST_URL is set to a TLS-enabled
+// redis (host:port). Connects with tls=true + tls_verify=false (self-signed dev
+// cert) and proves an encrypted PING + an XADD/XLEN round-trip work over TLS.
+TEST(RedisLive, TlsConnectionRoundTrip) {
+    const char* url = std::getenv("CLINK_REDIS_TLS_TEST_URL");
+    if (url == nullptr) {
+        GTEST_SKIP() << "set CLINK_REDIS_TLS_TEST_URL to a TLS redis host:port";
+    }
+    std::string hp = url;
+    ConnectOptions o;
+    if (auto c = hp.rfind(':'); c != std::string::npos) {
+        o.host = hp.substr(0, c);
+        o.port = static_cast<std::uint16_t>(std::stoi(hp.substr(c + 1)));
+    } else {
+        o.host = hp;
+    }
+    o.tls = true;
+    o.tls_verify = false;  // self-signed dev cert: encrypt but do not authenticate
+    Connection c{o};
+    clink::redis::Reply pong = c.command({"PING"});
+    ASSERT_TRUE(static_cast<bool>(pong));
+    const std::string stream = unique_stream();
+    c.command({"XADD", stream, "*", "v", "hello-tls"});
+    clink::redis::Reply len = c.command({"XLEN", stream});
+    ASSERT_TRUE(static_cast<bool>(len));
+    EXPECT_EQ(len->integer, 1);
+    c.command({"DEL", stream});
+}
+#endif  // CLINK_REDIS_TLS
+
 #endif  // CLINK_HAS_REDIS

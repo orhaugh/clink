@@ -46,6 +46,21 @@ if(NOT _redis_target)
     return()
 endif()
 
+# Optional TLS: hiredis SSL support is a SEPARATE library (libhiredis_ssl) plus
+# OpenSSL. When both are found, CLINK_REDIS_TLS is defined and tls=true works;
+# otherwise the connector still builds and tls=true is rejected at runtime with a
+# clear message (mirrors the http_connector https-iff-OpenSSL pattern).
+set(_redis_ssl_target "")
+find_library(_redis_ssl_lib NAMES hiredis_ssl
+    HINTS /opt/homebrew/lib /usr/local/lib /usr/lib)
+find_package(OpenSSL QUIET)
+if(_redis_ssl_lib AND OpenSSL_FOUND)
+    add_library(clink_hiredis_ssl_external INTERFACE)
+    target_link_libraries(clink_hiredis_ssl_external
+        INTERFACE ${_redis_ssl_lib} OpenSSL::SSL OpenSSL::Crypto)
+    set(_redis_ssl_target clink_hiredis_ssl_external)
+endif()
+
 add_library(clink_redis STATIC
     src/register_factories.cpp
 )
@@ -61,11 +76,23 @@ target_link_libraries(clink_redis
     PUBLIC  clink::core
     PRIVATE ${_redis_target}
 )
+if(_redis_ssl_target)
+    # PUBLIC define so the redis_client.hpp TLS path activates in consumers (tests);
+    # PRIVATE link for the module's own Connection instantiation.
+    target_compile_definitions(clink_redis PUBLIC CLINK_REDIS_TLS)
+    target_link_libraries(clink_redis PRIVATE ${_redis_ssl_target})
+    message(STATUS "clink::redis - TLS enabled (libhiredis_ssl)")
+else()
+    message(STATUS "clink::redis - TLS not available (libhiredis_ssl/OpenSSL missing)")
+endif()
 clink_set_warnings(clink_redis)
 
 # The manual-probe INTERFACE wrapper is a local target and must be exported with
 # the impl so an installed clinkConfig can resolve it; the package arms instead
 # emit a find_dependency line.
+if(TARGET clink_hiredis_ssl_external)
+    install(TARGETS clink_hiredis_ssl_external EXPORT ${CLINK_EXPORT_NAME})
+endif()
 if(TARGET clink_hiredis_external)
     install(TARGETS clink_hiredis_external EXPORT ${CLINK_EXPORT_NAME})
     clink_install_impl(TARGET clink_redis NAME redis)
