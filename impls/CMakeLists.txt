@@ -50,6 +50,7 @@ add_subdirectory(http_connector)
 add_subdirectory(redis)
 add_subdirectory(mysql)
 add_subdirectory(mqtt)
+add_subdirectory(mongodb)
 # rocksdb-s3 needs both clink::rocksdb and clink::s3, so it is added after them.
 add_subdirectory(rocksdb-s3)
 
@@ -57,7 +58,7 @@ add_subdirectory(rocksdb-s3)
 # Linking clink::impls_all is equivalent to the legacy
 # clink::clink behaviour (kitchen-sink dep on every available impl).
 add_library(clink_impls_all INTERFACE)
-foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd avro http_connector redis mysql mqtt rocksdb_s3)
+foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd avro http_connector redis mysql mqtt mongodb rocksdb_s3)
     if(TARGET clink::${_impl})
         target_link_libraries(clink_impls_all INTERFACE clink::${_impl})
     endif()
