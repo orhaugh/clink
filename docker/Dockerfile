@@ -10,6 +10,11 @@ ARG USER_GID=${USER_UID}
 # Install build dependencies via the shared setup script. It sources versions.env and
 # calls build-arrow.sh + build-iceberg-cpp.sh (the from-source, version-pinned toolchain
 # shared with the host), so copy the whole scripts/ dir, not just the entrypoint.
+# CLINK_BUILD_JOBS caps compile parallelism for the heavy from-source deps (Arrow's
+# compute kernels + the aws-sdk push past 1 GB resident per TU, so full -j can OOM a
+# RAM-limited Docker). Empty default = use all cores; override with --build-arg.
+ARG CLINK_BUILD_JOBS=""
+ENV CLINK_BUILD_JOBS=${CLINK_BUILD_JOBS}
 COPY scripts/ /tmp/clink-scripts/
 RUN chmod +x /tmp/clink-scripts/*.sh && /tmp/clink-scripts/setup-build-env.sh Debug && rm -rf /tmp/clink-scripts
 

@@ -50,7 +50,12 @@ if [ ! -d "${SRC_DIR}/src" ]; then
 fi
 
 echo "build-iceberg-cpp: configuring (bundle + S3 + sqlite catalog) against Arrow at ${PREFIX}"
+# --compile-no-warning-as-error: iceberg-cpp 0.3.0 forces CMAKE_COMPILE_WARNING_AS_ERROR=ON
+# (a plain set(), so -D cannot override it), and gcc 14 (Debian trixie) raises a
+# -Werror=free-nonheap-object FALSE POSITIVE in json_serde.cc. It is a dependency, so we
+# do not want its warnings to be errors; this flag overrides the property cross-platform.
 cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
+    --compile-no-warning-as-error \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
     -DCMAKE_PREFIX_PATH="${PREFIX}" \

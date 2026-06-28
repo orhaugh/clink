@@ -77,7 +77,7 @@ if [ ! -f "/usr/local/lib/libaws-cpp-sdk-s3.so" ] && \
           -DBUILD_SHARED_LIBS=ON \
           -DENABLE_TESTING=OFF \
           -DAUTORUN_UNIT_TESTS=OFF
-    cmake --build "$WORK_DIR/aws-sdk-cpp/build" --target install -- -j"$(nproc)"
+    cmake --build "$WORK_DIR/aws-sdk-cpp/build" --target install -- -j"${CLINK_BUILD_JOBS:-$(nproc)}"
     cd /
     rm -rf "$WORK_DIR"
     ldconfig
@@ -115,7 +115,7 @@ if [ ! -f "/usr/local/lib/libclickhouse-cpp-lib.a" ] && \
           -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
           -DBUILD_SHARED_LIBS=ON \
           ..
-    cmake --build . --target install -- -j"$(nproc)"
+    cmake --build . --target install -- -j"${CLINK_BUILD_JOBS:-$(nproc)}"
     cd /
     rm -rf "$WORK_DIR"
     ldconfig

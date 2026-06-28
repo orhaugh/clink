@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # build-arrow.sh - compile + install Apache Arrow + Parquet FROM SOURCE at the pinned
-# version (scripts/versions.env) into CLINK_DEPS_PREFIX, with exactly the feature set
-# clink links: Parquet, S3 (impls/s3 + the Iceberg S3 FileIO), Compute, IPC, and every
-# Parquet compression codec. Dropped vs a stock distro Arrow: Flight/Acero/Dataset/
-# Gandiva (clink links none of them) to keep the build bounded.
+# version (scripts/versions.env) into CLINK_DEPS_PREFIX, with the feature set clink + its
+# deps need: Parquet, S3 (impls/s3 + the Iceberg S3 FileIO), Compute, IPC, every Parquet
+# compression codec, and JSON (iceberg-cpp's avro module includes arrow/json - the host
+# only got away without it because Homebrew's Arrow headers leaked in). Dropped vs a stock
+# distro Arrow: Flight/Acero/Dataset/Gandiva (nothing links them) to keep the build bounded.
 #
 # Dependencies are BUNDLED (Arrow fetches + builds its own thrift/snappy/zstd/aws-sdk/...
 # at Arrow-pinned versions) so the macOS host and the Debian image link byte-for-byte
@@ -79,6 +80,8 @@ cmake -S "${SRC_DIR}/cpp" -B "${BUILD_DIR}" \
     -DARROW_FILESYSTEM=ON \
     -DARROW_S3=ON \
     -DARROW_COMPUTE=ON \
+    -DARROW_JSON=ON \
+    -DARROW_WITH_RAPIDJSON=ON \
     -DARROW_WITH_SNAPPY=ON \
     -DARROW_WITH_ZSTD=ON \
     -DARROW_WITH_LZ4=ON \
