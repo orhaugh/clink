@@ -6,24 +6,25 @@
 // iceberg-cpp for the manifests + table metadata + the atomic catalog commit, so the
 // result is a real Iceberg table that Spark / Trino / PyIceberg / DuckDB read.
 //
-// CADENCE: one Iceberg snapshot (FastAppend commit) per checkpoint interval - write
-// the interval's Rows into one Parquet data file, then on the barrier commit a
-// snapshot whose `add` references it.
+// CADENCE: one Iceberg snapshot per checkpoint interval - write the interval's Rows into
+// one Parquet data file, then snapshot (FastAppend) it.
 //
-// DELIVERY = AT-LEAST-ONCE, append-only, SINGLE-WRITER (only subtask 0 active). NOT
-// in v1: UPDATE/DELETE/MERGE, partitioning, exactly-once. v1 catalog = SQLite SQL
-// catalog (server-less, offline-testable); REST catalog + S3 FileIO are follow-ons.
+// DELIVERY = EXACTLY-ONCE when wired into the engine's two-phase commit (the data file is
+// staged on the barrier and the snapshot is committed only after the checkpoint is
+// globally durable - on_commit; the commit is idempotent, tagged with a clink.checkpoint-id
+// snapshot summary property, so a redelivered commit or recovery replay never
+// double-commits). Append-only, SINGLE-WRITER (only subtask 0 active). Falls back to
+// AT-LEAST-ONCE in standalone use (no state backend / no JM): the barrier commits
+// immediately. NOT in v1: UPDATE/DELETE/MERGE, partitioning. v1 catalog = SQLite SQL
+// catalog (server-less, offline-testable); REST catalog is a follow-on; S3 FileIO is
+// supported (s3:// warehouse).
 //
-// DUPLICATE WINDOW: the snapshot is committed when the barrier reaches this sink, which
-// is BEFORE the job confirms the checkpoint is globally durable (there is no 2PC
-// on_commit phase here). So duplicates arise not only from a crash between the data-file
-// write and commit, but also when a checkpoint that already passed this sink is later
-// ABORTED job-wide: failover replays the interval and commits a SECOND snapshot with the
-// same rows. Both are valid at-least-once (no loss; readers may see duplicate rows). A
-// data file written but not committed (commit failure / crash before commit) is orphaned;
-// it is best-effort deleted on a commit failure, otherwise needs Iceberg orphan-file
-// maintenance to reclaim. SINGLE-WRITER is enforced within a job (subtask 0 only); it is
-// a precondition, NOT enforced, that no other job writes the same table concurrently.
+// RESIDUALS: a data file staged before a crash but whose checkpoint never completed is an
+// orphan until the engine's abort deletes it, or until Iceberg orphan-file maintenance
+// reclaims it. SINGLE-WRITER is enforced within a job (subtask 0 only); the
+// clink.checkpoint-id idempotency marker protects against THIS writer's own
+// redelivery/replay - it is a precondition, NOT enforced, that no other job writes the
+// same table concurrently (a foreign concurrent writer could defeat the idempotency scan).
 //
 // This header is driver-free (no iceberg-cpp includes) so the factory registration
 // and tests do not need the iceberg-cpp headers; the implementation is in the .cpp.

@@ -259,6 +259,26 @@ TEST(IcebergSink2PC, RecoveryCommitsPendingStagedData) {
     fs::remove_all(wh);
 }
 
+// A corrupt staged-commit blob surfaces as a clear error during recovery (not a raw
+// std::stoll exception escaping the recovery scan).
+TEST(IcebergSink2PC, CorruptStagedStateFailsLoudlyOnRecovery) {
+    auto wh = make_2pc_wh("corrupt");
+    InMemoryStateBackend state;
+    state.put(OperatorId{42}, "_2pc_pending_sub0_99", "not-a-valid-blob");
+    RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &state, /*metrics=*/nullptr);
+
+    IcebergRowSinkOptions o;
+    o.warehouse = wh.string();
+    o.table = "events";
+    o.batcher = make_row_columnar_arrow_batcher(schema());
+    auto sink = make_iceberg_row_sink(std::move(o));
+    sink->set_id(OperatorId{42});
+    sink->attach_runtime(&rctx);
+    EXPECT_THROW(sink->open(), std::runtime_error);
+
+    fs::remove_all(wh);
+}
+
 // An s3:// warehouse needs an explicit local catalog_uri (SQLite cannot live on S3).
 // Offline: the precondition throws in open() before any S3 call.
 TEST(IcebergSink, S3WarehouseRequiresLocalCatalogUri) {

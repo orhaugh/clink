@@ -170,6 +170,9 @@ public:
         if (dormant_) {
             return;
         }
+        // Hold mu_ across the whole of open() (incl. recovery) so an early CommitCheckpoint
+        // on the TM thread cannot race the catalog/table build or the recovery commit.
+        std::lock_guard<std::mutex> lk(mu_);
         ensure_registered();
         schema_ = opts_.batcher.schema();
         ice_schema_ = arrow_schema_to_ice(*schema_);
@@ -252,6 +255,12 @@ public:
         if (dormant_ || batch.empty()) {
             return;
         }
+        // mu_ serialises the runner thread (on_data/on_barrier) against the TM reader thread
+        // that delivers on_commit/on_abort - both touch table_/catalog_/file_io_/writer_.
+        std::lock_guard<std::mutex> lk(mu_);
+        if (table_ == nullptr) {
+            return;  // closed concurrently
+        }
         if (!writer_) {
             open_writer_();
         }
@@ -284,6 +293,10 @@ public:
         if (dormant_) {
             return;
         }
+        std::lock_guard<std::mutex> lk(mu_);
+        if (table_ == nullptr) {
+            return;  // closed concurrently
+        }
         const std::uint64_t ckpt = b.id().value();
         if (two_phase_()) {
             stage_current_(ckpt);
@@ -299,8 +312,11 @@ public:
         if (dormant_) {
             return;
         }
+        // Runs on the TM reader thread; serialise against close()/on_barrier and bail if the
+        // sink was torn down concurrently (a late CommitCheckpoint racing shutdown).
+        std::lock_guard<std::mutex> lk(mu_);
         auto* state = state_backend_();
-        if (state == nullptr) {
+        if (state == nullptr || table_ == nullptr || catalog_ == nullptr) {
             return;
         }
         auto stored = state->get(this->id(), state_key_(checkpoint_id));
@@ -318,9 +334,10 @@ public:
         if (dormant_) {
             return;
         }
+        std::lock_guard<std::mutex> lk(mu_);
         auto* state = state_backend_();
-        if (state == nullptr) {
-            return;
+        if (state == nullptr || file_io_ == nullptr) {
+            return;  // closed concurrently
         }
         auto stored = state->get(this->id(), state_key_(checkpoint_id));
         if (!stored.has_value()) {
@@ -332,7 +349,10 @@ public:
     }
 
     void close() override {
-        if (!dormant_) {
+        // Hold mu_ across teardown so a late on_commit/on_abort on the TM thread either runs
+        // fully before close (mutex) or sees the reset table_/catalog_/file_io_ and bails.
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!dormant_ && table_ != nullptr) {
             if (two_phase_()) {
                 // The interval since the last barrier was never staged/committed; drop its
                 // partial data file (the source replays it). Committed + staged-pending data
@@ -403,7 +423,7 @@ private:
             return;  // empty interval -> nothing to stage, no snapshot
         }
         std::string blob =
-            st.path + "\t" + std::to_string(st.records) + "\t" + std::to_string(st.size);
+            std::to_string(st.records) + "\t" + std::to_string(st.size) + "\t" + st.path;
         state_backend_()->put(
             this->id(), state_key_(ckpt), std::string_view{blob.data(), blob.size()});
     }
@@ -474,17 +494,25 @@ private:
         cur_records_ = 0;
     }
 
+    // Blob layout = "<records>\t<size>\t<path>". The path is the tail (everything after the
+    // 2nd tab) so it may contain any character; stoll failures surface as a clear error
+    // (not a raw std::invalid_argument escaping recovery's catch).
     Staged parse_staged_(const std::vector<std::byte>& blob) const {
         std::string s(reinterpret_cast<const char*>(blob.data()), blob.size());
-        Staged st;
         const auto t1 = s.find('\t');
-        const auto t2 = s.find('\t', t1 == std::string::npos ? t1 : t1 + 1);
+        const auto t2 = (t1 == std::string::npos) ? std::string::npos : s.find('\t', t1 + 1);
         if (t1 == std::string::npos || t2 == std::string::npos) {
             throw std::runtime_error(opts_.name + ": corrupt staged-commit state: " + s);
         }
-        st.path = s.substr(0, t1);
-        st.records = std::stoll(s.substr(t1 + 1, t2 - t1 - 1));
-        st.size = std::stoll(s.substr(t2 + 1));
+        Staged st;
+        try {
+            st.records = std::stoll(s.substr(0, t1));
+            st.size = std::stoll(s.substr(t1 + 1, t2 - t1 - 1));
+        } catch (const std::exception& e) {
+            throw std::runtime_error(opts_.name + ": corrupt staged-commit state (" + e.what() +
+                                     "): " + s);
+        }
+        st.path = s.substr(t2 + 1);
         return st;
     }
 
@@ -523,6 +551,9 @@ private:
 
     IcebergRowSinkOptions opts_;
     bool dormant_{false};
+    // Serialises the runner thread (open/on_data/on_barrier/close) against the TM reader
+    // thread that delivers on_commit/on_abort. Single-writer table, so contention is rare.
+    mutable std::mutex mu_;
     std::shared_ptr<arrow::Schema> schema_;
     std::shared_ptr<ice::Schema> ice_schema_;
     std::shared_ptr<ice::FileIO> file_io_;
