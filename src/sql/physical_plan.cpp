@@ -514,6 +514,20 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{"delta_row_sink", kChannelRow, {}};
     }
+    if (connector == "iceberg") {
+        // Apache Iceberg table sink (typed Parquet data files + Iceberg snapshots via
+        // iceberg-cpp + a SQLite/REST catalog). Append-only, single-writer,
+        // at-least-once - upsert and exactly-once are not supported in v1.
+        if (upsert) {
+            unsupported("connector='iceberg' sink does not support mode='upsert' (append-only v1)");
+        }
+        if (exactly_once) {
+            unsupported(
+                "connector='iceberg' sink is at-least-once in v1; exactly-once is not yet "
+                "supported");
+        }
+        return RowConnectorBinding{"iceberg_row_sink", kChannelRow, {}};
+    }
     if (connector == "blackhole") {
         // Discard sink: counts + drops every row (the runner's records_in
         // metric still tallies them). For benchmarks where sink I/O must not

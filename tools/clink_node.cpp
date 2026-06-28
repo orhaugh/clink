@@ -115,6 +115,9 @@
 #ifdef CLINK_LINKED_MONGODB
 #include "clink/mongodb/install.hpp"
 #endif
+#ifdef CLINK_LINKED_ICEBERG
+#include "clink/iceberg/install.hpp"
+#endif
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/rocksdb/install.hpp"
 #endif
@@ -1985,6 +1988,9 @@ void install_linked_impls() {
 #endif
 #ifdef CLINK_LINKED_MONGODB
     clink::mongodb::install(reg);  // MongoDB change-streams CDC source + sink
+#endif
+#ifdef CLINK_LINKED_ICEBERG
+    clink::iceberg::install(reg);  // Apache Iceberg table sink
 #endif
     // RocksDB is unconditionally linked into clink_node (matches
     // bundled rocksdb-jni model). install() registers the

@@ -120,6 +120,35 @@ if [ ! -f "/usr/local/lib/libaws-cpp-sdk-s3.so" ] && \
     ldconfig
 fi
 
+# -- Apache iceberg-cpp (Iceberg table-format sink) --
+# Not packaged by Debian. The clink::iceberg module links the "battery-included"
+# bundle (Arrow/Parquet/Avro write backend) + the SQLite SQL catalog, so build with
+# ICEBERG_BUILD_BUNDLE=ON + ICEBERG_BUILD_SQL_CATALOG=ON + ICEBERG_SQL_SQLITE=ON.
+# iceberg-cpp 0.3.0's Avro backend does not compile against newer system avro-cpp
+# (1.12 changed the codec API), so force the pinned, vendored Avro by disabling the
+# system find_package for it only - Arrow + Parquet stay system so the ABI matches
+# clink's Arrow. Built against the same Apache Arrow installed above.
+if [ ! -f "/usr/local/lib/libiceberg_bundle.a" ]; then
+    echo "▶ Building apache/iceberg-cpp (bundle + sqlite catalog) from source..."
+    apt-get install -y --no-install-recommends libsqlite3-dev
+    WORK_DIR=$(mktemp -d)
+    git clone --depth 1 --branch v0.3.0 \
+        https://github.com/apache/iceberg-cpp.git "$WORK_DIR/iceberg-cpp"
+    cmake -S "$WORK_DIR/iceberg-cpp" -B "$WORK_DIR/iceberg-cpp/build" \
+          -DCMAKE_INSTALL_PREFIX=/usr/local \
+          -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+          -DICEBERG_BUILD_STATIC=ON \
+          -DICEBERG_BUILD_BUNDLE=ON \
+          -DICEBERG_BUILD_SQL_CATALOG=ON \
+          -DICEBERG_SQL_SQLITE=ON \
+          -DICEBERG_BUILD_TESTS=OFF \
+          -DCMAKE_DISABLE_FIND_PACKAGE_avro-cpp=ON
+    cmake --build "$WORK_DIR/iceberg-cpp/build" --target install -- -j"$(nproc)"
+    cd /
+    rm -rf "$WORK_DIR"
+    ldconfig
+fi
+
 rm -rf /var/lib/apt/lists/*
 
 echo "▶ Build env ready."
