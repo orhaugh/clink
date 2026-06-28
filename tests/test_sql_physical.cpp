@@ -188,6 +188,34 @@ TEST(SqlPhysical, ElasticsearchConnectorSinkLowersToBulkSink) {
     EXPECT_NE(find_op(os_spec, "opensearch_sink"), nullptr);
 }
 
+// connector='influxdb' lowers to the influxdb_sink (string channel) via the
+// row_to_json_string bridge, carrying url/org/bucket/token/measurement/tags.
+TEST(SqlPhysical, InfluxDbConnectorSinkLowersToLineProtocolSink) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE ix_out (a BIGINT) WITH (connector='influxdb', format='json', "
+        "url='http://influx:8086', org='o', bucket='b', token='t', measurement='m', "
+        "tags='host');");
+    for (int i = 0; i < 2; ++i) {
+        cat.register_table(
+            std::get<ast::CreateTableStmt>(s.statements[static_cast<std::size_t>(i)]));
+    }
+
+    auto plan = bind_insert(cat, "INSERT INTO ix_out SELECT a FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* ix = find_op(spec, "influxdb_sink");
+    ASSERT_NE(ix, nullptr);
+    EXPECT_EQ(ix->params.at("url"), "http://influx:8086");
+    EXPECT_EQ(ix->params.at("org"), "o");
+    EXPECT_EQ(ix->params.at("bucket"), "b");
+    EXPECT_EQ(ix->params.at("measurement"), "m");
+    EXPECT_EQ(ix->params.at("tags"), "host");
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+}
+
 // connector='splunk_hec' lowers to the splunk_hec_sink (string channel) via the
 // row_to_json_string bridge, carrying url/token/index.
 TEST(SqlPhysical, SplunkHecConnectorSinkLowersToHecSink) {

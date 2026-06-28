@@ -14,6 +14,7 @@
 #include "clink/http_connector/bulk_sink_builders.hpp"
 #include "clink/http_connector/http_poll_source.hpp"
 #include "clink/http_connector/http_request.hpp"
+#include "clink/http_connector/influxdb_sink.hpp"
 #include "clink/http_connector/install.hpp"
 #include "clink/http_connector/prometheus_push_sink.hpp"
 #include "clink/http_connector/pubsub.hpp"
@@ -174,6 +175,44 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
             o.name = "splunk_hec_sink";
             return make_splunk_hec_sink(std::move(o));
+        });
+
+    // influxdb_sink: convert each JSON-object row to one InfluxDB v2 line-protocol point
+    // and POST newline-delimited batches to /api/v2/write with `Authorization: Token <token>`.
+    // At-least-once; effectively-once when timestamp_field is set (an identical point is
+    // idempotent). Every JSON number becomes a float field. Params:
+    //   url (required)        - scheme://host[:port], e.g. http://influxdb:8086
+    //   org, bucket (required)- InfluxDB v2 organisation + bucket
+    //   token (required)      - API token (sets the Authorization header)
+    //   measurement (required)- line-protocol measurement name
+    //   tags                  - CSV of row fields to emit as tags (else all are fields)
+    //   timestamp_field       - row field holding the point timestamp (else server-assigned)
+    //   precision (default "ns") - ns|us|ms|s (write precision)
+    //   headers               - extra "K: V; ..." (rarely needed)
+    //   batch_records (default 500), batch_bytes (default 4194304)
+    //   max_retries (default 4; clamped to [0, 20])
+    //   dlq ("fail" [default] | "drop"), verify_tls ("true" [default] | "false")
+    reg.register_sink<std::string>(
+        "influxdb_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            InfluxDbOptions o;
+            o.url = ctx.param_or("url");
+            o.org = ctx.param_or("org", "");
+            o.bucket = ctx.param_or("bucket", "");
+            o.token = ctx.param_or("token", "");
+            o.measurement = ctx.param_or("measurement", "");
+            o.tag_keys = ctx.param_or("tags", "");
+            o.timestamp_field = ctx.param_or("timestamp_field", "");
+            o.precision = ctx.param_or("precision", "ns");
+            o.headers = ctx.param_or("headers", "");
+            o.verify_tls = ctx.param_or("verify_tls", "true") != "false";
+            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
+            o.batch_bytes =
+                static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 4 * 1024 * 1024));
+            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            o.dlq_policy = parse_dlq(ctx);
+            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
+            o.name = "influxdb_sink";
+            return make_influxdb_sink(std::move(o));
         });
 
     // prometheus_sink: push batched records as gauge samples to a Prometheus

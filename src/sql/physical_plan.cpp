@@ -407,6 +407,21 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{"prometheus_sink", kChannelString, "row_to_json_string"};
     }
+    if (connector == "influxdb") {
+        // InfluxDB v2 line-protocol write (/api/v2/write). At-least-once;
+        // effectively-once when a timestamp_field is set (an identical point is
+        // idempotent). Each row -> JSON object string -> one line-protocol point
+        // (every number a float field; `tags` names the tag columns).
+        if (exactly_once) {
+            unsupported(
+                "connector='influxdb' sink is at-least-once (set timestamp_field for idempotent "
+                "writes); exactly-once delivery is not supported");
+        }
+        if (upsert) {
+            unsupported("connector='influxdb' sink does not support mode='upsert'");
+        }
+        return RowConnectorBinding{"influxdb_sink", kChannelString, "row_to_json_string"};
+    }
     if (connector == "kinesis") {
         // Kinesis Data Streams sink (PutRecords). At-least-once; no producer
         // dedup key (a retry of throttled records may duplicate). Each row -> JSON
