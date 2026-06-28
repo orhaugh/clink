@@ -96,6 +96,19 @@ std::uint64_t get_u64(const unsigned char* p) {
     return v;
 }
 
+// Hex-encode a raw binlog row image for the DLQ payload (the bytes are binary, so
+// hex keeps them legible in the log and reversible for a sink-backed DLQ).
+std::string to_hex(const std::uint8_t* p, std::size_t n) {
+    static const char* k = "0123456789abcdef";
+    std::string out;
+    out.reserve(n * 2);
+    for (std::size_t i = 0; i < n; ++i) {
+        out.push_back(k[p[i] >> 4]);
+        out.push_back(k[p[i] & 0x0F]);
+    }
+    return out;
+}
+
 // Parse the member list out of an ENUM/SET column's information_schema
 // COLUMN_TYPE, e.g. "enum('active','closed')" -> {"active","closed"}. MySQL
 // doubles an embedded quote (''), which we collapse. Returns {} for non-enum/set.
@@ -622,32 +635,61 @@ private:
 
     void handle_rows_(MARIADB_RPL_EVENT* ev, Batch<std::string>& batch, std::uint64_t& bytes) {
         const std::uint64_t id = ev->event.rows.table_id;
+        const auto* rd = reinterpret_cast<const std::uint8_t*>(ev->event.rows.row_data);
+        const std::size_t rsz = ev->event.rows.row_data_size;
         auto it = tables_.find(id);
         if (it == tables_.end()) {
             ++dropped_;  // a row event with no preceding table-map -> poison
+            report_poison_(
+                rd,
+                rsz,
+                "row event for table_id " + std::to_string(id) + " with no preceding TABLE_MAP");
             return;
         }
         if (it->second.filtered) {
             return;  // excluded by the allowlist -> benign skip (not a drop)
         }
-        const auto* rd = reinterpret_cast<const std::uint8_t*>(ev->event.rows.row_data);
-        const std::size_t rsz = ev->event.rows.row_data_size;
         if (rd == nullptr || rsz == 0) {
             return;
         }
+        // Build lsn only past the filtered-skip fast path (the common case for an
+        // allowlisted source on a busy master is a skipped non-allowlisted table).
+        const std::string lsn = pos_str_();
         const RowOp op = ev->event.rows.type == UPDATE_ROWS   ? RowOp::Update
                          : ev->event.rows.type == DELETE_ROWS ? RowOp::Delete
                                                               : RowOp::Insert;
-        const std::string lsn = cur_file_ + ":" + std::to_string(cur_pos_);
         MysqlDecodeResult res =
             decode_rows_payload(rd, rsz, op, it->second.metas, it->second.schema, lsn, cur_xid_);
         dropped_ += res.dropped;
+        if (res.dropped > 0) {
+            // The raw event blob holds every row of the event; report it once with
+            // the count rather than per-row (the per-row bytes are not surfaced by
+            // the decoder). The metric still counts each dropped row.
+            report_poison_(
+                rd, rsz, std::to_string(res.dropped) + " row(s) in the event failed to decode");
+        }
         for (const auto& cev : res.events) {
             if (auto js = clink::cdc::cdc_event_to_json_row(cev)) {
                 bytes += js->size();
                 batch.emplace(std::move(*js));
             }
         }
+    }
+
+    // Route a poison binlog row event to the DLQ (best-effort; no-op if no runtime
+    // context is attached, e.g. a unit test driving the source directly). Formats
+    // the lsn lazily, so a no-op report costs nothing.
+    void report_poison_(const std::uint8_t* rd, std::size_t rsz, std::string why) {
+        auto* rt = this->runtime();
+        if (rt == nullptr) {
+            return;
+        }
+        rt->report_bad_record(clink::BadRecord{
+            .payload = (rd != nullptr && rsz > 0) ? to_hex(rd, rsz) : std::string{},
+            .error = std::move(why),
+            .connector = kLabel,
+            .direction = "source",
+            .location = pos_str_()});
     }
 
     enum class Phase { Snapshot, Stream };

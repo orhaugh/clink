@@ -110,6 +110,7 @@ add_executable(clink_core_tests
     test_subtask_emitter.cpp
     test_keyed_state_multitype.cpp
     test_runtime_context.cpp
+    test_dead_letter.cpp
     test_operator_lifecycle.cpp
     test_checkpoint_barrier.cpp
     test_in_memory_state.cpp

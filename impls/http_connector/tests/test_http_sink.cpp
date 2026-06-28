@@ -6,6 +6,7 @@
 #include <chrono>
 #include <httplib.h>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -14,8 +15,11 @@
 
 #include "clink/core/record.hpp"
 #include "clink/core/stream_element.hpp"
+#include "clink/core/types.hpp"
 #include "clink/http_connector/batched_http_bulk_sink.hpp"
 #include "clink/metrics/metrics_registry.hpp"
+#include "clink/runtime/dead_letter.hpp"
+#include "clink/runtime/runtime_context.hpp"
 
 using clink::Batch;
 using clink::CheckpointBarrier;
@@ -248,6 +252,45 @@ TEST(HttpDlq, DropPolicyDropsPermanentFailureInsteadOfThrowing) {
     const auto before = counter_value(dropped);
     EXPECT_NO_THROW(sink.flush());  // poison batch dropped, not crash-looped
     EXPECT_EQ(counter_value(dropped) - before, 2u);
+}
+
+// The engine DLQ seam: under Drop, the poison records are not just counted but
+// routed to the RuntimeContext's dead-letter queue with their payloads.
+TEST(HttpDlq, DropPolicyRoutesDroppedRecordsToDeadLetterQueue) {
+    struct CapturingDlq final : clink::DeadLetterQueue {
+        void report(const clink::BadRecord& r) override { records.push_back(r); }
+        std::vector<clink::BadRecord> records;
+    } cap;
+
+    StubServer srv;
+    auto opts = base_opts(srv.url(), 100);
+    opts.path = "/always400";
+    opts.max_retries = 1;
+    opts.dlq_policy = DlqPolicy::Drop;
+    opts.name = "dlq_http_sink";
+    BatchedHttpBulkSink<std::string> sink(opts, verbatim());
+
+    clink::RuntimeContext ctx{clink::OperatorId{1}, "dlq_http_sink", nullptr, nullptr};
+    ctx.set_dead_letter_queue(&cap);
+    sink.attach_runtime(&ctx);
+
+    sink.open();
+    Batch<std::string> b;
+    b.emplace(std::string{R"({"a":1})"});
+    b.emplace(std::string{R"({"a":2})"});
+    sink.on_data(b);
+    EXPECT_NO_THROW(sink.flush());
+    sink.attach_runtime(nullptr);
+
+    ASSERT_EQ(cap.records.size(), 2u) << "both poison records routed to the DLQ";
+    for (const auto& r : cap.records) {
+        EXPECT_EQ(r.connector, "dlq_http_sink");
+        EXPECT_EQ(r.direction, "sink");
+        EXPECT_FALSE(r.error.empty());
+    }
+    std::set<std::string> payloads{cap.records[0].payload, cap.records[1].payload};
+    EXPECT_TRUE(payloads.count(R"({"a":1})")) << "payload preserved";
+    EXPECT_TRUE(payloads.count(R"({"a":2})"));
 }
 
 TEST(HttpDlq, DropPolicyStillThrowsOnTransientExhaustion) {

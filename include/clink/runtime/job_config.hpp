@@ -21,6 +21,7 @@ class logger;
 namespace clink {
 
 class MetricsRegistry;
+class DeadLetterQueue;
 
 // JobConfig is the bag of optional knobs the LocalExecutor consults at
 // startup. It is intentionally a plain struct - every field can be omitted
@@ -87,6 +88,16 @@ struct JobConfig {
     // address space, so still correct). Raw non-owning pointer, lifetime owned
     // by clink::logging.
     spdlog::logger* logger{nullptr};
+
+    // Engine-level dead-letter queue. The executor copies this onto every
+    // RuntimeContext so a connector can route a poison record (a source decode
+    // failure / a sink permanent write failure) somewhere instead of silently
+    // dropping it. When null (the default), the executor installs a
+    // LoggingDeadLetterQueue over `logger`, so bad records are at least logged with
+    // zero config; set a NullDeadLetterQueue to drop silently, or a sink-backed one
+    // to capture. Raw non-owning pointer; lifetime owned by the caller (or, for the
+    // default, by the executor). See clink/runtime/dead_letter.hpp.
+    DeadLetterQueue* dead_letter_queue{nullptr};
 
     // Called by each operator runner after it successfully snapshots its
     // state in response to a CheckpointBarrier. The cluster's TaskManager

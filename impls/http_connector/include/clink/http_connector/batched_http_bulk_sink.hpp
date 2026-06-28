@@ -155,12 +155,25 @@ public:
             if (!r.failed_permanent.empty()) {
                 if (opts_.dlq_policy == DlqPolicy::Drop) {
                     std::size_t valid = 0;
+                    auto* rt = this->runtime();
                     for (std::size_t rel : r.failed_permanent) {
                         if (rel >= active.size()) {
                             continue;
                         }
-                        dropped_bytes += fragments_[active[rel]].size();
+                        const std::string& frag = fragments_[active[rel]];
+                        dropped_bytes += frag.size();
                         ++valid;
+                        // Route the poison record to the DLQ before it is dropped, so
+                        // it is surfaced (logged by default) rather than vanishing.
+                        if (rt != nullptr) {
+                            rt->report_bad_record(clink::BadRecord{
+                                .payload = frag,
+                                .error = "permanently rejected by " + opts_.http.base_url +
+                                         opts_.path + " (" + delivery_detail_(last) + ")",
+                                .connector = opts_.name,
+                                .direction = "sink",
+                                .location = opts_.http.base_url + opts_.path});
+                        }
                     }
                     dropped += valid;
                     if (valid > 0) {

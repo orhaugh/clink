@@ -127,6 +127,16 @@ public:
             // let it through and PutRecords rejects the batch loudly.
             if (rec.value().size() > opts_.max_record_bytes &&
                 opts_.dlq_policy == DlqPolicy::Drop) {
+                if (auto* rt = this->runtime(); rt != nullptr) {
+                    rt->report_bad_record(
+                        clink::BadRecord{.payload = rec.value(),
+                                         .error = "record " + std::to_string(rec.value().size()) +
+                                                  " bytes exceeds the Kinesis per-record limit (" +
+                                                  std::to_string(opts_.max_record_bytes) + ")",
+                                         .connector = "kinesis",
+                                         .direction = "sink",
+                                         .location = opts_.stream});
+                }
                 clink::metrics::connector::dropped_records_inc("kinesis", 1);
                 clink::metrics::connector::permanent_failures_inc("kinesis");
                 continue;

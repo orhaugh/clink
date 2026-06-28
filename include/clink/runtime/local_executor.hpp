@@ -114,6 +114,10 @@ private:
     std::atomic<bool> cancel_{false};
     std::vector<std::jthread> threads_;
     std::vector<std::unique_ptr<RuntimeContext>> contexts_;
+    // Default DLQ installed when JobConfig::dead_letter_queue is unset, so bad
+    // records are logged with zero config. Owned here so it outlives the contexts
+    // that point at it. Null when the job supplied its own DLQ.
+    std::unique_ptr<DeadLetterQueue> default_dlq_;
     std::jthread metrics_thread_;
     std::jthread external_cancel_watch_thread_;
     mutable std::mutex error_mu_;

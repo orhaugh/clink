@@ -17,6 +17,7 @@
 #include "clink/core/types.hpp"
 #include "clink/metrics/operator_metrics.hpp"
 #include "clink/runtime/bounded_channel.hpp"
+#include "clink/runtime/dead_letter.hpp"
 #include "clink/runtime/log_buffer.hpp"
 #include "clink/runtime/output_tag.hpp"
 #include "clink/runtime/timer_service.hpp"
@@ -127,6 +128,27 @@ public:
     void log_info(std::string_view message) const { log(LogSeverity::Info, message); }
     void log_warn(std::string_view message) const { log(LogSeverity::Warn, message); }
     void log_error(std::string_view message) const { log(LogSeverity::Error, message); }
+
+    // Dead-letter queue seam. The executor hands every subtask one shared DLQ (the
+    // default logs bad records; a job may swap in a null or sink-backed one). A
+    // connector that must drop a poison record - a source decode failure, a sink
+    // permanent write failure - calls report_bad_record() so the record is surfaced
+    // rather than silently lost. Best-effort: never throws, never blocks the
+    // pipeline (a no-op when no DLQ is wired, e.g. legacy / unit-test paths).
+    void set_dead_letter_queue(DeadLetterQueue* dlq) noexcept { dlq_ = dlq; }
+    DeadLetterQueue* dead_letter_queue() const noexcept { return dlq_; }
+    void report_bad_record(const BadRecord& rec) const noexcept {
+        if (dlq_ == nullptr) {
+            return;
+        }
+        // Best-effort at the C/pipeline seam: a DLQ that throws (e.g. bad_alloc
+        // formatting a huge payload, or a misbehaving custom sink) must NEVER take
+        // the job down - reporting a bad record is strictly diagnostic.
+        try {
+            dlq_->report(rec);
+        } catch (...) {
+        }
+    }
 
     // Per-operator processing-time TimerService. Always present; users
     // call timer_service()->register_processing_time_timer(...) from
@@ -375,6 +397,7 @@ private:
     MetricsRegistry* metrics_{nullptr};
     std::uint64_t attributed_op_id_{0};
     spdlog::logger* host_logger_{nullptr};
+    DeadLetterQueue* dlq_{nullptr};
     TimerService timer_service_{};
     SideOutputChannelMap side_outputs_;
     CheckpointAckFn ack_fn_;

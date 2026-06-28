@@ -12,6 +12,7 @@
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/metrics/operator_metrics.hpp"
 #include "clink/runtime/cpu_affinity.hpp"
+#include "clink/runtime/dead_letter.hpp"
 #include "clink/state/state_migration_on_restore.hpp"
 
 namespace clink {
@@ -56,6 +57,15 @@ void LocalExecutor::start() {
 
     threads_.reserve(dag_.runners().size());
     contexts_.reserve(dag_.runners().size());
+    // Resolve the dead-letter queue every subtask reports poison records to. When
+    // the job did not supply one, install the default (logs bad records over the
+    // host logger) so they are visible with zero config. Owned by default_dlq_ so
+    // it outlives the contexts that point at it.
+    DeadLetterQueue* dlq = config_.dead_letter_queue;
+    if (dlq == nullptr) {
+        default_dlq_ = std::make_unique<LoggingDeadLetterQueue>(config_.logger);
+        dlq = default_dlq_.get();
+    }
     for (std::size_t i = 0; i < dag_.runners().size(); ++i) {
         const auto& runner = dag_.runners()[i];
         contexts_.push_back(std::make_unique<RuntimeContext>(
@@ -97,6 +107,9 @@ void LocalExecutor::start() {
         // JobConfig::logger). Null in in-process / legacy paths, where the
         // operator log helpers fall back to the process LogBuffer.
         contexts_.back()->set_logger(config_.logger);
+        // Ambient DLQ: a connector routes a poison record here instead of dropping
+        // it silently. Same instance on every context (it is thread-safe).
+        contexts_.back()->set_dead_letter_queue(dlq);
         auto* ctx_ptr = contexts_.back().get();
         auto run_fn = runner.run;
         auto cancel_fn = runner.cancel;
