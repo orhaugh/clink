@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "clink/core/arrow_batcher.hpp"
@@ -40,12 +41,20 @@
 namespace clink::iceberg {
 
 struct IcebergRowSinkOptions {
-    std::string warehouse;  // catalog warehouse location (local path; s3:// is a follow-on)
+    // Catalog warehouse location. A local filesystem path (data + metadata + catalog all
+    // local), OR an "s3://bucket/prefix" URI to write data + table metadata to S3/MinIO.
+    std::string warehouse;
     std::vector<std::string> namespace_levels{"default"};  // table namespace
     std::string table;                                     // table name (required)
-    // SQLite catalog DB path; default "<warehouse>/catalog.db". (REST catalog is a
-    // follow-on - a uri starting with http(s):// would select it.)
+    // SQLite catalog DB path; default "<warehouse>/catalog.db" for a LOCAL warehouse.
+    // REQUIRED (and must be a local path) for an s3:// warehouse - the SQLite catalog
+    // file cannot live on S3. (REST catalog is a follow-on - an http(s):// uri selects it.)
     std::string catalog_uri;
+    // FileIO properties for an s3:// warehouse (iceberg S3 keys: "s3.endpoint",
+    // "s3.region", "s3.access-key-id", "s3.secret-access-key", "s3.path-style-access",
+    // "s3.session-token"). Empty for a local warehouse. Missing creds fall back to the
+    // standard AWS env/credential chain.
+    std::unordered_map<std::string, std::string> file_io_props;
     ArrowBatcher<clink::sql::Row> batcher;  // schema-driven typed Arrow batcher
     std::uint32_t subtask_idx{0};           // only subtask 0 writes (single-writer table)
     std::string name{"iceberg_row_sink"};

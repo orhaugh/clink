@@ -13,6 +13,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -43,6 +44,10 @@
 // factory registration (it is explicit, not static-init that survives a static-lib link).
 namespace iceberg::arrow {
 std::unique_ptr<::iceberg::FileIO> MakeLocalFileIO();
+// MakeS3FileIO self-initialises Arrow's S3 subsystem (EnsureS3Initialized) on first
+// use; clink never calls arrow::fs::InitializeS3 elsewhere, so there is no double-init.
+std::unique_ptr<::iceberg::FileIO> MakeS3FileIO(
+    const std::unordered_map<std::string, std::string>& properties);
 }  // namespace iceberg::arrow
 namespace iceberg::parquet {
 void RegisterAll();
@@ -167,9 +172,24 @@ public:
         schema_ = opts_.batcher.schema();
         ice_schema_ = arrow_schema_to_ice(*schema_);
 
-        // Local FileIO for v1 (S3 FileIO is a follow-on). MakeLocalFileIO returns a
-        // unique_ptr; the catalog + writer want a shared_ptr.
-        file_io_ = std::shared_ptr<ice::FileIO>(ice::arrow::MakeLocalFileIO().release());
+        // FileIO by warehouse scheme: S3 for an s3:// warehouse (data + table metadata go
+        // to the object store), else local filesystem. Both factories return unique_ptr;
+        // the catalog + writer want shared_ptr.
+        const bool s3 = opts_.warehouse.rfind("s3://", 0) == 0;
+        if (s3) {
+            // The SQLite catalog file cannot live on S3, so an s3:// warehouse needs an
+            // explicit LOCAL catalog_uri. (Full-S3 deployments use the REST catalog.)
+            if (opts_.catalog_uri.empty()) {
+                throw std::runtime_error(
+                    opts_.name +
+                    ": an s3:// warehouse requires an explicit local catalog_uri (the SQLite "
+                    "catalog cannot live on S3; or use a REST catalog)");
+            }
+            file_io_ = std::shared_ptr<ice::FileIO>(
+                ice::arrow::MakeS3FileIO(opts_.file_io_props).release());
+        } else {
+            file_io_ = std::shared_ptr<ice::FileIO>(ice::arrow::MakeLocalFileIO().release());
+        }
 
         ice::sql::SqlCatalogConfig cfg;
         cfg.name = "clink";
@@ -186,18 +206,22 @@ public:
         id_.ns = ns;
         id_.name = opts_.table;
 
-        // Drive the table location explicitly (warehouse/<ns levels>/<table>) so we can
-        // pre-create the metadata/ + data/ dirs: iceberg-cpp's local Arrow FileIO writes
-        // through OpenOutputStream, which does NOT create parent directories, so the very
-        // first metadata write in CreateTable would fail on a fresh warehouse.
+        // Drive the table location explicitly (warehouse/<ns levels>/<table>).
         std::string location = opts_.warehouse;
         for (const auto& level : opts_.namespace_levels) {
             location += "/" + level;
         }
         location += "/" + opts_.table;
+
+        // Pre-create the metadata/ + data/ dirs for a LOCAL warehouse: iceberg-cpp's local
+        // Arrow FileIO writes through OpenOutputStream, which does NOT create parent
+        // directories, so the first metadata write in CreateTable would fail on a fresh
+        // warehouse. On S3 directories are implicit (key prefixes), so this is skipped.
         std::error_code ec;
-        std::filesystem::create_directories(location + "/metadata", ec);
-        std::filesystem::create_directories(location + "/data", ec);
+        if (!s3) {
+            std::filesystem::create_directories(location + "/metadata", ec);
+            std::filesystem::create_directories(location + "/data", ec);
+        }
 
         if (auto ex = catalog_->TableExists(id_); ex.has_value() && !ex.value()) {
             (void)unwrap(catalog_->CreateTable(id_,
@@ -210,10 +234,12 @@ public:
         }
         table_ = unwrap(catalog_->LoadTable(id_), "load table");
 
-        // For an already-existing table the loaded location may differ from ours; make
-        // sure its data/ + metadata/ dirs exist before the writer + snapshot commits.
-        std::filesystem::create_directories(std::string(table_->location()) + "/metadata", ec);
-        std::filesystem::create_directories(std::string(table_->location()) + "/data", ec);
+        // For an already-existing LOCAL table the loaded location may differ from ours;
+        // make sure its data/ + metadata/ dirs exist before the writer + snapshot commits.
+        if (!s3) {
+            std::filesystem::create_directories(std::string(table_->location()) + "/metadata", ec);
+            std::filesystem::create_directories(std::string(table_->location()) + "/data", ec);
+        }
     }
 
     void on_data(const Batch<clink::sql::Row>& batch) override {

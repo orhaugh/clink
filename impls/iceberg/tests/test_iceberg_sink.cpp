@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -129,4 +130,84 @@ TEST(IcebergSink, NonZeroSubtaskIsDormant) {
     EXPECT_EQ(count_paths_containing(wh, ".parquet"), 0);
 
     fs::remove_all(wh);
+}
+
+// An s3:// warehouse needs an explicit local catalog_uri (SQLite cannot live on S3).
+// Offline: the precondition throws in open() before any S3 call.
+TEST(IcebergSink, S3WarehouseRequiresLocalCatalogUri) {
+    IcebergRowSinkOptions o;
+    o.warehouse = "s3://bucket/warehouse";
+    o.table = "events";
+    o.batcher = make_row_columnar_arrow_batcher(schema());  // catalog_uri left empty
+    auto sink = make_iceberg_row_sink(std::move(o));
+    EXPECT_THROW(sink->open(), std::runtime_error);
+}
+
+// Live S3 round-trip via MinIO/LocalStack: write a real Iceberg table whose data + table
+// metadata live on S3 (SQLite catalog stays local), then re-open it to prove the metadata
+// reads back from S3. Gated on CLINK_S3_TEST_ENDPOINT (+ CLINK_S3_TEST_BUCKET); skips in
+// CI. PyIceberg-over-S3 is the external data oracle (set CLINK_ICEBERG_KEEP_DIR for the
+// local catalog.db so an external reader can load the table).
+TEST(IcebergS3Live, WritesToS3AndReopens) {
+    const char* endpoint = std::getenv("CLINK_S3_TEST_ENDPOINT");
+    if (endpoint == nullptr) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT (+ CLINK_S3_TEST_BUCKET) to run";
+    }
+    const char* bucket = std::getenv("CLINK_S3_TEST_BUCKET");
+    const std::string bkt = bucket != nullptr ? bucket : "clink-iceberg";
+    const char* ak = std::getenv("AWS_ACCESS_KEY_ID");
+    const char* sk = std::getenv("AWS_SECRET_ACCESS_KEY");
+
+    const std::string warehouse =
+        "s3://" + bkt + "/wh_" + std::to_string(static_cast<long>(::getpid()));
+    const char* keep = std::getenv("CLINK_ICEBERG_KEEP_DIR");
+    const auto cat =
+        keep != nullptr
+            ? fs::path(keep) / "catalog.db"
+            : fs::temp_directory_path() /
+                  ("clink_ice_s3_" + std::to_string(static_cast<long>(::getpid())) + ".db");
+    fs::remove(cat);
+
+    auto make_opts = [&]() {
+        IcebergRowSinkOptions o;
+        o.warehouse = warehouse;
+        o.namespace_levels = {"default"};
+        o.table = "events";
+        o.catalog_uri = cat.string();  // SQLite catalog stays local
+        o.file_io_props["s3.endpoint"] = endpoint;
+        o.file_io_props["s3.path-style-access"] = "true";  // required for MinIO
+        o.file_io_props["s3.region"] = "us-east-1";
+        if (ak != nullptr)
+            o.file_io_props["s3.access-key-id"] = ak;
+        if (sk != nullptr)
+            o.file_io_props["s3.secret-access-key"] = sk;
+        o.batcher = make_row_columnar_arrow_batcher(schema());
+        return o;
+    };
+
+    // Write two snapshots to S3.
+    {
+        auto sink = make_iceberg_row_sink(make_opts());
+        ASSERT_NO_THROW(sink->open());
+        Batch<Row> b0;
+        b0.emplace(make_row(1, "a"));
+        b0.emplace(make_row(2, "b"));
+        sink->on_data(b0);
+        sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        Batch<Row> b1;
+        b1.emplace(make_row(3, "c"));
+        sink->on_data(b1);
+        ASSERT_NO_THROW(sink->close());
+    }
+    // Re-open the now-existing table: open() does LoadTable, which reads the table metadata
+    // back from S3 (proves the S3 write + commit round-trips).
+    {
+        auto sink = make_iceberg_row_sink(make_opts());
+        EXPECT_NO_THROW(sink->open());
+        EXPECT_NO_THROW(sink->close());
+    }
+
+    if (keep == nullptr) {
+        fs::remove(cat);
+    }
 }

@@ -72,6 +72,22 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.table = ctx.param_or("table", "");
             o.namespace_levels = split_namespace(ctx.param_or("namespace", "default"));
             o.catalog_uri = ctx.param_or("catalog_uri", "");
+            // S3 FileIO config for an s3:// warehouse. clink-friendly param names mapped to
+            // the iceberg S3 property keys; anything left unset falls back to the standard
+            // AWS env/credential chain (incl. AWS_ENDPOINT_URL). path-style is required for
+            // MinIO ('s3_path_style'='true').
+            auto put_s3 = [&](const char* param, const char* ice_key) {
+                std::string v = ctx.param_or(param, "");
+                if (!v.empty()) {
+                    o.file_io_props[ice_key] = std::move(v);
+                }
+            };
+            put_s3("s3_endpoint", "s3.endpoint");
+            put_s3("s3_region", "s3.region");
+            put_s3("s3_access_key", "s3.access-key-id");
+            put_s3("s3_secret_key", "s3.secret-access-key");
+            put_s3("s3_session_token", "s3.session-token");
+            put_s3("s3_path_style", "s3.path-style-access");
             o.batcher = clink::sql::make_row_columnar_arrow_batcher(
                 clink::sql::parse_row_schema(ctx.param_or("schema_columns")));
             o.subtask_idx = ctx.subtask_idx;
