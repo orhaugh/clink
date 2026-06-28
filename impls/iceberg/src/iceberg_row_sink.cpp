@@ -627,19 +627,26 @@ private:
                                      "partition values)");
         }
         const auto& jv = it->second;
-        switch (pc.atype) {
-            case arrow::Type::INT64:
-                return std::to_string(static_cast<std::int64_t>(jv.as_number()));
-            case arrow::Type::INT32:
-                return std::to_string(static_cast<std::int32_t>(jv.as_number()));
-            case arrow::Type::DOUBLE:
-                return std::to_string(jv.as_number());
-            case arrow::Type::FLOAT:
-                return std::to_string(static_cast<float>(jv.as_number()));
-            case arrow::Type::BOOL:
-                return jv.as_bool() ? "true" : "false";
-            default:
-                return jv.as_string();  // STRING / LARGE_STRING
+        // The JsonValue accessors throw std::bad_variant_access on a type mismatch (e.g. a
+        // string value in an int64 key column); rethrow as a clear, sink-scoped error.
+        try {
+            switch (pc.atype) {
+                case arrow::Type::INT64:
+                    return std::to_string(static_cast<std::int64_t>(jv.as_number()));
+                case arrow::Type::INT32:
+                    return std::to_string(static_cast<std::int32_t>(jv.as_number()));
+                case arrow::Type::DOUBLE:
+                    return std::to_string(jv.as_number());
+                case arrow::Type::FLOAT:
+                    return std::to_string(static_cast<float>(jv.as_number()));
+                case arrow::Type::BOOL:
+                    return jv.as_bool() ? "true" : "false";
+                default:
+                    return jv.as_string();  // STRING / LARGE_STRING
+            }
+        } catch (const std::exception&) {
+            throw std::runtime_error(opts_.name + ": column '" + pc.name +
+                                     "' value does not match its declared type");
         }
     }
 
