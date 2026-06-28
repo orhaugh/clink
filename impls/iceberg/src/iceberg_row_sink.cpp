@@ -26,6 +26,9 @@
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/state_backend.hpp"
 
+#include "iceberg/catalog.h"
+#include "iceberg/catalog/rest/catalog_properties.h"
+#include "iceberg/catalog/rest/rest_catalog.h"
 #include "iceberg/catalog/sql/sql_catalog.h"
 #include "iceberg/expression/literal.h"
 #include "iceberg/file_format.h"
@@ -56,6 +59,10 @@ std::unique_ptr<::iceberg::FileIO> MakeLocalFileIO();
 // use; clink never calls arrow::fs::InitializeS3 elsewhere, so there is no double-init.
 std::unique_ptr<::iceberg::FileIO> MakeS3FileIO(
     const std::unordered_map<std::string, std::string>& properties);
+// Registers the arrow-fs-local + arrow-fs-s3 FileIO factories in the FileIORegistry. The
+// SQLite-catalog path builds FileIO directly, but the REST catalog resolves it by name via
+// the registry, so this must run before a REST catalog is constructed.
+void RegisterAll();
 }  // namespace iceberg::arrow
 namespace iceberg::parquet {
 void RegisterAll();
@@ -78,6 +85,7 @@ void ensure_registered() {
     std::call_once(once, [] {
         ice::parquet::RegisterAll();
         ice::avro::RegisterAll();
+        ice::arrow::RegisterAll();  // arrow-fs-local + arrow-fs-s3 FileIO factories (REST catalog)
     });
 }
 
@@ -186,13 +194,37 @@ public:
         ice_schema_ = arrow_schema_to_ice(*schema_);
         auto spec = build_partition_spec_();  // also fills part_cols_
 
-        // FileIO by warehouse scheme: S3 for an s3:// warehouse (data + table metadata go
-        // to the object store), else local filesystem. Both factories return unique_ptr;
-        // the catalog + writer want shared_ptr.
+        // Catalog selection by catalog_uri scheme:
+        //   http(s)://  -> REST catalog (resolves its own FileIO, e.g. S3, from /config +
+        //                  the io props; the table location is server-assigned).
+        //   otherwise   -> SQLite SQL catalog + an explicit local/S3 FileIO.
+        const bool rest = opts_.catalog_uri.rfind("http://", 0) == 0 ||
+                          opts_.catalog_uri.rfind("https://", 0) == 0;
         const bool s3 = opts_.warehouse.rfind("s3://", 0) == 0;
-        if (s3) {
+
+        if (rest) {
+            std::unordered_map<std::string, std::string> props;
+            props["uri"] = opts_.catalog_uri;
+            props["name"] = "clink";
+            if (!opts_.warehouse.empty()) {
+                props["warehouse"] = opts_.warehouse;
+            }
+            // Pass FileIO props (s3.endpoint/region/credentials/path-style) through so the
+            // catalog-resolved FileIO can reach the object store.
+            for (const auto& [k, v] : opts_.file_io_props) {
+                props[k] = v;
+            }
+            if (!opts_.rest_auth_token.empty()) {
+                props["header.Authorization"] = "Bearer " + opts_.rest_auth_token;
+            }
+            // RestCatalog::Make does a synchronous GET /config here; a bad/unreachable
+            // endpoint surfaces as a clear error (open() is otherwise local-only).
+            catalog_ = unwrap(ice::rest::RestCatalog::Make(
+                                  ice::rest::RestCatalogProperties::FromMap(std::move(props))),
+                              "make rest catalog");
+        } else if (s3) {
             // The SQLite catalog file cannot live on S3, so an s3:// warehouse needs an
-            // explicit LOCAL catalog_uri. (Full-S3 deployments use the REST catalog.)
+            // explicit LOCAL catalog_uri (or use a REST catalog for full-S3).
             if (opts_.catalog_uri.empty()) {
                 throw std::runtime_error(
                     opts_.name +
@@ -205,13 +237,15 @@ public:
             file_io_ = std::shared_ptr<ice::FileIO>(ice::arrow::MakeLocalFileIO().release());
         }
 
-        ice::sql::SqlCatalogConfig cfg_;
-        cfg_.name = "clink";
-        cfg_.warehouse_location = opts_.warehouse;
-        cfg_.uri =
-            opts_.catalog_uri.empty() ? (opts_.warehouse + "/catalog.db") : opts_.catalog_uri;
-        catalog_ =
-            unwrap(ice::sql::SqlCatalog::MakeSqliteCatalog(cfg_, file_io_), "make sqlite catalog");
+        if (!rest) {
+            ice::sql::SqlCatalogConfig cfg_;
+            cfg_.name = "clink";
+            cfg_.warehouse_location = opts_.warehouse;
+            cfg_.uri =
+                opts_.catalog_uri.empty() ? (opts_.warehouse + "/catalog.db") : opts_.catalog_uri;
+            catalog_ = unwrap(ice::sql::SqlCatalog::MakeSqliteCatalog(cfg_, file_io_),
+                              "make sqlite catalog");
+        }
 
         ice::Namespace ns;
         ns.levels = opts_.namespace_levels;
@@ -221,19 +255,18 @@ public:
         id_.ns = ns;
         id_.name = opts_.table;
 
-        // Drive the table location explicitly (warehouse/<ns levels>/<table>).
-        std::string location = opts_.warehouse;
-        for (const auto& level : opts_.namespace_levels) {
-            location += "/" + level;
-        }
-        location += "/" + opts_.table;
-
-        // Pre-create the metadata/ + data/ dirs for a LOCAL warehouse: iceberg-cpp's local
-        // Arrow FileIO writes through OpenOutputStream, which does NOT create parent
-        // directories, so the first metadata write in CreateTable would fail on a fresh
-        // warehouse. On S3 directories are implicit (key prefixes), so this is skipped.
-        std::error_code ec;
-        if (!s3) {
+        // Local-FS table location (warehouse/<ns>/<table>); REST + S3 let the catalog/server
+        // assign it (pass empty so the server decides). Only a local-FS warehouse needs the
+        // dirs pre-created (iceberg-cpp's local Arrow FileIO does not mkdir parents).
+        const bool local_fs = !rest && !s3;
+        std::string location;
+        if (local_fs) {
+            location = opts_.warehouse;
+            for (const auto& level : opts_.namespace_levels) {
+                location += "/" + level;
+            }
+            location += "/" + opts_.table;
+            std::error_code ec;
             std::filesystem::create_directories(location + "/metadata", ec);
             std::filesystem::create_directories(location + "/data", ec);
         }
@@ -245,9 +278,12 @@ public:
         }
         table_ = unwrap(catalog_->LoadTable(id_), "load table");
 
-        // For an already-existing LOCAL table the loaded location may differ from ours;
-        // make sure its data/ + metadata/ dirs exist before the writer + snapshot commits.
-        if (!s3) {
+        // REST: the table carries the catalog-resolved FileIO (e.g. S3) - adopt it for the
+        // data-file writer. For an existing local table, ensure its data/metadata dirs exist.
+        if (rest) {
+            file_io_ = table_->io();
+        } else if (local_fs) {
+            std::error_code ec;
             std::filesystem::create_directories(std::string(table_->location()) + "/metadata", ec);
             std::filesystem::create_directories(std::string(table_->location()) + "/data", ec);
         }
@@ -777,7 +813,7 @@ private:
     std::shared_ptr<ice::Schema> ice_schema_;
     std::vector<PartCol> part_cols_;  // empty = unpartitioned
     std::shared_ptr<ice::FileIO> file_io_;
-    std::shared_ptr<ice::sql::SqlCatalog> catalog_;
+    std::shared_ptr<ice::Catalog> catalog_;  // SqlCatalog (sqlite) or RestCatalog
     ice::TableIdentifier id_;
     std::shared_ptr<ice::Table> table_;
     std::map<std::string, OpenPart> open_;  // open per-partition writers this interval

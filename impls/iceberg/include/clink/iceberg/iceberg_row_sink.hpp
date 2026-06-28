@@ -56,10 +56,14 @@ struct IcebergRowSinkOptions {
     // value); bucket/truncate/temporal transforms are follow-ons. v1 requires the partition
     // values present + non-null.
     std::vector<std::string> partition_by;
-    // SQLite catalog DB path; default "<warehouse>/catalog.db" for a LOCAL warehouse.
-    // REQUIRED (and must be a local path) for an s3:// warehouse - the SQLite catalog
-    // file cannot live on S3. (REST catalog is a follow-on - an http(s):// uri selects it.)
+    // Catalog selector. Default "<warehouse>/catalog.db" for a LOCAL warehouse (SQLite).
+    // REQUIRED + must be a local path for an s3:// warehouse with the SQLite catalog (the
+    // catalog file cannot live on S3). An http(s):// uri selects the REST catalog instead
+    // (which resolves its own FileIO from the server config + file_io_props, so it works
+    // with an S3 warehouse end to end).
     std::string catalog_uri;
+    // Optional bearer token for a REST catalog (sent as "Authorization: Bearer <token>").
+    std::string rest_auth_token;
     // FileIO properties for an s3:// warehouse (iceberg S3 keys: "s3.endpoint",
     // "s3.region", "s3.access-key-id", "s3.secret-access-key", "s3.path-style-access",
     // "s3.session-token"). Empty for a local warehouse. Missing creds fall back to the

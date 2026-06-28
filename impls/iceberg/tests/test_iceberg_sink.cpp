@@ -357,6 +357,63 @@ TEST(IcebergSinkPartitioned, MultiFileStageThenCommit) {
     fs::remove_all(wh);
 }
 
+// Live REST catalog round-trip: write an Iceberg table whose catalog ops go through a REST
+// server (Polaris/Nessie/iceberg-rest-fixture) and whose data lives on the S3 warehouse the
+// catalog manages, then re-open it (LoadTable via REST). Gated on CLINK_ICEBERG_REST_URI
+// (+ CLINK_ICEBERG_REST_WAREHOUSE + the S3 env). PyIceberg-over-REST is the external oracle.
+TEST(IcebergRestLive, WritesViaRestCatalog) {
+    const char* rest = std::getenv("CLINK_ICEBERG_REST_URI");
+    if (rest == nullptr) {
+        GTEST_SKIP() << "set CLINK_ICEBERG_REST_URI (+ CLINK_ICEBERG_REST_WAREHOUSE, S3 env)";
+    }
+    const char* wh = std::getenv("CLINK_ICEBERG_REST_WAREHOUSE");
+    const char* s3ep = std::getenv("CLINK_S3_TEST_ENDPOINT");
+    const char* ak = std::getenv("AWS_ACCESS_KEY_ID");
+    const char* sk = std::getenv("AWS_SECRET_ACCESS_KEY");
+    const char* tok = std::getenv("CLINK_ICEBERG_REST_TOKEN");
+
+    const std::string table = "rest_events_" + std::to_string(static_cast<long>(::getpid()));
+    auto make_opts = [&]() {
+        IcebergRowSinkOptions o;
+        o.catalog_uri = rest;
+        if (wh != nullptr)
+            o.warehouse = wh;
+        o.namespace_levels = {"default"};
+        o.table = table;
+        if (tok != nullptr)
+            o.rest_auth_token = tok;
+        if (s3ep != nullptr)
+            o.file_io_props["s3.endpoint"] = s3ep;
+        o.file_io_props["s3.path-style-access"] = "true";
+        o.file_io_props["s3.region"] = "us-east-1";
+        if (ak != nullptr)
+            o.file_io_props["s3.access-key-id"] = ak;
+        if (sk != nullptr)
+            o.file_io_props["s3.secret-access-key"] = sk;
+        o.batcher = make_row_columnar_arrow_batcher(schema());
+        return o;
+    };
+
+    {
+        auto sink = make_iceberg_row_sink(make_opts());
+        ASSERT_NO_THROW(sink->open());
+        Batch<Row> b0;
+        b0.emplace(make_row(1, "a"));
+        b0.emplace(make_row(2, "b"));
+        sink->on_data(b0);
+        sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        Batch<Row> b1;
+        b1.emplace(make_row(3, "c"));
+        sink->on_data(b1);
+        ASSERT_NO_THROW(sink->close());
+    }
+    {
+        auto sink = make_iceberg_row_sink(make_opts());
+        EXPECT_NO_THROW(sink->open());  // LoadTable via REST proves the catalog round-trips
+        EXPECT_NO_THROW(sink->close());
+    }
+}
+
 // An s3:// warehouse needs an explicit local catalog_uri (SQLite cannot live on S3).
 // Offline: the precondition throws in open() before any S3 call.
 TEST(IcebergSink, S3WarehouseRequiresLocalCatalogUri) {

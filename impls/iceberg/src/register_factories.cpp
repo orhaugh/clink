@@ -97,6 +97,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.table = ctx.param_or("table", "");
             o.namespace_levels = split_namespace(ctx.param_or("namespace", "default"));
             o.catalog_uri = ctx.param_or("catalog_uri", "");
+            o.rest_auth_token = ctx.param_or("rest_auth_token", "");  // REST catalog bearer token
             // partition_by: comma-separated identity partition columns (empty = unpartitioned).
             o.partition_by = split_csv(ctx.param_or("partition_by", ""));
             // S3 FileIO config for an s3:// warehouse. clink-friendly param names mapped to

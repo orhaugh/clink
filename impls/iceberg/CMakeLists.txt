@@ -56,6 +56,7 @@ target_link_libraries(clink_iceberg
     PUBLIC  clink::core
     PRIVATE iceberg::iceberg_bundle_static
             iceberg::iceberg_sql_catalog_static
+            iceberg::iceberg_rest_static
 )
 
 clink_set_warnings(clink_iceberg)
