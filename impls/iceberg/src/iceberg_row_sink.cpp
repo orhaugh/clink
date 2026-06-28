@@ -94,12 +94,12 @@ void ensure_registered() {
         ice::parquet::RegisterAll();
         ice::avro::RegisterAll();
         ice::arrow::RegisterAll();  // arrow-fs-local + arrow-fs-s3 FileIO factories (REST catalog)
-        // Arrow 24 aborts at process exit if its S3 subsystem was initialised but not
-        // finalised. The iceberg S3 FileIO (explicit s3:// warehouse) and an S3-backed
-        // REST catalog both lazily EnsureS3Initialized via Arrow under the hood, so pair
-        // it with an atexit finalise here. EnsureS3Finalized is a no-op when S3 was never
-        // initialised, so registering this on the local-only path too is harmless.
-        clink::connectors::ensure_arrow_s3_finalize_registered();
+        // The iceberg S3 FileIO (explicit s3:// warehouse) and an S3-backed REST catalog both
+        // lazily EnsureS3Initialized via Arrow's AWS CRT under the hood, bringing up system
+        // OpenSSL. Suppress OpenSSL's heap-corrupting atexit before that can happen; harmless on
+        // the local-only path. S3 finalisation (joining the CRT threads) is the host process's
+        // job at end of main - clink_node does it; see arrow_s3_lifecycle.hpp.
+        clink::connectors::suppress_openssl_atexit();
     });
 }
 
@@ -288,9 +288,9 @@ public:
                     ": an s3:// warehouse requires an explicit local catalog_uri (the SQLite "
                     "catalog cannot live on S3; or use a REST catalog)");
             }
-            // Init Arrow S3 through the single engine-wide owner first (sets a quiet log
-            // level + registers the atexit FinalizeS3); MakeS3FileIO's own lazy
-            // EnsureS3Initialized then sees it is already up and no-ops.
+            // Init Arrow S3 through the single engine-wide owner first (suppresses OpenSSL's
+            // atexit + sets a quiet log level); MakeS3FileIO's own lazy EnsureS3Initialized
+            // then sees it is already up and no-ops.
             clink::connectors::ensure_arrow_s3_initialised();
             file_io_ = std::shared_ptr<ice::FileIO>(
                 ice::arrow::MakeS3FileIO(opts_.file_io_props).release());

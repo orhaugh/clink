@@ -45,6 +45,7 @@
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/ha_coordinator.hpp"
+#include "clink/connectors/arrow_s3_lifecycle.hpp"
 #include "clink/connectors/openssl_atexit_guard.hpp"
 #ifdef CLINK_LINKED_ETCD
 #include "clink/etcd/etcd_ha_coordinator.hpp"
@@ -2075,6 +2076,11 @@ int main(int argc, char** argv) {
             // path. Not called from the signal handler (atomic-only); the role
             // mainloops observe the flag and return here.
             clink::logging::shutdown();
+            // Join the AWS CRT event-loop threads (if a job used an S3/Iceberg/Parquet-S3
+            // sink) on the main thread, BEFORE static destruction. Doing it from an atexit
+            // handler instead races the CRT teardown and crashes; see arrow_s3_lifecycle.hpp.
+            // A no-op when S3 was never initialised.
+            clink::connectors::finalize_arrow_s3();
             return rc;
         }
         std::cerr << "Usage: clink_node --role={jm|tm} ... (--help for details)\n";

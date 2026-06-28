@@ -4,11 +4,14 @@
 add_executable(clink_rocksdb_s3_tests
     register.cpp
     test_s3_rocksdb_scheme.cpp
+    # Finalises Arrow/AWS S3 before static destruction (joins the AWS CRT threads
+    # off the static-destruction path); see the file.
+    ${CMAKE_SOURCE_DIR}/tests/test_helpers/s3_finalizing_gtest_main.cpp
 )
 target_link_libraries(clink_rocksdb_s3_tests PRIVATE
     clink::core
     clink::rocksdb_s3
-    GTest::gtest_main
+    GTest::gtest
 )
 clink_set_warnings(clink_rocksdb_s3_tests)
 gtest_discover_tests(clink_rocksdb_s3_tests

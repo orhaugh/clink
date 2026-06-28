@@ -2,40 +2,40 @@
 
 // Single owner of the Arrow / AWS-SDK S3 lifecycle for the whole engine.
 //
-// THE PROBLEM. Two separate code paths used to initialise the AWS C++ SDK:
-//   - Arrow's S3FileSystem (Parquet-on-S3, S3 snapshot/CAS stores, the Delta and
-//     Iceberg S3 sinks) lazily calls arrow::fs::InitializeS3 -> Aws::InitAPI.
-//   - clink's raw connectors (impls/s3 S3Source/S3Sink, impls/aws Kinesis) called
-//     Aws::InitAPI directly via aws_sdk_init.hpp.
-// Aws::InitAPI / Aws::ShutdownAPI manage GLOBAL, non-ref-counted SDK state, so a
-// process that used BOTH paths called InitAPI twice. That was harmless only because
-// nobody ever called ShutdownAPI - the "never FinalizeS3" stance papered over it.
+// INIT. Two code paths initialise the AWS C++ SDK: Arrow's S3FileSystem (Parquet-on-S3, S3
+// snapshot/CAS stores, the Delta + Iceberg S3 sinks) via arrow::fs::InitializeS3, and clink's
+// raw connectors (impls/s3 S3Source/S3Sink, impls/aws Kinesis) which used to call Aws::InitAPI
+// directly. We funnel both through ensure_arrow_s3_initialised() so Aws::InitAPI runs exactly
+// once under Arrow's guard; arrow::fs::InitializeS3 brings up the whole AWS SDK (memory system,
+// HTTP factory, crypto, logging), so a raw Aws::S3 / Aws::Kinesis client built afterwards works
+// against that same global state.
 //
-// It stopped being harmless on the pinned from-source Arrow 24: that build ABORTS at
-// process exit if S3 was initialised but never finalised ("arrow::fs::FinalizeS3 was
-// not called ..."). Adding a FinalizeS3 atexit then exposed the underlying double-init:
-// one ShutdownAPI tore down SDK globals while the other path still held them, giving a
-// "corrupted size vs. prev_size" heap abort at exit. (The prior distro Arrow tolerated
-// the un-finalised state, which is why none of this surfaced before the toolchain swap.)
+// EXIT. The pinned from-source Arrow 24 + aws-sdk has TWO distinct, Linux-only exit-time faults
+// (macOS's allocator + libc++ teardown masked both, which is why neither showed before the
+// toolchain swap), each needing its own fix:
 //
-// THE FIX: a SINGLE owner. Every S3 user - Arrow-based or raw-SDK - initialises through
-// arrow::fs (here), so Aws::InitAPI is called exactly once (under Arrow's own guard) and
-// a single atexit FinalizeS3 tears it down exactly once. arrow::fs::InitializeS3 brings up
-// the entire AWS SDK (memory system, HTTP factory, crypto, logging), so a raw Aws::S3 or
-// Aws::Kinesis client constructed afterwards works against the same global SDK state.
+//   (a) OpenSSL 3 atexit. The AWS CRT (aws-c-cal) brings up system libcrypto during InitAPI;
+//       OpenSSL's atexit OPENSSL_cleanup then corrupts the heap fighting the SDK over the crypto
+//       allocator. Fixed with OPENSSL_INIT_NO_ATEXIT (openssl_atexit_guard.hpp), applied on
+//       every platform (harmless where unneeded), from a before-main ctor and from init below.
 //
-// WHY atexit (not connector close()): the finalise runs AFTER main returns, by which point
-// every connector object holding an S3FileSystem or an Aws client has been destroyed during
-// job/test shutdown (those handles are instance-scoped, never static). That ordering is what
-// makes finalising safe - the FinalizeS3-vs-live-client race that motivated the original
-// "never finalize" stance cannot happen at atexit time.
+//   (b) AWS CRT event-loop threads. The SDK runs background event-loop threads. They MUST be
+//       joined (Aws::ShutdownAPI, i.e. arrow::fs::FinalizeS3) before C++ static destruction, or
+//       they run canceled tasks mid-teardown and call into half-destroyed statics: "pure virtual
+//       method called" on the EvntLoopCleanup thread (Linux), "mutex lock failed" / SIGSEGV
+//       (macOS). CRITICALLY, finalising from an atexit handler does NOT work - atexit runs
+//       DURING static destruction and races the very teardown it must precede (flaky aborts on
+//       both platforms; Arrow's own source calls atexit-FinalizeS3 "a bad idea"). So this header
+//       does NOT register any atexit. Instead each entry point that may initialise S3 calls
+//       finalize_arrow_s3() explicitly, on the main thread, AFTER its work and BEFORE returning
+//       (clink_node's main; the s3_finalizing_gtest_main used by S3-capable test binaries). By
+//       then every connector S3FileSystem / Aws client is destroyed and all statics are alive,
+//       so ShutdownAPI joins the CRT threads cleanly. finalize_arrow_s3() is a no-op when S3 was
+//       never initialised, so calling it unconditionally at an entry point is always safe.
 //
-// This header pulls in Arrow's S3 header, so include it only from TUs that carry the Arrow
-// include path (every S3-backed connector, plus clink_core, does). The call_once guards keep
-// init to a single InitializeS3 and the atexit registration to a single handler no matter how
-// many call sites or modules invoke them.
+// Include only from TUs that carry the Arrow include path (every S3-backed connector, plus
+// clink_core, does). The call_once guard keeps init to one InitializeS3.
 
-#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -46,24 +46,9 @@
 
 namespace clink::connectors {
 
-// Register arrow::fs::EnsureS3Finalized() to run once at process exit. Use this on paths
-// where Arrow itself lazily initialises S3 out of our sight (e.g. an iceberg REST catalog
-// resolving an arrow-fs-s3 FileIO internally): we cannot intercept that InitializeS3, but we
-// must still pair it with a finalise. EnsureS3Finalized is a no-op when S3 was never
-// initialised, so registering this unconditionally is harmless.
-inline void ensure_arrow_s3_finalize_registered() {
-    static std::once_flag flag;
-    std::call_once(flag, [] {
-        suppress_openssl_atexit();
-        std::atexit([] { (void)arrow::fs::EnsureS3Finalized(); });
-    });
-}
-
-// THE canonical "I am about to use Arrow/AWS S3" call. Initialises Arrow's S3 subsystem
-// (and therefore the AWS SDK) exactly once with a quiet log level, and registers the atexit
-// finalise. Idempotent and safe to call from every S3 entry point in the engine; it is also
-// robust to Arrow having already initialised S3 behind our back (it skips the InitializeS3 in
-// that case and just registers the finalise).
+// THE canonical "I am about to use Arrow/AWS S3" call. Suppresses OpenSSL's heap-corrupting
+// atexit, then initialises Arrow's S3 subsystem (and therefore the AWS SDK) exactly once with a
+// quiet log level. Idempotent; robust to Arrow having already initialised S3 behind our back.
 inline void ensure_arrow_s3_initialised() {
     static std::once_flag once;
     std::call_once(once, [] {
@@ -76,8 +61,15 @@ inline void ensure_arrow_s3_initialised() {
                 throw std::runtime_error("Arrow S3 init failed: " + s.ToString());
             }
         }
-        ensure_arrow_s3_finalize_registered();
     });
+}
+
+// Finalise Arrow S3 (joins the AWS CRT event-loop threads). Call this exactly once per process,
+// on the main thread, AFTER all S3 work and BEFORE returning from main / before static
+// destruction - NEVER from an atexit handler or a static destructor (see note (b) above). A
+// no-op when S3 was never initialised, so it is safe to call from any entry point unconditionally.
+inline void finalize_arrow_s3() {
+    (void)arrow::fs::EnsureS3Finalized();
 }
 
 }  // namespace clink::connectors
