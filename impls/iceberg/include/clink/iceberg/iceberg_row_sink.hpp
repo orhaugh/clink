@@ -14,6 +14,17 @@
 // in v1: UPDATE/DELETE/MERGE, partitioning, exactly-once. v1 catalog = SQLite SQL
 // catalog (server-less, offline-testable); REST catalog + S3 FileIO are follow-ons.
 //
+// DUPLICATE WINDOW: the snapshot is committed when the barrier reaches this sink, which
+// is BEFORE the job confirms the checkpoint is globally durable (there is no 2PC
+// on_commit phase here). So duplicates arise not only from a crash between the data-file
+// write and commit, but also when a checkpoint that already passed this sink is later
+// ABORTED job-wide: failover replays the interval and commits a SECOND snapshot with the
+// same rows. Both are valid at-least-once (no loss; readers may see duplicate rows). A
+// data file written but not committed (commit failure / crash before commit) is orphaned;
+// it is best-effort deleted on a commit failure, otherwise needs Iceberg orphan-file
+// maintenance to reclaim. SINGLE-WRITER is enforced within a job (subtask 0 only); it is
+// a precondition, NOT enforced, that no other job writes the same table concurrently.
+//
 // This header is driver-free (no iceberg-cpp includes) so the factory registration
 // and tests do not need the iceberg-cpp headers; the implementation is in the .cpp.
 

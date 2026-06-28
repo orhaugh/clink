@@ -231,8 +231,15 @@ public:
         if (auto st = arrow::ExportRecordBatch(*rb, &c_arr); !st.ok()) {
             throw std::runtime_error(opts_.name + ": ExportRecordBatch: " + st.ToString());
         }
-        // Writer::Write does ImportRecordBatch, which consumes (releases) c_arr.
-        ensure_ok(writer_->Write(&c_arr), "writer Write");
+        // Writer::Write does ImportRecordBatch, which on success MOVES c_arr (nulling its
+        // release). On failure it may NOT consume it, so the C Data Interface leaves us, the
+        // consumer, owning it. Release iff still owned: skips on success (no double-free),
+        // frees on failure (no leak). Do this BEFORE ensure_ok throws on a bad status.
+        auto wst = writer_->Write(&c_arr);
+        if (c_arr.release != nullptr) {
+            c_arr.release(&c_arr);
+        }
+        ensure_ok(wst, "writer Write");
         cur_records_ += static_cast<std::int64_t>(batch.size());
     }
 
@@ -282,7 +289,13 @@ private:
         // table is stale after commit, so reload it from the catalog for the next append.
         auto fa = unwrap(table_->NewFastAppend(), "new fast append");
         fa->AppendFile(df);
-        ensure_ok(fa->Commit(), "commit snapshot");
+        if (auto cst = fa->Commit(); !cst.has_value()) {
+            // The data file is written but no snapshot references it. Best-effort delete so
+            // a repeatedly-failing commit does not strand orphan files in the warehouse (a
+            // replay writes a fresh uuid file, so the orphan would otherwise never be GC'd).
+            (void)file_io_->DeleteFile(cur_data_path_);
+            throw std::runtime_error("iceberg: commit snapshot: " + cst.error().message);
+        }
         table_ = unwrap(catalog_->LoadTable(id_), "reload table after commit");
 
         clink::metrics::connector::records_out_inc(kLabel,
