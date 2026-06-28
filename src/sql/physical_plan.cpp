@@ -516,15 +516,28 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     }
     if (connector == "iceberg") {
         // Apache Iceberg table sink (typed Parquet data files + Iceberg snapshots via
-        // iceberg-cpp + a SQLite/REST catalog). Append-only, single-writer,
-        // at-least-once - upsert and exactly-once are not supported in v1.
-        if (upsert) {
-            unsupported("connector='iceberg' sink does not support mode='upsert' (append-only v1)");
-        }
+        // iceberg-cpp + a SQLite/REST catalog). Single-writer. Exactly-once is provided
+        // automatically via two-phase commit when the job checkpoints; the explicit
+        // exactly_once DDL flag (its source-replay coordination contract) is a follow-on,
+        // so it is still rejected here.
         if (exactly_once) {
             unsupported(
-                "connector='iceberg' sink is at-least-once in v1; exactly-once is not yet "
-                "supported");
+                "connector='iceberg' provides exactly-once via 2PC when the job checkpoints; "
+                "the explicit exactly_once flag is not yet wired");
+        }
+        if (upsert) {
+            // mode='upsert': consume the changelog and maintain the table by primary key via
+            // Iceberg v2 equality deletes. Needs a PRIMARY KEY (or primary_key=) -> equality_key.
+            if (table.primary_key.empty()) {
+                unsupported(
+                    "connector='iceberg' mode='upsert' requires a PRIMARY KEY (or primary_key=)");
+            }
+            std::string keys;
+            for (std::size_t i = 0; i < table.primary_key.size(); ++i) {
+                keys += (i ? "," : "") + table.primary_key[i];
+            }
+            return RowConnectorBinding{
+                "iceberg_row_sink", kChannelRow, "", {{"equality_key", keys}}};
         }
         return RowConnectorBinding{"iceberg_row_sink", kChannelRow, {}};
     }

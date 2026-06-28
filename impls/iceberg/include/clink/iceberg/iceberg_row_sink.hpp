@@ -56,6 +56,13 @@ struct IcebergRowSinkOptions {
     // value); bucket/truncate/temporal transforms are follow-ons. v1 requires the partition
     // values present + non-null.
     std::vector<std::string> partition_by;
+    // UPSERT mode: non-empty = the sink consumes a changelog (the __row_kind field) and
+    // maintains the table by primary key via Iceberg v2 equality deletes. Each insert/
+    // update_after writes the row to a data file AND an equality-delete on its key (removing
+    // any prior row for that key); each delete/update_before writes only the equality-delete.
+    // v1 upsert is UNPARTITIONED (cannot combine with partition_by) and keys must be present
+    // + non-null on every record. Empty = plain append.
+    std::vector<std::string> equality_key;
     // Catalog selector. Default "<warehouse>/catalog.db" for a LOCAL warehouse (SQLite).
     // REQUIRED + must be a local path for an s3:// warehouse with the SQLite catalog (the
     // catalog file cannot live on S3). An http(s):// uri selects the REST catalog instead

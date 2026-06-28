@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -24,12 +25,15 @@
 #include "clink/config/json.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 #include "clink/runtime/runtime_context.hpp"
+#include "clink/sql/row_kind.hpp"
 #include "clink/state/state_backend.hpp"
 
 #include "iceberg/catalog.h"
 #include "iceberg/catalog/rest/catalog_properties.h"
 #include "iceberg/catalog/rest/rest_catalog.h"
 #include "iceberg/catalog/sql/sql_catalog.h"
+#include "iceberg/data/equality_delete_writer.h"
+#include "iceberg/data/writer.h"
 #include "iceberg/expression/literal.h"
 #include "iceberg/file_format.h"
 #include "iceberg/file_io.h"
@@ -44,9 +48,11 @@
 #include "iceberg/sort_order.h"
 #include "iceberg/table.h"
 #include "iceberg/table_identifier.h"
+#include "iceberg/transaction.h"
 #include "iceberg/transform.h"
 #include "iceberg/type.h"
 #include "iceberg/update/fast_append.h"
+#include "iceberg/update/merging_snapshot_update.h"
 
 // iceberg-cpp's Arrow / Parquet / Avro write backend lives in libiceberg_bundle. These
 // entry points are exported there but their headers (iceberg/arrow/arrow_io_util.h,
@@ -165,6 +171,30 @@ std::string make_uuid() {
            "-" + b.substr(20, 12);
 }
 
+// Concrete MergingSnapshotUpdate so the upsert path can commit data files AND v2 equality-
+// delete files in one snapshot (iceberg-cpp 0.3.0 ships no public RowDelta; the base's
+// AddDataFile/AddDeleteFile are protected, so a thin subclass exposes them - the pattern
+// the in-tree merging_snapshot_update_test uses). operation() = overwrite.
+class RowDelta : public ice::MergingSnapshotUpdate {
+public:
+    static ice::Result<std::unique_ptr<RowDelta>> Make(std::string table_name,
+                                                       std::shared_ptr<ice::Table> table) {
+        auto ctx = ice::TransactionContext::Make(std::move(table), ice::TransactionKind::kUpdate);
+        if (!ctx.has_value()) {
+            return std::unexpected(ctx.error());
+        }
+        return std::unique_ptr<RowDelta>(
+            new RowDelta(std::move(table_name), std::move(ctx.value())));
+    }
+    std::string operation() override { return "overwrite"; }
+    ice::Status AddData(std::shared_ptr<ice::DataFile> f) { return AddDataFile(std::move(f)); }
+    ice::Status AddDelete(std::shared_ptr<ice::DataFile> f) { return AddDeleteFile(std::move(f)); }
+
+private:
+    RowDelta(std::string table_name, std::shared_ptr<ice::TransactionContext> ctx)
+        : ice::MergingSnapshotUpdate(std::move(table_name), std::move(ctx)) {}
+};
+
 }  // namespace
 
 class IcebergRowSink final : public Sink<clink::sql::Row> {
@@ -193,6 +223,25 @@ public:
         schema_ = opts_.batcher.schema();
         ice_schema_ = arrow_schema_to_ice(*schema_);
         auto spec = build_partition_spec_();  // also fills part_cols_
+
+        upsert_ = !opts_.equality_key.empty();
+        if (upsert_) {
+            if (!opts_.partition_by.empty()) {
+                throw std::runtime_error(opts_.name +
+                                         ": upsert (equality_key) + partition_by is not "
+                                         "supported in v1");
+            }
+            eq_cols_ = resolve_cols_(opts_.equality_key, "equality_key");
+            // The equality-delete files carry only the key columns, identified by field id.
+            std::vector<ice::SchemaField> kf;
+            for (const auto& kc : eq_cols_) {
+                kf.push_back(ice::SchemaField::MakeRequired(
+                    kc.source_id,
+                    kc.name,
+                    arrow_to_ice_type(*schema_->field(kc.source_id - 1)->type())));
+            }
+            key_ice_schema_ = std::make_shared<ice::Schema>(std::move(kf));
+        }
 
         // Catalog selection by catalog_uri scheme:
         //   http(s)://  -> REST catalog (resolves its own FileIO, e.g. S3, from /config +
@@ -302,6 +351,28 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         if (table_ == nullptr) {
             return;  // closed concurrently
+        }
+        if (upsert_) {
+            // Changelog: net per key in memory for this interval (last op wins). The actual
+            // data + equality-delete files are written at the barrier (flush_upsert_), because
+            // netting needs the whole interval (a delete then re-insert of a key must NOT also
+            // delete the re-insert - they share a snapshot sequence number).
+            for (std::size_t i = 0; i < batch.size(); ++i) {
+                const auto& row = batch[i].value();
+                std::string key;
+                for (const auto& kc : eq_cols_) {
+                    std::string v = part_value_string_(row, kc);
+                    key += std::to_string(v.size());
+                    key.push_back(':');
+                    key.append(v);
+                }
+                NetEntry e;
+                e.is_delete = clink::sql::is_delete_like(clink::sql::row_kind_of(row));
+                e.row = row;
+                e.event_time = batch[i].event_time();
+                net_[std::move(key)] = std::move(e);  // last op for the key wins
+            }
+            return;
         }
         if (part_cols_.empty()) {
             write_group_("", {}, batch);  // unpartitioned: one data file per interval
@@ -449,12 +520,22 @@ private:
         std::vector<std::string> partition;  // string-encoded partition values (1 per PartCol)
     };
 
-    // A closed, staged data file awaiting (or undergoing) commit.
+    // A closed, staged file awaiting (or undergoing) commit: a data file, or (upsert) an
+    // equality-delete file.
     struct StagedFile {
         std::string path;
         std::int64_t records{0};
         std::int64_t size{0};
-        std::vector<std::string> partition;  // string-encoded partition values
+        std::vector<std::string> partition;      // string-encoded partition values (data files)
+        bool is_delete{false};                   // true = equality-delete file (upsert)
+        std::vector<std::int32_t> equality_ids;  // delete files: the PK field ids
+    };
+
+    // The netted last-known op for one key in the current interval (upsert mode).
+    struct NetEntry {
+        bool is_delete{false};
+        clink::sql::Row row;                  // the row (insert) or the key-carrying row (delete)
+        std::optional<EventTime> event_time;  // last op's event time (for the data file)
     };
 
     bool two_phase_() const noexcept { return state_backend_() != nullptr; }
@@ -469,17 +550,12 @@ private:
         return "_2pc_pending_sub" + std::to_string(opts_.subtask_idx) + "_" + std::to_string(ckpt);
     }
 
-    // Build the table's PartitionSpec from opts_.partition_by (identity transforms) and fill
-    // part_cols_ for value extraction. Empty partition_by -> Unpartitioned. v1 supports only
-    // IDENTITY (the partition value == the column value, so no transform-result-type concern).
-    std::shared_ptr<ice::PartitionSpec> build_partition_spec_() {
-        part_cols_.clear();
-        if (opts_.partition_by.empty()) {
-            return ice::PartitionSpec::Unpartitioned();
-        }
-        std::vector<ice::PartitionField> fields;
-        int32_t field_id = ice::PartitionSpec::kLegacyPartitionDataIdStart;  // 1000
-        for (const auto& col : opts_.partition_by) {
+    // Resolve a list of column names to {name, iceberg source field id, arrow type}. ids in
+    // ice_schema_ are assigned 1..N in column order (arrow_schema_to_ice), so the source field
+    // id for the column at arrow index idx is idx + 1. Used for both partition + equality key.
+    std::vector<PartCol> resolve_cols_(const std::vector<std::string>& names, const char* label) {
+        std::vector<PartCol> out;
+        for (const auto& col : names) {
             int idx = -1;
             for (int i = 0; i < schema_->num_fields(); ++i) {
                 if (schema_->field(i)->name() == col) {
@@ -488,18 +564,31 @@ private:
                 }
             }
             if (idx < 0) {
-                throw std::runtime_error(opts_.name + ": partition_by column '" + col +
+                throw std::runtime_error(opts_.name + ": " + label + " column '" + col +
                                          "' is not in the sink schema");
             }
             const auto atype = schema_->field(idx)->type()->id();
             if (!partition_type_supported_(atype)) {
-                throw std::runtime_error(opts_.name + ": partition_by column '" + col +
-                                         "' has an unsupported type for identity partitioning");
+                throw std::runtime_error(opts_.name + ": " + label + " column '" + col +
+                                         "' has an unsupported type (int/long/bool/string only)");
             }
-            // ids in ice_schema_ are assigned 1..N in column order (arrow_schema_to_ice), so
-            // the source field id for the column at arrow index idx is idx + 1.
-            part_cols_.push_back(PartCol{col, idx + 1, atype});
-            fields.emplace_back(idx + 1, field_id++, col, ice::Transform::Identity());
+            out.push_back(PartCol{col, idx + 1, atype});
+        }
+        return out;
+    }
+
+    // Build the table's PartitionSpec from opts_.partition_by (identity transforms) and fill
+    // part_cols_ for value extraction. Empty partition_by -> Unpartitioned. v1 supports only
+    // IDENTITY (the partition value == the column value, so no transform-result-type concern).
+    std::shared_ptr<ice::PartitionSpec> build_partition_spec_() {
+        part_cols_ = resolve_cols_(opts_.partition_by, "partition_by");
+        if (part_cols_.empty()) {
+            return ice::PartitionSpec::Unpartitioned();
+        }
+        std::vector<ice::PartitionField> fields;
+        int32_t field_id = ice::PartitionSpec::kLegacyPartitionDataIdStart;  // 1000
+        for (const auto& pc : part_cols_) {
+            fields.emplace_back(pc.source_id, field_id++, pc.name, ice::Transform::Identity());
         }
         return std::shared_ptr<ice::PartitionSpec>(
             unwrap(ice::PartitionSpec::Make(*ice_schema_,
@@ -612,8 +701,12 @@ private:
         op.records += static_cast<std::int64_t>(b.size());
     }
 
-    // Close all open per-partition writers, producing complete Parquet data files.
+    // Close all open per-partition writers, producing complete Parquet data files. In upsert
+    // mode the interval was buffered in net_, so flush that instead.
     std::vector<StagedFile> finish_all_() {
+        if (upsert_) {
+            return flush_upsert_();
+        }
         std::vector<StagedFile> out;
         for (auto& [key, op] : open_) {
             if (!op.writer) {
@@ -629,6 +722,156 @@ private:
         }
         open_.clear();
         return out;
+    }
+
+    // Upsert flush: from the netted interval, write ONE data file (the surviving inserts) and
+    // ONE equality-delete file keyed on EVERY touched key. The equality delete (snapshot seq S)
+    // removes any prior row for the key (seq < S); the new insert is in the same snapshot (seq
+    // S, not deleted). So an insert upserts (delete-old + write-new) and a delete removes.
+    std::vector<StagedFile> flush_upsert_() {
+        std::vector<StagedFile> out;
+        if (net_.empty()) {
+            return out;
+        }
+        Batch<clink::sql::Row> inserts;
+        std::vector<const clink::sql::Row*> key_rows;  // every touched key -> equality-delete
+        for (auto& [k, e] : net_) {
+            key_rows.push_back(&e.row);
+            if (!e.is_delete) {
+                if (e.event_time.has_value()) {
+                    inserts.emplace(e.row, *e.event_time);
+                } else {
+                    inserts.emplace(e.row);
+                }
+            }
+        }
+        if (!inserts.empty()) {
+            out.push_back(write_one_data_file_(inserts));
+        }
+        out.push_back(write_eq_delete_file_(key_rows));
+        net_.clear();
+        return out;
+    }
+
+    // Write a complete Parquet data file from a batch (one-shot, unpartitioned upsert).
+    StagedFile write_one_data_file_(const Batch<clink::sql::Row>& b) {
+        const std::string path =
+            std::string(table_->location()) + "/data/" + make_uuid() + ".parquet";
+        ice::WriterOptions wopts;
+        wopts.path = path;
+        wopts.schema = ice_schema_;
+        wopts.io = file_io_;
+        auto w = unwrap(ice::WriterFactoryRegistry::Open(ice::FileFormatType::kParquet, wopts),
+                        "open parquet writer");
+        auto rb = opts_.batcher.build(b);
+        if (!rb) {
+            throw std::runtime_error(opts_.name + ": batcher.build returned null");
+        }
+        ArrowArray c_arr{};
+        if (auto st = arrow::ExportRecordBatch(*rb, &c_arr); !st.ok()) {
+            throw std::runtime_error(opts_.name + ": ExportRecordBatch: " + st.ToString());
+        }
+        auto wst = w->Write(&c_arr);
+        if (c_arr.release != nullptr) {
+            c_arr.release(&c_arr);
+        }
+        ensure_ok(wst, "writer Write");
+        ensure_ok(w->Close(), "writer Close");
+        StagedFile sf;
+        sf.path = path;
+        sf.records = static_cast<std::int64_t>(b.size());
+        sf.size = unwrap(w->length(), "writer length");
+        return sf;
+    }
+
+    // Write an Iceberg v2 equality-delete file holding the key columns of every touched key.
+    StagedFile write_eq_delete_file_(const std::vector<const clink::sql::Row*>& key_rows) {
+        const std::string path =
+            std::string(table_->location()) + "/data/" + make_uuid() + "-del.parquet";
+        std::vector<std::int32_t> eq_ids;
+        for (const auto& kc : eq_cols_) {
+            eq_ids.push_back(kc.source_id);
+        }
+        ice::EqualityDeleteWriterOptions eo;
+        eo.path = path;
+        eo.schema = key_ice_schema_;
+        eo.spec = ice::PartitionSpec::Unpartitioned();
+        eo.io = file_io_;
+        eo.equality_field_ids = eq_ids;
+        auto w = unwrap(ice::EqualityDeleteWriter::Make(eo), "make equality-delete writer");
+        auto rb = build_key_record_batch_(key_rows);
+        ArrowArray c_arr{};
+        if (auto st = arrow::ExportRecordBatch(*rb, &c_arr); !st.ok()) {
+            throw std::runtime_error(opts_.name + ": ExportRecordBatch(delete): " + st.ToString());
+        }
+        auto wst = w->Write(&c_arr);
+        if (c_arr.release != nullptr) {
+            c_arr.release(&c_arr);
+        }
+        ensure_ok(wst, "eq-delete Write");
+        ensure_ok(w->Close(), "eq-delete Close");
+        StagedFile sf;
+        sf.path = path;
+        sf.records = static_cast<std::int64_t>(key_rows.size());
+        sf.size = unwrap(w->Length(), "eq-delete length");
+        sf.is_delete = true;
+        sf.equality_ids = std::move(eq_ids);
+        return sf;
+    }
+
+    // Build an Arrow RecordBatch with just the equality-key columns from the given rows. NO
+    // event_time (the delete file contains only the key columns the equality_field_ids name).
+    std::shared_ptr<arrow::RecordBatch> build_key_record_batch_(
+        const std::vector<const clink::sql::Row*>& rows) {
+        std::vector<std::shared_ptr<arrow::Field>> fields;
+        std::vector<std::shared_ptr<arrow::Array>> arrays;
+        for (const auto& kc : eq_cols_) {
+            const auto* afield = schema_->field(kc.source_id - 1).get();  // source_id = idx + 1
+            fields.push_back(arrow::field(kc.name, afield->type(), /*nullable=*/false));
+            arrays.push_back(build_key_array_(rows, kc));
+        }
+        return arrow::RecordBatch::Make(
+            arrow::schema(fields), static_cast<std::int64_t>(rows.size()), arrays);
+    }
+
+    std::shared_ptr<arrow::Array> build_key_array_(const std::vector<const clink::sql::Row*>& rows,
+                                                   const PartCol& kc) {
+        auto must_finish = [&](arrow::ArrayBuilder& bld) {
+            std::shared_ptr<arrow::Array> a;
+            if (auto st = bld.Finish(&a); !st.ok()) {
+                throw std::runtime_error(opts_.name + ": key array Finish: " + st.ToString());
+            }
+            return a;
+        };
+        auto val = [&](const clink::sql::Row* r) -> const cfg::JsonValue& {
+            return r->values.at(kc.name);
+        };
+        switch (kc.atype) {
+            case arrow::Type::INT64: {
+                arrow::Int64Builder b;
+                for (auto* r : rows)
+                    (void)b.Append(static_cast<std::int64_t>(val(r).as_number()));
+                return must_finish(b);
+            }
+            case arrow::Type::INT32: {
+                arrow::Int32Builder b;
+                for (auto* r : rows)
+                    (void)b.Append(static_cast<std::int32_t>(val(r).as_number()));
+                return must_finish(b);
+            }
+            case arrow::Type::BOOL: {
+                arrow::BooleanBuilder b;
+                for (auto* r : rows)
+                    (void)b.Append(val(r).as_bool());
+                return must_finish(b);
+            }
+            default: {  // STRING / LARGE_STRING
+                arrow::StringBuilder b;
+                for (auto* r : rows)
+                    (void)b.Append(val(r).as_string());
+                return must_finish(b);
+            }
+        }
     }
 
     // Phase 1: close the data files + record them in state, keyed by checkpoint. No snapshot.
@@ -660,31 +903,60 @@ private:
         if (files.empty() || already_committed_(ckpt)) {
             return;  // idempotent: this checkpoint's snapshot already exists
         }
-        auto fa = unwrap(table_->NewFastAppend(), "new fast append");
+        // Build DataFiles, splitting data vs equality-delete (upsert).
+        std::vector<std::shared_ptr<ice::DataFile>> data_files;
+        std::vector<std::shared_ptr<ice::DataFile>> delete_files;
         std::int64_t total_records = 0;
         std::int64_t total_size = 0;
         for (const auto& sf : files) {
             auto df = std::make_shared<ice::DataFile>();
-            df->content = ice::DataFile::Content::kData;
             df->file_path = sf.path;
             df->file_format = ice::FileFormatType::kParquet;
             df->record_count = sf.records;
             df->file_size_in_bytes = sf.size;
             df->partition_spec_id = ice::PartitionSpec::kInitialSpecId;  // 0
-            if (!part_cols_.empty()) {
-                std::vector<ice::Literal> lits;
-                lits.reserve(sf.partition.size());
-                for (std::size_t i = 0; i < part_cols_.size() && i < sf.partition.size(); ++i) {
-                    lits.push_back(literal_from_string_(sf.partition[i], part_cols_[i]));
+            if (sf.is_delete) {
+                df->content = ice::DataFile::Content::kEqualityDeletes;
+                df->equality_ids = sf.equality_ids;
+                delete_files.push_back(std::move(df));
+            } else {
+                df->content = ice::DataFile::Content::kData;
+                if (!part_cols_.empty()) {
+                    std::vector<ice::Literal> lits;
+                    lits.reserve(sf.partition.size());
+                    for (std::size_t i = 0; i < part_cols_.size() && i < sf.partition.size(); ++i) {
+                        lits.push_back(literal_from_string_(sf.partition[i], part_cols_[i]));
+                    }
+                    df->partition = ice::PartitionValues(std::move(lits));
                 }
-                df->partition = ice::PartitionValues(std::move(lits));
+                data_files.push_back(std::move(df));
             }
-            fa->AppendFile(df);
             total_records += sf.records;
             total_size += sf.size;
         }
-        fa->Set(kCheckpointProp, std::to_string(ckpt));  // idempotency marker on the snapshot
-        if (auto cst = fa->Commit(); !cst.has_value()) {
+
+        // With equality-delete files (upsert) commit via a RowDelta so data + deletes land in
+        // ONE snapshot; otherwise a plain FastAppend. Both tag the snapshot for idempotency.
+        ice::Status cst = ice::Status{};
+        if (!delete_files.empty()) {
+            auto rd = unwrap(RowDelta::Make(opts_.table, table_), "make row delta");
+            for (auto& d : data_files) {
+                ensure_ok(rd->AddData(d), "RowDelta AddData");
+            }
+            for (auto& d : delete_files) {
+                ensure_ok(rd->AddDelete(d), "RowDelta AddDelete");
+            }
+            rd->Set(kCheckpointProp, std::to_string(ckpt));
+            cst = rd->Commit();
+        } else {
+            auto fa = unwrap(table_->NewFastAppend(), "new fast append");
+            for (auto& d : data_files) {
+                fa->AppendFile(d);
+            }
+            fa->Set(kCheckpointProp, std::to_string(ckpt));
+            cst = fa->Commit();
+        }
+        if (!cst.has_value()) {
             if (delete_data_on_commit_failure) {
                 // Standalone: no state to retry from, so do not strand the orphan data files.
                 // (In 2PC, leave them: state still references them and recovery retries.)
@@ -713,8 +985,10 @@ private:
         return false;
     }
 
-    // Drop all in-progress (un-staged) writers: delete their partial data files.
+    // Drop all in-progress (un-staged) work: the upsert net buffer (nothing written yet) and
+    // any open per-partition writers' partial data files.
     void abandon_current_() {
+        net_.clear();
         for (auto& [key, op] : open_) {
             if (op.writer) {
                 (void)op.writer->Close();
@@ -727,8 +1001,9 @@ private:
         open_.clear();
     }
 
-    // Staged state = a JSON array of {path, records, size, partition:[str,...]}. JSON so an
-    // arbitrary string partition value (or a path) cannot break a delimiter scheme.
+    // Staged state = a JSON array of {path, records, size, partition:[str,...], is_delete,
+    // equality_ids:[int,...]}. JSON so an arbitrary string partition value (or a path) cannot
+    // break a delimiter scheme.
     std::string serialize_staged_(const std::vector<StagedFile>& files) const {
         cfg::JsonArray arr;
         for (const auto& sf : files) {
@@ -741,6 +1016,14 @@ private:
                 pv.push_back(cfg::JsonValue{s});
             }
             o["partition"] = cfg::JsonValue{std::move(pv)};
+            if (sf.is_delete) {
+                o["is_delete"] = cfg::JsonValue{true};
+                cfg::JsonArray eq;
+                for (auto fid : sf.equality_ids) {
+                    eq.push_back(cfg::JsonValue{static_cast<std::int64_t>(fid)});
+                }
+                o["equality_ids"] = cfg::JsonValue{std::move(eq)};
+            }
             arr.push_back(cfg::JsonValue{std::move(o)});
         }
         return cfg::JsonValue{std::move(arr)}.serialize(0);
@@ -760,6 +1043,14 @@ private:
                 if (auto pit = o.find("partition"); pit != o.end()) {
                     for (const auto& pv : pit->second.as_array()) {
                         sf.partition.push_back(pv.as_string());
+                    }
+                }
+                if (auto dit = o.find("is_delete"); dit != o.end()) {
+                    sf.is_delete = dit->second.as_bool();
+                }
+                if (auto eit = o.find("equality_ids"); eit != o.end()) {
+                    for (const auto& fid : eit->second.as_array()) {
+                        sf.equality_ids.push_back(static_cast<std::int32_t>(fid.as_number()));
                     }
                 }
                 out.push_back(std::move(sf));
@@ -816,7 +1107,12 @@ private:
     std::shared_ptr<ice::Catalog> catalog_;  // SqlCatalog (sqlite) or RestCatalog
     ice::TableIdentifier id_;
     std::shared_ptr<ice::Table> table_;
-    std::map<std::string, OpenPart> open_;  // open per-partition writers this interval
+    std::map<std::string, OpenPart> open_;  // open per-partition writers this interval (append)
+    // Upsert mode (equality_key non-empty): changelog netted by key, flushed at the barrier.
+    bool upsert_{false};
+    std::vector<PartCol> eq_cols_;                 // the equality-key columns
+    std::shared_ptr<ice::Schema> key_ice_schema_;  // key-columns-only schema for delete files
+    std::map<std::string, NetEntry> net_;          // netted ops for the current interval
 };
 
 std::shared_ptr<Sink<clink::sql::Row>> make_iceberg_row_sink(IcebergRowSinkOptions opts) {

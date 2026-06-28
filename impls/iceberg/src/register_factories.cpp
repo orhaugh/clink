@@ -100,6 +100,9 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.rest_auth_token = ctx.param_or("rest_auth_token", "");  // REST catalog bearer token
             // partition_by: comma-separated identity partition columns (empty = unpartitioned).
             o.partition_by = split_csv(ctx.param_or("partition_by", ""));
+            // equality_key: comma-separated PK columns -> UPSERT mode (changelog by key via
+            // Iceberg v2 equality deletes). Empty = plain append.
+            o.equality_key = split_csv(ctx.param_or("equality_key", ""));
             // S3 FileIO config for an s3:// warehouse. clink-friendly param names mapped to
             // the iceberg S3 property keys; anything left unset falls back to the standard
             // AWS env/credential chain (incl. AWS_ENDPOINT_URL). path-style is required for

@@ -66,6 +66,15 @@ Row make_region_row(std::int64_t id, const std::string& region) {
     return r;
 }
 
+// A changelog row {id:int64, name:string} carrying a __row_kind (insert/delete/update_after).
+Row make_cdc_row(std::int64_t id, const std::string& name, const std::string& kind) {
+    Row r;
+    r.values["id"] = cfg::JsonValue{id};
+    r.values["name"] = cfg::JsonValue{name};
+    r.values["__row_kind"] = cfg::JsonValue{kind};
+    return r;
+}
+
 // Recursively count files under `root` whose path contains `needle`.
 int count_paths_containing(const fs::path& root, const std::string& needle) {
     int n = 0;
@@ -354,6 +363,93 @@ TEST(IcebergSinkPartitioned, MultiFileStageThenCommit) {
     EXPECT_EQ(count_paths_containing(wh, "snap-"), 1) << "both staged files in one snapshot";
     sink->close();
 
+    fs::remove_all(wh);
+}
+
+// ---- Upsert (changelog -> v2 equality deletes) ----
+// An interval writes ONE data file (the surviving inserts) + ONE equality-delete file (every
+// touched key), all in one snapshot. CLINK_ICEBERG_KEEP_DIR keeps the table so an external
+// iceberg-cpp reader can verify merge-on-read (PyIceberg cannot read equality deletes).
+TEST(IcebergUpsert, WritesDataPlusEqualityDeletePerInterval) {
+    const char* keep = std::getenv("CLINK_ICEBERG_KEEP_DIR");
+    auto wh = keep != nullptr ? fs::path(keep) : make_2pc_wh("upsert");
+    if (keep != nullptr) {
+        fs::remove_all(wh);
+        fs::create_directories(wh);
+    }
+    IcebergRowSinkOptions o;
+    o.warehouse = wh.string();
+    o.table = "events";
+    o.equality_key = {"id"};
+    o.batcher = make_row_columnar_arrow_batcher(schema());
+    auto sink = make_iceberg_row_sink(std::move(o));
+    sink->open();  // standalone -> immediate commit per barrier
+
+    // Interval 1: insert id=1,2,3.
+    Batch<Row> b0;
+    b0.emplace(make_cdc_row(1, "a", "insert"));
+    b0.emplace(make_cdc_row(2, "b", "insert"));
+    b0.emplace(make_cdc_row(3, "c", "insert"));
+    sink->on_data(b0);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    EXPECT_EQ(count_paths_containing(wh, ".parquet"), 2) << "1 data file + 1 equality-delete file";
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 1);
+
+    // Interval 2: update id=1 -> a2, delete id=2 (id=3 untouched).
+    Batch<Row> b1;
+    b1.emplace(make_cdc_row(1, "a2", "update_after"));
+    b1.emplace(make_cdc_row(2, "b", "delete"));
+    sink->on_data(b1);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{2}});
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 2);
+    sink->close();
+
+    // Net table (verified by iceberg-cpp merge-on-read, external): {1:a2, 3:c}; id=2 deleted.
+    if (keep == nullptr) {
+        fs::remove_all(wh);
+    }
+}
+
+// Within one interval, the last op per key wins: insert -> delete -> insert (same key) nets to
+// a single insert, so the data file has exactly one row for that key.
+TEST(IcebergUpsert, NetsLastOpPerKeyWithinInterval) {
+    auto wh = make_2pc_wh("upsert_net");
+    InMemoryStateBackend state;
+    RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &state, /*metrics=*/nullptr);
+    IcebergRowSinkOptions o;
+    o.warehouse = wh.string();
+    o.table = "events";
+    o.equality_key = {"id"};
+    o.batcher = make_row_columnar_arrow_batcher(schema());
+    auto sink = make_iceberg_row_sink(std::move(o));
+    sink->set_id(OperatorId{42});
+    sink->attach_runtime(&rctx);
+    sink->open();
+
+    Batch<Row> b;
+    b.emplace(make_cdc_row(5, "x", "insert"));
+    b.emplace(make_cdc_row(5, "x", "delete"));
+    b.emplace(make_cdc_row(5, "z", "insert"));  // net: insert id=5 = "z"
+    sink->on_data(b);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});  // staged (2PC), not committed
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 0);
+    sink->on_commit(1);
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 1) << "one snapshot (data + delete) on commit";
+    sink->close();
+    fs::remove_all(wh);
+}
+
+// upsert + partition_by is rejected in v1.
+TEST(IcebergUpsert, PartitionedUpsertRejected) {
+    auto wh = make_2pc_wh("upsert_part");
+    IcebergRowSinkOptions o;
+    o.warehouse = wh.string();
+    o.table = "events";
+    o.equality_key = {"id"};
+    o.partition_by = {"name"};
+    o.batcher = make_row_columnar_arrow_batcher(schema());
+    auto sink = make_iceberg_row_sink(std::move(o));
+    EXPECT_THROW(sink->open(), std::runtime_error);
     fs::remove_all(wh);
 }
 
