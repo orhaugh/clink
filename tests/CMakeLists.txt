@@ -386,6 +386,7 @@ endif()
 if(CLINK_BUILD_SQL)
     add_executable(clink_sql_tests
         test_sql_parser.cpp
+        test_delta_sink.cpp
         test_sql_catalog.cpp
         test_sql_binder.cpp
         test_sql_cardinality.cpp

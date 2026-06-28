@@ -40,6 +40,7 @@
 #include "clink/runtime/async_execution_controller.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/async_function_registry.hpp"
+#include "clink/sql/delta_row_sink.hpp"
 #include "clink/sql/json_string_to_row_columnar.hpp"
 #include "clink/sql/ptf_registry.hpp"
 #include "clink/sql/row.hpp"
@@ -5445,6 +5446,29 @@ void install(clink::plugin::PluginRegistry& reg) {
                 make_row_columnar_arrow_batcher(parse_row_schema(ctx.param_or("schema_columns"))),
                 parquet::Compression::ZSTD,
                 "parquet_row_sink");
+        });
+
+    // delta_row_sink: write Rows as a Delta Lake table (Parquet data files + the
+    // _delta_log transaction log) at a local path or s3:// URI. Append-only,
+    // single-writer, at-least-once (see delta_row_sink.hpp). One commit per
+    // checkpoint interval.
+    //   path / table_root (required), schema_columns (required for typed columns)
+    reg.register_sink<Row>(
+        "delta_row_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<Row>> {
+            auto path = ctx.param_or("path");
+            if (path.empty()) {
+                path = ctx.param_or("table_root");
+            }
+            if (path.empty()) {
+                throw std::runtime_error("delta_row_sink: 'path' (the table root) is required");
+            }
+            DeltaRowSinkOptions o;
+            o.table_root = path;
+            o.batcher =
+                make_row_columnar_arrow_batcher(parse_row_schema(ctx.param_or("schema_columns")));
+            o.subtask_idx = ctx.subtask_idx;
+            o.name = "delta_row_sink";
+            return std::make_shared<DeltaRowSink>(std::move(o));
         });
 
     // parquet_row_2pc_sink: transactional typed-columnar Parquet

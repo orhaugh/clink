@@ -501,6 +501,19 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{"parquet_row_sink", kChannelRow, {}};
     }
+    if (connector == "delta") {
+        // Delta Lake table sink: typed Parquet data files + the _delta_log
+        // transaction log (clink::delta). Append-only, single-writer,
+        // at-least-once - upsert and exactly-once are not supported in v1.
+        if (upsert) {
+            unsupported("connector='delta' sink does not support mode='upsert' (append-only v1)");
+        }
+        if (exactly_once) {
+            unsupported(
+                "connector='delta' sink is at-least-once in v1; exactly-once is not yet supported");
+        }
+        return RowConnectorBinding{"delta_row_sink", kChannelRow, {}};
+    }
     if (connector == "blackhole") {
         // Discard sink: counts + drops every row (the runner's records_in
         // metric still tallies them). For benchmarks where sink I/O must not
