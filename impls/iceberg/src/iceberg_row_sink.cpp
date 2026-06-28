@@ -1,13 +1,14 @@
 // Apache Iceberg sink implementation, built on iceberg-cpp. Reuses the SQL Row
 // columnar Arrow batcher for typed Parquet data files (handed to iceberg-cpp's
-// Parquet writer via the Arrow C Data Interface), and commits one Iceberg snapshot
-// (FastAppend) per checkpoint interval through a SQLite SQL catalog. See
-// iceberg_row_sink.hpp for the delivery contract.
+// Parquet writer via the Arrow C Data Interface), and commits Iceberg snapshots
+// (FastAppend) through a SQLite SQL catalog. See iceberg_row_sink.hpp for the
+// delivery contract (exactly-once under 2PC), S3 + partitioning support.
 
 #include "clink/iceberg/iceberg_row_sink.hpp"
 
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -20,22 +21,27 @@
 #include <arrow/api.h>
 #include <arrow/c/bridge.h>  // ExportRecordBatch (defines the shared ArrowArray first)
 
+#include "clink/config/json.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/state_backend.hpp"
 
 #include "iceberg/catalog/sql/sql_catalog.h"
+#include "iceberg/expression/literal.h"
 #include "iceberg/file_format.h"
 #include "iceberg/file_io.h"
 #include "iceberg/file_writer.h"
 #include "iceberg/manifest/manifest_entry.h"
+#include "iceberg/partition_field.h"
 #include "iceberg/partition_spec.h"
 #include "iceberg/result.h"
+#include "iceberg/row/partition_values.h"
 #include "iceberg/schema.h"
 #include "iceberg/schema_field.h"
 #include "iceberg/sort_order.h"
 #include "iceberg/table.h"
 #include "iceberg/table_identifier.h"
+#include "iceberg/transform.h"
 #include "iceberg/type.h"
 #include "iceberg/update/fast_append.h"
 
@@ -61,6 +67,7 @@ void RegisterAll();
 namespace clink::iceberg {
 
 namespace ice = ::iceberg;
+namespace cfg = clink::config;
 
 namespace {
 
@@ -119,6 +126,7 @@ std::shared_ptr<ice::Type> arrow_to_ice_type(const arrow::DataType& t) {
 
 // Build the iceberg Schema from the batcher's Arrow schema, matching each field's
 // nullability so the iceberg->Arrow round-trip the writer does agrees with the data.
+// Field ids are assigned 1..N in column order (so the partition source ids below match).
 std::shared_ptr<ice::Schema> arrow_schema_to_ice(const arrow::Schema& s) {
     std::vector<ice::SchemaField> fields;
     fields.reserve(static_cast<std::size_t>(s.num_fields()));
@@ -176,6 +184,7 @@ public:
         ensure_registered();
         schema_ = opts_.batcher.schema();
         ice_schema_ = arrow_schema_to_ice(*schema_);
+        auto spec = build_partition_spec_();  // also fills part_cols_
 
         // FileIO by warehouse scheme: S3 for an s3:// warehouse (data + table metadata go
         // to the object store), else local filesystem. Both factories return unique_ptr;
@@ -196,12 +205,13 @@ public:
             file_io_ = std::shared_ptr<ice::FileIO>(ice::arrow::MakeLocalFileIO().release());
         }
 
-        ice::sql::SqlCatalogConfig cfg;
-        cfg.name = "clink";
-        cfg.warehouse_location = opts_.warehouse;
-        cfg.uri = opts_.catalog_uri.empty() ? (opts_.warehouse + "/catalog.db") : opts_.catalog_uri;
+        ice::sql::SqlCatalogConfig cfg_;
+        cfg_.name = "clink";
+        cfg_.warehouse_location = opts_.warehouse;
+        cfg_.uri =
+            opts_.catalog_uri.empty() ? (opts_.warehouse + "/catalog.db") : opts_.catalog_uri;
         catalog_ =
-            unwrap(ice::sql::SqlCatalog::MakeSqliteCatalog(cfg, file_io_), "make sqlite catalog");
+            unwrap(ice::sql::SqlCatalog::MakeSqliteCatalog(cfg_, file_io_), "make sqlite catalog");
 
         ice::Namespace ns;
         ns.levels = opts_.namespace_levels;
@@ -229,12 +239,8 @@ public:
         }
 
         if (auto ex = catalog_->TableExists(id_); ex.has_value() && !ex.value()) {
-            (void)unwrap(catalog_->CreateTable(id_,
-                                               ice_schema_,
-                                               ice::PartitionSpec::Unpartitioned(),
-                                               ice::SortOrder::Unsorted(),
-                                               location,
-                                               {}),
+            (void)unwrap(catalog_->CreateTable(
+                             id_, ice_schema_, spec, ice::SortOrder::Unsorted(), location, {}),
                          "create table");
         }
         table_ = unwrap(catalog_->LoadTable(id_), "load table");
@@ -256,36 +262,44 @@ public:
             return;
         }
         // mu_ serialises the runner thread (on_data/on_barrier) against the TM reader thread
-        // that delivers on_commit/on_abort - both touch table_/catalog_/file_io_/writer_.
+        // that delivers on_commit/on_abort - both touch table_/catalog_/file_io_/open_.
         std::lock_guard<std::mutex> lk(mu_);
         if (table_ == nullptr) {
             return;  // closed concurrently
         }
-        if (!writer_) {
-            open_writer_();
+        if (part_cols_.empty()) {
+            write_group_("", {}, batch);  // unpartitioned: one data file per interval
+            return;
         }
-        auto rb = opts_.batcher.build(batch);
-        if (!rb) {
-            throw std::runtime_error(opts_.name + ": batcher.build returned null");
+        // Partitioned: fan the batch out by its identity-partition tuple, one data file per
+        // (partition, interval). Group row indices first, then build a sub-batch per group.
+        std::map<std::string, std::vector<std::size_t>> groups;
+        std::map<std::string, std::vector<std::string>> group_pv;
+        for (std::size_t i = 0; i < batch.size(); ++i) {
+            const auto& row = batch[i].value();
+            std::vector<std::string> pv;
+            pv.reserve(part_cols_.size());
+            std::string key;
+            for (const auto& pc : part_cols_) {
+                std::string v = part_value_string_(row, pc);
+                key.append(v);
+                key.push_back('\x1f');
+                pv.push_back(std::move(v));
+            }
+            groups[key].push_back(i);
+            group_pv.emplace(key, std::move(pv));
         }
-        ArrowArray c_arr{};
-        if (auto st = arrow::ExportRecordBatch(*rb, &c_arr); !st.ok()) {
-            throw std::runtime_error(opts_.name + ": ExportRecordBatch: " + st.ToString());
+        for (const auto& [key, idxs] : groups) {
+            Batch<clink::sql::Row> sub;
+            for (std::size_t i : idxs) {
+                sub.emplace(batch[i].value());
+            }
+            write_group_(key, group_pv[key], sub);
         }
-        // Writer::Write does ImportRecordBatch, which on success MOVES c_arr (nulling its
-        // release). On failure it may NOT consume it, so the C Data Interface leaves us, the
-        // consumer, owning it. Release iff still owned: skips on success (no double-free),
-        // frees on failure (no leak). Do this BEFORE ensure_ok throws on a bad status.
-        auto wst = writer_->Write(&c_arr);
-        if (c_arr.release != nullptr) {
-            c_arr.release(&c_arr);
-        }
-        ensure_ok(wst, "writer Write");
-        cur_records_ += static_cast<std::int64_t>(batch.size());
     }
 
-    // Barrier = 2PC phase 1 (PRE-COMMIT). With a state backend the interval's data file is
-    // closed + recorded in state but NOT yet snapshotted - it becomes visible only when the
+    // Barrier = 2PC phase 1 (PRE-COMMIT). With a state backend the interval's data files are
+    // closed + recorded in state but NOT yet snapshotted - they become visible only when the
     // engine confirms the checkpoint is globally durable (on_commit). Without a state
     // backend (standalone use, no JM) there is no second phase to wait for, so commit
     // immediately = at-least-once, preserving the simple-sink behaviour.
@@ -305,7 +319,7 @@ public:
         }
     }
 
-    // 2PC phase 2 (COMMIT): the checkpoint is globally durable, so snapshot the data file
+    // 2PC phase 2 (COMMIT): the checkpoint is globally durable, so snapshot the data files
     // staged for it. Idempotent (skips a checkpoint already snapshotted), so a redelivered
     // commit or a recovery replay never double-commits.
     void on_commit(std::uint64_t checkpoint_id) override {
@@ -323,13 +337,13 @@ public:
         if (!stored.has_value()) {
             return;  // nothing staged for this checkpoint (empty interval / already committed)
         }
-        Staged st = parse_staged_(*stored);
-        commit_staged_(checkpoint_id, st, /*delete_data_on_commit_failure=*/false);
+        auto files = parse_staged_(*stored);
+        commit_staged_(checkpoint_id, files, /*delete_data_on_commit_failure=*/false);
         state->erase(this->id(), state_key_(checkpoint_id));
     }
 
     // 2PC abort: the checkpoint did NOT complete globally, so drop the staged (unreferenced)
-    // data file. The source replays the interval, which writes a fresh data file.
+    // data files. The source replays the interval, which writes fresh data files.
     void on_abort(std::uint64_t checkpoint_id) override {
         if (dormant_) {
             return;
@@ -343,8 +357,9 @@ public:
         if (!stored.has_value()) {
             return;
         }
-        Staged st = parse_staged_(*stored);
-        (void)file_io_->DeleteFile(st.path);  // best-effort orphan cleanup
+        for (const auto& sf : parse_staged_(*stored)) {
+            (void)file_io_->DeleteFile(sf.path);  // best-effort orphan cleanup
+        }
         state->erase(this->id(), state_key_(checkpoint_id));
     }
 
@@ -355,14 +370,14 @@ public:
         if (!dormant_ && table_ != nullptr) {
             if (two_phase_()) {
                 // The interval since the last barrier was never staged/committed; drop its
-                // partial data file (the source replays it). Committed + staged-pending data
-                // is durable in the catalog / state, untouched here.
+                // partial data files (the source replays them). Committed + staged-pending
+                // data is durable in the catalog / state, untouched here.
                 abandon_current_();
             } else {
                 commit_current_immediate_(0);  // flush the tail (at-least-once standalone)
             }
         }
-        writer_.reset();
+        open_.clear();
         table_.reset();
         catalog_.reset();
         file_io_.reset();
@@ -371,10 +386,28 @@ public:
     std::string name() const override { return opts_.name; }
 
 private:
-    struct Staged {
+    // An identity-partition source column: its name, its iceberg-schema field id, and the
+    // Arrow type used to extract a value from a Row + rebuild the partition Literal.
+    struct PartCol {
+        std::string name;
+        int32_t source_id{0};
+        arrow::Type::type atype{arrow::Type::NA};
+    };
+
+    // An open per-partition writer for the current interval.
+    struct OpenPart {
+        std::unique_ptr<ice::Writer> writer;
+        std::string data_path;
+        std::int64_t records{0};
+        std::vector<std::string> partition;  // string-encoded partition values (1 per PartCol)
+    };
+
+    // A closed, staged data file awaiting (or undergoing) commit.
+    struct StagedFile {
         std::string path;
         std::int64_t records{0};
         std::int64_t size{0};
+        std::vector<std::string> partition;  // string-encoded partition values
     };
 
     bool two_phase_() const noexcept { return state_backend_() != nullptr; }
@@ -389,84 +422,233 @@ private:
         return "_2pc_pending_sub" + std::to_string(opts_.subtask_idx) + "_" + std::to_string(ckpt);
     }
 
-    void open_writer_() {
-        cur_data_path_ = std::string(table_->location()) + "/data/" + make_uuid() + ".parquet";
-        ice::WriterOptions wopts;
-        wopts.path = cur_data_path_;
-        wopts.schema = ice_schema_;
-        wopts.io = file_io_;
-        writer_ = unwrap(ice::WriterFactoryRegistry::Open(ice::FileFormatType::kParquet, wopts),
-                         "open parquet writer");
-        cur_records_ = 0;
-    }
-
-    // Close the interval's writer (producing a complete Parquet data file) and return its
-    // DataFile facts. Returns false if there was no data this interval.
-    bool finish_writer_(Staged& out) {
-        if (!writer_) {
-            return false;
+    // Build the table's PartitionSpec from opts_.partition_by (identity transforms) and fill
+    // part_cols_ for value extraction. Empty partition_by -> Unpartitioned. v1 supports only
+    // IDENTITY (the partition value == the column value, so no transform-result-type concern).
+    std::shared_ptr<ice::PartitionSpec> build_partition_spec_() {
+        part_cols_.clear();
+        if (opts_.partition_by.empty()) {
+            return ice::PartitionSpec::Unpartitioned();
         }
-        ensure_ok(writer_->Close(), "writer Close");
-        out.path = cur_data_path_;
-        out.records = cur_records_;
-        out.size = unwrap(writer_->length(), "writer length");
-        writer_.reset();
-        cur_data_path_.clear();
-        cur_records_ = 0;
-        return true;
+        std::vector<ice::PartitionField> fields;
+        int32_t field_id = ice::PartitionSpec::kLegacyPartitionDataIdStart;  // 1000
+        for (const auto& col : opts_.partition_by) {
+            int idx = -1;
+            for (int i = 0; i < schema_->num_fields(); ++i) {
+                if (schema_->field(i)->name() == col) {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx < 0) {
+                throw std::runtime_error(opts_.name + ": partition_by column '" + col +
+                                         "' is not in the sink schema");
+            }
+            const auto atype = schema_->field(idx)->type()->id();
+            if (!partition_type_supported_(atype)) {
+                throw std::runtime_error(opts_.name + ": partition_by column '" + col +
+                                         "' has an unsupported type for identity partitioning");
+            }
+            // ids in ice_schema_ are assigned 1..N in column order (arrow_schema_to_ice), so
+            // the source field id for the column at arrow index idx is idx + 1.
+            part_cols_.push_back(PartCol{col, idx + 1, atype});
+            fields.emplace_back(idx + 1, field_id++, col, ice::Transform::Identity());
+        }
+        return std::shared_ptr<ice::PartitionSpec>(
+            unwrap(ice::PartitionSpec::Make(*ice_schema_,
+                                            ice::PartitionSpec::kInitialSpecId,
+                                            std::move(fields),
+                                            /*allow_missing_fields=*/false),
+                   "make partition spec")
+                .release());
     }
 
-    // Phase 1: close the data file + record it in state, keyed by checkpoint. No snapshot.
+    static bool partition_type_supported_(arrow::Type::type t) {
+        switch (t) {
+            case arrow::Type::INT64:
+            case arrow::Type::INT32:
+            case arrow::Type::DOUBLE:
+            case arrow::Type::FLOAT:
+            case arrow::Type::BOOL:
+            case arrow::Type::STRING:
+            case arrow::Type::LARGE_STRING:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Extract a Row's partition value for one column as a canonical string (round-trips
+    // through literal_from_string_). v1 requires the value present + non-null.
+    std::string part_value_string_(const clink::sql::Row& row, const PartCol& pc) const {
+        auto it = row.values.find(pc.name);
+        if (it == row.values.end() || it->second.is_null()) {
+            throw std::runtime_error(opts_.name + ": partition column '" + pc.name +
+                                     "' is null/missing (v1 requires non-null identity "
+                                     "partition values)");
+        }
+        const auto& jv = it->second;
+        switch (pc.atype) {
+            case arrow::Type::INT64:
+                return std::to_string(static_cast<std::int64_t>(jv.as_number()));
+            case arrow::Type::INT32:
+                return std::to_string(static_cast<std::int32_t>(jv.as_number()));
+            case arrow::Type::DOUBLE:
+                return std::to_string(jv.as_number());
+            case arrow::Type::FLOAT:
+                return std::to_string(static_cast<float>(jv.as_number()));
+            case arrow::Type::BOOL:
+                return jv.as_bool() ? "true" : "false";
+            default:
+                return jv.as_string();  // STRING / LARGE_STRING
+        }
+    }
+
+    ice::Literal literal_from_string_(const std::string& s, const PartCol& pc) const {
+        switch (pc.atype) {
+            case arrow::Type::INT64:
+                return ice::Literal::Long(std::stoll(s));
+            case arrow::Type::INT32:
+                return ice::Literal::Int(static_cast<std::int32_t>(std::stoll(s)));
+            case arrow::Type::DOUBLE:
+                return ice::Literal::Double(std::stod(s));
+            case arrow::Type::FLOAT:
+                return ice::Literal::Float(static_cast<float>(std::stod(s)));
+            case arrow::Type::BOOL:
+                return ice::Literal::Boolean(s == "true");
+            default:
+                return ice::Literal::String(s);  // STRING / LARGE_STRING
+        }
+    }
+
+    // Write one partition group (or the whole batch when unpartitioned) into its open writer,
+    // opening the writer lazily under the table's data/ dir.
+    void write_group_(const std::string& key,
+                      const std::vector<std::string>& partition,
+                      const Batch<clink::sql::Row>& b) {
+        if (b.empty()) {
+            return;
+        }
+        OpenPart& op = open_[key];
+        if (!op.writer) {
+            op.data_path = std::string(table_->location()) + "/data/" + make_uuid() + ".parquet";
+            op.partition = partition;
+            op.records = 0;
+            ice::WriterOptions wopts;
+            wopts.path = op.data_path;
+            wopts.schema = ice_schema_;
+            wopts.io = file_io_;
+            op.writer =
+                unwrap(ice::WriterFactoryRegistry::Open(ice::FileFormatType::kParquet, wopts),
+                       "open parquet writer");
+        }
+        auto rb = opts_.batcher.build(b);
+        if (!rb) {
+            throw std::runtime_error(opts_.name + ": batcher.build returned null");
+        }
+        ArrowArray c_arr{};
+        if (auto st = arrow::ExportRecordBatch(*rb, &c_arr); !st.ok()) {
+            throw std::runtime_error(opts_.name + ": ExportRecordBatch: " + st.ToString());
+        }
+        // Writer::Write does ImportRecordBatch, which on success MOVES c_arr (nulling its
+        // release). On failure it may NOT consume it, so the C Data Interface leaves us, the
+        // consumer, owning it. Release iff still owned: skips on success (no double-free),
+        // frees on failure (no leak). Do this BEFORE ensure_ok throws on a bad status.
+        auto wst = op.writer->Write(&c_arr);
+        if (c_arr.release != nullptr) {
+            c_arr.release(&c_arr);
+        }
+        ensure_ok(wst, "writer Write");
+        op.records += static_cast<std::int64_t>(b.size());
+    }
+
+    // Close all open per-partition writers, producing complete Parquet data files.
+    std::vector<StagedFile> finish_all_() {
+        std::vector<StagedFile> out;
+        for (auto& [key, op] : open_) {
+            if (!op.writer) {
+                continue;
+            }
+            ensure_ok(op.writer->Close(), "writer Close");
+            StagedFile sf;
+            sf.path = op.data_path;
+            sf.records = op.records;
+            sf.size = unwrap(op.writer->length(), "writer length");
+            sf.partition = op.partition;
+            out.push_back(std::move(sf));
+        }
+        open_.clear();
+        return out;
+    }
+
+    // Phase 1: close the data files + record them in state, keyed by checkpoint. No snapshot.
     void stage_current_(std::uint64_t ckpt) {
-        Staged st;
-        if (!finish_writer_(st)) {
+        auto files = finish_all_();
+        if (files.empty()) {
             return;  // empty interval -> nothing to stage, no snapshot
         }
-        std::string blob =
-            std::to_string(st.records) + "\t" + std::to_string(st.size) + "\t" + st.path;
+        std::string blob = serialize_staged_(files);
         state_backend_()->put(
             this->id(), state_key_(ckpt), std::string_view{blob.data(), blob.size()});
     }
 
     // Standalone (no 2PC): close + snapshot immediately.
     void commit_current_immediate_(std::uint64_t ckpt) {
-        Staged st;
-        if (!finish_writer_(st)) {
+        auto files = finish_all_();
+        if (files.empty()) {
             return;
         }
-        commit_staged_(ckpt, st, /*delete_data_on_commit_failure=*/true);
+        commit_staged_(ckpt, files, /*delete_data_on_commit_failure=*/true);
     }
 
-    // Snapshot one staged data file via a FastAppend, tagging the snapshot with the
-    // checkpoint id so the commit is idempotent. The in-memory table is stale after a
+    // Snapshot all staged data files for a checkpoint via one FastAppend, tagging the snapshot
+    // with the checkpoint id so the commit is idempotent. The in-memory table is stale after a
     // commit, so reload it for the next append.
-    void commit_staged_(std::uint64_t ckpt, const Staged& st, bool delete_data_on_commit_failure) {
-        if (already_committed_(ckpt)) {
+    void commit_staged_(std::uint64_t ckpt,
+                        const std::vector<StagedFile>& files,
+                        bool delete_data_on_commit_failure) {
+        if (files.empty() || already_committed_(ckpt)) {
             return;  // idempotent: this checkpoint's snapshot already exists
         }
-        auto df = std::make_shared<ice::DataFile>();
-        df->content = ice::DataFile::Content::kData;
-        df->file_path = st.path;
-        df->file_format = ice::FileFormatType::kParquet;
-        df->record_count = st.records;
-        df->file_size_in_bytes = st.size;
-        df->partition_spec_id = 0;  // the table is created unpartitioned (spec id 0)
-
         auto fa = unwrap(table_->NewFastAppend(), "new fast append");
-        fa->AppendFile(df);
+        std::int64_t total_records = 0;
+        std::int64_t total_size = 0;
+        for (const auto& sf : files) {
+            auto df = std::make_shared<ice::DataFile>();
+            df->content = ice::DataFile::Content::kData;
+            df->file_path = sf.path;
+            df->file_format = ice::FileFormatType::kParquet;
+            df->record_count = sf.records;
+            df->file_size_in_bytes = sf.size;
+            df->partition_spec_id = ice::PartitionSpec::kInitialSpecId;  // 0
+            if (!part_cols_.empty()) {
+                std::vector<ice::Literal> lits;
+                lits.reserve(sf.partition.size());
+                for (std::size_t i = 0; i < part_cols_.size() && i < sf.partition.size(); ++i) {
+                    lits.push_back(literal_from_string_(sf.partition[i], part_cols_[i]));
+                }
+                df->partition = ice::PartitionValues(std::move(lits));
+            }
+            fa->AppendFile(df);
+            total_records += sf.records;
+            total_size += sf.size;
+        }
         fa->Set(kCheckpointProp, std::to_string(ckpt));  // idempotency marker on the snapshot
         if (auto cst = fa->Commit(); !cst.has_value()) {
             if (delete_data_on_commit_failure) {
-                // Standalone: no state to retry from, so do not strand the orphan data file.
-                // (In 2PC, leave it: state still references it and recovery retries this commit.)
-                (void)file_io_->DeleteFile(st.path);
+                // Standalone: no state to retry from, so do not strand the orphan data files.
+                // (In 2PC, leave them: state still references them and recovery retries.)
+                for (const auto& sf : files) {
+                    (void)file_io_->DeleteFile(sf.path);
+                }
             }
             throw std::runtime_error("iceberg: commit snapshot: " + cst.error().message);
         }
         table_ = unwrap(catalog_->LoadTable(id_), "reload table after commit");
 
-        clink::metrics::connector::records_out_inc(kLabel, static_cast<std::uint64_t>(st.records));
-        clink::metrics::connector::bytes_out_inc(kLabel, static_cast<std::uint64_t>(st.size));
+        clink::metrics::connector::records_out_inc(kLabel,
+                                                   static_cast<std::uint64_t>(total_records));
+        clink::metrics::connector::bytes_out_inc(kLabel, static_cast<std::uint64_t>(total_size));
     }
 
     // Has a snapshot tagged with this checkpoint id already been committed?
@@ -481,39 +663,62 @@ private:
         return false;
     }
 
-    // Drop the in-progress (un-staged) interval: delete its partial data file.
+    // Drop all in-progress (un-staged) writers: delete their partial data files.
     void abandon_current_() {
-        if (writer_) {
-            (void)writer_->Close();
-            writer_.reset();
+        for (auto& [key, op] : open_) {
+            if (op.writer) {
+                (void)op.writer->Close();
+                op.writer.reset();
+            }
+            if (!op.data_path.empty() && file_io_ != nullptr) {
+                (void)file_io_->DeleteFile(op.data_path);
+            }
         }
-        if (!cur_data_path_.empty()) {
-            (void)file_io_->DeleteFile(cur_data_path_);
-            cur_data_path_.clear();
-        }
-        cur_records_ = 0;
+        open_.clear();
     }
 
-    // Blob layout = "<records>\t<size>\t<path>". The path is the tail (everything after the
-    // 2nd tab) so it may contain any character; stoll failures surface as a clear error
-    // (not a raw std::invalid_argument escaping recovery's catch).
-    Staged parse_staged_(const std::vector<std::byte>& blob) const {
-        std::string s(reinterpret_cast<const char*>(blob.data()), blob.size());
-        const auto t1 = s.find('\t');
-        const auto t2 = (t1 == std::string::npos) ? std::string::npos : s.find('\t', t1 + 1);
-        if (t1 == std::string::npos || t2 == std::string::npos) {
-            throw std::runtime_error(opts_.name + ": corrupt staged-commit state: " + s);
+    // Staged state = a JSON array of {path, records, size, partition:[str,...]}. JSON so an
+    // arbitrary string partition value (or a path) cannot break a delimiter scheme.
+    std::string serialize_staged_(const std::vector<StagedFile>& files) const {
+        cfg::JsonArray arr;
+        for (const auto& sf : files) {
+            cfg::JsonObject o;
+            o["path"] = cfg::JsonValue{sf.path};
+            o["records"] = cfg::JsonValue{sf.records};
+            o["size"] = cfg::JsonValue{sf.size};
+            cfg::JsonArray pv;
+            for (const auto& s : sf.partition) {
+                pv.push_back(cfg::JsonValue{s});
+            }
+            o["partition"] = cfg::JsonValue{std::move(pv)};
+            arr.push_back(cfg::JsonValue{std::move(o)});
         }
-        Staged st;
+        return cfg::JsonValue{std::move(arr)}.serialize(0);
+    }
+
+    std::vector<StagedFile> parse_staged_(const std::vector<std::byte>& blob) const {
+        std::string s(reinterpret_cast<const char*>(blob.data()), blob.size());
+        std::vector<StagedFile> out;
         try {
-            st.records = std::stoll(s.substr(0, t1));
-            st.size = std::stoll(s.substr(t1 + 1, t2 - t1 - 1));
+            auto v = cfg::parse(s);
+            for (const auto& e : v.as_array()) {
+                const auto& o = e.as_object();
+                StagedFile sf;
+                sf.path = o.at("path").as_string();
+                sf.records = static_cast<std::int64_t>(o.at("records").as_number());
+                sf.size = static_cast<std::int64_t>(o.at("size").as_number());
+                if (auto pit = o.find("partition"); pit != o.end()) {
+                    for (const auto& pv : pit->second.as_array()) {
+                        sf.partition.push_back(pv.as_string());
+                    }
+                }
+                out.push_back(std::move(sf));
+            }
         } catch (const std::exception& e) {
             throw std::runtime_error(opts_.name + ": corrupt staged-commit state (" + e.what() +
                                      "): " + s);
         }
-        st.path = s.substr(t2 + 1);
-        return st;
+        return out;
     }
 
     // Recovery: snapshot any data files staged before a crash but not yet committed. Routed
@@ -541,8 +746,8 @@ private:
             } catch (...) {
                 continue;
             }
-            Staged st = parse_staged_(blob);
-            commit_staged_(ckpt, st, /*delete_data_on_commit_failure=*/false);
+            auto files = parse_staged_(blob);
+            commit_staged_(ckpt, files, /*delete_data_on_commit_failure=*/false);
             state->erase(this->id(), key);
         }
     }
@@ -556,13 +761,12 @@ private:
     mutable std::mutex mu_;
     std::shared_ptr<arrow::Schema> schema_;
     std::shared_ptr<ice::Schema> ice_schema_;
+    std::vector<PartCol> part_cols_;  // empty = unpartitioned
     std::shared_ptr<ice::FileIO> file_io_;
     std::shared_ptr<ice::sql::SqlCatalog> catalog_;
     ice::TableIdentifier id_;
     std::shared_ptr<ice::Table> table_;
-    std::unique_ptr<ice::Writer> writer_;
-    std::string cur_data_path_;
-    std::int64_t cur_records_{0};
+    std::map<std::string, OpenPart> open_;  // open per-partition writers this interval
 };
 
 std::shared_ptr<Sink<clink::sql::Row>> make_iceberg_row_sink(IcebergRowSinkOptions opts) {

@@ -54,6 +54,18 @@ Row make_row(std::int64_t id, const std::string& name) {
     return r;
 }
 
+// Partitioned-table schema {id:int64, region:string} + a matching row helper.
+std::vector<RowColumn> part_schema() {
+    return {{"id", arrow::int64()}, {"region", arrow::utf8()}};
+}
+
+Row make_region_row(std::int64_t id, const std::string& region) {
+    Row r;
+    r.values["id"] = cfg::JsonValue{id};
+    r.values["region"] = cfg::JsonValue{region};
+    return r;
+}
+
 // Recursively count files under `root` whose path contains `needle`.
 int count_paths_containing(const fs::path& root, const std::string& needle) {
     int n = 0;
@@ -275,6 +287,72 @@ TEST(IcebergSink2PC, CorruptStagedStateFailsLoudlyOnRecovery) {
     sink->set_id(OperatorId{42});
     sink->attach_runtime(&rctx);
     EXPECT_THROW(sink->open(), std::runtime_error);
+
+    fs::remove_all(wh);
+}
+
+// ---- Identity partitioning ----
+// A batch spanning N partition values fans out to N data files in ONE snapshot.
+TEST(IcebergSinkPartitioned, OneDataFilePerPartitionValue) {
+    const char* keep = std::getenv("CLINK_ICEBERG_KEEP_DIR");
+    auto wh = keep != nullptr ? fs::path(keep) : make_2pc_wh("partition");
+    if (keep != nullptr) {
+        fs::remove_all(wh);
+        fs::create_directories(wh);
+    }
+    IcebergRowSinkOptions o;
+    o.warehouse = wh.string();
+    o.table = "events";
+    o.partition_by = {"region"};
+    o.batcher = make_row_columnar_arrow_batcher(part_schema());
+    auto sink = make_iceberg_row_sink(std::move(o));
+    sink->open();  // standalone -> immediate commit on barrier
+
+    Batch<Row> b;
+    b.emplace(make_region_row(1, "us"));
+    b.emplace(make_region_row(2, "eu"));
+    b.emplace(make_region_row(3, "us"));
+    sink->on_data(b);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});  // one snapshot, two data files
+    sink->close();
+
+    EXPECT_EQ(count_paths_containing(wh, ".parquet"), 2) << "one data file per (us, eu)";
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 1) << "a single snapshot referencing both";
+
+    if (keep == nullptr) {
+        fs::remove_all(wh);
+    }
+}
+
+// Partitioning composes with 2PC: a partitioned interval stages multiple files, all
+// committed atomically in one snapshot on on_commit.
+TEST(IcebergSinkPartitioned, MultiFileStageThenCommit) {
+    auto wh = make_2pc_wh("partition2pc");
+    InMemoryStateBackend state;
+    RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &state, /*metrics=*/nullptr);
+
+    IcebergRowSinkOptions o;
+    o.warehouse = wh.string();
+    o.table = "events";
+    o.partition_by = {"region"};
+    o.batcher = make_row_columnar_arrow_batcher(part_schema());
+    auto sink = make_iceberg_row_sink(std::move(o));
+    sink->set_id(OperatorId{42});
+    sink->attach_runtime(&rctx);
+    sink->open();
+
+    Batch<Row> b;
+    b.emplace(make_region_row(1, "us"));
+    b.emplace(make_region_row(2, "eu"));
+    sink->on_data(b);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    // Staged: two data files, but NO snapshot yet.
+    EXPECT_EQ(count_paths_containing(wh, ".parquet"), 2);
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 0);
+
+    sink->on_commit(1);
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 1) << "both staged files in one snapshot";
+    sink->close();
 
     fs::remove_all(wh);
 }

@@ -37,6 +37,31 @@ std::vector<std::string> split_namespace(const std::string& s) {
     return out;
 }
 
+// Split a comma-separated list ("a,b,c") into trimmed non-empty items; empty -> {}.
+std::vector<std::string> split_csv(const std::string& s) {
+    std::vector<std::string> out;
+    std::size_t i = 0;
+    while (i < s.size()) {
+        std::size_t comma = s.find(',', i);
+        if (comma == std::string::npos) {
+            comma = s.size();
+        }
+        std::size_t b = i;
+        std::size_t e = comma;
+        while (b < e && (s[b] == ' ' || s[b] == '\t')) {
+            ++b;
+        }
+        while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t')) {
+            --e;
+        }
+        if (e > b) {
+            out.push_back(s.substr(b, e - b));
+        }
+        i = comma + 1;
+    }
+    return out;
+}
+
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
@@ -72,6 +97,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.table = ctx.param_or("table", "");
             o.namespace_levels = split_namespace(ctx.param_or("namespace", "default"));
             o.catalog_uri = ctx.param_or("catalog_uri", "");
+            // partition_by: comma-separated identity partition columns (empty = unpartitioned).
+            o.partition_by = split_csv(ctx.param_or("partition_by", ""));
             // S3 FileIO config for an s3:// warehouse. clink-friendly param names mapped to
             // the iceberg S3 property keys; anything left unset falls back to the standard
             // AWS env/credential chain (incl. AWS_ENDPOINT_URL). path-style is required for

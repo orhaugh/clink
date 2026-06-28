@@ -47,6 +47,11 @@ struct IcebergRowSinkOptions {
     std::string warehouse;
     std::vector<std::string> namespace_levels{"default"};  // table namespace
     std::string table;                                     // table name (required)
+    // Identity partition columns (each must be a column of the sink schema). Empty = the
+    // table is unpartitioned. v1 supports IDENTITY only (the partition value is the column
+    // value); bucket/truncate/temporal transforms are follow-ons. v1 requires the partition
+    // values present + non-null.
+    std::vector<std::string> partition_by;
     // SQLite catalog DB path; default "<warehouse>/catalog.db" for a LOCAL warehouse.
     // REQUIRED (and must be a local path) for an s3:// warehouse - the SQLite catalog
     // file cannot live on S3. (REST catalog is a follow-on - an http(s):// uri selects it.)
