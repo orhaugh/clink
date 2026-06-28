@@ -22,12 +22,17 @@
 #include "clink/config/json.hpp"
 #include "clink/core/record.hpp"
 #include "clink/iceberg/iceberg_row_sink.hpp"
+#include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
+#include "clink/state/in_memory_state_backend.hpp"
 
 using clink::Batch;
 using clink::CheckpointBarrier;
 using clink::CheckpointId;
+using clink::InMemoryStateBackend;
+using clink::OperatorId;
+using clink::RuntimeContext;
 using clink::iceberg::IcebergRowSinkOptions;
 using clink::iceberg::make_iceberg_row_sink;
 using clink::sql::make_row_columnar_arrow_batcher;
@@ -128,6 +133,128 @@ TEST(IcebergSink, NonZeroSubtaskIsDormant) {
 
     EXPECT_FALSE(fs::exists(wh / "catalog.db"));
     EXPECT_EQ(count_paths_containing(wh, ".parquet"), 0);
+
+    fs::remove_all(wh);
+}
+
+// ---- Exactly-once 2PC (with a state backend) ----
+// A snapshot manifest list is "snap-<id>-...avro"; one per committed snapshot, so counting
+// "snap-" paths counts committed snapshots.
+namespace {
+fs::path make_2pc_wh(const std::string& tag) {
+    auto wh = fs::temp_directory_path() /
+              ("clink_iceberg_2pc_" + tag + "_" + std::to_string(static_cast<long>(::getpid())));
+    fs::remove_all(wh);
+    fs::create_directories(wh);
+    return wh;
+}
+}  // namespace
+
+// With a state backend, on_barrier STAGES (writes the data file, no snapshot); the snapshot
+// appears only on on_commit. A redelivered commit is idempotent.
+TEST(IcebergSink2PC, StagesOnBarrierCommitsOnCommit) {
+    auto wh = make_2pc_wh("commit");
+    InMemoryStateBackend state;
+    RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &state, /*metrics=*/nullptr);
+
+    IcebergRowSinkOptions o;
+    o.warehouse = wh.string();
+    o.table = "events";
+    o.batcher = make_row_columnar_arrow_batcher(schema());
+    auto sink = make_iceberg_row_sink(std::move(o));
+    sink->set_id(OperatorId{42});
+    sink->attach_runtime(&rctx);
+    sink->open();
+
+    Batch<Row> b0;
+    b0.emplace(make_row(1, "a"));
+    b0.emplace(make_row(2, "b"));
+    sink->on_data(b0);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    // Staged, NOT committed: data file on disk, but NO snapshot yet.
+    EXPECT_EQ(count_paths_containing(wh, ".parquet"), 1);
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 0)
+        << "a barrier alone must not create a snapshot (exactly-once)";
+
+    sink->on_commit(1);
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 1) << "on_commit creates the snapshot";
+
+    sink->on_commit(1);  // redelivered / recovery replay
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 1) << "commit is idempotent";
+
+    sink->close();
+    fs::remove_all(wh);
+}
+
+// on_abort drops the staged (unreferenced) data file and creates no snapshot.
+TEST(IcebergSink2PC, AbortDropsStagedDataNoSnapshot) {
+    auto wh = make_2pc_wh("abort");
+    InMemoryStateBackend state;
+    RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &state, /*metrics=*/nullptr);
+
+    IcebergRowSinkOptions o;
+    o.warehouse = wh.string();
+    o.table = "events";
+    o.batcher = make_row_columnar_arrow_batcher(schema());
+    auto sink = make_iceberg_row_sink(std::move(o));
+    sink->set_id(OperatorId{42});
+    sink->attach_runtime(&rctx);
+    sink->open();
+
+    Batch<Row> b;
+    b.emplace(make_row(1, "a"));
+    sink->on_data(b);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{7}});
+    EXPECT_EQ(count_paths_containing(wh, ".parquet"), 1);
+
+    sink->on_abort(7);
+    EXPECT_EQ(count_paths_containing(wh, ".parquet"), 0) << "aborted staged data file deleted";
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 0);
+
+    sink->close();
+    fs::remove_all(wh);
+}
+
+// Recovery: a sink that staged a checkpoint then crashed (no on_commit) is replaced by a new
+// sink sharing the same state backend + id; open() commits the pending staged data.
+TEST(IcebergSink2PC, RecoveryCommitsPendingStagedData) {
+    auto wh = make_2pc_wh("recover");
+    InMemoryStateBackend state;  // shared across the two sink "lives"
+
+    auto opts = [&]() {
+        IcebergRowSinkOptions o;
+        o.warehouse = wh.string();
+        o.table = "events";
+        o.batcher = make_row_columnar_arrow_batcher(schema());
+        return o;
+    };
+
+    // Life 1: stage checkpoint 5, then "crash" (drop the sink without on_commit/close).
+    {
+        RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &state, /*metrics=*/nullptr);
+        auto sink = make_iceberg_row_sink(opts());
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();
+        Batch<Row> b;
+        b.emplace(make_row(1, "a"));
+        b.emplace(make_row(2, "b"));
+        sink->on_data(b);
+        sink->on_barrier(CheckpointBarrier{CheckpointId{5}});
+        EXPECT_EQ(count_paths_containing(wh, "snap-"), 0) << "staged, not committed";
+    }
+
+    // Life 2: same state backend + id; open() recovery commits checkpoint 5.
+    {
+        RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &state, /*metrics=*/nullptr);
+        auto sink = make_iceberg_row_sink(opts());
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();  // recover_pending_ commits the staged checkpoint
+        EXPECT_EQ(count_paths_containing(wh, "snap-"), 1)
+            << "recovery committed the pending staged checkpoint";
+        sink->close();
+    }
 
     fs::remove_all(wh);
 }

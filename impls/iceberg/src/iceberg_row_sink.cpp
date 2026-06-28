@@ -21,6 +21,8 @@
 #include <arrow/c/bridge.h>  // ExportRecordBatch (defines the shared ArrowArray first)
 
 #include "clink/metrics/connector_metrics.hpp"
+#include "clink/runtime/runtime_context.hpp"
+#include "clink/state/state_backend.hpp"
 
 #include "iceberg/catalog/sql/sql_catalog.h"
 #include "iceberg/file_format.h"
@@ -240,6 +242,10 @@ public:
             std::filesystem::create_directories(std::string(table_->location()) + "/metadata", ec);
             std::filesystem::create_directories(std::string(table_->location()) + "/data", ec);
         }
+
+        // Exactly-once recovery: commit any data files staged before a crash whose
+        // checkpoint completed globally (idempotent - skips checkpoints already snapshotted).
+        recover_pending_();
     }
 
     void on_data(const Batch<clink::sql::Row>& batch) override {
@@ -269,11 +275,72 @@ public:
         cur_records_ += static_cast<std::int64_t>(batch.size());
     }
 
-    void on_barrier(CheckpointBarrier /*b*/) override { commit_current_(); }
+    // Barrier = 2PC phase 1 (PRE-COMMIT). With a state backend the interval's data file is
+    // closed + recorded in state but NOT yet snapshotted - it becomes visible only when the
+    // engine confirms the checkpoint is globally durable (on_commit). Without a state
+    // backend (standalone use, no JM) there is no second phase to wait for, so commit
+    // immediately = at-least-once, preserving the simple-sink behaviour.
+    void on_barrier(CheckpointBarrier b) override {
+        if (dormant_) {
+            return;
+        }
+        const std::uint64_t ckpt = b.id().value();
+        if (two_phase_()) {
+            stage_current_(ckpt);
+        } else {
+            commit_current_immediate_(ckpt);
+        }
+    }
+
+    // 2PC phase 2 (COMMIT): the checkpoint is globally durable, so snapshot the data file
+    // staged for it. Idempotent (skips a checkpoint already snapshotted), so a redelivered
+    // commit or a recovery replay never double-commits.
+    void on_commit(std::uint64_t checkpoint_id) override {
+        if (dormant_) {
+            return;
+        }
+        auto* state = state_backend_();
+        if (state == nullptr) {
+            return;
+        }
+        auto stored = state->get(this->id(), state_key_(checkpoint_id));
+        if (!stored.has_value()) {
+            return;  // nothing staged for this checkpoint (empty interval / already committed)
+        }
+        Staged st = parse_staged_(*stored);
+        commit_staged_(checkpoint_id, st, /*delete_data_on_commit_failure=*/false);
+        state->erase(this->id(), state_key_(checkpoint_id));
+    }
+
+    // 2PC abort: the checkpoint did NOT complete globally, so drop the staged (unreferenced)
+    // data file. The source replays the interval, which writes a fresh data file.
+    void on_abort(std::uint64_t checkpoint_id) override {
+        if (dormant_) {
+            return;
+        }
+        auto* state = state_backend_();
+        if (state == nullptr) {
+            return;
+        }
+        auto stored = state->get(this->id(), state_key_(checkpoint_id));
+        if (!stored.has_value()) {
+            return;
+        }
+        Staged st = parse_staged_(*stored);
+        (void)file_io_->DeleteFile(st.path);  // best-effort orphan cleanup
+        state->erase(this->id(), state_key_(checkpoint_id));
+    }
 
     void close() override {
         if (!dormant_) {
-            commit_current_();
+            if (two_phase_()) {
+                // The interval since the last barrier was never staged/committed; drop its
+                // partial data file (the source replays it). Committed + staged-pending data
+                // is durable in the catalog / state, untouched here.
+                abandon_current_();
+            } else {
+                commit_current_immediate_(0);  // flush the tail (at-least-once standalone)
+            }
         }
         writer_.reset();
         table_.reset();
@@ -284,6 +351,24 @@ public:
     std::string name() const override { return opts_.name; }
 
 private:
+    struct Staged {
+        std::string path;
+        std::int64_t records{0};
+        std::int64_t size{0};
+    };
+
+    bool two_phase_() const noexcept { return state_backend_() != nullptr; }
+
+    StateBackend* state_backend_() const noexcept {
+        return this->runtime() != nullptr ? this->runtime()->state_backend() : nullptr;
+    }
+
+    // Single-writer table (only subtask 0 active), but keep the subtask in the key so the
+    // scheme is uniform with the other 2PC sinks.
+    std::string state_key_(std::uint64_t ckpt) const {
+        return "_2pc_pending_sub" + std::to_string(opts_.subtask_idx) + "_" + std::to_string(ckpt);
+    }
+
     void open_writer_() {
         cur_data_path_ = std::string(table_->location()) + "/data/" + make_uuid() + ".parquet";
         ice::WriterOptions wopts;
@@ -295,41 +380,146 @@ private:
         cur_records_ = 0;
     }
 
-    void commit_current_() {
+    // Close the interval's writer (producing a complete Parquet data file) and return its
+    // DataFile facts. Returns false if there was no data this interval.
+    bool finish_writer_(Staged& out) {
         if (!writer_) {
-            return;  // no rows this interval
+            return false;
         }
         ensure_ok(writer_->Close(), "writer Close");
-        const std::int64_t size = unwrap(writer_->length(), "writer length");
+        out.path = cur_data_path_;
+        out.records = cur_records_;
+        out.size = unwrap(writer_->length(), "writer length");
         writer_.reset();
+        cur_data_path_.clear();
+        cur_records_ = 0;
+        return true;
+    }
 
+    // Phase 1: close the data file + record it in state, keyed by checkpoint. No snapshot.
+    void stage_current_(std::uint64_t ckpt) {
+        Staged st;
+        if (!finish_writer_(st)) {
+            return;  // empty interval -> nothing to stage, no snapshot
+        }
+        std::string blob =
+            st.path + "\t" + std::to_string(st.records) + "\t" + std::to_string(st.size);
+        state_backend_()->put(
+            this->id(), state_key_(ckpt), std::string_view{blob.data(), blob.size()});
+    }
+
+    // Standalone (no 2PC): close + snapshot immediately.
+    void commit_current_immediate_(std::uint64_t ckpt) {
+        Staged st;
+        if (!finish_writer_(st)) {
+            return;
+        }
+        commit_staged_(ckpt, st, /*delete_data_on_commit_failure=*/true);
+    }
+
+    // Snapshot one staged data file via a FastAppend, tagging the snapshot with the
+    // checkpoint id so the commit is idempotent. The in-memory table is stale after a
+    // commit, so reload it for the next append.
+    void commit_staged_(std::uint64_t ckpt, const Staged& st, bool delete_data_on_commit_failure) {
+        if (already_committed_(ckpt)) {
+            return;  // idempotent: this checkpoint's snapshot already exists
+        }
         auto df = std::make_shared<ice::DataFile>();
         df->content = ice::DataFile::Content::kData;
-        df->file_path = cur_data_path_;
+        df->file_path = st.path;
         df->file_format = ice::FileFormatType::kParquet;
-        df->record_count = cur_records_;
-        df->file_size_in_bytes = size;
+        df->record_count = st.records;
+        df->file_size_in_bytes = st.size;
         df->partition_spec_id = 0;  // the table is created unpartitioned (spec id 0)
 
-        // FastAppend is created off the (current) table, then committed; the in-memory
-        // table is stale after commit, so reload it from the catalog for the next append.
         auto fa = unwrap(table_->NewFastAppend(), "new fast append");
         fa->AppendFile(df);
+        fa->Set(kCheckpointProp, std::to_string(ckpt));  // idempotency marker on the snapshot
         if (auto cst = fa->Commit(); !cst.has_value()) {
-            // The data file is written but no snapshot references it. Best-effort delete so
-            // a repeatedly-failing commit does not strand orphan files in the warehouse (a
-            // replay writes a fresh uuid file, so the orphan would otherwise never be GC'd).
-            (void)file_io_->DeleteFile(cur_data_path_);
+            if (delete_data_on_commit_failure) {
+                // Standalone: no state to retry from, so do not strand the orphan data file.
+                // (In 2PC, leave it: state still references it and recovery retries this commit.)
+                (void)file_io_->DeleteFile(st.path);
+            }
             throw std::runtime_error("iceberg: commit snapshot: " + cst.error().message);
         }
         table_ = unwrap(catalog_->LoadTable(id_), "reload table after commit");
 
-        clink::metrics::connector::records_out_inc(kLabel,
-                                                   static_cast<std::uint64_t>(cur_records_));
-        clink::metrics::connector::bytes_out_inc(kLabel, static_cast<std::uint64_t>(size));
-        cur_data_path_.clear();
+        clink::metrics::connector::records_out_inc(kLabel, static_cast<std::uint64_t>(st.records));
+        clink::metrics::connector::bytes_out_inc(kLabel, static_cast<std::uint64_t>(st.size));
+    }
+
+    // Has a snapshot tagged with this checkpoint id already been committed?
+    bool already_committed_(std::uint64_t ckpt) const {
+        const std::string want = std::to_string(ckpt);
+        for (const auto& snap : table_->snapshots()) {
+            auto it = snap->summary.find(kCheckpointProp);
+            if (it != snap->summary.end() && it->second == want) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Drop the in-progress (un-staged) interval: delete its partial data file.
+    void abandon_current_() {
+        if (writer_) {
+            (void)writer_->Close();
+            writer_.reset();
+        }
+        if (!cur_data_path_.empty()) {
+            (void)file_io_->DeleteFile(cur_data_path_);
+            cur_data_path_.clear();
+        }
         cur_records_ = 0;
     }
+
+    Staged parse_staged_(const std::vector<std::byte>& blob) const {
+        std::string s(reinterpret_cast<const char*>(blob.data()), blob.size());
+        Staged st;
+        const auto t1 = s.find('\t');
+        const auto t2 = s.find('\t', t1 == std::string::npos ? t1 : t1 + 1);
+        if (t1 == std::string::npos || t2 == std::string::npos) {
+            throw std::runtime_error(opts_.name + ": corrupt staged-commit state: " + s);
+        }
+        st.path = s.substr(0, t1);
+        st.records = std::stoll(s.substr(t1 + 1, t2 - t1 - 1));
+        st.size = std::stoll(s.substr(t2 + 1));
+        return st;
+    }
+
+    // Recovery: snapshot any data files staged before a crash but not yet committed. Routed
+    // through the idempotent commit, so a file whose checkpoint already snapshotted is skipped
+    // (its state key is then cleared). A still-pending key whose checkpoint never completed is
+    // left for the engine's abort, or harmlessly re-committed on the next global checkpoint.
+    void recover_pending_() {
+        auto* state = state_backend_();
+        if (state == nullptr) {
+            return;
+        }
+        const std::string prefix = "_2pc_pending_sub" + std::to_string(opts_.subtask_idx) + "_";
+        std::vector<std::pair<std::string, std::vector<std::byte>>> pending;
+        state->scan(this->id(), [&](StateBackend::KeyView k, StateBackend::ValueView v) {
+            const std::string key{k};
+            if (key.rfind(prefix, 0) == 0) {
+                const auto* p = reinterpret_cast<const std::byte*>(v.data());
+                pending.emplace_back(key, std::vector<std::byte>{p, p + v.size()});
+            }
+        });
+        for (const auto& [key, blob] : pending) {
+            std::uint64_t ckpt = 0;
+            try {
+                ckpt = std::stoull(key.substr(prefix.size()));
+            } catch (...) {
+                continue;
+            }
+            Staged st = parse_staged_(blob);
+            commit_staged_(ckpt, st, /*delete_data_on_commit_failure=*/false);
+            state->erase(this->id(), key);
+        }
+    }
+
+    static constexpr const char* kCheckpointProp = "clink.checkpoint-id";
 
     IcebergRowSinkOptions opts_;
     bool dormant_{false};
@@ -345,7 +535,18 @@ private:
 };
 
 std::shared_ptr<Sink<clink::sql::Row>> make_iceberg_row_sink(IcebergRowSinkOptions opts) {
-    return std::make_shared<IcebergRowSink>(std::move(opts));
+    // The sink is stateful under 2PC (it stages pending commits in the state backend keyed
+    // by its OperatorId, which derives from the uid). Default a stable uid from the target
+    // table so the staged-commit state survives a restart even if the caller did not pin one
+    // explicitly; an explicit .uid() from the planner still overrides this.
+    std::string uid = "iceberg:";
+    for (const auto& level : opts.namespace_levels) {
+        uid += level + ".";
+    }
+    uid += opts.table;
+    auto sink = std::make_shared<IcebergRowSink>(std::move(opts));
+    sink->set_uid(uid);
+    return sink;
 }
 
 }  // namespace clink::iceberg
