@@ -109,6 +109,9 @@
 #ifdef CLINK_LINKED_MYSQL
 #include "clink/mysql/install.hpp"
 #endif
+#ifdef CLINK_LINKED_MQTT
+#include "clink/mqtt/install.hpp"
+#endif
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/rocksdb/install.hpp"
 #endif
@@ -1973,6 +1976,9 @@ void install_linked_impls() {
 #endif
 #ifdef CLINK_LINKED_MYSQL
     clink::mysql::install(reg);  // MySQL source + sink
+#endif
+#ifdef CLINK_LINKED_MQTT
+    clink::mqtt::install(reg);  // MQTT source + sink
 #endif
     // RocksDB is unconditionally linked into clink_node (matches
     // bundled rocksdb-jni model). install() registers the
