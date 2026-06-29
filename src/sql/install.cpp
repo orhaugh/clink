@@ -2331,14 +2331,17 @@ public:
     [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
 
     // Async ingest: buffer each non-late record into its partition's pending map
-    // under gate-key = partition key (so same-partition records serialise and
-    // their seq order is preserved), and register an event-time timer at the
-    // record's event time. seq is assigned synchronously here in arrival order so
-    // the (ts, seq) pending order is byte-identical to the sync path. No emit here
-    // - rows emit when their partition's timer fires. The late-record drop uses
-    // current_wm_, kept up to date by on_watermark_observed (which the runner
-    // calls synchronously when it pulls a watermark, BEFORE the watermark's effect
-    // is epoch-deferred), so it matches the sync handle_record_ drop exactly.
+    // under gate-key = partition key (so same-partition records serialise), and
+    // register an event-time timer at the record's event time. The (ts, seq)
+    // tiebreaker uses the PER-PARTITION st.next_seq, assigned inside the gated
+    // coroutine in arrival order - byte-identical pending order to the sync path
+    // (pending is per-partition; the gate keeps same-key records in arrival
+    // order) AND checkpoint-safe (next_seq rides PartState, so a restore never
+    // resets it and collides). No emit here - rows emit when their partition's
+    // timer fires. The late-record drop uses current_wm_, kept up to date by
+    // on_watermark_observed (the runner calls it synchronously when it pulls a
+    // watermark, BEFORE the watermark's effect is epoch-deferred) and restored by
+    // restore_timers, so it matches the sync handle_record_ drop exactly.
     void process_async(const StreamElement<Row>& element,
                        Emitter<Row>& /*out*/,
                        AsyncExecutionController& aec) override {
@@ -2355,18 +2358,18 @@ public:
                 continue;  // late: its running value already emitted (matches handle_record_)
             }
             std::string key = partition_key_(row);
-            const std::uint64_t myseq = seq_++;  // arrival order, deterministic
             const std::int64_t ts = *ts_opt;
             auto kv = keyed_state_();
             auto* rt = this->runtime();
             Row row_copy = row;
-            auto factory = [this, kv, key, ts, myseq, row = std::move(row_copy), rt]() mutable
-                -> async::Task<void> {
+            auto factory =
+                [this, kv, key, ts, row = std::move(row_copy), rt]() mutable -> async::Task<void> {
                 auto cur = co_await kv.get_async(key);
                 PartState st = cur.has_value() ? std::move(*cur) : PartState{};
                 if (st.agg.empty()) {
                     st.agg.resize(specs_.size());
                 }
+                const std::uint64_t myseq = st.next_seq++;  // per-partition, arrival order
                 st.pending.emplace(std::make_pair(ts, myseq), std::move(row));
                 kv.put(key, st);
                 rt->timer_service()->register_event_time_timer(ts, key);
@@ -2375,6 +2378,45 @@ public:
             while (!aec.submit(key, factory)) {
                 aec.poll();
             }
+        }
+    }
+
+    // Checkpoint the async late-drop bound alongside the operator's timers (the
+    // runner calls these at the barrier / on restore). pending rides KeyedState
+    // and the per-partition next_seq rides PartState, so persisting current_wm_ /
+    // have_wm_ here makes the whole async OVER state checkpoint-consistent: a
+    // restore re-establishes the late bound so post-restore records are dropped
+    // exactly as before the checkpoint. Mirrors detail::snapshot_timer_service.
+    void snapshot_timers(StateBackend& backend,
+                         OperatorId op_id,
+                         const std::string& slot = "") override {
+        Operator<Row, Row>::snapshot_timers(backend, op_id, slot);
+        std::array<std::byte, 9> bytes{};
+        const auto v = static_cast<std::uint64_t>(current_wm_);
+        for (int i = 0; i < 8; ++i) {
+            bytes[static_cast<std::size_t>(i)] = static_cast<std::byte>((v >> (i * 8)) & 0xFF);
+        }
+        bytes[8] = static_cast<std::byte>(have_wm_ ? 1 : 0);
+        const std::string wm_key = std::string("over.wm") + slot;
+        backend.put_operator_state(
+            op_id,
+            StateBackend::KeyView{wm_key.data(), wm_key.size()},
+            StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+    }
+    void restore_timers(StateBackend& backend,
+                        OperatorId op_id,
+                        const std::string& slot = "") override {
+        Operator<Row, Row>::restore_timers(backend, op_id, slot);
+        const std::string wm_key = std::string("over.wm") + slot;
+        auto v =
+            backend.get_operator_state(op_id, StateBackend::KeyView{wm_key.data(), wm_key.size()});
+        if (v.has_value() && v->size() >= 9) {
+            std::uint64_t raw = 0;
+            for (int i = 0; i < 8; ++i) {
+                raw |= static_cast<std::uint64_t>(static_cast<std::uint8_t>((*v)[i])) << (i * 8);
+            }
+            current_wm_ = static_cast<std::int64_t>(raw);
+            have_wm_ = static_cast<std::uint8_t>((*v)[8]) != 0;
         }
     }
 
@@ -2448,6 +2490,14 @@ private:
         // with their event time. Only maintained when a spec has a ROWS /
         // RANGE frame; trimmed to the widest frame reach.
         std::deque<std::pair<std::int64_t, Row>> folded;
+        // Per-partition pending-tiebreaker seq used ONLY by the async path. It is
+        // checkpointed with the rest of PartState, so a restore never resets it to
+        // 0 and collides with a restored pending entry's (ts, seq) key (which would
+        // silently drop a record via map::emplace). Within a partition it is
+        // monotonic in arrival order - byte-identical pending order to the sync
+        // path's operator-global seq_, because pending is per-partition and the
+        // per-key gate keeps same-partition records in arrival order.
+        std::uint64_t next_seq = 0;
     };
 
     std::optional<std::int64_t> ts_of_(const Row& row) const {
@@ -2670,6 +2720,7 @@ private:
                 agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(ts));
                 agg_codec_detail::put_str(o, row_text(r));
             }
+            agg_codec_detail::put_u64(o, st.next_seq);
         };
         return clink::Codec<PartState>{
             .encode = [body](const PartState& st) -> Bytes {
@@ -2699,6 +2750,7 @@ private:
                     const auto ts = static_cast<std::int64_t>(r.u64());
                     st.folded.emplace_back(ts, parse_row(r.str()));
                 }
+                st.next_seq = r.u64();
                 if (!r.ok) {
                     return std::nullopt;
                 }
