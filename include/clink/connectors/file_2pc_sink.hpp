@@ -122,7 +122,7 @@ public:
         state->erase(this->id(), key);
     }
 
-    // Phase 30c: abort the pre-committed file for this checkpoint.
+    // Abort the pre-committed file for this checkpoint.
     // Mirrors on_commit but rolls back instead of finalising: delete
     // the staging file and clear the state key. Idempotent - a
     // second on_abort for the same id is a no-op.

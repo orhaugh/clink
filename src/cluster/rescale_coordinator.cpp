@@ -59,8 +59,8 @@ RescaleCoordinator::RequestResult RescaleCoordinator::request_rescale(
         clink::metrics::orch::rescale_request_rejected();
         return RequestResult{.ok = false,
                              .reason = "operator '" + op_id +
-                                       "' has no autoscale bounds (Phase 29a "
-                                       "min_parallelism / max_parallelism unset)"};
+                                       "' has no autoscale bounds "
+                                       "(min_parallelism / max_parallelism unset)"};
     }
     if (new_parallelism < st.min_parallelism) {
         clink::metrics::orch::rescale_request_rejected();

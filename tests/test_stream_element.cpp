@@ -117,7 +117,7 @@ TEST(CheckpointBarrier, EqualityComparesId) {
     EXPECT_NE(CheckpointBarrier{CheckpointId{1}}, CheckpointBarrier{CheckpointId{2}});
 }
 
-// --- Phase 29b: drain marker --------------------------------------
+// --- Drain marker -------------------------------------------------
 
 TEST(StreamElement, DrainElementCarriesMarkerFields) {
     DrainMarker d{.subtask_idx = 3, .target_parallelism = 8};

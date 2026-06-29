@@ -1,4 +1,4 @@
-// Phase 28e-3 tests: HttpPool over io_uring socket awaitables vs a
+// HttpPool over io_uring socket awaitables vs a
 // real (cpp-httplib-backed) mock HTTP server. Linux-only.
 //
 // Test pattern:
@@ -218,7 +218,7 @@ TEST(HttpPoolIoUring, ExhaustedPoolFailsCleanly) {
     // succeeds (the slot is reusable). The fast-fail path is
     // exercised via the request flow when we wedge the pool by
     // never releasing - too racy to test deterministically here.
-    // For 28e-3 we settle for: a max-1 pool issues sequential
+    // We settle for: a max-1 pool issues sequential
     // requests cleanly.
     auto t2 = pool.get("/hello");
     t2.resume();

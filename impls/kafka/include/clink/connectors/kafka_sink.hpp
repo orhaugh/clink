@@ -65,7 +65,7 @@ public:
         // Empty disables registration.
         std::string metric_prefix = "default";
 
-        // Phase 23c: when non-empty, the producer is configured with
+        // When non-empty, the producer is configured with
         // `transactional.id` + `enable.idempotence=true`, and open()
         // runs init_transactions() + begin_transaction() so that
         // every produced record lands inside the current transaction.
@@ -96,7 +96,7 @@ public:
     // Last delivery error message; empty if none seen.
     std::string last_error() const;
 
-    // Phase 23c: transactional API. Callable only when Options.
+    // Transactional API. Callable only when Options.
     // transactional_id was non-empty. commit_transaction() flushes
     // in-flight records, then commits the current transaction and
     // begins a new one. abort_transaction() rolls back AND likewise

@@ -71,7 +71,7 @@ void define_job(clink::api::StreamExecutionEnvironment& env) {
 
     // Register the slow source factory in this job's bundle. The .so
     // dlopened on the JM and each TM re-runs this build_fn and
-    // re-registers - the per-job-bundle scoping (Phase 2) keeps the
+    // re-registers - the per-job-bundle scoping keeps the
     // registrations isolated from other concurrent jobs.
     env.registry().register_source<std::int64_t>("cancel_test.slow_source",
                                                  [tick](const clink::plugin::BuildContext&) {

@@ -468,10 +468,10 @@ std::vector<std::int64_t> drain_int_channel(BoundedChannel<StreamElement<std::in
     return out;
 }
 
-// End-to-end through the CO-OPERATOR runner's ASYNC path: phase 1 flows an
-// aligned barrier through a two-input stateful op on FileBacked; the
+// End-to-end through the CO-OPERATOR runner's ASYNC path: the first stage flows
+// an aligned barrier through a two-input stateful op on FileBacked; the
 // snapshot worker durably persists the keyed state off-thread (drained
-// before the runner exits) and acks it. Phase 2 restores from that
+// before the runner exits) and acks it. The second stage restores from that
 // async-acked checkpoint and proves the per-key counts resumed.
 TEST(FileBackedStateBackend, CoOperatorAsyncCheckpointThroughRunnerIsRestorable) {
     const auto dir = scratch_dir("coop_async_recovery");
@@ -480,7 +480,7 @@ TEST(FileBackedStateBackend, CoOperatorAsyncCheckpointThroughRunnerIsRestorable)
     std::vector<std::tuple<std::uint64_t, bool>> acks;
     std::mutex ack_mu;
 
-    // ---- Phase 1: process left {1,2} and right {2,3}, then an aligned
+    // ---- Stage 1: process left {1,2} and right {2,3}, then an aligned
     // barrier on both inputs that the worker persists. ----
     {
         auto backend = std::make_shared<FileBackedStateBackend>(dir);
@@ -534,7 +534,7 @@ TEST(FileBackedStateBackend, CoOperatorAsyncCheckpointThroughRunnerIsRestorable)
         EXPECT_TRUE(acked_ok) << "co-op async checkpoint 1 must ack ok";
     }
 
-    // ---- Phase 2: restore the async-written checkpoint, process one more
+    // ---- Stage 2: restore the async-written checkpoint, process one more
     // record for an existing key, prove the count resumed. ----
     {
         auto backend = std::make_shared<FileBackedStateBackend>(dir);

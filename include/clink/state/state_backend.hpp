@@ -285,7 +285,7 @@ public:
     // in-memory backends that keep no per-checkpoint artefacts.
     virtual void purge_checkpoint(CheckpointId /*id*/) {}
 
-    // Phase 27b: record the codec version for each (operator, state_type)
+    // Record the codec version for each (operator, state_type)
     // before the next snapshot fires. The default is to ignore - backends
     // that support versioned state override these. snapshot() writes the
     // map into its serialized format; restore() repopulates it so the

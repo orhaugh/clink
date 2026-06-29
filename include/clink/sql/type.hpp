@@ -15,7 +15,7 @@
 // names to Arrow's type system, which is also clink's type system on
 // the wire and in storage.
 //
-// Phase 1 scope: integer family, float family, string family, bool,
+// Supported scope: integer family, float family, string family, bool,
 // timestamp, date. Decimal (numeric) carries through but defaults to
 // (38, 9) when precision/scale aren't supplied. Arrays / structs /
 // maps land in a later phase.

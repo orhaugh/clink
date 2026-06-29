@@ -185,7 +185,7 @@ TEST(JobGraphSpec, FromJsonRejectsDuplicateId) {
     EXPECT_THROW(JobGraphSpec::from_json(json), std::runtime_error);
 }
 
-// --- Phase 29a: per-operator parallelism bounds ----------------
+// --- Per-operator parallelism bounds ----------------
 
 TEST(JobGraphSpec, BoundsDefaultToZeroNoAutoscaling) {
     // The default OperatorSpec carries 0 / 0 bounds, signalling "this

@@ -9,17 +9,17 @@
 #include "clink/config/decimal.hpp"
 #include "clink/config/json.hpp"
 
-// JSON predicate evaluator. Used by filter_string_predicate (Phase
-// 3.1, single-TEXT column) and filter_row_predicate (Phase 3.2,
-// multi-column Row records).
+// JSON predicate evaluator. Used by filter_string_predicate
+// (single-TEXT column) and filter_row_predicate (multi-column Row
+// records).
 //
-// Phase 3.5 introduces SQL-standard three-valued logic. Comparisons
-// with NULL on either side yield Unknown (not False); AND / OR / NOT
-// follow the three-valued truth tables. WHERE filters keep a row
-// only when the predicate evaluates to True - both False and Unknown
-// drop the row, identical to standard SQL.
+// SQL-standard three-valued logic. Comparisons with NULL on either
+// side yield Unknown (not False); AND / OR / NOT follow the
+// three-valued truth tables. WHERE filters keep a row only when the
+// predicate evaluates to True - both False and Unknown drop the row,
+// identical to standard SQL.
 //
-// Predicate JSON shape (unchanged from Phase 3.4):
+// Predicate JSON shape:
 //
 //   {"op": "eq"|"ne"|"lt"|"le"|"gt"|"ge", "col": "<name>",
 //    "literal": <JsonValue>}             literal carries its type
@@ -249,7 +249,7 @@ TriBool evaluate_json_predicate_tri(const clink::config::JsonValue& pred, Resolv
         const auto& pattern = pred.at("pattern").as_string();
         return detail::from_bool(detail::like_match(pattern, detail::to_text(val)));
     }
-    // Phase 19a: x IN (v1, v2, ...). Three-valued semantics: NULL on
+    // x IN (v1, v2, ...). Three-valued semantics: NULL on
     // the column side is Unknown; if no value matches but at least one
     // value is NULL, the result is Unknown (matches SQL's `x IN (1,
     // NULL)` returning Unknown when x != 1).

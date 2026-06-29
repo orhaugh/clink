@@ -512,7 +512,7 @@ TEST(WireProtocol, HelloClientHasEmptyBody) {
     SUCCEED();
 }
 
-// Phase 30c: AbortCheckpoint wire frame round-trips. Same payload
+// AbortCheckpoint wire frame round-trips. Same payload
 // shape as CommitCheckpoint (job_id + checkpoint_id); the kind byte
 // is what distinguishes them.
 TEST(WireProtocol, AbortCheckpointRoundTrips) {
@@ -529,7 +529,7 @@ TEST(WireProtocol, CommitCheckpointRoundTrips) {
     EXPECT_EQ(out.checkpoint_id, 99u);
 }
 
-// Phase 29d: BeginRescale message frame. JM -> TM signal that starts
+// BeginRescale message frame. JM -> TM signal that starts
 // the dual-run rescale: target_parallelism + cutover_checkpoint
 // pinpoint exactly which checkpoint the new subtasks load their
 // state slice from.
@@ -553,7 +553,7 @@ TEST(WireProtocol, BeginRescaleHandlesEmptyOpId) {
     EXPECT_EQ(out.target_parallelism, 2u);
 }
 
-// Phase 29d-4: per-operator rescale request + ack.
+// Per-operator rescale request + ack.
 TEST(WireProtocol, RescaleOperatorRoundTrips) {
     RescaleOperatorMsg in{.job_id = 7, .op_id = "join", .new_parallelism = 8};
     auto out = round_trip(MessageKind::RescaleOperator, in, decode_rescale_operator);

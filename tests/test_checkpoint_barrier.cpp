@@ -99,7 +99,7 @@ TEST(CheckpointCoordinator, AbortPreventsCompletion) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 26a: barrier alignment mode
+// Barrier alignment mode
 // ---------------------------------------------------------------------------
 
 TEST(CheckpointBarrier, DefaultModeIsAligned) {
@@ -158,7 +158,7 @@ TEST(CheckpointCoordinator, TriggerWithOverrideWinsOverConfig) {
     EXPECT_EQ(c.mode(), CheckpointBarrier::Mode::Aligned);
 }
 
-// Phase 26c: adaptive mode resolver chooses per-checkpoint mode from
+// Adaptive mode resolver chooses per-checkpoint mode from
 // an external signal. We simulate the signal here; production wiring
 // will feed it from NetworkChannelSink::saturation_events totals.
 TEST(CheckpointCoordinator, ModeResolverGetsCalledOnEachTrigger) {

@@ -1,4 +1,4 @@
-// Phase 29g: unit tests for the autoscaler loop. The autoscaler is
+// Unit tests for the autoscaler loop. The autoscaler is
 // callback-pluggable so these tests inject deterministic sample /
 // status / request shims and verify decision shape per tick.
 

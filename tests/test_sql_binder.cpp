@@ -610,7 +610,7 @@ TEST(SqlBinder, ExplainProducesReadableTree) {
     EXPECT_NE(text.find("BIGINT"), std::string::npos);
 }
 
-// --- Phase 4: aggregates + windowed GROUP BY -----------------------
+// --- Aggregates + windowed GROUP BY -------------------------------
 
 TEST(SqlBinder, AggregateWithoutGroupByRejected) {
     Catalog cat;
@@ -1173,7 +1173,7 @@ TEST(SqlBinder, ScalarSubqueryNonAggregateRejected) {
                      parse("SELECT * FROM orders WHERE amount > (SELECT amount FROM refs)"))),
                  TranslationError);
 }
-// --- Phase 23a: 2PC SQL contract ----------------------------------
+// --- 2PC SQL contract ---------------------------------------------
 
 TEST(SqlBinder, ExactlyOnceFileSinkAccepted) {
     Catalog cat;
@@ -1236,7 +1236,7 @@ TEST(SqlBinder, ExactlyOncePlusUpsertRejected) {
                  TranslationError);
 }
 
-// --- Phase 30a: cross-sink commit group ---------------------------
+// --- Cross-sink commit group --------------------------------------
 
 TEST(SqlBinder, CommitGroupOnExactlyOnceFileSinkAccepted) {
     Catalog cat;
@@ -1297,7 +1297,7 @@ TEST(SqlBinder, EmptyCommitGroupOnAppendSinkAccepted) {
     EXPECT_FALSE(table->has_commit_group());
 }
 
-// --- Phase 22a: catalog upsert metadata + bind-time validation ---
+// --- Catalog upsert metadata + bind-time validation ---------------
 
 TEST(SqlBinder, AppendSinkRejectsChangelogStream) {
     Catalog cat;
@@ -1383,7 +1383,7 @@ TEST(SqlBinder, UpsertSinkAcceptsAppendStreamAsAllInserts) {
     ASSERT_NE(plan, nullptr);
 }
 
-// --- Phase 21c: TOP-N-per-key pattern -----------------------------
+// --- TOP-N-per-key pattern ----------------------------------------
 
 TEST(SqlBinder, RowNumberWhereLeBuildsLogicalTopNPerKey) {
     Catalog cat;
@@ -1473,7 +1473,7 @@ TEST(SqlBinder, RowNumberWhereOnNonRnColumnNotMatched) {
     EXPECT_NE(proj.input().kind(), "TopNPerKey");
 }
 
-// --- Phase 21b: ROW_NUMBER OVER parsing ---------------------------
+// --- ROW_NUMBER OVER parsing --------------------------------------
 
 TEST(SqlBinder, RowNumberOverBuildsLogicalRowNumber) {
     Catalog cat;
@@ -1564,7 +1564,7 @@ TEST(SqlBinder, RowNumberOnlyAcceptsSelectStarShape) {
                  TranslationError);
 }
 
-// --- Phase 20: FROM-derived tables --------------------------------
+// --- FROM-derived tables ------------------------------------------
 
 TEST(SqlBinder, DerivedTableInlinesIntoOuterPlan) {
     Catalog cat;
@@ -1615,7 +1615,7 @@ TEST(SqlBinder, DerivedTableReferencingUnknownColumnRejected) {
         TranslationError);
 }
 
-// --- Phase 19d: INSERT column list --------------------------------
+// --- INSERT column list -------------------------------------------
 
 TEST(SqlBinder, InsertColumnListReordersSelectOutputs) {
     Catalog cat;
@@ -1666,7 +1666,7 @@ TEST(SqlBinder, InsertPartialColumnListRejected) {
                  TranslationError);
 }
 
-// --- Phase 19c: HAVING with direct aggregate ----------------------
+// --- HAVING with direct aggregate ---------------------------------
 
 TEST(SqlBinder, HavingDirectAggregateReferencesMatchingAlias) {
     Catalog cat;
@@ -1709,7 +1709,7 @@ TEST(SqlBinder, HavingDirectAggregateWithoutMatchInSelectRejected) {
                  TranslationError);
 }
 
-// --- Phase 19b: OFFSET --------------------------------------------
+// --- OFFSET -------------------------------------------------------
 
 TEST(SqlBinder, LimitOffsetWrapsLogicalLimitWithOffset) {
     Catalog cat;
@@ -1742,7 +1742,7 @@ TEST(SqlBinder, OffsetWithoutLimitRejected) {
                  TranslationError);
 }
 
-// --- Phase 19a: IN literal-list ----------------------------------
+// --- IN literal-list ----------------------------------------------
 
 TEST(SqlBinder, InListLowersToInPredicate) {
     Catalog cat;
@@ -1771,7 +1771,7 @@ TEST(SqlBinder, NotInListWrapsInNot) {
     EXPECT_NE(f.predicate_json().find("\"op\":\"in\""), std::string::npos);
 }
 
-// --- Phase 17: ORDER BY + LIMIT TOP-N -----------------------------
+// --- ORDER BY + LIMIT TOP-N ---------------------------------------
 
 TEST(SqlBinder, OrderByLimitWrapsInLogicalTopN) {
     Catalog cat;
@@ -1818,7 +1818,7 @@ TEST(SqlBinder, OrderByUnknownColumnRejected) {
         TranslationError);
 }
 
-// --- Phase 16: CTEs (WITH clause) ---------------------------------
+// --- CTEs (WITH clause) -------------------------------------------
 
 TEST(SqlBinder, SingleCteInlinesIntoOuterPlan) {
     Catalog cat;
@@ -1895,7 +1895,7 @@ TEST(SqlBinder, CteShadowsCatalogTableForOuterSelect) {
     EXPECT_EQ(plan->schema()->field(0)->name(), "user_id");
 }
 
-// --- Phase 15: extended built-in scalar functions -----------------
+// --- Extended built-in scalar functions ---------------------------
 
 TEST(SqlBinder, SubstringLowersToSubstringOp) {
     Catalog cat;
@@ -1967,7 +1967,7 @@ TEST(SqlBinder, GreatestLeastLowerToGreatestLeastOps) {
     EXPECT_TRUE(project.outputs()[0].type->Equals(*arrow::int64()));
 }
 
-// --- Phase 13: UNION ALL ------------------------------------------
+// --- UNION ALL ----------------------------------------------------
 
 TEST(SqlBinder, UnionAllBuildsLogicalUnion) {
     Catalog cat;
@@ -2077,7 +2077,7 @@ TEST(SqlBinder, UnionAllColumnTypeMismatchRejected) {
                  TranslationError);
 }
 
-// --- Phase 12: CASE WHEN ------------------------------------------
+// --- CASE WHEN ----------------------------------------------------
 
 TEST(SqlBinder, CaseWhenLowersToCaseValueExpression) {
     Catalog cat;
@@ -2129,7 +2129,7 @@ TEST(SqlBinder, CaseElseTypeMismatchRejected) {
 
 TEST(SqlBinder, SimpleFormCaseRejected) {
     // CASE x WHEN 1 THEN ... is the simple form; we only support
-    // searched-CASE in Phase 12.
+    // searched-CASE.
     Catalog cat;
     register_clicks(cat);
     Binder b(cat);
@@ -2165,7 +2165,7 @@ TEST(SqlBinder, SelectDistinctWrapsProjectionInDistinct) {
 }
 
 TEST(SqlBinder, HavingClauseWrapsAggregateInFilter) {
-    // Phase 9: HAVING on aggregate alias wraps the aggregate node in a
+    // HAVING on aggregate alias wraps the aggregate node in a
     // LogicalFilter. The filter's predicate references the aggregate's
     // emitted column name.
     Catalog cat;
@@ -2192,7 +2192,7 @@ TEST(SqlBinder, HavingClauseAllowsGroupColumnReference) {
 }
 
 TEST(SqlBinder, GroupByWithoutWindowTvfBuildsLogicalAggregate) {
-    // Phase 8: GROUP BY without a window TVF is now supported and
+    // GROUP BY without a window TVF is now supported and
     // lowers to LogicalAggregate (unbounded, upsert-style output).
     Catalog cat;
     register_clicks(cat);
@@ -2209,7 +2209,7 @@ TEST(SqlBinder, GroupByWithoutWindowTvfBuildsLogicalAggregate) {
     EXPECT_EQ(agg.aggregates()[0].output_name, "s");
 }
 
-// --- Phase 5.1: interval join --------------------------------------
+// --- Interval join ------------------------------------------------
 
 TEST(SqlBinder, IntervalJoinBuildsLogicalIntervalJoin) {
     Catalog cat;
@@ -2244,7 +2244,7 @@ TEST(SqlBinder, IntervalJoinBuildsLogicalIntervalJoin) {
     EXPECT_EQ(j.upper_offset_ms(), 10000);
 }
 
-// Phase 18: equi-join without an interval window is now supported.
+// Equi-join without an interval window is now supported.
 
 TEST(SqlBinder, EquiJoinBuildsLogicalEquiJoin) {
     Catalog cat;
@@ -2562,7 +2562,7 @@ TEST(SqlBinder, EmptyFromRejected) {
     EXPECT_THROW(b.bind_select(as_select(parse("SELECT 1"))), TranslationError);
 }
 
-// --- Phase 3.1: WHERE clause ---------------------------------------
+// --- WHERE clause -------------------------------------------------
 
 TEST(SqlBinder, WhereWrapsScanInLogicalFilter) {
     Catalog cat;
@@ -2648,7 +2648,7 @@ TEST(SqlBinder, WhereOnUnknownColumnRejected) {
 }
 
 TEST(SqlBinder, WhereLiteralOnLeftSideRejected) {
-    // Phase 3.1 expects column on the left, literal on the right.
+    // The binder expects column on the left, literal on the right.
     Catalog cat;
     register_clicks(cat);
     Binder b(cat);

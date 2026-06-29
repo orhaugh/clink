@@ -1,9 +1,9 @@
 #pragma once
 
-// Phase 28e-3: HttpPool over io_uring socket awaitables.
+// HttpPool over io_uring socket awaitables.
 //
 // A coroutine-aware HTTP/1.1 client with connection-reuse pooling.
-// Composes the Phase 28e socket awaitables (connect / write / read)
+// Composes the io_uring socket awaitables (connect / write / read)
 // into a coherent request/response API:
 //
 //   IoUringReactor reactor;
@@ -16,7 +16,7 @@
 //   auto resp = t.get();
 //   EXPECT_EQ(resp.status, 200);
 //
-// HTTP/1.1 features in 28e-3 MVP:
+// HTTP/1.1 features:
 //   - GET and POST methods.
 //   - Request: Host header is auto-set from config; Content-Length
 //     auto-set on POST body. Caller can supply additional headers.
@@ -25,7 +25,7 @@
 //     is the default and the fd returns to the pool; Connection:
 //     close drops the fd.
 //
-// Out of scope for 28e-3 (next slice):
+// Out of scope (next slice):
 //   - Transfer-Encoding: chunked response bodies.
 //   - HTTPS / TLS.
 //   - HTTP/2.
@@ -33,9 +33,8 @@
 //   - Connection-acquire backpressure beyond max_connections fast-
 //     fail; users compose RetryPolicy externally.
 //
-// Linux-only (Phase 28e is io_uring-based). On non-Linux the header
-// is empty so callers that conditionally use it don't break the
-// build.
+// Linux-only (io_uring-based). On non-Linux the header is empty so
+// callers that conditionally use it don't break the build.
 
 #include <chrono>
 #include <cstdint>

@@ -500,7 +500,7 @@ TEST(Kafka, ManualCommitMode) {
     sink_h.sink->on_data(batch);
     sink_h.sink->flush();
 
-    // Phase 1: consume 5, commit explicitly.
+    // Stage 1: consume 5, commit explicitly.
     {
         KafkaSource::Options src_opts;
         src_opts.brokers = mock.brokers();
@@ -515,8 +515,8 @@ TEST(Kafka, ManualCommitMode) {
         EXPECT_TRUE(src_h.source->commit_current());
     }
 
-    // Phase 2: same group, auto_offset_reset=earliest. Manual commits
-    // from phase 1 mean we should see no records - group offset is past
+    // Stage 2: same group, auto_offset_reset=earliest. Manual commits
+    // from stage 1 mean we should see no records - group offset is past
     // the end of the partition.
     {
         KafkaSource::Options src_opts;

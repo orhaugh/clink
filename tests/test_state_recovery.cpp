@@ -31,14 +31,14 @@ std::string to_string(const StateBackend::Value& v) {
 }  // namespace
 
 TEST(StateRecovery, RestoreFromSnapshotRunsBeforeOperators) {
-    // Phase 1: write some keyed state into a backend, then snapshot it.
+    // Write some keyed state into a backend, then snapshot it.
     auto original = std::make_shared<InMemoryStateBackend>();
     OperatorId op{7};
     original->put(op, sv(std::string{"counter"}), sv(std::string{"100"}));
     original->put(op, sv(std::string{"label"}), sv(std::string{"alpha"}));
     auto snap = original->snapshot(CheckpointId{42});
 
-    // Phase 2: build a fresh backend, run a no-op job that asks the runtime
+    // Build a fresh backend, run a no-op job that asks the runtime
     // to restore from the snapshot before starting.
     auto fresh = std::make_shared<InMemoryStateBackend>();
     EXPECT_FALSE(fresh->get(op, sv(std::string{"counter"})).has_value());

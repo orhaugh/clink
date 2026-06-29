@@ -1303,7 +1303,7 @@ RescaleCoordinator::RequestResult JobManager::request_operator_rescale(
     auto& job = *it->second;
     if (!job.rescale_coordinator) {
         return RescaleCoordinator::RequestResult{
-            .ok = false, .reason = "job has no rescale coordinator (Phase 29 not enabled)"};
+            .ok = false, .reason = "job has no rescale coordinator (rescale not enabled)"};
     }
     // A rescale advances Preparing -> Draining only when a checkpoint
     // lands (mark_checkpoint_ready, driven by the periodic-checkpoint
@@ -1599,13 +1599,13 @@ JobId JobManager::submit_job(const JobGraphSpec& graph,
                                          std::move(checkpoint),
                                          std::move(bundle),
                                          graph.expected_state_versions.pack());
-    // Phase 30b: derive commit-group memberships from sink-op params
+    // Derive commit-group memberships from sink-op params
     // and stash them on JobState so handle_subtask_checkpointed_ can
     // gate CommitCheckpoint broadcasts on the group's collective ack.
     //
-    // Phase 29d: in the same walk, populate the RescaleCoordinator
-    // with each operator's current parallelism + Phase 29a
-    // min/max bounds. Operators with 0/0 bounds register too (the
+    // In the same walk, populate the RescaleCoordinator
+    // with each operator's current parallelism + min/max
+    // bounds. Operators with 0/0 bounds register too (the
     // coordinator's request_rescale will reject them as
     // not-scalable; cleaner than skipping at register time because
     // status() then surfaces them as Idle for dashboards).
@@ -1633,8 +1633,8 @@ JobId JobManager::submit_job(const JobGraphSpec& graph,
                 }
             }
 
-            // Phase 29h: spin up the per-job autoscaler if the cluster
-            // config opts in AND at least one op carries Phase 29a
+            // Spin up the per-job autoscaler if the cluster
+            // config opts in AND at least one op carries [min, max]
             // bounds. The autoscaler captures `this` + `job_id` so its
             // callbacks route into JobManager::request_operator_rescale
             // / operator_rescale_status under the JM's lock discipline.
@@ -1990,7 +1990,7 @@ void JobManager::handle_subtask_listening_(MessageReader& r) {
             job.peer_updates_sent = true;
         }
 
-        // Phase 29f: if the listening subtask's operator is in
+        // If the listening subtask's operator is in
         // CuttingOver, treat the SubtaskListening as the readiness
         // signal that closes the rescale. Mark the new subtask
         // ready; when every new subtask has reported the coordinator
@@ -2867,15 +2867,15 @@ void JobManager::handle_subtask_finished_(MessageReader& r) {
                                           .count();
         }
 
-        // Phase 29d-3: if the operator this subtask belonged to is in
+        // If the operator this subtask belonged to is in
         // the Draining state, count this SubtaskFinished as a drained
         // ack. The coordinator transitions Draining -> CuttingOver
-        // when every old subtask has drained; 29d's deploy step then
+        // when every old subtask has drained; the deploy step then
         // brings up the new subtasks. Failed (had_error=true)
         // shutdowns also count - the operator's old subtasks are
         // going away one way or another.
         //
-        // Phase 29f: if the mark_old_drained transition lands the
+        // If the mark_old_drained transition lands the
         // operator in CuttingOver, fire the cutover-deployment slice
         // here so the new subtasks come up without a separate trigger.
         // Drained subtasks must NOT flow through the regular
@@ -2929,7 +2929,7 @@ void JobManager::handle_subtask_finished_(MessageReader& r) {
         // them toward completion or errors - they're being retired
         // ahead of the redeploy. Free their slots and record the drain.
         if (was_drain) {
-            // Phase 29f: drained subtasks have already been torn down
+            // Drained subtasks have already been torn down
             // by dispatch_cutover_deploy_locked_ above. Skip the
             // completed_count / slot-free / signal_job_completion path
             // entirely - the rescale lifecycle owns the bookkeeping
@@ -3243,7 +3243,7 @@ std::vector<std::string> JobManager::lost_tms() const {
 
 void JobManager::stop() {
     stop_.store(true, std::memory_order_release);
-    // Phase 29h: tear down per-job autoscalers before everything else.
+    // Tear down per-job autoscalers before everything else.
     // Their polling threads might be sitting on mu_ trying to call
     // request_operator_rescale; joining them now (under the move-out +
     // destroy-outside-the-lock pattern) lets the rest of stop()
@@ -3368,11 +3368,11 @@ void JobManager::handle_subtask_checkpointed_(MessageReader& r) {
     auto msg = decode_subtask_checkpointed(r);
     std::vector<std::pair<JobId, std::uint64_t>> just_completed;
     std::string completed_marker_dir;
-    // Phase 30b: a group whose member failed gets AbortCheckpoint
+    // A group whose member failed gets AbortCheckpoint
     // broadcast to every TM hosting any of its members. Collected
     // under the lock; sent outside it.
     std::vector<std::pair<JobId, std::uint64_t>> groups_to_abort;
-    // Phase 29f: BeginRescale frames queued by the checkpoint-completed
+    // BeginRescale frames queued by the checkpoint-completed
     // path. When the cutover checkpoint ack closes, any operator still
     // in Preparing advances to Draining and we send BeginRescale to
     // every TM hosting it.
@@ -3416,7 +3416,7 @@ void JobManager::handle_subtask_checkpointed_(MessageReader& r) {
         }
         ckpt_it->second.erase(key);
 
-        // Phase 30b: commit-group progress accounting. If this subtask
+        // Commit-group progress accounting. If this subtask
         // belongs to a commit_group, update group state. A failed ack
         // aborts the whole group; we mark it and queue a broadcast.
         if (auto cg_it = job.subtask_commit_group.find(key);
@@ -3444,7 +3444,7 @@ void JobManager::handle_subtask_checkpointed_(MessageReader& r) {
             }
         }
 
-        // Phase 30d (metrics-coverage pass): per-subtask snapshot ack
+        // Per-subtask snapshot ack
         // counters fire regardless of whether the whole checkpoint
         // completes - they tell us how many subtask snapshots came
         // back ok vs failed, independent of the JM-level
@@ -3472,13 +3472,13 @@ void JobManager::handle_subtask_checkpointed_(MessageReader& r) {
                 clink::metrics::ckpt::completed(0);
             }
 
-            // Phase 29f: any operator in Preparing uses THIS
+            // Any operator in Preparing uses THIS
             // checkpoint as its cutover_checkpoint. Advance to
             // Draining and dispatch BeginRescale to every TM hosting
             // an old subtask of the op. The drain emits DrainMarker,
             // which closes the source-runner loop, which triggers
-            // SubtaskFinished, which (29d-3) calls mark_old_drained,
-            // which (29f) fires dispatch_cutover_deploy_locked_ when
+            // SubtaskFinished, which calls mark_old_drained,
+            // which fires dispatch_cutover_deploy_locked_ when
             // the last old subtask drains.
             if (job.rescale_coordinator) {
                 for (const auto& op_status : job.rescale_coordinator->all()) {
@@ -3500,7 +3500,7 @@ void JobManager::handle_subtask_checkpointed_(MessageReader& r) {
             }
         }
     }
-    // Phase 29f: send BeginRescale frames outside the lock. Best-effort:
+    // Send BeginRescale frames outside the lock. Best-effort:
     // a send failure means the watchdog will catch the TM loss; the
     // coordinator's rescale will time out from the user's POV (no
     // dedicated timeout wired here yet) and a future re-request will
@@ -3510,7 +3510,7 @@ void JobManager::handle_subtask_checkpointed_(MessageReader& r) {
             send_frame(*f.conn, f.frame);
     }
 
-    // Phase 30b: broadcast AbortCheckpoint to every TM hosting tasks
+    // Broadcast AbortCheckpoint to every TM hosting tasks
     // for this job. Each TM dispatches to its registered abort
     // callbacks; non-group sinks ignore (their Sink::on_abort is the
     // default no-op). We send abort BEFORE the commit broadcast below

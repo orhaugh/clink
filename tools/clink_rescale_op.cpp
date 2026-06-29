@@ -1,5 +1,5 @@
-// clink_rescale_op - Phase 29d-4 client CLI: ask a running JobManager
-// to rescale ONE operator within a job to a new parallelism.
+// clink_rescale_op - client CLI: ask a running JobManager to rescale
+// ONE operator within a job to a new parallelism.
 // Mirrors clink_rescale_job's wire flow but targets a single operator
 // (via its OperatorSpec.id) rather than a whole role list.
 //
@@ -7,7 +7,7 @@
 //   clink rescale-op --job-id=N --op=<op_id> --parallelism=<p> \
 //                    [--jm-host=127.0.0.1] [--jm-port=6123]
 //
-// The JM validates against the operator's Phase 29a min/max bounds
+// The JM validates against the operator's min/max bounds
 // (set in the OperatorSpec at submit time) and rejects out-of-range
 // requests, requests equal to the current parallelism, and requests
 // against operators that already have a rescale in progress.

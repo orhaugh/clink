@@ -188,7 +188,7 @@ inline std::string output_base_path() {
 inline void define_job(clink::api::StreamExecutionEnvironment& env) {
     // Register the custom typed channels. Goes through env.registry()
     // so the registrations land in the per-job bundle on the JM/TM
-    // (Phase 2) AND the .so's local default-instance (via the mirror
+    // AND the .so's local default-instance (via the mirror
     // in plugin_impl.hpp::register_type) so the .so's runtime
     // template instantiations resolve them too.
     env.registry().register_type<Customer>("heavy.customer", customer_codec());

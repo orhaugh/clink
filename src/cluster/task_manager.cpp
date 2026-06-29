@@ -1270,7 +1270,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 for (auto& cb : cbs)
                     bucket.push_back(std::move(cb));
             };
-            // Phase 30c: abort-callback registration. Mirrors the
+            // Abort-callback registration. Mirrors the
             // commit-callback path; sink runners register one or more
             // abort callbacks alongside their commits, and the TM
             // dispatches them on AbortCheckpoint.
@@ -1281,7 +1281,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 for (auto& cb : cbs)
                     bucket.push_back(std::move(cb));
             };
-            // Phase 29d-2: drain-callback registration. Subtasks
+            // Drain-callback registration. Subtasks
             // participating in adaptive rescaling register their
             // drain closure here; the TM keys the registration by
             // (job_id, role) so BeginRescale dispatch can target the
@@ -1397,7 +1397,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                     if (ab_it->second.empty())
                         per_job_aborters_.erase(ab_it);
                 }
-                // Phase 29d-2: drain callbacks are keyed by
+                // Drain callbacks are keyed by
                 // (job_id, role) not (job_id, subtask_idx). Erasing
                 // the whole role's entry on any subtask exit would
                 // drop callbacks for sibling subtasks still running,

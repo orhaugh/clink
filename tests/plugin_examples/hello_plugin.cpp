@@ -117,7 +117,7 @@ private:
 // Emits one Greeting per input, with `message` rewritten to
 // "<bucket>:<count>" so the downstream sink sees the running counts.
 //
-// This is the smoke test for Phase 1: keyed state survives across
+// This is the smoke test for keyed state surviving across
 // process() invocations within a subtask, sourced from the
 // runtime()->keyed_state<K, V>() handle the cluster provisions per
 // subtask via JobConfig::state_backend.

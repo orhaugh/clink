@@ -116,7 +116,7 @@ private:
     KafkaSink inner_;
 };
 
-// Phase 23c: 2PC-aware Kafka sink. Holds a transactional KafkaSink
+// 2PC-aware Kafka sink. Holds a transactional KafkaSink
 // internally; treats on_data as plain forwarding (records produce
 // inside the open transaction), on_barrier as a flush + record of
 // the pending checkpoint id, on_commit as commitTransaction +
@@ -154,7 +154,7 @@ public:
         inner_.commit_transaction();
         pending_checkpoint_.reset();
     }
-    // Phase 30c: abort the prepared transaction. Mirrors on_commit
+    // Abort the prepared transaction. Mirrors on_commit
     // but calls abort_transaction so the broker discards the
     // PREPARED records. Idempotent against same checkpoint id.
     void on_abort(std::uint64_t checkpoint_id) override {
@@ -180,7 +180,7 @@ private:
     std::optional<std::uint64_t> pending_checkpoint_;
 };
 
-// Phase 22c: upsert-shaped Kafka sink. Takes JSON rows (each row is
+// Upsert-shaped Kafka sink. Takes JSON rows (each row is
 // a complete JSON object) and emits Kafka records keyed by the
 // configured primary_key columns. Rows tagged with
 // `__row_kind == "delete"` are emitted with an empty payload, the
@@ -237,7 +237,7 @@ private:
                 key += it->second.serialize(0);
             }
         }
-        // Phase 24a kinds:
+        // Row kinds:
         //   delete         -> tombstone (empty payload)
         //   update_before  -> drop on the floor; the matching
         //                     update_after will overwrite by key
@@ -367,7 +367,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     reg.register_sink<std::string>("kafka_text_sink", text_sink_builder);
     reg.register_sink<std::string>("kafka_sink_string", text_sink_builder);
 
-    // Phase 23c: kafka_2pc_sink_string. Transactional producer mode;
+    // kafka_2pc_sink_string. Transactional producer mode;
     // records are produced inside an open transaction. Barriers
     // flush; on_commit issues a commitTransaction call to the broker.
     //   brokers, topic, client_id, acks, compression - same as
@@ -398,7 +398,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 opts.transactional_id += "-" + std::to_string(ctx.subtask_idx);
             }
             auto sink = std::make_shared<TwoPhaseCommitStringKafkaSink>(std::move(opts));
-            // Phase 30a: declare commit-group membership so the JM can
+            // Declare commit-group membership so the JM can
             // gate this sink's CommitCheckpoint on its group peers.
             if (auto cg = ctx.param_or("commit_group", ""); !cg.empty()) {
                 sink->set_commit_group(cg);
@@ -406,7 +406,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             return sink;
         });
 
-    // Phase 22c: kafka_upsert_sink_string. Takes JSON rows on the
+    // kafka_upsert_sink_string. Takes JSON rows on the
     // string channel and emits keyed Kafka records. The SQL planner
     // chains this behind row_to_json_string when a sink table has
     // mode='upsert' and connector='kafka'.

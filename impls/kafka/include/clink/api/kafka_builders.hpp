@@ -1,6 +1,4 @@
-// Fluent builders for the Kafka text source/sink factories. Lives at
-// include/clink/api/ during Phase 1 of the impls split; in Phase 2
-// this header moves to impls/kafka/include/clink/api/.
+// Fluent builders for the Kafka text source/sink factories.
 
 #pragma once
 

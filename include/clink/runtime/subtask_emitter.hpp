@@ -113,7 +113,7 @@ public:
         return ok;
     }
 
-    // Phase 29d-3: drain marker. Broadcast to every downstream channel
+    // Drain marker. Broadcast to every downstream channel
     // so the entire fan-out gets the "this upstream subtask is winding
     // down" signal before the channel closes behind it.
     bool emit_drain(DrainMarker d) {

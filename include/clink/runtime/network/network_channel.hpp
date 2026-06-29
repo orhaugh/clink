@@ -172,7 +172,7 @@ private:
                 static_cast<std::byte>(wm.is_idle() ? Kind::WatermarkIdle : Kind::Watermark));
             put_i64_be(payload, wm.timestamp().millis());
         } else if (el.is_drain()) {
-            // Phase 29b: drain marker frame.
+            // Drain marker frame.
             payload.push_back(static_cast<std::byte>(Kind::Drain));
             put_u32_be(payload, el.as_drain().subtask_idx);
             put_u32_be(payload, el.as_drain().target_parallelism);
@@ -180,7 +180,7 @@ private:
             payload.push_back(static_cast<std::byte>(
                 el.as_barrier().is_terminal() ? Kind::Terminal : Kind::Barrier));
             put_u64_be(payload, el.as_barrier().id().value());
-            // Phase 26a: append the alignment mode as one byte. Old
+            // Append the alignment mode as one byte. Old
             // peers that don't know about this byte get a 9-byte
             // payload; the length-prefixed framing ensures they read
             // the right amount and the mode byte is silently dropped
@@ -644,9 +644,9 @@ private:
                 }
                 case Kind::Barrier: {
                     const std::uint64_t id = read_u64_be(body.data() + pos);
-                    // Phase 26a: mode is the byte AFTER the id when
-                    // the frame is long enough; pre-26a frames omit
-                    // it and we default to Aligned.
+                    // Mode is the byte AFTER the id when the frame is
+                    // long enough; older frames omit it and we default
+                    // to Aligned.
                     auto mode = CheckpointBarrier::Mode::Aligned;
                     if (body.size() >= pos + 8 + 1) {
                         mode = static_cast<CheckpointBarrier::Mode>(
@@ -676,7 +676,7 @@ private:
                     // Protocol noise; loop.
                     break;
                 case Kind::Drain: {
-                    // Phase 29b: drain marker. [u32 subtask_idx][u32 target_parallelism].
+                    // Drain marker. [u32 subtask_idx][u32 target_parallelism].
                     DrainMarker d;
                     d.subtask_idx = read_u32_be(body.data() + pos);
                     d.target_parallelism = read_u32_be(body.data() + pos + 4);

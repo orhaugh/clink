@@ -132,7 +132,7 @@ std::string JobGraphSpec::to_json() const {
         out += escape_json_string(channel_type_name(op.out_channel));
         out += ",\"parallelism\":";
         out += std::to_string(op.parallelism);
-        // Phase 29a: emit autoscale bounds only when set so older
+        // Emit autoscale bounds only when set so older
         // consumers parsing this JSON without bounds-awareness see
         // unchanged shape.
         if (op.min_parallelism != 0 || op.max_parallelism != 0) {
@@ -237,7 +237,7 @@ JobGraphSpec JobGraphSpec::from_json(std::string_view json_text) {
             throw std::runtime_error("JobGraphSpec::from_json: op '" + op.id +
                                      "' parallelism must be >= 1");
         }
-        // Phase 29a: optional autoscale bounds. Default 0 (no bounds).
+        // Optional autoscale bounds. Default 0 (no bounds).
         // validate() enforces the cross-field invariants below.
         op.min_parallelism = static_cast<std::uint32_t>(v.int_or("min_parallelism", 0));
         op.max_parallelism = static_cast<std::uint32_t>(v.int_or("max_parallelism", 0));
@@ -328,7 +328,7 @@ void JobGraphSpec::validate() const {
         if (!ids.insert(op.id).second) {
             throw std::runtime_error("JobGraphSpec::validate: duplicate op id '" + op.id + "'");
         }
-        // Phase 29a: autoscale-bound invariants. Either both bounds
+        // Autoscale-bound invariants. Either both bounds
         // are zero (no autoscaling) or both are non-zero and form a
         // valid range bracketing the current parallelism.
         const bool min_set = op.min_parallelism != 0;

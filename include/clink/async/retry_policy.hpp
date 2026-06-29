@@ -1,20 +1,20 @@
 #pragma once
 
-// Phase 28d: retry policy for async lookup pipelines.
+// Retry policy for async lookup pipelines.
 //
 // A small utility that wraps a user callable in a retry-with-backoff
 // loop. Mirrors the shape of AsyncRetryStrategy
 // (operators/async_map_operator.hpp) but is *generic* and *outside*
-// the operator: the same policy is what 28d's HttpPool and 28b's
+// the operator: the same policy is what HttpPool and
 // AsyncLookupOperator (eventually) use to absorb transient
 // upstream failures.
 //
 // Design choices:
 // - Header-only, no allocations beyond what the user fn itself does.
 // - Caller-driven sleep: apply() invokes std::this_thread::sleep_for
-//   directly on the calling thread. With Phase 28e's coroutine /
-//   io_uring backend, an async variant returning Task<T> will
-//   replace the sleep with `co_await sleep_for(...)`.
+//   directly on the calling thread. With the coroutine / io_uring
+//   backend, an async variant returning Task<T> will replace the
+//   sleep with `co_await sleep_for(...)`.
 // - should_retry callback decides which exceptions are transient.
 //   Default: retry on every std::exception subclass; surface
 //   anything else immediately.

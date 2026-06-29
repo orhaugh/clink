@@ -27,8 +27,8 @@ private:
 };
 
 // Translation error: PG accepted the syntax but the construct is
-// outside clink's supported subset (Phase 1 is intentionally narrow;
-// this class is how we surface "we'll add this in a later phase").
+// outside clink's supported subset (the subset is intentionally narrow;
+// this class is how we surface a construct we do not yet handle).
 // cursor_position is 1-based byte offset within the source, or 0 if
 // libpg_query didn't localize the offending node.
 class TranslationError : public std::runtime_error {

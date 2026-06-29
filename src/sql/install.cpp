@@ -534,7 +534,7 @@ inline bool is_batch_foldable(const AggSpec& spec) {
     return (fn == "min" || fn == "max") && !spec.retractable;
 }
 
-// Phase 24b: subtract one input row's column value from the running
+// Subtract one input row's column value from the running
 // accumulator. Mirrors update_agg but inverted for SUM / COUNT / AVG.
 // MIN and MAX retraction needs a multiset of seen values, which we
 // don't track; for those functions retraction is a no-op (the
@@ -2682,7 +2682,7 @@ private:
     clink::FlatMap<std::string, PartState> state_;
 };
 
-// Phase 8: unbounded GROUP BY aggregator (no window TVF).
+// Unbounded GROUP BY aggregator (no window TVF).
 //
 // Per-group running state kept in an unordered_map keyed by the
 // concatenated group-key values. Each input record updates the
@@ -3065,7 +3065,7 @@ private:
     }
 
     // Fold one input row into the bucket and emit the output row(s) into `out`.
-    // Phase 24b: retraction-aware INPUT. Input rows tagged delete / update_before
+    // Retraction-aware INPUT. Input rows tagged delete / update_before
     // subtract; insert / update_after / untagged add.
     //
     // Two emission modes:
@@ -4242,7 +4242,7 @@ private:
     clink::config::JsonValue scalar_value_{nullptr};
 };
 
-// Phase 22b: in-memory upsert sink that maintains the current value
+// In-memory upsert sink that maintains the current value
 // for each primary key and writes the final state to an NDJSON file
 // on EOS (flush()). Atomic via write-tmp-then-rename. State is
 // unbounded (one entry per surviving PK); typical use is downstream
@@ -4266,7 +4266,7 @@ public:
             const auto& row = rec.value();
             auto key = make_key_(row);
             const auto kind = row_kind_of(row);
-            // Phase 24a: delete erases; update_before is dropped on
+            // delete erases; update_before is dropped on
             // the floor because the matching update_after will
             // overwrite by PK on the same logical change. insert and
             // update_after both materialise the row.
@@ -4487,7 +4487,7 @@ private:
     std::map<std::string, std::ofstream> files_;
 };
 
-// Phase 21c: TOP-N-per-partition. Single-input op that maintains a
+// TOP-N-per-partition. Single-input op that maintains a
 // per-partition sorted buffer of at most `count_` records. On each
 // arriving record:
 //   1. Compute the partition key (concatenated values of the
@@ -4675,7 +4675,7 @@ private:
     clink::FlatMap<std::string, std::vector<Row>> state_;
 };
 
-// Phase 13: UNION ALL. Single-input identity map; the OperatorSpec
+// UNION ALL. Single-input identity map; the OperatorSpec
 // carries multiple upstreams in `inputs` and the runtime merges
 // them into one Row stream via build_typed_input_stage<Row>. We
 // don't model this as a CoOperator because that path requires
@@ -4686,7 +4686,7 @@ private:
 // ALL semantics where row order across the two branches is
 // unspecified.
 
-// Phase 17: ORDER BY + LIMIT n (TOP-N). Holds up to N records in a
+// ORDER BY + LIMIT n (TOP-N). Holds up to N records in a
 // reverse-priority-queue so the worst element by sort key sits at
 // the top and is evicted when a better record arrives. Watermarks
 // and barriers pass through; the buffered top-n is emitted at the
@@ -4818,7 +4818,7 @@ private:
     bool flushed_{false};
 };
 
-// Phase 11: LIMIT n. Stateful counter, no per-key state. Forwards
+// LIMIT n. Stateful counter, no per-key state. Forwards
 // the first `count` records and drops the rest. Watermarks and
 // barriers always pass through so the rest of the graph still sees
 // the lifecycle signals.
@@ -4857,7 +4857,7 @@ private:
     std::int64_t to_skip_;
 };
 
-// Phase 10: dedupe operator. Maintains an unordered_set keyed by the
+// Dedupe operator. Maintains an unordered_set keyed by the
 // canonical serialization of the input Row's value map. Emits each
 // unique row at most once. State grows unbounded; pair with a
 // row_compute_key upstream so each subtask sees only the records
@@ -5400,7 +5400,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                     parse_decimal_columns(ctx.param_or("decimal_columns"))),
                 ctx.subtask_idx,
                 "file_2pc_sink_row");
-            // Phase 30a: declare commit-group membership so the JM can
+            // Declare commit-group membership so the JM can
             // gate this sink's CommitCheckpoint on its group peers.
             if (auto cg = ctx.param_or("commit_group", ""); !cg.empty()) {
                 sink->set_commit_group(cg);
@@ -5586,8 +5586,8 @@ void install(clink::plugin::PluginRegistry& reg) {
     // Row and emit watermarks. Params:
     //   column (required): name of the timestamp column. The column
     //                      value must be a JSON integer carrying
-    //                      milliseconds-since-epoch (Phase 4.1 scope;
-    //                      ISO-string parsing follows in a later phase).
+    //                      milliseconds-since-epoch (ISO-string parsing
+    //                      follows in a later phase).
     //   out_of_order_ms (default 0): bounded out-of-orderness lag in
     //                      milliseconds. 0 -> monotonic watermarks.
     //
@@ -5807,7 +5807,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                                             [](const Row& r) { return r; }, "identity_row");
                                     });
 
-    // Phase 28c (runtime slice): async_lookup_row. Drives a registered
+    // async_lookup_row. Drives a registered
     // AsyncLookupFn against Row input via AsyncLookupOperator<Row, Row>.
     // Params:
     //   function_name (required) - key in AsyncFunctionRegistry::global()

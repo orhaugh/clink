@@ -10,7 +10,7 @@
 
 namespace clink {
 
-// Phase 29b: drain marker for adaptive rescaling.
+// Drain marker for adaptive rescaling.
 //
 // Carried in-band on the operator wire (StreamElement::Drain). When
 // an operator's run() loop is asked to rescale out (29c/d will wire
@@ -46,7 +46,7 @@ struct DrainMarker {
 //   - Data      : a Batch<T> of user records
 //   - Watermark : the time-progress signal
 //   - Barrier   : a checkpoint barrier
-//   - Drain     : Phase 29b - this upstream subtask is winding down;
+//   - Drain     : this upstream subtask is winding down;
 //                 downstream should expect a fresh stream from the
 //                 rescaled set
 //

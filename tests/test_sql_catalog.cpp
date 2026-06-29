@@ -214,7 +214,7 @@ TEST(SqlCatalog, JsonRoundTripPreservesTableDef) {
 
 TEST(SqlCatalog, PersistenceDirAutoSavesAndReloads) {
     auto dir = make_temp_catalog_dir();
-    // Phase 1: write, reload, see same entries.
+    // Write, reload, see same entries.
     {
         Catalog cat;
         cat.set_persistence_dir(dir.string());

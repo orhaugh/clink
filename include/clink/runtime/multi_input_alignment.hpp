@@ -24,7 +24,7 @@ namespace clink {
 // barrier that other inputs haven't reached yet).
 class MultiInputAlignment {
 public:
-    // Alias to CheckpointBarrier::Mode. Pre-Phase-26a the aligner
+    // Alias to CheckpointBarrier::Mode. The aligner formerly
     // owned this enum and chose the alignment policy at startup; that
     // captured-at-startup model has been replaced by a per-barrier
     // mode (the barrier carries its own Mode and the aligner honours
@@ -193,7 +193,7 @@ public:
     // engine guaranteed past us" - e.g. dropping late-arriving records.
     Watermark current_watermark() const noexcept { return emitted_wm_; }
 
-    // Phase 26d: enumerate inputs that have NOT yet delivered the
+    // Enumerate inputs that have NOT yet delivered the
     // barrier `ck_id`. Returned indices skip closed inputs (closed
     // inputs implicitly satisfy any barrier and have nothing to
     // drain). Empty result means "every alive input has delivered;

@@ -343,7 +343,7 @@ TEST(NetworkChannel, ClosedConnectionPropagatesNullopt) {
     sender.join();
 }
 
-// Phase 29b: drain stream-element wire round-trip. New Kind::Drain
+// Drain stream-element wire round-trip. New Kind::Drain
 // frame carries (subtask_idx, target_parallelism) across the socket
 // transport.
 TEST(NetworkChannel, DrainMarkerRoundTripsAcrossWire) {
@@ -370,7 +370,7 @@ TEST(NetworkChannel, DrainMarkerRoundTripsAcrossWire) {
     sender.join();
 }
 
-// Phase 26a: alignment mode rides the Barrier and Terminal wire frames
+// Alignment mode rides the Barrier and Terminal wire frames
 // as one trailing byte after the 8-byte id. Both Aligned and Unaligned
 // stamps must round-trip cleanly across the socket transport.
 TEST(NetworkChannel, BarrierModeRoundTripsAcrossWire) {

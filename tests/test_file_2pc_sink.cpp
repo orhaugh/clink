@@ -72,7 +72,7 @@ Batch<std::string> batch_of(const std::vector<std::string>& xs) {
 }  // namespace
 
 TEST(FileSink2PC, CommitGroupDefaultsEmpty) {
-    // Phase 30a: every sink has a commit_group accessor; default is empty.
+    // Every sink has a commit_group accessor; default is empty.
     auto sink = std::make_shared<FileSink2PC<std::string>>(
         std::filesystem::temp_directory_path() / "cg_default",
         string_text_format(),
@@ -93,7 +93,7 @@ TEST(FileSink2PC, SetCommitGroupIsObservable) {
     EXPECT_EQ(sink->commit_group(), "my-group");
 }
 
-// --- Phase 30c: on_abort rollback ---------------------------------
+// --- on_abort rollback ---------------------------------
 
 TEST(FileSink2PC, AbortRemovesStagingFileAndClearsState) {
     const auto out = mktmpdir("abort");

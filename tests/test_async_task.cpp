@@ -1,7 +1,7 @@
-// Unit tests for clink::async::Task<T> (Phase 28a coroutine primitive).
+// Unit tests for clink::async::Task<T> (coroutine primitive).
 //
-// Covers the foundational coroutine contract that the rest of Phase 28
-// builds on:
+// Covers the foundational coroutine contract that the rest of the async
+// stack builds on:
 //   - Lazy start: a constructed Task does NOT run its body until the
 //     caller resumes it.
 //   - Single-step resume drives the body to completion.

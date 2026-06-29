@@ -272,11 +272,11 @@ public:
 };
 
 // Regression test for the "ChainedOperator inner-op timers don't fire"
-// gap (Phase 4-b). When two ops are chained into a single subtask via
+// gap. When two ops are chained into a single subtask via
 // ChainedOperator, the inner ops share a runner but each must keep its
 // own TimerService - otherwise a timer registered by the LEAD inner op
 // in open() never fires because the runner only polls the outer op's
-// (empty) TimerService. After Phase 4-b: each inner op has its own
+// (empty) TimerService. With the fix: each inner op has its own
 // RuntimeContext (with its own TimerService) and the runner polls them
 // via Operator::fire_due_timers / Operator::next_timer_deadline_ms.
 TEST(TimerService, ProcessingTimeTimerFiresInChainedOperatorInnerOp) {

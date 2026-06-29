@@ -105,7 +105,7 @@ TEST(JsonValueExpr, NestedArithmeticWithColumnRefs) {
     EXPECT_EQ(v.as_number(), 16.0);
 }
 
-// --- Phase 15: extended scalar built-ins -------------------------
+// --- Extended scalar built-ins -------------------------
 
 TEST(JsonValueExpr, Substring) {
     EXPECT_EQ(

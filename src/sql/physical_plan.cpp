@@ -24,7 +24,7 @@ constexpr const char* kChannelString = "string";
 constexpr const char* kChannelRow = "row";
 
 // A plan's channel type: every op on the chain must speak the same
-// channel. Phase 3.2 picks the channel at the source table based on
+// channel. The channel is picked at the source table based on
 // column count + format='json' property.
 enum class Channel { String, Row };
 
@@ -63,7 +63,7 @@ void check_string_channel_table(const TableDef& table) {
     }
 }
 
-// --- Channel::String factory dispatch (Phase 2 logic) ---
+// --- Channel::String factory dispatch ---
 
 std::string string_source_factory_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
@@ -185,7 +185,7 @@ std::string string_sink_factory_for(const TableDef& table) {
     unsupported("unsupported sink connector '" + connector + "' for table " + table.name);
 }
 
-// --- Channel::Row factory dispatch (Phase 3.2 / Phase 6.4) ---
+// --- Channel::Row factory dispatch ---
 
 // Describes how a Row-typed scan / sink lowers to one or more ops.
 // 'bridge' is empty when the connector natively speaks the Row channel
@@ -706,7 +706,7 @@ std::map<std::string, std::string> build_params(const TableDef& table) {
     return out;
 }
 
-// Source-side watermark wiring (Phase 4.1). When the source table
+// Source-side watermark wiring. When the source table
 // declares an event_time_column, the planner emits an
 // assign_timestamps_row op right after the scan so the rest of the
 // chain has event-time + watermarks to align on.
@@ -838,7 +838,7 @@ std::string compile_node(const LogicalPlan& node,
         return after_src;
     }
     if (node.kind() == "EquiJoin") {
-        // Phase 18: stream-stream equi-join. Mirrors the IntervalJoin
+        // Stream-stream equi-join. Mirrors the IntervalJoin
         // wiring: row_compute_key on each side keys by the join
         // column, then a co-op merges the keyed streams.
         const auto& jn = static_cast<const LogicalEquiJoin&>(node);
@@ -1054,7 +1054,7 @@ std::string compile_node(const LogicalPlan& node,
         std::string left_id = compile_node(jn.left(), ch, spec, next_id, async_agg);
         std::string right_id = compile_node(jn.right(), ch, spec, next_id, async_agg);
 
-        // Phase 7: insert row_compute_key on each side so the
+        // Insert row_compute_key on each side so the
         // upstream routing layer hash-partitions records by the
         // join key. Without this, parallelism > 1 would route
         // same-key records to different subtasks and miss matches.
@@ -1118,7 +1118,7 @@ std::string compile_node(const LogicalPlan& node,
         return id;
     }
     if (node.kind() == "Aggregate") {
-        // Phase 8: unbounded GROUP BY. Same Row-channel constraint as
+        // Unbounded GROUP BY. Same Row-channel constraint as
         // the windowed path; key-by routes by group columns so par>1
         // keeps each group on one subtask. Emits an upsert-style Row
         // per input record carrying the latest aggregate values.
@@ -1315,9 +1315,9 @@ std::string compile_node(const LogicalPlan& node,
         }
         const auto& w = agg.window();
 
-        // Phase 7: insert row_compute_key upstream so the routing
-        // layer hash-partitions by the group keys. Phase 7.x makes
-        // this a multi-column hash so GROUP BY a, b lands every
+        // Insert row_compute_key upstream so the routing
+        // layer hash-partitions by the group keys. It is a
+        // multi-column hash so GROUP BY a, b lands every
         // (a, b) tuple on the same subtask at par > 1.
         if (!agg.group_keys().empty()) {
             std::string keys_csv;
@@ -1413,7 +1413,7 @@ std::string compile_node(const LogicalPlan& node,
         return id;
     }
     if (node.kind() == "Union") {
-        // Phase 13: UNION ALL. Compile both sides on the same Row
+        // UNION ALL. Compile both sides on the same Row
         // channel and feed both into the union_row co-op. Schema is
         // identical to either side (binder validates).
         const auto& un = static_cast<const LogicalUnion&>(node);
@@ -1517,7 +1517,7 @@ std::string compile_node(const LogicalPlan& node,
         return id;
     }
     if (node.kind() == "Limit") {
-        // Phase 11: LIMIT n. Pass-through schema; runtime emits the
+        // LIMIT n. Pass-through schema; runtime emits the
         // first n records and drops the rest. Per-subtask semantics
         // at parallelism > 1 - same caveat as the runtime op.
         const auto& lim = static_cast<const LogicalLimit&>(node);
@@ -1539,7 +1539,7 @@ std::string compile_node(const LogicalPlan& node,
         return id;
     }
     if (node.kind() == "Distinct") {
-        // Phase 10: dedupe by every input column. For parallelism > 1
+        // Dedupe by every input column. For parallelism > 1
         // we must keyBy all columns so each unique row lands on a
         // deterministic subtask and the per-subtask seen-set is
         // sufficient. String-channel DISTINCT is not yet supported.
@@ -1589,7 +1589,7 @@ std::string compile_node(const LogicalPlan& node,
         return id;
     }
     if (node.kind() == "AsyncMap") {
-        // Phase 28c-frontend: lower a registered async lookup to the
+        // Lower a registered async lookup to the
         // async_lookup_row runtime operator. The operator drives the
         // Row -> async::Task<Row> coroutine looked up by function_name
         // in AsyncFunctionRegistry::global(). Row channel only (the
@@ -1806,7 +1806,7 @@ std::string compile_node(const LogicalPlan& node,
         return id;
     }
     if (node.kind() == "TopNPerKey") {
-        // Phase 21c: row_compute_key over the partition columns
+        // row_compute_key over the partition columns
         // (Hash routing keeps a partition's records on one subtask),
         // then top_n_per_key_row co-... single-input op emitting
         // changelog rows tagged via __row_kind.
@@ -1874,21 +1874,21 @@ std::string compile_node(const LogicalPlan& node,
         return id;
     }
     if (node.kind() == "RowNumber") {
-        // Phase 21b: ROW_NUMBER() at the top level isn't a valid
+        // ROW_NUMBER() at the top level isn't a valid
         // runtime shape - emitting per-record ranks over an unbounded
-        // stream needs unbounded state. Phase 21c rewrites the
-        // bounded `WHERE rn <= N` pattern into LogicalTopNPerKey;
+        // stream needs unbounded state. The bounded `WHERE rn <= N`
+        // pattern is rewritten into LogicalTopNPerKey;
         // anything else is rejected here with a clear message.
         unsupported(
             "ROW_NUMBER() OVER must be paired with a 'WHERE rn <= N' filter in an enclosing "
-            "SELECT (Phase 21c)");
+            "SELECT");
     }
     unsupported("PhysicalPlanner: unsupported LogicalPlan kind '" + node.kind() + "'");
 }
 
 // Find the root scan of a plan tree and decide the channel from its
 // table. The whole chain runs on that one channel; the sink table
-// must agree (no implicit conversions in Phase 3.2).
+// must agree (no implicit conversions).
 Channel decide_channel(const LogicalPlan& node) {
     if (node.kind() == "Scan") {
         return channel_for_table(static_cast<const LogicalScan&>(node).table());

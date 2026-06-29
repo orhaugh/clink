@@ -1,17 +1,16 @@
 #pragma once
 
-// Phase 29e: PID controller for adaptive rescaling.
+// PID controller for adaptive rescaling.
 //
 // A textbook PID controller: given a series of (measured, dt) samples
 // and a setpoint, produces a continuous control output that drives
 // the measured signal towards the setpoint. The output is clamped
-// to a configured range so the consumer (Phase 29c's
-// RescaleCoordinator) can map it onto discrete scaling decisions
-// (+1 / 0 / -1 subtask) without having to handle unbounded values.
+// to a configured range so the consumer (the RescaleCoordinator) can
+// map it onto discrete scaling decisions (+1 / 0 / -1 subtask)
+// without having to handle unbounded values.
 //
 // This is a standalone utility - the controller knows nothing about
-// operators, metrics, or io_uring. Autoscaler integration happens
-// in 29c/d; here we just ship the math.
+// operators, metrics, or io_uring. Here we just ship the math.
 //
 // Anti-windup: when the output saturates (hits min/max), the integral
 // term stops accumulating in the saturating direction. Prevents the

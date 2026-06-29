@@ -1,4 +1,4 @@
-// AsyncLookupOperator<In, Out> - coroutine-shaped async map (Phase 28b).
+// AsyncLookupOperator<In, Out> - coroutine-shaped async map.
 //
 // Tests cover:
 //   * Synchronous-completing lookup bodies (the canonical "Task that

@@ -1005,7 +1005,7 @@ TEST(SqlRuntime, MatchRecognizeMatchesEndToEnd) {
     EXPECT_EQ(static_cast<std::int64_t>(r.values.at("final_price").as_number()), 250);
 }
 
-// --- Phase 24b: retracting aggregate ------------------------------
+// --- retracting aggregate ------------------------------
 
 TEST(SqlRuntime, AggregateRetractsOnDeleteTaggedInput) {
     ensure_sql_installed_once();
@@ -1974,7 +1974,7 @@ TEST(SqlRuntime, ArrayAggSessionMergeKeepsAllValues) {
     std::filesystem::remove(out_path);
 }
 
-// --- Phase 23b: file 2PC sink e2e ---------------------------------
+// --- file 2PC sink e2e ---------------------------------
 
 TEST(SqlRuntime, FileExactlyOnceSinkProducesCommittedRecords) {
     ensure_sql_installed_once();
@@ -2035,7 +2035,7 @@ TEST(SqlRuntime, FileExactlyOnceSinkProducesCommittedRecords) {
     std::filesystem::remove_all(out_dir);
 }
 
-// --- Phase 21c: TOP-N-per-key e2e ---------------------------------
+// --- TOP-N-per-key e2e ---------------------------------
 
 TEST(SqlRuntime, TopNPerKeyEmitsChangelog) {
     ensure_sql_installed_once();
@@ -2186,7 +2186,7 @@ TEST(SqlRuntime, RankAndDenseRankTopNSemantics) {
     EXPECT_EQ(run_topn("dr_b", ds_b, "DENSE_RANK", 2), (std::set<std::int64_t>{1, 2, 3}));
 }
 
-// --- Phase 20: FROM-derived tables e2e ----------------------------
+// --- FROM-derived tables e2e ----------------------------
 
 TEST(SqlRuntime, DerivedTableFeedsOuterAggregate) {
     ensure_sql_installed_once();
@@ -2243,7 +2243,7 @@ TEST(SqlRuntime, DerivedTableFeedsOuterAggregate) {
     std::filesystem::remove(out_path);
 }
 
-// --- Phase 19d: INSERT column list e2e ----------------------------
+// --- INSERT column list e2e ----------------------------
 
 TEST(SqlRuntime, InsertColumnListReordersToSinkSchema) {
     ensure_sql_installed_once();
@@ -2296,7 +2296,7 @@ TEST(SqlRuntime, InsertColumnListReordersToSinkSchema) {
     std::filesystem::remove(out_path);
 }
 
-// --- Phase 19c: HAVING with direct aggregate e2e ------------------
+// --- HAVING with direct aggregate e2e ------------------
 
 TEST(SqlRuntime, HavingDirectAggregateFiltersGroups) {
     ensure_sql_installed_once();
@@ -2355,7 +2355,7 @@ TEST(SqlRuntime, HavingDirectAggregateFiltersGroups) {
     std::filesystem::remove(out_path);
 }
 
-// --- Phase 19b: OFFSET e2e ----------------------------------------
+// --- OFFSET e2e ----------------------------------------
 
 TEST(SqlRuntime, LimitOffsetSkipsThenForwards) {
     ensure_sql_installed_once();
@@ -2406,7 +2406,7 @@ TEST(SqlRuntime, LimitOffsetSkipsThenForwards) {
     std::filesystem::remove(out_path);
 }
 
-// --- Phase 19a: IN literal-list e2e -------------------------------
+// --- IN literal-list e2e -------------------------------
 
 TEST(SqlRuntime, InListFiltersUsers) {
     ensure_sql_installed_once();
@@ -2460,7 +2460,7 @@ TEST(SqlRuntime, InListFiltersUsers) {
     std::filesystem::remove(out_path);
 }
 
-// --- Phase 18: stream-stream equi-join e2e ------------------------
+// --- stream-stream equi-join e2e ------------------------
 
 TEST(SqlRuntime, EquiJoinMatchesAllPairsByKey) {
     ensure_sql_installed_once();
@@ -2805,7 +2805,7 @@ TEST(SqlRuntime, OuterEquiJoins) {
                                           "c_id=NULL;c_name=NULL;o_cust=4;o_amt=40"}));
 }
 
-// --- Phase 14: window + interval-join e2e -------------------------
+// --- window + interval-join e2e -------------------------
 
 TEST(SqlRuntime, TumbleWindowAggregatesByUserPerSecond) {
     ensure_sql_installed_once();
@@ -6934,7 +6934,7 @@ TEST(SqlRuntime, SetOpExceptRetractsDeletedLeftRow) {
         std::filesystem::remove(p);
 }
 
-// --- Phase 17: ORDER BY + LIMIT TOP-N e2e -------------------------
+// --- ORDER BY + LIMIT TOP-N e2e -------------------------
 
 TEST(SqlRuntime, TopNReturnsHighestThreeByAmount) {
     ensure_sql_installed_once();
@@ -6989,7 +6989,7 @@ TEST(SqlRuntime, TopNReturnsHighestThreeByAmount) {
     std::filesystem::remove(out_path);
 }
 
-// --- Phase 16: CTEs (WITH clause) e2e -----------------------------
+// --- CTEs (WITH clause) e2e -----------------------------
 
 TEST(SqlRuntime, CteFiltersFeedingUnboundedAggregate) {
     ensure_sql_installed_once();
@@ -7050,7 +7050,7 @@ TEST(SqlRuntime, CteFiltersFeedingUnboundedAggregate) {
     std::filesystem::remove(out_path);
 }
 
-// --- Phase 15: built-in scalar functions e2e ----------------------
+// --- built-in scalar functions e2e ----------------------
 
 TEST(SqlRuntime, ScalarBuiltinsAppliedPerRow) {
     ensure_sql_installed_once();
@@ -7387,7 +7387,7 @@ TEST(SqlRuntime, FilterAndProjectRunsEndToEnd) {
     std::filesystem::remove(out_path);
 }
 
-// --- Phase 24a/b: full changelog pair model -----------------------
+// --- full changelog pair model -----------------------
 //
 // The delete-tagged retraction test above exercises insert + delete.
 // This one exercises the explicit update_before / update_after pair
@@ -7464,7 +7464,7 @@ TEST(SqlRuntime, AggregateNetsUpdateBeforeAfterPairs) {
     std::filesystem::remove(out_path);
 }
 
-// --- Phase 23: 2PC sink driven from SQL, commit verified ----------
+// --- 2PC sink driven from SQL, commit verified ----------
 //
 // FileExactlyOnceSinkProducesCommittedRecords above only proves
 // records are STAGED (no checkpoint completes in that run). This test
@@ -7553,7 +7553,7 @@ TEST(SqlRuntime, ExactlyOnceSinkViaSqlCommitsRecordsExactlyOnce) {
     std::filesystem::remove_all(ckpt_dir);
 }
 
-// --- Phase 28c-frontend: async lookup via SQL ----------------------
+// --- async lookup via SQL ----------------------
 //
 // `INSERT INTO enriched SELECT enrich_double(*) FROM events`, with
 // `enrich_double` registered in AsyncFunctionRegistry, lowers through

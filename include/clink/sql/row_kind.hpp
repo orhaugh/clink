@@ -8,7 +8,7 @@
 
 // Changelog convention for clink::sql::Row.
 //
-// Phase 21a: operators that produce changelog streams (TOP-N-per-key,
+// Operators that produce changelog streams (TOP-N-per-key,
 // future retracting aggregates, CDC-style sources) tag each emitted
 // Row with a synthetic "__row_kind" field whose value is one of
 // kRowKindInsert / kRowKindDelete (extendable to update before/after
@@ -34,8 +34,8 @@ namespace clink::sql {
 // user-declared SQL column.
 inline constexpr std::string_view kRowKindField = "__row_kind";
 
-// Canonical kind values. Phase 24a adds update_before / update_after
-// so producers can emit a single in-flight update as a pair instead
+// Canonical kind values. update_before / update_after let producers
+// emit a single in-flight update as a pair instead
 // of decomposing to delete + insert. Sinks that key by primary
 // key (upsert sinks) treat update_after as overwrite and drop
 // update_before; sinks that natively support UPDATE statements can

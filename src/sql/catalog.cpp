@@ -40,8 +40,8 @@ void write_file_atomic(const fs::path& target, const std::string& text) {
     fs::rename(tmp, target);
 }
 
-// Phase 22a: lift primary_key from the WITH-options bag into the
-// typed TableDef field. Trims whitespace per entry so `'a, b'`
+// Lift primary_key from the WITH-options bag into the typed TableDef
+// field. Trims whitespace per entry so `'a, b'`
 // works as expected.
 void lift_typed_fields(TableDef& def) {
     def.primary_key.clear();

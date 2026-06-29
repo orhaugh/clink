@@ -1,6 +1,4 @@
-// Fluent builder for the s3_text_sink factory. Lives at
-// include/clink/api/ during Phase 1 of the impls split; in Phase 2
-// this header moves to impls/s3/include/clink/api/.
+// Fluent builder for the s3_text_sink factory.
 
 #pragma once
 

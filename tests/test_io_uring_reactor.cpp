@@ -1,4 +1,4 @@
-// Phase 28e: io_uring reactor smoke + integration tests.
+// io_uring reactor smoke + integration tests.
 //
 // Linux-only; conditionally compiled. When CLINK_HAS_URING isn't
 // defined (macOS, or Linux without liburing), the file collapses to

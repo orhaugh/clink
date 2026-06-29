@@ -331,7 +331,7 @@ TEST(AsyncTumblingWindowOperator, EpochGatedFiringObservesAllInFlightReads) {
 TEST(AsyncTumblingWindowOperator, TimersAndAccumulatorsSurviveCheckpointRestore) {
     const OperatorId op_id{2};
 
-    // Phase 1: ingest into an OPEN window (no firing watermark), then checkpoint
+    // Ingest into an OPEN window (no firing watermark), then checkpoint
     // both the timers (operator-state) and the accumulators (keyed state).
     auto backend1 = std::make_shared<InMemoryStateBackend>();
     Snapshot snap;
@@ -352,7 +352,7 @@ TEST(AsyncTumblingWindowOperator, TimersAndAccumulatorsSurviveCheckpointRestore)
         EXPECT_TRUE(drain_ch(ch).empty()) << "nothing fires before the window's watermark";
     }
 
-    // Phase 2: a FRESH operator + backend restores the checkpoint, then a
+    // A FRESH operator + backend restores the checkpoint, then a
     // watermark at 1000 must re-fire window [0,1000) with the restored sum (40).
     auto backend2 = std::make_shared<InMemoryStateBackend>();
     backend2->restore(snap);
@@ -383,7 +383,7 @@ TEST(AsyncTumblingWindowOperator, TimersAndAccumulatorsSurviveCheckpointRestore)
 TEST(AsyncTumblingWindowOperator, LateDropBoundarySurvivesRestore) {
     const OperatorId op_id{3};
 
-    // Phase 1: ingest + FIRE window [0,1000) (watermark 1000), then checkpoint.
+    // Ingest + FIRE window [0,1000) (watermark 1000), then checkpoint.
     // The window is now fired+purged; the late-drop boundary (1000) is persisted.
     auto backend1 = std::make_shared<InMemoryStateBackend>();
     Snapshot snap;
@@ -403,7 +403,7 @@ TEST(AsyncTumblingWindowOperator, LateDropBoundarySurvivesRestore) {
         snap = backend1->snapshot(CheckpointId{1});
     }
 
-    // Phase 2: restore, then a genuinely-late record for the already-fired
+    // Restore, then a genuinely-late record for the already-fired
     // window must be DROPPED (boundary 1000 was restored), so a later watermark
     // emits NOTHING - no duplicate window.
     auto backend2 = std::make_shared<InMemoryStateBackend>();
@@ -698,7 +698,7 @@ TEST(AsyncTumblingWindowOperator, OnTimePaneIsLastWhenWatermarkJumpsPastPurge) {
 TEST(AsyncTumblingWindowOperator, LatenessAndPaneIndexSurviveRestore) {
     const OperatorId op_id{14};
 
-    // Phase 1: on-time fire with lateness>0 (fired=true, pane_index bumped, the
+    // On-time fire with lateness>0 (fired=true, pane_index bumped, the
     // purge timer pending), then checkpoint.
     auto backend1 = std::make_shared<InMemoryStateBackend>();
     Snapshot snap;
@@ -721,7 +721,7 @@ TEST(AsyncTumblingWindowOperator, LatenessAndPaneIndexSurviveRestore) {
         EXPECT_EQ(e[0].pane.pane_index, 0);
     }
 
-    // Phase 2: restore, then a within-band late record continues the pane index
+    // Restore, then a within-band late record continues the pane index
     // monotonically; advancing past the deadline erases with no on-time re-emit.
     auto backend2 = std::make_shared<InMemoryStateBackend>();
     backend2->restore(snap);

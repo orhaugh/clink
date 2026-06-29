@@ -94,7 +94,7 @@ std::shared_ptr<arrow::DataType> sql_type_to_arrow(const ast::TypeName& type) {
     if (n == "numeric") {
         // PG NUMERIC without precision defaults to "any" - we pin to
         // decimal128(38, 9) so we have a concrete on-wire shape.
-        // Decimal arithmetic itself is out of scope for Phase 1.
+        // Decimal arithmetic itself is out of scope for now.
         int precision = type.typmods.size() > 0 ? type.typmods[0] : 38;
         int scale = type.typmods.size() > 1 ? type.typmods[1] : 9;
         if (precision < 1 || precision > 38)
@@ -141,7 +141,7 @@ std::shared_ptr<arrow::DataType> sql_type_to_arrow(const ast::TypeName& type) {
         reject(type, "composite types (MAP/ROW/MULTISET) are only supported as column types");
     }
 
-    reject(type, "type not supported in Phase 1");
+    reject(type, "type not supported");
 }
 
 std::string arrow_to_sql_type_string(const arrow::DataType& type) {

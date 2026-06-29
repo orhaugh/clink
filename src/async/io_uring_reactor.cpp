@@ -1,4 +1,4 @@
-// Phase 28e: io_uring reactor implementation.
+// io_uring reactor implementation.
 //
 // Linux-only. Built conditionally by CMakeLists.txt when liburing is
 // present; the header guards its declarations with the same macros

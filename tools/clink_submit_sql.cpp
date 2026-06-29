@@ -1,14 +1,13 @@
 // clink_submit_sql: SQL-to-JobGraphSpec compiler.
 //
-// Phase 1 deliverable. Reads a SQL file (or inline -e expression),
-// processes statements:
+// Reads a SQL file (or inline -e expression), processes statements:
 //   * CREATE TABLE: registers in an in-memory catalog
 //   * INSERT INTO ... SELECT: binds + compiles to a JobGraphSpec
 //                              and prints the JSON to stdout
 //
-// Submission to a running JM is NOT yet wired (Phase 2 will add an
-// HTTP submit path that takes the JSON spec directly). For now,
-// pipe the JSON to a separate submit tool or use it for inspection.
+// Submission to a running JM is NOT yet wired (a future HTTP submit
+// path will take the JSON spec directly). For now, pipe the JSON to a
+// separate submit tool or use it for inspection.
 //
 // Usage:
 //   clink_submit_sql --file path/to/job.sql
@@ -347,7 +346,7 @@ int main(int argc, char** argv) {
                     std::cout << plan->explain();
                 } else {
                     std::cerr << "error: bare SELECT must be wrapped in INSERT INTO ... "
-                              << "SELECT for Phase 1 (no print-to-stdout sink yet); "
+                              << "SELECT (no print-to-stdout sink yet); "
                               << "use --explain to inspect the LogicalPlan\n";
                     return 1;
                 }

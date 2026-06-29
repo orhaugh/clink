@@ -1,6 +1,6 @@
 #pragma once
 
-// Phase 29f: cutover-deployment planner for adaptive rescale.
+// Cutover-deployment planner for adaptive rescale.
 //
 // When the JM's RescaleCoordinator transitions an operator from
 // Draining to CuttingOver, the JM has to bring up the new-parallelism

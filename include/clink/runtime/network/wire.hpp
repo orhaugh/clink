@@ -93,14 +93,14 @@ enum class Kind : std::uint8_t {
     // historic per-record framing; the runtime stopped emitting it
     // when the wire migrated to Arrow IPC.
     ArrowBatch = 7,
-    // Phase 29b: drain marker. Payload:
+    // Drain marker. Payload:
     //   [u32 subtask_idx_be][u32 target_parallelism_be]
     // Announces "this upstream subtask is winding down; routing for
     // its key-groups is moving to peer subtasks." Downstream
     // operators consume it to know a fresh stream is incoming from
     // the new subtask set. The actual rescale choreography (when to
     // emit drain, when to shut the upstream down) is owned by the
-    // JM's RescaleCoordinator (29c/d); this kind is the wire bit.
+    // JM's RescaleCoordinator; this kind is the wire bit.
     Drain = 8,
 };
 

@@ -70,7 +70,7 @@ std::shared_ptr<FixedAdapter> make_fixed_adapter(std::int64_t add_amount) {
 TEST(OperatorUid, UidPinsOperatorIdAcrossRebuild) {
     auto backend = std::make_shared<InMemoryStateBackend>();
 
-    // Phase 1: build Dag, op has uid="fixed-add". Run input {1, 2},
+    // Build Dag, op has uid="fixed-add". Run input {1, 2},
     // each becomes prev+1 (so key=1 -> 1, key=2 -> 1).
     {
         Dag dag;
@@ -90,7 +90,7 @@ TEST(OperatorUid, UidPinsOperatorIdAcrossRebuild) {
         EXPECT_EQ(sink->collected(), (std::vector<std::int64_t>{1, 1}));
     }
 
-    // Phase 2: rebuild a DIFFERENT Dag - one extra map() upstream so
+    // Rebuild a DIFFERENT Dag - one extra map() upstream so
     // the stage_idx for the counter shifts (which would invalidate
     // the legacy hash-derived OperatorId). Same uid → same
     // OperatorId → state recovers.
@@ -107,7 +107,7 @@ TEST(OperatorUid, UidPinsOperatorIdAcrossRebuild) {
         auto h_id = dag.add_operator<std::int64_t, std::int64_t>(h_src, identity);
 
         auto op = make_fixed_adapter(1);
-        op->set_uid("fixed-add");  // same uid as phase 1
+        op->set_uid("fixed-add");  // same uid as the first build
         auto h_op = dag.add_operator<std::int64_t, std::int64_t>(h_id, op);
         auto sink = std::make_shared<CollectingSink<std::int64_t>>();
         dag.add_sink<std::int64_t>(h_op, sink);

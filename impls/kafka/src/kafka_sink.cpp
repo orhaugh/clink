@@ -134,7 +134,7 @@ void KafkaSink::open() {
     set_or_throw("acks", impl_->opts.acks);
     set_or_throw("compression.type", impl_->opts.compression_type);
     set_or_throw("linger.ms", std::to_string(impl_->opts.linger_ms.count()));
-    // Phase 23c: transactional producer mode. Setting transactional.id
+    // Transactional producer mode. Setting transactional.id
     // automatically enables idempotence and requires acks=all. We set
     // enable.idempotence explicitly so the config matches librdkafka's
     // implicit requirements regardless of broker version.
@@ -175,7 +175,7 @@ void KafkaSink::open() {
     }
     impl_->producer.reset(producer);
 
-    // Phase 23c: kick off transactions if configured. init_transactions
+    // Kick off transactions if configured. init_transactions
     // talks to the transaction coordinator and fences any prior
     // producer instance with the same transactional.id (the recovery-
     // safety property). begin_transaction opens the first transaction

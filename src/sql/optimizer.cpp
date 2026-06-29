@@ -83,7 +83,7 @@ void set_scan_projection(LogicalScan& scan, const std::set<std::string>& used) {
 
 // Bottom-up traversal accumulating used-column sets as we cross each
 // node. Returns the set of columns the input of `node` must produce.
-// Phase 6.3 first cut: single-source chains only - we walk through
+// First cut: single-source chains only - we walk through
 // Filter / Project / WindowAggregate / Sink and recurse into the
 // child. IntervalJoin opts out (it conceptually projects both sides
 // in full); we just don't push through it.
@@ -154,7 +154,7 @@ void apply_projection_pushdown(LogicalPlan& node, std::set<std::string>& cumulat
     auto inputs = node.inputs();
     if (inputs.empty())
         return;
-    // Phase 6.3: handle single-input chains. Multi-input nodes
+    // Handle single-input chains. Multi-input nodes
     // (interval join) propagate cumulative-as-is to each side, but
     // we only annotate one Scan in a single-source chain.
     if (inputs.size() == 1) {

@@ -250,7 +250,7 @@ TEST(DagIterationCheckpoint, BarrierCapturesInflightFeedbackRecords) {
 }
 
 TEST(DagIterationCheckpoint, RestoreReplaysCapturedInflightRecords) {
-    // Phase 1: synthesize a state-backend entry that pretends a
+    // Stage 1: synthesize a state-backend entry that pretends a
     // previous run snapshotted some in-flight records. We don't go
     // through a real barrier here - the goal is to verify that the
     // head's RESTORE path picks up the persisted records and pushes
@@ -286,7 +286,7 @@ TEST(DagIterationCheckpoint, RestoreReplaysCapturedInflightRecords) {
             StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
     }
 
-    // Phase 2: build the live DAG. External input is empty (the
+    // Stage 2: build the live DAG. External input is empty (the
     // previous run is what fed the iteration). The body subtracts 1
     // until zero. Captured records should reach the output sink.
     Dag dag;

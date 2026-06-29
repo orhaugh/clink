@@ -112,7 +112,7 @@ public:
     explicit Emitter(SubtaskEmitter<Out>* sub) : sub_(sub) {}
     explicit Emitter(Forward forward) : forward_(std::move(forward)) {}
 
-    // Phase 26a: source-side mode override. The source runner sets this
+    // Source-side mode override. The source runner sets this
     // from RuntimeContext::unaligned_checkpoints() so user sources don't
     // have to know about barrier modes; every barrier the source emits
     // through this Emitter is stamped with the runner-decided mode.
@@ -213,7 +213,7 @@ public:
         return emit(Element::barrier(b));
     }
 
-    // Phase 29d-3: drain marker. Source runners and stateful
+    // Drain marker. Source runners and stateful
     // intermediate operators emit this when the JM has signalled a
     // rescale at their operator; downstream consumers see it
     // immediately before this subtask closes its outputs.
@@ -1108,12 +1108,12 @@ public:
     // PREPARED). Must be idempotent - a recovery-time on_commit for an
     // already-committed checkpoint may legitimately fire.
     virtual void on_commit(std::uint64_t /*checkpoint_id*/) {}
-    // Phase 30c hook (declared here, wired later). Called when the JM
+    // Abort hook (declared here, wired later). Called when the JM
     // determines this sink's commit group cannot commit atomically
     // (one or more members of the group failed their pre-commit). The
     // sink rolls back any prepared state: file_2pc unlinks staging
     // files, kafka_2pc calls abort_transaction(). Non-2PC sinks
-    // ignore this. Default no-op preserves pre-Phase-30 behaviour.
+    // ignore this. Default no-op preserves the prior behaviour.
     virtual void on_abort(std::uint64_t /*checkpoint_id*/) {}
     // Called once after the input channel is closed and drained, before
     // close(). Sinks that buffer (e.g. for batched commits) flush here.
@@ -1139,14 +1139,13 @@ public:
     void attach_runtime(RuntimeContext* ctx) noexcept { runtime_ = ctx; }
     RuntimeContext* runtime() const noexcept { return runtime_; }
 
-    // Phase 30a: commit-group declaration. Sinks that share a non-empty
+    // Commit-group declaration. Sinks that share a non-empty
     // commit_group must commit together or all abort together; the
     // JobManager will only broadcast CommitCheckpoint to group
     // members once every member of the group has acked its pre-commit
     // (on_barrier). Empty string (the default) means "this sink is
     // not in any commit group; it commits independently as soon as
-    // the JM marks the checkpoint COMPLETED" - the pre-Phase-30
-    // behaviour. 30a ships the declaration + accessor only.
+    // the JM marks the checkpoint COMPLETED".
     void set_commit_group(std::string group) noexcept { commit_group_ = std::move(group); }
     [[nodiscard]] const std::string& commit_group() const noexcept { return commit_group_; }
     [[nodiscard]] bool has_commit_group() const noexcept { return !commit_group_.empty(); }

@@ -63,14 +63,14 @@ private:
 }  // namespace
 
 // End-to-end: state written by a persistent TumblingWindowOperator survives
-// snapshot/restore across two LocalExecutor runs. Phase 1 ingests partial
-// input and is snapshotted mid-flight; phase 2 restores into a fresh backend
-// and continues, producing aggregates that span events from both phases.
+// snapshot/restore across two LocalExecutor runs. The first run ingests partial
+// input and is snapshotted mid-flight; the second run restores into a fresh backend
+// and continues, producing aggregates that span events from both runs.
 TEST(WindowRecovery, AggregationContinuesAfterRestart) {
     using KV = std::pair<std::string, int>;
 
     // -----------------------------------------------------------------
-    // Phase 1: emit some events, snapshot, cancel before flush fires
+    // First run: emit some events, snapshot, cancel before flush fires
     // -----------------------------------------------------------------
     auto backend1 = std::make_shared<InMemoryStateBackend>();
 
@@ -118,11 +118,11 @@ TEST(WindowRecovery, AggregationContinuesAfterRestart) {
     exec1.cancel();
     exec1.await_termination();
 
-    // No window fired in phase 1 (no max-watermark, no flush).
+    // No window fired in the first run (no max-watermark, no flush).
     EXPECT_TRUE(sink1->collected().empty());
 
     // -----------------------------------------------------------------
-    // Phase 2: fresh backend, restore from the snapshot, feed remaining
+    // Second run: fresh backend, restore from the snapshot, feed remaining
     // events, run to completion (flush fires the windows).
     // -----------------------------------------------------------------
     auto backend2 = std::make_shared<InMemoryStateBackend>();
@@ -142,10 +142,10 @@ TEST(WindowRecovery, AggregationContinuesAfterRestart) {
 
     Dag dag2;
     auto h0_2 = dag2.add_source<KV>(source2);
-    // NB: use a default-named source, but the holding source in phase 1 is
+    // NB: use a default-named source, but the holding source in the first run is
     // named "holding_source" - different name → different OperatorId → no
-    // collision with phase 1's window id. The window operator itself uses
-    // the default "tumbling_window" name in both phases AND sits at the
+    // collision with the first run's window id. The window operator itself uses
+    // the default "tumbling_window" name in both runs AND sits at the
     // same DAG position, so its OperatorId is identical across runs and
     // the snapshot's keys line up.
     auto h1_2 = dag2.add_operator<KV, std::pair<std::string, std::int64_t>>(h0_2, window2);

@@ -1,8 +1,8 @@
-// Unit tests for Phase 28d pool primitives:
+// Unit tests for the pool primitives:
 //   - RetryPolicy + retry() generic invoker.
 //   - CircuitBreaker state machine.
 //
-// These two compose into Phase 28d's HttpPool (and future JdbcPool /
+// These two compose into the HttpPool (and future JdbcPool /
 // RedisPool). Test in isolation here so the failure mode is the
 // primitive, not the consumer.
 

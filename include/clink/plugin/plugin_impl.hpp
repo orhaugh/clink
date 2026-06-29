@@ -290,7 +290,7 @@ void PluginRegistry::register_source(
                     dag.source_injectors().begin(), dag.source_injectors().end());
                 rctx.register_source_injectors(std::move(injectors));
             }
-            // Phase 29d-3: bridge BeginRescale dispatch into the source
+            // Bridge BeginRescale dispatch into the source
             // runner. Create a shared atomic signal; register a drain
             // callback that sets it to target_parallelism on dispatch;
             // thread the same atomic onto JobConfig so RuntimeContext /
@@ -388,7 +388,7 @@ void PluginRegistry::register_sink(
                 },
             });
         }
-        // Phase 30c: register abort callback alongside commit. The
+        // Register abort callback alongside commit. The
         // TM dispatches it on AbortCheckpoint; non-2PC sinks ignore
         // the call (Sink::on_abort default no-op).
         if (rctx.register_abort_callbacks) {

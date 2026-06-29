@@ -31,7 +31,7 @@ namespace {
 // key_bytes when applied.
 //
 // Field structure is identical across all snapshots. The schema's
-// arrow::KeyValueMetadata carries optional Phase 27b annotations:
+// arrow::KeyValueMetadata carries optional state-version annotations:
 //   - "clink.state_versions": packed StateVersionMap. Absent on
 //     v1-format snapshots; restore must tolerate missing metadata.
 std::shared_ptr<arrow::Schema> snapshot_schema() {
@@ -209,7 +209,7 @@ void InMemoryStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg
             reader->schema()->ToString());
     }
 
-    // Recover the Phase 27b state version map if present. Absence is
+    // Recover the state version map if present. Absence is
     // expected for older snapshots; treat that as "no stamps recorded"
     // (control plane will then assume version 1 per the trait default).
     if (const auto& metadata = reader->schema()->metadata(); metadata) {

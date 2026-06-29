@@ -91,14 +91,14 @@ void LocalExecutor::start() {
         // route each timer to the subtask owning its key group on a rescale
         // (full range = same-parallelism, keep all). See Operator::restore_timers.
         contexts_.back()->set_restore_key_group_range(config_.restore_key_group_filter);
-        // Phase 26b: stamp the per-operator mode override (if any)
+        // Stamp the per-operator mode override (if any)
         // so this operator's runner can stamp barriers passing
         // through with the override mode.
         if (auto it = config_.barrier_mode_overrides_by_operator.find(runner.id);
             it != config_.barrier_mode_overrides_by_operator.end()) {
             contexts_.back()->set_barrier_mode_override(it->second);
         }
-        // Phase 29d-3: thread the shared drain-target signal so the
+        // Thread the shared drain-target signal so the
         // source runner can poll it and emit DrainMarker on rescale.
         // Null in non-cluster paths; the runner observes 0 and
         // produces normally.

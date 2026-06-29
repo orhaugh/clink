@@ -138,7 +138,7 @@ struct JobConfig {
     // buffer via the state backend).
     bool unaligned_checkpoints{false};
 
-    // Phase 29d-3: shared drain-target signal. The cluster's TM wires
+    // Shared drain-target signal. The cluster's TM wires
     // BeginRescale dispatch to set this atomic to the rescale's
     // target_parallelism; the source runner in dag.hpp polls it
     // between produce() calls and, when non-zero, emits a
@@ -147,7 +147,7 @@ struct JobConfig {
     // source runner observes a null signal and produces normally.
     std::shared_ptr<std::atomic<std::uint32_t>> drain_target;
 
-    // Phase 26b: per-operator override of the global alignment mode.
+    // Per-operator override of the global alignment mode.
     // Maps OperatorId -> Mode. When an operator's id appears in this
     // map, the runner stamps every barrier passing through that
     // operator with the override mode (instead of the upstream-stamped
@@ -158,9 +158,9 @@ struct JobConfig {
     //
     // Typical usage: force a specific operator to stay aligned (e.g.,
     // a stateful join that doesn't yet implement in-flight capture)
-    // while the rest of the job runs unaligned. The 26c adaptive
-    // policy will populate this map dynamically from backpressure
-    // signals; for 26b the map is a static job-config knob.
+    // while the rest of the job runs unaligned. An adaptive policy
+    // may populate this map dynamically from backpressure signals;
+    // here the map is a static job-config knob.
     std::unordered_map<OperatorId, CheckpointBarrier::Mode> barrier_mode_overrides_by_operator;
 
     // Pin each operator thread to a CPU core (round-robin over the available

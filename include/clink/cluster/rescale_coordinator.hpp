@@ -1,6 +1,6 @@
 #pragma once
 
-// Phase 29c: per-operator RescaleCoordinator on the JM.
+// Per-operator RescaleCoordinator on the JM.
 //
 // Tracks per-operator rescale state across the lifecycle:
 //
@@ -24,9 +24,9 @@
 // Each transition is mutex-protected; the coordinator is safe to
 // drive from JM RPC handlers running on multiple threads.
 //
-// Phase 29c scope: the state machine + bounds validation. The actual
+// Scope here: the state machine + bounds validation. The actual
 // JM-side dispatch (BeginRescale message to old TMs, deploying new
-// subtasks, the DrainMarker emit) is Phase 29d's job; this object
+// subtasks, the DrainMarker emit) is the dispatch layer's job; this object
 // is the state record those handlers update. Tests drive the state
 // machine end-to-end without spinning up a cluster.
 
@@ -80,8 +80,7 @@ public:
     //
     // min == 0 && max == 0 signals "no autoscaling for this operator"
     // - subsequent request_rescale calls are rejected with reason
-    // "operator not scalable." Mirrors the OperatorSpec convention
-    // from Phase 29a.
+    // "operator not scalable." Mirrors the OperatorSpec convention.
     void register_operator(std::string op_id,
                            std::uint32_t current_parallelism,
                            std::uint32_t min_parallelism,

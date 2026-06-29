@@ -1,8 +1,8 @@
 #pragma once
 
-// Phase 29g: adaptive autoscaler loop.
+// Adaptive autoscaler loop.
 //
-// Closes the Phase 29 arc by driving `JobManager::request_operator_rescale`
+// Drives `JobManager::request_operator_rescale`
 // from a periodic metric poll, one PidController per operator. The
 // autoscaler is intentionally decoupled from JobManager via three
 // function objects (sample / request / status) so it's testable
@@ -10,7 +10,7 @@
 //
 // Per-tick algorithm:
 //   1. For each registered operator, status_fn(op_id) returns its
-//      current parallelism + Phase 29a [min, max] bounds + whether a
+//      current parallelism + [min, max] bounds + whether a
 //      rescale is already in flight.
 //   2. If the operator is mid-rescale, skip the tick - the PidController
 //      keeps its state but emits no decision until the rescale completes.

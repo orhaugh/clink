@@ -102,7 +102,7 @@ TEST(RuntimeContext, BroadcastStateRoundTrip) {
     EXPECT_EQ(*bs.get(), 42);
 }
 
-// --- Phase 29d-3: drain-target signal --------------------------------
+// --- Drain-target signal ---------------------------------------------
 
 TEST(RuntimeContext, DrainTargetReturnsZeroWhenSignalUnset) {
     RuntimeContext ctx(OperatorId{1}, "src", nullptr, nullptr);

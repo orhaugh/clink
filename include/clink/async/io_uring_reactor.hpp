@@ -1,6 +1,6 @@
 #pragma once
 
-// Phase 28e: io_uring-backed reactor for coroutine-driven async I/O.
+// io_uring-backed reactor for coroutine-driven async I/O.
 //
 // IoUringReactor owns one io_uring submission / completion ring pair
 // and runs a single dispatch loop. Coroutines suspend on awaitables
@@ -25,7 +25,7 @@
 // CLINK_HAS_URING is set by CMake. On macOS / non-Linux this file
 // compiles to an empty namespace.
 //
-// Scope of 28e:
+// Scope:
 //   - Reactor lifecycle (ctor / dtor / run / stop).
 //   - sleep_for(duration) awaitable using IORING_OP_TIMEOUT.
 //   - The completion bookkeeping (per-op state, SQE user_data, CQE

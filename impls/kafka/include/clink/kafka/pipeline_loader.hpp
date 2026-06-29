@@ -10,9 +10,7 @@
 #include "clink/connectors/kafka_message.hpp"
 #include "clink/runtime/dag.hpp"
 
-// Kafka-specific JSON-driven pipeline loader. Lives at
-// include/clink/kafka/ during Phase 1 of the impls split; in Phase 2
-// this header moves to impls/kafka/include/clink/kafka/.
+// Kafka-specific JSON-driven pipeline loader.
 //
 // Renamed from clink::config::PipelineLoader to make the dependency
 // on KafkaMessage explicit at the type level; previously the loader

@@ -86,7 +86,7 @@ using V = std::int64_t;
 }  // namespace
 
 TEST(ProcessWindowPersistence, TumblingBufferSurvivesSnapshotRestore) {
-    // Phase 1: build operator A with persistent ctor, push records
+    // Build operator A with persistent ctor, push records
     // into 3 distinct windows for 2 distinct keys, take snapshot.
     InMemoryStateBackend backend_a;
     auto fn_a = std::make_shared<RecordingFn<K, V>>();
@@ -115,7 +115,7 @@ TEST(ProcessWindowPersistence, TumblingBufferSurvivesSnapshotRestore) {
 
     op_a.close();
 
-    // Phase 2: build operator B, restore the backend, fire watermark
+    // Build operator B, restore the backend, fire watermark
     // past every window. Every input record must show up in some
     // process() invocation.
     InMemoryStateBackend backend_b;

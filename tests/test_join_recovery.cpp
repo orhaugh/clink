@@ -63,14 +63,14 @@ private:
 }  // namespace
 
 // End-to-end: an interval-join's keyed buffer state survives snapshot/restore.
-// Phase 1 ingests only left events (no matches yet); phase 2 starts with a
-// fresh backend, restores, and emits right events that match the phase-1
-// left records purely from restored state.
+// The first stage ingests only left events (no matches yet); the second stage
+// starts with a fresh backend, restores, and emits right events that match the
+// earlier left records purely from restored state.
 TEST(JoinRecovery, BufferedLeftRecordsMatchAcrossRestart) {
     using V = std::int64_t;
     using K = std::string;
 
-    // -------- Phase 1: two left records, zero right --------
+    // -------- Stage 1: two left records, zero right --------
     auto backend1 = std::make_shared<InMemoryStateBackend>();
 
     auto src_a1 = std::make_shared<HoldingVectorSource<V>>(
@@ -138,7 +138,7 @@ TEST(JoinRecovery, BufferedLeftRecordsMatchAcrossRestart) {
     exec1.await_termination();
     EXPECT_TRUE(sink1->collected().empty());
 
-    // -------- Phase 2: fresh backend, restore, supply matching right --------
+    // -------- Stage 2: fresh backend, restore, supply matching right --------
     auto backend2 = std::make_shared<InMemoryStateBackend>();
 
     auto src_a2 = std::make_shared<VectorSource<V>>(std::vector<Record<V>>{}, "left");
@@ -199,7 +199,7 @@ TEST(JoinRecovery, UnalignedModeBufferedRecordsMatchExactlyOnceAcrossRestart) {
     using V = std::int64_t;
     using K = std::string;
 
-    // -------- Phase 1: two left records, zero right, UNALIGNED -------
+    // -------- Stage 1: two left records, zero right, UNALIGNED -------
     auto backend1 = std::make_shared<InMemoryStateBackend>();
 
     auto src_a1 = std::make_shared<HoldingVectorSource<V>>(
@@ -264,7 +264,7 @@ TEST(JoinRecovery, UnalignedModeBufferedRecordsMatchExactlyOnceAcrossRestart) {
     exec1.await_termination();
     EXPECT_TRUE(sink1->collected().empty());
 
-    // -------- Phase 2: fresh backend, restore, matching right, UNALIGNED
+    // -------- Stage 2: fresh backend, restore, matching right, UNALIGNED
     auto backend2 = std::make_shared<InMemoryStateBackend>();
 
     auto src_a2 = std::make_shared<VectorSource<V>>(std::vector<Record<V>>{}, "left");

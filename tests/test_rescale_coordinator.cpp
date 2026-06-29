@@ -1,4 +1,4 @@
-// Phase 29c: RescaleCoordinator unit tests.
+// RescaleCoordinator unit tests.
 //
 // Drives the per-operator rescale state machine end-to-end without
 // any cluster machinery: register an operator with bounds, request
@@ -88,7 +88,7 @@ TEST(RescaleCoordinator, RequestRescaleHonoursBounds) {
 
 TEST(RescaleCoordinator, RequestRejectedWhenOperatorNotScalable) {
     RescaleCoordinator c;
-    // 0/0 bounds = not scalable per Phase 29a convention.
+    // 0/0 bounds = not scalable by convention.
     c.register_operator("static_op", /*current=*/3, /*min=*/0, /*max=*/0);
     auto r = c.request_rescale("static_op", 5);
     EXPECT_FALSE(r.ok);

@@ -1,4 +1,4 @@
-// Unit tests for clink::sql::AsyncFunctionRegistry (Phase 28c runtime
+// Unit tests for clink::sql::AsyncFunctionRegistry (runtime
 // slice). The registry is the seam between the SQL frontend (which
 // users programmatically populate today; binder lowering of an async
 // UDF call is a follow-on) and the async_lookup_row runtime

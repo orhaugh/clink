@@ -21,8 +21,8 @@ namespace clink::cluster {
 // v1: handles are tracked but never explicitly released - we keep
 // plugins loaded for the TM's lifetime. dlclose() with registered
 // std::function closures pointing back into plugin code is risky
-// without quiescing all in-flight subtasks first; deferring that
-// machinery to Phase 0d-followup.
+// without quiescing all in-flight subtasks first; that
+// machinery is deferred.
 struct LoadedPlugin {
     std::string source_path;  // Original .so path on disk.
     std::string name;         // From clink_plugin_metadata().

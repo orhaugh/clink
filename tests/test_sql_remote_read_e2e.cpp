@@ -299,7 +299,7 @@ TEST(SqlRemoteReadE2E, MultiKeyEvictionAndRestoreShardedOverS3) {
     constexpr std::size_t kHot = 32;   // << the 20-key working set: forces eviction
     constexpr std::uint32_t kPar = 4;  // sharded GROUP BY across 4 keyed subtasks
 
-    // Phase 1: build 20-key aggregate state, sharded, evicting under the budget.
+    // Build 20-key aggregate state, sharded, evicting under the budget.
     auto built = run_groupby_evict("tm-rr-mk-build",
                                    in1,
                                    out1,
@@ -312,7 +312,7 @@ TEST(SqlRemoteReadE2E, MultiKeyEvictionAndRestoreShardedOverS3) {
     for (std::int64_t k = 1; k <= kKeys; ++k)
         EXPECT_EQ(built[k], kB1PerKey) << "build key " << k;
 
-    // Phase 2: fresh cluster restores all 20 keys lazily from S3 (hot tier empty)
+    // Fresh cluster restores all 20 keys lazily from S3 (hot tier empty)
     // and folds batch 2 touching every key. Under the tiny budget each key is
     // cold-read from S3, filled, then evicted as others arrive (heavy churn).
     auto restored = run_groupby_evict("tm-rr-mk-restore",
@@ -363,12 +363,12 @@ TEST(SqlRemoteReadE2E, GroupByAsyncCheckpointsToS3AndRestores) {
     const std::string prefix_main = "clink-sql-rr-e2e/" + pid + "/main";
     const std::string prefix_ctrl = "clink-sql-rr-e2e/" + pid + "/ctrl";
 
-    // ---- Phase 1: build aggregate state and commit it to S3. ----
+    // ---- Build aggregate state and commit it to S3. ----
     const std::int64_t built =
         run_groupby_job("tm-rr-e2e-build", in1, out1, prefix_main, /*restore=*/false, 0);
     EXPECT_EQ(built, kBatch1Rows);  // GROUP BY SUM over batch 1
 
-    // ---- Phase 2: fresh cluster restores that state from S3, folds batch 2. ----
+    // ---- Fresh cluster restores that state from S3, folds batch 2. ----
     const std::int64_t restored = run_groupby_job("tm-rr-e2e-restore",
                                                   in2,
                                                   out2,
@@ -376,7 +376,7 @@ TEST(SqlRemoteReadE2E, GroupByAsyncCheckpointsToS3AndRestores) {
                                                   /*restore=*/true,
                                                   kEndOfStreamCheckpoint);
 
-    // ---- Phase 3: control - fresh empty prefix, no restore. ----
+    // ---- Control: fresh empty prefix, no restore. ----
     const std::int64_t control =
         run_groupby_job("tm-rr-e2e-control", in2, outc, prefix_ctrl, /*restore=*/false, 0);
 

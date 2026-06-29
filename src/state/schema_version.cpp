@@ -19,7 +19,7 @@ namespace clink {
 
 namespace {
 
-// Phase 27d helpers ------------------------------------------------------
+// Auto-migration helpers -------------------------------------------------
 
 // Is `from` an integer type that promotes losslessly to `to`? Returns
 // true for same-width integer with same signedness, and for widenings
@@ -436,7 +436,7 @@ std::vector<std::byte> StateMigrationRegistry::migrate(const std::string& state_
 
     auto path = plan_path_unlocked(state_type, from_version, to_version);
     if (path.empty()) {
-        // Phase 27d: fall back to Arrow auto-migration when both
+        // Fall back to Arrow auto-migration when both
         // versions have registered schemas and the change is
         // additively compatible. This handles "added nullable column"
         // and "widened integer" cases without an explicit user fn.
@@ -489,7 +489,7 @@ bool StateMigrationRegistry::has_path(const std::string& state_type,
     if (!plan_path_unlocked(state_type, from_version, to_version).empty()) {
         return true;
     }
-    // Phase 27d: auto-migration is also a valid path when both
+    // Auto-migration is also a valid path when both
     // versions have registered schemas and the change is additive.
     auto from_schema = arrow_schema_unlocked(state_type, from_version);
     auto to_schema = arrow_schema_unlocked(state_type, to_version);
@@ -515,7 +515,7 @@ StateMigrationRegistry& StateMigrationRegistry::global() {
     return instance;
 }
 
-// --- Phase 27d: Arrow-aware auto-migration -----------------------------
+// --- Arrow-aware auto-migration ----------------------------------------
 
 void StateMigrationRegistry::register_arrow_schema(std::string state_type,
                                                    std::uint32_t version,

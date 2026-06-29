@@ -156,9 +156,9 @@ public:
         // NOT durable across a restart - safe only for dev/test; production
         // clusters should set a durable tier (remote-read:// on S3).
         std::string default_state_backend_uri{};
-        // Phase 29h: optional adaptive autoscaler config. When set,
+        // Optional adaptive autoscaler config. When set,
         // every submitted job whose graph declares at least one
-        // operator with Phase 29a [min, max] bounds spawns a per-job
+        // operator with [min, max] bounds spawns a per-job
         // Autoscaler thread that polls the sample function on this
         // cadence and calls request_operator_rescale on overload /
         // underload. Default (nullopt) disables autoscaling - manual
@@ -362,14 +362,14 @@ public:
     RescaleJobAckMsg rescale_job(JobId job_id,
                                  const std::unordered_map<std::string, std::uint32_t>& role_p);
 
-    // Phase 29d: per-operator rescale request. Validates the new
-    // parallelism against the operator's Phase 29a [min, max] bounds
+    // Per-operator rescale request. Validates the new
+    // parallelism against the operator's [min, max] bounds
     // (registered at submit time), refuses if a rescale is already in
     // progress for the operator, and on accept transitions the
     // operator's RescaleCoordinator state to Preparing. The actual
     // BeginRescale broadcast + drain choreography is the follow-on
-    // 29d-2 slice; this method is the public surface a future REST
-    // endpoint or autoscaler thread (29e wiring) will call.
+    // slice; this method is the public surface a future REST
+    // endpoint or autoscaler thread will call.
     //
     // Returns the underlying RescaleCoordinator::RequestResult. On
     // reject, .ok=false and .reason carries a descriptive message;
@@ -385,7 +385,7 @@ public:
     std::optional<OperatorRescaleStatus> operator_rescale_status(JobId job_id,
                                                                  const std::string& op_id) const;
 
-    // Phase 29h: install the metric source the per-job autoscaler
+    // Install the metric source the per-job autoscaler
     // consumes. Signature mirrors Autoscaler::SampleFn but adds JobId
     // so one global metric source can serve every job's operators.
     // Default (when not set) returns 0.5 (mid-band, no rescale) so
@@ -395,7 +395,7 @@ public:
     using AutoscalerSampleFn = std::function<double(JobId, const std::string&)>;
     void set_autoscaler_sample_fn(AutoscalerSampleFn fn);
 
-    // Phase 29h: diagnostic accessor. Returns the per-job autoscaler's
+    // Diagnostic accessor. Returns the per-job autoscaler's
     // tick counter, or nullopt if the job has no autoscaler attached.
     // Used by tests / dashboards to confirm the loop is alive.
     std::optional<std::uint64_t> autoscaler_ticks(JobId job_id) const;
@@ -590,7 +590,7 @@ private:
         // on disk separately via PluginLoader.
         std::vector<PluginBinary> plugins;
 
-        // Phase 29d: per-operator rescale state machine. Populated at
+        // Per-operator rescale state machine. Populated at
         // deploy_internal_ by walking graph.ops and calling
         // register_operator for each op with parallelism + bounds.
         // unique_ptr because RescaleCoordinator is non-copyable (mutex
@@ -598,9 +598,9 @@ private:
         // unordered_map storage.
         std::unique_ptr<RescaleCoordinator> rescale_coordinator;
 
-        // Phase 29h: per-job adaptive autoscaler. Created in
+        // Per-job adaptive autoscaler. Created in
         // deploy_internal_ when cfg_.autoscaler is set and at least
-        // one of the job's operators carries Phase 29a bounds.
+        // one of the job's operators carries [min, max] bounds.
         // Owns its own polling thread; destroyed (and joins) when
         // JobState is removed or when JM::stop_autoscalers_() runs.
         std::unique_ptr<Autoscaler> autoscaler;
@@ -620,7 +620,7 @@ private:
         // <checkpoint_dir>/<job_id>/COMPLETED-<id> marker and updates
         // `latest_completed_checkpoint_id`.
         std::unordered_map<std::uint64_t, std::unordered_set<std::string>> pending_checkpoint_acks;
-        // Phase 30d (metrics-coverage pass): start time per in-flight
+        // Start time per in-flight
         // checkpoint id. Stamped at trigger; consumed at completion
         // to feed clink_ckpt_duration_ms_sum / count. Entries are
         // dropped when the matching pending set empties.
@@ -651,22 +651,22 @@ private:
         std::optional<std::uint64_t> test_stalled_final_id;
         std::string test_stall_key;
 
-        // Phase 30b: commit-group memberships derived from the job's
+        // Commit-group memberships derived from the job's
         // sink operator params at submit time. group_name -> ordered
         // set of "role:subtask_idx" keys belonging to the group.
         // Used by handle_subtask_checkpointed_ to gate
         // CommitCheckpoint broadcasts: a group's members commit
         // together once every member has acked its pre-commit
         // successfully, or all abort together on any member's failure.
-        // Empty when no sinks declared a commit_group (the default,
-        // pre-Phase-30 behaviour).
+        // Empty when no sinks declared a commit_group (the default
+        // behaviour).
         std::unordered_map<std::string, std::unordered_set<std::string>> commit_groups;
         // Reverse index: "role:subtask_idx" -> group_name. nullopt
         // entry / absent key means "no group; commits independently"
-        // (pre-Phase-30 behaviour).
+        // (the default behaviour).
         std::unordered_map<std::string, std::string> subtask_commit_group;
 
-        // Phase 30b: per-checkpoint group state. For each in-flight
+        // Per-checkpoint group state. For each in-flight
         // checkpoint that touches at least one commit-group,
         // group_state[ckpt_id][group_name] tracks the set of subtasks
         // that have NOT yet acked. When the set empties the JM
@@ -718,7 +718,7 @@ private:
     void handle_subtask_finished_(MessageReader& r);
     void handle_subtask_listening_(MessageReader& r);
     void handle_rescale_job_(network::Connection& conn, MessageReader& r);
-    // Phase 29d-4: per-operator rescale request dispatch.
+    // Per-operator rescale request dispatch.
     void handle_rescale_operator_(network::Connection& conn, MessageReader& r);
     void handle_savepoint_(network::Connection& conn, MessageReader& r);
     void start_reader_for_(std::shared_ptr<TmConnection> tm);
@@ -738,7 +738,7 @@ private:
     };
     std::vector<PendingDeploy> restart_job_locked_(JobState& job);
 
-    // Phase 29f: coordinator-driven adaptive rescale dispatch.
+    // Coordinator-driven adaptive rescale dispatch.
     //
     // dispatch_begin_rescale_locked_: builds one BeginRescaleMsg per
     // TM hosting at least one old subtask of `op_id`. Appended to
@@ -780,14 +780,14 @@ private:
     // from set_ha_dir; no-op if ha_dir_ is empty.
     void reload_history_from_disk_();
 
-    // Phase 29h: extract every per-job Autoscaler under the lock and
+    // Extract every per-job Autoscaler under the lock and
     // join its thread outside the lock. Called from JM::stop() before
     // tearing down jobs_, and from job-completion paths so a finished
     // job's autoscaler thread doesn't linger.
     void stop_autoscalers_();
 
     Config cfg_;
-    // Phase 29h: optional metric source for the per-job autoscaler.
+    // Optional metric source for the per-job autoscaler.
     // Empty by default - autoscaler tick will report 0.5 and idle.
     AutoscalerSampleFn autoscaler_sample_fn_;
     // HA persistence root. When empty, no manifests are written.

@@ -1,8 +1,8 @@
 // clink_check_savepoint - inspect the state-schema version stamps
 // embedded in a savepoint produced by InMemoryStateBackend (or a
-// derivative). Phase 27c surfaces the StateVersionMap to operators
-// without a running JM: read the file, decode the Arrow IPC stream,
-// print the (op_id, state_type, version) tuples plus a row count.
+// derivative). Surfaces the StateVersionMap to operators without a
+// running JM: read the file, decode the Arrow IPC stream, print the
+// (op_id, state_type, version) tuples plus a row count.
 //
 // This is the inspector form. A future enhancement loads the live
 // job's expected version map (via `clink_job_expected_state_versions`

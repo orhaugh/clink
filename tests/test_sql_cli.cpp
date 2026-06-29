@@ -27,7 +27,7 @@ extern char** environ;
 // file, invokes the compiler, captures stdout, asserts the produced
 // JobGraphSpec JSON matches the expected shape.
 //
-// Phase 1 SCOPES OUT actual cluster execution of the produced spec -
+// This SCOPES OUT actual cluster execution of the produced spec -
 // that needs an HTTP / wire submission path the JM doesn't expose yet
 // for JSON specs. The clink::sql tests verify the compile path; this
 // test verifies the BINARY assembles the same artifact when invoked
@@ -141,7 +141,7 @@ TEST(SqlCli, ParseErrorExitsNonZeroWithDiagnostic) {
 
 TEST(SqlCli, TranslationErrorExitsNonZeroWithDiagnostic) {
     // Channel mismatch: source is Row (format='json'), sink is String.
-    // Phase 3.2 requires both endpoints to use the same channel.
+    // Both endpoints are required to use the same channel.
     auto result = run_compiler(
         "-e \"CREATE TABLE r_in (a BIGINT, b TEXT) WITH (connector='file', format='json', "
         "path='/x'); "

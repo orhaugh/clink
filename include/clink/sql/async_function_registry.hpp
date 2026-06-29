@@ -1,7 +1,7 @@
 #pragma once
 
-// Phase 28c (runtime slice): user-registered async functions keyed by
-// name. The runtime factory for `async_lookup_row` reads
+// User-registered async functions keyed by name. The runtime factory
+// for `async_lookup_row` reads
 // `function_name` from its OperatorSpec params and looks up the
 // registered closure here. SQL-frontend wiring (binder lowering of a
 // FunctionCall whose name is in this registry to a LogicalAsyncMap)

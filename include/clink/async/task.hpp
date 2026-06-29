@@ -1,23 +1,22 @@
 #pragma once
 
-// Phase 28a: Task<T> coroutine primitive.
+// Task<T> coroutine primitive.
 //
 // A lightweight C++20 coroutine return type. Move-only, lazy-start
 // (initial_suspend returns suspend_always so the coroutine doesn't
 // run until the caller resumes it), exception-safe (uncaught
 // exceptions inside the coroutine body are captured on the promise
-// and rethrown from get()). Designed as the building block for
-// Phase 28's async lookup pipeline: an async lookup function
-// declared as `Task<Out> lookup(In)` returns a Task that the
-// operator scheduler advances via resume(), polls with done(), and
-// drains with get().
+// and rethrown from get()). Designed as the building block for the
+// async lookup pipeline: an async lookup function declared as
+// `Task<Out> lookup(In)` returns a Task that the operator scheduler
+// advances via resume(), polls with done(), and drains with get().
 //
 // Composition: Task<T> is itself awaitable, so a coroutine can
 // `co_await another_task()` to chain async work without futures.
 // The awaiter resumes the awaiting coroutine when the awaited Task
 // completes (which the user-driven scheduler arranges).
 //
-// Scope of 28a:
+// Scope:
 // - Task<T> and Task<void> with promise_type, get_return_object,
 //   initial_suspend (lazy), final_suspend, return_value/return_void,
 //   unhandled_exception.
@@ -27,7 +26,7 @@
 //   coroutine; the await_suspend records the awaiting handle on the
 //   awaited task's promise so the scheduler can chain resumption.
 //
-// Out of scope for 28a (deferred to 28b+):
+// Out of scope (deferred):
 // - Scheduler / event loop.
 // - Integration with AsyncMapOperator / SQL LATERAL LOOKUP.
 // - I/O primitives (HTTP pool, io_uring backend).

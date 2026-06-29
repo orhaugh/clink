@@ -13,11 +13,6 @@
 // libpg_query's JSON parse tree never escapes src/sql/ast_builder.cpp -
 // keeps the upstream dependency contained and lets us swap parsers
 // later without disturbing higher layers.
-//
-// Phase 1 scope is deliberately narrow: CREATE TABLE, SELECT column-
-// list FROM, INSERT INTO ... SELECT, plus the leaf expressions
-// (column references and literals). Arithmetic / comparisons /
-// function calls land in Phase 3, joins in Phase 5.
 
 namespace clink::sql::ast {
 
@@ -64,8 +59,8 @@ struct NullLiteral {
     Loc loc;
 };
 
-// Phase 3.1 added the recursive expression kinds (BinaryOp / LogicalOp
-// / NotOp / IsNullOp). Recursive cases are wrapped in unique_ptr so
+// The recursive expression kinds (BinaryOp / LogicalOp / NotOp /
+// IsNullOp). Recursive cases are wrapped in unique_ptr so
 // the variant template only sees a forward declaration; bodies are
 // defined below the Expression alias.
 
@@ -111,8 +106,8 @@ using Expression = std::variant<ColumnRef,
                                 std::unique_ptr<FieldAccess>>;
 
 // Binary comparison: left <op> right. Both operands are Expressions
-// so they can themselves recurse (constant folding etc.). For Phase
-// 3.1 the binder only allows {ColumnRef, Literal} leaves.
+// so they can themselves recurse (constant folding etc.). The binder
+// only allows {ColumnRef, Literal} leaves.
 struct BinaryOp {
     BinOp op;
     Expression left;
@@ -140,7 +135,7 @@ struct IsNullOp {
     Loc loc;
 };
 
-// Arithmetic + concat (Phase 3.3 / 3.4). Plus/Minus/Mul/Div/Mod take
+// Arithmetic + concat. Plus/Minus/Mul/Div/Mod take
 // two args; Neg takes one; Concat is variadic in the AST (PG parses
 // 'a' || 'b' || 'c' as left-associative pairs, but we keep the variant
 // flexible for the binder to flatten).
@@ -152,7 +147,7 @@ struct ArithOp {
 
 // Scalar function call: UPPER(x), LENGTH(s), COALESCE(a, b, c), etc.
 // Name is lowercase canonical (PG normalizes the user's casing).
-// Phase 21b: optional over_clause is set when PG emits a windowed
+// Optional over_clause is set when PG emits a windowed
 // FuncCall such as `ROW_NUMBER() OVER (PARTITION BY p ORDER BY o)`.
 struct FunctionCall {
     std::string name;
@@ -163,7 +158,7 @@ struct FunctionCall {
 };
 
 // CASE WHEN <expr> THEN <expr> [WHEN ... THEN ...] [ELSE <expr>] END.
-// Phase 12: searched-CASE only (no simple-CASE; users rewrite
+// Searched-CASE only (no simple-CASE; users rewrite
 // `CASE x WHEN 1 ...` as `CASE WHEN x = 1 ...`). At least one WHEN
 // branch is required; ELSE is optional and defaults to NULL.
 struct CaseBranch {
@@ -267,7 +262,7 @@ struct TableRef {
 };
 
 // FROM-clause entry: either a table reference or a join over two
-// sources. Phase 5.1 captures the structure; the binder pattern-
+// sources. Captures the structure; the binder pattern-
 // matches specific join shapes (interval join, equi-join) into
 // LogicalIntervalJoin / LogicalJoin nodes.
 struct JoinClause;
@@ -291,7 +286,7 @@ struct JoinClause {
     Loc loc;
 };
 
-// Phase 20: FROM (SELECT ...) AS sub. PG requires an alias on a
+// FROM (SELECT ...) AS sub. PG requires an alias on a
 // subquery in FROM and our binder enforces it too. The body is
 // pre-bound in the binder; this AST node just carries the textual
 // structure.
@@ -301,7 +296,7 @@ struct SubqueryItem {
     Loc loc;
 };
 
-// MATCH_RECOGNIZE row-pattern matching over a source (#61 phase 2). The
+// MATCH_RECOGNIZE row-pattern matching over a source (#61). The
 // pre-parser shim parses the (PG-ungrammatical) clause body STRUCTURALLY and
 // stores the expression sub-fragments (DEFINE predicates, MEASURES exprs) as
 // raw SQL text; the binder parses those via the normal expression path. v1
@@ -372,7 +367,7 @@ struct ColumnDef {
     Loc loc;
 };
 
-// CREATE TABLE ... WITH (key='value', ...). Phase 1: string-typed
+// CREATE TABLE ... WITH (key='value', ...). String-typed
 // values only; the connector configs we care about (connector,
 // topic, bootstrap, path) are all strings.
 struct StorageOption {
@@ -392,7 +387,7 @@ struct CreateTableStmt {
     Loc loc;
 };
 
-// Phase 13: set-op kind on a SelectStmt. None = normal SELECT.
+// Set-op kind on a SelectStmt. None = normal SELECT.
 // Otherwise the statement is (larg) <set-op> (rarg); target_list /
 // from_* / where / group / having on the outer are unused. UnionAll
 // keeps duplicates; UnionDistinct / Intersect / Except are set
@@ -408,7 +403,7 @@ enum class SelectSetOp {
     ExceptAll
 };
 
-// Phase 16: one CommonTableExpression in a WITH clause. The binder
+// One CommonTableExpression in a WITH clause. The binder
 // pre-binds each ctequery to a LogicalPlan and registers it as a
 // virtual table for the lifetime of the outer SELECT.
 struct CommonTableExpr;
@@ -420,7 +415,7 @@ struct CommonTableExpr {
     Loc loc;
 };
 
-// Phase 17: one entry in an ORDER BY clause. Phase 17 v1 only
+// One entry in an ORDER BY clause. v1 only
 // accepts a bare column reference; expressions in sort keys land
 // in a follow-up.
 struct SortItem {
@@ -429,7 +424,7 @@ struct SortItem {
     Loc loc;
 };
 
-// Phase 21b: the OVER (...) clause on a window function call.
+// The OVER (...) clause on a window function call.
 // Carries PARTITION BY columns (any Expression for now; binder
 // restricts to ColumnRef) and ORDER BY entries.
 // OVER window frame (Wave 7). Running is the default
@@ -450,26 +445,26 @@ struct OverClause {
 
 struct SelectStmt {
     std::vector<SelectItem> target_list;
-    std::vector<TableRef> from_clause;         // Phase 1: 0 (SELECT 1) or 1 table
-    std::vector<FromItem> from_items;          // Phase 5: tables and joins
-    std::optional<Expression> where_clause;    // Phase 3.1: optional WHERE predicate
-    std::vector<Expression> group_clause;      // Phase 4: GROUP BY entries
-    std::optional<Expression> having_clause;   // Phase 9: HAVING predicate
-    bool distinct = false;                     // Phase 10: SELECT DISTINCT
-    std::optional<std::int64_t> limit_count;   // Phase 11: LIMIT n
-    std::optional<std::int64_t> offset_count;  // Phase 19b: OFFSET n
-    SelectSetOp set_op = SelectSetOp::None;    // Phase 13: UNION ALL
+    std::vector<TableRef> from_clause;         // 0 (SELECT 1) or 1 table
+    std::vector<FromItem> from_items;          // tables and joins
+    std::optional<Expression> where_clause;    // optional WHERE predicate
+    std::vector<Expression> group_clause;      // GROUP BY entries
+    std::optional<Expression> having_clause;   // HAVING predicate
+    bool distinct = false;                     // SELECT DISTINCT
+    std::optional<std::int64_t> limit_count;   // LIMIT n
+    std::optional<std::int64_t> offset_count;  // OFFSET n
+    SelectSetOp set_op = SelectSetOp::None;    // UNION ALL
     std::unique_ptr<SelectStmt> larg;          // left branch when set_op != None
     std::unique_ptr<SelectStmt> rarg;          // right branch when set_op != None
-    std::vector<CommonTableExpr> with_clause;  // Phase 16: WITH ctes
-    std::vector<SortItem> sort_clause;         // Phase 17: ORDER BY
+    std::vector<CommonTableExpr> with_clause;  // WITH ctes
+    std::vector<SortItem> sort_clause;         // ORDER BY
     Loc loc;
 };
 
 struct InsertStmt {
     TableRef target;
     SelectStmt select;
-    // Phase 19d: optional explicit column list `INSERT INTO t (a, b)
+    // Optional explicit column list `INSERT INTO t (a, b)
     // SELECT ...`. When present, each name must be a column of `target`
     // and the SELECT projects in column-list order. Empty means the
     // legacy positional form: SELECT must project sink columns in

@@ -83,7 +83,7 @@ TEST(JsonPredicate, LikePatterns) {
     EXPECT_TRUE(eval_str(R"({"op":"like","col":"x","pattern":"%"})", std::string{""}));
 }
 
-// --- Phase 3.5: three-valued logic ---------------------------------
+// --- Three-valued logic ---------------------------------
 
 namespace {
 
@@ -166,7 +166,7 @@ TEST(JsonPredicate, RejectsUnknownOp) {
                  std::runtime_error);
 }
 
-// --- Phase 3.4: typed-literal comparisons --------------------------
+// --- Typed-literal comparisons --------------------------
 
 TEST(JsonPredicate, NumericComparisonAvoidsStringLex) {
     using clink::config::JsonValue;

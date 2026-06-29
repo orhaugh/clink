@@ -15,8 +15,7 @@
 // topic, bootstrap, path, etc.) the planner needs to lower a logical
 // scan/sink down to a clink built-in.
 //
-// Phase 1 is in-memory only. Persistence to <ha-dir>/catalog/ comes in
-// Phase 2.
+// In-memory only for now. Persistence to <ha-dir>/catalog/ comes later.
 
 namespace clink::sql {
 
@@ -29,10 +28,10 @@ struct TableDef {
     std::string name;
     std::vector<ColumnSpec> columns;
     // Insertion-order preserving for deterministic EXPLAIN output and
-    // round-tripping JSON catalogs in Phase 2.
+    // round-tripping JSON catalogs.
     std::map<std::string, std::string> properties;
 
-    // Phase 22a: primary key + sink mode.
+    // Primary key + sink mode.
     //
     // primary_key holds the column names that identify a row for
     // upsert sinks. Populated from a `PRIMARY KEY (col, ...)` column
@@ -50,7 +49,7 @@ struct TableDef {
     }
     [[nodiscard]] bool is_upsert() const { return mode() == "upsert"; }
 
-    // Phase 23a: sink delivery guarantee. Default 'at_least_once'.
+    // Sink delivery guarantee. Default 'at_least_once'.
     // 'exactly_once' enables a 2PC-aware sink op: the planner routes
     // to a transactional variant (file_2pc_sink_row,
     // kafka_2pc_sink_string, ...) and the runtime stages records per
@@ -64,12 +63,12 @@ struct TableDef {
     }
     [[nodiscard]] bool is_exactly_once() const { return delivery_guarantee() == "exactly_once"; }
 
-    // Phase 30a: cross-sink commit group. Multiple sinks that share a
-    // non-empty commit_group must commit together or all abort
-    // together. Defaults to "" (no group; sink commits independently).
-    // Only meaningful for exactly_once sinks (a non-2PC sink has no
-    // commit phase to coordinate); the binder rejects commit_group
-    // on non-exactly_once tables in 30a.
+    // Cross-sink commit group. Multiple sinks that share a non-empty
+    // commit_group must commit together or all abort together. Defaults
+    // to "" (no group; sink commits independently). Only meaningful for
+    // exactly_once sinks (a non-2PC sink has no commit phase to
+    // coordinate); the binder rejects commit_group on non-exactly_once
+    // tables.
     [[nodiscard]] std::string commit_group() const {
         auto it = properties.find("commit_group");
         if (it != properties.end())
@@ -133,8 +132,8 @@ public:
 
     // Convenience: translate a CREATE TABLE AST into a TableDef and
     // register it. Resolves column types through sql_type_to_arrow.
-    // Throws TranslationError if a column type isn't supported in
-    // Phase 1, or if the table is already registered.
+    // Throws TranslationError if a column type isn't supported, or if
+    // the table is already registered.
     void register_table(const ast::CreateTableStmt& stmt);
 
     // Remove a table by name. Returns true if it existed. When a
@@ -155,7 +154,7 @@ public:
     // List currently-registered table names in registration order.
     [[nodiscard]] std::vector<std::string> list_tables() const;
 
-    // Persistence (Phase 2):
+    // Persistence:
     //
     //   set_persistence_dir(dir) - subsequent register / drop calls
     //   auto-persist to <dir>/<table>.json. The directory is created
@@ -172,7 +171,7 @@ public:
     void load_from_dir(const std::string& dir);
 
     // Round-trip a single table's JSON form. Useful for tests and
-    // for the HTTP catalog API in Phase 2.3.
+    // for the HTTP catalog API.
     [[nodiscard]] static std::string to_json(const TableDef& def);
     [[nodiscard]] static TableDef from_json(const std::string& text);
 

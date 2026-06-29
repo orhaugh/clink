@@ -1,6 +1,6 @@
 #pragma once
 
-// Phase 28d: circuit-breaker for async lookup pipelines.
+// Circuit-breaker for async lookup pipelines.
 //
 // Three-state machine. The breaker sits in front of a downstream
 // service (HTTP endpoint, database). On normal call results it stays

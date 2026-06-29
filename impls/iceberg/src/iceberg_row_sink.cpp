@@ -893,7 +893,7 @@ private:
         }
     }
 
-    // Phase 1: close the data files + record them in state, keyed by checkpoint. No snapshot.
+    // Close the data files + record them in state, keyed by checkpoint. No snapshot.
     void stage_current_(std::uint64_t ckpt) {
         auto files = finish_all_();
         if (files.empty()) {

@@ -102,7 +102,7 @@ std::int64_t state_for(StateBackend& backend, OperatorId op, const std::string& 
 }  // namespace
 
 TEST(BatchBootstrap, BoundedRunSeedsStreamingState) {
-    // ---- Phase 1: bounded backfill builds keyed state, then savepoint. ----
+    // ---- Stage 1: bounded backfill builds keyed state, then savepoint. ----
     auto backfill_backend = std::make_shared<InMemoryStateBackend>();
     OperatorId sum_op_id{0};
     Snapshot savepoint;
@@ -129,7 +129,7 @@ TEST(BatchBootstrap, BoundedRunSeedsStreamingState) {
         savepoint = exec.take_savepoint(CheckpointId{1});
     }
 
-    // ---- Phase 2: streaming job restores the savepoint and continues. ----
+    // ---- Stage 2: streaming job restores the savepoint and continues. ----
     auto live_backend = std::make_shared<InMemoryStateBackend>();
     {
         Dag dag;

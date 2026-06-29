@@ -440,7 +440,7 @@ TEST(AsyncSessionWindowOperator, MergeExtendedEndStaleTimerDoesNotDoubleEmit) {
 TEST(AsyncSessionWindowOperator, SessionsSurviveCheckpointRestore) {
     const OperatorId op_id{4};
 
-    // Phase 1: two distinct OPEN sessions for key 1 (no firing watermark), then
+    // Two distinct OPEN sessions for key 1 (no firing watermark), then
     // checkpoint both the timers and the per-key session rows.
     auto backend1 = std::make_shared<InMemoryStateBackend>();
     Snapshot snap;
@@ -461,7 +461,7 @@ TEST(AsyncSessionWindowOperator, SessionsSurviveCheckpointRestore) {
         EXPECT_TRUE(collect(ch).empty()) << "nothing fires before a watermark";
     }
 
-    // Phase 2: fresh operator + backend restores, then a watermark past both ends
+    // A fresh operator + backend restores, then a watermark past both ends
     // re-fires the two restored sessions with their sums.
     auto backend2 = std::make_shared<InMemoryStateBackend>();
     backend2->restore(snap);
@@ -484,7 +484,7 @@ TEST(AsyncSessionWindowOperator, SessionsSurviveCheckpointRestore) {
 TEST(AsyncSessionWindowOperator, MergeAfterRestoreBridgesRestoredSessions) {
     const OperatorId op_id{5};
 
-    // Phase 1: two distinct OPEN sessions [0,100] and [150,250], checkpoint.
+    // Two distinct OPEN sessions [0,100] and [150,250], checkpoint.
     auto backend1 = std::make_shared<InMemoryStateBackend>();
     Snapshot snap;
     {
@@ -503,7 +503,7 @@ TEST(AsyncSessionWindowOperator, MergeAfterRestoreBridgesRestoredSessions) {
         snap = backend1->snapshot(CheckpointId{1});
     }
 
-    // Phase 2: restore, then a record at @90 (provisional [90,190]) bridges the two
+    // Restore, then a record at @90 (provisional [90,190]) bridges the two
     // restored sessions into one [0,250]; a watermark past 250 fires it once = 35.
     auto backend2 = std::make_shared<InMemoryStateBackend>();
     backend2->restore(snap);

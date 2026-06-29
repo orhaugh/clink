@@ -56,7 +56,7 @@ std::vector<int> drain_ints(BoundedChannel<StreamElement<int>>& ch) {
 }  // namespace
 
 TEST(SourceReplay, VectorSourceSnapshotsAndRestoresNextIndex) {
-    // Phase 1: feed VectorSource a 10-record vector. Manually run
+    // Feed VectorSource a 10-record vector. Manually run
     // produce() through a captured emitter to drive emission, then
     // pretend a barrier arrived halfway through.
     InMemoryStateBackend backend;
@@ -89,7 +89,7 @@ TEST(SourceReplay, VectorSourceSnapshotsAndRestoresNextIndex) {
     src.produce(emitter);
     src.snapshot_offset(backend, op_id, CheckpointId{2});
 
-    // Phase 2: fresh source, restore from the saved offset, and verify
+    // Fresh source, restore from the saved offset, and verify
     // produce() emits nothing further (next_index_ == size).
     VectorSource<int> fresh(std::vector<Record<int>>(10), "test_source");
     ASSERT_TRUE(fresh.restore_offset(backend, op_id));

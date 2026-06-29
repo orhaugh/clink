@@ -1,6 +1,4 @@
 // Fluent builders for the Postgres text source / CDC source factories.
-// Lives at include/clink/api/ during Phase 1 of the impls split; in
-// Phase 2 this header moves to impls/postgres/include/clink/api/.
 
 #pragma once
 

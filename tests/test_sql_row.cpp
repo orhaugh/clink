@@ -130,7 +130,7 @@ TEST(SqlRow, JsonTextFormatSkipsMalformedLines) {
     EXPECT_FALSE(fmt.decode("[1, 2]").has_value());  // arrays aren't Row objects
 }
 
-// --- Phase 21a: changelog wire convention --------------------------
+// --- changelog wire convention --------------------------
 
 TEST(SqlRow, RowKindHelpersRoundTrip) {
     Row r;
@@ -156,7 +156,7 @@ TEST(SqlRow, CopyRowKindNoOpsWhenUnset) {
     EXPECT_FALSE(has_row_kind(dst));
 }
 
-// --- Phase 24a: update_before / update_after classifiers -----------
+// --- update_before / update_after classifiers -----------
 
 TEST(SqlRow, IsInsertLikeMatchesInsertAndUpdateAfter) {
     EXPECT_TRUE(is_insert_like(kRowKindInsert));

@@ -179,7 +179,7 @@ public:
     };
     std::vector<Edge> edges_for(const std::string& state_type) const;
 
-    // Phase 27d: Arrow-aware auto-migration. Users register the Arrow
+    // Arrow-aware auto-migration. Users register the Arrow
     // schema of each (state_type, version) they care about. When a
     // migrate() call has no explicit migration registered but BOTH
     // versions have registered schemas AND the change is "additive"

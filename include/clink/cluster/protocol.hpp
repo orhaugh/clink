@@ -45,7 +45,7 @@ enum class MessageKind : std::uint8_t {
     // each new subtask with a key-group range filter and a pointer at
     // its parent old subtask's state file (see DeploymentTask).
     RescaleJob = 11,
-    // Phase 29d-4: client-initiated per-operator rescale request.
+    // Client-initiated per-operator rescale request.
     // Wraps JobManager::request_operator_rescale (which delegates to
     // RescaleCoordinator). The JM responds with RescaleOperatorAck
     // carrying ok + reason; on accept the RescaleCoordinator state
@@ -76,17 +76,17 @@ enum class MessageKind : std::uint8_t {
     // pre-committed transaction (file stage, Kafka tx, SQL PREPARED)
     // finalizes only after this message.
     CommitCheckpoint = 110,
-    // Phase 30c: broadcast to TMs hosting sinks in a commit_group when
+    // Broadcast to TMs hosting sinks in a commit_group when
     // the JM has decided the group cannot commit atomically (any
     // member's pre-commit failed). Sinks implementing 2PC roll back
     // their prepared state: file_2pc deletes staging file, kafka_2pc
     // calls abort_transaction. Mirrors CommitCheckpointMsg's payload
     // shape; the kind byte distinguishes commit-vs-abort intent.
     AbortCheckpoint = 113,
-    // Phase 29d: JM -> TM. Asks the TM hosting old subtasks for an
+    // JM -> TM. Asks the TM hosting old subtasks for an
     // operator to begin the dual-run rescale: finish current barrier
-    // alignment, emit DrainMarker downstream (Phase 29b primitive),
-    // close output channels, signal shutdown via SubtaskFinished.
+    // alignment, emit DrainMarker downstream, close output channels,
+    // signal shutdown via SubtaskFinished.
     // New subtasks are deployed separately via Deploy with key-group
     // ranges sliced from the cutover checkpoint.
     BeginRescale = 114,
@@ -260,9 +260,9 @@ struct RescaleJobAckMsg {
     std::string message;
 };
 
-// Phase 29d-4: client -> JM. Per-operator rescale request. The JM
+// Client -> JM. Per-operator rescale request. The JM
 // delegates to JobManager::request_operator_rescale, which validates
-// new_parallelism against the operator's Phase 29a bounds and
+// new_parallelism against the operator's [min, max] bounds and
 // transitions the operator's RescaleCoordinator state to Preparing
 // on accept. The reply (RescaleOperatorAckMsg) carries the
 // RequestResult.
@@ -494,7 +494,7 @@ struct CommitCheckpointMsg {
     std::uint64_t checkpoint_id{};
 };
 
-// JM → TM. Phase 30c: broadcast when the JM decides a checkpoint
+// JM → TM. Broadcast when the JM decides a checkpoint
 // must abort - one member of a commit_group failed its pre-commit,
 // so every member of the group rolls back. The TM dispatches this
 // to per_job_aborters_, mirroring the CommitCheckpoint path; sinks
@@ -504,16 +504,16 @@ struct AbortCheckpointMsg {
     std::uint64_t checkpoint_id{};
 };
 
-// JM -> TM. Phase 29d: signal the TM hosting one or more old
+// JM -> TM. Signal the TM hosting one or more old
 // subtasks of `op_id` to begin the dual-run rescale. The TM
 // dispatches to per-subtask drain callbacks: each old subtask
 // runner finishes its current barrier alignment, emits a
-// DrainMarker downstream (Phase 29b primitive) announcing
+// DrainMarker downstream announcing
 // `target_parallelism` to consumers, closes its output channels,
 // and signals shutdown via SubtaskFinished. The new-parallelism
 // subtasks are deployed separately via Deploy with key-group
 // ranges sliced from the cutover checkpoint. The JM's
-// RescaleCoordinator (Phase 29c) tracks drained / ready acks and
+// RescaleCoordinator tracks drained / ready acks and
 // completes the rescale when both populations settle.
 struct BeginRescaleMsg {
     JobId job_id{};

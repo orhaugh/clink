@@ -134,7 +134,7 @@ public:
     // IPC streams via merge_snapshot_bytes.
     Snapshot combine_snapshots(std::vector<Snapshot> parts) const override;
 
-    // Phase 27b: stamp (operator, state_type) -> version on every
+    // Stamp (operator, state_type) -> version on every
     // snapshot, recover the same map on restore. The snapshot embeds
     // the packed map in the Arrow IPC schema metadata under
     // "clink.state_versions", so any standard Arrow consumer can see

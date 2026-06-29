@@ -54,16 +54,16 @@ struct OperatorSpec {
     std::string uid;
     std::vector<std::string> inputs;
     std::uint32_t parallelism{1};
-    // Phase 29a: bounds for adaptive rescaling. When both are zero
+    // Bounds for adaptive rescaling. When both are zero
     // (the default), this operator does NOT participate in
     // autoscaling - its parallelism stays at the static value above.
     // When `max_parallelism > parallelism`, the JM's autoscaler
-    // (Phase 29e) may scale this operator up to max_parallelism in
+    // may scale this operator up to max_parallelism in
     // response to backpressure / load signals. When
     // `min_parallelism < parallelism`, it may scale down to
     // min_parallelism. Manual rescale via clink_rescale_job already
-    // works without these bounds; 29a defines the policy surface
-    // that 29d's RescaleCoordinator + 29e's autoscaler consume.
+    // works without these bounds; these bounds define the policy
+    // surface the RescaleCoordinator + autoscaler consume.
     //
     // Invariants (enforced by validate()):
     //   - If either bound is non-zero, both must be non-zero.

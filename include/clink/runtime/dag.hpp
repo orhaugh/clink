@@ -313,7 +313,7 @@ public:
             Emitter<T> emitter(channel.get());
             emitter.set_operator_id(id.value());
             emitter.set_metrics_registry(ctx.metrics());
-            // Phase 26a: stamp the job-global checkpoint mode onto
+            // Stamp the job-global checkpoint mode onto
             // every barrier the source emits. Sources stay
             // mode-agnostic; the runner translates
             // JobConfig.unaligned_checkpoints into the wire stamp.
@@ -518,7 +518,7 @@ public:
             Emitter<Out> emitter(out_channel.get());
             emitter.set_operator_id(id.value());
             emitter.set_metrics_registry(ctx.metrics());
-            // Phase 26b: if this operator carries a per-operator mode
+            // If this operator carries a per-operator mode
             // override, stamp every emitted barrier with it. Source
             // operators have already stamped from JobConfig in their
             // dedicated runner; for regular operators the override
@@ -1298,7 +1298,7 @@ public:
             // *destination* operator (the one with state) - union has
             // no state itself, so its job is just to let the barrier
             // overtake.
-            // Phase 26a: per-barrier mode. The aligner reads each
+            // Per-barrier mode. The aligner reads each
             // barrier's stamped mode rather than capturing the
             // job-global flag at startup; the coordinator stamps mode
             // when issuing the barrier (defaults derive from
@@ -1875,7 +1875,7 @@ public:
                       late_policy,
                       id](RuntimeContext& ctx, const std::function<bool()>& should_stop) {
             using namespace std::chrono_literals;
-            // Phase 26a: aligner reads each barrier's stamped mode;
+            // Aligner reads each barrier's stamped mode;
             // can_unalign now gates only the in-flight CAPTURE step
             // (we still need codecs + state backend to serialize the
             // in-flight buffer). If a barrier arrives stamped
@@ -3328,7 +3328,7 @@ public:
                 }
                 source->open();
                 Emitter<T> typed_emitter(emitter.get());
-                // Phase 26a: same source-side stamping as the
+                // Same source-side stamping as the
                 // single-subtask path. Sources emit mode-agnostic
                 // barriers; the runner stamps from JobConfig.
                 typed_emitter.set_default_barrier_mode(ctx.barrier_mode_override().value_or(
@@ -3350,7 +3350,7 @@ public:
                 bool drained = false;
                 while (!should_stop() && source->produce(typed_emitter)) {
                     drain_pending_barriers();
-                    // Phase 29d-3: rescale-driven drain. The TM's
+                    // Rescale-driven drain. The TM's
                     // BeginRescale dispatch sets ctx.drain_target() to
                     // the rescale's target_parallelism via the
                     // JobConfig-threaded shared atomic; here the

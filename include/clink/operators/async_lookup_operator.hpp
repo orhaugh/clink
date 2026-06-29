@@ -2,7 +2,7 @@
 
 // AsyncLookupOperator<In, Out>
 //
-// Phase 28b - coroutine-shaped analogue of AsyncMapOperator. Where
+// Coroutine-shaped analogue of AsyncMapOperator. Where
 // AsyncMapOperator takes `std::function<Out(const In&)>` and runs it
 // on a worker-thread pool, AsyncLookupOperator takes
 // `std::function<async::Task<Out>(const In&)>` and drives the
@@ -15,13 +15,13 @@
 // Why not just reuse AsyncMapOperator? Two practical wins:
 //   1. No worker threads. A lookup that mostly waits for I/O
 //      shouldn't pin a thread; with a coroutine + io_uring/HTTP-pool
-//      (28d/e) the operator scales to 1000s of concurrent lookups
+//      the operator scales to 1000s of concurrent lookups
 //      on one thread.
 //   2. Natural composition. `co_await another_lookup()` is just
 //      another awaitable; cascading async work doesn't need
 //      `then()`-style continuation chaining.
 //
-// Scheduling model for 28b:
+// Scheduling model:
 //   - process(data): for each record, kick off lookup_fn(record),
 //     get back a Task<Out>, resume() once. If the task completes in
 //     a single step (synchronous lookup), the result is captured
@@ -35,7 +35,7 @@
 //     synchronous-completing tasks this is immediate; for tasks
 //     suspended on real I/O, this currently spin-waits with a
 //     short sleep + resume() to let the user's awaitable advance.
-//     A proper async-aware barrier is part of 28e.
+//     A proper async-aware barrier is a follow-on.
 //   - max_in_flight: process() blocks once max_in_flight tasks are
 //     queued so a slow lookup naturally throttles upstream.
 //
@@ -198,7 +198,7 @@ private:
         b.emplace(slot.task.get());
         out.emit_data(std::move(b));
         ++emitted_count_;
-        // Phase 30d (metrics-coverage pass): every completed slot
+        // Metrics-coverage pass: every completed slot
         // counts as one async-lookup completion. The hit/miss
         // distinction lives in the user-supplied LookupFn (the
         // operator can't tell - Out is opaque); user code can

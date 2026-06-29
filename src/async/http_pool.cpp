@@ -1,4 +1,4 @@
-// Phase 28e-3: HttpPool implementation.
+// HttpPool implementation.
 
 #include "clink/async/http_pool.hpp"
 

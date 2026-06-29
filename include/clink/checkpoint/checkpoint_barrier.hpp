@@ -16,12 +16,12 @@ namespace clink {
 // on receipt). The interface is designed so multi-input alignment can be added
 // without changing call sites.
 //
-// Phase 26a: each barrier carries its own alignment Mode. The
+// Each barrier carries its own alignment Mode. The
 // CheckpointCoordinator stamps the mode when issuing a barrier; downstream
 // operators honour the stamped mode rather than capturing a job-global
 // config flag at startup. This is what lets one checkpoint go aligned and
 // the next go unaligned over the same wire, and is the substrate for the
-// adaptive-per-operator policy in 26c.
+// adaptive-per-operator policy.
 class CheckpointBarrier {
 public:
     // Alignment policy stamped on the barrier by the coordinator.

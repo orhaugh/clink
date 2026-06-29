@@ -1,6 +1,6 @@
-// Phase 29e: PidController unit tests.
+// PidController unit tests.
 //
-// The autoscaler (29c+e wiring) feeds queue-depth / saturation samples
+// The autoscaler feeds queue-depth / saturation samples
 // to a PidController; the controller's clamped output maps onto
 // per-checkpoint scaling deltas. These tests pin the math + edge
 // cases (saturation, anti-windup, reset, dt=0 safety) without

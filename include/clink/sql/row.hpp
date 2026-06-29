@@ -18,16 +18,16 @@
 // clink::sql::Row - a dynamic-schema row carrying multiple typed
 // values on the per-record wire.
 //
-// Phase 3.2 takes the pragmatic route: each row is a JSON object
+// We take the pragmatic route: each row is a JSON object
 // (column name -> value). Serialization is plain UTF-8 JSON bytes,
-// which has 3 properties we want for Phase 3:
+// which has 3 properties we want:
 //
 //   1. Debuggable: messages are human-readable in transit.
 //   2. No new ABI: rides the existing per-record Codec<T> wire path.
 //   3. Schema-decoupled: the codec doesn't need to know the table
 //      schema at construction time, so wire-side code stays generic.
 //
-// Phase 10 (perf) will likely swap this for an Arrow-RecordBatch-
+// A later perf pass will likely swap this for an Arrow-RecordBatch-
 // batched wire path, but the Row value type stays - the Codec<Row>
 // just learns an alternate encoding.
 

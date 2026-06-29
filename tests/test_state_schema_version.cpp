@@ -1,6 +1,6 @@
 // Unit tests for state schema versioning + migration registry.
 //
-// The registry is the foundation for Phase 27 (state schema evolution):
+// The registry is the foundation for state schema evolution:
 // users declare a SchemaVersionTrait<T> bump on a breaking shape
 // change, register a migration function from the old version to the
 // new one, and the engine composes single-step migrations into chains
@@ -372,7 +372,7 @@ TEST(StateVersionMap, InMemoryBackendSnapshotRoundTripsVersions) {
 }
 
 TEST(StateVersionMap, RestoreFromUnversionedSnapshotLeavesMapEmpty) {
-    // Default (no versions stamped) - simulates a pre-Phase-27b
+    // Default (no versions stamped) - simulates an unversioned
     // snapshot. Restore should succeed and leave the version map empty
     // so the caller falls back to the SchemaVersionTrait default.
     auto original = std::make_shared<clink::InMemoryStateBackend>();
@@ -412,7 +412,7 @@ TEST(StateVersionMap, EntriesAreSorted) {
     EXPECT_EQ(entries[2].state_type, "B");
 }
 
-// --- Phase 27d: Arrow auto-migration --------------------------------
+// --- Arrow auto-migration -------------------------------------------
 
 namespace {
 
@@ -610,7 +610,7 @@ TEST(StateSchemaArrowMigration, ExplicitMigrationWinsOverAutoMigration) {
     EXPECT_TRUE(explicit_called) << "explicit fn must be preferred over auto-migration";
 }
 
-// --- Phase 27 integration: stamp drives a real value migration -----
+// --- Integration: stamp drives a real value migration --------------
 //
 // The pieces above are tested in isolation (registry migrate; version
 // stamps round-tripping a snapshot). This stitches them into the flow

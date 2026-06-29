@@ -96,7 +96,7 @@ ast::Expression translate_a_const(const JsonValue& body) {
     // PG's A_Const carries the literal under a typed wrapper:
     //   {"ival": {"ival": 42}}      integer
     //   {"sval": {"sval": "hi"}}    string
-    //   {"fval": {"fval": "1.5"}}   numeric (we reject these in Phase 1)
+    //   {"fval": {"fval": "1.5"}}   numeric
     //   {"boolval": {"boolval": t}} bool
     //   {"isnull": true}            null
     if (body.contains("isnull") && body.at("isnull").is_bool() && body.at("isnull").as_bool()) {
@@ -241,10 +241,10 @@ ast::Expression translate_a_expr(const JsonValue& body) {
         }
         return ast::Expression{std::move(fc)};
     }
-    // Phase 19a: IN literal list. PG emits A_Expr{kind=AEXPR_IN,
+    // IN literal list. PG emits A_Expr{kind=AEXPR_IN,
     // name=["="]} for IN and name=["<>"] for NOT IN. rexpr is a List
     // of A_Const literals (subquery forms come through as SubLink
-    // and are deferred to a later phase). Lower to a FunctionCall
+    // and are handled separately). Lower to a FunctionCall
     // 'in' so the binder can route through lower_predicate; NOT IN
     // wraps in NotOp.
     if (kind_str == "AEXPR_IN") {
@@ -272,7 +272,7 @@ ast::Expression translate_a_expr(const JsonValue& body) {
         }
         return ast::Expression{std::move(fc)};
     }
-    // Phase 15: NULLIF(a, b) arrives as A_Expr{kind=AEXPR_NULLIF}.
+    // NULLIF(a, b) arrives as A_Expr{kind=AEXPR_NULLIF}.
     // Lower to a synthetic 2-arg FunctionCall("nullif") so the binder
     // routes it through lower_value_expr like any other function.
     if (kind_str == "AEXPR_NULLIF") {
@@ -340,7 +340,7 @@ ast::Expression translate_func_call(const JsonValue& body) {
     fc->loc = loc;
     // PG normalises function names; take the last component as the
     // unqualified identifier. Schema-qualified function refs
-    // (pg_catalog.upper) aren't differentiated in Phase 3.
+    // (pg_catalog.upper) aren't differentiated.
     const auto& names = body.at("funcname").as_array();
     fc->name = string_atom(names.back());
     for (auto& c : fc->name)
@@ -362,7 +362,7 @@ ast::Expression translate_func_call(const JsonValue& body) {
         !body.at("agg_order").as_array().empty()) {
         unsupported("aggregate ORDER BY (e.g. array_agg(x ORDER BY y)) is not supported", loc.pos);
     }
-    // Phase 21b: OVER (...) makes this a windowed function call.
+    // OVER (...) makes this a windowed function call.
     // The WindowDef body is a statically-typed PG field (no node
     // wrapper). frameOptions carries PG's frame-spec encoding which
     // we ignore for ROW_NUMBER (frame is irrelevant for ranking).
@@ -609,7 +609,7 @@ ast::Expression translate_null_test(const JsonValue& body) {
     return ast::Expression{std::move(n)};
 }
 
-// Phase 12: CASE WHEN <expr> THEN <expr> [...] [ELSE <expr>] END.
+// CASE WHEN <expr> THEN <expr> [...] [ELSE <expr>] END.
 // PG body: { "args": [ {"CaseWhen": {"expr": ..., "result": ...}}, ...],
 //            "defresult": <Expression-wrapper or absent> }
 // Simple-CASE form (CASE <expr> WHEN <val> THEN ...) sets PG's "arg"
@@ -865,7 +865,7 @@ ast::Expression translate_expression(const JsonValue& wrapper) {
     if (kind == "CaseExpr") {
         return translate_case_expr(*body);
     }
-    // Phase 15: GREATEST(...) / LEAST(...) arrive as MinMaxExpr with
+    // GREATEST(...) / LEAST(...) arrive as MinMaxExpr with
     // op = IS_GREATEST | IS_LEAST. Lower to a variadic FunctionCall.
     if (kind == "MinMaxExpr") {
         auto fc = std::make_unique<ast::FunctionCall>();
@@ -914,7 +914,7 @@ ast::TableRef translate_range_var(const JsonValue& body) {
     return ref;
 }
 
-// --- FROM-item translation (Phase 5: JOIN support) -----------------
+// --- FROM-item translation (JOIN support) --------------------------
 
 ast::FromItem translate_from_item(const JsonValue& wrapper) {
     auto [kind, body] = node_wrapper(wrapper);
@@ -950,7 +950,7 @@ ast::FromItem translate_from_item(const JsonValue& wrapper) {
         return ast::FromItem{std::move(join)};
     }
     if (kind == "RangeSubselect") {
-        // Phase 20: FROM (SELECT ...) AS alias. PG requires an alias
+        // FROM (SELECT ...) AS alias. PG requires an alias
         // and we surface a friendly error if it's missing.
         auto loc = loc_from(*body);
         auto sq = std::make_unique<ast::SubqueryItem>();
@@ -987,7 +987,7 @@ ast::TypeName translate_type_name(const JsonValue& body) {
     // PG encodes types as [schema, name] or just [name]. The last
     // entry is always the type identifier; everything before it is
     // the namespace path. We collapse to (schema, name) since clink
-    // doesn't model multi-level type namespaces in Phase 1.
+    // doesn't model multi-level type namespaces.
     if (names.size() == 1) {
         type.name = string_atom(names[0]);
     } else if (names.size() == 2) {
@@ -1052,7 +1052,7 @@ ast::StorageOption translate_storage_option(const JsonValue& def_elem_body) {
     if (!def_elem_body.contains("arg")) {
         unsupported("CREATE TABLE storage option requires a value", opt.loc.pos);
     }
-    // Phase 1 scope: only string values are supported (every Kafka /
+    // Only string values are supported (every Kafka /
     // file-sink / Parquet config knob is string-typed at the wire).
     opt.value = string_atom(def_elem_body.at("arg"));
     return opt;
@@ -1077,7 +1077,7 @@ ast::SelectStmt translate_select_stmt(const JsonValue& body) {
     ast::SelectStmt stmt;
     stmt.loc = loc_from(body);
 
-    // Phase 16: WITH clause. PG emits withClause = {recursive, ctes}.
+    // WITH clause. PG emits withClause = {recursive, ctes}.
     // RECURSIVE is rejected; each CTE has ctename (string) and
     // ctequery (a SelectStmt). The CTE bodies are translated as full
     // SelectStmts up-front so the binder can pre-bind them.
@@ -1113,7 +1113,7 @@ ast::SelectStmt translate_select_stmt(const JsonValue& body) {
         }
     }
 
-    // Phase 13: set-op SELECT (UNION / INTERSECT / EXCEPT). PG marks
+    // Set-op SELECT (UNION / INTERSECT / EXCEPT). PG marks
     // the outer SelectStmt with op != "SETOP_NONE" and emits the
     // branches under bare larg/rarg fields (no node wrapper because
     // they're statically-typed SelectStmt fields).
@@ -1159,7 +1159,7 @@ ast::SelectStmt translate_select_stmt(const JsonValue& body) {
             stmt.from_items.push_back(translate_from_item(wrapper));
             // Also populate from_clause for the simple single-table
             // path that the binder still uses when from_items has
-            // no joins. Mirrors existing Phase 1-4 access patterns.
+            // no joins. Mirrors the existing single-table access patterns.
             if (std::holds_alternative<ast::TableRef>(stmt.from_items.back())) {
                 stmt.from_clause.push_back(std::get<ast::TableRef>(stmt.from_items.back()));
             }
@@ -1176,7 +1176,7 @@ ast::SelectStmt translate_select_stmt(const JsonValue& body) {
     if (body.contains("havingClause") && !body.at("havingClause").is_null()) {
         stmt.having_clause = translate_expression(body.at("havingClause"));
     }
-    // Phase 17: ORDER BY. Each entry is a SortBy node carrying a
+    // ORDER BY. Each entry is a SortBy node carrying a
     // sort expression and direction. sortby_dir is one of
     // SORTBY_ASC / SORTBY_DESC / SORTBY_DEFAULT (treated as ASC).
     // The binder validates that the sort expr is a column ref.
@@ -1205,7 +1205,7 @@ ast::SelectStmt translate_select_stmt(const JsonValue& body) {
         }
     }
 
-    // Phase 11: LIMIT n. PG sends limitCount as a wrapped A_Const
+    // LIMIT n. PG sends limitCount as a wrapped A_Const
     // (or ParamRef). We support integer literals only - bind expr
     // LIMITs and parameterised LIMITs aren't streamable today.
     if (body.contains("limitCount") && !body.at("limitCount").is_null()) {
@@ -1235,7 +1235,7 @@ ast::SelectStmt translate_select_stmt(const JsonValue& body) {
         }
         stmt.limit_count = value;
     }
-    // Phase 19b: OFFSET n. Same A_Const integer-literal shape as
+    // OFFSET n. Same A_Const integer-literal shape as
     // LIMIT. Expression / ParamRef offsets are rejected for the same
     // streaming-safety reason.
     if (body.contains("limitOffset") && !body.at("limitOffset").is_null()) {
@@ -1262,7 +1262,7 @@ ast::SelectStmt translate_select_stmt(const JsonValue& body) {
         }
         stmt.offset_count = value;
     }
-    // Phase 10: PG emits a non-empty distinctClause array for any
+    // PG emits a non-empty distinctClause array for any
     // DISTINCT form. SELECT DISTINCT ON (...) sends column refs in
     // that array; we only support plain SELECT DISTINCT for now.
     if (body.contains("distinctClause") && body.at("distinctClause").is_array() &&
@@ -1295,7 +1295,7 @@ ast::CreateTableStmt translate_create_stmt(const JsonValue& body) {
         for (const auto& wrapper : body.at("tableElts").as_array()) {
             auto [kind, inner] = node_wrapper(wrapper);
             if (kind != "ColumnDef") {
-                // Constraints / indexes etc. come in later phases.
+                // Constraints / indexes etc. are not yet supported.
                 unsupported("table element kind " + kind, stmt.loc.pos);
             }
             stmt.columns.push_back(translate_column_def(*inner));
@@ -1322,7 +1322,7 @@ ast::InsertStmt translate_insert_stmt(const JsonValue& body) {
     // relation is a statically-typed RangeVar field; no node wrapper.
     stmt.target = translate_range_var(body.at("relation"));
     if (!body.contains("selectStmt") || !body.at("selectStmt").is_object()) {
-        // INSERT VALUES (without SELECT) is rejected in Phase 1; the
+        // INSERT VALUES (without SELECT) is rejected; the
         // streaming case is INSERT INTO sink SELECT FROM source.
         unsupported("INSERT requires a SELECT source", stmt.loc.pos);
     }
@@ -1331,7 +1331,7 @@ ast::InsertStmt translate_insert_stmt(const JsonValue& body) {
         unsupported("INSERT selectStmt kind " + sel_kind, stmt.loc.pos);
     }
     stmt.select = translate_select_stmt(*sel_body);
-    // Phase 19d: optional column list. PG emits cols as an array of
+    // Optional column list. PG emits cols as an array of
     // ResTarget nodes whose `name` field carries the target column
     // name. (PG also allows multi-part names for nested fields; we
     // accept simple identifiers only.)
@@ -1359,9 +1359,8 @@ ast::DropTableStmt translate_drop_stmt(const JsonValue& body) {
         unsupported("DropStmt missing removeType", stmt.loc.pos);
     }
     if (body.at("removeType").as_string() != "OBJECT_TABLE") {
-        unsupported(
-            "only DROP TABLE is supported in Phase 2; got " + body.at("removeType").as_string(),
-            stmt.loc.pos);
+        unsupported("only DROP TABLE is supported; got " + body.at("removeType").as_string(),
+                    stmt.loc.pos);
     }
     if (body.contains("missing_ok") && body.at("missing_ok").is_bool()) {
         stmt.if_exists = body.at("missing_ok").as_bool();

@@ -178,7 +178,7 @@ struct RunnerContext {
     using CommitCheckpointFn = std::function<void(std::uint64_t /*checkpoint_id*/)>;
     std::function<void(std::vector<CommitCheckpointFn>)> register_commit_callbacks;
 
-    // Phase 30c: abort callbacks. Sink subtasks that pre-commit on a
+    // Abort callbacks. Sink subtasks that pre-commit on a
     // CheckpointBarrier register a paired abort callback here; the TM
     // dispatches it on AbortCheckpoint so the sink can roll back its
     // prepared state (file_2pc removes staging file, kafka_2pc calls
@@ -186,7 +186,7 @@ struct RunnerContext {
     using AbortCheckpointFn = std::function<void(std::uint64_t /*checkpoint_id*/)>;
     std::function<void(std::vector<AbortCheckpointFn>)> register_abort_callbacks;
 
-    // Phase 29d-2: drain callbacks. Subtask runners that participate in
+    // Drain callbacks. Subtask runners that participate in
     // adaptive rescaling register one or more callbacks here. The TM
     // dispatches them on BeginRescale arriving for the operator this
     // subtask belongs to: the callback runs the drain choreography

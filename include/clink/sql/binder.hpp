@@ -13,7 +13,7 @@
 
 // Binder: ast::Statement + Catalog -> LogicalPlan.
 //
-// Phase 1 responsibilities:
+// Responsibilities:
 //   * Resolve table names in FROM clauses against the catalog
 //   * Resolve column names in SELECT against the source table's schema
 //   * Build a Scan -> Project -> Sink tree for INSERT INTO SELECT
@@ -43,7 +43,7 @@ public:
 private:
     // Construct a plan node for the given table name. When a CTE in
     // the current bind scope matches, that CTE's pre-bound plan is
-    // moved out (each CTE is at-most-once in Phase 16). Otherwise a
+    // moved out (each CTE is at-most-once). Otherwise a
     // plain LogicalScan against `resolved` is returned.
     std::unique_ptr<LogicalPlan> make_table_plan(const std::string& table_name,
                                                  const TableDef& resolved,
@@ -147,15 +147,15 @@ private:
     BoundRel bind_base_table_rel(const ast::TableRef& ref) const;
 
     const Catalog& catalog_;
-    // Phase 16: WITH clause. Synthetic TableDefs serve column
+    // WITH clause. Synthetic TableDefs serve column
     // resolution for CTE references inside the outer SELECT; matching
     // entries in cte_plans_ are consumed (moved) at the point where a
     // LogicalScan would otherwise be created. Each CTE is at-most-once
-    // in Phase 16 v1 (no plan-tree deep copy yet); the binder errors
+    // (no plan-tree deep copy yet); the binder errors
     // on a second reference.
     mutable std::unordered_map<std::string, TableDef> cte_synth_tables_;
     mutable std::unordered_map<std::string, std::unique_ptr<LogicalPlan>> cte_plans_;
-    // Phase 21c: set when the outer WHERE was consumed by the
+    // Set when the outer WHERE was consumed by the
     // ROW_NUMBER pattern matcher; the regular projection path skips
     // the WHERE so the predicate doesn't get reapplied to the
     // already-bounded LogicalTopNPerKey output.

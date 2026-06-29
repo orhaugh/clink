@@ -373,7 +373,7 @@ TEST(AsyncKeyedProcessFunction, EventTimeTimerFiresInEpochRelease) {
 TEST(AsyncKeyedProcessFunction, CheckpointRestoreStateAndTimers) {
     const OperatorId op_id{5};
 
-    // Phase 1: ingest (sum=1 for key 1) and leave a pending event-time timer at
+    // Ingest (sum=1 for key 1) and leave a pending event-time timer at
     // 1000 (no firing watermark yet), then checkpoint state + timers.
     auto backend1 = std::make_shared<InMemoryStateBackend>();
     Snapshot snap;
@@ -391,7 +391,7 @@ TEST(AsyncKeyedProcessFunction, CheckpointRestoreStateAndTimers) {
         EXPECT_EQ(drain_data(ch), (std::vector<std::int64_t>{1}));
     }
 
-    // Phase 2: a fresh adapter+fn+backend restores, then a watermark past 1000
+    // A fresh adapter+fn+backend restores, then a watermark past 1000
     // re-fires the restored timer, observing the restored sum (1 + 100 = 101).
     auto backend2 = std::make_shared<InMemoryStateBackend>();
     backend2->restore(snap);

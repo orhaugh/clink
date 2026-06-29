@@ -228,7 +228,7 @@ private:
 // Unaligned-checkpoint state machine + end-to-end
 // ---------------------------------------------------------------------------
 
-// Phase 26a: mode is carried on the barrier itself. Tests below stamp
+// Mode is carried on the barrier itself. Tests below stamp
 // each barrier with its desired Mode; the aligner reads mode from the
 // barrier on first delivery for a given checkpoint id.
 TEST(MultiInputAlignment, UnalignedModeForwardsFirstBarrierImmediately) {
@@ -271,7 +271,7 @@ TEST(MultiInputAlignment, AlignedAndUnalignedModesAreIndependentPerBarrier) {
 }
 
 TEST(MultiInputAlignment, SameAlignerHandlesAlignedThenUnalignedAcrossCheckpoints) {
-    // Phase 26a: one aligner can serve checkpoint 1 in aligned mode
+    // One aligner can serve checkpoint 1 in aligned mode
     // and checkpoint 2 in unaligned mode; mode is per-checkpoint, not
     // per-aligner. The coordinator decides each checkpoint's mode.
     MultiInputAlignment a(2);
@@ -295,7 +295,7 @@ TEST(MultiInputAlignment, SameAlignerHandlesAlignedThenUnalignedAcrossCheckpoint
 }
 
 TEST(DagUnion, PerOperatorOverrideForcesAlignedDespiteUnalignedJobConfig) {
-    // Phase 26b: even when JobConfig.unaligned_checkpoints=true (so
+    // Even when JobConfig.unaligned_checkpoints=true (so
     // source-stamped barriers carry Mode::Unaligned), a per-operator
     // override at the union operator stamps Aligned on the way in,
     // and the aligner pins Aligned for the checkpoint. The slow B
@@ -359,7 +359,7 @@ TEST(DagUnion, PerOperatorOverrideForcesAlignedDespiteUnalignedJobConfig) {
     exec.await_termination();
 }
 
-// Phase 26d: pending_inputs_for tells stateful multi-input operators
+// pending_inputs_for tells stateful multi-input operators
 // which input channels still need draining when a barrier goes
 // unaligned. Foundation for generic in-flight capture beyond the
 // bespoke interval-join logic.

@@ -262,7 +262,7 @@ TEST(Cep, KeyedRoutingIsolatesPerKeyPartials) {
 }
 
 TEST(Cep, RestoreFromSnapshotResumesInflightPartial) {
-    // Phase 1: feed only the "start" event, snapshot, stop.
+    // Stage 1: feed only the "start" event, snapshot, stop.
     auto backend = std::make_shared<InMemoryStateBackend>();
     Snapshot snap;
     {
@@ -299,7 +299,7 @@ TEST(Cep, RestoreFromSnapshotResumesInflightPartial) {
         snap = backend->snapshot(CheckpointId{1});
     }
 
-    // Phase 2: fresh backend restored from the snapshot. Feed only the
+    // Stage 2: fresh backend restored from the snapshot. Feed only the
     // "end" event - the restored partial should complete and emit.
     {
         auto fresh = std::make_shared<InMemoryStateBackend>();

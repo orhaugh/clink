@@ -10,16 +10,16 @@
 
 // Logical relational algebra for clink SQL.
 //
-// Phase 1 nodes: Scan, Project, Sink.
+// Core nodes: Scan, Project, Sink.
 //
 //   LogicalScan(table_def)
 //       Reads rows from a catalog-registered table. Output schema is
 //       derived directly from the TableDef's column list.
 //
 //   LogicalProject(input, column_indices, output_names)
-//       Phase 1 is column-list projection only: each output column
-//       references one input column by index. Expression projection
-//       (a+b, fn(x), etc.) lands in Phase 3.
+//       Column-list projection only: each output column references one
+//       input column by index. Expression projection (a+b, fn(x), etc.)
+//       lands later.
 //
 //   LogicalSink(input, sink_table_def)
 //       Writes the input stream to a catalog-registered sink table.
@@ -99,7 +99,7 @@ private:
     std::string predicate_json_;
 };
 
-// Phase 28c-frontend: async lookup / enrichment map. Lowered from a
+// Async lookup / enrichment map. Lowered from a
 // SELECT whose sole projection is a registered async function applied
 // to the row (`SELECT enrich(*) FROM t`). The runtime emits an
 // async_lookup_row operator that drives the registered
@@ -127,7 +127,7 @@ private:
     std::shared_ptr<arrow::Schema> schema_;
 };
 
-// Phase 3.3: each output column is described by (name, expression
+// Each output column is described by (name, expression
 // JSON text, inferred Arrow type). For pure column-ref outputs the
 // expression is {"col": "name"}; computed outputs hold a richer
 // expression tree the runtime evaluates via
@@ -156,7 +156,7 @@ private:
     std::shared_ptr<arrow::Schema> schema_;
 };
 
-// Phase 4: windowed aggregation.
+// Windowed aggregation.
 //
 // Window kinds and their parameters (all expressed in milliseconds):
 //   TUMBLE(ts, size)        fixed non-overlapping windows
@@ -190,11 +190,11 @@ struct AggregateOutput {
     double percentile = 0.0;  // fraction for PERCENTILE / APPROX_PERCENTILE
 };
 
-// Phase 8: unbounded GROUP BY (no window TVF). Each input record
+// Unbounded GROUP BY (no window TVF). Each input record
 // updates the running per-group aggregate; the runtime emits one
 // Row per input carrying the latest finalised aggregate values.
 // Downstream upsert-aware sinks dedupe by the group columns; an
-// explicit retract/changelog wire is Phase 8 follow-up work.
+// explicit retract/changelog wire is follow-up work.
 class LogicalAggregate final : public LogicalPlan {
 public:
     LogicalAggregate(std::unique_ptr<LogicalPlan> input,
@@ -383,7 +383,7 @@ private:
 // finite, so its null-pad at eviction is final (no retraction).
 enum class JoinType : std::uint8_t { Inner, LeftOuter, RightOuter, FullOuter };
 
-// Phase 5: stream-stream interval join. The condition pattern this
+// Stream-stream interval join. The condition pattern this
 // node represents:
 //
 //   a JOIN b ON a.<left_key> = b.<right_key>
@@ -450,7 +450,7 @@ private:
 // `WHERE rn <= N` filter and how the runtime evicts on displacement.
 enum class RankKind { RowNumber, Rank, DenseRank };
 
-// Phase 21c: TOP-N-per-partition, the recognised target shape of
+// TOP-N-per-partition, the recognised target shape of
 // `SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY p
 // ORDER BY o) AS rn FROM t) WHERE rn <= N`. The binder rewrites
 // the LogicalRowNumber + outer WHERE pattern into this node.
@@ -500,14 +500,14 @@ private:
     RankKind rank_kind_;
 };
 
-// Phase 21b: window function projection. Carries the bound inner
+// Window function projection. Carries the bound inner
 // plan plus the partition / sort spec extracted from
 // `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)`. Its output
 // schema is the input's schema with a synthetic BIGINT column
 // (`output_name`, conventionally `rn`) appended. By itself this
 // node is not a viable runtime shape - emitting ROW_NUMBER over
 // an unbounded stream needs unbounded state and isn't meaningful.
-// Phase 21c's pattern matcher pairs it with a `WHERE rn <= N`
+// The pattern matcher pairs it with a `WHERE rn <= N`
 // outer filter and rewrites the combination into a bounded
 // LogicalTopNPerKey; everything else is rejected at planning time.
 class LogicalRowNumber final : public LogicalPlan {
@@ -533,7 +533,7 @@ public:
     [[nodiscard]] const std::string& output_name() const noexcept { return output_name_; }
     [[nodiscard]] RankKind rank_kind() const noexcept { return rank_kind_; }
 
-    // Phase 21c: the pattern matcher rewrites this node into a
+    // The pattern matcher rewrites this node into a
     // LogicalTopNPerKey by stealing the inner plan. The owning
     // wrapper is then dropped.
     std::unique_ptr<LogicalPlan> release_input() { return std::move(input_); }
@@ -552,7 +552,7 @@ private:
     std::shared_ptr<arrow::Schema> schema_;
 };
 
-// Phase 18: stream-stream INNER equi-join.
+// Stream-stream INNER equi-join.
 //
 //   a JOIN b ON a.<left_key> = b.<right_key>
 //
@@ -659,7 +659,7 @@ private:
     std::shared_ptr<arrow::Schema> schema_;
 };
 
-// Phase 10: SELECT DISTINCT dedupe.
+// SELECT DISTINCT dedupe.
 //
 // Pass-through schema; the runtime maintains a per-key seen-set
 // and emits each unique output Row at most once. State is unbounded
@@ -681,7 +681,7 @@ private:
     std::unique_ptr<LogicalPlan> input_;
 };
 
-// Phase 13: UNION ALL. Two children with structurally-identical
+// UNION ALL. Two children with structurally-identical
 // schemas; the runtime merges records from both sides into one
 // stream. Schema is taken from the left input - the binder validates
 // the right matches column-by-column.
@@ -738,7 +738,7 @@ private:
     bool all_;
 };
 
-// Phase 17: TOP-N (ORDER BY + LIMIT). Pass-through schema; the
+// TOP-N (ORDER BY + LIMIT). Pass-through schema; the
 // runtime maintains a bounded heap of size `count` keyed by the
 // sort columns and emits the top-n at end-of-stream. ORDER BY
 // without LIMIT is rejected at the binder.
@@ -775,7 +775,7 @@ private:
     std::int64_t offset_;
 };
 
-// Phase 11: LIMIT n. Pass-through schema; the runtime drops every
+// LIMIT n. Pass-through schema; the runtime drops every
 // record after the n-th. Local to each subtask: at parallelism > 1
 // the wire emits up to n records per subtask, so author SQL with
 // LIMIT against a single-source pipeline if global semantics matter.

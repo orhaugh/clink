@@ -4,8 +4,7 @@
 
 #include "clink/sql/logical_plan.hpp"
 
-// Rule-based optimizer. Phase 6 ships with one user-visible
-// optimisation:
+// Rule-based optimizer. Ships with one user-visible optimisation:
 //
 //   Projection pushdown - walk the plan top-down, collect the union of
 //   columns each upstream consumer references, and annotate the source

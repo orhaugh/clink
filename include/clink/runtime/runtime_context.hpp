@@ -215,7 +215,7 @@ public:
         return restore_kg_range_.covers_all();
     }
 
-    // Phase 29d-3: drain-target signal. The shared atomic (if set
+    // Drain-target signal. The shared atomic (if set
     // by the executor at startup) is the rendezvous between the
     // cluster's BeginRescale dispatch and the source runner: the
     // TM's drain callback sets the atomic to target_parallelism;
@@ -232,7 +232,7 @@ public:
         return drain_target_->load(std::memory_order_acquire);
     }
 
-    // Phase 26b: per-operator alignment mode override. When set, the
+    // Per-operator alignment mode override. When set, the
     // operator's runner stamps every barrier passing through with
     // this mode before the aligner pins it; the override propagates
     // to downstream operators via the forwarded barrier. Nullopt

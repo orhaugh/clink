@@ -512,7 +512,7 @@ TEST(SqlPhysical, PubSubConnectorSinkLowersToPublishSink) {
 
 // M4: connector='postgres' SINK lowers to postgres_sink (string channel) via the
 // row_to_json_string bridge, carrying the on_conflict knob; columns derive from
-// the declared schema (no columns= needed). The "Phase 3" rejection is gone.
+// the declared schema (no columns= needed). The old rejection is gone.
 TEST(SqlPhysical, PostgresConnectorSinkLowers) {
     Catalog cat;
     auto s = parse(
@@ -809,7 +809,7 @@ TEST(SqlPhysical, JsonRoundTripPreservesSpec) {
 }
 
 TEST(SqlPhysical, ChannelMismatchSourceRowSinkStringRejected) {
-    // Phase 3.2: source and sink must agree on the channel. A Row
+    // Source and sink must agree on the channel. A Row
     // source (multi-column + format='json') feeding a string sink
     // (single TEXT, no format) is rejected at compile time.
     Catalog cat;
@@ -1039,7 +1039,7 @@ TEST(SqlPhysical, S3TextSinkMaps) {
 }
 
 // M4: the postgres sink is now implemented, so a postgres sink table lowers to
-// postgres_sink instead of the old "Phase 3" rejection. (The multi-column JSON
+// postgres_sink instead of the old rejection. (The multi-column JSON
 // path is covered by PostgresConnectorSinkLowers; this is the string-channel
 // lowering.)
 TEST(SqlPhysical, PostgresSinkLowersToPostgresSink) {
@@ -1158,7 +1158,7 @@ TEST(SqlPhysical, GroupByTumbleEmitsTumblingWindowRow) {
     EXPECT_NE(agg->params.at("aggregates").find("\"name\":\"total\""), std::string::npos);
 
     // chain: source -> assign_timestamps -> row_compute_key -> window -> sink
-    // (Phase 7 inserts the keyer for par > 1 hash routing.)
+    // (the keyer is inserted for par > 1 hash routing.)
     const auto* keyer = find_op(spec, "row_compute_key");
     ASSERT_NE(keyer, nullptr);
     EXPECT_EQ(keyer->inputs[0], ts->id);
@@ -1855,7 +1855,7 @@ TEST(SqlPhysical, FileExactlyOnceSinkSelected) {
 }
 
 TEST(SqlPhysical, CommitGroupThreadsThroughToSinkParams) {
-    // Phase 30a: commit_group property on the table flows through the
+    // commit_group property on the table flows through the
     // physical planner into OperatorSpec.params, where sink factories
     // pick it up and call set_commit_group on the constructed sink.
     Catalog cat;

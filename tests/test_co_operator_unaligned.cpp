@@ -68,7 +68,7 @@ constexpr const char* kRightInflight = "__co_op_right_inflight__";
 TEST(CoOperatorUnaligned, CapturesPendingInputInflightAndReplaysOnRestore) {
     auto backend1 = std::make_shared<InMemoryStateBackend>();
 
-    // ---- Phase 1: unaligned barrier on LEFT; RIGHT has queued 10, 20. ----
+    // ---- Stage 1: unaligned barrier on LEFT; RIGHT has queued 10, 20. ----
     auto left1 = std::make_shared<BoundedChannel<StreamElement<V>>>(64);
     auto right1 = std::make_shared<BoundedChannel<StreamElement<V>>>(64);
 
@@ -94,7 +94,7 @@ TEST(CoOperatorUnaligned, CapturesPendingInputInflightAndReplaysOnRestore) {
     auto stored = backend1->get(id, StateBackend::KeyView{kRightInflight});
     ASSERT_TRUE(stored.has_value()) << "pending-input in-flight was not captured";
 
-    // ---- Phase 2: snapshot -> restore into a fresh backend -> a fresh
+    // ---- Stage 2: snapshot -> restore into a fresh backend -> a fresh
     // runner with no live input replays the captured in-flight exactly once.
     auto snap = backend1->snapshot(CheckpointId{1});
     auto backend2 = std::make_shared<InMemoryStateBackend>();
@@ -158,7 +158,7 @@ TEST(CoOperatorUnaligned, BroadcastCapturesPendingInputInflightAndReplaysOnResto
     using S = std::int64_t;  // broadcast state type (unused by the callbacks here)
     constexpr const char* kBrodInflight = "__broadcast_brod_inflight__";
 
-    // ---- Phase 1: unaligned barrier on MAIN; BROADCAST has queued 100,200.
+    // ---- Stage 1: unaligned barrier on MAIN; BROADCAST has queued 100,200.
     auto backend1 = std::make_shared<InMemoryStateBackend>();
     auto brod_seen1 = std::make_shared<std::vector<V>>();
     auto main1 = std::make_shared<BoundedChannel<StreamElement<V>>>(64);
@@ -189,7 +189,7 @@ TEST(CoOperatorUnaligned, BroadcastCapturesPendingInputInflightAndReplaysOnResto
     EXPECT_TRUE(brod_seen1->empty());  // drained into in-flight, not applied
     ASSERT_TRUE(backend1->get(id, StateBackend::KeyView{kBrodInflight}).has_value());
 
-    // ---- Phase 2: restore replays the captured broadcast records.
+    // ---- Stage 2: restore replays the captured broadcast records.
     auto snap = backend1->snapshot(CheckpointId{1});
     auto backend2 = std::make_shared<InMemoryStateBackend>();
     backend2->restore(snap);

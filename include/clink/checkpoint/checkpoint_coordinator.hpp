@@ -24,10 +24,11 @@ namespace clink {
 struct CheckpointCoordinatorConfig {
     std::chrono::milliseconds interval{0};  // 0 disables periodic checkpointing
     std::chrono::milliseconds timeout{60'000};
-    // Phase 26a: default barrier mode. The coordinator stamps every
+    // Default barrier mode. The coordinator stamps every
     // issued barrier with this mode unless a per-trigger override is
     // supplied. JobConfig::unaligned_checkpoints is plumbed here to
-    // pick the global default; 26b will surface per-operator overrides.
+    // pick the global default; per-operator overrides are surfaced
+    // separately.
     CheckpointBarrier::Mode default_mode{CheckpointBarrier::Mode::Aligned};
 };
 
@@ -93,7 +94,7 @@ public:
     void set_on_complete(OnComplete cb) { on_complete_ = std::move(cb); }
     void set_on_abort(OnAbort cb) { on_abort_ = std::move(cb); }
 
-    // Phase 26c: adaptive-mode resolver. Called on every trigger to
+    // Adaptive-mode resolver. Called on every trigger to
     // decide which mode to stamp on this checkpoint's barrier; the
     // resolver sees the prospective checkpoint id and the
     // coordinator's config default, and returns the mode to use.
@@ -107,7 +108,7 @@ public:
     // only exposes the resolver seam.
     //
     // When not set, the coordinator falls back to the configured
-    // default_mode (Phase 26a behaviour).
+    // default_mode.
     using ModeResolver =
         std::function<CheckpointBarrier::Mode(CheckpointId, CheckpointBarrier::Mode default_mode)>;
     void set_mode_resolver(ModeResolver resolver) { mode_resolver_ = std::move(resolver); }

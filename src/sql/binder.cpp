@@ -26,7 +26,7 @@ namespace {
     throw TranslationError(msg, pos);
 }
 
-// Phase 28c-frontend: detect `SELECT <fn>(*) FROM <table>` where <fn>
+// Detect `SELECT <fn>(*) FROM <table>` where <fn>
 // is a registered async lookup. Returns (function_name, source table
 // ref) so bind_insert can lower it to Scan -> AsyncMap -> Sink. The
 // args are intentionally ignored - the runtime passes the whole row to
@@ -63,8 +63,7 @@ const TableDef& resolve_table(const Catalog& cat,
                               const ast::TableRef& ref,
                               const std::unordered_map<std::string, TableDef>& cte_overlay) {
     if (ref.schema.has_value()) {
-        bind_error("schema-qualified table names not supported in Phase 1: " + *ref.schema + "." +
-                       ref.name,
+        bind_error("schema-qualified table names not supported: " + *ref.schema + "." + ref.name,
                    ref.loc.pos);
     }
     auto it = cte_overlay.find(ref.name);
@@ -96,7 +95,7 @@ int find_column(const TableDef& table, const std::string& name, int pos) {
     return found;
 }
 
-// --- Value-expression lowering (Phase 3.3) -------------------------
+// --- Value-expression lowering ------------------------------------
 
 clink::config::JsonValue lower_value_expr(const ast::Expression& expr,
                                           const TableDef& source,
@@ -350,7 +349,7 @@ clink::config::JsonValue lower_value_expr(const ast::Expression& expr,
         return JsonValue{std::move(obj)};
     }
     if (std::holds_alternative<std::unique_ptr<ast::CaseExpr>>(expr)) {
-        // Phase 12: lower searched-CASE to
+        // Lower searched-CASE to
         //   {"op":"case","branches":[{"when":<pred>,"then":<val>}],
         //    "else":<val>}.
         // when-predicates ride the lower_predicate JSON shape (so
@@ -374,7 +373,7 @@ clink::config::JsonValue lower_value_expr(const ast::Expression& expr,
     }
     // Boolean expressions in SELECT clause: lower the predicate via
     // the predicate-shaped lower_predicate helper above so the runtime
-    // can produce a bool value. Phase 3.5 will reconcile this with
+    // can produce a bool value. This is not yet reconciled with
     // three-valued semantics.
     bind_error("expression kind not supported in SELECT", 0);
 }
@@ -467,8 +466,8 @@ std::shared_ptr<arrow::DataType> decimal_literal_type(const std::string& text) {
     return make_decimal(std::max(digits, scale), scale);
 }
 
-// Infer the Arrow type of an expression at bind time. Phase 3.3 keeps
-// this coarse: column refs adopt the source column's type; arithmetic
+// Infer the Arrow type of an expression at bind time. This is kept
+// coarse: column refs adopt the source column's type; arithmetic
 // promotes to float64 (or decimal when an operand is decimal); string
 // functions stay utf8; everything else falls back to utf8.
 std::shared_ptr<arrow::DataType> infer_expr_type(const ast::Expression& expr,
@@ -545,7 +544,7 @@ std::shared_ptr<arrow::DataType> infer_expr_type(const ast::Expression& expr,
         if ((fc.name == "nullif" || fc.name == "greatest" || fc.name == "least") &&
             !fc.args.empty()) {
             // Result type follows the first argument; binder does no
-            // type unification across siblings in Phase 15.
+            // type unification across siblings.
             return infer_expr_type(fc.args[0], source);
         }
         // Date/time: EXTRACT / DATE_TRUNC / TO_TIMESTAMP return epoch-
@@ -662,12 +661,12 @@ std::shared_ptr<arrow::DataType> infer_expr_type(const ast::Expression& expr,
     return arrow::utf8();
 }
 
-// Phase 17: wrap a just-bound plan in LogicalTopN when ORDER BY is
+// Wrap a just-bound plan in LogicalTopN when ORDER BY is
 // present, else LogicalLimit if just LIMIT is set, else passthrough.
 // ORDER BY without LIMIT is rejected here: a streaming engine has no
 // "end of input" except at bounded sources, and an unbounded sort
 // buffer is a footgun. Sort keys must be bare column refs against
-// the plan's emitted schema (Phase 17 v1).
+// the plan's emitted schema.
 std::unique_ptr<LogicalPlan> wrap_top_n_or_limit(std::unique_ptr<LogicalPlan> plan,
                                                  const ast::SelectStmt& stmt) {
     if (!stmt.sort_clause.empty()) {
@@ -682,7 +681,7 @@ std::unique_ptr<LogicalPlan> wrap_top_n_or_limit(std::unique_ptr<LogicalPlan> pl
         sort_descending.reserve(stmt.sort_clause.size());
         for (const auto& item : stmt.sort_clause) {
             if (!std::holds_alternative<ast::ColumnRef>(item.expr)) {
-                bind_error("ORDER BY entry must be a column reference (Phase 17 v1)", item.loc.pos);
+                bind_error("ORDER BY entry must be a column reference", item.loc.pos);
             }
             const auto& cr = std::get<ast::ColumnRef>(item.expr);
             if (cr.is_star || cr.parts.empty()) {
@@ -722,7 +721,7 @@ std::unique_ptr<LogicalPlan> wrap_top_n_or_limit(std::unique_ptr<LogicalPlan> pl
 }
 
 // Resolve a SELECT-item expression to a ProjectOutput. The expression
-// itself can be a bare ColumnRef (Phase 1 path), SELECT * (expanded
+// itself can be a bare ColumnRef, SELECT * (expanded
 // here), or a richer expression tree handled by lower_value_expr.
 std::vector<ProjectOutput> resolve_select_items(const std::vector<ast::SelectItem>& items,
                                                 const TableDef& source,
@@ -758,7 +757,7 @@ std::vector<ProjectOutput> resolve_select_items(const std::vector<ast::SelectIte
     return out;
 }
 
-// --- WHERE predicate -> JSON (Phase 3.1) ---------------------------
+// --- WHERE predicate -> JSON --------------------------------------
 
 const char* bin_op_to_predicate_op(ast::BinOp op) {
     switch (op) {
@@ -779,11 +778,11 @@ const char* bin_op_to_predicate_op(ast::BinOp op) {
 }
 
 // Resolve a column-ref Expression to the column name in the source
-// table. Throws on anything else (Phase 3.1 binary operands are
+// table. Throws on anything else (binary operands are
 // limited to column refs and string literals).
 std::string resolve_column_name(const ast::Expression& expr, const TableDef& source) {
     if (!std::holds_alternative<ast::ColumnRef>(expr)) {
-        bind_error("WHERE predicate must compare a column reference (Phase 3.1)", 0);
+        bind_error("WHERE predicate must compare a column reference", 0);
     }
     const auto& ref = std::get<ast::ColumnRef>(expr);
     if (ref.is_star || ref.parts.empty()) {
@@ -820,7 +819,7 @@ clink::config::JsonValue literal_to_json(const ast::Expression& expr) {
     if (std::holds_alternative<ast::NullLiteral>(expr)) {
         return clink::config::JsonValue{nullptr};
     }
-    bind_error("WHERE predicate RHS must be a literal (Phase 3.4)", 0);
+    bind_error("WHERE predicate RHS must be a literal", 0);
 }
 
 // Walk the WHERE expression and produce a JSON predicate in the
@@ -885,7 +884,7 @@ clink::config::JsonValue lower_predicate(const ast::Expression& expr, const Tabl
             return JsonValue{std::move(obj)};
         }
         if (fc.name == "in") {
-            // Phase 19a: WHERE x IN (lit, lit, ...). First arg is the
+            // WHERE x IN (lit, lit, ...). First arg is the
             // column reference; the rest are literal values (subquery
             // forms come through as SubLink, which we reject elsewhere).
             if (fc.args.size() < 2) {
@@ -903,7 +902,7 @@ clink::config::JsonValue lower_predicate(const ast::Expression& expr, const Tabl
             return JsonValue{std::move(obj)};
         }
     }
-    bind_error("WHERE predicate kind not supported in Phase 3.1", 0);
+    bind_error("WHERE predicate kind not supported", 0);
 }
 
 // Inc 4: flatten a top-level AND into its conjuncts. A non-AND
@@ -1025,7 +1024,7 @@ void check_sink_compatibility(const TableDef& sink, const arrow::Schema& source_
 
 }  // namespace
 
-// --- Phase 4: aggregate-aware SELECT binding -----------------------
+// --- Aggregate-aware SELECT binding -------------------------------
 
 namespace {
 
@@ -1063,17 +1062,17 @@ std::int64_t interval_to_ms(const ast::Expression& expr) {
         // StringLiteral carrying the numeric quantity; the cast's
         // target carries the unit (currently we encode all of int /
         // float / str — the interval-specific unit needs more parser
-        // work). For Phase 4 we accept INTERVAL '<n>' [SECOND|MINUTE|
+        // work). We accept INTERVAL '<n>' [SECOND|MINUTE|
         // HOUR|MILLISECOND]; PG's typmod encoding is checked at the
         // ast_builder level for the unit. Until then, the inner
         // string is the numeric quantity in the user's chosen unit.
     }
-    // TODO: distinguish SECOND/MINUTE/HOUR units. Phase 4 first cut
+    // TODO: distinguish SECOND/MINUTE/HOUR units. The first cut
     // expects users to use raw milliseconds, e.g. TUMBLE(ts, 5000).
     return 0;
 }
 
-// Phase 4 first cut: only support TUMBLE(time_col, <int_ms>) and
+// First cut: only support TUMBLE(time_col, <int_ms>) and
 // require the size to be a plain integer literal in milliseconds.
 // INTERVAL syntax recognition lands once the unit-aware parsing is
 // wired through CastOp.
@@ -1148,7 +1147,7 @@ WindowSpec decode_window_call(const ast::FunctionCall& fc,
 
 // Inspect a SELECT-item Expression and find any aggregate function
 // call. Returns the FunctionCall name + the input column name (empty
-// for COUNT(*)). For Phase 4 we accept only the simplest shapes:
+// for COUNT(*)). We accept only the simplest shapes:
 // aggregate-of-column-ref or COUNT(*).
 struct AggregateExtraction {
     bool found = false;
@@ -1233,7 +1232,7 @@ AggregateExtraction extract_aggregate(const ast::Expression& expr,
                 bind_error(fc.name + " takes exactly one argument", fc.loc.pos);
             }
             if (!std::holds_alternative<ast::ColumnRef>(fc.args[0])) {
-                bind_error(fc.name + ": argument must be a column reference (Phase 4)", fc.loc.pos);
+                bind_error(fc.name + ": argument must be a column reference", fc.loc.pos);
             }
             out.input_column = resolve_value_column_name(
                 std::get<ast::ColumnRef>(fc.args[0]), source, source_alias);
@@ -1243,7 +1242,7 @@ AggregateExtraction extract_aggregate(const ast::Expression& expr,
     return out;
 }
 
-// Phase 19c: deep-copy an Expression. Variant arms holding unique_ptr
+// Deep-copy an Expression. Variant arms holding unique_ptr
 // need allocation; literals and ColumnRef copy by value.
 ast::Expression clone_expression(const ast::Expression& expr);
 
@@ -1353,7 +1352,7 @@ ast::Expression clone_expression(const ast::Expression& expr) {
     bind_error("clone_expression: unsupported variant arm", 0);
 }
 
-// Phase 19c: rewrite aggregate FunctionCalls in a HAVING expression
+// Rewrite aggregate FunctionCalls in a HAVING expression
 // into ColumnRef(output_name) so lower_predicate can resolve them
 // against the synthetic post-aggregate schema. Errors when an
 // aggregate FunctionCall has no matching slot in `aggregates`.
@@ -1474,7 +1473,7 @@ std::shared_ptr<arrow::DataType> aggregate_output_type(const std::string& fn,
 
 }  // namespace
 
-// --- Phase 5: interval-join detection ------------------------------
+// --- Interval-join detection --------------------------------------
 
 namespace {
 
@@ -1608,7 +1607,7 @@ std::optional<IntervalJoinShape> match_interval_join(const ast::Expression& on,
     return s;
 }
 
-// Phase 18: stream-stream equi-join. Recognises a single equality
+// Stream-stream equi-join. Recognises a single equality
 // `a.k = b.k` with one column from each declared alias, in either
 // order. Anything more complex (AND, OR, expressions on either
 // side) returns nullopt so the dispatcher can fall through to the
@@ -1642,7 +1641,7 @@ std::optional<EquiJoinShape> match_equi_join(const ast::Expression& on,
     return std::nullopt;
 }
 
-// Phase 22a: walk a bound LogicalPlan tree and decide whether it
+// Walk a bound LogicalPlan tree and decide whether it
 // produces changelog records (rows tagged with __row_kind=delete
 // at runtime). Today only LogicalTopNPerKey is a producer; this
 // helper recurses through pass-through nodes so a Project wrapping
@@ -2914,7 +2913,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_scalar_select_projection(
 
 std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) const {
     BindTimingGuard bind_timer;
-    // Phase 16: WITH clause. Bind each CTE body sequentially so cte2
+    // WITH clause. Bind each CTE body sequentially so cte2
     // can reference cte1 (PG semantics). Each body gets a synthetic
     // TableDef whose columns come from the bound schema; the bound
     // plan is parked in cte_plans_ and consumed at the LogicalScan-
@@ -2955,7 +2954,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
         }
     }
 
-    // Phase 13 / set ops: UNION [ALL] / INTERSECT / EXCEPT. Bind each
+    // Set ops: UNION [ALL] / INTERSECT / EXCEPT. Bind each
     // branch independently then check the schemas are union-compatible
     // (same count, same Arrow types). The outer SelectStmt only carries
     // the set-op markers when set_op != None; other fields (where /
@@ -3024,7 +3023,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
     // WHERE / GROUP BY path below then applies over it.
     std::optional<ast::TableRef> derived_table_ref;
 
-    // Phase 5: handle a JOIN at the top level of from_items.
+    // Handle a JOIN at the top level of from_items.
     if (stmt.from_items.size() == 1 &&
         std::holds_alternative<std::unique_ptr<ast::JoinClause>>(stmt.from_items[0])) {
         const auto& jc = *std::get<std::unique_ptr<ast::JoinClause>>(stmt.from_items[0]);
@@ -3084,7 +3083,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             if (!jc.on_clause.has_value()) {
                 bind_error("JOIN requires an ON clause", jc.loc.pos);
             }
-            // Phase 18: try the equi-join shape first (simpler, narrower).
+            // Try the equi-join shape first (simpler, narrower).
             // Falls through to the interval-join recognizer when the ON
             // clause is the eq + BETWEEN AND-pair.
             auto equi_shape = match_equi_join(*jc.on_clause, left_alias, right_alias);
@@ -3232,7 +3231,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
         }  // end else (2-base-table top-level join)
     }
 
-    // Phase 20: FROM (SELECT ...) AS sub. When from_items carries a
+    // FROM (SELECT ...) AS sub. When from_items carries a
     // single SubqueryItem (no JOIN, no base table), pre-bind its body
     // and register a synthetic CTE-like entry under the alias so the
     // existing from_clause path picks it up via cte_synth_tables_ /
@@ -3249,7 +3248,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
         }
         auto body_plan = bind_select(*sq.body);
 
-        // Phase 21c: pattern-match TOP-N-per-key.
+        // Pattern-match TOP-N-per-key.
         //   SELECT * FROM (SELECT *, ROW_NUMBER() OVER (...) AS rn
         //                   FROM t [WHERE ...]) sub
         //   WHERE rn <op> N           with op in {<=, <, =}
@@ -3375,11 +3374,10 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
 
     if (!derived_table_ref.has_value()) {
         if (stmt.from_clause.empty()) {
-            bind_error("SELECT without FROM not supported in Phase 1", stmt.loc.pos);
+            bind_error("SELECT without FROM not supported", stmt.loc.pos);
         }
         if (stmt.from_clause.size() > 1) {
-            bind_error("multi-table FROM (joins / cross product) not supported in Phase 1",
-                       stmt.loc.pos);
+            bind_error("multi-table FROM (joins / cross product) not supported", stmt.loc.pos);
         }
     }
     const ast::TableRef& ref =
@@ -3578,12 +3576,12 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
         for (const auto& item : stmt.target_list) {
             if (std::holds_alternative<ast::ColumnRef>(item.expr) &&
                 std::get<ast::ColumnRef>(item.expr).is_star) {
-                bind_error("SELECT * with GROUP BY is not supported in Phase 4", item.loc.pos);
+                bind_error("SELECT * with GROUP BY is not supported", item.loc.pos);
             }
         }
     }
     if (!has_aggs && !has_group) {
-        // Phase 1-3 path: pure projection.
+        // Pure projection path.
         auto resolved = resolve_select_items(stmt.target_list, source, alias);
         std::unique_ptr<LogicalPlan> scan_or_filter =
             make_table_plan(ref.name, source, ref.loc.pos);
@@ -3601,7 +3599,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
     }
     if (has_aggs && !has_group) {
         bind_error(
-            "aggregate functions in SELECT require a GROUP BY clause (Phase 4 streaming "
+            "aggregate functions in SELECT require a GROUP BY clause (streaming "
             "semantics)",
             stmt.loc.pos);
     }
@@ -3653,7 +3651,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
         }
     }
 
-    // Phase 8: GROUP BY without a window TVF is now allowed. The
+    // GROUP BY without a window TVF is allowed. The
     // runtime maintains per-group state forever and emits the latest
     // aggregate Row per input record (upsert mode). The output below
     // branches on whether a window was supplied.
@@ -3798,13 +3796,13 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             std::move(scan_or_filter), group_keys, aggregates, out_schema, key_output_names);
     }
     if (stmt.having_clause.has_value()) {
-        // Phase 9: HAVING runs on the aggregate's emitted rows. Build
+        // HAVING runs on the aggregate's emitted rows. Build
         // a synthetic source whose columns are (group keys with their
         // source types) + (aggregate alias with declared agg type) so
         // lower_predicate can resolve refs against the post-aggregate
         // schema.
         //
-        // Phase 19c: when HAVING references aggregates directly
+        // When HAVING references aggregates directly
         // (e.g. `HAVING SUM(amount) > 100` without an alias), rewrite
         // the expression to replace each aggregate FunctionCall with
         // a ColumnRef to the matching aggregate slot's output_name.
@@ -3843,7 +3841,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
     BindTimingGuard bind_timer;
     const auto& sink = resolve_table(catalog_, stmt.target, cte_synth_tables_);
 
-    // Phase 28c-frontend: async-lookup lowering. `INSERT INTO out SELECT
+    // Async-lookup lowering. `INSERT INTO out SELECT
     // enrich(*) FROM src`, with `enrich` registered in
     // AsyncFunctionRegistry, lowers to Scan(src) -> AsyncMap(enrich) ->
     // Sink(out). The async function defines the enriched row shape, so
@@ -3859,7 +3857,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
 
     auto select_plan = bind_select(stmt.select);
 
-    // Phase 19d: optional column list `INSERT INTO t (a, b)`. Each
+    // Optional column list `INSERT INTO t (a, b)`. Each
     // listed name must be a column of the sink; the SELECT projects
     // in column-list order. We rewrite the plan with a LogicalProject
     // that reorders the SELECT outputs to match the sink's declared
@@ -3922,7 +3920,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
 
     check_sink_compatibility(sink, *select_plan->schema(), stmt.loc.pos);
 
-    // Phase 23a: delivery_guarantee='exactly_once' enables a 2PC
+    // delivery_guarantee='exactly_once' enables a 2PC
     // sink at runtime. Only the connectors that have a 2PC variant
     // are eligible; upsert + 2PC is out of scope for now (upsert
     // sinks aren't barrier-aware yet).
@@ -3945,7 +3943,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
                 stmt.loc.pos);
         }
     } else if (sink.has_commit_group()) {
-        // Phase 30a: commit_group is a 2PC concept. Setting it on a
+        // commit_group is a 2PC concept. Setting it on a
         // non-2PC sink wouldn't do anything useful (no commit phase
         // to coordinate); reject up front so users don't think it's
         // working.
@@ -3955,7 +3953,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
             stmt.loc.pos);
     }
 
-    // Phase 22a: changelog / append compatibility between SELECT and
+    // Changelog / append compatibility between SELECT and
     // sink. Plans that include a LogicalTopNPerKey (or any future
     // retracting operator) emit `__row_kind=delete` records; sinks
     // that don't understand them must reject. Upsert sinks must

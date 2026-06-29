@@ -1,4 +1,4 @@
-// Phase 29f: unit tests for plan_operator_cutover. Drives the pure
+// Unit tests for plan_operator_cutover. Drives the pure
 // planning helper that the JM uses when the RescaleCoordinator
 // transitions an operator from Draining to CuttingOver.
 

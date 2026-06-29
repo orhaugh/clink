@@ -906,7 +906,7 @@ TEST(Cluster, HistoryServerPersistsAcrossRestart) {
     std::filesystem::remove_all(ha_dir);
 }
 
-// --- Phase 29d: per-operator rescale request surface ---------------
+// --- Per-operator rescale request surface ---------------
 
 TEST(JobManagerRescale, RequestOperatorRescaleUnknownJobReturnsError) {
     // The JM-level delegate validates job existence; the underlying
@@ -991,7 +991,7 @@ TEST(JobManagerRescale, OperatorRescaleStatusUnknownJobReturnsNullopt) {
     EXPECT_FALSE(st.has_value());
 }
 
-// --- Phase 29h: autoscaler wiring through JobManager -----------------
+// --- Autoscaler wiring through JobManager -----------------
 
 TEST(JobManagerAutoscaler, NoConfigMeansNoAutoscaler) {
     // Default JobManager::Config leaves the autoscaler unset.

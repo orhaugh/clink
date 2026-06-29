@@ -9,8 +9,8 @@
 
 // Physical planner: LogicalPlan -> clink::cluster::JobGraphSpec.
 //
-// Phase 1 scope is INTENTIONALLY narrow to ship the end-to-end story
-// before the format / multi-column work in Phase 2:
+// The initial scope is INTENTIONALLY narrow to ship the end-to-end
+// story before the format / multi-column work:
 //
 //   * Every table is single-column with type TEXT/VARCHAR (Arrow utf8).
 //     The "format" layer that turns multi-column rows into a wire
@@ -43,8 +43,8 @@ public:
 
     // Compile a bound LogicalPlan (always rooted in a LogicalSink for
     // INSERT INTO ... SELECT) to a JobGraphSpec the JM can submit.
-    // Throws TranslationError when the plan uses constructs outside
-    // Phase 1 scope (multi-column tables, unknown connectors, etc.).
+    // Throws TranslationError when the plan uses unsupported constructs
+    // (multi-column tables, unknown connectors, etc.).
     [[nodiscard]] cluster::JobGraphSpec compile(const LogicalSink& root) const;
 
     // Opt into the async-state execution path for unbounded GROUP BY.

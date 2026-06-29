@@ -1,4 +1,4 @@
-// Phase 30d (metrics-coverage pass): per-operator data-plane metrics.
+// Per-operator data-plane metrics.
 // Drives small in-process DAGs and asserts that the global
 // MetricsRegistry exposes records_in / records_out / window_panes /
 // join_matches / async_lookup_hits with the right operator-id suffix.

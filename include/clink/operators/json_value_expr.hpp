@@ -28,15 +28,13 @@
 //                                  null)
 //   {"op": "<name>", "args": [...]} operation. Reserved op names:
 //                                    add, sub, mul, div, mod, neg,
-//                                    concat (Phase 3.3)
+//                                    concat
 //                                    upper, lower, length, coalesce,
 //                                    cast_int, cast_float, cast_str
-//                                    (Phase 3.4)
 //
-// Phase 3.5 will switch null propagation to three-valued semantics;
-// for Phase 3.3-3.4 the rule is: any non-numeric / non-string
-// operand collapses the expression to null, and any arithmetic with
-// a null operand yields null.
+// Null propagation: any non-numeric / non-string operand collapses
+// the expression to null, and any arithmetic with a null operand
+// yields null.
 
 namespace clink::operators {
 
@@ -396,7 +394,7 @@ clink::config::JsonValue evaluate_json_value_expr(const clink::config::JsonValue
         }
     }
 
-    // --- Arithmetic (Phase 3.3; exact DECIMAL path #56) ---
+    // --- Arithmetic (exact DECIMAL path #56) ---
     // #56: when an operand is a dec-string, compute EXACTLY in fixed point.
     // Returns nullopt to fall through to the double path (no decimal operand,
     // or a decimal mixed with a non-integral double -> documented demote).
@@ -479,8 +477,7 @@ clink::config::JsonValue evaluate_json_value_expr(const clink::config::JsonValue
         return JsonValue{-*n};
     }
     if (op == "concat") {
-        // SQL || is null-strict in Phase 3.3 (any null collapses); Phase 3.5
-        // will make this CONCAT-style null-tolerant per standard SQL.
+        // SQL || is null-strict (any null collapses).
         std::string out;
         for (const auto& a : args) {
             if (a.is_null())
@@ -490,7 +487,7 @@ clink::config::JsonValue evaluate_json_value_expr(const clink::config::JsonValue
         return JsonValue{out};
     }
 
-    // --- Functions (Phase 3.4) ---
+    // --- Functions ---
     if (op == "upper" || op == "lower") {
         if (args.size() != 1) {
             throw std::runtime_error("json_value_expr: '" + op + "' takes one arg");
@@ -742,7 +739,7 @@ clink::config::JsonValue evaluate_json_value_expr(const clink::config::JsonValue
         return it->second;
     }
 
-    // --- Phase 15: extended scalar built-ins ---
+    // --- Extended scalar built-ins ---
 
     // substring(s, start, len?) - SQL: 1-based start, optional length;
     // out-of-range bounds clamp to the string. Null in any arg -> null.

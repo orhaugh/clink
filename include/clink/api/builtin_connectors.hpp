@@ -8,7 +8,7 @@
 // per-impl headers under clink/api/<vendor>_builders.hpp during the
 // impls split. This header transitively re-includes them so existing
 // `#include <clink/api/builtin_connectors.hpp>` callsites keep
-// resolving the vendor builder names. In Phase 2 those re-includes get
+// resolving the vendor builder names. Eventually those re-includes get
 // dropped and callers must `#include <clink/api/kafka_builders.hpp>`
 // (etc.) explicitly.
 //
@@ -28,7 +28,7 @@
 // Transitional vendor re-exports for back-compat with code that used to
 // pull all builders through this single umbrella header. Each include
 // is guarded by __has_include so callers can build core-only without
-// the impl include dirs on the search path. Phase 3 removes these
+// the impl include dirs on the search path. A later change removes these
 // re-exports entirely - callers will need to include the matching
 // clink/api/<vendor>_builders.hpp explicitly.
 #if __has_include("clink/api/kafka_builders.hpp")

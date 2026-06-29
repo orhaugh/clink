@@ -155,12 +155,12 @@ private:
     // Reply to a source's RequestFinalCheckpoint: records the JM-assigned id and
     // wakes the blocked source runner (see request_final_checkpoint hook wiring).
     void handle_final_checkpoint_assigned_(MessageReader& r);
-    // Phase 30c: dispatch AbortCheckpoint to per-subtask abort
+    // Dispatch AbortCheckpoint to per-subtask abort
     // callbacks. Mirrors handle_commit_checkpoint_; sinks register
     // their abort callback alongside their commit callback at
     // startup.
     void handle_abort_checkpoint_(MessageReader& r);
-    // Phase 29d-2: dispatch BeginRescale to per-(job, op) drain
+    // Dispatch BeginRescale to per-(job, op) drain
     // callbacks. The TM looks up callbacks registered against the
     // op_id in the BeginRescaleMsg payload and invokes them outside
     // the lock with the target_parallelism. Subtask runners
@@ -282,7 +282,7 @@ private:
         per_job_backends_;
     std::unordered_map<JobId, CheckpointRetention> per_job_retention_;
 
-    // Phase 30c: per-(job_id, subtask_idx) abort callbacks. Sinks
+    // Per-(job_id, subtask_idx) abort callbacks. Sinks
     // register an abort closure alongside their commit closure at
     // startup; the TM dispatches it on AbortCheckpoint. Same
     // signature shape as CommitCallback so callers can use the same
@@ -291,7 +291,7 @@ private:
     std::unordered_map<JobId, std::unordered_map<std::uint32_t, std::vector<AbortCallback>>>
         per_job_aborters_;
 
-    // Phase 29d-2: per-(job_id, op_id) drain callbacks. Subtask
+    // Per-(job_id, op_id) drain callbacks. Subtask
     // runners register one or more closures at startup against the
     // op_id their subtask serves (op_id == DeploymentTask.role).
     // BeginRescale dispatch looks up by (job_id, op_id) and invokes

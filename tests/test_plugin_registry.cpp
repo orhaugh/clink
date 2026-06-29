@@ -1,5 +1,5 @@
-// In-process exercise of the PluginRegistry API. No dlopen yet (that's
-// Phase 0d); these tests instantiate the templates in the cluster's
+// In-process exercise of the PluginRegistry API. No dlopen yet;
+// these tests instantiate the templates in the cluster's
 // own compilation unit and verify they wire into the singletons
 // correctly. A real plugin .so would produce the same registrations.
 
