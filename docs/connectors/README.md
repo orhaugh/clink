@@ -68,8 +68,12 @@ is reachable through the programmatic API only.
 Guarantees vary by connector and are stated on each page. In summary:
 
 - Exactly-once sinks require the `on_barrier` / `on_commit` two-phase-commit
-  contract. The Kafka transactional sink (`kafka_2pc_sink_string`) implements
-  it; the Parquet sinks (S3, GCS, Azure, WebHDFS) do not, and are at-least-once.
+  contract. The Kafka transactional sink (`kafka_2pc_sink_string`) implements it.
+  The object-store and WebHDFS Parquet connectors offer both: the default
+  single-object sink is at-least-once, and a 2PC variant
+  (`<connector>_2pc_*_sink`, or `delivery_guarantee='exactly_once'` in SQL) stages
+  one file per checkpoint under `<prefix>/staging` and atomically promotes it to
+  `<prefix>/committed` only when the checkpoint completes globally.
 - Sources that record their position as operator state replay from the last
   checkpoint on recovery; the exact mechanism (Kafka offsets, Postgres LSN,
   object index, row index) and any caveats are documented per connector.

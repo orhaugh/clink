@@ -132,13 +132,15 @@ Through the registry, look the factory up by its registered name (for example `a
 
 ## Delivery semantics
 
-The Parquet blob is finalised only when the sink's `close()` runs, which closes each writer and output stream and flushes Arrow's background write buffer. There is no two-phase commit and no per-checkpoint blob rotation in this connector, so a sink failure or job restart before `close()` can leave a partial or zero-length blob; the writer's `close()` is written to close and release every per-key stream before reporting the first error, so teardown does not strand other keys' streams (`parquet_azure_sink.hpp`). Treat the sink as at-least-once at best, with no exactly-once guarantee.
+The Parquet blob is finalised only when the sink's `close()` runs, which closes each writer and output stream and flushes Arrow's background write buffer. There is no two-phase commit and no per-checkpoint blob rotation in this connector, so a sink failure or job restart before `close()` can leave a partial or zero-length blob; the writer's `close()` is written to close and release every per-key stream before reporting the first error, so teardown does not strand other keys' streams (`parquet_azure_sink.hpp`). Treat this single-object sink as at-least-once at best.
+
+For exactly-once, use the 2PC sink: `azure_parquet_2pc_{int64,string}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet blob per checkpoint interval under `<container>/<prefix>/staging` and promotes it to `<container>/<prefix>/committed` only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Read the result with the source pointed at `<prefix>/committed`.
 
 The source reads a single Parquet object to its last row group and reports `is_bounded() == true` (`parquet_azure_source.hpp`). It validates the file schema against the `ArrowBatcher` schema (ignoring metadata) and throws on mismatch. It carries no offset or replay tracking, so it is a bounded one-shot read rather than a checkpointed, replayable source.
 
 ## Limitations
 
-- Sink commit is whole-blob at `close()`; no two-phase commit, no incremental or per-checkpoint commit, so failures can leave partial blobs.
+- The default single-object sink commits the whole blob at `close()` (a failure before then can leave a partial blob). For exactly-once use the 2PC sink (`prefix` + `delivery_guarantee='exactly_once'`), which stages and atomically promotes one blob per checkpoint.
 - The source reads one object with `key`, or every object under `prefix` (a `prefix` instead of a `key` routes to the shared `MultiObjectParquetSource`, which lists the prefix, sorts, and shards objects round-robin across subtasks: object `i` is read by subtask `i % parallelism`). Optional multi-object source params: `recursive` (default `true`), `suffix` (default `.parquet`). Hive-partition pruning and column projection are not performed.
 - Source has no replay or offset tracking; it is a bounded one-shot read.
 - Record channels are limited to `int64` and `string`. Only those four factories are registered.

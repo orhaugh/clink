@@ -125,6 +125,8 @@ The source validates the file schema against the batcher's expected schema in `o
 
 The S3 multipart upload completes in the sink's `close()`, when every open `FileWriter` and stream is finalised. Until `close()` runs, no object is committed, so there is no transactional, per-checkpoint two-phase commit and no exactly-once guarantee on the sink path. A failure before `close()` leaves no committed object; a re-run rewrites the object from scratch. `close()` closes and releases every writer before reporting an error so that a failure on one key does not strand other keys' streams as partial objects.
 
+For exactly-once, use the 2PC sink: `s3_parquet_2pc_{int64,string}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet file per checkpoint interval under `<bucket>/<prefix>/staging` and promotes it to `<bucket>/<prefix>/committed` (a streamed copy that appears atomically on close) only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Read the result with the source pointed at `<prefix>/committed`.
+
 The source reads a single object to its last row group and reports itself as bounded (`is_bounded()` returns true). It does not track or replay from an offset within the object.
 
 ## Limitations

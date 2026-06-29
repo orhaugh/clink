@@ -128,13 +128,15 @@ Via the registry, look up the factory by name and channel, for example `gcs_parq
 
 The Parquet object is finalised in `close()`: the sink keeps a `parquet::arrow::FileWriter` per key, accumulates record batches across `on_data` calls, and only flushes and closes the writer and the output stream at `close()` (`parquet_gcs_sink.hpp`). There is no two-phase commit and no barrier-aligned commit, so the sink is not transactional or exactly-once. A job that fails before `close()` leaves no finalised object for that writer. The `close()` path is hardened to close every writer and stream before rethrowing the first error, so a failure on one key does not strand other keys' streams as partial objects.
 
+For exactly-once, use the 2PC sink: `gcs_parquet_2pc_{int64,string}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet file per checkpoint interval under `<bucket>/<prefix>/staging` and promotes it to `<bucket>/<prefix>/committed` only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Read the result with the source pointed at `<prefix>/committed`.
+
 The source reads a single Parquet object to its last row group and reports `is_bounded() == true` (`parquet_gcs_source.hpp`). It does not track or replay from an offset. On `open()` it validates that the file schema equals the `ArrowBatcher` schema (ignoring metadata) and throws on a mismatch.
 
 ## Limitations
 
 - The source reads one object with `key`, or every object under `prefix` (a `prefix` instead of a `key` routes to the shared `MultiObjectParquetSource`, which lists the prefix, sorts, and shards objects round-robin across subtasks: object `i` is read by subtask `i % parallelism`). Optional multi-object source params: `recursive` (default `true`), `suffix` (default `.parquet`). There is no Hive-partition pruning or column projection on either path.
 - Channels are limited to `int64` and `string`; there are no other typed factories.
-- The whole sink writer set is held open until `close()`; output is not committed incrementally and is not transactional (no 2PC).
+- The default single-object sink holds its writer set open until `close()` and is not transactional. For exactly-once use the 2PC sink (`prefix` + `delivery_guarantee='exactly_once'`), which stages and atomically promotes one file per checkpoint.
 - `compression` and the per-record `bucket_assigner` exist on the sink `Options` but are not configurable through the factory parameters or SQL; they require the programmatic API. The compression default is ZSTD.
 - `access_token` is treated as static with a fixed 24-hour expiry; token refresh is not handled by the connector.
 - The source requires the on-disk Parquet schema to match the `ArrowBatcher` schema exactly (metadata aside), otherwise `open()` throws.
