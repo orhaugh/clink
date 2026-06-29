@@ -158,17 +158,13 @@ std::string string_sink_factory_for(const TableDef& table) {
     if (connector == "parquet") {
         return "parquet_string_sink";
     }
-    if (connector == "s3_parquet") {
-        return "s3_parquet_string_sink";
-    }
-    if (connector == "gcs_parquet") {
-        return "gcs_parquet_string_sink";
-    }
-    if (connector == "azure_parquet") {
-        return "azure_parquet_string_sink";
-    }
-    if (connector == "webhdfs_parquet") {
-        return "webhdfs_parquet_string_sink";
+    if (connector == "s3_parquet" || connector == "gcs_parquet" || connector == "azure_parquet" ||
+        connector == "webhdfs_parquet") {
+        // delivery_guarantee='exactly_once' selects the 2PC sink (stages then atomically
+        // promotes one file per checkpoint under <prefix>/committed); else the at-least-once
+        // single-object sink.
+        return table.is_exactly_once() ? connector + "_2pc_string_sink"
+                                       : connector + "_string_sink";
     }
     if (connector == "redis") {
         return "redis_sink";
@@ -628,6 +624,22 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
             return RowConnectorBinding{"parquet_row_2pc_sink", kChannelRow, {}};
         }
         return RowConnectorBinding{"parquet_row_sink", kChannelRow, {}};
+    }
+    if (connector == "s3_parquet" || connector == "gcs_parquet" || connector == "azure_parquet" ||
+        connector == "webhdfs_parquet") {
+        // Object-store / WebHDFS Parquet sink. Rows are serialised to JSON strings and written as a
+        // single-column Parquet file. exactly_once routes to the 2PC variant (stages one file per
+        // checkpoint under <prefix>/staging and atomically promotes it to <prefix>/committed); the
+        // default is the at-least-once single-object sink. upsert is not supported (append-only).
+        if (upsert) {
+            unsupported("connector='" + connector + "' sink does not support mode='upsert'");
+        }
+        if (exactly_once) {
+            return RowConnectorBinding{
+                connector + "_2pc_string_sink", kChannelString, "row_to_json_string"};
+        }
+        return RowConnectorBinding{
+            connector + "_string_sink", kChannelString, "row_to_json_string"};
     }
     if (connector == "delta") {
         // Delta Lake table sink: typed Parquet data files + the _delta_log

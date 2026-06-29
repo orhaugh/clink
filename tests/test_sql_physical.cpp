@@ -961,6 +961,41 @@ TEST(SqlPhysical, ExactlyOnceParquetMapsTo2pcRowSink) {
     EXPECT_EQ(find_op(spec, "parquet_row_sink"), nullptr);
 }
 
+TEST(SqlPhysical, ExactlyOnceObjectStoreParquetMapsTo2pcSink) {
+    // delivery_guarantee='exactly_once' routes each object-store / WebHDFS Parquet sink to its
+    // 2PC factory; the default routes to the at-least-once string sink.
+    struct Case {
+        std::string connector;
+        std::string src_props;   // single-object source props (string channel)
+        std::string sink_props;  // 2PC sink props (writes under <prefix>/committed)
+    };
+    const std::vector<Case> cases = {
+        {"s3_parquet", "bucket='b', key='in.parquet'", "bucket='b', prefix='out'"},
+        {"gcs_parquet", "bucket='b', key='in.parquet'", "bucket='b', prefix='out'"},
+        {"azure_parquet",
+         "container='c', account_name='a', key='in.parquet'",
+         "container='c', account_name='a', prefix='out'"},
+        {"webhdfs_parquet",
+         "base_url='http://nn:9870', path='/in.parquet'",
+         "base_url='http://nn:9870', prefix='/out'"},
+    };
+    for (const auto& c : cases) {
+        Catalog cat;
+        auto s = parse("CREATE TABLE eo_in (v TEXT) WITH (connector='" + c.connector + "', " +
+                       c.src_props +
+                       ");"
+                       "CREATE TABLE eo_out (v TEXT) WITH (connector='" +
+                       c.connector + "', " + c.sink_props + ", delivery_guarantee='exactly_once')");
+        cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+        auto plan = bind_insert(cat, "INSERT INTO eo_out SELECT v FROM eo_in");
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        EXPECT_NE(find_op(spec, c.connector + "_2pc_string_sink"), nullptr) << c.connector;
+        EXPECT_EQ(find_op(spec, c.connector + "_string_sink"), nullptr) << c.connector;
+    }
+}
+
 TEST(SqlPhysical, S3ParquetSourceAndSinkMap) {
     Catalog cat;
     auto s = parse(
