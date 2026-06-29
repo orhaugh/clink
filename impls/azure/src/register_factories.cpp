@@ -2,12 +2,16 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
+#include <arrow/filesystem/filesystem.h>
+
 #include "clink/azure/install.hpp"
+#include "clink/connectors/multi_object_parquet_source.hpp"
 #include "clink/connectors/parquet_azure_sink.hpp"
 #include "clink/connectors/parquet_azure_source.hpp"
 #include "clink/core/arrow_batcher.hpp"
@@ -42,6 +46,78 @@ void apply_azure_params(const clink::plugin::BuildContext& ctx, Opts& opts) {
         throw std::runtime_error(
             "azure_parquet: 'container', 'key' and 'account_name' are required");
     }
+}
+
+// Register an Azure Blob Parquet source: a single `key` reads one object; a `prefix` reads every
+// matching object beneath it, sharded across subtasks via the shared MultiObjectParquetSource.
+// The AzureFileSystem is built on the runner thread in open() via the captured options, reusing
+// azure_detail::make_azure_options (the same call the single-object source uses).
+template <typename T>
+void register_azure_parquet_source(clink::plugin::PluginRegistry& reg,
+                                   std::string name,
+                                   ArrowBatcher<T> batcher) {
+    reg.register_source<T>(
+        name,
+        [name, batcher](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Source<T>> {
+            const auto container = ctx.param_or("container");
+            const auto account_name = ctx.param_or("account_name");
+            if (container.empty() || account_name.empty()) {
+                throw std::runtime_error(name + ": 'container' and 'account_name' are required");
+            }
+            // Auth/endpoint params shared by the single- and multi-object paths.
+            typename ParquetAzureSource<T>::Options opts;
+            opts.account_name = account_name;
+            opts.anonymous = ctx.param_or("anonymous", "false") == "true";
+            opts.use_default_credential = ctx.param_or("use_default_credential", "false") == "true";
+            if (const auto k = ctx.param_or("account_key", ""); !k.empty()) {
+                opts.account_key = k;
+            }
+            if (const auto s = ctx.param_or("sas_token", ""); !s.empty()) {
+                opts.sas_token = s;
+            }
+            if (const auto a = ctx.param_or("blob_storage_authority", ""); !a.empty()) {
+                opts.blob_storage_authority = a;
+            }
+            if (const auto s = ctx.param_or("blob_storage_scheme", ""); !s.empty()) {
+                opts.blob_storage_scheme = s;
+            }
+
+            // Multi-object: read every object under `prefix`, sharded by subtask.
+            if (const auto prefix = ctx.param_or("prefix", ""); !prefix.empty()) {
+                auto fs_factory = [opts, name]() -> std::shared_ptr<arrow::fs::FileSystem> {
+                    auto azure_opts =
+                        clink::azure_detail::make_azure_options(opts.account_name,
+                                                                opts.anonymous,
+                                                                opts.account_key,
+                                                                opts.sas_token,
+                                                                opts.use_default_credential,
+                                                                opts.blob_storage_authority,
+                                                                opts.blob_storage_scheme);
+                    auto r = arrow::fs::AzureFileSystem::Make(azure_opts);
+                    if (!r.ok()) {
+                        throw std::runtime_error(
+                            name + ": AzureFileSystem::Make: " + r.status().ToString());
+                    }
+                    return *r;
+                };
+                typename MultiObjectParquetSource<T>::Options mo;
+                mo.prefix = container + "/" + prefix;
+                mo.subtask_idx = static_cast<int>(ctx.subtask_idx);
+                mo.parallelism = static_cast<int>(ctx.parallelism);
+                mo.recursive = ctx.param_or("recursive", "true") == "true";
+                mo.suffix = ctx.param_or("suffix", ".parquet");
+                return std::make_shared<MultiObjectParquetSource<T>>(
+                    std::move(fs_factory), std::move(mo), batcher);
+            }
+
+            // Single object.
+            opts.container = container;
+            opts.key = ctx.param_or("key");
+            if (opts.key.empty()) {
+                throw std::runtime_error(name + ": 'key' or 'prefix' is required");
+            }
+            return std::make_shared<ParquetAzureSource<T>>(std::move(opts), batcher);
+        });
 }
 
 }  // namespace
@@ -79,23 +155,10 @@ void install(clink::plugin::PluginRegistry& reg) {
                                                                    string_arrow_batcher());
         });
 
-    reg.register_source<std::int64_t>(
-        "azure_parquet_int64_source",
-        [](const BuildContext& ctx) -> std::shared_ptr<Source<std::int64_t>> {
-            ParquetAzureSource<std::int64_t>::Options opts;
-            apply_azure_params(ctx, opts);
-            return std::make_shared<ParquetAzureSource<std::int64_t>>(std::move(opts),
-                                                                      int64_arrow_batcher());
-        });
-
-    reg.register_source<std::string>(
-        "azure_parquet_string_source",
-        [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
-            ParquetAzureSource<std::string>::Options opts;
-            apply_azure_params(ctx, opts);
-            return std::make_shared<ParquetAzureSource<std::string>>(std::move(opts),
-                                                                     string_arrow_batcher());
-        });
+    register_azure_parquet_source<std::int64_t>(
+        reg, "azure_parquet_int64_source", int64_arrow_batcher());
+    register_azure_parquet_source<std::string>(
+        reg, "azure_parquet_string_source", string_arrow_batcher());
 }
 
 }  // namespace clink::azure

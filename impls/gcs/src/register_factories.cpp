@@ -2,11 +2,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
+#include <arrow/filesystem/filesystem.h>
+
+#include "clink/connectors/multi_object_parquet_source.hpp"
 #include "clink/connectors/parquet_gcs_sink.hpp"
 #include "clink/connectors/parquet_gcs_source.hpp"
 #include "clink/core/arrow_batcher.hpp"
@@ -44,6 +48,76 @@ void apply_gcs_params(const clink::plugin::BuildContext& ctx, Opts& opts) {
     }
 }
 
+// Register a GCS Parquet source: a single `key` reads one object; a `prefix` reads every
+// matching object beneath it, sharded across subtasks via the shared MultiObjectParquetSource.
+// The GcsFileSystem is built on the runner thread in open() via the captured options, reusing
+// gcs_detail::make_gcs_options (the same call the single-object source uses).
+template <typename T>
+void register_gcs_parquet_source(clink::plugin::PluginRegistry& reg,
+                                 std::string name,
+                                 ArrowBatcher<T> batcher) {
+    reg.register_source<T>(
+        name,
+        [name, batcher](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Source<T>> {
+            const auto bucket = ctx.param_or("bucket");
+            if (bucket.empty()) {
+                throw std::runtime_error(name + ": 'bucket' is required");
+            }
+            // Auth/endpoint params shared by the single- and multi-object paths.
+            typename ParquetGcsSource<T>::Options opts;
+            opts.anonymous = ctx.param_or("anonymous", "false") == "true";
+            if (const auto t = ctx.param_or("access_token", ""); !t.empty()) {
+                opts.access_token = t;
+            }
+            if (const auto e = ctx.param_or("endpoint_override", ""); !e.empty()) {
+                opts.endpoint_override = e;
+            }
+            if (const auto s = ctx.param_or("scheme", ""); !s.empty()) {
+                opts.scheme = s;
+            }
+            if (const auto p = ctx.param_or("project_id", ""); !p.empty()) {
+                opts.project_id = p;
+            }
+            if (const auto r = ctx.param_int64_or("retry_limit_seconds", 0); r > 0) {
+                opts.retry_limit_seconds = static_cast<double>(r);
+            }
+
+            // Multi-object: read every object under `prefix`, sharded by subtask.
+            if (const auto prefix = ctx.param_or("prefix", ""); !prefix.empty()) {
+                auto fs_factory = [opts, name]() -> std::shared_ptr<arrow::fs::FileSystem> {
+                    auto gcs_opts = clink::gcs_detail::make_gcs_options(opts.anonymous,
+                                                                        opts.access_token,
+                                                                        opts.endpoint_override,
+                                                                        opts.scheme,
+                                                                        opts.project_id,
+                                                                        opts.retry_limit_seconds);
+                    auto r = arrow::fs::GcsFileSystem::Make(gcs_opts);
+                    if (!r.ok()) {
+                        throw std::runtime_error(name +
+                                                 ": GcsFileSystem::Make: " + r.status().ToString());
+                    }
+                    return *r;
+                };
+                typename MultiObjectParquetSource<T>::Options mo;
+                mo.prefix = bucket + "/" + prefix;
+                mo.subtask_idx = static_cast<int>(ctx.subtask_idx);
+                mo.parallelism = static_cast<int>(ctx.parallelism);
+                mo.recursive = ctx.param_or("recursive", "true") == "true";
+                mo.suffix = ctx.param_or("suffix", ".parquet");
+                return std::make_shared<MultiObjectParquetSource<T>>(
+                    std::move(fs_factory), std::move(mo), batcher);
+            }
+
+            // Single object.
+            opts.bucket = bucket;
+            opts.key = ctx.param_or("key");
+            if (opts.key.empty()) {
+                throw std::runtime_error(name + ": 'key' or 'prefix' is required");
+            }
+            return std::make_shared<ParquetGcsSource<T>>(std::move(opts), batcher);
+        });
+}
+
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
@@ -78,23 +152,10 @@ void install(clink::plugin::PluginRegistry& reg) {
                                                                  string_arrow_batcher());
         });
 
-    reg.register_source<std::int64_t>(
-        "gcs_parquet_int64_source",
-        [](const BuildContext& ctx) -> std::shared_ptr<Source<std::int64_t>> {
-            ParquetGcsSource<std::int64_t>::Options opts;
-            apply_gcs_params(ctx, opts);
-            return std::make_shared<ParquetGcsSource<std::int64_t>>(std::move(opts),
-                                                                    int64_arrow_batcher());
-        });
-
-    reg.register_source<std::string>(
-        "gcs_parquet_string_source",
-        [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
-            ParquetGcsSource<std::string>::Options opts;
-            apply_gcs_params(ctx, opts);
-            return std::make_shared<ParquetGcsSource<std::string>>(std::move(opts),
-                                                                   string_arrow_batcher());
-        });
+    register_gcs_parquet_source<std::int64_t>(
+        reg, "gcs_parquet_int64_source", int64_arrow_batcher());
+    register_gcs_parquet_source<std::string>(
+        reg, "gcs_parquet_string_source", string_arrow_batcher());
 }
 
 }  // namespace clink::gcs

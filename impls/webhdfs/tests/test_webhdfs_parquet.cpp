@@ -3,6 +3,7 @@
 // emulates WebHDFS's CREATE/OPEN 307-redirect protocol (CI-runnable, no external Hadoop). The
 // gated round-trip against a real WebHDFS/HttpFS lives in test_webhdfs_parquet_live.cpp.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <httplib.h>
@@ -28,6 +29,7 @@ using clink::Emitter;
 using clink::int64_arrow_batcher;
 using clink::StreamElement;
 using clink::string_arrow_batcher;
+using clink::WebHdfsMultiObjectParquetSource;
 using clink::WebHdfsParquetSink;
 using clink::WebHdfsParquetSource;
 
@@ -54,6 +56,30 @@ public:
         });
         svr_.Get(R"(/webhdfs/v1/.*)", [this](const httplib::Request& req, httplib::Response& res) {
             const std::string op = req.has_param("op") ? req.get_param_value("op") : "";
+            if (op == "LISTSTATUS") {
+                // List the direct file children of req.path as a WebHDFS FileStatuses document.
+                const std::string child_prefix = req.path + "/";
+                std::string entries;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    for (const auto& [k, v] : files_) {
+                        if (k.rfind(child_prefix, 0) != 0) {
+                            continue;
+                        }
+                        const std::string suffix = k.substr(child_prefix.size());
+                        if (suffix.find('/') != std::string::npos) {
+                            continue;  // not a direct child
+                        }
+                        if (!entries.empty()) {
+                            entries += ",";
+                        }
+                        entries += R"({"pathSuffix":")" + suffix + R"(","type":"FILE"})";
+                    }
+                }
+                res.set_content(R"({"FileStatuses":{"FileStatus":[)" + entries + "]}}",
+                                "application/json");
+                return;
+            }
             if (op == "OPEN" && !req.has_param("dn")) {
                 res.status = 307;
                 res.set_header("Location", base_url() + req.path + "?op=OPEN&dn=1");
@@ -257,4 +283,88 @@ TEST(WebHdfsParquetRoundTrip, StringWriteThenRead) {
     ASSERT_EQ(got.size(), 2u);
     EXPECT_EQ(got[0], "alpha");
     EXPECT_EQ(got[1], "beta");
+}
+
+namespace {
+
+void write_int64_object(MockWebHdfs& srv,
+                        const std::string& path,
+                        const std::vector<std::int64_t>& vals) {
+    WebHdfsParquetSink<std::int64_t>::Options so;
+    so.base_url = srv.base_url();
+    so.path = path;
+    WebHdfsParquetSink<std::int64_t> sink(so, int64_arrow_batcher());
+    sink.open();
+    Batch<std::int64_t> b;
+    for (auto v : vals) {
+        b.emplace(v);
+    }
+    sink.on_data(b);
+    sink.close();
+}
+
+std::vector<std::int64_t> drain_dir_source(WebHdfsMultiObjectParquetSource<std::int64_t>& src) {
+    std::vector<std::int64_t> out;
+    Emitter<std::int64_t> em([&out](StreamElement<std::int64_t> e) -> bool {
+        if (e.is_data()) {
+            for (const auto& rec : e.as_data()) {
+                out.push_back(rec.value());
+            }
+        }
+        return true;
+    });
+    src.open();
+    while (src.produce(em)) {
+    }
+    src.close();
+    return out;
+}
+
+}  // namespace
+
+TEST(WebHdfsMultiObjectParquet, ReadsEveryObjectUnderDir) {
+    MockWebHdfs srv;
+    write_int64_object(srv, "/clink/multi/a.parquet", {1, 2, 3});
+    write_int64_object(srv, "/clink/multi/b.parquet", {4, 5});
+    write_int64_object(srv, "/clink/multi/c.parquet", {6});
+
+    WebHdfsMultiObjectParquetSource<std::int64_t>::Options ro;
+    ro.base_url = srv.base_url();
+    ro.dir = "/clink/multi";
+    WebHdfsMultiObjectParquetSource<std::int64_t> src(ro, int64_arrow_batcher());
+    auto got = drain_dir_source(src);
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(got, (std::vector<std::int64_t>{1, 2, 3, 4, 5, 6}));
+}
+
+TEST(WebHdfsMultiObjectParquet, ShardsDisjointlyAndCompletelyAcrossSubtasks) {
+    MockWebHdfs srv;
+    write_int64_object(srv, "/clink/shard/f0.parquet", {0});
+    write_int64_object(srv, "/clink/shard/f1.parquet", {10});
+    write_int64_object(srv, "/clink/shard/f2.parquet", {20});
+    write_int64_object(srv, "/clink/shard/f3.parquet", {30});
+
+    std::vector<std::int64_t> all;
+    for (int s = 0; s < 2; ++s) {
+        WebHdfsMultiObjectParquetSource<std::int64_t>::Options ro;
+        ro.base_url = srv.base_url();
+        ro.dir = "/clink/shard";
+        ro.subtask_idx = s;
+        ro.parallelism = 2;
+        WebHdfsMultiObjectParquetSource<std::int64_t> src(ro, int64_arrow_batcher());
+        auto part = drain_dir_source(src);
+        all.insert(all.end(), part.begin(), part.end());
+    }
+    std::sort(all.begin(), all.end());
+    EXPECT_EQ(all, (std::vector<std::int64_t>{0, 10, 20, 30}));
+    EXPECT_EQ(all.size(), 4u);  // disjoint: no object read twice
+}
+
+TEST(WebHdfsMultiObjectParquet, EmptyDirYieldsNoRecords) {
+    MockWebHdfs srv;
+    WebHdfsMultiObjectParquetSource<std::int64_t>::Options ro;
+    ro.base_url = srv.base_url();
+    ro.dir = "/clink/does-not-exist";
+    WebHdfsMultiObjectParquetSource<std::int64_t> src(ro, int64_arrow_batcher());
+    EXPECT_TRUE(drain_dir_source(src).empty());
 }

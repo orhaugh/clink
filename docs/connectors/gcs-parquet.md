@@ -132,7 +132,7 @@ The source reads a single Parquet object to its last row group and reports `is_b
 
 ## Limitations
 
-- Single-object source: `ParquetGcsSource` reads exactly one `bucket`/`key` object. There is no glob, prefix scan, or Hive-partitioned dataset read (noted as a follow-up in `parquet_gcs_source.hpp`).
+- The source reads one object with `key`, or every object under `prefix` (a `prefix` instead of a `key` routes to the shared `MultiObjectParquetSource`, which lists the prefix, sorts, and shards objects round-robin across subtasks: object `i` is read by subtask `i % parallelism`). Optional multi-object source params: `recursive` (default `true`), `suffix` (default `.parquet`). There is no Hive-partition pruning or column projection on either path.
 - Channels are limited to `int64` and `string`; there are no other typed factories.
 - The whole sink writer set is held open until `close()`; output is not committed incrementally and is not transactional (no 2PC).
 - `compression` and the per-record `bucket_assigner` exist on the sink `Options` but are not configurable through the factory parameters or SQL; they require the programmatic API. The compression default is ZSTD.

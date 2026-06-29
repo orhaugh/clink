@@ -59,6 +59,34 @@ std::shared_ptr<Sink<T>> make_sink(const clink::plugin::BuildContext& ctx,
 template <typename T>
 std::shared_ptr<Source<T>> make_source(const clink::plugin::BuildContext& ctx,
                                        ArrowBatcher<T> batcher) {
+    // A `prefix` reads every matching Parquet object under that HDFS directory (via LISTSTATUS),
+    // sharded across subtasks; a `path` reads one object. They are mutually exclusive.
+    if (const auto prefix = ctx.param_or("prefix", ""); !prefix.empty()) {
+        if (ctx.param_or("base_url").empty()) {
+            throw std::runtime_error("webhdfs_parquet: 'base_url' is required");
+        }
+        typename WebHdfsMultiObjectParquetSource<T>::Options o;
+        o.base_url = ctx.param_or("base_url");
+        o.dir = prefix;
+        if (const auto u = ctx.param_or("user", ""); !u.empty()) {
+            o.user = u;
+        }
+        if (const auto d = ctx.param_or("delegation_token", ""); !d.empty()) {
+            o.delegation_token = d;
+        }
+        o.verify_tls = ctx.param_or("verify_tls", "true") == "true";
+        if (const auto c = ctx.param_int64_or("connect_timeout_ms", 0); c > 0) {
+            o.connect_timeout_ms = static_cast<int>(c);
+        }
+        if (const auto r = ctx.param_int64_or("rw_timeout_ms", 0); r > 0) {
+            o.rw_timeout_ms = static_cast<int>(r);
+        }
+        o.suffix = ctx.param_or("suffix", ".parquet");
+        o.subtask_idx = static_cast<int>(ctx.subtask_idx);
+        o.parallelism = static_cast<int>(ctx.parallelism);
+        return std::make_shared<WebHdfsMultiObjectParquetSource<T>>(std::move(o),
+                                                                    std::move(batcher));
+    }
     typename WebHdfsParquetSource<T>::Options opts;
     apply_common_params(ctx, opts);
     return std::make_shared<WebHdfsParquetSource<T>>(std::move(opts), std::move(batcher));

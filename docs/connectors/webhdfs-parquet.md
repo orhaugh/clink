@@ -137,7 +137,7 @@ The source reports `is_bounded() == true`: it reads a single Parquet object to i
 
 ## Limitations
 
-- Single-object source: it reads one Parquet file. There is no directory or glob support (noted as the obvious follow-up in `webhdfs_parquet_source.hpp`).
+- The source reads one Parquet file with `path`, or every matching file under `prefix` (an HDFS directory). With `prefix`, `WebHdfsMultiObjectParquetSource` enumerates the directory via a `LISTSTATUS` call, sorts the files, and shards them round-robin across subtasks (file `i` is read by subtask `i % parallelism`), reading each through the single-object source. Optional param: `suffix` (default `.parquet`). The directory listing is non-recursive (`LISTSTATUS` direct children only) and there is no cross-file replay.
 - The sink buffers the whole Parquet file in memory before upload, since WebHDFS has no incremental Arrow output stream; file size is bounded by available memory.
 - The sink is at-least-once only, with no two-phase commit.
 - Record channels are limited to the registered `int64` and `string` types.

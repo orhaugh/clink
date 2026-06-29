@@ -139,7 +139,7 @@ The source reads a single Parquet object to its last row group and reports `is_b
 ## Limitations
 
 - Sink commit is whole-blob at `close()`; no two-phase commit, no incremental or per-checkpoint commit, so failures can leave partial blobs.
-- Source is single-object only. Multi-object, glob, or partitioned-dataset reads are noted in the source header as a follow-up and are not implemented.
+- The source reads one object with `key`, or every object under `prefix` (a `prefix` instead of a `key` routes to the shared `MultiObjectParquetSource`, which lists the prefix, sorts, and shards objects round-robin across subtasks: object `i` is read by subtask `i % parallelism`). Optional multi-object source params: `recursive` (default `true`), `suffix` (default `.parquet`). Hive-partition pruning and column projection are not performed.
 - Source has no replay or offset tracking; it is a bounded one-shot read.
 - Record channels are limited to `int64` and `string`. Only those four factories are registered.
 - The source enforces an exact schema match (excluding metadata) against the batcher and throws otherwise.
