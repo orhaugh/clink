@@ -87,3 +87,4 @@ benchmarks/prod_compare/*/rocksdb:/
 /docs/*
 !/docs/consumer-examples/
 !/docs/connectors/
+!/docs/internals/

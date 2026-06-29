@@ -1,6 +1,34 @@
 # clink - agent notes
 No emdashes!!!
 
+## Codebase map (read this before scanning the tree)
+
+Persisted orientation so work starts informed instead of re-deriving the layout
+each time. For any "how does X work" or "where does X live" question, consult the
+relevant `docs/internals/` page first, then go to the source it cites. Keep these
+docs current when a subsystem changes.
+
+- Deep per-subsystem references: `docs/internals/` (index: `docs/internals/README.md`).
+- Per-connector references (deps, factory names, options, SQL usage): `docs/connectors/`.
+- Runnable API examples: `docs/consumer-examples/`.
+
+| Subsystem | Source | Internals page |
+|-----------|--------|----------------|
+| Engine core (types, StreamElement, batches) | `include/clink/core/` | `docs/internals/architecture.md` |
+| Operators + DAG + fluent API | `include/clink/operators/`, `include/clink/runtime/dag.hpp`, `include/clink/api/` | `docs/internals/operator-model.md` |
+| Local runtime / task lifecycle | `src/runtime/local_executor.cpp`, `include/clink/runtime/` | `docs/internals/task-lifecycle.md` |
+| Jobs, parallelism, scheduling, key groups | `include/clink/cluster/job_graph.hpp`, `include/clink/job/` | `docs/internals/jobs-and-scheduling.md` |
+| Cluster control plane (JM/TM, protocol, HA, plugin model) | `src/cluster/`, `include/clink/cluster/`, `include/clink/plugin/`, `tools/clink_node.cpp` | `docs/internals/distributed-runtime.md` |
+| Network / channels / Arrow wire / backpressure | `include/clink/runtime/network/`, `include/clink/runtime/multi_input_alignment.hpp` | `docs/internals/network-stack.md` |
+| Time, watermarks, windows, CEP | `include/clink/time/`, `include/clink/operators/`, `include/clink/cep/` | `docs/internals/time-and-windowing.md` |
+| Keyed/broadcast state + backends + queryable state | `include/clink/state/`, `src/state/`, `include/clink/queryable_state/` | `docs/internals/state-and-backends.md` |
+| Checkpointing, barriers, 2PC sinks | `include/clink/checkpoint/`, `src/checkpoint/`, `include/clink/connectors/file_2pc_sink.hpp` | `docs/internals/checkpointing.md` |
+| Failover, rescale, schema evolution, savepoints | `include/clink/cluster/rescale_*`, `include/clink/state/schema_version.hpp`, `include/clink/state_processor/` | `docs/internals/fault-tolerance-and-rescale.md` |
+| Arrow columnar execution | `include/clink/core/arrow_batcher.hpp`, columnar hooks in `include/clink/operators/` | `docs/internals/columnar-execution.md` |
+| Async substrate + disaggregated state | `include/clink/async/`, `src/async/`, RemoteReadBackend in `include/clink/state/` | `docs/internals/async-state-execution.md` |
+| SQL frontend (parse -> bind -> plan -> ops) | `include/clink/sql/`, `src/sql/` | `docs/internals/sql-frontend.md` |
+| Connectors (sources/sinks/backends) | `impls/<name>/` | `docs/connectors/<name>.md` |
+
 ## Pinned toolchain (one-time bootstrap)
 
 Arrow/Parquet + iceberg-cpp are COMPILED FROM SOURCE at exact versions

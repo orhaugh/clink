@@ -35,6 +35,7 @@ section below.
   - [Reproducible build + sanitizer matrix](#reproducible-build--sanitizer-matrix)
   - [Optional dependencies](#optional-dependencies)
 - [Connectors](#connectors)
+- [Internals](#internals)
 - [Installing clink](#installing-clink)
 - [Using clink as a library](#using-clink-as-a-library)
   - [One-call default registration](#one-call-default-registration)
@@ -272,6 +273,20 @@ The full set lives in the [connector reference](docs/connectors/README.md). In b
 - Databases and key-value: [PostgreSQL](docs/connectors/postgres.md), [MySQL / MariaDB](docs/connectors/mysql.md), [ClickHouse](docs/connectors/clickhouse.md), [Cassandra / ScyllaDB](docs/connectors/cassandra.md), [MongoDB](docs/connectors/mongodb.md), [Redis](docs/connectors/redis.md)
 - Cloud services and HTTP: [AWS (Kinesis / Firehose / DynamoDB)](docs/connectors/aws.md), [HTTP (Elasticsearch, OpenSearch, Splunk, InfluxDB, Prometheus, poll, Pub/Sub)](docs/connectors/http.md)
 - Serialization: [Avro](docs/connectors/avro.md)
+
+## Internals
+
+For a deeper look at how the engine works inside, the [internals
+reference](docs/internals/README.md) documents each subsystem and names the
+source files behind it. Start with [Architecture and component
+stack](docs/internals/architecture.md), which links out to the rest:
+
+- Engine core and runtime: [operator model](docs/internals/operator-model.md), [task lifecycle](docs/internals/task-lifecycle.md), [jobs and scheduling](docs/internals/jobs-and-scheduling.md)
+- Distribution and data movement: [distributed runtime](docs/internals/distributed-runtime.md), [network stack](docs/internals/network-stack.md)
+- Time and state: [time, watermarks and windows](docs/internals/time-and-windowing.md), [state and backends](docs/internals/state-and-backends.md)
+- Reliability: [checkpointing](docs/internals/checkpointing.md), [fault tolerance and rescale](docs/internals/fault-tolerance-and-rescale.md)
+- Execution paths: [columnar execution](docs/internals/columnar-execution.md), [async execution and disaggregated state](docs/internals/async-state-execution.md)
+- [SQL frontend internals](docs/internals/sql-frontend.md)
 
 ## Using clink as a library
 
