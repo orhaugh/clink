@@ -7,16 +7,24 @@ ARG USERNAME=clink
 ARG USER_UID=1000
 ARG USER_GID=${USER_UID}
 
-# Install build dependencies via the shared setup script. It sources versions.env and
-# calls build-arrow.sh + build-iceberg-cpp.sh (the from-source, version-pinned toolchain
-# shared with the host), so copy the whole scripts/ dir, not just the entrypoint.
-# CLINK_BUILD_JOBS caps compile parallelism for the heavy from-source deps (Arrow's
-# compute kernels + the aws-sdk push past 1 GB resident per TU, so full -j can OOM a
-# RAM-limited Docker). Empty default = use all cores; override with --build-arg.
+# Build deps install in TWO layers so adding a connector's apt package does not invalidate
+# the from-source toolchain (~40-60 min recompile of aws-sdk + Arrow + iceberg-cpp + ...).
+# Each layer COPYs only the scripts it needs, so editing the cheap connector script cannot
+# bust the expensive layer's cache. CLINK_BUILD_JOBS caps compile parallelism for the heavy
+# from-source deps (Arrow's compute kernels + the aws-sdk push past 1 GB resident per TU, so
+# full -j can OOM a RAM-limited Docker). Empty default = use all cores; override with --build-arg.
 ARG CLINK_BUILD_JOBS=""
 ENV CLINK_BUILD_JOBS=${CLINK_BUILD_JOBS}
-COPY scripts/ /tmp/clink-scripts/
-RUN chmod +x /tmp/clink-scripts/*.sh && /tmp/clink-scripts/setup-build-env.sh Debug && rm -rf /tmp/clink-scripts
+
+# Layer 1 (EXPENSIVE, rarely invalidated): base toolchain + from-source toolchain. Sources
+# versions.env and calls build-arrow.sh + build-iceberg-cpp.sh, so copy those alongside it.
+COPY scripts/versions.env scripts/build-arrow.sh scripts/build-iceberg-cpp.sh scripts/install-system-deps.sh /tmp/clink-sys/
+RUN chmod +x /tmp/clink-sys/*.sh && /tmp/clink-sys/install-system-deps.sh Debug && rm -rf /tmp/clink-sys
+
+# Layer 2 (CHEAP, volatile): optional connector client apt packages + the Pulsar .deb.
+# Re-runs in ~1-2 min when a connector adds a dep; the layer above stays cached.
+COPY scripts/versions.env scripts/install-connector-deps.sh /tmp/clink-conn/
+RUN chmod +x /tmp/clink-conn/*.sh && /tmp/clink-conn/install-connector-deps.sh && rm -rf /tmp/clink-conn
 
 # Additional debugging tools, useful when shelling into the image to
 # diagnose CI failures.
