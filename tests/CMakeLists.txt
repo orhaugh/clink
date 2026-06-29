@@ -36,6 +36,7 @@ add_executable(clink_core_tests
     test_columnar_parquet_factories.cpp
     test_parquet_connector.cpp
     test_multi_object_parquet_source.cpp
+    test_parquet_fs_2pc_sink.cpp
     test_polling_source.cpp
     test_file_2pc_sink.cpp
     test_state_recovery.cpp
