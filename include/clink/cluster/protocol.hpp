@@ -483,7 +483,7 @@ struct TriggerCheckpointMsg {
     std::uint64_t checkpoint_id{};
 };
 
-// JM → TM. Phase-2 of the 2PC sink protocol. Broadcast to every TM
+// JM → TM. The commit phase of the 2PC sink protocol. Broadcast to every TM
 // hosting tasks for the job once SubtaskCheckpointed acks for
 // `checkpoint_id` are all in and the COMPLETED-N marker is on disk.
 // Sinks implementing TwoPhaseCommitSink<T> finalize their pre-

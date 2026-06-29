@@ -3548,7 +3548,7 @@ void JobManager::handle_subtask_checkpointed_(MessageReader& r) {
             std::ofstream out(marker);
             out << "job=" << jid << "\ncheckpoint=" << ckpt_id << "\n";
         }
-        // Phase-2 of the 2PC sink protocol: broadcast CommitCheckpoint
+        // The commit phase of the 2PC sink protocol: broadcast CommitCheckpoint
         // to every TM hosting tasks for this job. The marker write
         // ordering matters - by the time TMs commit their pre-staged
         // transactions, the marker is durable, so a crash mid-broadcast
