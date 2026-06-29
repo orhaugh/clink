@@ -176,6 +176,29 @@ TEST(SqlPhysical, PulsarConnectorMapsToPulsarFactories) {
     EXPECT_EQ(snk->params.at("topic"), "out");
 }
 
+// connector='cassandra' (sink only) lowers to cassandra_sink_string via the row_to_json_string
+// bridge, carrying keyspace/table/contact_points.
+TEST(SqlPhysical, CassandraConnectorSinkLowersToJsonInsertSink) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/i.ndjson');"
+        "CREATE TABLE cs_out (a BIGINT) WITH (connector='cassandra', format='json', "
+        "contact_points='cass', keyspace='ks', table='events');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO cs_out SELECT a FROM src_t");
+
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* snk = find_op(spec, "cassandra_sink_string");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("keyspace"), "ks");
+    EXPECT_EQ(snk->params.at("table"), "events");
+    EXPECT_EQ(snk->params.at("contact_points"), "cass");
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+}
+
 // Wave 2 inc1: a kafka json table with columnar_decode='true' swaps the
 // row-form JSON bridge for the columnar one, and the columnar bridge must
 // carry the declared schema so it can build typed Arrow columns.

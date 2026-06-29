@@ -129,6 +129,9 @@
 #ifdef CLINK_LINKED_PULSAR
 #include "clink/pulsar/install.hpp"
 #endif
+#ifdef CLINK_LINKED_CASSANDRA
+#include "clink/cassandra/install.hpp"
+#endif
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/rocksdb/install.hpp"
 #endif
@@ -2011,6 +2014,9 @@ void install_linked_impls() {
 #endif
 #ifdef CLINK_LINKED_PULSAR
     clink::pulsar::install(reg);  // Apache Pulsar source + sink
+#endif
+#ifdef CLINK_LINKED_CASSANDRA
+    clink::cassandra::install(reg);  // Cassandra / ScyllaDB sink
 #endif
     // RocksDB is unconditionally linked into clink_node (matches
     // bundled rocksdb-jni model). install() registers the

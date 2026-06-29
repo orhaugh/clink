@@ -137,6 +137,9 @@ std::string string_sink_factory_for(const TableDef& table) {
     if (connector == "pulsar") {
         return "pulsar_sink_string";
     }
+    if (connector == "cassandra") {
+        return "cassandra_sink_string";
+    }
     if (connector == "clickhouse") {
         return "clickhouse_sink";
     }
@@ -375,6 +378,23 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
             unsupported("connector='pulsar' sink does not support mode='upsert'");
         }
         return RowConnectorBinding{"pulsar_sink_string", kChannelString, "row_to_json_string"};
+    }
+    if (connector == "cassandra") {
+        // Cassandra / ScyllaDB sink. Each row -> JSON object string -> INSERT ... JSON ?. At-least-
+        // once; a CQL INSERT is an upsert keyed by the primary key, so replay is idempotent for a
+        // stable PK. The simple JSON-insert path has no delete/tombstone handling, so mode='upsert'
+        // (changelog) is rejected; exactly-once is not supported.
+        if (exactly_once) {
+            unsupported(
+                "connector='cassandra' sink is at-least-once (idempotent for a stable primary "
+                "key); exactly-once delivery is not supported");
+        }
+        if (upsert) {
+            unsupported(
+                "connector='cassandra' sink does not support mode='upsert' (no tombstone "
+                "handling); a CQL INSERT already upserts by primary key");
+        }
+        return RowConnectorBinding{"cassandra_sink_string", kChannelString, "row_to_json_string"};
     }
     if (connector == "clickhouse") {
         // ClickHouse sink (M1). Each row -> JSON object string -> the sink's

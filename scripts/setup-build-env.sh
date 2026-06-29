@@ -155,6 +155,30 @@ if [ ! -f "/usr/lib/libpulsar.so" ] && [ ! -f "/usr/lib/$(dpkg-architecture -qDE
     ldconfig
 fi
 
+# -- DataStax C/C++ driver for Cassandra / ScyllaDB --
+# Not packaged by Debian and no prebuilt arm64 release; build the pinned tag (versions.env) from
+# source via CMake. Needs libuv (event loop) + openssl/zlib (already present). clink uses the C
+# API (cassandra.h), so the build is ABI-safe regardless of the compiler. Docker-layer-cached.
+if [ ! -f "/usr/local/lib/libcassandra.so" ] && [ ! -f "/usr/lib/libcassandra.so" ]; then
+    echo "▶ Building DataStax cpp-driver ${CASSANDRA_CPP_DRIVER_VERSION} from source..."
+    apt-get install -y --no-install-recommends libuv1-dev zlib1g-dev
+    WORK_DIR=$(mktemp -d)
+    git clone --depth 1 --branch "${CASSANDRA_CPP_DRIVER_VERSION}" \
+        https://github.com/apache/cassandra-cpp-driver.git "$WORK_DIR/cpp-driver"
+    cmake -S "$WORK_DIR/cpp-driver" -B "$WORK_DIR/cpp-driver/build" \
+          -DCMAKE_INSTALL_PREFIX=/usr/local \
+          -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+          -DCASS_BUILD_SHARED=ON \
+          -DCASS_BUILD_STATIC=OFF \
+          -DCASS_BUILD_EXAMPLES=OFF \
+          -DCASS_BUILD_UNIT_TESTS=OFF \
+          -DCASS_BUILD_INTEGRATION_TESTS=OFF
+    cmake --build "$WORK_DIR/cpp-driver/build" --target install -- -j"${CLINK_BUILD_JOBS:-$(nproc)}"
+    cd /
+    rm -rf "$WORK_DIR"
+    ldconfig
+fi
+
 rm -rf /var/lib/apt/lists/*
 
 echo "▶ Build env ready."
