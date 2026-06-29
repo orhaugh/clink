@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -37,6 +38,11 @@ public:
         int connect_timeout_ms{5000};
         int rw_timeout_ms{30000};
         bool verify_tls{true};  // https only; false skips server-cert verification
+        // Optional bearer-token provider, consulted before EACH request: when set, an
+        // "Authorization: Bearer <provider()>" header is added per-request, so a token that
+        // rotates (e.g. a re-read file) is picked up without rebuilding the client. Leave a
+        // static `Authorization` out of `headers` when using this. Empty result = no auth header.
+        std::function<std::string()> auth_token_provider;
     };
 
     explicit HttpRequest(Options opts);

@@ -152,7 +152,8 @@ Shared Pub/Sub options:
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `endpoint` | No | (env / real service) | Override base URL (e.g. an emulator). |
-| `auth_token` | No | (empty) | Bearer token; sets `Authorization: Bearer <token>`. |
+| `auth_token` | No | (empty) | Static bearer token; sets `Authorization: Bearer <token>`. Valid only for its lifetime (no refresh). |
+| `auth_token_file` | No | (empty) | Path to a file holding the bearer token, re-read per request when the file changes. An external refresher (Workload Identity / sidecar / Vault agent) rotating the file is picked up without restarting the job. Takes precedence over `auth_token`. |
 | `headers` | No | (empty) | Extra headers, merged after the token (an explicit `Authorization` header wins). |
 | `verify_tls` | No | `true` | HTTPS certificate verification. |
 | `max_retries` | No | `4` | Retry attempts; clamped to `[0, 20]`. |
@@ -179,7 +180,7 @@ Shared Pub/Sub options:
 | `poll_interval_ms` | No | `500` | Sleep after an empty pull. |
 | `retry_base_backoff_ms` | No | `200` | Base backoff between transient-pull retries. |
 
-Authentication note: this build does not mint OAuth2 tokens. Supply a bearer token via `auth_token` or `headers`; against the Pub/Sub emulator no auth is needed. A static token is valid only for its lifetime.
+Authentication note: this build does not mint OAuth2 tokens. Supply a bearer token via `auth_token` (static) or `headers`, or via `auth_token_file` (re-read per request, so an external refresher rotating the file is picked up without a restart); against the Pub/Sub emulator no auth is needed.
 
 ## SQL usage
 
@@ -278,7 +279,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 - HTTPS works only if cpp-httplib was built with OpenSSL; otherwise an `https://` URL is rejected at construction.
 - `prometheus_sink` targets a Pushgateway, which is a latest-value store for low-cardinality service metrics, not a high-throughput event TSDB. Records whose `value_field` is missing or non-numeric are dropped (no sample). Remote-write is not implemented.
 - `http_poll_source` requires the API to return records ascending by `cursor_field`; it has no client-side ordering or de-duplication beyond the cursor.
-- Pub/Sub uses the synchronous REST `Pull` with `returnImmediately`; gRPC StreamingPull is not used. The build does not refresh OAuth2 tokens; a supplied static token expires after its lifetime. Multiple subtasks pull the same subscription and Pub/Sub load-balances across them (no client-side sharding).
+- Pub/Sub uses the synchronous REST `Pull` with `returnImmediately`; gRPC StreamingPull is not used. The build does not mint OAuth2 tokens itself; a static `auth_token` expires after its lifetime, but `auth_token_file` lets an external refresher rotate the token without a restart. Multiple subtasks pull the same subscription and Pub/Sub load-balances across them (no client-side sharding).
 - The bulk sinks buffer rendered records in memory until a flush trigger; `batch_records` / `batch_bytes` / `linger_ms` bound that buffer.
 - `linger_ms` is evaluated only when a record arrives (no timer thread), so a fully idle buffer waits for the next checkpoint barrier.
 

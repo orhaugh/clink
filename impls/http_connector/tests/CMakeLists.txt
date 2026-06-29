@@ -14,6 +14,7 @@ add_executable(clink_http_connector_tests
     test_prometheus_sink.cpp
     test_http_poll_source.cpp
     test_http_roundtrip.cpp
+    test_token_refresh.cpp
     test_pubsub.cpp
     test_pubsub_live.cpp
 )

@@ -39,7 +39,9 @@ HttpResponse to_response(Result&& res) {
 
 struct HttpRequest::Impl {
     httplib::Client client;
-    explicit Impl(const Options& o) : client(o.base_url) {
+    std::function<std::string()> auth_token_provider;
+    explicit Impl(const Options& o)
+        : client(o.base_url), auth_token_provider(o.auth_token_provider) {
         client.set_keep_alive(true);
         client.set_connection_timeout(std::chrono::milliseconds{o.connect_timeout_ms});
         client.set_read_timeout(std::chrono::milliseconds{o.rw_timeout_ms});
@@ -53,6 +55,16 @@ struct HttpRequest::Impl {
         client.enable_server_certificate_verification(o.verify_tls);
 #endif
     }
+
+    // Per-request headers: a fresh bearer token when a provider is set, else none. Consulted on
+    // every request so a rotating token (e.g. a re-read file) is picked up without a new client.
+    httplib::Headers auth_headers() const {
+        if (!auth_token_provider) {
+            return {};
+        }
+        return {{"Authorization", "Bearer " + auth_token_provider()}};
+    }
+    bool has_auth_provider() const { return static_cast<bool>(auth_token_provider); }
 };
 
 HttpRequest::HttpRequest(Options opts) : impl_(std::make_unique<Impl>(opts)) {}
@@ -63,10 +75,16 @@ HttpRequest& HttpRequest::operator=(HttpRequest&&) noexcept = default;
 HttpResponse HttpRequest::post(const std::string& path,
                                const std::string& body,
                                const std::string& content_type) {
+    if (impl_->has_auth_provider()) {
+        return to_response(impl_->client.Post(path, impl_->auth_headers(), body, content_type));
+    }
     return to_response(impl_->client.Post(path, body, content_type));
 }
 
 HttpResponse HttpRequest::get(const std::string& path) {
+    if (impl_->has_auth_provider()) {
+        return to_response(impl_->client.Get(path, impl_->auth_headers()));
+    }
     return to_response(impl_->client.Get(path));
 }
 
@@ -76,16 +94,25 @@ HttpResponse HttpRequest::get(const std::string& path,
     for (const auto& [k, v] : extra_headers) {
         h.emplace(k, v);
     }
+    if (impl_->has_auth_provider()) {
+        h.emplace("Authorization", "Bearer " + impl_->auth_token_provider());
+    }
     return to_response(impl_->client.Get(path, h));
 }
 
 HttpResponse HttpRequest::put(const std::string& path,
                               const std::string& body,
                               const std::string& content_type) {
+    if (impl_->has_auth_provider()) {
+        return to_response(impl_->client.Put(path, impl_->auth_headers(), body, content_type));
+    }
     return to_response(impl_->client.Put(path, body, content_type));
 }
 
 HttpResponse HttpRequest::del(const std::string& path) {
+    if (impl_->has_auth_provider()) {
+        return to_response(impl_->client.Delete(path, impl_->auth_headers()));
+    }
     return to_response(impl_->client.Delete(path));
 }
 

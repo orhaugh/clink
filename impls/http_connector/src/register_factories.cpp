@@ -18,6 +18,7 @@
 #include "clink/http_connector/install.hpp"
 #include "clink/http_connector/prometheus_push_sink.hpp"
 #include "clink/http_connector/pubsub.hpp"
+#include "clink/http_connector/token_source.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
@@ -48,7 +49,12 @@ HttpRequest::Options pubsub_http_options(const clink::plugin::BuildContext& ctx)
     http.base_url = endpoint.empty() ? "https://pubsub.googleapis.com" : endpoint;
     http.verify_tls = ctx.param_or("verify_tls", "true") != "false";
     std::map<std::string, std::string> headers;
-    if (const std::string token = ctx.param_or("auth_token", ""); !token.empty()) {
+    // `auth_token_file` (refreshing) takes precedence over a static `auth_token`: the file is
+    // re-read per request when it changes, so an external refresher rotating the token is picked
+    // up without a restart. With a provider set, do not also add a static Authorization header.
+    if (const std::string token_file = ctx.param_or("auth_token_file", ""); !token_file.empty()) {
+        http.auth_token_provider = make_file_token_provider(token_file);
+    } else if (const std::string token = ctx.param_or("auth_token", ""); !token.empty()) {
         headers["Authorization"] = "Bearer " + token;
     }
     for (auto& kv : parse_headers(ctx.param_or("headers", ""))) {
