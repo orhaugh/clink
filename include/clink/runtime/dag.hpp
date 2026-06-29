@@ -789,6 +789,11 @@ public:
                         // event-time timers) only after its epoch has drained,
                         // so it never overtakes a record that arrived before it.
                         const Watermark wm = maybe->as_watermark();
+                        // Eager observation hook: let the operator update
+                        // event-time bookkeeping (e.g. a process_async late-drop
+                        // bound) the instant the watermark is pulled, before its
+                        // fire/forward is deferred below. Default no-op.
+                        op->on_watermark_observed(wm);
                         if (op->fires_async_event_time_timers()) {
                             // The release only MARKS the epoch drained; the
                             // runner fires the due timers as overlapping

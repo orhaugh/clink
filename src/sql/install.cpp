@@ -2300,6 +2300,144 @@ public:
 
     std::string name() const override { return "over_aggregate_row"; }
 
+    // Auto-on the async/disaggregated path when the bound backend defers reads
+    // AND this OVER carries no LAG ring and no bounded-frame buffer
+    // (max_lag_ == 0 && !needs_buffer_). In that scope a partition's state is just
+    // {running aggregates, first_row, pending buffer}; it lives in KeyedState
+    // (the pool, evictable + lazy-restore) keyed by the PARTITION key (so routing
+    // matches the keyer), and each buffered row registers an event-time timer at
+    // its event time. A watermark fires the due partition's timer, which
+    // point-reads ONLY that partition's state - never a scan of every partition.
+    // LAG / ROWS / RANGE-frame OVER keep the byte-identical in-memory state_ +
+    // watermark scan (their per-partition deque buffers are a larger
+    // serialisation surface; a scoped follow-on), so this is non-breaking.
+    void open() override {
+        const bool backend_defers = this->runtime() != nullptr &&
+                                    this->runtime()->has_state_backend() &&
+                                    this->runtime()->state_backend()->supports_async_get();
+        effective_async_ = backend_defers && max_lag_ == 0 && !needs_buffer_;
+    }
+    [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
+    [[nodiscard]] bool fires_state_touching_timers() const noexcept override {
+        return effective_async_;
+    }
+    [[nodiscard]] bool fires_async_event_time_timers() const noexcept override {
+        return effective_async_;
+    }
+    // Coalesce both ingest and fire reads into batched get_many round-trips (the
+    // runner wraps the backend in a CoalescingBackend, gated on a deferring
+    // backend; inert on a sync one). Evaluated before open(), so it must be a
+    // static opt-in like the window/join/aggregate ops.
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
+
+    // Async ingest: buffer each non-late record into its partition's pending map
+    // under gate-key = partition key (so same-partition records serialise and
+    // their seq order is preserved), and register an event-time timer at the
+    // record's event time. seq is assigned synchronously here in arrival order so
+    // the (ts, seq) pending order is byte-identical to the sync path. No emit here
+    // - rows emit when their partition's timer fires. The late-record drop uses
+    // current_wm_, kept up to date by on_watermark_observed (which the runner
+    // calls synchronously when it pulls a watermark, BEFORE the watermark's effect
+    // is epoch-deferred), so it matches the sync handle_record_ drop exactly.
+    void process_async(const StreamElement<Row>& element,
+                       Emitter<Row>& /*out*/,
+                       AsyncExecutionController& aec) override {
+        if (!element.is_data()) {
+            return;
+        }
+        for (const auto& rec : element.as_data()) {
+            const Row& row = rec.value();
+            auto ts_opt = ts_of_(row);
+            if (!ts_opt) {
+                continue;  // no usable event time -> dropped (matches handle_record_)
+            }
+            if (have_wm_ && *ts_opt <= current_wm_) {
+                continue;  // late: its running value already emitted (matches handle_record_)
+            }
+            std::string key = partition_key_(row);
+            const std::uint64_t myseq = seq_++;  // arrival order, deterministic
+            const std::int64_t ts = *ts_opt;
+            auto kv = keyed_state_();
+            auto* rt = this->runtime();
+            Row row_copy = row;
+            auto factory = [this, kv, key, ts, myseq, row = std::move(row_copy), rt]() mutable
+                -> async::Task<void> {
+                auto cur = co_await kv.get_async(key);
+                PartState st = cur.has_value() ? std::move(*cur) : PartState{};
+                if (st.agg.empty()) {
+                    st.agg.resize(specs_.size());
+                }
+                st.pending.emplace(std::make_pair(ts, myseq), std::move(row));
+                kv.put(key, st);
+                rt->timer_service()->register_event_time_timer(ts, key);
+                co_return;
+            };
+            while (!aec.submit(key, factory)) {
+                aec.poll();
+            }
+        }
+    }
+
+    // Sync single-timer fire (fallback path): drain this partition's pending rows
+    // due at <= win_end in (ts, seq) order, fold + emit each, write back once.
+    void on_event_time_timer(std::int64_t win_end,
+                             const std::string& key,
+                             Emitter<Row>& out) override {
+        auto kv = keyed_state_();
+        auto cur = kv.get(key);
+        if (!cur.has_value()) {
+            return;
+        }
+        PartState st = std::move(*cur);
+        Batch<Row> batch;
+        drain_due_(st, win_end, batch);
+        if (!batch.empty()) {
+            out.emit_data(std::move(batch));
+        }
+        kv.put(key, st);
+    }
+
+    // Async fire (overlap path): ONE point-read of the due partition's state,
+    // drain every pending row with ts <= the max fired timer (each pending ts <=
+    // wm registered a timer, so the max fired ts is this partition's largest due
+    // event time), fold + emit in (ts, seq) order, one write-back. The runner
+    // submits one of these per due partition, so distinct partitions' reads
+    // coalesce into ONE get_many.
+    async::Task<void> on_event_time_timers_async(std::vector<std::int64_t> timestamps,
+                                                 std::string key,
+                                                 Emitter<Row>& out) override {
+        auto kv = keyed_state_();
+        auto cur = co_await kv.get_async(key);
+        if (!cur.has_value()) {
+            co_return;
+        }
+        PartState st = std::move(*cur);
+        const std::int64_t bound = timestamps.empty() ? current_wm_ : timestamps.back();
+        Batch<Row> batch;
+        drain_due_(st, bound, batch);
+        if (!batch.empty()) {
+            out.emit_data(std::move(batch));
+        }
+        kv.put(key, st);
+    }
+
+    // Eager watermark observation (async path): the runner calls this the moment
+    // it pulls a watermark, BEFORE deferring the watermark's fire/forward to its
+    // epoch drain. Updating current_wm_ here (not in on_watermark, which lags
+    // ingest because its release runs only after the epoch drains) keeps the
+    // process_async late-drop in step with the sync handle_record_ drop. Records
+    // that arrived before the watermark are already submitted, so advancing the
+    // bound only affects records pulled after it - exactly the late ones.
+    void on_watermark_observed(Watermark wm) override {
+        if (!wm.is_idle()) {
+            have_wm_ = true;
+            const std::int64_t t = wm.timestamp().millis();
+            if (t > current_wm_) {
+                current_wm_ = t;
+            }
+        }
+    }
+
 private:
     struct PartState {
         std::vector<AggState> agg;     // parallel to specs_ (used for aggregate fns)
@@ -2467,6 +2605,110 @@ private:
                fn == "array_agg";
     }
 
+    // Pop this partition's pending rows with ts <= bound in (ts, seq) order and
+    // fold + emit each via the shared emit_one_ - byte-identical to fire_due_'s
+    // inner loop for one partition. Only reached on the async path, where
+    // max_lag_ == 0 && !needs_buffer_, so emit_one_'s LAG ring and bounded-frame
+    // branches are inert (no recent / folded mutation), matching the sync output.
+    void drain_due_(PartState& st, std::int64_t bound, Batch<Row>& batch) {
+        while (!st.pending.empty() && st.pending.begin()->first.first <= bound) {
+            Row r = std::move(st.pending.begin()->second);
+            st.pending.erase(st.pending.begin());
+            emit_one_(st, r, batch);
+        }
+    }
+
+    KeyedState<std::string, PartState> keyed_state_() {
+        return this->runtime()->template keyed_state<std::string, PartState>(
+            "over", clink::string_codec(), part_state_codec());
+    }
+
+    // Binary codec for one partition's PartState over the async/disaggregated
+    // KeyedState path. Reuses the exact AggState (de)serialisation the GROUP BY's
+    // AggBucket codec proves, and the Row-as-JSON idiom the window codec uses. The
+    // async path is gated to max_lag_ == 0 && !needs_buffer_, so recent / folded
+    // are always empty here, but they are serialised for fidelity (and so the
+    // codec stays correct if the gate is later widened).
+    static clink::Codec<PartState> part_state_codec() {
+        using Bytes = clink::Codec<PartState>::Bytes;
+        using BytesView = clink::Codec<PartState>::BytesView;
+        auto row_text = [](const Row& r) {
+            return clink::config::JsonValue{clink::config::JsonObject{r.values}}.serialize(0);
+        };
+        auto parse_row = [](const std::string& t) -> Row {
+            Row r;
+            try {
+                auto j = clink::config::parse(t);
+                if (j.is_object()) {
+                    r.values = j.as_object();
+                }
+            } catch (...) {
+            }
+            return r;
+        };
+        auto body = [row_text](const PartState& st, Bytes& o) {
+            agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(st.agg.size()));
+            for (const auto& a : st.agg) {
+                agg_codec_detail::encode_agg_state(o, a);
+            }
+            agg_codec_detail::put_bool(o, st.first_row.has_value());
+            if (st.first_row.has_value()) {
+                agg_codec_detail::put_str(o, row_text(*st.first_row));
+            }
+            agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(st.recent.size()));
+            for (const auto& r : st.recent) {
+                agg_codec_detail::put_str(o, row_text(r));
+            }
+            agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(st.pending.size()));
+            for (const auto& [k, r] : st.pending) {
+                agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(k.first));
+                agg_codec_detail::put_u64(o, k.second);
+                agg_codec_detail::put_str(o, row_text(r));
+            }
+            agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(st.folded.size()));
+            for (const auto& [ts, r] : st.folded) {
+                agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(ts));
+                agg_codec_detail::put_str(o, row_text(r));
+            }
+        };
+        return clink::Codec<PartState>{
+            .encode = [body](const PartState& st) -> Bytes {
+                Bytes o;
+                body(st, o);
+                return o;
+            },
+            .decode = [parse_row](BytesView buf) -> std::optional<PartState> {
+                agg_codec_detail::Reader r{buf, 0, true};
+                PartState st;
+                for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i) {
+                    st.agg.push_back(agg_codec_detail::decode_agg_state(r));
+                }
+                if (r.boolean()) {
+                    st.first_row = parse_row(r.str());
+                }
+                for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i) {
+                    st.recent.push_back(parse_row(r.str()));
+                }
+                for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i) {
+                    const auto ts = static_cast<std::int64_t>(r.u64());
+                    const auto seq = r.u64();
+                    Row row = parse_row(r.str());
+                    st.pending.emplace(std::make_pair(ts, seq), std::move(row));
+                }
+                for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i) {
+                    const auto ts = static_cast<std::int64_t>(r.u64());
+                    st.folded.emplace_back(ts, parse_row(r.str()));
+                }
+                if (!r.ok) {
+                    return std::nullopt;
+                }
+                return st;
+            },
+            .encode_into = body,
+        };
+    }
+
+    bool effective_async_ = false;
     std::string time_column_;
     std::vector<std::string> partition_columns_;
     std::vector<OverSpec> specs_;

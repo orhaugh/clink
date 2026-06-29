@@ -867,6 +867,156 @@ TEST(SqlRuntime, AsyncStateCumulateWindowFiresMultiplePerGroupInOneRead) {
         << "the group's 3 cumulate slices did not batch into a single fire read";
 }
 
+// OVER aggregate over the async/disaggregated path. With a deferring backend and
+// no LAG ring / bounded frame, OverAggregateRowOp keeps each partition's running
+// state in KeyedState and fires per-partition event-time timers, so a fire
+// point-reads only the due partition. Proven by comparing the per-row relation to
+// the synchronous in-memory path (identical) over a MULTI-watermark script that
+// fires each partition more than once - so the running aggregate (and first_row)
+// round-trips through the PartState codec ACROSS fires - plus a late record that
+// both paths must drop. remote_loads > 0 proves the async path went through the
+// deferring tier.
+namespace {
+
+struct OverScriptStep {
+    std::vector<Record<Row>> records;   // emitted as one data batch (if non-empty)
+    std::optional<std::int64_t> wm_ms;  // a watermark at this event time (if set)
+};
+
+// A source that emits a scripted sequence of data batches and watermarks in order
+// (VectorSource only emits a single trailing max watermark, so it cannot fire a
+// watermark-driven operator more than once). A trailing max watermark flushes
+// anything still pending.
+class ScriptedRowSource final : public clink::Source<Row> {
+public:
+    explicit ScriptedRowSource(std::vector<OverScriptStep> steps) : steps_(std::move(steps)) {}
+    [[nodiscard]] bool is_bounded() const noexcept override { return true; }
+    bool produce(Emitter<Row>& out) override {
+        if (done_ || this->cancelled()) {
+            return false;
+        }
+        for (auto& s : steps_) {
+            if (!s.records.empty()) {
+                Batch<Row> b;
+                for (auto& r : s.records) {
+                    b.push(r);
+                }
+                out.emit_data(std::move(b));
+            }
+            if (s.wm_ms.has_value()) {
+                out.emit_watermark(clink::Watermark{clink::EventTime::from_millis(*s.wm_ms)});
+            }
+        }
+        out.emit_watermark(clink::Watermark::max());
+        done_ = true;
+        return false;
+    }
+    std::string name() const override { return "scripted_row_source"; }
+
+private:
+    std::vector<OverScriptStep> steps_;
+    bool done_ = false;
+};
+
+Record<Row> over_row(std::int64_t id, std::int64_t p, std::int64_t ts, std::int64_t amt) {
+    Row r;
+    r.values["id"] = clink::config::JsonValue{static_cast<double>(id)};
+    r.values["p"] = clink::config::JsonValue{static_cast<double>(p)};
+    r.values["ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+    r.values["amt"] = clink::config::JsonValue{static_cast<double>(amt)};
+    return Record<Row>{std::move(r)};
+}
+
+std::vector<Record<Row>> run_over_aggregate(std::vector<OverScriptStep> steps,
+                                            std::shared_ptr<StateBackend> backend) {
+    const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+        "over_aggregate_row", std::string{kChannelRow}, std::string{kChannelRow});
+    cluster::OperatorBuildContext octx;
+    octx.params["time_column"] = "ts";
+    octx.params["partition_columns"] = "p";
+    octx.params["outputs"] = R"([{"name":"sm","fn":"sum","input_column":"amt"},)"
+                             R"({"name":"cnt","fn":"count","input_column":"amt"},)"
+                             R"({"name":"av","fn":"avg","input_column":"amt"},)"
+                             R"({"name":"mn","fn":"min","input_column":"amt"},)"
+                             R"({"name":"mx","fn":"max","input_column":"amt"},)"
+                             R"({"name":"fv","fn":"first_value","input_column":"amt"},)"
+                             R"({"name":"lv","fn":"last_value","input_column":"amt"}])";
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+
+    Dag dag;
+    auto h_src = dag.add_source<Row>(std::make_shared<ScriptedRowSource>(std::move(steps)));
+    auto h_op = dag.add_operator<Row, Row>(h_src, op);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_op, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return sink->collected_records();
+}
+
+// id -> the row's computed OVER values, serialised for an order-independent
+// comparison (OVER emits one row per input; the async fire order differs from the
+// sync scan, but the per-id computed values must be identical).
+std::map<std::int64_t, std::string> over_relation(const std::vector<Record<Row>>& rows) {
+    std::map<std::int64_t, std::string> rel;
+    for (const auto& rec : rows) {
+        const Row& r = rec.value();
+        const auto id = static_cast<std::int64_t>(r.values.at("id").as_number());
+        std::string vals;
+        for (const char* col : {"sm", "cnt", "av", "mn", "mx", "fv", "lv"}) {
+            auto it = r.values.find(col);
+            vals += std::string(col) + "=" +
+                    (it == r.values.end() ? std::string("<>") : it->second.serialize(0)) + ";";
+        }
+        rel[id] = vals;
+    }
+    return rel;
+}
+
+std::vector<OverScriptStep> over_parity_script() {
+    std::vector<OverScriptStep> steps;
+    // Wave 1: p1 gets id1(ts10), id3(ts15); p2 gets id2(ts12).
+    steps.push_back(
+        {{over_row(1, 1, 10, 5), over_row(2, 2, 12, 100), over_row(3, 1, 15, 7)}, std::nullopt});
+    steps.push_back({{}, 12});  // fire: p1 id1 (ts10<=12), p2 id2 (ts12<=12); id3 stays
+    // Wave 2: id4(ts20) is in time; id5(ts11) is LATE (<= the wm 12 already seen).
+    steps.push_back({{over_row(4, 1, 20, 3), over_row(5, 1, 11, 99)}, std::nullopt});
+    steps.push_back({{}, 25});  // fire: p1 id3 (ts15) then id4 (ts20) in order; id5 dropped
+    return steps;
+}
+
+}  // namespace
+
+TEST(SqlRuntime, OverAggregateAsyncMatchesSyncPath) {
+    ensure_sql_installed_once();
+
+    const auto sync_rel = over_relation(
+        run_over_aggregate(over_parity_script(), std::make_shared<InMemoryStateBackend>()));
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    const auto async_rel = over_relation(run_over_aggregate(over_parity_script(), rrb));
+
+    // Sanity on the sync oracle: id5 (late) is dropped, 4 rows emit, and the
+    // running aggregate accumulated across the two fires of partition 1.
+    EXPECT_EQ(sync_rel.size(), 4u) << "the late record id5 must be dropped";
+    EXPECT_EQ(sync_rel.count(5), 0u) << "late record must not emit";
+    ASSERT_EQ(sync_rel.count(1), 1u);
+    ASSERT_EQ(sync_rel.count(4), 1u);
+    EXPECT_NE(sync_rel.at(1).find("sm=5;"), std::string::npos) << "id1 running sum = 5";
+    EXPECT_NE(sync_rel.at(4).find("sm=15;"), std::string::npos)
+        << "id4 running sum = 5+7+3 = 15 (agg survived the fire at wm 12 via the codec)";
+    EXPECT_NE(sync_rel.at(4).find("fv=5;"), std::string::npos)
+        << "first_value persisted across fires";
+
+    // The async/disaggregated path is byte-identical to the sync path, and it
+    // genuinely routed partition state through the deferring backend.
+    EXPECT_EQ(async_rel, sync_rel) << "async OVER must match the sync path exactly";
+    EXPECT_GT(rrb->remote_loads(), 0u)
+        << "OVER did not route its per-partition state through the deferring backend";
+}
+
 // #59: the same unbounded GROUP BY built through the programmatic Table API
 // instead of a SQL string. Proves the Table-API-built JobGraphSpec actually
 // executes end-to-end (the byte-identical-IR test in test_table_api.cpp proves

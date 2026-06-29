@@ -365,6 +365,16 @@ public:
         out.emit_watermark(wm);
     }
 
+    // Called by the async runner the instant a watermark is pulled from the input,
+    // BEFORE the watermark's timer fire / forward is deferred to its epoch drain.
+    // Lets a state operator update event-time bookkeeping that must not lag ingest
+    // - e.g. an event-time late-record drop inside process_async, which otherwise
+    // would not see the watermark until on_watermark runs (after the epoch drains,
+    // by which point later records have already been ingested). Default no-op; the
+    // synchronous on_watermark and timer fire still run later, epoch-gated. Not
+    // called on the sync path (process() routes watermarks through on_watermark).
+    virtual void on_watermark_observed(Watermark /*wm*/) {}
+
     virtual void on_barrier(CheckpointBarrier barrier, Emitter<Out>& out) {
         out.emit_barrier(barrier);
     }
