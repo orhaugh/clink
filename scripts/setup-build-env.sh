@@ -132,6 +132,29 @@ fi
 "${SCRIPT_DIR}/build-iceberg-cpp.sh"
 ldconfig
 
+# -- Apache Pulsar C++ client (NATS-style transport connector) --
+# Not in Debian apt. Apache publishes prebuilt .deb packages per arch; install the pinned
+# version (scripts/versions.env) matching the host's Homebrew libpulsar. clink uses the C API
+# (pulsar/c/), so no C++ ABI is shared with this prebuilt library. apt-get install -f resolves
+# its runtime deps (libssl/libcurl/...), already present from the optional-deps block above.
+if [ ! -f "/usr/lib/libpulsar.so" ] && [ ! -f "/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null)/libpulsar.so" ]; then
+    echo "▶ Installing Apache Pulsar C++ client ${PULSAR_CLIENT_CPP_VERSION} (.deb)..."
+    _deb_arch="$(dpkg --print-architecture)"  # amd64 | arm64
+    case "${_deb_arch}" in
+        amd64) _pulsar_arch="x86_64" ;;
+        arm64) _pulsar_arch="arm64" ;;
+        *)     _pulsar_arch="${_deb_arch}" ;;
+    esac
+    _pulsar_base="https://archive.apache.org/dist/pulsar/pulsar-client-cpp-${PULSAR_CLIENT_CPP_VERSION}/deb-${_pulsar_arch}"
+    _pulsar_tmp="$(mktemp -d)"
+    curl -fsSL "${_pulsar_base}/apache-pulsar-client.deb" -o "${_pulsar_tmp}/client.deb"
+    curl -fsSL "${_pulsar_base}/apache-pulsar-client-dev.deb" -o "${_pulsar_tmp}/client-dev.deb"
+    apt-get update >/dev/null 2>&1 || true
+    dpkg -i "${_pulsar_tmp}/client.deb" "${_pulsar_tmp}/client-dev.deb" || apt-get install -y -f
+    rm -rf "${_pulsar_tmp}"
+    ldconfig
+fi
+
 rm -rf /var/lib/apt/lists/*
 
 echo "▶ Build env ready."

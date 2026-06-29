@@ -152,6 +152,30 @@ TEST(SqlPhysical, NatsConnectorMapsToJetStreamFactories) {
     EXPECT_EQ(snk->params.at("subject"), "out");
 }
 
+// connector='pulsar' lowers to pulsar_source_string / pulsar_sink_string (string channel) via
+// the json_string_to_row + row_to_json_string bridges, carrying topic/service_url.
+TEST(SqlPhysical, PulsarConnectorMapsToPulsarFactories) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE p_in (msg TEXT) "
+        "WITH (connector='pulsar', service_url='pulsar://mq:6650', topic='events');"
+        "CREATE TABLE p_out (msg TEXT) "
+        "WITH (connector='pulsar', service_url='pulsar://mq:6650', topic='out');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO p_out SELECT msg FROM p_in");
+
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* src = find_op(spec, "pulsar_source_string");
+    ASSERT_NE(src, nullptr);
+    EXPECT_EQ(src->params.at("topic"), "events");
+    EXPECT_EQ(src->params.at("service_url"), "pulsar://mq:6650");
+    const auto* snk = find_op(spec, "pulsar_sink_string");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("topic"), "out");
+}
+
 // Wave 2 inc1: a kafka json table with columnar_decode='true' swaps the
 // row-form JSON bridge for the columnar one, and the columnar bridge must
 // carry the declared schema so it can build typed Arrow columns.

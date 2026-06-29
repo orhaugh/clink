@@ -79,6 +79,9 @@ std::string string_source_factory_for(const TableDef& table) {
     if (connector == "nats") {
         return "nats_source_string";
     }
+    if (connector == "pulsar") {
+        return "pulsar_source_string";
+    }
     if (connector == "postgres") {
         auto it = table.properties.find("mode");
         if (it != table.properties.end() && it->second == "cdc") {
@@ -130,6 +133,9 @@ std::string string_sink_factory_for(const TableDef& table) {
     }
     if (connector == "nats") {
         return "nats_sink_string";
+    }
+    if (connector == "pulsar") {
+        return "pulsar_sink_string";
     }
     if (connector == "clickhouse") {
         return "clickhouse_sink";
@@ -212,6 +218,11 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // NATS JetStream source: each message body is a JSON object string (string channel)
         // bridged to Row. At-least-once (durable pull consumer, ack at the checkpoint barrier).
         return RowConnectorBinding{"nats_source_string", kChannelString, "json_string_to_row"};
+    }
+    if (connector == "pulsar") {
+        // Apache Pulsar source: each message body is a JSON object string (string channel)
+        // bridged to Row. At-least-once (Shared subscription, ack at the checkpoint barrier).
+        return RowConnectorBinding{"pulsar_source_string", kChannelString, "json_string_to_row"};
     }
     if (connector == "parquet") {
         // Typed-columnar Parquet: each declared column is its own Arrow
@@ -350,6 +361,20 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
             unsupported("connector='nats' sink does not support mode='upsert'");
         }
         return RowConnectorBinding{"nats_sink_string", kChannelString, "row_to_json_string"};
+    }
+    if (connector == "pulsar") {
+        // Apache Pulsar sink. Each row -> JSON object string -> async publish (acks awaited at
+        // each barrier). At-least-once; no producer dedup wired, so exactly-once and upsert are
+        // not supported.
+        if (exactly_once) {
+            unsupported(
+                "connector='pulsar' sink is at-least-once (publisher acks; producer dedup not "
+                "wired); exactly-once delivery is not supported");
+        }
+        if (upsert) {
+            unsupported("connector='pulsar' sink does not support mode='upsert'");
+        }
+        return RowConnectorBinding{"pulsar_sink_string", kChannelString, "row_to_json_string"};
     }
     if (connector == "clickhouse") {
         // ClickHouse sink (M1). Each row -> JSON object string -> the sink's
