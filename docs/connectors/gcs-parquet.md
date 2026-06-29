@@ -50,13 +50,14 @@ The sink and source share the same auth and endpoint parameters, parsed by `appl
 | `bucket` | Yes | (none) | Target GCS bucket. The factory throws if it is empty. |
 | `key` | Yes | (none) | Object key within the bucket. The object path is `bucket + "/" + key`. The factory throws if it is empty. |
 | `anonymous` | No | `false` | When `true`, uses anonymous access (`GcsOptions::Anonymous()`), suitable for the fake-gcs-server emulator or a public bucket. |
-| `access_token` | No | (unset) | An explicit OAuth2 access token. Treated as static, with a 24-hour far-future expiry; the caller is responsible for token validity. |
+| `access_token` | No | (unset) | An explicit OAuth2 access token. Static, with a 24-hour far-future expiry and no refresh; the caller is responsible for token validity. Prefer `credentials_file`/`credentials_json` or Application Default Credentials for a long-running job. |
+| `credentials_file` / `credentials_json` | No | (unset) | A service-account key, as a file path or inline JSON, mapped to `GcsOptions::FromServiceAccountCredentials`. Auto-refreshing: google-cloud-cpp mints and renews the OAuth token over the filesystem's lifetime. Takes precedence over `access_token`. |
 | `endpoint_override` | No | (unset) | Overrides the GCS API endpoint, for targeting an emulator such as fake-gcs-server. When set, `scheme` defaults to `http`. |
 | `scheme` | No | `https` (or `http` when `endpoint_override` is set) | Connection scheme. |
 | `project_id` | No | (unset) | GCP project id, applied to the `GcsOptions`. |
 | `retry_limit_seconds` | No | Arrow default (15 minutes) | Caps the GCS retry window. Parsed from `retry_limit_seconds` as an integer; only applied when greater than 0. The streaming sink uses this to fail fast on a dead endpoint. |
 
-Authentication: when neither `anonymous` nor `access_token` is supplied, the connector falls back to Application Default Credentials, that is `GOOGLE_APPLICATION_CREDENTIALS` or the ambient GCE/GKE/Cloud Run identity (`make_gcs_options` in `parquet_gcs_sink.hpp`).
+Authentication and refresh: the credential precedence is `anonymous` > a service-account key (`credentials_file`/`credentials_json`) > a static `access_token` > Application Default Credentials (the default, `GOOGLE_APPLICATION_CREDENTIALS` or the ambient GCE/GKE/Cloud Run identity). Both the service-account key and Application Default Credentials auto-refresh, that is google-cloud-cpp mints and renews the OAuth token over the filesystem's lifetime, so they suit a long-running job; only the explicit `access_token` is static and expires on its own (`make_gcs_options` in `parquet_gcs_sink.hpp`).
 
 The sink `Options` struct also carries `compression` (defaults to `parquet::Compression::ZSTD`) and an optional `bucket_assigner` for per-record Hive-style object keys. Neither is wired through the factory parameter parsing; they are only reachable via the programmatic API.
 
@@ -138,7 +139,7 @@ The source reads a single Parquet object to its last row group and reports `is_b
 - Channels are limited to `int64` and `string`; there are no other typed factories.
 - The default single-object sink holds its writer set open until `close()` and is not transactional. For exactly-once use the 2PC sink (`prefix` + `delivery_guarantee='exactly_once'`), which stages and atomically promotes one file per checkpoint.
 - `compression` and the per-record `bucket_assigner` exist on the sink `Options` but are not configurable through the factory parameters or SQL; they require the programmatic API. The compression default is ZSTD.
-- `access_token` is treated as static with a fixed 24-hour expiry; token refresh is not handled by the connector.
+- `access_token` is static (fixed 24-hour expiry, no refresh); use `credentials_file`/`credentials_json` (service account) or Application Default Credentials, both of which auto-refresh, for a long-running job.
 - The source requires the on-disk Parquet schema to match the `ArrowBatcher` schema exactly (metadata aside), otherwise `open()` throws.
 
 ## Testing

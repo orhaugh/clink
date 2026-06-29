@@ -29,7 +29,8 @@ public:
         std::string bucket;  // required
         std::string key;     // required
         bool anonymous{false};
-        std::optional<std::string> access_token;
+        std::optional<std::string> access_token;      // static OAuth token (no refresh)
+        std::optional<std::string> credentials_json;  // service-account key JSON (auto-refreshing)
         std::optional<std::string> endpoint_override;
         std::optional<std::string> scheme;
         std::optional<std::string> project_id;
@@ -59,7 +60,8 @@ public:
                                                      opts_.endpoint_override,
                                                      opts_.scheme,
                                                      opts_.project_id,
-                                                     opts_.retry_limit_seconds);
+                                                     opts_.retry_limit_seconds,
+                                                     opts_.credentials_json);
         auto fs_result = arrow::fs::GcsFileSystem::Make(gcs_opts);
         if (!fs_result.ok()) {
             throw std::runtime_error("ParquetGcsSource: GcsFileSystem::Make: " +

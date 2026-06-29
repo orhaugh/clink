@@ -2,8 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -23,6 +26,25 @@ namespace clink::gcs {
 
 namespace {
 
+// Resolve a service-account key JSON for the auto-refreshing credential mode: `credentials_json`
+// inline takes precedence, else `credentials_file` is read from disk. Returns nullopt when neither
+// is set (the caller then falls back to a static access_token or Application Default Credentials).
+inline std::optional<std::string> gcs_credentials_from(const clink::plugin::BuildContext& ctx) {
+    if (const auto j = ctx.param_or("credentials_json", ""); !j.empty()) {
+        return j;
+    }
+    if (const auto f = ctx.param_or("credentials_file", ""); !f.empty()) {
+        std::ifstream in(f, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("gcs_parquet: cannot read credentials_file '" + f + "'");
+        }
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    }
+    return std::nullopt;
+}
+
 // Apply the shared GCS auth/endpoint params onto an Options struct (sink or source share these).
 template <typename Opts>
 void apply_gcs_params(const clink::plugin::BuildContext& ctx, Opts& opts) {
@@ -32,6 +54,7 @@ void apply_gcs_params(const clink::plugin::BuildContext& ctx, Opts& opts) {
     if (const auto t = ctx.param_or("access_token", ""); !t.empty()) {
         opts.access_token = t;
     }
+    opts.credentials_json = gcs_credentials_from(ctx);
     if (const auto e = ctx.param_or("endpoint_override", ""); !e.empty()) {
         opts.endpoint_override = e;
     }
@@ -70,6 +93,7 @@ void register_gcs_parquet_source(clink::plugin::PluginRegistry& reg,
             if (const auto t = ctx.param_or("access_token", ""); !t.empty()) {
                 opts.access_token = t;
             }
+            opts.credentials_json = gcs_credentials_from(ctx);
             if (const auto e = ctx.param_or("endpoint_override", ""); !e.empty()) {
                 opts.endpoint_override = e;
             }
@@ -91,7 +115,8 @@ void register_gcs_parquet_source(clink::plugin::PluginRegistry& reg,
                                                                         opts.endpoint_override,
                                                                         opts.scheme,
                                                                         opts.project_id,
-                                                                        opts.retry_limit_seconds);
+                                                                        opts.retry_limit_seconds,
+                                                                        opts.credentials_json);
                     auto r = arrow::fs::GcsFileSystem::Make(gcs_opts);
                     if (!r.ok()) {
                         throw std::runtime_error(name +
@@ -141,6 +166,7 @@ void register_gcs_parquet_2pc_sink(clink::plugin::PluginRegistry& reg,
             if (const auto t = ctx.param_or("access_token", ""); !t.empty()) {
                 opts.access_token = t;
             }
+            opts.credentials_json = gcs_credentials_from(ctx);
             if (const auto e = ctx.param_or("endpoint_override", ""); !e.empty()) {
                 opts.endpoint_override = e;
             }
@@ -159,7 +185,8 @@ void register_gcs_parquet_2pc_sink(clink::plugin::PluginRegistry& reg,
                                                                     opts.endpoint_override,
                                                                     opts.scheme,
                                                                     opts.project_id,
-                                                                    opts.retry_limit_seconds);
+                                                                    opts.retry_limit_seconds,
+                                                                    opts.credentials_json);
                 auto r = arrow::fs::GcsFileSystem::Make(gcs_opts);
                 if (!r.ok()) {
                     throw std::runtime_error(name +

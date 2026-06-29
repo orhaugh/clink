@@ -33,15 +33,24 @@ namespace clink {
 namespace gcs_detail {
 
 // Build GcsOptions from the connector's auth/endpoint settings (shared by the sink + source).
-inline arrow::fs::GcsOptions make_gcs_options(bool anonymous,
-                                              const std::optional<std::string>& access_token,
-                                              const std::optional<std::string>& endpoint_override,
-                                              const std::optional<std::string>& scheme,
-                                              const std::optional<std::string>& project_id,
-                                              const std::optional<double>& retry_limit_seconds) {
-    arrow::fs::GcsOptions opts;  // default ctor == Application Default Credentials
+// Credential precedence: anonymous > a service-account key JSON > a static access token >
+// Application Default Credentials (the default). Both ADC and the service-account key are
+// AUTO-REFRESHING (google-cloud-cpp mints and renews the OAuth token over the filesystem's
+// lifetime); only the explicit access_token is static and expires on its own, so prefer
+// credentials_json or ADC for a long-running job.
+inline arrow::fs::GcsOptions make_gcs_options(
+    bool anonymous,
+    const std::optional<std::string>& access_token,
+    const std::optional<std::string>& endpoint_override,
+    const std::optional<std::string>& scheme,
+    const std::optional<std::string>& project_id,
+    const std::optional<double>& retry_limit_seconds,
+    const std::optional<std::string>& credentials_json = std::nullopt) {
+    arrow::fs::GcsOptions opts;  // default ctor == Application Default Credentials (refreshing)
     if (anonymous) {
         opts = arrow::fs::GcsOptions::Anonymous();
+    } else if (credentials_json) {
+        opts = arrow::fs::GcsOptions::FromServiceAccountCredentials(*credentials_json);
     } else if (access_token) {
         // A static token: set a far-future expiry (the caller is responsible for token validity).
         opts = arrow::fs::GcsOptions::FromAccessToken(
@@ -72,7 +81,8 @@ public:
         std::string bucket;  // required
         std::string key;     // required when `bucket_assigner` is unset
         bool anonymous{false};
-        std::optional<std::string> access_token;
+        std::optional<std::string> access_token;       // static OAuth token (no refresh)
+        std::optional<std::string> credentials_json;   // service-account key JSON (auto-refreshing)
         std::optional<std::string> endpoint_override;  // fake-gcs-server / emulator
         std::optional<std::string> scheme;             // http for the emulator; else https
         std::optional<std::string> project_id;
@@ -103,7 +113,8 @@ public:
                                                      opts_.endpoint_override,
                                                      opts_.scheme,
                                                      opts_.project_id,
-                                                     opts_.retry_limit_seconds);
+                                                     opts_.retry_limit_seconds,
+                                                     opts_.credentials_json);
         auto fs_result = arrow::fs::GcsFileSystem::Make(gcs_opts);
         if (!fs_result.ok()) {
             throw std::runtime_error("ParquetGcsSink: GcsFileSystem::Make: " +
