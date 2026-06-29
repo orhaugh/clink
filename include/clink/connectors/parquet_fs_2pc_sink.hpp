@@ -28,9 +28,10 @@
 //                   object (OpenOutputStream + Write + Close is atomic on object
 //                   stores: the object appears whole or not at all). Record the
 //                   staging key in operator state.
-//   on_commit(id) - CopyFile staging -> committed (the committed object appears
-//                   atomically), DeleteFile staging, erase state. Idempotent: a
-//                   missing staging object (already committed) is a no-op.
+//   on_commit(id) - copy staging -> committed (streamed via OpenInputFile +
+//                   OpenOutputStream, which every Arrow filesystem supports; the
+//                   committed object appears atomically), delete staging, erase
+//                   state. Idempotent: a missing staging object is a no-op.
 //   on_abort(id)  - DeleteFile staging, erase state.
 //   flush/close   - drop an in-progress (non-barriered) interval; its bytes were
 //                   never staged or state-tracked, so there is nothing to commit.
@@ -244,16 +245,46 @@ private:
         buf_out_.reset();
     }
 
-    // Copy staging -> committed (the committed object appears atomically), then delete staging.
+    // Copy staging -> committed, then delete staging. The copy streams the staging bytes through
+    // an input + output stream rather than FileSystem::CopyFile, because CopyFile is not
+    // implemented uniformly across Arrow's object-store filesystems; OpenInputFile +
+    // OpenOutputStream are. The committed object still appears atomically (object stores publish on
+    // Close), and the staging file is interval-sized, so the extra round-trip is bounded.
     // Idempotent on replay: a missing staging object means the commit already ran.
     void commit_one_(const std::string& staging_key, const std::string& committed_key) {
         auto info = fs_->GetFileInfo(staging_key);
         if (info.ok() && info->type() == arrow::fs::FileType::NotFound) {
             return;  // already committed and cleaned up
         }
-        if (auto s = fs_->CopyFile(staging_key, committed_key); !s.ok()) {
-            throw std::runtime_error("ParquetFsSink2PC: CopyFile(" + staging_key + " -> " +
-                                     committed_key + "): " + s.ToString());
+        auto in = fs_->OpenInputFile(staging_key);
+        if (!in.ok()) {
+            throw std::runtime_error("ParquetFsSink2PC: OpenInputFile(" + staging_key +
+                                     "): " + in.status().ToString());
+        }
+        auto size = (*in)->GetSize();
+        if (!size.ok()) {
+            throw std::runtime_error("ParquetFsSink2PC: GetSize(" + staging_key +
+                                     "): " + size.status().ToString());
+        }
+        auto buf = (*in)->ReadAt(0, *size);
+        if (!buf.ok()) {
+            throw std::runtime_error("ParquetFsSink2PC: read staging(" + staging_key +
+                                     "): " + buf.status().ToString());
+        }
+        (void)(*in)->Close();
+
+        auto out = fs_->OpenOutputStream(committed_key);
+        if (!out.ok()) {
+            throw std::runtime_error("ParquetFsSink2PC: OpenOutputStream(" + committed_key +
+                                     "): " + out.status().ToString());
+        }
+        if (auto s = (*out)->Write((*buf)->data(), (*buf)->size()); !s.ok()) {
+            throw std::runtime_error("ParquetFsSink2PC: write committed(" + committed_key +
+                                     "): " + s.ToString());
+        }
+        if (auto s = (*out)->Close(); !s.ok()) {
+            throw std::runtime_error("ParquetFsSink2PC: close committed(" + committed_key +
+                                     "): " + s.ToString());
         }
         delete_if_exists_(staging_key);
     }

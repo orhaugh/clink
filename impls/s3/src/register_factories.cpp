@@ -11,6 +11,7 @@
 #include <arrow/filesystem/s3fs.h>
 
 #include "clink/connectors/multi_object_parquet_source.hpp"
+#include "clink/connectors/parquet_fs_2pc_sink.hpp"
 #include "clink/connectors/parquet_s3_sink.hpp"
 #include "clink/connectors/parquet_s3_source.hpp"
 #include "clink/connectors/s3_sink.hpp"
@@ -188,6 +189,38 @@ void install(clink::plugin::PluginRegistry& reg) {
                                                               int64_arrow_batcher());
     register_parquet_source.template operator()<std::string>("s3_parquet_string_source",
                                                              string_arrow_batcher());
+
+    // Exactly-once Parquet sink over S3: stages one file per checkpoint interval under
+    // <bucket>/<prefix>/staging and promotes it to <bucket>/<prefix>/committed on commit
+    // (ParquetFsSink2PC). Read the result with s3_parquet source pointed at <prefix>/committed.
+    auto register_parquet_2pc_sink = [&reg, make_s3_fs_factory]<typename T>(
+                                         const std::string& factory_name, ArrowBatcher<T> batcher) {
+        reg.register_sink<T>(
+            factory_name,
+            [factory_name, make_s3_fs_factory, batcher](
+                const BuildContext& ctx) -> std::shared_ptr<Sink<T>> {
+                const auto bucket = ctx.param_or("bucket");
+                const auto prefix = ctx.param_or("prefix");
+                if (bucket.empty() || prefix.empty()) {
+                    throw std::runtime_error(factory_name + ": 'bucket' and 'prefix' are required");
+                }
+                typename ParquetFsSink2PC<T>::Options o;
+                o.base = bucket + "/" + prefix;
+                o.subtask_idx = static_cast<int>(ctx.subtask_idx);
+                return std::make_shared<ParquetFsSink2PC<T>>(
+                    make_s3_fs_factory(ctx.param_or("region", ""),
+                                       ctx.param_or("endpoint_override", ""),
+                                       ctx.param_or("anonymous", "false") == "true",
+                                       factory_name),
+                    std::move(o),
+                    batcher);
+            });
+    };
+
+    register_parquet_2pc_sink.template operator()<std::int64_t>("s3_parquet_2pc_int64_sink",
+                                                                int64_arrow_batcher());
+    register_parquet_2pc_sink.template operator()<std::string>("s3_parquet_2pc_string_sink",
+                                                               string_arrow_batcher());
 }
 
 }  // namespace clink::s3
