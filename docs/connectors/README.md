@@ -38,6 +38,7 @@ is reachable through the programmatic API only.
 | [Azure Blob Storage](azure-parquet.md) | source + sink | Arrow AzureFileSystem (`ARROW_AZURE`) | Arrow `24.0.0` | `azure_parquet` |
 | [WebHDFS / HttpFS](webhdfs-parquet.md) | source + sink | clink::http_connector (vendored httplib) | Arrow `24.0.0` | `webhdfs_parquet` |
 | [Apache Iceberg](iceberg.md) | sink | iceberg-cpp + Arrow | iceberg-cpp `v0.3.0`, Arrow `24.0.0` | `iceberg` |
+| [Local files and Parquet](local.md) | source + sink | core (Arrow for Parquet) | built in | `file`, `filesystem`, `parquet` |
 
 ## Databases and key-value stores
 
