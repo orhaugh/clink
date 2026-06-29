@@ -58,6 +58,8 @@ add_subdirectory(pulsar)
 add_subdirectory(cassandra)
 add_subdirectory(gcs)
 add_subdirectory(azure)
+# webhdfs reuses clink::http_connector (added above), so it comes after it.
+add_subdirectory(webhdfs)
 # rocksdb-s3 needs both clink::rocksdb and clink::s3, so it is added after them.
 add_subdirectory(rocksdb-s3)
 
@@ -65,7 +67,7 @@ add_subdirectory(rocksdb-s3)
 # Linking clink::impls_all is equivalent to the legacy
 # clink::clink behaviour (kitchen-sink dep on every available impl).
 add_library(clink_impls_all INTERFACE)
-foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd avro http_connector redis mysql mqtt mongodb iceberg rabbitmq nats pulsar cassandra gcs azure rocksdb_s3)
+foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd avro http_connector redis mysql mqtt mongodb iceberg rabbitmq nats pulsar cassandra gcs azure webhdfs rocksdb_s3)
     if(TARGET clink::${_impl})
         target_link_libraries(clink_impls_all INTERFACE clink::${_impl})
     endif()

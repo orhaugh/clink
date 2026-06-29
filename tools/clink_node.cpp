@@ -138,6 +138,9 @@
 #ifdef CLINK_LINKED_AZURE
 #include "clink/azure/install.hpp"
 #endif
+#ifdef CLINK_LINKED_WEBHDFS
+#include "clink/webhdfs/install.hpp"
+#endif
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/rocksdb/install.hpp"
 #endif
@@ -2029,6 +2032,9 @@ void install_linked_impls() {
 #endif
 #ifdef CLINK_LINKED_AZURE
     clink::azure::install(reg);  // Azure Blob Parquet source + sink
+#endif
+#ifdef CLINK_LINKED_WEBHDFS
+    clink::webhdfs::install(reg);  // WebHDFS / HttpFS Parquet source + sink
 #endif
     // RocksDB is unconditionally linked into clink_node (matches
     // bundled rocksdb-jni model). install() registers the

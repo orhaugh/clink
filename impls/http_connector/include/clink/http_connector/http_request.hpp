@@ -20,7 +20,8 @@ struct HttpResponse {
     std::string body;   // raw response body
     std::string error;  // human-readable, populated when status == 0
     // Response headers with LOWER-CASED names (HTTP header names are
-    // case-insensitive), e.g. headers["etag"]. Populated by get().
+    // case-insensitive), e.g. headers["etag"] or headers["location"] (the latter
+    // for a 307 redirect, as WebHDFS CREATE/OPEN use). Populated by get/post/put.
     std::map<std::string, std::string> headers;
 };
 

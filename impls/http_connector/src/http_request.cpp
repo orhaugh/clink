@@ -63,16 +63,7 @@ HttpRequest& HttpRequest::operator=(HttpRequest&&) noexcept = default;
 HttpResponse HttpRequest::post(const std::string& path,
                                const std::string& body,
                                const std::string& content_type) {
-    HttpResponse out;
-    auto res = impl_->client.Post(path, body, content_type);
-    if (!res) {
-        out.status = 0;
-        out.error = httplib::to_string(res.error());
-        return out;
-    }
-    out.status = res->status;
-    out.body = std::move(res->body);
-    return out;
+    return to_response(impl_->client.Post(path, body, content_type));
 }
 
 HttpResponse HttpRequest::get(const std::string& path) {
@@ -91,16 +82,7 @@ HttpResponse HttpRequest::get(const std::string& path,
 HttpResponse HttpRequest::put(const std::string& path,
                               const std::string& body,
                               const std::string& content_type) {
-    HttpResponse out;
-    auto res = impl_->client.Put(path, body, content_type);
-    if (!res) {
-        out.status = 0;
-        out.error = httplib::to_string(res.error());
-        return out;
-    }
-    out.status = res->status;
-    out.body = std::move(res->body);
-    return out;
+    return to_response(impl_->client.Put(path, body, content_type));
 }
 
 bool HttpRequest::tls_supported() noexcept {

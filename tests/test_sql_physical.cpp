@@ -1009,6 +1009,22 @@ TEST(SqlPhysical, AzureParquetSourceAndSinkMap) {
     EXPECT_NE(find_op(spec, "azure_parquet_string_sink"), nullptr);
 }
 
+TEST(SqlPhysical, WebHdfsParquetSourceAndSinkMap) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE w_in (line TEXT) WITH (connector='webhdfs_parquet', "
+        "base_url='http://nn:9870', path='/in.parquet');"
+        "CREATE TABLE w_out (line TEXT) WITH (connector='webhdfs_parquet', "
+        "base_url='http://nn:9870', path='/out.parquet')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO w_out SELECT line FROM w_in");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    EXPECT_NE(find_op(spec, "webhdfs_parquet_string_source"), nullptr);
+    EXPECT_NE(find_op(spec, "webhdfs_parquet_string_sink"), nullptr);
+}
+
 TEST(SqlPhysical, S3TextSinkMaps) {
     Catalog cat;
     auto s = parse(

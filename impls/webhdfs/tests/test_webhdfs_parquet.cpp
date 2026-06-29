@@ -1,0 +1,260 @@
+// Tests for the WebHDFS Parquet sink + source: required-param validation, clean failure against a
+// dead endpoint, and a full write->read round-trip against an in-process httplib server that
+// emulates WebHDFS's CREATE/OPEN 307-redirect protocol (CI-runnable, no external Hadoop). The
+// gated round-trip against a real WebHDFS/HttpFS lives in test_webhdfs_parquet_live.cpp.
+
+#include <chrono>
+#include <cstdint>
+#include <httplib.h>
+#include <map>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "clink/connectors/webhdfs_parquet_sink.hpp"
+#include "clink/connectors/webhdfs_parquet_source.hpp"
+#include "clink/core/arrow_batcher.hpp"
+#include "clink/core/record.hpp"
+#include "clink/core/stream_element.hpp"
+#include "clink/operators/operator_base.hpp"
+
+using clink::Batch;
+using clink::Emitter;
+using clink::int64_arrow_batcher;
+using clink::StreamElement;
+using clink::string_arrow_batcher;
+using clink::WebHdfsParquetSink;
+using clink::WebHdfsParquetSource;
+
+namespace {
+
+// In-process WebHDFS/HttpFS emulator: PUT ?op=CREATE -> 307 to a datanode URL (itself + &dn=1);
+// the redirected PUT stores the body keyed by path; GET ?op=OPEN -> 307 -> GET returns the body.
+// Faithfully exercises the connector's two-step redirect transport over a real socket.
+class MockWebHdfs {
+public:
+    MockWebHdfs() {
+        svr_.Put(R"(/webhdfs/v1/.*)", [this](const httplib::Request& req, httplib::Response& res) {
+            const std::string op = req.has_param("op") ? req.get_param_value("op") : "";
+            if (op == "CREATE" && !req.has_param("dn")) {
+                res.status = 307;
+                res.set_header("Location", base_url() + req.path + "?op=CREATE&dn=1");
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                files_[req.path] = req.body;
+            }
+            res.status = 201;
+        });
+        svr_.Get(R"(/webhdfs/v1/.*)", [this](const httplib::Request& req, httplib::Response& res) {
+            const std::string op = req.has_param("op") ? req.get_param_value("op") : "";
+            if (op == "OPEN" && !req.has_param("dn")) {
+                res.status = 307;
+                res.set_header("Location", base_url() + req.path + "?op=OPEN&dn=1");
+                return;
+            }
+            std::string body;
+            bool found = false;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                auto it = files_.find(req.path);
+                if (it != files_.end()) {
+                    body = it->second;
+                    found = true;
+                }
+            }
+            if (!found) {
+                res.status = 404;
+                return;
+            }
+            res.set_content(body, "application/octet-stream");
+        });
+        port_ = svr_.bind_to_any_port("127.0.0.1");
+        thread_ = std::thread([this] { svr_.listen_after_bind(); });
+        while (!svr_.is_running()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+    }
+    ~MockWebHdfs() {
+        svr_.stop();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+    std::string base_url() const { return "http://127.0.0.1:" + std::to_string(port_); }
+
+private:
+    httplib::Server svr_;
+    int port_{0};
+    std::thread thread_;
+    std::mutex mu_;
+    std::map<std::string, std::string> files_;
+};
+
+WebHdfsParquetSink<std::int64_t>::Options dead_sink_opts() {
+    WebHdfsParquetSink<std::int64_t>::Options o;
+    o.base_url = "http://127.0.0.1:1";  // no server
+    o.path = "/x.parquet";
+    o.connect_timeout_ms = 500;
+    return o;
+}
+
+WebHdfsParquetSource<std::int64_t>::Options dead_source_opts() {
+    WebHdfsParquetSource<std::int64_t>::Options o;
+    o.base_url = "http://127.0.0.1:1";
+    o.path = "/x.parquet";
+    o.connect_timeout_ms = 500;
+    return o;
+}
+
+}  // namespace
+
+TEST(WebHdfsPathBuild, EncodesPathSegmentsButKeepsSlashesAndQuery) {
+    using clink::webhdfs_detail::build_webhdfs_path;
+    // A normal path (unreserved chars only) is passed through untouched.
+    EXPECT_EQ(build_webhdfs_path("/clink/out.parquet", "CREATE", {}),
+              "/webhdfs/v1/clink/out.parquet?op=CREATE");
+    // Spaces and reserved query chars in a user path are percent-encoded per segment, so they
+    // cannot corrupt the request target; the '/' separators and the op query are preserved.
+    EXPECT_EQ(build_webhdfs_path("/a b/c%d.parquet", "CREATE", {}),
+              "/webhdfs/v1/a%20b/c%25d.parquet?op=CREATE");
+    EXPECT_EQ(build_webhdfs_path("/x?y#z", "OPEN", {}), "/webhdfs/v1/x%3Fy%23z?op=OPEN");
+}
+
+TEST(WebHdfsParquetSink, RequiresBaseUrlAndPath) {
+    {
+        WebHdfsParquetSink<std::int64_t>::Options o;  // both empty
+        EXPECT_THROW((WebHdfsParquetSink<std::int64_t>{o, int64_arrow_batcher()}),
+                     std::invalid_argument);
+    }
+    {
+        WebHdfsParquetSink<std::int64_t>::Options o;
+        o.base_url = "http://nn:9870";  // path still empty
+        EXPECT_THROW((WebHdfsParquetSink<std::int64_t>{o, int64_arrow_batcher()}),
+                     std::invalid_argument);
+    }
+}
+
+TEST(WebHdfsParquetSource, RequiresBaseUrlAndPath) {
+    {
+        WebHdfsParquetSource<std::int64_t>::Options o;  // both empty
+        EXPECT_THROW((WebHdfsParquetSource<std::int64_t>{o, int64_arrow_batcher()}),
+                     std::invalid_argument);
+    }
+    {
+        WebHdfsParquetSource<std::int64_t>::Options o;
+        o.base_url = "http://nn:9870";  // path still empty
+        EXPECT_THROW((WebHdfsParquetSource<std::int64_t>{o, int64_arrow_batcher()}),
+                     std::invalid_argument);
+    }
+}
+
+TEST(WebHdfsParquetSink, UploadAgainstDeadEndpointFailsCleanly) {
+    // open() + on_data() only touch the in-memory Parquet buffer; the upload (and so the failure)
+    // happens at close(). Assert the full cycle fails cleanly with a runtime_error.
+    EXPECT_THROW(
+        {
+            WebHdfsParquetSink<std::int64_t> sink(dead_sink_opts(), int64_arrow_batcher());
+            sink.open();
+            Batch<std::int64_t> b;
+            b.emplace(1);
+            b.emplace(2);
+            sink.on_data(b);
+            sink.close();
+        },
+        std::runtime_error);
+}
+
+TEST(WebHdfsParquetSource, OpenAgainstDeadEndpointFailsCleanly) {
+    WebHdfsParquetSource<std::int64_t> src(dead_source_opts(), int64_arrow_batcher());
+    EXPECT_THROW(src.open(), std::runtime_error);
+    EXPECT_NO_THROW(src.close());  // close after a failed open must be safe
+}
+
+TEST(WebHdfsParquetRoundTrip, Int64WriteThenRead) {
+    MockWebHdfs srv;
+    const std::string path = "/clink/rt_int64.parquet";
+
+    {
+        WebHdfsParquetSink<std::int64_t>::Options so;
+        so.base_url = srv.base_url();
+        so.path = path;
+        WebHdfsParquetSink<std::int64_t> sink(so, int64_arrow_batcher());
+        sink.open();
+        Batch<std::int64_t> b;
+        b.emplace(10);
+        b.emplace(20);
+        b.emplace(30);
+        sink.on_data(b);
+        sink.close();
+    }
+
+    std::vector<std::int64_t> got;
+    Emitter<std::int64_t> em([&](StreamElement<std::int64_t> e) -> bool {
+        if (e.is_data()) {
+            for (const auto& rec : e.as_data()) {
+                got.push_back(rec.value());
+            }
+        }
+        return true;
+    });
+    WebHdfsParquetSource<std::int64_t>::Options ro;
+    ro.base_url = srv.base_url();
+    ro.path = path;
+    WebHdfsParquetSource<std::int64_t> src(ro, int64_arrow_batcher());
+    src.open();
+    while (src.produce(em)) {
+    }
+    src.close();
+
+    ASSERT_EQ(got.size(), 3u);
+    EXPECT_EQ(got[0], 10);
+    EXPECT_EQ(got[1], 20);
+    EXPECT_EQ(got[2], 30);
+}
+
+TEST(WebHdfsParquetRoundTrip, StringWriteThenRead) {
+    MockWebHdfs srv;
+    const std::string path = "/clink/rt_string.parquet";
+
+    {
+        WebHdfsParquetSink<std::string>::Options so;
+        so.base_url = srv.base_url();
+        so.path = path;
+        WebHdfsParquetSink<std::string> sink(so, string_arrow_batcher());
+        sink.open();
+        Batch<std::string> b;
+        b.emplace(std::string{"alpha"});
+        b.emplace(std::string{"beta"});
+        sink.on_data(b);
+        sink.close();
+    }
+
+    std::vector<std::string> got;
+    Emitter<std::string> em([&](StreamElement<std::string> e) -> bool {
+        if (e.is_data()) {
+            for (const auto& rec : e.as_data()) {
+                got.push_back(rec.value());
+            }
+        }
+        return true;
+    });
+    WebHdfsParquetSource<std::string>::Options ro;
+    ro.base_url = srv.base_url();
+    ro.path = path;
+    WebHdfsParquetSource<std::string> src(ro, string_arrow_batcher());
+    src.open();
+    while (src.produce(em)) {
+    }
+    src.close();
+
+    ASSERT_EQ(got.size(), 2u);
+    EXPECT_EQ(got[0], "alpha");
+    EXPECT_EQ(got[1], "beta");
+}
