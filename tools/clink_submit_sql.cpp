@@ -273,11 +273,26 @@ int main(int argc, char** argv) {
             }
             if (std::holds_alternative<clink::sql::ast::DropTableStmt>(stmt)) {
                 const auto& drop = std::get<clink::sql::ast::DropTableStmt>(stmt);
+                const char* kind_noun =
+                    drop.object_kind == clink::sql::ast::DropKind::MaterializedView
+                        ? "materialized view"
+                        : (drop.object_kind == clink::sql::ast::DropKind::View ? "view" : "table");
                 bool failed = false;
                 for (const auto& tbl : drop.table_names) {
-                    if (!catalog.drop_table(tbl) && !drop.if_exists) {
-                        std::cerr << "error: table does not exist: " << tbl << "\n";
-                        failed = true;
+                    switch (catalog.drop_object(tbl, drop.object_kind)) {
+                        case clink::sql::Catalog::DropResult::Dropped:
+                            break;
+                        case clink::sql::Catalog::DropResult::NotFound:
+                            if (!drop.if_exists) {
+                                std::cerr << "error: " << kind_noun << " does not exist: " << tbl
+                                          << "\n";
+                                failed = true;
+                            }
+                            break;
+                        case clink::sql::Catalog::DropResult::KindMismatch:
+                            std::cerr << "error: \"" << tbl << "\" is not a " << kind_noun << "\n";
+                            failed = true;
+                            break;
                     }
                 }
                 if (failed) {

@@ -313,6 +313,32 @@ TEST(SqlParser, ParsesDropTableMultiple) {
     auto script = parse("DROP TABLE a, b, c");
     const auto& drop = std::get<ast::DropTableStmt>(script.statements[0]);
     EXPECT_EQ(drop.table_names, (std::vector<std::string>{"a", "b", "c"}));
+    EXPECT_EQ(drop.object_kind, ast::DropKind::Table);
+}
+
+TEST(SqlParser, ParsesDropMaterializedView) {
+    auto script = parse("DROP MATERIALIZED VIEW mv");
+    ASSERT_EQ(script.statements.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<ast::DropTableStmt>(script.statements[0]));
+    const auto& drop = std::get<ast::DropTableStmt>(script.statements[0]);
+    ASSERT_EQ(drop.table_names.size(), 1u);
+    EXPECT_EQ(drop.table_names[0], "mv");
+    EXPECT_EQ(drop.object_kind, ast::DropKind::MaterializedView);
+    EXPECT_FALSE(drop.if_exists);
+}
+
+TEST(SqlParser, ParsesDropMaterializedViewIfExistsMultiple) {
+    auto script = parse("DROP MATERIALIZED VIEW IF EXISTS a, b");
+    const auto& drop = std::get<ast::DropTableStmt>(script.statements[0]);
+    EXPECT_EQ(drop.table_names, (std::vector<std::string>{"a", "b"}));
+    EXPECT_EQ(drop.object_kind, ast::DropKind::MaterializedView);
+    EXPECT_TRUE(drop.if_exists);
+}
+
+// DROP VIEW parses but is rejected: CREATE VIEW (and so a droppable logical
+// view) is not supported, so it must error rather than silently no-op.
+TEST(SqlParser, RejectsDropView) {
+    EXPECT_THROW(parse("DROP VIEW v"), TranslationError);
 }
 
 TEST(SqlParser, ParsesCreateTableIfNotExists) {

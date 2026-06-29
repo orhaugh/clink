@@ -1354,12 +1354,21 @@ ast::DropTableStmt translate_drop_stmt(const JsonValue& body) {
     ast::DropTableStmt stmt;
     stmt.loc = loc_from(body);
     // PG's DropStmt covers many object kinds (TABLE, INDEX, etc).
-    // We support TABLE only.
+    // We support TABLE and MATERIALIZED VIEW.
     if (!body.contains("removeType") || !body.at("removeType").is_string()) {
         unsupported("DropStmt missing removeType", stmt.loc.pos);
     }
-    if (body.at("removeType").as_string() != "OBJECT_TABLE") {
-        unsupported("only DROP TABLE is supported; got " + body.at("removeType").as_string(),
+    const std::string remove_type = body.at("removeType").as_string();
+    if (remove_type == "OBJECT_TABLE") {
+        stmt.object_kind = ast::DropKind::Table;
+    } else if (remove_type == "OBJECT_MATVIEW") {
+        stmt.object_kind = ast::DropKind::MaterializedView;
+    } else if (remove_type == "OBJECT_VIEW") {
+        // Parsed for a clear message; CREATE VIEW (and so a droppable logical
+        // view) is not supported, so reject rather than silently no-op.
+        unsupported("DROP VIEW is not supported (CREATE VIEW is not supported)", stmt.loc.pos);
+    } else {
+        unsupported("only DROP TABLE and DROP MATERIALIZED VIEW are supported; got " + remove_type,
                     stmt.loc.pos);
     }
     if (body.contains("missing_ok") && body.at("missing_ok").is_bool()) {

@@ -144,6 +144,31 @@ bool Catalog::drop_table(const std::string& name) {
     return true;
 }
 
+Catalog::DropResult Catalog::drop_object(const std::string& name, ast::DropKind expected) {
+    auto it = tables_.find(name);
+    if (it == tables_.end()) {
+        return DropResult::NotFound;
+    }
+    const TableDef& def = it->second;
+    bool kind_ok = false;
+    switch (expected) {
+        case ast::DropKind::Table:
+            kind_ok = !def.is_materialized_view() && !def.is_logical_view();
+            break;
+        case ast::DropKind::MaterializedView:
+            kind_ok = def.is_materialized_view();
+            break;
+        case ast::DropKind::View:
+            kind_ok = def.is_logical_view();
+            break;
+    }
+    if (!kind_ok) {
+        return DropResult::KindMismatch;
+    }
+    drop_table(name);
+    return DropResult::Dropped;
+}
+
 const TableDef* Catalog::get_table(const std::string& name) const {
     auto it = tables_.find(name);
     return it == tables_.end() ? nullptr : &it->second;

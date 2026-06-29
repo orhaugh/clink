@@ -230,6 +230,43 @@ TEST(SqlCli, DropTableRemovesEntryAndFile) {
     fs::remove_all(cat_dir);
 }
 
+// DROP MATERIALIZED VIEW enforces object-kind matching end-to-end (the driver
+// maps Catalog::drop_object's KindMismatch to a non-zero exit + diagnostic): it
+// must refuse a plain table, leave it intact, and DROP TABLE then still works.
+// IF EXISTS on a genuinely-absent name is silent. (The successful matview drop
+// is covered by SqlCatalog.DropObjectEnforcesObjectKind without a cluster.)
+TEST(SqlCli, DropMaterializedViewRejectsPlainTable) {
+    namespace fs = std::filesystem;
+    auto cat_dir = fs::temp_directory_path() /
+                   ("clink_sql_cli_dropmv_" +
+                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::remove_all(cat_dir);
+
+    auto r1 = run_compiler("--catalog-dir " + cat_dir.string() +
+                           " -e \"CREATE TABLE t (a TEXT) WITH (connector='file', path='/x')\"");
+    EXPECT_EQ(r1.exit_code, 0) << "stderr: " << r1.stderr_text;
+
+    // DROP MATERIALIZED VIEW on a plain table is rejected; the table survives.
+    auto r2 =
+        run_compiler("--catalog-dir " + cat_dir.string() + " -e \"DROP MATERIALIZED VIEW t\"");
+    EXPECT_NE(r2.exit_code, 0);
+    EXPECT_NE(r2.stderr_text.find("not a materialized view"), std::string::npos)
+        << "stderr: " << r2.stderr_text;
+    EXPECT_TRUE(fs::exists(cat_dir / "t.json")) << "the table must not have been dropped";
+
+    // IF EXISTS on an absent materialized view is silent.
+    auto r3 = run_compiler("--catalog-dir " + cat_dir.string() +
+                           " -e \"DROP MATERIALIZED VIEW IF EXISTS nope\"");
+    EXPECT_EQ(r3.exit_code, 0) << "stderr: " << r3.stderr_text;
+
+    // The correct kind still drops the table.
+    auto r4 = run_compiler("--catalog-dir " + cat_dir.string() + " -e \"DROP TABLE t\"");
+    EXPECT_EQ(r4.exit_code, 0) << "stderr: " << r4.stderr_text;
+    EXPECT_FALSE(fs::exists(cat_dir / "t.json"));
+
+    fs::remove_all(cat_dir);
+}
+
 // ---------------------------------------------------------------------------
 // HTTP submission integration test. Skips when clink_node isn't available.
 // ---------------------------------------------------------------------------

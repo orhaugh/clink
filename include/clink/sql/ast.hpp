@@ -473,10 +473,17 @@ struct InsertStmt {
     Loc loc;
 };
 
+// The object kind a DROP statement targets. Postgres uses a distinct DROP for
+// each (DROP TABLE / DROP MATERIALIZED VIEW / DROP VIEW) and rejects a mismatch
+// (DROP TABLE on a materialized view errors, and vice versa); execution enforces
+// the same. View is parsed but currently rejected (CREATE VIEW is not supported).
+enum class DropKind { Table, MaterializedView, View };
+
 struct DropTableStmt {
-    // One or more tables: DROP TABLE a, b, c. Dropped left to right.
+    // One or more objects: DROP TABLE a, b, c. Dropped left to right.
     std::vector<std::string> table_names;
-    bool if_exists = false;  // DROP TABLE IF EXISTS - silent when absent
+    bool if_exists = false;  // DROP ... IF EXISTS - silent when absent
+    DropKind object_kind = DropKind::Table;
     Loc loc;
 };
 

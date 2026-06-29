@@ -107,6 +107,13 @@ struct TableDef {
         auto it = properties.find("view_kind");
         return it != properties.end() && it->second == "materialized";
     }
+    // A logical (non-materialized) view: view_kind='logical'. CREATE VIEW does
+    // not yet register these, so this is always false today; it lets the
+    // object-kind-aware DROP reject DROP VIEW / DROP TABLE mismatches uniformly.
+    [[nodiscard]] bool is_logical_view() const {
+        auto it = properties.find("view_kind");
+        return it != properties.end() && it->second == "logical";
+    }
     [[nodiscard]] std::string definition_sql() const {
         auto it = properties.find("definition_sql");
         if (it != properties.end())
@@ -137,8 +144,17 @@ public:
     void register_table(const ast::CreateTableStmt& stmt);
 
     // Remove a table by name. Returns true if it existed. When a
-    // persistence dir is set, removes <dir>/<name>.json too.
+    // persistence dir is set, removes <dir>/<name>.json too. Drops any object
+    // kind (table / materialized view); object-kind matching is the caller's
+    // job via drop_object below.
     bool drop_table(const std::string& name);
+
+    // Object-kind-aware drop (Postgres semantics: DROP TABLE rejects a
+    // materialized view and vice versa). Returns NotFound if `name` is unknown,
+    // KindMismatch if it exists but is not the requested kind, else removes it
+    // (via drop_table) and returns Dropped.
+    enum class DropResult { Dropped, NotFound, KindMismatch };
+    DropResult drop_object(const std::string& name, ast::DropKind expected);
 
     // ANALYZE write-back: merge computed statistics (the row_count / ndv_<col> /
     // nulls_<col> / hist_<col> / mcv_<col> WITH-option keys) into table `name`'s

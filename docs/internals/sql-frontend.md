@@ -43,7 +43,7 @@ flowchart TD
   CP --> JG["JobGraphSpec<br/>(op id, factory type, inputs, channel, params, parallelism)"]
 ```
 
-`parse()` (in `src/sql/parser.cpp`) glues the first four stages: it preparses, calls `pg_query_parse`, runs `translate_to_ast`, then runs the three reattach passes, freeing the libpg_query result on every path. The driver in `tools/clink_submit_sql.cpp` then walks the returned `ast::Script` statement by statement: `CREATE TABLE` registers a `TableDef` in the `Catalog`; `INSERT INTO ... SELECT` runs bind, then `optimize`, then `compile`; `DROP TABLE`, `SHOW TABLES`, `ANALYZE` and `CREATE MATERIALIZED VIEW` have their own handling. A bare `SELECT` only binds (for `--explain`); it has no stdout sink.
+`parse()` (in `src/sql/parser.cpp`) glues the first four stages: it preparses, calls `pg_query_parse`, runs `translate_to_ast`, then runs the three reattach passes, freeing the libpg_query result on every path. The driver in `tools/clink_submit_sql.cpp` then walks the returned `ast::Script` statement by statement: `CREATE TABLE` registers a `TableDef` in the `Catalog`; `INSERT INTO ... SELECT` runs bind, then `optimize`, then `compile`; `DROP TABLE` / `DROP MATERIALIZED VIEW` (object-kind matched via `Catalog::drop_object`, so DROP TABLE refuses a materialized view and vice versa), `SHOW TABLES`, `ANALYZE` and `CREATE MATERIALIZED VIEW` have their own handling. A bare `SELECT` only binds (for `--explain`); it has no stdout sink.
 
 ### Stage 1: the preparser shim
 

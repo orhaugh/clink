@@ -150,6 +150,37 @@ TEST(SqlCatalog, DropTableRemovesEntry) {
     EXPECT_FALSE(cat.drop_table("t"));  // already gone
 }
 
+// drop_object enforces Postgres object-kind matching: DROP TABLE rejects a
+// materialized view and DROP MATERIALIZED VIEW rejects a plain table, neither
+// removing anything; the matching kind drops.
+TEST(SqlCatalog, DropObjectEnforcesObjectKind) {
+    Catalog cat;
+    cat.register_table(std::get<ast::CreateTableStmt>(
+        parse("CREATE TABLE t (a BIGINT) WITH (connector='kafka', topic='x')").statements[0]));
+    // A materialized view is a backing TableDef tagged view_kind='materialized'.
+    TableDef mv;
+    mv.name = "mv";
+    mv.properties["view_kind"] = "materialized";
+    mv.properties["connector"] = "blackhole";
+    cat.register_table(std::move(mv));
+
+    using DR = Catalog::DropResult;
+    // Mismatched kinds are rejected and nothing is removed.
+    EXPECT_EQ(cat.drop_object("t", ast::DropKind::MaterializedView), DR::KindMismatch);
+    EXPECT_EQ(cat.drop_object("mv", ast::DropKind::Table), DR::KindMismatch);
+    EXPECT_NE(cat.get_table("t"), nullptr);
+    EXPECT_NE(cat.get_table("mv"), nullptr);
+    // Unknown name.
+    EXPECT_EQ(cat.drop_object("nope", ast::DropKind::Table), DR::NotFound);
+    // Matching kinds drop.
+    EXPECT_EQ(cat.drop_object("mv", ast::DropKind::MaterializedView), DR::Dropped);
+    EXPECT_EQ(cat.get_table("mv"), nullptr);
+    EXPECT_EQ(cat.drop_object("t", ast::DropKind::Table), DR::Dropped);
+    EXPECT_EQ(cat.get_table("t"), nullptr);
+    // Gone now.
+    EXPECT_EQ(cat.drop_object("mv", ast::DropKind::MaterializedView), DR::NotFound);
+}
+
 TEST(SqlCatalog, ListTablesPreservesRegistrationOrder) {
     Catalog cat;
     auto reg = [&](const char* sql) {
