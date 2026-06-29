@@ -1,11 +1,16 @@
 // S3 factory registration.
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
+#include <arrow/filesystem/filesystem.h>
+#include <arrow/filesystem/s3fs.h>
+
+#include "clink/connectors/multi_object_parquet_source.hpp"
 #include "clink/connectors/parquet_s3_sink.hpp"
 #include "clink/connectors/parquet_s3_source.hpp"
 #include "clink/connectors/s3_sink.hpp"
@@ -99,37 +104,90 @@ void install(clink::plugin::PluginRegistry& reg) {
                                                                 string_arrow_batcher());
         });
 
-    reg.register_source<std::int64_t>(
-        "s3_parquet_int64_source",
-        [parquet_s3_options](const BuildContext& ctx) -> std::shared_ptr<Source<std::int64_t>> {
-            auto [bucket, key, region, endpoint] =
-                parquet_s3_options(ctx, "s3_parquet_int64_source");
-            ParquetS3Source<std::int64_t>::Options opts;
-            opts.bucket = bucket;
-            opts.key = key;
-            if (!region.empty())
-                opts.region = region;
-            if (!endpoint.empty())
-                opts.endpoint_override = endpoint;
-            return std::make_shared<ParquetS3Source<std::int64_t>>(std::move(opts),
-                                                                   int64_arrow_batcher());
-        });
+    // Parquet S3 source. A single `key` reads one object; a `prefix` reads every
+    // matching object under it, sharded across subtasks (MultiObjectParquetSource).
+    // The S3FileSystem is built on the runner thread in open() via this factory.
+    auto make_s3_fs_factory =
+        [](std::string region,
+           std::string endpoint,
+           bool anon,
+           std::string op_label) -> MultiObjectParquetSource<std::int64_t>::FileSystemFactory {
+        return [region = std::move(region),
+                endpoint = std::move(endpoint),
+                anon,
+                op_label = std::move(op_label)]() -> std::shared_ptr<arrow::fs::FileSystem> {
+            clink::detail::ensure_arrow_s3_initialised();
+            auto o = arrow::fs::S3Options::Defaults();
+            if (!region.empty()) {
+                o.region = region;
+            }
+            if (!endpoint.empty()) {
+                o.endpoint_override = endpoint;
+                o.scheme = "http";
+            }
+            if (anon) {
+                o.ConfigureAnonymousCredentials();
+            }
+            auto r = arrow::fs::S3FileSystem::Make(o);
+            if (!r.ok()) {
+                throw std::runtime_error(op_label +
+                                         ": S3FileSystem::Make: " + r.status().ToString());
+            }
+            return *r;
+        };
+    };
 
-    reg.register_source<std::string>(
-        "s3_parquet_string_source",
-        [parquet_s3_options](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
-            auto [bucket, key, region, endpoint] =
-                parquet_s3_options(ctx, "s3_parquet_string_source");
-            ParquetS3Source<std::string>::Options opts;
-            opts.bucket = bucket;
-            opts.key = key;
-            if (!region.empty())
-                opts.region = region;
-            if (!endpoint.empty())
-                opts.endpoint_override = endpoint;
-            return std::make_shared<ParquetS3Source<std::string>>(std::move(opts),
-                                                                  string_arrow_batcher());
-        });
+    auto register_parquet_source = [&reg, make_s3_fs_factory]<typename T>(
+                                       const std::string& factory_name, ArrowBatcher<T> batcher) {
+        reg.register_source<T>(
+            factory_name,
+            [factory_name, make_s3_fs_factory, batcher](
+                const BuildContext& ctx) -> std::shared_ptr<Source<T>> {
+                const auto bucket = ctx.param_or("bucket");
+                if (bucket.empty()) {
+                    throw std::runtime_error(factory_name + ": 'bucket' is required");
+                }
+                const auto region = ctx.param_or("region", "");
+                const auto endpoint = ctx.param_or("endpoint_override", "");
+                const bool anon = ctx.param_or("anonymous", "false") == "true";
+
+                // Multi-object: read every object under `prefix`, sharded by subtask.
+                if (const auto prefix = ctx.param_or("prefix", ""); !prefix.empty()) {
+                    typename MultiObjectParquetSource<T>::Options mo;
+                    mo.prefix = bucket + "/" + prefix;
+                    mo.subtask_idx = static_cast<int>(ctx.subtask_idx);
+                    mo.parallelism = static_cast<int>(ctx.parallelism);
+                    mo.recursive = ctx.param_or("recursive", "true") == "true";
+                    mo.suffix = ctx.param_or("suffix", ".parquet");
+                    return std::make_shared<MultiObjectParquetSource<T>>(
+                        make_s3_fs_factory(region, endpoint, anon, factory_name),
+                        std::move(mo),
+                        batcher);
+                }
+
+                // Single object.
+                const auto key = ctx.param_or("key", "");
+                if (key.empty()) {
+                    throw std::runtime_error(factory_name + ": 'key' or 'prefix' is required");
+                }
+                typename ParquetS3Source<T>::Options opts;
+                opts.bucket = bucket;
+                opts.key = key;
+                if (!region.empty()) {
+                    opts.region = region;
+                }
+                if (!endpoint.empty()) {
+                    opts.endpoint_override = endpoint;
+                }
+                opts.allow_anonymous = anon;
+                return std::make_shared<ParquetS3Source<T>>(std::move(opts), batcher);
+            });
+    };
+
+    register_parquet_source.template operator()<std::int64_t>("s3_parquet_int64_source",
+                                                              int64_arrow_batcher());
+    register_parquet_source.template operator()<std::string>("s3_parquet_string_source",
+                                                             string_arrow_batcher());
 }
 
 }  // namespace clink::s3

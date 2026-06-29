@@ -50,13 +50,22 @@ Parsed in `impls/s3/src/register_factories.cpp` (the `parquet_s3_options` helper
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `bucket` | Yes | none | S3 bucket name. Construction throws if empty. |
-| `key` | Yes | none | Object key within the bucket. The full path is `bucket/key`. Construction throws if empty (sink: required when no bucket assigner is set). |
+| `key` | Sink: yes. Source: one of `key`/`prefix` | none | Object key within the bucket. The full path is `bucket/key`. Construction throws if empty (sink: required when no bucket assigner is set). |
 | `region` | No | unset (Arrow default region resolution) | Explicit AWS region. Forwarded only when non-empty. |
 | `endpoint_override` | No | unset | Override endpoint for localstack or MinIO. When set, the scheme is forced to `http`. |
 
 Authentication is not configured through these options. AWS credentials resolve via the standard chain. The header `Options` structs also expose `allow_anonymous` (anonymous credentials, for public-bucket reads), and the sink exposes `compression` (`parquet::Compression`, default `ZSTD`) and a `bucket_assigner` callback for per-record key partitioning; these are programmatic-only and are not surfaced through the factory parameter parsing or the SQL frontend.
 
 Subtask suffixing: for the two sink factories, when `parallelism > 1` the registration appends `.<subtask_idx>.parquet` to `key` so each subtask writes a distinct object.
+
+Multi-object source: the source factories accept a `prefix` instead of a `key` to read every Parquet object beneath it (via the shared `MultiObjectParquetSource`). The objects are listed, sorted for a deterministic order, and sharded round-robin across subtasks (object `i` is read by subtask `i % parallelism`), so a parallel source covers the whole prefix disjointly. Replay across the object set is preserved (emitted-batch cursor). Source-only options for this mode:
+
+| Option | Required | Default | Description |
+| --- | --- | --- | --- |
+| `prefix` | One of `key`/`prefix` | unset | Read every matching object under `bucket/prefix`. Used instead of `key`. |
+| `recursive` | No | `true` | Descend into sub-prefixes when listing. |
+| `suffix` | No | `.parquet` | Only objects whose key ends with this are read. |
+| `anonymous` | No | `false` | Use anonymous credentials (public-bucket reads). |
 
 ## SQL usage
 
@@ -120,7 +129,7 @@ The source reads a single object to its last row group and reports itself as bou
 
 ## Limitations
 
-- Single object per operator on both ends: the sink writes one file at `bucket/key` (or one file per distinct `bucket_assigner` key), and the source reads exactly one object. No glob, prefix scan, or Hive-partitioned dataset support; the source header notes multi-file support as a follow-up.
+- The sink writes one file at `bucket/key` (or one file per distinct `bucket_assigner` key); there is no glob or partitioned write. The source reads one object with `key` or every object under `prefix` (sharded across subtasks), but neither side performs Hive-partition pruning or column projection.
 - Channel types are limited to `int64` and `string` (the four registered factories); other record types are not registered.
 - The SQL frontend exposes only the `string` factories under `connector='s3_parquet'`; `int64` is programmatic-only.
 - No rolling policy: each subtask opens at most one file per distinct key for its lifetime; there is no size or time-based rollover within a key.
