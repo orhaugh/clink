@@ -80,6 +80,13 @@ TEST(ParquetAzureSource, RequiresContainerKeyAndAccount) {
         EXPECT_THROW((ParquetAzureSource<std::int64_t>{o, int64_arrow_batcher()}),
                      std::invalid_argument);
     }
+    {
+        ParquetAzureSource<std::int64_t>::Options o;
+        o.container = "c";
+        o.account_name = "a";  // key still empty
+        EXPECT_THROW((ParquetAzureSource<std::int64_t>{o, int64_arrow_batcher()}),
+                     std::invalid_argument);
+    }
 }
 
 TEST(ParquetAzureSink, OpenAgainstDeadEndpointFailsCleanly) {

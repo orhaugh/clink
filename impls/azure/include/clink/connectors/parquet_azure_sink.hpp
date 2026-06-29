@@ -6,10 +6,11 @@
 // process-wide init/finalise, and OpenSSL's atexit is already suppressed engine-wide
 // (openssl_atexit_guard), so there is no exit-teardown hook here.
 //
-// Auth (in precedence order): anonymous (public container / the Azurite emulator with a key),
-// an account shared key, a SAS token, or - by default - the DefaultAzureCredential chain
-// (environment, workload identity, managed identity, Azure CLI). blob_storage_authority +
-// blob_storage_scheme target an emulator such as Azurite.
+// Auth (in precedence order): anonymous (a public container), an account shared key (also how the
+// Azurite emulator authenticates), a SAS token, or - by default - the DefaultAzureCredential chain
+// (environment, workload identity, managed identity, Azure CLI). anonymous=true takes precedence
+// and ignores any account_key/sas_token also supplied. blob_storage_authority + blob_storage_scheme
+// target an emulator such as Azurite.
 //
 // Paths are "<container>/<blob>"; the storage account is named separately (account_name).
 
@@ -161,23 +162,30 @@ public:
     }
 
     void close() override {
+        // Close + release EVERY writer/stream before reporting an error. AzureFileSystem
+        // buffers writes in the background, so a failure commonly surfaces here at Close()
+        // time; a mid-loop throw would strand the other keys' streams un-Closed (a partial
+        // or zero-length blob) and leave writers_ populated for an unsafe retry. Capture the
+        // first error, finish the teardown, then rethrow.
+        std::string first_err;
         for (auto& [k, entry] : writers_) {
             if (entry.writer) {
-                if (auto s = entry.writer->Close(); !s.ok()) {
-                    throw std::runtime_error("ParquetAzureSink: writer close (" + k +
-                                             "): " + s.ToString());
+                if (auto s = entry.writer->Close(); !s.ok() && first_err.empty()) {
+                    first_err = "ParquetAzureSink: writer close (" + k + "): " + s.ToString();
                 }
                 entry.writer.reset();
             }
             if (entry.out) {
-                if (auto s = entry.out->Close(); !s.ok()) {
-                    throw std::runtime_error("ParquetAzureSink: stream close (" + k +
-                                             "): " + s.ToString());
+                if (auto s = entry.out->Close(); !s.ok() && first_err.empty()) {
+                    first_err = "ParquetAzureSink: stream close (" + k + "): " + s.ToString();
                 }
                 entry.out.reset();
             }
         }
         writers_.clear();
+        if (!first_err.empty()) {
+            throw std::runtime_error(first_err);
+        }
     }
 
     std::string name() const override { return name_; }

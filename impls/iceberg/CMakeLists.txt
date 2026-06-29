@@ -66,16 +66,29 @@ target_link_libraries(clink_iceberg
 # must link libxml2 explicitly (declared after the bundle so it resolves left-to-right under GNU
 # ld). clink_core links arrow_shared, where libxml2 is already baked into the dylib, so iceberg -
 # the one arrow_static consumer - is where this bites.
+set(_iceberg_find_deps "find_dependency(iceberg CONFIG)")
 if(ARROW_AZURE)
-    find_package(LibXml2 REQUIRED)
+    find_package(LibXml2 QUIET)
+    if(NOT LibXml2_FOUND)
+        message(FATAL_ERROR
+            "clink::iceberg: the pinned Arrow was built with ARROW_AZURE, so azure-sdk-for-cpp is "
+            "bundled into libarrow_bundled_dependencies.a (pulled in via iceberg::iceberg_bundle_static) "
+            "and system libxml2 is required to resolve its XML symbols when linking. Install libxml2 "
+            "(libxml2-dev on Debian; bundled with the macOS SDK) or rebuild Arrow without -DARROW_AZURE=ON.")
+    endif()
     target_link_libraries(clink_iceberg PRIVATE LibXml2::LibXml2)
+    # The installed clinkConfig must re-find LibXml2 too: clink_iceberg is a static lib, so this
+    # PRIVATE imported-target dep is recorded as $<LINK_ONLY:LibXml2::LibXml2> in clinkTargets.cmake;
+    # without this a downstream find_package(clink) linking clink::iceberg (or clink::clink) sees an
+    # undefined LibXml2::LibXml2 target at configure time.
+    list(APPEND _iceberg_find_deps "find_dependency(LibXml2)")
 endif()
 
 clink_set_warnings(clink_iceberg)
 clink_install_impl(
     TARGET   clink_iceberg
     NAME     iceberg
-    FIND_DEP "find_dependency(iceberg CONFIG)")
+    FIND_DEP ${_iceberg_find_deps})
 
 if(CLINK_BUILD_TESTS)
     add_subdirectory(tests)

@@ -186,23 +186,29 @@ public:
     }
 
     void close() override {
+        // Close + release EVERY writer/stream before reporting an error, so a failure on one
+        // key does not strand the other keys' streams un-Closed (a partial object) or leave
+        // writers_ populated for an unsafe retry. Capture the first error, finish the teardown,
+        // then rethrow.
+        std::string first_err;
         for (auto& [k, entry] : writers_) {
             if (entry.writer) {
-                if (auto s = entry.writer->Close(); !s.ok()) {
-                    throw std::runtime_error("ParquetS3Sink: writer close (" + k +
-                                             "): " + s.ToString());
+                if (auto s = entry.writer->Close(); !s.ok() && first_err.empty()) {
+                    first_err = "ParquetS3Sink: writer close (" + k + "): " + s.ToString();
                 }
                 entry.writer.reset();
             }
             if (entry.out) {
-                if (auto s = entry.out->Close(); !s.ok()) {
-                    throw std::runtime_error("ParquetS3Sink: stream close (" + k +
-                                             "): " + s.ToString());
+                if (auto s = entry.out->Close(); !s.ok() && first_err.empty()) {
+                    first_err = "ParquetS3Sink: stream close (" + k + "): " + s.ToString();
                 }
                 entry.out.reset();
             }
         }
         writers_.clear();
+        if (!first_err.empty()) {
+            throw std::runtime_error(first_err);
+        }
     }
 
     std::string name() const override { return name_; }
