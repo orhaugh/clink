@@ -147,6 +147,11 @@ void KafkaSink::open() {
     // a downed broker. Capped at the user's produce_timeout (we'll fail
     // fast on backpressure rather than letting librdkafka retry forever).
     set_or_throw("message.timeout.ms", std::to_string(impl_->opts.produce_timeout.count()));
+    // Extra librdkafka properties (security.protocol, sasl.*, ssl.*, ...) applied
+    // verbatim. librdkafka validates each key/value here and throws on a bad one.
+    for (const auto& [k, v] : impl_->opts.conf) {
+        set_or_throw(k, v);
+    }
 
     // Wire metrics first so the delivery callback can hit them on the
     // very first poll.

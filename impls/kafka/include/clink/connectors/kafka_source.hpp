@@ -56,6 +56,11 @@ public:
         //   kafka_source.<metric_prefix>.consume_errors
         // Empty disables the metric registration.
         std::string metric_prefix = "default";
+        // Extra librdkafka config properties applied verbatim after the fields
+        // above, e.g. {"security.protocol":"sasl_ssl", "sasl.mechanism":"PLAIN",
+        // "sasl.username":"u", "sasl.password":"p", "ssl.ca.location":"/ca.pem"}.
+        // The factory populates these from the SASL/SSL WITH-options.
+        std::map<std::string, std::string> conf;
     };
 
     explicit KafkaSource(Options opts);

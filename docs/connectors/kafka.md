@@ -93,7 +93,21 @@ Accepts `brokers`, `topic`, `client_id` (default `clink-sink`), `acks` and `comp
 
 Each incoming row must be a JSON object. A field named `__row_kind` is interpreted as the change kind: `delete` emits a tombstone (empty payload keyed by the primary key), `update_before` is dropped, and `insert`/`update_after` emit the row JSON minus `__row_kind` as the payload.
 
-There is no dedicated authentication option in the registered factories. Security and SASL settings are not exposed through these parameter keys.
+### Authentication and TLS
+
+All the factories above (sources, sinks, the transactional and upsert sinks) accept SASL and TLS options, mapped onto librdkafka config properties and applied verbatim when the client opens. SASL_PLAINTEXT / SASL_SSL with PLAIN or SCRAM, and SSL / mTLS, are all reachable:
+
+| Option | librdkafka property | Description |
+| --- | --- | --- |
+| `security_protocol` | `security.protocol` | `plaintext`, `ssl`, `sasl_plaintext` or `sasl_ssl`. |
+| `sasl_mechanism` | `sasl.mechanism` | `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `GSSAPI`, `OAUTHBEARER`. |
+| `sasl_username` / `sasl_password` | `sasl.username` / `sasl.password` | SASL credentials. |
+| `ssl_ca_location` | `ssl.ca.location` | CA certificate (path) for verifying the broker. |
+| `ssl_certificate_location` / `ssl_key_location` / `ssl_key_password` | `ssl.certificate.location` / `ssl.key.location` / `ssl.key.password` | Client certificate, key and key password for mTLS. |
+| `ssl_endpoint_identification_algorithm` | `ssl.endpoint.identification.algorithm` | `https` to verify the broker hostname, `none` to disable. |
+| `enable_ssl_certificate_verification` | `enable.ssl.certificate.verification` | `false` to skip broker-cert verification (testing only). |
+
+For any librdkafka property the aliases do not cover, an escape hatch passes it through verbatim: a WITH-option (or programmatic `Options.conf` entry) keyed `kafka.<property>` sets librdkafka `<property>` directly, e.g. `kafka.client.rack`. librdkafka validates each key/value when the client opens and throws on an unknown or unsupported one (for example an SSL setting on a build without SSL support). Credentials are passed through but never logged by the connector.
 
 ## SQL usage
 
@@ -175,7 +189,7 @@ When going through the plugin registry, call `clink::kafka::install(registry)` o
 ## Limitations
 
 - librdkafka commit-mode, batching and timeout knobs (`commit_mode`, `poll_timeout`, `max_batch_size`, `linger_ms`, `produce_timeout`, `flush_timeout`, `fixed_partition`, `metric_prefix`) exist on the `Options` structs but are not parsed from factory parameters, so through the registered factories they always take their struct defaults.
-- No authentication, TLS or SASL options are exposed through the registered factory parameters.
+- SASL and TLS are configured through the options in the Authentication and TLS section above (plus the generic `kafka.<property>` escape hatch); other security mechanisms are reachable only via that escape hatch.
 - The transactional sink requires a unique `transactional_id`; with `parallelism > 1` the factory appends the subtask index, and the uniqueness contract across producer instances is otherwise the caller's responsibility.
 - The upsert sink requires every input value to be a JSON object; malformed or non-object values are silently skipped, and `primary_key` is mandatory.
 - Sink delivery is at-least-once unless the transactional (`kafka_2pc_sink_string`) variant is used.

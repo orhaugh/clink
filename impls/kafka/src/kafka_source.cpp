@@ -233,6 +233,11 @@ void KafkaSource::open() {
     if (impl_->opts.enable_debug) {
         set_or_throw("debug", "consumer,cgrp,topic,fetch");
     }
+    // Extra librdkafka properties (security.protocol, sasl.*, ssl.*, ...) applied
+    // verbatim. librdkafka validates each key/value here and throws on a bad one.
+    for (const auto& [k, v] : impl_->opts.conf) {
+        set_or_throw(k, v);
+    }
 
     // Seek-on-assignment rebalance callback: applies any restored offsets so
     // the consumer resumes from the clink checkpoint rather than Kafka's

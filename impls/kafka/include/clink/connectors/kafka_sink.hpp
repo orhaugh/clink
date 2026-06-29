@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -72,6 +73,12 @@ public:
         // The 2PC adapter calls commit_transaction() / abort_transaction()
         // through the new public methods below.
         std::string transactional_id;
+
+        // Extra librdkafka config properties applied verbatim after the fields
+        // above, e.g. {"security.protocol":"sasl_ssl", "sasl.mechanism":"PLAIN",
+        // "sasl.username":"u", "sasl.password":"p", "ssl.ca.location":"/ca.pem"}.
+        // The factory populates these from the SASL/SSL WITH-options.
+        std::map<std::string, std::string> conf;
     };
 
     explicit KafkaSink(Options opts);

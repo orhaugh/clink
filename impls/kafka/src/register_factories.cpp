@@ -27,6 +27,7 @@
 #include "clink/core/record.hpp"
 #include "clink/kafka/install.hpp"
 #include "clink/kafka/kafka_message_codec.hpp"
+#include "clink/kafka/kafka_security.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -293,6 +294,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.group_id = ctx.param_or("group_id", "clink");
             opts.client_id = ctx.param_or("client_id", "clink-source");
             opts.auto_offset_reset = ctx.param_or("auto_offset_reset", "earliest");
+            populate_kafka_security_conf(ctx, opts.conf);
             if (opts.brokers.empty()) {
                 throw std::runtime_error("kafka_message_source: 'brokers' is required");
             }
@@ -310,6 +312,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.client_id = ctx.param_or("client_id", "clink-sink");
             opts.acks = ctx.param_or("acks", "all");
             opts.compression_type = ctx.param_or("compression", "none");
+            populate_kafka_security_conf(ctx, opts.conf);
             if (opts.brokers.empty()) {
                 throw std::runtime_error("kafka_message_sink: 'brokers' is required");
             }
@@ -338,6 +341,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         opts.group_id = ctx.param_or("group_id", "clink");
         opts.client_id = ctx.param_or("client_id", "clink-source");
         opts.auto_offset_reset = ctx.param_or("auto_offset_reset", "earliest");
+        populate_kafka_security_conf(ctx, opts.conf);
         if (opts.brokers.empty()) {
             throw std::runtime_error("kafka source: 'brokers' is required");
         }
@@ -356,6 +360,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         opts.client_id = ctx.param_or("client_id", "clink-sink");
         opts.acks = ctx.param_or("acks", "all");
         opts.compression_type = ctx.param_or("compression", "none");
+        populate_kafka_security_conf(ctx, opts.conf);
         if (opts.brokers.empty()) {
             throw std::runtime_error("kafka sink: 'brokers' is required");
         }
@@ -384,6 +389,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.client_id = ctx.param_or("client_id", "clink-sink-2pc");
             opts.compression_type = ctx.param_or("compression", "none");
             opts.transactional_id = ctx.param_or("transactional_id", "");
+            populate_kafka_security_conf(ctx, opts.conf);
             if (opts.brokers.empty()) {
                 throw std::runtime_error("kafka_2pc_sink_string: 'brokers' is required");
             }
@@ -423,6 +429,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.client_id = ctx.param_or("client_id", "clink-sink");
             opts.acks = ctx.param_or("acks", "all");
             opts.compression_type = ctx.param_or("compression", "none");
+            populate_kafka_security_conf(ctx, opts.conf);
             if (opts.brokers.empty()) {
                 throw std::runtime_error("kafka_upsert_sink_string: 'brokers' is required");
             }

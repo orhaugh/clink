@@ -8,6 +8,7 @@ add_executable(clink_kafka_tests
     register.cpp
     test_factory_registration.cpp
     test_kafka.cpp
+    test_kafka_security.cpp
     test_pipeline_loader.cpp
     test_pipeline_config.cpp
     test_typed_helpers.cpp
