@@ -141,8 +141,19 @@ private:
     };
 
     // Types whose JSON->Arrow->read_cell round-trip is an exact identity for a
-    // conforming value. FLOAT is lossy (double->float->double) and DECIMAL128
-    // coerces exact-or-null, so both keep the row path.
+    // conforming value, measured against the byte-equivalence REFERENCE: the
+    // plain (non-schema-aware) json_string_to_row decode, which keeps every JSON
+    // number as a full-precision double and never produces a dec-string. So:
+    //   - FLOAT is excluded because the columnar path would truncate to float32
+    //     (build_column appends `(float)v`) while the row reference keeps the
+    //     full double - serialize(0) then differs.
+    //   - DECIMAL128 is excluded because the columnar path would emit a
+    //     dec-string (read_cell -> make_dec_value) while the row reference keeps
+    //     a plain double (the Kafka decode is NOT row_json_text_format_with_decimals).
+    // Widening to these would require the row reference itself to be schema-aware
+    // (a behaviour change to json_string_to_row, out of scope here). Temporal
+    // types are not listed: effective_type maps them to utf8, so they ride the
+    // STRING case (string round-trips) or fall back (a numeric epoch value).
     static bool columnar_capable_type_(arrow::Type::type id) {
         switch (id) {
             case arrow::Type::INT64:

@@ -204,6 +204,58 @@ TEST(JsonColumnarDecode, FloatSchemaTakesRowPath) {
     EXPECT_EQ(encoded_rows(col_el.as_data()), encoded_rows(row_el.as_data()));
 }
 
+// A declared DECIMAL column keeps the row path: the byte-equivalence reference
+// (the plain json_string_to_row decode) stores a decimal value as a plain JSON
+// number, whereas a columnar DECIMAL128 column reads back as a dec-string
+// (make_dec_value) - so the schema is excluded and the batch stays row form.
+// (Analogous to FloatSchemaTakesRowPath; locks the exclusion in so a future
+// "add decimal to columnar_capable_type_" cannot silently break parity.)
+TEST(JsonColumnarDecode, DecimalSchemaTakesRowPath) {
+    auto oracle = make_row_oracle();
+    const std::vector<std::string> lines = {R"({"x":10.03})"};
+    auto row_el = run_one(oracle, lines_batch(lines));
+
+    JsonStringToRowColumnarOperator col_op({{"x", arrow::decimal128(10, 2)}});
+    auto col_el = run_one(col_op, lines_batch(lines));
+    ASSERT_TRUE(col_el.is_data());
+    EXPECT_FALSE(col_el.as_data().is_columnar());  // decimal forces the row path
+    EXPECT_EQ(encoded_rows(col_el.as_data()), encoded_rows(row_el.as_data()));
+}
+
+// A declared TIMESTAMP column is not a distinct columnar-capable type: it maps
+// (via effective_type) to utf8. A JSON STRING value round-trips faithfully so
+// the batch fires columnar as a string column; a numeric (epoch) value is not a
+// string and forces the row fallback. Both stay byte-equivalent to the row
+// decode, which is the contract.
+TEST(JsonColumnarDecode, TimestampStringColumnRidesStringPathEquivalent) {
+    const std::vector<RowColumn> schema = {{"a", arrow::int64()},
+                                           {"ts", arrow::timestamp(arrow::TimeUnit::MILLI)}};
+
+    // String timestamp value: utf8 round-trip is faithful -> columnar.
+    {
+        auto oracle = make_row_oracle();
+        const std::vector<std::string> lines = {R"({"a":1,"ts":"2026-06-29T12:00:00Z"})"};
+        auto row_el = run_one(oracle, lines_batch(lines));
+        JsonStringToRowColumnarOperator col_op(schema);
+        auto col_el = run_one(col_op, lines_batch(lines));
+        ASSERT_TRUE(col_el.is_data());
+        EXPECT_TRUE(col_el.as_data().is_columnar());  // utf8 string round-trips
+        EXPECT_EQ(encoded_rows(col_el.as_data()), encoded_rows(row_el.as_data()));
+    }
+    // Numeric timestamp value into the utf8 column: not a string -> row fallback,
+    // still byte-equivalent (the row decode keeps the number).
+    {
+        auto oracle = make_row_oracle();
+        const std::vector<std::string> lines = {R"({"a":1,"ts":1719662400000})"};
+        auto row_el = run_one(oracle, lines_batch(lines));
+        JsonStringToRowColumnarOperator col_op(schema);
+        auto col_el = run_one(col_op, lines_batch(lines));
+        ASSERT_TRUE(col_el.is_data());
+        EXPECT_FALSE(col_el.as_data().is_columnar());  // number in a utf8 column -> fallback
+        EXPECT_EQ(encoded_rows(col_el.as_data()), encoded_rows(row_el.as_data()));
+    }
+}
+
 // A partitioned source (every Kafka record carries source_partition) goes
 // columnar, carrying source_partition through the engine-only
 // __source_partition sidecar column so the downstream partition-aware watermark
