@@ -961,6 +961,21 @@ TEST(SqlPhysical, ExactlyOnceParquetMapsTo2pcRowSink) {
     EXPECT_EQ(find_op(spec, "parquet_row_sink"), nullptr);
 }
 
+// connector='parquet' source accepts a `prefix` (a local directory) and binds to the same
+// parquet_string_source factory, which routes the prefix to the multi-object reader at build time.
+TEST(SqlPhysical, LocalParquetPrefixSourceBindsAndMaps) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE pq_dir_in (v TEXT) WITH (connector='parquet', prefix='/tmp/pqdir');"
+        "CREATE TABLE pq_dir_out (v TEXT) WITH (connector='file', path='/tmp/out.ndjson')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO pq_dir_out SELECT v FROM pq_dir_in");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    EXPECT_NE(find_op(spec, "parquet_string_source"), nullptr);
+}
+
 TEST(SqlPhysical, ExactlyOnceObjectStoreParquetMapsTo2pcSink) {
     // delivery_guarantee='exactly_once' routes each object-store / WebHDFS Parquet sink to its
     // 2PC factory; the default routes to the at-least-once string sink.

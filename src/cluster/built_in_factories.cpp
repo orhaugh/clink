@@ -9,6 +9,9 @@
 #include <utility>
 #include <vector>
 
+#include <arrow/filesystem/filesystem.h>
+#include <arrow/filesystem/localfs.h>
+
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/type_registry.hpp"
@@ -16,6 +19,7 @@
 #include "clink/connectors/file_2pc_sink.hpp"
 #include "clink/connectors/file_sink.hpp"
 #include "clink/connectors/file_source.hpp"
+#include "clink/connectors/multi_object_parquet_source.hpp"
 #include "clink/connectors/parquet_sink.hpp"
 #include "clink/connectors/parquet_source.hpp"
 #include "clink/connectors/text_format.hpp"
@@ -183,27 +187,41 @@ void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
         });
 
     // ---- Parquet sources ----
-    reg.register_source<std::int64_t>(
-        "parquet_int64_source",
-        [](const BuildContext& ctx) -> std::shared_ptr<Source<std::int64_t>> {
-            auto path = ctx.param_or("path");
-            if (path.empty()) {
-                throw std::runtime_error("parquet_int64_source: 'path' param is required");
-            }
-            return std::make_shared<ParquetSource<std::int64_t>>(
-                path, int64_arrow_batcher(), "parquet_int64_source");
-        });
-
-    reg.register_source<std::string>(
-        "parquet_string_source",
-        [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
-            auto path = ctx.param_or("path");
-            if (path.empty()) {
-                throw std::runtime_error("parquet_string_source: 'path' param is required");
-            }
-            return std::make_shared<ParquetSource<std::string>>(
-                path, string_arrow_batcher(), "parquet_string_source");
-        });
+    // A single `path` reads one local file; a `prefix` (a directory) reads every matching Parquet
+    // file beneath it, sharded round-robin across subtasks, via the shared MultiObjectParquetSource
+    // over a LocalFileSystem (the same seam the S3/GCS/Azure sources use, with a local filesystem).
+    auto register_local_parquet_source = [&reg]<typename T>(const std::string& factory_name,
+                                                            ArrowBatcher<T> batcher) {
+        reg.register_source<T>(
+            factory_name,
+            [factory_name, batcher](const BuildContext& ctx) -> std::shared_ptr<Source<T>> {
+                if (const auto prefix = ctx.param_or("prefix", ""); !prefix.empty()) {
+                    typename MultiObjectParquetSource<T>::Options o;
+                    o.prefix = prefix;
+                    o.subtask_idx = static_cast<int>(ctx.subtask_idx);
+                    o.parallelism = static_cast<int>(ctx.parallelism);
+                    o.recursive = ctx.param_or("recursive", "true") == "true";
+                    o.suffix = ctx.param_or("suffix", ".parquet");
+                    return std::make_shared<MultiObjectParquetSource<T>>(
+                        []() -> std::shared_ptr<arrow::fs::FileSystem> {
+                            return std::make_shared<arrow::fs::LocalFileSystem>();
+                        },
+                        std::move(o),
+                        batcher,
+                        factory_name);
+                }
+                auto path = ctx.param_or("path");
+                if (path.empty()) {
+                    throw std::runtime_error(factory_name +
+                                             ": 'path' or 'prefix' param is required");
+                }
+                return std::make_shared<ParquetSource<T>>(path, batcher, factory_name);
+            });
+    };
+    register_local_parquet_source.template operator()<std::int64_t>("parquet_int64_source",
+                                                                    int64_arrow_batcher());
+    register_local_parquet_source.template operator()<std::string>("parquet_string_source",
+                                                                   string_arrow_batcher());
 
     reg.register_sink<std::int64_t>("collecting_int64_sink",
                                     [](const BuildContext&) -> std::shared_ptr<Sink<std::int64_t>> {
