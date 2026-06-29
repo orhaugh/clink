@@ -101,6 +101,9 @@ std::string string_source_factory_for(const TableDef& table) {
     if (connector == "gcs_parquet") {
         return "gcs_parquet_string_source";
     }
+    if (connector == "azure_parquet") {
+        return "azure_parquet_string_source";
+    }
     if (connector == "kinesis") {
         return "kinesis_source";
     }
@@ -157,6 +160,9 @@ std::string string_sink_factory_for(const TableDef& table) {
     }
     if (connector == "gcs_parquet") {
         return "gcs_parquet_string_sink";
+    }
+    if (connector == "azure_parquet") {
+        return "azure_parquet_string_sink";
     }
     if (connector == "redis") {
         return "redis_sink";

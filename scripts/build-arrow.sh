@@ -2,7 +2,8 @@
 # build-arrow.sh - compile + install Apache Arrow + Parquet FROM SOURCE at the pinned
 # version (scripts/versions.env) into CLINK_DEPS_PREFIX, with the feature set clink + its
 # deps need: Parquet, S3 (impls/s3 + the Iceberg S3 FileIO), GCS (impls/gcs - bundles
-# google-cloud-cpp storage), Compute, IPC, every Parquet compression codec, and JSON
+# google-cloud-cpp storage), Azure (impls/azure - bundles azure-sdk-for-cpp; needs system
+# libxml2 at build time), Compute, IPC, every Parquet compression codec, and JSON
 # (iceberg-cpp's avro module includes arrow/json - the host
 # only got away without it because Homebrew's Arrow headers leaked in). Dropped vs a stock
 # distro Arrow: Flight/Acero/Dataset/Gandiva (nothing links them) to keep the build bounded.
@@ -81,6 +82,7 @@ cmake -S "${SRC_DIR}/cpp" -B "${BUILD_DIR}" \
     -DARROW_FILESYSTEM=ON \
     -DARROW_S3=ON \
     -DARROW_GCS=ON \
+    -DARROW_AZURE=ON \
     -DARROW_COMPUTE=ON \
     -DARROW_JSON=ON \
     -DARROW_WITH_RAPIDJSON=ON \

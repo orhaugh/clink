@@ -33,6 +33,8 @@ export DEBIAN_FRONTEND=noninteractive
 #   libcurl4-openssl-dev - aws-sdk, Arrow GCS (google-cloud-cpp) link system libcurl
 #   libsqlite3-dev       - iceberg-cpp's SQLite catalog (find_package(SQLite3), build-time;
 #                          invisible to ldd because libiceberg is a static lib)
+#   libxml2-dev          - azure-sdk-for-cpp's storage libs (bundled by Arrow's ARROW_AZURE)
+#                          parse XML storage responses via system libxml2 at build time
 #   libzstd-dev, zlib1g-dev - compression libs the toolchain links
 # All are stable - they do not change when a connector is added - so they cache here.
 apt-get update && apt-get install -y --no-install-recommends \
@@ -49,6 +51,7 @@ apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     libcurl4-openssl-dev \
     libsqlite3-dev \
+    libxml2-dev \
     libzstd-dev \
     zlib1g-dev
 

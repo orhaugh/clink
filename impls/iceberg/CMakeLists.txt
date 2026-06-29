@@ -59,6 +59,18 @@ target_link_libraries(clink_iceberg
             iceberg::iceberg_rest_static
 )
 
+# When Arrow is built with ARROW_AZURE (scripts/build-arrow.sh), azure-sdk-for-cpp is bundled
+# into libarrow's STATIC archive (libarrow_bundled_dependencies.a), which we pull in transitively
+# via iceberg::iceberg_bundle_static. azure-sdk's storage XML layer references SYSTEM libxml2, and
+# Arrow's exported static config does not record that dependency, so consumers of arrow_static
+# must link libxml2 explicitly (declared after the bundle so it resolves left-to-right under GNU
+# ld). clink_core links arrow_shared, where libxml2 is already baked into the dylib, so iceberg -
+# the one arrow_static consumer - is where this bites.
+if(ARROW_AZURE)
+    find_package(LibXml2 REQUIRED)
+    target_link_libraries(clink_iceberg PRIVATE LibXml2::LibXml2)
+endif()
+
 clink_set_warnings(clink_iceberg)
 clink_install_impl(
     TARGET   clink_iceberg

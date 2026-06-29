@@ -135,6 +135,9 @@
 #ifdef CLINK_LINKED_GCS
 #include "clink/gcs/install.hpp"
 #endif
+#ifdef CLINK_LINKED_AZURE
+#include "clink/azure/install.hpp"
+#endif
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/rocksdb/install.hpp"
 #endif
@@ -2023,6 +2026,9 @@ void install_linked_impls() {
 #endif
 #ifdef CLINK_LINKED_GCS
     clink::gcs::install(reg);  // GCS Parquet source + sink
+#endif
+#ifdef CLINK_LINKED_AZURE
+    clink::azure::install(reg);  // Azure Blob Parquet source + sink
 #endif
     // RocksDB is unconditionally linked into clink_node (matches
     // bundled rocksdb-jni model). install() registers the
