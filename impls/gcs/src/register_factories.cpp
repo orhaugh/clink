@@ -11,6 +11,7 @@
 #include <arrow/filesystem/filesystem.h>
 
 #include "clink/connectors/multi_object_parquet_source.hpp"
+#include "clink/connectors/parquet_fs_2pc_sink.hpp"
 #include "clink/connectors/parquet_gcs_sink.hpp"
 #include "clink/connectors/parquet_gcs_source.hpp"
 #include "clink/core/arrow_batcher.hpp"
@@ -118,6 +119,62 @@ void register_gcs_parquet_source(clink::plugin::PluginRegistry& reg,
         });
 }
 
+// Register an exactly-once GCS Parquet sink (ParquetFsSink2PC): stages one file per checkpoint
+// interval under <bucket>/<prefix>/staging and promotes it to <bucket>/<prefix>/committed on
+// commit. The GcsFileSystem is built on the runner thread via gcs_detail::make_gcs_options (the
+// same call the source uses). Read the result with gcs_parquet source on <prefix>/committed.
+template <typename T>
+void register_gcs_parquet_2pc_sink(clink::plugin::PluginRegistry& reg,
+                                   std::string name,
+                                   ArrowBatcher<T> batcher) {
+    reg.register_sink<T>(
+        name, [name, batcher](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Sink<T>> {
+            const auto bucket = ctx.param_or("bucket");
+            const auto prefix = ctx.param_or("prefix");
+            if (bucket.empty() || prefix.empty()) {
+                throw std::runtime_error(name + ": 'bucket' and 'prefix' are required");
+            }
+            // Hold the auth/endpoint fields in the source Options so make_gcs_options gets the
+            // exact field types the single-object source passes.
+            typename ParquetGcsSource<T>::Options opts;
+            opts.anonymous = ctx.param_or("anonymous", "false") == "true";
+            if (const auto t = ctx.param_or("access_token", ""); !t.empty()) {
+                opts.access_token = t;
+            }
+            if (const auto e = ctx.param_or("endpoint_override", ""); !e.empty()) {
+                opts.endpoint_override = e;
+            }
+            if (const auto s = ctx.param_or("scheme", ""); !s.empty()) {
+                opts.scheme = s;
+            }
+            if (const auto p = ctx.param_or("project_id", ""); !p.empty()) {
+                opts.project_id = p;
+            }
+            if (const auto r = ctx.param_int64_or("retry_limit_seconds", 0); r > 0) {
+                opts.retry_limit_seconds = static_cast<double>(r);
+            }
+            auto fs_factory = [opts, name]() -> std::shared_ptr<arrow::fs::FileSystem> {
+                auto gcs_opts = clink::gcs_detail::make_gcs_options(opts.anonymous,
+                                                                    opts.access_token,
+                                                                    opts.endpoint_override,
+                                                                    opts.scheme,
+                                                                    opts.project_id,
+                                                                    opts.retry_limit_seconds);
+                auto r = arrow::fs::GcsFileSystem::Make(gcs_opts);
+                if (!r.ok()) {
+                    throw std::runtime_error(name +
+                                             ": GcsFileSystem::Make: " + r.status().ToString());
+                }
+                return *r;
+            };
+            typename ParquetFsSink2PC<T>::Options o;
+            o.base = bucket + "/" + prefix;
+            o.subtask_idx = static_cast<int>(ctx.subtask_idx);
+            return std::make_shared<ParquetFsSink2PC<T>>(
+                std::move(fs_factory), std::move(o), batcher);
+        });
+}
+
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
@@ -156,6 +213,10 @@ void install(clink::plugin::PluginRegistry& reg) {
         reg, "gcs_parquet_int64_source", int64_arrow_batcher());
     register_gcs_parquet_source<std::string>(
         reg, "gcs_parquet_string_source", string_arrow_batcher());
+    register_gcs_parquet_2pc_sink<std::int64_t>(
+        reg, "gcs_parquet_2pc_int64_sink", int64_arrow_batcher());
+    register_gcs_parquet_2pc_sink<std::string>(
+        reg, "gcs_parquet_2pc_string_sink", string_arrow_batcher());
 }
 
 }  // namespace clink::gcs

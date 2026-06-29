@@ -14,6 +14,7 @@
 #include "clink/connectors/multi_object_parquet_source.hpp"
 #include "clink/connectors/parquet_azure_sink.hpp"
 #include "clink/connectors/parquet_azure_source.hpp"
+#include "clink/connectors/parquet_fs_2pc_sink.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -120,6 +121,66 @@ void register_azure_parquet_source(clink::plugin::PluginRegistry& reg,
         });
 }
 
+// Register an exactly-once Azure Blob Parquet sink (ParquetFsSink2PC): stages one file per
+// checkpoint interval under <container>/<prefix>/staging and promotes it to
+// <container>/<prefix>/committed on commit. The AzureFileSystem is built on the runner thread via
+// azure_detail::make_azure_options (the same call the source uses). Read with azure_parquet source
+// on <prefix>/committed.
+template <typename T>
+void register_azure_parquet_2pc_sink(clink::plugin::PluginRegistry& reg,
+                                     std::string name,
+                                     ArrowBatcher<T> batcher) {
+    reg.register_sink<T>(
+        name, [name, batcher](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Sink<T>> {
+            const auto container = ctx.param_or("container");
+            const auto account_name = ctx.param_or("account_name");
+            const auto prefix = ctx.param_or("prefix");
+            if (container.empty() || account_name.empty() || prefix.empty()) {
+                throw std::runtime_error(name +
+                                         ": 'container', 'account_name' and 'prefix' are required");
+            }
+            // Hold the auth/endpoint fields in the source Options so make_azure_options gets the
+            // exact field types the single-object source passes.
+            typename ParquetAzureSource<T>::Options opts;
+            opts.account_name = account_name;
+            opts.anonymous = ctx.param_or("anonymous", "false") == "true";
+            opts.use_default_credential = ctx.param_or("use_default_credential", "false") == "true";
+            if (const auto k = ctx.param_or("account_key", ""); !k.empty()) {
+                opts.account_key = k;
+            }
+            if (const auto s = ctx.param_or("sas_token", ""); !s.empty()) {
+                opts.sas_token = s;
+            }
+            if (const auto a = ctx.param_or("blob_storage_authority", ""); !a.empty()) {
+                opts.blob_storage_authority = a;
+            }
+            if (const auto s = ctx.param_or("blob_storage_scheme", ""); !s.empty()) {
+                opts.blob_storage_scheme = s;
+            }
+            auto fs_factory = [opts, name]() -> std::shared_ptr<arrow::fs::FileSystem> {
+                auto azure_opts =
+                    clink::azure_detail::make_azure_options(opts.account_name,
+                                                            opts.anonymous,
+                                                            opts.account_key,
+                                                            opts.sas_token,
+                                                            opts.use_default_credential,
+                                                            opts.blob_storage_authority,
+                                                            opts.blob_storage_scheme);
+                auto r = arrow::fs::AzureFileSystem::Make(azure_opts);
+                if (!r.ok()) {
+                    throw std::runtime_error(name +
+                                             ": AzureFileSystem::Make: " + r.status().ToString());
+                }
+                return *r;
+            };
+            typename ParquetFsSink2PC<T>::Options o;
+            o.base = container + "/" + prefix;
+            o.subtask_idx = static_cast<int>(ctx.subtask_idx);
+            return std::make_shared<ParquetFsSink2PC<T>>(
+                std::move(fs_factory), std::move(o), batcher);
+        });
+}
+
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
@@ -159,6 +220,10 @@ void install(clink::plugin::PluginRegistry& reg) {
         reg, "azure_parquet_int64_source", int64_arrow_batcher());
     register_azure_parquet_source<std::string>(
         reg, "azure_parquet_string_source", string_arrow_batcher());
+    register_azure_parquet_2pc_sink<std::int64_t>(
+        reg, "azure_parquet_2pc_int64_sink", int64_arrow_batcher());
+    register_azure_parquet_2pc_sink<std::string>(
+        reg, "azure_parquet_2pc_string_sink", string_arrow_batcher());
 }
 
 }  // namespace clink::azure

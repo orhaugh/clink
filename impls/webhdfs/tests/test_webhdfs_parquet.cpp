@@ -23,14 +23,22 @@
 #include "clink/core/record.hpp"
 #include "clink/core/stream_element.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/runtime/runtime_context.hpp"
+#include "clink/state/in_memory_state_backend.hpp"
 
 using clink::Batch;
+using clink::CheckpointBarrier;
+using clink::CheckpointId;
 using clink::Emitter;
+using clink::InMemoryStateBackend;
 using clink::int64_arrow_batcher;
+using clink::OperatorId;
+using clink::RuntimeContext;
 using clink::StreamElement;
 using clink::string_arrow_batcher;
 using clink::WebHdfsMultiObjectParquetSource;
 using clink::WebHdfsParquetSink;
+using clink::WebHdfsParquetSink2PC;
 using clink::WebHdfsParquetSource;
 
 namespace {
@@ -48,14 +56,53 @@ public:
                 res.set_header("Location", base_url() + req.path + "?op=CREATE&dn=1");
                 return;
             }
+            if (op == "MKDIRS") {
+                res.set_content(R"({"boolean":true})", "application/json");
+                return;
+            }
+            if (op == "RENAME") {
+                const std::string dest =
+                    req.has_param("destination") ? req.get_param_value("destination") : "";
+                const std::string dest_key = "/webhdfs/v1" + dest;
+                bool ok = false;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    auto it = files_.find(req.path);
+                    if (it != files_.end() && !files_.contains(dest_key)) {
+                        files_[dest_key] = it->second;
+                        files_.erase(it);
+                        ok = true;
+                    }
+                }
+                res.set_content(ok ? R"({"boolean":true})" : R"({"boolean":false})",
+                                "application/json");
+                return;
+            }
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 files_[req.path] = req.body;
             }
             res.status = 201;
         });
+        svr_.Delete(R"(/webhdfs/v1/.*)",
+                    [this](const httplib::Request& req, httplib::Response& res) {
+                        {
+                            std::lock_guard<std::mutex> lk(mu_);
+                            files_.erase(req.path);
+                        }
+                        res.set_content(R"({"boolean":true})", "application/json");
+                    });
         svr_.Get(R"(/webhdfs/v1/.*)", [this](const httplib::Request& req, httplib::Response& res) {
             const std::string op = req.has_param("op") ? req.get_param_value("op") : "";
+            if (op == "GETFILESTATUS") {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (files_.contains(req.path)) {
+                    res.set_content(R"({"FileStatus":{"type":"FILE"}})", "application/json");
+                } else {
+                    res.status = 404;
+                }
+                return;
+            }
             if (op == "LISTSTATUS") {
                 // List the direct file children of req.path as a WebHDFS FileStatuses document.
                 const std::string child_prefix = req.path + "/";
@@ -367,4 +414,94 @@ TEST(WebHdfsMultiObjectParquet, EmptyDirYieldsNoRecords) {
     ro.dir = "/clink/does-not-exist";
     WebHdfsMultiObjectParquetSource<std::int64_t> src(ro, int64_arrow_batcher());
     EXPECT_TRUE(drain_dir_source(src).empty());
+}
+
+namespace {
+
+std::shared_ptr<WebHdfsParquetSink2PC<std::int64_t>> make_2pc_sink(MockWebHdfs& srv,
+                                                                   const std::string& base,
+                                                                   RuntimeContext& rctx,
+                                                                   OperatorId id) {
+    WebHdfsParquetSink2PC<std::int64_t>::Options o;
+    o.base_url = srv.base_url();
+    o.base = base;
+    auto sink = std::make_shared<WebHdfsParquetSink2PC<std::int64_t>>(o, int64_arrow_batcher());
+    sink->set_id(id);
+    sink->attach_runtime(&rctx);
+    return sink;
+}
+
+std::vector<std::int64_t> read_committed_dir(MockWebHdfs& srv, const std::string& committed_dir) {
+    WebHdfsMultiObjectParquetSource<std::int64_t>::Options ro;
+    ro.base_url = srv.base_url();
+    ro.dir = committed_dir;
+    WebHdfsMultiObjectParquetSource<std::int64_t> src(ro, int64_arrow_batcher());
+    return drain_dir_source(src);
+}
+
+}  // namespace
+
+TEST(WebHdfsParquetSink2PC, CommitRenamesStagingToCommittedAndIsReadable) {
+    MockWebHdfs srv;
+    InMemoryStateBackend state;
+    RuntimeContext rctx(OperatorId{42}, "wh2pc", &state, nullptr);
+    auto sink = make_2pc_sink(srv, "/clink/exactly", rctx, OperatorId{42});
+
+    sink->open();
+    Batch<std::int64_t> b;
+    b.emplace(10);
+    b.emplace(20);
+    sink->on_data(b);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{5}});
+    EXPECT_TRUE(state.get(OperatorId{42}, "_2pc_pending_sub0_5").has_value());
+    EXPECT_TRUE(read_committed_dir(srv, "/clink/exactly/committed").empty());  // not committed yet
+
+    sink->on_commit(5);
+    EXPECT_FALSE(state.get(OperatorId{42}, "_2pc_pending_sub0_5").has_value());
+
+    auto got = read_committed_dir(srv, "/clink/exactly/committed");
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(got, (std::vector<std::int64_t>{10, 20}));
+}
+
+TEST(WebHdfsParquetSink2PC, FreshSinkCommitsPendingOnOpen) {
+    MockWebHdfs srv;
+    InMemoryStateBackend state;
+    {
+        RuntimeContext rctx(OperatorId{5}, "wh2pc", &state, nullptr);
+        auto s1 = make_2pc_sink(srv, "/clink/rec", rctx, OperatorId{5});
+        s1->open();
+        Batch<std::int64_t> b;
+        b.emplace(100);
+        s1->on_data(b);
+        s1->on_barrier(CheckpointBarrier{CheckpointId{7}});
+        // "crash": no on_commit.
+    }
+    EXPECT_TRUE(read_committed_dir(srv, "/clink/rec/committed").empty());
+
+    {
+        RuntimeContext rctx(OperatorId{5}, "wh2pc", &state, nullptr);
+        auto s2 = make_2pc_sink(srv, "/clink/rec", rctx, OperatorId{5});
+        s2->open();  // recovery RENAMEs the pending staging file
+    }
+    EXPECT_FALSE(state.get(OperatorId{5}, "_2pc_pending_sub0_7").has_value());
+    EXPECT_EQ(read_committed_dir(srv, "/clink/rec/committed"), (std::vector<std::int64_t>{100}));
+}
+
+TEST(WebHdfsParquetSink2PC, AbortDeletesStagingAndClearsState) {
+    MockWebHdfs srv;
+    InMemoryStateBackend state;
+    RuntimeContext rctx(OperatorId{9}, "wh2pc", &state, nullptr);
+    auto sink = make_2pc_sink(srv, "/clink/ab", rctx, OperatorId{9});
+
+    sink->open();
+    Batch<std::int64_t> b;
+    b.emplace(1);
+    sink->on_data(b);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{9}});
+    EXPECT_TRUE(state.get(OperatorId{9}, "_2pc_pending_sub0_9").has_value());
+
+    sink->on_abort(9);
+    EXPECT_FALSE(state.get(OperatorId{9}, "_2pc_pending_sub0_9").has_value());
+    EXPECT_TRUE(read_committed_dir(srv, "/clink/ab/committed").empty());
 }

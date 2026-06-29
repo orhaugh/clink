@@ -67,6 +67,10 @@ public:
                      const std::string& body,
                      const std::string& content_type);
 
+    // Blocking DELETE (e.g. WebHDFS op=DELETE to remove a staging object). Same
+    // transport-error convention as post().
+    HttpResponse del(const std::string& path);
+
     // True iff this build can talk https (CPPHTTPLIB_OPENSSL_SUPPORT). Lets a
     // sink reject an https URL up front with a clear message.
     static bool tls_supported() noexcept;
