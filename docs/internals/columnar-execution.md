@@ -64,6 +64,8 @@ There are three tiers of batcher:
 
 3. The universal binary fallback, `make_default_arrow_batcher<T>(Codec<T>)`. Its schema is `{event_time:int64(null), value_bytes:binary}`; the `value_bytes` column carries each record's `Codec<T>::encode` output verbatim, and `parse` decodes it via `Codec<T>::decode`. No columnar win, but every type rides unified Arrow IPC framing automatically.
 
+Selection between tiers 2 and 3 is automatic. `make_auto_arrow_batcher<T>(codec)` returns the generated typed batcher when `HasArrowFields<T>` (the `CLINK_ARROW_FIELDS` opt-in), else the binary fallback. The codec-only registration paths (`TypeRegistry::register_typed`, `PluginRegistry::register_type`) and the codec-only network-channel constructors route through it, so describing a struct with `CLINK_ARROW_FIELDS` is sufficient to get typed columns through the ordinary registration API - the explicit `register_columnar_typed` / `register_columnar_type` helpers are only a statement of intent (and a compile error on an undescribed type). An explicit `ArrowBatcher<T>` passed to the 3-arg registration overrides the choice.
+
 ### Opting an operator into columnar processing
 
 `Operator<In, Out>` (in `operator_base.hpp`) exposes two virtuals, both no-op by default:
@@ -154,6 +156,7 @@ The same Arrow IPC machinery underpins state snapshots. The in-memory, changelog
 | `int64_arrow_batcher`, `string_arrow_batcher`, primitive/keyed batchers | `core/arrow_batcher.hpp` | Built-in typed columnar schemas |
 | `make_default_arrow_batcher<T>` | `core/arrow_batcher.hpp` | Binary `value_bytes` fallback wrapping `Codec<T>` |
 | `CLINK_ARROW_FIELDS`, `make_columnar_arrow_batcher<T>` | `core/columnar_batcher.hpp` | Per-field typed columns for a described plain struct |
+| `make_auto_arrow_batcher<T>` | `core/columnar_batcher.hpp` | Auto-selects typed (if `HasArrowFields<T>`) vs binary; used by the codec-only register/channel paths |
 | `arrow_batch_to_ipc`, `arrow_batch_from_ipc` | `core/arrow_batcher.hpp` | IPC serialise/deserialise used by the network channel |
 | `supports_columnar()`, `process_columnar()` | `operators/operator_base.hpp` | The opt-in operator hook and its no-double-emit contract |
 | `detail::try_process_columnar()` | `runtime/dag.hpp` | Shared runner dispatch into the fast path |

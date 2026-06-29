@@ -14,6 +14,7 @@
 
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/core/columnar_batcher.hpp"  // make_auto_arrow_batcher
 #include "clink/core/stream_element.hpp"
 #include "clink/metrics/network_metrics.hpp"
 #include "clink/metrics/operator_metrics.hpp"
@@ -38,12 +39,14 @@ namespace clink::network {
 template <typename T>
 class NetworkChannelSink {
 public:
-    // Codec-only ctor: builds the default (binary-fallback)
-    // ArrowBatcher from the codec. The codec itself is used once
-    // during construction and not retained - the wire path is purely
-    // Arrow IPC. Symmetric with NetworkChannelSource's codec-only ctor.
+    // Codec-only ctor: auto-selects the ArrowBatcher from the codec -
+    // the typed columnar layout when T opted in via CLINK_ARROW_FIELDS,
+    // else the binary fallback. The codec itself is used once during
+    // construction and not retained - the wire path is purely Arrow IPC.
+    // Symmetric with NetworkChannelSource's codec-only ctor and with the
+    // batcher the registration path stores for the same T.
     NetworkChannelSink(std::string host, std::uint16_t port, Codec<T> codec)
-        : host_(std::move(host)), port_(port), batcher_(make_default_arrow_batcher<T>(codec)) {}
+        : host_(std::move(host)), port_(port), batcher_(make_auto_arrow_batcher<T>(codec)) {}
 
     // Full ctor: use when T has a specialised ArrowBatcher (int64,
     // string, custom user schemas). The codec parameter is accepted
@@ -399,16 +402,19 @@ class NetworkChannelSource {
 public:
     static constexpr std::size_t kLocalChannelCapacity = 256;
 
-    // Codec-only ctor: builds the default binary-fallback ArrowBatcher
-    // from the codec. The codec itself is used once during construction
-    // and not retained - the wire path is purely Arrow IPC.
+    // Codec-only ctor: auto-selects the ArrowBatcher from the codec - the
+    // typed columnar layout when T opted in via CLINK_ARROW_FIELDS, else the
+    // binary fallback. The codec itself is used once during construction and
+    // not retained - the wire path is purely Arrow IPC. Matches the batcher
+    // NetworkChannelSink's codec-only ctor and the registration path produce
+    // for the same T, so the two ends agree on the schema.
     NetworkChannelSource(std::uint16_t port,
                          Codec<T> codec,
                          std::string bind_host = default_data_bind_host())
         : requested_port_(port),
           bound_port_(port),
           bind_host_(std::move(bind_host)),
-          batcher_(make_default_arrow_batcher<T>(codec)),
+          batcher_(make_auto_arrow_batcher<T>(codec)),
           local_channel_(std::make_shared<LocalEndpointChannel<T>>(kLocalChannelCapacity)) {}
 
     NetworkChannelSource(std::uint16_t port,

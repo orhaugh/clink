@@ -18,6 +18,7 @@
 #include "clink/cluster/runner_registry.hpp"    // ResolvedOutputGroup, RoutingMode
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/core/columnar_batcher.hpp"  // make_auto_arrow_batcher
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/key_groups.hpp"
 #include "clink/runtime/network/network_bridge.hpp"
@@ -139,9 +140,11 @@ public:
     // a specialised ArrowBatcher<T>. Multiple registrations under the
     // same name are accepted; latest wins.
     //
-    // The codec-only overload constructs a binary-fallback ArrowBatcher
-    // internally - every registered type rides Arrow IPC on the wire,
-    // whether or not it has a columnar Arrow schema.
+    // The codec-only overload auto-selects the ArrowBatcher: a type that
+    // opted in via CLINK_ARROW_FIELDS gets its generated typed columnar
+    // batcher, otherwise the binary-fallback batcher. Either way it rides
+    // Arrow IPC on the wire; the description just decides typed vs binary
+    // columns. Pass an explicit batcher to the 3-arg overload to override.
     template <typename T>
     void register_typed(const std::string& name, Codec<T> codec);
 
@@ -177,7 +180,7 @@ private:
 // boundary at run time.
 template <typename T>
 inline void TypeRegistry::register_typed(const std::string& name, Codec<T> codec) {
-    register_typed<T>(name, codec, make_default_arrow_batcher<T>(codec));
+    register_typed<T>(name, codec, make_auto_arrow_batcher<T>(codec));
 }
 
 template <typename T>
@@ -245,7 +248,7 @@ inline void TypeRegistry::register_typed(const std::string& name,
         return std::any{dag.template union_streams<T>(std::move(handles))};
     };
 
-    // Inline implementation of "attach one group's output" — mirrors
+    // Inline implementation of "attach one group's output" - mirrors
     // attach_typed_group_output<T> in runner_helpers.hpp. Self-
     // contained so we don't need to pull runner_helpers into this
     // header (which would form a circular include).
@@ -298,7 +301,7 @@ inline void TypeRegistry::register_typed(const std::string& name,
             }
             return;
         }
-        // Forward with multiple peers — fall back to broadcast for
+        // Forward with multiple peers - fall back to broadcast for
         // safety (planner shouldn't emit this combination).
         auto branches = dag.template fork<T>(handle, group.peers.size());
         for (std::size_t i = 0; i < group.peers.size(); ++i) {

@@ -300,6 +300,24 @@ inline ArrowBatcher<T> make_columnar_arrow_batcher() {
     return ArrowBatcher<T>{std::move(schema_fn), std::move(build), std::move(parse)};
 }
 
+// Auto-select the on-wire / Parquet ArrowBatcher for T. When T opted in to
+// a typed columnar layout via CLINK_ARROW_FIELDS, return the generated typed
+// batcher; otherwise the binary-fallback default. This is the policy the
+// codec-only register_* overloads and codec-only channel constructors use,
+// so a described struct gets typed Arrow columns through the ordinary API
+// with no separate columnar-register call, while undescribed types keep the
+// unified Arrow-IPC binary framing. The codec is consumed only by the
+// fallback (the typed layout is driven entirely by the field descriptors).
+template <typename T>
+inline ArrowBatcher<T> make_auto_arrow_batcher(Codec<T> codec) {
+    if constexpr (HasArrowFields<T>) {
+        (void)codec;
+        return make_columnar_arrow_batcher<T>();
+    } else {
+        return make_default_arrow_batcher<T>(std::move(codec));
+    }
+}
+
 }  // namespace clink
 
 // ---------------------------------------------------------------------

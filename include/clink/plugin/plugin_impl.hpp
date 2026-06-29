@@ -18,6 +18,7 @@
 
 #include "clink/cluster/dag_builder_registry.hpp"
 #include "clink/cluster/runner_helpers.hpp"
+#include "clink/core/columnar_batcher.hpp"  // make_auto_arrow_batcher
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/job_config.hpp"
@@ -199,10 +200,10 @@ inline void run_subtask_to_completion(clink::LocalExecutor& exec,
 
 template <typename T>
 void PluginRegistry::register_type(const std::string& name, Codec<T> codec) {
-    // Default Arrow path: every registered type gets a binary-fallback
-    // ArrowBatcher<T>. The PluginRegistry::register_type<T> overload
-    // below accepts an explicit batcher for the columnar specialisations
-    // wired in built_in_factories.cpp.
+    // Default Arrow path: pass an empty batcher so the 3-arg overload
+    // auto-selects one - typed columnar if T opted in via CLINK_ARROW_FIELDS,
+    // else binary fallback. The 3-arg overload below also accepts an explicit
+    // batcher for the columnar specialisations wired in built_in_factories.cpp.
     register_type<T>(name, std::move(codec), ArrowBatcher<T>{});
 }
 
@@ -211,7 +212,7 @@ void PluginRegistry::register_type(const std::string& name,
                                    Codec<T> codec,
                                    ArrowBatcher<T> batcher) {
     if (!batcher.build) {
-        batcher = make_default_arrow_batcher<T>(codec);
+        batcher = make_auto_arrow_batcher<T>(codec);
     }
     // Store the codec by typeid so fluent API methods that need to
     // wire a codec into operators (e.g. RocksDB-backed tumbling
