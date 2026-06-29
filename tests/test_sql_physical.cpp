@@ -104,6 +104,30 @@ TEST(SqlPhysical, KafkaConnectorMapsToKafkaFactories) {
     EXPECT_EQ(src->params.at("bootstrap"), "localhost:9092");
 }
 
+// connector='rabbitmq' lowers to rabbitmq_source_string / rabbitmq_sink_string (string channel)
+// via the json_string_to_row + row_to_json_string bridges, carrying queue/routing_key/host.
+TEST(SqlPhysical, RabbitMqConnectorMapsToAmqpFactories) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE r_in (msg TEXT) "
+        "WITH (connector='rabbitmq', host='mq', queue='events');"
+        "CREATE TABLE r_out (msg TEXT) "
+        "WITH (connector='rabbitmq', host='mq', routing_key='out');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO r_out SELECT msg FROM r_in");
+
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* src = find_op(spec, "rabbitmq_source_string");
+    ASSERT_NE(src, nullptr);
+    EXPECT_EQ(src->params.at("queue"), "events");
+    EXPECT_EQ(src->params.at("host"), "mq");
+    const auto* snk = find_op(spec, "rabbitmq_sink_string");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("routing_key"), "out");
+}
+
 // Wave 2 inc1: a kafka json table with columnar_decode='true' swaps the
 // row-form JSON bridge for the columnar one, and the columnar bridge must
 // carry the declared schema so it can build typed Arrow columns.
