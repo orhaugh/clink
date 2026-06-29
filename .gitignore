@@ -83,6 +83,7 @@ benchmarks/prod_compare/*/flink-job/target/
 benchmarks/prod_compare/*/rocksdb:/
 
 # Internal work-tracking docs live locally only; never under version control.
-# (the buildable consumer-examples stay tracked)
+# (the buildable consumer-examples and the published connector docs stay tracked)
 /docs/*
 !/docs/consumer-examples/
+!/docs/connectors/

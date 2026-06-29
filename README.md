@@ -34,6 +34,7 @@ section below.
 - [Build & test](#build--test)
   - [Reproducible build + sanitizer matrix](#reproducible-build--sanitizer-matrix)
   - [Optional dependencies](#optional-dependencies)
+- [Connectors](#connectors)
 - [Installing clink](#installing-clink)
 - [Using clink as a library](#using-clink-as-a-library)
   - [One-call default registration](#one-call-default-registration)
@@ -198,7 +199,9 @@ First image build is ~20-30 minutes because it compiles `aws-sdk-cpp` and
 Each connector / state-backend impl is gated by `find_package()`. When the
 dep is present, `clink::<impl>` is built; when absent, the impl module
 returns early and the target is simply not defined - call sites should
-guard on `if(TARGET clink::<impl>)`.
+guard on `if(TARGET clink::<impl>)`. The table below covers the core deps; the
+[connector reference](docs/connectors/README.md) documents every connector and
+its pinned version in full.
 
 | Connector / backend     | Detected via                                    | Debian package(s) / source              |
 |-------------------------|-------------------------------------------------|-----------------------------------------|
@@ -252,6 +255,23 @@ the path.
 Install to a non-system prefix (e.g. `~/.local` or `/opt/clink`) by setting
 `CMAKE_INSTALL_PREFIX` accordingly; downstream consumers then need
 `CMAKE_PREFIX_PATH` pointed at it.
+
+## Connectors
+
+clink ships source and sink connectors for messaging systems, object stores,
+databases, and HTTP / observability endpoints. Each is an optional module gated
+by a `CLINK_WITH_<NAME>` CMake option (default `AUTO`), and each has a reference
+page covering its dependency and pinned version, the exact factory names, every
+configuration option, SQL usage where available, an example, and delivery
+semantics.
+
+The full set lives in the [connector reference](docs/connectors/README.md). In brief:
+
+- Messaging and streaming: [Kafka](docs/connectors/kafka.md), [Pulsar](docs/connectors/pulsar.md), [RabbitMQ](docs/connectors/rabbitmq.md), [NATS JetStream](docs/connectors/nats.md), [MQTT](docs/connectors/mqtt.md)
+- Object storage and table formats (Parquet): [S3](docs/connectors/s3-parquet.md), [GCS](docs/connectors/gcs-parquet.md), [Azure Blob](docs/connectors/azure-parquet.md), [WebHDFS / HttpFS](docs/connectors/webhdfs-parquet.md), [Iceberg](docs/connectors/iceberg.md)
+- Databases and key-value: [PostgreSQL](docs/connectors/postgres.md), [MySQL / MariaDB](docs/connectors/mysql.md), [ClickHouse](docs/connectors/clickhouse.md), [Cassandra / ScyllaDB](docs/connectors/cassandra.md), [MongoDB](docs/connectors/mongodb.md), [Redis](docs/connectors/redis.md)
+- Cloud services and HTTP: [AWS (Kinesis / Firehose / DynamoDB)](docs/connectors/aws.md), [HTTP (Elasticsearch, OpenSearch, Splunk, InfluxDB, Prometheus, poll, Pub/Sub)](docs/connectors/http.md)
+- Serialization: [Avro](docs/connectors/avro.md)
 
 ## Using clink as a library
 
