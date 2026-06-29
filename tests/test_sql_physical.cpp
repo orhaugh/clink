@@ -977,6 +977,22 @@ TEST(SqlPhysical, S3ParquetSourceAndSinkMap) {
     EXPECT_NE(find_op(spec, "s3_parquet_string_sink"), nullptr);
 }
 
+TEST(SqlPhysical, GcsParquetSourceAndSinkMap) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE g_in (line TEXT) WITH (connector='gcs_parquet', bucket='b', "
+        "key='in.parquet');"
+        "CREATE TABLE g_out (line TEXT) WITH (connector='gcs_parquet', bucket='b', "
+        "key='out.parquet')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO g_out SELECT line FROM g_in");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    EXPECT_NE(find_op(spec, "gcs_parquet_string_source"), nullptr);
+    EXPECT_NE(find_op(spec, "gcs_parquet_string_sink"), nullptr);
+}
+
 TEST(SqlPhysical, S3TextSinkMaps) {
     Catalog cat;
     auto s = parse(
