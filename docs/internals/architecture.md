@@ -31,19 +31,30 @@ Key types to start from:
 
 ### The layering
 
-```
-   client / submission                  control plane                 execution
-  ------------------------         -----------------------       -----------------------
-   clink (CLI)                          JobManager                     TaskManager
-   clink_submit_sql       JobGraphSpec    plan + place    Deploy        (one per process)
-   StreamExecutionEnv  ---------------->  + track + ckpt  -------->   builds a Dag per subtask
-   JobSubmitter            (JSON)         coordinate              runs it via LocalExecutor
-                                                                         |
-                                                          one std::jthread per operator
-                                                                         |
-   SQL frontend ----compiles to----> JobGraphSpec                   clink::core
-   (CLINK_BUILD_SQL)                                            +    impls (connectors,
-                                                                     state backends)
+```mermaid
+flowchart LR
+  subgraph client["Client / submission"]
+    CLI["clink (CLI)"]
+    SUB["clink_submit_sql"]
+    ENV["StreamExecutionEnv"]
+    JS["JobSubmitter"]
+    SQLF["SQL frontend (CLINK_BUILD_SQL)"]
+  end
+  subgraph cp["Control plane"]
+    JM["JobManager: plan + place,<br/>track, checkpoint, coordinate"]
+  end
+  subgraph exec["Execution"]
+    TM["TaskManager (one per process)"]
+    DAG["builds a Dag per subtask,<br/>runs it via LocalExecutor,<br/>one std::jthread per operator"]
+    CORE["clink::core + impls<br/>(connectors, state backends)"]
+  end
+  CLI --> JM
+  SUB --> JM
+  ENV --> JM
+  JS -->|"JobGraphSpec (JSON)"| JM
+  SQLF -->|"compiles to JobGraphSpec"| JM
+  JM -->|"Deploy"| TM
+  TM --> DAG --> CORE
 ```
 
 Everything below the control plane is the engine core. `clink::core` has no dependency on the cluster, the connectors, or SQL. The connectors and state backends in `impls/` depend on the core and register themselves with an operator registry. The cluster control plane sits above the core: it accepts a `JobGraphSpec`, decides how to lay it out across task managers, and hands each task manager a chain of operator descriptors that the task manager rebuilds into a `Dag` and runs with the very same `LocalExecutor` used for in-process jobs.

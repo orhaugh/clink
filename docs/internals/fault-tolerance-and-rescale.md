@@ -34,29 +34,15 @@ When a TM is declared lost, `mark_tm_lost_locked_` walks every job that had a su
 
 On the recovery path the JM must first drain the surviving subtasks before it can safely redeploy. The lost-TM subtasks go into `restart_pending`; the still-in-flight subtasks on surviving TMs go into `restart_drain_expected`. The watchdog then broadcasts `CancelJob` to every surviving TM hosting that job. Each survivor's role handler is expected to observe `was_cancelled()`, exit, and report a normal `SubtaskFinished`, which decrements the expected-drain set. Once the drain set empties (or it was already empty because the survivors had finished), `restart_job_locked_` runs and rebuilds the deployment.
 
-```
-TM heartbeat stops
-        |
-        v
-watchdog_loop_ : now - last_seen > heartbeat_timeout
-        |
-        v
-mark_tm_lost_locked_ : restart budget left?
-   |                              |
-   | no                           | yes
-   v                              v
-fail fast               awaiting_restart
-(synthesise errors)     restart_pending  = lost-TM subtasks
-                        drain_expected   = surviving in-flight subtasks
-                        restart_deadline = now + restart_drain_timeout
-                              |
-                  CancelJob -> survivors drain (SubtaskFinished)
-                              |
-                  drain set empty?
-                              | yes
-                              v
-                   restart_job_locked_ : place tasks on survivor slots,
-                   Deploy with restore_from_dir + latest_completed_checkpoint_id
+```mermaid
+flowchart TD
+  HB["TM heartbeat stops"] --> WD["watchdog_loop_:<br/>now - last_seen &gt; heartbeat_timeout"]
+  WD --> ML{"mark_tm_lost_locked_:<br/>restart budget left?"}
+  ML -->|no| FF["fail fast (synthesise errors)"]
+  ML -->|yes| AR["awaiting_restart:<br/>restart_pending = lost-TM subtasks,<br/>drain_expected = surviving in-flight subtasks,<br/>restart_deadline = now + restart_drain_timeout"]
+  AR --> CJ["CancelJob: survivors drain (SubtaskFinished)"]
+  CJ --> DE{"drain set empty?"}
+  DE -->|yes| RJ["restart_job_locked_:<br/>place tasks on survivor slots,<br/>Deploy with restore_from_dir +<br/>latest_completed_checkpoint_id"]
 ```
 
 `restart_job_locked_` rebuilds a `DeploymentTask` template per subtask (preserving `role`, `subtask_idx`, `extra_config`, and peer topology while clearing resolved host/port), places the tasks round-robin across survivor TMs with free slots, resets the job's transient coordination state, and emits one `DeployMsg` per TM. The restore handle on every Deploy is the JM's own coordination directory and last acknowledged id:
@@ -103,17 +89,16 @@ clink has two rescale paths that share this math.
 
 **Operator-level adaptive rescale** is driven by the per-operator `RescaleCoordinator` (`include/clink/cluster/rescale_coordinator.hpp`). Its purpose is to run a graceful cutover under a coordinator state machine rather than a full job restart. An operator is registered with its current parallelism plus `[min_parallelism, max_parallelism]` bounds taken from the `OperatorSpec`; `min == 0 && max == 0` means the operator is not scalable and rescale requests are rejected. The state machine is:
 
-```
-Idle
-  -- request_rescale --> Preparing      (validate bounds, mark target)
-Preparing
-  -- mark_checkpoint_ready --> Draining (a checkpoint landed; gate the cutover on it)
-Draining
-  -- all old subtasks acked --> CuttingOver
-CuttingOver
-  -- all new subtasks ready --> Complete (current_parallelism = target_parallelism)
-any (except Idle/Complete)
-  -- abort --> Aborted                   (revert to pre-rescale parallelism)
+```mermaid
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Preparing: request_rescale (validate bounds, mark target)
+  Preparing --> Draining: mark_checkpoint_ready (a checkpoint landed)
+  Draining --> CuttingOver: all old subtasks acked
+  CuttingOver --> Complete: all new subtasks ready (current = target)
+  Preparing --> Aborted: abort (revert parallelism)
+  Draining --> Aborted: abort
+  CuttingOver --> Aborted: abort
 ```
 
 `JobManager::request_operator_rescale` validates the request and refuses if the job has no coordinator, or if periodic checkpointing is not configured (`checkpoint_dir` empty or `interval_ms <= 0`), because the `Preparing -> Draining` transition is driven by a checkpoint landing and would otherwise wait forever. The actual cutover deployment math lives in `plan_operator_cutover` (`rescale_dispatch.cpp`), which computes the same key-group ranges and `restore_from_*` mapping as the whole-job path and places the new subtasks greedily onto TMs with free slots. `JobManager::dispatch_begin_rescale_locked_` sends `BeginRescale` to every TM hosting the operator; each TM fires its drain callbacks so the running subtask emits a `DrainMarker` and shuts down. The coordinator itself is purely the state record: each transition is mutex-protected and the JM RPC handlers update it via `mark_checkpoint_ready`, `mark_old_drained`, and `mark_new_ready`.

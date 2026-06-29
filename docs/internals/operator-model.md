@@ -75,17 +75,17 @@ Operators opt in to two execution variants with `[[nodiscard]]` predicates that 
 
 ### The Dag builder
 
+```mermaid
+flowchart LR
+  src["src (add_source)"] -->|"StageHandle&lt;T&gt;"| op["op (add_operator)"] -->|"StageHandle&lt;U&gt;"| sink["sink (add_sink)"]
 ```
-        StageHandle<T>            StageHandle<U>
-   src ───────────────► op ─────────────────► sink
-   (add_source)      (add_operator)         (add_sink)
 
-   each add_* call:
-     - mints an OperatorId
-     - allocates the output BoundedChannel
-     - captures the operator + channels into a detail::OperatorRunner
-     - returns a StageHandle<Out> carrying the output channel + runner index
-```
+Each `add_*` call:
+
+- mints an `OperatorId`
+- allocates the output `BoundedChannel`
+- captures the operator and channels into a `detail::OperatorRunner`
+- returns a `StageHandle<Out>` carrying the output channel and runner index
 
 `Dag` (`include/clink/runtime/dag.hpp`) is the topology builder. Each `add_*` method allocates the operator's output channel, derives its `OperatorId`, and pushes a `detail::OperatorRunner` onto the DAG. A runner is a type-erased struct holding the operator's name and id, its `run` closure (given a `RuntimeContext&` and a `should_stop` predicate), a `cancel` closure, and channel-introspection callbacks for metrics. The methods return a `StageHandle<T>` carrying the new stage's output channel and its runner index, which the next `add_*` consumes as its upstream.
 
@@ -112,15 +112,21 @@ Multi-input shapes (`union_streams`, `interval_join`, broadcast, the shuffled pa
 
 `add_parallel_source` / `add_parallel_operator` / `add_parallel_operator_shuffled` / `add_parallel_sink` build N-way parallel stages, each subtask in its own runner with its own operator instance and its own `RuntimeContext` (hence its own keyed-state namespace). Operators are supplied as factories `(subtask_idx) -> shared_ptr<...>` so per-subtask state stays isolated. A `ParallelStageHandle<T>` carries the per-subtask `SubtaskEmitter`s and subtask ids. There are three edge layouts:
 
+```mermaid
+flowchart LR
+  subgraph fwd["Forward (N == M): 1:1, no downstream alignment"]
+    direction LR
+    a1["sub i"] --> a2["sub i"]
+  end
+  subgraph hash["Hash shuffle (N to M): N x M channels, each downstream aligns N inputs"]
+    direction LR
+    b["sub i"] --> c0["sub 0"]
+    b --> c1["sub 1"]
+    b --> c2["sub 2"]
+  end
 ```
- Forward (N == M):      sub i ──────────────► sub i        (1:1, no downstream alignment)
 
- Hash shuffle (N→M):    sub i ──┬─► ch(i,0) ─► sub 0
-                                ├─► ch(i,1) ─► sub 1        (N×M channels;
-                                └─► ch(i,2) ─► sub 2         each downstream aligns N inputs)
-
- Fan-in (N → 1):        degenerate shuffle with M = 1 (single downstream aligns N inputs)
-```
+Fan-in (N to 1) is a degenerate shuffle with M = 1: a single downstream aligns N inputs.
 
 `add_parallel_operator` requires `parallelism == upstream.parallelism` and installs the forward layout. A cross-parallelism edge requires `add_parallel_operator_shuffled` with a partitioner, which allocates the N×M channel grid; each upstream subtask's emitter is attached with the partitioner to choose the destination, and each downstream subtask reads from N inputs through `MultiInputAlignment`.
 

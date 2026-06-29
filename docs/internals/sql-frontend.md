@@ -31,35 +31,16 @@ The SQL frontend is a compile-time pipeline. It takes SQL text and produces a `c
 
 ### Pipeline at a glance
 
-```
-  SQL text
-     |
-     v
-  preparse::preparse()            text-level shim: MAP/ROW/MULTISET DDL types,
-     |   (rewritten_sql +         MATCH_RECOGNIZE, process-table-function clauses
-     |    recorded fragments)     replaced by PG-parseable placeholders
-     v
-  pg_query_parse()                libpg_query (PostgreSQL 16 grammar) -> JSON parse tree
-     |
-     v
-  translate_to_ast()             libpg_query JSON -> clink::sql::ast::Script
-     |
-     v
-  preparse::reattach_*()         swap placeholders back for the recorded fragments
-     |
-     v   ast::Script  (one or more ast::Statement)
-     |
-     v
-  Binder::bind_insert / bind_select   AST + Catalog -> LogicalPlan  (resolve, type, lower)
-     |
-     v
-  optimize()                     rule-based rewrites on the LogicalPlan tree
-     |
-     v
-  PhysicalPlanner::compile()     LogicalPlan -> cluster::JobGraphSpec (operator DAG)
-     |
-     v
-  JobGraphSpec  (op id, factory type, inputs, channel, params, parallelism)
+```mermaid
+flowchart TD
+  T["SQL text"] --> PP["preparse::preparse()<br/>text-level shim: MAP/ROW/MULTISET DDL types,<br/>MATCH_RECOGNIZE, process-table-function clauses<br/>replaced by PG-parseable placeholders"]
+  PP --> PG["pg_query_parse()<br/>libpg_query (PostgreSQL 16 grammar) to JSON parse tree"]
+  PG --> TR["translate_to_ast()<br/>libpg_query JSON to clink::sql::ast::Script"]
+  TR --> RA["preparse::reattach_*()<br/>swap placeholders back for the recorded fragments"]
+  RA --> BD["Binder::bind_insert / bind_select<br/>AST + Catalog to LogicalPlan (resolve, type, lower)"]
+  BD --> OPT["optimize()<br/>rule-based rewrites on the LogicalPlan tree"]
+  OPT --> CP["PhysicalPlanner::compile()<br/>LogicalPlan to cluster::JobGraphSpec (operator DAG)"]
+  CP --> JG["JobGraphSpec<br/>(op id, factory type, inputs, channel, params, parallelism)"]
 ```
 
 `parse()` (in `src/sql/parser.cpp`) glues the first four stages: it preparses, calls `pg_query_parse`, runs `translate_to_ast`, then runs the three reattach passes, freeing the libpg_query result on every path. The driver in `tools/clink_submit_sql.cpp` then walks the returned `ast::Script` statement by statement: `CREATE TABLE` registers a `TableDef` in the `Catalog`; `INSERT INTO ... SELECT` runs bind, then `optimize`, then `compile`; `DROP TABLE`, `SHOW TABLES`, `ANALYZE` and `CREATE MATERIALIZED VIEW` have their own handling. A bare `SELECT` only binds (for `--explain`); it has no stdout sink.

@@ -63,14 +63,18 @@ The expensive part of a checkpoint is the durable write, not building the in-mem
 
 A worker is constructed per operator subtask only when the backend `supports_async_persist()` (FileBacked and disk-backed changelog; InMemory, RAM-only changelog and RocksDB stay on the synchronous path and never build one). The split:
 
-```
-operator thread                          snapshot-worker thread
----------------                          ----------------------
-pop barrier
-capture(ckpt_id)  -> CaptureHandle       (blocks on queue.pop)
-forward barrier downstream
-enqueue(handle, backend, ack) ---------> persist(handle)   (slow durable write)
-continue processing records              ack(ckpt_id, ok, err)   <- after persist returns
+```mermaid
+sequenceDiagram
+  participant Op as Operator thread
+  participant SW as Snapshot-worker thread
+  Note over SW: blocks on queue.pop
+  Op->>Op: pop barrier
+  Op->>Op: capture(ckpt_id) returns CaptureHandle
+  Op->>Op: forward barrier downstream
+  Op->>SW: enqueue(handle, backend, ack)
+  Op->>Op: continue processing records
+  SW->>SW: persist(handle) (slow durable write)
+  SW->>Op: ack(ckpt_id, ok, err) (after persist returns)
 ```
 
 `StateBackend::capture(ckpt_id)` produces a detached point-in-time blob cheaply on the operator thread; the barrier is forwarded immediately because the blob already reflects state at the barrier point. The worker calls `StateBackend::persist` (the slow `write_fsync_rename`) on its own thread and fires the ack **only after persist returns**, so an async checkpoint is never reported durable before its bytes are on stable storage.

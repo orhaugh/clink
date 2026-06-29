@@ -102,17 +102,20 @@ The wider columnar-execution story (when the columnar form is preserved end-to-e
 
 The socket path cannot rely on `BoundedChannel` blocking alone, so it adds an explicit credit scheme over the reverse direction of the same connection. Credit is counted in records.
 
-```
-sink                                       source
-----                                       ------
-                          <-- CreditUpdate(kInitialNetworkCredit)   (right after accept)
-push(data of size n):
-  acquire_credit_(n)
-   - if budget >= n: deduct, send frame
-   - else: block on credit_cv_, count
-     saturation + blocked_ns               pop() dequeues a data batch of size n
-                          <-- CreditUpdate(n)                       (on consumer dequeue)
-  reader thread tops up budget, notifies cv
+```mermaid
+sequenceDiagram
+  participant SK as Sink
+  participant SR as Source
+  SR->>SK: CreditUpdate(kInitialNetworkCredit) (right after accept)
+  Note over SK: push(data of size n): acquire_credit_(n)
+  alt budget is at least n
+    SK->>SK: deduct, send frame
+  else budget is below n
+    SK->>SK: block on credit_cv_, count saturation + blocked_ns
+  end
+  Note over SR: pop() dequeues a data batch of size n
+  SR->>SK: CreditUpdate(n) (on consumer dequeue)
+  Note over SK: reader thread tops up budget, notifies cv
 ```
 
 The receiver bootstraps a fresh connection with one `CreditUpdate(kInitialNetworkCredit)` (2048 records, `wire.hpp`) immediately after `accept`. The sender's `acquire_credit_` deducts the batch size before each data frame and blocks on a condition variable when the budget is too small; a dedicated reader thread in the sink consumes incoming `CreditUpdate` frames and tops the budget back up. Crucially the receiver issues credit in `pop()`, that is, on consumer dequeue, not at parse time. Crediting at parse time would pace the sender only to socket throughput and miss the real backpressure signal when the consumer itself is slow. The sink exposes `credit_remaining()`, `blocked_ns_total()`, `saturation_events()` and `grants_received()` for backpressure dashboards. Watermarks, barriers, drain markers and close frames are not credit-gated; only data frames are.

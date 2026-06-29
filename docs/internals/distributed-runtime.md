@@ -36,17 +36,22 @@ Every message on a control connection is a length-prefixed frame: a 4-byte big-e
 
 `MessageKind` values are grouped by direction:
 
-```
-TM -> JM     Register(1) SubtaskFinished(2) Heartbeat(3) SubtaskListening(6)
-             SubtaskCheckpointed(9) RequestFinalCheckpoint(10)
-Client -> JM HelloClient(4) SubmitJob(5) ListJobs(7) RescaleJob(11)
-             RescaleOperator(12*) Savepoint(12*) CancelJob(103, overloaded)
-JM -> TM     RegisterAck(100) Deploy(101) StartJob(102) CancelJob(103)
-             PeerUpdate(104) TriggerCheckpoint(108) CommitCheckpoint(110)
-             AbortCheckpoint(113) BeginRescale(114) FinalCheckpointAssigned(116)
-JM -> Client SubmitJobAck(105) JobCompleted(106) ListJobsAck(107)
-             CancelJobAck(109) RescaleJobAck(111) SavepointAck(112)
-             RescaleOperatorAck(115)
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant JM as JobManager
+  participant TM as TaskManager
+  TM->>JM: Register
+  JM->>TM: RegisterAck
+  C->>JM: HelloClient
+  C->>JM: SubmitJob (graph+plugins)
+  JM->>TM: Deploy (tasks+plugins)
+  TM->>JM: SubtaskListening
+  JM->>TM: PeerUpdate
+  JM->>C: SubmitJobAck
+  Note over TM: subtasks run
+  TM->>JM: SubtaskFinished
+  JM->>C: JobCompleted
 ```
 
 (*The `RescaleOperator` and `Savepoint` enumerators share the literal value `12` in the source; they are distinguished by which connection direction and handler dispatches them. `CancelJob = 103` is deliberately overloaded for both the JM -> TM cancel broadcast and the client -> JM cancel request.)

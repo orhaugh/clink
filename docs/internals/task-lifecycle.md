@@ -52,32 +52,25 @@ LocalExecutor::start()
 
 Every node type runs the same shape of lifecycle, expressed through the virtual hooks on `Operator<In, Out>` (and the analogous `Source`, `Sink`, `CoOperator`). For a single-input single-output operator the runner in `Dag::add_operator` drives it as follows.
 
-```
-                 attach_runtime(ctx)
-                        |
-                 restore_timers(backend, id)        (same-parallelism restore)
-                        |
-                     open()                          (bind keyed state, etc.)
-                        |
-        +--------- main loop while !should_stop() ---------+
-        |   fire due timers (processing-time, between pops)|
-        |   pop_for(timeout sized to next timer deadline)  |
-        |     data      -> process()                       |
-        |                  (or process_columnar /          |
-        |                   process_async fast paths)      |
-        |     watermark  -> on_watermark() (fires ev-timers)|
-        |     barrier    -> snapshot state, then process() |
-        |     drain      -> rescale wind-down              |
-        |   channel closed & empty -> break                |
-        +--------------------------------------------------+
-                        |
-                 flush(emitter)                      (residual windows/joins)
-                        |
-                     close()
-                        |
-                 attach_runtime(nullptr)
-                        |
-                 out_channel->close()  + close side channels
+```mermaid
+flowchart TD
+  AR["attach_runtime(ctx)"] --> RT["restore_timers(backend, id)<br/>(same-parallelism restore)"]
+  RT --> OP["open() (bind keyed state, etc.)"]
+  OP --> LOOP
+  subgraph LOOP["main loop while !should_stop()"]
+    direction TB
+    FT["fire due timers (processing-time, between pops)"] --> POP["pop_for(timeout sized to next timer deadline)"]
+    POP --> D{"element kind?"}
+    D -->|data| PR["process()<br/>(or process_columnar / process_async)"]
+    D -->|watermark| WM["on_watermark() (fires event-timers)"]
+    D -->|barrier| BR["snapshot state, then process()"]
+    D -->|drain| DR["rescale wind-down"]
+    D -->|"channel closed and empty"| BRK["break"]
+  end
+  LOOP --> FL["flush(emitter) (residual windows/joins)"]
+  FL --> CL["close()"]
+  CL --> AN["attach_runtime(nullptr)"]
+  AN --> CC["out_channel-&gt;close() + close side channels"]
 ```
 
 `open()` runs once, after `attach_runtime` so the operator can reach state, metrics and timers, and after `restore_timers` so a restored timer set is visible. The default lifecycle hooks (`open`, `close`, `flush`, `on_processing_time_timer`, `on_event_time_timer`) are no-ops; operators override what they need. `flush(emitter)` is the explicit end-of-input hook for operators that buffer state (windows, sorts, joins) to emit their residual output before `close()`. It runs only on a clean shutdown (`should_stop()` false), so a cancelled job does not spuriously flush.

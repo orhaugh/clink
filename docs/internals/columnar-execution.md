@@ -29,13 +29,12 @@ The path is strictly opt-in and degrades cleanly. The default for every operator
 
 `Batch<T>` (in `record.hpp`) is two representations of the same data. It holds a `std::vector<Record<T>>` and, optionally, a `std::shared_ptr<arrow::RecordBatch>` plus a row count and a `MaterializeFn` closure:
 
-```
-Batch<T>
- ├─ records_      : vector<Record<T>>          (row form; may be empty)
- ├─ arrow_        : shared_ptr<RecordBatch>     (columnar sidecar; may be null)
- ├─ arrow_rows_   : size_t                      (row count, answered without decoding)
- └─ materialize_  : fn(const RecordBatch&) -> vector<Record<T>>   (lazy decoder)
-```
+| Field | Type | Notes |
+| --- | --- | --- |
+| `records_` | `vector<Record<T>>` | row form; may be empty |
+| `arrow_` | `shared_ptr<RecordBatch>` | columnar sidecar; may be null |
+| `arrow_rows_` | `size_t` | row count, answered without decoding |
+| `materialize_` | `fn(const RecordBatch&) -> vector<Record<T>>` | lazy decoder |
 
 Two constructors distinguish the cases. The row constructor takes a `vector<Record<T>>`. The columnar constructor takes `(shared_ptr<RecordBatch>, rows, MaterializeFn)` and leaves `records_` empty until needed. The surface:
 
@@ -95,21 +94,19 @@ process_columnar(element, out):
   return true
 ```
 
-```
-   incoming StreamElement<In>
-            │
-            ▼
-   try_process_columnar(op, el, out)
-      │
-      ├─ CLINK_DISABLE_COLUMNAR=1 ─────────────► op->process(el, out)   (row path)
-      ├─ !supports_columnar() ────────────────► op->process(el, out)
-      ├─ !el.as_data().is_columnar() ─────────► op->process(el, out)   (row-form batch)
-      └─ supports_columnar() && is_columnar()
-              │
-              ▼
-         op->process_columnar(el, out)
-              ├─ returns false (before any emit) ─► op->process(el, out)
-              └─ returns true ───────────────────► done (columnar, zero row decode)
+```mermaid
+flowchart TD
+  IN["incoming StreamElement&lt;In&gt;"] --> TPC["try_process_columnar(op, el, out)"]
+  TPC --> C1{"CLINK_DISABLE_COLUMNAR=1?"}
+  C1 -->|yes| ROW["op-&gt;process(el, out)  (row path)"]
+  C1 -->|no| C2{"supports_columnar()?"}
+  C2 -->|no| ROW
+  C2 -->|yes| C3{"el.as_data().is_columnar()?"}
+  C3 -->|"no (row-form batch)"| ROW
+  C3 -->|yes| PC["op-&gt;process_columnar(el, out)"]
+  PC --> R{"return value?"}
+  R -->|"false (before any emit)"| ROW
+  R -->|"true"| DONE["done (columnar, zero row decode)"]
 ```
 
 Watermarks and barriers never go through `process_columnar`; the runner routes those to `process()` (or the operator's `on_watermark` / `on_barrier`), so a columnar operator still implements `process()` for control elements and for the row-only fallback.

@@ -14,6 +14,7 @@ How to work in this repo. These reflect standing preferences; honour them by def
 - Build parallelism: use `cmake --build <dir> --parallel 10` and `ctest --test-dir <dir> --parallel 8` (or `-j8`). NEVER a bare `-j` (it can freeze this 12-core machine).
 - clang-format: the pre-commit hook uses Apple clang-format at `/Library/Developer/CommandLineTools/usr/bin/clang-format`. Format with THAT binary, not Homebrew's newer clang-format, or a version skew reformats lines differently and blocks the commit.
 - Docs: `/docs/*` is gitignored except `consumer-examples/`, `connectors/`, and `internals/`. Never commit other `docs/*.md` (internal work notes); to publish a new docs subdir, add a matching `!/docs/<dir>/` exception.
+- Diagrams in docs: use a fenced ` ```mermaid ` block (GitHub renders it), not ASCII art. Keep node labels in double quotes, escape `<`/`>`/`&` as `&lt;`/`&gt;`/`&amp;`, use `<br/>` for line breaks, and avoid `[`/`]`/`|`/`{`/`}` inside labels. For data layouts (struct fields, byte formats) a Markdown table is fine.
 
 ## Codebase map (read this before scanning the tree)
 

@@ -111,15 +111,12 @@ Placement happens in `JobManager::deploy_internal_` (`src/cluster/job_manager.cp
 
 After placement, the JM builds a `(role, subtask_idx) -> (tm_id, data_port)` index and resolves each task's `peer_refs` into concrete `host:port` `PeerAddress` entries, the host coming from the peer TM's `data_host`. Generic-role subtasks bind their data ports ephemerally and report back via `SubtaskListening`, so their peer ports start at 0 and are filled in later via `PeerUpdate` once the listening handshake completes. The JM groups the tasks by `tm_id` into `DeploymentTask` lists, records them in `JobState`, stamps each with its key-group range, and sends a `Deploy` to each affected TM carrying the tasks and any plugin binaries. The distributed control-plane mechanics (registration, heartbeats, listening handshake, the watchdog) are covered in `./distributed-runtime.md`.
 
-```
-submit_job ──► plan_job ──► JobPlan (tm_id empty) ──► deploy_internal_
-                                                          │
-   greedy first-fit: pick first non-lost TM with a free slot, ++slots_in_use
-                                                          │
-   resolve peer_refs ──► PeerAddress{host:port}  (generic-role ports filled
-                                                   later via PeerUpdate)
-                                                          │
-                              group by tm_id ──► Deploy(tasks, plugins) ──► TMs
+```mermaid
+flowchart TD
+  SJ["submit_job"] --> PJ["plan_job"] --> JP["JobPlan (tm_id empty)"] --> DI["deploy_internal_"]
+  DI --> FF["greedy first-fit: pick first non-lost TM<br/>with a free slot, ++slots_in_use"]
+  FF --> RP["resolve peer_refs to PeerAddress(host:port)<br/>(generic-role ports filled later via PeerUpdate)"]
+  RP --> GR["group by tm_id, send Deploy(tasks, plugins) to TMs"]
 ```
 
 ### Rescale

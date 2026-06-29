@@ -40,22 +40,19 @@ A `Task<T>` is itself awaitable, so a coroutine can `co_await another_task()` to
 
 The controlling component is `AsyncExecutionController` (`include/clink/runtime/async_execution_controller.hpp`), one per keyed-operator subtask. Its design rests on a single rule: coroutines are only ever resumed on the runner thread. That keeps the per-key gate, the in-flight table, the parked-waiter FIFOs and the epoch bookkeeping runner-thread-private and lock-free. The only cross-thread surface is `schedule_resume(handle)`, which a foreign IO thread calls to hand a suspended handle back through a mutex-guarded ready-queue and wake the runner.
 
-```
-  runner thread                          IO / completion thread
-  ------------                           ----------------------
-  submit(key, coro) ── per-key gate ──┐
-        │ free key: kick coroutine     │
-        ▼                              │
-  co_await get_async(key)              │
-        │ cold miss: suspend           │
-        └── executor.submit_blocking ──┼──► run blocking load
-                                       │         │
-        ┌──────── schedule_resume(h) ◄─┘    post handle to
-        ▼          (ready-queue + cv)        ready-queue
-  poll(): resume h on runner thread
-        │ write-through fills hot tier
-        ▼
-  emit / post-state mutation
+```mermaid
+flowchart TB
+  subgraph runner["Runner thread"]
+    S["submit(key, coro)"] --> G{"per-key gate:<br/>key free?"}
+    G -->|"free: kick coroutine"| AW["co_await get_async(key)"]
+    AW -->|"cold miss: suspend"| BLK["executor.submit_blocking"]
+    POLL["poll(): resume handle on runner thread,<br/>write-through fills hot tier"] --> EMIT["emit / post-state mutation"]
+  end
+  subgraph io["IO / completion thread"]
+    LOAD["run blocking load"] --> POST["post handle to ready-queue"]
+  end
+  BLK --> LOAD
+  POST -->|"schedule_resume(h)<br/>(ready-queue + cv)"| POLL
 ```
 
 Three mechanisms make this correct:

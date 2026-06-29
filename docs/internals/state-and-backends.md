@@ -70,15 +70,15 @@ Operators never construct these directly: they call `RuntimeContext::keyed_state
 
 ### The backends
 
-```
-                          StateBackend (interface)
-                                  |
-   +----------------+-------------+--------------+----------------+--------------+
-   |                |             |              |                |              |
- InMemory      Sharded         FileBacked    Changelog        RocksDB     RemoteRead
- (memory://)   InMemory        (file://)     (changelog*://)  (rocksdb*)  (remote-read,
-               (memory+                                                    disagg-local)
-                sharded://)
+```mermaid
+flowchart TD
+  SB["StateBackend (interface)"]
+  SB --> IM["InMemory<br/>(memory://)"]
+  SB --> SH["Sharded InMemory<br/>(memory+sharded://)"]
+  SB --> FB["FileBacked<br/>(file://)"]
+  SB --> CL["Changelog<br/>(changelog*://)"]
+  SB --> RD["RocksDB<br/>(rocksdb*)"]
+  SB --> RR["RemoteRead<br/>(remote-read, disagg-local)"]
 ```
 
 - **InMemoryStateBackend** (`memory://`, the default): a nested hash map under one mutex, with heterogeneous (string_view) lookup so the hot path never builds a `std::string` just to probe. `snapshot()`/`restore()` are Arrow IPC (see below). Fine for tests, examples and small workloads; state is lost on process death unless a wrapping backend persists it.
@@ -115,24 +115,15 @@ Rescale partitioning lives in `key_groups.hpp`. Every keyed record is bucketed i
 - Loader-only: cold reads run a pluggable `RemoteLoader`; snapshot/restore capture the hot tier only, with no durable remote write-back. Used for read-through caching over an external loader and for tests.
 - Pool-backed (production disaggregation): state lives in a durable `RemotePool` (`remote_pool.hpp`). The `disagg-local://` scheme uses a process-local `InMemoryRemotePool`; the `remote-read://` scheme uses the S3-backed pool. Cold reads fetch `(op, key)` from the pool as-of the current committed checkpoint, a snapshot commits only the delta since the last checkpoint (state is off the checkpoint-barrier path), and restore is lazy (cold reads serve the restored checkpoint, nothing is loaded eagerly), which is the fast-recovery and fast-rescale win.
 
-```
-   put / get / erase            snapshot barrier              cold get (async)
-        |                            |                              |
-        v                            v                              v
-   +---------------------- hot tier (InMemoryStateBackend) -----------------+
-   | recent writes, fill-on-read keys; single-writer on the runner thread   |
-   +------------------------------------------------------------------------+
-        |  capture(id): detach delta          ^  fill_hot_ (write-through)
-        |  (dirty_/deleted_ since last ckpt)   |  on the runner thread
-        v                                      |
-   +----------- PendingCommit ---------+   IO thread runs the blocking
-   | base, changed[], deleted[]        |   load, then posts the suspended
-   +-----------------------------------+   coroutine back to the runner
-        |  persist(handle): pool->commit
-        v  (off the operator thread, on the snapshot worker)
-   +------------------ RemotePool (durable, checkpoint-scoped) -------------+
-   | InMemoryRemotePool (disagg-local) | S3RemotePool (remote-read)         |
-   +------------------------------------------------------------------------+
+```mermaid
+flowchart TD
+  OPS["put / get / erase, snapshot barrier, cold get (async)"] --> HOT
+  subgraph HOT["Hot tier (InMemoryStateBackend)"]
+    H1["recent writes, fill-on-read keys;<br/>single-writer on the runner thread"]
+  end
+  HOT -->|"capture(id): detach delta<br/>(dirty_/deleted_ since last ckpt)"| PC["PendingCommit<br/>base, changed list, deleted list"]
+  PC -->|"persist(handle): pool-&gt;commit<br/>(off the operator thread, on the snapshot worker)"| RP["RemotePool (durable, checkpoint-scoped)<br/>InMemoryRemotePool (disagg-local) or<br/>S3RemotePool (remote-read)"]
+  IOT["IO thread runs the blocking load,<br/>then posts the suspended coroutine back to the runner"] -->|"fill_hot_ (write-through)<br/>on the runner thread"| HOT
 ```
 
 The async-persist split is the production lever. `capture(id)` runs on the operator thread under the backend mutex and detaches the delta (the `dirty_` and `deleted_` sets since the last checkpoint) into a `PendingCommit` keyed by checkpoint id, pinning the captured keys (ref-counted `persisting_dirty_` / `persisting_deleted_`) so a read during the commit window still sees this checkpoint's effect rather than cold-loading the stale pre-delta value. `persist(handle)` does the slow `pool->commit` off the operator thread on the snapshot worker, then advances `last_ckpt_` (the checkpoint cold reads load from) and releases the pins. Two counters separate the windows: `last_captured_` (the next delta's base, advanced in `capture`) and `last_ckpt_` (the committed checkpoint, advanced in `persist`); they differ exactly during an in-flight async persist.

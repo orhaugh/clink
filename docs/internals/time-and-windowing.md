@@ -37,13 +37,11 @@ This page covers the watermark machinery, the four window operators (tumbling, s
 
 A record may carry an `EventTime`. The `WatermarkAssignerOperator<T>` is a pass-through operator inserted into the stream that does two things per data element: it stamps event time on any record that lacks one (via a user-supplied extractor) and it feeds every record to a `WatermarkStrategy<T>`. The strategy is purely observational: `on_record(...)` updates its internal state and `current_watermark()` reports the current watermark if it advanced since the last query, otherwise `std::nullopt`. The assigner is the only component that actually emits watermarks; in the current cadence it queries the strategy once per batch and emits a watermark element downstream if one is available.
 
-```
-            record batch                  watermark (if advanced)
- source --> [WatermarkAssignerOperator] -----+------------------> downstream
-                   |                          |
-            extractor sets EventTime          |
-            strategy.on_record(r)             |
-            strategy.current_watermark() -----+
+```mermaid
+flowchart LR
+  SRC["source"] --> WA["WatermarkAssignerOperator<br/>extractor sets EventTime;<br/>strategy.on_record(r);<br/>strategy.current_watermark()"]
+  WA -->|"record batch"| DS["downstream"]
+  WA -->|"watermark (if advanced)"| DS
 ```
 
 Three strategies ship in `watermark_strategy.hpp`:
@@ -138,16 +136,14 @@ Quantifiers apply to a step after `.where(...)`: `.times(n)`, `.times(min,max)`,
 
 `CepOperator<T,U>` is an NFA-style matcher. Partial matches are stored per key in `KeyedState<int64_t, vector<PartialMatch<T>>>` under slot `"__cep_partials__"` (one row per user key, keeping routing-by-key correct under parallelism). A `PartialMatch<T>` tracks the captured events, a parallel list of which step captured each event, per-event timestamps, the current step index, and the capture count within the current step (for quantifiers).
 
-```
- record (key k) --> load_partials_(k)
-       |
-       v
-   advance_one_(p, rec) per existing partial  ---> Keep / Advanced / Completed / Died
-       |                                              |
-   spawn a fresh partial from step[0]                 +--> emit_match_ -> select / flat_select
-       |
-       v
-   save_partials_(k, survivors)
+```mermaid
+flowchart TD
+  REC["record (key k)"] --> LP["load_partials_(k)"]
+  LP --> AO["advance_one_(p, rec) per existing partial"]
+  LP --> SP["spawn a fresh partial from step 0"]
+  AO --> RES{"Keep / Advanced / Completed / Died"}
+  RES -->|Completed| EM["emit_match_ to select / flat_select"]
+  AO --> SV["save_partials_(k, survivors)"]
 ```
 
 `advance_one_` walks steps from the partial's current step, evaluating the predicate (iterative predicates receive a `PatternMatch<T>` view of events captured so far). A positive match captures the event up to `max_count` and auto-advances when the count is met; a non-match either advances (if the quantifier minimum is met) or dies (strict `Next`) or waits (`FollowedBy`). Negative steps do not capture: a match kills the partial, a non-match advances past it. A trailing `NotFollowedBy` stays pending until its `within` window closes, at which point `prune_expired_` completes it as a success (emitted on the operator's main output with the watermark as event time) rather than timing it out.
