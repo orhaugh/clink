@@ -1,6 +1,19 @@
 # clink - agent notes
 No emdashes!!!
 
+## Working conventions
+
+How to work in this repo. These reflect standing preferences; honour them by default.
+
+- Voice: British English. No em dashes anywhere (use a spaced hyphen or restructure). No hype or filler.
+- Framing: describe clink in its own terms. Do NOT frame it against Flink in code, tests, or docs. The only exceptions are the root README's existing "inspired by Apache Flink" note and the single sentence in `docs/internals/architecture.md`.
+- Git: work directly on `main`; no feature branches. Commit when a unit of work is done and verified; push only when asked. Do NOT add a `Co-Authored-By: Claude` trailer (this is a public repo).
+- Effort: default to working INLINE. Reserve multi-agent workflows for genuine large parallel fan-out (many independent units, parallel edits that would collide, scope beyond one context), not routine tasks. Consult the Codebase map and `docs/` below before scanning the tree, so work starts informed.
+- Comments: do not add internal roadmap or milestone tags (e.g. "Phase 12", "Phase 29d") to comments or messages; they carry no meaning outside the work plan and were deliberately removed.
+- Build parallelism: use `cmake --build <dir> --parallel 10` and `ctest --test-dir <dir> --parallel 8` (or `-j8`). NEVER a bare `-j` (it can freeze this 12-core machine).
+- clang-format: the pre-commit hook uses Apple clang-format at `/Library/Developer/CommandLineTools/usr/bin/clang-format`. Format with THAT binary, not Homebrew's newer clang-format, or a version skew reformats lines differently and blocks the commit.
+- Docs: `/docs/*` is gitignored except `consumer-examples/`, `connectors/`, and `internals/`. Never commit other `docs/*.md` (internal work notes); to publish a new docs subdir, add a matching `!/docs/<dir>/` exception.
+
 ## Codebase map (read this before scanning the tree)
 
 Persisted orientation so work starts informed instead of re-deriving the layout
@@ -76,7 +89,7 @@ Build artifacts go into `build/`, `build-asan/`, `build-tsan/`,
 For everyday local iteration without sanitizers:
 
 ```bash
-cmake -S . -B build && cmake --build build -j && ctest --test-dir build -j8
+cmake -S . -B build && cmake --build build --parallel 10 && ctest --test-dir build -j8
 ```
 
 `ctest --test-dir build -L core` runs just `clink_core_tests`;
