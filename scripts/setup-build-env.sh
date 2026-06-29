@@ -55,6 +55,7 @@ apt-get install -y --no-install-recommends \
     libsqlite3-dev \
     libcurl4-openssl-dev \
     librabbitmq-dev \
+    libnats-dev \
     libzstd-dev
 
 # -- AWS SDK for C++ (S3 transport for Arrow's S3FileSystem) --

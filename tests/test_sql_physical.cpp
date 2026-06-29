@@ -128,6 +128,30 @@ TEST(SqlPhysical, RabbitMqConnectorMapsToAmqpFactories) {
     EXPECT_EQ(snk->params.at("routing_key"), "out");
 }
 
+// connector='nats' lowers to nats_source_string / nats_sink_string (string channel) via the
+// json_string_to_row + row_to_json_string bridges, carrying subject/url.
+TEST(SqlPhysical, NatsConnectorMapsToJetStreamFactories) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE n_in (msg TEXT) "
+        "WITH (connector='nats', url='nats://mq:4222', subject='events');"
+        "CREATE TABLE n_out (msg TEXT) "
+        "WITH (connector='nats', url='nats://mq:4222', subject='out');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO n_out SELECT msg FROM n_in");
+
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* src = find_op(spec, "nats_source_string");
+    ASSERT_NE(src, nullptr);
+    EXPECT_EQ(src->params.at("subject"), "events");
+    EXPECT_EQ(src->params.at("url"), "nats://mq:4222");
+    const auto* snk = find_op(spec, "nats_sink_string");
+    ASSERT_NE(snk, nullptr);
+    EXPECT_EQ(snk->params.at("subject"), "out");
+}
+
 // Wave 2 inc1: a kafka json table with columnar_decode='true' swaps the
 // row-form JSON bridge for the columnar one, and the columnar bridge must
 // carry the declared schema so it can build typed Arrow columns.

@@ -123,6 +123,9 @@
 #ifdef CLINK_LINKED_RABBITMQ
 #include "clink/rabbitmq/install.hpp"
 #endif
+#ifdef CLINK_LINKED_NATS
+#include "clink/nats/install.hpp"
+#endif
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/rocksdb/install.hpp"
 #endif
@@ -1999,6 +2002,9 @@ void install_linked_impls() {
 #endif
 #ifdef CLINK_LINKED_RABBITMQ
     clink::rabbitmq::install(reg);  // RabbitMQ / AMQP source + sink
+#endif
+#ifdef CLINK_LINKED_NATS
+    clink::nats::install(reg);  // NATS JetStream source + sink
 #endif
     // RocksDB is unconditionally linked into clink_node (matches
     // bundled rocksdb-jni model). install() registers the

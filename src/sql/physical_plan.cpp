@@ -76,6 +76,9 @@ std::string string_source_factory_for(const TableDef& table) {
     if (connector == "rabbitmq") {
         return "rabbitmq_source_string";
     }
+    if (connector == "nats") {
+        return "nats_source_string";
+    }
     if (connector == "postgres") {
         auto it = table.properties.find("mode");
         if (it != table.properties.end() && it->second == "cdc") {
@@ -124,6 +127,9 @@ std::string string_sink_factory_for(const TableDef& table) {
     }
     if (connector == "rabbitmq") {
         return "rabbitmq_sink_string";
+    }
+    if (connector == "nats") {
+        return "nats_sink_string";
     }
     if (connector == "clickhouse") {
         return "clickhouse_sink";
@@ -201,6 +207,11 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // RabbitMQ / AMQP source: each message body is a JSON object string (string
         // channel) bridged to Row. At-least-once (manual ack at the checkpoint barrier).
         return RowConnectorBinding{"rabbitmq_source_string", kChannelString, "json_string_to_row"};
+    }
+    if (connector == "nats") {
+        // NATS JetStream source: each message body is a JSON object string (string channel)
+        // bridged to Row. At-least-once (durable pull consumer, ack at the checkpoint barrier).
+        return RowConnectorBinding{"nats_source_string", kChannelString, "json_string_to_row"};
     }
     if (connector == "parquet") {
         // Typed-columnar Parquet: each declared column is its own Arrow
@@ -325,6 +336,20 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
             unsupported("connector='rabbitmq' sink does not support mode='upsert'");
         }
         return RowConnectorBinding{"rabbitmq_sink_string", kChannelString, "row_to_json_string"};
+    }
+    if (connector == "nats") {
+        // NATS JetStream sink. Each row -> JSON object string -> async publish (acks awaited at
+        // each barrier). At-least-once; no producer dedup key set, so exactly-once and upsert
+        // are not supported.
+        if (exactly_once) {
+            unsupported(
+                "connector='nats' sink is at-least-once (publisher acks; no producer dedup key); "
+                "exactly-once delivery is not supported");
+        }
+        if (upsert) {
+            unsupported("connector='nats' sink does not support mode='upsert'");
+        }
+        return RowConnectorBinding{"nats_sink_string", kChannelString, "row_to_json_string"};
     }
     if (connector == "clickhouse") {
         // ClickHouse sink (M1). Each row -> JSON object string -> the sink's

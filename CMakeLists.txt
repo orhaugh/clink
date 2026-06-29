@@ -65,10 +65,12 @@ set(CLINK_WITH_MQTT       "AUTO" CACHE STRING "MQTT connector impl (AUTO/ON/OFF)
 set(CLINK_WITH_MONGODB    "AUTO" CACHE STRING "MongoDB connector impl (AUTO/ON/OFF)")
 set(CLINK_WITH_ICEBERG    "AUTO" CACHE STRING "Apache Iceberg sink impl via iceberg-cpp (AUTO/ON/OFF)")
 set(CLINK_WITH_RABBITMQ   "AUTO" CACHE STRING "RabbitMQ/AMQP connector impl via librabbitmq (AUTO/ON/OFF)")
+set(CLINK_WITH_NATS       "AUTO" CACHE STRING "NATS JetStream connector impl via libnats (AUTO/ON/OFF)")
 foreach(_opt CLINK_WITH_ROCKSDB CLINK_WITH_KAFKA CLINK_WITH_AWS_S3 CLINK_WITH_AWS
              CLINK_WITH_CLICKHOUSE CLINK_WITH_POSTGRES CLINK_WITH_TLS
              CLINK_WITH_ETCD CLINK_WITH_AVRO CLINK_WITH_HTTP CLINK_WITH_REDIS CLINK_WITH_MYSQL
-             CLINK_WITH_MQTT CLINK_WITH_MONGODB CLINK_WITH_ICEBERG CLINK_WITH_RABBITMQ)
+             CLINK_WITH_MQTT CLINK_WITH_MONGODB CLINK_WITH_ICEBERG CLINK_WITH_RABBITMQ
+             CLINK_WITH_NATS)
     set_property(CACHE ${_opt} PROPERTY STRINGS AUTO ON OFF)
 endforeach()
 if(CLINK_WITH_ROCKSDB STREQUAL "OFF")
@@ -575,7 +577,7 @@ clink_set_warnings(clink_node)
 # up clink::<x>::install() calls without #ifdef on macros that
 # leaked from libclink's old build. Each impl sets a CLINK_LINKED_<X>
 # define at the consumer-link boundary.
-foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd http_connector redis mysql mqtt mongodb iceberg rabbitmq)
+foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd http_connector redis mysql mqtt mongodb iceberg rabbitmq nats)
     if(TARGET clink::${_impl})
         string(TOUPPER ${_impl} _IMPL_UC)
         target_compile_definitions(clink_node PRIVATE CLINK_LINKED_${_IMPL_UC})
