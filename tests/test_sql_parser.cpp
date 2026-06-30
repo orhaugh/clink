@@ -402,9 +402,14 @@ TEST(SqlParser, ParsesAlterTableIfExistsAndIfNotExists) {
 }
 
 // Other AlterTableCmd subtypes are rejected in v1.
+// Unsupported AlterTableCmd subtypes are rejected. SET / DROP NOT NULL are
+// deliberately rejected rather than silently accepted: clink has no column-
+// nullability model (every column is nullable; CREATE TABLE NOT NULL is also
+// ignored), so accepting a constraint the engine cannot enforce would mislead.
 TEST(SqlParser, RejectsUnsupportedAlterTableActions) {
     EXPECT_THROW(parse("ALTER TABLE t ADD PRIMARY KEY (c)"), TranslationError);
     EXPECT_THROW(parse("ALTER TABLE t ALTER COLUMN c SET NOT NULL"), TranslationError);
+    EXPECT_THROW(parse("ALTER TABLE t ALTER COLUMN c DROP NOT NULL"), TranslationError);
 }
 
 TEST(SqlParser, ParsesAlterColumnType) {
