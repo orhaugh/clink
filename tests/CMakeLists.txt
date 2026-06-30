@@ -394,6 +394,7 @@ if(CLINK_BUILD_SQL)
         test_sql_binder.cpp
         test_sql_cardinality.cpp
         test_sql_physical.cpp
+        test_column_lineage.cpp
         test_sql_cli.cpp
         test_sql_row.cpp
         test_sql_runtime.cpp

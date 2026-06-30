@@ -147,7 +147,7 @@ produces the same `JobGraphSpec` as SQL.
 | Subsystem                   | Status                                              |
 |----------------------------|-----------------------------------------------------|
 | Metrics registry           | implemented (counter + gauge)                       |
-| Data lineage               | per-job source/sink dataset graph over `GET /api/v1/jobs/:id/lineage` and the event stream; pluggable `LineageListener` export with a built-in OpenLineage exporter |
+| Data lineage               | per-job source/sink dataset graph (plus column-level lineage for SQL) over `GET /api/v1/jobs/:id/lineage` and the event stream; pluggable `LineageListener` export with a built-in OpenLineage exporter |
 | OpenTelemetry integration  | boundary defined (`otel_boundary.hpp`); no exporter wired yet |
 | Arrow wire format          | every operator-to-operator data frame is an Arrow IPC stream (`Kind::ArrowBatch=7`); columnar schemas for built-in types, binary-column fallback for user types; control frames stay compact; `clink_serde_bench` shows roughly 4-9x over the per-record `Codec<T>` path |
 

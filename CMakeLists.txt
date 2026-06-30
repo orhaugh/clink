@@ -528,6 +528,7 @@ if(CLINK_BUILD_SQL)
         src/sql/logical_plan.cpp
         src/sql/binder.cpp
         src/sql/physical_plan.cpp
+        src/sql/column_lineage.cpp
         src/sql/materialized_view.cpp
         src/sql/view.cpp
         src/sql/optimizer.cpp

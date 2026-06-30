@@ -8,6 +8,7 @@
 #include "clink/cluster/job_graph.hpp"
 #include "clink/config/json.hpp"
 #include "clink/metrics/sql_metrics.hpp"
+#include "clink/sql/column_lineage.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/type.hpp"
@@ -1996,7 +1997,11 @@ cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
             "source and sink tables must use the same channel (string vs row): "
             "either both single-TEXT-column or both format='json'");
     }
-    compile_node(root, ch, spec, next_id, async_state_for_aggregation_);
+    const std::string sink_id = compile_node(root, ch, spec, next_id, async_state_for_aggregation_);
+    // Capture column-level lineage from the bound tree (column context is lost
+    // once the spec is lowered to operators). Best-effort; empty for shapes it
+    // cannot trace.
+    spec.column_lineage = capture_column_lineage(root, sink_id);
     mark_changelog_producers(spec);
     spec.validate();
     const auto dt =

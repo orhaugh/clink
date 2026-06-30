@@ -101,6 +101,14 @@ struct JobGraphSpec {
     // the submitter named nothing; consumers fall back to the job id.
     std::string name;
 
+    // Optional column-level lineage captured at SQL compile, as a JSON
+    // object keyed by sink op id:
+    //   {"<sink_id>":[{"output":"c","transformation":"IDENTITY",
+    //                  "inputs":[{"namespace":"..","name":"..","field":".."}]}]}
+    // Empty for non-SQL jobs. Carried so the JM's extract_lineage can attach
+    // it to the sink datasets; survives HA restart with the rest of the spec.
+    std::string column_lineage;
+
     // State schema evolution: the versions the job expects per
     // (op, state_type), declared via env.expect_state_version(...).
     // Carried in the submitted spec so the JM/TM can migrate restored

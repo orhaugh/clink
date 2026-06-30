@@ -194,6 +194,12 @@ std::string JobGraphSpec::to_json() const {
         out += ",\"expected_state_versions\":";
         out += escape_json_string(expected_state_versions.pack());
     }
+    // column_lineage is already a JSON object string; emit it raw (not as an
+    // escaped string) so it nests in the spec and parses back as an object.
+    if (!column_lineage.empty()) {
+        out += ",\"column_lineage\":";
+        out += column_lineage;
+    }
     out += "}";
     return out;
 }
@@ -311,6 +317,11 @@ JobGraphSpec JobGraphSpec::from_json(std::string_view json_text) {
     }
     // Optional human-readable job name (absent for unnamed jobs).
     spec.name = root.string_or("name", "");
+    // Optional column-lineage object (absent for non-SQL jobs); stored as its
+    // JSON text so it round-trips without a typed model in the spec layer.
+    if (root.contains("column_lineage") && root.at("column_lineage").is_object()) {
+        spec.column_lineage = root.at("column_lineage").serialize();
+    }
     // State schema evolution: unpack the expected-version map if the
     // spec carries one (absent for jobs that declare nothing).
     if (const auto packed = root.string_or("expected_state_versions", ""); !packed.empty()) {

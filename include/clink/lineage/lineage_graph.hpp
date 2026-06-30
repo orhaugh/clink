@@ -26,6 +26,26 @@ struct JobGraphSpec;
 
 namespace clink::lineage {
 
+// One source column that contributes to a sink output column. Identifies
+// the source dataset by the same (ns, name) the source vertex carries, plus
+// the source field name.
+struct ColumnInputField {
+    std::string ns;
+    std::string name;
+    std::string field;
+};
+
+// Column-level lineage for one sink output column: the source columns it is
+// derived from, and how. `transformation` is "IDENTITY" (a straight copy),
+// "TRANSFORMATION" (a computed expression) or "AGGREGATION" (through a GROUP
+// BY aggregate). Empty inputs means no traceable source (e.g. COUNT(*), a
+// window bound, or an opaque async lookup).
+struct ColumnLineageField {
+    std::string output;
+    std::string transformation;
+    std::vector<ColumnInputField> inputs;
+};
+
 // One external data entity a connector reads from or writes to. Identity
 // is the (ns, name) pair:
 //   * ns   - the storage system's address, e.g. "kafka://broker:9092",
@@ -39,6 +59,9 @@ struct LineageDataset {
     std::string ns;
     std::string name;
     std::map<std::string, std::string> facets;
+    // Per-output-column lineage. Populated on SINK datasets only, when the
+    // job came from SQL and column lineage was captured. Empty otherwise.
+    std::vector<ColumnLineageField> column_lineage;
 };
 
 // One connector in the lineage graph - a source or a sink - keyed by the
@@ -94,6 +117,20 @@ LineageGraph extract_lineage(const cluster::JobGraphSpec& spec);
 LineageDataset dataset_for(const std::string& op_type,
                            const std::map<std::string, std::string>& params,
                            const std::string& out_channel);
+
+// Build a dataset identity from an already-resolved connector family (rather
+// than a factory type) plus its option map. dataset_for() is exactly
+// connector_family(op_type) fed into this. Exposed so the SQL column-lineage
+// capture can compute a source table's (ns, name) the SAME way the lowered-op
+// path does, keeping column-lineage input refs aligned with source vertices.
+LineageDataset dataset_from_family(const std::string& family,
+                                   const std::map<std::string, std::string>& params,
+                                   const std::string& out_channel);
+
+// Serialise / parse a column-lineage field list as a JSON array. Shared by
+// the lineage model (sink dataset round-trip) and the SQL capture carrier.
+std::string column_lineage_to_json(const std::vector<ColumnLineageField>& fields);
+std::vector<ColumnLineageField> column_lineage_from_json(std::string_view json_array);
 
 // Parse the connector family out of a factory type string, e.g.
 // "kafka_2pc_sink_string" -> "kafka", "s3_parquet_string_source" ->

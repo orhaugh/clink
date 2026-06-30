@@ -103,6 +103,34 @@ served by `JobManager::snapshot_job_lineage`, a mirror of `snapshot_job_graph`
 that reads the retained `JobGraphSpec` and runs the extractor. `available` is
 false when the job exists but no graph was retained.
 
+## Column-level lineage
+
+For SQL jobs, lineage also records which source column(s) feed each sink column.
+This is only knowable at SQL compile time (the column mapping lives in the bound
+plan; the JobManager sees only the lowered operator graph), so it is captured in
+the planner and carried on the spec to the JobManager:
+
+- **Capture** (`src/sql/column_lineage.cpp`, run from `PhysicalPlanner::compile`).
+  A recursive tracer walks the bound `LogicalSink` tree. For each sink output
+  column it traces backwards to the source `(table, column)` it derives from:
+  `Scan` is the base case; `Project` parses the output's `expr_json` and recurses
+  on each `{"col":...}` leaf; `Aggregate` maps a group-key output to its source
+  column and an aggregate output to its `input_column`; `Filter` passes through;
+  `EquiJoin`/`IntervalJoin` map the output column ordinal to the owning child by
+  position (left columns then right). Source datasets are identified with the
+  same `dataset_from_family` helper the lowered-op path uses, so the captured
+  input refs line up with the source vertices.
+- **Carry**: `JobGraphSpec::column_lineage`, a JSON object keyed by sink op id,
+  serialised with the spec (so it survives HA restart) exactly like `name`.
+- **Attach**: `extract_lineage` reads it onto the sink `LineageDataset` as a
+  `column_lineage` list, round-tripped by the model's `to_json`/`from_json`.
+
+Each field records its `output` column, the `inputs` (`{namespace, name, field}`
+referencing a source dataset), and a `transformation`: `IDENTITY` (a straight
+copy), `TRANSFORMATION` (a computed expression) or `AGGREGATION` (through a GROUP
+BY aggregate). The export side maps this to the OpenLineage `columnLineage`
+dataset facet.
+
 ## Export
 
 A `LineageListener` (`include/clink/lineage/lineage_listener.hpp`) is the export
@@ -135,10 +163,12 @@ flowchart LR
 `JobStarted` to a START run event (sources as inputs, sinks as outputs) and a
 `JobCompleted` to a COMPLETE / FAIL / ABORT, correlated by a job-derived `runId`.
 A FAIL event carries the first failure as an OpenLineage `errorMessage` run
-facet. Delivery is asynchronous: `on_event` serialises the event and pushes it
-onto a bounded outbox; a worker thread POSTs from the outbox so the publish
-thread is never blocked. Overflow drops the oldest queued event and counts the
-drop.
+facet. Output datasets carry a `columnLineage` dataset facet when column lineage
+was captured (`fields → { <out>: { inputFields:[{namespace,name,field}],
+transformationType } }`). Delivery is asynchronous: `on_event` serialises the
+event and pushes it onto a bounded outbox; a worker thread POSTs from the outbox
+so the publish thread is never blocked. Overflow drops the oldest queued event
+and counts the drop.
 
 The OpenLineage job name is the submitter's job name (`JobGraphSpec::name`),
 carried through to both events; it falls back to `job_<id>` only when the job was
@@ -163,13 +193,17 @@ there is no double-emit and no leadership gating is needed.
 
 ## Scope
 
-v1 is dataset-level lineage. Out of scope:
+Lineage is dataset-level for every job and column-level for SQL jobs. Known
+limits:
 
-- **Column-level lineage.** Which source column feeds which sink column lives in
-  the lowered SQL plan, not in the job spec. The facets are open, so this can be
-  added later as a schema/column facet without breaking the model.
-- **Lookup-join dimension tables.** A `connector='lookup'` dimension is an async
-  function in the plan, not a source operator, so it is not captured as a source.
+- **Lookup-join dimension columns.** A `connector='lookup'` dimension is an async
+  function, not a source operator, so its columns are opaque: dimension-derived
+  sink columns trace only as far as the probe side, not the dimension.
+- **Window-synthetic columns.** `window_start` / `window_end` have no upstream
+  source column and carry no column-lineage entry.
+- **Sub-expression precision.** A computed expression records every leaf source
+  column it reads as an input with `transformation=TRANSFORMATION`; it does not
+  distinguish which operand of a nested expression each column feeds.
 - **Cross-job dataset stitching.** Correlating one job's sink topic with another
   job's source topic is left to the external lineage system, which already does
   this by `(namespace, name)`.
@@ -178,9 +212,10 @@ v1 is dataset-level lineage. Out of scope:
 
 | File | Role |
 | --- | --- |
-| `include/clink/lineage/lineage_graph.hpp`, `src/lineage/lineage_graph.cpp` | The model, `extract_lineage`, `connector_family`, `dataset_for`, JSON round-trip. |
+| `include/clink/lineage/lineage_graph.hpp`, `src/lineage/lineage_graph.cpp` | The model, `extract_lineage`, `connector_family`, `dataset_for` / `dataset_from_family`, column-lineage types + JSON round-trip. |
 | `include/clink/lineage/lineage_listener.hpp`, `src/lineage/lineage_listener.cpp` | `LineageEvent`, `LineageListener`, the registry, and the `LineageDispatcher` EventBus bridge. |
-| `include/clink/lineage/openlineage_exporter.hpp`, `src/lineage/openlineage_exporter.cpp` | The built-in OpenLineage HTTP exporter. |
+| `include/clink/lineage/openlineage_exporter.hpp`, `src/lineage/openlineage_exporter.cpp` | The built-in OpenLineage HTTP exporter (run events + `columnLineage` facet). |
+| `include/clink/sql/column_lineage.hpp`, `src/sql/column_lineage.cpp` | The SQL column-lineage tracer (`capture_column_lineage`), run from `PhysicalPlanner::compile`. |
 | `src/cluster/job_manager.cpp` | `snapshot_job_lineage` and the `jm.job_lineage` emit in `submit_job`. |
 | `tools/clink_node.cpp` | The `GET /api/v1/jobs/:id/lineage` route and the dispatcher wiring (`--lineage-*` flags). |
-| `tests/test_lineage.cpp` | Unit tests for the extractor, the normaliser, JSON, and the dispatcher. |
+| `tests/test_lineage.cpp`, `tests/test_column_lineage.cpp` | Unit tests for the model + dispatcher, and the SQL column-lineage tracer. |

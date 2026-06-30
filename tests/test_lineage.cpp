@@ -205,6 +205,69 @@ TEST(LineageJson, FromJsonIgnoresUnknownWrapperKeys) {
     EXPECT_EQ(g.sources[0].datasets[0].ns, "kafka://b");
 }
 
+// --- column lineage --------------------------------------------------------
+
+TEST(ColumnLineage, FieldArrayRoundTrips) {
+    std::vector<ColumnLineageField> fields;
+    ColumnLineageField f;
+    f.output = "total";
+    f.transformation = "AGGREGATION";
+    f.inputs.push_back({"kafka://b", "orders", "amount"});
+    fields.push_back(f);
+
+    const auto json = column_lineage_to_json(fields);
+    const auto back = column_lineage_from_json(json);
+    ASSERT_EQ(back.size(), 1u);
+    EXPECT_EQ(back[0].output, "total");
+    EXPECT_EQ(back[0].transformation, "AGGREGATION");
+    ASSERT_EQ(back[0].inputs.size(), 1u);
+    EXPECT_EQ(back[0].inputs[0].ns, "kafka://b");
+    EXPECT_EQ(back[0].inputs[0].name, "orders");
+    EXPECT_EQ(back[0].inputs[0].field, "amount");
+}
+
+TEST(ColumnLineage, AttachedFromSpecCarrierToSinkDataset) {
+    JobGraphSpec spec;
+    spec.ops.push_back(
+        op("src", "kafka_source_string", {}, {{"brokers", "b"}, {"topic", "orders"}}));
+    spec.ops.push_back(op("snk", "file_json_sink", {"src"}, {{"path", "/tmp/o"}}));
+    // Carrier keyed by sink op id, as the SQL planner produces.
+    spec.column_lineage =
+        R"({"snk":[{"output":"total","transformation":"AGGREGATION","inputs":[{"namespace":"kafka://b","name":"orders","field":"amount"}]}]})";
+
+    const auto g = extract_lineage(spec);
+    ASSERT_EQ(g.sinks.size(), 1u);
+    ASSERT_EQ(g.sinks[0].datasets.size(), 1u);
+    const auto& cl = g.sinks[0].datasets[0].column_lineage;
+    ASSERT_EQ(cl.size(), 1u);
+    EXPECT_EQ(cl[0].output, "total");
+    EXPECT_EQ(cl[0].transformation, "AGGREGATION");
+    ASSERT_EQ(cl[0].inputs.size(), 1u);
+    EXPECT_EQ(cl[0].inputs[0].field, "amount");
+    // Sources carry no column lineage.
+    EXPECT_TRUE(g.sources[0].datasets[0].column_lineage.empty());
+}
+
+TEST(ColumnLineage, SurvivesGraphJsonRoundTrip) {
+    JobGraphSpec spec;
+    spec.ops.push_back(op("src", "kafka_source_string", {}, {{"topic", "orders"}}));
+    spec.ops.push_back(op("snk", "file_json_sink", {"src"}, {{"path", "/tmp/o"}}));
+    spec.column_lineage =
+        R"({"snk":[{"output":"c","transformation":"IDENTITY","inputs":[{"namespace":"kafka://","name":"orders","field":"c"}]}]})";
+
+    // extract -> to_json -> from_json must preserve the sink column lineage,
+    // since the dispatcher reconstructs the graph this way for the exporter.
+    const auto g2 = LineageGraph::from_json(extract_lineage(spec).to_json());
+    ASSERT_EQ(g2.sinks.size(), 1u);
+    ASSERT_FALSE(g2.sinks[0].datasets.empty());
+    ASSERT_EQ(g2.sinks[0].datasets[0].column_lineage.size(), 1u);
+    EXPECT_EQ(g2.sinks[0].datasets[0].column_lineage[0].output, "c");
+    EXPECT_EQ(g2.sinks[0].datasets[0].column_lineage[0].transformation, "IDENTITY");
+    ASSERT_EQ(g2.sinks[0].datasets[0].column_lineage[0].inputs.size(), 1u);
+    EXPECT_EQ(g2.sinks[0].datasets[0].column_lineage[0].inputs[0].name, "orders");
+    EXPECT_EQ(g2.sinks[0].datasets[0].column_lineage[0].inputs[0].field, "c");
+}
+
 // --- dispatcher: EventBus -> listener --------------------------------------
 
 namespace {

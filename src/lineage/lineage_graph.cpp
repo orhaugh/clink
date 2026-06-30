@@ -181,7 +181,12 @@ std::string connector_family(const std::string& op_type) {
 LineageDataset dataset_for(const std::string& op_type,
                            const std::map<std::string, std::string>& params,
                            const std::string& out_channel) {
-    const std::string family = connector_family(op_type);
+    return dataset_from_family(connector_family(op_type), params, out_channel);
+}
+
+LineageDataset dataset_from_family(const std::string& family,
+                                   const std::map<std::string, std::string>& params,
+                                   const std::string& out_channel) {
     LineageDataset d;
     d.facets["connector"] = family;
     if (!out_channel.empty()) {
@@ -332,7 +337,7 @@ LineageDataset dataset_for(const std::string& op_type,
     }
     if (in_set(family, {"int64", "generator"})) {
         d.ns = "generator";
-        d.name = op_type;
+        d.name = family;
         return d;
     }
 
@@ -440,10 +445,76 @@ LineageVertex make_vertex(const cluster::OperatorSpec& op) {
     return v;
 }
 
+// Write a column-lineage field list as a JSON array value into `w` (the
+// caller has positioned the writer to receive a value).
+void write_cl_array(http::JsonWriter& w, const std::vector<ColumnLineageField>& fields) {
+    w.begin_array();
+    for (const auto& f : fields) {
+        w.begin_object();
+        w.kv("output", f.output);
+        if (!f.transformation.empty()) {
+            w.kv("transformation", f.transformation);
+        }
+        w.key("inputs").begin_array();
+        for (const auto& in : f.inputs) {
+            w.begin_object();
+            w.kv("namespace", in.ns);
+            w.kv("name", in.name);
+            w.kv("field", in.field);
+            w.end_object();
+        }
+        w.end_array();
+        w.end_object();
+    }
+    w.end_array();
+}
+
+std::vector<ColumnLineageField> parse_cl_array(const config::JsonValue& arr) {
+    std::vector<ColumnLineageField> out;
+    for (const auto& f : arr.as_array()) {
+        if (!f.is_object()) {
+            continue;
+        }
+        ColumnLineageField field;
+        field.output = f.string_or("output", "");
+        field.transformation = f.string_or("transformation", "");
+        if (f.contains("inputs") && f.at("inputs").is_array()) {
+            for (const auto& in : f.at("inputs").as_array()) {
+                if (in.is_object()) {
+                    field.inputs.push_back({in.string_or("namespace", ""),
+                                            in.string_or("name", ""),
+                                            in.string_or("field", "")});
+                }
+            }
+        }
+        out.push_back(std::move(field));
+    }
+    return out;
+}
+
 }  // namespace
 
 LineageGraph extract_lineage(const cluster::JobGraphSpec& spec) {
     LineageGraph g;
+
+    // Column lineage (SQL jobs only) is carried on the spec as a JSON object
+    // keyed by sink op id: {"<sink_id>": [<field>...]}. Parse it once and
+    // attach to the matching sink dataset below.
+    std::unordered_map<std::string, std::vector<ColumnLineageField>> col_lineage_by_sink;
+    if (!spec.column_lineage.empty()) {
+        try {
+            const auto root = config::parse(spec.column_lineage);
+            if (root.is_object()) {
+                for (const auto& [sink_id, arr] : root.as_object()) {
+                    if (arr.is_array()) {
+                        col_lineage_by_sink[sink_id] = parse_cl_array(arr);
+                    }
+                }
+            }
+        } catch (...) {
+            // Malformed column lineage is non-fatal: table-level lineage stands.
+        }
+    }
 
     std::unordered_set<std::string> has_downstream;
     std::unordered_map<std::string, std::vector<std::string>> downstream;  // up -> [op ids]
@@ -468,7 +539,12 @@ LineageGraph extract_lineage(const cluster::JobGraphSpec& spec) {
             v.boundedness = source_boundedness(connector_family(op.type), op.params);
             g.sources.push_back(std::move(v));
         } else if (is_sink) {
-            g.sinks.push_back(make_vertex(op));
+            auto v = make_vertex(op);
+            if (auto it = col_lineage_by_sink.find(op.id);
+                it != col_lineage_by_sink.end() && !v.datasets.empty()) {
+                v.datasets.front().column_lineage = std::move(it->second);
+            }
+            g.sinks.push_back(std::move(v));
             sink_ids.insert(op.id);
         }
     }
@@ -521,6 +597,10 @@ void write_vertex(http::JsonWriter& w, const LineageVertex& v) {
             w.kv(k, val);
         }
         w.end_object();
+        if (!d.column_lineage.empty()) {
+            w.key("column_lineage");
+            write_cl_array(w, d.column_lineage);
+        }
         w.end_object();
     }
     w.end_array();
@@ -537,6 +617,9 @@ LineageDataset parse_dataset(const config::JsonValue& jv) {
                 d.facets[k] = val.as_string();
             }
         }
+    }
+    if (jv.contains("column_lineage") && jv.at("column_lineage").is_array()) {
+        d.column_lineage = parse_cl_array(jv.at("column_lineage"));
     }
     return d;
 }
@@ -610,6 +693,20 @@ LineageGraph LineageGraph::from_json(std::string_view json_text) {
         }
     }
     return g;
+}
+
+std::string column_lineage_to_json(const std::vector<ColumnLineageField>& fields) {
+    http::JsonWriter w;
+    write_cl_array(w, fields);
+    return w.str();
+}
+
+std::vector<ColumnLineageField> column_lineage_from_json(std::string_view json_array) {
+    const auto root = config::parse(json_array);
+    if (!root.is_array()) {
+        return {};
+    }
+    return parse_cl_array(root);
 }
 
 }  // namespace clink::lineage
