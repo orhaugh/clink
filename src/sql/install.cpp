@@ -1863,12 +1863,27 @@ public:
                 handle_record_(rec.value());
         } else if (element.is_watermark()) {
             auto wm = element.as_watermark();
-            if (!wm.is_idle())
+            if (!wm.is_idle()) {
+                have_wm_ = true;
+                if (wm.timestamp().millis() > current_wm_)
+                    current_wm_ = wm.timestamp().millis();
                 fire_due_(wm.timestamp(), out);
+            }
             this->on_watermark(wm, out);
         } else {
             this->on_barrier(element.as_barrier(), out);
         }
+    }
+
+    // A record at `ts` is too late iff even a brand-new single-event session
+    // [ts, ts] would already have fired and been purged (ts + gap is at/under
+    // the current watermark, less allowed_lateness). It is only applied in the
+    // "open a new session" branch of the fold: a record that merges into a still
+    // -live session legitimately extends it (the session's end is beyond the
+    // watermark), so merge always proceeds. Sessions fold synchronously on the
+    // sync and columnar paths, so the live watermark is the ingest watermark.
+    [[nodiscard]] bool session_too_late_(std::int64_t ts) const {
+        return have_wm_ && ts + gap_ms_ <= current_wm_ - allowed_lateness_ms_;
     }
 
     // Columnar ingest: buffer columnar data via the time / group / agg-input
@@ -2109,7 +2124,11 @@ private:
         }
 
         if (overlap_starts.empty()) {
-            // New session.
+            // No live session to extend: this record would open a fresh session.
+            // If that session has already fired and been purged, the record is
+            // late - drop it rather than re-create the window and re-fire.
+            if (session_too_late_(ts))
+                return;
             Session s;
             s.start = ts;
             s.end = ts;
@@ -2177,6 +2196,8 @@ private:
             overlap_starts.push_back(it->first);
         }
         if (overlap_starts.empty()) {
+            if (session_too_late_(ts))
+                return;  // fresh session already purged: drop the late record
             Session s;
             s.start = ts;
             s.end = ts;
@@ -2288,6 +2309,12 @@ private:
 
     std::string time_column_;
     std::int64_t gap_ms_;
+    bool have_wm_ = false;
+    std::int64_t current_wm_ = 0;
+    // Grace period a fired session is kept for late updates. 0 (default) means
+    // fire-and-drop: a record that would open an already-purged session is
+    // dropped. A SQL knob to raise this is a follow-up (shared with WindowRowOp).
+    std::int64_t allowed_lateness_ms_ = 0;
     std::vector<std::string> group_keys_;
     std::vector<AggSpec> aggregates_;
     std::vector<std::string> group_key_outputs_;

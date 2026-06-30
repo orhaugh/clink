@@ -808,6 +808,60 @@ std::vector<Record<Row>> run_tumbling_window_scripted(std::shared_ptr<StateBacke
     return sink->collected_records();
 }
 
+// Session analogue of the late-data scenario (gap 5): a session [1,3] fires and
+// is purged at watermark 10, then a LATE record at ts=2 (which would open a
+// fresh, already-purged session [2,2]) must be dropped, while a record at ts=20
+// opens a new live session. A late record that instead MERGED into a live
+// session would legitimately extend it; this one opens a fresh purged session.
+class LateDataSessionSource final : public Source<Row> {
+public:
+    bool produce(Emitter<Row>& out) override {
+        if (this->cancelled() || done_) {
+            return false;
+        }
+        Batch<Row> b1;
+        b1.push(window_input_row(1, 1, 5));
+        b1.push(window_input_row(1, 3, 7));
+        out.emit_data(std::move(b1));
+        out.emit_watermark(Watermark{EventTime{10}});  // fires + purges session [1,3]
+        Batch<Row> b2;
+        b2.push(window_input_row(1, 2, 100));  // LATE: fresh session [2,2] already purged -> drop
+        b2.push(window_input_row(1, 20, 3));   // new live session [20,20]
+        out.emit_data(std::move(b2));
+        out.emit_watermark(Watermark{EventTime{40}});  // fires session [20,20]
+        done_ = true;
+        return false;
+    }
+    [[nodiscard]] bool is_bounded() const noexcept override { return true; }
+    std::string name() const override { return "late_data_session_src"; }
+
+private:
+    bool done_ = false;
+};
+
+std::vector<Record<Row>> run_session_window_scripted(std::shared_ptr<StateBackend> backend) {
+    const auto* builder =
+        cluster::DagBuilderRegistry::default_instance().find("session_window_row");
+    Dag dag;
+    auto h = dag.add_source<Row>(std::make_shared<LateDataSessionSource>());
+    clink::plugin::BuildContext ctx;
+    ctx.params["time_column"] = "ts";
+    ctx.params["gap_ms"] = "5";
+    ctx.params["group_keys"] = "k";
+    ctx.params["group_key_outputs"] = "k";
+    ctx.params["aggregates"] = R"([{"name":"s","fn":"sum","input_column":"amt"}])";
+    std::vector<std::any> upstream = {std::any{h}};
+    auto out = (*builder)(dag, upstream, ctx);
+    auto h_win = std::any_cast<StageHandle<Row>>(out.main_handle);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_win, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return sink->collected_records();
+}
+
 }  // namespace
 
 // Window aggregation rides the async/disaggregated path: with a deferring
@@ -865,6 +919,28 @@ TEST(SqlRuntime, TumblingWindowDropsLateRecord) {
                                                    /*io_threads=*/1,
                                                    /*hot_max_bytes=*/0);
     check(run_tumbling_window_scripted(rrb), "async");
+}
+
+// Late-data correctness for SESSION windows: a record that would open a session
+// already fired and purged is dropped, not re-created (which emitted a phantom
+// single-event session row before the fix). A record merging into a live session
+// still extends it; this late record opens a fresh, purged session.
+TEST(SqlRuntime, SessionWindowDropsLateRecord) {
+    ensure_sql_installed_once();
+    const auto rows = run_session_window_scripted(std::make_shared<InMemoryStateBackend>());
+    std::map<std::int64_t, std::vector<std::int64_t>> sums_by_start;
+    for (const auto& rec : rows) {
+        const Row& r = rec.value();
+        sums_by_start[static_cast<std::int64_t>(r.values.at("window_start").as_number())].push_back(
+            static_cast<std::int64_t>(r.values.at("s").as_number()));
+    }
+    // Session [1,3] fired once (sum 12, late 100 dropped); session [20,20] (sum
+    // 3). No fresh session at start=2 from the late record.
+    ASSERT_EQ(sums_by_start.count(2), 0u) << "late record opened a phantom session [2,2]";
+    ASSERT_EQ(sums_by_start[1].size(), 1u) << "session [1,3] re-fired";
+    EXPECT_EQ(sums_by_start[1][0], 12);
+    ASSERT_EQ(sums_by_start[20].size(), 1u);
+    EXPECT_EQ(sums_by_start[20][0], 3);
 }
 
 // Proves the OVERLAP (not just correctness): when many groups' windows fall due
