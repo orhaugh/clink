@@ -145,6 +145,46 @@ TEST(WatermarkStrategy, PartitionAwareDegradesToGlobalWithoutPartition) {
     ASSERT_EQ(s.current_watermark()->timestamp(), EventTime{1950});
 }
 
+TEST(WatermarkStrategy, PartitionAwareIdlePartitionExcludedFromMin) {
+    PartitionAwareBoundedOutOfOrdernessStrategy<int> s(std::chrono::milliseconds{0});
+    // Partition 1 lags at 200 and then goes quiet; partition 0 advances. Without
+    // idleness the min is pinned to 200.
+    s.on_record(part_rec(1, 1000, 0));
+    s.on_record(part_rec(2, 200, 1));
+    ASSERT_EQ(s.current_watermark()->timestamp(), EventTime{200});
+    s.on_record(part_rec(3, 5000, 0));
+    EXPECT_FALSE(s.current_watermark().has_value()) << "min still pinned to quiet partition 1";
+
+    // The assigner marks partition 1 idle: it drops out of the min, which now
+    // follows the still-active partition 0.
+    s.set_idle_partitions({1});
+    auto wm = s.current_watermark();
+    ASSERT_TRUE(wm.has_value());
+    EXPECT_EQ(wm->timestamp(), EventTime{5000}) << "watermark advances past the idle partition";
+}
+
+TEST(WatermarkStrategy, PartitionAwareIdlePartitionReactivatesOnRecord) {
+    PartitionAwareBoundedOutOfOrdernessStrategy<int> s(std::chrono::milliseconds{0});
+    s.on_record(part_rec(1, 1000, 0));
+    s.on_record(part_rec(2, 200, 1));
+    (void)s.current_watermark();
+    s.set_idle_partitions({1});
+    ASSERT_EQ(s.current_watermark()->timestamp(), EventTime{1000});  // 1 excluded, base=1000
+
+    // Partition 1 produces again at 1500: it re-enters the min immediately. The
+    // min is now min(p0=1000, p1=1500)=1000 - equal to the last emitted base, so
+    // the monotonic guard yields no new watermark.
+    s.on_record(part_rec(3, 1500, 1));  // re-activates partition 1
+    EXPECT_FALSE(s.current_watermark().has_value());
+
+    // Partition 0 races to 3000. The watermark advances only to 1500, proving
+    // the re-activated partition 1 is back in (and constraining) the min.
+    s.on_record(part_rec(4, 3000, 0));
+    auto wm = s.current_watermark();
+    ASSERT_TRUE(wm.has_value());
+    EXPECT_EQ(wm->timestamp(), EventTime{1500}) << "re-activated p1 constrains the min";
+}
+
 TEST(WatermarkAssigner, EmitsProgressingWatermarkInline) {
     using KV = std::pair<std::string, int>;
     Dag dag;

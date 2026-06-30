@@ -1218,6 +1218,34 @@ TEST(SqlPhysical, GroupByTumbleEmitsTumblingWindowRow) {
     EXPECT_EQ(agg->key_by, "row_key");
 }
 
+TEST(SqlPhysical, IdleTimeoutOptionThreadsIntoAssignTimestampsOp) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE orders (user_id BIGINT, ts BIGINT, amount BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/orders.ndjson', "
+        "event_time_column='ts', watermark_lag_ms='5', idle_timeout_ms='30000');"
+        "CREATE TABLE out_t (user_id BIGINT, total BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/out.ndjson')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat,
+                            "INSERT INTO out_t SELECT user_id, SUM(amount) AS total "
+                            "FROM orders GROUP BY TUMBLE(ts, 1000), user_id");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+
+    const auto* ts = find_op(spec, "assign_timestamps_row");
+    ASSERT_NE(ts, nullptr);
+    EXPECT_EQ(ts->params.at("idle_timeout_ms"), "30000");
+    EXPECT_EQ(ts->params.at("out_of_order_ms"), "5");
+    // The watermark options select the assigner op and must NOT leak into the
+    // source op's connector params.
+    const auto* src = find_op(spec, "file_json_source");
+    ASSERT_NE(src, nullptr);
+    EXPECT_EQ(src->params.count("idle_timeout_ms"), 0u);
+    EXPECT_EQ(src->params.count("event_time_column"), 0u);
+}
+
 TEST(SqlPhysical, MultiColumnKafkaSourceBridgesViaJsonStringToRow) {
     Catalog cat;
     auto s = parse(

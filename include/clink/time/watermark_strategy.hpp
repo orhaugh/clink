@@ -6,6 +6,8 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
+#include <vector>
 
 #include "clink/core/record.hpp"
 #include "clink/time/event_time.hpp"
@@ -34,6 +36,15 @@ public:
     // Returns the current watermark if the strategy has progressed since the
     // last query, otherwise nullopt.
     virtual std::optional<Watermark> current_watermark() = 0;
+
+    // Per-partition idleness hook. The assigner owns the wall clock, so it
+    // tells the strategy which source partitions have gone quiet (no record
+    // for the configured idleness duration). A partition-aware strategy
+    // excludes these from its min-watermark computation, so a stalled
+    // partition stops pinning the watermark low. Default no-op: strategies
+    // without per-partition state ignore it. Idempotent - the assigner passes
+    // the full idle set each probe.
+    virtual void set_idle_partitions(const std::vector<std::int32_t>& /*idle*/) {}
 };
 
 // Watermark = max event-time observed so far. Asserts records arrive in
@@ -115,11 +126,14 @@ private:
 // the min actually advances (it is monotonic: each per-partition max only
 // grows, so the min never regresses).
 //
-// LIMITATION (v1): a partition that produces some records then goes QUIET
-// mid-stream keeps pinning the min low (its max never advances). For a drained
-// benchmark every partition is active throughout, so this does not arise; a
-// per-partition idleness timeout (mirroring the assigner's stream-level
-// idleness) is the follow-on for long-lived jobs with bursty partitions.
+// Per-partition idleness: a partition that produces some records then goes
+// QUIET would keep pinning the min low (its max never advances). The owning
+// `WatermarkAssignerOperator` detects quiet partitions on its processing-time
+// probe and calls `set_idle_partitions`; those partitions are then excluded
+// from the min, so the watermark advances as fast as the slowest STILL-ACTIVE
+// partition. A partition re-activates the instant it produces again
+// (`on_record` clears it). This is the per-partition mirror of the assigner's
+// stream-level idleness.
 template <typename T>
 class PartitionAwareBoundedOutOfOrdernessStrategy final : public WatermarkStrategy<T> {
 public:
@@ -138,6 +152,11 @@ public:
             } else if (*t > it->second) {
                 it->second = *t;
             }
+            // A record re-activates its partition immediately (do not wait for
+            // the next idle probe to notice it came back).
+            if (idle_partitions_.erase(*p) != 0) {
+                dirty_ = true;
+            }
         } else {
             if (!global_seen_ || *t > global_max_) {
                 global_max_ = *t;
@@ -147,6 +166,14 @@ public:
         dirty_ = true;
     }
 
+    void set_idle_partitions(const std::vector<std::int32_t>& idle) override {
+        std::set<std::int32_t> next(idle.begin(), idle.end());
+        if (next != idle_partitions_) {
+            idle_partitions_ = std::move(next);
+            dirty_ = true;  // the min may now advance past a newly-idle partition
+        }
+    }
+
     std::optional<Watermark> current_watermark() override {
         if (!dirty_) {
             return std::nullopt;
@@ -154,7 +181,9 @@ public:
         dirty_ = false;
         std::optional<EventTime> base;
         for (const auto& [part, mx] : part_max_) {
-            (void)part;
+            if (idle_partitions_.count(part) != 0) {
+                continue;  // quiet partition: excluded from the min
+            }
             if (!base || mx < *base) {
                 base = mx;
             }
@@ -176,6 +205,7 @@ public:
 private:
     std::chrono::milliseconds bound_;
     std::map<std::int32_t, EventTime> part_max_;
+    std::set<std::int32_t> idle_partitions_;
     EventTime global_max_{};
     bool global_seen_{false};
     EventTime last_base_{};

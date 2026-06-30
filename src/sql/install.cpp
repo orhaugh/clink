@@ -5981,6 +5981,9 @@ void install(clink::plugin::PluginRegistry& reg) {
     //                      follows in a later phase).
     //   out_of_order_ms (default 0): bounded out-of-orderness lag in
     //                      milliseconds. 0 -> monotonic watermarks.
+    //   idle_timeout_ms (default 0): mark the source / a quiet partition idle
+    //                      after this many ms of no records, so it stops pinning
+    //                      the watermark. 0 disables idleness.
     //
     // The op is a pure pass-through for record values - the only
     // observable effect downstream is watermark emission.
@@ -6103,6 +6106,15 @@ void install(clink::plugin::PluginRegistry& reg) {
                 }
                 return true;
             });
+            // Idleness: when set, a source (or one of its partitions) that goes
+            // quiet for this long stops pinning the watermark - the assigner
+            // emits a stream-level idle marker and excludes quiet partitions from
+            // the partition-aware min, so downstream windows keep firing. 0
+            // (default) disables it (a quiet partition pins the watermark, the
+            // pre-existing behaviour).
+            if (const auto idle_ms = ctx.param_int64_or("idle_timeout_ms", 0); idle_ms > 0) {
+                op->with_idleness(std::chrono::milliseconds(idle_ms));
+            }
             return op;
         });
 

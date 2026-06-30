@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -181,6 +182,58 @@ TEST(WatermarkAssignerIdleness, EmitsIdleAfterTimeoutAndActiveOnNextRecord) {
         }
     }
     EXPECT_TRUE(saw_post_active) << "active watermark resumes after a record";
+}
+
+TEST(WatermarkAssignerIdleness, PerPartitionIdleAdvancesPastQuietPartition) {
+    // One source, two partitions. P1 lags and goes quiet; P0 stays active. The
+    // per-partition min would stay pinned to P1 forever; after the idle timeout
+    // the probe excludes P1 and the watermark advances to P0.
+    BoundedChannel<StreamElement<int>> out_ch(64);
+    Emitter<int> em(&out_ch);
+
+    auto strategy = std::make_unique<PartitionAwareBoundedOutOfOrdernessStrategy<int>>(0ms);
+    WatermarkAssignerOperator<int> op([](const int& v) { return EventTime{v}; },
+                                      std::move(strategy));
+    op.with_idleness(50ms);
+    RuntimeContext ctx(OperatorId{1}, "assigner", nullptr, nullptr);
+    op.attach_runtime(&ctx);
+    op.open();
+
+    auto feed = [&](std::vector<std::tuple<int, std::int64_t, std::int32_t>> recs) {
+        Batch<int> b;
+        for (auto [v, ts, partition] : recs) {
+            Record<int> r{v, EventTime{ts}};
+            r.set_source_partition(partition);
+            b.push(std::move(r));
+        }
+        op.process(StreamElement<int>::data(std::move(b)), em);
+    };
+    auto max_active_wm = [&]() -> std::int64_t {
+        std::int64_t mx = -1;
+        while (auto e = out_ch.try_pop()) {
+            if (e->is_watermark() && !e->as_watermark().is_idle()) {
+                mx = std::max(mx, e->as_watermark().timestamp().millis());
+            }
+        }
+        return mx;
+    };
+
+    // Both partitions in one batch so the min (P1=50) is the first watermark
+    // (a per-partition batch would race the watermark to whichever came first).
+    feed({{1, 100, /*partition=*/0}, {2, 50, /*partition=*/1}});
+    EXPECT_EQ(max_active_wm(), 50) << "min across partitions follows the slower P1";
+
+    // P1 now goes quiet. P0 keeps advancing - but the min stays pinned to P1=50.
+    std::this_thread::sleep_for(80ms);
+    feed({{3, 300, /*partition=*/0}});
+    EXPECT_EQ(max_active_wm(), -1) << "P1 still pins the min; no advance from a record alone";
+
+    // The idle probe fires: P1 (quiet > 50ms) is excluded, the min jumps to P0.
+    op.fire_due_timers(em,
+                       std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count());
+    EXPECT_EQ(max_active_wm(), 300) << "watermark advances past the idle partition";
 }
 
 TEST(WatermarkAssignerIdleness, NoTimeoutWhenIdlenessDisabled) {

@@ -3,9 +3,11 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "clink/operators/operator_base.hpp"
 #include "clink/time/alignment_group.hpp"
@@ -199,6 +201,13 @@ public:
             strategy_->on_record(probe);
         }
         last_record_time_ms_ = now_ms_();
+        if (have_parts && idleness_.count() > 0) {
+            for (const auto& p : parts) {
+                if (p.has_value()) {
+                    part_last_ms_[*p] = last_record_time_ms_;
+                }
+            }
+        }
         is_idle_ = false;
         // Forward the SAME batch unchanged - the sidecar (a shared_ptr member)
         // moves with it, so the stream stays columnar with zero row decode.
@@ -265,6 +274,7 @@ public:
                     strategy_->on_record(record);
                 }
                 last_record_time_ms_ = now_ms_();
+                track_row_partitions_(in_batch, last_record_time_ms_);
                 is_idle_ = false;
                 out.emit_data(std::move(const_cast<Batch<T>&>(in_batch)));
                 if (auto wm = strategy_->current_watermark(); wm.has_value()) {
@@ -287,6 +297,7 @@ public:
                 out_batch.push(std::move(record));
             }
             last_record_time_ms_ = now_ms_();
+            track_row_partitions_(out_batch, last_record_time_ms_);
             is_idle_ = false;
             if (!out_batch.empty()) {
                 out.emit_data(std::move(out_batch));
@@ -315,6 +326,26 @@ public:
             return;
         }
         const auto now = now_ms_();
+        // Per-partition idleness: exclude any partition quiet for >= idleness
+        // from the strategy's min, then re-emit if the watermark advanced. This
+        // is what lets a single source keep firing when one of its partitions
+        // stalls (the whole-stream check below only fires when ALL go quiet).
+        if (!part_last_ms_.empty()) {
+            std::vector<std::int32_t> idle;
+            for (const auto& [p, last] : part_last_ms_) {
+                if ((now - last) >= idleness_.count()) {
+                    idle.push_back(p);
+                }
+            }
+            strategy_->set_idle_partitions(idle);
+            if (auto wm = strategy_->current_watermark(); wm.has_value()) {
+                last_emitted_wm_ = *wm;
+                if (alignment_group_ != nullptr) {
+                    alignment_group_->update_watermark(alignment_member_id_, *wm);
+                }
+                out.emit_watermark(*wm);
+            }
+        }
         if (!is_idle_ && (now - last_record_time_ms_) >= idleness_.count()) {
             // Determine the timestamp to attach to the idle marker: the
             // strategy's latest observed watermark if any (preserves
@@ -339,6 +370,20 @@ public:
 
 private:
     static constexpr const char* kIdleProbeKey = "__idle_probe__";
+
+    // Stamp the batch's wall-clock against each partition it carries, so the
+    // idle probe can tell which partitions have gone quiet. No-op (and no
+    // per-record partition read) unless idleness is enabled.
+    void track_row_partitions_(const Batch<T>& batch, std::int64_t now) {
+        if (idleness_.count() <= 0) {
+            return;
+        }
+        for (const auto& r : batch) {
+            if (auto p = r.source_partition(); p.has_value()) {
+                part_last_ms_[*p] = now;
+            }
+        }
+    }
 
     void schedule_idle_probe_() {
         auto* rt = this->runtime();
@@ -366,6 +411,11 @@ private:
     std::chrono::milliseconds idleness_{0};
     std::int64_t last_record_time_ms_{0};
     bool is_idle_{false};
+    // Per-partition last-activity wall-clock, tracked only when idleness is on.
+    // The idle probe marks a partition idle once now - last >= idleness_ and
+    // tells the (partition-aware) strategy to exclude it, so a quiet partition
+    // stops pinning the min watermark. Empty for non-partitioned sources.
+    std::map<std::int32_t, std::int64_t> part_last_ms_;
 
     // Watermark alignment state (withWatermarkAlignment).
     std::shared_ptr<AlignmentGroup> alignment_group_;

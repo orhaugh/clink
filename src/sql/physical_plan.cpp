@@ -712,7 +712,7 @@ std::map<std::string, std::string> build_params(const TableDef& table) {
     for (const auto& [k, v] : table.properties) {
         if (k == "connector" || k == "format")
             continue;
-        if (k == "event_time_column" || k == "watermark_lag_ms")
+        if (k == "event_time_column" || k == "watermark_lag_ms" || k == "idle_timeout_ms")
             continue;
         out[k] = v;
     }
@@ -743,6 +743,10 @@ std::optional<std::string> maybe_emit_assign_timestamps(const TableDef& table,
     auto lag_it = table.properties.find("watermark_lag_ms");
     if (lag_it != table.properties.end() && !lag_it->second.empty()) {
         op.params["out_of_order_ms"] = lag_it->second;
+    }
+    auto idle_it = table.properties.find("idle_timeout_ms");
+    if (idle_it != table.properties.end() && !idle_it->second.empty()) {
+        op.params["idle_timeout_ms"] = idle_it->second;
     }
     std::string id = op.id;
     spec.ops.push_back(std::move(op));
