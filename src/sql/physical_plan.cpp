@@ -714,6 +714,10 @@ std::map<std::string, std::string> build_params(const TableDef& table) {
             continue;
         if (k == "event_time_column" || k == "watermark_lag_ms" || k == "idle_timeout_ms")
             continue;
+        // Window-level knobs declared on the source table: consumed by the
+        // window op downstream (first_source_property), not the source op.
+        if (k == "allowed_lateness_ms" || k == "late_records_to_dlq")
+            continue;
         out[k] = v;
     }
     return out;
@@ -751,6 +755,26 @@ std::optional<std::string> maybe_emit_assign_timestamps(const TableDef& table,
     std::string id = op.id;
     spec.ops.push_back(std::move(op));
     return id;
+}
+
+// Walk a plan subtree to the first source scan and read one of its WITH
+// properties. Window-level knobs (allowed_lateness_ms, late_records_to_dlq) are
+// declared on the source table but consumed by the window op downstream; this
+// threads them across the intervening project / filter / key nodes. Returns the
+// property of the first scan reached in a depth-first walk, or empty if none.
+std::string first_source_property(const LogicalPlan& node, const std::string& key) {
+    if (node.kind() == "Scan") {
+        const auto& scan = static_cast<const LogicalScan&>(node);
+        auto it = scan.table().properties.find(key);
+        return it != scan.table().properties.end() ? it->second : std::string{};
+    }
+    for (const auto* in : node.inputs()) {
+        if (in == nullptr)
+            continue;
+        if (auto v = first_source_property(*in, key); !v.empty())
+            return v;
+    }
+    return {};
 }
 
 // Backstop: reject a plan that carries a null child anywhere in its tree before
@@ -1424,6 +1448,14 @@ std::string compile_node(const LogicalPlan& node,
             arr.emplace_back(std::move(obj));
         }
         op.params["aggregates"] = clink::config::JsonValue{std::move(arr)}.serialize(0);
+
+        // Late-data handling: a grace band that holds a window open past its end
+        // and an opt-in side stream for fully-late records. Both are declared on
+        // the source table and threaded here to the window op.
+        if (auto al = first_source_property(agg.input(), "allowed_lateness_ms"); !al.empty())
+            op.params["allowed_lateness_ms"] = al;
+        if (auto lr = first_source_property(agg.input(), "late_records_to_dlq"); !lr.empty())
+            op.params["late_records_to_dlq"] = lr;
 
         std::string id = op.id;
         spec.ops.push_back(std::move(op));

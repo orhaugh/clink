@@ -1297,6 +1297,11 @@ public:
         }
     }
 
+    // Grace band for late records (fire the window once at window_end + this).
+    void set_allowed_lateness_ms(std::int64_t v) { allowed_lateness_ms_ = v < 0 ? 0 : v; }
+    // Route fully-late dropped records to the dead-letter channel.
+    void set_report_late(bool v) { report_late_ = v; }
+
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (element.is_data()) {
             const auto& batch = element.as_data();
@@ -1484,7 +1489,9 @@ public:
                 continue;
             }
             // Skip a wholly-late record before paying for a get_async/put round
-            // trip: if every window it lands in is already purged, drop it.
+            // trip: if every window it lands in is already purged, drop it. The
+            // sync path reports this drop from fold_record_into_ (folded == 0);
+            // the async fold never runs for these, so report here to match.
             const auto ts = static_cast<std::int64_t>(tit->second.as_number());
             bool any_live = false;
             for (auto [ws, we] : windows_for_(ts)) {
@@ -1495,6 +1502,8 @@ public:
                 }
             }
             if (!any_live) {
+                if (report_late_)
+                    emit_late_(row);
                 continue;
             }
             std::string key = group_key_(row);
@@ -1509,7 +1518,9 @@ public:
                 this->fold_record_into_(by_window, row, &new_win_ends, horizon);
                 kv.put(key, by_window);
                 for (std::int64_t we : new_win_ends) {
-                    rt->timer_service()->register_event_time_timer(we, key);
+                    // Fire at window_end + allowed_lateness (the grace-band end);
+                    // on_event_time_timer maps the timer time back to window_end.
+                    rt->timer_service()->register_event_time_timer(we + allowed_lateness_ms_, key);
                 }
                 co_return;
             };
@@ -1524,9 +1535,12 @@ public:
     // for now; the async-overlap variant follows. The async runner fires this
     // after the epoch drains + through the per-key gate, so the keyed-state
     // access is safe (no same-key in-flight read outstanding).
-    void on_event_time_timer(std::int64_t win_end,
+    void on_event_time_timer(std::int64_t timer_time,
                              const std::string& key,
                              Emitter<Row>& out) override {
+        // The timer was registered at window_end + allowed_lateness; recover the
+        // window_end (the map key) by subtracting the grace band.
+        const std::int64_t win_end = timer_time - allowed_lateness_ms_;
         auto kv = keyed_state_();
         auto cur = kv.get(key);
         if (!cur.has_value()) {
@@ -1563,7 +1577,8 @@ public:
         auto by_window = std::move(*cur);
         Batch<Row> batch;
         bool changed = false;
-        for (std::int64_t win_end : win_ends) {
+        for (std::int64_t timer_time : win_ends) {
+            const std::int64_t win_end = timer_time - allowed_lateness_ms_;
             auto wit = by_window.find(win_end);
             if (wit == by_window.end()) {
                 continue;  // already fired / never existed
@@ -1644,9 +1659,11 @@ private:
         if (it == row.values.end() || !it->second.is_number())
             return;
         const auto ts = static_cast<std::int64_t>(it->second.as_number());
+        int folded = 0;
         for (auto [win_start, win_end] : windows_for_(ts)) {
             if (win_end <= drop_horizon)
                 continue;  // late: window already fired + purged
+            ++folded;
             auto wit = by_window.find(win_end);
             if (wit == by_window.end()) {
                 WindowBucket b;
@@ -1665,6 +1682,12 @@ private:
                 update_agg(wit->second.agg_states[i], aggregates_[i], row);
             }
         }
+        // The record had a valid event time but every window it belongs to is
+        // already purged - it is fully late. Surface it to the dead-letter
+        // channel when opted in (the sync, columnar-WS3 and async paths all
+        // route through here). Default: silent drop.
+        if (folded == 0 && report_late_)
+            emit_late_(row);
     }
 
     // WS6: fully-columnar window fold. Slices the batch's records by
@@ -1772,7 +1795,13 @@ private:
         for (auto& [k, by_window] : state_) {
             (void)k;
             for (auto it = by_window.begin(); it != by_window.end();) {
-                if (it->first > wm_value) {
+                // Fire-once-after-grace-band: hold a window open until the
+                // watermark passes window_end + allowed_lateness, so late-but-
+                // within-band records are folded in before the single emit. With
+                // the default lateness 0 this is "fire + purge at window_end <=
+                // watermark", unchanged. Past the band, the late guard in
+                // fold_record_into_ drops further records.
+                if (it->first + allowed_lateness_ms_ > wm_value) {
                     ++it;
                     continue;
                 }
@@ -1799,14 +1828,32 @@ private:
         return have_wm_ ? current_wm_ - allowed_lateness_ms_ : kNoDropHorizon;
     }
 
+    // Surface a dropped late record to the dead-letter channel (opt-in). Late
+    // records are valid but past their window's grace band; routing them here
+    // gives a recoverable/observable side stream instead of a silent drop. It is
+    // best-effort and not barrier-tied (a replayed late record is re-reported).
+    void emit_late_(const Row& row) const {
+        auto* rt = this->runtime();
+        if (rt == nullptr)
+            return;
+        clink::BadRecord br;
+        br.payload = clink::config::JsonValue{row.values}.serialize(0);
+        br.error = "late record dropped: window fired and purged";
+        br.connector = "sql_window";
+        br.direction = "operator";
+        rt->report_bad_record(br);
+    }
+
     bool effective_async_ = false;
     bool have_wm_ = false;
     std::int64_t current_wm_ = 0;
-    // Grace period a fired window is kept for late updates. 0 (default) means
-    // fire-and-drop: late records are dropped, never re-folded. A SQL knob to
-    // raise this (keep the window and re-emit on late updates) is a follow-up;
-    // the field exists so the late guard reads a single horizon.
+    // Grace period a fired window is kept open: it fires once when the watermark
+    // passes window_end + allowed_lateness_ms_, including late-but-within-band
+    // records. 0 (default) = fire at window_end, drop anything later.
     std::int64_t allowed_lateness_ms_ = 0;
+    // When true, fully-late dropped records are reported to the dead-letter
+    // channel; default false = silent drop.
+    bool report_late_ = false;
     Kind kind_;
     std::string time_column_;
     std::int64_t size_ms_;
@@ -1857,6 +1904,11 @@ public:
         }
     }
 
+    // Grace band for late records (fire the session once at end + gap + this).
+    void set_allowed_lateness_ms(std::int64_t v) { allowed_lateness_ms_ = v < 0 ? 0 : v; }
+    // Route fully-late dropped records (new-session branch) to the dead-letter channel.
+    void set_report_late(bool v) { report_late_ = v; }
+
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (element.is_data()) {
             for (const auto& rec : element.as_data())
@@ -1884,6 +1936,20 @@ public:
     // sync and columnar paths, so the live watermark is the ingest watermark.
     [[nodiscard]] bool session_too_late_(std::int64_t ts) const {
         return have_wm_ && ts + gap_ms_ <= current_wm_ - allowed_lateness_ms_;
+    }
+
+    // Surface a dropped late record to the dead-letter channel (opt-in); see the
+    // WindowRowOp equivalent. Best-effort, not barrier-tied.
+    void emit_late_(const Row& row) const {
+        auto* rt = this->runtime();
+        if (rt == nullptr)
+            return;
+        clink::BadRecord br;
+        br.payload = clink::config::JsonValue{row.values}.serialize(0);
+        br.error = "late record dropped: session fired and purged";
+        br.connector = "sql_session_window";
+        br.direction = "operator";
+        rt->report_bad_record(br);
     }
 
     // Columnar ingest: buffer columnar data via the time / group / agg-input
@@ -2127,8 +2193,11 @@ private:
             // No live session to extend: this record would open a fresh session.
             // If that session has already fired and been purged, the record is
             // late - drop it rather than re-create the window and re-fire.
-            if (session_too_late_(ts))
+            if (session_too_late_(ts)) {
+                if (report_late_)
+                    emit_late_(row);
                 return;
+            }
             Session s;
             s.start = ts;
             s.end = ts;
@@ -2286,7 +2355,10 @@ private:
         for (auto& [k, by_session] : state_) {
             (void)k;
             for (auto it = by_session.begin(); it != by_session.end();) {
-                if (it->second.end + gap_ms_ > wm_value) {
+                // Fire-once-after-grace-band: a session closes at end + gap, and
+                // is held a further allowed_lateness_ms_ to absorb late records
+                // before the single emit. Default lateness 0 = fire at end + gap.
+                if (it->second.end + gap_ms_ + allowed_lateness_ms_ > wm_value) {
                     ++it;
                     continue;
                 }
@@ -2311,10 +2383,12 @@ private:
     std::int64_t gap_ms_;
     bool have_wm_ = false;
     std::int64_t current_wm_ = 0;
-    // Grace period a fired session is kept for late updates. 0 (default) means
-    // fire-and-drop: a record that would open an already-purged session is
-    // dropped. A SQL knob to raise this is a follow-up (shared with WindowRowOp).
+    // Grace period a fired session is held open: it fires once when the
+    // watermark passes end + gap + allowed_lateness_ms_, including late-but-
+    // within-band records. 0 (default) = fire at end + gap, drop anything later.
     std::int64_t allowed_lateness_ms_ = 0;
+    // When true, fully-late dropped records go to the dead-letter channel.
+    bool report_late_ = false;
     std::vector<std::string> group_keys_;
     std::vector<AggSpec> aggregates_;
     std::vector<std::string> group_key_outputs_;
@@ -6611,15 +6685,18 @@ void install(clink::plugin::PluginRegistry& reg) {
             decode_agg_extras(entry, spec);
             aggregates.push_back(std::move(spec));
         }
-        return std::make_shared<WindowRowOp>(kind,
-                                             std::move(time_column),
-                                             size_ms,
-                                             slide_ms,
-                                             std::move(group_keys),
-                                             std::move(aggregates),
-                                             std::move(group_key_outputs),
-                                             std::move(window_start_output),
-                                             std::move(window_end_output));
+        auto op = std::make_shared<WindowRowOp>(kind,
+                                                std::move(time_column),
+                                                size_ms,
+                                                slide_ms,
+                                                std::move(group_keys),
+                                                std::move(aggregates),
+                                                std::move(group_key_outputs),
+                                                std::move(window_start_output),
+                                                std::move(window_end_output));
+        op->set_allowed_lateness_ms(ctx.param_int64_or("allowed_lateness_ms", 0));
+        op->set_report_late(ctx.param_or("late_records_to_dlq", "") == "true");
+        return op;
     };
 
     reg.register_operator<Row, Row>(
@@ -7021,13 +7098,16 @@ void install(clink::plugin::PluginRegistry& reg) {
                 decode_agg_extras(entry, spec);
                 aggregates.push_back(std::move(spec));
             }
-            return std::make_shared<SessionWindowRowOp>(std::move(time_column),
-                                                        gap_ms,
-                                                        std::move(group_keys),
-                                                        std::move(aggregates),
-                                                        std::move(group_key_outputs),
-                                                        std::move(window_start_output),
-                                                        std::move(window_end_output));
+            auto op = std::make_shared<SessionWindowRowOp>(std::move(time_column),
+                                                           gap_ms,
+                                                           std::move(group_keys),
+                                                           std::move(aggregates),
+                                                           std::move(group_key_outputs),
+                                                           std::move(window_start_output),
+                                                           std::move(window_end_output));
+            op->set_allowed_lateness_ms(ctx.param_int64_or("allowed_lateness_ms", 0));
+            op->set_report_late(ctx.param_or("late_records_to_dlq", "") == "true");
+            return op;
         });
 
     // union_row: identity Map for UNION ALL. The OperatorSpec wires

@@ -1246,6 +1246,34 @@ TEST(SqlPhysical, IdleTimeoutOptionThreadsIntoAssignTimestampsOp) {
     EXPECT_EQ(src->params.count("event_time_column"), 0u);
 }
 
+TEST(SqlPhysical, LateDataOptionsThreadFromSourceTableIntoWindowOp) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE orders (user_id BIGINT, ts BIGINT, amount BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/orders.ndjson', "
+        "event_time_column='ts', allowed_lateness_ms='5000', late_records_to_dlq='true');"
+        "CREATE TABLE out_t (user_id BIGINT, total BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/out.ndjson')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat,
+                            "INSERT INTO out_t SELECT user_id, SUM(amount) AS total "
+                            "FROM orders GROUP BY TUMBLE(ts, 1000), user_id");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+
+    // Declared on the source table, the late-data knobs are consumed by the window
+    // op, not the source op.
+    const auto* agg = find_op(spec, "tumbling_window_row");
+    ASSERT_NE(agg, nullptr);
+    EXPECT_EQ(agg->params.at("allowed_lateness_ms"), "5000");
+    EXPECT_EQ(agg->params.at("late_records_to_dlq"), "true");
+    const auto* src = find_op(spec, "file_json_source");
+    ASSERT_NE(src, nullptr);
+    EXPECT_EQ(src->params.count("allowed_lateness_ms"), 0u);
+    EXPECT_EQ(src->params.count("late_records_to_dlq"), 0u);
+}
+
 TEST(SqlPhysical, MultiColumnKafkaSourceBridgesViaJsonStringToRow) {
     Catalog cat;
     auto s = parse(

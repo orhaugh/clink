@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -38,6 +39,7 @@
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/dag.hpp"
+#include "clink/runtime/dead_letter.hpp"
 #include "clink/runtime/job_config.hpp"
 #include "clink/runtime/local_executor.hpp"
 #include "clink/sql/analyze.hpp"
@@ -862,6 +864,159 @@ std::vector<Record<Row>> run_session_window_scripted(std::shared_ptr<StateBacken
     return sink->collected_records();
 }
 
+// A DLQ that just records every bad record it is handed, for tests that assert on
+// the late side output. Thread-safe (one instance is shared across subtasks).
+class CapturingDeadLetterQueue final : public DeadLetterQueue {
+public:
+    void report(const BadRecord& rec) override {
+        std::lock_guard<std::mutex> lk(mu_);
+        records_.push_back(rec);
+    }
+    std::vector<BadRecord> records() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return records_;
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::vector<BadRecord> records_;
+};
+
+// allowed_lateness scenario for a tumbling window (size 10, grace band 5):
+//   two on-time records into [0,10) (sum 12); a watermark at 10 that with a 5ms
+//   grace band HOLDS [0,10) open (it fires at >= 15) rather than purging it; a
+//   late-but-within-band record at ts=2 (amt 100) folded into the held window; a
+//   watermark at 15 firing [0,10) ONCE (sum 112); a fully-late record at ts=4
+//   (amt 9) past the band -> dropped (routed to the DLQ when opted in); a closing
+//   watermark. With lateness 0 the window fires at 10 with sum 12 and both later
+//   records drop, so sum 112 proves the grace band absorbed the within-band one.
+class AllowedLatenessWindowSource final : public Source<Row> {
+public:
+    bool produce(Emitter<Row>& out) override {
+        if (this->cancelled() || done_) {
+            return false;
+        }
+        Batch<Row> b1;
+        b1.push(window_input_row(1, 1, 5));
+        b1.push(window_input_row(1, 3, 7));
+        out.emit_data(std::move(b1));
+        out.emit_watermark(Watermark{EventTime{10}});  // grace band holds [0,10) open
+        Batch<Row> b2;
+        b2.push(window_input_row(1, 2, 100));  // late but within band -> folded in
+        out.emit_data(std::move(b2));
+        out.emit_watermark(Watermark{EventTime{15}});  // fires [0,10) once, sum 112
+        Batch<Row> b3;
+        b3.push(window_input_row(1, 4, 9));  // fully late -> dropped (DLQ if opted in)
+        out.emit_data(std::move(b3));
+        out.emit_watermark(Watermark{EventTime{30}});
+        done_ = true;
+        return false;
+    }
+    [[nodiscard]] bool is_bounded() const noexcept override { return true; }
+    std::string name() const override { return "allowed_lateness_window_src"; }
+
+private:
+    bool done_ = false;
+};
+
+// allowed_lateness scenario for a session window (gap 5, grace band 5): a session
+// [1,3] (sum 12) is held past its end+gap=8 by the 5ms band (fires at >= 13); a
+// late record at ts=2 (amt 100) merges into the still-held session (sum 112); a
+// watermark at 13 fires it once; then a fully-late record at ts=2 (amt 9) would
+// open a fresh, already-purged session -> dropped (DLQ if opted in).
+class AllowedLatenessSessionSource final : public Source<Row> {
+public:
+    bool produce(Emitter<Row>& out) override {
+        if (this->cancelled() || done_) {
+            return false;
+        }
+        Batch<Row> b1;
+        b1.push(window_input_row(1, 1, 5));
+        b1.push(window_input_row(1, 3, 7));
+        out.emit_data(std::move(b1));
+        out.emit_watermark(Watermark{EventTime{10}});  // grace band holds session [1,3] open
+        Batch<Row> b2;
+        b2.push(window_input_row(1, 2, 100));  // late, merges into held session
+        out.emit_data(std::move(b2));
+        out.emit_watermark(Watermark{EventTime{13}});  // fires session [1,3] once, sum 112
+        Batch<Row> b3;
+        b3.push(window_input_row(1, 2, 9));  // fully late: fresh purged session -> dropped
+        out.emit_data(std::move(b3));
+        out.emit_watermark(Watermark{EventTime{40}});
+        done_ = true;
+        return false;
+    }
+    [[nodiscard]] bool is_bounded() const noexcept override { return true; }
+    std::string name() const override { return "allowed_lateness_session_src"; }
+
+private:
+    bool done_ = false;
+};
+
+// Generic tumbling-window scripted run: feeds `source` through tumbling_window_row
+// (size 10, sum over amt, keyed by k) with `extra` params merged in and an
+// optional DLQ wired, returning the emitted rows.
+std::vector<Record<Row>> run_tumbling_window_with(std::shared_ptr<Source<Row>> source,
+                                                  std::shared_ptr<StateBackend> backend,
+                                                  const std::map<std::string, std::string>& extra,
+                                                  DeadLetterQueue* dlq = nullptr) {
+    const auto* builder =
+        cluster::DagBuilderRegistry::default_instance().find("tumbling_window_row");
+    Dag dag;
+    auto h = dag.add_source<Row>(std::move(source));
+    clink::plugin::BuildContext ctx;
+    ctx.params["time_column"] = "ts";
+    ctx.params["size_ms"] = "10";
+    ctx.params["group_keys"] = "k";
+    ctx.params["group_key_outputs"] = "k";
+    ctx.params["aggregates"] = R"([{"name":"s","fn":"sum","input_column":"amt"}])";
+    for (const auto& [k, v] : extra) {
+        ctx.params[k] = v;
+    }
+    std::vector<std::any> upstream = {std::any{h}};
+    auto out = (*builder)(dag, upstream, ctx);
+    auto h_win = std::any_cast<StageHandle<Row>>(out.main_handle);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_win, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    cfg.dead_letter_queue = dlq;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return sink->collected_records();
+}
+
+// Generic session-window scripted run (gap 5), mirror of run_tumbling_window_with.
+std::vector<Record<Row>> run_session_window_with(std::shared_ptr<Source<Row>> source,
+                                                 std::shared_ptr<StateBackend> backend,
+                                                 const std::map<std::string, std::string>& extra,
+                                                 DeadLetterQueue* dlq = nullptr) {
+    const auto* builder =
+        cluster::DagBuilderRegistry::default_instance().find("session_window_row");
+    Dag dag;
+    auto h = dag.add_source<Row>(std::move(source));
+    clink::plugin::BuildContext ctx;
+    ctx.params["time_column"] = "ts";
+    ctx.params["gap_ms"] = "5";
+    ctx.params["group_keys"] = "k";
+    ctx.params["group_key_outputs"] = "k";
+    ctx.params["aggregates"] = R"([{"name":"s","fn":"sum","input_column":"amt"}])";
+    for (const auto& [k, v] : extra) {
+        ctx.params[k] = v;
+    }
+    std::vector<std::any> upstream = {std::any{h}};
+    auto out = (*builder)(dag, upstream, ctx);
+    auto h_win = std::any_cast<StageHandle<Row>>(out.main_handle);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_win, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    cfg.dead_letter_queue = dlq;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return sink->collected_records();
+}
+
 }  // namespace
 
 // Window aggregation rides the async/disaggregated path: with a deferring
@@ -941,6 +1096,99 @@ TEST(SqlRuntime, SessionWindowDropsLateRecord) {
     EXPECT_EQ(sums_by_start[1][0], 12);
     ASSERT_EQ(sums_by_start[20].size(), 1u);
     EXPECT_EQ(sums_by_start[20][0], 3);
+}
+
+// allowed_lateness_ms holds a fired tumbling window open for a grace band so a
+// late-but-within-band record still lands in it, then fires the window ONCE. With
+// the band the window [0,10) emits sum 112 (the late 100 folded in); the fully-late
+// record past the band still drops. Verified on the sync and async paths - the
+// drop horizon (current_wm_ - allowed_lateness) must be identical across them.
+TEST(SqlRuntime, TumblingWindowAllowedLatenessHoldsAndIncludesLateRecord) {
+    ensure_sql_installed_once();
+    auto check = [](const std::vector<Record<Row>>& rows, const char* path) {
+        std::map<std::int64_t, std::vector<std::int64_t>> sums_by_start;
+        for (const auto& rec : rows) {
+            const Row& r = rec.value();
+            sums_by_start[static_cast<std::int64_t>(r.values.at("window_start").as_number())]
+                .push_back(static_cast<std::int64_t>(r.values.at("s").as_number()));
+        }
+        // Exactly one row for [0,10), summing 5+7+100 = 112 (the within-band late
+        // record folded in). A second row would mean it re-fired; sum 12 would mean
+        // the band did not hold the window open.
+        ASSERT_EQ(sums_by_start[0].size(), 1u) << path << ": window [0,10) fired more than once";
+        EXPECT_EQ(sums_by_start[0][0], 112) << path << ": within-band late record not included";
+    };
+    const std::map<std::string, std::string> params = {{"allowed_lateness_ms", "5"}};
+    check(run_tumbling_window_with(std::make_shared<AllowedLatenessWindowSource>(),
+                                   std::make_shared<InMemoryStateBackend>(),
+                                   params),
+          "sync");
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    check(run_tumbling_window_with(std::make_shared<AllowedLatenessWindowSource>(), rrb, params),
+          "async");
+}
+
+// late_records_to_dlq routes a fully-late tumbling-window record (one past its
+// window's grace band) to the dead-letter channel instead of dropping it silently.
+// Exercised on the sync and async paths; each drops exactly the one late record.
+TEST(SqlRuntime, TumblingWindowLateRecordToDeadLetterQueue) {
+    ensure_sql_installed_once();
+    const std::map<std::string, std::string> params = {{"late_records_to_dlq", "true"}};
+
+    CapturingDeadLetterQueue sync_dlq;
+    run_tumbling_window_with(std::make_shared<LateDataWindowSource>(),
+                             std::make_shared<InMemoryStateBackend>(),
+                             params,
+                             &sync_dlq);
+    const auto sync_recs = sync_dlq.records();
+    ASSERT_EQ(sync_recs.size(), 1u) << "sync: exactly one late record reported";
+    EXPECT_EQ(sync_recs[0].connector, "sql_window");
+    EXPECT_EQ(sync_recs[0].direction, "operator");
+    EXPECT_NE(sync_recs[0].payload.find("\"amt\""), std::string::npos)
+        << "payload carries the dropped record's columns";
+
+    CapturingDeadLetterQueue async_dlq;
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    run_tumbling_window_with(std::make_shared<LateDataWindowSource>(), rrb, params, &async_dlq);
+    EXPECT_EQ(async_dlq.records().size(), 1u) << "async: exactly one late record reported";
+}
+
+// allowed_lateness_ms for session windows: the band holds session [1,3] open past
+// end+gap so a late record at ts=2 merges in (sum 112) before the single fire.
+TEST(SqlRuntime, SessionWindowAllowedLatenessHoldsAndIncludesLateRecord) {
+    ensure_sql_installed_once();
+    const std::map<std::string, std::string> params = {{"allowed_lateness_ms", "5"}};
+    const auto rows = run_session_window_with(std::make_shared<AllowedLatenessSessionSource>(),
+                                              std::make_shared<InMemoryStateBackend>(),
+                                              params);
+    std::map<std::int64_t, std::vector<std::int64_t>> sums_by_start;
+    for (const auto& rec : rows) {
+        const Row& r = rec.value();
+        sums_by_start[static_cast<std::int64_t>(r.values.at("window_start").as_number())].push_back(
+            static_cast<std::int64_t>(r.values.at("s").as_number()));
+    }
+    ASSERT_EQ(sums_by_start[1].size(), 1u) << "session [1,3] fired more than once";
+    EXPECT_EQ(sums_by_start[1][0], 112) << "within-band late record not merged into the session";
+}
+
+// late_records_to_dlq for session windows: a record that would open an
+// already-purged session is routed to the dead-letter channel.
+TEST(SqlRuntime, SessionWindowLateRecordToDeadLetterQueue) {
+    ensure_sql_installed_once();
+    const std::map<std::string, std::string> params = {{"late_records_to_dlq", "true"}};
+    CapturingDeadLetterQueue dlq;
+    run_session_window_with(std::make_shared<LateDataSessionSource>(),
+                            std::make_shared<InMemoryStateBackend>(),
+                            params,
+                            &dlq);
+    const auto recs = dlq.records();
+    ASSERT_EQ(recs.size(), 1u) << "exactly one late record reported";
+    EXPECT_EQ(recs[0].connector, "sql_session_window");
+    EXPECT_EQ(recs[0].direction, "operator");
 }
 
 // Proves the OVERLAP (not just correctness): when many groups' windows fall due
