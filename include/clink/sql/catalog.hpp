@@ -187,6 +187,16 @@ public:
     // primary-key column, or leaving the table with no columns.
     void alter_table(const ast::AlterTableStmt& stmt);
 
+    // ALTER TABLE RENAME: rename a base table (re-keying the catalog and the
+    // persisted JSON) or rename one of its columns. A column rename cascades to
+    // the event-time-column and primary-key references that name it. Throws
+    // TranslationError on: an unknown table (unless IF EXISTS), a non-table target
+    // (view / materialized view), a destination table/column name that already
+    // exists, or (column rename) an absent source column. Dependent views that
+    // reference the old name are NOT rewritten in v1 (they fail at their next
+    // query). Re-persists when a persistence dir is set.
+    void rename(const ast::RenameStmt& stmt);
+
     // Lookup. Returns nullptr if not found.
     [[nodiscard]] const TableDef* get_table(const std::string& name) const;
 

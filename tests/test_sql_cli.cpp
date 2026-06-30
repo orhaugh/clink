@@ -317,6 +317,29 @@ TEST(SqlCli, AlterTablePersistsAcrossInvocations) {
     fs::remove_all(cat_dir);
 }
 
+// ALTER TABLE RENAME TO re-keys the persisted catalog: a later invocation loads
+// the table, renames it, and the JSON file moves from the old name to the new.
+TEST(SqlCli, RenameTablePersistsAcrossInvocations) {
+    namespace fs = std::filesystem;
+    auto cat_dir = fs::temp_directory_path() /
+                   ("clink_sql_cli_rename_" +
+                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::remove_all(cat_dir);
+
+    auto r1 = run_compiler("--catalog-dir " + cat_dir.string() +
+                           " -e \"CREATE TABLE t (a BIGINT) WITH (connector='file', path='/x')\"");
+    EXPECT_EQ(r1.exit_code, 0) << r1.stderr_text;
+    EXPECT_TRUE(fs::exists(cat_dir / "t.json"));
+
+    auto r2 =
+        run_compiler("--catalog-dir " + cat_dir.string() + " -e \"ALTER TABLE t RENAME TO t2\"");
+    EXPECT_EQ(r2.exit_code, 0) << r2.stderr_text;
+    EXPECT_FALSE(fs::exists(cat_dir / "t.json")) << "old table file should be removed";
+    EXPECT_TRUE(fs::exists(cat_dir / "t2.json")) << "renamed table file should exist";
+
+    fs::remove_all(cat_dir);
+}
+
 // ---------------------------------------------------------------------------
 // HTTP submission integration test. Skips when clink_node isn't available.
 // ---------------------------------------------------------------------------

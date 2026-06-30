@@ -209,6 +209,106 @@ void Catalog::alter_table(const ast::AlterTableStmt& stmt) {
     }
 }
 
+void Catalog::rename(const ast::RenameStmt& stmt) {
+    auto it = tables_.find(stmt.table_name);
+    if (it == tables_.end()) {
+        if (stmt.if_exists) {
+            return;
+        }
+        throw TranslationError("table does not exist: " + stmt.table_name, stmt.loc.pos);
+    }
+    if (it->second.is_materialized_view() || it->second.is_logical_view()) {
+        throw TranslationError("\"" + stmt.table_name +
+                                   "\" is not a table (ALTER TABLE RENAME applies to base tables "
+                                   "only)",
+                               stmt.loc.pos);
+    }
+
+    if (stmt.kind == ast::RenameStmt::Kind::Table) {
+        if (stmt.new_name == stmt.table_name) {
+            return;  // rename to itself: no-op
+        }
+        if (tables_.find(stmt.new_name) != tables_.end()) {
+            throw TranslationError("object '" + stmt.new_name + "' already exists", stmt.loc.pos);
+        }
+        TableDef def = std::move(it->second);
+        tables_.erase(it);
+        def.name = stmt.new_name;
+        tables_.emplace(stmt.new_name, std::move(def));
+        std::replace(order_.begin(), order_.end(), stmt.table_name, stmt.new_name);
+        if (!persistence_dir_.empty()) {
+            fs::create_directories(persistence_dir_);
+            write_file_atomic(table_json_path(persistence_dir_, stmt.new_name),
+                              to_json(tables_.at(stmt.new_name)));
+            std::error_code ec;
+            fs::remove(table_json_path(persistence_dir_, stmt.table_name), ec);
+        }
+        return;
+    }
+
+    // Column rename. Validate before mutating; the rename then cascades to the
+    // event-time-column and primary-key references that name the old column.
+    TableDef& def = it->second;
+    auto find_col = [&def](const std::string& name) {
+        return std::find_if(def.columns.begin(), def.columns.end(), [&name](const ColumnSpec& c) {
+            return c.name == name;
+        });
+    };
+    auto cit = find_col(stmt.old_column);
+    if (cit == def.columns.end()) {
+        throw TranslationError(
+            "column '" + stmt.old_column + "' does not exist in '" + stmt.table_name + "'",
+            stmt.loc.pos);
+    }
+    if (stmt.new_name == stmt.old_column) {
+        return;  // no-op
+    }
+    if (find_col(stmt.new_name) != def.columns.end()) {
+        throw TranslationError(
+            "column '" + stmt.new_name + "' already exists in '" + stmt.table_name + "'",
+            stmt.loc.pos);
+    }
+    cit->name = stmt.new_name;
+    if (auto et = def.properties.find("event_time_column");
+        et != def.properties.end() && et->second == stmt.old_column) {
+        et->second = stmt.new_name;
+    }
+    if (auto pk = def.properties.find("primary_key"); pk != def.properties.end()) {
+        // Rewrite the CSV, replacing the renamed column token (trimmed).
+        std::string out;
+        const std::string& csv = pk->second;
+        std::size_t pos = 0;
+        bool first = true;
+        while (pos <= csv.size()) {
+            auto end = csv.find(',', pos);
+            if (end == std::string::npos) {
+                end = csv.size();
+            }
+            auto tok = csv.substr(pos, end - pos);
+            auto a = tok.find_first_not_of(" \t");
+            auto b = tok.find_last_not_of(" \t");
+            if (a != std::string::npos) {
+                const std::string trimmed = tok.substr(a, b - a + 1);
+                if (!first) {
+                    out += ',';
+                }
+                out += (trimmed == stmt.old_column) ? stmt.new_name : trimmed;
+                first = false;
+            }
+            if (end == csv.size()) {
+                break;
+            }
+            pos = end + 1;
+        }
+        pk->second = out;
+    }
+    lift_typed_fields(def);  // re-derive primary_key from the rewritten CSV
+    if (!persistence_dir_.empty()) {
+        fs::create_directories(persistence_dir_);
+        write_file_atomic(table_json_path(persistence_dir_, stmt.table_name), to_json(def));
+    }
+}
+
 const ast::SelectStmt* Catalog::get_view_query(const std::string& name) const {
     auto it = view_queries_.find(name);
     return it == view_queries_.end() ? nullptr : &it->second;

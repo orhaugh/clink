@@ -261,6 +261,11 @@ int main(int argc, char** argv) {
                 catalog.alter_table(std::get<clink::sql::ast::AlterTableStmt>(stmt));
                 continue;
             }
+            if (std::holds_alternative<clink::sql::ast::RenameStmt>(stmt)) {
+                // ALTER TABLE RENAME TO / RENAME COLUMN: a catalog rename.
+                catalog.rename(std::get<clink::sql::ast::RenameStmt>(stmt));
+                continue;
+            }
             if (std::holds_alternative<clink::sql::ast::CreateMaterializedViewStmt>(stmt)) {
                 // MATTBL: register the backing table and submit the continuous
                 // maintenance job (INSERT INTO <view> <SELECT>). The original

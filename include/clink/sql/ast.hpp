@@ -411,6 +411,21 @@ struct AlterTableStmt {
     Loc loc;
 };
 
+// ALTER TABLE <name> RENAME TO <new> | RENAME COLUMN <old> TO <new>. libpg_query
+// parses both as a RenameStmt (renameType OBJECT_TABLE vs OBJECT_COLUMN). A
+// catalog rename: the table key / column name in the TableDef changes. v1 covers
+// base tables only (ALTER VIEW / ALTER MATERIALIZED VIEW RENAME are rejected).
+struct RenameStmt {
+    enum class Kind { Table, Column };
+    Kind kind;
+    std::string table_name;  // the table being altered
+    std::optional<std::string> schema;
+    std::string old_column;  // Column: the existing column name
+    std::string new_name;    // Table: the new table name; Column: the new column name
+    bool if_exists = false;  // ALTER TABLE IF EXISTS ... RENAME
+    Loc loc;
+};
+
 // Set-op kind on a SelectStmt. None = normal SELECT.
 // Otherwise the statement is (larg) <set-op> (rarg); target_list /
 // from_* / where / group / having on the outer are unused. UnionAll
@@ -566,6 +581,7 @@ using Statement = std::variant<CreateTableStmt,
                                CreateMaterializedViewStmt,
                                CreateViewStmt,
                                AlterTableStmt,
+                               RenameStmt,
                                AnalyzeStmt,
                                std::unique_ptr<ExplainStmt>>;
 

@@ -232,6 +232,64 @@ TEST(SqlCatalog, AlterTableRejectsDroppingLastColumn) {
     EXPECT_THROW(alter(cat, "ALTER TABLE t DROP COLUMN a"), TranslationError);
 }
 
+namespace {
+void rename_obj(Catalog& cat, const char* sql) {
+    cat.rename(std::get<ast::RenameStmt>(parse(sql).statements[0]));
+}
+}  // namespace
+
+TEST(SqlCatalog, RenameTableReKeysCatalog) {
+    Catalog cat;
+    make_table(cat, "CREATE TABLE t (a BIGINT) WITH (connector='kafka', topic='x')");
+    rename_obj(cat, "ALTER TABLE t RENAME TO t2");
+    EXPECT_EQ(cat.get_table("t"), nullptr);
+    ASSERT_NE(cat.get_table("t2"), nullptr);
+    EXPECT_EQ(cat.get_table("t2")->name, "t2");
+}
+
+TEST(SqlCatalog, RenameTableGuards) {
+    Catalog cat;
+    make_table(cat, "CREATE TABLE t (a BIGINT) WITH (connector='kafka', topic='x')");
+    make_table(cat, "CREATE TABLE u (a BIGINT) WITH (connector='kafka', topic='y')");
+    EXPECT_THROW(rename_obj(cat, "ALTER TABLE t RENAME TO u"), TranslationError);     // collision
+    EXPECT_THROW(rename_obj(cat, "ALTER TABLE nope RENAME TO z"), TranslationError);  // unknown
+    EXPECT_NO_THROW(rename_obj(cat, "ALTER TABLE IF EXISTS nope RENAME TO z"));       // IF EXISTS
+    // A materialized view is not ALTER TABLE RENAME-able.
+    TableDef mv;
+    mv.name = "mv";
+    mv.properties["view_kind"] = "materialized";
+    mv.columns.push_back(ColumnSpec{"a", arrow::int64()});
+    cat.register_table(std::move(mv));
+    EXPECT_THROW(rename_obj(cat, "ALTER TABLE mv RENAME TO mv2"), TranslationError);
+}
+
+// Renaming a column cascades to the event-time-column and primary-key references
+// that name it (and re-lifts the typed primary_key field).
+TEST(SqlCatalog, RenameColumnCascadesEventTimeAndPrimaryKey) {
+    Catalog cat;
+    make_table(cat,
+               "CREATE TABLE t (id BIGINT, ts BIGINT, v BIGINT) "
+               "WITH (connector='kafka', topic='x', event_time_column='ts', primary_key='id')");
+    rename_obj(cat, "ALTER TABLE t RENAME COLUMN ts TO event_ts");
+    rename_obj(cat, "ALTER TABLE t RENAME COLUMN id TO pk");
+    const TableDef* def = cat.get_table("t");
+    EXPECT_EQ(col_names(*def), (std::vector<std::string>{"pk", "event_ts", "v"}));
+    EXPECT_EQ(def->properties.at("event_time_column"), "event_ts");
+    EXPECT_EQ(def->properties.at("primary_key"), "pk");
+    ASSERT_EQ(def->primary_key.size(), 1u);
+    EXPECT_EQ(def->primary_key[0], "pk");
+}
+
+TEST(SqlCatalog, RenameColumnGuards) {
+    Catalog cat;
+    make_table(cat, "CREATE TABLE t (a BIGINT, b BIGINT) WITH (connector='kafka', topic='x')");
+    EXPECT_THROW(rename_obj(cat, "ALTER TABLE t RENAME COLUMN nope TO c"),
+                 TranslationError);  // absent source
+    EXPECT_THROW(rename_obj(cat, "ALTER TABLE t RENAME COLUMN a TO b"),
+                 TranslationError);  // destination exists
+    EXPECT_EQ(col_names(*cat.get_table("t")), (std::vector<std::string>{"a", "b"}));  // unchanged
+}
+
 // drop_object enforces Postgres object-kind matching: DROP TABLE rejects a
 // materialized view and DROP MATERIALIZED VIEW rejects a plain table, neither
 // removing anything; the matching kind drops.

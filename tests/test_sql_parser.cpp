@@ -407,6 +407,37 @@ TEST(SqlParser, RejectsUnsupportedAlterTableActions) {
     EXPECT_THROW(parse("ALTER TABLE t ADD PRIMARY KEY (c)"), TranslationError);
 }
 
+TEST(SqlParser, ParsesAlterTableRenameTo) {
+    auto script = parse("ALTER TABLE t RENAME TO t2");
+    ASSERT_EQ(script.statements.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<ast::RenameStmt>(script.statements[0]));
+    const auto& rn = std::get<ast::RenameStmt>(script.statements[0]);
+    EXPECT_EQ(rn.kind, ast::RenameStmt::Kind::Table);
+    EXPECT_EQ(rn.table_name, "t");
+    EXPECT_EQ(rn.new_name, "t2");
+    EXPECT_FALSE(rn.if_exists);
+}
+
+TEST(SqlParser, ParsesAlterTableRenameColumn) {
+    auto script = parse("ALTER TABLE t RENAME COLUMN a TO b");
+    const auto& rn = std::get<ast::RenameStmt>(script.statements[0]);
+    EXPECT_EQ(rn.kind, ast::RenameStmt::Kind::Column);
+    EXPECT_EQ(rn.table_name, "t");
+    EXPECT_EQ(rn.old_column, "a");
+    EXPECT_EQ(rn.new_name, "b");
+}
+
+TEST(SqlParser, ParsesAlterTableRenameIfExists) {
+    auto script = parse("ALTER TABLE IF EXISTS t RENAME TO t2");
+    EXPECT_TRUE(std::get<ast::RenameStmt>(script.statements[0]).if_exists);
+}
+
+// v1 supports ALTER TABLE renames only; ALTER VIEW / MATERIALIZED VIEW are rejected.
+TEST(SqlParser, RejectsAlterViewRename) {
+    EXPECT_THROW(parse("ALTER MATERIALIZED VIEW m RENAME TO m2"), TranslationError);
+    EXPECT_THROW(parse("ALTER VIEW v RENAME COLUMN a TO b"), TranslationError);
+}
+
 TEST(SqlParser, ParsesCreateTableIfNotExists) {
     auto script = parse(
         "CREATE TABLE IF NOT EXISTS t (a BIGINT) WITH (connector='file', format='json', "

@@ -1574,6 +1574,57 @@ ast::AlterTableStmt translate_alter_table_stmt(const JsonValue& body) {
 // form on a single table; VACUUM has no clink meaning and is rejected. The
 // optional `TABLE` keyword in the Flink-style spelling is stripped by the
 // pre-parser before this point.
+// ALTER TABLE <name> RENAME TO <new> / RENAME COLUMN <old> TO <new> parses as a
+// PG RenameStmt. renameType OBJECT_TABLE = rename the table; OBJECT_COLUMN =
+// rename a column (with relationType OBJECT_TABLE for ALTER TABLE). v1 supports
+// ALTER TABLE renames only; ALTER VIEW / MATERIALIZED VIEW renames and other
+// rename kinds are rejected.
+ast::RenameStmt translate_rename_stmt(const JsonValue& body) {
+    ast::RenameStmt stmt;
+    stmt.loc = loc_from(body);
+    const std::string rename_type = body.contains("renameType") && body.at("renameType").is_string()
+                                        ? body.at("renameType").as_string()
+                                        : std::string{};
+    const std::string relation_type =
+        body.contains("relationType") && body.at("relationType").is_string()
+            ? body.at("relationType").as_string()
+            : std::string{};
+    if (!body.contains("relation") || !body.at("relation").is_object()) {
+        unsupported("RENAME missing target relation", stmt.loc.pos);
+    }
+    auto rel = translate_range_var(body.at("relation"));
+    stmt.table_name = std::move(rel.name);
+    stmt.schema = std::move(rel.schema);
+    if (body.contains("missing_ok") && body.at("missing_ok").is_bool()) {
+        stmt.if_exists = body.at("missing_ok").as_bool();
+    }
+    if (!body.contains("newname") || !body.at("newname").is_string()) {
+        unsupported("RENAME missing the new name", stmt.loc.pos);
+    }
+    stmt.new_name = body.at("newname").as_string();
+    if (rename_type == "OBJECT_TABLE") {
+        stmt.kind = ast::RenameStmt::Kind::Table;
+    } else if (rename_type == "OBJECT_COLUMN") {
+        if (relation_type != "OBJECT_TABLE") {
+            unsupported("only ALTER TABLE ... RENAME COLUMN is supported (not ALTER " +
+                            (relation_type.empty() ? std::string("<unknown>") : relation_type) +
+                            ")",
+                        stmt.loc.pos);
+        }
+        stmt.kind = ast::RenameStmt::Kind::Column;
+        if (!body.contains("subname") || !body.at("subname").is_string()) {
+            unsupported("RENAME COLUMN missing the column name", stmt.loc.pos);
+        }
+        stmt.old_column = body.at("subname").as_string();
+    } else {
+        unsupported("unsupported RENAME: " +
+                        (rename_type.empty() ? std::string("<unknown>") : rename_type) +
+                        " (v1 supports ALTER TABLE RENAME TO / RENAME COLUMN)",
+                    stmt.loc.pos);
+    }
+    return stmt;
+}
+
 ast::AnalyzeStmt translate_vacuum_stmt(const JsonValue& body) {
     ast::AnalyzeStmt stmt;
     stmt.loc = loc_from(body);
@@ -1628,6 +1679,9 @@ ast::Statement translate_statement(const JsonValue& outer_stmt) {
     }
     if (kind == "AlterTableStmt") {
         return ast::Statement{translate_alter_table_stmt(*body)};
+    }
+    if (kind == "RenameStmt") {
+        return ast::Statement{translate_rename_stmt(*body)};
     }
     if (kind == "InsertStmt") {
         return ast::Statement{translate_insert_stmt(*body)};

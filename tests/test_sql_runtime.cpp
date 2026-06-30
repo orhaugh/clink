@@ -1197,6 +1197,58 @@ TEST(SqlRuntime, AlterTableAddColumnMakesItQueryableEndToEnd) {
     }
 }
 
+// ALTER TABLE RENAME COLUMN end-to-end: renaming a column to match the source's
+// actual field name makes it queryable + decode under the new name (and the old
+// name stops binding). Realistic use: fixing a declared column to match upstream.
+TEST(SqlRuntime, AlterTableRenameColumnTakesEffectEndToEnd) {
+    ensure_sql_installed_once();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_rename_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_rename_out.ndjson";
+    for (const auto& p : {in_path, out_path}) {
+        std::filesystem::remove(p);
+    }
+    // The source's field is named `amount`.
+    write_lines(in_path, {R"({"amount":10})", R"({"amount":20})"});
+
+    Catalog cat;
+    // Declared (wrongly) as `amt`; the source has `amount`, so it would decode null.
+    auto ddl = parse(std::string{"CREATE TABLE t (amt BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (amount BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    // `amount` is not a declared column yet, so a query on it cannot bind.
+    EXPECT_ANY_THROW((void)compile(cat, "INSERT INTO out_t SELECT amount FROM t"));
+
+    // Rename the column to match the source field; now it binds, runs, decodes.
+    cat.rename(std::get<ast::RenameStmt>(
+        parse("ALTER TABLE t RENAME COLUMN amt TO amount").statements[0]));
+    auto spec = compile(cat, "INSERT INTO out_t SELECT amount FROM t");
+
+    InProcessCluster cluster("tm-sql-rename-e2e", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    std::multiset<std::int64_t> got;
+    for (const auto& line : read_lines(out_path)) {
+        got.insert(static_cast<std::int64_t>(clink::config::parse(line).at("amount").as_number()));
+    }
+    EXPECT_EQ(got, (std::multiset<std::int64_t>{10, 20}));
+
+    for (const auto& p : {in_path, out_path}) {
+        std::filesystem::remove(p);
+    }
+}
+
 // #61 phase 2: end-to-end MATCH_RECOGNIZE. Compiles a real query to get the
 // actual match_recognize_row params, builds the op via the registry factory,
 // and drives it through a cluster-free Dag + LocalExecutor (VectorSource ->
