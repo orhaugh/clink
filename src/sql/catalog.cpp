@@ -141,6 +141,74 @@ void Catalog::register_logical_view(TableDef def, ast::SelectStmt query) {
     // materialized view's backing connector table).
 }
 
+void Catalog::alter_table(const ast::AlterTableStmt& stmt) {
+    auto it = tables_.find(stmt.table_name);
+    if (it == tables_.end()) {
+        if (stmt.if_exists) {
+            return;
+        }
+        throw TranslationError("table does not exist: " + stmt.table_name, stmt.loc.pos);
+    }
+    if (it->second.is_materialized_view() || it->second.is_logical_view()) {
+        throw TranslationError(
+            "\"" + stmt.table_name + "\" is not a table (ALTER TABLE applies to base tables only)",
+            stmt.loc.pos);
+    }
+    // Apply to a copy so a mid-statement failure leaves the table unchanged.
+    TableDef next = it->second;
+    const auto et = next.properties.find("event_time_column");
+    const std::string event_time_col = et != next.properties.end() ? et->second : std::string{};
+    auto find_col = [&next](const std::string& name) {
+        return std::find_if(next.columns.begin(), next.columns.end(), [&name](const ColumnSpec& c) {
+            return c.name == name;
+        });
+    };
+    for (const auto& cmd : stmt.cmds) {
+        if (cmd.kind == ast::AlterTableCmd::Kind::AddColumn) {
+            if (find_col(cmd.column_name) != next.columns.end()) {
+                if (cmd.missing_ok) {
+                    continue;  // ADD COLUMN IF NOT EXISTS
+                }
+                throw TranslationError(
+                    "column '" + cmd.column_name + "' already exists in '" + stmt.table_name + "'",
+                    cmd.loc.pos);
+            }
+            next.columns.push_back(ColumnSpec{cmd.column_name, sql_type_to_arrow(cmd.type)});
+        } else {  // DropColumn
+            auto cit = find_col(cmd.column_name);
+            if (cit == next.columns.end()) {
+                if (cmd.missing_ok) {
+                    continue;  // DROP COLUMN IF EXISTS
+                }
+                throw TranslationError(
+                    "column '" + cmd.column_name + "' does not exist in '" + stmt.table_name + "'",
+                    cmd.loc.pos);
+            }
+            if (cmd.column_name == event_time_col) {
+                throw TranslationError(
+                    "cannot drop column '" + cmd.column_name + "': it is the event-time column",
+                    cmd.loc.pos);
+            }
+            if (std::find(next.primary_key.begin(), next.primary_key.end(), cmd.column_name) !=
+                next.primary_key.end()) {
+                throw TranslationError(
+                    "cannot drop column '" + cmd.column_name + "': it is part of the primary key",
+                    cmd.loc.pos);
+            }
+            next.columns.erase(cit);
+        }
+    }
+    if (next.columns.empty()) {
+        throw TranslationError("ALTER TABLE would leave '" + stmt.table_name + "' with no columns",
+                               stmt.loc.pos);
+    }
+    it->second = std::move(next);  // commit
+    if (!persistence_dir_.empty()) {
+        fs::create_directories(persistence_dir_);
+        write_file_atomic(table_json_path(persistence_dir_, stmt.table_name), to_json(it->second));
+    }
+}
+
 const ast::SelectStmt* Catalog::get_view_query(const std::string& name) const {
     auto it = view_queries_.find(name);
     return it == view_queries_.end() ? nullptr : &it->second;

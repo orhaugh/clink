@@ -363,6 +363,50 @@ TEST(SqlParser, RejectsCreateViewColumnAliases) {
     EXPECT_THROW(parse("CREATE VIEW v (x, y) AS SELECT a, b FROM t"), TranslationError);
 }
 
+TEST(SqlParser, ParsesAlterTableAddColumn) {
+    auto script = parse("ALTER TABLE t ADD COLUMN c BIGINT");
+    ASSERT_EQ(script.statements.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<ast::AlterTableStmt>(script.statements[0]));
+    const auto& alt = std::get<ast::AlterTableStmt>(script.statements[0]);
+    EXPECT_EQ(alt.table_name, "t");
+    EXPECT_FALSE(alt.if_exists);
+    ASSERT_EQ(alt.cmds.size(), 1u);
+    EXPECT_EQ(alt.cmds[0].kind, ast::AlterTableCmd::Kind::AddColumn);
+    EXPECT_EQ(alt.cmds[0].column_name, "c");
+    EXPECT_FALSE(alt.cmds[0].missing_ok);
+}
+
+TEST(SqlParser, ParsesAlterTableDropColumn) {
+    auto script = parse("ALTER TABLE t DROP COLUMN c");
+    const auto& alt = std::get<ast::AlterTableStmt>(script.statements[0]);
+    ASSERT_EQ(alt.cmds.size(), 1u);
+    EXPECT_EQ(alt.cmds[0].kind, ast::AlterTableCmd::Kind::DropColumn);
+    EXPECT_EQ(alt.cmds[0].column_name, "c");
+}
+
+TEST(SqlParser, ParsesAlterTableMultipleCommands) {
+    auto script = parse("ALTER TABLE t ADD COLUMN a BIGINT, DROP COLUMN b");
+    const auto& alt = std::get<ast::AlterTableStmt>(script.statements[0]);
+    ASSERT_EQ(alt.cmds.size(), 2u);
+    EXPECT_EQ(alt.cmds[0].kind, ast::AlterTableCmd::Kind::AddColumn);
+    EXPECT_EQ(alt.cmds[0].column_name, "a");
+    EXPECT_EQ(alt.cmds[1].kind, ast::AlterTableCmd::Kind::DropColumn);
+    EXPECT_EQ(alt.cmds[1].column_name, "b");
+}
+
+TEST(SqlParser, ParsesAlterTableIfExistsAndIfNotExists) {
+    auto s1 = parse("ALTER TABLE IF EXISTS t DROP COLUMN c");
+    EXPECT_TRUE(std::get<ast::AlterTableStmt>(s1.statements[0]).if_exists);
+    auto s2 = parse("ALTER TABLE t ADD COLUMN IF NOT EXISTS c BIGINT");
+    EXPECT_TRUE(std::get<ast::AlterTableStmt>(s2.statements[0]).cmds[0].missing_ok);
+}
+
+// Other AlterTableCmd subtypes are rejected in v1.
+TEST(SqlParser, RejectsUnsupportedAlterTableActions) {
+    EXPECT_THROW(parse("ALTER TABLE t ALTER COLUMN c TYPE TEXT"), TranslationError);
+    EXPECT_THROW(parse("ALTER TABLE t ADD PRIMARY KEY (c)"), TranslationError);
+}
+
 TEST(SqlParser, ParsesCreateTableIfNotExists) {
     auto script = parse(
         "CREATE TABLE IF NOT EXISTS t (a BIGINT) WITH (connector='file', format='json', "

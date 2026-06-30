@@ -150,6 +150,88 @@ TEST(SqlCatalog, DropTableRemovesEntry) {
     EXPECT_FALSE(cat.drop_table("t"));  // already gone
 }
 
+namespace {
+// Apply an ALTER TABLE statement (parsed from SQL) to the catalog.
+void alter(Catalog& cat, const char* sql) {
+    cat.alter_table(std::get<ast::AlterTableStmt>(parse(sql).statements[0]));
+}
+void make_table(Catalog& cat, const char* sql) {
+    cat.register_table(std::get<ast::CreateTableStmt>(parse(sql).statements[0]));
+}
+std::vector<std::string> col_names(const TableDef& def) {
+    std::vector<std::string> out;
+    for (const auto& c : def.columns) {
+        out.push_back(c.name);
+    }
+    return out;
+}
+}  // namespace
+
+TEST(SqlCatalog, AlterTableAddAndDropColumn) {
+    Catalog cat;
+    make_table(cat, "CREATE TABLE t (a BIGINT, b BIGINT) WITH (connector='kafka', topic='x')");
+    alter(cat, "ALTER TABLE t ADD COLUMN c TEXT");
+    EXPECT_EQ(col_names(*cat.get_table("t")), (std::vector<std::string>{"a", "b", "c"}));
+    alter(cat, "ALTER TABLE t DROP COLUMN b");
+    EXPECT_EQ(col_names(*cat.get_table("t")), (std::vector<std::string>{"a", "c"}));
+    // Multiple commands apply in order.
+    alter(cat, "ALTER TABLE t ADD COLUMN d BIGINT, DROP COLUMN a");
+    EXPECT_EQ(col_names(*cat.get_table("t")), (std::vector<std::string>{"c", "d"}));
+}
+
+TEST(SqlCatalog, AlterTableDuplicateAndAbsentColumnGuards) {
+    Catalog cat;
+    make_table(cat, "CREATE TABLE t (a BIGINT) WITH (connector='kafka', topic='x')");
+    EXPECT_THROW(alter(cat, "ALTER TABLE t ADD COLUMN a BIGINT"), TranslationError);
+    EXPECT_THROW(alter(cat, "ALTER TABLE t DROP COLUMN nope"), TranslationError);
+    // IF (NOT) EXISTS makes both a no-op.
+    EXPECT_NO_THROW(alter(cat, "ALTER TABLE t ADD COLUMN IF NOT EXISTS a BIGINT"));
+    EXPECT_NO_THROW(alter(cat, "ALTER TABLE t DROP COLUMN IF EXISTS nope"));
+    EXPECT_EQ(col_names(*cat.get_table("t")), (std::vector<std::string>{"a"}));
+}
+
+TEST(SqlCatalog, AlterTableProtectsEventTimeAndPrimaryKeyColumns) {
+    Catalog cat;
+    make_table(cat,
+               "CREATE TABLE t (id BIGINT, ts BIGINT, v BIGINT) "
+               "WITH (connector='kafka', topic='x', event_time_column='ts', primary_key='id')");
+    EXPECT_THROW(alter(cat, "ALTER TABLE t DROP COLUMN ts"), TranslationError);  // event time
+    EXPECT_THROW(alter(cat, "ALTER TABLE t DROP COLUMN id"), TranslationError);  // primary key
+    EXPECT_NO_THROW(alter(cat, "ALTER TABLE t DROP COLUMN v"));                  // a plain column
+    EXPECT_EQ(col_names(*cat.get_table("t")), (std::vector<std::string>{"id", "ts"}));
+}
+
+TEST(SqlCatalog, AlterTableRejectsNonTableAndUnknown) {
+    Catalog cat;
+    // A materialized-view-kind TableDef is not ALTER TABLE-able.
+    TableDef mv;
+    mv.name = "mv";
+    mv.properties["view_kind"] = "materialized";
+    mv.columns.push_back(ColumnSpec{"a", arrow::int64()});
+    cat.register_table(std::move(mv));
+    EXPECT_THROW(alter(cat, "ALTER TABLE mv ADD COLUMN b BIGINT"), TranslationError);
+    // Unknown table: throws, unless IF EXISTS.
+    EXPECT_THROW(alter(cat, "ALTER TABLE nope ADD COLUMN b BIGINT"), TranslationError);
+    EXPECT_NO_THROW(alter(cat, "ALTER TABLE IF EXISTS nope ADD COLUMN b BIGINT"));
+}
+
+// A multi-command ALTER is atomic: a failing later command rolls back the whole
+// statement (the earlier ADD is not left applied).
+TEST(SqlCatalog, AlterTableIsAtomic) {
+    Catalog cat;
+    make_table(cat, "CREATE TABLE t (a BIGINT) WITH (connector='kafka', topic='x')");
+    EXPECT_THROW(alter(cat, "ALTER TABLE t ADD COLUMN c BIGINT, DROP COLUMN nope"),
+                 TranslationError);
+    // c must NOT have been added (the statement rolled back).
+    EXPECT_EQ(col_names(*cat.get_table("t")), (std::vector<std::string>{"a"}));
+}
+
+TEST(SqlCatalog, AlterTableRejectsDroppingLastColumn) {
+    Catalog cat;
+    make_table(cat, "CREATE TABLE t (a BIGINT) WITH (connector='kafka', topic='x')");
+    EXPECT_THROW(alter(cat, "ALTER TABLE t DROP COLUMN a"), TranslationError);
+}
+
 // drop_object enforces Postgres object-kind matching: DROP TABLE rejects a
 // materialized view and DROP MATERIALIZED VIEW rejects a plain table, neither
 // removing anything; the matching kind drops.

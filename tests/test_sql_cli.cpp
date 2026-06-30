@@ -289,6 +289,34 @@ TEST(SqlCli, CreateViewAndDropViewEndToEnd) {
     EXPECT_NE(r3.stderr_text.find("not a view"), std::string::npos) << r3.stderr_text;
 }
 
+// ALTER TABLE mutates the persisted catalog: a later invocation loads the table,
+// alters it, and re-persists, so the change survives across processes.
+TEST(SqlCli, AlterTablePersistsAcrossInvocations) {
+    namespace fs = std::filesystem;
+    auto cat_dir = fs::temp_directory_path() /
+                   ("clink_sql_cli_alter_" +
+                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::remove_all(cat_dir);
+
+    auto r1 = run_compiler("--catalog-dir " + cat_dir.string() +
+                           " -e \"CREATE TABLE t (a BIGINT) WITH (connector='file', path='/x')\"");
+    EXPECT_EQ(r1.exit_code, 0) << r1.stderr_text;
+
+    // A separate invocation loads the persisted table and adds a column.
+    auto r2 = run_compiler("--catalog-dir " + cat_dir.string() +
+                           " -e \"ALTER TABLE t ADD COLUMN bcol TEXT\"");
+    EXPECT_EQ(r2.exit_code, 0) << r2.stderr_text;
+
+    // The re-persisted catalog JSON now carries the new column.
+    std::ifstream in(cat_dir / "t.json");
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    EXPECT_NE(ss.str().find("bcol"), std::string::npos)
+        << "altered column not persisted: " << ss.str();
+
+    fs::remove_all(cat_dir);
+}
+
 // ---------------------------------------------------------------------------
 // HTTP submission integration test. Skips when clink_node isn't available.
 // ---------------------------------------------------------------------------

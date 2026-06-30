@@ -1144,6 +1144,59 @@ TEST(SqlRuntime, CreateViewExpandsAndFiltersEndToEnd) {
     }
 }
 
+// ALTER TABLE ADD COLUMN end-to-end: a column not in the original declaration is
+// unusable, and becomes queryable after the ALTER (the catalog change takes
+// effect for subsequent compilations), with its values flowing through.
+TEST(SqlRuntime, AlterTableAddColumnMakesItQueryableEndToEnd) {
+    ensure_sql_installed_once();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_alter_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_alter_out.ndjson";
+    for (const auto& p : {in_path, out_path}) {
+        std::filesystem::remove(p);
+    }
+    write_lines(in_path, {R"({"a":1,"b":10})", R"({"a":2,"b":20})"});
+
+    Catalog cat;
+    // Declare ONLY column `a` to begin with.
+    auto ddl = parse(std::string{"CREATE TABLE t (a BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (a BIGINT, b BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    // `b` is not declared yet, so a query referencing it cannot bind.
+    EXPECT_ANY_THROW((void)compile(cat, "INSERT INTO out_t SELECT a, b FROM t"));
+
+    // Declare it via ALTER, then the same query binds, runs, and carries b.
+    cat.alter_table(
+        std::get<ast::AlterTableStmt>(parse("ALTER TABLE t ADD COLUMN b BIGINT").statements[0]));
+    auto spec = compile(cat, "INSERT INTO out_t SELECT a, b FROM t");
+
+    InProcessCluster cluster("tm-sql-alter-e2e", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    std::multiset<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& line : read_lines(out_path)) {
+        auto js = clink::config::parse(line);
+        got.emplace(static_cast<std::int64_t>(js.at("a").as_number()),
+                    static_cast<std::int64_t>(js.at("b").as_number()));
+    }
+    EXPECT_EQ(got, (std::multiset<std::pair<std::int64_t, std::int64_t>>{{1, 10}, {2, 20}}));
+
+    for (const auto& p : {in_path, out_path}) {
+        std::filesystem::remove(p);
+    }
+}
+
 // #61 phase 2: end-to-end MATCH_RECOGNIZE. Compiles a real query to get the
 // actual match_recognize_row params, builds the op via the registry factory,
 // and drives it through a cluster-free Dag + LocalExecutor (VectorSource ->

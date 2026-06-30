@@ -387,6 +387,30 @@ struct CreateTableStmt {
     Loc loc;
 };
 
+// One command in an ALTER TABLE statement. v1 supports column add / drop only;
+// other AlterTableCmd subtypes (SET options, ALTER COLUMN TYPE, constraints) are
+// rejected at parse time.
+struct AlterTableCmd {
+    enum class Kind { AddColumn, DropColumn };
+    Kind kind;
+    std::string column_name;  // ADD: the new column; DROP: the target column
+    TypeName type;            // ADD COLUMN only
+    bool missing_ok = false;  // ADD COLUMN IF NOT EXISTS / DROP COLUMN IF EXISTS
+    Loc loc;
+};
+
+// ALTER TABLE [IF EXISTS] <name> <cmd> [, <cmd> ...]. A streaming table is a
+// catalog declaration over an external source/sink (no stored data to rewrite),
+// so this mutates the catalog TableDef's columns. Applied to a base table only
+// (ALTER VIEW / ALTER MATERIALIZED VIEW are rejected at parse time via objtype).
+struct AlterTableStmt {
+    std::string table_name;
+    std::optional<std::string> schema;
+    std::vector<AlterTableCmd> cmds;
+    bool if_exists = false;  // ALTER TABLE IF EXISTS - silent when the table is absent
+    Loc loc;
+};
+
 // Set-op kind on a SelectStmt. None = normal SELECT.
 // Otherwise the statement is (larg) <set-op> (rarg); target_list /
 // from_* / where / group / having on the outer are unused. UnionAll
@@ -541,6 +565,7 @@ using Statement = std::variant<CreateTableStmt,
                                ShowTablesStmt,
                                CreateMaterializedViewStmt,
                                CreateViewStmt,
+                               AlterTableStmt,
                                AnalyzeStmt,
                                std::unique_ptr<ExplainStmt>>;
 

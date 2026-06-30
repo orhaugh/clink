@@ -255,6 +255,12 @@ int main(int argc, char** argv) {
                     catalog, std::move(std::get<clink::sql::ast::CreateViewStmt>(stmt)));
                 continue;
             }
+            if (std::holds_alternative<clink::sql::ast::AlterTableStmt>(stmt)) {
+                // ALTER TABLE mutates the catalog declaration (column add/drop);
+                // a streaming table has no stored data to rewrite.
+                catalog.alter_table(std::get<clink::sql::ast::AlterTableStmt>(stmt));
+                continue;
+            }
             if (std::holds_alternative<clink::sql::ast::CreateMaterializedViewStmt>(stmt)) {
                 // MATTBL: register the backing table and submit the continuous
                 // maintenance job (INSERT INTO <view> <SELECT>). The original

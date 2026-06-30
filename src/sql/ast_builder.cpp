@@ -1498,6 +1498,78 @@ ast::CreateViewStmt translate_view_stmt(const JsonValue& body) {
     return stmt;
 }
 
+// ALTER TABLE [IF EXISTS] <name> <cmd>, ... parses as a PG AlterTableStmt with a
+// list of AlterTableCmd nodes. v1 supports ADD COLUMN / DROP COLUMN (column-level
+// schema evolution of the catalog declaration); other actions (SET options,
+// ALTER COLUMN TYPE, constraints) and ALTER VIEW / ALTER MATERIALIZED VIEW (other
+// objtypes) are rejected.
+ast::AlterTableStmt translate_alter_table_stmt(const JsonValue& body) {
+    ast::AlterTableStmt stmt;
+    stmt.loc = loc_from(body);
+    const std::string objtype = body.contains("objtype") && body.at("objtype").is_string()
+                                    ? body.at("objtype").as_string()
+                                    : std::string{};
+    if (objtype != "OBJECT_TABLE") {
+        unsupported("only ALTER TABLE is supported; got ALTER " +
+                        (objtype.empty() ? std::string("<unknown>") : objtype),
+                    stmt.loc.pos);
+    }
+    if (!body.contains("relation") || !body.at("relation").is_object()) {
+        unsupported("ALTER TABLE missing target relation", stmt.loc.pos);
+    }
+    auto rel = translate_range_var(body.at("relation"));
+    stmt.table_name = std::move(rel.name);
+    stmt.schema = std::move(rel.schema);
+    if (body.contains("missing_ok") && body.at("missing_ok").is_bool()) {
+        stmt.if_exists = body.at("missing_ok").as_bool();
+    }
+    if (!body.contains("cmds") || !body.at("cmds").is_array() ||
+        body.at("cmds").as_array().empty()) {
+        unsupported("ALTER TABLE requires at least one action", stmt.loc.pos);
+    }
+    for (const auto& wrapper : body.at("cmds").as_array()) {
+        auto [ckind, cbody] = node_wrapper(wrapper);
+        if (ckind != "AlterTableCmd" || cbody == nullptr) {
+            unsupported("ALTER TABLE: unexpected command node " + ckind, stmt.loc.pos);
+        }
+        ast::AlterTableCmd cmd;
+        cmd.loc = loc_from(*cbody);
+        const std::string subtype = cbody->contains("subtype") && cbody->at("subtype").is_string()
+                                        ? cbody->at("subtype").as_string()
+                                        : std::string{};
+        if (cbody->contains("missing_ok") && cbody->at("missing_ok").is_bool()) {
+            cmd.missing_ok = cbody->at("missing_ok").as_bool();
+        }
+        if (subtype == "AT_AddColumn") {
+            cmd.kind = ast::AlterTableCmd::Kind::AddColumn;
+            if (!cbody->contains("def") || !cbody->at("def").is_object()) {
+                unsupported("ALTER TABLE ADD COLUMN missing column definition", cmd.loc.pos);
+            }
+            auto [dkind, dbody] = node_wrapper(cbody->at("def"));
+            if (dkind != "ColumnDef" || dbody == nullptr) {
+                unsupported("ALTER TABLE ADD COLUMN: expected a ColumnDef, got " + dkind,
+                            cmd.loc.pos);
+            }
+            auto col = translate_column_def(*dbody);
+            cmd.column_name = std::move(col.name);
+            cmd.type = std::move(col.type);
+        } else if (subtype == "AT_DropColumn") {
+            cmd.kind = ast::AlterTableCmd::Kind::DropColumn;
+            if (!cbody->contains("name") || !cbody->at("name").is_string()) {
+                unsupported("ALTER TABLE DROP COLUMN missing column name", cmd.loc.pos);
+            }
+            cmd.column_name = cbody->at("name").as_string();
+        } else {
+            unsupported("unsupported ALTER TABLE action: " +
+                            (subtype.empty() ? std::string("<unknown>") : subtype) +
+                            " (v1 supports ADD COLUMN / DROP COLUMN)",
+                        cmd.loc.pos);
+        }
+        stmt.cmds.push_back(std::move(cmd));
+    }
+    return stmt;
+}
+
 // ANALYZE [<col>...] <table> parses as a PG VacuumStmt. We support the ANALYZE
 // form on a single table; VACUUM has no clink meaning and is rejected. The
 // optional `TABLE` keyword in the Flink-style spelling is stripped by the
@@ -1553,6 +1625,9 @@ ast::Statement translate_statement(const JsonValue& outer_stmt) {
     }
     if (kind == "ViewStmt") {
         return ast::Statement{translate_view_stmt(*body)};
+    }
+    if (kind == "AlterTableStmt") {
+        return ast::Statement{translate_alter_table_stmt(*body)};
     }
     if (kind == "InsertStmt") {
         return ast::Statement{translate_insert_stmt(*body)};

@@ -176,6 +176,17 @@ public:
     // registered logical view. The pointer is stable until the view is dropped.
     [[nodiscard]] const ast::SelectStmt* get_view_query(const std::string& name) const;
 
+    // ALTER TABLE: apply ADD COLUMN / DROP COLUMN commands to a base table's
+    // catalog declaration, re-persisting when a persistence dir is set. A
+    // streaming table has no stored data to rewrite, so this just mutates the
+    // declared columns. All commands apply atomically (a later failure rolls the
+    // whole statement back). Throws TranslationError on: an unknown table
+    // (unless IF EXISTS), a non-table target (view / materialized view), adding
+    // an existing column (unless ADD COLUMN IF NOT EXISTS), dropping an absent
+    // column (unless DROP COLUMN IF EXISTS), dropping the event-time or a
+    // primary-key column, or leaving the table with no columns.
+    void alter_table(const ast::AlterTableStmt& stmt);
+
     // Lookup. Returns nullptr if not found.
     [[nodiscard]] const TableDef* get_table(const std::string& name) const;
 
