@@ -1305,12 +1305,24 @@ public:
             }
         } else if (element.is_watermark()) {
             auto wm = element.as_watermark();
-            if (!wm.is_idle())
+            if (!wm.is_idle()) {
+                note_watermark_(wm.timestamp());
                 fire_due_(wm.timestamp(), out);
+            }
             this->on_watermark(wm, out);
         } else {
             this->on_barrier(element.as_barrier(), out);
         }
+    }
+
+    // Eager watermark observation for the async ingest path: the runner calls
+    // this the instant it pulls a watermark (before the fire/forward is
+    // epoch-deferred), so the process_async fold sees the same drop horizon the
+    // sync path does. The sync/columnar paths take the watermark through
+    // process() above; both route through note_watermark_.
+    void on_watermark_observed(Watermark wm) override {
+        if (!wm.is_idle())
+            note_watermark_(wm.timestamp());
     }
 
     // Columnar ingest: buffer columnar data by reading only the time / group /
@@ -1399,10 +1411,11 @@ public:
                 groups[git->second].push_back(i);
             }
         }
+        const std::int64_t horizon = drop_horizon_();  // late-data cutoff (live: sync fold)
         for (std::size_t g = 0; g < groups.size(); ++g) {
             auto& by_window = state_[group_keys[g]];
             for (const std::int64_t idx : groups[g]) {
-                fold_record_into_(by_window, rows[static_cast<std::size_t>(idx)], nullptr);
+                fold_record_into_(by_window, rows[static_cast<std::size_t>(idx)], nullptr, horizon);
             }
         }
         return true;
@@ -1459,22 +1472,41 @@ public:
         if (!element.is_data()) {
             return;
         }
+        // Late-data cutoff captured AT INGEST: this coroutine folds later (after
+        // get_async), by which time current_wm_ may have advanced past the
+        // record's window. Freezing the horizon here drops only records that were
+        // already too late when received, matching the sync path's inline drop.
+        const std::int64_t horizon = drop_horizon_();
         for (const auto& rec : element.as_data()) {
             Row row = rec.value();
             auto tit = row.values.find(time_column_);
             if (tit == row.values.end() || !tit->second.is_number()) {
                 continue;
             }
+            // Skip a wholly-late record before paying for a get_async/put round
+            // trip: if every window it lands in is already purged, drop it.
+            const auto ts = static_cast<std::int64_t>(tit->second.as_number());
+            bool any_live = false;
+            for (auto [ws, we] : windows_for_(ts)) {
+                (void)ws;
+                if (we > horizon) {
+                    any_live = true;
+                    break;
+                }
+            }
+            if (!any_live) {
+                continue;
+            }
             std::string key = group_key_(row);
             auto kv = keyed_state_();
             auto* rt = this->runtime();
             auto factory =
-                [this, kv, row = std::move(row), key, rt]() mutable -> async::Task<void> {
+                [this, kv, row = std::move(row), key, rt, horizon]() mutable -> async::Task<void> {
                 auto cur = co_await kv.get_async(key);
                 std::map<std::int64_t, WindowBucket> by_window =
                     cur.has_value() ? std::move(*cur) : std::map<std::int64_t, WindowBucket>{};
                 std::vector<std::int64_t> new_win_ends;
-                this->fold_record_into_(by_window, row, &new_win_ends);
+                this->fold_record_into_(by_window, row, &new_win_ends, horizon);
                 kv.put(key, by_window);
                 for (std::int64_t we : new_win_ends) {
                     rt->timer_service()->register_event_time_timer(we, key);
@@ -1594,14 +1626,27 @@ private:
     // Fold `row` into one group's window map (keyed by window_end), creating
     // buckets as needed. When new_win_ends != nullptr, appends the window_end of
     // each window first created here (so the async path can register a timer).
+    //
+    // `drop_horizon` is the late-data cutoff: a window whose end is <= it has
+    // already fired and been purged, so re-folding would re-create the bucket
+    // and emit a second, partial row for the same (group, window_end). Such
+    // contributions are dropped. The caller passes the horizon so it reflects
+    // the watermark AT INGEST: the sync/columnar paths fold inline (live
+    // current_wm_), but the async path folds inside a deferred coroutine, where
+    // current_wm_ may already have advanced past the record's window - using the
+    // live value there would wrongly drop a record that arrived on time. Pass
+    // kNoDropHorizon to fold everything.
     void fold_record_into_(std::map<std::int64_t, WindowBucket>& by_window,
                            const Row& row,
-                           std::vector<std::int64_t>* new_win_ends) const {
+                           std::vector<std::int64_t>* new_win_ends,
+                           std::int64_t drop_horizon) const {
         auto it = row.values.find(time_column_);
         if (it == row.values.end() || !it->second.is_number())
             return;
         const auto ts = static_cast<std::int64_t>(it->second.as_number());
         for (auto [win_start, win_end] : windows_for_(ts)) {
+            if (win_end <= drop_horizon)
+                continue;  // late: window already fired + purged
             auto wit = by_window.find(win_end);
             if (wit == by_window.end()) {
                 WindowBucket b;
@@ -1632,6 +1677,7 @@ private:
     // AVG / variance are order-independent. Emission stays watermark-driven.
     void vectorised_window_fold_(const arrow::RecordBatch& rb) {
         const std::int64_t n = rb.num_rows();
+        const std::int64_t horizon = drop_horizon_();  // late-data cutoff (live: sync fold)
         const int time_idx = rb.schema()->GetFieldIndex(time_column_);
         const auto time_type = time_idx >= 0 ? rb.schema()->field(time_idx)->type() : nullptr;
         std::vector<KeyCol> key_cols;
@@ -1661,6 +1707,8 @@ private:
             const auto ts = static_cast<std::int64_t>(tv.as_number());
             const std::string key = columnar_group_key(rb, key_cols, i);
             for (auto [win_start, win_end] : windows_for_(ts)) {
+                if (win_end <= horizon)
+                    continue;  // already-fired window: drop (matches fold_record_into_)
                 auto& slice = by_group[key][win_end];
                 slice.window_start = win_start;
                 slice.idxs.push_back(i);
@@ -1715,7 +1763,7 @@ private:
         auto it = row.values.find(time_column_);
         if (it == row.values.end() || !it->second.is_number())
             return;
-        fold_record_into_(state_[group_key_(row)], row, nullptr);
+        fold_record_into_(state_[group_key_(row)], row, nullptr, drop_horizon_());
     }
 
     void fire_due_(EventTime wm, Emitter<Row>& out) {
@@ -1736,7 +1784,29 @@ private:
             out.emit_data(std::move(emit_batch));
     }
 
+    // Record the latest event-time watermark seen, across every ingest path.
+    void note_watermark_(EventTime wm) {
+        have_wm_ = true;
+        if (wm.millis() > current_wm_)
+            current_wm_ = wm.millis();
+    }
+
+    // Late-data cutoff: a window whose end is <= this has already fired (and, at
+    // the default allowed_lateness of 0, been erased), so a record landing in it
+    // now is too late. Before the first watermark nothing is late.
+    static constexpr std::int64_t kNoDropHorizon = std::numeric_limits<std::int64_t>::min();
+    [[nodiscard]] std::int64_t drop_horizon_() const {
+        return have_wm_ ? current_wm_ - allowed_lateness_ms_ : kNoDropHorizon;
+    }
+
     bool effective_async_ = false;
+    bool have_wm_ = false;
+    std::int64_t current_wm_ = 0;
+    // Grace period a fired window is kept for late updates. 0 (default) means
+    // fire-and-drop: late records are dropped, never re-folded. A SQL knob to
+    // raise this (keep the window and re-emit on late updates) is a follow-up;
+    // the field exists so the late guard reads a single horizon.
+    std::int64_t allowed_lateness_ms_ = 0;
     Kind kind_;
     std::string time_column_;
     std::int64_t size_ms_;

@@ -754,6 +754,60 @@ std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> window_relation(
     return rel;
 }
 
+// Scripted source for the late-data regression: two records into window [0,10),
+// a watermark at 10 that fires and PURGES that window, then a LATE record whose
+// event time (2) falls in the already-fired window, then a record for window
+// [10,20) and a closing watermark. A correct engine drops the late record; the
+// pre-fix WindowRowOp re-created and re-fired [0,10), emitting a phantom row.
+class LateDataWindowSource final : public Source<Row> {
+public:
+    bool produce(Emitter<Row>& out) override {
+        if (this->cancelled() || done_) {
+            return false;
+        }
+        Batch<Row> b1;
+        b1.push(window_input_row(1, 1, 5));
+        b1.push(window_input_row(1, 3, 7));
+        out.emit_data(std::move(b1));
+        out.emit_watermark(Watermark{EventTime{10}});  // fires + purges [0,10) (k=1, sum=12)
+        Batch<Row> b2;
+        b2.push(window_input_row(1, 2, 100));  // LATE: belongs to purged [0,10) -> must drop
+        b2.push(window_input_row(1, 15, 3));   // window [10,20)
+        out.emit_data(std::move(b2));
+        out.emit_watermark(Watermark{EventTime{30}});  // fires [10,20) (k=1, sum=3)
+        done_ = true;
+        return false;
+    }
+    [[nodiscard]] bool is_bounded() const noexcept override { return true; }
+    std::string name() const override { return "late_data_window_src"; }
+
+private:
+    bool done_ = false;
+};
+
+std::vector<Record<Row>> run_tumbling_window_scripted(std::shared_ptr<StateBackend> backend) {
+    const auto* builder =
+        cluster::DagBuilderRegistry::default_instance().find("tumbling_window_row");
+    Dag dag;
+    auto h = dag.add_source<Row>(std::make_shared<LateDataWindowSource>());
+    clink::plugin::BuildContext ctx;
+    ctx.params["time_column"] = "ts";
+    ctx.params["size_ms"] = "10";
+    ctx.params["group_keys"] = "k";
+    ctx.params["group_key_outputs"] = "k";
+    ctx.params["aggregates"] = R"([{"name":"s","fn":"sum","input_column":"amt"}])";
+    std::vector<std::any> upstream = {std::any{h}};
+    auto out = (*builder)(dag, upstream, ctx);
+    auto h_win = std::any_cast<StageHandle<Row>>(out.main_handle);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_win, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::move(backend);
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return sink->collected_records();
+}
+
 }  // namespace
 
 // Window aggregation rides the async/disaggregated path: with a deferring
@@ -783,6 +837,34 @@ TEST(SqlRuntime, AsyncStateTumblingWindowMatchesSyncPath) {
         << "async window path must produce the same window relation as the sync path";
     EXPECT_GT(rrb->remote_loads(), 0u)
         << "window op did not route its per-group state through the deferring backend (async path)";
+}
+
+// Late-data correctness: a record arriving after its tumbling window has fired
+// and been purged must be DROPPED, not re-folded into a re-created window (which
+// emitted a duplicate, partial row for the same window before the fix). Verified
+// on both the sync in-memory path and the async/disaggregated path - the drop
+// horizon (current_wm_) must be identical across them.
+TEST(SqlRuntime, TumblingWindowDropsLateRecord) {
+    ensure_sql_installed_once();
+    auto check = [](const std::vector<Record<Row>>& rows, const char* path) {
+        std::map<std::int64_t, std::vector<std::int64_t>> sums_by_start;
+        for (const auto& rec : rows) {
+            const Row& r = rec.value();
+            sums_by_start[static_cast<std::int64_t>(r.values.at("window_start").as_number())]
+                .push_back(static_cast<std::int64_t>(r.values.at("s").as_number()));
+        }
+        // Exactly one row for [0,10) (sum 12, late 100 dropped) and one for
+        // [10,20) (sum 3). A second [0,10) row means the late record re-fired.
+        ASSERT_EQ(sums_by_start[0].size(), 1u) << path << ": late record re-fired window [0,10)";
+        EXPECT_EQ(sums_by_start[0][0], 12) << path;
+        ASSERT_EQ(sums_by_start[10].size(), 1u) << path;
+        EXPECT_EQ(sums_by_start[10][0], 3) << path;
+    };
+    check(run_tumbling_window_scripted(std::make_shared<InMemoryStateBackend>()), "sync");
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    check(run_tumbling_window_scripted(rrb), "async");
 }
 
 // Proves the OVERLAP (not just correctness): when many groups' windows fall due
