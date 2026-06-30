@@ -26,6 +26,14 @@ struct JobGraphSpec;
 
 namespace clink::lineage {
 
+// One column of a dataset's schema: a name and a friendly type
+// ("bigint", "string", "double", "decimal(p,s)", ...). Maps to an
+// OpenLineage SchemaDatasetFacet field.
+struct SchemaField {
+    std::string name;
+    std::string type;
+};
+
 // One source column that contributes to a sink output column. Identifies
 // the source dataset by the same (ns, name) the source vertex carries, plus
 // the source field name.
@@ -59,6 +67,10 @@ struct LineageDataset {
     std::string ns;
     std::string name;
     std::map<std::string, std::string> facets;
+    // Column schema (name + type), when the connector op carries one (SQL
+    // jobs, via the schema_columns param). Empty when unknown. Maps to the
+    // OpenLineage SchemaDatasetFacet.
+    std::vector<SchemaField> schema;
     // Per-output-column lineage. Populated on SINK datasets only, when the
     // job came from SQL and column lineage was captured. Empty otherwise.
     std::vector<ColumnLineageField> column_lineage;

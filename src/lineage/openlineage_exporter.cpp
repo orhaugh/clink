@@ -78,6 +78,22 @@ void write_datasets(http::JsonWriter& w,
                 w.kv(k, val);
             }
             w.end_object();
+            // OpenLineage schema facet (column name + type), when known.
+            if (!d.schema.empty()) {
+                w.key("schema").begin_object();
+                w.kv("_producer", producer);
+                w.kv("_schemaURL",
+                     "https://openlineage.io/spec/facets/1-1-0/SchemaDatasetFacet.json");
+                w.key("fields").begin_array();
+                for (const auto& f : d.schema) {
+                    w.begin_object();
+                    w.kv("name", f.name);
+                    w.kv("type", f.type);
+                    w.end_object();
+                }
+                w.end_array();
+                w.end_object();
+            }
             // OpenLineage columnLineage facet (output datasets only).
             if (!d.column_lineage.empty()) {
                 w.key("columnLineage").begin_object();

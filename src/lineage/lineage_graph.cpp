@@ -156,6 +156,52 @@ bool in_set(std::string_view family, std::initializer_list<const char*> set) {
     return false;
 }
 
+// Friendly name for a serialize_row_schema type code (row_columnar_batcher.hpp).
+// Unknown codes pass through verbatim rather than being lost.
+std::string friendly_type(const std::string& code) {
+    if (code == "i64") {
+        return "bigint";
+    }
+    if (code == "i32") {
+        return "int";
+    }
+    if (code == "f64") {
+        return "double";
+    }
+    if (code == "f32") {
+        return "float";
+    }
+    if (code == "bool") {
+        return "boolean";
+    }
+    if (code == "str") {
+        return "string";
+    }
+    if (code.rfind("dec_", 0) == 0) {  // dec_<precision>_<scale>
+        auto rest = code.substr(4);
+        if (const auto us = rest.find('_'); us != std::string::npos) {
+            return "decimal(" + rest.substr(0, us) + "," + rest.substr(us + 1) + ")";
+        }
+    }
+    return code;
+}
+
+// Parse a schema_columns string ("name:code;name:code") into schema fields.
+std::vector<SchemaField> parse_schema_columns(const std::string& spec) {
+    std::vector<SchemaField> out;
+    for (const auto& entry : split(spec, ';')) {
+        if (entry.empty()) {
+            continue;
+        }
+        const auto colon = entry.rfind(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        out.push_back({entry.substr(0, colon), friendly_type(entry.substr(colon + 1))});
+    }
+    return out;
+}
+
 }  // namespace
 
 std::string connector_family(const std::string& op_type) {
@@ -190,13 +236,19 @@ LineageDataset dataset_from_family(const std::string& family,
     LineageDataset d;
     d.facets["connector"] = family;
     if (!out_channel.empty()) {
-        d.facets["schema"] = out_channel;  // coarse element-type hint
+        d.facets["channel"] = out_channel;  // coarse element-type hint (row/int64/string)
     }
     if (const auto fmt = first_of(params, {"format"}); !fmt.empty()) {
         d.facets["format"] = fmt;
     }
     if (const auto mode = first_of(params, {"mode"}); !mode.empty()) {
         d.facets["mode"] = mode;
+    }
+    // Column schema, when the op carries one (SQL Row-channel sources/sinks set
+    // the schema_columns param: "name:code;name:code", codes per
+    // serialize_row_schema in row_columnar_batcher.hpp).
+    if (const auto sc = first_of(params, {"schema_columns"}); !sc.empty()) {
+        d.schema = parse_schema_columns(sc);
     }
 
     // Message brokers and streaming systems.
@@ -597,6 +649,16 @@ void write_vertex(http::JsonWriter& w, const LineageVertex& v) {
             w.kv(k, val);
         }
         w.end_object();
+        if (!d.schema.empty()) {
+            w.key("schema").begin_array();
+            for (const auto& f : d.schema) {
+                w.begin_object();
+                w.kv("name", f.name);
+                w.kv("type", f.type);
+                w.end_object();
+            }
+            w.end_array();
+        }
         if (!d.column_lineage.empty()) {
             w.key("column_lineage");
             write_cl_array(w, d.column_lineage);
@@ -615,6 +677,13 @@ LineageDataset parse_dataset(const config::JsonValue& jv) {
         for (const auto& [k, val] : jv.at("facets").as_object()) {
             if (val.is_string()) {
                 d.facets[k] = val.as_string();
+            }
+        }
+    }
+    if (jv.contains("schema") && jv.at("schema").is_array()) {
+        for (const auto& f : jv.at("schema").as_array()) {
+            if (f.is_object()) {
+                d.schema.push_back({f.string_or("name", ""), f.string_or("type", "")});
             }
         }
     }

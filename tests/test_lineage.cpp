@@ -69,7 +69,27 @@ TEST(LineageDataset, Kafka) {
     EXPECT_EQ(d.ns, "kafka://broker:9092");
     EXPECT_EQ(d.name, "orders");
     EXPECT_EQ(d.facets.at("connector"), "kafka");
-    EXPECT_EQ(d.facets.at("schema"), "string");
+    EXPECT_EQ(d.facets.at("channel"), "string");  // coarse element-type hint
+}
+
+TEST(LineageDataset, SchemaFromSchemaColumns) {
+    // SQL Row-channel ops carry the column schema in the schema_columns param.
+    const auto d = dataset_for(
+        "file_json_source",
+        {{"path", "/data/orders"}, {"schema_columns", "id:i64;region:str;rate:dec_10_2"}},
+        "row");
+    ASSERT_EQ(d.schema.size(), 3u);
+    EXPECT_EQ(d.schema[0].name, "id");
+    EXPECT_EQ(d.schema[0].type, "bigint");
+    EXPECT_EQ(d.schema[1].name, "region");
+    EXPECT_EQ(d.schema[1].type, "string");
+    EXPECT_EQ(d.schema[2].name, "rate");
+    EXPECT_EQ(d.schema[2].type, "decimal(10,2)");
+}
+
+TEST(LineageDataset, NoSchemaWhenAbsent) {
+    const auto d = dataset_for("kafka_source_string", {{"topic", "t"}}, "string");
+    EXPECT_TRUE(d.schema.empty());
 }
 
 TEST(LineageDataset, S3Parquet) {
@@ -203,6 +223,25 @@ TEST(LineageJson, FromJsonIgnoresUnknownWrapperKeys) {
     ASSERT_EQ(g.sources.size(), 1u);
     EXPECT_EQ(g.sources[0].id, "s");
     EXPECT_EQ(g.sources[0].datasets[0].ns, "kafka://b");
+}
+
+TEST(LineageJson, SchemaSurvivesRoundTrip) {
+    JobGraphSpec spec;
+    spec.ops.push_back(
+        op("src", "file_json_source", {}, {{"path", "/d"}, {"schema_columns", "id:i64;name:str"}}));
+    spec.ops.push_back(op("snk", "file_json_sink", {"src"}, {{"path", "/o"}}));
+
+    const auto g = extract_lineage(spec);
+    ASSERT_EQ(g.sources.size(), 1u);
+    ASSERT_EQ(g.sources[0].datasets[0].schema.size(), 2u);
+    EXPECT_EQ(g.sources[0].datasets[0].schema[0].name, "id");
+    EXPECT_EQ(g.sources[0].datasets[0].schema[0].type, "bigint");
+
+    const auto g2 = LineageGraph::from_json(g.to_json());
+    ASSERT_EQ(g2.sources.size(), 1u);
+    ASSERT_EQ(g2.sources[0].datasets[0].schema.size(), 2u);
+    EXPECT_EQ(g2.sources[0].datasets[0].schema[1].name, "name");
+    EXPECT_EQ(g2.sources[0].datasets[0].schema[1].type, "string");
 }
 
 // --- column lineage --------------------------------------------------------

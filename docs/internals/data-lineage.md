@@ -26,7 +26,7 @@ plus open, additive facets) so the common adapter is a near-trivial mapping.
 
 | Type | What it is |
 | --- | --- |
-| `LineageDataset` | One external data entity. `ns` is the storage system's address (`kafka://broker:9092`, `postgres://db:5432`, `s3://bucket`, `file`); `name` is the entity within it (a topic, a table, an object key, a path); `facets` is open string metadata (connector family, record format, element-schema hint, delivery mode). |
+| `LineageDataset` | One external data entity. `ns` is the storage system's address (`kafka://broker:9092`, `postgres://db:5432`, `s3://bucket`, `file`); `name` is the entity within it (a topic, a table, an object key, a path); `facets` is open string metadata (connector family, record format, channel hint, delivery mode); `schema` is the column list (name + friendly type) when the op carries one. |
 | `LineageVertex` | One connector: a source or a sink. Keyed by the graph-local operator `id`, with the stable `uid` when set. Source vertices also carry `boundedness` (`bounded` / `unbounded` / `unknown`). |
 | `LineageEdge` | A coarse source-vertex to sink-vertex dependency. |
 | `LineageGraph` | `sources`, `sinks`, `edges`. `to_json()` / `from_json()` round-trip it. |
@@ -163,8 +163,9 @@ flowchart LR
 `JobStarted` to a START run event (sources as inputs, sinks as outputs) and a
 `JobCompleted` to a COMPLETE / FAIL / ABORT, correlated by a job-derived `runId`.
 A FAIL event carries the first failure as an OpenLineage `errorMessage` run
-facet. Output datasets carry a `columnLineage` dataset facet when column lineage
-was captured (`fields → { <out>: { inputFields:[{namespace,name,field}],
+facet. Datasets carry a `schema` facet (column name + type) when the connector
+op declares one; output datasets also carry a `columnLineage` facet when column
+lineage was captured (`fields → { <out>: { inputFields:[{namespace,name,field}],
 transformationType } }`). Delivery is asynchronous: `on_event` serialises the
 event and pushes it onto a bounded outbox; a worker thread POSTs from the outbox
 so the publish thread is never blocked. Overflow drops the oldest queued event
