@@ -149,6 +149,7 @@
 #include "clink/rocksdb_s3/install.hpp"
 #endif
 #ifdef CLINK_LINKED_SQL
+#include "clink/nexmark/register.hpp"  // header-only synthetic 'nexmark' Row source
 #include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/install.hpp"
@@ -2466,6 +2467,12 @@ void install_linked_impls() {
 #endif
 #ifdef CLINK_LINKED_SQL
     clink::sql::install(reg);
+    // Synthetic 'nexmark' Row source (header-only generator): lets a SQL table
+    // WITH (connector='nexmark', ...) run end to end with no external broker -
+    // useful for trying the SQL workbench and for self-contained demos. Mirrors
+    // what the nexmark benchmarks register; re-registering the (already-installed)
+    // blackhole_sink_row is harmless (same as the benchmarks do).
+    clink::nexmark::register_nexmark_factories(reg);
 #endif
 }
 
