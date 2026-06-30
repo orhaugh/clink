@@ -34,6 +34,7 @@
 #include "clink/connectors/parquet_s3_sink.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/core/columnar_batcher.hpp"  // make_auto_arrow_batcher
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
@@ -74,7 +75,9 @@ inline void parquet_sink(clink::api::DataStream<T> stream,
     auto* env = stream.env();
     auto& reg = env->registry();
     const std::string op_type = env->mint_inline_op_type("s3_parquet_typed_sink");
-    auto batcher = clink::make_default_arrow_batcher<T>(std::move(codec));
+    // Auto-select: a CLINK_ARROW_FIELDS-described T gets typed columnar Parquet
+    // columns; anything else keeps the binary-fallback layout.
+    auto batcher = clink::make_auto_arrow_batcher<T>(std::move(codec));
     reg.template register_sink<T>(
         op_type,
         [opts, batcher, bucket_assigner](

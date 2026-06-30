@@ -30,9 +30,13 @@
 // Constraints on T:
 //   * default-constructible (parse default-constructs then assigns)
 //   * public, assignable data members named in CLINK_ARROW_FIELDS
-//   * each named field's type has an ArrowColumnTraits mapping (the
-//     fixed-width integer types, float, double, bool, std::string;
-//     extend ArrowColumnTraits for more)
+//   * each named field's type is one of:
+//       - a leaf: fixed-width integer, float, double, bool, std::string
+//         (or a type with an ArrowColumnTraits specialisation)
+//       - a composite that recurses to leaves: std::optional<E> (nullable
+//         column), std::vector<E> (Arrow list), std::map<K,V> (Arrow map),
+//         or a nested struct that ALSO has a CLINK_ARROW_FIELDS description
+//         (Arrow struct). Nesting is arbitrary-depth.
 //
 // Scope of this prototype: the wire/Parquet layout becomes genuinely
 // columnar and externally typed. It does NOT auto-vectorise row
@@ -46,6 +50,7 @@
 // and the generator below stay exactly as they are.
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -57,6 +62,8 @@
 #include "clink/core/arrow_batcher.hpp"
 
 #ifdef CLINK_HAS_ARROW
+
+#include <arrow/api.h>  // StructBuilder/ListBuilder/MapBuilder + arrays, MakeBuilder
 
 namespace clink {
 
@@ -72,10 +79,12 @@ namespace clink {
 template <typename F>
 struct ArrowColumnTraits {
     static_assert(sizeof(F) == 0,
-                  "clink: no Arrow column mapping for this field type. Supported out of the "
-                  "box: fixed-width integers (8/16/32/64, signed + unsigned), float, double, "
-                  "bool, std::string. Either store the field as one of those, or add an "
-                  "ArrowColumnTraits<> specialisation for it.");
+                  "clink: no Arrow column mapping for this field type. Supported: fixed-width "
+                  "integers (8/16/32/64, signed + unsigned), float, double, bool, std::string "
+                  "(leaves); std::optional<E>, std::vector<E>, std::map<K,V>, and nested "
+                  "CLINK_ARROW_FIELDS structs (composites). For a nested struct field, that "
+                  "struct must ALSO have a CLINK_ARROW_FIELDS description. Otherwise store the "
+                  "field as one of those, or add an ArrowColumnTraits<> specialisation for it.");
 };
 
 #define CLINK_DEFINE_ARROW_COLUMN(CppT, BuilderT, ArrayT, DT_FACTORY) \
@@ -151,41 +160,266 @@ concept HasArrowFields = ArrowFields<T>::registered;
 
 namespace detail {
 
-// Build one Arrow column from field `d` across the whole batch.
+// ---------------------------------------------------------------------
+// Composite field detection (nested struct / container)
+// ---------------------------------------------------------------------
+template <typename>
+struct is_std_vector : std::false_type {};
+template <typename E, typename A>
+struct is_std_vector<std::vector<E, A>> : std::true_type {};
+
+template <typename>
+struct is_std_optional : std::false_type {};
+template <typename E>
+struct is_std_optional<std::optional<E>> : std::true_type {};
+
+template <typename>
+struct is_std_map : std::false_type {};
+template <typename K, typename V, typename C, typename A>
+struct is_std_map<std::map<K, V, C, A>> : std::true_type {};
+
+// A composite field is anything the recursive machinery below decomposes:
+// a described nested struct, an optional, a vector, or a map. Everything
+// else is a leaf handled by an ArrowColumnTraits specialisation.
+template <typename F>
+constexpr bool is_composite_field() {
+    return HasArrowFields<F> || is_std_vector<F>::value || is_std_optional<F>::value ||
+           is_std_map<F>::value;
+}
+
+// A field is nullable iff it is std::optional<E> (the only column with
+// nulls; everything else is non-null by construction).
+template <typename F>
+constexpr bool is_field_nullable() {
+    return is_std_optional<F>::value;
+}
+
+// ---------------------------------------------------------------------
+// Recursive Arrow DataType for any supported field type
+// ---------------------------------------------------------------------
+template <typename F>
+std::shared_ptr<arrow::DataType> arrow_datatype();
+
+template <typename F>
+std::shared_ptr<arrow::DataType> arrow_datatype() {
+    if constexpr (HasArrowFields<F>) {
+        // Nested struct: one Arrow child field per described member.
+        std::vector<std::shared_ptr<arrow::Field>> children;
+        std::apply(
+            [&](auto const&... d) {
+                (children.push_back(arrow::field(
+                     d.name,
+                     arrow_datatype<typename std::decay_t<decltype(d)>::field_type>(),
+                     is_field_nullable<typename std::decay_t<decltype(d)>::field_type>())),
+                 ...);
+            },
+            ArrowFields<F>::descriptors());
+        return arrow::struct_(std::move(children));
+    } else if constexpr (is_std_optional<F>::value) {
+        // Nullability rides on the arrow::Field, not the DataType.
+        return arrow_datatype<typename F::value_type>();
+    } else if constexpr (is_std_vector<F>::value) {
+        using E = typename F::value_type;
+        return arrow::list(arrow::field("item", arrow_datatype<E>(), is_field_nullable<E>()));
+    } else if constexpr (is_std_map<F>::value) {
+        using K = typename F::key_type;
+        using V = typename F::mapped_type;
+        return arrow::map(arrow_datatype<K>(), arrow_datatype<V>());
+    } else {
+        return ArrowColumnTraits<F>::datatype();
+    }
+}
+
+// ---------------------------------------------------------------------
+// Append one value of F to a base builder (downcasts to the concrete
+// builder the matching DataType produced via arrow::MakeBuilder).
+// ---------------------------------------------------------------------
+template <typename F>
+arrow::Status append_value(arrow::ArrayBuilder& b, const F& v);
+
+template <typename F>
+arrow::Status append_value(arrow::ArrayBuilder& b, const F& v) {
+    if constexpr (HasArrowFields<F>) {
+        auto& sb = static_cast<arrow::StructBuilder&>(b);
+        if (auto s = sb.Append(); !s.ok()) {
+            return s;
+        }
+        arrow::Status st = arrow::Status::OK();
+        int idx = 0;
+        std::apply(
+            [&](auto const&... d) {
+                (
+                    [&] {
+                        if (!st.ok()) {
+                            return;
+                        }
+                        using FT = typename std::decay_t<decltype(d)>::field_type;
+                        st = append_value<FT>(*sb.field_builder(idx++), v.*(d.member));
+                    }(),
+                    ...);
+            },
+            ArrowFields<F>::descriptors());
+        return st;
+    } else if constexpr (is_std_optional<F>::value) {
+        if (!v.has_value()) {
+            return b.AppendNull();
+        }
+        return append_value<typename F::value_type>(b, *v);
+    } else if constexpr (is_std_vector<F>::value) {
+        auto& lb = static_cast<arrow::ListBuilder&>(b);
+        if (auto s = lb.Append(); !s.ok()) {
+            return s;
+        }
+        for (const auto& e : v) {
+            if (auto s = append_value<typename F::value_type>(*lb.value_builder(), e); !s.ok()) {
+                return s;
+            }
+        }
+        return arrow::Status::OK();
+    } else if constexpr (is_std_map<F>::value) {
+        auto& mb = static_cast<arrow::MapBuilder&>(b);
+        if (auto s = mb.Append(); !s.ok()) {
+            return s;
+        }
+        for (const auto& [k, val] : v) {
+            if (auto s = append_value<typename F::key_type>(*mb.key_builder(), k); !s.ok()) {
+                return s;
+            }
+            if (auto s = append_value<typename F::mapped_type>(*mb.item_builder(), val); !s.ok()) {
+                return s;
+            }
+        }
+        return arrow::Status::OK();
+    } else {
+        return ArrowColumnTraits<F>::append(static_cast<typename ArrowColumnTraits<F>::Builder&>(b),
+                                            v);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Read one value of F from a base array at index i. A failed downcast
+// throws std::bad_cast; callers catch it to reject a mismatched batch.
+// ---------------------------------------------------------------------
+template <typename F>
+F read_value(const arrow::Array& a, std::int64_t i);
+
+template <typename F>
+F read_value(const arrow::Array& a, std::int64_t i) {
+    if constexpr (HasArrowFields<F>) {
+        const auto& sa = dynamic_cast<const arrow::StructArray&>(a);
+        F out{};
+        int idx = 0;
+        std::apply(
+            [&](auto const&... d) {
+                (
+                    [&] {
+                        using FT = typename std::decay_t<decltype(d)>::field_type;
+                        out.*(d.member) = read_value<FT>(*sa.field(idx++), i);
+                    }(),
+                    ...);
+            },
+            ArrowFields<F>::descriptors());
+        return out;
+    } else if constexpr (is_std_optional<F>::value) {
+        if (a.IsNull(i)) {
+            return std::nullopt;
+        }
+        return read_value<typename F::value_type>(a, i);
+    } else if constexpr (is_std_vector<F>::value) {
+        const auto& la = dynamic_cast<const arrow::ListArray&>(a);
+        F out;
+        const auto start = la.value_offset(i);
+        const auto end = la.value_offset(i + 1);
+        const auto& vals = *la.values();
+        for (auto j = start; j < end; ++j) {
+            out.push_back(read_value<typename F::value_type>(vals, j));
+        }
+        return out;
+    } else if constexpr (is_std_map<F>::value) {
+        const auto& ma = dynamic_cast<const arrow::MapArray&>(a);
+        F out;
+        const auto start = ma.value_offset(i);
+        const auto end = ma.value_offset(i + 1);
+        const auto& keys = *ma.keys();
+        const auto& items = *ma.items();
+        for (auto j = start; j < end; ++j) {
+            out.emplace(read_value<typename F::key_type>(keys, j),
+                        read_value<typename F::mapped_type>(items, j));
+        }
+        return out;
+    } else {
+        return ArrowColumnTraits<F>::read(
+            dynamic_cast<const typename ArrowColumnTraits<F>::Array&>(a), i);
+    }
+}
+
+// Build one Arrow column from field `d` across the whole batch. Leaf scalar
+// fields take the fast path (one concrete builder, no per-row dispatch);
+// composite fields (struct/list/map/optional) build the nested builder tree
+// via arrow::MakeBuilder and recurse.
 template <typename T, typename Desc>
 inline std::shared_ptr<arrow::Array> build_field_column(const Batch<T>& batch, const Desc& d) {
     using F = typename Desc::field_type;
-    using Traits = ArrowColumnTraits<F>;
-    typename Traits::Builder b;
-    if (auto s = b.Reserve(static_cast<std::int64_t>(batch.size())); !s.ok())
-        return nullptr;
-    for (const auto& rec : batch) {
-        if (auto s = Traits::append(b, rec.value().*(d.member)); !s.ok())
+    if constexpr (!is_composite_field<F>()) {
+        using Traits = ArrowColumnTraits<F>;
+        typename Traits::Builder b;
+        if (auto s = b.Reserve(static_cast<std::int64_t>(batch.size())); !s.ok())
             return nullptr;
+        for (const auto& rec : batch) {
+            if (auto s = Traits::append(b, rec.value().*(d.member)); !s.ok())
+                return nullptr;
+        }
+        std::shared_ptr<arrow::Array> arr;
+        if (auto s = b.Finish(&arr); !s.ok())
+            return nullptr;
+        return arr;
+    } else {
+        std::unique_ptr<arrow::ArrayBuilder> b;
+        if (auto s = arrow::MakeBuilder(arrow::default_memory_pool(), arrow_datatype<F>(), &b);
+            !s.ok())
+            return nullptr;
+        for (const auto& rec : batch) {
+            if (auto s = append_value<F>(*b, rec.value().*(d.member)); !s.ok())
+                return nullptr;
+        }
+        std::shared_ptr<arrow::Array> arr;
+        if (auto s = b->Finish(&arr); !s.ok())
+            return nullptr;
+        return arr;
     }
-    std::shared_ptr<arrow::Array> arr;
-    if (auto s = b.Finish(&arr); !s.ok())
-        return nullptr;
-    return arr;
 }
 
-// Read column `col_index` back into field `d` of every row. dynamic_cast
-// guards against a mismatched incoming schema (returns false -> parse
-// rejects the batch, matching the built-in batchers' contract).
+// Read column `col_index` back into field `d` of every row. A schema
+// mismatch (wrong column type) returns false -> parse rejects the batch,
+// matching the built-in batchers' contract. Leaf scalars downcast once;
+// composites reconstruct per row (a bad_cast aborts the column).
 template <typename T, typename Desc>
 inline bool read_field_column(const arrow::RecordBatch& batch,
                               int col_index,
                               const Desc& d,
                               std::vector<T>& rows) {
     using F = typename Desc::field_type;
-    using Traits = ArrowColumnTraits<F>;
-    const auto* col = dynamic_cast<const typename Traits::Array*>(batch.column(col_index).get());
-    if (col == nullptr)
-        return false;
-    for (std::int64_t i = 0; i < batch.num_rows(); ++i) {
-        rows[static_cast<std::size_t>(i)].*(d.member) = Traits::read(*col, i);
+    if constexpr (!is_composite_field<F>()) {
+        using Traits = ArrowColumnTraits<F>;
+        const auto* col =
+            dynamic_cast<const typename Traits::Array*>(batch.column(col_index).get());
+        if (col == nullptr)
+            return false;
+        for (std::int64_t i = 0; i < batch.num_rows(); ++i) {
+            rows[static_cast<std::size_t>(i)].*(d.member) = Traits::read(*col, i);
+        }
+        return true;
+    } else {
+        const auto& col = *batch.column(col_index);
+        try {
+            for (std::int64_t i = 0; i < batch.num_rows(); ++i) {
+                rows[static_cast<std::size_t>(i)].*(d.member) = read_value<F>(col, i);
+            }
+        } catch (const std::bad_cast&) {
+            return false;  // incoming column type does not match F
+        }
+        return true;
     }
-    return true;
 }
 
 }  // namespace detail
@@ -208,8 +442,8 @@ inline ArrowBatcher<T> make_columnar_arrow_batcher() {
             [&](auto const&... d) {
                 (fields.push_back(arrow::field(
                      d.name,
-                     ArrowColumnTraits<typename std::decay_t<decltype(d)>::field_type>::datatype(),
-                     /*nullable=*/false)),
+                     detail::arrow_datatype<typename std::decay_t<decltype(d)>::field_type>(),
+                     detail::is_field_nullable<typename std::decay_t<decltype(d)>::field_type>())),
                  ...);
             },
             descs);
