@@ -2773,6 +2773,33 @@ TEST(SqlBinder, CreateViewRejectsNameCollisionWithTable) {
                  TranslationError);
 }
 
+// A view can be referenced more than once in a query (unlike a CTE, which is
+// at-most-once here): each reference re-binds the defining query independently.
+TEST(SqlBinder, ViewReferencedTwiceExpandsEachTime) {
+    Catalog cat;
+    register_clicks(cat);
+    make_view(cat, "CREATE VIEW v AS SELECT user_id, url FROM clicks");
+    Binder b(cat);
+    // Two references in a UNION ALL: both expand (no at-most-once CTE error).
+    auto plan = b.bind_select(as_select(parse("SELECT url FROM v UNION ALL SELECT url FROM v")));
+    ASSERT_NE(plan, nullptr);
+}
+
+// A view on a join side expands to its defining query, and the join resolves
+// its key against the view's exposed columns (the view name is a valid
+// qualifier in the ON clause, exactly as a base-table name would be).
+TEST(SqlBinder, ViewUsedAsJoinSide) {
+    Catalog cat;
+    register_clicks(cat);  // user_id, ts, url
+    register_events(cat);  // user_id, ts, amount
+    make_view(cat, "CREATE VIEW vclicks AS SELECT user_id, url FROM clicks");
+    Binder b(cat);
+    auto plan = b.bind_select(
+        as_select(parse("SELECT * FROM vclicks JOIN evt ON vclicks.user_id = evt.user_id")));
+    ASSERT_NE(plan, nullptr);
+    EXPECT_NE(join_node(plan.get()), nullptr) << "the view-vs-table join must bind as a join";
+}
+
 // A reference cycle (introduced via OR REPLACE: v1 binds against the prior
 // definition, so creation succeeds) is caught by the expanding-views guard the
 // moment a query tries to expand it.
