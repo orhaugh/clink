@@ -617,6 +617,11 @@ private:
         // without needing the original submitter.
         std::string graph_json;
 
+        // Human-readable job name from the submitted spec (empty when
+        // unnamed). Carried so lifecycle events (lineage start / complete)
+        // can identify the job by name, not just id.
+        std::string name;
+
         // Distributed-checkpointing config carried from SubmitJob. The
         // JM uses checkpoint_dir to address per-job snapshot storage,
         // and interval_ms to drive its periodic trigger thread.

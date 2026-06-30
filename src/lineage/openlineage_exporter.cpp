@@ -93,10 +93,20 @@ std::string build_event_json(const LineageEvent& ev, const OpenLineageConfig& cf
     w.kv("producer", cfg.producer);
     w.key("run").begin_object();
     w.kv("runId", run_id_for(ev.job_id));
+    if (!ev.error.empty()) {
+        w.key("facets").begin_object();
+        w.key("errorMessage").begin_object();
+        w.kv("_producer", cfg.producer);
+        w.kv("_schemaURL", "https://openlineage.io/spec/facets/1-0-0/ErrorMessageRunFacet.json");
+        w.kv("message", ev.error);
+        w.end_object();
+        w.end_object();
+    }
     w.end_object();
     w.key("job").begin_object();
     w.kv("namespace", cfg.job_namespace);
-    w.kv("name", "job_" + std::to_string(ev.job_id));
+    // Prefer the submitter's job name; fall back to the id for unnamed jobs.
+    w.kv("name", ev.job_name.empty() ? "job_" + std::to_string(ev.job_id) : ev.job_name);
     w.end_object();
     // Inputs/outputs are established by the START event; the terminal
     // events carry none (correlated by runId).

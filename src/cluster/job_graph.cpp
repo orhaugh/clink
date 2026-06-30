@@ -110,7 +110,13 @@ std::string escape_json_string(std::string_view s) {
 }  // namespace
 
 std::string JobGraphSpec::to_json() const {
-    std::string out = "{\"ops\":[";
+    std::string out = "{";
+    if (!name.empty()) {
+        out += "\"name\":";
+        out += escape_json_string(name);
+        out += ',';
+    }
+    out += "\"ops\":[";
     for (std::size_t i = 0; i < ops.size(); ++i) {
         const auto& op = ops[i];
         if (i > 0) {
@@ -303,6 +309,8 @@ JobGraphSpec JobGraphSpec::from_json(std::string_view json_text) {
         }
         spec.ops.push_back(std::move(op));
     }
+    // Optional human-readable job name (absent for unnamed jobs).
+    spec.name = root.string_or("name", "");
     // State schema evolution: unpack the expected-version map if the
     // spec carries one (absent for jobs that declare nothing).
     if (const auto packed = root.string_or("expected_state_versions", ""); !packed.empty()) {

@@ -84,10 +84,12 @@ The capture side rides the existing in-process `EventBus`
 `/api/v1/events` SSE stream:
 
 - At submit, `JobManager::submit_job` publishes `jm.job_lineage` with the lineage
-  graph (payload `{"job_id":N,"lineage":{...}}`). Best-effort: a job is never
-  failed because of lineage.
+  graph (payload `{"job_id":N,"job_name":"...","lineage":{...}}`). Best-effort: a
+  job is never failed because of lineage.
 - At termination, the existing `jm.job_completed` event carries the outcome
-  (`ok` / `failed` / `cancelled`).
+  (payload `{"job_id":N,"job_name":"...","status":"...","errors":<count>}`, plus
+  an `"error"` string on failure). The `job_name` and `error` keys are additive;
+  `errors` stays a count for existing consumers.
 
 The graph is also available to poll, for tools that prefer pull over the event
 stream:
@@ -132,9 +134,18 @@ flowchart LR
 `OpenLineageExporter` (`src/lineage/openlineage_exporter.cpp`) maps a
 `JobStarted` to a START run event (sources as inputs, sinks as outputs) and a
 `JobCompleted` to a COMPLETE / FAIL / ABORT, correlated by a job-derived `runId`.
-Delivery is asynchronous: `on_event` serialises the event and pushes it onto a
-bounded outbox; a worker thread POSTs from the outbox so the publish thread is
-never blocked. Overflow drops the oldest queued event and counts the drop.
+A FAIL event carries the first failure as an OpenLineage `errorMessage` run
+facet. Delivery is asynchronous: `on_event` serialises the event and pushes it
+onto a bounded outbox; a worker thread POSTs from the outbox so the publish
+thread is never blocked. Overflow drops the oldest queued event and counts the
+drop.
+
+The OpenLineage job name is the submitter's job name (`JobGraphSpec::name`),
+carried through to both events; it falls back to `job_<id>` only when the job was
+submitted unnamed. The name is set per submission path: the `?name=` query (or a
+`name` in the spec body) for `POST /api/v1/jobs/spec` and `/api/v1/jobs`, and the
+per-statement name for SQL. The name also rides the retained graph and the HA
+manifest, so it survives a leader takeover.
 
 Enable it on the JobManager:
 

@@ -37,6 +37,9 @@ struct LineageEvent {
     Kind kind{Kind::JobStarted};
     std::int64_t ts_ms{0};
     std::uint64_t job_id{0};
+    // Human-readable job name from the submitted spec; empty when the job
+    // was submitted without one (consumers fall back to the id).
+    std::string job_name;
     // JobStarted only: the lineage graph. Empty for JobCompleted.
     LineageGraph graph;
     // JobCompleted only: "ok" | "failed" | "cancelled". Empty otherwise.

@@ -530,6 +530,11 @@ clink::http::HttpResponse handle_submit_job(clink::cluster::JobManager& jm,
     } catch (const std::exception& e) {
         return fail(500, std::string{"failed to parse JobGraphSpec: "} + e.what());
     }
+    // Carry the resolved job name (the job_name part / ?name= / .so stem) on
+    // the spec so it reaches lineage; a name baked into the graph is kept.
+    if (graph.name.empty()) {
+        graph.name = job_name;
+    }
 
     std::vector<clink::cluster::PluginBinary> plugins;
     plugins.push_back(clink::cluster::make_plugin_binary_from_file(temp_path.string(), job_name));
@@ -577,17 +582,20 @@ clink::http::HttpResponse handle_submit_spec(clink::cluster::JobManager& jm,
         return fail(400, "request body is required");
     }
 
-    std::string job_name = "sql_job";
-    if (auto it = req.query.find("name"); it != req.query.end() && !it->second.empty()) {
-        job_name = it->second;
-    }
-
     clink::cluster::JobGraphSpec graph;
     try {
         graph = clink::cluster::JobGraphSpec::from_json(req.body);
     } catch (const std::exception& e) {
         return fail(400, std::string{"failed to parse JobGraphSpec: "} + e.what());
     }
+    // Job name precedence: explicit ?name= query, else a "name" in the spec
+    // body, else a default. Carried on the spec so it reaches lineage.
+    if (auto it = req.query.find("name"); it != req.query.end() && !it->second.empty()) {
+        graph.name = it->second;
+    } else if (graph.name.empty()) {
+        graph.name = "sql_job";
+    }
+    const std::string& job_name = graph.name;
 
     std::uint64_t job_id = 0;
     try {
@@ -721,6 +729,7 @@ clink::http::HttpResponse handle_sql(clink::cluster::JobManager& jm,
         const auto& sink = static_cast<const clink::sql::LogicalSink&>(optimised);
         auto spec = planner.compile(sink);
         apply_parallelism(spec);
+        spec.name = nm;  // human-readable job name -> lineage
         if (mode == "compile") {
             specs.push_back({nm, spec.to_json()});
         } else {  // submit

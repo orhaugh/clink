@@ -1709,8 +1709,10 @@ JobId JobManager::submit_job(const JobGraphSpec& graph,
         {
             std::lock_guard lock(mu_);
             auto it = jobs_.find(job_id);
-            if (it != jobs_.end())
+            if (it != jobs_.end()) {
                 it->second->graph_json = graph_json;
+                it->second->name = graph.name;
+            }
         }
         if (!ha_dir_.empty()) {
             persist_job_manifest_(ha_dir_, job_id, graph_json, plugins_copy, checkpoint_copy);
@@ -1719,14 +1721,15 @@ JobId JobManager::submit_job(const JobGraphSpec& graph,
 
     // Emit the job's data lineage on the event bus so any registered
     // lineage exporter (and the /api/v1/events stream) can ship it. The
-    // payload wraps the lineage graph with the job id; a LineageDispatcher
-    // reconstructs both. Best-effort: never fail a submit on lineage.
+    // payload wraps the lineage graph with the job id and name; a
+    // LineageDispatcher reconstructs them. Best-effort: never fail a
+    // submit on lineage.
     try {
         const auto lg = lineage::extract_lineage(graph);
         if (!lg.empty()) {
-            events::publish(
-                "jm.job_lineage",
-                "{\"job_id\":" + std::to_string(job_id) + ",\"lineage\":" + lg.to_json() + "}");
+            events::publish("jm.job_lineage",
+                            "{\"job_id\":" + std::to_string(job_id) + ",\"job_name\":" +
+                                js_quote(graph.name) + ",\"lineage\":" + lg.to_json() + "}");
         }
     } catch (...) {
     }
@@ -3152,9 +3155,18 @@ void JobManager::signal_job_completion_locked_(JobState& job) {
                       " failed errors=" + std::to_string(job.errors.size()));
         status = "failed";
     }
-    events::publish("jm.job_completed",
-                    "{\"job_id\":" + std::to_string(job.id) + ",\"status\":\"" + status + "\"" +
-                        ",\"errors\":" + std::to_string(job.errors.size()) + "}");
+    {
+        // "errors" stays a count for existing consumers; "job_name" and the
+        // first "error" string are additive (a lineage FAIL event uses them).
+        std::string payload = "{\"job_id\":" + std::to_string(job.id) +
+                              ",\"job_name\":" + js_quote(job.name) + ",\"status\":\"" + status +
+                              "\"" + ",\"errors\":" + std::to_string(job.errors.size());
+        if (!job.errors.empty()) {
+            payload += ",\"error\":" + js_quote(job.errors.front());
+        }
+        payload += "}";
+        events::publish("jm.job_completed", payload);
+    }
     {
         CompletedJobRecord rec;
         rec.job_id = job.id;

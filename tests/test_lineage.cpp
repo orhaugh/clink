@@ -232,12 +232,16 @@ TEST(LineageDispatcher, TranslatesBusEventsToListenerCalls) {
         op("src", "kafka_source_string", {}, {{"brokers", "b:9092"}, {"topic", "in"}}));
     spec.ops.push_back(op("snk", "file_json_sink", {"src"}, {{"path", "/tmp/o"}}));
     const auto lg = extract_lineage(spec);
-    bus.publish(
-        clink::Event{123, kEventJobLineage, "{\"job_id\":42,\"lineage\":" + lg.to_json() + "}"});
+    bus.publish(clink::Event{
+        123,
+        kEventJobLineage,
+        "{\"job_id\":42,\"job_name\":\"orders-etl\",\"lineage\":" + lg.to_json() + "}"});
 
-    // A completion event -> JobCompleted with status.
-    bus.publish(
-        clink::Event{456, kEventJobCompleted, R"({"job_id":42,"status":"ok","errors":[]})"});
+    // A completion event -> JobCompleted with name + status (real payload
+    // shape: "errors" is a count).
+    bus.publish(clink::Event{456,
+                             kEventJobCompleted,
+                             R"({"job_id":42,"job_name":"orders-etl","status":"ok","errors":0})"});
 
     // An unrelated event -> ignored.
     bus.publish(clink::Event{789, "jm.tm_registered", R"({"tm_id":"tm-1"})"});
@@ -247,12 +251,14 @@ TEST(LineageDispatcher, TranslatesBusEventsToListenerCalls) {
     const auto& started = raw->events[0];
     EXPECT_EQ(started.kind, LineageEvent::Kind::JobStarted);
     EXPECT_EQ(started.job_id, 42u);
+    EXPECT_EQ(started.job_name, "orders-etl");
     ASSERT_EQ(started.graph.sources.size(), 1u);
     EXPECT_EQ(started.graph.sources[0].datasets[0].name, "in");
 
     const auto& completed = raw->events[1];
     EXPECT_EQ(completed.kind, LineageEvent::Kind::JobCompleted);
     EXPECT_EQ(completed.job_id, 42u);
+    EXPECT_EQ(completed.job_name, "orders-etl");
     EXPECT_EQ(completed.status, "ok");
 }
 
@@ -264,8 +270,12 @@ TEST(LineageDispatcher, FailedCompletionCarriesError) {
     listeners.push_back(std::move(listener));
     LineageDispatcher dispatcher(std::move(listeners), bus);
 
+    // Real failed-completion payload: "errors" is a count, "error" the first
+    // failure string.
     bus.publish(
-        clink::Event{1, kEventJobCompleted, R"({"job_id":9,"status":"failed","errors":["boom"]})"});
+        clink::Event{1,
+                     kEventJobCompleted,
+                     R"({"job_id":9,"job_name":"j","status":"failed","errors":2,"error":"boom"})"});
 
     ASSERT_EQ(raw->events.size(), 1u);
     EXPECT_EQ(raw->events[0].status, "failed");

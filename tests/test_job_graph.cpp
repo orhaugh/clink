@@ -185,6 +185,30 @@ TEST(JobGraphSpec, FromJsonRejectsDuplicateId) {
     EXPECT_THROW(JobGraphSpec::from_json(json), std::runtime_error);
 }
 
+// --- Job name -----------------------------------------
+
+TEST(JobGraphSpec, NameRoundTripsThroughJson) {
+    const std::string json = R"({"name":"orders-etl","ops":[
+        {"id":"src","type":"int64_range_source","out_channel":"int64"}
+    ]})";
+    auto spec = JobGraphSpec::from_json(json);
+    EXPECT_EQ(spec.name, "orders-etl");
+    const auto serialised = spec.to_json();
+    EXPECT_NE(serialised.find("\"name\":\"orders-etl\""), std::string::npos);
+    EXPECT_EQ(JobGraphSpec::from_json(serialised).name, "orders-etl");
+}
+
+TEST(JobGraphSpec, NameOmittedWhenEmpty) {
+    // A spec with no name emits no "name" key, so the JSON shape is
+    // unchanged for unnamed jobs.
+    const std::string json = R"({"ops":[
+        {"id":"src","type":"int64_range_source","out_channel":"int64"}
+    ]})";
+    auto spec = JobGraphSpec::from_json(json);
+    EXPECT_TRUE(spec.name.empty());
+    EXPECT_EQ(spec.to_json().find("\"name\""), std::string::npos);
+}
+
 // --- Per-operator parallelism bounds ----------------
 
 TEST(JobGraphSpec, BoundsDefaultToZeroNoAutoscaling) {

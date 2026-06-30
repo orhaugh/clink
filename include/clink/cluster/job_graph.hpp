@@ -94,6 +94,13 @@ struct OperatorSpec {
 struct JobGraphSpec {
     std::vector<OperatorSpec> ops;
 
+    // Optional human-readable job name. Set by the submitter (e.g. the
+    // HTTP ?name= param, or the SQL statement's derived name). Carried in
+    // the submitted spec and the retained graph so it survives HA restart,
+    // and surfaced in data lineage (the OpenLineage job name). Empty when
+    // the submitter named nothing; consumers fall back to the job id.
+    std::string name;
+
     // State schema evolution: the versions the job expects per
     // (op, state_type), declared via env.expect_state_version(...).
     // Carried in the submitted spec so the JM/TM can migrate restored

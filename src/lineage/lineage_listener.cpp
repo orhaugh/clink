@@ -69,6 +69,7 @@ void LineageDispatcher::on_bus_event(const Event& e) {
             const auto root = config::parse(e.payload);
             ev.kind = LineageEvent::Kind::JobStarted;
             ev.job_id = static_cast<std::uint64_t>(root.int_or("job_id", 0));
+            ev.job_name = root.string_or("job_name", "");
             if (root.contains("lineage")) {
                 ev.graph = LineageGraph::from_json(root.at("lineage").serialize());
             }
@@ -76,16 +77,10 @@ void LineageDispatcher::on_bus_event(const Event& e) {
             const auto root = config::parse(e.payload);
             ev.kind = LineageEvent::Kind::JobCompleted;
             ev.job_id = static_cast<std::uint64_t>(root.int_or("job_id", 0));
+            ev.job_name = root.string_or("job_name", "");
             ev.status = root.string_or("status", "");
-            // The completed event carries an "errors" array; surface the
-            // first as the failure detail.
-            if (root.contains("errors") && root.at("errors").is_array() &&
-                !root.at("errors").as_array().empty()) {
-                const auto& first = root.at("errors").as_array().front();
-                if (first.is_string()) {
-                    ev.error = first.as_string();
-                }
-            }
+            // The completed event carries the first failure as "error".
+            ev.error = root.string_or("error", "");
         } else {
             return;  // not a lineage-bearing event
         }
