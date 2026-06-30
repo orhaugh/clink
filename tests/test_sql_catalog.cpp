@@ -257,6 +257,57 @@ TEST(SqlCatalog, AlterColumnTypeGuards) {
     EXPECT_TRUE(cat.get_table("t")->columns[0].type->Equals(*arrow::int64()));
 }
 
+// SET adds or overwrites WITH-options; RESET removes them. These feed the binder
+// and source/sink bindings on the next compile, so the effect is real.
+TEST(SqlCatalog, AlterTableSetAndResetOptions) {
+    Catalog cat;
+    make_table(cat, "CREATE TABLE t (a BIGINT) WITH (connector='kafka', topic='old')");
+    alter(cat, "ALTER TABLE t SET (topic='new', group_id='g1')");
+    const TableDef* def = cat.get_table("t");
+    EXPECT_EQ(def->properties.at("topic"), "new");    // overwritten
+    EXPECT_EQ(def->properties.at("group_id"), "g1");  // added
+    alter(cat, "ALTER TABLE t RESET (group_id)");
+    def = cat.get_table("t");
+    EXPECT_EQ(def->properties.count("group_id"), 0u);  // removed
+    EXPECT_EQ(def->properties.at("topic"), "new");     // untouched
+}
+
+// SET / RESET of the primary_key property must re-lift the derived primary_key
+// vector so the binder and a later command in the same statement see it.
+TEST(SqlCatalog, AlterTableSetPrimaryKeyReLifts) {
+    Catalog cat;
+    make_table(cat, "CREATE TABLE t (a BIGINT, b BIGINT) WITH (connector='kafka', topic='x')");
+    alter(cat, "ALTER TABLE t SET (primary_key='a,b')");
+    const TableDef* def = cat.get_table("t");
+    EXPECT_EQ(def->primary_key, (std::vector<std::string>{"a", "b"}));
+    alter(cat, "ALTER TABLE t RESET (primary_key)");
+    EXPECT_TRUE(cat.get_table("t")->primary_key.empty());
+}
+
+// Commands in one ALTER statement apply in order: a SET that re-points the
+// primary key before a DROP frees the old key column to be dropped.
+TEST(SqlCatalog, AlterTableSetThenDropHonoursNewPrimaryKey) {
+    Catalog cat;
+    make_table(cat,
+               "CREATE TABLE t (a BIGINT, b BIGINT) WITH (connector='kafka', topic='x', "
+               "primary_key='a')");
+    alter(cat, "ALTER TABLE t SET (primary_key='b'), DROP COLUMN a");
+    const TableDef* def = cat.get_table("t");
+    EXPECT_EQ(col_names(*def), (std::vector<std::string>{"b"}));
+    EXPECT_EQ(def->primary_key, (std::vector<std::string>{"b"}));
+}
+
+// SET on a non-table object (a view-kind TableDef) is rejected, like other ALTERs.
+TEST(SqlCatalog, AlterTableSetRejectsNonTable) {
+    Catalog cat;
+    TableDef mv;
+    mv.name = "mv";
+    mv.properties["view_kind"] = "materialized";
+    mv.columns.push_back(ColumnSpec{"a", arrow::int64()});
+    cat.register_table(std::move(mv));
+    EXPECT_THROW(alter(cat, "ALTER TABLE mv SET (k='v')"), TranslationError);
+}
+
 namespace {
 void rename_obj(Catalog& cat, const char* sql) {
     cat.rename(std::get<ast::RenameStmt>(parse(sql).statements[0]));

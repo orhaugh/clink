@@ -436,6 +436,31 @@ TEST(SqlParser, RejectsAlterColumnTypeUsing) {
     EXPECT_THROW(parse("ALTER TABLE t ALTER COLUMN c TYPE BIGINT USING c"), TranslationError);
 }
 
+TEST(SqlParser, ParsesAlterTableSetOptions) {
+    auto script = parse("ALTER TABLE t SET (topic='clicks', group_id='g1')");
+    ASSERT_TRUE(std::holds_alternative<ast::AlterTableStmt>(script.statements[0]));
+    const auto& alt = std::get<ast::AlterTableStmt>(script.statements[0]);
+    ASSERT_EQ(alt.cmds.size(), 1u);
+    EXPECT_EQ(alt.cmds[0].kind, ast::AlterTableCmd::Kind::SetOptions);
+    ASSERT_EQ(alt.cmds[0].options.size(), 2u);
+    EXPECT_EQ(alt.cmds[0].options[0].key, "topic");
+    EXPECT_EQ(alt.cmds[0].options[0].value, "clicks");
+    EXPECT_EQ(alt.cmds[0].options[1].key, "group_id");
+    EXPECT_EQ(alt.cmds[0].options[1].value, "g1");
+}
+
+// RESET names options to clear; each DefElem carries no arg, so the value is empty.
+TEST(SqlParser, ParsesAlterTableResetOptions) {
+    auto script = parse("ALTER TABLE t RESET (topic, group_id)");
+    const auto& alt = std::get<ast::AlterTableStmt>(script.statements[0]);
+    ASSERT_EQ(alt.cmds.size(), 1u);
+    EXPECT_EQ(alt.cmds[0].kind, ast::AlterTableCmd::Kind::ResetOptions);
+    ASSERT_EQ(alt.cmds[0].options.size(), 2u);
+    EXPECT_EQ(alt.cmds[0].options[0].key, "topic");
+    EXPECT_TRUE(alt.cmds[0].options[0].value.empty());
+    EXPECT_EQ(alt.cmds[0].options[1].key, "group_id");
+}
+
 TEST(SqlParser, ParsesAlterTableRenameTo) {
     auto script = parse("ALTER TABLE t RENAME TO t2");
     ASSERT_EQ(script.statements.size(), 1u);

@@ -156,8 +156,6 @@ void Catalog::alter_table(const ast::AlterTableStmt& stmt) {
     }
     // Apply to a copy so a mid-statement failure leaves the table unchanged.
     TableDef next = it->second;
-    const auto et = next.properties.find("event_time_column");
-    const std::string event_time_col = et != next.properties.end() ? et->second : std::string{};
     auto find_col = [&next](const std::string& name) {
         return std::find_if(next.columns.begin(), next.columns.end(), [&name](const ColumnSpec& c) {
             return c.name == name;
@@ -186,7 +184,7 @@ void Catalog::alter_table(const ast::AlterTableStmt& stmt) {
             // column and how downstream binds it. sql_type_to_arrow validates /
             // rejects an unsupported type.
             cit->type = sql_type_to_arrow(cmd.type);
-        } else {  // DropColumn
+        } else if (cmd.kind == ast::AlterTableCmd::Kind::DropColumn) {
             auto cit = find_col(cmd.column_name);
             if (cit == next.columns.end()) {
                 if (cmd.missing_ok) {
@@ -196,7 +194,10 @@ void Catalog::alter_table(const ast::AlterTableStmt& stmt) {
                     "column '" + cmd.column_name + "' does not exist in '" + stmt.table_name + "'",
                     cmd.loc.pos);
             }
-            if (cmd.column_name == event_time_col) {
+            // Read the event-time / primary-key guards freshly: an earlier SET /
+            // RESET in this same statement may have changed which column they name.
+            const auto et = next.properties.find("event_time_column");
+            if (et != next.properties.end() && et->second == cmd.column_name) {
                 throw TranslationError(
                     "cannot drop column '" + cmd.column_name + "': it is the event-time column",
                     cmd.loc.pos);
@@ -208,6 +209,17 @@ void Catalog::alter_table(const ast::AlterTableStmt& stmt) {
                     cmd.loc.pos);
             }
             next.columns.erase(cit);
+        } else {  // SetOptions / ResetOptions: mutate the WITH-option bag.
+            for (const auto& opt : cmd.options) {
+                if (cmd.kind == ast::AlterTableCmd::Kind::SetOptions) {
+                    next.properties[opt.key] = opt.value;  // last-write-wins
+                } else {
+                    next.properties.erase(opt.key);  // RESET
+                }
+            }
+            // A changed primary_key property must re-lift the typed field so a
+            // later command in this statement (and the binder) sees it.
+            lift_typed_fields(next);
         }
     }
     if (next.columns.empty()) {

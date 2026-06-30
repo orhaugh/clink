@@ -1197,6 +1197,57 @@ TEST(SqlRuntime, AlterTableAddColumnMakesItQueryableEndToEnd) {
     }
 }
 
+// ALTER TABLE SET (...) end-to-end: SET rewrites a WITH-option, and the next
+// compile binds the source from the new value. Here SET re-points the file
+// source's `path`, so the query reads the second file's rows, not the first.
+TEST(SqlRuntime, AlterTableSetOptionRedirectsSourceEndToEnd) {
+    ensure_sql_installed_once();
+    const auto in_a = std::filesystem::temp_directory_path() / "clink_sql_set_a.ndjson";
+    const auto in_b = std::filesystem::temp_directory_path() / "clink_sql_set_b.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_set_out.ndjson";
+    for (const auto& p : {in_a, in_b, out_path}) {
+        std::filesystem::remove(p);
+    }
+    write_lines(in_a, {R"({"a":1})", R"({"a":2})"});
+    write_lines(in_b, {R"({"a":100})", R"({"a":200})"});
+
+    Catalog cat;
+    // Table declared against the first file.
+    auto ddl = parse(std::string{"CREATE TABLE t (a BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_a.string() +
+                     "');"
+                     "CREATE TABLE out_t (a BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    // Re-point the source to the second file; the next compile binds from it.
+    cat.alter_table(std::get<ast::AlterTableStmt>(
+        parse(std::string{"ALTER TABLE t SET (path='"} + in_b.string() + "')").statements[0]));
+    auto spec = compile(cat, "INSERT INTO out_t SELECT a FROM t");
+
+    InProcessCluster cluster("tm-sql-set-e2e", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    std::multiset<std::int64_t> got;
+    for (const auto& line : read_lines(out_path)) {
+        got.insert(static_cast<std::int64_t>(clink::config::parse(line).at("a").as_number()));
+    }
+    // Rows come from the second file, proving SET took effect at compile time.
+    EXPECT_EQ(got, (std::multiset<std::int64_t>{100, 200}));
+
+    for (const auto& p : {in_a, in_b, out_path}) {
+        std::filesystem::remove(p);
+    }
+}
+
 // ALTER TABLE RENAME COLUMN end-to-end: renaming a column to match the source's
 // actual field name makes it queryable + decode under the new name (and the old
 // name stops binding). Realistic use: fixing a declared column to match upstream.

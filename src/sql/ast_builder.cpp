@@ -1584,11 +1584,46 @@ ast::AlterTableStmt translate_alter_table_stmt(const JsonValue& body) {
                 unsupported("ALTER COLUMN TYPE missing the new type", cmd.loc.pos);
             }
             cmd.type = translate_type_name(dbody->at("typeName"));
+        } else if (subtype == "AT_SetRelOptions" || subtype == "AT_ResetRelOptions") {
+            // SET (k='v', ...) / RESET (k, ...): the table's WITH-option bag. The
+            // cmd's def is a List of DefElem - {defname, arg} for SET, defname-only
+            // for RESET.
+            const bool is_set = subtype == "AT_SetRelOptions";
+            cmd.kind = is_set ? ast::AlterTableCmd::Kind::SetOptions
+                              : ast::AlterTableCmd::Kind::ResetOptions;
+            if (!cbody->contains("def") || !cbody->at("def").is_object()) {
+                unsupported("ALTER TABLE SET / RESET requires an option list", cmd.loc.pos);
+            }
+            auto [lkind, lbody] = node_wrapper(cbody->at("def"));
+            if (lkind != "List" || lbody == nullptr || !lbody->contains("items") ||
+                !lbody->at("items").is_array()) {
+                unsupported("ALTER TABLE SET / RESET: expected an option list", cmd.loc.pos);
+            }
+            for (const auto& item : lbody->at("items").as_array()) {
+                auto [okind, obody] = node_wrapper(item);
+                if (okind != "DefElem" || obody == nullptr) {
+                    unsupported("ALTER TABLE SET / RESET option must be a DefElem, got " + okind,
+                                cmd.loc.pos);
+                }
+                if (is_set) {
+                    cmd.options.push_back(translate_storage_option(*obody));  // key + value
+                } else {
+                    // RESET carries the key only (no arg).
+                    if (!obody->contains("defname") || !obody->at("defname").is_string()) {
+                        unsupported("ALTER TABLE RESET option missing a name", cmd.loc.pos);
+                    }
+                    ast::StorageOption opt;
+                    opt.loc = loc_from(*obody);
+                    opt.key = obody->at("defname").as_string();
+                    cmd.options.push_back(std::move(opt));  // value empty -> remove
+                }
+            }
         } else {
-            unsupported("unsupported ALTER TABLE action: " +
-                            (subtype.empty() ? std::string("<unknown>") : subtype) +
-                            " (v1 supports ADD COLUMN / DROP COLUMN / ALTER COLUMN TYPE)",
-                        cmd.loc.pos);
+            unsupported(
+                "unsupported ALTER TABLE action: " +
+                    (subtype.empty() ? std::string("<unknown>") : subtype) +
+                    " (v1 supports ADD COLUMN / DROP COLUMN / ALTER COLUMN TYPE / SET / RESET)",
+                cmd.loc.pos);
         }
         stmt.cmds.push_back(std::move(cmd));
     }
