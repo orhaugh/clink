@@ -403,8 +403,32 @@ TEST(SqlParser, ParsesAlterTableIfExistsAndIfNotExists) {
 
 // Other AlterTableCmd subtypes are rejected in v1.
 TEST(SqlParser, RejectsUnsupportedAlterTableActions) {
-    EXPECT_THROW(parse("ALTER TABLE t ALTER COLUMN c TYPE TEXT"), TranslationError);
     EXPECT_THROW(parse("ALTER TABLE t ADD PRIMARY KEY (c)"), TranslationError);
+    EXPECT_THROW(parse("ALTER TABLE t ALTER COLUMN c SET NOT NULL"), TranslationError);
+}
+
+TEST(SqlParser, ParsesAlterColumnType) {
+    auto script = parse("ALTER TABLE t ALTER COLUMN c TYPE BIGINT");
+    ASSERT_TRUE(std::holds_alternative<ast::AlterTableStmt>(script.statements[0]));
+    const auto& alt = std::get<ast::AlterTableStmt>(script.statements[0]);
+    ASSERT_EQ(alt.cmds.size(), 1u);
+    EXPECT_EQ(alt.cmds[0].kind, ast::AlterTableCmd::Kind::AlterColumnType);
+    EXPECT_EQ(alt.cmds[0].column_name, "c");
+    EXPECT_EQ(alt.cmds[0].type.name, "int8");  // BIGINT -> PG canonical int8
+}
+
+// `SET DATA TYPE` is the verbose spelling of the same AT_AlterColumnType command.
+TEST(SqlParser, ParsesAlterColumnSetDataType) {
+    auto script = parse("ALTER TABLE t ALTER COLUMN c SET DATA TYPE TEXT");
+    const auto& alt = std::get<ast::AlterTableStmt>(script.statements[0]);
+    ASSERT_EQ(alt.cmds.size(), 1u);
+    EXPECT_EQ(alt.cmds[0].kind, ast::AlterTableCmd::Kind::AlterColumnType);
+    EXPECT_EQ(alt.cmds[0].column_name, "c");
+}
+
+// USING transforms stored rows; a streaming table has none, so it is rejected.
+TEST(SqlParser, RejectsAlterColumnTypeUsing) {
+    EXPECT_THROW(parse("ALTER TABLE t ALTER COLUMN c TYPE BIGINT USING c"), TranslationError);
 }
 
 TEST(SqlParser, ParsesAlterTableRenameTo) {

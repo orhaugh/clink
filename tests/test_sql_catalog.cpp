@@ -232,6 +232,31 @@ TEST(SqlCatalog, AlterTableRejectsDroppingLastColumn) {
     EXPECT_THROW(alter(cat, "ALTER TABLE t DROP COLUMN a"), TranslationError);
 }
 
+TEST(SqlCatalog, AlterColumnTypeChangesDeclaredType) {
+    Catalog cat;
+    make_table(cat, "CREATE TABLE t (a BIGINT, b TEXT) WITH (connector='kafka', topic='x')");
+    alter(cat, "ALTER TABLE t ALTER COLUMN b TYPE BIGINT");
+    const TableDef* def = cat.get_table("t");
+    ASSERT_EQ(def->columns.size(), 2u);
+    EXPECT_EQ(def->columns[1].name, "b");
+    EXPECT_TRUE(def->columns[1].type->Equals(*arrow::int64()));  // was utf8, now int64
+    // Combined with ADD/DROP in one (atomic, ordered) statement.
+    alter(cat, "ALTER TABLE t ADD COLUMN c TEXT, ALTER COLUMN a TYPE INTEGER");
+    def = cat.get_table("t");
+    EXPECT_TRUE(def->columns[0].type->Equals(*arrow::int32()));  // a: BIGINT -> INTEGER
+    EXPECT_EQ(def->columns[2].name, "c");
+}
+
+TEST(SqlCatalog, AlterColumnTypeGuards) {
+    Catalog cat;
+    make_table(cat, "CREATE TABLE t (a BIGINT) WITH (connector='kafka', topic='x')");
+    EXPECT_THROW(alter(cat, "ALTER TABLE t ALTER COLUMN nope TYPE TEXT"),
+                 TranslationError);  // absent column
+    // An unsupported target type is rejected (sql_type_to_arrow), leaving a intact.
+    EXPECT_THROW(alter(cat, "ALTER TABLE t ALTER COLUMN a TYPE xml"), TranslationError);
+    EXPECT_TRUE(cat.get_table("t")->columns[0].type->Equals(*arrow::int64()));
+}
+
 namespace {
 void rename_obj(Catalog& cat, const char* sql) {
     cat.rename(std::get<ast::RenameStmt>(parse(sql).statements[0]));

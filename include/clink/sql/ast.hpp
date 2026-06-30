@@ -387,14 +387,14 @@ struct CreateTableStmt {
     Loc loc;
 };
 
-// One command in an ALTER TABLE statement. v1 supports column add / drop only;
-// other AlterTableCmd subtypes (SET options, ALTER COLUMN TYPE, constraints) are
+// One command in an ALTER TABLE statement. v1 supports column add / drop and
+// ALTER COLUMN TYPE; other AlterTableCmd subtypes (SET options, constraints) are
 // rejected at parse time.
 struct AlterTableCmd {
-    enum class Kind { AddColumn, DropColumn };
+    enum class Kind { AddColumn, DropColumn, AlterColumnType };
     Kind kind;
-    std::string column_name;  // ADD: the new column; DROP: the target column
-    TypeName type;            // ADD COLUMN only
+    std::string column_name;  // ADD: the new column; DROP / ALTER TYPE: the target column
+    TypeName type;            // ADD COLUMN / ALTER COLUMN TYPE: the (new) column type
     bool missing_ok = false;  // ADD COLUMN IF NOT EXISTS / DROP COLUMN IF EXISTS
     Loc loc;
 };

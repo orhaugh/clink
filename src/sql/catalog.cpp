@@ -174,6 +174,18 @@ void Catalog::alter_table(const ast::AlterTableStmt& stmt) {
                     cmd.loc.pos);
             }
             next.columns.push_back(ColumnSpec{cmd.column_name, sql_type_to_arrow(cmd.type)});
+        } else if (cmd.kind == ast::AlterTableCmd::Kind::AlterColumnType) {
+            auto cit = find_col(cmd.column_name);
+            if (cit == next.columns.end()) {
+                throw TranslationError(
+                    "column '" + cmd.column_name + "' does not exist in '" + stmt.table_name + "'",
+                    cmd.loc.pos);
+            }
+            // Catalog-level type swap: a streaming table has no stored rows to
+            // cast, so the new type just changes how the source decodes the
+            // column and how downstream binds it. sql_type_to_arrow validates /
+            // rejects an unsupported type.
+            cit->type = sql_type_to_arrow(cmd.type);
         } else {  // DropColumn
             auto cit = find_col(cmd.column_name);
             if (cit == next.columns.end()) {

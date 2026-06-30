@@ -1559,10 +1559,35 @@ ast::AlterTableStmt translate_alter_table_stmt(const JsonValue& body) {
                 unsupported("ALTER TABLE DROP COLUMN missing column name", cmd.loc.pos);
             }
             cmd.column_name = cbody->at("name").as_string();
+        } else if (subtype == "AT_AlterColumnType") {
+            cmd.kind = ast::AlterTableCmd::Kind::AlterColumnType;
+            if (!cbody->contains("name") || !cbody->at("name").is_string()) {
+                unsupported("ALTER TABLE ALTER COLUMN missing column name", cmd.loc.pos);
+            }
+            cmd.column_name = cbody->at("name").as_string();
+            if (!cbody->contains("def") || !cbody->at("def").is_object()) {
+                unsupported("ALTER COLUMN TYPE missing the new type", cmd.loc.pos);
+            }
+            auto [dkind, dbody] = node_wrapper(cbody->at("def"));
+            if (dkind != "ColumnDef" || dbody == nullptr) {
+                unsupported("ALTER COLUMN TYPE: expected a ColumnDef, got " + dkind, cmd.loc.pos);
+            }
+            // A USING <expr> transform only makes sense over stored rows; a
+            // streaming table has none, so reject it rather than silently drop it.
+            if (dbody->contains("raw_default") && dbody->at("raw_default").is_object()) {
+                unsupported(
+                    "ALTER COLUMN TYPE ... USING is not supported (a streaming table has "
+                    "no stored data to transform)",
+                    cmd.loc.pos);
+            }
+            if (!dbody->contains("typeName") || !dbody->at("typeName").is_object()) {
+                unsupported("ALTER COLUMN TYPE missing the new type", cmd.loc.pos);
+            }
+            cmd.type = translate_type_name(dbody->at("typeName"));
         } else {
             unsupported("unsupported ALTER TABLE action: " +
                             (subtype.empty() ? std::string("<unknown>") : subtype) +
-                            " (v1 supports ADD COLUMN / DROP COLUMN)",
+                            " (v1 supports ADD COLUMN / DROP COLUMN / ALTER COLUMN TYPE)",
                         cmd.loc.pos);
         }
         stmt.cmds.push_back(std::move(cmd));
