@@ -32,6 +32,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <poll.h>
 #include <sstream>
 #include <stdexcept>
@@ -148,7 +149,15 @@
 #include "clink/rocksdb_s3/install.hpp"
 #endif
 #ifdef CLINK_LINKED_SQL
+#include "clink/sql/binder.hpp"
+#include "clink/sql/catalog.hpp"
 #include "clink/sql/install.hpp"
+#include "clink/sql/logical_plan.hpp"
+#include "clink/sql/materialized_view.hpp"
+#include "clink/sql/optimizer.hpp"
+#include "clink/sql/parser.hpp"
+#include "clink/sql/physical_plan.hpp"
+#include "clink/sql/view.hpp"
 #endif
 
 namespace {
@@ -599,6 +608,380 @@ clink::http::HttpResponse handle_submit_spec(clink::cluster::JobManager& jm,
     resp.body = w.str();
     return resp;
 }
+
+#ifdef CLINK_LINKED_SQL
+// Server-side SQL session: one catalog shared across requests so DDL registered
+// by one /api/v1/jobs/sql call (CREATE TABLE / VIEW, ALTER, RENAME, DROP) is
+// visible to later statements and later requests, and to the /api/v1/catalog
+// browser. Optionally persisted to a dir (--sql-catalog-dir) so it survives a JM
+// restart. The mutex serialises the (rare, interactive) SQL requests against the
+// concurrent catalog reads.
+struct SqlSession {
+    std::mutex mu;
+    clink::sql::Catalog catalog;
+};
+
+SqlSession& sql_session() {
+    static SqlSession session;
+    return session;
+}
+
+// POST /api/v1/jobs/sql?mode=explain|compile|submit[&parallelism=N][&name=foo]
+// Body: raw SQL text (one or more statements; no JSON wrapper, so SQL quoting is
+// untouched). DDL mutates the session catalog. For each INSERT / CREATE
+// MATERIALIZED VIEW (and an explicit EXPLAIN) the mode decides the action:
+//   explain -> return the LogicalPlan tree text (no job is created)
+//   compile -> return the compiled JobGraphSpec JSON as a string (no job)
+//   submit  -> submit to the JM and return the job id
+// Returns 200 with {ok:true,mode,applied,plans|specs|jobs}, or 400 with
+// {ok:false,error,position} on a parse/bind/compile error (position is the
+// 1-based byte offset, 0 if unknown).
+clink::http::HttpResponse handle_sql(clink::cluster::JobManager& jm,
+                                     const clink::http::HttpRequest& req) {
+    clink::http::HttpResponse resp;
+    auto fail = [&](int status, std::string msg, int position = -1) {
+        resp.status = status;
+        std::string body = std::string{R"({"ok":false,"error":")"} + json_escape(msg) + "\"";
+        if (position >= 0) {
+            body += R"(,"position":)" + std::to_string(position);
+        }
+        body += "}";
+        resp.body = std::move(body);
+        return resp;
+    };
+
+    if (req.body.empty()) {
+        return fail(400, "request body must be SQL text");
+    }
+    std::string mode = "explain";
+    if (auto it = req.query.find("mode"); it != req.query.end() && !it->second.empty()) {
+        mode = it->second;
+    }
+    if (mode != "explain" && mode != "compile" && mode != "submit") {
+        return fail(400, "mode must be one of explain, compile, submit");
+    }
+    std::uint32_t parallelism = 1;
+    if (auto it = req.query.find("parallelism"); it != req.query.end() && !it->second.empty()) {
+        try {
+            parallelism = static_cast<std::uint32_t>(std::stoul(it->second));
+        } catch (const std::exception&) {
+            return fail(400, "parallelism must be a positive integer");
+        }
+        if (parallelism < 1) {
+            parallelism = 1;
+        }
+    }
+    std::string base_name = "sql_job";
+    if (auto it = req.query.find("name"); it != req.query.end() && !it->second.empty()) {
+        base_name = it->second;
+    }
+
+    auto apply_parallelism = [&](clink::cluster::JobGraphSpec& spec) {
+        if (parallelism <= 1) {
+            return;
+        }
+        for (auto& op : spec.ops) {
+            op.parallelism = parallelism;
+        }
+    };
+
+    // Accumulate results, then emit JSON only after the whole script succeeds -
+    // so a mid-script error produces a clean error body, never a half-written one.
+    struct PlanEntry {
+        std::string kind;
+        std::string text;
+    };
+    struct SpecEntry {
+        std::string name;
+        std::string spec_json;
+    };
+    struct JobEntry {
+        std::string name;
+        std::uint64_t job_id;
+    };
+    std::vector<PlanEntry> plans;
+    std::vector<SpecEntry> specs;
+    std::vector<JobEntry> jobs;
+    int applied = 0;
+    int job_index = 0;
+
+    auto& session = sql_session();
+    std::lock_guard<std::mutex> lock(session.mu);
+    auto& catalog = session.catalog;
+    clink::sql::Binder binder(catalog);
+    clink::sql::PhysicalPlanner planner;
+
+    namespace ast = clink::sql::ast;
+    auto next_name = [&]() {
+        return job_index++ == 0 ? base_name : base_name + "_" + std::to_string(job_index - 1);
+    };
+    auto handle_compiled = [&](clink::sql::LogicalPlan& optimised, const std::string& nm) {
+        const auto& sink = static_cast<const clink::sql::LogicalSink&>(optimised);
+        auto spec = planner.compile(sink);
+        apply_parallelism(spec);
+        if (mode == "compile") {
+            specs.push_back({nm, spec.to_json()});
+        } else {  // submit
+            auto job_id = jm.submit_job(spec,
+                                        clink::cluster::OperatorRegistry::default_instance(),
+                                        /*plugins=*/{},
+                                        clink::cluster::CheckpointConfig{},
+                                        /*bundle=*/nullptr,
+                                        /*notify_client_conn=*/nullptr);
+            jobs.push_back({nm, job_id});
+        }
+    };
+
+    try {
+        auto script = clink::sql::parse(req.body);
+        for (auto& stmt : script.statements) {
+            if (std::holds_alternative<std::unique_ptr<ast::ExplainStmt>>(stmt)) {
+                const auto& exp = *std::get<std::unique_ptr<ast::ExplainStmt>>(stmt);
+                if (std::holds_alternative<ast::InsertStmt>(exp.query)) {
+                    plans.push_back(
+                        {"insert",
+                         binder.bind_insert(std::get<ast::InsertStmt>(exp.query))->explain()});
+                } else if (std::holds_alternative<ast::SelectStmt>(exp.query)) {
+                    plans.push_back(
+                        {"select",
+                         binder.bind_select(std::get<ast::SelectStmt>(exp.query))->explain()});
+                } else {
+                    return fail(400, "EXPLAIN supports only SELECT / INSERT INTO");
+                }
+            } else if (std::holds_alternative<ast::CreateTableStmt>(stmt)) {
+                catalog.register_table(std::get<ast::CreateTableStmt>(stmt));
+                ++applied;
+            } else if (std::holds_alternative<ast::CreateViewStmt>(stmt)) {
+                clink::sql::register_view(catalog, std::move(std::get<ast::CreateViewStmt>(stmt)));
+                ++applied;
+            } else if (std::holds_alternative<ast::AlterTableStmt>(stmt)) {
+                catalog.alter_table(std::get<ast::AlterTableStmt>(stmt));
+                ++applied;
+            } else if (std::holds_alternative<ast::RenameStmt>(stmt)) {
+                clink::sql::rename_object(catalog, std::get<ast::RenameStmt>(stmt));
+                ++applied;
+            } else if (std::holds_alternative<ast::DropTableStmt>(stmt)) {
+                const auto& drop = std::get<ast::DropTableStmt>(stmt);
+                const char* noun =
+                    drop.object_kind == ast::DropKind::MaterializedView
+                        ? "materialized view"
+                        : (drop.object_kind == ast::DropKind::View ? "view" : "table");
+                for (const auto& tbl : drop.table_names) {
+                    switch (catalog.drop_object(tbl, drop.object_kind)) {
+                        case clink::sql::Catalog::DropResult::Dropped:
+                            ++applied;
+                            break;
+                        case clink::sql::Catalog::DropResult::NotFound:
+                            if (!drop.if_exists) {
+                                return fail(400, std::string{noun} + " does not exist: " + tbl);
+                            }
+                            break;
+                        case clink::sql::Catalog::DropResult::KindMismatch:
+                            return fail(400, "\"" + tbl + "\" is not a " + noun);
+                    }
+                }
+            } else if (std::holds_alternative<ast::ShowTablesStmt>(stmt)) {
+                // Listing is the job of GET /api/v1/catalog; ignore here.
+            } else if (std::holds_alternative<ast::AnalyzeStmt>(stmt)) {
+                return fail(400,
+                            "ANALYZE is not supported over HTTP (it runs a local scan); "
+                            "use the clink_submit_sql CLI");
+            } else if (std::holds_alternative<ast::CreateMaterializedViewStmt>(stmt)) {
+                auto& mv = std::get<ast::CreateMaterializedViewStmt>(stmt);
+                auto mvplan = clink::sql::plan_materialized_view(std::move(mv), catalog, req.body);
+                const std::string view_name = mvplan.backing.name;
+                ++applied;  // the backing table was registered
+                auto optimised = clink::sql::optimize(std::move(mvplan.maintenance));
+                if (mode == "explain") {
+                    plans.push_back({"materialized_view", optimised->explain()});
+                } else {
+                    handle_compiled(*optimised, "mv_" + view_name);
+                }
+            } else if (std::holds_alternative<ast::InsertStmt>(stmt)) {
+                auto plan =
+                    clink::sql::optimize(binder.bind_insert(std::get<ast::InsertStmt>(stmt)));
+                if (mode == "explain") {
+                    plans.push_back({"insert", plan->explain()});
+                } else {
+                    handle_compiled(*plan, next_name());
+                }
+            } else if (std::holds_alternative<ast::SelectStmt>(stmt)) {
+                if (mode != "explain") {
+                    return fail(400,
+                                "a bare SELECT has no sink; wrap it in INSERT INTO ... SELECT, "
+                                "or use mode=explain to inspect the plan");
+                }
+                plans.push_back(
+                    {"select", binder.bind_select(std::get<ast::SelectStmt>(stmt))->explain()});
+            }
+        }
+    } catch (const clink::sql::ParseError& e) {
+        return fail(400, std::string{"parse error: "} + e.what(), e.cursor_position());
+    } catch (const clink::sql::TranslationError& e) {
+        return fail(400, std::string{"compile error: "} + e.what(), e.cursor_position());
+    } catch (const std::exception& e) {
+        return fail(400, std::string{"SQL error: "} + e.what());
+    }
+
+    clink::http::JsonWriter w;
+    w.begin_object();
+    w.kv("ok", true);
+    w.kv("mode", mode);
+    w.kv("applied", static_cast<std::int64_t>(applied));
+    if (mode == "explain") {
+        w.key("plans").begin_array();
+        for (const auto& p : plans) {
+            w.begin_object();
+            w.kv("kind", p.kind);
+            w.kv("explain", p.text);
+            w.end_object();
+        }
+        w.end_array();
+    } else if (mode == "compile") {
+        w.key("specs").begin_array();
+        for (const auto& s : specs) {
+            w.begin_object();
+            w.kv("name", s.name);
+            w.kv("spec_json", s.spec_json);
+            w.end_object();
+        }
+        w.end_array();
+    } else {  // submit
+        w.key("jobs").begin_array();
+        for (const auto& j : jobs) {
+            w.begin_object();
+            w.kv("name", j.name);
+            w.kv("job_id", static_cast<std::int64_t>(j.job_id));
+            w.end_object();
+        }
+        w.end_array();
+    }
+    w.end_object();
+    resp.body = w.str();
+    return resp;
+}
+
+// GET /api/v1/catalog - the SQL session catalog: every registered table / view /
+// materialized view with its declared columns, kind, connector and primary key.
+// Powers the workbench catalogue browser and autocomplete.
+clink::http::HttpResponse handle_catalog(const clink::http::HttpRequest&) {
+    auto& session = sql_session();
+    std::lock_guard<std::mutex> lock(session.mu);
+    const auto& catalog = session.catalog;
+
+    clink::http::JsonWriter w;
+    w.begin_object();
+    w.kv("ok", true);
+    w.key("tables").begin_array();
+    for (const auto& name : catalog.list_tables()) {
+        const auto* def = catalog.get_table(name);
+        if (def == nullptr) {
+            continue;
+        }
+        w.begin_object();
+        w.kv("name", def->name);
+        const char* kind =
+            def->is_materialized_view()
+                ? "materialized_view"
+                : (def->is_logical_view() ? "view" : (def->is_lookup() ? "lookup" : "table"));
+        w.kv("kind", kind);
+        if (auto it = def->properties.find("connector"); it != def->properties.end()) {
+            w.kv("connector", it->second);
+        }
+        w.key("columns").begin_array();
+        for (const auto& c : def->columns) {
+            w.begin_object();
+            w.kv("name", c.name);
+            w.kv("type", c.type ? c.type->ToString() : std::string{"unknown"});
+            w.end_object();
+        }
+        w.end_array();
+        if (!def->primary_key.empty()) {
+            w.key("primary_key").begin_array();
+            for (const auto& k : def->primary_key) {
+                w.string_value(k);
+            }
+            w.end_array();
+        }
+        w.end_object();
+    }
+    w.end_array();
+    w.end_object();
+
+    clink::http::HttpResponse resp;
+    resp.body = w.str();
+    return resp;
+}
+
+// GET /api/v1/connectors - the SQL connector vocabulary (the values accepted in
+// WITH (connector='...')). Names are authoritative (mirror the planner); the
+// source/sink flags are best-effort and a connector only works at submit time if
+// its impl is linked into this build. Drives autocomplete + the connectors page.
+clink::http::HttpResponse handle_connectors(const clink::http::HttpRequest&) {
+    struct ConnectorInfo {
+        const char* name;
+        bool source;
+        bool sink;
+        const char* category;
+    };
+    // clang-format off
+    static const ConnectorInfo kConnectors[] = {
+        {"kafka",            true,  true,  "messaging"},
+        {"pulsar",           true,  true,  "messaging"},
+        {"rabbitmq",         true,  true,  "messaging"},
+        {"nats",             true,  true,  "messaging"},
+        {"pubsub",           true,  true,  "messaging"},
+        {"kinesis",          true,  true,  "messaging"},
+        {"firehose",         false, true,  "messaging"},
+        {"file",             true,  true,  "storage"},
+        {"filesystem",       true,  true,  "storage"},
+        {"parquet",          true,  true,  "storage"},
+        {"s3",               true,  true,  "storage"},
+        {"s3_parquet",       true,  true,  "storage"},
+        {"gcs_parquet",      true,  true,  "storage"},
+        {"azure_parquet",    true,  true,  "storage"},
+        {"webhdfs_parquet",  true,  true,  "storage"},
+        {"iceberg",          false, true,  "storage"},
+        {"delta",            false, true,  "storage"},
+        {"postgres",         true,  true,  "database"},
+        {"mysql",            true,  true,  "database"},
+        {"clickhouse",       true,  true,  "database"},
+        {"cassandra",        false, true,  "database"},
+        {"dynamodb",         false, true,  "database"},
+        {"redis",            true,  true,  "database"},
+        {"http",             true,  true,  "observability"},
+        {"http_poll",        true,  false, "observability"},
+        {"elasticsearch",    false, true,  "observability"},
+        {"opensearch",       false, true,  "observability"},
+        {"splunk",           false, true,  "observability"},
+        {"splunk_hec",       false, true,  "observability"},
+        {"influxdb",         false, true,  "observability"},
+        {"prometheus",       false, true,  "observability"},
+        {"blackhole",        false, true,  "testing"},
+        {"nexmark",          true,  false, "testing"},
+    };
+    // clang-format on
+
+    clink::http::JsonWriter w;
+    w.begin_object();
+    w.kv("ok", true);
+    w.key("connectors").begin_array();
+    for (const auto& c : kConnectors) {
+        w.begin_object();
+        w.kv("name", c.name);
+        w.kv("source", c.source);
+        w.kv("sink", c.sink);
+        w.kv("category", c.category);
+        w.end_object();
+    }
+    w.end_array();
+    w.end_object();
+
+    clink::http::HttpResponse resp;
+    resp.body = w.str();
+    return resp;
+}
+#endif  // CLINK_LINKED_SQL
 
 // Build an SseFactory that subscribes each new connection to the
 // process-wide EventBus and yields one SSE chunk per event. A heartbeat
@@ -1364,6 +1747,22 @@ int run_jm(int argc, char** argv) {
             }
             clink::metrics::configure_disk_volumes(std::move(vols));
         }
+#ifdef CLINK_LINKED_SQL
+        // Optional persistent SQL catalog for the /api/v1/jobs/sql workbench:
+        // load any tables/views from the dir and auto-save subsequent DDL, so
+        // table definitions survive a JM restart. Without it the catalog is
+        // in-memory (session-scoped).
+        if (const auto sql_dir = get_arg(argc, argv, "sql-catalog-dir", ""); !sql_dir.empty()) {
+            try {
+                sql_session().catalog.load_from_dir(sql_dir);
+                sql_session().catalog.set_persistence_dir(sql_dir);
+                std::cout << "JM SQL catalog dir: " << sql_dir << "\n";
+            } catch (const std::exception& e) {
+                std::cerr << "JM: failed to load --sql-catalog-dir " << sql_dir << ": " << e.what()
+                          << "\n";
+            }
+        }
+#endif
         auto* jm_ptr = &jm;
         http_srv->get("/api/v1/health", [start_time, jm_ptr](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
@@ -1506,6 +1905,26 @@ int run_jm(int argc, char** argv) {
             clink::metrics::http::request_seen();
             return handle_submit_spec(*jm_ptr, req);
         });
+
+#ifdef CLINK_LINKED_SQL
+        // POST /api/v1/jobs/sql - compile / explain / submit SQL text directly.
+        // Body is raw SQL; ?mode=explain|compile|submit. DDL accumulates in the
+        // JM's session catalog (optionally persisted via --sql-catalog-dir).
+        http_srv->post("/api/v1/jobs/sql", [jm_ptr](const clink::http::HttpRequest& req) {
+            clink::metrics::http::request_seen();
+            return handle_sql(*jm_ptr, req);
+        });
+        // GET /api/v1/catalog - the session catalog (tables / views + columns).
+        http_srv->get("/api/v1/catalog", [](const clink::http::HttpRequest& req) {
+            clink::metrics::http::request_seen();
+            return handle_catalog(req);
+        });
+        // GET /api/v1/connectors - the SQL connector vocabulary.
+        http_srv->get("/api/v1/connectors", [](const clink::http::HttpRequest& req) {
+            clink::metrics::http::request_seen();
+            return handle_connectors(req);
+        });
+#endif
 
         // POST /api/v1/jobs/:id/cancel - HTTP equivalent of
         // clink_cancel_job. Surfaces the same ack JSON; maps

@@ -123,6 +123,22 @@ HttpResult http_post_empty(const std::string& host, std::uint16_t port, const st
     return send_raw(host, port, req);
 }
 
+// POST `path` with a raw body + content type. Used for the SQL endpoint
+// (body is plain SQL text, options ride the query string).
+HttpResult http_post_body(const std::string& host,
+                          std::uint16_t port,
+                          const std::string& path,
+                          const std::string& body,
+                          const std::string& content_type = "text/plain") {
+    std::string req = "POST " + path + " HTTP/1.1\r\n";
+    req += "Host: " + host + "\r\n";
+    req += "Connection: close\r\n";
+    req += "Content-Type: " + content_type + "\r\n";
+    req += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+    req += body;
+    return send_raw(host, port, req);
+}
+
 // POST `path` with a multipart/form-data body carrying one file. Used
 // for the .so upload - hand-crafted instead of pulling in a third-
 // party HTTP client.
@@ -287,6 +303,98 @@ TEST(HttpSubmit, PostJobsRejectsRequestWithoutFile) {
     EXPECT_EQ(resp.status, 400);
     EXPECT_NE(resp.body.find("job_so"), std::string::npos)
         << "expected job_so mention in error body: " << resp.body;
+}
+
+// The SQL endpoints (compiled into the JM when libclink_sql is linked) are not
+// present in a SQL-less build; skip the whole group then.
+bool sql_endpoints_present(std::uint16_t http_port) {
+    return http_get("127.0.0.1", http_port, "/api/v1/connectors").status == 200;
+}
+
+TEST(HttpSql, ExplainAppliesDdlAndReturnsPlan) {
+    auto c = start_cluster(/*n_tms=*/0);
+    if (!c.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
+    if (!sql_endpoints_present(c->jm_http_port)) {
+        GTEST_SKIP() << "JM built without SQL";
+    }
+    // Two DDL statements register tables in the session catalog; the INSERT
+    // explains against them.
+    const std::string sql =
+        "CREATE TABLE src (a BIGINT, b BIGINT) WITH (connector='kafka', topic='t', "
+        "bootstrap='h:1'); "
+        "CREATE TABLE dst (a BIGINT) WITH (connector='file', format='json', path='/tmp/o.ndjson'); "
+        "INSERT INTO dst SELECT a FROM src WHERE b > 10;";
+    const auto resp =
+        http_post_body("127.0.0.1", c->jm_http_port, "/api/v1/jobs/sql?mode=explain", sql);
+    EXPECT_EQ(resp.status, 200) << resp.body;
+    EXPECT_NE(resp.body.find("\"ok\":true"), std::string::npos) << resp.body;
+    EXPECT_NE(resp.body.find("\"applied\":2"), std::string::npos) << resp.body;
+    EXPECT_NE(resp.body.find("Sink"), std::string::npos) << resp.body;
+
+    // The DDL persisted into the session catalog, visible via /api/v1/catalog.
+    const auto cat = http_get("127.0.0.1", c->jm_http_port, "/api/v1/catalog");
+    EXPECT_EQ(cat.status, 200);
+    EXPECT_NE(cat.body.find("\"name\":\"src\""), std::string::npos) << cat.body;
+    EXPECT_NE(cat.body.find("\"name\":\"dst\""), std::string::npos) << cat.body;
+    EXPECT_NE(cat.body.find("\"connector\":\"kafka\""), std::string::npos) << cat.body;
+}
+
+TEST(HttpSql, CompileReturnsParallelisedSpec) {
+    auto c = start_cluster(/*n_tms=*/0);
+    if (!c.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
+    if (!sql_endpoints_present(c->jm_http_port)) {
+        GTEST_SKIP() << "JM built without SQL";
+    }
+    // A compatible JSON file source + sink so the physical planner accepts it.
+    http_post_body("127.0.0.1",
+                   c->jm_http_port,
+                   "/api/v1/jobs/sql?mode=explain",
+                   "CREATE TABLE s (a BIGINT, b BIGINT) WITH (connector='file', format='json', "
+                   "path='/tmp/i.ndjson'); "
+                   "CREATE TABLE d (a BIGINT) WITH (connector='file', format='json', "
+                   "path='/tmp/o.ndjson');");
+    const auto resp = http_post_body("127.0.0.1",
+                                     c->jm_http_port,
+                                     "/api/v1/jobs/sql?mode=compile&parallelism=3",
+                                     "INSERT INTO d SELECT a FROM s WHERE b > 5;");
+    EXPECT_EQ(resp.status, 200) << resp.body;
+    EXPECT_NE(resp.body.find("\"specs\""), std::string::npos) << resp.body;
+    EXPECT_NE(resp.body.find("\"ops\""), std::string::npos) << resp.body;
+}
+
+TEST(HttpSql, RejectsBadSqlWithPosition) {
+    auto c = start_cluster(/*n_tms=*/0);
+    if (!c.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
+    if (!sql_endpoints_present(c->jm_http_port)) {
+        GTEST_SKIP() << "JM built without SQL";
+    }
+    const auto resp = http_post_body("127.0.0.1",
+                                     c->jm_http_port,
+                                     "/api/v1/jobs/sql?mode=explain",
+                                     "INSERT INTO nope SELECT 1;");
+    EXPECT_EQ(resp.status, 400) << resp.body;
+    EXPECT_NE(resp.body.find("\"ok\":false"), std::string::npos) << resp.body;
+    EXPECT_NE(resp.body.find("\"position\""), std::string::npos) << resp.body;
+}
+
+TEST(HttpSql, ConnectorsListIncludesKnownNames) {
+    auto c = start_cluster(/*n_tms=*/0);
+    if (!c.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
+    const auto resp = http_get("127.0.0.1", c->jm_http_port, "/api/v1/connectors");
+    if (resp.status != 200) {
+        GTEST_SKIP() << "JM built without SQL";
+    }
+    EXPECT_NE(resp.body.find("\"name\":\"kafka\""), std::string::npos) << resp.body;
+    EXPECT_NE(resp.body.find("\"name\":\"parquet\""), std::string::npos) << resp.body;
+    EXPECT_NE(resp.body.find("\"category\":\"messaging\""), std::string::npos) << resp.body;
 }
 
 TEST(HttpBackpressure, TmMetricsExposeOperatorInputGauges) {
