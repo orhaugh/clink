@@ -183,7 +183,8 @@ private:
                         }
                     }
                     if (all_digits) {
-                        maxv = std::max(maxv, std::stoll(fn.substr(0, 20)));
+                        maxv =
+                            std::max(maxv, static_cast<std::int64_t>(std::stoll(fn.substr(0, 20))));
                     }
                 }
             }
