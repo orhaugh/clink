@@ -147,6 +147,7 @@ produces the same `JobGraphSpec` as SQL.
 | Subsystem                   | Status                                              |
 |----------------------------|-----------------------------------------------------|
 | Metrics registry           | implemented (counter + gauge)                       |
+| Data lineage               | per-job source/sink dataset graph over `GET /api/v1/jobs/:id/lineage` and the event stream; pluggable `LineageListener` export with a built-in OpenLineage exporter |
 | OpenTelemetry integration  | boundary defined (`otel_boundary.hpp`); no exporter wired yet |
 | Arrow wire format          | every operator-to-operator data frame is an Arrow IPC stream (`Kind::ArrowBatch=7`); columnar schemas for built-in types, binary-column fallback for user types; control frames stay compact; `clink_serde_bench` shows roughly 4-9x over the per-record `Codec<T>` path |
 
@@ -287,6 +288,7 @@ stack](docs/internals/architecture.md), which links out to the rest:
 - Reliability: [checkpointing](docs/internals/checkpointing.md), [fault tolerance and rescale](docs/internals/fault-tolerance-and-rescale.md)
 - Execution paths: [columnar execution](docs/internals/columnar-execution.md), [async execution and disaggregated state](docs/internals/async-state-execution.md)
 - [SQL frontend internals](docs/internals/sql-frontend.md)
+- Observability: [data lineage](docs/internals/data-lineage.md)
 
 ## Using clink as a library
 

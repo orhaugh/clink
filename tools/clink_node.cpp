@@ -60,6 +60,7 @@
 #include "clink/cluster/plugin_loader.hpp"
 #include "clink/cluster/protocol.hpp"
 #include "clink/cluster/task_manager.hpp"
+#include "clink/lineage/lineage_listener.hpp"
 #ifdef CLINK_HAS_HTTP
 #include "clink/cluster/snapshots.hpp"
 #include "clink/core/types.hpp"  // operator_id_from_uid
@@ -1635,6 +1636,15 @@ int run_jm(int argc, char** argv) {
     // is process-local + non-durable (dev/test only); use a durable tier here
     // on a production cluster. A per-job --state-backend still overrides.
     const auto default_state_backend = get_arg(argc, argv, "default-state-backend", "");
+    // Data lineage export. --lineage-listener names a registered listener
+    // (e.g. "openlineage"); empty disables export. The listener's config is
+    // built from the --lineage-* flags below and passed through verbatim.
+    // The job's lineage is always available over GET /api/v1/jobs/:id/lineage
+    // and the /api/v1/events stream regardless of this flag; this only wires
+    // an outbound exporter.
+    const auto lineage_listener = get_arg(argc, argv, "lineage-listener", "");
+    const auto lineage_endpoint = get_arg(argc, argv, "lineage-endpoint", "");
+    const auto lineage_namespace = get_arg(argc, argv, "lineage-namespace", "");
 
     JobManager::Config cfg;
     cfg.bind_host = bind_host;
@@ -1655,6 +1665,37 @@ int run_jm(int argc, char** argv) {
     JobManager jm(cfg);
     if (!ha_dir.empty()) {
         jm.set_ha_dir(ha_dir);
+    }
+
+    // Data-lineage exporter. Subscribe to the EventBus before any job is
+    // submitted or replayed (HA takeover replays on becoming leader), so no
+    // jm.job_lineage event is missed. The dispatcher owns the listener and
+    // the subscription for the lifetime of run_jm. Off unless a listener is
+    // named; only the leader produces job events, so no HA-double-emit guard
+    // is needed (a standby never submits).
+    std::unique_ptr<clink::lineage::LineageDispatcher> lineage_dispatcher;
+    if (!lineage_listener.empty()) {
+        clink::lineage::register_builtin_lineage_listeners();
+        clink::lineage::LineageListenerConfig lcfg;
+        if (!lineage_endpoint.empty()) {
+            lcfg["endpoint"] = lineage_endpoint;
+        }
+        if (!lineage_namespace.empty()) {
+            lcfg["namespace"] = lineage_namespace;
+        }
+        auto listener =
+            clink::lineage::LineageListenerRegistry::global().create(lineage_listener, lcfg);
+        if (listener) {
+            std::vector<std::unique_ptr<clink::lineage::LineageListener>> listeners;
+            listeners.push_back(std::move(listener));
+            lineage_dispatcher =
+                std::make_unique<clink::lineage::LineageDispatcher>(std::move(listeners));
+            std::cout << "JM lineage export via '" << lineage_listener << "'\n";
+        } else {
+            clink::log::warn("jm.lineage",
+                             "unknown or unconfigured lineage listener '" + lineage_listener +
+                                 "'; export disabled");
+        }
     }
 #ifdef CLINK_LINKED_TLS
     if (!tls_cert.empty() && !tls_key.empty()) {
@@ -1843,6 +1884,34 @@ int run_jm(int argc, char** argv) {
             clink::http::JsonWriter w;
             write_job_graph(w, *g);
             resp.body = w.str();
+            return resp;
+        });
+        // GET /api/v1/jobs/:id/lineage - the external datasets the job reads
+        // from and writes to, plus coarse source -> sink edges. Derived from
+        // the retained JobGraphSpec; for integrating clink into an external
+        // lineage system by polling (the same data is pushed on
+        // /api/v1/events as jm.job_lineage).
+        http_srv->get("/api/v1/jobs/:id/lineage", [jm_ptr](const clink::http::HttpRequest& req) {
+            clink::http::HttpResponse resp;
+            clink::cluster::JobId job_id = 0;
+            if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
+                try {
+                    job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
+                } catch (...) {
+                    resp.status = 400;
+                    resp.body = R"({"error":"invalid job id"})";
+                    return resp;
+                }
+            }
+            auto lg = jm_ptr->snapshot_job_lineage(job_id);
+            if (!lg.has_value()) {
+                resp.status = 404;
+                resp.body = R"({"error":"no such job"})";
+                return resp;
+            }
+            resp.body = "{\"job_id\":" + std::to_string(job_id) +
+                        ",\"available\":" + (lg->empty() ? "false" : "true") +
+                        ",\"lineage\":" + lg->to_json() + "}";
             return resp;
         });
         // GET /api/v1/jobs/:id/operators - per-operator runtime stats (records

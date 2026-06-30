@@ -56,3 +56,9 @@ then follow the links into each subsystem.
 | --- | --- |
 | [SQL frontend internals](sql-frontend.md) | How a SQL statement becomes an operator DAG: preparse shim, libpg_query parse, AST, binder, rule-based optimiser, and physical planner producing a JobGraphSpec. |
 
+## Observability
+
+| Page | What it covers |
+| --- | --- |
+| [Data lineage](data-lineage.md) | How clink derives the external datasets a job reads and writes, exposes them over HTTP and the event bus, and ships them to an external lineage system via a pluggable listener with a built-in OpenLineage exporter. |
+

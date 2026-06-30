@@ -986,6 +986,24 @@ std::optional<JobGraphDetail> JobManager::snapshot_job_graph(JobId job_id) const
     return d;
 }
 
+std::optional<lineage::LineageGraph> JobManager::snapshot_job_lineage(JobId job_id) const {
+    std::lock_guard lock(mu_);
+    auto it = jobs_.find(job_id);
+    if (it == jobs_.end()) {
+        return std::nullopt;
+    }
+    const auto& job = *it->second;
+    if (job.graph_json.empty()) {
+        return lineage::LineageGraph{};  // known job, but no retained graph
+    }
+    try {
+        const auto spec = JobGraphSpec::from_json(job.graph_json);
+        return lineage::extract_lineage(spec);
+    } catch (...) {
+        return lineage::LineageGraph{};
+    }
+}
+
 std::optional<std::pair<std::string, std::uint16_t>> JobManager::tm_http_target(
     const std::string& tm_id) const {
     std::lock_guard lock(mu_);
@@ -1698,6 +1716,21 @@ JobId JobManager::submit_job(const JobGraphSpec& graph,
             persist_job_manifest_(ha_dir_, job_id, graph_json, plugins_copy, checkpoint_copy);
         }
     }
+
+    // Emit the job's data lineage on the event bus so any registered
+    // lineage exporter (and the /api/v1/events stream) can ship it. The
+    // payload wraps the lineage graph with the job id; a LineageDispatcher
+    // reconstructs both. Best-effort: never fail a submit on lineage.
+    try {
+        const auto lg = lineage::extract_lineage(graph);
+        if (!lg.empty()) {
+            events::publish(
+                "jm.job_lineage",
+                "{\"job_id\":" + std::to_string(job_id) + ",\"lineage\":" + lg.to_json() + "}");
+        }
+    } catch (...) {
+    }
+
     return job_id;
 }
 

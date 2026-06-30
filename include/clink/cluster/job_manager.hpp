@@ -22,6 +22,7 @@
 #include "clink/cluster/protocol.hpp"
 #include "clink/cluster/rescale_coordinator.hpp"
 #include "clink/cluster/snapshots.hpp"
+#include "clink/lineage/lineage_graph.hpp"
 #include "clink/runtime/network/connection.hpp"
 
 namespace clink::cluster {
@@ -303,6 +304,12 @@ public:
     // if job_id isn't known; a detail with available=false when the job exists
     // but no graph was retained (e.g. submitted before graph retention).
     std::optional<JobGraphDetail> snapshot_job_graph(JobId job_id) const;
+
+    // Data-lineage view for GET /api/v1/jobs/:id/lineage: the external
+    // datasets the job reads from and writes to, derived from the retained
+    // JobGraphSpec. nullopt if job_id isn't known; an empty graph when the
+    // job exists but no graph was retained.
+    std::optional<lineage::LineageGraph> snapshot_job_lineage(JobId job_id) const;
 
     // (data_host, http_port) for the TM with the given id, or nullopt
     // if the TM isn't registered, is lost, or didn't enable HTTP.

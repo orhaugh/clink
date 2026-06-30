@@ -203,6 +203,8 @@ add_library(clink_core STATIC
     src/cluster/built_in_factories.cpp
     src/cluster/plugin_loader.cpp
     src/cluster/plugin_cache.cpp
+    src/lineage/lineage_graph.cpp
+    src/lineage/lineage_listener.cpp
     src/config/json.cpp
     src/connectors/openssl_atexit_guard.cpp
 )
@@ -210,6 +212,7 @@ if(CLINK_BUILD_HTTP)
     target_sources(clink_core PRIVATE
         src/http/http_server.cpp
         src/http/http_client.cpp
+        src/lineage/openlineage_exporter.cpp
     )
     # Embed the dashboard SPA. configure_file runs at configure time, so
     # re-run `cmake -S . -B build` after editing dashboard.html to

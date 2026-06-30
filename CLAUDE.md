@@ -43,6 +43,7 @@ docs current when a subsystem changes.
 | Arrow columnar execution | `include/clink/core/arrow_batcher.hpp`, columnar hooks in `include/clink/operators/` | `docs/internals/columnar-execution.md` |
 | Async substrate + disaggregated state | `include/clink/async/`, `src/async/`, RemoteReadBackend in `include/clink/state/` | `docs/internals/async-state-execution.md` |
 | SQL frontend (parse -> bind -> plan -> ops) | `include/clink/sql/`, `src/sql/` | `docs/internals/sql-frontend.md` |
+| Data lineage (capture + pluggable export) | `include/clink/lineage/`, `src/lineage/` | `docs/internals/data-lineage.md` |
 | Connectors (sources/sinks/backends) | `impls/<name>/` | `docs/connectors/<name>.md` |
 
 ## Pinned toolchain (one-time bootstrap)
