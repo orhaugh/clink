@@ -33,6 +33,7 @@
 #include "clink/sql/optimizer.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/physical_plan.hpp"
+#include "clink/sql/view.hpp"
 
 namespace {
 
@@ -244,6 +245,14 @@ int main(int argc, char** argv) {
             }
             if (std::holds_alternative<clink::sql::ast::CreateTableStmt>(stmt)) {
                 catalog.register_table(std::get<clink::sql::ast::CreateTableStmt>(stmt));
+                continue;
+            }
+            if (std::holds_alternative<clink::sql::ast::CreateViewStmt>(stmt)) {
+                // A logical view is pure catalog registration (no storage, no
+                // job): bind the defining query for its columns and store it; a
+                // reference to the view is expanded inline at bind time.
+                clink::sql::register_view(
+                    catalog, std::move(std::get<clink::sql::ast::CreateViewStmt>(stmt)));
                 continue;
             }
             if (std::holds_alternative<clink::sql::ast::CreateMaterializedViewStmt>(stmt)) {

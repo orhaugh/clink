@@ -518,6 +518,20 @@ struct CreateMaterializedViewStmt {
     Loc loc;
 };
 
+// CREATE [OR REPLACE] VIEW <name> AS <SELECT>. A logical (non-materialized)
+// view: no backing table and no maintenance job - the catalog stores the
+// defining query, and a reference to the view is expanded inline (re-bound as a
+// sub-plan) at bind time. libpg_query parses it as a ViewStmt. v1 does not
+// support a column-alias list `CREATE VIEW v (a, b) AS ...` (name the columns in
+// the SELECT) or WITH CHECK OPTION.
+struct CreateViewStmt {
+    std::string view_name;
+    std::optional<std::string> schema;
+    SelectStmt query;
+    bool or_replace = false;
+    Loc loc;
+};
+
 struct ExplainStmt;
 
 using Statement = std::variant<CreateTableStmt,
@@ -526,6 +540,7 @@ using Statement = std::variant<CreateTableStmt,
                                DropTableStmt,
                                ShowTablesStmt,
                                CreateMaterializedViewStmt,
+                               CreateViewStmt,
                                AnalyzeStmt,
                                std::unique_ptr<ExplainStmt>>;
 

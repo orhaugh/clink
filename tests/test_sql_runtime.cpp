@@ -53,6 +53,7 @@
 #include "clink/sql/ptf_registry.hpp"
 #include "clink/sql/row_kind.hpp"
 #include "clink/sql/table_api.hpp"
+#include "clink/sql/view.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/remote_pool.hpp"
 #include "clink/state/remote_read_backend.hpp"
@@ -1084,6 +1085,63 @@ TEST(SqlRuntime, TableApiGroupBySumRunsEndToEnd) {
 
     std::filesystem::remove(in_path);
     std::filesystem::remove(out_path);
+}
+
+// CREATE VIEW end-to-end: a query over a logical view runs by expanding the
+// view inline. Proves both that the view's own filter is applied and that data
+// flows through the expanded plan (the view has no storage of its own).
+TEST(SqlRuntime, CreateViewExpandsAndFiltersEndToEnd) {
+    ensure_sql_installed_once();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_view_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_view_out.ndjson";
+    for (const auto& p : {in_path, out_path}) {
+        std::filesystem::remove(p);
+    }
+    write_lines(in_path,
+                {
+                    R"({"a":1,"b":5})",
+                    R"({"a":2,"b":50})",
+                    R"({"a":3,"b":7})",
+                    R"({"a":4,"b":99})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE src (a BIGINT, b BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (a BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    // A logical view that keeps only b > 10. Querying it must apply that filter.
+    register_view(
+        cat,
+        std::move(std::get<ast::CreateViewStmt>(
+            parse("CREATE VIEW big AS SELECT a, b FROM src WHERE b > 10").statements[0])));
+
+    auto spec = compile(cat, "INSERT INTO out_t SELECT a FROM big");
+
+    InProcessCluster cluster("tm-sql-view-e2e", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    std::multiset<std::int64_t> got;
+    for (const auto& line : read_lines(out_path)) {
+        auto js = clink::config::parse(line);
+        got.insert(static_cast<std::int64_t>(js.at("a").as_number()));
+    }
+    // Only the b>10 rows (a=2 b=50, a=4 b=99) survive the view's filter.
+    EXPECT_EQ(got, (std::multiset<std::int64_t>{2, 4}));
+
+    for (const auto& p : {in_path, out_path}) {
+        std::filesystem::remove(p);
+    }
 }
 
 // #61 phase 2: end-to-end MATCH_RECOGNIZE. Compiles a real query to get the

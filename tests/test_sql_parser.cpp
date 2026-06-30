@@ -335,10 +335,32 @@ TEST(SqlParser, ParsesDropMaterializedViewIfExistsMultiple) {
     EXPECT_TRUE(drop.if_exists);
 }
 
-// DROP VIEW parses but is rejected: CREATE VIEW (and so a droppable logical
-// view) is not supported, so it must error rather than silently no-op.
-TEST(SqlParser, RejectsDropView) {
-    EXPECT_THROW(parse("DROP VIEW v"), TranslationError);
+TEST(SqlParser, ParsesDropView) {
+    auto script = parse("DROP VIEW v");
+    ASSERT_TRUE(std::holds_alternative<ast::DropTableStmt>(script.statements[0]));
+    const auto& drop = std::get<ast::DropTableStmt>(script.statements[0]);
+    EXPECT_EQ(drop.table_names, (std::vector<std::string>{"v"}));
+    EXPECT_EQ(drop.object_kind, ast::DropKind::View);
+}
+
+TEST(SqlParser, ParsesCreateView) {
+    auto script = parse("CREATE VIEW v AS SELECT a, b FROM t");
+    ASSERT_EQ(script.statements.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<ast::CreateViewStmt>(script.statements[0]));
+    const auto& cv = std::get<ast::CreateViewStmt>(script.statements[0]);
+    EXPECT_EQ(cv.view_name, "v");
+    EXPECT_FALSE(cv.or_replace);
+}
+
+TEST(SqlParser, ParsesCreateOrReplaceView) {
+    auto script = parse("CREATE OR REPLACE VIEW v AS SELECT a FROM t");
+    ASSERT_TRUE(std::holds_alternative<ast::CreateViewStmt>(script.statements[0]));
+    EXPECT_TRUE(std::get<ast::CreateViewStmt>(script.statements[0]).or_replace);
+}
+
+// v1 does not support a column-alias list; the columns must be named in the SELECT.
+TEST(SqlParser, RejectsCreateViewColumnAliases) {
+    EXPECT_THROW(parse("CREATE VIEW v (x, y) AS SELECT a, b FROM t"), TranslationError);
 }
 
 TEST(SqlParser, ParsesCreateTableIfNotExists) {

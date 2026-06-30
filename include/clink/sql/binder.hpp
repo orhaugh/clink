@@ -155,6 +155,10 @@ private:
     // on a second reference.
     mutable std::unordered_map<std::string, TableDef> cte_synth_tables_;
     mutable std::unordered_map<std::string, std::unique_ptr<LogicalPlan>> cte_plans_;
+    // CREATE VIEW: the logical views currently being expanded (make_table_plan
+    // re-binds a view's defining SELECT inline). A view re-entered while already
+    // expanding is a cycle (direct or transitive self-reference) - rejected.
+    mutable std::set<std::string> expanding_views_;
     // Set when the outer WHERE was consumed by the
     // ROW_NUMBER pattern matcher; the regular projection path skips
     // the WHERE so the predicate doesn't get reapplied to the

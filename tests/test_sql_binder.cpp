@@ -4,6 +4,7 @@
 #include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/parser.hpp"
+#include "clink/sql/view.hpp"
 
 #include "arrow/api.h"
 
@@ -2654,6 +2655,136 @@ TEST(SqlBinder, WhereLiteralOnLeftSideRejected) {
     Binder b(cat);
     EXPECT_THROW(b.bind_select(as_select(parse("SELECT url FROM clicks WHERE 'x' = url"))),
                  TranslationError);
+}
+
+// ---------------------------------------------------------------------------
+// CREATE VIEW: a logical view is expanded inline at each reference.
+// ---------------------------------------------------------------------------
+namespace {
+
+// The leaf base-table scan reached by walking the primary input chain.
+const LogicalScan* deepest_scan(const LogicalPlan* p) {
+    while (p != nullptr) {
+        if (p->kind() == "Scan") {
+            return static_cast<const LogicalScan*>(p);
+        }
+        auto ins = p->inputs();
+        if (ins.empty()) {
+            return nullptr;
+        }
+        p = ins[0];
+    }
+    return nullptr;
+}
+
+// Does any node on the primary input chain have this kind?
+bool chain_contains(const LogicalPlan* p, const std::string& kind) {
+    while (p != nullptr) {
+        if (p->kind() == kind) {
+            return true;
+        }
+        auto ins = p->inputs();
+        if (ins.empty()) {
+            return false;
+        }
+        p = ins[0];
+    }
+    return false;
+}
+
+void make_view(Catalog& cat, const char* sql) {
+    register_view(cat, std::move(std::get<ast::CreateViewStmt>(parse(sql).statements[0])));
+}
+
+}  // namespace
+
+TEST(SqlBinder, ViewExpandsToBaseTableAtReference) {
+    Catalog cat;
+    register_clicks(cat);
+    make_view(cat, "CREATE VIEW v AS SELECT user_id, url FROM clicks");
+    // The view's TableDef carries the inferred output columns.
+    const TableDef* def = cat.get_table("v");
+    ASSERT_NE(def, nullptr);
+    EXPECT_TRUE(def->is_logical_view());
+    ASSERT_EQ(def->columns.size(), 2u);
+    EXPECT_EQ(def->columns[0].name, "user_id");
+    EXPECT_EQ(def->columns[1].name, "url");
+
+    // A reference expands inline: the leaf scan is the base table `clicks`,
+    // never a scan of `v` (a view has no storage).
+    Binder b(cat);
+    auto plan = b.bind_select(as_select(parse("SELECT url FROM v")));
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(plan->kind(), "Project");
+    const LogicalScan* scan = deepest_scan(plan.get());
+    ASSERT_NE(scan, nullptr);
+    EXPECT_EQ(scan->table().name, "clicks");
+}
+
+TEST(SqlBinder, ViewPreservesItsOwnFilter) {
+    Catalog cat;
+    register_clicks(cat);
+    make_view(cat, "CREATE VIEW big AS SELECT user_id, url FROM clicks WHERE user_id > 100");
+    Binder b(cat);
+    auto plan = b.bind_select(as_select(parse("SELECT url FROM big")));
+    // The view's WHERE survives expansion: a Filter is on the chain over clicks.
+    EXPECT_TRUE(chain_contains(plan.get(), "Filter"));
+    EXPECT_EQ(deepest_scan(plan.get())->table().name, "clicks");
+}
+
+TEST(SqlBinder, ViewColumnResolutionRejectsUnknownColumn) {
+    Catalog cat;
+    register_clicks(cat);
+    make_view(cat, "CREATE VIEW v AS SELECT user_id FROM clicks");
+    Binder b(cat);
+    // `url` is not exposed by the view (only user_id is).
+    EXPECT_THROW(b.bind_select(as_select(parse("SELECT url FROM v"))), TranslationError);
+}
+
+TEST(SqlBinder, NestedViewExpandsTransitively) {
+    Catalog cat;
+    register_clicks(cat);
+    make_view(cat, "CREATE VIEW v1 AS SELECT user_id, url FROM clicks");
+    make_view(cat, "CREATE VIEW v2 AS SELECT user_id FROM v1");
+    Binder b(cat);
+    auto plan = b.bind_select(as_select(parse("SELECT user_id FROM v2")));
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(deepest_scan(plan.get())->table().name, "clicks");
+}
+
+TEST(SqlBinder, CreateViewRejectsDuplicateWithoutOrReplace) {
+    Catalog cat;
+    register_clicks(cat);
+    make_view(cat, "CREATE VIEW v AS SELECT user_id FROM clicks");
+    EXPECT_THROW(make_view(cat, "CREATE VIEW v AS SELECT url FROM clicks"), TranslationError);
+    // OR REPLACE updates the definition (and the exposed columns).
+    EXPECT_NO_THROW(make_view(cat, "CREATE OR REPLACE VIEW v AS SELECT url FROM clicks"));
+    const TableDef* def = cat.get_table("v");
+    ASSERT_NE(def, nullptr);
+    ASSERT_EQ(def->columns.size(), 1u);
+    EXPECT_EQ(def->columns[0].name, "url");
+}
+
+TEST(SqlBinder, CreateViewRejectsNameCollisionWithTable) {
+    Catalog cat;
+    register_clicks(cat);
+    // `clicks` is a base table, not a view - even shape-compatible, reject.
+    EXPECT_THROW(make_view(cat, "CREATE VIEW clicks AS SELECT user_id FROM clicks"),
+                 TranslationError);
+}
+
+// A reference cycle (introduced via OR REPLACE: v1 binds against the prior
+// definition, so creation succeeds) is caught by the expanding-views guard the
+// moment a query tries to expand it.
+TEST(SqlBinder, CyclicViewReferenceRejectedAtBind) {
+    Catalog cat;
+    register_clicks(cat);
+    make_view(cat, "CREATE VIEW v1 AS SELECT user_id FROM clicks");
+    make_view(cat, "CREATE VIEW v2 AS SELECT user_id FROM v1");
+    // Redefine v1 to reference v2 -> catalog now has v1 -> v2 -> v1.
+    make_view(cat, "CREATE OR REPLACE VIEW v1 AS SELECT user_id FROM v2");
+    Binder b(cat);
+    EXPECT_THROW(b.bind_select(as_select(parse("SELECT user_id FROM v1"))), TranslationError);
 }
 
 }  // namespace clink::sql

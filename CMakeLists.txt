@@ -526,6 +526,7 @@ if(CLINK_BUILD_SQL)
         src/sql/binder.cpp
         src/sql/physical_plan.cpp
         src/sql/materialized_view.cpp
+        src/sql/view.cpp
         src/sql/optimizer.cpp
         src/sql/analyze.cpp
         src/sql/install.cpp

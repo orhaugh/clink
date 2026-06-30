@@ -128,11 +128,30 @@ void Catalog::register_table(const ast::CreateTableStmt& stmt) {
     register_table(std::move(def));
 }
 
+void Catalog::register_logical_view(TableDef def, ast::SelectStmt query) {
+    if (tables_.find(def.name) != tables_.end()) {
+        throw TranslationError("object '" + def.name + "' is already registered", 0);
+    }
+    const std::string name = def.name;
+    tables_.emplace(name, std::move(def));
+    order_.push_back(name);
+    view_queries_.emplace(name, std::move(query));
+    // Intentionally NOT persisted: a logical view is session-scoped in v1 (the
+    // defining SELECT is not serialised to the catalog dir, unlike a
+    // materialized view's backing connector table).
+}
+
+const ast::SelectStmt* Catalog::get_view_query(const std::string& name) const {
+    auto it = view_queries_.find(name);
+    return it == view_queries_.end() ? nullptr : &it->second;
+}
+
 bool Catalog::drop_table(const std::string& name) {
     auto it = tables_.find(name);
     if (it == tables_.end())
         return false;
     tables_.erase(it);
+    view_queries_.erase(name);  // no-op unless `name` is a logical view
     auto pos = std::find(order_.begin(), order_.end(), name);
     if (pos != order_.end())
         order_.erase(pos);

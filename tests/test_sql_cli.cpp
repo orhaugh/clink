@@ -267,6 +267,28 @@ TEST(SqlCli, DropMaterializedViewRejectsPlainTable) {
     fs::remove_all(cat_dir);
 }
 
+// CREATE VIEW + DROP VIEW through the driver, in a single invocation (logical
+// views are session-scoped, not persisted). Also checks the object-kind guards:
+// DROP TABLE refuses a view and DROP VIEW refuses a table.
+TEST(SqlCli, CreateViewAndDropViewEndToEnd) {
+    const std::string mk =
+        "CREATE TABLE t (a BIGINT) WITH (connector='file', format='json', path='/x'); ";
+
+    // Create a table, a view over it, then drop the view - all succeed.
+    auto r1 = run_compiler("-e \"" + mk + "CREATE VIEW v AS SELECT a FROM t; DROP VIEW v\"");
+    EXPECT_EQ(r1.exit_code, 0) << "stderr: " << r1.stderr_text;
+
+    // DROP TABLE on a view is rejected.
+    auto r2 = run_compiler("-e \"" + mk + "CREATE VIEW v AS SELECT a FROM t; DROP TABLE v\"");
+    EXPECT_NE(r2.exit_code, 0);
+    EXPECT_NE(r2.stderr_text.find("not a table"), std::string::npos) << r2.stderr_text;
+
+    // DROP VIEW on a table is rejected.
+    auto r3 = run_compiler("-e \"" + mk + "DROP VIEW t\"");
+    EXPECT_NE(r3.exit_code, 0);
+    EXPECT_NE(r3.stderr_text.find("not a view"), std::string::npos) << r3.stderr_text;
+}
+
 // ---------------------------------------------------------------------------
 // HTTP submission integration test. Skips when clink_node isn't available.
 // ---------------------------------------------------------------------------

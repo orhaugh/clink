@@ -1364,11 +1364,10 @@ ast::DropTableStmt translate_drop_stmt(const JsonValue& body) {
     } else if (remove_type == "OBJECT_MATVIEW") {
         stmt.object_kind = ast::DropKind::MaterializedView;
     } else if (remove_type == "OBJECT_VIEW") {
-        // Parsed for a clear message; CREATE VIEW (and so a droppable logical
-        // view) is not supported, so reject rather than silently no-op.
-        unsupported("DROP VIEW is not supported (CREATE VIEW is not supported)", stmt.loc.pos);
+        stmt.object_kind = ast::DropKind::View;
     } else {
-        unsupported("only DROP TABLE and DROP MATERIALIZED VIEW are supported; got " + remove_type,
+        unsupported("only DROP TABLE, DROP MATERIALIZED VIEW and DROP VIEW are supported; got " +
+                        remove_type,
                     stmt.loc.pos);
     }
     if (body.contains("missing_ok") && body.at("missing_ok").is_bool()) {
@@ -1466,6 +1465,39 @@ ast::CreateMaterializedViewStmt translate_matview_stmt(const JsonValue& body) {
     return stmt;
 }
 
+// CREATE [OR REPLACE] VIEW <name> AS <SELECT>. libpg_query emits a ViewStmt with
+// the view name under `view` (a RangeVar), the defining query under `query` (a
+// SelectStmt node), `replace` for OR REPLACE, and `aliases` for a column-alias
+// list. v1 rejects the alias list (name columns in the SELECT) and any non-SELECT
+// defining query.
+ast::CreateViewStmt translate_view_stmt(const JsonValue& body) {
+    ast::CreateViewStmt stmt;
+    stmt.loc = loc_from(body);
+    if (!body.contains("view") || !body.at("view").is_object()) {
+        unsupported("CREATE VIEW missing target relation", stmt.loc.pos);
+    }
+    auto rel = translate_range_var(body.at("view"));
+    stmt.view_name = std::move(rel.name);
+    stmt.schema = std::move(rel.schema);
+    if (body.contains("aliases") && body.at("aliases").is_array() &&
+        !body.at("aliases").as_array().empty()) {
+        unsupported("CREATE VIEW column aliases (name the columns in the SELECT instead)",
+                    stmt.loc.pos);
+    }
+    if (body.contains("replace") && body.at("replace").is_bool()) {
+        stmt.or_replace = body.at("replace").as_bool();
+    }
+    if (!body.contains("query") || !body.at("query").is_object()) {
+        unsupported("CREATE VIEW missing defining query", stmt.loc.pos);
+    }
+    auto [qkind, qbody] = node_wrapper(body.at("query"));
+    if (qkind != "SelectStmt") {
+        unsupported("CREATE VIEW defining query kind " + qkind, stmt.loc.pos);
+    }
+    stmt.query = translate_select_stmt(*qbody);
+    return stmt;
+}
+
 // ANALYZE [<col>...] <table> parses as a PG VacuumStmt. We support the ANALYZE
 // form on a single table; VACUUM has no clink meaning and is rejected. The
 // optional `TABLE` keyword in the Flink-style spelling is stripped by the
@@ -1518,6 +1550,9 @@ ast::Statement translate_statement(const JsonValue& outer_stmt) {
     }
     if (kind == "CreateTableAsStmt") {
         return ast::Statement{translate_matview_stmt(*body)};
+    }
+    if (kind == "ViewStmt") {
+        return ast::Statement{translate_view_stmt(*body)};
     }
     if (kind == "InsertStmt") {
         return ast::Statement{translate_insert_stmt(*body)};

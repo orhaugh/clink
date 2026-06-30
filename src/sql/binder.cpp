@@ -1061,7 +1061,7 @@ std::int64_t interval_to_ms(const ast::Expression& expr) {
         // The cast lowers PG's INTERVAL TypeCast. The inner arg is a
         // StringLiteral carrying the numeric quantity; the cast's
         // target carries the unit (currently we encode all of int /
-        // float / str — the interval-specific unit needs more parser
+        // float / str - the interval-specific unit needs more parser
         // work). We accept INTERVAL '<n>' [SECOND|MINUTE|
         // HOUR|MILLISECOND]; PG's typmod encoding is checked at the
         // ast_builder level for the unit. Until then, the inner
@@ -1673,6 +1673,44 @@ std::unique_ptr<LogicalPlan> Binder::make_table_plan(const std::string& table_na
                        pos);
         }
         return std::move(it->second);
+    }
+    // CREATE VIEW: a logical view is expanded inline - re-bind its defining
+    // SELECT as a sub-plan in place of a scan, so every reference site (single
+    // FROM, joins, subqueries, ...) that routes through here picks it up.
+    if (resolved.is_logical_view()) {
+        const ast::SelectStmt* view_query = catalog_.get_view_query(table_name);
+        if (view_query == nullptr) {
+            bind_error("view '" + table_name + "' has no stored definition", pos);
+        }
+        if (!expanding_views_.insert(table_name).second) {
+            bind_error("recursive / cyclic view reference: '" + table_name + "'", pos);
+        }
+        // A view definition binds against the catalog, NOT the referencing
+        // query's WITH-CTE scope (or its consumed-WHERE flag). Save that
+        // per-statement state, bind the view with a clean scope, then restore -
+        // on the throw path too, so a bind error inside the view does not leave
+        // the outer binder corrupted.
+        auto saved_synth = std::move(cte_synth_tables_);
+        auto saved_plans = std::move(cte_plans_);
+        const bool saved_topn = consumed_topn_where_;
+        cte_synth_tables_.clear();
+        cte_plans_.clear();
+        consumed_topn_where_ = false;
+        auto restore = [&] {
+            cte_synth_tables_ = std::move(saved_synth);
+            cte_plans_ = std::move(saved_plans);
+            consumed_topn_where_ = saved_topn;
+            expanding_views_.erase(table_name);
+        };
+        std::unique_ptr<LogicalPlan> sub;
+        try {
+            sub = bind_select(*view_query);
+        } catch (...) {
+            restore();
+            throw;
+        }
+        restore();
+        return sub;
     }
     if (resolved.is_lookup()) {
         bind_error("lookup table '" + resolved.name +

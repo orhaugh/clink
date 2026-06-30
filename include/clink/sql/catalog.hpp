@@ -164,6 +164,18 @@ public:
     bool merge_table_stats(const std::string& name,
                            const std::map<std::string, std::string>& stats);
 
+    // CREATE VIEW: register a logical (non-materialized) view - a TableDef tagged
+    // view_kind='logical' (carrying the view's output columns for name
+    // resolution) plus the defining SELECT, which the binder expands inline at
+    // each reference. Throws TranslationError if the name is already taken.
+    // Logical views are session-scoped in v1: the defining query is NOT
+    // persisted to the catalog dir (unlike a materialized view's backing table).
+    void register_logical_view(TableDef def, ast::SelectStmt query);
+
+    // The defining SELECT for a logical view, or nullptr if `name` is not a
+    // registered logical view. The pointer is stable until the view is dropped.
+    [[nodiscard]] const ast::SelectStmt* get_view_query(const std::string& name) const;
+
     // Lookup. Returns nullptr if not found.
     [[nodiscard]] const TableDef* get_table(const std::string& name) const;
 
@@ -193,6 +205,9 @@ public:
 
 private:
     std::unordered_map<std::string, TableDef> tables_;
+    // Defining SELECT for each logical view (view_kind='logical' in tables_).
+    // Node-stable so get_view_query can hand the binder a pointer.
+    std::unordered_map<std::string, ast::SelectStmt> view_queries_;
     std::vector<std::string> order_;  // registration order, for list_tables
     std::string persistence_dir_;
 };
