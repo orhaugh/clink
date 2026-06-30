@@ -115,7 +115,7 @@ public:
             // (without consuming the factory); poll() drains completions and
             // we retry, so no record is dropped.
             while (!aec.submit(gate, factory)) {
-                aec.poll();
+                aec.poll_or_flush();  // flush parked coalesced reads so the cap can free
             }
         }
     }

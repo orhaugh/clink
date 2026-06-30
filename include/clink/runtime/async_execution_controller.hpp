@@ -192,6 +192,24 @@ public:
         return finished;
     }
 
+    // Runner thread. poll() completions and, if none were ready, give a read
+    // coalescer the chance to issue its parked batch (the same flush drain()
+    // does when stuck). Use this - not bare poll() - in a submit-retry spin at
+    // the in-flight cap: with coalesce_reads() on, every submitted record's
+    // first step is a get_async the coalescer PARKS until flush(), so poll()
+    // alone never issues those reads, never completes them, and never frees
+    // capacity - the spin livelocks the runner thread. Flushing here issues the
+    // parked batch so completions can land and capacity can free. A no-op when
+    // not coalescing (flush_hook_ unset), so the non-coalescing path is
+    // byte-identical to poll().
+    std::size_t poll_or_flush() {
+        const std::size_t finished = poll();
+        if (finished == 0 && flush_hook_) {
+            flush_hook_();
+        }
+        return finished;
+    }
+
     // Runner thread. Block until all in-flight and parked work is done,
     // servicing completions as they arrive.
     void drain() {

@@ -136,7 +136,7 @@ private:
             const auto kb = key_codec_.encode(k);
             std::string gate(reinterpret_cast<const char*>(kb.data()), kb.size());
             while (!aec.submit(gate, factory)) {
-                aec.poll();
+                aec.poll_or_flush();  // flush parked coalesced reads so the cap can free
             }
         }
     }

@@ -1525,7 +1525,7 @@ public:
                 co_return;
             };
             while (!aec.submit(key, factory)) {
-                aec.poll();
+                aec.poll_or_flush();  // flush parked coalesced reads so the cap can free
             }
         }
     }
@@ -2547,7 +2547,7 @@ public:
                 co_return;
             };
             while (!aec.submit(key, factory)) {
-                aec.poll();
+                aec.poll_or_flush();  // flush parked coalesced reads so the cap can free
             }
         }
     }
@@ -3495,7 +3495,7 @@ public:
             // Backpressure: at the in-flight cap submit() refuses without
             // consuming the factory; poll() drains completions and we retry.
             while (!aec.submit(key, factory)) {
-                aec.poll();
+                aec.poll_or_flush();  // flush parked coalesced reads so the cap can free
             }
         }
     }
@@ -4025,7 +4025,8 @@ private:
             co_return;
         };
         while (!aec.submit(key, factory)) {
-            aec.poll();  // backpressure: drain completions then retry
+            // backpressure: flush parked coalesced reads + drain completions, retry
+            aec.poll_or_flush();
         }
     }
 

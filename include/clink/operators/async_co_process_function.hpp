@@ -158,7 +158,7 @@ public:
                 co_return;
             };
             while (!aec.submit(gate, factory)) {
-                aec.poll();
+                aec.poll_or_flush();  // flush parked coalesced reads so the cap can free
             }
         }
     }
@@ -181,7 +181,7 @@ public:
                 co_return;
             };
             while (!aec.submit(gate, factory)) {
-                aec.poll();
+                aec.poll_or_flush();  // flush parked coalesced reads so the cap can free
             }
         }
     }

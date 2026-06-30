@@ -77,7 +77,9 @@ void gated_fire_processing_time_timers(Op& op,
             co_return;
         };
         while (!aec.submit(key, factory)) {
-            aec.poll();  // free capacity, then retry (the timer is still owned here)
+            // free capacity, then retry (the timer is still owned here); flush
+            // parked coalesced reads so the cap can actually free under coalescing
+            aec.poll_or_flush();
         }
     }
     aec.poll();  // settle any timer that ran synchronously (free key) + surface throws
@@ -146,7 +148,9 @@ void gated_fire_event_time_timers(Op& op,
             co_await op.on_event_time_timers_async(timestamps, key, out);
         };
         while (!aec.submit(key, factory)) {
-            aec.poll();  // free capacity, then retry (the timer set is still owned here)
+            // free capacity, then retry (the timer set is still owned here); flush
+            // parked coalesced reads so the cap can actually free under coalescing
+            aec.poll_or_flush();
         }
     }
     aec.poll();  // kick any fire coroutine that completed synchronously + surface throws

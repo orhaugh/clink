@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <mutex>
 #include <set>
@@ -395,6 +396,84 @@ TEST(SqlRuntime, GroupByAutoActivatesAsyncOnDeferringBackend) {
     EXPECT_EQ(auto2, 25);
     EXPECT_GE(rrb->remote_loads(), 2u)
         << "auto-on did not route GROUP BY state through the deferring backend";
+}
+
+// Regression for the coalescing async submit-retry livelock: a single batch that
+// carries MORE than the in-flight cap (kDefaultMaxInFlight = 6000) distinct keys
+// fills the cap mid-batch. With coalesce_reads() on (auto for GROUP BY over a
+// deferring backend) every submitted record's first step is a get_async the
+// coalescer PARKS until flush(); the old submit-retry spin called only poll(),
+// which never flushed, so capacity never freed and the runner thread livelocked.
+// poll_or_flush() in the spin issues the parked batch so it makes progress. A
+// watchdog turns a regression into a bounded failure instead of a CI hang.
+TEST(SqlRuntime, GroupByFatBatchDoesNotLivelockAtInFlightCap) {
+    ensure_sql_installed_once();
+
+    Catalog cat;
+    auto ddl = parse(
+        std::string{"CREATE TABLE orders (user_id BIGINT, amount BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/fatbatch_orders.ndjson');"
+                    "CREATE TABLE out_t (user_id BIGINT, total BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/fatbatch_totals.ndjson')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT user_id, SUM(amount) AS total "
+                        "FROM orders GROUP BY user_id",
+                        /*async_agg=*/false);
+    std::map<std::string, std::string> agg_params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "aggregate_row") {
+            agg_params = op.params;
+        }
+    }
+    ASSERT_FALSE(agg_params.empty());
+
+    // One fat batch (VectorSource ships its whole vector as a single Batch) of
+    // N > 6000 distinct keys, so process_async submits past the cap before the
+    // runner's post-batch flush can run.
+    constexpr int kKeys = 6500;
+    std::vector<Record<Row>> input;
+    input.reserve(kKeys);
+    for (int i = 0; i < kKeys; ++i) {
+        Row r;
+        r.values["user_id"] = clink::config::JsonValue{static_cast<double>(i)};
+        r.values["amount"] = clink::config::JsonValue{static_cast<double>(i)};
+        input.push_back(Record<Row>{std::move(r)});
+    }
+
+    auto run = [&]() -> std::size_t {
+        const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+            "aggregate_row", std::string{kChannelRow}, std::string{kChannelRow});
+        cluster::OperatorBuildContext octx;
+        octx.params = agg_params;
+        auto op = std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+
+        Dag dag;
+        auto src = std::make_shared<VectorSource<Row>>(input);
+        auto h_src = dag.add_source<Row>(src);
+        auto h_op = dag.add_operator<Row, Row>(h_src, op);
+        auto sink = std::make_shared<CollectingSink<Row>>();
+        dag.add_sink<Row>(h_op, sink);
+        JobConfig cfg;
+        cfg.state_backend = std::make_shared<RemoteReadBackend>(
+            std::make_shared<InMemoryRemotePool>(), /*io_threads=*/1, /*hot_max_bytes=*/0);
+        LocalExecutor exec(std::move(dag), std::move(cfg));
+        exec.run();
+        return sink->collected_records().size();
+    };
+
+    std::packaged_task<std::size_t()> task(run);
+    auto fut = task.get_future();
+    std::thread th(std::move(task));
+    if (fut.wait_for(std::chrono::seconds(60)) != std::future_status::ready) {
+        th.detach();  // wedged runner thread; only reached on a real regression
+        FAIL() << "GROUP BY over a >cap fat batch livelocked at the in-flight cap";
+    }
+    th.join();
+    // Unbounded GROUP BY emits the running total per input row, so every one of
+    // the kKeys rows produced an emit - none were stranded behind the cap.
+    EXPECT_EQ(fut.get(), static_cast<std::size_t>(kKeys));
 }
 
 // Increment 5: a SQL stream-stream INNER join run over a deferring backend
