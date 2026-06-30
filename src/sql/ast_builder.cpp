@@ -1465,11 +1465,11 @@ ast::CreateMaterializedViewStmt translate_matview_stmt(const JsonValue& body) {
     return stmt;
 }
 
-// CREATE [OR REPLACE] VIEW <name> AS <SELECT>. libpg_query emits a ViewStmt with
-// the view name under `view` (a RangeVar), the defining query under `query` (a
-// SelectStmt node), `replace` for OR REPLACE, and `aliases` for a column-alias
-// list. v1 rejects the alias list (name columns in the SELECT) and any non-SELECT
-// defining query.
+// CREATE [OR REPLACE] VIEW <name> [(col, ...)] AS <SELECT>. libpg_query emits a
+// ViewStmt with the view name under `view` (a RangeVar), the defining query under
+// `query` (a SelectStmt node), `replace` for OR REPLACE, and `aliases` for the
+// optional column-alias list (a String per name). The alias list renames the
+// query's output columns positionally; a non-SELECT defining query is rejected.
 ast::CreateViewStmt translate_view_stmt(const JsonValue& body) {
     ast::CreateViewStmt stmt;
     stmt.loc = loc_from(body);
@@ -1479,10 +1479,10 @@ ast::CreateViewStmt translate_view_stmt(const JsonValue& body) {
     auto rel = translate_range_var(body.at("view"));
     stmt.view_name = std::move(rel.name);
     stmt.schema = std::move(rel.schema);
-    if (body.contains("aliases") && body.at("aliases").is_array() &&
-        !body.at("aliases").as_array().empty()) {
-        unsupported("CREATE VIEW column aliases (name the columns in the SELECT instead)",
-                    stmt.loc.pos);
+    if (body.contains("aliases") && body.at("aliases").is_array()) {
+        for (const auto& a : body.at("aliases").as_array()) {
+            stmt.column_aliases.push_back(string_atom(a));
+        }
     }
     if (body.contains("replace") && body.at("replace").is_bool()) {
         stmt.or_replace = body.at("replace").as_bool();

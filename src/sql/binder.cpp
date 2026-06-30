@@ -1710,6 +1710,35 @@ std::unique_ptr<LogicalPlan> Binder::make_table_plan(const std::string& table_na
             throw;
         }
         restore();
+        // The view's declared columns (resolved.columns) carry its output names -
+        // which differ from the re-bound sub-plan's names when the view was
+        // created with a column-alias list. Reconcile positionally with a thin
+        // renaming projection so every reference sees the declared names.
+        if (auto sub_schema = sub->schema();
+            sub_schema &&
+            static_cast<std::size_t>(sub_schema->num_fields()) == resolved.columns.size()) {
+            bool differs = false;
+            for (int i = 0; i < sub_schema->num_fields(); ++i) {
+                if (sub_schema->field(i)->name() !=
+                    resolved.columns[static_cast<std::size_t>(i)].name) {
+                    differs = true;
+                    break;
+                }
+            }
+            if (differs) {
+                std::vector<ProjectOutput> outs;
+                outs.reserve(resolved.columns.size());
+                for (int i = 0; i < sub_schema->num_fields(); ++i) {
+                    clink::config::JsonObject ref;
+                    ref["col"] = clink::config::JsonValue{sub_schema->field(i)->name()};
+                    outs.push_back(
+                        ProjectOutput{resolved.columns[static_cast<std::size_t>(i)].name,
+                                      clink::config::JsonValue{std::move(ref)}.serialize(0),
+                                      sub_schema->field(i)->type()});
+                }
+                sub = std::make_unique<LogicalProject>(std::move(sub), std::move(outs));
+            }
+        }
         return sub;
     }
     if (resolved.is_lookup()) {

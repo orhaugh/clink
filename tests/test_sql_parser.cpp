@@ -358,9 +358,12 @@ TEST(SqlParser, ParsesCreateOrReplaceView) {
     EXPECT_TRUE(std::get<ast::CreateViewStmt>(script.statements[0]).or_replace);
 }
 
-// v1 does not support a column-alias list; the columns must be named in the SELECT.
-TEST(SqlParser, RejectsCreateViewColumnAliases) {
-    EXPECT_THROW(parse("CREATE VIEW v (x, y) AS SELECT a, b FROM t"), TranslationError);
+// A column-alias list renames the view's output columns positionally.
+TEST(SqlParser, ParsesCreateViewColumnAliases) {
+    auto script = parse("CREATE VIEW v (x, y) AS SELECT a, b FROM t");
+    ASSERT_TRUE(std::holds_alternative<ast::CreateViewStmt>(script.statements[0]));
+    const auto& cv = std::get<ast::CreateViewStmt>(script.statements[0]);
+    EXPECT_EQ(cv.column_aliases, (std::vector<std::string>{"x", "y"}));
 }
 
 TEST(SqlParser, ParsesAlterTableAddColumn) {
@@ -402,14 +405,17 @@ TEST(SqlParser, ParsesAlterTableIfExistsAndIfNotExists) {
 }
 
 // Other AlterTableCmd subtypes are rejected in v1.
-// Unsupported AlterTableCmd subtypes are rejected. SET / DROP NOT NULL are
-// deliberately rejected rather than silently accepted: clink has no column-
-// nullability model (every column is nullable; CREATE TABLE NOT NULL is also
-// ignored), so accepting a constraint the engine cannot enforce would mislead.
+// Unsupported AlterTableCmd subtypes are rejected. Column constraints (NOT NULL,
+// DEFAULT) are deliberately rejected rather than silently accepted: clink has no
+// column-nullability model (every column is nullable; CREATE TABLE NOT NULL is
+// also ignored) and no decode-time default-injection, so accepting a constraint
+// the engine cannot enforce would mislead.
 TEST(SqlParser, RejectsUnsupportedAlterTableActions) {
     EXPECT_THROW(parse("ALTER TABLE t ADD PRIMARY KEY (c)"), TranslationError);
     EXPECT_THROW(parse("ALTER TABLE t ALTER COLUMN c SET NOT NULL"), TranslationError);
     EXPECT_THROW(parse("ALTER TABLE t ALTER COLUMN c DROP NOT NULL"), TranslationError);
+    EXPECT_THROW(parse("ALTER TABLE t ALTER COLUMN c SET DEFAULT 0"), TranslationError);
+    EXPECT_THROW(parse("ALTER TABLE t ALTER COLUMN c DROP DEFAULT"), TranslationError);
 }
 
 TEST(SqlParser, ParsesAlterColumnType) {

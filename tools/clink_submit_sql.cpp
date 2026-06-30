@@ -262,8 +262,9 @@ int main(int argc, char** argv) {
                 continue;
             }
             if (std::holds_alternative<clink::sql::ast::RenameStmt>(stmt)) {
-                // ALTER TABLE RENAME TO / RENAME COLUMN: a catalog rename.
-                catalog.rename(std::get<clink::sql::ast::RenameStmt>(stmt));
+                // ALTER TABLE RENAME TO / RENAME COLUMN: a catalog rename, rejected
+                // (and rolled back) if it would break a dependent logical view.
+                clink::sql::rename_object(catalog, std::get<clink::sql::ast::RenameStmt>(stmt));
                 continue;
             }
             if (std::holds_alternative<clink::sql::ast::CreateMaterializedViewStmt>(stmt)) {

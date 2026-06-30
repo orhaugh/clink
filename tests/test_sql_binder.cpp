@@ -2696,6 +2696,24 @@ void make_view(Catalog& cat, const char* sql) {
     register_view(cat, std::move(std::get<ast::CreateViewStmt>(parse(sql).statements[0])));
 }
 
+void rename_via(Catalog& cat, const char* sql) {
+    rename_object(cat, std::get<ast::RenameStmt>(parse(sql).statements[0]));
+}
+
+bool view_binds(const Catalog& cat, const char* name) {
+    const ast::SelectStmt* q = cat.get_view_query(name);
+    if (q == nullptr) {
+        return false;
+    }
+    try {
+        Binder b(cat);
+        (void)b.bind_select(*q);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 }  // namespace
 
 TEST(SqlBinder, ViewExpandsToBaseTableAtReference) {
@@ -2719,6 +2737,96 @@ TEST(SqlBinder, ViewExpandsToBaseTableAtReference) {
     const LogicalScan* scan = deepest_scan(plan.get());
     ASSERT_NE(scan, nullptr);
     EXPECT_EQ(scan->table().name, "clicks");
+}
+
+TEST(SqlBinder, ViewColumnAliasRenamesOutputColumns) {
+    Catalog cat;
+    register_clicks(cat);
+    make_view(cat, "CREATE VIEW v (clk, link) AS SELECT user_id, url FROM clicks");
+    // The alias list becomes the view's declared output column names.
+    const TableDef* def = cat.get_table("v");
+    ASSERT_NE(def, nullptr);
+    ASSERT_EQ(def->columns.size(), 2u);
+    EXPECT_EQ(def->columns[0].name, "clk");
+    EXPECT_EQ(def->columns[1].name, "link");
+
+    // A reference resolves the aliased names, and the expanded plan exposes them
+    // on its output schema (the thin renaming projection over the base query).
+    Binder b(cat);
+    auto plan = b.bind_select(as_select(parse("SELECT clk, link FROM v")));
+    ASSERT_NE(plan, nullptr);
+    auto schema = plan->schema();
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->num_fields(), 2);
+    EXPECT_EQ(schema->field(0)->name(), "clk");
+    EXPECT_EQ(schema->field(1)->name(), "link");
+    EXPECT_EQ(deepest_scan(plan.get())->table().name, "clicks");
+
+    // The underlying query's own names no longer resolve through the view.
+    Binder b2(cat);
+    EXPECT_THROW(b2.bind_select(as_select(parse("SELECT user_id FROM v"))), TranslationError);
+}
+
+TEST(SqlBinder, RegisterViewRejectsAliasArityMismatch) {
+    Catalog cat;
+    register_clicks(cat);
+    EXPECT_THROW(make_view(cat, "CREATE VIEW v (a, b, c) AS SELECT user_id, url FROM clicks"),
+                 TranslationError);
+}
+
+TEST(SqlBinder, RegisterViewRejectsDuplicateAlias) {
+    Catalog cat;
+    register_clicks(cat);
+    EXPECT_THROW(make_view(cat, "CREATE VIEW v (dup, dup) AS SELECT user_id, url FROM clicks"),
+                 TranslationError);
+}
+
+// rename_object rejects (and rolls back) a table rename that would break a view
+// referencing the table by name.
+TEST(SqlBinder, RenameTableRejectedWhenDependentViewBreaks) {
+    Catalog cat;
+    register_clicks(cat);
+    make_view(cat, "CREATE VIEW v AS SELECT user_id FROM clicks");
+    EXPECT_THROW(rename_via(cat, "ALTER TABLE clicks RENAME TO hits"), TranslationError);
+    // Rolled back: the original name stays, the new name is absent, view still binds.
+    EXPECT_NE(cat.get_table("clicks"), nullptr);
+    EXPECT_EQ(cat.get_table("hits"), nullptr);
+    EXPECT_TRUE(view_binds(cat, "v"));
+}
+
+// A column rename that the view depends on is likewise rejected and rolled back.
+TEST(SqlBinder, RenameColumnRejectedWhenDependentViewBreaks) {
+    Catalog cat;
+    register_clicks(cat);
+    make_view(cat, "CREATE VIEW v AS SELECT user_id FROM clicks");
+    EXPECT_THROW(rename_via(cat, "ALTER TABLE clicks RENAME COLUMN user_id TO uid"),
+                 TranslationError);
+    // Rolled back: the column keeps its name and the view still binds.
+    const TableDef* def = cat.get_table("clicks");
+    ASSERT_NE(def, nullptr);
+    EXPECT_EQ(def->columns[0].name, "user_id");
+    EXPECT_TRUE(view_binds(cat, "v"));
+}
+
+// A rename that no view depends on goes through: a table no view references, and
+// a column the view does not select.
+TEST(SqlBinder, RenameAllowedWhenNoDependentViewBreaks) {
+    Catalog cat;
+    register_clicks(cat);
+    make_view(cat, "CREATE VIEW v AS SELECT user_id FROM clicks");
+
+    // `url` is not used by the view, so renaming it succeeds.
+    EXPECT_NO_THROW(rename_via(cat, "ALTER TABLE clicks RENAME COLUMN url TO link"));
+    EXPECT_EQ(cat.get_table("clicks")->columns[2].name, "link");
+    EXPECT_TRUE(view_binds(cat, "v"));
+
+    // A second, unreferenced table renames freely even with a view present.
+    auto s =
+        parse("CREATE TABLE other (k BIGINT) WITH (connector='kafka', topic='o', bootstrap='h:1')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    EXPECT_NO_THROW(rename_via(cat, "ALTER TABLE other RENAME TO other2"));
+    EXPECT_NE(cat.get_table("other2"), nullptr);
+    EXPECT_EQ(cat.get_table("other"), nullptr);
 }
 
 TEST(SqlBinder, ViewPreservesItsOwnFilter) {

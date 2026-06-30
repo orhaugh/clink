@@ -1144,6 +1144,55 @@ TEST(SqlRuntime, CreateViewExpandsAndFiltersEndToEnd) {
     }
 }
 
+// CREATE VIEW column-alias end-to-end: the alias list renames the view's output
+// columns, and the aliased names are what a referencing query selects and filters
+// on. Proves the renaming projection flows data under the aliased names.
+TEST(SqlRuntime, CreateViewColumnAliasFlowsUnderAliasedNamesEndToEnd) {
+    ensure_sql_installed_once();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_valias_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_valias_out.ndjson";
+    for (const auto& p : {in_path, out_path}) {
+        std::filesystem::remove(p);
+    }
+    write_lines(in_path, {R"({"a":1,"b":5})", R"({"a":2,"b":50})", R"({"a":3,"b":99})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE src (a BIGINT, b BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (id BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    // The view renames a -> id, b -> score; the query uses those aliased names.
+    register_view(cat,
+                  std::move(std::get<ast::CreateViewStmt>(
+                      parse("CREATE VIEW v (id, score) AS SELECT a, b FROM src").statements[0])));
+
+    auto spec = compile(cat, "INSERT INTO out_t SELECT id FROM v WHERE score > 10");
+
+    InProcessCluster cluster("tm-sql-valias-e2e", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    std::multiset<std::int64_t> got;
+    for (const auto& line : read_lines(out_path)) {
+        got.insert(static_cast<std::int64_t>(clink::config::parse(line).at("id").as_number()));
+    }
+    // score>10 keeps a=2 (b=50) and a=3 (b=99); their ids are 2 and 3.
+    EXPECT_EQ(got, (std::multiset<std::int64_t>{2, 3}));
+
+    for (const auto& p : {in_path, out_path}) {
+        std::filesystem::remove(p);
+    }
+}
+
 // ALTER TABLE ADD COLUMN end-to-end: a column not in the original declaration is
 // unusable, and becomes queryable after the ALTER (the catalog change takes
 // effect for subsequent compilations), with its values flowing through.
