@@ -830,6 +830,12 @@ public:
                             }
                         }
                         aec->poll();
+                    } else if (maybe->is_drain()) {
+                        // Rescale drain marker: forward it downstream so the
+                        // wind-down signal reaches the eventual sink, and never
+                        // hand it to op->process() (whose control-element else
+                        // branch calls as_barrier() and would throw on a Drain).
+                        emitter.emit_drain(maybe->as_drain());
                     } else if (detail::try_process_columnar(op, *maybe, emitter)) {
                         // Columnar-native fast path: the operator consumed the
                         // Arrow sidecar directly (vectorized), no row decode.
@@ -1359,6 +1365,11 @@ public:
                         if (auto adv = align.on_watermark(i, maybe->as_watermark()); adv.forward) {
                             out_channel->push(StreamElement<T>::watermark(adv.watermark));
                         }
+                    } else if (maybe->is_drain()) {
+                        // Rescale drain: forward the wind-down marker as-is (not
+                        // through the aligner, which only tracks watermarks and
+                        // barriers); as_barrier() on a Drain would throw.
+                        out_channel->push(std::move(*maybe));
                     } else {
                         if (auto adv = align.on_barrier(
                                 i, ctx.apply_barrier_mode_override(maybe->as_barrier()));
@@ -2207,6 +2218,10 @@ public:
                         evict(adv.watermark.timestamp());
                         out_channel->push(StreamElement<C>::watermark(adv.watermark));
                     }
+                } else if (el.is_drain()) {
+                    // Rescale wind-down marker: forward downstream (not through
+                    // the barrier aligner, which would as_barrier() a Drain).
+                    out_channel->push(StreamElement<C>::drain(el.as_drain()));
                 } else {
                     auto adv =
                         align.on_barrier(0, ctx.apply_barrier_mode_override(el.as_barrier()));
@@ -2277,6 +2292,10 @@ public:
                         evict(adv.watermark.timestamp());
                         out_channel->push(StreamElement<C>::watermark(adv.watermark));
                     }
+                } else if (el.is_drain()) {
+                    // Rescale wind-down marker: forward downstream (not through
+                    // the barrier aligner, which would as_barrier() a Drain).
+                    out_channel->push(StreamElement<C>::drain(el.as_drain()));
                 } else {
                     auto adv =
                         align.on_barrier(1, ctx.apply_barrier_mode_override(el.as_barrier()));
@@ -2592,6 +2611,10 @@ public:
                     if (auto adv = align.on_watermark(1, el.as_watermark()); adv.forward) {
                         out_channel->push(StreamElement<Out>::watermark(adv.watermark));
                     }
+                } else if (el.is_drain()) {
+                    // Rescale wind-down marker: forward (not through the barrier
+                    // aligner, which would as_barrier() a Drain).
+                    out_channel->push(StreamElement<Out>::drain(el.as_drain()));
                 } else {
                     auto adv =
                         align.on_barrier(1, ctx.apply_barrier_mode_override(el.as_barrier()));
@@ -2615,6 +2638,10 @@ public:
                     if (auto adv = align.on_watermark(0, el.as_watermark()); adv.forward) {
                         out_channel->push(StreamElement<Out>::watermark(adv.watermark));
                     }
+                } else if (el.is_drain()) {
+                    // Rescale wind-down marker: forward (not through the barrier
+                    // aligner, which would as_barrier() a Drain).
+                    out_channel->push(StreamElement<Out>::drain(el.as_drain()));
                 } else {
                     auto adv =
                         align.on_barrier(0, ctx.apply_barrier_mode_override(el.as_barrier()));
@@ -3046,6 +3073,10 @@ public:
                     if (auto adv = align.on_watermark(0, el.as_watermark()); adv.forward) {
                         forward_watermark(adv.watermark);
                     }
+                } else if (el.is_drain()) {
+                    // Rescale wind-down marker: forward downstream (not through
+                    // the barrier aligner, which would as_barrier() a Drain).
+                    out_emitter.emit_drain(el.as_drain());
                 } else {
                     auto adv =
                         align.on_barrier(0, ctx.apply_barrier_mode_override(el.as_barrier()));
@@ -3074,6 +3105,10 @@ public:
                     if (auto adv = align.on_watermark(1, el.as_watermark()); adv.forward) {
                         forward_watermark(adv.watermark);
                     }
+                } else if (el.is_drain()) {
+                    // Rescale wind-down marker: forward downstream (not through
+                    // the barrier aligner, which would as_barrier() a Drain).
+                    out_emitter.emit_drain(el.as_drain());
                 } else {
                     auto adv =
                         align.on_barrier(1, ctx.apply_barrier_mode_override(el.as_barrier()));
@@ -3716,6 +3751,12 @@ public:
                         for (auto& e : per_branch_emitters) {
                             e->emit_watermark(maybe->as_watermark());
                         }
+                    } else if (maybe->is_drain()) {
+                        // Rescale wind-down marker: fan it out to every branch
+                        // (as_barrier() on a Drain would throw).
+                        for (auto& e : per_branch_emitters) {
+                            e->emit_drain(maybe->as_drain());
+                        }
                     } else {
                         for (auto& e : per_branch_emitters) {
                             e->emit_barrier(maybe->as_barrier());
@@ -4043,6 +4084,11 @@ private:
                             if (auto adv = align.on_watermark(k, m->as_watermark()); adv.forward) {
                                 op->on_watermark(adv.watermark, out_emitter);
                             }
+                        } else if (m->is_drain()) {
+                            // Rescale wind-down marker: forward downstream
+                            // without handing it to op->process()/as_barrier()
+                            // (which would throw on a Drain).
+                            out_emitter.emit_drain(m->as_drain());
                         } else {
                             if (auto adv = align.on_barrier(
                                     k, ctx.apply_barrier_mode_override(m->as_barrier()));

@@ -151,6 +151,13 @@ public:
             clink::metrics::net::records_received_inc(sz);
         } else if (e->is_watermark()) {
             out.emit_watermark(e->as_watermark());
+        } else if (e->is_drain()) {
+            // A rescale drain marker arrives over the wire when an upstream
+            // subtask on the sending TM winds down. Forward it so the marker
+            // keeps flowing through this TM's chain to the eventual sink (which
+            // no-ops it). The old else-branch called as_barrier() on the Drain
+            // variant and threw bad_variant_access, killing the recv consumer.
+            out.emit_drain(e->as_drain());
         } else {
             out.emit_barrier(e->as_barrier());
         }

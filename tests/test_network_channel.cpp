@@ -8,6 +8,9 @@
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/core/stream_element.hpp"
+#include "clink/operators/operator_base.hpp"
+#include "clink/runtime/bounded_channel.hpp"
+#include "clink/runtime/network/network_bridge.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 #include "clink/runtime/network/wire.hpp"
@@ -367,6 +370,47 @@ TEST(NetworkChannel, DrainMarkerRoundTripsAcrossWire) {
 
     auto eof = source.pop();
     EXPECT_FALSE(eof.has_value());
+    sender.join();
+}
+
+// The bridge adapter (NetworkBridgeSource::produce) must FORWARD a wire-delivered
+// drain marker, not route it into as_barrier() - the old else-branch did the
+// latter and threw bad_variant_access, killing the cross-TM recv consumer the
+// moment a rescale drained an upstream subtask on the sending TM. The channel-
+// level round-trip above never goes through produce(); this exercises it.
+TEST(NetworkBridge, ProduceForwardsDrainMarker) {
+    NetworkBridgeSource<std::int64_t> source(/*port*/ 0, int64_codec());
+    const std::uint16_t port = source.prepare_listen();
+
+    std::thread sender([port] {
+        NetworkChannelSink<std::int64_t> sink("127.0.0.1", port, int64_codec());
+        sink.connect();
+        Batch<std::int64_t> b;
+        b.emplace(7, EventTime{1});
+        sink.push(StreamElement<std::int64_t>::data(std::move(b)));
+        sink.push(StreamElement<std::int64_t>::drain(
+            DrainMarker{.subtask_idx = 2, .target_parallelism = 4}));
+        sink.close_send();
+    });
+
+    source.open();  // accept() the peer connection
+    BoundedChannel<StreamElement<std::int64_t>> out_ch(64);
+    Emitter<std::int64_t> em(&out_ch);
+
+    ASSERT_TRUE(source.produce(em));  // the data record
+    ASSERT_TRUE(source.produce(em));  // the drain marker - must not throw
+
+    std::vector<StreamElement<std::int64_t>> got;
+    while (auto e = out_ch.try_pop()) {
+        got.push_back(std::move(*e));
+    }
+    ASSERT_EQ(got.size(), 2u);
+    EXPECT_TRUE(got[0].is_data());
+    ASSERT_TRUE(got[1].is_drain()) << "bridge must forward the drain, not crash on it";
+    EXPECT_EQ(got[1].as_drain().subtask_idx, 2u);
+    EXPECT_EQ(got[1].as_drain().target_parallelism, 4u);
+
+    source.cancel();
     sender.join();
 }
 

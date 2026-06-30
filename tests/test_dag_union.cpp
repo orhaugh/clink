@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/operators/map_operator.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/runtime/dag.hpp"
@@ -489,4 +490,90 @@ TEST(DagUnion, BarrierAlignmentReleasesOnlyAfterAllInputsDeliver) {
     // Exactly one aligned barrier should have been forwarded.
     ASSERT_EQ(seen.size(), 1u);
     EXPECT_EQ(seen[0].value(), 42u);
+}
+
+// ---------------------------------------------------------------------------
+// Rescale drain-marker forwarding through operator runners
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Emits a batch, then a rescale drain marker mid-stream, then another batch,
+// then ends. A forward-edge operator must FORWARD the drain and keep processing
+// the post-drain batch. Before the fix the operator runner handed the drain to
+// op->process(), whose control-element else branch called as_barrier() and threw
+// bad_variant_access, killing the operator thread and dropping the post-drain
+// records (and failing the job).
+class DrainMidStreamSource final : public Source<int> {
+public:
+    bool produce(Emitter<int>& out) override {
+        if (this->cancelled() || step_ > 2) {
+            return false;
+        }
+        if (step_ == 0) {
+            Batch<int> b;
+            b.emplace(1);
+            b.emplace(2);
+            out.emit_data(std::move(b));
+        } else if (step_ == 1) {
+            out.emit_drain(DrainMarker{.subtask_idx = 0, .target_parallelism = 2});
+        } else {
+            Batch<int> b;
+            b.emplace(3);
+            b.emplace(4);
+            out.emit_data(std::move(b));
+        }
+        ++step_;
+        return step_ <= 2;
+    }
+    [[nodiscard]] bool is_bounded() const noexcept override { return true; }
+    std::string name() const override { return "drain_mid_stream_src"; }
+
+private:
+    int step_ = 0;
+};
+
+}  // namespace
+
+TEST(DagDrain, SingleInputOperatorForwardsDrainAndKeepsProcessing) {
+    Dag dag;
+    auto src = std::make_shared<DrainMidStreamSource>();
+    auto map = std::make_shared<MapOperator<int, int>>([](const int& v) { return v * 10; });
+    auto sink = std::make_shared<CollectingSink<int>>();
+
+    auto h0 = dag.add_source<int>(src);
+    auto h1 = dag.add_operator<int, int>(h0, map);
+    dag.add_sink<int>(h1, sink);
+
+    LocalExecutor exec(std::move(dag));
+    exec.run();
+
+    auto got = sink->collected();
+    std::sort(got.begin(), got.end());
+    // All four records (pre- AND post-drain) survive; the operator forwarded the
+    // drain rather than throwing on it.
+    EXPECT_EQ(got, (std::vector<int>{10, 20, 30, 40}));
+}
+
+TEST(DagDrain, UnionForwardsDrainFromOneBranch) {
+    Dag dag;
+    auto src_a = std::make_shared<DrainMidStreamSource>();  // 1,2, <drain>, 3,4
+    std::vector<Record<int>> b_recs;
+    for (int i = 100; i <= 103; ++i) {
+        b_recs.emplace_back(Record<int>{i});
+    }
+    auto src_b = std::make_shared<VectorSource<int>>(std::move(b_recs), "src_b");
+    auto sink = std::make_shared<CollectingSink<int>>();
+
+    auto h_a = dag.add_source<int>(src_a);
+    auto h_b = dag.add_source<int>(src_b);
+    auto h_u = dag.union_streams<int>(std::vector<StageHandle<int>>{h_a, h_b});
+    dag.add_sink<int>(h_u, sink);
+
+    LocalExecutor exec(std::move(dag));
+    exec.run();
+
+    auto got = sink->collected();
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(got, (std::vector<int>{1, 2, 3, 4, 100, 101, 102, 103}));
 }
