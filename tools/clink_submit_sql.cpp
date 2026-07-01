@@ -14,6 +14,7 @@
 //   clink_submit_sql -e "CREATE TABLE ...; INSERT INTO ..."
 //   clink_submit_sql --explain --file job.sql   (prints LogicalPlan tree)
 
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -44,9 +45,30 @@ struct Args {
     std::string jm_host;
     std::uint16_t jm_port = 0;
     std::string job_name;
+    std::string state_backend;  // per-job state backend URI (empty = cluster default)
     bool explain = false;
     std::uint32_t parallelism = 1;  // uniform op parallelism (>1 fans the plan out)
 };
+
+// Percent-encode a query-param value (RFC 3986 unreserved chars pass through).
+// A state-backend URI can carry its own "://" and even a "?a=1&b=2" query, so
+// it must be encoded to survive the JM's query parsing; the server decodes it.
+std::string url_encode(const std::string& s) {
+    static const char* kHex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() * 3);
+    for (char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (std::isalnum(c) != 0 || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += ch;
+        } else {
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 0x0FU];
+        }
+    }
+    return out;
+}
 
 void print_usage() {
     std::cerr
@@ -64,6 +86,9 @@ void print_usage() {
         << "                      printing JSON. The JM runs the job and replies with a\n"
         << "                      job id.\n"
         << "  --name <job>        Job name (default 'sql_job'). Only used with --jm-host.\n"
+        << "  --state-backend <uri>  Per-job state backend URI, overriding the cluster default.\n"
+        << "                      A disaggregated tier (e.g. remote-read://...) activates the\n"
+        << "                      async KeyedState path. Only used with --jm-host.\n"
         << "  --parallelism <n>   Uniform op parallelism (default 1). >1 fans every op out to\n"
         << "  -p <n>              n subtasks; keyed ops hash-partition by key, sources split\n"
         << "                      partitions across subtasks (Kafka needs >= n partitions).\n"
@@ -111,6 +136,12 @@ Args parse_args(int argc, char** argv) {
                 std::exit(2);
             }
             a.job_name = argv[i];
+        } else if (arg == "--state-backend") {
+            if (++i >= argc) {
+                std::cerr << "error: --state-backend requires a URI\n";
+                std::exit(2);
+            }
+            a.state_backend = argv[i];
         } else if (arg == "--parallelism" || arg == "-p") {
             if (++i >= argc) {
                 std::cerr << "error: --parallelism requires a number\n";
@@ -207,9 +238,17 @@ int main(int argc, char** argv) {
             if (!args.jm_host.empty() && args.jm_port != 0) {
                 clink::http::HttpClient client(args.jm_host, args.jm_port);
                 std::string path = "/api/v1/jobs/spec";
-                if (!name.empty()) {
-                    path += "?name=" + name;
-                }
+                char sep = '?';
+                auto add_param = [&](const std::string& key, const std::string& value) {
+                    if (value.empty()) {
+                        return;
+                    }
+                    path += sep;
+                    path += key + "=" + url_encode(value);
+                    sep = '&';
+                };
+                add_param("name", name);
+                add_param("state_backend", args.state_backend);
                 auto resp = client.post(path, json);
                 if (resp.status == 0) {
                     std::cerr << "error: HTTP transport failure: " << resp.error << "\n";
@@ -352,25 +391,8 @@ int main(int argc, char** argv) {
                     const auto& sink = static_cast<const clink::sql::LogicalSink&>(*plan);
                     auto spec = planner.compile(sink);
                     apply_parallelism(spec);
-                    auto json = spec.to_json();
-                    if (!args.jm_host.empty() && args.jm_port != 0) {
-                        clink::http::HttpClient client(args.jm_host, args.jm_port);
-                        std::string path = "/api/v1/jobs/spec";
-                        if (!args.job_name.empty()) {
-                            path += "?name=" + args.job_name;
-                        }
-                        auto resp = client.post(path, json);
-                        if (resp.status == 0) {
-                            std::cerr << "error: HTTP transport failure: " << resp.error << "\n";
-                            return 1;
-                        }
-                        std::cout << resp.body << "\n";
-                        if (resp.status != 200) {
-                            std::cerr << "error: JM returned status " << resp.status << "\n";
-                            return 1;
-                        }
-                    } else {
-                        std::cout << json << "\n";
+                    if (int rc = submit_or_print(spec.to_json(), args.job_name); rc != 0) {
+                        return rc;
                     }
                 }
                 produced_spec = true;

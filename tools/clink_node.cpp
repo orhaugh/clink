@@ -567,8 +567,9 @@ clink::http::HttpResponse handle_submit_job(clink::cluster::JobManager& jm,
 // built-in operator factories already registered on every TM.
 //
 // Optional ?name=<job_name> picks the display name (defaults to
-// "sql_job"). Returns 200 with {ok:true,job_id,name} on success,
-// 400 on bad JSON, 500 on submit failure.
+// "sql_job"). Optional ?state_backend=<uri> picks the per-job state
+// backend (else the cluster default). Returns 200 with
+// {ok:true,job_id,name} on success, 400 on bad JSON, 500 on submit failure.
 clink::http::HttpResponse handle_submit_spec(clink::cluster::JobManager& jm,
                                              const clink::http::HttpRequest& req) {
     clink::http::HttpResponse resp;
@@ -597,12 +598,22 @@ clink::http::HttpResponse handle_submit_spec(clink::cluster::JobManager& jm,
     }
     const std::string& job_name = graph.name;
 
+    // Optional ?state_backend=<uri> picks the per-job state backend (e.g. a
+    // disaggregated remote-read:// tier that activates the async KeyedState
+    // path). Left empty, submit_job applies the cluster default. cpp-httplib
+    // has already percent-decoded the value, so a URI carrying its own query
+    // (remote-read://...?hot_max_bytes=N) round-trips intact.
+    clink::cluster::CheckpointConfig ckpt;
+    if (auto it = req.query.find("state_backend"); it != req.query.end() && !it->second.empty()) {
+        ckpt.state_backend_uri = it->second;
+    }
+
     std::uint64_t job_id = 0;
     try {
         job_id = jm.submit_job(graph,
                                clink::cluster::OperatorRegistry::default_instance(),
                                /*plugins=*/{},
-                               clink::cluster::CheckpointConfig{},
+                               ckpt,
                                /*bundle=*/nullptr,
                                /*notify_client_conn=*/nullptr);
     } catch (const std::exception& e) {
