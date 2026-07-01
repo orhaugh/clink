@@ -5591,6 +5591,137 @@ private:
     std::map<std::string, std::ofstream> files_;
 };
 
+// Full-refresh partitioned overwrite sink (materialized tables with partition_by):
+// writes one file per distinct partition value into a STAGING directory
+// (<dir>.staging/<key>), then on clean end-of-input (flush) atomically publishes the
+// whole partitioned set by replacing <dir> with the staging directory. A reader that
+// lists <dir> sees the previous partitioned snapshot for the whole job and then the
+// new one after the swap; a mid-job failure (no flush) leaves the staging dir
+// orphaned and <dir> untouched. Single-file-per-partition, so parallelism 1. Reading
+// a partitioned directory backing back into a query needs a directory-capable Row
+// source, which is a documented follow-on.
+class PartitionOverwriteSink final : public Sink<Row> {
+public:
+    PartitionOverwriteSink(std::string dir,
+                           std::vector<std::string> partition_cols,
+                           std::map<std::string, int> decimal_scales = {})
+        : dir_(std::move(dir)),
+          partition_cols_(std::move(partition_cols)),
+          decimal_scales_(std::move(decimal_scales)) {
+        if (partition_cols_.empty()) {
+            throw std::runtime_error("partition_overwrite_sink: 'partition_by' is required");
+        }
+    }
+
+    void open() override {
+        staging_ = dir_ + ".staging";
+        std::error_code ec;
+        std::filesystem::remove_all(staging_, ec);  // clear any stale staging
+        std::filesystem::create_directories(staging_, ec);
+        if (ec) {
+            throw std::runtime_error("partition_overwrite_sink: cannot create staging dir " +
+                                     staging_ + ": " + ec.message());
+        }
+    }
+
+    void on_data(const Batch<Row>& batch) override {
+        for (const auto& rec : batch) {
+            const auto& row = rec.value();
+            const std::string key = partition_key_(row);
+            Row q = row;
+            requantise_row_decimals(q, decimal_scales_);
+            const std::string line = clink::config::serialize_output(
+                clink::config::JsonValue{clink::config::JsonObject{q.values}});
+            auto [it, inserted] = files_.try_emplace(key);
+            if (inserted) {
+                const std::string path = staging_ + "/" + key;
+                it->second.open(path, std::ios::binary | std::ios::trunc);
+                if (!it->second) {
+                    throw std::runtime_error("partition_overwrite_sink: cannot open " + path);
+                }
+            }
+            it->second.write(line.data(), static_cast<std::streamsize>(line.size()));
+            it->second.put('\n');
+        }
+    }
+
+    void flush() override {
+        if (published_) {
+            return;
+        }
+        for (auto& [_k, f] : files_) {
+            f.flush();
+            f.close();
+        }
+        files_.clear();
+        // Publish: replace <dir> with the freshly-built staging dir. A non-empty dir
+        // cannot be renamed over in one step, so remove-then-rename; the window is
+        // brief and a crash leaves staging orphaned + <dir> intact.
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+        std::filesystem::rename(staging_, dir_, ec);
+        if (ec) {
+            throw std::runtime_error("partition_overwrite_sink: cannot publish " + staging_ +
+                                     " -> " + dir_ + ": " + ec.message());
+        }
+        published_ = true;
+    }
+
+    void close() override {
+        for (auto& [_k, f] : files_) {
+            if (f.is_open()) {
+                f.close();
+            }
+        }
+    }
+
+    std::string name() const override { return "partition_overwrite_sink"; }
+
+private:
+    // Path-safe, collision-free key from the partition columns: percent-encode each
+    // column value (as PartitionedJsonSink does) and join multi-column keys with '.'
+    // (a '.' can never appear in the encoded output, so the join is unambiguous).
+    std::string partition_key_(const Row& row) const {
+        static const char* kHex = "0123456789ABCDEF";
+        std::string key;
+        for (std::size_t i = 0; i < partition_cols_.size(); ++i) {
+            if (i > 0) {
+                key.push_back('.');
+            }
+            const auto it = row.values.find(partition_cols_[i]);
+            if (it == row.values.end() || it->second.is_null()) {
+                key += "%null";
+                continue;
+            }
+            const std::string raw =
+                it->second.is_string() ? it->second.as_string() : it->second.serialize(0);
+            if (raw.empty()) {
+                key += "%empty";
+                continue;
+            }
+            for (const unsigned char c : raw) {
+                const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                  (c >= '0' && c <= '9') || c == '_' || c == '-';
+                if (safe) {
+                    key.push_back(static_cast<char>(c));
+                } else {
+                    key.push_back('%');
+                    key.push_back(kHex[c >> 4]);
+                    key.push_back(kHex[c & 0xF]);
+                }
+            }
+        }
+        return key;
+    }
+
+    std::string dir_;
+    std::vector<std::string> partition_cols_;
+    std::string staging_;
+    std::map<std::string, int> decimal_scales_;
+    std::map<std::string, std::ofstream> files_;
+    bool published_ = false;
+};
+
 // TOP-N-per-partition. Single-input op that maintains a
 // per-partition sorted buffer of at most `count_` records. On each
 // arriving record:
@@ -7103,6 +7234,49 @@ void install(clink::plugin::PluginRegistry& reg) {
             return std::make_shared<PartitionedJsonSink>(
                 std::move(path),
                 std::move(partition_by),
+                parse_decimal_columns(ctx.param_or("decimal_columns")));
+        });
+
+    // partition_overwrite_sink: the full-refresh partitioned backing (materialized
+    // tables with partition_by). Writes one file per partition value into
+    // <path>.staging/ and atomically publishes the whole partitioned set (replacing
+    // <path>) on clean end-of-input. Single output set, so parallelism 1. Params:
+    // path (a directory), partition_by (csv).
+    reg.register_sink<Row>(
+        "partition_overwrite_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<Row>> {
+            auto path = ctx.param_or("path");
+            if (path.empty()) {
+                throw std::runtime_error("partition_overwrite_sink: 'path' param is required");
+            }
+            const auto partition_by = ctx.param_or("partition_by");
+            if (partition_by.empty()) {
+                throw std::runtime_error(
+                    "partition_overwrite_sink: 'partition_by' param is required");
+            }
+            if (ctx.parallelism > 1) {
+                throw std::runtime_error(
+                    "partition_overwrite_sink: requires parallelism 1 (a single partitioned set "
+                    "is published atomically)");
+            }
+            std::vector<std::string> cols;
+            std::size_t start = 0;
+            while (start <= partition_by.size()) {
+                const auto comma = partition_by.find(',', start);
+                const auto end = comma == std::string::npos ? partition_by.size() : comma;
+                auto c = partition_by.substr(start, end - start);
+                const auto a = c.find_first_not_of(" \t");
+                const auto b = c.find_last_not_of(" \t");
+                if (a != std::string::npos) {
+                    cols.push_back(c.substr(a, b - a + 1));
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                start = comma + 1;
+            }
+            return std::make_shared<PartitionOverwriteSink>(
+                std::move(path),
+                std::move(cols),
                 parse_decimal_columns(ctx.param_or("decimal_columns")));
         });
 

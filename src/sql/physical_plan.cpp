@@ -320,6 +320,12 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         // combination with upsert / exactly-once rather than silently ignoring
         // those modes.
         if (table.properties.find("partition_by") != table.properties.end()) {
+            // A full-refresh materialized-view backing (write_mode=overwrite) writes a
+            // partitioned set atomically (one file per partition, whole-set swap).
+            const auto wm = table.properties.find("write_mode");
+            if (wm != table.properties.end() && wm->second == "overwrite") {
+                return RowConnectorBinding{"partition_overwrite_sink", kChannelRow, {}};
+            }
             if (upsert || exactly_once) {
                 unsupported(
                     "connector='file' partition_by is append-only and cannot be combined "

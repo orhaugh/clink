@@ -675,6 +675,31 @@ TEST(SqlPreparse, MaterializedViewFullRefreshAcceptedForBoundedSource) {
     EXPECT_EQ(cat.get_table("mv")->properties.at("refresh_arm"), "full");
 }
 
+TEST(SqlPreparse, MaterializedViewPartitionByColumnMustExist) {
+    Catalog cat;
+    register_source(cat, "t", "a BIGINT, region VARCHAR");  // connector='file' (bounded)
+    // A partition_by naming an output column is accepted and threads through to the
+    // backing so the overwrite sink partitions by it.
+    auto ok = plan_materialized_view(
+        parse_mv("CREATE MATERIALIZED VIEW mv "
+                 "WITH (freshness='5m', connector='file', format='json', partition_by='region', "
+                 "path='/tmp/mv_part_ok') AS SELECT region, a FROM t"),
+        cat);
+    EXPECT_EQ(ok.arm, clink::sql::RefreshArm::Full);
+    EXPECT_EQ(cat.get_table("mv")->properties.at("partition_by"), "region");
+    // A partition_by naming a column absent from the view's output is rejected at plan
+    // time rather than producing an empty or malformed partitioned set.
+    Catalog cat2;
+    register_source(cat2, "t", "a BIGINT, region VARCHAR");
+    EXPECT_THROW(
+        (void)plan_materialized_view(
+            parse_mv("CREATE MATERIALIZED VIEW mv2 "
+                     "WITH (freshness='5m', connector='file', format='json', partition_by='nope', "
+                     "path='/tmp/mv_part_bad') AS SELECT region, a FROM t"),
+            cat2),
+        TranslationError);
+}
+
 TEST(SqlPreparse, FullRefreshBackingSurvivesCatalogReload) {
     // HA / restart survival: a full-refresh backing persists its refresh metadata to
     // the catalog dir, so a new leader that reloads the catalog has everything the

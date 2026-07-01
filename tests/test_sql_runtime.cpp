@@ -11244,4 +11244,74 @@ TEST(SqlRuntime, MaterializedViewSchedulerAutoRefreshes) {
     std::filesystem::remove(out);
 }
 
+// Materialized tables with PARTITIONED BY: a full-refresh view whose backing carries a
+// partition_by writes one file per distinct partition value into a directory and swaps
+// the whole partitioned set atomically on completion. Here the view partitions by
+// `region`, so the published directory holds one file per region, each containing only
+// that region's rows.
+TEST(SqlRuntime, MaterializedViewPartitionedFullRefresh) {
+    ensure_sql_installed_once();
+    const auto src = std::filesystem::temp_directory_path() / "clink_mvpart_src.ndjson";
+    const auto out = std::filesystem::temp_directory_path() / "clink_mvpart_out";
+    std::filesystem::remove(src);
+    std::filesystem::remove_all(out);
+    std::filesystem::remove_all(std::filesystem::path(out.string() + ".staging"));
+    write_lines(src,
+                {R"({"region":"eu","amt":10})",
+                 R"({"region":"us","amt":20})",
+                 R"({"region":"eu","amt":5})"});
+
+    Catalog cat;
+    auto src_ddl = parse(std::string{"CREATE TABLE psrc (region VARCHAR, amt BIGINT) "
+                                     "WITH (connector='file', format='json', path='"} +
+                         src.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(src_ddl.statements[0]));
+
+    const std::string mv_sql =
+        std::string{
+            "CREATE MATERIALIZED VIEW pmv "
+            "WITH (connector='file', format='json', freshness='1h', partition_by='region', "
+            "path='"} +
+        out.string() + "') AS SELECT region, amt FROM psrc";
+    auto mv_script = parse(mv_sql);
+    auto mvplan = plan_materialized_view(
+        std::get<ast::CreateMaterializedViewStmt>(std::move(mv_script.statements[0])), cat, mv_sql);
+    EXPECT_EQ(mvplan.arm, RefreshArm::Full);
+    EXPECT_EQ(cat.get_table("pmv")->properties.at("write_mode"), "overwrite");
+    EXPECT_EQ(cat.get_table("pmv")->properties.at("partition_by"), "region");
+
+    InProcessCluster cluster("tm-sql-mvpart", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+
+    {
+        auto plan = optimize(std::move(mvplan.maintenance));
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        auto result = submitter.submit(spec.to_json(), {}, opts);
+        EXPECT_TRUE(result.completed) << "reject: " << result.reject_message;
+        EXPECT_TRUE(result.ok) << "errors: "
+                               << (result.errors.empty() ? "(none)" : result.errors[0]);
+    }
+
+    // The published directory holds one file per region; each file carries only that
+    // region's rows (eu has two, us has one).
+    ASSERT_TRUE(std::filesystem::is_directory(out)) << "expected partitioned dir " << out;
+    EXPECT_TRUE(std::filesystem::exists(out / "eu"));
+    EXPECT_TRUE(std::filesystem::exists(out / "us"));
+    auto amts_in = [&](const std::string& region) {
+        std::multiset<std::int64_t> amts;
+        for (const auto& l : read_lines(out / region)) {
+            amts.insert(static_cast<std::int64_t>(clink::config::parse(l).at("amt").as_number()));
+        }
+        return amts;
+    };
+    EXPECT_EQ(amts_in("eu"), (std::multiset<std::int64_t>{5, 10}));
+    EXPECT_EQ(amts_in("us"), (std::multiset<std::int64_t>{20}));
+
+    std::filesystem::remove(src);
+    std::filesystem::remove_all(out);
+}
+
 }  // namespace clink::sql

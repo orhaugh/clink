@@ -219,6 +219,34 @@ MaterializedViewPlan plan_materialized_view(ast::CreateMaterializedViewStmt stmt
         backing.properties["write_mode"] = "overwrite";
     }
 
+    // partition_by (bucketing): every partition column must exist in the view's
+    // output. A full-refresh partitioned backing writes one file per partition value
+    // and atomically publishes the whole partitioned set on each refresh.
+    if (const auto pb = backing.properties.find("partition_by");
+        pb != backing.properties.end() && !pb->second.empty()) {
+        std::size_t start = 0;
+        while (start <= pb->second.size()) {
+            const auto comma = pb->second.find(',', start);
+            const auto end = comma == std::string::npos ? pb->second.size() : comma;
+            std::string col = pb->second.substr(start, end - start);
+            const auto a = col.find_first_not_of(" \t");
+            const auto b = col.find_last_not_of(" \t");
+            if (a != std::string::npos) {
+                const std::string name = col.substr(a, b - a + 1);
+                if (out_schema->GetFieldByName(name) == nullptr) {
+                    throw TranslationError("materialized view '" + stmt.view_name +
+                                               "': partition_by column '" + name +
+                                               "' is not in the view's output columns",
+                                           stmt.loc.pos);
+                }
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+    }
+
     // Auto-derive an upsert backing for a keyed aggregation when the user did
     // not state mode/primary_key. A keyed GROUP BY emits the latest aggregate
     // per key, so the backing keeps the current row per key rather than every
