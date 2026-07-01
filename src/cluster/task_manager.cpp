@@ -1559,6 +1559,18 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             bctx.subtask_idx = chain.subtask_idx_in_op;
             bctx.parallelism = fk.parallelism;
             auto boxed = sf->build(bctx);
+            // Wire the fused 2PC sink's per-checkpoint commit/abort (the inline
+            // fused-chain rctx has no register_commit_callbacks; without this a
+            // fused 2PC sink would only commit at terminal via the dag path). A
+            // shared copy of the boxed sink is passed (weak-captured inside), so
+            // ownership still moves to the dag below. The same post-run cleanup
+            // that drops the fused source's callbacks covers these.
+            if (out_ops->fused_sink_commit_hooks) {
+                auto [commit_cb, abort_cb] = out_ops->fused_sink_commit_hooks(boxed);
+                std::lock_guard lock(mu_);
+                per_job_committers_[job_id][task.subtask_idx].push_back(std::move(commit_cb));
+                per_job_aborters_[job_id][task.subtask_idx].push_back(std::move(abort_cb));
+            }
             out_ops->add_fused_sink_to_dag(dag, std::move(prev), std::move(boxed));
         } else {
             if (!out_ops->attach_chain_main_outputs) {

@@ -135,6 +135,18 @@ struct TypeOps {
     std::function<std::pair<std::function<void(std::uint64_t)>, std::function<void(std::uint64_t)>>(
         std::shared_ptr<void> /*source*/)>
         fused_source_commit_hooks;
+
+    // fused_sink_commit_hooks: the sink counterpart. Recover the typed Sink<T>
+    // from the boxed shared_ptr<void> and return {commit, abort} callbacks bound
+    // to its on_commit / on_abort (weak-captured). The fused-chain dispatch
+    // registers these into the TM's per-subtask committer/aborter buckets so a
+    // 2PC sink fused into a par-1 chain commits per checkpoint - the same wiring
+    // the non-fused SubtaskRunner does via register_commit_callbacks. on_commit /
+    // on_abort are idempotent (the dag's terminal path may also fire them), so a
+    // duplicate commit for the terminal checkpoint is harmless.
+    std::function<std::pair<std::function<void(std::uint64_t)>, std::function<void(std::uint64_t)>>(
+        std::shared_ptr<void> /*sink*/)>
+        fused_sink_commit_hooks;
 };
 
 // TypeRegistry maps channel-name strings to TypeOps. It also maintains
@@ -395,6 +407,22 @@ inline void TypeRegistry::register_typed(const std::string& name,
         auto abort = [weak](std::uint64_t ckpt) {
             if (auto s = weak.lock()) {
                 s->notify_checkpoint_aborted(clink::CheckpointId{ckpt});
+            }
+        };
+        return {std::move(commit), std::move(abort)};
+    };
+    ops.fused_sink_commit_hooks = [](std::shared_ptr<void> sink)
+        -> std::pair<std::function<void(std::uint64_t)>, std::function<void(std::uint64_t)>> {
+        std::weak_ptr<clink::Sink<T>> weak =
+            std::static_pointer_cast<clink::Sink<T>>(std::move(sink));
+        auto commit = [weak](std::uint64_t ckpt) {
+            if (auto s = weak.lock()) {
+                s->on_commit(ckpt);
+            }
+        };
+        auto abort = [weak](std::uint64_t ckpt) {
+            if (auto s = weak.lock()) {
+                s->on_abort(ckpt);
             }
         };
         return {std::move(commit), std::move(abort)};

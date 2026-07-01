@@ -517,6 +517,18 @@ public:
     std::vector<std::uint64_t> completed;
     std::vector<std::uint64_t> aborted;
 };
+
+// Sink counterpart: records on_commit / on_abort so a test can prove the
+// fused-chain dispatch reaches a fused 2PC sink's commit hooks.
+class CommitCountingSink final : public Sink<std::int64_t> {
+public:
+    void on_data(const Batch<std::int64_t>&) override {}
+    void on_commit(std::uint64_t id) override { committed.push_back(id); }
+    void on_abort(std::uint64_t id) override { aborted.push_back(id); }
+    std::string name() const override { return "commit_counting_sink"; }
+    std::vector<std::uint64_t> committed;
+    std::vector<std::uint64_t> aborted;
+};
 }  // namespace
 
 // The TypeOps::fused_source_commit_hooks seam (used by the fused-chain dispatch in
@@ -549,5 +561,33 @@ TEST(FusedSourceCommit, HooksDriveTypedSourceNotificationsAndAreWeak) {
     src.reset();
     commit_cb(8);  // no crash, nothing to record
     abort_cb(9);
+    SUCCEED();
+}
+
+// The sink counterpart: fused_sink_commit_hooks recovers the typed Sink and its
+// callbacks drive on_commit / on_abort, weak-captured. This closes the fused 2PC
+// sink gap - a sink fused into a par-1 chain now commits per checkpoint, not just
+// at terminal.
+TEST(FusedSourceCommit, SinkHooksDriveTypedSinkCommitAndAreWeak) {
+    TypeRegistry reg;
+    reg.register_typed<std::int64_t>("i64.fusedsink", int64_codec());
+    const auto* ops = reg.find("i64.fusedsink");
+    ASSERT_NE(ops, nullptr);
+    ASSERT_TRUE(static_cast<bool>(ops->fused_sink_commit_hooks));
+
+    auto snk = std::make_shared<CommitCountingSink>();
+    std::shared_ptr<void> boxed = std::static_pointer_cast<void>(snk);
+    auto [commit_cb, abort_cb] = ops->fused_sink_commit_hooks(boxed);
+
+    commit_cb(11);
+    abort_cb(12);
+    commit_cb(13);
+    EXPECT_EQ(snk->committed, (std::vector<std::uint64_t>{11, 13}));
+    EXPECT_EQ(snk->aborted, (std::vector<std::uint64_t>{12}));
+
+    boxed.reset();
+    snk.reset();
+    commit_cb(14);  // weak: safe no-op after teardown
+    abort_cb(15);
     SUCCEED();
 }
