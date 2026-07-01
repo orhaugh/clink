@@ -29,6 +29,16 @@ add_executable(clink_mfast_bench clink_mfast_bench.cpp)
 target_link_libraries(clink_mfast_bench PRIVATE clink::core)
 clink_set_warnings(clink_mfast_bench)
 
+# Disaggregated-state property proof (PARITY-P3) - clink-vs-clink, controlled,
+# in-process. Scenario 1: checkpoint cost scales with the delta (RemoteReadBackend
+# + pool) not the total state (full Arrow-IPC snapshot). Scenario 2: a working set
+# larger than the hot tier still runs correctly by spilling + cold-loading.
+# Premise-free counters (committed entries/bytes, remote_loads) beside wall-clock;
+# structural invariants hard-fail.
+add_executable(clink_disagg_bench clink_disagg_bench.cpp)
+target_link_libraries(clink_disagg_bench PRIVATE clink::core)
+clink_set_warnings(clink_disagg_bench)
+
 # Serde benchmark - compares the legacy record-by-record Codec<T>
 # wire encoding against the Arrow RecordBatch + IPC path. The Arrow
 # path is the production path; the legacy path is benched as a
