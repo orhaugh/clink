@@ -6134,21 +6134,28 @@ public:
             handle_right_(rec.value(), out);
     }
 
-    // Auto-on the async/disaggregated path for an INNER interval join when the
-    // bound backend defers reads. Each side's per-key buffer lives in KeyedState
-    // keyed by the join key (routing matches the keyer), so a left arrival reads
-    // the right buffer, emits matches, and appends to the left buffer (and
-    // symmetrically) - the EquiJoin RMW shape plus the time predicate. An OUTER
-    // interval join keeps the sync in-memory path: its unmatched null-padding
-    // fires when a row is EVICTED at the watermark, which needs per-key eviction
-    // timers (a follow-on), so scoping async to INNER is non-breaking.
+    // Auto-on the async/disaggregated path (INNER and OUTER) when the bound
+    // backend defers reads. Each side's per-key buffer lives in KeyedState keyed
+    // by the join key (routing matches the keyer), so a left arrival reads the
+    // right buffer, emits matches (and, for OUTER, marks the matched right rows),
+    // then appends to the left buffer - the EquiJoin RMW shape plus the time
+    // predicate. Eviction is watermark-driven per key via event-time timers: each
+    // buffered row registers a timer at its eviction time, and the fire drops due
+    // rows, null-padding an unmatched kept-side (OUTER) row exactly as the sync
+    // watermark scan does. This sidesteps any "scan every key" primitive.
     void open() override {
-        const bool backend_defers = this->runtime() != nullptr &&
-                                    this->runtime()->has_state_backend() &&
-                                    this->runtime()->state_backend()->supports_async_get();
-        effective_async_ = kind_ == EquiJoinKind::Inner && backend_defers;
+        effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
+                           this->runtime()->state_backend()->supports_async_get();
     }
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
+    // The eviction fire (on_event_time_timers_async) reads + writes both side
+    // buffers for the due key.
+    [[nodiscard]] bool fires_state_touching_timers() const noexcept override {
+        return effective_async_;
+    }
+    [[nodiscard]] bool fires_async_event_time_timers() const noexcept override {
+        return effective_async_;
+    }
     // ASYNC-10 read coalescing: each arrival's process_async issues get_async for
     // its join key on the two side slots. No-op on a non-deferring backend.
     [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
@@ -6173,14 +6180,9 @@ public:
     void on_watermark(Watermark wm, Emitter<Row>& out) override {
         if (!wm.is_idle()) {
             const auto wm_ms = wm.timestamp().millis();
-            // Track the high watermark for the async path's lazy per-key prune
-            // (the sync in-memory state_ below is empty on the async path, so its
-            // prune is a no-op there; the async handlers prune their KeyedState
-            // buffers by current_wm_ on each arrival). On the sync path this is
-            // just bookkeeping alongside the real in-memory prune.
-            if (wm_ms > current_wm_) {
-                current_wm_ = wm_ms;
-            }
+            // Sync path only: prune the in-memory buffers. On the async path these
+            // maps are empty (arrivals go to KeyedState), so this is a no-op there
+            // and eviction happens via the per-key event-time timers instead.
             // OUTER: null-pad unmatched rows as they are evicted, emitting them
             // BEFORE the watermark is forwarded (their event time is <= wm).
             Batch<Row> null_pads;
@@ -6253,6 +6255,18 @@ private:
             return INT64_MIN;
         }
         return a - b;
+    }
+
+    // a + b clamped to the int64 range (guards the eviction-timer time ts + offset
+    // + 1 against signed-overflow UB for extreme timestamps / offsets).
+    static std::int64_t sat_add_(std::int64_t a, std::int64_t b) {
+        if (b > 0 && a > INT64_MAX - b) {
+            return INT64_MAX;
+        }
+        if (b < 0 && a < INT64_MIN - b) {
+            return INT64_MIN;
+        }
+        return a + b;
     }
 
     static std::string key_string(const Row& row, const std::string& key_column) {
@@ -6362,13 +6376,21 @@ private:
         }
     }
 
-    // Drop buffered rows whose ts < cutoff (no future partner can match). The
-    // async twin of prune_'s inner compaction; INNER only, so no null-padding.
-    static void prune_vec_(std::vector<Buffered>& vec, std::int64_t cutoff) {
+    // Evict one side's buffered rows with ts < cutoff (the single-vector twin of
+    // prune_'s inner compaction), null-padding an unmatched kept-side (OUTER) row
+    // as it goes. Used by the async eviction-timer fire.
+    void evict_side_(std::vector<Buffered>& vec,
+                     std::int64_t cutoff,
+                     bool emit_unmatched,
+                     bool present_is_left,
+                     Batch<Row>& null_pads) const {
         std::size_t w = 0;
         for (std::size_t r = 0; r < vec.size(); ++r) {
             if (vec[r].ts < cutoff) {
-                continue;
+                if (emit_unmatched && !vec[r].matched) {
+                    null_pads.push(Record<Row>{build_outer_(vec[r].row, present_is_left)});
+                }
+                continue;  // evicted
             }
             if (w != r) {
                 vec[w] = std::move(vec[r]);
@@ -6378,12 +6400,23 @@ private:
         vec.resize(w);
     }
 
-    // Async INNER left arrival: read the right buffer for this key, prune it by
-    // the watermark, emit joins for right rows in [ts - upper, ts - lower], then
-    // append this left row to the left buffer. Both slots key by the join key, so
-    // both sides for a key co-locate on the subtask the record routes to. For
-    // in-order input the prune only ever drops rows that could not match a future
-    // row, so the output equals the sync path's.
+    // Register an eviction timer (keyed by the join key) at a buffered row's
+    // eviction point + 1 tick, so the timer fires strictly after the sync cutoff
+    // (which evicts ts + offset < wm). left rows evict at ts + lower; right at
+    // ts + upper. Over-registration across a key is harmless: the fire re-derives
+    // the eviction cutoff from the due timers and drops exactly the sync set.
+    void register_evict_timer_(std::int64_t ts, std::int64_t offset, const std::string& key) {
+        auto* rt = this->runtime();
+        if (rt != nullptr) {
+            rt->timer_service()->register_event_time_timer(sat_add_(sat_add_(ts, offset), 1), key);
+        }
+    }
+
+    // Async left arrival: read the right buffer, emit joins for right rows in
+    // [ts - upper, ts - lower] (marking those right rows matched for OUTER), write
+    // it back, then append this left row (matched = did it join?) to the left
+    // buffer and arm its eviction timer. Both slots key by the join key, so both
+    // sides for a key co-locate on the subtask the record routes to.
     void handle_left_async_(const Row& l, Emitter<Row>& out, AsyncExecutionController& aec) {
         auto ts_opt = ts_value(l, left_ts_column_);
         if (!ts_opt.has_value()) {
@@ -6391,17 +6424,20 @@ private:
         }
         const std::int64_t ts = *ts_opt;
         std::string key = key_string(l, left_key_column_);
+        register_evict_timer_(ts, lower_offset_ms_, key);
         auto kv_l = kv_left_();
         auto kv_r = kv_right_();
         auto factory = [this, kv_l, kv_r, l, ts, key, &out]() mutable -> async::Task<void> {
             auto right = (co_await kv_r.get_async(key)).value_or(std::vector<Buffered>{});
-            prune_vec_(right, sat_sub_(current_wm_, upper_offset_ms_));
             const std::int64_t rlow = ts - upper_offset_ms_;
             const std::int64_t rhigh = ts - lower_offset_ms_;
             Batch<Row> emit;
-            for (const auto& r : right) {
+            bool any_match = false;
+            for (auto& r : right) {
                 if (r.ts >= rlow && r.ts <= rhigh) {
                     emit.push(Record<Row>{build_joined_(l, r.row)});
+                    r.matched = true;  // OUTER: this right row found a partner
+                    any_match = true;
                 }
             }
             if (!emit.empty()) {
@@ -6409,8 +6445,7 @@ private:
             }
             kv_r.put(key, right);
             auto left = (co_await kv_l.get_async(key)).value_or(std::vector<Buffered>{});
-            prune_vec_(left, sat_sub_(current_wm_, lower_offset_ms_));
-            left.push_back(Buffered{ts, l, false});
+            left.push_back(Buffered{ts, l, any_match});
             kv_l.put(key, left);
             co_return;
         };
@@ -6419,7 +6454,7 @@ private:
         }
     }
 
-    // Async INNER right arrival: symmetric to handle_left_async_.
+    // Async right arrival: symmetric to handle_left_async_.
     void handle_right_async_(const Row& r, Emitter<Row>& out, AsyncExecutionController& aec) {
         auto ts_opt = ts_value(r, right_ts_column_);
         if (!ts_opt.has_value()) {
@@ -6427,17 +6462,20 @@ private:
         }
         const std::int64_t ts = *ts_opt;
         std::string key = key_string(r, right_key_column_);
+        register_evict_timer_(ts, upper_offset_ms_, key);
         auto kv_l = kv_left_();
         auto kv_r = kv_right_();
         auto factory = [this, kv_l, kv_r, r, ts, key, &out]() mutable -> async::Task<void> {
             auto left = (co_await kv_l.get_async(key)).value_or(std::vector<Buffered>{});
-            prune_vec_(left, sat_sub_(current_wm_, lower_offset_ms_));
             const std::int64_t llow = ts + lower_offset_ms_;
             const std::int64_t lhigh = ts + upper_offset_ms_;
             Batch<Row> emit;
-            for (const auto& l : left) {
+            bool any_match = false;
+            for (auto& l : left) {
                 if (l.ts >= llow && l.ts <= lhigh) {
                     emit.push(Record<Row>{build_joined_(l.row, r)});
+                    l.matched = true;  // OUTER: this left row found a partner
+                    any_match = true;
                 }
             }
             if (!emit.empty()) {
@@ -6445,14 +6483,49 @@ private:
             }
             kv_l.put(key, left);
             auto right = (co_await kv_r.get_async(key)).value_or(std::vector<Buffered>{});
-            prune_vec_(right, sat_sub_(current_wm_, upper_offset_ms_));
-            right.push_back(Buffered{ts, r, false});
+            right.push_back(Buffered{ts, r, any_match});
             kv_r.put(key, right);
             co_return;
         };
         while (!aec.submit(key, factory)) {
             aec.poll_or_flush();
         }
+    }
+
+    // Async eviction fire: one point-read of the due key's two buffers, evict
+    // every row past its window, null-pad unmatched kept-side (OUTER) rows, write
+    // back. `timestamps` are this key's due eviction-timer times (ascending, all
+    // <= the firing watermark); the largest acts as the watermark for the cutoff -
+    // it selects exactly the rows the sync watermark scan would evict, because a
+    // row is due iff its eviction timer (ts + offset + 1) is <= it.
+    async::Task<void> on_event_time_timers_async(std::vector<std::int64_t> timestamps,
+                                                 std::string key,
+                                                 Emitter<Row>& out) override {
+        if (timestamps.empty()) {
+            co_return;
+        }
+        const std::int64_t bound = timestamps.back();
+        auto kv_l = kv_left_();
+        auto kv_r = kv_right_();
+        auto left = (co_await kv_l.get_async(key)).value_or(std::vector<Buffered>{});
+        auto right = (co_await kv_r.get_async(key)).value_or(std::vector<Buffered>{});
+        Batch<Row> null_pads;
+        evict_side_(left,
+                    sat_sub_(bound, lower_offset_ms_),
+                    left_keeps_unmatched_(),
+                    /*present_is_left=*/true,
+                    null_pads);
+        evict_side_(right,
+                    sat_sub_(bound, upper_offset_ms_),
+                    right_keeps_unmatched_(),
+                    /*present_is_left=*/false,
+                    null_pads);
+        if (!null_pads.empty()) {
+            out.emit_data(std::move(null_pads));
+        }
+        kv_l.put(key, left);
+        kv_r.put(key, right);
+        co_return;
     }
 
     // Codec for one key's buffered rows over the async/disaggregated path: a JSON
@@ -6535,12 +6608,9 @@ private:
     EquiJoinKind kind_;
     std::vector<std::string> left_columns_;
     std::vector<std::string> right_columns_;
-    // Finalised in open(): INNER + a deferring backend -> the async KeyedState
-    // path (process_async{1,2}); otherwise the sync in-memory path below.
+    // Finalised in open(): a deferring backend -> the async KeyedState path
+    // (process_async{1,2} + eviction timers); otherwise the sync in-memory path.
     bool effective_async_ = false;
-    // High watermark seen (async lazy-prune bound). INT64_MIN = prune nothing
-    // until a real watermark arrives.
-    std::int64_t current_wm_ = INT64_MIN;
     clink::FlatMap<std::string, std::vector<Buffered>> left_state_;
     clink::FlatMap<std::string, std::vector<Buffered>> right_state_;
 };

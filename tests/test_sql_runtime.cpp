@@ -7330,6 +7330,130 @@ TEST(SqlRuntime, IntervalJoinInnerRidesRemoteReadPath) {
         << "interval join did not route its per-key state through the deferring backend";
 }
 
+// Emits a fixed row vector as one batch then a closing watermark, so a
+// cluster-free co-op test can drive watermark-triggered eviction / null-padding.
+class TsWatermarkSource final : public Source<Row> {
+public:
+    TsWatermarkSource(std::vector<Record<Row>> rows, std::int64_t closing_wm)
+        : rows_(std::move(rows)), closing_wm_(closing_wm) {}
+    bool produce(Emitter<Row>& out) override {
+        if (this->cancelled() || done_) {
+            return false;
+        }
+        Batch<Row> b;
+        for (const auto& r : rows_) {
+            b.push(r);
+        }
+        out.emit_data(std::move(b));
+        out.emit_watermark(Watermark{EventTime{closing_wm_}});
+        done_ = true;
+        return false;
+    }
+    [[nodiscard]] bool is_bounded() const noexcept override { return true; }
+    std::string name() const override { return "ts_wm_src"; }
+
+private:
+    std::vector<Record<Row>> rows_;
+    std::int64_t closing_wm_;
+    bool done_ = false;
+};
+
+// OUTER interval joins ride the async/disaggregated path too: matched rows join,
+// and an unmatched kept-side row is null-padded when its window is EVICTED at the
+// watermark, via a per-key eviction timer (the async twin of the sync watermark
+// scan). u1 click joins u1 order; u2 click is unmatched (kept by LEFT/FULL); u3
+// order is unmatched (kept only by FULL). Verified for LEFT and FULL OUTER
+// against the sync in-memory path, with the exact expected rows, and
+// remote_loads > 0 to prove the per-key state rode the deferring tier.
+TEST(SqlRuntime, OuterIntervalJoinAsyncMatchesSyncPath) {
+    ensure_sql_installed_once();
+    const auto* builder = cluster::DagBuilderRegistry::default_instance().find("interval_join_row");
+    ASSERT_NE(builder, nullptr) << "interval_join_row Dag builder not registered";
+
+    auto click = [](std::int64_t u, std::int64_t ts, const char* page) {
+        Row r;
+        r.values["user_id"] = clink::config::JsonValue{static_cast<double>(u)};
+        r.values["click_ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        r.values["page"] = clink::config::JsonValue{std::string{page}};
+        return Record<Row>{std::move(r)};
+    };
+    auto order = [](std::int64_t u, std::int64_t ts, const char* sku) {
+        Row r;
+        r.values["user_id"] = clink::config::JsonValue{static_cast<double>(u)};
+        r.values["order_ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        r.values["sku"] = clink::config::JsonValue{std::string{sku}};
+        return Record<Row>{std::move(r)};
+    };
+    const std::vector<Record<Row>> left = {click(1, 100, "home"), click(2, 2000, "docs")};
+    const std::vector<Record<Row>> right = {order(1, 150, "x"), order(3, 5000, "z")};
+
+    auto run = [&](const char* join_type, std::shared_ptr<StateBackend> backend) {
+        Dag dag;
+        auto hl = dag.add_source<Row>(std::make_shared<TsWatermarkSource>(left, 1000000));
+        auto hr = dag.add_source<Row>(std::make_shared<TsWatermarkSource>(right, 1000000));
+        clink::plugin::BuildContext ctx;
+        ctx.params["left_key_column"] = "user_id";
+        ctx.params["right_key_column"] = "user_id";
+        ctx.params["left_ts_column"] = "click_ts";
+        ctx.params["right_ts_column"] = "order_ts";
+        ctx.params["left_alias"] = "c";
+        ctx.params["right_alias"] = "o";
+        ctx.params["lower_offset_ms"] = "-50";
+        ctx.params["upper_offset_ms"] = "200";
+        ctx.params["join_type"] = join_type;
+        ctx.params["left_columns"] = "user_id,click_ts,page";
+        ctx.params["right_columns"] = "user_id,order_ts,sku";
+        std::vector<std::any> upstream = {std::any{hl}, std::any{hr}};
+        auto built = (*builder)(dag, upstream, ctx);
+        auto h_op = std::any_cast<StageHandle<Row>>(built.main_handle);
+        auto sink = std::make_shared<CollectingSink<Row>>();
+        dag.add_sink<Row>(h_op, sink);
+        JobConfig cfg;
+        cfg.state_backend = std::move(backend);
+        LocalExecutor exec(std::move(dag), std::move(cfg));
+        exec.run();
+        // Each output row as (c_user_id or -1, o_user_id or -1); -1 = null/absent.
+        auto rd = [](const Row& r, const char* c) -> std::int64_t {
+            auto it = r.values.find(c);
+            if (it == r.values.end() || it->second.is_null()) {
+                return -1;
+            }
+            return static_cast<std::int64_t>(it->second.as_number());
+        };
+        std::set<std::pair<std::int64_t, std::int64_t>> rows;
+        for (const auto& rec : sink->collected_records()) {
+            rows.emplace(rd(rec.value(), "c_user_id"), rd(rec.value(), "o_user_id"));
+        }
+        return rows;
+    };
+
+    using P = std::pair<std::int64_t, std::int64_t>;
+    // LEFT OUTER: u1 join + u2 left null-pad (u3 order unmatched but RIGHT not kept).
+    {
+        const auto sync_rows = run("left_outer", std::make_shared<InMemoryStateBackend>());
+        auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                       /*io_threads=*/1,
+                                                       /*hot_max_bytes=*/0);
+        const auto async_rows = run("left_outer", rrb);
+        const std::set<P> want = {P{1, 1}, P{2, -1}};
+        EXPECT_EQ(sync_rows, want) << "sync LEFT OUTER interval join";
+        EXPECT_EQ(async_rows, sync_rows) << "async LEFT OUTER must match the sync path";
+        EXPECT_GT(rrb->remote_loads(), 0u) << "LEFT OUTER did not ride the deferring backend";
+    }
+    // FULL OUTER: u1 join + u2 left null-pad + u3 right null-pad.
+    {
+        const auto sync_rows = run("full_outer", std::make_shared<InMemoryStateBackend>());
+        auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                       /*io_threads=*/1,
+                                                       /*hot_max_bytes=*/0);
+        const auto async_rows = run("full_outer", rrb);
+        const std::set<P> want = {P{1, 1}, P{2, -1}, P{-1, 3}};
+        EXPECT_EQ(sync_rows, want) << "sync FULL OUTER interval join";
+        EXPECT_EQ(async_rows, sync_rows) << "async FULL OUTER must match the sync path";
+        EXPECT_GT(rrb->remote_loads(), 0u) << "FULL OUTER did not ride the deferring backend";
+    }
+}
+
 // SQLOPT-1: LEFT OUTER interval join. An unmatched left (click) row is
 // null-padded at watermark eviction; matched rows are unaffected.
 TEST(SqlRuntime, LeftOuterIntervalJoinNullPadsUnmatchedLeft) {
