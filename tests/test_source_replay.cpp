@@ -8,9 +8,11 @@
 // the earlier recovery suite already covers, a job that crashes
 // between checkpoints can now restart and not double-count records.
 
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -236,4 +238,98 @@ TEST(SourceReplay, FileSourceNoStateReturnsFalse) {
     FileSource<int> src(path, int_lines(), 10, "fsrc");
     EXPECT_FALSE(src.restore_offset(backend, OperatorId{203}));
     std::filesystem::remove(path);
+}
+
+namespace {
+// Broker-free stand-in for the messaging sources (RabbitMQ/NATS/Pulsar): it
+// implements the shared checkpoint-completion ACK-DEFERRAL contract without any
+// transport. Consumed tokens are held; snapshot_offset() buckets the held tokens
+// under a checkpoint id (no ack); notify_checkpoint_complete() acks every bucket
+// up to the committed id; notify_checkpoint_aborted() drops a bucket unacked so
+// the "broker" would redeliver. Acking at the barrier (the old behaviour) would
+// lose a token if its checkpoint later aborted - this locks in that it does not.
+class DeferredAckSource final : public Source<int> {
+public:
+    void consume(int token) { held_.push_back(token); }
+
+    void snapshot_offset(StateBackend&, OperatorId, CheckpointId ckpt) override {
+        if (held_.empty()) {
+            return;
+        }
+        pending_[ckpt.value()] = std::move(held_);
+        held_.clear();
+    }
+    void notify_checkpoint_complete(CheckpointId ckpt) override {
+        for (auto it = pending_.begin(); it != pending_.end() && it->first <= ckpt.value();) {
+            acked_.insert(acked_.end(), it->second.begin(), it->second.end());
+            it = pending_.erase(it);
+        }
+    }
+    void notify_checkpoint_aborted(CheckpointId ckpt) override { pending_.erase(ckpt.value()); }
+
+    bool produce(Emitter<int>&) override { return false; }
+    std::string name() const override { return "deferred_ack_source"; }
+
+    const std::vector<int>& acked() const { return acked_; }
+    std::size_t pending_count() const {
+        std::size_t n = 0;
+        for (const auto& [c, v] : pending_) {
+            n += v.size();
+        }
+        return n;
+    }
+
+private:
+    std::vector<int> held_;
+    std::map<std::uint64_t, std::vector<int>> pending_;
+    std::vector<int> acked_;
+};
+}  // namespace
+
+// The shared ack-deferral contract: a message is acked only after the checkpoint
+// that captured it commits, and an aborted checkpoint's messages are never acked
+// (left for redelivery). Exercised through the Source<int> base so it also proves
+// the new hooks dispatch virtually.
+TEST(SourceReplay, DeferredAckHoldsUntilCommitAndDropsOnAbort) {
+    InMemoryStateBackend backend;
+    const OperatorId op_id{909};
+    DeferredAckSource concrete;
+    Source<int>& src = concrete;  // drive via the base to prove virtual dispatch
+
+    // Batch A captured by checkpoint 1.
+    concrete.consume(10);
+    concrete.consume(11);
+    src.snapshot_offset(backend, op_id, CheckpointId{1});
+    EXPECT_TRUE(concrete.acked().empty()) << "barrier must NOT ack; ack waits for commit";
+    EXPECT_EQ(concrete.pending_count(), 2u);
+
+    // Batch B captured by checkpoint 2.
+    concrete.consume(20);
+    src.snapshot_offset(backend, op_id, CheckpointId{2});
+
+    // Checkpoint 1 commits: only its batch is acked; checkpoint 2 still pending.
+    src.notify_checkpoint_complete(CheckpointId{1});
+    EXPECT_EQ(concrete.acked(), (std::vector<int>{10, 11}));
+    EXPECT_EQ(concrete.pending_count(), 1u);
+
+    // Checkpoint 2 aborts: its batch is dropped unacked (broker redelivers), never
+    // acked even though a later checkpoint arrives.
+    src.notify_checkpoint_aborted(CheckpointId{2});
+    concrete.consume(30);
+    src.snapshot_offset(backend, op_id, CheckpointId{3});
+    src.notify_checkpoint_complete(CheckpointId{3});
+    EXPECT_EQ(concrete.acked(), (std::vector<int>{10, 11, 30}))
+        << "aborted checkpoint 2's token (20) must never be acked";
+}
+
+// Default Source hooks are no-ops: an offset-replay source (Kafka/Parquet/File)
+// that does not override them is unaffected by commit/abort notifications.
+TEST(SourceReplay, DefaultCheckpointHooksAreNoOps) {
+    const auto path = write_int_lines("noophooks", 2);
+    FileSource<int> src(path, int_lines(), 10, "fsrc");
+    Source<int>& base = src;
+    base.notify_checkpoint_complete(CheckpointId{1});  // no throw, no effect
+    base.notify_checkpoint_aborted(CheckpointId{2});
+    std::filesystem::remove(path);
+    SUCCEED();
 }

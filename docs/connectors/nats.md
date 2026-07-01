@@ -142,7 +142,7 @@ A JetStream stream bound to the subject must already exist; the connectors do no
 
 Both directions are at-least-once.
 
-- Source: a durable explicit-ack pull consumer. Messages are acked at the checkpoint barrier (`snapshot_offset`); until then JetStream holds them (bounded by `max_ack_pending`) and redelivers any left unacked after a failure. The durable consumer's ack floor is persisted server-side, so recovery needs no local state and `restore_offset` is a no-op. Honest caveat noted in the source header: the ack happens at the barrier because the Source interface has no post-commit hook, so a crash between the barrier ack and checkpoint completion could drop those messages. Keep `ack_wait_s` larger than the checkpoint interval so held, unacked messages are not redelivered before a barrier.
+- Source: a durable explicit-ack pull consumer. The ack is deferred to checkpoint COMMIT, not the barrier: `snapshot_offset` buckets the messages emitted before each barrier against that checkpoint id, `notify_checkpoint_complete` (driven from the cluster's `CommitCheckpoint` dispatch) queues a committed bucket for ack, and the next `produce()` turn issues each `natsMsg_Ack` - so a message is acked only after the checkpoint that captured it is globally durable. `notify_checkpoint_aborted` releases a bucket without acking, so an aborted checkpoint (or a crash before commit) leaves those messages for redelivery (JetStream redelivers after `AckWait`). Until acked JetStream holds them (bounded by `max_ack_pending`); all nats.c calls stay on the `produce()` thread. The durable consumer's ack floor is persisted server-side, so recovery needs no local state and `restore_offset` is a no-op. Keep `ack_wait_s` larger than the checkpoint interval so held, unacked messages are not redelivered before their checkpoint commits.
 - Sink: records are published asynchronously (`js_PublishAsync`) for throughput; `flush()` / `on_barrier()` call `js_PublishAsyncComplete` to block until the server has acked every pending publish, and throw on timeout so the job replays from the last checkpoint rather than dropping data. JetStream de-dup via `Nats-Msg-Id` is not set, so replay can duplicate. The SQL planner therefore rejects `exactly_once` and `upsert`.
 
 ## Limitations
@@ -150,7 +150,7 @@ Both directions are at-least-once.
 - String record type only; there is no int64 or Arrow channel for this connector.
 - Sink requires a pre-existing JetStream stream bound to the target subject; stream provisioning is not performed by the connector.
 - No producer dedup key (`Nats-Msg-Id`) is set, so exactly-once and upsert are unsupported (enforced by the SQL planner).
-- The source's barrier-time ack carries the standard at-least-once caveat: a crash between the barrier ack and checkpoint completion can drop in-flight messages.
+- The source acks at checkpoint commit (not the barrier), so the earlier crash-window drop is closed; duplicates on replay remain the at-least-once trade-off. This relies on the cluster's per-checkpoint `CommitCheckpoint` dispatch (the default, non-fused deployment) - the opt-in par-1 chain fusion (`CLINK_PLAN_FUSE_PAR1=1`) does not drive source commit notifications, so run messaging sources unfused.
 - `subject` is required for both source and sink; construction throws if it is empty.
 
 ## Testing

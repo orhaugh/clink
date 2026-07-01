@@ -11,15 +11,18 @@
 namespace clink::pulsar {
 
 // Apache Pulsar source: subscribes to a topic and emits each message body as a std::string.
-// Delivery is AT-LEAST-ONCE. Messages are received and held, then individually acknowledged at
-// the checkpoint barrier (snapshot_offset); the subscription cursor is durable server-side, so
-// after a failure Pulsar redelivers everything left unacked (recovery needs no local state -
-// restore_offset is a no-op). A Shared subscription is used by default so parallel subtasks
-// sharing the subscription distribute the topic's messages and each acks only its own.
+// Delivery is AT-LEAST-ONCE. The subscription cursor is durable server-side, so after a failure
+// Pulsar redelivers everything left unacked (recovery needs no local state - restore_offset is a
+// no-op). A Shared subscription is used by default so parallel subtasks sharing the subscription
+// distribute the topic's messages and each acks only its own.
 //
-// HONEST CAVEAT: like the RabbitMQ/NATS sources, the ack happens at the barrier (the Source
-// interface has no post-commit hook), so a crash between the barrier ack and the checkpoint
-// completing could drop those messages. The receiver-queue size bounds the held-unacked buffer.
+// The ack is deferred to CHECKPOINT COMMIT, not the barrier. snapshot_offset() buckets the
+// messages emitted before each barrier against that checkpoint id; notify_checkpoint_complete()
+// (driven from the cluster's CommitCheckpoint path) marks a bucket's messages safe to ack, and
+// the next produce() turn issues their pulsar_consumer_acknowledge - so a message is acked only
+// after the checkpoint that captured it is globally durable. All pulsar C calls stay on the
+// produce() thread (one consumer). notify_checkpoint_aborted() frees the bucket WITHOUT acking,
+// so Pulsar redelivers. The receiver-queue size bounds the held-unacked buffer.
 //
 // libpulsar types do not appear here (the pulsar C API is confined to the .cpp via a pImpl).
 class PulsarSource final : public Source<std::string> {
@@ -45,10 +48,16 @@ public:
     void close() override;
     [[nodiscard]] bool is_bounded() const noexcept override { return false; }
 
-    // At-least-once ack point: acknowledge (and free) every message emitted since the last
-    // barrier. Runs on the produce() thread (see dag.hpp), serialised with receive().
+    // Bucket the messages emitted before this barrier against the checkpoint id (no ack yet).
+    // Runs on the produce() thread (see dag.hpp). Persists nothing - the cursor is server-side.
     void snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId ckpt_id) override;
     bool restore_offset(StateBackend& backend, OperatorId op_id) override;
+
+    // Checkpoint committed/aborted (cluster CommitCheckpoint / AbortCheckpoint dispatch thread).
+    // complete() queues the captured messages for ack; aborted() queues them for free without ack
+    // (Pulsar redelivers). The actual acknowledge/free runs on the produce() thread.
+    void notify_checkpoint_complete(CheckpointId ckpt_id) override;
+    void notify_checkpoint_aborted(CheckpointId ckpt_id) override;
 
 private:
     struct Impl;

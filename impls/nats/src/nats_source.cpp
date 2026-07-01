@@ -1,6 +1,8 @@
 #include "clink/nats/nats_source.hpp"
 
 #include <cstdint>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -21,8 +23,35 @@ struct NatsSource::Impl {
     natsConnection* conn{nullptr};
     jsCtx* js{nullptr};
     natsSubscription* sub{nullptr};
-    std::vector<natsMsg*> held;  // emitted-but-unacked messages, ack'd at the next barrier
+    std::vector<natsMsg*> held;  // emitted since the last barrier (produce thread only)
+    // Cross-thread ack bookkeeping (guarded by mu): snapshot_offset (produce thread) buckets
+    // `held` under a checkpoint id; notify_checkpoint_* (commit-dispatch thread) move buckets into
+    // ack_ready / abort_drop; produce() (produce thread) drains those, keeping every natsMsg_Ack /
+    // natsMsg_Destroy on the produce thread (the subscription is not thread-safe).
+    std::mutex mu;
+    std::map<std::uint64_t, std::vector<natsMsg*>> pending;  // ckpt id -> captured messages
+    std::vector<natsMsg*> ack_ready;                         // committed: ack then destroy
+    std::vector<natsMsg*> abort_drop;  // aborted: destroy without ack (-> JetStream redelivers)
     explicit Impl(Options o) : opts(std::move(o)) {}
+
+    // Destroy every not-yet-acked message (held + bucketed + queued) WITHOUT acking, so JetStream
+    // redelivers them after AckWait (at-least-once). Called from close()/dtor after the runner
+    // thread has stopped, so no locking is needed.
+    void destroy_unacked() {
+        auto wipe = [](std::vector<natsMsg*>& v) {
+            for (natsMsg* m : v) {
+                natsMsg_Destroy(m);
+            }
+            v.clear();
+        };
+        wipe(held);
+        for (auto& [ckpt, msgs] : pending) {
+            wipe(msgs);
+        }
+        pending.clear();
+        wipe(ack_ready);
+        wipe(abort_drop);
+    }
 };
 
 NatsSource::NatsSource(Options opts) : impl_(std::make_unique<Impl>(std::move(opts))) {
@@ -32,10 +61,7 @@ NatsSource::NatsSource(Options opts) : impl_(std::make_unique<Impl>(std::move(op
 }
 
 NatsSource::~NatsSource() {
-    for (natsMsg* m : impl_->held) {
-        natsMsg_Destroy(m);
-    }
-    impl_->held.clear();
+    impl_->destroy_unacked();
     natsSubscription_Destroy(impl_->sub);
     jsCtx_Destroy(impl_->js);  // destroy JetStream ctx BEFORE the connection (nats.c requirement)
     natsConnection_Destroy(impl_->conn);
@@ -74,6 +100,32 @@ void NatsSource::open() {
 }
 
 bool NatsSource::produce(Emitter<std::string>& out) {
+    // Ack/release messages whose checkpoint resolved since the last turn. Done here (the produce
+    // thread) so every natsMsg_Ack stays on the single non-thread-safe subscription.
+    {
+        std::vector<natsMsg*> to_ack;
+        std::vector<natsMsg*> to_drop;
+        {
+            std::lock_guard<std::mutex> lk(impl_->mu);
+            to_ack.swap(impl_->ack_ready);
+            to_drop.swap(impl_->abort_drop);
+        }
+        natsStatus first_err = NATS_OK;
+        for (natsMsg* m : to_ack) {
+            const natsStatus s = natsMsg_Ack(m, nullptr);
+            if (s != NATS_OK && first_err == NATS_OK) {
+                first_err = s;
+            }
+            natsMsg_Destroy(m);
+        }
+        for (natsMsg* m : to_drop) {
+            natsMsg_Destroy(m);  // no ack -> JetStream redelivers after AckWait
+        }
+        if (first_err != NATS_OK) {
+            clink::metrics::connector::error_inc(kLabel, "source");
+            throw std::runtime_error(impl_->opts.name + ": ack: " + natsStatus_GetText(first_err));
+        }
+    }
     natsMsgList list;
     list.Msgs = nullptr;
     list.Count = 0;
@@ -112,21 +164,37 @@ bool NatsSource::produce(Emitter<std::string>& out) {
 
 void NatsSource::snapshot_offset(StateBackend& /*backend*/,
                                  OperatorId /*op_id*/,
-                                 CheckpointId /*ckpt_id*/) {
-    // Ack + release every message emitted since the last barrier (at-least-once). Runs on the
-    // produce() thread, so it is serialised with Fetch on the single subscription.
-    natsStatus first_err = NATS_OK;
-    for (natsMsg* m : impl_->held) {
-        const natsStatus s = natsMsg_Ack(m, nullptr);
-        if (s != NATS_OK && first_err == NATS_OK) {
-            first_err = s;
-        }
-        natsMsg_Destroy(m);
+                                 CheckpointId ckpt_id) {
+    // Bucket the messages emitted before this barrier under the checkpoint id (no ack yet). The
+    // ack is deferred to notify_checkpoint_complete so a message is confirmed only after the
+    // checkpoint that captured it is globally durable. Runs on the produce() thread.
+    if (impl_->held.empty()) {
+        return;
     }
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto& bucket = impl_->pending[ckpt_id.value()];
+    bucket.insert(bucket.end(), impl_->held.begin(), impl_->held.end());
     impl_->held.clear();
-    if (first_err != NATS_OK) {
-        clink::metrics::connector::error_inc(kLabel, "source");
-        throw std::runtime_error(impl_->opts.name + ": ack: " + natsStatus_GetText(first_err));
+}
+
+void NatsSource::notify_checkpoint_complete(CheckpointId ckpt_id) {
+    // Every checkpoint up to the committed id is durable: queue its messages for ack on the
+    // produce() thread.
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    for (auto it = impl_->pending.begin();
+         it != impl_->pending.end() && it->first <= ckpt_id.value();) {
+        impl_->ack_ready.insert(impl_->ack_ready.end(), it->second.begin(), it->second.end());
+        it = impl_->pending.erase(it);
+    }
+}
+
+void NatsSource::notify_checkpoint_aborted(CheckpointId ckpt_id) {
+    // The checkpoint aborted: release its messages WITHOUT acking so JetStream redelivers them.
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    auto it = impl_->pending.find(ckpt_id.value());
+    if (it != impl_->pending.end()) {
+        impl_->abort_drop.insert(impl_->abort_drop.end(), it->second.begin(), it->second.end());
+        impl_->pending.erase(it);
     }
 }
 
@@ -135,10 +203,7 @@ bool NatsSource::restore_offset(StateBackend& /*backend*/, OperatorId /*op_id*/)
 }
 
 void NatsSource::close() {
-    for (natsMsg* m : impl_->held) {
-        natsMsg_Destroy(m);  // unacked on close -> JetStream redelivers them (at-least-once)
-    }
-    impl_->held.clear();
+    impl_->destroy_unacked();  // unacked on close -> JetStream redelivers them (at-least-once)
     natsSubscription_Destroy(impl_->sub);
     impl_->sub = nullptr;
     jsCtx_Destroy(impl_->js);

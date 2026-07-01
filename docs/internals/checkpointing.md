@@ -17,7 +17,7 @@ A checkpoint is a globally consistent cut across a running job: every operator's
 | `include/clink/runtime/snapshot_worker.hpp` | `SnapshotWorker`: off-thread durable-write + ack |
 | `include/clink/state/durable_file_write.hpp` | `write_fsync_rename` and `CLINK_STATE_FSYNC` |
 | `include/clink/runtime/dag.hpp` | Barrier flow through source / single-input / multi-input / sink runners; the snapshot-on-barrier and unaligned-capture logic |
-| `include/clink/operators/operator_base.hpp` | Source `snapshot_offset`/`restore_offset`/`inject_pending_barrier`; sink `on_barrier`/`on_commit`/`on_abort`/`commit_group` hooks |
+| `include/clink/operators/operator_base.hpp` | Source `snapshot_offset`/`restore_offset`/`notify_checkpoint_complete`/`notify_checkpoint_aborted`/`inject_pending_barrier`; sink `on_barrier`/`on_commit`/`on_abort`/`commit_group` hooks |
 | `include/clink/connectors/file_2pc_sink.hpp` | `FileSink2PC<T>`: the canonical two-phase-commit sink |
 | `include/clink/connectors/parquet_2pc_sink.hpp` | `ParquetSink2PC<T>`: a fsync-durable Parquet 2PC sink |
 | `src/cluster/job_manager.cpp` | Cluster-side ack tracking, `COMPLETED-N` marker, `CommitCheckpoint`/`AbortCheckpoint` broadcast, commit-group gating |
@@ -143,6 +143,8 @@ Durability is on by default and disabled with `CLINK_STATE_FSYNC=0` (or `false`)
 
 The source side of exactly-once is `snapshot_offset` / `restore_offset` on `Source` (`operator_base.hpp`). `snapshot_offset(backend, op_id, ckpt_id)` persists whatever read position the source needs to resume from; it runs inside the barrier drain so the offset is captured atomically with the barrier. `restore_offset(backend, op_id)` is called by the source runner **before** `open()` on startup, so the source resumes from the recovered position. The defaults are no-ops: a source that does not override these replays from the start on restart (at-least-once at the source boundary). Sources that do override participate in pipeline-wide exactly-once. At end-of-stream a bounded source can request one final JM-coordinated checkpoint that durably commits the tail (records since the last completed periodic checkpoint) and blocks until it commits before the runner returns, so the job cannot be reported complete with an uncommitted tail; a crash in that window leaves the source unfinished and is recovered by restart-and-replay.
 
+`Source` also exposes `notify_checkpoint_complete(ckpt_id)` / `notify_checkpoint_aborted(ckpt_id)` - the source-side mirror of a 2PC sink's `on_commit` / `on_abort`. Where `snapshot_offset` is a replayable offset (Kafka, Parquet, File), a crash simply resumes from it and these hooks are unused. But a source whose resume is an *irreversible broker consume* - an AMQP / JetStream / Pulsar ack, a cursor advance - cannot ack at the barrier: if the checkpoint later aborts, the broker will not redeliver an already-acked message, so that message is lost. Such a source records the position at `snapshot_offset` and defers the actual ack until `notify_checkpoint_complete` confirms the capturing checkpoint is globally durable; `notify_checkpoint_aborted` releases the pinned messages for redelivery. The cluster source runner (`plugin_impl.hpp`) drives both from the same `CommitCheckpoint` / `AbortCheckpoint` dispatch the 2PC sinks use (`register_commit_callbacks` / `register_abort_callbacks`), weak-capturing the source so a late notification during teardown is a safe no-op. The RabbitMQ, NATS and Pulsar sources adopt this; each keeps every broker call on the `produce()` thread (the notification only hands work across), so the non-thread-safe client connection is untouched from the dispatch thread. This applies to the default (non-fused) subtask deployment; the opt-in par-1 chain fusion (`CLINK_PLAN_FUSE_PAR1=1`) does not wire source commit notifications.
+
 ## Key types and APIs
 
 | Type / function | Responsibility |
@@ -159,6 +161,7 @@ The source side of exactly-once is `snapshot_offset` / `restore_offset` on `Sour
 | `state::detail::write_fsync_rename` | Crash-safe durable write (file + dir fsync, atomic rename) |
 | `Source::inject_pending_barrier` / `take_pending_barrier` | Barrier handoff into the source's drain loop |
 | `Source::snapshot_offset` / `restore_offset` | Source-offset persistence and replay |
+| `Source::notify_checkpoint_complete` / `notify_checkpoint_aborted` | Source-side commit/abort hooks for irreversible-consume sources (messaging acks) |
 | `Sink::on_barrier` / `on_commit` / `on_abort` | 2PC pre-commit / commit / rollback hooks |
 | `Sink::set_commit_group` / `commit_group` | Atomic-commit group membership |
 

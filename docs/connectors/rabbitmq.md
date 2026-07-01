@@ -150,7 +150,7 @@ The same factories can be resolved by name through the runner registry, as `impl
 
 Both ends are at-least-once.
 
-Source: messages are consumed with manual ack (`no_ack=false`) and acked at the checkpoint barrier via `basic.ack(multiple=true)` up to the highest delivery tag emitted so far. On failure the broker redelivers anything left unacked on reconnect. AMQP has no seekable offset, so recovery relies on broker redelivery rather than offset replay. The source header records an honest caveat: because the `Source` interface has no post-commit hook, the ack happens at the barrier rather than after the global checkpoint commits, so a crash in the narrow window between the barrier ack and the checkpoint completing could drop those messages.
+Source: messages are consumed with manual ack (`no_ack=false`). The ack is deferred to checkpoint COMMIT, not the barrier. `snapshot_offset()` records the highest delivery tag emitted before each barrier against that checkpoint id; `notify_checkpoint_complete()` (driven from the cluster's `CommitCheckpoint` dispatch) advances a safe-to-ack watermark, and the next `produce()` turn issues one `basic.ack(multiple=true)` up to it - so a message is confirmed to the broker only after the checkpoint that captured it is globally durable. `notify_checkpoint_aborted()` drops the pending record without acking, so an aborted checkpoint (or a crash before commit) leaves those messages for redelivery. All AMQP calls stay on the `produce()` thread (the connection is not thread-safe); the commit notification only advances an atomic watermark that `produce()` drains. AMQP has no seekable offset, so recovery relies on broker redelivery rather than offset replay.
 
 Sink: messages are published persistent (delivery mode 2 by default) on a channel in publisher-confirm mode (`confirm.select`). `flush()` / `on_barrier()` block until the broker has confirmed every outstanding publish, and throw on a nack or timeout so the job replays from the last checkpoint rather than dropping data. Replay can duplicate messages. RabbitMQ has no producer dedup key, so exactly-once is rejected by the SQL planner.
 
@@ -160,8 +160,9 @@ Sink: messages are published persistent (delivery mode 2 by default) on a channe
 - Plain TCP only; no TLS in this version.
 - Authentication is SASL PLAIN (`user` / `password`); no other mechanisms.
 - At-least-once on both ends; the sink does not support exactly-once (`mode='exactly_once'`) or `mode='upsert'` (rejected at SQL bind time).
-- The source has a redelivery-window caveat: the barrier ack is not post-commit, so a crash between the ack and checkpoint completion could drop those messages.
+- The source acks at checkpoint commit (not the barrier), so the earlier drop-on-crash window is closed; duplicates on replay remain the at-least-once trade-off.
 - The AMQP connection is not thread-safe; the source serialises `basic.ack` with `basic.consume` on the single connection, and the ack runs on the `produce()` thread.
+- The commit-time ack relies on the cluster's per-checkpoint `CommitCheckpoint` dispatch (the default, non-fused subtask deployment). The opt-in par-1 chain fusion (`CLINK_PLAN_FUSE_PAR1=1`) does not drive source commit notifications, so run messaging sources unfused.
 
 ## Testing
 

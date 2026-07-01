@@ -267,6 +267,31 @@ void PluginRegistry::register_source(
         [factory, &type_registry = type_registry_](const clink::cluster::RunnerContext& rctx) {
             auto src = factory(detail::build_ctx_from(rctx));
             detail::apply_chain_identity(src, rctx);
+            // Checkpoint-completion notifications for a source whose resume is an
+            // irreversible broker consume (AMQP/JetStream/Pulsar ack): defer the
+            // ack from barrier-emit to global commit. Mirrors the 2PC sink wiring
+            // below. Weak-capture: a late CommitCheckpoint/AbortCheckpoint during
+            // teardown locks to nullptr after the source is destroyed.
+            if (rctx.register_commit_callbacks) {
+                std::weak_ptr<clink::Source<T>> weak_src = src;
+                rctx.register_commit_callbacks({
+                    [weak_src](std::uint64_t ckpt) {
+                        if (auto s = weak_src.lock()) {
+                            s->notify_checkpoint_complete(CheckpointId{ckpt});
+                        }
+                    },
+                });
+            }
+            if (rctx.register_abort_callbacks) {
+                std::weak_ptr<clink::Source<T>> weak_src = src;
+                rctx.register_abort_callbacks({
+                    [weak_src](std::uint64_t ckpt) {
+                        if (auto s = weak_src.lock()) {
+                            s->notify_checkpoint_aborted(CheckpointId{ckpt});
+                        }
+                    },
+                });
+            }
             const auto& chain = rctx.chain;
             const auto& out_channel = chain.ops.empty() ? std::string{} : chain.ops[0].out_channel;
             const auto& ops = detail::require_type_ops(type_registry, out_channel);

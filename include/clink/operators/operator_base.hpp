@@ -669,6 +669,26 @@ public:
                                  CheckpointId /*ckpt_id*/) {}
     virtual bool restore_offset(StateBackend& /*backend*/, OperatorId /*op_id*/) { return false; }
 
+    // Checkpoint-completion notifications (the source-side mirror of a 2PC
+    // sink's on_commit/on_abort). snapshot_offset() captures WHERE the source
+    // is at the barrier; these say whether the checkpoint that captured that
+    // position became globally durable. A source whose resume mechanism is a
+    // one-way, irreversible broker-side consume (an AMQP/JetStream/Pulsar ack,
+    // a cursor advance) must defer that consume until notify_checkpoint_complete
+    // - acking at snapshot_offset (barrier emit) loses data if the checkpoint
+    // later aborts, since the broker will not redeliver an already-acked
+    // message. notify_checkpoint_aborted lets the source release any state it
+    // pinned for an in-flight checkpoint so the broker redelivers instead.
+    //
+    // Driven by the cluster source runner from the CommitCheckpoint /
+    // AbortCheckpoint path (the same one 2PC sinks use). Best-effort and not
+    // ordered against produce(); a source must tolerate a completion for a
+    // checkpoint it has already released (idempotent) and a late/never-arriving
+    // notification (a crash before commit replays from the last durable offset).
+    // Default no-ops, so offset-replay sources (Kafka, Parquet) are unaffected.
+    virtual void notify_checkpoint_complete(CheckpointId /*ckpt_id*/) {}
+    virtual void notify_checkpoint_aborted(CheckpointId /*ckpt_id*/) {}
+
     // Barrier handoff: the cluster's source-barrier injector pushes
     // here instead of into the downstream channel directly. The source
     // runner loop drains the queue between produce() calls, calling

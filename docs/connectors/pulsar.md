@@ -119,7 +119,7 @@ Through the registry, look up the factories `pulsar_source_string` and `pulsar_s
 
 Both ends are at-least-once.
 
-- Source: messages are received and held, then individually acknowledged at the checkpoint barrier (`snapshot_offset`). The subscription cursor is durable server-side, so after a failure Pulsar redelivers everything left unacked, and recovery needs no local state (`restore_offset` is a no-op). The default Shared subscription lets parallel subtasks split the topic, each acking only its own messages. Honest caveat: the ack happens at the barrier (the source interface has no post-commit hook), so a crash between the barrier ack and checkpoint completion can drop those messages. The receiver-queue size bounds the held-unacked buffer.
+- Source: messages are received and held. The acknowledge is deferred to checkpoint COMMIT, not the barrier: `snapshot_offset` buckets the messages emitted before each barrier against that checkpoint id, `notify_checkpoint_complete` (driven from the cluster's `CommitCheckpoint` dispatch) queues a committed bucket for ack, and the next `produce()` turn issues `pulsar_consumer_acknowledge` for them - so a message is acked only after the checkpoint that captured it is globally durable. `notify_checkpoint_aborted` frees a bucket without acking, so an aborted checkpoint (or a crash before commit) leaves those messages for redelivery. All pulsar C calls stay on the `produce()` thread. The subscription cursor is durable server-side, so recovery needs no local state (`restore_offset` is a no-op). The default Shared subscription lets parallel subtasks split the topic, each acking only its own messages. The receiver-queue size bounds the held-unacked buffer.
 - Sink: records are published asynchronously for throughput; `flush()` / `on_barrier()` blocks until the broker has persisted every pending publish, and throws if any send failed so the job replays from the last checkpoint rather than dropping data. Replay can therefore duplicate messages (at-least-once). The SQL planner rejects `exactly_once`: Pulsar producer dedup would need a producer name plus sequence id, which is not wired in v1.
 
 ## Limitations
@@ -127,7 +127,7 @@ Both ends are at-least-once.
 - String channel only. Both factories are `std::string`; there is no int64 channel and no native columnar/Arrow path.
 - Source and sink each handle a single topic; no topic patterns, glob or multi-topic subscription.
 - Sink is at-least-once only. `exactly_once` and `mode='upsert'` are rejected by the SQL planner; no producer dedup (producer name + sequence id) is wired.
-- Source acknowledges at the barrier with no post-commit hook, leaving a crash window between barrier ack and checkpoint completion.
+- Source acknowledges at checkpoint commit (not the barrier), so the earlier crash-window drop is closed; duplicates on replay remain the at-least-once trade-off. This relies on the cluster's per-checkpoint `CommitCheckpoint` dispatch (the default, non-fused deployment) - the opt-in par-1 chain fusion (`CLINK_PLAN_FUSE_PAR1=1`) does not drive source commit notifications, so run messaging sources unfused.
 - Authentication is limited to an optional JWT token; no other auth mechanisms are exposed.
 
 ## Testing
