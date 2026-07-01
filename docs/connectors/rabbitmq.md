@@ -162,7 +162,7 @@ Sink: messages are published persistent (delivery mode 2 by default) on a channe
 - At-least-once on both ends; the sink does not support exactly-once (`mode='exactly_once'`) or `mode='upsert'` (rejected at SQL bind time).
 - The source acks at checkpoint commit (not the barrier), so the earlier drop-on-crash window is closed; duplicates on replay remain the at-least-once trade-off.
 - The AMQP connection is not thread-safe; the source serialises `basic.ack` with `basic.consume` on the single connection, and the ack runs on the `produce()` thread.
-- The commit-time ack relies on the cluster's per-checkpoint `CommitCheckpoint` dispatch (the default, non-fused subtask deployment). The opt-in par-1 chain fusion (`CLINK_PLAN_FUSE_PAR1=1`) does not drive source commit notifications, so run messaging sources unfused.
+- The commit-time ack relies on the cluster's per-checkpoint `CommitCheckpoint` dispatch, wired for both the default (non-fused) subtask deployment and the opt-in par-1 chain fusion (`CLINK_PLAN_FUSE_PAR1=1`).
 
 ## Testing
 

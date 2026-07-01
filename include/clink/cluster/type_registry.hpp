@@ -123,6 +123,18 @@ struct TypeOps {
     // std::any).
     std::function<void(clink::Dag&, std::any /*upstream*/, std::shared_ptr<void> /*sink*/)>
         add_fused_sink_to_dag;
+
+    // fused_source_commit_hooks: recover the typed Source<T> from the boxed
+    // shared_ptr<void> and return {commit, abort} callbacks bound to its
+    // notify_checkpoint_complete / notify_checkpoint_aborted (weak-captured, so a
+    // late notification after teardown is a safe no-op). The fused-chain
+    // dispatch registers these into the TM's per-subtask committer/aborter
+    // buckets, so a source fused into a par-1 chain still gets its broker ack
+    // deferred to checkpoint commit - the same wiring the non-fused SubtaskRunner
+    // does via register_commit_callbacks.
+    std::function<std::pair<std::function<void(std::uint64_t)>, std::function<void(std::uint64_t)>>(
+        std::shared_ptr<void> /*source*/)>
+        fused_source_commit_hooks;
 };
 
 // TypeRegistry maps channel-name strings to TypeOps. It also maintains
@@ -370,6 +382,22 @@ inline void TypeRegistry::register_typed(const std::string& name,
         auto typed_sink = std::static_pointer_cast<clink::Sink<T>>(std::move(sink));
         auto handle = std::any_cast<clink::StageHandle<T>>(std::move(upstream));
         dag.template add_sink<T>(handle, std::move(typed_sink));
+    };
+    ops.fused_source_commit_hooks = [](std::shared_ptr<void> source)
+        -> std::pair<std::function<void(std::uint64_t)>, std::function<void(std::uint64_t)>> {
+        std::weak_ptr<clink::Source<T>> weak =
+            std::static_pointer_cast<clink::Source<T>>(std::move(source));
+        auto commit = [weak](std::uint64_t ckpt) {
+            if (auto s = weak.lock()) {
+                s->notify_checkpoint_complete(clink::CheckpointId{ckpt});
+            }
+        };
+        auto abort = [weak](std::uint64_t ckpt) {
+            if (auto s = weak.lock()) {
+                s->notify_checkpoint_aborted(clink::CheckpointId{ckpt});
+            }
+        };
+        return {std::move(commit), std::move(abort)};
     };
 
     std::lock_guard lock(mu_);

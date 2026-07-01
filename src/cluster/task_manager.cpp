@@ -1479,6 +1479,20 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             bctx.subtask_idx = chain.subtask_idx_in_op;
             bctx.parallelism = fs.parallelism;
             auto boxed = sf->build(bctx);
+            // Wire the fused source's checkpoint commit/abort notifications
+            // (messaging sources defer their broker ack to commit). The non-fused
+            // SubtaskRunner does this via register_commit_callbacks; the inline
+            // fused-chain path has no such wiring, so register directly into the
+            // TM's per-subtask committer/aborter buckets - dispatched by
+            // handle_commit_checkpoint_ / handle_abort_checkpoint_ the same way. A
+            // shared copy of the boxed source is passed (weak-captured inside), so
+            // ownership still moves to the dag below.
+            if (in_ops->fused_source_commit_hooks) {
+                auto [commit_cb, abort_cb] = in_ops->fused_source_commit_hooks(boxed);
+                std::lock_guard lock(mu_);
+                per_job_committers_[job_id][task.subtask_idx].push_back(std::move(commit_cb));
+                per_job_aborters_[job_id][task.subtask_idx].push_back(std::move(abort_cb));
+            }
             prev = in_ops->add_fused_source_to_dag(dag, std::move(boxed));
         } else {
             if (!in_ops->build_chain_input_stage) {
@@ -1658,6 +1672,24 @@ void TaskManager::run_generic_subtask_(JobId job_id,
         };
         LocalExecutor exec(std::move(dag), clink::plugin::detail::make_subtask_job_config(rctx));
         exec.run();
+        // Drop this subtask's fused-source commit/abort callbacks now the runner
+        // has exited; a late CommitCheckpoint/AbortCheckpoint then finds none
+        // registered (mirrors the SubtaskRunner path's cleanup above).
+        {
+            std::lock_guard lock(mu_);
+            if (auto it = per_job_committers_.find(job_id); it != per_job_committers_.end()) {
+                it->second.erase(task.subtask_idx);
+                if (it->second.empty()) {
+                    per_job_committers_.erase(it);
+                }
+            }
+            if (auto it = per_job_aborters_.find(job_id); it != per_job_aborters_.end()) {
+                it->second.erase(task.subtask_idx);
+                if (it->second.empty()) {
+                    per_job_aborters_.erase(it);
+                }
+            }
+        }
         return;
     }
 

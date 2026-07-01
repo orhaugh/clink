@@ -127,7 +127,7 @@ Both ends are at-least-once.
 - String channel only. Both factories are `std::string`; there is no int64 channel and no native columnar/Arrow path.
 - Source and sink each handle a single topic; no topic patterns, glob or multi-topic subscription.
 - Sink is at-least-once only. `exactly_once` and `mode='upsert'` are rejected by the SQL planner; no producer dedup (producer name + sequence id) is wired.
-- Source acknowledges at checkpoint commit (not the barrier), so the earlier crash-window drop is closed; duplicates on replay remain the at-least-once trade-off. This relies on the cluster's per-checkpoint `CommitCheckpoint` dispatch (the default, non-fused deployment) - the opt-in par-1 chain fusion (`CLINK_PLAN_FUSE_PAR1=1`) does not drive source commit notifications, so run messaging sources unfused.
+- Source acknowledges at checkpoint commit (not the barrier), so the earlier crash-window drop is closed; duplicates on replay remain the at-least-once trade-off. This relies on the cluster's per-checkpoint `CommitCheckpoint` dispatch, wired for both the default (non-fused) deployment and the opt-in par-1 chain fusion (`CLINK_PLAN_FUSE_PAR1=1`).
 - Authentication is limited to an optional JWT token; no other auth mechanisms are exposed.
 
 ## Testing

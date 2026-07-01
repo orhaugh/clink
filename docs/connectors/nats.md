@@ -150,7 +150,7 @@ Both directions are at-least-once.
 - String record type only; there is no int64 or Arrow channel for this connector.
 - Sink requires a pre-existing JetStream stream bound to the target subject; stream provisioning is not performed by the connector.
 - No producer dedup key (`Nats-Msg-Id`) is set, so exactly-once and upsert are unsupported (enforced by the SQL planner).
-- The source acks at checkpoint commit (not the barrier), so the earlier crash-window drop is closed; duplicates on replay remain the at-least-once trade-off. This relies on the cluster's per-checkpoint `CommitCheckpoint` dispatch (the default, non-fused deployment) - the opt-in par-1 chain fusion (`CLINK_PLAN_FUSE_PAR1=1`) does not drive source commit notifications, so run messaging sources unfused.
+- The source acks at checkpoint commit (not the barrier), so the earlier crash-window drop is closed; duplicates on replay remain the at-least-once trade-off. This relies on the cluster's per-checkpoint `CommitCheckpoint` dispatch, wired for both the default (non-fused) deployment and the opt-in par-1 chain fusion (`CLINK_PLAN_FUSE_PAR1=1`).
 - `subject` is required for both source and sink; construction throws if it is empty.
 
 ## Testing

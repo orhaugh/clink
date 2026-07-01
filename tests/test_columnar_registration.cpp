@@ -34,6 +34,7 @@
 
 #include "clink/cluster/columnar_registration.hpp"
 #include "clink/core/arrow_batcher.hpp"
+#include "clink/core/codec.hpp"
 #include "clink/core/record.hpp"
 #include "clink/core/stream_element.hpp"
 #include "clink/operators/operator_base.hpp"
@@ -502,4 +503,51 @@ TEST(ColumnarAutoRegistration, ExplicitSendImplicitReceiveRoundTrips) {
     ASSERT_EQ(got.size(), sent.size());
     for (std::size_t i = 0; i < sent.size(); ++i)
         EXPECT_TRUE(trade_eq(got[i], sent[i]));
+}
+
+namespace {
+// Records the checkpoint-completion notifications it receives, so a test can
+// prove the fused-chain dispatch reaches a fused source's notify hooks.
+class NotifyCountingSource final : public Source<std::int64_t> {
+public:
+    bool produce(Emitter<std::int64_t>&) override { return false; }
+    std::string name() const override { return "notify_counting_source"; }
+    void notify_checkpoint_complete(CheckpointId id) override { completed.push_back(id.value()); }
+    void notify_checkpoint_aborted(CheckpointId id) override { aborted.push_back(id.value()); }
+    std::vector<std::uint64_t> completed;
+    std::vector<std::uint64_t> aborted;
+};
+}  // namespace
+
+// The TypeOps::fused_source_commit_hooks seam (used by the fused-chain dispatch in
+// task_manager.cpp) must recover the typed Source from the boxed shared_ptr<void>
+// and return callbacks that drive its notify_checkpoint_complete / _aborted, and
+// those callbacks must weak-capture so a notification after teardown is a safe
+// no-op. This is the mechanism that closes the messaging-source ack window under
+// par-1 chain fusion.
+TEST(FusedSourceCommit, HooksDriveTypedSourceNotificationsAndAreWeak) {
+    TypeRegistry reg;
+    reg.register_typed<std::int64_t>("i64.fused", int64_codec());
+    const auto* ops = reg.find("i64.fused");
+    ASSERT_NE(ops, nullptr);
+    ASSERT_TRUE(static_cast<bool>(ops->fused_source_commit_hooks));
+
+    auto src = std::make_shared<NotifyCountingSource>();
+    std::shared_ptr<void> boxed = std::static_pointer_cast<void>(src);
+    auto [commit_cb, abort_cb] = ops->fused_source_commit_hooks(boxed);
+
+    commit_cb(5);
+    commit_cb(6);
+    abort_cb(7);
+    EXPECT_EQ(src->completed, (std::vector<std::uint64_t>{5, 6}));
+    EXPECT_EQ(src->aborted, (std::vector<std::uint64_t>{7}));
+
+    // Drop every strong ref; the weak-captured callbacks must now no-op, not
+    // dangle (mirrors a late CommitCheckpoint arriving after the source is torn
+    // down).
+    boxed.reset();
+    src.reset();
+    commit_cb(8);  // no crash, nothing to record
+    abort_cb(9);
+    SUCCEED();
 }
