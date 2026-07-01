@@ -1343,6 +1343,33 @@ private:
     bool done_ = false;
 };
 
+// Multi-key session scenario for the async-vs-sync proof (gap 5): key 1 has a
+// burst [1,3] (sum 12) plus a separate later session [20,20] (sum 3); key 2 has
+// [2,4] (sum 30). One closing watermark past every end+gap fires them all once.
+class AsyncSessionScenarioSource final : public Source<Row> {
+public:
+    bool produce(Emitter<Row>& out) override {
+        if (this->cancelled() || done_) {
+            return false;
+        }
+        Batch<Row> b;
+        b.push(window_input_row(1, 1, 5));
+        b.push(window_input_row(1, 3, 7));
+        b.push(window_input_row(2, 2, 10));
+        b.push(window_input_row(2, 4, 20));
+        b.push(window_input_row(1, 20, 3));
+        out.emit_data(std::move(b));
+        out.emit_watermark(Watermark{EventTime{100}});  // fires every session once
+        done_ = true;
+        return false;
+    }
+    [[nodiscard]] bool is_bounded() const noexcept override { return true; }
+    std::string name() const override { return "async_session_scenario_src"; }
+
+private:
+    bool done_ = false;
+};
+
 // Generic tumbling-window scripted run: feeds `source` through tumbling_window_row
 // (size 10, sum over amt, keyed by k) with `extra` params merged in and an
 // optional DLQ wired, returning the emitted rows.
@@ -1436,6 +1463,47 @@ TEST(SqlRuntime, AsyncStateTumblingWindowMatchesSyncPath) {
         << "async window path must produce the same window relation as the sync path";
     EXPECT_GT(rrb->remote_loads(), 0u)
         << "window op did not route its per-group state through the deferring backend (async path)";
+}
+
+// Session windows ride the async/disaggregated path: with a deferring backend,
+// SessionWindowRowOp keeps each group's session map in KeyedState and registers
+// an event-time timer per fold at the session's end + gap + lateness, so firing
+// point-reads only the due group (never scans all groups). Session merges make
+// the timers dynamic (a session that extends leaves a stale timer; a merge
+// leaves duplicates), so the fire re-checks each session's live end against the
+// watermark - idempotent. Proven by comparing the session relation to the sync
+// in-memory path (identical) and showing the async path went through the backend
+// (remote_loads > 0).
+TEST(SqlRuntime, AsyncStateSessionWindowMatchesSyncPath) {
+    ensure_sql_installed_once();
+    auto relation = [](const std::vector<Record<Row>>& rows) {
+        std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> rel;
+        for (const auto& rec : rows) {
+            const Row& r = rec.value();
+            rel[{static_cast<std::int64_t>(r.values.at("k").as_number()),
+                 static_cast<std::int64_t>(r.values.at("window_start").as_number())}] =
+                static_cast<std::int64_t>(r.values.at("s").as_number());
+        }
+        return rel;
+    };
+
+    const auto sync_rel =
+        relation(run_session_window_with(std::make_shared<AsyncSessionScenarioSource>(),
+                                         std::make_shared<InMemoryStateBackend>(),
+                                         {}));
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    const auto async_rel =
+        relation(run_session_window_with(std::make_shared<AsyncSessionScenarioSource>(), rrb, {}));
+
+    const std::map<std::pair<std::int64_t, std::int64_t>, std::int64_t> want = {
+        {{1, 1}, 12}, {{1, 20}, 3}, {{2, 2}, 30}};
+    EXPECT_EQ(sync_rel, want) << "sync in-memory session relation";
+    EXPECT_EQ(async_rel, sync_rel)
+        << "async session path must produce the same session relation as the sync path";
+    EXPECT_GT(rrb->remote_loads(), 0u) << "session op did not route its per-group state through "
+                                          "the deferring backend (async path)";
 }
 
 // Late-data correctness: a record arriving after its tumbling window has fired

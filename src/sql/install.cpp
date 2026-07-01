@@ -1927,6 +1927,40 @@ public:
         }
     }
 
+    // Auto-on the async/disaggregated path when the bound backend defers reads:
+    // per-group session maps live in KeyedState keyed by the GROUP KEY (routing
+    // matches the keyer), and each fold registers an event-time timer at the
+    // session's end + gap + lateness so firing point-reads only the due group's
+    // map - never a scan of all groups. Default (non-deferring backend) keeps the
+    // byte-identical in-memory state_ + watermark scan.
+    void open() override {
+        effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
+                           this->runtime()->state_backend()->supports_async_get();
+    }
+    [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
+    // The fire (on_event_time_timers_async) reads + writes the group's session map.
+    [[nodiscard]] bool fires_state_touching_timers() const noexcept override {
+        return effective_async_;
+    }
+    [[nodiscard]] bool fires_async_event_time_timers() const noexcept override {
+        return effective_async_;
+    }
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
+
+    // Async path: the runner delivers the watermark here the instant it is pulled
+    // (before the deferred fire), so the fold's late-drop horizon and the timer
+    // fire's due-check see the same watermark the sync process() would. Idle
+    // watermarks carry no timestamp.
+    void on_watermark_observed(Watermark wm) override {
+        if (wm.is_idle()) {
+            return;
+        }
+        have_wm_ = true;
+        if (wm.timestamp().millis() > current_wm_) {
+            current_wm_ = wm.timestamp().millis();
+        }
+    }
+
     // A record at `ts` is too late iff even a brand-new single-event session
     // [ts, ts] would already have fired and been purged (ts + gap is at/under
     // the current watermark, less allowed_lateness). It is only applied in the
@@ -1955,8 +1989,9 @@ public:
     // Columnar ingest: buffer columnar data via the time / group / agg-input
     // columns read straight from the sidecar into a narrow row; session firing
     // stays on the watermark via process(). The runner only routes columnar
-    // DATA here.
-    [[nodiscard]] bool supports_columnar() const noexcept override { return true; }
+    // DATA here. Disabled on the async path (which ingests via process_async
+    // over KeyedState), mirroring WindowRowOp.
+    [[nodiscard]] bool supports_columnar() const noexcept override { return !effective_async_; }
 
     bool process_columnar(const StreamElement<Row>& element, Emitter<Row>& /*out*/) override {
         if (!element.is_data() || !element.as_data().is_columnar()) {
@@ -2030,13 +2065,14 @@ public:
                 groups[git->second].push_back(i);
             }
         }
+        const std::int64_t late_bound = late_bound_();
         for (std::size_t g = 0; g < groups.size(); ++g) {
             auto& by_session = state_[group_keys[g]];
             for (const std::int64_t idx : groups[g]) {
                 const Row& r = rows[static_cast<std::size_t>(idx)];
                 const auto ts =
                     static_cast<std::int64_t>(r.values.find(time_column_)->second.as_number());
-                fold_session_(by_session, r, ts);
+                fold_session_(by_session, r, ts, late_bound);
             }
         }
         return true;
@@ -2173,9 +2209,24 @@ private:
     // reuses this so a group's rows fold behind ONE state_ probe in arrival
     // order, byte-identical to the per-record path (session merges within a key
     // are order-sensitive, so input order is preserved).
-    void fold_session_(std::map<std::int64_t, Session>& by_session,
-                       const Row& row,
-                       std::int64_t ts) const {
+    // Late-drop bound: a fresh single-event session [ts,ts] is too late iff
+    // ts + gap <= late_bound. INT64_MIN (no watermark yet) never drops. Frozen
+    // at ingest on the async path so a watermark advancing between ingest and
+    // the deferred fold cannot drop a record that was on time when received;
+    // the sync callers pass the live bound.
+    [[nodiscard]] std::int64_t late_bound_() const {
+        return have_wm_ ? current_wm_ - allowed_lateness_ms_
+                        : std::numeric_limits<std::int64_t>::min();
+    }
+
+    // Fold one event into a group's session map and return the start of the
+    // session it landed in (nullopt if dropped as late) so the async path can
+    // register that session's firing timer. `late_bound` is the frozen
+    // late-drop horizon (see late_bound_()).
+    std::optional<std::int64_t> fold_session_(std::map<std::int64_t, Session>& by_session,
+                                              const Row& row,
+                                              std::int64_t ts,
+                                              std::int64_t late_bound) const {
         // Find sessions that the new event extends or merges. Iterate
         // upper-bound back: any session with end + gap >= ts and
         // start - gap <= ts overlaps.
@@ -2193,10 +2244,10 @@ private:
             // No live session to extend: this record would open a fresh session.
             // If that session has already fired and been purged, the record is
             // late - drop it rather than re-create the window and re-fire.
-            if (session_too_late_(ts)) {
+            if (ts + gap_ms_ <= late_bound) {
                 if (report_late_)
                     emit_late_(row);
-                return;
+                return std::nullopt;
             }
             Session s;
             s.start = ts;
@@ -2211,7 +2262,7 @@ private:
                 update_agg(s.agg_states[i], aggregates_[i], row);
             }
             by_session.emplace(ts, std::move(s));
-            return;
+            return ts;
         }
 
         // Merge all overlapping sessions plus the new event into the
@@ -2233,6 +2284,7 @@ private:
         // group_values stay the same (group key unchanged within group).
         std::int64_t new_start = merged.start;
         by_session.emplace(new_start, std::move(merged));
+        return new_start;
     }
 
     void handle_record_(const Row& row) {
@@ -2240,7 +2292,7 @@ private:
         if (tit == row.values.end() || !tit->second.is_number())
             return;
         const auto ts = static_cast<std::int64_t>(tit->second.as_number());
-        fold_session_(state_[group_key_(row)], row, ts);
+        fold_session_(state_[group_key_(row)], row, ts, late_bound_());
     }
 
     // WS6 cell-based session fold: the byte-identical twin of fold_session_ that
@@ -2349,6 +2401,41 @@ private:
         }
     }
 
+    // Build the emit Row for one fired session (group columns + finalised
+    // aggregates + window_start/window_end). window_end is end + gap (the
+    // session's inactivity close), matching the sync and async fire paths.
+    Row finalize_session_(const Session& s) const {
+        Row out_row = s.group_values;
+        for (std::size_t i = 0; i < aggregates_.size(); ++i) {
+            out_row.values[aggregates_[i].output_name] =
+                finalize_agg(s.agg_states[i], aggregates_[i]);
+        }
+        out_row.values[window_start_output_] =
+            clink::config::JsonValue{static_cast<std::int64_t>(s.start)};
+        out_row.values[window_end_output_] =
+            clink::config::JsonValue{static_cast<std::int64_t>(s.end + gap_ms_)};
+        return out_row;
+    }
+
+    // Fire + erase every session in one group's map that is due at current_wm_
+    // (end + gap + allowed_lateness <= watermark). Shared by the sync scan and
+    // the async timer fire; returns whether the map changed. Re-checking each
+    // session's live end makes a stale or duplicate timer (a session extended
+    // past its timer, or several timers from merges) an idempotent no-op.
+    bool fire_due_sessions_(std::map<std::int64_t, Session>& by_session, Batch<Row>& batch) const {
+        bool changed = false;
+        for (auto it = by_session.begin(); it != by_session.end();) {
+            if (it->second.end + gap_ms_ + allowed_lateness_ms_ > current_wm_) {
+                ++it;
+                continue;
+            }
+            batch.push(Record<Row>{finalize_session_(it->second)});
+            it = by_session.erase(it);
+            changed = true;
+        }
+        return changed;
+    }
+
     void fire_due_(EventTime wm, Emitter<Row>& out) {
         const auto wm_value = wm.millis();
         Batch<Row> emit_batch;
@@ -2362,21 +2449,169 @@ private:
                     ++it;
                     continue;
                 }
-                Row out_row = it->second.group_values;
-                for (std::size_t i = 0; i < aggregates_.size(); ++i) {
-                    out_row.values[aggregates_[i].output_name] =
-                        finalize_agg(it->second.agg_states[i], aggregates_[i]);
-                }
-                out_row.values[window_start_output_] =
-                    clink::config::JsonValue{static_cast<std::int64_t>(it->second.start)};
-                out_row.values[window_end_output_] =
-                    clink::config::JsonValue{static_cast<std::int64_t>(it->second.end + gap_ms_)};
-                emit_batch.push(Record<Row>{std::move(out_row)});
+                emit_batch.push(Record<Row>{finalize_session_(it->second)});
                 it = by_session.erase(it);
             }
         }
         if (!emit_batch.empty())
             out.emit_data(std::move(emit_batch));
+    }
+
+    // Async ingest: fold each record into its group's session map (one keyed
+    // read + write under gate-key = group key, so same-group records serialise),
+    // and register an event-time timer at the landed session's end + gap +
+    // lateness. No emit here - sessions emit when their timer fires.
+    void process_async(const StreamElement<Row>& element,
+                       Emitter<Row>& /*out*/,
+                       AsyncExecutionController& aec) override {
+        if (!element.is_data()) {
+            return;
+        }
+        const std::int64_t late_bound = late_bound_();  // frozen at ingest
+        auto kv = keyed_state_();
+        auto* rt = this->runtime();
+        for (const auto& rec : element.as_data()) {
+            Row row = rec.value();
+            auto tit = row.values.find(time_column_);
+            if (tit == row.values.end() || !tit->second.is_number()) {
+                continue;
+            }
+            const auto ts = static_cast<std::int64_t>(tit->second.as_number());
+            std::string key = group_key_(row);
+            auto factory = [this, kv, row = std::move(row), key, ts, late_bound, rt]() mutable
+                -> async::Task<void> {
+                auto cur = co_await kv.get_async(key);
+                std::map<std::int64_t, Session> by_session =
+                    cur.has_value() ? std::move(*cur) : std::map<std::int64_t, Session>{};
+                auto landed = fold_session_(by_session, row, ts, late_bound);
+                if (landed.has_value()) {
+                    const std::int64_t fire_at =
+                        by_session[*landed].end + gap_ms_ + allowed_lateness_ms_;
+                    kv.put(key, by_session);
+                    rt->timer_service()->register_event_time_timer(fire_at, key);
+                }
+                co_return;
+            };
+            while (!aec.submit(key, factory)) {
+                aec.poll_or_flush();  // flush parked coalesced reads so the cap can free
+            }
+        }
+    }
+
+    // Timer-indexed fire (async path): point-read ONLY this group's session map
+    // (the timer key IS the group key) and fire every session now due. Sync-read
+    // fallback for a state-touching (non-overlap) timer.
+    void on_event_time_timer(std::int64_t /*timer_time*/,
+                             const std::string& key,
+                             Emitter<Row>& out) override {
+        auto kv = keyed_state_();
+        auto cur = kv.get(key);
+        if (!cur.has_value()) {
+            return;
+        }
+        auto by_session = std::move(*cur);
+        Batch<Row> batch;
+        const bool changed = fire_due_sessions_(by_session, batch);
+        if (!batch.empty()) {
+            out.emit_data(std::move(batch));
+        }
+        if (changed) {
+            kv.put(key, by_session);
+        }
+    }
+
+    // Async fire (the overlap path): ONE co_await get_async point-read of the due
+    // group's session map, fire every session due at the watermark, write back
+    // once. Distinct groups' reads coalesce into one get_many. The specific timer
+    // times are ignored - fire_due_sessions_ re-checks each session's live end
+    // against current_wm_, so stale/duplicate timers are idempotent no-ops.
+    async::Task<void> on_event_time_timers_async(std::vector<std::int64_t> /*timer_times*/,
+                                                 std::string key,
+                                                 Emitter<Row>& out) override {
+        auto kv = keyed_state_();
+        auto cur = co_await kv.get_async(key);
+        if (!cur.has_value()) {
+            co_return;
+        }
+        auto by_session = std::move(*cur);
+        Batch<Row> batch;
+        const bool changed = fire_due_sessions_(by_session, batch);
+        if (!batch.empty()) {
+            out.emit_data(std::move(batch));
+        }
+        if (changed) {
+            kv.put(key, by_session);
+        }
+        co_return;
+    }
+
+    KeyedState<std::string, std::map<std::int64_t, Session>> keyed_state_() {
+        return this->runtime()->template keyed_state<std::string, std::map<std::int64_t, Session>>(
+            "session", clink::string_codec(), session_map_codec());
+    }
+
+    // Codec for ONE group key's session map (session_start -> Session) over the
+    // async/disaggregated KeyedState path. Reuses the exact AggState
+    // (de)serialisation the GROUP BY / window codecs prove; a Session is a
+    // WindowBucket plus an explicit end.
+    static clink::Codec<std::map<std::int64_t, Session>> session_map_codec() {
+        using Map = std::map<std::int64_t, Session>;
+        using Bytes = clink::Codec<Map>::Bytes;
+        using BytesView = clink::Codec<Map>::BytesView;
+        auto body = [](const Map& m, Bytes& o) {
+            agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(m.size()));
+            for (const auto& [start, s] : m) {
+                agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(start));
+                agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(s.end));
+                clink::config::JsonValue gv{clink::config::JsonObject{s.group_values.values}};
+                agg_codec_detail::put_str(o, gv.serialize(0));
+                agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(s.agg_states.size()));
+                for (const auto& as : s.agg_states) {
+                    agg_codec_detail::encode_agg_state(o, as);
+                }
+            }
+        };
+        return clink::Codec<Map>{
+            .encode = [body](const Map& m) -> Bytes {
+                Bytes o;
+                body(m, o);
+                return o;
+            },
+            .decode = [](BytesView buf) -> std::optional<Map> {
+                agg_codec_detail::Reader r{buf, 0, true};
+                Map m;
+                for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i) {
+                    const auto start = static_cast<std::int64_t>(r.u64());
+                    Session s;
+                    s.start = start;
+                    s.end = static_cast<std::int64_t>(r.u64());
+                    const std::string gv_text = r.str();
+                    if (!r.ok) {
+                        return std::nullopt;
+                    }
+                    try {
+                        auto j = clink::config::parse(gv_text);
+                        if (j.is_object()) {
+                            s.group_values.values = j.as_object();
+                        }
+                    } catch (...) {
+                        return std::nullopt;
+                    }
+                    for (std::uint32_t an = r.u32(), k = 0; k < an && r.ok; ++k) {
+                        s.agg_states.push_back(agg_codec_detail::decode_agg_state(r));
+                    }
+                    if (!r.ok) {
+                        return std::nullopt;
+                    }
+                    m.emplace(start, std::move(s));
+                }
+                if (!r.ok) {
+                    return std::nullopt;
+                }
+                return m;
+            },
+            .encode_into = body,
+        };
     }
 
     std::string time_column_;
@@ -2394,6 +2629,9 @@ private:
     std::vector<std::string> group_key_outputs_;
     std::string window_start_output_;
     std::string window_end_output_;
+    // Finalised in open(): a deferring backend -> the async KeyedState path
+    // (process_async + event-time timers); otherwise the sync in-memory state_.
+    bool effective_async_ = false;
     clink::FlatMap<std::string, std::map<std::int64_t, Session>> state_;
     std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
 };
