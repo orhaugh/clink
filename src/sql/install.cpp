@@ -6134,9 +6134,53 @@ public:
             handle_right_(rec.value(), out);
     }
 
+    // Auto-on the async/disaggregated path for an INNER interval join when the
+    // bound backend defers reads. Each side's per-key buffer lives in KeyedState
+    // keyed by the join key (routing matches the keyer), so a left arrival reads
+    // the right buffer, emits matches, and appends to the left buffer (and
+    // symmetrically) - the EquiJoin RMW shape plus the time predicate. An OUTER
+    // interval join keeps the sync in-memory path: its unmatched null-padding
+    // fires when a row is EVICTED at the watermark, which needs per-key eviction
+    // timers (a follow-on), so scoping async to INNER is non-breaking.
+    void open() override {
+        const bool backend_defers = this->runtime() != nullptr &&
+                                    this->runtime()->has_state_backend() &&
+                                    this->runtime()->state_backend()->supports_async_get();
+        effective_async_ = kind_ == EquiJoinKind::Inner && backend_defers;
+    }
+    [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
+    // ASYNC-10 read coalescing: each arrival's process_async issues get_async for
+    // its join key on the two side slots. No-op on a non-deferring backend.
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
+
+    void process_async1(const StreamElement<Row>& element,
+                        Emitter<Row>& out,
+                        AsyncExecutionController& aec) override {
+        if (!element.is_data())
+            return;
+        for (const auto& rec : element.as_data())
+            handle_left_async_(rec.value(), out, aec);
+    }
+    void process_async2(const StreamElement<Row>& element,
+                        Emitter<Row>& out,
+                        AsyncExecutionController& aec) override {
+        if (!element.is_data())
+            return;
+        for (const auto& rec : element.as_data())
+            handle_right_async_(rec.value(), out, aec);
+    }
+
     void on_watermark(Watermark wm, Emitter<Row>& out) override {
         if (!wm.is_idle()) {
             const auto wm_ms = wm.timestamp().millis();
+            // Track the high watermark for the async path's lazy per-key prune
+            // (the sync in-memory state_ below is empty on the async path, so its
+            // prune is a no-op there; the async handlers prune their KeyedState
+            // buffers by current_wm_ on each arrival). On the sync path this is
+            // just bookkeeping alongside the real in-memory prune.
+            if (wm_ms > current_wm_) {
+                current_wm_ = wm_ms;
+            }
             // OUTER: null-pad unmatched rows as they are evicted, emitting them
             // BEFORE the watermark is forwarded (their event time is <= wm).
             Batch<Row> null_pads;
@@ -6318,6 +6362,168 @@ private:
         }
     }
 
+    // Drop buffered rows whose ts < cutoff (no future partner can match). The
+    // async twin of prune_'s inner compaction; INNER only, so no null-padding.
+    static void prune_vec_(std::vector<Buffered>& vec, std::int64_t cutoff) {
+        std::size_t w = 0;
+        for (std::size_t r = 0; r < vec.size(); ++r) {
+            if (vec[r].ts < cutoff) {
+                continue;
+            }
+            if (w != r) {
+                vec[w] = std::move(vec[r]);
+            }
+            ++w;
+        }
+        vec.resize(w);
+    }
+
+    // Async INNER left arrival: read the right buffer for this key, prune it by
+    // the watermark, emit joins for right rows in [ts - upper, ts - lower], then
+    // append this left row to the left buffer. Both slots key by the join key, so
+    // both sides for a key co-locate on the subtask the record routes to. For
+    // in-order input the prune only ever drops rows that could not match a future
+    // row, so the output equals the sync path's.
+    void handle_left_async_(const Row& l, Emitter<Row>& out, AsyncExecutionController& aec) {
+        auto ts_opt = ts_value(l, left_ts_column_);
+        if (!ts_opt.has_value()) {
+            return;
+        }
+        const std::int64_t ts = *ts_opt;
+        std::string key = key_string(l, left_key_column_);
+        auto kv_l = kv_left_();
+        auto kv_r = kv_right_();
+        auto factory = [this, kv_l, kv_r, l, ts, key, &out]() mutable -> async::Task<void> {
+            auto right = (co_await kv_r.get_async(key)).value_or(std::vector<Buffered>{});
+            prune_vec_(right, sat_sub_(current_wm_, upper_offset_ms_));
+            const std::int64_t rlow = ts - upper_offset_ms_;
+            const std::int64_t rhigh = ts - lower_offset_ms_;
+            Batch<Row> emit;
+            for (const auto& r : right) {
+                if (r.ts >= rlow && r.ts <= rhigh) {
+                    emit.push(Record<Row>{build_joined_(l, r.row)});
+                }
+            }
+            if (!emit.empty()) {
+                out.emit_data(std::move(emit));
+            }
+            kv_r.put(key, right);
+            auto left = (co_await kv_l.get_async(key)).value_or(std::vector<Buffered>{});
+            prune_vec_(left, sat_sub_(current_wm_, lower_offset_ms_));
+            left.push_back(Buffered{ts, l, false});
+            kv_l.put(key, left);
+            co_return;
+        };
+        while (!aec.submit(key, factory)) {
+            aec.poll_or_flush();
+        }
+    }
+
+    // Async INNER right arrival: symmetric to handle_left_async_.
+    void handle_right_async_(const Row& r, Emitter<Row>& out, AsyncExecutionController& aec) {
+        auto ts_opt = ts_value(r, right_ts_column_);
+        if (!ts_opt.has_value()) {
+            return;
+        }
+        const std::int64_t ts = *ts_opt;
+        std::string key = key_string(r, right_key_column_);
+        auto kv_l = kv_left_();
+        auto kv_r = kv_right_();
+        auto factory = [this, kv_l, kv_r, r, ts, key, &out]() mutable -> async::Task<void> {
+            auto left = (co_await kv_l.get_async(key)).value_or(std::vector<Buffered>{});
+            prune_vec_(left, sat_sub_(current_wm_, lower_offset_ms_));
+            const std::int64_t llow = ts + lower_offset_ms_;
+            const std::int64_t lhigh = ts + upper_offset_ms_;
+            Batch<Row> emit;
+            for (const auto& l : left) {
+                if (l.ts >= llow && l.ts <= lhigh) {
+                    emit.push(Record<Row>{build_joined_(l.row, r)});
+                }
+            }
+            if (!emit.empty()) {
+                out.emit_data(std::move(emit));
+            }
+            kv_l.put(key, left);
+            auto right = (co_await kv_r.get_async(key)).value_or(std::vector<Buffered>{});
+            prune_vec_(right, sat_sub_(current_wm_, upper_offset_ms_));
+            right.push_back(Buffered{ts, r, false});
+            kv_r.put(key, right);
+            co_return;
+        };
+        while (!aec.submit(key, factory)) {
+            aec.poll_or_flush();
+        }
+    }
+
+    // Codec for one key's buffered rows over the async/disaggregated path: a JSON
+    // array of {"t": ts, "r": <row object>, "m": matched}.
+    static clink::Codec<std::vector<Buffered>> buffered_list_codec() {
+        using Bytes = clink::Codec<std::vector<Buffered>>::Bytes;
+        using BytesView = clink::Codec<std::vector<Buffered>>::BytesView;
+        auto body = [](const std::vector<Buffered>& es, Bytes& out) {
+            clink::config::JsonArray arr;
+            arr.reserve(es.size());
+            for (const auto& e : es) {
+                clink::config::JsonObject o;
+                o["t"] = clink::config::JsonValue{static_cast<double>(e.ts)};
+                o["r"] = clink::config::JsonValue{clink::config::JsonObject{e.row.values}};
+                o["m"] = clink::config::JsonValue{e.matched};
+                arr.emplace_back(std::move(o));
+            }
+            const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
+            const auto* p = reinterpret_cast<const std::byte*>(s.data());
+            out.insert(out.end(), p, p + s.size());
+        };
+        return clink::Codec<std::vector<Buffered>>{
+            .encode = [body](const std::vector<Buffered>& es) -> Bytes {
+                Bytes out;
+                body(es, out);
+                return out;
+            },
+            .decode = [](BytesView b) -> std::optional<std::vector<Buffered>> {
+                std::string text(reinterpret_cast<const char*>(b.data()), b.size());
+                try {
+                    auto j = clink::config::parse(text);
+                    if (!j.is_array()) {
+                        return std::nullopt;
+                    }
+                    std::vector<Buffered> es;
+                    es.reserve(j.as_array().size());
+                    for (const auto& el : j.as_array()) {
+                        if (!el.is_object()) {
+                            return std::nullopt;
+                        }
+                        const auto& o = el.as_object();
+                        Buffered e;
+                        if (auto it = o.find("t"); it != o.end() && it->second.is_number()) {
+                            e.ts = static_cast<std::int64_t>(it->second.as_number());
+                        }
+                        if (auto it = o.find("r"); it != o.end() && it->second.is_object()) {
+                            e.row.values = it->second.as_object();
+                        }
+                        if (auto it = o.find("m"); it != o.end() && it->second.is_bool()) {
+                            e.matched = it->second.as_bool();
+                        }
+                        es.push_back(std::move(e));
+                    }
+                    return es;
+                } catch (...) {
+                    return std::nullopt;
+                }
+            },
+            .encode_into = body,
+        };
+    }
+
+    KeyedState<std::string, std::vector<Buffered>> kv_left_() {
+        return this->runtime()->template keyed_state<std::string, std::vector<Buffered>>(
+            "ijL", clink::string_codec(), buffered_list_codec());
+    }
+    KeyedState<std::string, std::vector<Buffered>> kv_right_() {
+        return this->runtime()->template keyed_state<std::string, std::vector<Buffered>>(
+            "ijR", clink::string_codec(), buffered_list_codec());
+    }
+
     std::string left_key_column_;
     std::string right_key_column_;
     std::string left_ts_column_;
@@ -6329,6 +6535,12 @@ private:
     EquiJoinKind kind_;
     std::vector<std::string> left_columns_;
     std::vector<std::string> right_columns_;
+    // Finalised in open(): INNER + a deferring backend -> the async KeyedState
+    // path (process_async{1,2}); otherwise the sync in-memory path below.
+    bool effective_async_ = false;
+    // High watermark seen (async lazy-prune bound). INT64_MIN = prune nothing
+    // until a real watermark arrives.
+    std::int64_t current_wm_ = INT64_MIN;
     clink::FlatMap<std::string, std::vector<Buffered>> left_state_;
     clink::FlatMap<std::string, std::vector<Buffered>> right_state_;
 };

@@ -7248,6 +7248,88 @@ TEST(SqlRuntime, IntervalJoinMatchesWithinWindow) {
     std::filesystem::remove(out_path);
 }
 
+// An INNER interval join rides the checkpointed KeyedState path and auto-activates
+// the async/disaggregated path on a deferring backend. Each side's per-key buffer
+// was an in-memory map a restore would lose; both now live in per-join-key
+// KeyedState slots (ijL / ijR), and a left arrival reads the right buffer + emits
+// matches + appends to the left buffer (and symmetrically) - the EquiJoin RMW
+// shape plus the time predicate. OUTER interval joins keep the sync path (their
+// eviction-time null-padding needs per-key timers, a follow-on). Driven
+// cluster-free through the interval_join_row Dag builder (INNER matches emit on
+// arrival, so no watermark is needed) on a RemoteReadBackend so remote_loads()
+// proves the per-key state went through the deferring tier. clicks(u1@100,
+// u2@2000) JOIN orders(u1@150, u2@4000) ON u AND click BETWEEN order-50 AND
+// order+200: only (u1 click, u1 order) matches.
+TEST(SqlRuntime, IntervalJoinInnerRidesRemoteReadPath) {
+    ensure_sql_installed_once();
+    const auto* builder = cluster::DagBuilderRegistry::default_instance().find("interval_join_row");
+    ASSERT_NE(builder, nullptr) << "interval_join_row Dag builder not registered";
+
+    auto click = [](std::int64_t u, std::int64_t ts, const char* page) {
+        Row r;
+        r.values["user_id"] = clink::config::JsonValue{static_cast<double>(u)};
+        r.values["click_ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        r.values["page"] = clink::config::JsonValue{std::string{page}};
+        return Record<Row>{std::move(r)};
+    };
+    auto order = [](std::int64_t u, std::int64_t ts, const char* sku) {
+        Row r;
+        r.values["user_id"] = clink::config::JsonValue{static_cast<double>(u)};
+        r.values["order_ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        r.values["sku"] = clink::config::JsonValue{std::string{sku}};
+        return Record<Row>{std::move(r)};
+    };
+    const std::vector<Record<Row>> left = {click(1, 100, "home"), click(2, 2000, "docs")};
+    const std::vector<Record<Row>> right = {order(1, 150, "x"), order(2, 4000, "y")};
+
+    auto run = [&](std::shared_ptr<StateBackend> backend) {
+        Dag dag;
+        auto hl = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(left));
+        auto hr = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(right));
+        clink::plugin::BuildContext ctx;
+        ctx.params["left_key_column"] = "user_id";
+        ctx.params["right_key_column"] = "user_id";
+        ctx.params["left_ts_column"] = "click_ts";
+        ctx.params["right_ts_column"] = "order_ts";
+        ctx.params["left_alias"] = "c";
+        ctx.params["right_alias"] = "o";
+        ctx.params["lower_offset_ms"] = "-50";
+        ctx.params["upper_offset_ms"] = "200";
+        ctx.params["join_type"] = "inner";
+        ctx.params["left_columns"] = "user_id,click_ts,page";
+        ctx.params["right_columns"] = "user_id,order_ts,sku";
+        std::vector<std::any> upstream = {std::any{hl}, std::any{hr}};
+        auto built = (*builder)(dag, upstream, ctx);
+        auto h_op = std::any_cast<StageHandle<Row>>(built.main_handle);
+        auto sink = std::make_shared<CollectingSink<Row>>();
+        dag.add_sink<Row>(h_op, sink);
+        JobConfig cfg;
+        cfg.state_backend = std::move(backend);
+        LocalExecutor exec(std::move(dag), std::move(cfg));
+        exec.run();
+        std::set<std::pair<std::int64_t, std::string>> pairs;  // (c_user_id, o_sku)
+        for (const auto& rec : sink->collected_records()) {
+            const Row& r = rec.value();
+            pairs.emplace(static_cast<std::int64_t>(r.values.at("c_user_id").as_number()),
+                          r.values.at("o_sku").as_string());
+        }
+        return pairs;
+    };
+
+    const auto sync_pairs = run(std::make_shared<InMemoryStateBackend>());
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    const auto async_pairs = run(rrb);
+
+    const std::set<std::pair<std::int64_t, std::string>> want = {{1, "x"}};
+    EXPECT_EQ(sync_pairs, want) << "sync interval join matches";
+    EXPECT_EQ(async_pairs, sync_pairs)
+        << "async interval join must produce the same matches as the sync path";
+    EXPECT_GT(rrb->remote_loads(), 0u)
+        << "interval join did not route its per-key state through the deferring backend";
+}
+
 // SQLOPT-1: LEFT OUTER interval join. An unmatched left (click) row is
 // null-padded at watermark eviction; matched rows are unaffected.
 TEST(SqlRuntime, LeftOuterIntervalJoinNullPadsUnmatchedLeft) {
