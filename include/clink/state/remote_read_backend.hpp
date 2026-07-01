@@ -101,6 +101,14 @@ public:
     // The runner wires this to AsyncExecutionController::schedule_resume.
     using ResumeScheduler = std::function<void(std::coroutine_handle<>)>;
 
+    // The resume target for one runner thread: its controller's FIFO resume plus
+    // an optional deadline-aware (order_key-carrying) resume. Captured per cold
+    // read so the completion routes to the op that ISSUED it (see schedulers_).
+    struct ResumeTarget {
+        ResumeScheduler resume;
+        DeadlineResumeScheduler deadline;
+    };
+
     // io_threads sizes the DEFAULT completion executor (a sized thread pool);
     // inject `executor` to share one sized IO pool across backends or to use
     // the io_uring-backed executor on Linux. The completion source (thread pool
@@ -151,7 +159,7 @@ public:
 
     ~RemoteReadBackend() override {
         // Drop our reference to the executor BEFORE the members its in-flight
-        // jobs touch (loader_/pool_/resume_scheduler_/hot_) are destroyed. If
+        // jobs touch (loader_/pool_/schedulers_/hot_) are destroyed. If
         // this is the sole owner (the default per-backend executor) the reset
         // joins its workers here, so any in-flight load finishes against
         // still-live state; a shared executor (more than one owner) relies on
@@ -163,19 +171,34 @@ public:
     RemoteReadBackend(const RemoteReadBackend&) = delete;
     RemoteReadBackend& operator=(const RemoteReadBackend&) = delete;
 
-    // Wired once by the runner before any read, so the IO thread can post
-    // resumptions to the controller. Not thread-safe vs concurrent reads (set
-    // at wire-up). Overrides the StateBackend hook the runner calls generically
-    // for any async-capable backend (the type matches AsyncResumeScheduler).
+    // Wired by each async operator's runner (on ITS runner thread) before any
+    // read, so the IO thread can post resumptions to THAT op's controller. Keyed
+    // by the calling runner thread: one backend instance is shared by every
+    // runner of a fused subtask AND by multiple async ops in one in-process job,
+    // so a single shared slot would be last-writer-wins - misrouting (and
+    // deadlocking) the other ops' cold-read completions. An empty scheduler
+    // clears this thread's slot (teardown). Overrides the generic StateBackend
+    // hook (the type matches AsyncResumeScheduler).
     void set_async_resume_scheduler(AsyncResumeScheduler s) override {
-        resume_scheduler_ = std::move(s);
+        std::lock_guard<std::mutex> lk(sched_mu_);
+        if (s) {
+            schedulers_[std::this_thread::get_id()].resume = std::move(s);
+        } else {
+            clear_sched_field_(std::this_thread::get_id(), /*is_resume=*/true);
+        }
     }
 
     // Deadline-aware hand-back (ASYNC-12 consumer), wired alongside the plain
-    // scheduler when the operator opts into deadline-aware resume. When set,
-    // post_resume_ uses it so the cold-load completion carries its order_key.
+    // scheduler when the operator opts into deadline-aware resume. When set, the
+    // cold-load completion carries its order_key. Keyed by runner thread, as
+    // set_async_resume_scheduler.
     void set_deadline_resume_scheduler(DeadlineResumeScheduler s) override {
-        deadline_scheduler_ = std::move(s);
+        std::lock_guard<std::mutex> lk(sched_mu_);
+        if (s) {
+            schedulers_[std::this_thread::get_id()].deadline = std::move(s);
+        } else {
+            clear_sched_field_(std::this_thread::get_id(), /*is_resume=*/false);
+        }
     }
 
     // --- sync StateBackend surface ---
@@ -421,7 +444,8 @@ public:
                 co_return std::nullopt;
             }
         }
-        if (!resume_scheduler_) {
+        const ResumeTarget rt = sched_for_thread_();
+        if (!rt.resume) {
             // No runner to marshal resumes to: safe inline blocking load. The
             // lock is held only for the write-through, never the load itself.
             auto v = timed_remote_load_(op, owned);
@@ -432,8 +456,10 @@ public:
             co_return v;
         }
         // Cold key + wired runner: suspend, load on an IO thread, resume on the
-        // runner. await_resume (on the runner) does the write-through.
-        co_return co_await RemoteLoad{this, op, std::move(owned), order_key};
+        // runner. await_resume (on the runner) does the write-through. rt is this
+        // op's resume target (captured on the runner thread), so the completion
+        // routes here even when other async ops share this backend instance.
+        co_return co_await RemoteLoad{this, op, std::move(owned), order_key, rt};
     }
 
     // Batched read (ASYNC-10): serve hot hits immediately, then fetch ALL cold
@@ -466,7 +492,8 @@ public:
         if (cold_keys.empty()) {
             co_return out;  // all hot/deleted: no suspension
         }
-        if (!resume_scheduler_) {
+        const ResumeTarget rt = sched_for_thread_();
+        if (!rt.resume) {
             // No runner: inline batched blocking load (lock held only for the
             // write-through, never the load).
             auto vals = batch_remote_load_(op, cold_keys);
@@ -484,7 +511,7 @@ public:
             co_return out;
         }
         // Cold misses + wired runner: ONE batched fetch, ONE suspension.
-        auto vals = co_await RemoteLoadMany{this, op, std::move(cold_keys), {}};
+        auto vals = co_await RemoteLoadMany{this, op, std::move(cold_keys), rt};
         for (std::size_t j = 0; j < cold_idx.size(); ++j) {
             out[cold_idx[j]] = std::move(vals[j]);
         }
@@ -527,13 +554,14 @@ private:
         OperatorId op;
         std::string key;
         std::uint64_t order_key{0};  // ASYNC-12 resume priority (0 = unset/FIFO)
+        ResumeTarget target;         // issuing op's resume target, captured on the runner thread
         std::optional<Value> value{};
 
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> h) {
             self->executor_->submit_blocking([this, h]() {
                 value = self->timed_remote_load_(op, key);  // BLOCKING remote read, executor thread
-                self->post_resume_(h, order_key);           // hand back to the runner thread
+                post_resume_(target, h, order_key);         // hand back to the issuing op's runner
             });
         }
         std::optional<Value> await_resume() {
@@ -555,13 +583,14 @@ private:
         const RemoteReadBackend* self;
         OperatorId op;
         std::vector<std::string> keys;
-        std::vector<std::optional<Value>> values;
+        ResumeTarget target;  // issuing op's resume target, captured on the runner thread
+        std::vector<std::optional<Value>> values{};
 
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> h) {
             self->executor_->submit_blocking([this, h]() {
                 values = self->batch_remote_load_(op, keys);  // batched read, executor thread
-                self->post_resume_(h, 0);  // hand back to the runner thread (FIFO)
+                post_resume_(target, h, 0);  // hand back to the issuing op's runner (FIFO)
             });
         }
         std::vector<std::optional<Value>> await_resume() {
@@ -769,21 +798,49 @@ private:
         }
     }
 
-    // Hand a completed cold read back to the runner. Prefers the deadline-aware
-    // scheduler (carries order_key) when wired; otherwise the plain one (FIFO).
-    // Called on the IO/executor thread, after the load, exactly like the old
-    // direct resume_scheduler_(h) call.
-    void post_resume_(std::coroutine_handle<> h, std::uint64_t order_key) const {
-        if (deadline_scheduler_) {
-            deadline_scheduler_(h, order_key);
-        } else if (resume_scheduler_) {
-            resume_scheduler_(h);
+    // The resume target for the CALLING (runner) thread, captured into a cold
+    // read at issue time so the completion routes to the op that issued it. Empty
+    // target => no wired runner => the caller does an inline blocking load.
+    ResumeTarget sched_for_thread_() const {
+        std::lock_guard<std::mutex> lk(sched_mu_);
+        auto it = schedulers_.find(std::this_thread::get_id());
+        return it == schedulers_.end() ? ResumeTarget{} : it->second;
+    }
+    // Clear one field of this thread's target (teardown); drop the entry when
+    // both fields are empty. Caller holds sched_mu_.
+    void clear_sched_field_(std::thread::id tid, bool is_resume) {
+        auto it = schedulers_.find(tid);
+        if (it == schedulers_.end()) {
+            return;
+        }
+        if (is_resume) {
+            it->second.resume = nullptr;
+        } else {
+            it->second.deadline = nullptr;
+        }
+        if (!it->second.resume && !it->second.deadline) {
+            schedulers_.erase(it);
+        }
+    }
+    // Route a completed cold read to a captured target (called on the IO thread).
+    // Prefers the deadline-aware scheduler (carries order_key) when wired.
+    static void post_resume_(const ResumeTarget& t,
+                             std::coroutine_handle<> h,
+                             std::uint64_t order_key) {
+        if (t.deadline) {
+            t.deadline(h, order_key);
+        } else if (t.resume) {
+            t.resume(h);
         }
     }
 
     RemoteLoader loader_;
-    ResumeScheduler resume_scheduler_;
-    DeadlineResumeScheduler deadline_scheduler_;  // ASYNC-12: order_key-carrying hand-back
+    // Per-runner-thread resume targets (see set_async_resume_scheduler). Guarded
+    // by sched_mu_: set/cleared on runner threads at wire-up/teardown, read on
+    // the runner thread per cold read. A single shared slot would misroute (and
+    // deadlock) reads when multiple async ops share this backend instance.
+    mutable std::mutex sched_mu_;
+    mutable std::unordered_map<std::thread::id, ResumeTarget> schedulers_;
     // Guards the mutable working set (hot_, dirty_, deleted_, and the LRU
     // bookkeeping lru_/index_/hot_bytes_). A single backend instance is SHARED
     // by every runner of a fused subtask, so the state WRITER and the checkpoint
@@ -804,8 +861,9 @@ private:
     // The off-runner-thread IO executor (ASYNC-9). Default is a per-backend
     // sized ThreadPoolCompletionExecutor; a shared or io_uring-backed executor
     // can be injected at construction. The cold-read path posts its blocking
-    // load here; the executor invokes resume_scheduler_ (schedule_resume) when
-    // done. shared_ptr so it can be shared across a process's backends.
+    // load here; the executor invokes the issuing op's resume target
+    // (schedule_resume) when done. shared_ptr so it can be shared across a
+    // process's backends.
     std::shared_ptr<async::CompletionExecutor> executor_;
 
     mutable std::atomic<std::uint64_t> remote_loads_{0};

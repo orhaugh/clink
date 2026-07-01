@@ -604,26 +604,20 @@ TEST(SqlRuntime, AsyncStateInnerJoinRidesRemoteReadPath) {
         << "INNER join did not route its per-key state through the deferring backend (async path)";
 }
 
-// PARITY-P1 whole-job proof - DISABLED: it reproduces a real DEADLOCK, kept as a
-// pending regression that flips green once the bug is fixed.
+// PARITY-P1 whole-job proof: a job with MULTIPLE distinct stateful operators (an
+// INNER equi-join feeding a GROUP BY, both auto-async on a deferring backend)
+// SHARING ONE backend instance has every stateful op ride the async path and
+// completes correctly - i.e. selecting a disaggregated backend is the single
+// switch that makes the whole job async. Verified by output == the in-memory
+// baseline AND remote_loads > 0 (both ops' state went through the deferring tier).
 //
-// FINDING (2026-07-01): composing MULTIPLE async operators that SHARE ONE
-// deferring backend instance deadlocks. This job (INNER equi-join feeding a
-// GROUP BY, both auto-async on a deferring backend) hangs at end-of-stream with
-// io_threads=1 AND io_threads=8, so it is a genuine deadlock, not thread
-// starvation. The stuck-channel dump points at the async-persist teardown:
-// multiple "snapshot-worker" bounded channels stuck in pop (each async op that
-// supports_async_persist spins up a SnapshotWorker against the shared backend).
-//
-// SCOPE: this hits paths where several async ops share ONE backend instance -
-// the in-process LocalExecutor / LocalSubmitter (whose DEFAULT backend is the
-// deferring disagg-local://) and fused par-1 chains. The distributed non-fused
-// path is unaffected (each op is a separate subtask with its own per-subtask
-// backend), which is why the per-op async tests pass. So the "one switch -> whole
-// job async" claim holds distributed but NOT in-process/fused today. Fixing this
-// async-persist teardown deadlock is the core PARITY-P1 work; re-enable this test
-// (drop the DISABLED_ prefix) when it is fixed.
-TEST(SqlRuntime, DISABLED_WholeJobRidesAsyncOnOneSharedDeferringBackend) {
+// Also a regression for a fixed DEADLOCK: each async op's runner used to wire ITS
+// controller into the backend's SINGLE resume-scheduler slot, so the second op
+// clobbered the first and the first's cold-read completions were misrouted,
+// hanging the job (stuck async-persist "snapshot-worker" teardown) at io_threads
+// = 1 AND 8. RemoteReadBackend now keys the resume target by runner thread, so a
+// shared backend routes each completion to the op that issued the read.
+TEST(SqlRuntime, WholeJobRidesAsyncOnOneSharedDeferringBackend) {
     ensure_sql_installed_once();
     const auto* join_builder =
         cluster::DagBuilderRegistry::default_instance().find("equi_join_row");
