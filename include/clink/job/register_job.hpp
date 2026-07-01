@@ -10,13 +10,14 @@
 //
 // Contract - a job .so MUST export:
 //
-//   1. clink_plugin_abi_version()    -- inherited from CLINK_DECLARE_PLUGIN;
-//                                        the compatibility gate (must equal the
-//                                        cluster's, unless strict mode)
-//   2. clink_plugin_abi_hash()       -- ditto (informational / strict-mode gate)
-//   3. clink_plugin_target_triple()  -- ditto
-//   4. clink_plugin_metadata()       -- ditto
-//   5. clink_plugin_register(...)    -- runs the user's build_fn under
+//   1. clink_plugin_abi_fingerprint()-- inherited from CLINK_DECLARE_PLUGIN;
+//                                        the default compatibility gate (must
+//                                        equal the cluster's, unless strict mode)
+//   2. clink_plugin_abi_version()    -- ditto (manual ABI-break knob / diagnostic)
+//   3. clink_plugin_abi_hash()       -- ditto (informational / strict-mode gate)
+//   4. clink_plugin_target_triple()  -- ditto
+//   5. clink_plugin_metadata()       -- ditto
+//   6. clink_plugin_register(...)    -- runs the user's build_fn under
 //                                         std::call_once; registers all
 //                                         inline ops as a side effect.
 //                                         Returns 0 on success, non-zero

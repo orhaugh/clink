@@ -42,6 +42,10 @@ std::string current_dlerror() {
 
 }  // namespace
 
+const char* cluster_abi_fingerprint() noexcept {
+    return ::clink::plugin::kAbiFingerprint;
+}
+
 int cluster_abi_version() noexcept {
     return ::clink::plugin::kAbiVersion;
 }
@@ -60,23 +64,27 @@ bool strict_plugin_abi_enabled() noexcept {
 }
 
 std::string check_plugin_abi(const AbiCheckInput& in) {
-    // Strict mode, or a legacy plugin that predates the ABI-version symbol:
+    // Strict mode, or a legacy plugin that predates the fingerprint symbol:
     // fall back to the historic exact commit-hash gate.
-    if (in.strict || !in.plugin_has_version) {
+    if (in.strict || !in.plugin_has_fingerprint) {
         if (in.plugin_hash != in.cluster_hash) {
-            const char* why = in.strict ? "strict mode" : "legacy plugin (no ABI-version symbol)";
+            const char* why =
+                in.strict ? "strict mode" : "legacy plugin (no ABI-fingerprint symbol)";
             return std::string{"plugin ABI hash mismatch ("} + why + "): plugin reports '" +
                    (in.plugin_hash.empty() ? "(none)" : in.plugin_hash) + "', cluster expects '" +
                    in.cluster_hash + "'";
         }
         return {};
     }
-    // Default gate: compatible iff the ABI-compat versions match.
-    if (in.plugin_abi_version != in.cluster_abi_version) {
-        return "plugin ABI version mismatch: plugin built for ABI v" +
-               std::to_string(in.plugin_abi_version) + ", cluster is ABI v" +
-               std::to_string(in.cluster_abi_version) +
-               " (a major ABI change; rebuild the plugin against this clink release). "
+    // Default gate: compatible iff the structural ABI fingerprints match. The
+    // fingerprint hashes the public headers + ABI options + manual ABI version,
+    // so a difference means the plugin was built against an incompatible clink
+    // ABI surface and must be rebuilt against this release.
+    if (in.plugin_fingerprint != in.cluster_fingerprint) {
+        return std::string{"plugin ABI fingerprint mismatch: plugin '"} +
+               (in.plugin_fingerprint.empty() ? "(none)" : in.plugin_fingerprint) + "', cluster '" +
+               in.cluster_fingerprint +
+               "' (the clink ABI surface differs; rebuild the plugin against this release). "
                "plugin commit '" +
                (in.plugin_hash.empty() ? "(none)" : in.plugin_hash) + "', cluster commit '" +
                in.cluster_hash + "'";
@@ -142,14 +150,17 @@ PluginLoadResult PluginLoader::load_into(const std::string& so_path,
         return result;
     };
 
+    using AbiFingerprintFn = const char* (*)();
     using AbiVersionFn = int (*)();
     using AbiHashFn = const char* (*)();
     using TripleFn = const char* (*)();
     using MetadataFn = const ::clink::plugin::PluginMetadata* (*)();
     using RegisterFn = int (*)(void*, char*, std::size_t);
 
-    // ABI-version symbol is OPTIONAL: a plugin built before the version gate
-    // lacks it, and check_plugin_abi falls back to the exact-hash comparison.
+    // Fingerprint + version symbols are OPTIONAL: a plugin built before the
+    // fingerprint gate lacks them, and check_plugin_abi falls back to the
+    // exact-hash comparison.
+    auto abi_fp_fn = dlsym_as<AbiFingerprintFn>(handle, "clink_plugin_abi_fingerprint");
     auto abi_version_fn = dlsym_as<AbiVersionFn>(handle, "clink_plugin_abi_version");
     auto abi_hash_fn = dlsym_as<AbiHashFn>(handle, "clink_plugin_abi_hash");
     if (abi_hash_fn == nullptr) {
@@ -169,11 +180,12 @@ PluginLoadResult PluginLoader::load_into(const std::string& so_path,
     }
 
     const char* plugin_abi = abi_hash_fn();
+    const char* plugin_fp = abi_fp_fn != nullptr ? abi_fp_fn() : nullptr;
     AbiCheckInput abi_in;
     abi_in.strict = strict_plugin_abi_enabled();
-    abi_in.plugin_has_version = abi_version_fn != nullptr;
-    abi_in.plugin_abi_version = abi_version_fn != nullptr ? abi_version_fn() : 0;
-    abi_in.cluster_abi_version = cluster_abi_version();
+    abi_in.plugin_has_fingerprint = abi_fp_fn != nullptr;
+    abi_in.plugin_fingerprint = plugin_fp != nullptr ? plugin_fp : "";
+    abi_in.cluster_fingerprint = cluster_abi_fingerprint();
     abi_in.plugin_hash = plugin_abi != nullptr ? plugin_abi : "";
     abi_in.cluster_hash = cluster_abi_hash();
     if (auto err = check_plugin_abi(abi_in); !err.empty()) {
@@ -203,7 +215,8 @@ PluginLoadResult PluginLoader::load_into(const std::string& so_path,
     lp.source_path = so_path;
     lp.name = meta->name != nullptr ? meta->name : "";
     lp.version = meta->version != nullptr ? meta->version : "";
-    lp.abi_version = abi_in.plugin_abi_version;
+    lp.abi_fingerprint = plugin_fp != nullptr ? plugin_fp : "";
+    lp.abi_version = abi_version_fn != nullptr ? abi_version_fn() : 0;
     lp.abi_hash = plugin_abi;
     lp.target_triple = plugin_triple;
     lp.dl_handle = handle;

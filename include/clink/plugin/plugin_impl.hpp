@@ -857,6 +857,9 @@ void PluginRegistry::register_selector(const std::string& name, std::function<in
 // decide whether to load this plugin. Place once at file scope. All
 // strings must be literals.
 #define CLINK_DECLARE_PLUGIN(plugin_name, plugin_version, plugin_description)   \
+    extern "C" const char* clink_plugin_abi_fingerprint() {                     \
+        return ::clink::plugin::kAbiFingerprint;                                \
+    }                                                                           \
     extern "C" int clink_plugin_abi_version() {                                 \
         return ::clink::plugin::kAbiVersion;                                    \
     }                                                                           \

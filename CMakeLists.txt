@@ -149,6 +149,30 @@ if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
     endif()
 endif()
 message(STATUS "clink: plugin ABI hash = ${CLINK_ABI_HASH} (clean: ${CLINK_ABI_HASH_CLEAN})")
+
+# Structural ABI fingerprint: a hash of the public header content plus the
+# ABI-relevant compile options and CLINK_ABI_VERSION. This is the DEFAULT
+# compatibility gate. It rotates when the plugin ABI/behaviour surface actually
+# changes - a public header edit (layout, virtual, inline/template body, macro),
+# a toggled ABI option, or a manual CLINK_ABI_VERSION bump - but NOT on the
+# majority of commits that touch only .cpp / tests / docs / build scaffolding.
+# So a cluster patch rebuild keeps loading existing plugins, while a real ABI
+# change auto-invalidates them without anyone remembering to bump a number.
+# Errs toward over-invalidation (hashes the whole public include tree, not a
+# curated ABI subset) - the safe direction for a load gate. CLINK_ABI_VERSION
+# folds in as a manual force-rotate for a semantic break the header text can't
+# capture. The generated header is in the BINARY dir, so it is not self-hashed.
+file(GLOB_RECURSE _clink_abi_headers CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/include/clink/*.hpp")
+list(SORT _clink_abi_headers)
+set(_clink_abi_material "abi_version=${CLINK_ABI_VERSION};flat_hash_map=${CLINK_USE_FLAT_HASH_MAP};")
+foreach(_clink_h IN LISTS _clink_abi_headers)
+    file(SHA256 "${_clink_h}" _clink_h_hash)
+    string(APPEND _clink_abi_material "${_clink_h_hash}")
+endforeach()
+string(SHA256 CLINK_ABI_FINGERPRINT "${_clink_abi_material}")
+message(STATUS "clink: plugin ABI fingerprint = ${CLINK_ABI_FINGERPRINT} (abi v${CLINK_ABI_VERSION})")
+
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/clink/plugin/abi_version.hpp.in"
     "${CMAKE_CURRENT_BINARY_DIR}/include/clink/plugin/abi_version.hpp"

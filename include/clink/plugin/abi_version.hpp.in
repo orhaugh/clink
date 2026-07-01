@@ -6,11 +6,19 @@
 
 namespace clink::plugin {
 
-// Plugin-ABI compatibility version - the DEFAULT load gate. The loader
-// accepts a plugin whose kAbiVersion equals the cluster's and refuses
-// otherwise, so a plugin survives any marketing-version bump that does not
-// change the ABI. Bumped by hand (CLINK_ABI_VERSION in CMakeLists.txt) only on
-// an intentional ABI break. Decoupled from kClinkVersion.
+// Structural ABI fingerprint - the DEFAULT load gate. A hash of the public
+// header content + ABI-relevant compile options + kAbiVersion, computed at
+// clink configure time (CMakeLists.txt) and baked in identically to the cluster
+// and to any plugin built against these headers. The loader accepts a plugin
+// whose kAbiFingerprint equals the cluster's and refuses otherwise. It rotates
+// when the ABI/behaviour surface actually changes but NOT on .cpp / test / doc /
+// build-only commits, so a cluster patch rebuild keeps loading existing plugins
+// while a real ABI change auto-invalidates them - no human bump required.
+inline constexpr const char* kAbiFingerprint = "@CLINK_ABI_FINGERPRINT@";
+
+// Manual ABI-break knob, folded INTO kAbiFingerprint. Bump it (CLINK_ABI_VERSION
+// in CMakeLists.txt) to force-rotate the fingerprint for a semantic break the
+// header text does not capture. Also exported for human-readable diagnostics.
 inline constexpr int kAbiVersion = @CLINK_ABI_VERSION@;
 
 // Exact commit hash of the clink source tree at build time. INFORMATIONAL:

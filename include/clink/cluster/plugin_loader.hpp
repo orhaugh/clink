@@ -27,10 +27,11 @@ struct LoadedPlugin {
     std::string source_path;  // Original .so path on disk.
     std::string name;         // From clink_plugin_metadata().
     std::string version;
-    int abi_version{0};         // From clink_plugin_abi_version() (0 = legacy plugin).
-    std::string abi_hash;       // From clink_plugin_abi_hash() (informational).
-    std::string target_triple;  // From clink_plugin_target_triple().
-    void* dl_handle{nullptr};   // dlopen handle - opaque.
+    std::string abi_fingerprint;  // From clink_plugin_abi_fingerprint() (the default gate).
+    int abi_version{0};           // From clink_plugin_abi_version() (diagnostic; 0 = legacy).
+    std::string abi_hash;         // From clink_plugin_abi_hash() (informational / strict gate).
+    std::string target_triple;    // From clink_plugin_target_triple().
+    void* dl_handle{nullptr};     // dlopen handle - opaque.
 };
 
 // Outcome of a load attempt. Holds the parsed LoadedPlugin on success
@@ -90,10 +91,13 @@ private:
     std::unordered_map<std::string, LoadedPlugin> loaded_;
 };
 
-// The cluster's plugin-ABI compatibility version (baked in at build time via
-// abi_version.hpp). A plugin loads when its ABI version equals this. Bumped by
-// hand only on an intentional ABI break, so patch/feature rebuilds of the
-// cluster keep loading existing plugins.
+// The cluster's structural ABI fingerprint (baked in at build time via
+// abi_version.hpp). The DEFAULT gate: a plugin loads when its fingerprint equals
+// this. Rotates on a real ABI/behaviour change, not on .cpp/test/doc commits.
+const char* cluster_abi_fingerprint() noexcept;
+
+// The cluster's manual ABI-break version (folded into the fingerprint). Exported
+// for diagnostics.
 int cluster_abi_version() noexcept;
 
 // The cluster's own ABI hash (git commit at build time). Informational: used as
@@ -108,18 +112,21 @@ const char* cluster_target_triple() noexcept;
 
 // True when strict plugin-ABI matching is requested (CLINK_STRICT_PLUGIN_ABI=1
 // in the environment). In strict mode the loader falls back to the historic
-// exact commit-hash gate instead of the ABI-version gate.
+// exact commit-hash gate instead of the fingerprint gate.
 bool strict_plugin_abi_enabled() noexcept;
 
 // Pure decision for whether a plugin is ABI-compatible with the cluster,
 // factored out of PluginLoader::load so it can be unit-tested without a real
 // .so. Returns an empty string when compatible, otherwise a human-readable
 // rejection reason. The target-triple gate is applied separately by the loader.
+//
+// Default: compare structural fingerprints. Strict mode, or a legacy plugin
+// that predates the fingerprint symbol, falls back to the exact commit-hash.
 struct AbiCheckInput {
-    bool strict{false};              // strict mode requested (exact-hash gate)
-    bool plugin_has_version{false};  // plugin exports clink_plugin_abi_version
-    int plugin_abi_version{0};
-    int cluster_abi_version{0};
+    bool strict{false};                  // strict mode requested (exact-hash gate)
+    bool plugin_has_fingerprint{false};  // plugin exports clink_plugin_abi_fingerprint
+    std::string plugin_fingerprint;
+    std::string cluster_fingerprint;
     std::string plugin_hash;
     std::string cluster_hash;
 };
