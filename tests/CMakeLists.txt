@@ -404,6 +404,7 @@ if(CLINK_BUILD_SQL)
         test_async_function_registry.cpp
         test_table_api.cpp
         test_sql_preparse.cpp
+        test_sql_ai.cpp
     )
     target_link_libraries(clink_sql_tests PRIVATE
         clink::sql

@@ -286,6 +286,13 @@ int main(int argc, char** argv) {
                 catalog.register_table(std::get<clink::sql::ast::CreateTableStmt>(stmt));
                 continue;
             }
+            if (std::holds_alternative<clink::sql::ast::CreateModelStmt>(stmt)) {
+                // SQL-native AI: CREATE MODEL is pure catalog registration (no job).
+                // ML_PREDICT reads the model's OUTPUT columns + provider properties
+                // from the catalog when it binds.
+                catalog.register_model(std::get<clink::sql::ast::CreateModelStmt>(stmt));
+                continue;
+            }
             if (std::holds_alternative<clink::sql::ast::CreateViewStmt>(stmt)) {
                 // A logical view is pure catalog registration (no storage, no
                 // job): bind the defining query for its columns and store it; a

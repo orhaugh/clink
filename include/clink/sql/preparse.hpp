@@ -34,11 +34,26 @@ inline constexpr const char* kMatchRecognizePrefix = "__clink_mr_";
 // form, so the clause is recognised structurally in the shim.
 inline constexpr const char* kProcessTableFunctionPrefix = "__clink_ptf_";
 
+// SQL-native AI islands (libpg_query has no MODEL / DESCRIPTOR grammar):
+//  - a whole `CREATE MODEL ...` statement is replaced by a placeholder
+//    `CREATE TABLE __clink_model_N (...)` statement and the parsed CreateModelStmt
+//    recorded (N = index into models); reattach swaps the whole Statement.
+//  - an `ML_PREDICT(TABLE t, MODEL m, DESCRIPTOR(...))` FROM island becomes a
+//    placeholder table ref "__clink_mlp_N" (N = index into ml_predicts).
+//  - a `VECTOR_SEARCH(TABLE t, ...)` FROM island becomes "__clink_vs_N"
+//    (N = index into vector_searches).
+inline constexpr const char* kCreateModelPrefix = "__clink_model_";
+inline constexpr const char* kMlPredictPrefix = "__clink_mlp_";
+inline constexpr const char* kVectorSearchPrefix = "__clink_vs_";
+
 struct PreparseResult {
     std::string rewritten_sql;                               // PG-parseable SQL, islands replaced
     std::vector<ast::TypeName> composite_types;              // indexed by the placeholder suffix
     std::vector<ast::MatchRecognizeClause> match_recognize;  // indexed by placeholder suffix
     std::vector<ast::ProcessTableFunctionClause> table_functions;  // indexed by placeholder suffix
+    std::vector<ast::CreateModelStmt> models;                      // indexed by placeholder suffix
+    std::vector<ast::MlPredictClause> ml_predicts;                 // indexed by placeholder suffix
+    std::vector<ast::VectorSearchClause> vector_searches;          // indexed by placeholder suffix
 };
 
 // Scan + rewrite. Throws TranslationError on a malformed island (e.g. an
@@ -80,5 +95,23 @@ ast::ProcessTableFunctionClause parse_process_table_function(std::string_view fn
 // reference with table_functions[N] (carrying the placeholder's alias).
 void reattach_process_table_functions(
     ast::Script& script, std::vector<ast::ProcessTableFunctionClause>& table_functions);
+
+// Parse a whole `CREATE MODEL ...` statement structurally into a CreateModelStmt.
+// Exposed for unit testing. Throws TranslationError on malformed input.
+ast::CreateModelStmt parse_create_model(std::string_view stmt_text);
+
+// Parse an ML_PREDICT / VECTOR_SEARCH FROM-island body (the text inside the outer
+// parens) into its structural clause. Exposed for unit testing. Throws on malformed
+// input.
+ast::MlPredictClause parse_ml_predict(std::string_view body);
+ast::VectorSearchClause parse_vector_search(std::string_view body);
+
+// Post-parse reattach: swap the placeholder CreateTableStmt for the recorded
+// CreateModelStmt, and the "__clink_mlp_N" / "__clink_vs_N" placeholder table refs
+// for the recorded ML_PREDICT / VECTOR_SEARCH clauses (carrying the alias).
+void reattach_create_models(ast::Script& script, std::vector<ast::CreateModelStmt>& models);
+void reattach_ml_predicts(ast::Script& script, std::vector<ast::MlPredictClause>& ml_predicts);
+void reattach_vector_searches(ast::Script& script,
+                              std::vector<ast::VectorSearchClause>& vector_searches);
 
 }  // namespace clink::sql::preparse

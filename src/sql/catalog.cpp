@@ -128,6 +128,62 @@ void Catalog::register_table(const ast::CreateTableStmt& stmt) {
     register_table(std::move(def));
 }
 
+void Catalog::register_model(ModelDef def) {
+    if (models_.find(def.name) != models_.end()) {
+        throw TranslationError("model already exists: " + def.name, 0);
+    }
+    if (tables_.find(def.name) != tables_.end()) {
+        throw TranslationError(
+            "cannot create model '" + def.name + "': a table with that name already exists", 0);
+    }
+    std::string name = def.name;
+    models_.emplace(name, std::move(def));
+    models_order_.push_back(std::move(name));
+}
+
+void Catalog::register_model(const ast::CreateModelStmt& stmt) {
+    // CREATE MODEL IF NOT EXISTS: a no-op when the model is already registered.
+    if (stmt.if_not_exists && get_model(stmt.model_name) != nullptr) {
+        return;
+    }
+    ModelDef def;
+    def.name = stmt.model_name;
+    def.input_columns.reserve(stmt.input_columns.size());
+    for (const auto& col : stmt.input_columns) {
+        def.input_columns.push_back(ColumnSpec{col.name, sql_type_to_arrow(col.type)});
+    }
+    def.output_columns.reserve(stmt.output_columns.size());
+    for (const auto& col : stmt.output_columns) {
+        def.output_columns.push_back(ColumnSpec{col.name, sql_type_to_arrow(col.type)});
+    }
+    for (const auto& opt : stmt.options) {
+        def.properties[opt.key] = opt.value;  // last-write-wins, like CREATE TABLE
+    }
+    register_model(std::move(def));
+}
+
+const ModelDef* Catalog::get_model(const std::string& name) const {
+    auto it = models_.find(name);
+    return it == models_.end() ? nullptr : &it->second;
+}
+
+bool Catalog::drop_model(const std::string& name) {
+    auto it = models_.find(name);
+    if (it == models_.end()) {
+        return false;
+    }
+    models_.erase(it);
+    auto pos = std::find(models_order_.begin(), models_order_.end(), name);
+    if (pos != models_order_.end()) {
+        models_order_.erase(pos);
+    }
+    return true;
+}
+
+std::vector<std::string> Catalog::list_models() const {
+    return models_order_;
+}
+
 void Catalog::register_logical_view(TableDef def, ast::SelectStmt query) {
     if (tables_.find(def.name) != tables_.end()) {
         throw TranslationError("object '" + def.name + "' is already registered", 0);

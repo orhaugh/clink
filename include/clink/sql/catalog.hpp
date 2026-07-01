@@ -128,6 +128,42 @@ struct TableDef {
     }
 };
 
+// SQL-native AI: a model registered via CREATE MODEL. A model is pure declaration
+// (no C++ factory) - a name, an INPUT and OUTPUT column schema, and provider
+// properties (provider, task, endpoint, ...) - so it lives in the catalog beside a
+// table declaration rather than in a runtime registry. ML_PREDICT reads the OUTPUT
+// columns from the catalog at bind time to build its derived-table schema; the
+// physical planner reads `provider` to choose the sync vs async predict operator,
+// and passes the remaining properties to the runtime provider factory.
+struct ModelDef {
+    std::string name;
+    std::vector<ColumnSpec> input_columns;
+    std::vector<ColumnSpec> output_columns;
+    // Insertion-order preserving, like TableDef::properties.
+    std::map<std::string, std::string> properties;
+
+    // Named WITH-option accessors (empty string when absent).
+    [[nodiscard]] std::string provider() const {
+        auto it = properties.find("provider");
+        return it != properties.end() ? it->second : "";
+    }
+    [[nodiscard]] std::string task() const {
+        auto it = properties.find("task");
+        return it != properties.end() ? it->second : "";
+    }
+
+    // The model's OUTPUT columns as an Arrow schema, for the binder to append to
+    // ML_PREDICT's derived-table schema.
+    [[nodiscard]] std::shared_ptr<arrow::Schema> output_schema() const {
+        arrow::FieldVector fields;
+        fields.reserve(output_columns.size());
+        for (const auto& c : output_columns) {
+            fields.push_back(arrow::field(c.name, c.type));
+        }
+        return arrow::schema(std::move(fields));
+    }
+};
+
 class Catalog {
 public:
     Catalog() = default;
@@ -203,6 +239,28 @@ public:
     // List currently-registered table names in registration order.
     [[nodiscard]] std::vector<std::string> list_tables() const;
 
+    // SQL-native AI: model registry (CREATE MODEL). Models occupy a namespace
+    // separate from tables (a model and a table may not share a name - both
+    // register_model overloads reject a collision with an existing table, and
+    // register_table is unaffected). Models are in-memory only in v1 (not persisted
+    // to the catalog dir); registration is per-session / per-script.
+    void register_model(ModelDef def);
+
+    // Convenience: translate a CREATE MODEL AST into a ModelDef and register it.
+    // Resolves INPUT / OUTPUT column types through sql_type_to_arrow. Honours
+    // IF NOT EXISTS. Throws TranslationError on a duplicate model name, a name
+    // already used by a table, or an unsupported column type.
+    void register_model(const ast::CreateModelStmt& stmt);
+
+    // Lookup. Returns nullptr if not found.
+    [[nodiscard]] const ModelDef* get_model(const std::string& name) const;
+
+    // Remove a model by name. Returns true if it existed.
+    bool drop_model(const std::string& name);
+
+    // List currently-registered model names in registration order.
+    [[nodiscard]] std::vector<std::string> list_models() const;
+
     // Persistence:
     //
     //   set_persistence_dir(dir) - subsequent register / drop calls
@@ -231,6 +289,9 @@ private:
     std::unordered_map<std::string, ast::SelectStmt> view_queries_;
     std::vector<std::string> order_;  // registration order, for list_tables
     std::string persistence_dir_;
+    // SQL-native AI models (CREATE MODEL). In-memory only in v1.
+    std::unordered_map<std::string, ModelDef> models_;
+    std::vector<std::string> models_order_;  // registration order, for list_models
 };
 
 }  // namespace clink::sql

@@ -60,6 +60,16 @@ private:
     std::unique_ptr<LogicalPlan> bind_process_table_function(
         const ast::ProcessTableFunctionClause& ptf) const;
 
+    // SQL-native AI: bind ML_PREDICT(...) into a LogicalMlPredict (input scan +
+    // model name + feature columns + the model's OUTPUT columns from the catalog;
+    // output schema = input columns then model OUTPUT columns).
+    std::unique_ptr<LogicalPlan> bind_ml_predict(const ast::MlPredictClause& mlp) const;
+
+    // SQL-native AI: bind VECTOR_SEARCH(...) into a LogicalVectorSearch (input scan
+    // + the vector table + query / index columns + top_k + metric; output schema =
+    // input columns then vector-table columns then a synthetic score DOUBLE).
+    std::unique_ptr<LogicalPlan> bind_vector_search(const ast::VectorSearchClause& vs) const;
+
     // Analytics depth: bind `SELECT *, agg(x) OVER (PARTITION BY ...
     // ORDER BY <event_time>) AS c, ...` into a LogicalOverAggregate.
     // window_targets are the indices of the SELECT items carrying an

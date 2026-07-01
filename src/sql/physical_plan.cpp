@@ -1348,6 +1348,92 @@ std::string compile_node(const LogicalPlan& node,
         spec.ops.push_back(std::move(op));
         return id;
     }
+    if (node.kind() == "MlPredict") {
+        // SQL-native AI: ml_predict_row applies a model per row and appends its
+        // OUTPUT columns. The runtime factory resolves the provider from the
+        // threaded model.* params (a TaskManager has no catalog) and runs it on the
+        // sync flatmap or the async path per the provider's kind. No keyer needed.
+        const auto& mp = static_cast<const LogicalMlPredict&>(node);
+        std::string input_id = compile_node(mp.input(), ch, spec, next_id, async_agg);
+        if (ch != Channel::Row) {
+            unsupported("ML_PREDICT requires format='json' Row channel");
+        }
+        auto csv = [](const std::vector<std::string>& v) {
+            std::string out;
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                if (i > 0) {
+                    out += ',';
+                }
+                out += v[i];
+            }
+            return out;
+        };
+        cluster::OperatorSpec op;
+        op.id = "mlpredict_" + std::to_string(next_id++);
+        op.type = "ml_predict_row";
+        op.inputs = {std::move(input_id)};
+        op.out_channel = std::string{kChannelRow};
+        op.params["model_name"] = mp.model_name();
+        op.params["feature_columns"] = csv(mp.feature_columns());
+        op.params["output_columns"] = csv(mp.output_columns());
+        // The output columns (names + types) so the runtime builds typed cells. The
+        // node schema is input columns then the OUTPUT columns; the last N are ours.
+        std::vector<RowColumn> out_cols;
+        const auto sch = mp.schema();
+        const int nout = static_cast<int>(mp.output_columns().size());
+        for (int i = sch->num_fields() - nout; i < sch->num_fields(); ++i) {
+            out_cols.push_back(RowColumn{sch->field(i)->name(), sch->field(i)->type()});
+        }
+        op.params["output_schema"] = serialize_row_schema(out_cols);
+        // Provider config, namespaced so it cannot collide with the op's own params.
+        for (const auto& [k, v] : mp.model_properties()) {
+            op.params["model." + k] = v;
+        }
+        std::string id = op.id;
+        spec.ops.push_back(std::move(op));
+        return id;
+    }
+    if (node.kind() == "VectorSearch") {
+        // SQL-native AI: vector_search_row bounded-loads the vector table into an
+        // in-memory index at open() and emits, per input row, its top_k nearest
+        // rows + a score. The vector table's connector props are threaded namespaced
+        // so the runtime can build the bounded source itself.
+        const auto& vs = static_cast<const LogicalVectorSearch&>(node);
+        std::string input_id = compile_node(vs.input(), ch, spec, next_id, async_agg);
+        if (ch != Channel::Row) {
+            unsupported("VECTOR_SEARCH requires format='json' Row channel");
+        }
+        auto csv = [](const std::vector<std::string>& v) {
+            std::string out;
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                if (i > 0) {
+                    out += ',';
+                }
+                out += v[i];
+            }
+            return out;
+        };
+        const TableDef& vtab = vs.vector_table();
+        cluster::OperatorSpec op;
+        op.id = "vsearch_" + std::to_string(next_id++);
+        op.type = "vector_search_row";
+        op.inputs = {std::move(input_id)};
+        op.out_channel = std::string{kChannelRow};
+        op.params["vector_table_connector"] = require_property(vtab, "connector");
+        for (const auto& [k, v] : build_params(vtab)) {
+            op.params["vector_table." + k] = v;  // namespaced connector props
+        }
+        op.params["vector_schema_columns"] = serialize_row_schema(row_columns_of(vtab));
+        op.params["query_column"] = vs.query_column();
+        op.params["index_column"] = vs.index_column();
+        op.params["top_k"] = std::to_string(vs.top_k());
+        op.params["metric"] = vs.metric();
+        op.params["input_columns"] = csv(vs.input_columns());
+        op.params["vector_columns"] = csv(vs.vector_columns());
+        std::string id = op.id;
+        spec.ops.push_back(std::move(op));
+        return id;
+    }
     if (node.kind() == "WindowAggregate") {
         const auto& agg = static_cast<const LogicalWindowAggregate&>(node);
         std::string input_id = compile_node(agg.input(), ch, spec, next_id, async_agg);

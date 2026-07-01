@@ -269,12 +269,16 @@ struct JoinClause;
 struct SubqueryItem;
 struct MatchRecognizeClause;
 struct ProcessTableFunctionClause;
+struct MlPredictClause;
+struct VectorSearchClause;
 struct SelectStmt;
 using FromItem = std::variant<TableRef,
                               std::unique_ptr<JoinClause>,
                               std::unique_ptr<SubqueryItem>,
                               std::unique_ptr<MatchRecognizeClause>,
-                              std::unique_ptr<ProcessTableFunctionClause>>;
+                              std::unique_ptr<ProcessTableFunctionClause>,
+                              std::unique_ptr<MlPredictClause>,
+                              std::unique_ptr<VectorSearchClause>>;
 
 enum class JoinKind { Inner, Left, Right, Full };
 
@@ -376,6 +380,41 @@ struct StorageOption {
     Loc loc;
 };
 
+// ML_PREDICT(TABLE input, MODEL model_name, DESCRIPTOR(feature_col, ...)) in FROM
+// (SQL-native AI). The pre-parser shim parses this PG-ungrammatical FROM island
+// STRUCTURALLY (libpg_query has no MODEL / DESCRIPTOR grammar) and stores it here;
+// the binder resolves the model from the catalog, validates the DESCRIPTOR feature
+// columns against the model INPUT, and builds a synthetic derived table whose schema
+// is the input columns followed by the model OUTPUT columns. The model is a per-row
+// enrichment run on the async operator path (inference is a remote / costly call).
+// v1: exactly one TABLE input and one MODEL; DESCRIPTOR names the feature columns
+// positionally against the model INPUT.
+struct MlPredictClause {
+    TableRef input;                            // the TABLE(...) argument
+    std::string model_name;                    // MODEL <name>
+    std::vector<std::string> feature_columns;  // DESCRIPTOR(...) column names
+    std::optional<std::string> alias;          // FROM ML_PREDICT(...) AS p
+    Loc loc;
+};
+
+// VECTOR_SEARCH(TABLE input, <query_vec_col>, <vector_table>, DESCRIPTOR(index_col),
+// <top_k> [, k='v', ...]) in FROM (SQL-native AI). The pre-parser shim parses this
+// PG-ungrammatical FROM island STRUCTURALLY; the binder resolves the input and the
+// vector table from the catalog, validates the query column and the index column are
+// array types, and builds a synthetic derived table whose schema is the input columns
+// followed by the vector-table columns and a synthetic `score DOUBLE`. Each input row
+// yields its top_k nearest rows from the vector table by the chosen distance metric.
+struct VectorSearchClause {
+    TableRef input;                      // the TABLE(...) argument
+    std::string query_vector_column;     // <query_vec_col> in `input`
+    std::string vector_table;            // <vector_table> (a catalog table)
+    std::string index_column;            // DESCRIPTOR(index_col) in vector_table
+    std::int64_t top_k = 0;              // <top_k> literal (validated > 0 at bind)
+    std::vector<StorageOption> options;  // trailing k='v' (e.g. metric='cosine')
+    std::optional<std::string> alias;    // FROM VECTOR_SEARCH(...) AS v
+    Loc loc;
+};
+
 // --- Statements ----------------------------------------------------
 
 struct CreateTableStmt {
@@ -384,6 +423,24 @@ struct CreateTableStmt {
     std::vector<ColumnDef> columns;
     std::vector<StorageOption> options;
     bool if_not_exists = false;  // CREATE TABLE IF NOT EXISTS - skip when present
+    Loc loc;
+};
+
+// CREATE MODEL [IF NOT EXISTS] <name> INPUT (col type, ...) OUTPUT (col type, ...)
+// WITH ('provider'='...', ...) (SQL-native AI). libpg_query has no MODEL grammar, so
+// the pre-parser shim parses the whole leading statement STRUCTURALLY into this node
+// and hands it back through a placeholder that reattach swaps for the parsed node.
+// The driver registers it as a catalog ModelDef (name + INPUT / OUTPUT schemas +
+// provider properties); ML_PREDICT reads the OUTPUT columns from the catalog at bind
+// time to build its output schema. A model is pure declaration (no C++ factory), so
+// it lives in the catalog beside a table declaration rather than in a registry.
+struct CreateModelStmt {
+    std::string model_name;
+    std::optional<std::string> schema;
+    std::vector<ColumnDef> input_columns;   // INPUT (...)
+    std::vector<ColumnDef> output_columns;  // OUTPUT (...)
+    std::vector<StorageOption> options;     // WITH (...)
+    bool if_not_exists = false;             // CREATE MODEL IF NOT EXISTS
     Loc loc;
 };
 
@@ -578,6 +635,7 @@ struct CreateViewStmt {
 struct ExplainStmt;
 
 using Statement = std::variant<CreateTableStmt,
+                               CreateModelStmt,
                                SelectStmt,
                                InsertStmt,
                                DropTableStmt,

@@ -2139,6 +2139,202 @@ std::unique_ptr<LogicalPlan> Binder::bind_process_table_function(
 
 namespace {
 
+// A broad numeric family test used for ML_PREDICT feature/INPUT compatibility: a
+// numeric feature column widens to a numeric model INPUT column without an error.
+bool is_numeric_type(const arrow::DataType& t) {
+    switch (t.id()) {
+        case arrow::Type::INT8:
+        case arrow::Type::INT16:
+        case arrow::Type::INT32:
+        case arrow::Type::INT64:
+        case arrow::Type::UINT8:
+        case arrow::Type::UINT16:
+        case arrow::Type::UINT32:
+        case arrow::Type::UINT64:
+        case arrow::Type::HALF_FLOAT:
+        case arrow::Type::FLOAT:
+        case arrow::Type::DOUBLE:
+        case arrow::Type::DECIMAL128:
+        case arrow::Type::DECIMAL256:
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
+std::unique_ptr<LogicalPlan> Binder::bind_ml_predict(const ast::MlPredictClause& mlp) const {
+    const TableDef& input = resolve_table(catalog_, mlp.input, cte_synth_tables_);
+    const ModelDef* model = catalog_.get_model(mlp.model_name);
+    if (model == nullptr) {
+        bind_error("ML_PREDICT: model not found in catalog: " + mlp.model_name, mlp.loc.pos);
+    }
+    if (mlp.feature_columns.empty()) {
+        bind_error("ML_PREDICT: DESCRIPTOR requires at least one feature column", mlp.loc.pos);
+    }
+    if (mlp.feature_columns.size() != model->input_columns.size()) {
+        bind_error("ML_PREDICT: DESCRIPTOR lists " + std::to_string(mlp.feature_columns.size()) +
+                       " feature column(s) but model '" + mlp.model_name + "' declares " +
+                       std::to_string(model->input_columns.size()) + " INPUT column(s)",
+                   mlp.loc.pos);
+    }
+    auto find_col = [&](const std::string& n) -> const ColumnSpec* {
+        for (const auto& c : input.columns) {
+            if (c.name == n) {
+                return &c;
+            }
+        }
+        return nullptr;
+    };
+    for (std::size_t i = 0; i < mlp.feature_columns.size(); ++i) {
+        const ColumnSpec* fc = find_col(mlp.feature_columns[i]);
+        if (fc == nullptr) {
+            bind_error("ML_PREDICT: feature column not found in input table '" + input.name +
+                           "': " + mlp.feature_columns[i],
+                       mlp.loc.pos);
+        }
+        const auto& in_type = model->input_columns[i].type;
+        if (!fc->type->Equals(*in_type) &&
+            !(is_numeric_type(*fc->type) && is_numeric_type(*in_type))) {
+            bind_error("ML_PREDICT: feature column '" + mlp.feature_columns[i] + "' type " +
+                           fc->type->ToString() + " is not compatible with model INPUT column '" +
+                           model->input_columns[i].name + "' type " + in_type->ToString(),
+                       mlp.loc.pos);
+        }
+    }
+    // Output schema = all input columns (declaration order) then the model OUTPUT
+    // columns. An OUTPUT column may not collide with an input column (flat Row).
+    arrow::FieldVector fields;
+    fields.reserve(input.columns.size() + model->output_columns.size());
+    for (const auto& c : input.columns) {
+        fields.push_back(arrow::field(c.name, c.type));
+    }
+    std::vector<std::string> output_names;
+    output_names.reserve(model->output_columns.size());
+    for (const auto& oc : model->output_columns) {
+        if (find_col(oc.name) != nullptr) {
+            bind_error("ML_PREDICT: model OUTPUT column '" + oc.name +
+                           "' collides with an input column of the same name",
+                       mlp.loc.pos);
+        }
+        fields.push_back(arrow::field(oc.name, oc.type));
+        output_names.push_back(oc.name);
+    }
+    auto schema = arrow::schema(std::move(fields));
+    auto scan = make_table_plan(mlp.input.name, input, mlp.loc.pos);
+    return std::make_unique<LogicalMlPredict>(std::move(scan),
+                                              mlp.model_name,
+                                              mlp.feature_columns,
+                                              std::move(output_names),
+                                              model->properties,
+                                              std::move(schema));
+}
+
+std::unique_ptr<LogicalPlan> Binder::bind_vector_search(const ast::VectorSearchClause& vs) const {
+    const TableDef& input = resolve_table(catalog_, vs.input, cte_synth_tables_);
+    const TableDef* vtab = catalog_.get_table(vs.vector_table);
+    if (vtab == nullptr) {
+        bind_error("VECTOR_SEARCH: vector table not found in catalog: " + vs.vector_table,
+                   vs.loc.pos);
+    }
+    if (vs.top_k <= 0) {
+        bind_error("VECTOR_SEARCH: top_k must be a positive integer", vs.loc.pos);
+    }
+    auto find_in = [&](const TableDef& t, const std::string& n) -> const ColumnSpec* {
+        for (const auto& c : t.columns) {
+            if (c.name == n) {
+                return &c;
+            }
+        }
+        return nullptr;
+    };
+    const ColumnSpec* qcol = find_in(input, vs.query_vector_column);
+    if (qcol == nullptr) {
+        bind_error("VECTOR_SEARCH: query vector column not found in input table '" + input.name +
+                       "': " + vs.query_vector_column,
+                   vs.loc.pos);
+    }
+    if (qcol->type->id() != arrow::Type::LIST) {
+        bind_error("VECTOR_SEARCH: query vector column '" + vs.query_vector_column +
+                       "' must be an array type (got " + qcol->type->ToString() + ")",
+                   vs.loc.pos);
+    }
+    const ColumnSpec* icol = find_in(*vtab, vs.index_column);
+    if (icol == nullptr) {
+        bind_error("VECTOR_SEARCH: index column not found in vector table '" + vtab->name +
+                       "': " + vs.index_column,
+                   vs.loc.pos);
+    }
+    if (icol->type->id() != arrow::Type::LIST) {
+        bind_error("VECTOR_SEARCH: index column '" + vs.index_column +
+                       "' must be an array type (got " + icol->type->ToString() + ")",
+                   vs.loc.pos);
+    }
+    // Element types must match (same-dim, same-precision KNN).
+    const auto q_elem = std::static_pointer_cast<arrow::ListType>(qcol->type)->value_type();
+    const auto i_elem = std::static_pointer_cast<arrow::ListType>(icol->type)->value_type();
+    if (!q_elem->Equals(*i_elem)) {
+        bind_error("VECTOR_SEARCH: query vector element type (" + q_elem->ToString() +
+                       ") does not match the index column element type (" + i_elem->ToString() +
+                       ")",
+                   vs.loc.pos);
+    }
+    // metric option (default cosine); validate against the supported set.
+    std::string metric = "cosine";
+    for (const auto& opt : vs.options) {
+        if (opt.key == "metric") {
+            metric = opt.value;
+        }
+    }
+    if (metric != "cosine" && metric != "l2" && metric != "dot") {
+        bind_error(
+            "VECTOR_SEARCH: unsupported metric '" + metric + "' (expected cosine, l2 or dot)",
+            vs.loc.pos);
+    }
+    // Output schema = input columns, then vector-table columns, then score DOUBLE.
+    // Vector-table columns and `score` may not collide with an input column name.
+    arrow::FieldVector fields;
+    fields.reserve(input.columns.size() + vtab->columns.size() + 1);
+    std::vector<std::string> input_cols;
+    input_cols.reserve(input.columns.size());
+    for (const auto& c : input.columns) {
+        fields.push_back(arrow::field(c.name, c.type));
+        input_cols.push_back(c.name);
+    }
+    std::vector<std::string> vector_cols;
+    vector_cols.reserve(vtab->columns.size());
+    for (const auto& c : vtab->columns) {
+        if (find_in(input, c.name) != nullptr) {
+            bind_error("VECTOR_SEARCH: vector-table column '" + c.name +
+                           "' collides with an input column of the same name",
+                       vs.loc.pos);
+        }
+        fields.push_back(arrow::field(c.name, c.type));
+        vector_cols.push_back(c.name);
+    }
+    if (find_in(input, "score") != nullptr) {
+        bind_error(
+            "VECTOR_SEARCH: input table already has a 'score' column, which collides with "
+            "the emitted score",
+            vs.loc.pos);
+    }
+    fields.push_back(arrow::field("score", arrow::float64()));
+    auto schema = arrow::schema(std::move(fields));
+    auto scan = make_table_plan(vs.input.name, input, vs.loc.pos);
+    return std::make_unique<LogicalVectorSearch>(std::move(scan),
+                                                 vtab,
+                                                 vs.query_vector_column,
+                                                 vs.index_column,
+                                                 vs.top_k,
+                                                 metric,
+                                                 std::move(input_cols),
+                                                 std::move(vector_cols),
+                                                 std::move(schema));
+}
+
+namespace {
+
 // RAII guard that tears down a Binder's per-statement CTE scope on
 // exit. The scope is set up by the outermost bind_select with a
 // non-empty with_clause; nested bind_select calls (for the CTE
@@ -3436,6 +3632,63 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
         ast::TableRef tr;
         tr.name = ptf_alias;
         tr.loc = ptf.loc;
+        derived_table_ref = std::move(tr);
+    }
+
+    // SQL-native AI: FROM ML_PREDICT(TABLE t, MODEL m, DESCRIPTOR(cols)). Bind the
+    // clause and register its output (input columns + model OUTPUT columns) as a
+    // synthetic derived table so the outer projection / WHERE apply over the
+    // prediction result (mirrors MATCH_RECOGNIZE / PTF).
+    if (!derived_table_ref.has_value() && stmt.from_items.size() == 1 &&
+        std::holds_alternative<std::unique_ptr<ast::MlPredictClause>>(stmt.from_items[0])) {
+        const auto& mlp = *std::get<std::unique_ptr<ast::MlPredictClause>>(stmt.from_items[0]);
+        const std::string mlp_alias = mlp.alias.value_or(std::string{"__ml_predict"});
+        if (cte_synth_tables_.count(mlp_alias) != 0) {
+            bind_error("ML_PREDICT alias collides with an in-scope name: " + mlp_alias,
+                       mlp.loc.pos);
+        }
+        auto plan = bind_ml_predict(mlp);
+        auto body_schema = plan->schema();
+        TableDef synth;
+        synth.name = mlp_alias;
+        synth.columns.reserve(static_cast<std::size_t>(body_schema->num_fields()));
+        for (int i = 0; i < body_schema->num_fields(); ++i) {
+            synth.columns.push_back(
+                ColumnSpec{body_schema->field(i)->name(), body_schema->field(i)->type()});
+        }
+        cte_synth_tables_.emplace(mlp_alias, std::move(synth));
+        cte_plans_.emplace(mlp_alias, std::move(plan));
+        ast::TableRef tr;
+        tr.name = mlp_alias;
+        tr.loc = mlp.loc;
+        derived_table_ref = std::move(tr);
+    }
+
+    // SQL-native AI: FROM VECTOR_SEARCH(TABLE t, query_col, vec_table,
+    // DESCRIPTOR(idx), top_k). Bind the clause and register its output (input
+    // columns + vector-table columns + score) as a synthetic derived table.
+    if (!derived_table_ref.has_value() && stmt.from_items.size() == 1 &&
+        std::holds_alternative<std::unique_ptr<ast::VectorSearchClause>>(stmt.from_items[0])) {
+        const auto& vs = *std::get<std::unique_ptr<ast::VectorSearchClause>>(stmt.from_items[0]);
+        const std::string vs_alias = vs.alias.value_or(std::string{"__vector_search"});
+        if (cte_synth_tables_.count(vs_alias) != 0) {
+            bind_error("VECTOR_SEARCH alias collides with an in-scope name: " + vs_alias,
+                       vs.loc.pos);
+        }
+        auto plan = bind_vector_search(vs);
+        auto body_schema = plan->schema();
+        TableDef synth;
+        synth.name = vs_alias;
+        synth.columns.reserve(static_cast<std::size_t>(body_schema->num_fields()));
+        for (int i = 0; i < body_schema->num_fields(); ++i) {
+            synth.columns.push_back(
+                ColumnSpec{body_schema->field(i)->name(), body_schema->field(i)->type()});
+        }
+        cte_synth_tables_.emplace(vs_alias, std::move(synth));
+        cte_plans_.emplace(vs_alias, std::move(plan));
+        ast::TableRef tr;
+        tr.name = vs_alias;
+        tr.loc = vs.loc;
         derived_table_ref = std::move(tr);
     }
 

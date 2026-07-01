@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -729,14 +730,324 @@ ast::ProcessTableFunctionClause parse_process_table_function(std::string_view fn
 
 namespace {
 
+// From an open-paren at text[open], return the index just past the matching ')',
+// skipping strings/comments. Throws on imbalance.
+std::size_t match_paren(std::string_view text, std::size_t open, std::string_view ctx) {
+    int depth = 1;
+    std::size_t k = open + 1;
+    while (k < text.size() && depth > 0) {
+        const std::size_t q = skip_quote_or_comment(text, k);
+        if (q != k) {
+            k = q;
+            continue;
+        }
+        if (text[k] == '(') {
+            ++depth;
+        } else if (text[k] == ')') {
+            --depth;
+        }
+        ++k;
+    }
+    if (depth != 0) {
+        throw TranslationError(std::string(ctx) + ": unbalanced parentheses", 0);
+    }
+    return k;  // index just past ')'
+}
+
+// Extract a `TABLE <ref>` island argument into a TableRef (schema.name aware).
+ast::TableRef parse_table_arg(std::string_view part, std::string_view ctx) {
+    const std::string_view t = trim(part);
+    if (!(left_boundary(t, 0) && word_at(t, 0, "table"))) {
+        throw TranslationError(std::string(ctx) + ": first argument must be TABLE <name>", 0);
+    }
+    const std::string_view region = trim(t.substr(std::string_view("table").size()));
+    std::size_t n = 0;
+    while (n < region.size() && (is_ident_char(region[n]) || region[n] == '.')) {
+        ++n;
+    }
+    if (n == 0) {
+        throw TranslationError(std::string(ctx) + ": TABLE requires a table name", 0);
+    }
+    if (!trim(region.substr(n)).empty()) {
+        throw TranslationError(std::string(ctx) + ": unexpected tokens after the TABLE argument",
+                               0);
+    }
+    ast::TableRef ref;
+    ref.name = std::string(region.substr(0, n));
+    if (const auto dot = ref.name.find('.'); dot != std::string::npos) {
+        ref.schema = ref.name.substr(0, dot);
+        ref.name = ref.name.substr(dot + 1);
+    }
+    return ref;
+}
+
+// Read a bare identifier that fills the whole (trimmed) part.
+std::string parse_bare_ident(std::string_view part, std::string_view ctx, std::string_view what) {
+    const std::string_view t = trim(part);
+    std::size_t n = 0;
+    while (n < t.size() && is_ident_char(t[n])) {
+        ++n;
+    }
+    if (n == 0 || !trim(t.substr(n)).empty()) {
+        throw TranslationError(std::string(ctx) + ": expected " + std::string(what), 0);
+    }
+    return std::string(t.substr(0, n));
+}
+
+// Parse a `DESCRIPTOR(col, col, ...)` part into its column-name list.
+std::vector<std::string> parse_descriptor(std::string_view part, std::string_view ctx) {
+    const std::string_view t = trim(part);
+    if (!(left_boundary(t, 0) && word_at(t, 0, "descriptor"))) {
+        throw TranslationError(std::string(ctx) + ": expected DESCRIPTOR(columns)", 0);
+    }
+    const std::size_t p = skip_ws(t, std::string_view("descriptor").size());
+    if (p >= t.size() || t[p] != '(') {
+        throw TranslationError(std::string(ctx) + ": DESCRIPTOR must be followed by (columns)", 0);
+    }
+    const std::size_t close = match_paren(t, p, ctx);  // index past ')'
+    if (!trim(t.substr(close)).empty()) {
+        throw TranslationError(std::string(ctx) + ": unexpected tokens after DESCRIPTOR(...)", 0);
+    }
+    const std::string_view inner = t.substr(p + 1, (close - 1) - (p + 1));
+    std::vector<std::string> cols;
+    for (const auto c : split_top_level(inner)) {
+        const std::string_view col = trim(c);
+        if (col.empty()) {
+            continue;
+        }
+        std::size_t n = 0;
+        while (n < col.size() && is_ident_char(col[n])) {
+            ++n;
+        }
+        if (n == 0 || n != col.size()) {
+            throw TranslationError(
+                std::string(ctx) + ": DESCRIPTOR columns must be simple identifiers", 0);
+        }
+        cols.emplace_back(col);
+    }
+    if (cols.empty()) {
+        throw TranslationError(std::string(ctx) + ": DESCRIPTOR requires at least one column", 0);
+    }
+    return cols;
+}
+
+// Parse a single `key = 'value'` option part into a StorageOption.
+ast::StorageOption parse_kv_option(std::string_view part, std::string_view ctx) {
+    const std::string_view t = trim(part);
+    const auto eq = t.find('=');
+    if (eq == std::string_view::npos) {
+        throw TranslationError(std::string(ctx) + ": option must be key='value'", 0);
+    }
+    ast::StorageOption opt;
+    // The key may be a bare identifier (connector='...') or a quoted string
+    // ('provider'='...'); accept both and store the unquoted key.
+    std::string_view k = trim(t.substr(0, eq));
+    if (k.size() >= 2 && k.front() == '\'' && k.back() == '\'') {
+        k = k.substr(1, k.size() - 2);
+    }
+    opt.key = std::string(k);
+    std::string_view v = trim(t.substr(eq + 1));
+    if (v.size() < 2 || v.front() != '\'' || v.back() != '\'') {
+        throw TranslationError(
+            std::string(ctx) + ": option value must be a quoted string for key '" + opt.key + "'",
+            0);
+    }
+    opt.value = std::string(v.substr(1, v.size() - 2));
+    return opt;
+}
+
+// Parse `name TYPE[, name TYPE ...]` into a ColumnDef list (INPUT / OUTPUT lists).
+std::vector<ast::ColumnDef> parse_column_defs(std::string_view inner, std::string_view ctx) {
+    std::vector<ast::ColumnDef> cols;
+    for (const auto part : split_top_level(inner)) {
+        const std::string_view p = trim(part);
+        if (p.empty()) {
+            continue;
+        }
+        std::size_t n = 0;
+        while (n < p.size() && is_ident_char(p[n])) {
+            ++n;
+        }
+        if (n == 0) {
+            throw TranslationError(std::string(ctx) + ": expected 'column type'", 0);
+        }
+        ast::ColumnDef col;
+        col.name = std::string(p.substr(0, n));
+        const std::string_view type_expr = trim(p.substr(n));
+        if (type_expr.empty()) {
+            throw TranslationError(std::string(ctx) + ": column '" + col.name + "' has no type", 0);
+        }
+        col.type = parse_composite_type(type_expr);  // handles scalar + MAP/ROW/ARRAY leaves
+        cols.push_back(std::move(col));
+    }
+    if (cols.empty()) {
+        throw TranslationError(std::string(ctx) + ": empty column list", 0);
+    }
+    return cols;
+}
+
+}  // namespace
+
+ast::MlPredictClause parse_ml_predict(std::string_view body) {
+    ast::MlPredictClause c;
+    const auto parts = split_top_level(body);
+    if (parts.size() != 3) {
+        throw TranslationError(
+            "ML_PREDICT: expected ML_PREDICT(TABLE t, MODEL m, DESCRIPTOR(cols))", 0);
+    }
+    c.input = parse_table_arg(parts[0], "ML_PREDICT");
+    // MODEL <name>
+    const std::string_view m = trim(parts[1]);
+    if (!(left_boundary(m, 0) && word_at(m, 0, "model"))) {
+        throw TranslationError("ML_PREDICT: second argument must be MODEL <name>", 0);
+    }
+    c.model_name = parse_bare_ident(
+        m.substr(std::string_view("model").size()), "ML_PREDICT", "a model name after MODEL");
+    c.feature_columns = parse_descriptor(parts[2], "ML_PREDICT");
+    return c;
+}
+
+ast::VectorSearchClause parse_vector_search(std::string_view body) {
+    ast::VectorSearchClause c;
+    const auto parts = split_top_level(body);
+    if (parts.size() < 5) {
+        throw TranslationError(
+            "VECTOR_SEARCH: expected VECTOR_SEARCH(TABLE t, query_col, vector_table, "
+            "DESCRIPTOR(index_col), top_k [, k='v', ...])",
+            0);
+    }
+    c.input = parse_table_arg(parts[0], "VECTOR_SEARCH");
+    c.query_vector_column = parse_bare_ident(parts[1], "VECTOR_SEARCH", "the query vector column");
+    c.vector_table = parse_bare_ident(parts[2], "VECTOR_SEARCH", "the vector table name");
+    const auto index_cols = parse_descriptor(parts[3], "VECTOR_SEARCH");
+    if (index_cols.size() != 1) {
+        throw TranslationError("VECTOR_SEARCH: DESCRIPTOR must name exactly one index column", 0);
+    }
+    c.index_column = index_cols[0];
+    // top_k integer literal
+    const std::string_view topk = trim(parts[4]);
+    std::int64_t k = 0;
+    const auto* first = topk.data();
+    const auto* last = topk.data() + topk.size();
+    const auto res = std::from_chars(first, last, k);
+    if (res.ec != std::errc{} || res.ptr != last) {
+        throw TranslationError("VECTOR_SEARCH: top_k must be an integer literal", 0);
+    }
+    c.top_k = k;
+    // Trailing k='v' options (e.g. metric='cosine').
+    for (std::size_t p = 5; p < parts.size(); ++p) {
+        if (trim(parts[p]).empty()) {
+            continue;
+        }
+        c.options.push_back(parse_kv_option(parts[p], "VECTOR_SEARCH"));
+    }
+    return c;
+}
+
+ast::CreateModelStmt parse_create_model(std::string_view text) {
+    ast::CreateModelStmt c;
+    std::size_t i = skip_ws(text, 0);
+    if (!word_at(text, i, "create")) {
+        throw TranslationError("CREATE MODEL: expected CREATE", 0);
+    }
+    i = skip_ws(text, i + std::string_view("create").size());
+    if (!word_at(text, i, "model")) {
+        throw TranslationError("CREATE MODEL: expected MODEL", 0);
+    }
+    i = skip_ws(text, i + std::string_view("model").size());
+    // IF NOT EXISTS
+    if (word_at(text, i, "if")) {
+        i = skip_ws(text, i + 2);
+        if (!word_at(text, i, "not")) {
+            throw TranslationError("CREATE MODEL: expected NOT after IF", 0);
+        }
+        i = skip_ws(text, i + 3);
+        if (!word_at(text, i, "exists")) {
+            throw TranslationError("CREATE MODEL: expected EXISTS after IF NOT", 0);
+        }
+        i = skip_ws(text, i + 6);
+        c.if_not_exists = true;
+    }
+    // model name (identifier, optional schema.name)
+    std::size_t n = 0;
+    while (i + n < text.size() && (is_ident_char(text[i + n]) || text[i + n] == '.')) {
+        ++n;
+    }
+    if (n == 0) {
+        throw TranslationError("CREATE MODEL: expected a model name", 0);
+    }
+    c.model_name = std::string(text.substr(i, n));
+    if (const auto dot = c.model_name.find('.'); dot != std::string::npos) {
+        c.schema = c.model_name.substr(0, dot);
+        c.model_name = c.model_name.substr(dot + 1);
+    }
+    i = skip_ws(text, i + n);
+    // INPUT ( ... )
+    if (!word_at(text, i, "input")) {
+        throw TranslationError("CREATE MODEL '" + c.model_name + "': expected INPUT (columns)", 0);
+    }
+    i = skip_ws(text, i + std::string_view("input").size());
+    if (i >= text.size() || text[i] != '(') {
+        throw TranslationError(
+            "CREATE MODEL '" + c.model_name + "': INPUT must be followed by (columns)", 0);
+    }
+    std::size_t close = match_paren(text, i, "CREATE MODEL INPUT");
+    c.input_columns =
+        parse_column_defs(text.substr(i + 1, (close - 1) - (i + 1)), "CREATE MODEL INPUT");
+    i = skip_ws(text, close);
+    // OUTPUT ( ... )
+    if (!word_at(text, i, "output")) {
+        throw TranslationError("CREATE MODEL '" + c.model_name + "': expected OUTPUT (columns)", 0);
+    }
+    i = skip_ws(text, i + std::string_view("output").size());
+    if (i >= text.size() || text[i] != '(') {
+        throw TranslationError(
+            "CREATE MODEL '" + c.model_name + "': OUTPUT must be followed by (columns)", 0);
+    }
+    close = match_paren(text, i, "CREATE MODEL OUTPUT");
+    c.output_columns =
+        parse_column_defs(text.substr(i + 1, (close - 1) - (i + 1)), "CREATE MODEL OUTPUT");
+    i = skip_ws(text, close);
+    // WITH ( ... )  (optional)
+    if (i < text.size() && word_at(text, i, "with")) {
+        i = skip_ws(text, i + std::string_view("with").size());
+        if (i >= text.size() || text[i] != '(') {
+            throw TranslationError(
+                "CREATE MODEL '" + c.model_name + "': WITH must be followed by (options)", 0);
+        }
+        close = match_paren(text, i, "CREATE MODEL WITH");
+        for (const auto part : split_top_level(text.substr(i + 1, (close - 1) - (i + 1)))) {
+            if (trim(part).empty()) {
+                continue;
+            }
+            c.options.push_back(parse_kv_option(part, "CREATE MODEL WITH"));
+        }
+        i = skip_ws(text, close);
+    }
+    if (!trim(text.substr(i)).empty()) {
+        throw TranslationError("CREATE MODEL '" + c.model_name + "': unexpected trailing tokens",
+                               0);
+    }
+    return c;
+}
+
+namespace {
+
 // Rewrite `name(TABLE t PARTITION BY ...)` FROM-clause islands to "__clink_ptf_N"
 // placeholder table refs. Fires only when a '(' whose first significant token is
 // the keyword TABLE is preceded by an identifier (the function name) in FROM
 // position (the token before it is FROM / JOIN / ','), so a scalar call like
 // count(table) outside FROM is left untouched. Any trailing `[AS] alias` is left
 // in place so PG parses it onto the placeholder TableRef (reattached later).
+// Also dispatches the SQL-native-AI FROM islands ML_PREDICT / VECTOR_SEARCH, which
+// share the exact `name(TABLE ...)`-in-FROM detection: the function-name token
+// selects which structural parser + placeholder prefix to use, so a single scanner
+// covers all three (and there is no double-detection risk of the generic PTF path
+// swallowing an ML_PREDICT / VECTOR_SEARCH first).
 std::string rewrite_table_functions(std::string_view sql,
-                                    std::vector<ast::ProcessTableFunctionClause>& sites) {
+                                    std::vector<ast::ProcessTableFunctionClause>& sites,
+                                    std::vector<ast::MlPredictClause>& ml_sites,
+                                    std::vector<ast::VectorSearchClause>& vs_sites) {
     std::string out;
     out.reserve(sql.size());
     std::size_t i = 0;
@@ -812,12 +1123,29 @@ std::string rewrite_table_functions(std::string_view sql,
                         throw TranslationError("process table function: unbalanced parentheses", 0);
                     }
                     const std::string_view body = sql.substr(body_start, (k - 1) - body_start);
-                    ast::ProcessTableFunctionClause clause =
-                        parse_process_table_function(fn_name, body);
+                    std::string fn_lower;
+                    fn_lower.reserve(fn_name.size());
+                    for (const char ch : fn_name) {
+                        fn_lower.push_back(lower(ch));
+                    }
                     out.erase(ts);  // drop the function-name token + trailing ws
-                    out.append(kProcessTableFunctionPrefix);
-                    out.append(std::to_string(sites.size()));
-                    sites.push_back(std::move(clause));
+                    if (fn_lower == "ml_predict") {
+                        ast::MlPredictClause clause = parse_ml_predict(body);
+                        out.append(kMlPredictPrefix);
+                        out.append(std::to_string(ml_sites.size()));
+                        ml_sites.push_back(std::move(clause));
+                    } else if (fn_lower == "vector_search") {
+                        ast::VectorSearchClause clause = parse_vector_search(body);
+                        out.append(kVectorSearchPrefix);
+                        out.append(std::to_string(vs_sites.size()));
+                        vs_sites.push_back(std::move(clause));
+                    } else {
+                        ast::ProcessTableFunctionClause clause =
+                            parse_process_table_function(fn_name, body);
+                        out.append(kProcessTableFunctionPrefix);
+                        out.append(std::to_string(sites.size()));
+                        sites.push_back(std::move(clause));
+                    }
                     i = k;  // resume past the closing ')'; any trailing alias flows to PG
                     continue;
                 }
@@ -1080,15 +1408,81 @@ std::string strip_analyze_table_keyword(std::string_view sql) {
     return out;
 }
 
+// Rewrite each leading `CREATE MODEL ...` statement to a placeholder
+// `CREATE TABLE __clink_model_N (...)` statement (which libpg_query parses), recording
+// the structurally-parsed CreateModelStmt for reattach. A statement-boundary walk like
+// strip_analyze_table_keyword: at each top-level statement start, if it is CREATE MODEL,
+// replace the whole statement text; otherwise copy verbatim (so CREATE TABLE / VIEW /
+// MATERIALIZED VIEW fall through to libpg_query untouched).
+std::string rewrite_create_model(std::string_view sql, std::vector<ast::CreateModelStmt>& sites) {
+    std::string out;
+    out.reserve(sql.size());
+    std::size_t i = 0;
+    bool stmt_start = true;
+    while (i < sql.size()) {
+        if (stmt_start) {
+            const std::size_t k = skip_ws(sql, i);  // leading ws + comments
+            out.append(sql.substr(i, k - i));
+            i = k;
+            stmt_start = false;
+            if (i >= sql.size()) {
+                break;
+            }
+            if (word_at(sql, i, "create")) {
+                const std::size_t a = skip_ws(sql, i + std::string_view("create").size());
+                if (word_at(sql, a, "model")) {
+                    // Statement extent: up to the next top-level ';' or end of input.
+                    std::size_t j = i;
+                    while (j < sql.size()) {
+                        const std::size_t q = skip_quote_or_comment(sql, j);
+                        if (q != j) {
+                            j = q;
+                            continue;
+                        }
+                        if (sql[j] == ';') {
+                            break;
+                        }
+                        ++j;
+                    }
+                    sites.push_back(parse_create_model(sql.substr(i, j - i)));
+                    out.append("CREATE TABLE ");
+                    out.append(kCreateModelPrefix);
+                    out.append(std::to_string(sites.size() - 1));
+                    out.append(" (__clink_model_marker BIGINT)");
+                    i = j;  // resume at ';' or end; the ';' (if any) copied below
+                }
+            }
+            continue;
+        }
+        const std::size_t q = skip_quote_or_comment(sql, i);
+        if (q != i) {  // a string/comment: copy verbatim
+            out.append(sql.substr(i, q - i));
+            i = q;
+            continue;
+        }
+        const char c = sql[i];
+        out.push_back(c);
+        ++i;
+        if (c == ';') {
+            stmt_start = true;
+        }
+    }
+    return out;
+}
+
 PreparseResult preparse(std::string_view sql) {
     PreparseResult res;
     // Rewrite the FROM-clause islands PG cannot grammar-parse to placeholder
-    // table refs (MATCH_RECOGNIZE, then process-table-function), then rewrite
-    // composite-type islands on the result. The three are independent. The
-    // ANALYZE-TABLE keyword strip runs first (a leading-statement rewrite).
+    // table refs (MATCH_RECOGNIZE, then the table-function family: process-table
+    // functions plus the SQL-native-AI ML_PREDICT / VECTOR_SEARCH), then rewrite
+    // composite-type islands on the result. The passes are independent. The
+    // leading-statement rewrites (ANALYZE-TABLE keyword strip, then CREATE MODEL)
+    // run first.
     const std::string an_sql = strip_analyze_table_keyword(sql);
-    const std::string mr_sql = rewrite_match_recognize(an_sql, res.match_recognize);
-    const std::string ptf_sql = rewrite_table_functions(mr_sql, res.table_functions);
+    const std::string cm_sql = rewrite_create_model(an_sql, res.models);
+    const std::string mr_sql = rewrite_match_recognize(cm_sql, res.match_recognize);
+    const std::string ptf_sql =
+        rewrite_table_functions(mr_sql, res.table_functions, res.ml_predicts, res.vector_searches);
     res.rewritten_sql = rewrite_composite_types(ptf_sql, res.composite_types);
     return res;
 }
@@ -1249,6 +1643,72 @@ void reattach_stmt_ptf(ast::Statement& stmt, std::vector<ast::ProcessTableFuncti
     }
 }
 
+// Generic FROM-island reattach for the SQL-native-AI clauses (ML_PREDICT /
+// VECTOR_SEARCH): swap a "<prefix>N" placeholder TableRef for sites[N] (carrying the
+// alias), drop the mirror from from_clause, and recurse into subqueries / set-op
+// branches / CTEs. Clause must be a FromItem variant alternative carrying an `alias`.
+template <class Clause>
+void reattach_select_island(ast::SelectStmt& sel,
+                            std::vector<Clause>& sites,
+                            const std::string& prefix) {
+    for (auto& item : sel.from_items) {
+        if (auto* tr = std::get_if<ast::TableRef>(&item)) {
+            if (tr->name.rfind(prefix, 0) != 0) {
+                continue;
+            }
+            std::size_t idx = 0;
+            try {
+                idx = static_cast<std::size_t>(std::stoul(tr->name.substr(prefix.size())));
+            } catch (...) {
+                continue;
+            }
+            if (idx >= sites.size()) {
+                continue;
+            }
+            if (tr->alias.has_value() && !sites[idx].alias.has_value()) {
+                sites[idx].alias = tr->alias;
+            }
+            const std::string placeholder = tr->name;
+            item = std::make_unique<Clause>(std::move(sites[idx]));
+            sel.from_clause.erase(
+                std::remove_if(sel.from_clause.begin(),
+                               sel.from_clause.end(),
+                               [&](const ast::TableRef& t) { return t.name == placeholder; }),
+                sel.from_clause.end());
+        } else if (auto* sub = std::get_if<std::unique_ptr<ast::SubqueryItem>>(&item)) {
+            if (*sub && (*sub)->body) {
+                reattach_select_island(*(*sub)->body, sites, prefix);
+            }
+        }
+    }
+    if (sel.larg) {
+        reattach_select_island(*sel.larg, sites, prefix);
+    }
+    if (sel.rarg) {
+        reattach_select_island(*sel.rarg, sites, prefix);
+    }
+    for (auto& cte : sel.with_clause) {
+        if (cte.body) {
+            reattach_select_island(*cte.body, sites, prefix);
+        }
+    }
+}
+
+template <class Clause>
+void reattach_stmt_island(ast::Statement& stmt,
+                          std::vector<Clause>& sites,
+                          const std::string& prefix) {
+    if (auto* sel = std::get_if<ast::SelectStmt>(&stmt)) {
+        reattach_select_island(*sel, sites, prefix);
+    } else if (auto* ins = std::get_if<ast::InsertStmt>(&stmt)) {
+        reattach_select_island(ins->select, sites, prefix);
+    } else if (auto* ex = std::get_if<std::unique_ptr<ast::ExplainStmt>>(&stmt)) {
+        if (*ex) {
+            reattach_stmt_island((*ex)->query, sites, prefix);
+        }
+    }
+}
+
 }  // namespace
 
 void reattach_match_recognize(ast::Script& script,
@@ -1268,6 +1728,53 @@ void reattach_process_table_functions(
     }
     for (auto& stmt : script.statements) {
         reattach_stmt_ptf(stmt, table_functions);
+    }
+}
+
+void reattach_create_models(ast::Script& script, std::vector<ast::CreateModelStmt>& models) {
+    if (models.empty()) {
+        return;
+    }
+    const std::string prefix = kCreateModelPrefix;
+    for (auto& stmt : script.statements) {
+        auto* create = std::get_if<ast::CreateTableStmt>(&stmt);
+        if (create == nullptr || create->table_name.rfind(prefix, 0) != 0) {
+            continue;
+        }
+        std::size_t idx = 0;
+        try {
+            idx = static_cast<std::size_t>(std::stoul(create->table_name.substr(prefix.size())));
+        } catch (...) {
+            continue;
+        }
+        if (idx >= models.size()) {
+            continue;
+        }
+        // Swap the whole Statement for the recorded CreateModelStmt. emplace<T> is
+        // used rather than converting assignment so the alternative is selected
+        // unambiguously (the variant holds move-only alternatives).
+        stmt.emplace<ast::CreateModelStmt>(std::move(models[idx]));
+    }
+}
+
+void reattach_ml_predicts(ast::Script& script, std::vector<ast::MlPredictClause>& ml_predicts) {
+    if (ml_predicts.empty()) {
+        return;
+    }
+    const std::string prefix = kMlPredictPrefix;
+    for (auto& stmt : script.statements) {
+        reattach_stmt_island(stmt, ml_predicts, prefix);
+    }
+}
+
+void reattach_vector_searches(ast::Script& script,
+                              std::vector<ast::VectorSearchClause>& vector_searches) {
+    if (vector_searches.empty()) {
+        return;
+    }
+    const std::string prefix = kVectorSearchPrefix;
+    for (auto& stmt : script.statements) {
+        reattach_stmt_island(stmt, vector_searches, prefix);
     }
 }
 

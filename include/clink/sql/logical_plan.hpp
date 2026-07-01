@@ -376,6 +376,112 @@ private:
     std::shared_ptr<arrow::Schema> schema_;
 };
 
+// SQL-native AI: ML_PREDICT applies a registered model to each input row and appends
+// the model's OUTPUT columns. The output schema is a FRESH schema (input columns
+// followed by the model OUTPUT columns), built by the binder from the catalog
+// ModelDef. feature_columns are the DESCRIPTOR columns, positional against the model
+// INPUT; output_columns are the model OUTPUT column names the runtime op appends.
+class LogicalMlPredict final : public LogicalPlan {
+public:
+    LogicalMlPredict(std::unique_ptr<LogicalPlan> input,
+                     std::string model_name,
+                     std::vector<std::string> feature_columns,
+                     std::vector<std::string> output_columns,
+                     std::map<std::string, std::string> model_properties,
+                     std::shared_ptr<arrow::Schema> schema)
+        : input_(std::move(input)),
+          model_name_(std::move(model_name)),
+          feature_columns_(std::move(feature_columns)),
+          output_columns_(std::move(output_columns)),
+          model_properties_(std::move(model_properties)),
+          schema_(std::move(schema)) {}
+
+    [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
+    [[nodiscard]] const std::string& model_name() const noexcept { return model_name_; }
+    [[nodiscard]] const std::vector<std::string>& feature_columns() const noexcept {
+        return feature_columns_;
+    }
+    [[nodiscard]] const std::vector<std::string>& output_columns() const noexcept {
+        return output_columns_;
+    }
+    // The model's provider WITH-options (provider / endpoint / task / ...), threaded
+    // to the runtime operator's params so a TaskManager (which has no catalog) can
+    // build the model provider from the JobGraphSpec alone.
+    [[nodiscard]] const std::map<std::string, std::string>& model_properties() const noexcept {
+        return model_properties_;
+    }
+
+    [[nodiscard]] std::string kind() const override { return "MlPredict"; }
+    [[nodiscard]] std::shared_ptr<arrow::Schema> schema() const override { return schema_; }
+    [[nodiscard]] std::vector<const LogicalPlan*> inputs() const override { return {input_.get()}; }
+
+private:
+    std::unique_ptr<LogicalPlan> input_;
+    std::string model_name_;
+    std::vector<std::string> feature_columns_;
+    std::vector<std::string> output_columns_;
+    std::map<std::string, std::string> model_properties_;
+    std::shared_ptr<arrow::Schema> schema_;
+};
+
+// SQL-native AI: VECTOR_SEARCH emits, for each input row, its top_k nearest rows from
+// a vector table by a distance metric. The output schema is a FRESH schema (input
+// columns, then the vector-table columns, then a synthetic `score DOUBLE`). Holds a
+// const TableDef* into the catalog (which outlives the plan, like LogicalScan) so the
+// physical planner can thread the vector table's connector properties to the runtime
+// operator that bounded-loads and indexes it.
+class LogicalVectorSearch final : public LogicalPlan {
+public:
+    LogicalVectorSearch(std::unique_ptr<LogicalPlan> input,
+                        const TableDef* vector_table,
+                        std::string query_column,
+                        std::string index_column,
+                        std::int64_t top_k,
+                        std::string metric,
+                        std::vector<std::string> input_columns,
+                        std::vector<std::string> vector_columns,
+                        std::shared_ptr<arrow::Schema> schema)
+        : input_(std::move(input)),
+          vector_table_(vector_table),
+          query_column_(std::move(query_column)),
+          index_column_(std::move(index_column)),
+          metric_(std::move(metric)),
+          top_k_(top_k),
+          input_columns_(std::move(input_columns)),
+          vector_columns_(std::move(vector_columns)),
+          schema_(std::move(schema)) {}
+
+    [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
+    [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
+    [[nodiscard]] const TableDef& vector_table() const noexcept { return *vector_table_; }
+    [[nodiscard]] const std::string& query_column() const noexcept { return query_column_; }
+    [[nodiscard]] const std::string& index_column() const noexcept { return index_column_; }
+    [[nodiscard]] std::int64_t top_k() const noexcept { return top_k_; }
+    [[nodiscard]] const std::string& metric() const noexcept { return metric_; }
+    [[nodiscard]] const std::vector<std::string>& input_columns() const noexcept {
+        return input_columns_;
+    }
+    [[nodiscard]] const std::vector<std::string>& vector_columns() const noexcept {
+        return vector_columns_;
+    }
+
+    [[nodiscard]] std::string kind() const override { return "VectorSearch"; }
+    [[nodiscard]] std::shared_ptr<arrow::Schema> schema() const override { return schema_; }
+    [[nodiscard]] std::vector<const LogicalPlan*> inputs() const override { return {input_.get()}; }
+
+private:
+    std::unique_ptr<LogicalPlan> input_;
+    const TableDef* vector_table_;
+    std::string query_column_;
+    std::string index_column_;
+    std::string metric_;
+    std::int64_t top_k_;
+    std::vector<std::string> input_columns_;
+    std::vector<std::string> vector_columns_;
+    std::shared_ptr<arrow::Schema> schema_;
+};
+
 // Join variety for the stream-stream joins (equi and interval). Inner emits
 // matched pairs only; the outer variants additionally emit null-padded rows for
 // unmatched rows on the kept side(s). The equi join retracts a null-padded row

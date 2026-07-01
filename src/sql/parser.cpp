@@ -41,6 +41,9 @@ ast::Script parse(std::string_view sql) {
         preparse::reattach_composite_types(script, pre.composite_types);
         preparse::reattach_match_recognize(script, pre.match_recognize);
         preparse::reattach_process_table_functions(script, pre.table_functions);
+        preparse::reattach_create_models(script, pre.models);
+        preparse::reattach_ml_predicts(script, pre.ml_predicts);
+        preparse::reattach_vector_searches(script, pre.vector_searches);
         pg_query_free_parse_result(result);
         const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - t0)
