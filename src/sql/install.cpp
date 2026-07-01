@@ -5323,19 +5323,39 @@ private:
     std::int64_t to_skip_;
 };
 
-// Dedupe operator. Maintains an unordered_set keyed by the
-// canonical serialization of the input Row's value map. Emits each
-// unique row at most once. State grows unbounded; pair with a
-// row_compute_key upstream so each subtask sees only the records
-// hashing to it.
+// Dedupe operator. Holds one presence marker per distinct row in
+// KeyedState, so the seen-set is CHECKPOINTED and survives failover: the
+// former in-memory FlatSet was not snapshotted, so a restore replayed
+// already-emitted rows and broke DISTINCT's at-most-once contract. On a
+// deferring (RemoteReadBackend) backend the per-key presence read runs
+// through the async path, so the seen-set spills / disaggregates like any
+// other keyed state. State grows unbounded; pair with a row_compute_key
+// upstream (the planner always does) so each subtask sees only the rows
+// hashing to it. The state key is built from the SAME columns with the
+// SAME serialize(0) encoding as GROUP BY's group_key_, so a row's per-key
+// state lands in the same key-group its record routes to.
 class DistinctRowOp final : public Operator<Row, Row> {
 public:
+    explicit DistinctRowOp(std::vector<std::string> columns = {}) : columns_(std::move(columns)) {}
+
+    // Ride the async/disaggregated KeyedState path whenever the bound
+    // backend can genuinely defer reads (supports_async_get()); on a
+    // non-deferring backend (memory/file/changelog) this stays false and
+    // process() drives the synchronous KeyedState get/put. Either way the
+    // seen-set is checkpointed - unlike the former in-memory set.
+    void open() override {
+        effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
+                           this->runtime()->state_backend()->supports_async_get();
+    }
+
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (element.is_data()) {
             Batch<Row> emit_batch;
+            auto kv = keyed_state_();
             for (const auto& rec : element.as_data()) {
-                std::string key = render_key_(rec.value());
-                if (seen_.insert(std::move(key)).second) {
+                const std::string key = state_key_(rec.value());
+                if (!kv.get(key).has_value()) {
+                    kv.put(key, kSeen);
                     emit_batch.push(rec);
                 }
             }
@@ -5348,17 +5368,78 @@ public:
         }
     }
 
+    [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
+
+    // ASYNC-10 read coalescing: each record's process_async issues one
+    // get_async for its row key, so a batch reading many distinct rows
+    // collapses into one get_many_async. No-op on a non-deferring backend.
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
+
+    void process_async(const StreamElement<Row>& element,
+                       Emitter<Row>& out,
+                       AsyncExecutionController& aec) override {
+        if (!element.is_data()) {
+            return;  // the runner routes watermarks/barriers through the controller
+        }
+        auto kv = keyed_state_();
+        for (const auto& rec : element.as_data()) {
+            std::string key = state_key_(rec.value());
+            auto factory = [kv, rec, key, &out]() mutable -> async::Task<void> {
+                auto cur = co_await kv.get_async(key);
+                if (!cur.has_value()) {
+                    kv.put(key, kSeen);
+                    Batch<Row> b;
+                    b.push(std::move(rec));
+                    out.emit_data(std::move(b));
+                }
+                co_return;
+            };
+            // Backpressure: at the in-flight cap submit() refuses without
+            // consuming the factory; poll_or_flush() drains completions
+            // (and flushes parked coalesced reads) and we retry.
+            while (!aec.submit(key, factory)) {
+                aec.poll_or_flush();
+            }
+        }
+    }
+
     std::string name() const override { return "distinct_row"; }
 
 private:
-    static std::string render_key_(const Row& row) {
-        // Order-stable: row.values is a std::map (sorted by key), so
-        // serialize(0) produces a deterministic string per row.
-        clink::config::JsonObject obj = row.values;
-        return clink::config::JsonValue{std::move(obj)}.serialize(0);
+    // The KeyedState key for a row: its dedup identity. Built byte-for-byte
+    // like GROUP BY's group_key_ - each column's serialize(0) joined on
+    // '\x1f', a null/absent column contributing the empty string - over the
+    // SAME columns the upstream row_compute_key hashes, so the state
+    // key-group matches the record's routing key-group. Falls back to the
+    // full-row JSON serialization when no columns are declared (parallelism
+    // 1, no upstream keyer) - the historical dedup identity.
+    std::string state_key_(const Row& row) const {
+        if (columns_.empty()) {
+            clink::config::JsonObject obj = row.values;
+            return clink::config::JsonValue{std::move(obj)}.serialize(0);
+        }
+        std::string key;
+        for (std::size_t i = 0; i < columns_.size(); ++i) {
+            if (i > 0)
+                key += '\x1f';
+            auto vit = row.values.find(columns_[i]);
+            if (vit != row.values.end() && !vit->second.is_null()) {
+                key += vit->second.serialize(0);
+            }
+        }
+        return key;
     }
 
-    clink::FlatSet<std::string> seen_;
+    KeyedState<std::string, std::string> keyed_state_() {
+        return this->runtime()->template keyed_state<std::string, std::string>(
+            "distinct", clink::string_codec(), clink::string_codec());
+    }
+
+    // Value is a presence marker only; get().has_value() answers "seen?".
+    static inline const std::string kSeen = "1";
+
+    std::vector<std::string> columns_;
+    bool effective_async_ = false;
 };
 
 // Stream-stream interval join over Row records.
@@ -7233,11 +7314,29 @@ void install(clink::plugin::PluginRegistry& reg) {
             return std::make_shared<LimitRowOp>(count, offset);
         });
 
-    // distinct_row: dedupe each Row across the run. No params.
-    reg.register_operator<Row, Row>("distinct_row",
-                                    [](const BuildContext&) -> std::shared_ptr<Operator<Row, Row>> {
-                                        return std::make_shared<DistinctRowOp>();
-                                    });
+    // distinct_row: dedupe each Row across the run. The seen-set is a
+    // checkpointed KeyedState presence-marker per distinct row (failover-safe)
+    // and rides the async path on a deferring backend. 'columns' (csv, set by
+    // the planner) are the dedup columns - the same set the upstream
+    // row_compute_key hashes, so the per-key state routes with the record.
+    reg.register_operator<Row, Row>(
+        "distinct_row", [](const BuildContext& ctx) -> std::shared_ptr<Operator<Row, Row>> {
+            std::vector<std::string> columns;
+            const auto csv = ctx.param_or("columns", "");
+            std::size_t pos = 0;
+            while (pos <= csv.size()) {
+                auto end = csv.find(',', pos);
+                if (end == std::string::npos)
+                    end = csv.size();
+                auto k = csv.substr(pos, end - pos);
+                if (!k.empty())
+                    columns.push_back(std::move(k));
+                if (end == csv.size())
+                    break;
+                pos = end + 1;
+            }
+            return std::make_shared<DistinctRowOp>(std::move(columns));
+        });
 
     // aggregate_row: unbounded GROUP BY (no window TVF). Params mirror
     // the window factories minus the time/size knobs:

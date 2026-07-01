@@ -398,6 +398,99 @@ TEST(SqlRuntime, GroupByAutoActivatesAsyncOnDeferringBackend) {
         << "auto-on did not route GROUP BY state through the deferring backend";
 }
 
+// SELECT DISTINCT dedups end-to-end AND rides the checkpointed KeyedState path,
+// auto-activating the async/disaggregated path on a deferring backend. The op
+// once held an in-memory FlatSet that was never snapshotted (a restore replayed
+// already-emitted rows); it is now a KeyedState presence-marker per distinct
+// row. Baseline (in-memory backend, sync KeyedState) and a RemoteReadBackend
+// (disagg-local://) must dedup identically; remote_loads() proves the seen-set
+// was read THROUGH the deferring tier - the sync path leaves it 0. Cluster-free
+// (VectorSource -> distinct_row -> CollectingSink) so the backend + its counters
+// are injectable. Also locks the planner contract that distinct_row is handed
+// the dedup columns, so its state key routes to the record's key-group.
+TEST(SqlRuntime, SelectDistinctDedupsAndAutoRidesDeferringBackend) {
+    ensure_sql_installed_once();
+
+    Catalog cat;
+    auto ddl = parse(
+        std::string{"CREATE TABLE clicks (user_id BIGINT, url TEXT) "
+                    "WITH (connector='file', format='json', path='/tmp/distinct_clicks.ndjson');"
+                    "CREATE TABLE out_t (user_id BIGINT, url TEXT) "
+                    "WITH (connector='file', format='json', path='/tmp/distinct_out.ndjson')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat, "INSERT INTO out_t SELECT DISTINCT user_id, url FROM clicks");
+
+    std::map<std::string, std::string> dist_params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "distinct_row") {
+            dist_params = op.params;
+        }
+    }
+    ASSERT_FALSE(dist_params.empty()) << "no distinct_row op in the compiled spec";
+    EXPECT_EQ(dist_params.at("columns"), "user_id,url")
+        << "planner must hand distinct_row the dedup columns for a routing-consistent state key";
+
+    // (1,a) x3, (1,b), (2,a) -> 3 distinct rows.
+    auto mk = [](std::int64_t uid, const char* url) {
+        Row r;
+        r.values["user_id"] = clink::config::JsonValue{static_cast<double>(uid)};
+        r.values["url"] = clink::config::JsonValue{std::string{url}};
+        return Record<Row>{std::move(r)};
+    };
+    const std::vector<Record<Row>> input = {
+        mk(1, "a"),
+        mk(1, "a"),
+        mk(1, "b"),
+        mk(2, "a"),
+        mk(1, "a"),
+    };
+
+    auto build_distinct = [&]() {
+        const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+            "distinct_row", std::string{kChannelRow}, std::string{kChannelRow});
+        EXPECT_NE(factory, nullptr);
+        cluster::OperatorBuildContext octx;
+        octx.params = dist_params;
+        return std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+    };
+
+    auto run_on = [&](std::shared_ptr<StateBackend> backend) {
+        Dag dag;
+        auto src = std::make_shared<VectorSource<Row>>(input);
+        auto h_src = dag.add_source<Row>(src);
+        auto h_op = dag.add_operator<Row, Row>(h_src, build_distinct());
+        auto sink = std::make_shared<CollectingSink<Row>>();
+        dag.add_sink<Row>(h_op, sink);
+        JobConfig cfg;
+        cfg.state_backend = std::move(backend);
+        LocalExecutor exec(std::move(dag), std::move(cfg));
+        exec.run();
+        std::set<std::pair<std::int64_t, std::string>> out;
+        for (const auto& rec : sink->collected_records()) {
+            const Row& row = rec.value();
+            out.emplace(static_cast<std::int64_t>(row.values.at("user_id").as_number()),
+                        row.values.at("url").as_string());
+        }
+        return out;
+    };
+
+    const std::set<std::pair<std::int64_t, std::string>> expected = {{1, "a"}, {1, "b"}, {2, "a"}};
+
+    // Baseline: non-deferring in-memory backend -> synchronous KeyedState path.
+    EXPECT_EQ(run_on(std::make_shared<InMemoryStateBackend>()), expected);
+
+    // Auto-on: a deferring backend activates the async KeyedState path with no
+    // manual flag. Identical dedup, and remote_loads() >= 3 (three distinct
+    // rows => three first-touch cold reads) proves it rode the deferring tier.
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    EXPECT_EQ(run_on(rrb), expected);
+    EXPECT_GE(rrb->remote_loads(), 3u)
+        << "auto-on did not route DISTINCT state through the deferring backend";
+}
+
 // Regression for the coalescing async submit-retry livelock: a single batch that
 // carries MORE than the in-flight cap (kDefaultMaxInFlight = 6000) distinct keys
 // fills the cap mid-batch. With coalesce_reads() on (auto for GROUP BY over a

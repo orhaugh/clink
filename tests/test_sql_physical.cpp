@@ -2143,6 +2143,10 @@ TEST(SqlPhysical, SelectDistinctEmitsDistinctRowKeyedByAllColumns) {
     EXPECT_EQ(keyer->params.at("columns"), "user_id,url");
     ASSERT_EQ(dist->inputs.size(), 1u);
     EXPECT_EQ(dist->inputs[0], keyer->id);
+    // distinct_row builds its checkpointed per-row KeyedState key from the SAME
+    // columns the keyer hashes, so the seen-marker routes to the record's
+    // key-group. The planner must therefore hand it the identical column list.
+    EXPECT_EQ(dist->params.at("columns"), "user_id,url");
 }
 
 TEST(SqlPhysical, HavingEmitsFilterRowPredicateAfterAggregate) {

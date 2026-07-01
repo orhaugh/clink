@@ -1610,7 +1610,7 @@ std::string compile_node(const LogicalPlan& node,
             keyer.type = "row_compute_key";
             keyer.inputs = {std::move(input_id)};
             keyer.out_channel = std::string{kChannelRow};
-            keyer.params["columns"] = std::move(columns_csv);
+            keyer.params["columns"] = columns_csv;
             input_id = keyer.id;
             spec.ops.push_back(std::move(keyer));
         }
@@ -1620,6 +1620,10 @@ std::string compile_node(const LogicalPlan& node,
         op.inputs = {std::move(input_id)};
         op.out_channel = std::string{kChannelRow};
         op.key_by = "row_key";
+        // The dedup columns: distinct_row builds its checkpointed per-row
+        // KeyedState key from these with the same encoding row_compute_key
+        // hashes, so the seen-marker routes to the record's key-group.
+        op.params["columns"] = std::move(columns_csv);
         std::string id = op.id;
         spec.ops.push_back(std::move(op));
         return id;
