@@ -143,6 +143,9 @@
 #ifdef CLINK_LINKED_WEBHDFS
 #include "clink/webhdfs/install.hpp"
 #endif
+#ifdef CLINK_LINKED_VECTOR_SEARCH
+#include "clink/vector_search/install.hpp"
+#endif
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/rocksdb/install.hpp"
 #endif
@@ -2562,6 +2565,11 @@ void install_linked_impls() {
     // what the nexmark benchmarks register; re-registering the (already-installed)
     // blackhole_sink_row is harmless (same as the benchmarks do).
     clink::nexmark::register_nexmark_factories(reg);
+#ifdef CLINK_LINKED_VECTOR_SEARCH
+    // SQL-native AI: the vector_search_row operator. Registered after
+    // clink::sql::install so the Row channel type it keys on already exists.
+    clink::vector_search::install(reg);
+#endif
 #endif
 }
 

@@ -46,6 +46,9 @@
 #include "clink/sql/analyze.hpp"
 #include "clink/sql/async_function_registry.hpp"
 #include "clink/sql/binder.hpp"
+#ifdef CLINK_TESTS_HAVE_VECTOR_SEARCH
+#include "clink/vector_search/install.hpp"
+#endif
 #include "clink/sql/cardinality.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/install.hpp"
@@ -93,6 +96,10 @@ void ensure_sql_installed_once() {
         cluster::ensure_built_ins_registered();
         clink::plugin::PluginRegistry reg;
         clink::sql::install(reg);
+#ifdef CLINK_TESTS_HAVE_VECTOR_SEARCH
+        // SQL-native AI: register vector_search_row after the Row channel exists.
+        clink::vector_search::install(reg);
+#endif
         return true;
     }();
     (void)done;
@@ -10941,5 +10948,66 @@ TEST(SqlAnalyzeStmt, RejectsUnboundedSource) {
     EXPECT_THROW(analyze_table(cat, "s"), TranslationError);
     EXPECT_THROW(analyze_table(cat, "no_such_table"), TranslationError);
 }
+
+#ifdef CLINK_TESTS_HAVE_VECTOR_SEARCH
+// SQL-native AI end to end: VECTOR_SEARCH loads a bounded corpus at open(), then
+// emits each query row joined to its top-k nearest corpus rows + a score. The
+// operator runs on the in-process cluster; the corpus file source is loaded via the
+// same registry the SQL Row sources register into.
+TEST(SqlRuntime, VectorSearchTopKEndToEnd) {
+    ensure_sql_installed_once();
+    const auto docs = std::filesystem::temp_directory_path() / "clink_vs_docs.ndjson";
+    const auto queries = std::filesystem::temp_directory_path() / "clink_vs_queries.ndjson";
+    const auto out = std::filesystem::temp_directory_path() / "clink_vs_out.ndjson";
+    std::filesystem::remove(docs);
+    std::filesystem::remove(queries);
+    std::filesystem::remove(out);
+    write_lines(docs,
+                {R"({"doc_id":1,"vec":[1.0,0.0],"title":"east"})",
+                 R"({"doc_id":2,"vec":[0.0,1.0],"title":"north"})",
+                 R"({"doc_id":3,"vec":[1.0,1.0],"title":"ne"})"});
+    write_lines(queries, {R"({"qid":1,"emb":[1.0,0.1]})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE q (qid BIGINT, emb DOUBLE PRECISION ARRAY) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     queries.string() +
+                     "');"
+                     "CREATE TABLE docs (doc_id BIGINT, vec DOUBLE PRECISION ARRAY, title TEXT) "
+                     "WITH (connector='file', format='json', path='" +
+                     docs.string() +
+                     "');"
+                     "CREATE TABLE vout (qid BIGINT, emb DOUBLE PRECISION ARRAY, doc_id BIGINT, "
+                     "vec DOUBLE PRECISION ARRAY, title TEXT, score DOUBLE PRECISION) "
+                     "WITH (connector='file', format='json', path='" +
+                     out.string() + "')");
+    for (int i = 0; i < 3; ++i) {
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[i]));
+    }
+    auto spec = compile(cat,
+                        "INSERT INTO vout SELECT * FROM VECTOR_SEARCH("
+                        "TABLE q, emb, docs, DESCRIPTOR(vec), 1, metric='cosine')");
+
+    InProcessCluster cluster("tm-sql-vs", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out);
+    ASSERT_EQ(lines.size(), 1U) << "expected one top-1 hit for the single query";
+    auto js = clink::config::parse(lines[0]);
+    ASSERT_TRUE(js.is_object());
+    EXPECT_EQ(static_cast<std::int64_t>(js.at("qid").as_number()), 1);
+    EXPECT_EQ(static_cast<std::int64_t>(js.at("doc_id").as_number()), 1);  // [1,0] is nearest
+    EXPECT_EQ(js.at("title").as_string(), "east");
+    EXPECT_GT(js.at("score").as_number(), 0.9);  // cosine similarity ~0.995
+    std::filesystem::remove(docs);
+    std::filesystem::remove(queries);
+    std::filesystem::remove(out);
+}
+#endif  // CLINK_TESTS_HAVE_VECTOR_SEARCH
 
 }  // namespace clink::sql

@@ -327,12 +327,13 @@ TEST(SqlAiPhysical, VectorSearchLowersToVectorSearchRow) {
     EXPECT_EQ(op->params.at("index_column"), "vec");
     EXPECT_EQ(op->params.at("top_k"), "7");
     EXPECT_EQ(op->params.at("metric"), "l2");
-    EXPECT_EQ(op->params.at("vector_table_connector"), "file");
-    EXPECT_EQ(op->params.at("input_columns"), "id,emb");
     EXPECT_EQ(op->params.at("vector_columns"), "doc_id,vec,title");
-    // The vector table's connector props are namespaced under vector_table.*
+    // The corpus is resolved to a bounded Row source factory + namespaced build params.
+    EXPECT_EQ(op->params.at("vector_source_factory"), "file_json_source");
     EXPECT_EQ(op->params.at("vector_table.path"), "/tmp/docs.ndjson");
-    EXPECT_FALSE(op->params.at("vector_schema_columns").empty());
+    EXPECT_FALSE(op->params.at("vector_table.schema_columns").empty());
+    // The raw connector name is not leaked as a bare param.
+    EXPECT_EQ(op->params.count("vector_table_connector"), 0u);
 }
 
 }  // namespace clink::sql

@@ -1414,21 +1414,25 @@ std::string compile_node(const LogicalPlan& node,
             return out;
         };
         const TableDef& vtab = vs.vector_table();
+        // Resolve the vector table to a bounded Row source (the ANALYZE mechanism):
+        // this throws for a string-backed / bridged connector, giving the v1
+        // "corpus must be a Row-native bounded connector (file/parquet)" restriction
+        // for free. The runtime operator rebuilds this source at open() to load +
+        // index the corpus. spec.params already carries the serialised schema_columns.
+        const ScanSourceSpec corpus = row_scan_source_spec(vtab);
         cluster::OperatorSpec op;
         op.id = "vsearch_" + std::to_string(next_id++);
         op.type = "vector_search_row";
         op.inputs = {std::move(input_id)};
         op.out_channel = std::string{kChannelRow};
-        op.params["vector_table_connector"] = require_property(vtab, "connector");
-        for (const auto& [k, v] : build_params(vtab)) {
-            op.params["vector_table." + k] = v;  // namespaced connector props
+        op.params["vector_source_factory"] = corpus.type;
+        for (const auto& [k, v] : corpus.params) {
+            op.params["vector_table." + k] = v;  // namespaced corpus source build params
         }
-        op.params["vector_schema_columns"] = serialize_row_schema(row_columns_of(vtab));
         op.params["query_column"] = vs.query_column();
         op.params["index_column"] = vs.index_column();
         op.params["top_k"] = std::to_string(vs.top_k());
         op.params["metric"] = vs.metric();
-        op.params["input_columns"] = csv(vs.input_columns());
         op.params["vector_columns"] = csv(vs.vector_columns());
         std::string id = op.id;
         spec.ops.push_back(std::move(op));

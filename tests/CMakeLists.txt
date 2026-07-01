@@ -410,6 +410,12 @@ if(CLINK_BUILD_SQL)
         clink::sql
         GTest::gtest_main
     )
+    # SQL-native AI: link the vector_search impl so the in-process SqlRuntime cluster
+    # can register + run vector_search_row end to end (guarded - the impl may be off).
+    if(TARGET clink::vector_search)
+        target_link_libraries(clink_sql_tests PRIVATE clink::vector_search)
+        target_compile_definitions(clink_sql_tests PRIVATE CLINK_TESTS_HAVE_VECTOR_SEARCH)
+    endif()
     target_compile_definitions(clink_sql_tests PRIVATE
         CLINK_SUBMIT_SQL_BINARY=\"$<TARGET_FILE:clink_submit_sql>\"
         CLINK_NODE_BINARY=\"$<TARGET_FILE:clink_node>\")
