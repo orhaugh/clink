@@ -42,6 +42,7 @@
 #include "clink/sql/async_function_registry.hpp"
 #include "clink/sql/delta_row_sink.hpp"
 #include "clink/sql/json_string_to_row_columnar.hpp"
+#include "clink/sql/model_provider.hpp"
 #include "clink/sql/ptf_registry.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
@@ -6758,6 +6759,66 @@ private:
     std::vector<std::string> columns_;
 };
 
+// SQL-native AI: ML_PREDICT applies a model per row and appends its OUTPUT columns.
+// A synchronous flatmap (v1 providers are synchronous - inference is a blocking call
+// on the operator thread, so throughput is one inference at a time; a concurrent /
+// async provider is a documented follow-on). The provider is built once at
+// construction from the model's WITH-options via ModelProviderRegistry.
+class MlPredictRowOp final : public Operator<Row, Row> {
+public:
+    MlPredictRowOp(std::shared_ptr<ModelProvider> provider,
+                   std::vector<std::string> feature_columns,
+                   std::vector<std::string> output_columns)
+        : provider_(std::move(provider)),
+          feature_columns_(std::move(feature_columns)),
+          output_columns_(std::move(output_columns)) {}
+
+    void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        if (element.is_data()) {
+            Batch<Row> emit_batch;
+            for (const auto& rec : element.as_data()) {
+                const Row& in = rec.value();
+                // The features Row is keyed by the DESCRIPTOR feature-column names.
+                Row features;
+                for (const auto& c : feature_columns_) {
+                    auto it = in.values.find(c);
+                    if (it != in.values.end()) {
+                        features.values[c] = it->second;
+                    }
+                }
+                const Row prediction = provider_->predict(features);
+                Row out_row = in;  // carry input columns + __row_kind through
+                for (const auto& oc : output_columns_) {
+                    auto it = prediction.values.find(oc);
+                    out_row.values[oc] =
+                        it != prediction.values.end() ? it->second : clink::config::JsonValue{};
+                }
+                if (rec.event_time().has_value()) {
+                    emit_batch.push(Record<Row>{std::move(out_row), *rec.event_time()});
+                } else {
+                    emit_batch.push(Record<Row>{std::move(out_row)});
+                }
+            }
+            if (!emit_batch.empty()) {
+                out.emit_data(std::move(emit_batch));
+            }
+        } else if (element.is_watermark()) {
+            this->on_watermark(element.as_watermark(), out);
+        } else if (element.is_barrier()) {
+            this->on_barrier(element.as_barrier(), out);
+        } else if (element.is_drain()) {
+            out.emit_drain(element.as_drain());
+        }
+    }
+
+    std::string name() const override { return "ml_predict_row"; }
+
+private:
+    std::shared_ptr<ModelProvider> provider_;
+    std::vector<std::string> feature_columns_;
+    std::vector<std::string> output_columns_;
+};
+
 void install(clink::plugin::PluginRegistry& reg) {
     // ---- Channel type ----
     // The Row wire batcher preserves columnar data across TM boundaries: a
@@ -7284,6 +7345,52 @@ void install(clink::plugin::PluginRegistry& reg) {
                                         return std::make_shared<MapOperator<Row, Row>>(
                                             [](const Row& r) { return r; }, "identity_row");
                                     });
+
+    // SQL-native AI: ml_predict_row. Builds the model provider from the namespaced
+    // model.* params (provider / endpoint / task / ...) via ModelProviderRegistry,
+    // injecting the query-level feature/output column lists so the provider knows the
+    // request / response shape. Params: model_name, feature_columns (DESCRIPTOR cols),
+    // output_columns (model OUTPUT cols), output_schema, model.<k> provider config.
+    reg.register_operator<Row, Row>(
+        "ml_predict_row", [](const BuildContext& ctx) -> std::shared_ptr<Operator<Row, Row>> {
+            auto split_csv = [](const std::string& csv) {
+                std::vector<std::string> out;
+                std::size_t start = 0;
+                while (start <= csv.size()) {
+                    const auto comma = csv.find(',', start);
+                    if (comma == std::string::npos) {
+                        if (start < csv.size()) {
+                            out.push_back(csv.substr(start));
+                        }
+                        break;
+                    }
+                    out.push_back(csv.substr(start, comma - start));
+                    start = comma + 1;
+                }
+                return out;
+            };
+            const auto feature_cols = split_csv(ctx.param_or("feature_columns", ""));
+            const auto output_cols = split_csv(ctx.param_or("output_columns", ""));
+            // Reconstruct the provider options from the namespaced model.* params.
+            std::map<std::string, std::string> opts;
+            const std::string prefix = "model.";
+            for (const auto& [k, v] : ctx.params) {
+                if (k.rfind(prefix, 0) == 0) {
+                    opts[k.substr(prefix.size())] = v;
+                }
+            }
+            // Hand the provider the request/response shape (feature + output columns).
+            opts["feature_columns"] = ctx.param_or("feature_columns", "");
+            opts["output_columns"] = ctx.param_or("output_columns", "");
+            opts["output_schema"] = ctx.param_or("output_schema", "");
+            const auto it = opts.find("provider");
+            if (it == opts.end() || it->second.empty()) {
+                throw std::runtime_error(
+                    "ml_predict_row: model has no 'provider' (set it in CREATE MODEL WITH)");
+            }
+            auto provider = ModelProviderRegistry::global().create(it->second, opts);
+            return std::make_shared<MlPredictRowOp>(std::move(provider), feature_cols, output_cols);
+        });
 
     // async_lookup_row. Drives a registered
     // AsyncLookupFn against Row input via AsyncLookupOperator<Row, Row>.

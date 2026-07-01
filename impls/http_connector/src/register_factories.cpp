@@ -12,6 +12,7 @@
 
 #include "clink/http_connector/batched_http_bulk_sink.hpp"
 #include "clink/http_connector/bulk_sink_builders.hpp"
+#include "clink/http_connector/http_model_provider.hpp"
 #include "clink/http_connector/http_poll_source.hpp"
 #include "clink/http_connector/http_request.hpp"
 #include "clink/http_connector/influxdb_sink.hpp"
@@ -67,6 +68,15 @@ HttpRequest::Options pubsub_http_options(const clink::plugin::BuildContext& ctx)
 
 void install(clink::plugin::PluginRegistry& reg) {
     using clink::plugin::BuildContext;
+
+    // SQL-native AI: register the HTTP model-inference provider so ML_PREDICT with a
+    // model declared WITH (provider='http', endpoint='...') can run against a REST
+    // inference endpoint. Registered into the process-wide ModelProviderRegistry
+    // (not the PluginRegistry) - the ml_predict_row operator looks it up by name.
+    clink::sql::ModelProviderRegistry::global().register_provider(
+        "http", [](const std::map<std::string, std::string>& opts) {
+            return make_http_model_provider(opts);
+        });
 
     // http_sink: POST batched records to an HTTP(S) endpoint (a webhook or any
     // bulk-ingest API). Each record is one std::string (a JSON object on the

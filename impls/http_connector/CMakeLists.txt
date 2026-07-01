@@ -31,6 +31,7 @@ endif()
 
 add_library(clink_http_connector STATIC
     src/http_request.cpp
+    src/http_model_provider.cpp
     src/register_factories.cpp
 )
 add_library(clink::http_connector ALIAS clink_http_connector)

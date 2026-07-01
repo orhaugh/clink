@@ -13,6 +13,7 @@ add_executable(clink_http_connector_tests
     test_influxdb_live.cpp
     test_prometheus_sink.cpp
     test_http_poll_source.cpp
+    test_http_model_provider.cpp
     test_http_roundtrip.cpp
     test_token_refresh.cpp
     test_pubsub.cpp

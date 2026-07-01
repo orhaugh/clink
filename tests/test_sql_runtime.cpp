@@ -46,6 +46,7 @@
 #include "clink/sql/analyze.hpp"
 #include "clink/sql/async_function_registry.hpp"
 #include "clink/sql/binder.hpp"
+#include "clink/sql/model_provider.hpp"
 #ifdef CLINK_TESTS_HAVE_VECTOR_SEARCH
 #include "clink/vector_search/install.hpp"
 #endif
@@ -100,6 +101,42 @@ void ensure_sql_installed_once() {
         // SQL-native AI: register vector_search_row after the Row channel exists.
         clink::vector_search::install(reg);
 #endif
+        // SQL-native AI: a deterministic in-process model provider for ML_PREDICT
+        // end-to-end tests (no network). Reads the first feature value, doubles it
+        // into the first OUTPUT column, and sets a second OUTPUT column to "ok".
+        ModelProviderRegistry::global().register_provider(
+            "test_double", [](const std::map<std::string, std::string>& opts) {
+                auto split = [](const std::string& s) {
+                    std::vector<std::string> out;
+                    std::size_t start = 0;
+                    while (start <= s.size()) {
+                        auto comma = s.find(',', start);
+                        auto end = comma == std::string::npos ? s.size() : comma;
+                        if (end > start)
+                            out.push_back(s.substr(start, end - start));
+                        if (comma == std::string::npos)
+                            break;
+                        start = comma + 1;
+                    }
+                    return out;
+                };
+                auto feats = split(opts.count("feature_columns") ? opts.at("feature_columns") : "");
+                auto outs = split(opts.count("output_columns") ? opts.at("output_columns") : "");
+                return make_closure_provider("test_double", [feats, outs](const Row& f) -> Row {
+                    double v = 0.0;
+                    if (!feats.empty()) {
+                        auto it = f.values.find(feats[0]);
+                        if (it != f.values.end() && it->second.is_number())
+                            v = it->second.as_number();
+                    }
+                    Row out;
+                    if (!outs.empty())
+                        out.values[outs[0]] = clink::config::JsonValue{v * 2.0};
+                    if (outs.size() >= 2)
+                        out.values[outs[1]] = clink::config::JsonValue{std::string("ok")};
+                    return out;
+                });
+            });
         return true;
     }();
     (void)done;
@@ -11009,5 +11046,63 @@ TEST(SqlRuntime, VectorSearchTopKEndToEnd) {
     std::filesystem::remove(out);
 }
 #endif  // CLINK_TESTS_HAVE_VECTOR_SEARCH
+
+// SQL-native AI end to end: ML_PREDICT applies a registered model per row and appends
+// its OUTPUT columns. Uses the in-process "test_double" closure provider (no network),
+// so it exercises the full CREATE MODEL -> bind -> ml_predict_row -> provider path.
+TEST(SqlRuntime, MlPredictAppendsModelOutputEndToEnd) {
+    ensure_sql_installed_once();
+    const auto in = std::filesystem::temp_directory_path() / "clink_mlp_in.ndjson";
+    const auto out = std::filesystem::temp_directory_path() / "clink_mlp_out.ndjson";
+    std::filesystem::remove(in);
+    std::filesystem::remove(out);
+    write_lines(in, {R"({"id":1,"n":21})", R"({"id":2,"n":10})"});
+
+    Catalog cat;
+    // The model is a catalog object; ML_PREDICT reads its OUTPUT columns + provider at
+    // bind time. provider='test_double' resolves to the in-process closure provider.
+    auto model_ddl = parse(
+        "CREATE MODEL doubler INPUT (n BIGINT) OUTPUT (doubled DOUBLE PRECISION, tag TEXT) "
+        "WITH (provider='test_double')");
+    cat.register_model(std::get<ast::CreateModelStmt>(model_ddl.statements[0]));
+    auto ddl = parse(std::string{"CREATE TABLE nums (id BIGINT, n BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in.string() +
+                     "');"
+                     "CREATE TABLE mlout (id BIGINT, n BIGINT, doubled DOUBLE PRECISION, tag TEXT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(
+        cat,
+        "INSERT INTO mlout SELECT * FROM ML_PREDICT(TABLE nums, MODEL doubler, DESCRIPTOR(n))");
+
+    InProcessCluster cluster("tm-sql-mlp", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out);
+    ASSERT_EQ(lines.size(), 2U);
+    std::map<std::int64_t, double> doubled_by_id;
+    std::map<std::int64_t, std::string> tag_by_id;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        ASSERT_TRUE(js.is_object());
+        const auto id = static_cast<std::int64_t>(js.at("id").as_number());
+        doubled_by_id[id] = js.at("doubled").as_number();
+        tag_by_id[id] = js.at("tag").as_string();
+    }
+    EXPECT_EQ(doubled_by_id[1], 42);  // 21 * 2
+    EXPECT_EQ(doubled_by_id[2], 20);  // 10 * 2
+    EXPECT_EQ(tag_by_id[1], "ok");
+    EXPECT_EQ(tag_by_id[2], "ok");
+    std::filesystem::remove(in);
+    std::filesystem::remove(out);
+}
 
 }  // namespace clink::sql
