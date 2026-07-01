@@ -604,6 +604,104 @@ TEST(SqlRuntime, AsyncStateInnerJoinRidesRemoteReadPath) {
         << "INNER join did not route its per-key state through the deferring backend (async path)";
 }
 
+// PARITY-P1 whole-job proof - DISABLED: it reproduces a real DEADLOCK, kept as a
+// pending regression that flips green once the bug is fixed.
+//
+// FINDING (2026-07-01): composing MULTIPLE async operators that SHARE ONE
+// deferring backend instance deadlocks. This job (INNER equi-join feeding a
+// GROUP BY, both auto-async on a deferring backend) hangs at end-of-stream with
+// io_threads=1 AND io_threads=8, so it is a genuine deadlock, not thread
+// starvation. The stuck-channel dump points at the async-persist teardown:
+// multiple "snapshot-worker" bounded channels stuck in pop (each async op that
+// supports_async_persist spins up a SnapshotWorker against the shared backend).
+//
+// SCOPE: this hits paths where several async ops share ONE backend instance -
+// the in-process LocalExecutor / LocalSubmitter (whose DEFAULT backend is the
+// deferring disagg-local://) and fused par-1 chains. The distributed non-fused
+// path is unaffected (each op is a separate subtask with its own per-subtask
+// backend), which is why the per-op async tests pass. So the "one switch -> whole
+// job async" claim holds distributed but NOT in-process/fused today. Fixing this
+// async-persist teardown deadlock is the core PARITY-P1 work; re-enable this test
+// (drop the DISABLED_ prefix) when it is fixed.
+TEST(SqlRuntime, DISABLED_WholeJobRidesAsyncOnOneSharedDeferringBackend) {
+    ensure_sql_installed_once();
+    const auto* join_builder =
+        cluster::DagBuilderRegistry::default_instance().find("equi_join_row");
+    const auto* agg_builder = cluster::DagBuilderRegistry::default_instance().find("aggregate_row");
+    ASSERT_NE(join_builder, nullptr);
+    ASSERT_NE(agg_builder, nullptr) << "aggregate_row Dag builder not registered";
+
+    auto mkrow = [](std::int64_t id, const char* col, std::int64_t v) {
+        Row r;
+        r.values["id"] = clink::config::JsonValue{static_cast<double>(id)};
+        r.values[col] = clink::config::JsonValue{static_cast<double>(v)};
+        return Record<Row>{std::move(r)};
+    };
+    const std::vector<Record<Row>> left = {
+        mkrow(1, "lv", 10), mkrow(2, "lv", 20), mkrow(1, "lv", 11)};
+    const std::vector<Record<Row>> right = {
+        mkrow(1, "rv", 100), mkrow(1, "rv", 101), mkrow(3, "rv", 300)};
+
+    // Build source -> equi_join_row -> aggregate_row -> sink on the given backend
+    // and return the final SUM per join-key (unbounded GROUP BY emits the running
+    // total per input row, so the last value per key is the answer).
+    auto run_on = [&](std::shared_ptr<StateBackend> backend) {
+        Dag dag;
+        auto hl = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(left));
+        auto hr = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(right));
+
+        clink::plugin::BuildContext jctx;
+        jctx.params["left_key_column"] = "id";
+        jctx.params["right_key_column"] = "id";
+        jctx.params["left_alias"] = "l";
+        jctx.params["right_alias"] = "r";
+        jctx.params["join_type"] = "inner";
+        jctx.params["left_columns"] = "id,lv";
+        jctx.params["right_columns"] = "id,rv";
+        std::vector<std::any> j_up = {std::any{hl}, std::any{hr}};
+        auto h_join = (*join_builder)(dag, j_up, jctx).main_handle;
+
+        // GROUP BY the join key (l_id), SUM the left value (l_lv).
+        clink::plugin::BuildContext actx;
+        actx.params["group_keys"] = "l_id";
+        actx.params["group_key_outputs"] = "l_id";
+        actx.params["aggregates"] = R"([{"name":"tot","fn":"sum","input_column":"l_lv"}])";
+        std::vector<std::any> a_up = {h_join};
+        auto out = (*agg_builder)(dag, a_up, actx);
+        auto h_agg = std::any_cast<StageHandle<Row>>(out.main_handle);
+
+        auto sink = std::make_shared<CollectingSink<Row>>();
+        dag.add_sink<Row>(h_agg, sink);
+        JobConfig cfg;
+        cfg.state_backend = std::move(backend);
+        LocalExecutor exec(std::move(dag), std::move(cfg));
+        exec.run();
+
+        std::map<std::int64_t, std::int64_t> final_by_key;
+        for (const auto& rec : sink->collected_records()) {
+            const Row& r = rec.value();
+            final_by_key[static_cast<std::int64_t>(r.values.at("l_id").as_number())] =
+                static_cast<std::int64_t>(r.values.at("tot").as_number());
+        }
+        return final_by_key;
+    };
+
+    const auto baseline = run_on(std::make_shared<InMemoryStateBackend>());
+    // id=1: left lv {10,11} each join right {100,101} -> 4 rows, all l_id=1,
+    // l_lv {10,10,11,11} -> SUM = 42.
+    const std::map<std::int64_t, std::int64_t> want = {{1, 42}};
+    EXPECT_EQ(baseline, want) << "in-memory baseline";
+
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    const auto async_res = run_on(rrb);
+    EXPECT_EQ(async_res, baseline)
+        << "whole-job async output must match the in-memory baseline (correctness)";
+    EXPECT_GT(rrb->remote_loads(), 0u)
+        << "no stateful op rode the deferring backend - the one-switch whole-job async claim fails";
+}
+
 namespace {
 
 // Build an equi-join of `join_type` via the registered Dag builder over
