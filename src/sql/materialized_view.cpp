@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
 #include "clink/sql/binder.hpp"
-#include "clink/sql/parser.hpp"  // TranslationError
+#include "clink/sql/logical_plan.hpp"  // LogicalScan
+#include "clink/sql/parser.hpp"        // TranslationError
 
 namespace clink::sql {
 
@@ -23,12 +26,84 @@ bool is_both_capable(std::string_view connector) {
            kBothCapableConnectors.end();
 }
 
-// v1 honours only continuous (streaming) freshness. These spellings all mean
-// "keep the view live with a continuously running maintenance job"; any other
-// value names a relaxed-refresh budget the scheduled-batch arm does not yet
-// implement.
-bool is_continuous_freshness(std::string_view f) {
-    return f.empty() || f == "0" || f == "0s" || f == "0ms" || f == "0m" || f == "continuous";
+// The refresh budget parsed from the FRESHNESS WITH-option. A zero / "continuous"
+// budget keeps a live streaming maintenance job; a positive interval selects the
+// full (scheduled / on-demand) arm that recomputes and atomically overwrites.
+struct FreshnessSpec {
+    bool continuous = true;
+    std::int64_t interval_ms = 0;
+};
+
+FreshnessSpec parse_freshness(std::string_view f) {
+    if (f.empty() || f == "0" || f == "0s" || f == "0ms" || f == "0m" || f == "continuous") {
+        return {true, 0};
+    }
+    std::size_t i = 0;
+    while (i < f.size() && std::isdigit(static_cast<unsigned char>(f[i])) != 0) {
+        ++i;
+    }
+    if (i == 0) {
+        throw TranslationError("freshness '" + std::string(f) +
+                                   "': expected <number><unit> (ms/s/m/h/d) or '0'/'continuous'",
+                               0);
+    }
+    const std::int64_t num = std::stoll(std::string(f.substr(0, i)));
+    const std::string_view unit = f.substr(i);
+    std::int64_t mult = 0;
+    if (unit == "ms") {
+        mult = 1;
+    } else if (unit == "s") {
+        mult = 1000;
+    } else if (unit == "m") {
+        mult = 60LL * 1000;
+    } else if (unit == "h") {
+        mult = 3600LL * 1000;
+    } else if (unit == "d") {
+        mult = 24LL * 3600 * 1000;
+    } else {
+        throw TranslationError("freshness '" + std::string(f) + "': unknown unit '" +
+                                   std::string(unit) + "' (expected ms/s/m/h/d)",
+                               0);
+    }
+    if (num <= 0) {
+        return {true, 0};
+    }
+    return {false, num * mult};
+}
+
+// Source connectors that can be read as a bounded scan (so a full refresh can run to
+// completion). An unbounded stream (kafka, CDC, poll) cannot back a full-refresh view
+// - the recompute job would never finish - so it is rejected at plan time.
+constexpr std::array<std::string_view, 5> kBoundedSourceConnectors = {
+    "file", "filesystem", "parquet", "s3_parquet", "clickhouse"};
+
+bool is_bounded_source(std::string_view connector) {
+    return std::find(kBoundedSourceConnectors.begin(), kBoundedSourceConnectors.end(), connector) !=
+           kBoundedSourceConnectors.end();
+}
+
+// Walk the bound defining plan; reject if any source scan reads an unbounded stream.
+void reject_unbounded_sources(const LogicalPlan* p, const std::string& view, int pos) {
+    if (p == nullptr) {
+        return;
+    }
+    if (const auto* scan = dynamic_cast<const LogicalScan*>(p)) {
+        const auto& t = scan->table();
+        const auto it = t.properties.find("connector");
+        const std::string connector = it != t.properties.end() ? it->second : "";
+        if (!is_bounded_source(connector)) {
+            throw TranslationError(
+                "materialized view '" + view +
+                    "': full (scheduled) refresh requires bounded-readable sources; source '" +
+                    t.name + "' (connector='" + connector +
+                    "') is not a bounded source. Use freshness='0' (continuous), or back it with a "
+                    "bounded snapshot (file / parquet / clickhouse)",
+                pos);
+        }
+    }
+    for (const auto* in : p->inputs()) {
+        reject_unbounded_sources(in, view, pos);
+    }
 }
 
 // Walk the plan spine (root, then first input, ...) looking for a non-windowed
@@ -95,13 +170,10 @@ MaterializedViewPlan plan_materialized_view(ast::CreateMaterializedViewStmt stmt
                 "file, kafka, clickhouse, parquet, s3_parquet",
             stmt.loc.pos);
     }
-    if (!is_continuous_freshness(freshness)) {
-        throw TranslationError(
-            "materialized view '" + stmt.view_name + "': freshness='" + freshness +
-                "' requires scheduled refresh, which is not yet supported; use freshness='0' "
-                "(continuous) in v1",
-            stmt.loc.pos);
-    }
+    // FRESHNESS selects the arm: continuous (a live streaming maintenance job) or
+    // full (recompute + atomic overwrite, driven by REFRESH / a scheduler).
+    const FreshnessSpec fresh = parse_freshness(freshness);
+    const RefreshArm arm = fresh.continuous ? RefreshArm::Continuous : RefreshArm::Full;
 
     // Bind the defining query once to derive the output schema and detect a
     // keyed aggregation. A fresh binder keeps any WITH-clause state isolated
@@ -113,6 +185,11 @@ MaterializedViewPlan plan_materialized_view(ast::CreateMaterializedViewStmt stmt
         throw TranslationError(
             "materialized view '" + stmt.view_name + "': defining query has no output columns",
             stmt.loc.pos);
+    }
+    // A full refresh runs a bounded recompute to completion, so every source must be
+    // bounded-readable; reject an unbounded stream up front.
+    if (arm == RefreshArm::Full) {
+        reject_unbounded_sources(schema_plan.get(), stmt.view_name, stmt.loc.pos);
     }
     const LogicalAggregate* spine_agg = find_spine_aggregate(schema_plan.get());
 
@@ -134,29 +211,43 @@ MaterializedViewPlan plan_materialized_view(ast::CreateMaterializedViewStmt stmt
     if (backing.properties.find("freshness") == backing.properties.end()) {
         backing.properties["freshness"] = "0";  // default continuous
     }
+    if (arm == RefreshArm::Full) {
+        // The full arm recomputes the whole result and atomically overwrites the
+        // backing on each refresh; the write_mode drives the sink's staged swap.
+        backing.properties["refresh_arm"] = "full";
+        backing.properties["freshness_ms"] = std::to_string(fresh.interval_ms);
+        backing.properties["write_mode"] = "overwrite";
+    }
 
     // Auto-derive an upsert backing for a keyed aggregation when the user did
     // not state mode/primary_key. A keyed GROUP BY emits the latest aggregate
     // per key, so the backing keeps the current row per key rather than every
     // intermediate. Other changelog-emitting shapes are not auto-derived; if
     // the user left an append backing for one, bind_insert's changelog/append
-    // compatibility check rejects it with a clear message.
-    if (!user_set_mode && spine_agg != nullptr && !spine_agg->group_keys().empty()) {
-        backing.properties["mode"] = "upsert";
-        if (!user_set_pk) {
-            backing.properties["primary_key"] = join_csv(spine_agg->group_keys());
+    // compatibility check rejects it with a clear message. This applies only to the
+    // continuous arm: a full-refresh backing is overwritten wholesale, so upsert
+    // netting does not apply - a changelog defining query (an aggregate) into a
+    // full-refresh view is rejected by bind_insert's append/changelog guard, and
+    // full-refresh of an aggregate (upsert + atomic overwrite netting) is a
+    // documented follow-on. v1 full refresh covers append-only defining queries.
+    if (arm == RefreshArm::Continuous) {
+        if (!user_set_mode && spine_agg != nullptr && !spine_agg->group_keys().empty()) {
+            backing.properties["mode"] = "upsert";
+            if (!user_set_pk) {
+                backing.properties["primary_key"] = join_csv(spine_agg->group_keys());
+            }
+        } else if (!user_set_mode && spine_agg != nullptr && spine_agg->group_keys().empty()) {
+            // A global (ungrouped) aggregate emits a changelog with no natural key,
+            // so an append backing would silently accumulate every intermediate
+            // value rather than the current one. Reject rather than materialise a
+            // misleading view; the user can add a GROUP BY or declare an explicit
+            // mode='upsert' + primary_key for a constant-key view.
+            throw TranslationError(
+                "materialized view '" + stmt.view_name +
+                    "': a global (ungrouped) aggregate has no key to materialise; add a GROUP BY, "
+                    "or declare mode='upsert' with a primary_key",
+                stmt.loc.pos);
         }
-    } else if (!user_set_mode && spine_agg != nullptr && spine_agg->group_keys().empty()) {
-        // A global (ungrouped) aggregate emits a changelog with no natural key,
-        // so an append backing would silently accumulate every intermediate
-        // value rather than the current one. Reject rather than materialise a
-        // misleading view; the user can add a GROUP BY or declare an explicit
-        // mode='upsert' + primary_key for a constant-key view.
-        throw TranslationError(
-            "materialized view '" + stmt.view_name +
-                "': a global (ungrouped) aggregate has no key to materialise; add a GROUP BY, "
-                "or declare mode='upsert' with a primary_key",
-            stmt.loc.pos);
     }
 
     // Lift the primary_key property into the typed field. register_table(TableDef)
@@ -196,7 +287,48 @@ MaterializedViewPlan plan_materialized_view(ast::CreateMaterializedViewStmt stmt
     Binder maintenance_binder(catalog);
     auto maintenance = maintenance_binder.bind_insert(insert);
 
-    return MaterializedViewPlan{std::move(backing), std::move(maintenance)};
+    return MaterializedViewPlan{std::move(backing), arm, std::move(maintenance)};
+}
+
+std::unique_ptr<LogicalPlan> plan_materialized_view_refresh(const std::string& view_name,
+                                                            Catalog& catalog) {
+    const TableDef* backing = catalog.get_table(view_name);
+    if (backing == nullptr) {
+        throw TranslationError("REFRESH: materialized view '" + view_name + "' does not exist", 0);
+    }
+    if (!backing->is_materialized_view()) {
+        throw TranslationError("REFRESH: '" + view_name + "' is not a materialized view", 0);
+    }
+    const auto arm_it = backing->properties.find("refresh_arm");
+    if (arm_it == backing->properties.end() || arm_it->second != "full") {
+        throw TranslationError(
+            "REFRESH: '" + view_name +
+                "' is a continuous materialized view (kept live by its maintenance job); REFRESH "
+                "applies to full-refresh views declared with freshness > 0",
+            0);
+    }
+    const std::string def_sql = backing->definition_sql();
+    if (def_sql.empty()) {
+        throw TranslationError("REFRESH: '" + view_name + "' has no stored definition to recompute",
+                               0);
+    }
+    // Re-parse the stored definition and locate the CREATE MATERIALIZED VIEW for this
+    // view; its defining SELECT is recomputed as INSERT INTO <backing> (which already
+    // carries write_mode=overwrite, so the sink atomically publishes on completion).
+    auto script = parse(def_sql);
+    for (auto& s : script.statements) {
+        auto* mv = std::get_if<ast::CreateMaterializedViewStmt>(&s);
+        if (mv != nullptr && mv->view_name == view_name) {
+            ast::InsertStmt insert;
+            insert.loc = mv->loc;
+            insert.target = ast::TableRef{view_name, std::nullopt, std::nullopt, mv->loc};
+            insert.select = std::move(mv->query);
+            Binder binder(catalog);
+            return binder.bind_insert(insert);
+        }
+    }
+    throw TranslationError("REFRESH: could not locate the defining query for '" + view_name + "'",
+                           0);
 }
 
 }  // namespace clink::sql

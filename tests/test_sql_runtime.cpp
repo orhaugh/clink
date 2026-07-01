@@ -11105,4 +11105,70 @@ TEST(SqlRuntime, MlPredictAppendsModelOutputEndToEnd) {
     std::filesystem::remove(out);
 }
 
+// Materialized tables (full-refresh arm): a FRESHNESS > 0 view recomputes its whole
+// result and atomically overwrites the backing. The initial CREATE population and a
+// later REFRESH both run as bounded jobs; the overwrite sink publishes on completion,
+// so the backing file reflects exactly the current source each time.
+TEST(SqlRuntime, MaterializedViewFullRefreshOverwritesAtomically) {
+    ensure_sql_installed_once();
+    const auto src = std::filesystem::temp_directory_path() / "clink_mv_src.ndjson";
+    const auto out = std::filesystem::temp_directory_path() / "clink_mv_out.ndjson";
+    std::filesystem::remove(src);
+    std::filesystem::remove(out);
+    std::filesystem::remove(std::filesystem::path(out.string() + ".staging"));
+    write_lines(src, {R"({"id":1,"val":5})", R"({"id":2,"val":20})", R"({"id":3,"val":30})"});
+
+    Catalog cat;
+    auto src_ddl = parse(std::string{"CREATE TABLE src (id BIGINT, val BIGINT) "
+                                     "WITH (connector='file', format='json', path='"} +
+                         src.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(src_ddl.statements[0]));
+
+    const std::string mv_sql =
+        std::string{
+            "CREATE MATERIALIZED VIEW mv "
+            "WITH (connector='file', format='json', freshness='1h', path='"} +
+        out.string() + "') AS SELECT id, val FROM src WHERE val > 10";
+    auto mv_script = parse(mv_sql);
+    auto mvplan = plan_materialized_view(
+        std::get<ast::CreateMaterializedViewStmt>(std::move(mv_script.statements[0])), cat, mv_sql);
+    EXPECT_EQ(mvplan.arm, RefreshArm::Full);
+    EXPECT_EQ(cat.get_table("mv")->properties.at("write_mode"), "overwrite");
+
+    InProcessCluster cluster("tm-sql-mv", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+
+    auto submit_plan = [&](std::unique_ptr<LogicalPlan> plan) {
+        auto optimised = optimize(std::move(plan));
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*optimised));
+        auto result = submitter.submit(spec.to_json(), {}, opts);
+        EXPECT_TRUE(result.completed) << "reject: " << result.reject_message;
+        EXPECT_TRUE(result.ok) << "errors: "
+                               << (result.errors.empty() ? "(none)" : result.errors[0]);
+    };
+    auto ids_in_out = [&]() {
+        std::set<std::int64_t> ids;
+        for (const auto& l : read_lines(out)) {
+            ids.insert(static_cast<std::int64_t>(clink::config::parse(l).at("id").as_number()));
+        }
+        return ids;
+    };
+
+    // Initial population: only val > 10 (ids 2, 3).
+    submit_plan(std::move(mvplan.maintenance));
+    EXPECT_EQ(ids_in_out(), (std::set<std::int64_t>{2, 3}));
+
+    // Change the source, then REFRESH: the backing is atomically overwritten to
+    // reflect the new source (only id 4 has val > 10).
+    write_lines(src, {R"({"id":4,"val":50})", R"({"id":5,"val":1})"});
+    submit_plan(plan_materialized_view_refresh("mv", cat));
+    EXPECT_EQ(ids_in_out(), (std::set<std::int64_t>{4}));
+
+    std::filesystem::remove(src);
+    std::filesystem::remove(out);
+}
+
 }  // namespace clink::sql

@@ -659,13 +659,32 @@ TEST(SqlPreparse, MaterializedViewNonBothCapableConnectorRejected) {
                  TranslationError);
 }
 
-TEST(SqlPreparse, MaterializedViewRelaxedFreshnessRejected) {
+TEST(SqlPreparse, MaterializedViewFullRefreshAcceptedForBoundedSource) {
     Catalog cat;
-    register_source(cat, "t", "a BIGINT");
+    register_source(cat, "t", "a BIGINT");  // connector='file' (bounded)
+    auto plan = plan_materialized_view(
+        parse_mv("CREATE MATERIALIZED VIEW mv "
+                 "WITH (freshness='5m', connector='file', format='json', path='/tmp/mv_fr.ndjson') "
+                 "AS SELECT a FROM t"),
+        cat);
+    EXPECT_EQ(plan.arm, clink::sql::RefreshArm::Full);
+    // The full-refresh backing overwrites wholesale on each refresh.
+    ASSERT_NE(cat.get_table("mv"), nullptr);
+    EXPECT_EQ(cat.get_table("mv")->properties.at("write_mode"), "overwrite");
+    EXPECT_EQ(cat.get_table("mv")->properties.at("refresh_arm"), "full");
+}
+
+TEST(SqlPreparse, MaterializedViewFullRefreshRejectsUnboundedSource) {
+    Catalog cat;
+    // A kafka source is an unbounded stream: a full (scheduled) refresh recompute
+    // would never finish, so it is rejected at plan time.
+    cat.register_table(std::get<ast::CreateTableStmt>(
+        parse("CREATE TABLE ks (a BIGINT) WITH (connector='kafka', format='json', topic='t')")
+            .statements[0]));
     EXPECT_THROW((void)plan_materialized_view(
                      parse_mv("CREATE MATERIALIZED VIEW mv "
-                              "WITH (freshness='5m', connector='file', format='json') "
-                              "AS SELECT a FROM t"),
+                              "WITH (freshness='5m', connector='file', format='json', "
+                              "path='/tmp/mv_fr2.ndjson') AS SELECT a FROM ks"),
                      cat),
                  TranslationError);
 }

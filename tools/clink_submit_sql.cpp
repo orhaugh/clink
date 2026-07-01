@@ -322,6 +322,7 @@ int main(int argc, char** argv) {
                 auto& mv = std::get<clink::sql::ast::CreateMaterializedViewStmt>(stmt);
                 auto mvplan = clink::sql::plan_materialized_view(std::move(mv), catalog, sql);
                 const std::string view_name = mvplan.backing.name;
+                const bool full_refresh = mvplan.arm == clink::sql::RefreshArm::Full;
                 auto plan = clink::sql::optimize(std::move(mvplan.maintenance));
                 if (args.explain) {
                     std::cout << plan->explain();
@@ -329,8 +330,35 @@ int main(int argc, char** argv) {
                     const auto& sink = static_cast<const clink::sql::LogicalSink&>(*plan);
                     auto spec = planner.compile(sink);
                     apply_parallelism(spec);
+                    // Continuous: a live maintenance job (mv_<name>). Full-refresh: a
+                    // one-shot bounded initial population (refresh_<name>) - it runs to
+                    // completion and the overwrite sink atomically publishes; a later
+                    // REFRESH MATERIALIZED VIEW re-runs the same recompute.
+                    const std::string default_name =
+                        (full_refresh ? "refresh_" : "mv_") + view_name;
+                    const std::string name = args.job_name.empty() ? default_name : args.job_name;
+                    if (int rc = submit_or_print(spec.to_json(), name); rc != 0) {
+                        return rc;
+                    }
+                }
+                produced_spec = true;
+                continue;
+            }
+            if (std::holds_alternative<clink::sql::ast::RefreshMatViewStmt>(stmt)) {
+                // REFRESH MATERIALIZED VIEW <name>: recompute the full-refresh backing
+                // as a bounded INSERT that atomically overwrites it. Runs the same
+                // recompute the initial population + a scheduler tick would.
+                const auto& rf = std::get<clink::sql::ast::RefreshMatViewStmt>(stmt);
+                auto plan = clink::sql::optimize(
+                    clink::sql::plan_materialized_view_refresh(rf.view_name, catalog));
+                if (args.explain) {
+                    std::cout << plan->explain();
+                } else {
+                    const auto& sink = static_cast<const clink::sql::LogicalSink&>(*plan);
+                    auto spec = planner.compile(sink);
+                    apply_parallelism(spec);
                     const std::string name =
-                        args.job_name.empty() ? ("mv_" + view_name) : args.job_name;
+                        args.job_name.empty() ? ("refresh_" + rf.view_name) : args.job_name;
                     if (int rc = submit_or_print(spec.to_json(), name); rc != 0) {
                         return rc;
                     }

@@ -1465,6 +1465,21 @@ ast::CreateMaterializedViewStmt translate_matview_stmt(const JsonValue& body) {
     return stmt;
 }
 
+// REFRESH MATERIALIZED VIEW <name>. libpg_query emits a RefreshMatViewStmt with the
+// target under `relation` (a RangeVar). CONCURRENTLY / WITH [NO] DATA are ignored in
+// v1 (a full-refresh recompute always produces data).
+ast::RefreshMatViewStmt translate_refresh_matview_stmt(const JsonValue& body) {
+    ast::RefreshMatViewStmt stmt;
+    stmt.loc = loc_from(body);
+    if (!body.contains("relation") || !body.at("relation").is_object()) {
+        unsupported("REFRESH MATERIALIZED VIEW missing target relation", stmt.loc.pos);
+    }
+    auto rel = translate_range_var(body.at("relation"));
+    stmt.view_name = std::move(rel.name);
+    stmt.schema = std::move(rel.schema);
+    return stmt;
+}
+
 // CREATE [OR REPLACE] VIEW <name> [(col, ...)] AS <SELECT>. libpg_query emits a
 // ViewStmt with the view name under `view` (a RangeVar), the defining query under
 // `query` (a SelectStmt node), `replace` for OR REPLACE, and `aliases` for the
@@ -1733,6 +1748,9 @@ ast::Statement translate_statement(const JsonValue& outer_stmt) {
     }
     if (kind == "CreateTableAsStmt") {
         return ast::Statement{translate_matview_stmt(*body)};
+    }
+    if (kind == "RefreshMatViewStmt") {
+        return ast::Statement{translate_refresh_matview_stmt(*body)};
     }
     if (kind == "ViewStmt") {
         return ast::Statement{translate_view_stmt(*body)};

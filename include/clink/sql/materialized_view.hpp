@@ -32,12 +32,22 @@
 
 namespace clink::sql {
 
+// The refresh arm chosen from the FRESHNESS budget. Continuous keeps a live
+// streaming maintenance job; Full recomputes the whole backing on demand (a bounded
+// INSERT that atomically overwrites), driven by a manual REFRESH (and, in a later
+// increment, a scheduler at the freshness cadence).
+enum class RefreshArm { Continuous, Full };
+
 struct MaterializedViewPlan {
     // The backing table that was registered into the catalog (a copy, for the
     // caller's convenience; the authoritative entry lives in the catalog).
     TableDef backing;
-    // INSERT INTO <backing> <defining SELECT>, bound to a LogicalSink. The
-    // caller optimises + compiles + submits this as the maintenance job.
+    RefreshArm arm = RefreshArm::Continuous;
+    // The bound INSERT INTO <backing> <defining SELECT>, rooted in a LogicalSink.
+    // Continuous: the caller submits it as a live maintenance job. Full: the caller
+    // submits it as a one-shot BOUNDED job (the backing is tagged write_mode=overwrite
+    // so the sink atomically publishes on completion) - an initial population; a
+    // subsequent REFRESH re-runs the same recompute.
     std::unique_ptr<LogicalPlan> maintenance;
 };
 
@@ -54,5 +64,16 @@ struct MaterializedViewPlan {
 MaterializedViewPlan plan_materialized_view(ast::CreateMaterializedViewStmt stmt,
                                             Catalog& catalog,
                                             std::string_view definition_sql = {});
+
+// Build the bounded recompute plan for a REFRESH MATERIALIZED VIEW: look up the
+// (already-registered) full-refresh backing table, re-parse its stored definition,
+// and return the bound INSERT INTO <backing> <SELECT>. The backing carries
+// write_mode=overwrite, so compiling + submitting this as a bounded job recomputes
+// the whole result and atomically overwrites the backing on completion.
+//
+// Throws TranslationError if the view is unknown, is not a materialized view, is a
+// continuous (not full-refresh) view, or has no stored definition.
+std::unique_ptr<LogicalPlan> plan_materialized_view_refresh(const std::string& view_name,
+                                                            Catalog& catalog);
 
 }  // namespace clink::sql

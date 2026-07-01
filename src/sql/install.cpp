@@ -6889,11 +6889,19 @@ void install(clink::plugin::PluginRegistry& reg) {
     // file_json_sink: write one Row per line as a JSON object.
     //   path (required): filesystem path
     //   append (default "false"): open in append mode if "true"
+    //   write_mode=overwrite: atomically replace `path` on clean end-of-input (the
+    //     full-refresh materialized-table mechanic; single-file, so parallelism 1).
     reg.register_sink<Row>(
         "file_json_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<Row>> {
             auto path = ctx.param_or("path");
             if (path.empty()) {
                 throw std::runtime_error("file_json_sink: 'path' param is required");
+            }
+            const bool overwrite = ctx.param_or("write_mode", "") == "overwrite";
+            if (overwrite && ctx.parallelism > 1) {
+                throw std::runtime_error(
+                    "file_json_sink: write_mode=overwrite requires parallelism 1 (a single output "
+                    "file is swapped atomically); set the maintenance job parallelism to 1");
             }
             if (ctx.parallelism > 1) {
                 path += "." + std::to_string(ctx.subtask_idx);
@@ -6904,7 +6912,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                 row_json_text_format_with_decimals(
                     parse_decimal_columns(ctx.param_or("decimal_columns"))),
                 append,
-                "file_json_sink");
+                "file_json_sink",
+                overwrite);
         });
 
     // file_2pc_sink_row: two-phase-commit file sink for the Row

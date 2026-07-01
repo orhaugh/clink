@@ -617,6 +617,16 @@ struct CreateMaterializedViewStmt {
     Loc loc;
 };
 
+// REFRESH MATERIALIZED VIEW <name>. libpg_query parses this natively as a
+// RefreshMatViewStmt. For a full-refresh (freshness > 0) materialized view it drives
+// a one-shot bounded recompute of the backing table that atomically overwrites it;
+// on a continuous view it is rejected (that arm is already kept live by its job).
+struct RefreshMatViewStmt {
+    std::string view_name;
+    std::optional<std::string> schema;
+    Loc loc;
+};
+
 // CREATE [OR REPLACE] VIEW <name> [(col, ...)] AS <SELECT>. A logical
 // (non-materialized) view: no backing table and no maintenance job - the catalog
 // stores the defining query, and a reference to the view is expanded inline
@@ -641,6 +651,7 @@ using Statement = std::variant<CreateTableStmt,
                                DropTableStmt,
                                ShowTablesStmt,
                                CreateMaterializedViewStmt,
+                               RefreshMatViewStmt,
                                CreateViewStmt,
                                AlterTableStmt,
                                RenameStmt,
