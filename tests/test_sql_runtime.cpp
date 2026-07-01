@@ -697,6 +697,70 @@ TEST(SqlRuntime, AsyncStateInnerJoinRidesRemoteReadPath) {
         << "INNER join did not route its per-key state through the deferring backend (async path)";
 }
 
+// SET operations (INTERSECT / EXCEPT) ride the checkpointed KeyedState path and
+// auto-activate the async/disaggregated path on a deferring backend. The op once
+// held five in-memory maps (per-side counts, representatives, emitted
+// multiplicity) that were never snapshotted, so a restore re-emitted or dropped
+// rows; both sides' per-tuple state now lives in ONE KeyedState bucket. Driven
+// cluster-free through the set_op_row Dag builder (two VectorSources -> co-op) on
+// a RemoteReadBackend so remote_loads() proves the tuple state went through the
+// deferring tier. Interleaving of the two inputs differs between the sync and
+// async runners, so we assert on the settled live set (net inserts minus
+// retractions), not the raw emission order. Distinct INTERSECT of {1,2,2,3} and
+// {2,3,3,4} = {2,3}.
+TEST(SqlRuntime, SetOpIntersectRidesRemoteReadPath) {
+    ensure_sql_installed_once();
+    const auto* builder = cluster::DagBuilderRegistry::default_instance().find("set_op_row");
+    ASSERT_NE(builder, nullptr) << "set_op_row Dag builder not registered";
+
+    auto mkrow = [](std::int64_t v) {
+        Row r;
+        r.values["v"] = clink::config::JsonValue{static_cast<double>(v)};
+        return Record<Row>{std::move(r)};
+    };
+    const std::vector<Record<Row>> left = {mkrow(1), mkrow(2), mkrow(2), mkrow(3)};
+    const std::vector<Record<Row>> right = {mkrow(2), mkrow(3), mkrow(3), mkrow(4)};
+
+    Dag dag;
+    auto hl = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(left));
+    auto hr = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(right));
+    clink::plugin::BuildContext ctx;
+    ctx.params["mode"] = "intersect";
+    ctx.params["all"] = "false";
+    ctx.params["left_columns"] = "v";
+    ctx.params["right_columns"] = "v";
+    std::vector<std::any> upstream = {std::any{hl}, std::any{hr}};
+    auto built = (*builder)(dag, upstream, ctx);
+    auto h_op = std::any_cast<StageHandle<Row>>(built.main_handle);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_op, sink);
+
+    // Deferring backend: SetOpRowOp auto-enables the async KeyedState path.
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    JobConfig cfg;
+    cfg.state_backend = rrb;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    std::map<std::int64_t, int> net;
+    for (const auto& rec : sink->collected_records()) {
+        Row r = rec.value();
+        const std::string kind = row_kind_of(r);
+        const auto v = static_cast<std::int64_t>(r.values.at("v").as_number());
+        net[v] += is_delete_like(kind) ? -1 : 1;
+    }
+    std::set<std::int64_t> present;
+    for (const auto& [v, n] : net) {
+        if (n > 0)
+            present.insert(v);
+    }
+    EXPECT_EQ(present, (std::set<std::int64_t>{2, 3}));
+    EXPECT_GT(rrb->remote_loads(), 0u)
+        << "INTERSECT did not route its per-tuple state through the deferring backend (async path)";
+}
+
 // PARITY-P1 whole-job proof: a job with MULTIPLE distinct stateful operators (an
 // INNER equi-join feeding a GROUP BY, both auto-async on a deferring backend)
 // SHARING ONE backend instance has every stateful op ride the async path and

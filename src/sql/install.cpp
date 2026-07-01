@@ -4437,12 +4437,23 @@ public:
           is_except_(is_except),
           all_(all) {}
 
+    // Ride the async/disaggregated KeyedState path whenever the bound backend
+    // can genuinely defer reads (supports_async_get()); on a non-deferring
+    // backend this stays false and process_element{1,2} drive the synchronous
+    // KeyedState get/put. Either way the per-key state is checkpointed - the
+    // former in-memory maps were not, so a restore re-emitted or dropped rows.
+    void open() override {
+        effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
+                           this->runtime()->state_backend()->supports_async_get();
+    }
+
     void process_element1(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (!element.is_data())
             return;
         Batch<Row> batch;
+        auto kv = keyed_state_();
         for (const auto& rec : element.as_data())
-            handle_(rec.value(), /*left=*/true, batch);
+            handle_sync_(rec.value(), /*left=*/true, batch, kv);
         if (!batch.empty())
             out.emit_data(std::move(batch));
     }
@@ -4450,14 +4461,55 @@ public:
         if (!element.is_data())
             return;
         Batch<Row> batch;
+        auto kv = keyed_state_();
         for (const auto& rec : element.as_data())
-            handle_(rec.value(), /*left=*/false, batch);
+            handle_sync_(rec.value(), /*left=*/false, batch, kv);
         if (!batch.empty())
             out.emit_data(std::move(batch));
     }
+
+    [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
+
+    // ASYNC-10 read coalescing: each arrival's process_async issues one
+    // get_async for its tuple key, so a batch spanning many distinct tuples
+    // collapses into one get_many_async. No-op on a non-deferring backend.
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
+
+    void process_async1(const StreamElement<Row>& element,
+                        Emitter<Row>& out,
+                        AsyncExecutionController& aec) override {
+        if (!element.is_data())
+            return;
+        for (const auto& rec : element.as_data())
+            handle_async_(rec.value(), /*left=*/true, out, aec);
+    }
+    void process_async2(const StreamElement<Row>& element,
+                        Emitter<Row>& out,
+                        AsyncExecutionController& aec) override {
+        if (!element.is_data())
+            return;
+        for (const auto& rec : element.as_data())
+            handle_async_(rec.value(), /*left=*/false, out, aec);
+    }
+
     std::string name() const override { return "set_op_row"; }
 
 private:
+    // Per-tuple state bundled into ONE keyed value: both sides' live
+    // multiplicities, the currently-emitted multiplicity, and a
+    // representative row per side (preferring the left) that backs both the
+    // insert and the owed retraction. Both left and right records for the
+    // same tuple route to the same key-group, so one slot per key suffices.
+    struct Bucket {
+        int left_count = 0;
+        int right_count = 0;
+        int emitted = 0;
+        bool has_left_rep = false;
+        bool has_right_rep = false;
+        Row left_rep;
+        Row right_rep;
+    };
+
     static std::string key_of_(const Row& row, const std::vector<std::string>& cols) {
         clink::config::JsonArray arr;
         arr.reserve(cols.size());
@@ -4474,40 +4526,36 @@ private:
         batch.push(Record<Row>{std::move(r)});
     }
 
-    // Both sides feed a per-key multiplicity. INTERSECT wants min(L, R)
-    // copies of each key; EXCEPT wants max(L - R, 0); the distinct (set)
-    // variants clamp the same formulas to 0/1. After each arrival we
-    // recompute the desired multiplicity and emit the changelog delta
-    // (inserts when it grows, deletes when it shrinks), so the model is
-    // identical for the set and multiset cases. Input row-kind is honored:
-    // a delete-tagged input decrements its side (correct for changelog
-    // inputs); plain sources are all inserts.
-    void handle_(const Row& row, bool left, Batch<Row>& batch) {
-        const auto& cols = left ? left_columns_ : right_columns_;
-        std::string key = key_of_(row, cols);
+    // Fold one input row into its side of the bucket. INTERSECT wants
+    // min(L, R) copies of each key; EXCEPT wants max(L - R, 0); the distinct
+    // (set) variants clamp the same formulas to 0/1. Input row-kind is
+    // honored: a delete-tagged input decrements its side (correct for
+    // changelog inputs); plain sources are all inserts. The representative is
+    // seeded on the first insert and kept while the bucket lives so
+    // recompute_ can emit the retraction a count dropping to zero owes.
+    static void apply_(Bucket& b, const Row& row, bool left) {
         const int delta = is_delete_like(row_kind_of(row)) ? -1 : 1;
-        auto& counts = left ? left_count_ : right_count_;
-        auto& reps = left ? left_rep_ : right_rep_;
-        const int newc = counts[key] + delta;
-        if (newc <= 0) {
-            counts.erase(key);
-            // Keep the representative row: recompute_ still needs it to emit
-            // the retraction that the count dropping to zero owes. It is
-            // cleaned up there once both sides are empty. (Erasing it here
-            // dropped the owed delete -> a phantom row leaked downstream.)
-        } else {
-            counts[key] = newc;
-            if (delta > 0)
-                reps.try_emplace(key, row);
+        int& count = left ? b.left_count : b.right_count;
+        const int newc = count + delta;
+        count = newc > 0 ? newc : 0;
+        if (delta > 0) {
+            if (left && !b.has_left_rep) {
+                b.left_rep = row;
+                b.has_left_rep = true;
+            } else if (!left && !b.has_right_rep) {
+                b.right_rep = row;
+                b.has_right_rep = true;
+            }
         }
-        recompute_(key, batch);
     }
 
-    void recompute_(const std::string& key, Batch<Row>& batch) {
-        const auto lc = left_count_.find(key);
-        const auto rc = right_count_.find(key);
-        const int L = lc != left_count_.end() ? lc->second : 0;
-        const int R = rc != right_count_.end() ? rc->second : 0;
+    // Recompute the desired multiplicity from the bucket's L/R counts and
+    // emit the changelog delta (inserts as it grows, deletes as it shrinks),
+    // so the model is identical for the set and multiset cases. Mutates
+    // b.emitted.
+    void recompute_(Bucket& b, Batch<Row>& batch) const {
+        const int L = b.left_count;
+        const int R = b.right_count;
         // Multiset: INTERSECT wants min(L,R); EXCEPT wants max(L-R,0).
         // Distinct collapses to presence: INTERSECT iff both sides have the
         // key; EXCEPT iff the left has it and the right does NOT (note this
@@ -4519,17 +4567,12 @@ private:
         } else {
             want = is_except_ ? (L > 0 && R == 0 ? 1 : 0) : (L > 0 && R > 0 ? 1 : 0);
         }
-        const auto em = emitted_.find(key);
-        int cur = em != emitted_.end() ? em->second : 0;
+        int cur = b.emitted;
         if (cur == want)
             return;
         // A representative row exists whenever want > 0 (which requires
         // L > 0). Prefer the left row; fall back to the right.
-        const Row* rep = nullptr;
-        if (auto lr = left_rep_.find(key); lr != left_rep_.end())
-            rep = &lr->second;
-        else if (auto rr = right_rep_.find(key); rr != right_rep_.end())
-            rep = &rr->second;
+        const Row* rep = b.has_left_rep ? &b.left_rep : (b.has_right_rep ? &b.right_rep : nullptr);
         if (rep == nullptr)
             return;  // defensive: nothing to emit without a representative
         while (cur < want) {
@@ -4540,31 +4583,126 @@ private:
             emit_(*rep, kRowKindDelete, batch);
             --cur;
         }
-        if (cur == 0)
-            emitted_.erase(key);
-        else
-            emitted_[key] = cur;
-        // Once both sides are empty and nothing is owed, the key is gone for
-        // good (counts only ever rise from a fresh insert, which re-seeds its
-        // own rep). Drop the representatives to bound memory.
-        if (L == 0 && R == 0)
-            erase_reps_(key);
+        b.emitted = cur;
     }
 
-    void erase_reps_(const std::string& key) {
-        left_rep_.erase(key);
-        right_rep_.erase(key);
+    // Persist the bucket, or erase it once the key is fully drained (both
+    // sides empty and nothing emitted, so nothing is owed) - keeps keyed
+    // state bounded. A future insert re-seeds its own representative.
+    static void store_(KeyedState<std::string, Bucket>& kv,
+                       const std::string& key,
+                       const Bucket& b) {
+        if (b.left_count == 0 && b.right_count == 0 && b.emitted == 0) {
+            kv.erase(key);
+        } else {
+            kv.put(key, b);
+        }
+    }
+
+    void handle_sync_(const Row& row,
+                      bool left,
+                      Batch<Row>& batch,
+                      KeyedState<std::string, Bucket>& kv) {
+        const std::string key = key_of_(row, left ? left_columns_ : right_columns_);
+        Bucket b = kv.get(key).value_or(Bucket{});
+        apply_(b, row, left);
+        recompute_(b, batch);
+        store_(kv, key, b);
+    }
+
+    void handle_async_(const Row& row,
+                       bool left,
+                       Emitter<Row>& out,
+                       AsyncExecutionController& aec) {
+        auto kv = keyed_state_();
+        std::string key = key_of_(row, left ? left_columns_ : right_columns_);
+        auto factory = [this, kv, row, key, left, &out]() mutable -> async::Task<void> {
+            Bucket b = (co_await kv.get_async(key)).value_or(Bucket{});
+            Batch<Row> batch;
+            apply_(b, row, left);
+            recompute_(b, batch);
+            store_(kv, key, b);
+            if (!batch.empty())
+                out.emit_data(std::move(batch));
+            co_return;
+        };
+        while (!aec.submit(key, factory)) {
+            // backpressure: flush parked coalesced reads + drain completions, retry
+            aec.poll_or_flush();
+        }
+    }
+
+    // Codec for one tuple's Bucket over the async/disaggregated KeyedState
+    // path: a JSON object {"lc","rc","em"} plus the representative rows
+    // {"lr","rr"} (present only when seeded).
+    static clink::Codec<Bucket> bucket_codec() {
+        using Bytes = clink::Codec<Bucket>::Bytes;
+        using BytesView = clink::Codec<Bucket>::BytesView;
+        auto body = [](const Bucket& b, Bytes& out) {
+            clink::config::JsonObject o;
+            o["lc"] = clink::config::JsonValue{static_cast<double>(b.left_count)};
+            o["rc"] = clink::config::JsonValue{static_cast<double>(b.right_count)};
+            o["em"] = clink::config::JsonValue{static_cast<double>(b.emitted)};
+            if (b.has_left_rep)
+                o["lr"] = clink::config::JsonValue{clink::config::JsonObject{b.left_rep.values}};
+            if (b.has_right_rep)
+                o["rr"] = clink::config::JsonValue{clink::config::JsonObject{b.right_rep.values}};
+            const std::string s = clink::config::JsonValue{std::move(o)}.serialize(0);
+            const auto* p = reinterpret_cast<const std::byte*>(s.data());
+            out.insert(out.end(), p, p + s.size());
+        };
+        return clink::Codec<Bucket>{
+            .encode = [body](const Bucket& b) -> Bytes {
+                Bytes out;
+                body(b, out);
+                return out;
+            },
+            .decode = [](BytesView bv) -> std::optional<Bucket> {
+                std::string text(reinterpret_cast<const char*>(bv.data()), bv.size());
+                try {
+                    auto j = clink::config::parse(text);
+                    if (!j.is_object())
+                        return std::nullopt;
+                    const auto& o = j.as_object();
+                    Bucket b;
+                    auto geti = [&](const char* k) -> int {
+                        auto it = o.find(k);
+                        return it != o.end() && it->second.is_number()
+                                   ? static_cast<int>(it->second.as_number())
+                                   : 0;
+                    };
+                    b.left_count = geti("lc");
+                    b.right_count = geti("rc");
+                    b.emitted = geti("em");
+                    if (auto it = o.find("lr"); it != o.end() && it->second.is_object()) {
+                        b.left_rep.values = it->second.as_object();
+                        b.has_left_rep = true;
+                    }
+                    if (auto it = o.find("rr"); it != o.end() && it->second.is_object()) {
+                        b.right_rep.values = it->second.as_object();
+                        b.has_right_rep = true;
+                    }
+                    return b;
+                } catch (...) {
+                    return std::nullopt;
+                }
+            },
+            .encode_into = body,
+        };
+    }
+
+    KeyedState<std::string, Bucket> keyed_state_() {
+        return this->runtime()->template keyed_state<std::string, Bucket>(
+            "setop", clink::string_codec(), bucket_codec());
     }
 
     std::vector<std::string> left_columns_;
     std::vector<std::string> right_columns_;
     bool is_except_;
     bool all_;
-    clink::FlatMap<std::string, int> left_count_;   // key -> live left multiplicity
-    clink::FlatMap<std::string, int> right_count_;  // key -> live right multiplicity
-    clink::FlatMap<std::string, Row> left_rep_;     // key -> representative left row
-    clink::FlatMap<std::string, Row> right_rep_;    // key -> representative right row
-    clink::FlatMap<std::string, int> emitted_;      // key -> currently emitted multiplicity
+    // Finalised in open(): a deferring backend -> the async KeyedState path
+    // (process_async{1,2}); otherwise the sync path above.
+    bool effective_async_ = false;
 };
 
 // Inc 4: uncorrelated scalar-subquery filter. The scalar (right) side is
