@@ -27,7 +27,8 @@ struct LoadedPlugin {
     std::string source_path;  // Original .so path on disk.
     std::string name;         // From clink_plugin_metadata().
     std::string version;
-    std::string abi_hash;       // From clink_plugin_abi_hash().
+    int abi_version{0};         // From clink_plugin_abi_version() (0 = legacy plugin).
+    std::string abi_hash;       // From clink_plugin_abi_hash() (informational).
     std::string target_triple;  // From clink_plugin_target_triple().
     void* dl_handle{nullptr};   // dlopen handle - opaque.
 };
@@ -89,8 +90,14 @@ private:
     std::unordered_map<std::string, LoadedPlugin> loaded_;
 };
 
-// The cluster's own ABI hash (baked in at build time via
-// abi_version.hpp). Plugins must match this exactly.
+// The cluster's plugin-ABI compatibility version (baked in at build time via
+// abi_version.hpp). A plugin loads when its ABI version equals this. Bumped by
+// hand only on an intentional ABI break, so patch/feature rebuilds of the
+// cluster keep loading existing plugins.
+int cluster_abi_version() noexcept;
+
+// The cluster's own ABI hash (git commit at build time). Informational: used as
+// the gate only under strict mode (CLINK_STRICT_PLUGIN_ABI=1).
 const char* cluster_abi_hash() noexcept;
 
 // The cluster's target triple (linux-x86_64 / linux-arm64 /
@@ -98,5 +105,24 @@ const char* cluster_abi_hash() noexcept;
 // load time. The macro is defined in plugin.hpp; this function exposes
 // it as a runtime string for diagnostics.
 const char* cluster_target_triple() noexcept;
+
+// True when strict plugin-ABI matching is requested (CLINK_STRICT_PLUGIN_ABI=1
+// in the environment). In strict mode the loader falls back to the historic
+// exact commit-hash gate instead of the ABI-version gate.
+bool strict_plugin_abi_enabled() noexcept;
+
+// Pure decision for whether a plugin is ABI-compatible with the cluster,
+// factored out of PluginLoader::load so it can be unit-tested without a real
+// .so. Returns an empty string when compatible, otherwise a human-readable
+// rejection reason. The target-triple gate is applied separately by the loader.
+struct AbiCheckInput {
+    bool strict{false};              // strict mode requested (exact-hash gate)
+    bool plugin_has_version{false};  // plugin exports clink_plugin_abi_version
+    int plugin_abi_version{0};
+    int cluster_abi_version{0};
+    std::string plugin_hash;
+    std::string cluster_hash;
+};
+std::string check_plugin_abi(const AbiCheckInput& in);
 
 }  // namespace clink::cluster

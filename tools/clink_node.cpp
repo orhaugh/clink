@@ -2562,9 +2562,9 @@ int main(int argc, char** argv) {
     clink::connectors::clink_force_openssl_atexit_guard = 1;
     try {
         if (has_flag(argc, argv, "version")) {
-            std::cout << "clink " << clink::plugin::kClinkVersion << " (commit "
-                      << clink::plugin::kAbiHash << (clink::plugin::kAbiHashIsClean ? "" : "-dirty")
-                      << ")\n";
+            std::cout << "clink " << clink::plugin::kClinkVersion << " (plugin ABI v"
+                      << clink::plugin::kAbiVersion << ", commit " << clink::plugin::kAbiHash
+                      << (clink::plugin::kAbiHashIsClean ? "" : "-dirty") << ")\n";
             return 0;
         }
         if (has_flag(argc, argv, "help")) {

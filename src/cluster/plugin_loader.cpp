@@ -1,6 +1,7 @@
 #include "clink/cluster/plugin_loader.hpp"
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <stdexcept>
@@ -41,12 +42,46 @@ std::string current_dlerror() {
 
 }  // namespace
 
+int cluster_abi_version() noexcept {
+    return ::clink::plugin::kAbiVersion;
+}
+
 const char* cluster_abi_hash() noexcept {
     return ::clink::plugin::kAbiHash;
 }
 
 const char* cluster_target_triple() noexcept {
     return CLINK_PLUGIN_TARGET_TRIPLE;
+}
+
+bool strict_plugin_abi_enabled() noexcept {
+    const char* v = std::getenv("CLINK_STRICT_PLUGIN_ABI");
+    return v != nullptr && std::strcmp(v, "1") == 0;
+}
+
+std::string check_plugin_abi(const AbiCheckInput& in) {
+    // Strict mode, or a legacy plugin that predates the ABI-version symbol:
+    // fall back to the historic exact commit-hash gate.
+    if (in.strict || !in.plugin_has_version) {
+        if (in.plugin_hash != in.cluster_hash) {
+            const char* why = in.strict ? "strict mode" : "legacy plugin (no ABI-version symbol)";
+            return std::string{"plugin ABI hash mismatch ("} + why + "): plugin reports '" +
+                   (in.plugin_hash.empty() ? "(none)" : in.plugin_hash) + "', cluster expects '" +
+                   in.cluster_hash + "'";
+        }
+        return {};
+    }
+    // Default gate: compatible iff the ABI-compat versions match.
+    if (in.plugin_abi_version != in.cluster_abi_version) {
+        return "plugin ABI version mismatch: plugin built for ABI v" +
+               std::to_string(in.plugin_abi_version) + ", cluster is ABI v" +
+               std::to_string(in.cluster_abi_version) +
+               " (a major ABI change; rebuild the plugin against this clink release). "
+               "plugin commit '" +
+               (in.plugin_hash.empty() ? "(none)" : in.plugin_hash) + "', cluster commit '" +
+               in.cluster_hash + "'";
+    }
+    return {};
 }
 
 PluginLoadResult PluginLoader::load(const std::string& so_path) {
@@ -107,11 +142,15 @@ PluginLoadResult PluginLoader::load_into(const std::string& so_path,
         return result;
     };
 
+    using AbiVersionFn = int (*)();
     using AbiHashFn = const char* (*)();
     using TripleFn = const char* (*)();
     using MetadataFn = const ::clink::plugin::PluginMetadata* (*)();
     using RegisterFn = int (*)(void*, char*, std::size_t);
 
+    // ABI-version symbol is OPTIONAL: a plugin built before the version gate
+    // lacks it, and check_plugin_abi falls back to the exact-hash comparison.
+    auto abi_version_fn = dlsym_as<AbiVersionFn>(handle, "clink_plugin_abi_version");
     auto abi_hash_fn = dlsym_as<AbiHashFn>(handle, "clink_plugin_abi_hash");
     if (abi_hash_fn == nullptr) {
         return fail("plugin missing clink_plugin_abi_hash symbol");
@@ -130,10 +169,15 @@ PluginLoadResult PluginLoader::load_into(const std::string& so_path,
     }
 
     const char* plugin_abi = abi_hash_fn();
-    if (plugin_abi == nullptr || std::strcmp(plugin_abi, cluster_abi_hash()) != 0) {
-        return fail(std::string{"plugin ABI hash mismatch: plugin reports '"} +
-                    (plugin_abi == nullptr ? "(null)" : plugin_abi) + "', cluster expects '" +
-                    cluster_abi_hash() + "'");
+    AbiCheckInput abi_in;
+    abi_in.strict = strict_plugin_abi_enabled();
+    abi_in.plugin_has_version = abi_version_fn != nullptr;
+    abi_in.plugin_abi_version = abi_version_fn != nullptr ? abi_version_fn() : 0;
+    abi_in.cluster_abi_version = cluster_abi_version();
+    abi_in.plugin_hash = plugin_abi != nullptr ? plugin_abi : "";
+    abi_in.cluster_hash = cluster_abi_hash();
+    if (auto err = check_plugin_abi(abi_in); !err.empty()) {
+        return fail(err);
     }
 
     const char* plugin_triple = triple_fn();
@@ -159,6 +203,7 @@ PluginLoadResult PluginLoader::load_into(const std::string& so_path,
     lp.source_path = so_path;
     lp.name = meta->name != nullptr ? meta->name : "";
     lp.version = meta->version != nullptr ? meta->version : "";
+    lp.abi_version = abi_in.plugin_abi_version;
     lp.abi_hash = plugin_abi;
     lp.target_triple = plugin_triple;
     lp.dl_handle = handle;

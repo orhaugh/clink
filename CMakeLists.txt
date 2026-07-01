@@ -106,13 +106,26 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
-# Plugin ABI hash: git commit hash baked into both clink and any
-# plugin built against these headers. The plugin loader compares
-# byte-for-byte and refuses mismatches. Re-runs at configure time only;
-# `cmake --build` after a `git commit` won't pick up a new hash unless
-# you re-configure - acceptable since plugins should be rebuilt against
-# matching clink releases anyway.
+# Plugin ABI compatibility.
+#
+# CLINK_ABI_VERSION is the compatibility gate: a single integer baked into
+# both clink and any plugin built against these headers. The loader accepts a
+# plugin whose ABI version equals the cluster's and refuses otherwise, so a
+# plugin survives any marketing-version bump (patch or feature) that does NOT
+# change the ABI. BUMP IT BY HAND, and only on an intentional ABI break -
+# anything that changes a layout crossing the dlopen boundary: a data member
+# added to RuntimeContext / BuildContext / StreamElement / Batch / Record /
+# PluginRegistry, a virtual added or reordered on Operator / Source / Sink, an
+# enum's underlying type, an inline/template body compiled into plugins, or the
+# CLINK_USE_FLAT_HASH_MAP choice (the FlatMap type must match across the seam).
+# It is deliberately decoupled from project(VERSION); once the project reaches
+# 1.0 it can simply track the semver major.
+#
+# The git commit hash is still baked in (below) but is now INFORMATIONAL - it
+# is reported in logs / plugin metadata and used only by the opt-in strict mode
+# (CLINK_STRICT_PLUGIN_ABI=1), which restores the historic exact-match gate.
 # ---------------------------------------------------------------------------
+set(CLINK_ABI_VERSION 1)
 find_package(Git QUIET)
 set(CLINK_ABI_HASH "unknown")
 set(CLINK_ABI_HASH_CLEAN "false")
