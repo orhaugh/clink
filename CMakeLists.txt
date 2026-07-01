@@ -237,6 +237,7 @@ add_library(clink_core STATIC
     src/cluster/rescale_coordinator.cpp
     src/cluster/rescale_dispatch.cpp
     src/cluster/autoscaler.cpp
+    src/cluster/refresh_scheduler.cpp
     src/cluster/dag_builder_registry.cpp
     src/cluster/built_in_factories.cpp
     src/cluster/plugin_loader.cpp

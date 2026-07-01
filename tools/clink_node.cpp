@@ -153,6 +153,7 @@
 #include "clink/rocksdb_s3/install.hpp"
 #endif
 #ifdef CLINK_LINKED_SQL
+#include "clink/cluster/refresh_scheduler.hpp"
 #include "clink/nexmark/register.hpp"  // header-only synthetic 'nexmark' Row source
 #include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
@@ -650,6 +651,39 @@ SqlSession& sql_session() {
     return session;
 }
 
+// Process-global scheduler for full-refresh materialized views. Started once the JM
+// is up (see main); each full-refresh CREATE registers its view + recompute callback.
+clink::cluster::RefreshScheduler& refresh_scheduler() {
+    static clink::cluster::RefreshScheduler scheduler;
+    return scheduler;
+}
+
+// Build + submit + await one full-refresh recompute for `view_name`. Shared by the
+// on-CREATE initial population is separate (handle_compiled); this is the cadence /
+// manual REFRESH path. Locks the SQL session only to compile the spec (fast), then
+// submits + awaits without the lock so a long recompute never blocks interactive SQL.
+void run_materialized_view_refresh(clink::cluster::JobManager& jm, const std::string& view_name) {
+    clink::cluster::JobGraphSpec spec;
+    {
+        auto& session = sql_session();
+        std::lock_guard<std::mutex> lock(session.mu);
+        auto plan = clink::sql::optimize(
+            clink::sql::plan_materialized_view_refresh(view_name, session.catalog));
+        clink::sql::PhysicalPlanner planner;
+        spec = planner.compile(static_cast<const clink::sql::LogicalSink&>(*plan));
+        spec.name = "refresh_" + view_name;
+    }
+    const auto job_id = jm.submit_job(spec,
+                                      clink::cluster::OperatorRegistry::default_instance(),
+                                      /*plugins=*/{},
+                                      clink::cluster::CheckpointConfig{},
+                                      /*bundle=*/nullptr,
+                                      /*notify_client_conn=*/nullptr);
+    // A bounded recompute; wait for it to finish (the overwrite sink republishes on
+    // completion). A generous cap bounds a wedged job without hanging the scheduler.
+    jm.await_job_completion(job_id, std::chrono::minutes{10});
+}
+
 // POST /api/v1/jobs/sql?mode=explain|compile|submit[&parallelism=N][&name=foo]
 // Body: raw SQL text (one or more statements; no JSON wrapper, so SQL quoting is
 // untouched). DDL mutates the session catalog. For each INSERT / CREATE
@@ -815,12 +849,51 @@ clink::http::HttpResponse handle_sql(clink::cluster::JobManager& jm,
                 auto& mv = std::get<ast::CreateMaterializedViewStmt>(stmt);
                 auto mvplan = clink::sql::plan_materialized_view(std::move(mv), catalog, req.body);
                 const std::string view_name = mvplan.backing.name;
+                const bool full = mvplan.arm == clink::sql::RefreshArm::Full;
                 ++applied;  // the backing table was registered
                 auto optimised = clink::sql::optimize(std::move(mvplan.maintenance));
                 if (mode == "explain") {
                     plans.push_back({"materialized_view", optimised->explain()});
                 } else {
-                    handle_compiled(*optimised, "mv_" + view_name);
+                    // Continuous: a live maintenance job (mv_<name>). Full: an initial
+                    // bounded population (refresh_<name>) whose overwrite sink
+                    // republishes on completion; the scheduler then re-runs it every
+                    // freshness interval.
+                    handle_compiled(*optimised, (full ? "refresh_" : "mv_") + view_name);
+                    if (full && mode == "submit") {
+                        std::int64_t interval_ms = 0;
+                        if (const auto* t = catalog.get_table(view_name); t != nullptr) {
+                            if (const auto it = t->properties.find("freshness_ms");
+                                it != t->properties.end()) {
+                                try {
+                                    interval_ms = std::stoll(it->second);
+                                } catch (...) {
+                                    interval_ms = 0;
+                                }
+                            }
+                        }
+                        if (interval_ms > 0) {
+                            refresh_scheduler().register_view(
+                                view_name,
+                                std::chrono::milliseconds{interval_ms},
+                                [&jm, view_name]() {
+                                    run_materialized_view_refresh(jm, view_name);
+                                });
+                        }
+                    }
+                }
+            } else if (std::holds_alternative<ast::RefreshMatViewStmt>(stmt)) {
+                // Manual REFRESH: recompute now as a bounded overwrite job. Compiled
+                // inline (we already hold the session lock; run_materialized_view_refresh
+                // re-locks it and is only for the scheduler thread).
+                const auto& rf = std::get<ast::RefreshMatViewStmt>(stmt);
+                auto plan = clink::sql::optimize(
+                    clink::sql::plan_materialized_view_refresh(rf.view_name, catalog));
+                ++applied;
+                if (mode == "explain") {
+                    plans.push_back({"refresh_materialized_view", plan->explain()});
+                } else {
+                    handle_compiled(*plan, "refresh_" + rf.view_name);
                 }
             } else if (std::holds_alternative<ast::InsertStmt>(stmt)) {
                 auto plan =
@@ -2252,12 +2325,19 @@ int run_jm(int argc, char** argv) {
     (void)http_bind;
 #endif
 
+    // Full-refresh materialized views recompute on their FRESHNESS cadence: the
+    // scheduler fires each registered view's recompute + atomic overwrite. Views are
+    // registered by handle_sql when a full-refresh CREATE is submitted on this node
+    // (only the leader accepts SQL, so a standby's scheduler stays empty).
+    refresh_scheduler().start();
+
     // Run until either the user-requested duration elapses or the
     // process catches SIGTERM/SIGINT (handler set in main()). The JM
     // threads do all the real work; we just gate the lifetime here.
     const auto max_duration = duration_str.empty() ? std::chrono::seconds{0}
                                                    : std::chrono::seconds{std::stoi(duration_str)};
     wait_for_shutdown(max_duration);
+    refresh_scheduler().stop();  // join the scheduler thread before tearing down the JM
 #ifdef CLINK_HAS_HTTP
     if (http_srv) {
         http_srv->stop();

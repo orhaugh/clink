@@ -67,6 +67,7 @@ add_executable(clink_core_tests
     test_rescale_coordinator.cpp
     test_rescale_dispatch.cpp
     test_autoscaler.cpp
+    test_refresh_scheduler.cpp
     test_operator_metrics.cpp
     test_state_metrics.cpp
     test_checkpoint_metrics.cpp

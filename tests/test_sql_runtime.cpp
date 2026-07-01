@@ -31,6 +31,7 @@
 #include "clink/cluster/dag_builder_registry.hpp"
 #include "clink/cluster/job_manager.hpp"
 #include "clink/cluster/operator_registry.hpp"
+#include "clink/cluster/refresh_scheduler.hpp"
 #include "clink/cluster/task_manager.hpp"
 #include "clink/config/json.hpp"
 #include "clink/operators/agg_function_registry.hpp"
@@ -11166,6 +11167,78 @@ TEST(SqlRuntime, MaterializedViewFullRefreshOverwritesAtomically) {
     write_lines(src, {R"({"id":4,"val":50})", R"({"id":5,"val":1})"});
     submit_plan(plan_materialized_view_refresh("mv", cat));
     EXPECT_EQ(ids_in_out(), (std::set<std::int64_t>{4}));
+
+    std::filesystem::remove(src);
+    std::filesystem::remove(out);
+}
+
+// The RefreshScheduler drives the recompute automatically at the freshness cadence:
+// with a short freshness, changing the source and waiting (no manual REFRESH) is
+// enough for the backing to be atomically overwritten to the new result.
+TEST(SqlRuntime, MaterializedViewSchedulerAutoRefreshes) {
+    ensure_sql_installed_once();
+    const auto src = std::filesystem::temp_directory_path() / "clink_mvsched_src.ndjson";
+    const auto out = std::filesystem::temp_directory_path() / "clink_mvsched_out.ndjson";
+    std::filesystem::remove(src);
+    std::filesystem::remove(out);
+    write_lines(src, {R"({"id":1,"val":5})", R"({"id":2,"val":20})"});
+
+    Catalog cat;
+    auto src_ddl = parse(std::string{"CREATE TABLE ssrc (id BIGINT, val BIGINT) "
+                                     "WITH (connector='file', format='json', path='"} +
+                         src.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(src_ddl.statements[0]));
+    const std::string mv_sql =
+        std::string{
+            "CREATE MATERIALIZED VIEW smv "
+            "WITH (connector='file', format='json', freshness='300ms', path='"} +
+        out.string() + "') AS SELECT id, val FROM ssrc WHERE val > 10";
+    auto mv_script = parse(mv_sql);
+    auto mvplan = plan_materialized_view(
+        std::get<ast::CreateMaterializedViewStmt>(std::move(mv_script.statements[0])), cat, mv_sql);
+    ASSERT_EQ(mvplan.arm, RefreshArm::Full);
+
+    InProcessCluster cluster("tm-sql-mvsched", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto ids_in_out = [&]() {
+        std::set<std::int64_t> ids;
+        for (const auto& l : read_lines(out)) {
+            ids.insert(static_cast<std::int64_t>(clink::config::parse(l).at("id").as_number()));
+        }
+        return ids;
+    };
+
+    // Initial population.
+    {
+        auto plan = optimize(std::move(mvplan.maintenance));
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        ASSERT_TRUE(submitter.submit(spec.to_json(), {}, opts).completed);
+    }
+    EXPECT_EQ(ids_in_out(), (std::set<std::int64_t>{2}));
+
+    // Register the view with a scheduler whose callback recompiles + submits + waits.
+    clink::cluster::RefreshSchedulerConfig scfg;
+    scfg.tick_period = 100ms;
+    clink::cluster::RefreshScheduler sched(scfg);
+    sched.register_view("smv", 300ms, [&]() {
+        auto plan = optimize(plan_materialized_view_refresh("smv", cat));
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        (void)submitter.submit(spec.to_json(), {}, opts);
+    });
+
+    // Change the source; the scheduler should refresh the backing to {4} on its own.
+    write_lines(src, {R"({"id":4,"val":50})", R"({"id":5,"val":1})"});
+    sched.start();
+    for (int i = 0; i < 60 && ids_in_out() != std::set<std::int64_t>{4}; ++i) {
+        std::this_thread::sleep_for(100ms);
+    }
+    sched.stop();
+    EXPECT_EQ(ids_in_out(), (std::set<std::int64_t>{4}));
+    EXPECT_GE(sched.refreshes(), 1U);
 
     std::filesystem::remove(src);
     std::filesystem::remove(out);
