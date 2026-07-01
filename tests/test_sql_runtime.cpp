@@ -1882,6 +1882,85 @@ TEST(SqlRuntime, OverAggregateAsyncMatchesSyncPath) {
         << "OVER did not route its per-partition state through the deferring backend";
 }
 
+// Bounded-frame (ROWS / RANGE) and LAG OVER ride the async/disaggregated path
+// too. The per-partition LAG ring (recent) and frame buffer (folded) already
+// ride the PartState codec, and emit_one_ maintains them identically on both
+// paths, so a deferring backend produces the same per-row OVER values as the
+// sync in-memory path. Verified against the sync oracle AND with the exact
+// expected values, plus remote_loads > 0 to prove the deferring tier was used.
+TEST(SqlRuntime, OverBoundedFrameAndLagAsyncMatchesSyncPath) {
+    ensure_sql_installed_once();
+    // One partition (p=1), four rows in (ts, seq) order: id1(ts1,10),
+    // id2(ts1,15), id3(ts2,20), id4(ts5,50); a closing watermark fires them all.
+    auto steps = [] {
+        std::vector<OverScriptStep> s;
+        s.push_back({{over_row(1, 1, 1, 10),
+                      over_row(2, 1, 1, 15),
+                      over_row(3, 1, 2, 20),
+                      over_row(4, 1, 5, 50)},
+                     std::nullopt});
+        s.push_back({{}, 100});  // fire every buffered row once
+        return s;
+    };
+    auto run = [&](std::shared_ptr<StateBackend> backend) {
+        const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+            "over_aggregate_row", std::string{kChannelRow}, std::string{kChannelRow});
+        cluster::OperatorBuildContext octx;
+        octx.params["time_column"] = "ts";
+        octx.params["partition_columns"] = "p";
+        octx.params["outputs"] =
+            R"([{"name":"sr","fn":"sum","input_column":"amt","frame_mode":1,"frame_start":2},)"
+            R"({"name":"sg","fn":"sum","input_column":"amt","frame_mode":2,"frame_start":2},)"
+            R"({"name":"lg","fn":"lag","input_column":"amt","lag_offset":1}])";
+        auto op = std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+        Dag dag;
+        auto h_src = dag.add_source<Row>(std::make_shared<ScriptedRowSource>(steps()));
+        auto h_op = dag.add_operator<Row, Row>(h_src, op);
+        auto sink = std::make_shared<CollectingSink<Row>>();
+        dag.add_sink<Row>(h_op, sink);
+        JobConfig cfg;
+        cfg.state_backend = std::move(backend);
+        LocalExecutor exec(std::move(dag), std::move(cfg));
+        exec.run();
+        // id -> (ROWS sum, RANGE sum, LAG or -1 for NULL). Typed, so the
+        // number formatting cannot skew the comparison.
+        auto read = [](const Row& r, const char* c) -> std::int64_t {
+            auto it = r.values.find(c);
+            if (it == r.values.end() || it->second.is_null()) {
+                return -1;
+            }
+            return static_cast<std::int64_t>(it->second.as_number());
+        };
+        std::map<std::int64_t, std::tuple<std::int64_t, std::int64_t, std::int64_t>> rel;
+        for (const auto& rec : sink->collected_records()) {
+            const Row& r = rec.value();
+            rel[static_cast<std::int64_t>(r.values.at("id").as_number())] = {
+                read(r, "sr"), read(r, "sg"), read(r, "lg")};
+        }
+        return rel;
+    };
+
+    const auto sync_rel = run(std::make_shared<InMemoryStateBackend>());
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    const auto async_rel = run(rrb);
+
+    using T = std::tuple<std::int64_t, std::int64_t, std::int64_t>;
+    const std::map<std::int64_t, T> want = {
+        {1, T{10, 10, -1}},  // ROWS [10]; RANGE [10]; no prior row -> LAG null
+        {2, T{25, 25, 10}},  // ROWS [10,15]; RANGE ts in [-1,1] {10,15}; LAG id1=10
+        {3, T{45, 45, 15}},  // ROWS [10,15,20]; RANGE ts in [0,2] all; LAG id2=15
+        {4, T{85, 50, 20}},  // ROWS last3 [15,20,50]=85; RANGE ts in [3,5] {50}; LAG id3=20
+    };
+    EXPECT_EQ(sync_rel, want) << "sync bounded-frame / LAG OVER values";
+    EXPECT_EQ(async_rel, sync_rel)
+        << "async bounded-frame / LAG OVER must match the sync path exactly";
+    EXPECT_GT(rrb->remote_loads(), 0u)
+        << "bounded-frame / LAG OVER did not route its per-partition state through the "
+           "deferring backend";
+}
+
 // #59: the same unbounded GROUP BY built through the programmatic Table API
 // instead of a SQL string. Proves the Table-API-built JobGraphSpec actually
 // executes end-to-end (the byte-identical-IR test in test_table_api.cpp proves

@@ -2651,12 +2651,13 @@ struct OverSpec {
     [[nodiscard]] bool bounded() const { return frame_mode != 0; }
 };
 
-// OVER (running) aggregate over Row records. Emits one append-only Row
-// per input, carrying the original columns plus the OVER outputs,
-// finalised once the watermark passes the row's event time so the
-// running frame (UNBOUNDED PRECEDING ... CURRENT ROW) up to and
-// including it is complete. No retraction: the result for a row never
-// changes after it is emitted.
+// OVER aggregate over Row records (running UNBOUNDED PRECEDING ...
+// CURRENT ROW, bounded ROWS / RANGE <n> PRECEDING frames, and the
+// navigation fns FIRST_VALUE / LAST_VALUE / LAG). Emits one append-only
+// Row per input, carrying the original columns plus the OVER outputs,
+// finalised once the watermark passes the row's event time so its frame
+// is complete. No retraction: the result for a row never changes after it
+// is emitted.
 //
 // Per-partition state: a running AggState per aggregate output, the
 // first folded row (FIRST_VALUE), a small ring of the most recent
@@ -2709,22 +2710,19 @@ public:
 
     std::string name() const override { return "over_aggregate_row"; }
 
-    // Auto-on the async/disaggregated path when the bound backend defers reads
-    // AND this OVER carries no LAG ring and no bounded-frame buffer
-    // (max_lag_ == 0 && !needs_buffer_). In that scope a partition's state is just
-    // {running aggregates, first_row, pending buffer}; it lives in KeyedState
-    // (the pool, evictable + lazy-restore) keyed by the PARTITION key (so routing
-    // matches the keyer), and each buffered row registers an event-time timer at
-    // its event time. A watermark fires the due partition's timer, which
-    // point-reads ONLY that partition's state - never a scan of every partition.
-    // LAG / ROWS / RANGE-frame OVER keep the byte-identical in-memory state_ +
-    // watermark scan (their per-partition deque buffers are a larger
-    // serialisation surface; a scoped follow-on), so this is non-breaking.
+    // Auto-on the async/disaggregated path when the bound backend defers reads.
+    // A partition's whole state - running aggregates, first_row, the LAG ring
+    // (recent), the bounded-frame buffer (folded) and the pending buffer - lives
+    // in KeyedState (the pool, evictable + lazy-restore) keyed by the PARTITION
+    // key (so routing matches the keyer), and each buffered row registers an
+    // event-time timer at its event time. A watermark fires the due partition's
+    // timer, which point-reads ONLY that partition's state - never a scan of
+    // every partition. LAG and ROWS / RANGE bounded frames are covered too: the
+    // codec serialises recent/folded and emit_one_ maintains them identically on
+    // both paths, so the async output matches the sync in-memory path exactly.
     void open() override {
-        const bool backend_defers = this->runtime() != nullptr &&
-                                    this->runtime()->has_state_backend() &&
-                                    this->runtime()->state_backend()->supports_async_get();
-        effective_async_ = backend_defers && max_lag_ == 0 && !needs_buffer_;
+        effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
+                           this->runtime()->state_backend()->supports_async_get();
     }
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
     [[nodiscard]] bool fires_state_touching_timers() const noexcept override {
@@ -3066,9 +3064,9 @@ private:
 
     // Pop this partition's pending rows with ts <= bound in (ts, seq) order and
     // fold + emit each via the shared emit_one_ - byte-identical to fire_due_'s
-    // inner loop for one partition. Only reached on the async path, where
-    // max_lag_ == 0 && !needs_buffer_, so emit_one_'s LAG ring and bounded-frame
-    // branches are inert (no recent / folded mutation), matching the sync output.
+    // inner loop for one partition. emit_one_ maintains the LAG ring and the
+    // bounded-frame buffer, which ride PartState in KeyedState, so LAG and
+    // ROWS / RANGE frames are correct on the async path too.
     void drain_due_(PartState& st, std::int64_t bound, Batch<Row>& batch) {
         while (!st.pending.empty() && st.pending.begin()->first.first <= bound) {
             Row r = std::move(st.pending.begin()->second);
@@ -3084,10 +3082,9 @@ private:
 
     // Binary codec for one partition's PartState over the async/disaggregated
     // KeyedState path. Reuses the exact AggState (de)serialisation the GROUP BY's
-    // AggBucket codec proves, and the Row-as-JSON idiom the window codec uses. The
-    // async path is gated to max_lag_ == 0 && !needs_buffer_, so recent / folded
-    // are always empty here, but they are serialised for fidelity (and so the
-    // codec stays correct if the gate is later widened).
+    // AggBucket codec proves, and the Row-as-JSON idiom the window codec uses. All
+    // fields ride the codec - the LAG ring (recent) and bounded-frame buffer
+    // (folded) included - so a LAG / ROWS / RANGE OVER disaggregates correctly.
     static clink::Codec<PartState> part_state_codec() {
         using Bytes = clink::Codec<PartState>::Bytes;
         using BytesView = clink::Codec<PartState>::BytesView;
