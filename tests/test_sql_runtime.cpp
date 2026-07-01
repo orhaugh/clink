@@ -761,6 +761,68 @@ TEST(SqlRuntime, SetOpIntersectRidesRemoteReadPath) {
         << "INTERSECT did not route its per-tuple state through the deferring backend (async path)";
 }
 
+// A plain semi join (IN / EXISTS, null_aware=0) rides the checkpointed KeyedState
+// path and auto-activates the async/disaggregated path on a deferring backend.
+// The left entries and the right presence-count were in-memory maps that a
+// restore would lose; both now live in per-join-key KeyedState slots. Null-aware
+// NOT IN keeps the in-memory path (cross-key NULL poison, parallelism 1). Driven
+// cluster-free through the semi_join_row Dag builder (two VectorSources -> co-op)
+// on a RemoteReadBackend so remote_loads() proves the state went through the
+// deferring tier. Semi(IN) of left {1,2,3} against right {2,3,3} = {2,3}.
+TEST(SqlRuntime, SemiJoinInRidesRemoteReadPath) {
+    ensure_sql_installed_once();
+    const auto* builder = cluster::DagBuilderRegistry::default_instance().find("semi_join_row");
+    ASSERT_NE(builder, nullptr) << "semi_join_row Dag builder not registered";
+
+    auto mkrow = [](std::int64_t k) {
+        Row r;
+        r.values["k"] = clink::config::JsonValue{static_cast<double>(k)};
+        return Record<Row>{std::move(r)};
+    };
+    const std::vector<Record<Row>> left = {mkrow(1), mkrow(2), mkrow(3)};
+    const std::vector<Record<Row>> right = {mkrow(2), mkrow(3), mkrow(3)};
+
+    Dag dag;
+    auto hl = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(left));
+    auto hr = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(right));
+    clink::plugin::BuildContext ctx;
+    ctx.params["left_key_column"] = "k";
+    ctx.params["right_key_column"] = "k";
+    ctx.params["anti"] = "0";
+    ctx.params["null_aware"] = "0";
+    std::vector<std::any> upstream = {std::any{hl}, std::any{hr}};
+    auto built = (*builder)(dag, upstream, ctx);
+    auto h_op = std::any_cast<StageHandle<Row>>(built.main_handle);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_op, sink);
+
+    // Deferring backend: SemiAntiJoinRowOp's plain path auto-enables async.
+    auto rrb = std::make_shared<RemoteReadBackend>(std::make_shared<InMemoryRemotePool>(),
+                                                   /*io_threads=*/1,
+                                                   /*hot_max_bytes=*/0);
+    JobConfig cfg;
+    cfg.state_backend = rrb;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    // Semi is insert-only over append inputs; net the live set to be order-safe.
+    std::map<std::int64_t, int> net;
+    for (const auto& rec : sink->collected_records()) {
+        Row r = rec.value();
+        const std::string kind = row_kind_of(r);
+        const auto k = static_cast<std::int64_t>(r.values.at("k").as_number());
+        net[k] += is_delete_like(kind) ? -1 : 1;
+    }
+    std::set<std::int64_t> present;
+    for (const auto& [k, n] : net) {
+        if (n > 0)
+            present.insert(k);
+    }
+    EXPECT_EQ(present, (std::set<std::int64_t>{2, 3}));
+    EXPECT_GT(rrb->remote_loads(), 0u)
+        << "semi join did not route its per-key state through the deferring backend (async path)";
+}
+
 // PARITY-P1 whole-job proof: a job with MULTIPLE distinct stateful operators (an
 // INNER equi-join feeding a GROUP BY, both auto-async on a deferring backend)
 // SHARING ONE backend instance has every stateful op ride the async path and

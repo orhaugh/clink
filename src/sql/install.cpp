@@ -4137,12 +4137,32 @@ public:
           anti_(anti),
           null_aware_(null_aware) {}
 
+    // The PLAIN semi / anti path (IN / EXISTS / NOT EXISTS) is per-key: the
+    // left entries and the right presence-count key by the join tuple, so it
+    // rides checkpointed KeyedState and, on a deferring backend, the async
+    // path. The former in-memory maps were not snapshotted, so a restore
+    // replayed or dropped rows. The null-aware NOT IN path stays in-memory: a
+    // NULL right poisons probes ACROSS keys (per-position wildcard match) and
+    // it is already a parallelism-1 operator, so it does not fit per-key state.
+    void open() override {
+        effective_async_ = !null_aware_ && this->runtime() != nullptr &&
+                           this->runtime()->has_state_backend() &&
+                           this->runtime()->state_backend()->supports_async_get();
+    }
+
     void process_element1(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (!element.is_data())
             return;
         Batch<Row> batch;
-        for (const auto& rec : element.as_data())
-            handle_left_(rec.value(), batch);
+        if (null_aware_) {
+            for (const auto& rec : element.as_data())
+                handle_left_(rec.value(), batch);
+        } else {
+            auto kv_l = kv_left_();
+            auto kv_r = kv_right_();
+            for (const auto& rec : element.as_data())
+                handle_left_keyed_(rec.value(), batch, kv_l, kv_r);
+        }
         if (!batch.empty())
             out.emit_data(std::move(batch));
     }
@@ -4150,11 +4170,121 @@ public:
         if (!element.is_data())
             return;
         Batch<Row> batch;
-        for (const auto& rec : element.as_data())
-            handle_right_(rec.value(), batch);
+        if (null_aware_) {
+            for (const auto& rec : element.as_data())
+                handle_right_(rec.value(), batch);
+        } else {
+            auto kv_l = kv_left_();
+            auto kv_r = kv_right_();
+            for (const auto& rec : element.as_data())
+                handle_right_keyed_(rec.value(), batch, kv_l, kv_r);
+        }
         if (!batch.empty())
             out.emit_data(std::move(batch));
     }
+
+    [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
+
+    // ASYNC-10 read coalescing: each arrival's process_async issues get_async
+    // for its join key on the two slots. No-op on a non-deferring backend.
+    [[nodiscard]] bool coalesce_reads() const noexcept override { return true; }
+
+    void process_async1(const StreamElement<Row>& element,
+                        Emitter<Row>& out,
+                        AsyncExecutionController& aec) override {
+        if (!element.is_data())
+            return;
+        auto kv_l = kv_left_();
+        auto kv_r = kv_right_();
+        for (const auto& rec : element.as_data()) {
+            Row row = rec.value();
+            auto keyopt = key_of_(row, left_key_columns_);
+            if (!keyopt.has_value()) {
+                // Plain NULL-component probe: semi (IN) never matches (drop);
+                // anti (NOT EXISTS) qualifies and can never be retracted. It
+                // touches no state, so emit inline.
+                if (anti_) {
+                    Batch<Row> b;
+                    emit_(row, kRowKindInsert, b);
+                    out.emit_data(std::move(b));
+                }
+                continue;
+            }
+            std::string key = *keyopt;
+            auto factory =
+                [this, kv_l, kv_r, row = std::move(row), key, &out]() mutable -> async::Task<void> {
+                const bool right_present = (co_await kv_r.get_async(key)).value_or(0) > 0;
+                LeftEntry e{std::move(row), false};
+                Batch<Row> b;
+                if (!anti_) {
+                    if (right_present) {
+                        e.emitted = true;
+                        emit_(e.row, kRowKindInsert, b);
+                    }
+                } else if (!right_present) {
+                    e.emitted = true;
+                    emit_(e.row, kRowKindInsert, b);
+                }
+                auto list = (co_await kv_l.get_async(key)).value_or(std::vector<LeftEntry>{});
+                list.push_back(std::move(e));
+                kv_l.put(key, list);
+                if (!b.empty())
+                    out.emit_data(std::move(b));
+                co_return;
+            };
+            while (!aec.submit(key, factory)) {
+                aec.poll_or_flush();
+            }
+        }
+    }
+    void process_async2(const StreamElement<Row>& element,
+                        Emitter<Row>& out,
+                        AsyncExecutionController& aec) override {
+        if (!element.is_data())
+            return;
+        auto kv_l = kv_left_();
+        auto kv_r = kv_right_();
+        for (const auto& rec : element.as_data()) {
+            auto keyopt = key_of_(rec.value(), right_key_columns_);
+            if (!keyopt.has_value()) {
+                continue;  // plain: a NULL-component right tuple matches nothing
+            }
+            std::string key = *keyopt;
+            auto factory = [this, kv_l, kv_r, key, &out]() mutable -> async::Task<void> {
+                const int before = static_cast<int>((co_await kv_r.get_async(key)).value_or(0));
+                kv_r.put(key, static_cast<std::int64_t>(before + 1));
+                if (before != 0) {
+                    co_return;  // key already present; no transition
+                }
+                auto list = (co_await kv_l.get_async(key)).value_or(std::vector<LeftEntry>{});
+                Batch<Row> b;
+                bool changed = false;
+                for (auto& e : list) {
+                    if (!anti_) {
+                        if (!e.emitted) {
+                            e.emitted = true;
+                            emit_(e.row, kRowKindInsert, b);
+                            changed = true;
+                        }
+                    } else if (e.emitted) {
+                        e.emitted = false;
+                        emit_(e.row, kRowKindDelete, b);
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    kv_l.put(key, list);
+                }
+                if (!b.empty())
+                    out.emit_data(std::move(b));
+                co_return;
+            };
+            while (!aec.submit(key, factory)) {
+                aec.poll_or_flush();
+            }
+        }
+    }
+
     std::string name() const override { return "semi_join_row"; }
 
 private:
@@ -4393,10 +4523,144 @@ private:
         }
     }
 
+    // --- plain (non-null-aware) keyed-state path: sync twins of the async
+    // process_async{1,2}, used when the bound backend cannot defer reads. Both
+    // slots key by the join tuple, so left entries and the right presence-count
+    // for a key co-locate on the subtask the record routes to. ---
+    void handle_left_keyed_(const Row& row,
+                            Batch<Row>& batch,
+                            KeyedState<std::string, std::vector<LeftEntry>>& kv_l,
+                            KeyedState<std::string, std::int64_t>& kv_r) {
+        auto key = key_of_(row, left_key_columns_);
+        if (!key.has_value()) {
+            // Plain NULL-component probe: semi (IN) never matches; anti
+            // (NOT EXISTS) qualifies once, never retracted (no state needed).
+            if (anti_) {
+                emit_(row, kRowKindInsert, batch);
+            }
+            return;
+        }
+        const bool right_present = kv_r.get(*key).value_or(0) > 0;
+        LeftEntry e{row, false};
+        if (!anti_) {
+            if (right_present) {
+                e.emitted = true;
+                emit_(e.row, kRowKindInsert, batch);
+            }
+        } else if (!right_present) {
+            e.emitted = true;
+            emit_(e.row, kRowKindInsert, batch);
+        }
+        auto list = kv_l.get(*key).value_or(std::vector<LeftEntry>{});
+        list.push_back(std::move(e));
+        kv_l.put(*key, list);
+    }
+
+    void handle_right_keyed_(const Row& row,
+                             Batch<Row>& batch,
+                             KeyedState<std::string, std::vector<LeftEntry>>& kv_l,
+                             KeyedState<std::string, std::int64_t>& kv_r) {
+        auto key = key_of_(row, right_key_columns_);
+        if (!key.has_value()) {
+            return;  // plain: a NULL-component right tuple matches nothing
+        }
+        const int before = static_cast<int>(kv_r.get(*key).value_or(0));
+        kv_r.put(*key, static_cast<std::int64_t>(before + 1));
+        if (before != 0) {
+            return;  // key already present; no transition
+        }
+        auto list = kv_l.get(*key).value_or(std::vector<LeftEntry>{});
+        bool changed = false;
+        for (auto& e : list) {
+            if (!anti_) {
+                if (!e.emitted) {
+                    e.emitted = true;
+                    emit_(e.row, kRowKindInsert, batch);
+                    changed = true;
+                }
+            } else if (e.emitted) {
+                e.emitted = false;
+                emit_(e.row, kRowKindDelete, batch);
+                changed = true;
+            }
+        }
+        if (changed) {
+            kv_l.put(*key, list);
+        }
+    }
+
+    // Codec for one key's left-entry list over the async/disaggregated path: a
+    // JSON array of {"r": <row object>, "e": <emitted>}.
+    static clink::Codec<std::vector<LeftEntry>> left_entry_list_codec() {
+        using Bytes = clink::Codec<std::vector<LeftEntry>>::Bytes;
+        using BytesView = clink::Codec<std::vector<LeftEntry>>::BytesView;
+        auto body = [](const std::vector<LeftEntry>& es, Bytes& out) {
+            clink::config::JsonArray arr;
+            arr.reserve(es.size());
+            for (const auto& e : es) {
+                clink::config::JsonObject o;
+                o["r"] = clink::config::JsonValue{clink::config::JsonObject{e.row.values}};
+                o["e"] = clink::config::JsonValue{e.emitted};
+                arr.emplace_back(std::move(o));
+            }
+            const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
+            const auto* p = reinterpret_cast<const std::byte*>(s.data());
+            out.insert(out.end(), p, p + s.size());
+        };
+        return clink::Codec<std::vector<LeftEntry>>{
+            .encode = [body](const std::vector<LeftEntry>& es) -> Bytes {
+                Bytes out;
+                body(es, out);
+                return out;
+            },
+            .decode = [](BytesView b) -> std::optional<std::vector<LeftEntry>> {
+                std::string text(reinterpret_cast<const char*>(b.data()), b.size());
+                try {
+                    auto j = clink::config::parse(text);
+                    if (!j.is_array()) {
+                        return std::nullopt;
+                    }
+                    std::vector<LeftEntry> es;
+                    es.reserve(j.as_array().size());
+                    for (const auto& el : j.as_array()) {
+                        if (!el.is_object()) {
+                            return std::nullopt;
+                        }
+                        const auto& o = el.as_object();
+                        LeftEntry e;
+                        if (auto it = o.find("r"); it != o.end() && it->second.is_object()) {
+                            e.row.values = it->second.as_object();
+                        }
+                        if (auto it = o.find("e"); it != o.end() && it->second.is_bool()) {
+                            e.emitted = it->second.as_bool();
+                        }
+                        es.push_back(std::move(e));
+                    }
+                    return es;
+                } catch (...) {
+                    return std::nullopt;
+                }
+            },
+            .encode_into = body,
+        };
+    }
+
+    KeyedState<std::string, std::vector<LeftEntry>> kv_left_() {
+        return this->runtime()->template keyed_state<std::string, std::vector<LeftEntry>>(
+            "saL", clink::string_codec(), left_entry_list_codec());
+    }
+    KeyedState<std::string, std::int64_t> kv_right_() {
+        return this->runtime()->template keyed_state<std::string, std::int64_t>(
+            "saR", clink::string_codec(), clink::int64_codec());
+    }
+
     std::vector<std::string> left_key_columns_;
     std::vector<std::string> right_key_columns_;
     bool anti_;
     bool null_aware_;
+    // Finalised in open(): the plain path on a deferring backend -> async
+    // process_async{1,2}; otherwise the sync path above.
+    bool effective_async_ = false;
     clink::FlatMap<std::string, std::vector<LeftEntry>> left_state_;
     clink::FlatMap<std::string, int> right_count_;
     // #49 null-aware NOT IN only: probes with >= 1 NULL key component (never
