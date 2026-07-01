@@ -316,6 +316,97 @@ void scenario_working_set(std::int64_t keys, std::int64_t reads) {
     require(unbounded.remote_loads == 0, "unbounded arm must never cold-load (all state resident)");
 }
 
+// =================== Scenario 3: recovery cost ~ touched keys ===============
+
+void scenario_recovery(std::int64_t total, std::int64_t touch) {
+    const OperatorId op{1};
+    if (touch > total) {
+        touch = total;
+    }
+    std::printf("\n== Scenario 3: recovery cost ~ touched keys, not total ==\n");
+    std::printf("   total state T=%lld keys, post-recovery working set W=%lld distinct reads\n",
+                static_cast<long long>(total),
+                static_cast<long long>(touch));
+
+    // --- Disaggregated recovery: state is durable in the pool; a fresh backend
+    // restores LAZILY (nothing downloaded) and pays a cold-load only per key it
+    // actually touches. ---
+    auto pool = std::make_shared<CountingPool>();
+    RemoteReadBackend src(pool, /*io_threads=*/4, /*hot_max_bytes=*/0);
+    for (std::int64_t k = 0; k < total; ++k) {
+        put_key(src, op, k, k * 7 + 1);
+    }
+    const auto snap_d = src.snapshot(CheckpointId{1});  // commit all T to the pool
+
+    RemoteReadBackend recovered(pool, /*io_threads=*/4, /*hot_max_bytes=*/0);
+    auto t0 = std::chrono::steady_clock::now();
+    recovered.restore(snap_d);  // lazy: sets the restore checkpoint, loads nothing
+    const double d_restore_ms = ms_since(t0);
+    std::int64_t d_sum = 0;
+    t0 = std::chrono::steady_clock::now();
+    for (std::int64_t k = 0; k < touch; ++k) {
+        auto v = get_key(recovered, op, k);
+        require(v.has_value(), "scenario 3: recovered key must read back");
+        if (v) {
+            d_sum += decode(*v);
+        }
+    }
+    const double d_read_ms = ms_since(t0);
+    const std::uint64_t d_loads = recovered.remote_loads();
+
+    // --- Full-state recovery: the snapshot IS the state; restore must
+    // materialise all T before the backend is usable. ---
+    InMemoryStateBackend fsrc;
+    for (std::int64_t k = 0; k < total; ++k) {
+        put_key(fsrc, op, k, k * 7 + 1);
+    }
+    const auto snap_f = fsrc.snapshot(CheckpointId{1});
+    InMemoryStateBackend frec;
+    t0 = std::chrono::steady_clock::now();
+    frec.restore(snap_f);  // deserialises the whole T-key state up front
+    const double f_restore_ms = ms_since(t0);
+    std::int64_t f_sum = 0;
+    t0 = std::chrono::steady_clock::now();
+    for (std::int64_t k = 0; k < touch; ++k) {
+        auto v = get_key(frec, op, k);
+        if (v) {
+            f_sum += decode(*v);
+        }
+    }
+    const double f_read_ms = ms_since(t0);
+
+    std::printf(
+        "   disagg  : restore %.3f ms (blob %zu bytes, lazy), then %lld cold reads %.3f ms, "
+        "remote_loads=%llu\n",
+        d_restore_ms,
+        snap_d.bytes.size(),
+        static_cast<long long>(touch),
+        d_read_ms,
+        static_cast<unsigned long long>(d_loads));
+    std::printf(
+        "   full-snap: restore %.3f ms (blob %zu bytes = whole state), then %lld reads %.3f ms\n",
+        f_restore_ms,
+        snap_f.bytes.size(),
+        static_cast<long long>(touch),
+        f_read_ms);
+    std::printf(
+        "   >> to become usable, disagg moved a %zu-byte handle + %lld touched keys; "
+        "full-snap moved all %lld keys (%zu bytes)\n",
+        snap_d.bytes.size(),
+        static_cast<long long>(touch),
+        static_cast<long long>(total),
+        snap_f.bytes.size());
+
+    // Structural invariants: same result; disagg touched ONLY the working set (not
+    // T); the disagg recovery blob is far smaller than the full-state snapshot
+    // (state lives in the pool, not the checkpoint).
+    require(d_sum == f_sum, "recovery arms must produce identical read results");
+    require(d_loads == static_cast<std::uint64_t>(touch),
+            "disagg recovery must cold-load ONLY the touched keys, not the whole state");
+    require(snap_d.bytes.size() < snap_f.bytes.size(),
+            "disagg recovery blob must be smaller than the full-state snapshot");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -323,10 +414,12 @@ int main(int argc, char** argv) {
     const std::int64_t delta = std::stoll(get_arg(argc, argv, "delta", "1000"));
     const std::int64_t keys = std::stoll(get_arg(argc, argv, "keys", "40000"));
     const std::int64_t reads = std::stoll(get_arg(argc, argv, "reads", "200000"));
+    const std::int64_t touch = std::stoll(get_arg(argc, argv, "touch", "2000"));
 
     std::printf("clink_disagg_bench (PARITY-P3): disaggregated-state property proof\n");
     scenario_checkpoint_delta(total, delta);
     scenario_working_set(keys, reads);
+    scenario_recovery(total, touch);
 
     if (g_failures > 0) {
         std::fprintf(stderr, "\n%d structural invariant(s) FAILED\n", g_failures);
