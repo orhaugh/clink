@@ -665,14 +665,18 @@ Advanced and extensibility (each a documented v1 subset)
 - `MATCH_RECOGNIZE (PARTITION BY ... ORDER BY ... PATTERN ... DEFINE ...
   MEASURES ...)`: linear greedy patterns, simple DEFINE predicates, FIRST/LAST
   measures, ONE ROW PER MATCH; lowered onto the CEP engine
-- `CREATE MATERIALIZED VIEW ... AS <SELECT>` with continuous maintenance; keyed
-  GROUP BY auto-derives upsert mode and primary key
+- `CREATE MATERIALIZED VIEW ... AS <SELECT>`: continuous maintenance (keyed GROUP
+  BY auto-derives upsert mode and primary key), or a scheduled full-refresh arm via
+  `WITH ('freshness'='1h')` that recomputes over bounded sources and atomically
+  overwrites the backing, driven by a JobManager-side scheduler and `REFRESH
+  MATERIALIZED VIEW`; `partition_by` writes a per-partition set swapped atomically
 - SQL-native AI: `CREATE MODEL name INPUT (...) OUTPUT (...) WITH (provider=...)`
   registers a model, and `ML_PREDICT(TABLE t, MODEL m, DESCRIPTOR(cols))` applies
-  it per row (a built-in HTTP inference provider plus a C++-closure provider SPI);
-  `VECTOR_SEARCH(TABLE t, query_col, vec_table, DESCRIPTOR(idx), top_k [, metric])`
-  returns each row's top-K nearest vectors + a score, with SIMD distance kernels
-  (SimSIMD) and exact-flat or approximate-HNSW (usearch) indexing
+  it per row (a built-in HTTP inference provider, a local ONNX Runtime provider, and
+  a C++-closure provider SPI); `VECTOR_SEARCH(TABLE t, query_col, vec_table,
+  DESCRIPTOR(idx), top_k [, metric])` returns each row's top-K nearest vectors + a
+  score, with SIMD distance kernels (SimSIMD) and exact-flat or approximate-HNSW
+  (usearch) indexing
 - Process table functions: a C++-registered `KeyedProcessFunction<string,Row,
   Row>` callable as `fn(TABLE t PARTITION BY cols)` with isolated per-key state
   (v1 is timerless)

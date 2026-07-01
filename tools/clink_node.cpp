@@ -146,6 +146,9 @@
 #ifdef CLINK_LINKED_VECTOR_SEARCH
 #include "clink/vector_search/install.hpp"
 #endif
+#ifdef CLINK_LINKED_ONNX
+#include "clink/onnx/install.hpp"
+#endif
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/rocksdb/install.hpp"
 #endif
@@ -2712,6 +2715,11 @@ void install_linked_impls() {
     // SQL-native AI: the vector_search_row operator. Registered after
     // clink::sql::install so the Row channel type it keys on already exists.
     clink::vector_search::install(reg);
+#endif
+#ifdef CLINK_LINKED_ONNX
+    // SQL-native AI: the local ONNX Runtime ML_PREDICT provider (provider='onnx').
+    // Registered into the process-wide ModelProviderRegistry like the HTTP provider.
+    clink::onnx::install(reg);
 #endif
 #endif
 }
