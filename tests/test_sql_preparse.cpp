@@ -3,6 +3,7 @@
 // the composite-type parser, full parse() -> Arrow type resolution, the catalog
 // round-trip, and sink-compatibility for composite columns.
 
+#include <filesystem>
 #include <memory>
 #include <variant>
 
@@ -672,6 +673,35 @@ TEST(SqlPreparse, MaterializedViewFullRefreshAcceptedForBoundedSource) {
     ASSERT_NE(cat.get_table("mv"), nullptr);
     EXPECT_EQ(cat.get_table("mv")->properties.at("write_mode"), "overwrite");
     EXPECT_EQ(cat.get_table("mv")->properties.at("refresh_arm"), "full");
+}
+
+TEST(SqlPreparse, FullRefreshBackingSurvivesCatalogReload) {
+    // HA / restart survival: a full-refresh backing persists its refresh metadata to
+    // the catalog dir, so a new leader that reloads the catalog has everything the
+    // scheduler needs to resume the view (refresh_arm + freshness_ms + definition_sql).
+    const auto dir = std::filesystem::temp_directory_path() / "clink_mv_ha_catalog";
+    std::filesystem::remove_all(dir);
+    {
+        Catalog cat;
+        cat.set_persistence_dir(dir.string());
+        register_source(cat, "t", "a BIGINT");  // connector='file' (bounded), persisted
+        const std::string mv_sql =
+            "CREATE MATERIALIZED VIEW mv "
+            "WITH (freshness='30m', connector='file', format='json', path='/tmp/mv_ha.ndjson') "
+            "AS SELECT a FROM t";
+        (void)plan_materialized_view(parse_mv(mv_sql.c_str()), cat, mv_sql);
+    }
+    // A fresh catalog loaded from the dir (as a new JM leader would) sees the view.
+    Catalog reloaded;
+    reloaded.load_from_dir(dir.string());
+    const auto* mv = reloaded.get_table("mv");
+    ASSERT_NE(mv, nullptr);
+    EXPECT_TRUE(mv->is_materialized_view());
+    EXPECT_EQ(mv->properties.at("refresh_arm"), "full");
+    EXPECT_EQ(mv->properties.at("freshness_ms"), std::to_string(30LL * 60 * 1000));
+    EXPECT_EQ(mv->properties.at("write_mode"), "overwrite");
+    EXPECT_FALSE(mv->definition_sql().empty());
+    std::filesystem::remove_all(dir);
 }
 
 TEST(SqlPreparse, MaterializedViewFullRefreshRejectsUnboundedSource) {

@@ -684,6 +684,50 @@ void run_materialized_view_refresh(clink::cluster::JobManager& jm, const std::st
     jm.await_job_completion(job_id, std::chrono::minutes{10});
 }
 
+// Re-register every full-refresh materialized view in the session catalog with the
+// scheduler (HA / restart survival: the backing tables persist refresh_arm='full' +
+// freshness_ms + definition_sql to --sql-catalog-dir, so a new leader that has loaded
+// the catalog resumes their cadence without the original CREATE request). Idempotent:
+// a view already scheduled is skipped. The published backing data is served as-is
+// until the next scheduled refresh (no forced repopulate on takeover).
+void reregister_full_refresh_views(clink::cluster::JobManager& jm) {
+    auto& session = sql_session();
+    std::vector<std::pair<std::string, std::int64_t>> full_views;
+    {
+        std::lock_guard<std::mutex> lock(session.mu);
+        for (const auto& name : session.catalog.list_tables()) {
+            const auto* t = session.catalog.get_table(name);
+            if (t == nullptr || !t->is_materialized_view()) {
+                continue;
+            }
+            const auto arm = t->properties.find("refresh_arm");
+            if (arm == t->properties.end() || arm->second != "full") {
+                continue;
+            }
+            std::int64_t interval_ms = 0;
+            if (const auto it = t->properties.find("freshness_ms"); it != t->properties.end()) {
+                try {
+                    interval_ms = std::stoll(it->second);
+                } catch (...) {
+                    interval_ms = 0;
+                }
+            }
+            if (interval_ms > 0) {
+                full_views.emplace_back(name, interval_ms);
+            }
+        }
+    }
+    for (const auto& [name, interval_ms] : full_views) {
+        if (refresh_scheduler().has_view(name)) {
+            continue;
+        }
+        refresh_scheduler().register_view(
+            name, std::chrono::milliseconds{interval_ms}, [&jm, name]() {
+                run_materialized_view_refresh(jm, name);
+            });
+    }
+}
+
 // POST /api/v1/jobs/sql?mode=explain|compile|submit[&parallelism=N][&name=foo]
 // Body: raw SQL text (one or more statements; no JSON wrapper, so SQL quoting is
 // untouched). DDL mutates the session catalog. For each INSERT / CREATE
@@ -1811,6 +1855,10 @@ int run_jm(int argc, char** argv) {
     }
 #endif
     const auto want_port = static_cast<std::uint16_t>(std::stoi(port_str));
+    // Persistent SQL catalog dir (shared by the HTTP workbench + the HA takeover
+    // path). Full-refresh materialized views persist here, so a new leader can reload
+    // them and resume their refresh schedule.
+    const std::string sql_catalog_dir = get_arg(argc, argv, "sql-catalog-dir", "");
     std::unique_ptr<clink::cluster::HaCoordinator> ha_coord;
     if (ha_dir.empty()) {
         const auto bound = jm.start(want_port);
@@ -1844,17 +1892,27 @@ int run_jm(int argc, char** argv) {
         } else {
             ha_coord = clink::cluster::make_file_ha_coordinator(ha_dir, advertise);
         }
-        ha_coord->set_on_become_leader([&jm, want_port, advertise_host](std::uint64_t epoch) {
-            try {
-                const auto bound = jm.start(want_port);
-                std::cout << "JM became leader (epoch=" << epoch << "), listening on "
-                          << advertise_host << ":" << bound << "\n";
-                std::cout.flush();
-                jm.recover_persisted_jobs();
-            } catch (const std::exception& e) {
-                std::cerr << "JM HA takeover failed: " << e.what() << "\n";
-            }
-        });
+        ha_coord->set_on_become_leader(
+            [&jm, want_port, advertise_host, sql_catalog_dir](std::uint64_t epoch) {
+                try {
+                    const auto bound = jm.start(want_port);
+                    std::cout << "JM became leader (epoch=" << epoch << "), listening on "
+                              << advertise_host << ":" << bound << "\n";
+                    std::cout.flush();
+                    jm.recover_persisted_jobs();
+                    // Reload the persisted catalog (the previous leader may have
+                    // created materialized views after this node's startup load) and
+                    // resume every full-refresh view's schedule on this new leader.
+                    if (!sql_catalog_dir.empty()) {
+                        auto& session = sql_session();
+                        std::lock_guard<std::mutex> lock(session.mu);
+                        session.catalog.load_from_dir(sql_catalog_dir);
+                    }
+                    reregister_full_refresh_views(jm);
+                } catch (const std::exception& e) {
+                    std::cerr << "JM HA takeover failed: " << e.what() << "\n";
+                }
+            });
         ha_coord->start();
         std::cout << "JM standby (ha-dir=" << ha_dir << ")\n";
         std::cout.flush();
@@ -2330,6 +2388,11 @@ int run_jm(int argc, char** argv) {
     // registered by handle_sql when a full-refresh CREATE is submitted on this node
     // (only the leader accepts SQL, so a standby's scheduler stays empty).
     refresh_scheduler().start();
+    // Non-HA restart survival: resume any full-refresh views loaded from a persisted
+    // catalog. (The HA path re-registers in the leadership callback after reloading.)
+    if (ha_dir.empty()) {
+        reregister_full_refresh_views(jm);
+    }
 
     // Run until either the user-requested duration elapses or the
     // process catches SIGTERM/SIGINT (handler set in main()). The JM
