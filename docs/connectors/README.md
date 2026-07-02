@@ -33,7 +33,8 @@ is reachable through the programmatic API only.
 
 | Connector | I/O | Client dependency | Version | SQL `connector=` |
 | --- | --- | --- | --- | --- |
-| [Amazon S3](s3-parquet.md) | source + sink | Arrow S3FileSystem + aws-sdk-cpp | Arrow `24.0.0`, aws-sdk `1.11.795` | `s3_parquet` |
+| [Amazon S3 (Parquet)](s3-parquet.md) | source + sink | Arrow S3FileSystem + aws-sdk-cpp | Arrow `24.0.0`, aws-sdk `1.11.795` | `s3_parquet` |
+| [Amazon S3 (raw objects)](s3.md) | sink | aws-sdk-cpp | `1.11.795` | `s3` |
 | [Google Cloud Storage](gcs-parquet.md) | source + sink | Arrow GcsFileSystem (`ARROW_GCS`) | Arrow `24.0.0` | `gcs_parquet` |
 | [Azure Blob Storage](azure-parquet.md) | source + sink | Arrow AzureFileSystem (`ARROW_AZURE`) | Arrow `24.0.0` | `azure_parquet` |
 | [WebHDFS / HttpFS](webhdfs-parquet.md) | source + sink | clink::http_connector (vendored httplib) | Arrow `24.0.0` | `webhdfs_parquet` |

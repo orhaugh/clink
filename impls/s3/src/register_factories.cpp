@@ -15,6 +15,7 @@
 #include "clink/connectors/parquet_s3_sink.hpp"
 #include "clink/connectors/parquet_s3_source.hpp"
 #include "clink/connectors/s3_sink.hpp"
+#include "clink/connectors/s3_sink_2pc.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -49,6 +50,38 @@ void install(clink::plugin::PluginRegistry& reg) {
                 throw std::runtime_error("s3_text_sink: 'bucket' is required");
             }
             return std::make_shared<S3Sink>(std::move(opts));
+        });
+
+    // s3_2pc_string_sink: EXACTLY-ONCE raw-object S3 sink via multipart-upload-
+    // complete-on-commit. Selected for delivery_guarantee='exactly_once'. One
+    // object per (subtask, checkpoint) under <key_prefix>/sub<N>-<ckpt>.ndjson,
+    // made visible atomically by CompleteMultipartUpload once the checkpoint is
+    // globally durable. params: bucket (required), key_prefix, region,
+    // endpoint_override (MinIO/LocalStack), part_size (default 5 MiB).
+    reg.register_sink<std::string>(
+        "s3_2pc_string_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            S3Sink2PC::Options opts;
+            opts.bucket = ctx.param_or("bucket");
+            opts.key_prefix = ctx.param_or("key_prefix", "");
+            const auto region = ctx.param_or("region", "");
+            if (!region.empty()) {
+                opts.region = region;
+            }
+            const auto endpoint = ctx.param_or("endpoint_override", "");
+            if (!endpoint.empty()) {
+                opts.endpoint_override = endpoint;
+            }
+            opts.subtask_idx = ctx.subtask_idx;
+            opts.part_size =
+                static_cast<std::size_t>(ctx.param_int64_or("part_size", 5 * 1024 * 1024));
+            if (opts.bucket.empty()) {
+                throw std::runtime_error("s3_2pc_string_sink: 'bucket' is required");
+            }
+            auto sink = std::make_shared<S3Sink2PC>(std::move(opts));
+            if (auto cg = ctx.param_or("commit_group", ""); !cg.empty()) {
+                sink->set_commit_group(cg);
+            }
+            return sink;
         });
 
     // ---- Parquet over S3 (sink + source pair) ----

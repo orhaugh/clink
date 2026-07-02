@@ -25,6 +25,7 @@ endif()
 add_library(clink_s3 STATIC
     src/s3_source.cpp
     src/s3_sink.cpp
+    src/s3_sink_2pc.cpp
     src/register_factories.cpp
     src/register_state_backend.cpp
 )

@@ -14,4 +14,10 @@ TEST(S3FactoryRegistration, S3TextSinkIsRegistered) {
     EXPECT_NE(rr.find_sink("s3_text_sink", "string"), nullptr);
 }
 
+TEST(S3FactoryRegistration, S3ExactlyOnceSinkIsRegistered) {
+    // The multipart-complete-on-commit 2PC sink selected by exactly_once.
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("s3_2pc_string_sink", "string"), nullptr);
+}
+
 }  // namespace

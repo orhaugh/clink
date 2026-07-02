@@ -5,6 +5,7 @@ add_executable(clink_s3_tests
     register.cpp
     test_factory_registration.cpp
     test_s3_connector.cpp
+    test_s3_2pc_sink.cpp
     test_builder.cpp
     test_parquet_s3.cpp
     test_typed_sink.cpp
