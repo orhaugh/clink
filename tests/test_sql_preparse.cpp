@@ -675,6 +675,55 @@ TEST(SqlPreparse, MaterializedViewFullRefreshAcceptedForBoundedSource) {
     EXPECT_EQ(cat.get_table("mv")->properties.at("refresh_arm"), "full");
 }
 
+TEST(SqlPreparse, MaterializedViewFullRefreshKeyedAggregateDerivesUpsert) {
+    Catalog cat;
+    register_source(cat, "t", "region VARCHAR, amt BIGINT");  // connector='file' (bounded)
+    // A keyed-aggregate full-refresh view is now accepted: it auto-derives an upsert
+    // backing keyed by the GROUP BY columns. The upsert sink nets by primary key and
+    // writes its whole netted state atomically on flush, so it is a full overwrite.
+    auto plan = plan_materialized_view(
+        parse_mv(
+            "CREATE MATERIALIZED VIEW mv "
+            "WITH (freshness='1h', connector='file', format='json', path='/tmp/mv_agg.ndjson') "
+            "AS SELECT region, COUNT(*) AS cnt FROM t GROUP BY region"),
+        cat);
+    EXPECT_EQ(plan.arm, clink::sql::RefreshArm::Full);
+    const auto* mv = cat.get_table("mv");
+    ASSERT_NE(mv, nullptr);
+    EXPECT_EQ(mv->properties.at("mode"), "upsert");
+    EXPECT_EQ(mv->properties.at("primary_key"), "region");
+    EXPECT_EQ(mv->properties.at("write_mode"), "overwrite");
+    EXPECT_EQ(mv->properties.at("refresh_arm"), "full");
+}
+
+TEST(SqlPreparse, MaterializedViewFullRefreshGlobalAggregateRejected) {
+    Catalog cat;
+    register_source(cat, "t", "region VARCHAR, amt BIGINT");
+    // A global (ungrouped) aggregate has no key to materialise on either arm.
+    EXPECT_THROW(
+        (void)plan_materialized_view(
+            parse_mv(
+                "CREATE MATERIALIZED VIEW mv "
+                "WITH (freshness='1h', connector='file', format='json', path='/tmp/mv_g.ndjson') "
+                "AS SELECT COUNT(*) AS cnt FROM t"),
+            cat),
+        TranslationError);
+}
+
+TEST(SqlPreparse, MaterializedViewFullRefreshPartitionedAggregateRejected) {
+    Catalog cat;
+    register_source(cat, "t", "region VARCHAR, amt BIGINT");
+    // partition_by + an aggregating full-refresh is rejected in v1 (per-partition
+    // upsert netting is a follow-on).
+    EXPECT_THROW((void)plan_materialized_view(
+                     parse_mv("CREATE MATERIALIZED VIEW mv "
+                              "WITH (freshness='1h', connector='file', format='json', "
+                              "partition_by='region', path='/tmp/mv_pa') "
+                              "AS SELECT region, COUNT(*) AS cnt FROM t GROUP BY region"),
+                     cat),
+                 TranslationError);
+}
+
 TEST(SqlPreparse, MaterializedViewPartitionByColumnMustExist) {
     Catalog cat;
     register_source(cat, "t", "a BIGINT, region VARCHAR");  // connector='file' (bounded)

@@ -250,30 +250,50 @@ MaterializedViewPlan plan_materialized_view(ast::CreateMaterializedViewStmt stmt
     // Auto-derive an upsert backing for a keyed aggregation when the user did
     // not state mode/primary_key. A keyed GROUP BY emits the latest aggregate
     // per key, so the backing keeps the current row per key rather than every
-    // intermediate. Other changelog-emitting shapes are not auto-derived; if
-    // the user left an append backing for one, bind_insert's changelog/append
-    // compatibility check rejects it with a clear message. This applies only to the
-    // continuous arm: a full-refresh backing is overwritten wholesale, so upsert
-    // netting does not apply - a changelog defining query (an aggregate) into a
-    // full-refresh view is rejected by bind_insert's append/changelog guard, and
-    // full-refresh of an aggregate (upsert + atomic overwrite netting) is a
-    // documented follow-on. v1 full refresh covers append-only defining queries.
-    if (arm == RefreshArm::Continuous) {
-        if (!user_set_mode && spine_agg != nullptr && !spine_agg->group_keys().empty()) {
-            backing.properties["mode"] = "upsert";
-            if (!user_set_pk) {
-                backing.properties["primary_key"] = join_csv(spine_agg->group_keys());
-            }
-        } else if (!user_set_mode && spine_agg != nullptr && spine_agg->group_keys().empty()) {
-            // A global (ungrouped) aggregate emits a changelog with no natural key,
-            // so an append backing would silently accumulate every intermediate
-            // value rather than the current one. Reject rather than materialise a
-            // misleading view; the user can add a GROUP BY or declare an explicit
-            // mode='upsert' + primary_key for a constant-key view.
+    // intermediate. This applies to BOTH arms:
+    //  - continuous: the upsert sink nets the live changelog by primary key;
+    //  - full-refresh: the bounded recompute's changelog is netted by primary key
+    //    and the final relation is written atomically on flush. file_json_upsert_sink
+    //    already writes its whole netted state to <path>.tmp and renames over <path>,
+    //    so an upsert backing IS a full atomic overwrite - no separate sink is needed
+    //    (the write_mode=overwrite set for the full arm is a no-op for that sink).
+    // A global (ungrouped) aggregate has no natural key on either arm, so it is
+    // rejected (add a GROUP BY, or declare an explicit mode='upsert' + primary_key for
+    // a constant-key view). Other changelog-emitting shapes are not auto-derived; if
+    // the user left an append backing for one, bind_insert's changelog/append guard
+    // rejects it with a clear message.
+    if (!user_set_mode && spine_agg != nullptr && !spine_agg->group_keys().empty()) {
+        backing.properties["mode"] = "upsert";
+        if (!user_set_pk) {
+            backing.properties["primary_key"] = join_csv(spine_agg->group_keys());
+        }
+    } else if (!user_set_mode && spine_agg != nullptr && spine_agg->group_keys().empty()) {
+        // A global (ungrouped) aggregate emits a changelog with no natural key,
+        // so an append backing would silently accumulate every intermediate
+        // value rather than the current one. Reject rather than materialise a
+        // misleading view; the user can add a GROUP BY or declare an explicit
+        // mode='upsert' + primary_key for a constant-key view.
+        throw TranslationError(
+            "materialized view '" + stmt.view_name +
+                "': a global (ungrouped) aggregate has no key to materialise; add a GROUP BY, "
+                "or declare mode='upsert' with a primary_key",
+            stmt.loc.pos);
+    }
+
+    // A full-refresh keyed aggregate nets by primary key via the upsert sink, which
+    // writes a single atomically-overwritten file. partition_overwrite_sink instead
+    // writes every row for a partition with no primary-key netting, so a partitioned
+    // aggregating full-refresh would materialise intermediate changelog rows rather
+    // than the final relation. Reject the combination; per-partition upsert netting is
+    // a follow-on.
+    if (arm == RefreshArm::Full && spine_agg != nullptr && !spine_agg->group_keys().empty()) {
+        const auto pb = backing.properties.find("partition_by");
+        if (pb != backing.properties.end() && !pb->second.empty()) {
             throw TranslationError(
                 "materialized view '" + stmt.view_name +
-                    "': a global (ungrouped) aggregate has no key to materialise; add a GROUP BY, "
-                    "or declare mode='upsert' with a primary_key",
+                    "': partition_by with an aggregating full-refresh query is not supported "
+                    "(per-partition upsert netting is a follow-on); drop partition_by or the "
+                    "aggregation",
                 stmt.loc.pos);
         }
     }

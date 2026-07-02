@@ -11314,4 +11314,76 @@ TEST(SqlRuntime, MaterializedViewPartitionedFullRefresh) {
     std::filesystem::remove_all(out);
 }
 
+// Materialized tables (full-refresh arm) over an AGGREGATING defining query. A keyed
+// GROUP BY auto-derives an upsert backing; the bounded recompute's changelog is netted
+// by primary key and the final aggregate per key is written atomically on each refresh.
+TEST(SqlRuntime, MaterializedViewFullRefreshAggregateNetsByKey) {
+    ensure_sql_installed_once();
+    const auto src = std::filesystem::temp_directory_path() / "clink_mvagg_src.ndjson";
+    const auto out = std::filesystem::temp_directory_path() / "clink_mvagg_out.ndjson";
+    std::filesystem::remove(src);
+    std::filesystem::remove(out);
+    std::filesystem::remove(std::filesystem::path(out.string() + ".tmp"));
+    write_lines(src,
+                {R"({"region":"eu","amt":10})",
+                 R"({"region":"us","amt":20})",
+                 R"({"region":"eu","amt":5})"});
+
+    Catalog cat;
+    auto src_ddl = parse(std::string{"CREATE TABLE asrc (region VARCHAR, amt BIGINT) "
+                                     "WITH (connector='file', format='json', path='"} +
+                         src.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(src_ddl.statements[0]));
+
+    const std::string mv_sql =
+        std::string{
+            "CREATE MATERIALIZED VIEW amv "
+            "WITH (connector='file', format='json', freshness='1h', path='"} +
+        out.string() + "') AS SELECT region, COUNT(*) AS cnt FROM asrc GROUP BY region";
+    auto mv_script = parse(mv_sql);
+    auto mvplan = plan_materialized_view(
+        std::get<ast::CreateMaterializedViewStmt>(std::move(mv_script.statements[0])), cat, mv_sql);
+    EXPECT_EQ(mvplan.arm, RefreshArm::Full);
+    EXPECT_EQ(cat.get_table("amv")->properties.at("mode"), "upsert");
+    EXPECT_EQ(cat.get_table("amv")->properties.at("primary_key"), "region");
+
+    InProcessCluster cluster("tm-sql-mvagg", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto submit_plan = [&](std::unique_ptr<LogicalPlan> plan) {
+        auto optimised = optimize(std::move(plan));
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*optimised));
+        auto result = submitter.submit(spec.to_json(), {}, opts);
+        EXPECT_TRUE(result.completed) << "reject: " << result.reject_message;
+        EXPECT_TRUE(result.ok) << "errors: "
+                               << (result.errors.empty() ? "(none)" : result.errors[0]);
+    };
+    auto counts_in_out = [&]() {
+        std::map<std::string, std::int64_t> by_region;
+        for (const auto& l : read_lines(out)) {
+            auto row = clink::config::parse(l);
+            by_region[row.at("region").as_string()] =
+                static_cast<std::int64_t>(row.at("cnt").as_number());
+        }
+        return by_region;
+    };
+
+    // Initial population: eu has 2 rows, us has 1.
+    submit_plan(std::move(mvplan.maintenance));
+    EXPECT_EQ(counts_in_out(), (std::map<std::string, std::int64_t>{{"eu", 2}, {"us", 1}}));
+
+    // Change the source, then REFRESH: the backing is atomically overwritten to the new
+    // aggregate (eu 1, ap 2). The stale us key is gone - a full recompute, not a merge.
+    write_lines(
+        src,
+        {R"({"region":"eu","amt":1})", R"({"region":"ap","amt":2})", R"({"region":"ap","amt":3})"});
+    submit_plan(plan_materialized_view_refresh("amv", cat));
+    EXPECT_EQ(counts_in_out(), (std::map<std::string, std::int64_t>{{"eu", 1}, {"ap", 2}}));
+
+    std::filesystem::remove(src);
+    std::filesystem::remove(out);
+}
+
 }  // namespace clink::sql
