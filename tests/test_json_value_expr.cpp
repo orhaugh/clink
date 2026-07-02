@@ -488,4 +488,64 @@ TEST(JsonValueExpr, MapGetLooksUpKeyElseNull) {
     EXPECT_TRUE(eval(R"({"op":"map_get","args":[{"lit":5},{"lit":"k"}]})").is_null());
 }
 
+// --- functions not previously exercised (coverage of the dispatch tail) ---
+
+TEST(JsonValueExpr, Neg) {
+    EXPECT_EQ(eval(R"({"op":"neg","args":[{"lit":5}]})").as_number(), -5.0);
+    EXPECT_EQ(eval(R"({"op":"neg","args":[{"lit":-2.5}]})").as_number(), 2.5);
+    EXPECT_TRUE(eval(R"({"op":"neg","args":[{"col":"missing"}]})").is_null());
+}
+
+TEST(JsonValueExpr, ExpAndLn) {
+    EXPECT_DOUBLE_EQ(eval(R"({"op":"exp","args":[{"lit":0}]})").as_number(), 1.0);
+    EXPECT_DOUBLE_EQ(eval(R"({"op":"ln","args":[{"lit":1}]})").as_number(), 0.0);
+    // exp(ln(x)) round-trips.
+    const double e = eval(R"({"op":"exp","args":[{"lit":1}]})").as_number();
+    EXPECT_NEAR(e, 2.718281828, 1e-6);
+    EXPECT_TRUE(eval(R"({"op":"ln","args":[{"col":"missing"}]})").is_null());
+}
+
+TEST(JsonValueExpr, CeilingAliasOfCeil) {
+    EXPECT_EQ(eval(R"({"op":"ceiling","args":[{"lit":1.2}]})").as_number(), 2.0);
+    EXPECT_EQ(eval(R"({"op":"ceiling","args":[{"lit":-1.2}]})").as_number(), -1.0);
+}
+
+TEST(JsonValueExpr, CastBool) {
+    EXPECT_TRUE(eval(R"({"op":"cast_bool","args":[{"lit":5}]})").as_bool());
+    EXPECT_FALSE(eval(R"({"op":"cast_bool","args":[{"lit":0}]})").as_bool());
+    EXPECT_TRUE(eval(R"({"op":"cast_bool","args":[{"lit":"yes"}]})").as_bool());
+    EXPECT_FALSE(eval(R"({"op":"cast_bool","args":[{"lit":"off"}]})").as_bool());
+    EXPECT_TRUE(eval(R"({"op":"cast_bool","args":[{"lit":true}]})").as_bool());
+    // Unrecognised string and NULL -> NULL (UNKNOWN).
+    EXPECT_TRUE(eval(R"({"op":"cast_bool","args":[{"lit":"maybe"}]})").is_null());
+    EXPECT_TRUE(eval(R"({"op":"cast_bool","args":[{"col":"missing"}]})").is_null());
+}
+
+TEST(JsonValueExpr, CastDecimal) {
+    // Valid re-quantise to scale=2 within precision=10 -> non-null.
+    EXPECT_FALSE(
+        eval(R"({"op":"cast_decimal","args":[{"lit":"3.14159"}],"scale":2,"precision":10})")
+            .is_null());
+    // Overflow past the declared precision -> NULL.
+    EXPECT_TRUE(
+        eval(R"({"op":"cast_decimal","args":[{"lit":"123456.789"}],"scale":2,"precision":3})")
+            .is_null());
+    EXPECT_TRUE(eval(R"({"op":"cast_decimal","args":[{"col":"missing"}],"scale":2})").is_null());
+}
+
+TEST(JsonValueExpr, MakeArrayAndElementAt) {
+    const std::string arr = R"({"op":"make_array","args":[{"lit":"a"},{"lit":"b"},{"lit":"c"}]})";
+    auto v = eval(arr);
+    ASSERT_TRUE(v.is_array());
+    EXPECT_EQ(v.as_array().size(), 3u);
+    // element_at is 1-based.
+    EXPECT_EQ(eval(R"({"op":"element_at","args":[)" + arr + R"(,{"lit":1}]})").as_string(), "a");
+    EXPECT_EQ(eval(R"({"op":"element_at","args":[)" + arr + R"(,{"lit":3}]})").as_string(), "c");
+    // Out-of-range, non-array base, and NULL index all yield NULL (no error).
+    EXPECT_TRUE(eval(R"({"op":"element_at","args":[)" + arr + R"(,{"lit":0}]})").is_null());
+    EXPECT_TRUE(eval(R"({"op":"element_at","args":[)" + arr + R"(,{"lit":9}]})").is_null());
+    EXPECT_TRUE(eval(R"({"op":"element_at","args":[{"lit":5},{"lit":1}]})").is_null());
+    EXPECT_TRUE(eval(R"({"op":"element_at","args":[)" + arr + R"(,{"col":"missing"}]})").is_null());
+}
+
 }  // namespace clink::operators
