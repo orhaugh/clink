@@ -1,8 +1,11 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
+
+#include <arrow/api.h>
 
 #include "clink/config/json.hpp"
 #include "clink/sql/row.hpp"
@@ -10,14 +13,19 @@
 // SQL-native AI: extracting an embedding vector from a Row column as a contiguous
 // float32 buffer, ready for a distance kernel.
 //
-// v1 reads from the JSON Row array (each element is a JsonValue number). This is
-// correct and simple, and it is the only path today because the columnar Row batcher
-// does not yet decode arrow::list columns. Honest precision caveat: a float32
-// embedding stored in a source rides the JSON wire as a double (float32 -> double ->
-// text -> double), then is narrowed back to float32 here; the last narrowing is
-// exact but any upstream text round-trip already happened. For KNN ranking this is
-// within tolerance, but it is a stated v1 boundary. A future list<float32> sidecar
-// path (vector_from_list_cell) avoids the text round-trip entirely.
+// vector_from_row reads from the JSON Row array (each element is a JsonValue number):
+// correct and simple, and it is the path the vector_search operator takes today because
+// it materialises rows. Honest precision caveat: a float32 embedding rides the JSON Row
+// as a double (float32 -> double -> ... -> double), narrowed back to float32 here.
+//
+// vector_from_list_cell is the columnar counterpart: it copies float32 straight out of an
+// Arrow list<float32> ListArray with no JSON round-trip. The Row columnar batcher now
+// carries a list<float32> column as a contiguous Arrow list across the wire (rather than
+// a stringified JSON array), so this decode is exact and cheap for a columnar-native
+// corpus. Wiring the vector_search operator to read the sidecar directly via this helper
+// (a columnar process path, skipping row materialisation) is the remaining follow-on;
+// until then the operator uses vector_from_row and the list column is materialised back
+// to a JSON array first.
 
 namespace clink::sql {
 
@@ -50,6 +58,31 @@ inline VectorCell vector_from_row(const Row& r,
             return cell;
         }
         cell.data.push_back(static_cast<float>(e.as_number()));
+    }
+    cell.dim_ok = (expected_dim == 0 || cell.data.size() == expected_dim);
+    return cell;
+}
+
+// Read an embedding directly from an Arrow list<float32> column (the columnar path),
+// with no JSON round-trip: the float32 values are copied straight out of the ListArray's
+// value buffer. This is the efficient counterpart to vector_from_row for a corpus/query
+// that arrives columnar (e.g. a Parquet source with a list<float32> embedding column);
+// the row_columnar_batcher carries such a column as a contiguous Arrow list rather than a
+// stringified JSON array. A null cell is present=false (the caller skips or fails).
+inline VectorCell vector_from_list_cell(const arrow::ListArray& list,
+                                        std::int64_t row_idx,
+                                        std::size_t expected_dim = 0) {
+    VectorCell cell;
+    if (row_idx < 0 || row_idx >= list.length() || list.IsNull(row_idx)) {
+        return cell;  // present=false
+    }
+    const auto& values = static_cast<const arrow::FloatArray&>(*list.values());
+    const std::int32_t start = list.value_offset(row_idx);
+    const std::int32_t end = list.value_offset(row_idx + 1);
+    cell.present = true;
+    cell.data.reserve(static_cast<std::size_t>(end - start));
+    for (std::int32_t j = start; j < end; ++j) {
+        cell.data.push_back(values.Value(j));  // float32 read directly, no narrowing
     }
     cell.dim_ok = (expected_dim == 0 || cell.data.size() == expected_dim);
     return cell;

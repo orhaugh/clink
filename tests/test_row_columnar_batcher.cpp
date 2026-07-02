@@ -21,6 +21,7 @@
 #include "clink/core/record.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
+#include "clink/sql/vector_value.hpp"
 
 using namespace clink;
 using clink::sql::make_row_columnar_arrow_batcher;
@@ -144,6 +145,86 @@ TEST(RowColumnarBatcher, NullAndMissingColumnsBecomeArrowNull) {
     EXPECT_TRUE(got.values.at("qty").is_null());
     EXPECT_TRUE(got.values.at("active").is_null());
     EXPECT_TRUE(got.values.at("amount").is_null());
+}
+
+TEST(RowColumnarBatcher, ListFloat32RoundTripsOverArrowIpc) {
+    // An embedding column (list<float32>) rides the columnar wire as a contiguous Arrow
+    // list, not a stringified JSON array, and round-trips back to a JSON number array.
+    std::vector<RowColumn> schema{{"id", arrow::int64()}, {"emb", arrow::list(arrow::float32())}};
+    auto batcher = make_row_columnar_arrow_batcher(schema);
+    ASSERT_EQ(batcher.schema()->field(2)->type()->id(), arrow::Type::LIST);
+
+    auto make_emb_row = [](std::int64_t id, std::vector<double> emb) {
+        Row r;
+        r.values["id"] = cfg::JsonValue{id};
+        cfg::JsonArray arr;
+        for (double v : emb) {
+            arr.push_back(cfg::JsonValue{v});
+        }
+        r.values["emb"] = cfg::JsonValue{std::move(arr)};
+        return r;
+    };
+    Batch<Row> in;
+    in.emplace(make_emb_row(1, {1.5, 2.0, -3.25}), EventTime{10});
+    in.emplace(make_emb_row(2, {0.0, 100.0}), EventTime{11});
+
+    auto rb = batcher.build(in);
+    ASSERT_NE(rb, nullptr);
+    auto ipc = arrow_batch_to_ipc(*rb);
+    auto rb2 = arrow_batch_from_ipc(ipc.data(), ipc.size());
+    ASSERT_NE(rb2, nullptr);
+    auto out = batcher.parse(*rb2);
+    ASSERT_TRUE(out.has_value());
+    ASSERT_EQ(out->size(), 2u);
+
+    const auto& e0 = (*out)[0].value().values.at("emb");
+    ASSERT_TRUE(e0.is_array());
+    ASSERT_EQ(e0.as_array().size(), 3u);
+    EXPECT_DOUBLE_EQ(e0.as_array()[0].as_number(), 1.5);
+    EXPECT_DOUBLE_EQ(e0.as_array()[2].as_number(), -3.25);
+    const auto& e1 = (*out)[1].value().values.at("emb");
+    ASSERT_EQ(e1.as_array().size(), 2u);
+    EXPECT_DOUBLE_EQ(e1.as_array()[1].as_number(), 100.0);
+}
+
+TEST(RowColumnarBatcher, ListFloat32SchemaCodeRoundTrips) {
+    std::vector<RowColumn> cols{{"emb", arrow::list(arrow::float32())}};
+    const auto spec = clink::sql::serialize_row_schema(cols);
+    EXPECT_NE(spec.find("list_f32"), std::string::npos);
+    const auto parsed = clink::sql::parse_row_schema(spec);
+    ASSERT_EQ(parsed.size(), 1u);
+    EXPECT_TRUE(parsed[0].type->Equals(*arrow::list(arrow::float32())));
+}
+
+TEST(VectorValue, FromListCellReadsFloat32Directly) {
+    // vector_from_list_cell copies float32 straight out of an Arrow ListArray - no JSON
+    // round-trip, no double narrowing.
+    auto vb = std::make_shared<arrow::FloatBuilder>();
+    arrow::ListBuilder lb(arrow::default_memory_pool(), vb);
+    ASSERT_TRUE(lb.Append().ok());
+    ASSERT_TRUE(vb->AppendValues({1.5F, 2.5F, 3.5F}).ok());
+    ASSERT_TRUE(lb.Append().ok());  // second row: 2 values
+    ASSERT_TRUE(vb->AppendValues({-1.0F, 0.0F}).ok());
+    ASSERT_TRUE(lb.AppendNull().ok());  // third row: null
+    std::shared_ptr<arrow::Array> arr;
+    ASSERT_TRUE(lb.Finish(&arr).ok());
+    const auto& list = static_cast<const arrow::ListArray&>(*arr);
+
+    auto c0 = clink::sql::vector_from_list_cell(list, 0);
+    ASSERT_TRUE(c0.present);
+    EXPECT_EQ(c0.data, (std::vector<float>{1.5F, 2.5F, 3.5F}));
+
+    auto c1 = clink::sql::vector_from_list_cell(list, 1, /*expected_dim*/ 2);
+    ASSERT_TRUE(c1.present);
+    EXPECT_TRUE(c1.dim_ok);
+    EXPECT_EQ(c1.data, (std::vector<float>{-1.0F, 0.0F}));
+
+    auto c1_bad = clink::sql::vector_from_list_cell(list, 1, /*expected_dim*/ 5);
+    EXPECT_TRUE(c1_bad.present);
+    EXPECT_FALSE(c1_bad.dim_ok);
+
+    auto c2 = clink::sql::vector_from_list_cell(list, 2);  // null cell
+    EXPECT_FALSE(c2.present);
 }
 
 TEST(RowColumnarBatcher, SchemaParamRoundTrips) {

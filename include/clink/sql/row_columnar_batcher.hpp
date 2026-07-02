@@ -59,6 +59,14 @@ inline constexpr const char* kSourcePartitionColumn = "__source_partition";
 namespace row_columnar_detail {
 
 // The Arrow type a column is actually stored as: the declared type when
+// True for a list<float32> column: the columnar form for embeddings (VECTOR_SEARCH),
+// carried as a contiguous Arrow list of float32 instead of a stringified JSON array.
+// Other list value types are not columnar-supported and fall back to utf8.
+inline bool is_list_float32(const arrow::DataType& t) {
+    return t.id() == arrow::Type::LIST &&
+           static_cast<const arrow::ListType&>(t).value_type()->id() == arrow::Type::FLOAT;
+}
+
 // it is in the supported set, else utf8 (the stringified fallback).
 inline std::shared_ptr<arrow::DataType> effective_type(const std::shared_ptr<arrow::DataType>& t) {
     if (!t) {
@@ -73,6 +81,8 @@ inline std::shared_ptr<arrow::DataType> effective_type(const std::shared_ptr<arr
         case arrow::Type::STRING:
         case arrow::Type::DECIMAL128:
             return t;
+        case arrow::Type::LIST:
+            return is_list_float32(*t) ? t : arrow::utf8();
         default:
             return arrow::utf8();
     }
@@ -201,6 +211,26 @@ inline std::shared_ptr<arrow::Array> build_column(const std::string& name,
             (void)b.Finish(&out);
             break;
         }
+        case arrow::Type::LIST: {  // list<float32>: an embedding vector (VECTOR_SEARCH)
+            auto vb = std::make_shared<arrow::FloatBuilder>();
+            arrow::ListBuilder b(arrow::default_memory_pool(), vb);
+            for (const auto& rec : batch) {
+                const auto* v = field(rec.value(), name);
+                if (v != nullptr && v->is_array()) {
+                    (void)b.Append();  // open a new list slot
+                    for (const auto& e : v->as_array()) {
+                        if (e.is_number())
+                            (void)vb->Append(static_cast<float>(e.as_number()));
+                        else
+                            (void)vb->AppendNull();
+                    }
+                } else {
+                    (void)b.AppendNull();
+                }
+            }
+            (void)b.Finish(&out);
+            break;
+        }
         default: {  // utf8 (declared STRING or the stringified fallback)
             arrow::StringBuilder b;
             (void)b.Reserve(n);
@@ -244,6 +274,18 @@ inline clink::config::JsonValue read_cell(const std::shared_ptr<arrow::DataType>
             const auto& darr = static_cast<const arrow::Decimal128Array&>(arr);
             arrow::Decimal128 dv(darr.GetValue(i));
             return clink::config::make_dec_value(clink::config::Decimal{dv, dt.scale()});
+        }
+        case arrow::Type::LIST: {  // list<float32> -> JSON array of numbers
+            const auto& la = static_cast<const arrow::ListArray&>(arr);
+            const auto& values = static_cast<const arrow::FloatArray&>(*la.values());
+            const std::int32_t start = la.value_offset(i);
+            const std::int32_t end = la.value_offset(i + 1);
+            clink::config::JsonArray out_arr;
+            out_arr.reserve(static_cast<std::size_t>(end - start));
+            for (std::int32_t j = start; j < end; ++j) {
+                out_arr.push_back(clink::config::JsonValue{static_cast<double>(values.Value(j))});
+            }
+            return clink::config::JsonValue{std::move(out_arr)};
         }
         default:
             return clink::config::JsonValue{
@@ -377,7 +419,8 @@ inline bool row_record_batch_supported(const arrow::RecordBatch& batch) {
     if (dynamic_cast<const arrow::Int64Array*>(batch.column(0).get()) == nullptr)
         return false;
     for (int ci = 1; ci < batch.num_columns(); ++ci) {
-        switch (batch.schema()->field(ci)->type()->id()) {
+        const auto& ty = *batch.schema()->field(ci)->type();
+        switch (ty.id()) {
             case arrow::Type::INT64:
             case arrow::Type::INT32:
             case arrow::Type::DOUBLE:
@@ -385,6 +428,10 @@ inline bool row_record_batch_supported(const arrow::RecordBatch& batch) {
             case arrow::Type::BOOL:
             case arrow::Type::DECIMAL128:
             case arrow::Type::STRING:
+                break;
+            case arrow::Type::LIST:
+                if (!row_columnar_detail::is_list_float32(ty))
+                    return false;
                 break;
             default:
                 return false;
@@ -428,6 +475,10 @@ inline std::optional<std::vector<Record<Row>>> rows_from_record_batch(
             case arrow::Type::BOOL:
             case arrow::Type::DECIMAL128:
             case arrow::Type::STRING:
+                break;
+            case arrow::Type::LIST:
+                if (!row_columnar_detail::is_list_float32(*f->type()))
+                    return std::nullopt;
                 break;
             default:
                 return std::nullopt;  // unknown type: refuse rather than mis-cast
@@ -552,6 +603,8 @@ inline std::string row_schema_type_code(const std::shared_ptr<arrow::DataType>& 
             const auto& d = static_cast<const arrow::Decimal128Type&>(*t);
             return "dec_" + std::to_string(d.precision()) + "_" + std::to_string(d.scale());
         }
+        case arrow::Type::LIST:
+            return row_columnar_detail::is_list_float32(*t) ? "list_f32" : "str";
         case arrow::Type::STRING:
         default:
             return "str";
@@ -577,6 +630,8 @@ inline std::shared_ptr<arrow::DataType> row_schema_type_from_code(const std::str
         return arrow::float64();
     if (code == "f32")
         return arrow::float32();
+    if (code == "list_f32")
+        return arrow::list(arrow::float32());
     if (code == "bool")
         return arrow::boolean();
     if (code.rfind("dec_", 0) == 0) {
