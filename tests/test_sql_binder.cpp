@@ -1207,17 +1207,20 @@ TEST(SqlBinder, ExactlyOnceKafkaSinkAccepted) {
 }
 
 TEST(SqlBinder, ExactlyOnceOnUnsupportedConnectorRejected) {
+    // clickhouse has no 2PC sink variant (append-only, no cross-statement
+    // transactions), so delivery_guarantee='exactly_once' is rejected. (postgres
+    // IS supported via PREPARE TRANSACTION - see PostgresExactlyOnceSinkSelected.)
     Catalog cat;
     auto s = parse(
         "CREATE TABLE src_t (k BIGINT, v BIGINT) "
         "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
-        "CREATE TABLE pg_eo (k BIGINT, v BIGINT) "
-        "WITH (connector='postgres', dsn='postgresql://...', "
+        "CREATE TABLE ch_eo (k BIGINT, v BIGINT) "
+        "WITH (connector='clickhouse', dsn='tcp://localhost', "
         "      delivery_guarantee='exactly_once')");
     cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
     cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
     Binder b(cat);
-    EXPECT_THROW(b.bind_insert(as_insert(parse("INSERT INTO pg_eo SELECT k, v FROM src_t"))),
+    EXPECT_THROW(b.bind_insert(as_insert(parse("INSERT INTO ch_eo SELECT k, v FROM src_t"))),
                  TranslationError);
 }
 

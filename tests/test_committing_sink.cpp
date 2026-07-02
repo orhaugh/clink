@@ -22,6 +22,7 @@
 //                                    the same object across a crash).
 //  10. CommitGroupIsObservable    - the base keeps the Sink commit-group API.
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
@@ -117,6 +118,9 @@ public:
         c.payload = std::string(s.substr(pos + 1));
         return c;
     }
+
+    // Expose the protected reconciliation helper for testing.
+    std::vector<FakeCommittable> peek_pending() const { return this->pending_committables(); }
 
 private:
     World* world_;
@@ -313,6 +317,35 @@ TEST(CommittingSink, CodecRoundTripsCrossInstance) {
 
     EXPECT_EQ(back.ckpt, original.ckpt);
     EXPECT_EQ(back.payload, original.payload);
+}
+
+TEST(CommittingSink, PendingCommittablesReflectsPreparedSet) {
+    // pending_committables() returns the persisted-but-unfinalised handles, for a
+    // connector reconciling an external registry at open. Empty initially; holds
+    // the prepared handle after a barrier; empty again after commit.
+    World world;
+    InMemoryStateBackend state;
+    RuntimeContext rctx(kOp, "fake", &state, nullptr);
+    auto sink = make_sink(world, rctx);
+
+    sink->open();
+    EXPECT_TRUE(sink->peek_pending().empty());
+
+    sink->on_data(batch_of({"a", "b"}));
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    sink->on_data(batch_of({"c"}));
+    sink->on_barrier(CheckpointBarrier{CheckpointId{2}});
+
+    auto pending = sink->peek_pending();
+    std::vector<std::string> payloads;
+    for (const auto& c : pending)
+        payloads.push_back(c.payload);
+    std::sort(payloads.begin(), payloads.end());
+    EXPECT_EQ(payloads, (std::vector<std::string>{"ab", "c"}));
+
+    sink->on_commit(1);
+    sink->on_commit(2);
+    EXPECT_TRUE(sink->peek_pending().empty());
 }
 
 TEST(CommittingSink, CommitGroupIsObservable) {

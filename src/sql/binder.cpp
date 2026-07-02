@@ -4264,11 +4264,12 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
             conn_it != sink.properties.end() ? conn_it->second : std::string{};
         if (connector != "file" && connector != "filesystem" && connector != "kafka" &&
             connector != "parquet" && connector != "s3_parquet" && connector != "gcs_parquet" &&
-            connector != "azure_parquet" && connector != "webhdfs_parquet") {
+            connector != "azure_parquet" && connector != "webhdfs_parquet" &&
+            connector != "postgres") {
             bind_error(
                 "delivery_guarantee='exactly_once' is supported only for "
                 "connector='file', 'kafka', 'parquet', 's3_parquet', 'gcs_parquet', "
-                "'azure_parquet' or 'webhdfs_parquet' (got '" +
+                "'azure_parquet', 'webhdfs_parquet' or 'postgres' (got '" +
                     connector + "')",
                 stmt.loc.pos);
         }

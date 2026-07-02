@@ -28,6 +28,12 @@ TEST(PostgresFactoryRegistration, PostgresJsonSinkIsRegistered) {
     EXPECT_NE(rr.find_sink("postgres_sink", "string"), nullptr);
 }
 
+TEST(PostgresFactoryRegistration, PostgresExactlyOnceSinkIsRegistered) {
+    // The two-phase-commit sink selected by delivery_guarantee='exactly_once'.
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("postgres_2pc_sink", "string"), nullptr);
+}
+
 TEST(PostgresFactoryRegistration, PostgresJsonSourceIsRegistered) {
     // M3: the JSON source on the string channel (delimited postgres_text_source
     // kept for back-compat).

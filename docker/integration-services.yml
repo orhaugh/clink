@@ -97,6 +97,10 @@ services:
       - max_wal_senders=10
       - -c
       - max_replication_slots=10
+      # Enable two-phase commit (PREPARE TRANSACTION) for the postgres
+      # exactly-once sink live IT; defaults to 0 (disabled).
+      - -c
+      - max_prepared_transactions=10
     ports:
       - "5432:5432"
     healthcheck:

@@ -437,14 +437,14 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     }
     if (connector == "postgres") {
         // Postgres sink (M4). Each row -> JSON object string -> batched INSERT.
-        // At-least-once. exactly_once (2PC) not supported. clink mode='upsert' is a
-        // changelog contract (delete tombstones) this append sink does not
-        // implement; use the WITH-option on_conflict='update' (+ conflict_columns)
-        // for idempotent insert-or-update by key.
+        // delivery_guarantee='exactly_once' selects the two-phase-commit sink
+        // (PREPARE TRANSACTION / COMMIT PREPARED, requires the server's
+        // max_prepared_transactions > 0); otherwise at-least-once. clink
+        // mode='upsert' is a changelog contract (delete tombstones) this append
+        // sink does not implement; use the WITH-option on_conflict='update' (+
+        // conflict_columns) for idempotent insert-or-update by key.
         if (exactly_once) {
-            unsupported(
-                "connector='postgres' sink is at-least-once; exactly-once delivery is not "
-                "supported");
+            return RowConnectorBinding{"postgres_2pc_sink", kChannelString, "row_to_json_string"};
         }
         if (upsert) {
             unsupported(

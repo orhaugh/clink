@@ -128,6 +128,28 @@ public:
 protected:
     std::uint32_t subtask_idx() const noexcept { return subtask_idx_; }
 
+    // The committables currently persisted (prepared-but-unfinalised) for this
+    // sink, deserialized. Intended for a connector that must reconcile an
+    // external registry at on_open() - e.g. an XA sink that rolls back prepared
+    // transactions NOT in this set (their checkpoint never became durable).
+    // Safe to call from on_open(): recover_all_() has not yet run, so the full
+    // pending set is still present.
+    std::vector<Committable> pending_committables() const {
+        std::vector<Committable> out;
+        auto* state = state_backend_();
+        if (state == nullptr)
+            return out;
+        const std::string prefix = key_prefix_();
+        state->scan_operator_state(this->id(),
+                                   [&](StateBackend::KeyView k, StateBackend::ValueView v) {
+                                       const std::string key{k};
+                                       if (key.rfind(prefix, 0) != 0)
+                                           return;
+                                       out.push_back(deserialize(v));
+                                   });
+        return out;
+    }
+
     // One-time upgrade bridge for sinks migrated from the pre-framework 2PC
     // implementation, which persisted the committable via a RAW put() under
     // "<legacy_prefix>sub<N>_<ckpt>" (no operator-state reserved byte, so the

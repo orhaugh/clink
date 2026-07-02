@@ -131,7 +131,24 @@ CREATE TABLE users_out (
 );
 ```
 
-The SQL sink rejects exactly-once delivery and `mode='upsert'`; use `on_conflict='update'` with `conflict_columns` for idempotent insert-or-update by key.
+For at-least-once delivery use `on_conflict='update'` with `conflict_columns` for idempotent insert-or-update by key. For true exactly-once, set `delivery_guarantee='exactly_once'` (see below). `mode='upsert'` (changelog tombstones) is not implemented.
+
+### Exactly-once sink (`postgres_2pc_sink`)
+
+`delivery_guarantee='exactly_once'` selects a two-phase-commit sink built on `PREPARE TRANSACTION` / `COMMIT PREPARED`:
+
+```sql
+CREATE TABLE users_sink (id BIGINT, name STRING) WITH (
+  connector          = 'postgres',
+  conninfo           = 'host=localhost port=5432 user=postgres password=postgres dbname=postgres',
+  "table"            = 'public.users',
+  delivery_guarantee = 'exactly_once'
+);
+```
+
+Rows since the last checkpoint barrier are `INSERT`ed into an open transaction; at the barrier the transaction is `PREPARE`d under a deterministic global id (`clink_<uid>_sub<N>_<ckpt>`), and the framework `COMMIT PREPARED`s it once the checkpoint is globally durable (`ROLLBACK PREPARED` on abort). A prepared transaction survives the session, so a crash between prepare and commit does not lose it: on restart the sink commits any gid in the restored checkpoint state and rolls back any of its own prepared transactions that are not (their checkpoint never became durable). It participates in `commit_group` for atomic multi-sink commit.
+
+Requires the server's `max_prepared_transactions > 0` (it defaults to `0`, which disables `PREPARE TRANSACTION`); a prepare against a server with it disabled fails the checkpoint loudly. Reusing the same operator uid across two jobs that write to the same server is a misconfiguration (their global ids collide).
 
 ## Example
 
@@ -166,7 +183,9 @@ clink::postgres::install(env.registry());
 
 ## Delivery semantics
 
-Sink: at-least-once. A replay after a failed checkpoint re-runs the buffered INSERT, appending duplicates. With `on_conflict='update'` and `conflict_columns` the INSERT is idempotent by key, which is effectively-once for keyed upserts. There is no two-phase commit; on a flush error the connection is dropped, the buffer cleared, and the exception propagated so the job replays from the last checkpoint. The sink flushes on every checkpoint barrier.
+Sink (default, `postgres_sink`): at-least-once. A replay after a failed checkpoint re-runs the buffered INSERT, appending duplicates. With `on_conflict='update'` and `conflict_columns` the INSERT is idempotent by key, which is effectively-once for keyed upserts. On a flush error the connection is dropped, the buffer cleared, and the exception propagated so the job replays from the last checkpoint. The sink flushes on every checkpoint barrier.
+
+Sink (`delivery_guarantee='exactly_once'`, `postgres_2pc_sink`): exactly-once via two-phase commit (`PREPARE TRANSACTION` / `COMMIT PREPARED`). Rows land iff their checkpoint completes globally; a prepared-but-uncommitted transaction survives a crash and is committed on restart, and an orphaned prepared transaction from a checkpoint that never became durable is rolled back at open. Requires `max_prepared_transactions > 0` on the server. See the exactly-once sink section above.
 
 CDC source: the cursor is the received WAL LSN, persisted through `snapshot_offset` / `restore_offset`. A restart resumes `START_REPLICATION` from the checkpointed LSN, which is exactly-once at the source boundary for the decodable change stream, provided the slot still retains WAL from that LSN. Records between the last checkpoint and a crash are replayed and must be reconciled downstream. A change event that the decoder cannot decode is dropped (the checkpointed LSN advances past it) unless `on_decode_error=fail`, so undecodable events are at-most-once under the default policy. Because the cursor is the received WAL LSN rather than the last decoded commit LSN, a resume can re-read from the start of an in-flight transaction.
 
@@ -174,8 +193,8 @@ SELECT source: the cursor is the row index into the materialised result set. A r
 
 ## Limitations
 
-- The sink writes one batched multi-row INSERT per flush and is not two-phase commit; exactly-once delivery is not supported.
-- SQL sink rejects `mode='upsert'` (changelog tombstone semantics are not implemented); use `on_conflict='update'` with `conflict_columns` instead.
+- The default sink (`postgres_sink`) writes one batched multi-row INSERT per flush and is at-least-once. Exactly-once needs `delivery_guarantee='exactly_once'` (the `postgres_2pc_sink` variant) and a server with `max_prepared_transactions > 0`.
+- SQL sink rejects `mode='upsert'` (changelog tombstone semantics are not implemented); use `on_conflict='update'` with `conflict_columns` instead. `mode='upsert'` combined with `delivery_guarantee='exactly_once'` is rejected.
 - The SELECT source is snapshot mode only: it runs the query once at `open()` and closes when the result set is exhausted. There is no incremental polling or `refresh_interval` behaviour (the field is reserved and ignored).
 - The CDC source requires the server to run with `wal_level=logical`, verified at `open()`; the connection is forced to `replication=database`.
 - `pgoutput` requires `publication_names`; construction throws otherwise.

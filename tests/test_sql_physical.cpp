@@ -1960,6 +1960,26 @@ TEST(SqlPhysical, FileExactlyOnceSinkSelected) {
     EXPECT_EQ(sink->params.at("path"), "/tmp/eo_dir/");
 }
 
+TEST(SqlPhysical, PostgresExactlyOnceSinkSelected) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE peo (k BIGINT, v BIGINT) "
+        "WITH (connector='postgres', conninfo='host=localhost', "
+        "      delivery_guarantee='exactly_once')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO peo SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* sink = find_op(spec, "postgres_2pc_sink");
+    ASSERT_NE(sink, nullptr);
+    // The at-least-once variant must NOT be selected; the Row->JSON bridge is present.
+    EXPECT_EQ(find_op(spec, "postgres_sink"), nullptr);
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+}
+
 TEST(SqlPhysical, CommitGroupThreadsThroughToSinkParams) {
     // commit_group property on the table flows through the
     // physical planner into OperatorSpec.params, where sink factories

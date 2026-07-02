@@ -24,6 +24,7 @@
 #include "clink/connectors/cdc_json.hpp"
 #include "clink/connectors/postgres_cdc_source.hpp"
 #include "clink/connectors/postgres_json_sink.hpp"
+#include "clink/connectors/postgres_json_sink_2pc.hpp"
 #include "clink/connectors/postgres_row.hpp"
 #include "clink/connectors/postgres_source.hpp"
 #include "clink/connectors/postgres_sql.hpp"
@@ -477,6 +478,36 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
             o.name = "postgres_sink";
             return std::make_shared<PostgresJsonSink>(std::move(o));
+        });
+
+    // postgres_2pc_sink: EXACTLY-ONCE via two-phase commit (PREPARE TRANSACTION /
+    // COMMIT PREPARED). Selected by the SQL path for delivery_guarantee=
+    // 'exactly_once'. Rows since the last barrier are INSERTed into an open
+    // transaction, PREPAREd at the barrier under a deterministic global id, and
+    // COMMIT PREPAREd once the checkpoint is globally durable. Requires the
+    // server's max_prepared_transactions > 0. params:
+    //   conninfo (required), table (required)
+    //   columns  - comma-separated projection; on the SQL Row path defaults to
+    //              the declared table schema (schema_columns)
+    //   batch_records (default 1000), max_bytes (0=off)
+    reg.register_sink<std::string>(
+        "postgres_2pc_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            PostgresJsonSink2PCOptions o;
+            o.conninfo = ctx.param_or("conninfo");
+            o.table = ctx.param_or("table");
+            o.columns = split_csv(ctx.param_or("columns", ""));
+            if (o.columns.empty()) {
+                o.columns = pgsql::columns_from_schema(ctx.param_or("schema_columns", ""));
+            }
+            o.subtask_idx = ctx.subtask_idx;
+            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 1000));
+            o.max_bytes = static_cast<std::size_t>(ctx.param_int64_or("max_bytes", 0));
+            o.name = "postgres_2pc_sink";
+            auto sink = std::make_shared<PostgresJsonSink2PC>(std::move(o));
+            if (auto cg = ctx.param_or("commit_group", ""); !cg.empty()) {
+                sink->set_commit_group(cg);
+            }
+            return sink;
         });
 }
 

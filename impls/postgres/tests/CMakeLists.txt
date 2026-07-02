@@ -12,6 +12,7 @@ add_executable(clink_postgres_tests
     test_postgres_cdc_live.cpp
     test_postgres_json_sink.cpp
     test_postgres_json_sink_live.cpp
+    test_postgres_2pc_sink.cpp
     test_cdc_json.cpp
 )
 target_link_libraries(clink_postgres_tests PRIVATE
