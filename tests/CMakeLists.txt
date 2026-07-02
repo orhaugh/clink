@@ -40,6 +40,7 @@ add_executable(clink_core_tests
     test_parquet_fs_2pc_sink.cpp
     test_polling_source.cpp
     test_file_2pc_sink.cpp
+    test_committing_sink.cpp
     test_state_recovery.cpp
     test_keyed_state.cpp
     test_window_recovery.cpp
