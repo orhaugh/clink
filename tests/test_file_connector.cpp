@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/connectors/directory_file_source.hpp"
 #include "clink/connectors/file_sink.hpp"
 #include "clink/connectors/file_source.hpp"
 #include "clink/connectors/text_format.hpp"
@@ -62,6 +63,75 @@ TEST(FileConnector, SourceReadsLinesIntoCollectingSink) {
     auto got = sink->collected();
     EXPECT_EQ(got, (std::vector<std::string>{"alpha", "beta", "gamma", "delta"}));
 
+    std::filesystem::remove(path);
+}
+
+TEST(FileConnector, DirectorySourceReadsAllFilesInSortedOrder) {
+    // A directory of files is read wholesale, files traversed in filename order
+    // regardless of creation order, so a partitioned backing reads back deterministically.
+    const auto dir = std::filesystem::temp_directory_path() / "clink_dir_src";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    write_lines(dir / "c.ndjson", {"delta"});
+    write_lines(dir / "a.ndjson", {"alpha", "beta"});
+    write_lines(dir / "b.ndjson", {"gamma"});
+
+    Dag dag;
+    auto src = std::make_shared<DirectoryFileSource<std::string>>(dir,
+                                                                  string_text_format(),
+                                                                  /*batch_size*/ 2);
+    auto sink = std::make_shared<CollectingSink<std::string>>();
+    auto h0 = dag.add_source<std::string>(src);
+    dag.add_sink<std::string>(h0, sink);
+
+    LocalExecutor exec(std::move(dag));
+    exec.run();
+
+    EXPECT_EQ(sink->collected(), (std::vector<std::string>{"alpha", "beta", "gamma", "delta"}));
+    std::filesystem::remove_all(dir);
+}
+
+TEST(FileConnector, DirectorySourceEmptyDirProducesNoRecords) {
+    const auto dir = std::filesystem::temp_directory_path() / "clink_dir_src_empty";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Dag dag;
+    auto src = std::make_shared<DirectoryFileSource<std::string>>(dir, string_text_format());
+    auto sink = std::make_shared<CollectingSink<std::string>>();
+    auto h0 = dag.add_source<std::string>(src);
+    dag.add_sink<std::string>(h0, sink);
+
+    LocalExecutor exec(std::move(dag));
+    exec.run();
+
+    EXPECT_TRUE(sink->collected().empty());
+    std::filesystem::remove_all(dir);
+}
+
+TEST(FileConnector, DirectorySourceRejectsNonDirectory) {
+    // Pointed at a plain file, DirectoryFileSource fails open() with a clear message
+    // (recorded as an operator error, like the missing-file case).
+    const auto path = tmp_path("clink_dir_src_not_a_dir.txt");
+    write_lines(path, {"x"});
+
+    auto src = std::make_shared<DirectoryFileSource<std::string>>(path, string_text_format());
+    Dag dag;
+    auto h0 = dag.add_source<std::string>(src);
+    auto sink = std::make_shared<CollectingSink<std::string>>();
+    dag.add_sink<std::string>(h0, sink);
+
+    LocalExecutor exec(std::move(dag));
+    exec.run();
+
+    const auto errors = exec.operator_errors();
+    bool found = false;
+    for (const auto& [op_name, msg] : errors) {
+        if (msg.find("not a directory") != std::string::npos) {
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found);
     std::filesystem::remove(path);
 }
 

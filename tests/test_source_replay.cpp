@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/connectors/directory_file_source.hpp"
 #include "clink/connectors/file_source.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
@@ -320,6 +321,48 @@ TEST(SourceReplay, DeferredAckHoldsUntilCommitAndDropsOnAbort) {
     src.notify_checkpoint_complete(CheckpointId{3});
     EXPECT_EQ(concrete.acked(), (std::vector<int>{10, 11, 30}))
         << "aborted checkpoint 2's token (20) must never be acked";
+}
+
+// DirectoryFileSource: a multi-file read position (file index + line index). After a
+// partial read across a file boundary + snapshot, a fresh instance restored from that
+// position resumes at the next un-emitted line, so the union of the two runs is the
+// whole directory with no duplication and no gap.
+TEST(SourceReplay, DirectoryFileSourceResumesAcrossFileBoundary) {
+    InMemoryStateBackend backend;
+    const OperatorId op_id{303};
+    const auto dir = std::filesystem::temp_directory_path() / "clink_dirsrc_replay";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    // Three files of two lines each: 0..5 in filename+line order.
+    {
+        std::ofstream(dir / "p0.ndjson", std::ios::trunc) << "0\n1\n";
+        std::ofstream(dir / "p1.ndjson", std::ios::trunc) << "2\n3\n";
+        std::ofstream(dir / "p2.ndjson", std::ios::trunc) << "4\n5\n";
+    }
+
+    // First run: one produce() of batch_size 3 reads across the p0/p1 boundary
+    // (0,1 from p0 then 2 from p1), then snapshot mid-p1.
+    DirectoryFileSource<int> first(dir, int_lines(), /*batch_size*/ 3, "dsrc");
+    first.open();
+    auto ch1 = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+    Emitter<int> em1(ch1.get());
+    first.produce(em1);
+    first.snapshot_offset(backend, op_id, CheckpointId{1});
+    auto run1 = drain_ints(*ch1);
+    ASSERT_EQ(run1, (std::vector<int>{0, 1, 2}));
+
+    // Fresh source restored from that position drains the remaining lines exactly once.
+    DirectoryFileSource<int> second(dir, int_lines(), /*batch_size*/ 3, "dsrc");
+    ASSERT_TRUE(second.restore_offset(backend, op_id));
+    second.open();
+    auto ch2 = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+    Emitter<int> em2(ch2.get());
+    while (second.produce(em2)) {
+    }
+    auto run2 = drain_ints(*ch2);
+    EXPECT_EQ(run2, (std::vector<int>{3, 4, 5}));
+
+    std::filesystem::remove_all(dir);
 }
 
 // Default Source hooks are no-ops: an offset-replay source (Kafka/Parquet/File)

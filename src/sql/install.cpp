@@ -19,6 +19,7 @@
 #include "clink/cep/cep_operator.hpp"
 #include "clink/cep/pattern.hpp"
 #include "clink/config/json.hpp"
+#include "clink/connectors/directory_file_source.hpp"
 #include "clink/connectors/file_2pc_sink.hpp"
 #include "clink/connectors/file_sink.hpp"
 #include "clink/connectors/file_source.hpp"
@@ -6977,8 +6978,12 @@ void install(clink::plugin::PluginRegistry& reg) {
 
     // ---- Sources ----
 
-    // file_json_source: read NDJSON file, emit one Row per line.
-    //   path (required): filesystem path
+    // file_json_source: read NDJSON, emit one Row per line. When `path` names a
+    // directory it reads every file directly under it (a DirectoryFileSource) in a
+    // stable filename order, so a partitioned / full-refresh materialized-view backing
+    // (a directory of files) can be read straight back into a downstream query. A plain
+    // file path keeps the single-file FileSource.
+    //   path (required): filesystem path (a file, or a directory to read wholesale)
     //   batch_size (default 256): lines per produce() batch
     reg.register_source<Row>(
         "file_json_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<Row>> {
@@ -7007,10 +7012,18 @@ void install(clink::plugin::PluginRegistry& reg) {
                 }
             }
             // #56: DECIMAL columns are tagged exact at ingestion.
+            auto decimals = parse_decimal_columns(ctx.param_or("decimal_columns"));
+            std::error_code dir_ec;
+            if (std::filesystem::is_directory(path, dir_ec)) {
+                return std::make_shared<DirectoryFileSource<Row>>(
+                    path,
+                    row_json_text_format_projected(std::move(decimals), std::move(projected)),
+                    batch_size,
+                    "file_json_source");
+            }
             return std::make_shared<FileSource<Row>>(
                 path,
-                row_json_text_format_projected(
-                    parse_decimal_columns(ctx.param_or("decimal_columns")), std::move(projected)),
+                row_json_text_format_projected(std::move(decimals), std::move(projected)),
                 batch_size,
                 "file_json_source");
         });

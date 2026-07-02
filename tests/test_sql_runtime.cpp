@@ -11386,4 +11386,53 @@ TEST(SqlRuntime, MaterializedViewFullRefreshAggregateNetsByKey) {
     std::filesystem::remove(out);
 }
 
+// A table over a DIRECTORY reads every file under it: connector='file' with a directory
+// path auto-detects and reads the whole set, so a partitioned materialized-view backing
+// (one file per partition, as partition_overwrite_sink writes) can be read straight back
+// into a downstream query.
+TEST(SqlRuntime, FileSourceReadsBackPartitionedDirectory) {
+    ensure_sql_installed_once();
+    const auto dir = std::filesystem::temp_directory_path() / "clink_readback_dir";
+    const auto out = std::filesystem::temp_directory_path() / "clink_readback_out.ndjson";
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove(out);
+    std::filesystem::create_directories(dir);
+    // A partitioned backing: one file per region, as partition_overwrite_sink writes.
+    write_lines(dir / "eu", {R"({"region":"eu","amt":10})", R"({"region":"eu","amt":5})"});
+    write_lines(dir / "us", {R"({"region":"us","amt":20})"});
+
+    Catalog cat;
+    auto rb_ddl = parse(std::string{"CREATE TABLE rb (region VARCHAR, amt BIGINT) "
+                                    "WITH (connector='file', format='json', path='"} +
+                        dir.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(rb_ddl.statements[0]));
+    auto out_ddl = parse(std::string{"CREATE TABLE out_t (region VARCHAR, amt BIGINT) "
+                                     "WITH (connector='file', format='json', path='"} +
+                         out.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(out_ddl.statements[0]));
+
+    InProcessCluster cluster("tm-sql-readback", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto spec = compile(cat, "INSERT INTO out_t SELECT region, amt FROM rb");
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    EXPECT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    // Every row from every partition file is read back.
+    std::multiset<std::pair<std::string, std::int64_t>> got;
+    for (const auto& l : read_lines(out)) {
+        auto row = clink::config::parse(l);
+        got.emplace(row.at("region").as_string(),
+                    static_cast<std::int64_t>(row.at("amt").as_number()));
+    }
+    EXPECT_EQ(
+        got,
+        (std::multiset<std::pair<std::string, std::int64_t>>{{"eu", 10}, {"eu", 5}, {"us", 20}}));
+
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove(out);
+}
+
 }  // namespace clink::sql
