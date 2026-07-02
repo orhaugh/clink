@@ -857,6 +857,12 @@ clink::http::HttpResponse handle_sql(clink::cluster::JobManager& jm,
             } else if (std::holds_alternative<ast::CreateTableStmt>(stmt)) {
                 catalog.register_table(std::get<ast::CreateTableStmt>(stmt));
                 ++applied;
+            } else if (std::holds_alternative<ast::CreateModelStmt>(stmt)) {
+                // SQL-native AI: register the model in the JM's catalog so it persists
+                // (survives restart / HA takeover) and a later ML_PREDICT re-plan - a
+                // scheduled full-refresh REFRESH, a client re-submit - can resolve it.
+                catalog.register_model(std::get<ast::CreateModelStmt>(stmt));
+                ++applied;
             } else if (std::holds_alternative<ast::CreateViewStmt>(stmt)) {
                 clink::sql::register_view(catalog, std::move(std::get<ast::CreateViewStmt>(stmt)));
                 ++applied;

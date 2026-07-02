@@ -23,6 +23,16 @@ fs::path table_json_path(const std::string& dir, const std::string& name) {
     return fs::path(dir) / (name + ".json");
 }
 
+// Models persist under a `models/` subdir so their files never collide with the flat
+// per-table files at the catalog root (load_from_dir parses every root .json as a
+// TableDef; the subdir is skipped there and loaded separately).
+fs::path models_dir(const std::string& dir) {
+    return fs::path(dir) / "models";
+}
+fs::path model_json_path(const std::string& dir, const std::string& name) {
+    return models_dir(dir) / (name + ".json");
+}
+
 void write_file_atomic(const fs::path& target, const std::string& text) {
     // <target>.tmp then rename - survives crashes mid-write.
     auto tmp = target;
@@ -137,6 +147,10 @@ void Catalog::register_model(ModelDef def) {
             "cannot create model '" + def.name + "': a table with that name already exists", 0);
     }
     std::string name = def.name;
+    if (!persistence_dir_.empty()) {
+        fs::create_directories(models_dir(persistence_dir_));
+        write_file_atomic(model_json_path(persistence_dir_, name), to_json(def));
+    }
     models_.emplace(name, std::move(def));
     models_order_.push_back(std::move(name));
 }
@@ -176,6 +190,10 @@ bool Catalog::drop_model(const std::string& name) {
     auto pos = std::find(models_order_.begin(), models_order_.end(), name);
     if (pos != models_order_.end()) {
         models_order_.erase(pos);
+    }
+    if (!persistence_dir_.empty()) {
+        std::error_code ec;
+        fs::remove(model_json_path(persistence_dir_, name), ec);
     }
     return true;
 }
@@ -452,6 +470,8 @@ void Catalog::set_persistence_dir(std::string dir) {
 void Catalog::load_from_dir(const std::string& dir) {
     tables_.clear();
     order_.clear();
+    models_.clear();
+    models_order_.clear();
     fs::path root(dir);
     if (!fs::exists(root))
         return;  // empty catalog is a valid initial state
@@ -474,6 +494,24 @@ void Catalog::load_from_dir(const std::string& dir) {
         std::string name = def.name;
         tables_.emplace(name, std::move(def));
         order_.push_back(std::move(name));
+    }
+
+    // Models live in the `models/` subdir (skipped by the root file scan above).
+    const fs::path mdir = models_dir(dir);
+    if (fs::is_directory(mdir)) {
+        std::vector<fs::path> ments;
+        for (auto& e : fs::directory_iterator(mdir)) {
+            if (e.is_regular_file() && e.path().extension() == ".json") {
+                ments.push_back(e.path());
+            }
+        }
+        std::sort(ments.begin(), ments.end());
+        for (const auto& p : ments) {
+            auto def = model_from_json(read_file(p));
+            std::string name = def.name;
+            models_.emplace(name, std::move(def));
+            models_order_.push_back(std::move(name));
+        }
     }
 }
 
@@ -538,6 +576,76 @@ TableDef Catalog::from_json(const std::string& text) {
         }
     }
     lift_typed_fields(def);
+    return def;
+}
+
+namespace {
+JsonArray columns_to_json(const std::vector<ColumnSpec>& cols) {
+    JsonArray arr;
+    arr.reserve(cols.size());
+    for (const auto& c : cols) {
+        JsonObject col;
+        col["name"] = JsonValue{c.name};
+        col["type"] = JsonValue{arrow_to_sql_type_string(*c.type)};
+        arr.emplace_back(std::move(col));
+    }
+    return arr;
+}
+void columns_from_json(const JsonValue& arr, std::vector<ColumnSpec>& out) {
+    if (!arr.is_array()) {
+        throw std::runtime_error("catalog: model columns must be an array");
+    }
+    for (const auto& c : arr.as_array()) {
+        if (!c.is_object() || !c.contains("name") || !c.at("name").is_string() ||
+            !c.contains("type") || !c.at("type").is_string()) {
+            throw std::runtime_error("catalog: model column must have string name + type");
+        }
+        auto type_ast = parse_sql_type_expression(c.at("type").as_string());
+        out.push_back(ColumnSpec{c.at("name").as_string(), sql_type_to_arrow(type_ast)});
+    }
+}
+}  // namespace
+
+std::string Catalog::to_json(const ModelDef& def) {
+    JsonObject props;
+    for (const auto& [k, v] : def.properties) {
+        props[k] = JsonValue{v};
+    }
+    JsonObject root;
+    root["name"] = JsonValue{def.name};
+    root["input_columns"] = JsonValue{columns_to_json(def.input_columns)};
+    root["output_columns"] = JsonValue{columns_to_json(def.output_columns)};
+    root["properties"] = JsonValue{std::move(props)};
+    return JsonValue{std::move(root)}.serialize(2);
+}
+
+ModelDef Catalog::model_from_json(const std::string& text) {
+    auto j = clink::config::parse(text);
+    if (!j.is_object()) {
+        throw std::runtime_error("catalog: ModelDef JSON must be an object");
+    }
+    ModelDef def;
+    if (!j.contains("name") || !j.at("name").is_string()) {
+        throw std::runtime_error("catalog: ModelDef JSON missing name");
+    }
+    def.name = j.at("name").as_string();
+    if (j.contains("input_columns")) {
+        columns_from_json(j.at("input_columns"), def.input_columns);
+    }
+    if (j.contains("output_columns")) {
+        columns_from_json(j.at("output_columns"), def.output_columns);
+    }
+    if (j.contains("properties")) {
+        if (!j.at("properties").is_object()) {
+            throw std::runtime_error("catalog: properties must be an object");
+        }
+        for (const auto& [k, v] : j.at("properties").as_object()) {
+            if (!v.is_string()) {
+                throw std::runtime_error("catalog: property values must be strings");
+            }
+            def.properties[k] = v.as_string();
+        }
+    }
     return def;
 }
 

@@ -242,8 +242,11 @@ public:
     // SQL-native AI: model registry (CREATE MODEL). Models occupy a namespace
     // separate from tables (a model and a table may not share a name - both
     // register_model overloads reject a collision with an existing table, and
-    // register_table is unaffected). Models are in-memory only in v1 (not persisted
-    // to the catalog dir); registration is per-session / per-script.
+    // register_table is unaffected). Models persist to a `models/` subdir of the
+    // catalog dir (kept separate from the flat table files), so a CREATE MODEL
+    // survives a JobManager restart / HA takeover the same way a table does, and a
+    // job that re-plans against the catalog (a scheduled REFRESH, a client re-submit)
+    // still resolves the model.
     void register_model(ModelDef def);
 
     // Convenience: translate a CREATE MODEL AST into a ModelDef and register it.
@@ -281,6 +284,10 @@ public:
     // for the HTTP catalog API.
     [[nodiscard]] static std::string to_json(const TableDef& def);
     [[nodiscard]] static TableDef from_json(const std::string& text);
+
+    // Round-trip a single model's JSON form (the persisted catalog format).
+    [[nodiscard]] static std::string to_json(const ModelDef& def);
+    [[nodiscard]] static ModelDef model_from_json(const std::string& text);
 
 private:
     std::unordered_map<std::string, TableDef> tables_;

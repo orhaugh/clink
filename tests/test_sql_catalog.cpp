@@ -505,6 +505,73 @@ TEST(SqlCatalog, DropAlsoRemovesPersistedFile) {
     std::filesystem::remove_all(dir);
 }
 
+TEST(SqlCatalog, ModelPersistsAndReloads) {
+    auto dir = make_temp_catalog_dir();
+    {
+        Catalog cat;
+        cat.set_persistence_dir(dir.string());
+        // A table and a model coexist; the model file lives under models/.
+        cat.register_table(std::get<ast::CreateTableStmt>(
+            parse("CREATE TABLE t (a BIGINT) WITH (connector='file', path='/tmp/t')")
+                .statements[0]));
+        cat.register_model(std::get<ast::CreateModelStmt>(
+            parse("CREATE MODEL sentiment INPUT (text VARCHAR) "
+                  "OUTPUT (label VARCHAR, score DOUBLE PRECISION) "
+                  "WITH (provider='http', endpoint='https://x/infer')")
+                .statements[0]));
+        EXPECT_TRUE(std::filesystem::exists(dir / "t.json"));
+        EXPECT_TRUE(std::filesystem::exists(dir / "models" / "sentiment.json"));
+    }
+    // A fresh catalog (a new leader on HA takeover) reloads both.
+    {
+        Catalog cat;
+        cat.load_from_dir(dir.string());
+        ASSERT_EQ(cat.list_tables().size(), 1u);
+        ASSERT_EQ(cat.list_models().size(), 1u);
+        const auto* m = cat.get_model("sentiment");
+        ASSERT_NE(m, nullptr);
+        ASSERT_EQ(m->input_columns.size(), 1u);
+        EXPECT_EQ(m->input_columns[0].name, "text");
+        ASSERT_EQ(m->output_columns.size(), 2u);
+        EXPECT_EQ(m->output_columns[0].name, "label");
+        EXPECT_TRUE(m->output_columns[1].type->Equals(*arrow::float64()));
+        EXPECT_EQ(m->provider(), "http");
+        EXPECT_EQ(m->properties.at("endpoint"), "https://x/infer");
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(SqlCatalog, DropModelRemovesPersistedFile) {
+    auto dir = make_temp_catalog_dir();
+    Catalog cat;
+    cat.set_persistence_dir(dir.string());
+    cat.register_model(std::get<ast::CreateModelStmt>(
+        parse("CREATE MODEL m INPUT (a BIGINT) OUTPUT (y BIGINT) WITH (provider='onnx')")
+            .statements[0]));
+    EXPECT_TRUE(std::filesystem::exists(dir / "models" / "m.json"));
+
+    EXPECT_TRUE(cat.drop_model("m"));
+    EXPECT_FALSE(std::filesystem::exists(dir / "models" / "m.json"));
+    std::filesystem::remove_all(dir);
+}
+
+TEST(SqlCatalog, ModelJsonRoundTrips) {
+    Catalog src;
+    src.register_model(std::get<ast::CreateModelStmt>(
+        parse("CREATE MODEL m INPUT (a BIGINT, b TEXT) OUTPUT (y DOUBLE PRECISION) "
+              "WITH (provider='http', task='classify')")
+            .statements[0]));
+    auto json = Catalog::to_json(*src.get_model("m"));
+    auto round = Catalog::model_from_json(json);
+    EXPECT_EQ(round.name, "m");
+    ASSERT_EQ(round.input_columns.size(), 2u);
+    EXPECT_TRUE(round.input_columns[0].type->Equals(*arrow::int64()));
+    ASSERT_EQ(round.output_columns.size(), 1u);
+    EXPECT_TRUE(round.output_columns[0].type->Equals(*arrow::float64()));
+    EXPECT_EQ(round.properties.at("provider"), "http");
+    EXPECT_EQ(round.properties.at("task"), "classify");
+}
+
 TEST(SqlCatalog, LoadFromMissingDirLeavesCatalogEmpty) {
     Catalog cat;
     EXPECT_NO_THROW(cat.load_from_dir("/tmp/clink_definitely_does_not_exist_xyz"));
