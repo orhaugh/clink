@@ -41,6 +41,7 @@ then follow the links into each subsystem.
 | Page | What it covers |
 | --- | --- |
 | [Checkpointing and barriers](checkpointing.md) | How clink takes a globally consistent snapshot by flowing in-band barriers through the dataflow, snapshotting state on barrier receipt off-thread, and committing two-phase-commit sinks once every subtask has acked. |
+| [The sink committer framework](sink-committer-framework.md) | How CommittingSink gives a connector exactly-once (or honest effectively-once) delivery without hand-rolling 2PC: the verbs a connector supplies, per-checkpoint committable persistence + recover-at-open, the three delivery shapes (staged artifact / external XA / idempotent upsert), and precise guarantee labelling. |
 | [Fault tolerance, rescale and schema evolution](fault-tolerance-and-rescale.md) | How clink recovers a job after a lost TaskManager, rescales operator parallelism via key groups, and migrates keyed state across schema changes, all anchored on completed checkpoints. |
 
 ## Execution paths

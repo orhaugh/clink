@@ -39,6 +39,7 @@ docs current when a subsystem changes.
 | Time, watermarks, windows, CEP | `include/clink/time/`, `include/clink/operators/`, `include/clink/cep/` | `docs/internals/time-and-windowing.md` |
 | Keyed/broadcast state + backends + queryable state | `include/clink/state/`, `src/state/`, `include/clink/queryable_state/` | `docs/internals/state-and-backends.md` |
 | Checkpointing, barriers, 2PC sinks | `include/clink/checkpoint/`, `src/checkpoint/`, `include/clink/connectors/file_2pc_sink.hpp` | `docs/internals/checkpointing.md` |
+| Sink committer framework (exactly-once / upsert sinks) | `include/clink/connectors/committing_sink.hpp`, `include/clink/connectors/sql_json_builder.hpp`, per-connector `*_2pc_sink`/`*_upsert_sink` in `impls/<name>/` | `docs/internals/sink-committer-framework.md` |
 | Failover, rescale, schema evolution, savepoints | `include/clink/cluster/rescale_*`, `include/clink/state/schema_version.hpp`, `include/clink/state_processor/` | `docs/internals/fault-tolerance-and-rescale.md` |
 | Arrow columnar execution | `include/clink/core/arrow_batcher.hpp`, columnar hooks in `include/clink/operators/` | `docs/internals/columnar-execution.md` |
 | Async substrate + disaggregated state | `include/clink/async/`, `src/async/`, RemoteReadBackend in `include/clink/state/` | `docs/internals/async-state-execution.md` |
