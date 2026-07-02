@@ -173,6 +173,24 @@ TEST(HttpModelProvider, RetriesTransientFailure) {
     EXPECT_GE(stub.flaky_call_count(), 2);  // at least one retry happened
 }
 
+TEST(HttpModelProvider, ReusesPooledClientAcrossCalls) {
+    // Many sequential predicts through one provider all return correctly: the leased
+    // client is returned to the pool and reused (keep-alive) without corrupting state.
+    InferStub stub;
+    std::map<std::string, std::string> opts;
+    opts["endpoint"] = stub.url() + "/infer";
+    opts["output_columns"] = "label";
+    opts["conn_pool_size"] = "2";
+    auto provider = clink::http_connector::make_http_model_provider(opts);
+
+    for (int i = 0; i < 5; ++i) {
+        clink::sql::Row f;
+        f.values["text"] = clink::config::JsonValue{std::string("v") + std::to_string(i)};
+        const clink::sql::Row out = provider->predict(f);
+        EXPECT_EQ(out.values.at("label").as_string(), std::string("v") + std::to_string(i));
+    }
+}
+
 TEST(HttpModelProvider, MissingEndpointRejected) {
     const std::map<std::string, std::string> opts;  // no endpoint
     EXPECT_THROW((void)clink::http_connector::make_http_model_provider(opts), std::runtime_error);

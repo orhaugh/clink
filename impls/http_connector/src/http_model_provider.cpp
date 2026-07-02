@@ -2,6 +2,8 @@
 
 #include <chrono>
 #include <cstddef>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -65,6 +67,65 @@ std::vector<std::string> split_csv(const std::string& s) {
     return out;
 }
 
+// A tiny thread-safe pool of keep-alive HTTP clients. The async ML_PREDICT operator fans
+// predict() across worker threads; without pooling each call builds a fresh HttpRequest
+// and pays a new TCP (+ TLS) handshake. The pool hands each call an idle client (reusing
+// its kept-alive connection) and takes it back on completion. cpp-httplib's Client is not
+// safe for concurrent use, so a client is only ever held by one caller at a time.
+class ClientPool {
+public:
+    ClientPool(HttpRequest::Options opts, std::size_t max_idle)
+        : opts_(std::move(opts)), max_idle_(max_idle == 0 ? 1 : max_idle) {}
+
+    std::unique_ptr<HttpRequest> acquire() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (!idle_.empty()) {
+                auto c = std::move(idle_.back());
+                idle_.pop_back();
+                return c;
+            }
+        }
+        return std::make_unique<HttpRequest>(opts_);  // build a new client outside the lock
+    }
+
+    void release(std::unique_ptr<HttpRequest> c) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (idle_.size() < max_idle_) {
+            idle_.push_back(std::move(c));
+        }
+        // else drop it (destroy) - bounds the kept-idle connections / file descriptors.
+    }
+
+private:
+    HttpRequest::Options opts_;
+    std::size_t max_idle_;
+    std::mutex mu_;
+    std::vector<std::unique_ptr<HttpRequest>> idle_;
+};
+
+// RAII lease: returns the client to the pool on scope exit, including on exception (a
+// failed request does not corrupt the client - cpp-httplib re-establishes on next use).
+class ClientLease {
+public:
+    ClientLease(ClientPool& pool, std::unique_ptr<HttpRequest> c)
+        : pool_(&pool), client_(std::move(c)) {}
+    ClientLease(const ClientLease&) = delete;
+    ClientLease& operator=(const ClientLease&) = delete;
+    ClientLease(ClientLease&&) = delete;
+    ClientLease& operator=(ClientLease&&) = delete;
+    ~ClientLease() {
+        if (client_) {
+            pool_->release(std::move(client_));
+        }
+    }
+    HttpRequest& get() { return *client_; }
+
+private:
+    ClientPool* pool_;
+    std::unique_ptr<HttpRequest> client_;
+};
+
 class HttpModelProvider final : public clink::sql::ModelProvider {
 public:
     struct RetryPolicy {
@@ -78,30 +139,30 @@ public:
                       std::string response_path,
                       std::string content_type,
                       std::size_t max_batch_size,
-                      RetryPolicy retry)
-        : http_opts_(std::move(http_opts)),
-          path_(std::move(path)),
+                      RetryPolicy retry,
+                      std::size_t conn_pool_size)
+        : path_(std::move(path)),
           output_columns_(std::move(output_columns)),
           response_path_(std::move(response_path)),
           content_type_(std::move(content_type)),
           max_batch_size_(max_batch_size < 1 ? 1 : max_batch_size),
-          retry_(retry) {}
+          retry_(retry),
+          pool_(std::make_shared<ClientPool>(std::move(http_opts), conn_pool_size)) {}
 
     // Inference is a blocking network round-trip, so the HTTP provider is async: the
     // ml_predict_row factory drives predict() on a thread pool with many requests in
     // flight instead of one blocking call at a time.
     [[nodiscard]] bool is_async() const override { return true; }
 
-    // Concurrency-safe as the async contract requires: each call builds its OWN
-    // HttpRequest (its own client + socket). cpp-httplib's keep-alive Client holds a
-    // single connection and is not safe for concurrent posts, so a shared client could
-    // not fan out; a fresh client per call is the price of concurrency (no keep-alive
-    // reuse across calls, which a connection-pooling client would restore - a follow-on).
+    // Concurrency-safe as the async contract requires: each call leases its OWN client
+    // from the pool for the duration of the request (cpp-httplib's Client is not safe for
+    // concurrent use), and the lease reuses a kept-alive connection instead of a fresh
+    // handshake per call.
     clink::sql::Row predict(const clink::sql::Row& features) override {
-        HttpRequest req(http_opts_);
         const std::string body =
             clink::config::JsonValue{clink::config::JsonObject{features.values}}.serialize(0);
-        clink::config::JsonValue root = post_and_root_(req, body);
+        ClientLease lease(*pool_, pool_->acquire());
+        clink::config::JsonValue root = post_and_root_(lease.get(), body);
         return extract_output_(root, output_columns_);
     }
 
@@ -122,8 +183,8 @@ public:
             body_arr.push_back(clink::config::JsonValue{clink::config::JsonObject{f.values}});
         }
         const std::string body = clink::config::JsonValue{std::move(body_arr)}.serialize(0);
-        HttpRequest req(http_opts_);
-        clink::config::JsonValue root = post_and_root_(req, body);
+        ClientLease lease(*pool_, pool_->acquire());
+        clink::config::JsonValue root = post_and_root_(lease.get(), body);
         if (!root.is_array()) {
             throw std::runtime_error(
                 "ML_PREDICT http provider: batch response must be a JSON array (one prediction per "
@@ -197,13 +258,13 @@ private:
         return out;
     }
 
-    HttpRequest::Options http_opts_;
     std::string path_;
     std::vector<std::string> output_columns_;
     std::string response_path_;
     std::string content_type_;
     std::size_t max_batch_size_;
     RetryPolicy retry_;
+    std::shared_ptr<ClientPool> pool_;
 };
 
 }  // namespace
@@ -244,13 +305,17 @@ std::shared_ptr<clink::sql::ModelProvider> make_http_model_provider(
     if (retry.backoff_ms < 0) {
         retry.backoff_ms = 0;
     }
+    // conn_pool_size caps the kept-alive clients; default matches the async operator's
+    // pool thread count so a fully-busy operator keeps every worker's connection warm.
+    const auto conn_pool_size = static_cast<std::size_t>(opt_int(opts, "conn_pool_size", 16));
     return std::make_shared<HttpModelProvider>(std::move(http),
                                                std::move(path),
                                                split_csv(opt_str(opts, "output_columns", "")),
                                                opt_str(opts, "response_path", ""),
                                                opt_str(opts, "content_type", "application/json"),
                                                max_batch_size,
-                                               retry);
+                                               retry,
+                                               conn_pool_size);
 }
 
 }  // namespace clink::http_connector
