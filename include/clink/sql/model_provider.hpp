@@ -56,6 +56,25 @@ public:
     // async operator owns the pool and the nudge-safe polling coroutine, so the provider
     // exposes only the plain synchronous predict().
     [[nodiscard]] virtual bool is_async() const { return false; }
+
+    // Batched inference. A provider whose endpoint accepts many feature rows per request
+    // (the norm for model servers) reports max_batch_size() > 1 and overrides
+    // predict_batch to issue one request per buffered batch. The ml_predict_row factory
+    // then drives it on the batching operator, which buffers up to max_batch_size rows
+    // and flushes on a full buffer / watermark / barrier / end-of-input. This amortises
+    // the per-request (HTTP + model-load) overhead over the whole batch - the single
+    // biggest throughput lever for remote inference. The default predict_batch calls
+    // predict() per row, so any provider is usable; only an override wins the amortisation.
+    // predict_batch MUST return one prediction row per input row, in the same order.
+    [[nodiscard]] virtual std::size_t max_batch_size() const { return 1; }
+    virtual std::vector<Row> predict_batch(const std::vector<Row>& features_batch) {
+        std::vector<Row> out;
+        out.reserve(features_batch.size());
+        for (const auto& f : features_batch) {
+            out.push_back(predict(f));
+        }
+        return out;
+    }
 };
 
 // A ModelProvider backed by a std::function - the "closure SPI". Lets a user (or a

@@ -673,7 +673,9 @@ Advanced and extensibility (each a documented v1 subset)
 - SQL-native AI: `CREATE MODEL name INPUT (...) OUTPUT (...) WITH (provider=...)`
   registers a model, and `ML_PREDICT(TABLE t, MODEL m, DESCRIPTOR(cols))` applies
   it per row (a built-in HTTP inference provider that runs async with many inferences
-  in flight, a local ONNX Runtime provider, and a C++-closure provider SPI);
+  in flight, or batched - many rows per request - when the model sets max_batch_size;
+  a local ONNX Runtime provider; and a C++-closure provider SPI; model declarations
+  persist in the catalog and survive a restart);
   `VECTOR_SEARCH(TABLE t, query_col, vec_table,
   DESCRIPTOR(idx), top_k [, metric])` returns each row's top-K nearest vectors + a
   score, with SIMD distance kernels (SimSIMD) and exact-flat or approximate-HNSW

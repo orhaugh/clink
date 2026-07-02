@@ -6954,6 +6954,96 @@ private:
     std::vector<std::string> output_columns_;
 };
 
+// Batched ML_PREDICT: buffers up to max_batch_size input rows and applies the model to
+// the whole buffer in one provider->predict_batch call (one request for a batch-capable
+// endpoint, amortising the per-request overhead over the batch). The buffer flushes on a
+// full buffer, a watermark, a barrier (so no buffered row crosses a checkpoint
+// unemitted), a drain, and end-of-input. Per-record event-times are preserved.
+class MlPredictBatchRowOp final : public Operator<Row, Row> {
+public:
+    MlPredictBatchRowOp(std::shared_ptr<ModelProvider> provider,
+                        std::vector<std::string> feature_columns,
+                        std::vector<std::string> output_columns,
+                        std::size_t max_batch_size)
+        : provider_(std::move(provider)),
+          feature_columns_(std::move(feature_columns)),
+          output_columns_(std::move(output_columns)),
+          max_batch_size_(max_batch_size < 1 ? 1 : max_batch_size) {}
+
+    void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        if (element.is_data()) {
+            for (const auto& rec : element.as_data()) {
+                buffer_.push_back(rec);
+                if (buffer_.size() >= max_batch_size_) {
+                    flush_(out);
+                }
+            }
+        } else if (element.is_watermark()) {
+            flush_(out);
+            this->on_watermark(element.as_watermark(), out);
+        } else if (element.is_barrier()) {
+            flush_(out);
+            this->on_barrier(element.as_barrier(), out);
+        } else if (element.is_drain()) {
+            flush_(out);
+            out.emit_drain(element.as_drain());
+        }
+    }
+
+    // End-of-input: apply the model to any partial buffer before teardown.
+    void flush(Emitter<Row>& out) override { flush_(out); }
+
+    std::string name() const override { return "ml_predict_batch_row"; }
+
+private:
+    void flush_(Emitter<Row>& out) {
+        if (buffer_.empty()) {
+            return;
+        }
+        std::vector<Row> features_batch;
+        features_batch.reserve(buffer_.size());
+        for (const auto& rec : buffer_) {
+            Row features;
+            for (const auto& c : feature_columns_) {
+                auto it = rec.value().values.find(c);
+                if (it != rec.value().values.end()) {
+                    features.values[c] = it->second;
+                }
+            }
+            features_batch.push_back(std::move(features));
+        }
+        // One request for the whole buffer. Contract: one prediction per input row, same
+        // order (a shortfall leaves the tail rows with null OUTPUT columns).
+        const std::vector<Row> preds = provider_->predict_batch(features_batch);
+        Batch<Row> emit_batch;
+        for (std::size_t i = 0; i < buffer_.size(); ++i) {
+            Row out_row = buffer_[i].value();  // input columns (and __row_kind) through
+            if (i < preds.size()) {
+                for (const auto& oc : output_columns_) {
+                    auto it = preds[i].values.find(oc);
+                    out_row.values[oc] =
+                        it != preds[i].values.end() ? it->second : clink::config::JsonValue{};
+                }
+            }
+            if (buffer_[i].event_time().has_value()) {
+                emit_batch.push(Record<Row>{std::move(out_row), *buffer_[i].event_time()});
+            } else {
+                emit_batch.push(Record<Row>{std::move(out_row)});
+            }
+        }
+        buffer_.clear();
+        if (!emit_batch.empty()) {
+            out.emit_data(std::move(emit_batch));
+        }
+    }
+
+    std::shared_ptr<ModelProvider> provider_;
+    std::vector<std::string> feature_columns_;
+    std::vector<std::string> output_columns_;
+    std::size_t max_batch_size_;
+    std::vector<Record<Row>> buffer_;
+};
+
 void install(clink::plugin::PluginRegistry& reg) {
     // ---- Channel type ----
     // The Row wire batcher preserves columnar data across TM boundaries: a
@@ -7588,6 +7678,16 @@ void install(clink::plugin::PluginRegistry& reg) {
                     "ml_predict_row: model has no 'provider' (set it in CREATE MODEL WITH)");
             }
             auto provider = ModelProviderRegistry::global().create(it->second, opts);
+            // Batching takes priority: a model declaring max_batch_size > 1 sends the
+            // whole buffer in one request (best for a batch-capable endpoint), which
+            // beats many concurrent single requests. Then the async path (concurrent
+            // per-row); then the synchronous flatmap. The choice is made here from the
+            // actual provider, so the physical plan stays provider-agnostic.
+            if (provider->max_batch_size() > 1) {
+                const std::size_t mb = provider->max_batch_size();
+                return std::make_shared<MlPredictBatchRowOp>(
+                    std::move(provider), feature_cols, output_cols, mb);
+            }
             // An async provider (a slow-I/O model such as an HTTP endpoint) drives many
             // inferences at once on the AsyncLookupOperator; a synchronous provider (a
             // CPU-bound local model) uses the one-at-a-time flatmap. The provider knows

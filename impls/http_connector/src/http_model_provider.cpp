@@ -68,12 +68,14 @@ public:
                       std::string path,
                       std::vector<std::string> output_columns,
                       std::string response_path,
-                      std::string content_type)
+                      std::string content_type,
+                      std::size_t max_batch_size)
         : http_opts_(std::move(http_opts)),
           path_(std::move(path)),
           output_columns_(std::move(output_columns)),
           response_path_(std::move(response_path)),
-          content_type_(std::move(content_type)) {}
+          content_type_(std::move(content_type)),
+          max_batch_size_(max_batch_size < 1 ? 1 : max_batch_size) {}
 
     // Inference is a blocking network round-trip, so the HTTP provider is async: the
     // ml_predict_row factory drives predict() on a thread pool with many requests in
@@ -87,25 +89,60 @@ public:
     // reuse across calls, which a connection-pooling client would restore - a follow-on).
     clink::sql::Row predict(const clink::sql::Row& features) override {
         HttpRequest req(http_opts_);
-        return post_and_extract_(
-            req, path_, content_type_, output_columns_, response_path_, features);
+        const std::string body =
+            clink::config::JsonValue{clink::config::JsonObject{features.values}}.serialize(0);
+        clink::config::JsonValue root = post_and_root_(req, body);
+        return extract_output_(root, output_columns_);
+    }
+
+    // Batching: when the model declares max_batch_size > 1, the batching operator hands
+    // predict_batch a buffer of feature rows, and this issues ONE request whose body is a
+    // JSON array of the per-row feature objects, expecting a JSON array of predictions in
+    // the same order (optionally under response_path). One row in, one row out.
+    [[nodiscard]] std::size_t max_batch_size() const override { return max_batch_size_; }
+
+    std::vector<clink::sql::Row> predict_batch(
+        const std::vector<clink::sql::Row>& features_batch) override {
+        if (features_batch.empty()) {
+            return {};
+        }
+        clink::config::JsonArray body_arr;
+        body_arr.reserve(features_batch.size());
+        for (const auto& f : features_batch) {
+            body_arr.push_back(clink::config::JsonValue{clink::config::JsonObject{f.values}});
+        }
+        const std::string body = clink::config::JsonValue{std::move(body_arr)}.serialize(0);
+        HttpRequest req(http_opts_);
+        clink::config::JsonValue root = post_and_root_(req, body);
+        if (!root.is_array()) {
+            throw std::runtime_error(
+                "ML_PREDICT http provider: batch response must be a JSON array (one prediction per "
+                "input row)");
+        }
+        const auto& arr = root.as_array();
+        if (arr.size() != features_batch.size()) {
+            throw std::runtime_error(
+                "ML_PREDICT http provider: batch response length " + std::to_string(arr.size()) +
+                " does not match request length " + std::to_string(features_batch.size()));
+        }
+        std::vector<clink::sql::Row> out;
+        out.reserve(arr.size());
+        for (const auto& el : arr) {
+            out.push_back(extract_output_(el, output_columns_));
+        }
+        return out;
     }
 
     [[nodiscard]] std::string name() const override { return "http"; }
 
 private:
-    // POST the feature row as JSON and map the response object into the OUTPUT columns.
-    // Takes the HttpRequest by reference so predict() can hand it a fresh per-call client
-    // (the async operator fans predict() out across threads, so no client is shared).
-    static clink::sql::Row post_and_extract_(HttpRequest& req,
-                                             const std::string& path,
-                                             const std::string& content_type,
-                                             const std::vector<std::string>& output_columns,
-                                             const std::string& response_path,
-                                             const clink::sql::Row& features) {
-        const std::string body =
-            clink::config::JsonValue{clink::config::JsonObject{features.values}}.serialize(0);
-        HttpResponse resp = req.post(path, body, content_type);
+    // POST `body`, check the status, parse the response, and resolve response_path (when
+    // set and present) - returning the JSON root the caller reads (an object for a single
+    // prediction, an array for a batch). Takes the HttpRequest by reference so callers can
+    // hand it a fresh per-call client (predict() is fanned across threads; predict_batch
+    // runs on the single operator thread).
+    clink::config::JsonValue post_and_root_(HttpRequest& req, const std::string& body) const {
+        HttpResponse resp = req.post(path_, body, content_type_);
         if (resp.status == 0) {
             throw std::runtime_error("ML_PREDICT http provider: transport error: " + resp.error);
         }
@@ -114,17 +151,22 @@ private:
                                      std::to_string(resp.status));
         }
         clink::config::JsonValue parsed = clink::config::parse(resp.body);
-        const clink::config::JsonValue* root = &parsed;
-        if (!response_path.empty() && parsed.is_object() &&
-            parsed.as_object().find(response_path) != parsed.as_object().end()) {
-            root = &parsed.at(response_path);
+        if (!response_path_.empty() && parsed.is_object() &&
+            parsed.as_object().find(response_path_) != parsed.as_object().end()) {
+            return parsed.at(response_path_);
         }
+        return parsed;
+    }
+
+    // Map one prediction JSON object into the model's OUTPUT columns.
+    static clink::sql::Row extract_output_(const clink::config::JsonValue& obj,
+                                           const std::vector<std::string>& output_columns) {
         clink::sql::Row out;
-        if (root->is_object()) {
-            const auto& obj = root->as_object();
+        if (obj.is_object()) {
+            const auto& o = obj.as_object();
             for (const auto& oc : output_columns) {
-                const auto it = obj.find(oc);
-                if (it != obj.end()) {
+                const auto it = o.find(oc);
+                if (it != o.end()) {
                     out.values[oc] = it->second;
                 }
             }
@@ -137,6 +179,7 @@ private:
     std::vector<std::string> output_columns_;
     std::string response_path_;
     std::string content_type_;
+    std::size_t max_batch_size_;
 };
 
 }  // namespace
@@ -165,11 +208,15 @@ std::shared_ptr<clink::sql::ModelProvider> make_http_model_provider(
         http.headers[k] = v;
     }
 
+    // max_batch_size > 1 opts the model into the batching operator (one request per
+    // buffered batch, array in / array out). Default 1 = per-row requests.
+    const auto max_batch_size = static_cast<std::size_t>(opt_int(opts, "max_batch_size", 1));
     return std::make_shared<HttpModelProvider>(std::move(http),
                                                std::move(path),
                                                split_csv(opt_str(opts, "output_columns", "")),
                                                opt_str(opts, "response_path", ""),
-                                               opt_str(opts, "content_type", "application/json"));
+                                               opt_str(opts, "content_type", "application/json"),
+                                               max_batch_size);
 }
 
 }  // namespace clink::http_connector

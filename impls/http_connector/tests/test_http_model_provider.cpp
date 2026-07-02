@@ -36,6 +36,27 @@ public:
         });
         svr_.Post("/boom",
                   [](const httplib::Request&, httplib::Response& res) { res.status = 500; });
+        // POST /infer_batch takes a JSON array of feature objects and returns a JSON
+        // array of predictions in the same order (one per input row).
+        svr_.Post("/infer_batch", [](const httplib::Request& req, httplib::Response& res) {
+            auto parsed = clink::config::parse(req.body);
+            clink::config::JsonArray out;
+            if (parsed.is_array()) {
+                for (const auto& el : parsed.as_array()) {
+                    std::string text;
+                    if (el.is_object() && el.as_object().find("text") != el.as_object().end()) {
+                        text = el.at("text").as_string();
+                    }
+                    clink::config::JsonObject o;
+                    o["label"] = clink::config::JsonValue{text};
+                    o["conf"] = clink::config::JsonValue{0.9};
+                    out.push_back(clink::config::JsonValue{std::move(o)});
+                }
+            }
+            res.set_content(clink::config::JsonValue{std::move(out)}.serialize(0),
+                            "application/json");
+            res.status = 200;
+        });
         port_ = svr_.bind_to_any_port("127.0.0.1");
         thread_ = std::thread([this] { svr_.listen_after_bind(); });
         while (!svr_.is_running()) {
@@ -85,6 +106,29 @@ TEST(HttpModelProvider, PredictThrowsOnErrorStatus) {
     clink::sql::Row features;
     features.values["text"] = clink::config::JsonValue{std::string("x")};
     EXPECT_THROW((void)provider->predict(features), std::runtime_error);
+}
+
+TEST(HttpModelProvider, PredictBatchRoundTripsArray) {
+    InferStub stub;
+    std::map<std::string, std::string> opts;
+    opts["endpoint"] = stub.url() + "/infer_batch";
+    opts["output_columns"] = "label,conf";
+    opts["max_batch_size"] = "8";
+    auto provider = clink::http_connector::make_http_model_provider(opts);
+    EXPECT_EQ(provider->max_batch_size(), 8u);  // routes ML_PREDICT to the batching op
+
+    std::vector<clink::sql::Row> batch;
+    for (const char* t : {"a", "b", "c"}) {
+        clink::sql::Row f;
+        f.values["text"] = clink::config::JsonValue{std::string(t)};
+        batch.push_back(std::move(f));
+    }
+    const std::vector<clink::sql::Row> out = provider->predict_batch(batch);
+    ASSERT_EQ(out.size(), 3u);  // one prediction per input row, in order
+    EXPECT_EQ(out[0].values.at("label").as_string(), "a");
+    EXPECT_EQ(out[1].values.at("label").as_string(), "b");
+    EXPECT_EQ(out[2].values.at("label").as_string(), "c");
+    EXPECT_NEAR(out[2].values.at("conf").as_number(), 0.9, 1e-9);
 }
 
 TEST(HttpModelProvider, MissingEndpointRejected) {

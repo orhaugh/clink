@@ -90,6 +90,54 @@ std::vector<std::string> read_lines(const std::filesystem::path& path) {
     return lines;
 }
 
+// Largest batch predict_batch has been handed (process-global), so a test can prove the
+// batching operator actually grouped rows rather than calling per row.
+std::atomic<std::size_t>& max_batch_seen() {
+    static std::atomic<std::size_t> v{0};
+    return v;
+}
+
+// A batch-capable test provider: max_batch_size() > 1 routes ML_PREDICT to the batching
+// operator, and predict_batch doubles the first feature into the first OUTPUT column (+
+// a "ok" tag) for every row in one call, recording the batch size it saw.
+class BatchTestProvider final : public clink::sql::ModelProvider {
+public:
+    BatchTestProvider(std::vector<std::string> feats,
+                      std::vector<std::string> outs,
+                      std::size_t max_batch)
+        : feats_(std::move(feats)), outs_(std::move(outs)), max_batch_(max_batch) {}
+    Row predict(const Row& f) override { return predict_batch({f}).front(); }
+    [[nodiscard]] std::size_t max_batch_size() const override { return max_batch_; }
+    std::vector<Row> predict_batch(const std::vector<Row>& fb) override {
+        std::size_t prev = max_batch_seen().load();
+        while (fb.size() > prev && !max_batch_seen().compare_exchange_weak(prev, fb.size())) {
+        }
+        std::vector<Row> out;
+        out.reserve(fb.size());
+        for (const auto& f : fb) {
+            double v = 0.0;
+            if (!feats_.empty()) {
+                auto it = f.values.find(feats_[0]);
+                if (it != f.values.end() && it->second.is_number())
+                    v = it->second.as_number();
+            }
+            Row r;
+            if (!outs_.empty())
+                r.values[outs_[0]] = clink::config::JsonValue{v * 2.0};
+            if (outs_.size() >= 2)
+                r.values[outs_[1]] = clink::config::JsonValue{std::string("ok")};
+            out.push_back(std::move(r));
+        }
+        return out;
+    }
+    [[nodiscard]] std::string name() const override { return "test_batch"; }
+
+private:
+    std::vector<std::string> feats_;
+    std::vector<std::string> outs_;
+    std::size_t max_batch_;
+};
+
 // Single static install: registering SQL ops a second time on the
 // global registry throws. Tests share the same process so we install
 // once and let every test reuse it.
@@ -174,6 +222,37 @@ void ensure_sql_installed_once() {
                             out.values[outs[1]] = clink::config::JsonValue{std::string("ok")};
                         return out;
                     });
+            });
+        // A batch-capable provider: max_batch_size (from the WITH-option) > 1 routes
+        // ML_PREDICT to the batching operator.
+        ModelProviderRegistry::global().register_provider(
+            "test_batch", [](const std::map<std::string, std::string>& opts) {
+                auto split = [](const std::string& s) {
+                    std::vector<std::string> out;
+                    std::size_t start = 0;
+                    while (start <= s.size()) {
+                        auto comma = s.find(',', start);
+                        auto end = comma == std::string::npos ? s.size() : comma;
+                        if (end > start)
+                            out.push_back(s.substr(start, end - start));
+                        if (comma == std::string::npos)
+                            break;
+                        start = comma + 1;
+                    }
+                    return out;
+                };
+                std::size_t mb = 1;
+                if (auto it = opts.find("max_batch_size"); it != opts.end()) {
+                    try {
+                        mb = static_cast<std::size_t>(std::stoull(it->second));
+                    } catch (...) {
+                        mb = 1;
+                    }
+                }
+                return std::make_shared<BatchTestProvider>(
+                    split(opts.count("feature_columns") ? opts.at("feature_columns") : ""),
+                    split(opts.count("output_columns") ? opts.at("output_columns") : ""),
+                    mb);
             });
         return true;
     }();
@@ -11206,6 +11285,74 @@ TEST(SqlRuntime, MlPredictAsyncProviderAppendsModelOutputEndToEnd) {
     EXPECT_EQ(doubled_by_id[4], 200);
     EXPECT_EQ(doubled_by_id[5], 0);
     EXPECT_EQ(doubled_by_id[6], 14);
+    std::filesystem::remove(in);
+    std::filesystem::remove(out);
+}
+
+// SQL-native AI, batched path: a model with max_batch_size > 1 routes ML_PREDICT to the
+// batching operator, which applies the model to a buffer of rows in one predict_batch
+// call. Output matches the per-row path, order is preserved, and the provider observes a
+// batch larger than one row (proving it actually grouped).
+TEST(SqlRuntime, MlPredictBatchedProviderEndToEnd) {
+    ensure_sql_installed_once();
+    max_batch_seen().store(0);
+    const auto in = std::filesystem::temp_directory_path() / "clink_mlpb_in.ndjson";
+    const auto out = std::filesystem::temp_directory_path() / "clink_mlpb_out.ndjson";
+    std::filesystem::remove(in);
+    std::filesystem::remove(out);
+    write_lines(in,
+                {R"({"id":1,"n":21})",
+                 R"({"id":2,"n":10})",
+                 R"({"id":3,"n":5})",
+                 R"({"id":4,"n":100})",
+                 R"({"id":5,"n":0})",
+                 R"({"id":6,"n":7})"});
+
+    Catalog cat;
+    auto model_ddl = parse(
+        "CREATE MODEL bdoubler INPUT (n BIGINT) OUTPUT (doubled DOUBLE PRECISION, tag TEXT) "
+        "WITH (provider='test_batch', max_batch_size='4')");
+    cat.register_model(std::get<ast::CreateModelStmt>(model_ddl.statements[0]));
+    auto ddl =
+        parse(std::string{"CREATE TABLE bnums (id BIGINT, n BIGINT) "
+                          "WITH (connector='file', format='json', path='"} +
+              in.string() +
+              "');"
+              "CREATE TABLE bmlout (id BIGINT, n BIGINT, doubled DOUBLE PRECISION, tag TEXT) "
+              "WITH (connector='file', format='json', path='" +
+              out.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(
+        cat,
+        "INSERT INTO bmlout SELECT * FROM ML_PREDICT(TABLE bnums, MODEL bdoubler, DESCRIPTOR(n))");
+
+    InProcessCluster cluster("tm-sql-mlpb", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out);
+    ASSERT_EQ(lines.size(), 6U);
+    std::vector<std::int64_t> id_order;
+    std::map<std::int64_t, double> doubled_by_id;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        const auto id = static_cast<std::int64_t>(js.at("id").as_number());
+        id_order.push_back(id);
+        doubled_by_id[id] = js.at("doubled").as_number();
+        EXPECT_EQ(js.at("tag").as_string(), "ok");
+    }
+    EXPECT_EQ(id_order, (std::vector<std::int64_t>{1, 2, 3, 4, 5, 6}));
+    EXPECT_EQ(doubled_by_id[1], 42);
+    EXPECT_EQ(doubled_by_id[4], 200);
+    EXPECT_EQ(doubled_by_id[6], 14);
+    // The batching operator grouped rows: with 6 rows and max_batch_size 4, at least one
+    // predict_batch saw more than one row.
+    EXPECT_GT(max_batch_seen().load(), 1U);
     std::filesystem::remove(in);
     std::filesystem::remove(out);
 }
