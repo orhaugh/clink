@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -13,6 +14,7 @@
 #include "clink/redis/redis_client.hpp"
 #include "clink/redis/redis_sink.hpp"
 #include "clink/redis/redis_source.hpp"
+#include "clink/redis/redis_upsert_sink.hpp"
 
 namespace clink::redis {
 
@@ -36,6 +38,31 @@ ConnectOptions conn_options_from(const clink::plugin::BuildContext& ctx) {
     o.tls_sni = ctx.param_or("tls_sni", "");
     o.tls_verify = ctx.param_or("tls_verify", "true") != "false";
     return o;
+}
+
+// Split a comma-separated option value, trimming spaces, dropping empties.
+std::vector<std::string> split_csv(const std::string& s) {
+    std::vector<std::string> out;
+    std::size_t i = 0;
+    while (i < s.size()) {
+        std::size_t j = s.find(',', i);
+        if (j == std::string::npos) {
+            j = s.size();
+        }
+        std::size_t b = i;
+        std::size_t e = j;
+        while (b < e && s[b] == ' ') {
+            ++b;
+        }
+        while (e > b && s[e - 1] == ' ') {
+            --e;
+        }
+        if (e > b) {
+            out.push_back(s.substr(b, e - b));
+        }
+        i = j + 1;
+    }
+    return out;
 }
 
 }  // namespace
@@ -65,6 +92,24 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
             o.name = "redis_sink";
             return std::make_shared<RedisSink>(std::move(o));
+        });
+
+    // redis_upsert_sink: changelog-aware key-value sink, mode='upsert'. Maintains
+    // a keyspace by PRIMARY KEY - SET <key> <json> for insert/update_after, DEL
+    // <key> for delete/update_before, where <key> = key_prefix + the PK tuple.
+    // Effectively-once on the keyspace for a stable PK. Lets a retracting SQL
+    // query maintain a Redis key-value view (the Streams sink can only append).
+    // params: host/port/... (as redis_sink), key_columns (the PRIMARY KEY,
+    // threaded from the SQL path), key_prefix (optional), batch_records.
+    reg.register_sink<std::string>(
+        "redis_upsert_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            RedisUpsertSinkOptions o;
+            o.conn = conn_options_from(ctx);
+            o.key_columns = split_csv(ctx.param_or("key_columns", ""));
+            o.key_prefix = ctx.param_or("key_prefix", "");
+            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 1000));
+            o.name = "redis_upsert_sink";
+            return std::make_shared<RedisUpsertSink>(std::move(o));
         });
 
     // redis_source: XREADGROUP from a stream via a consumer group; each subtask is

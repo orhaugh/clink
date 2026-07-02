@@ -7,6 +7,7 @@ add_executable(clink_cassandra_tests
     test_factory_registration.cpp
     test_cassandra.cpp
     test_cassandra_live.cpp
+    test_cassandra_upsert_sink.cpp
 )
 target_link_libraries(clink_cassandra_tests PRIVATE
     clink::core

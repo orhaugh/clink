@@ -62,7 +62,7 @@ CREATE TABLE sensor_out (
 );
 ```
 
-`mode='upsert'` (changelog) is rejected: the JSON-insert path has no delete or tombstone handling, and a CQL `INSERT` already upserts by primary key. `exactly_once` is also rejected; the sink is at-least-once (idempotent for a stable primary key).
+`mode='upsert'` with a PRIMARY KEY selects the changelog-aware upsert sink (`cassandra_upsert_sink_string`, see Delivery semantics), which applies deletes as well as upserts so a retracting query can maintain the table. `exactly_once` (2PC) is rejected; the default sink is at-least-once (idempotent for a stable primary key).
 
 ## Example
 
@@ -96,7 +96,9 @@ To obtain the sink from the plugin registry, look it up by the factory name `cas
 
 ## Delivery semantics
 
-At-least-once. Inserts are executed asynchronously for throughput, and `flush()` / `on_barrier()` waits for every pending insert and throws on any failure, so the job replays from the last checkpoint. A CQL `INSERT` is an upsert keyed by the primary key, so re-delivery on replay overwrites rather than duplicates: the result is effectively-once for a stable primary key. The SQL frontend rejects an explicit `exactly_once` request, since true exactly-once delivery is not provided.
+`cassandra_sink_string` (default): at-least-once. Inserts are executed asynchronously for throughput, and `flush()` / `on_barrier()` waits for every pending insert and throws on any failure, so the job replays from the last checkpoint. A CQL `INSERT` is an upsert keyed by the primary key, so re-delivery on replay overwrites rather than duplicates: the result is effectively-once for a stable primary key. The SQL frontend rejects an explicit `exactly_once` request, since true exactly-once delivery is not provided.
+
+`cassandra_upsert_sink_string` (`mode='upsert'`): effectively-once on the sink table for a stable PRIMARY KEY and a deterministic defining query. Consumes the changelog by key - insert/update_after `INSERT ... JSON` (a CQL upsert), delete/update_before a per-row `DELETE ... WHERE <pk>=<value>` (CQL has no multi-row IN over a composite key) - netted by key within a flush. A CQL INSERT and a keyed DELETE are both idempotent, so a replay converges the table. Lets a retracting query (GROUP BY, TOP-N, outer join) maintain a Cassandra table. Not two-phase commit.
 
 ## Limitations
 
@@ -105,8 +107,8 @@ At-least-once. Inserts are executed asynchronously for throughput, and `flush()`
 - Rows are written with `INSERT ... JSON`, so column mapping is by JSON field name and Cassandra's own type coercion. The schema must already exist.
 - The sink does not provision schema (no keyspace or table creation).
 - `keyspace` and `table` are required; an empty value throws at construction.
-- No delete or tombstone handling, so changelog / upsert mode (`mode='upsert'`) is not supported through SQL.
-- Delivery is at-least-once; exactly-once is not available.
+- The default sink has no delete handling; use `mode='upsert'` (the changelog-aware `cassandra_upsert_sink_string`) for a retracting query that must apply deletes.
+- Delivery is at-least-once (default) or effectively-once by PRIMARY KEY (`mode='upsert'`); two-phase-commit exactly-once is not available.
 
 ## Testing
 

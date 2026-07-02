@@ -13,4 +13,9 @@ TEST(CassandraFactoryRegistration, SinkIsRegistered) {
     EXPECT_NE(rr.find_sink("cassandra_sink_string", "string"), nullptr);
 }
 
+TEST(CassandraFactoryRegistration, UpsertSinkIsRegistered) {
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("cassandra_upsert_sink_string", "string"), nullptr);
+}
+
 }  // namespace

@@ -14,6 +14,11 @@ TEST(RedisFactoryRegistration, SinkIsRegistered) {
     EXPECT_NE(rr.find_sink("redis_sink", "string"), nullptr);
 }
 
+TEST(RedisFactoryRegistration, UpsertSinkIsRegistered) {
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("redis_upsert_sink", "string"), nullptr);
+}
+
 TEST(RedisFactoryRegistration, SourceIsRegistered) {
     const auto& rr = RunnerRegistry::default_instance();
     EXPECT_NE(rr.find_source("redis_source", "string"), nullptr);

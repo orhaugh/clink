@@ -165,7 +165,7 @@ CREATE TABLE orders_out (
 );
 ```
 
-On the SQL path, `columns` defaults to the declared table schema, so it does not need to be repeated. The planner rejects `mode='upsert'` (use `on_duplicate='update'` for idempotent insert-or-update by primary key) and rejects exactly-once delivery for the sink.
+On the SQL path, `columns` defaults to the declared table schema, so it does not need to be repeated. `mode='upsert'` with a PRIMARY KEY selects the changelog-aware upsert sink (`mysql_upsert_sink`, see Delivery semantics), which lets a retracting query maintain the table; `on_duplicate='update'` is the lighter append-stream idempotent-by-key option on the default sink. Exactly-once (XA 2PC) delivery is not supported.
 
 ## Example
 
@@ -207,6 +207,7 @@ The factories are also reachable through the registry on the `string` channel as
 ## Delivery semantics
 
 - `mysql_sink`: at-least-once. A replay after a failed checkpoint re-runs the `INSERT`. A plain insert appends duplicates on replay; with `on_duplicate='update'` (and a PRIMARY KEY or UNIQUE index) the insert-or-update is idempotent and so effectively-once by key. Buffered rows are flushed on the count, byte and linger thresholds and on every checkpoint barrier. A flush failure drops the connection, clears the pending buffer and rethrows so the job replays from the last checkpoint. Exactly-once (XA 2PC) is not supported.
+- `mysql_upsert_sink` (`mode='upsert'`): effectively-once on the sink table for a stable PRIMARY KEY and a deterministic defining query. Consumes the changelog by key - insert/update_after `INSERT ... ON DUPLICATE KEY UPDATE`, delete/update_before `DELETE ... WHERE <pk> IN (...)` - netted by key within a flush and applied in one transaction, so a replay converges the table to the same state. Lets a retracting query (GROUP BY, TOP-N, outer join) maintain a MySQL table. Not two-phase commit.
 - `mysql_source`: at-least-once. The cursor is checkpointed as operator state (via `PollingSource`) and replayed on restart; the exclusive `>` comparison avoids re-emitting the boundary row. A NULL cursor or id value in a delivered row is fatal rather than silently stalling the cursor.
 - `mysql_cdc_source`: at-least-once for the decodable change stream, with the checkpoint cursor being `(binlog_file, position)`. An undecodable row event (schema drift or an unseen table-map) is dropped and counted, so it is at-most-once for those events; it is never emitted half-populated. With `initial_snapshot` enabled and `snapshot_lock=true` the snapshot-to-stream boundary is exact; with `snapshot_lock=false` it is at-least-once. The snapshot is not checkpointed mid-way, so a crash during it re-snapshots from scratch on restart.
 

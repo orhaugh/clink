@@ -2001,6 +2001,60 @@ TEST(SqlPhysical, PostgresUpsertSinkSelected) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
 }
 
+TEST(SqlPhysical, MysqlUpsertSinkSelected) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE mup (k BIGINT, v BIGINT) "
+        "WITH (connector='mysql', dsn='host=localhost', mode='upsert', primary_key='k')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO mup SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* sink = find_op(spec, "mysql_upsert_sink");
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(sink->params.at("key_columns"), "k");
+    EXPECT_EQ(find_op(spec, "mysql_sink"), nullptr);
+}
+
+TEST(SqlPhysical, RedisUpsertSinkSelected) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE rup (k BIGINT, v BIGINT) "
+        "WITH (connector='redis', host='localhost', mode='upsert', primary_key='k')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO rup SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* sink = find_op(spec, "redis_upsert_sink");
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(sink->params.at("key_columns"), "k");
+    EXPECT_EQ(find_op(spec, "redis_sink"), nullptr);
+}
+
+TEST(SqlPhysical, CassandraUpsertSinkSelected) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE cup (k BIGINT, v BIGINT) "
+        "WITH (connector='cassandra', keyspace='ks', mode='upsert', primary_key='k')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO cup SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* sink = find_op(spec, "cassandra_upsert_sink_string");
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(sink->params.at("key_columns"), "k");
+    EXPECT_EQ(find_op(spec, "cassandra_sink_string"), nullptr);
+}
+
 TEST(SqlPhysical, CommitGroupThreadsThroughToSinkParams) {
     // commit_group property on the table flows through the
     // physical planner into OperatorSpec.params, where sink factories

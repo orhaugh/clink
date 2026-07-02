@@ -11,6 +11,7 @@
 #include "clink/mysql/install.hpp"
 #include "clink/mysql/mysql_cdc_source.hpp"
 #include "clink/mysql/mysql_client.hpp"
+#include "clink/mysql/mysql_json_upsert_sink.hpp"
 #include "clink/mysql/mysql_sink.hpp"
 #include "clink/mysql/mysql_source.hpp"
 #include "clink/operators/sink_operator.hpp"
@@ -101,6 +102,28 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
             o.name = "mysql_sink";
             return std::make_shared<MysqlSink>(std::move(o));
+        });
+
+    // mysql_upsert_sink: changelog-aware, mode='upsert'. Maintains a table by
+    // PRIMARY KEY - insert/update_after upsert (INSERT ON DUPLICATE KEY UPDATE),
+    // delete/update_before DELETE by key. Effectively-once on the sink table for a
+    // stable PK. Lets a retracting SQL query maintain a MySQL table. params:
+    //   table (required), columns (or schema_columns), key_columns (the PRIMARY
+    //   KEY, threaded from the SQL path), update_columns, batch_records.
+    reg.register_sink<std::string>(
+        "mysql_upsert_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            MysqlJsonUpsertSinkOptions o;
+            o.conn = conn_options_from(ctx);
+            o.table = ctx.param_or("table");
+            o.columns = split_csv(ctx.param_or("columns", ""));
+            if (o.columns.empty()) {
+                o.columns = columns_from_schema(ctx.param_or("schema_columns", ""));
+            }
+            o.key_columns = split_csv(ctx.param_or("key_columns", ""));
+            o.update_columns = split_csv(ctx.param_or("update_columns", ""));
+            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 1000));
+            o.name = "mysql_upsert_sink";
+            return std::make_shared<MysqlJsonUpsertSink>(std::move(o));
         });
 
     // mysql_source: incremental cursor SELECT, each row a JSON-object string.

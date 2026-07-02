@@ -414,9 +414,18 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
                 "key); exactly-once delivery is not supported");
         }
         if (upsert) {
-            unsupported(
-                "connector='cassandra' sink does not support mode='upsert' (no tombstone "
-                "handling); a CQL INSERT already upserts by primary key");
+            // Changelog-aware upsert: maintain the table by PRIMARY KEY (INSERT
+            // JSON - a CQL upsert - for insert/update_after, DELETE by key for
+            // delete/update_before). Effectively-once on the sink table for a
+            // stable PK. The binder has already checked a PRIMARY KEY.
+            std::string keys;
+            for (std::size_t i = 0; i < table.primary_key.size(); ++i) {
+                keys += (i ? "," : "") + table.primary_key[i];
+            }
+            return RowConnectorBinding{"cassandra_upsert_sink_string",
+                                       kChannelString,
+                                       "row_to_json_string",
+                                       {{"key_columns", keys}}};
         }
         return RowConnectorBinding{"cassandra_sink_string", kChannelString, "row_to_json_string"};
     }
@@ -575,7 +584,16 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
                 "dedup key); exactly-once delivery is not supported");
         }
         if (upsert) {
-            unsupported("connector='redis' sink does not support mode='upsert'");
+            // Changelog-aware key-value upsert: maintain a keyspace by PRIMARY KEY
+            // (SET on insert/update_after, DEL on delete/update_before), distinct
+            // from the append-only Streams sink. Effectively-once on the keyspace
+            // for a stable PK. The binder has already checked a PRIMARY KEY.
+            std::string keys;
+            for (std::size_t i = 0; i < table.primary_key.size(); ++i) {
+                keys += (i ? "," : "") + table.primary_key[i];
+            }
+            return RowConnectorBinding{
+                "redis_upsert_sink", kChannelString, "row_to_json_string", {{"key_columns", keys}}};
         }
         return RowConnectorBinding{"redis_sink", kChannelString, "row_to_json_string"};
     }
@@ -587,13 +605,16 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
                 "connector='mysql' sink is at-least-once; exactly-once delivery is not supported");
         }
         if (upsert) {
-            // clink mode='upsert' is a changelog contract (delete tombstones via
-            // __row_kind) this append sink does not implement. For idempotent
-            // insert-or-update by primary key on replay, use the WITH-option
-            // on_duplicate='update' instead (INSERT ... ON DUPLICATE KEY UPDATE).
-            unsupported(
-                "connector='mysql' sink does not implement mode='upsert' (changelog deletes); "
-                "use on_duplicate='update' for idempotent insert-or-update by primary key");
+            // Changelog-aware upsert: maintain the table by PRIMARY KEY (INSERT ON
+            // DUPLICATE KEY UPDATE for insert/update_after, DELETE for delete/
+            // update_before). Effectively-once on the sink table for a stable PK.
+            // The binder has already checked a PRIMARY KEY is declared + projected.
+            std::string keys;
+            for (std::size_t i = 0; i < table.primary_key.size(); ++i) {
+                keys += (i ? "," : "") + table.primary_key[i];
+            }
+            return RowConnectorBinding{
+                "mysql_upsert_sink", kChannelString, "row_to_json_string", {{"key_columns", keys}}};
         }
         return RowConnectorBinding{"mysql_sink", kChannelString, "row_to_json_string"};
     }

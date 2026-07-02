@@ -60,6 +60,19 @@ services:
       retries: 30
       start_period: 3s
 
+  # Cassandra for the Cassandra connector live ITs (sink + changelog upsert sink).
+  # CLINK_CASSANDRA_TEST_CONTACT_POINTS: "127.0.0.1"
+  cassandra:
+    image: cassandra:4
+    ports:
+      - "9042:9042"
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "SELECT cluster_name FROM system.local"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
   # MySQL for the MySQL connector live ITs (both the cursor source/sink and the
   # binlog CDC source). The binlog flags enable replication: ROW format with full
   # before/after images and a server-id, so mysql_cdc_source can stream changes.

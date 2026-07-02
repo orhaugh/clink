@@ -14,6 +14,11 @@ TEST(MysqlFactoryRegistration, SinkIsRegistered) {
     EXPECT_NE(rr.find_sink("mysql_sink", "string"), nullptr);
 }
 
+TEST(MysqlFactoryRegistration, UpsertSinkIsRegistered) {
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("mysql_upsert_sink", "string"), nullptr);
+}
+
 TEST(MysqlFactoryRegistration, SourceIsRegistered) {
     const auto& rr = RunnerRegistry::default_instance();
     EXPECT_NE(rr.find_source("mysql_source", "string"), nullptr);

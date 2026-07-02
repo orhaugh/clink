@@ -33,6 +33,7 @@ endif()
 
 add_library(clink_cassandra STATIC
     src/cassandra_sink.cpp
+    src/cassandra_upsert_sink.cpp
     src/register_factories.cpp
 )
 add_library(clink::cassandra ALIAS clink_cassandra)

@@ -82,7 +82,7 @@ Authentication-related options are `username`, `password`, and the `tls_*` set. 
 
 ## SQL usage
 
-Redis is mapped in `src/sql/physical_plan.cpp` to the `connector='redis'` string for both source (`redis_source`) and sink (`redis_sink`). On the SQL path the row is bridged to and from a JSON object string (`json_string_to_row` for the source, `row_to_json_string` for the sink). The sink is at-least-once and `mode='upsert'` is rejected.
+Redis is mapped in `src/sql/physical_plan.cpp` to the `connector='redis'` string for both source (`redis_source`) and sink (`redis_sink`). On the SQL path the row is bridged to and from a JSON object string (`json_string_to_row` for the source, `row_to_json_string` for the sink). The default Streams sink is at-least-once; `mode='upsert'` with a PRIMARY KEY selects the changelog-aware key-value sink (`redis_upsert_sink`, see Delivery semantics) instead.
 
 ```sql
 CREATE TABLE events_in (
@@ -155,7 +155,9 @@ The factories can also be resolved through the runner registry by name (`redis_s
 
 Both ends are at-least-once.
 
-Sink: `XADD` is append-only with no producer dedup key. Records are buffered and pipelined, then flushed on the count / byte / linger threshold and on every checkpoint barrier, so everything buffered is durable in the stream by the barrier. On a flush error the connection is dropped and the exception is rethrown, so the job replays the buffered batch from the last checkpoint, which re-appends and produces duplicates downstream. There is no two-phase commit and `mode='upsert'` is not supported on the SQL path.
+Sink (`redis_sink`): `XADD` is append-only with no producer dedup key. Records are buffered and pipelined, then flushed on the count / byte / linger threshold and on every checkpoint barrier, so everything buffered is durable in the stream by the barrier. On a flush error the connection is dropped and the exception is rethrown, so the job replays the buffered batch from the last checkpoint, which re-appends and produces duplicates downstream. There is no two-phase commit.
+
+Upsert sink (`redis_upsert_sink`, `mode='upsert'`): a separate key-value view (not Streams). Maintains one Redis key per PRIMARY KEY tuple - `SET <key_prefix><pk>` for insert/update_after, `DEL` for delete/update_before - netted by key within a flush and pipelined. Effectively-once on the keyspace for a stable PRIMARY KEY and a deterministic defining query (SET/DEL are keyed and idempotent, so a replay converges). The stored value is the row's JSON with the synthetic `__row_kind` removed. Lets a retracting query maintain a Redis key-value view.
 
 Source: the consumer group's per-consumer pending-entries list (PEL) is the durable cursor. On `open()` each consumer first re-drains its PEL (id `0`), re-delivering anything delivered-but-not-acked before a crash, then switches to new entries (`>`). `XACK` is the offset commit and rides `snapshot_offset()`, so entries delivered since the last checkpoint are acknowledged when the checkpoint is taken.
 
