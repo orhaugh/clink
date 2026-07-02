@@ -1,12 +1,36 @@
+#include <chrono>
+#include <memory>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "clink/cluster/operator_registry.hpp"
+#include "clink/config/json.hpp"
+#include "clink/core/record.hpp"
+#include "clink/core/stream_element.hpp"
+#include "clink/operators/operator_base.hpp"
+#include "clink/operators/source_operator.hpp"
+#include "clink/runtime/bounded_channel.hpp"
+#include "clink/sql/row.hpp"
 #include "clink/vector_search/distance_kernels.hpp"
 #include "clink/vector_search/knn_index.hpp"
+#include "clink/vector_search/vector_search_operator.hpp"
 
 namespace clink::vector_search {
 namespace {
+
+// Process-global corpus the vs_test_corpus source factory reads, so the test can change
+// the corpus between builds without re-registering the factory (repeat-safe).
+struct CorpusState {
+    std::string doc = "a";
+    std::vector<double> vec{1.0, 0.0};
+};
+CorpusState& corpus_state() {
+    static CorpusState s;
+    return s;
+}
 
 TEST(VectorDistance, DotProduct) {
     const std::vector<float> a{1, 2, 3};
@@ -86,6 +110,97 @@ TEST(KnnIndex, HnswRequestFindsNearest) {
     const auto hits = idx->search(q.data(), 2, 2);
     ASSERT_GE(hits.size(), 1U);
     EXPECT_EQ(hits[0].row_index, 1U);  // (1,1) nearest
+}
+
+// The corpus_refresh_ms knob rebuilds the in-memory index inline when the interval has
+// elapsed, so a changed reference table is picked up without a job restart.
+TEST(VectorSearchOperator, CorpusRefreshPicksUpChangedCorpus) {
+    using clink::sql::Row;
+
+    // Register (once) a source that yields the current process-global corpus.
+    auto& reg = clink::cluster::OperatorRegistry::default_instance();
+    if (reg.find_source("vs_test_corpus", std::string{"row"}) == nullptr) {
+        reg.register_source(
+            "vs_test_corpus",
+            clink::cluster::SourceFactory{
+                std::string{"row"},
+                [](const clink::cluster::OperatorBuildContext&) -> std::shared_ptr<void> {
+                    Row r;
+                    clink::config::JsonArray vec;
+                    for (double v : corpus_state().vec) {
+                        vec.push_back(clink::config::JsonValue{v});
+                    }
+                    r.values["vec"] = clink::config::JsonValue{std::move(vec)};
+                    r.values["doc"] = clink::config::JsonValue{corpus_state().doc};
+                    std::vector<clink::Record<Row>> rows;
+                    rows.emplace_back(std::move(r));
+                    std::shared_ptr<clink::Source<Row>> src =
+                        std::make_shared<clink::VectorSource<Row>>(std::move(rows),
+                                                                   "vs_test_corpus");
+                    return src;
+                }});
+    }
+
+    corpus_state().doc = "a";
+    corpus_state().vec = {1.0, 0.0};
+
+    VectorSearchOperator::Config cfg;
+    cfg.source_factory = "vs_test_corpus";
+    cfg.query_column = "q";
+    cfg.index_column = "vec";
+    cfg.vector_columns = {"doc"};
+    cfg.top_k = 1;
+    cfg.corpus_refresh_ms = 1;
+    cfg.index.kind = "flat";
+    cfg.index.metric = Metric::Cosine;
+    cfg.index.dim = 2;
+    VectorSearchOperator op(std::move(cfg));
+    op.open();  // builds corpus A (doc "a")
+
+    auto query_element = []() {
+        Row r;
+        clink::config::JsonArray q;
+        q.push_back(clink::config::JsonValue{1.0});
+        q.push_back(clink::config::JsonValue{0.1});
+        r.values["q"] = clink::config::JsonValue{std::move(q)};
+        clink::Batch<Row> b;
+        b.push(clink::Record<Row>{std::move(r)});
+        return clink::StreamElement<Row>::data(std::move(b));
+    };
+    auto drain_docs = [](clink::BoundedChannel<clink::StreamElement<Row>>& ch) {
+        std::vector<std::string> docs;
+        while (auto e = ch.try_pop()) {
+            if (e->is_data()) {
+                for (const auto& rec : e->as_data()) {
+                    docs.push_back(rec.value().values.at("doc").as_string());
+                }
+            }
+        }
+        return docs;
+    };
+
+    // First query: corpus A -> doc "a".
+    clink::BoundedChannel<clink::StreamElement<Row>> ch1(16);
+    clink::Emitter<Row> em1(&ch1);
+    auto q1 = query_element();
+    op.process(q1, em1);
+    auto d1 = drain_docs(ch1);
+    ASSERT_EQ(d1.size(), 1U);
+    EXPECT_EQ(d1[0], "a");
+
+    // Change the corpus, wait past the refresh interval, query again: the operator
+    // rebuilds the index inline and now searches corpus B -> doc "b".
+    corpus_state().doc = "b";
+    corpus_state().vec = {0.0, 1.0};
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+
+    clink::BoundedChannel<clink::StreamElement<Row>> ch2(16);
+    clink::Emitter<Row> em2(&ch2);
+    auto q2 = query_element();
+    op.process(q2, em2);
+    auto d2 = drain_docs(ch2);
+    ASSERT_EQ(d2.size(), 1U);
+    EXPECT_EQ(d2[0], "b");
 }
 
 }  // namespace

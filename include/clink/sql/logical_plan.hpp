@@ -439,6 +439,7 @@ public:
                         std::string index_column,
                         std::int64_t top_k,
                         std::string metric,
+                        std::int64_t corpus_refresh_ms,
                         std::vector<std::string> input_columns,
                         std::vector<std::string> vector_columns,
                         std::shared_ptr<arrow::Schema> schema)
@@ -448,6 +449,7 @@ public:
           index_column_(std::move(index_column)),
           metric_(std::move(metric)),
           top_k_(top_k),
+          corpus_refresh_ms_(corpus_refresh_ms),
           input_columns_(std::move(input_columns)),
           vector_columns_(std::move(vector_columns)),
           schema_(std::move(schema)) {}
@@ -459,6 +461,7 @@ public:
     [[nodiscard]] const std::string& index_column() const noexcept { return index_column_; }
     [[nodiscard]] std::int64_t top_k() const noexcept { return top_k_; }
     [[nodiscard]] const std::string& metric() const noexcept { return metric_; }
+    [[nodiscard]] std::int64_t corpus_refresh_ms() const noexcept { return corpus_refresh_ms_; }
     [[nodiscard]] const std::vector<std::string>& input_columns() const noexcept {
         return input_columns_;
     }
@@ -477,6 +480,7 @@ private:
     std::string index_column_;
     std::string metric_;
     std::int64_t top_k_;
+    std::int64_t corpus_refresh_ms_;
     std::vector<std::string> input_columns_;
     std::vector<std::string> vector_columns_;
     std::shared_ptr<arrow::Schema> schema_;

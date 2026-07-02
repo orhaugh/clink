@@ -2280,11 +2280,24 @@ std::unique_ptr<LogicalPlan> Binder::bind_vector_search(const ast::VectorSearchC
                        ")",
                    vs.loc.pos);
     }
-    // metric option (default cosine); validate against the supported set.
+    // Trailing named options. metric (default cosine, validated) picks the distance
+    // kernel; corpus_refresh_ms (default 0 = never) periodically rebuilds the in-memory
+    // corpus index so a slowly-changing vector table is picked up without a restart.
     std::string metric = "cosine";
+    std::int64_t corpus_refresh_ms = 0;
     for (const auto& opt : vs.options) {
         if (opt.key == "metric") {
             metric = opt.value;
+        } else if (opt.key == "corpus_refresh_ms") {
+            try {
+                corpus_refresh_ms = std::stoll(opt.value);
+            } catch (...) {
+                bind_error("VECTOR_SEARCH: corpus_refresh_ms must be an integer (milliseconds)",
+                           vs.loc.pos);
+            }
+            if (corpus_refresh_ms < 0) {
+                bind_error("VECTOR_SEARCH: corpus_refresh_ms must be >= 0", vs.loc.pos);
+            }
         }
     }
     if (metric != "cosine" && metric != "l2" && metric != "dot") {
@@ -2328,6 +2341,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_vector_search(const ast::VectorSearchC
                                                  vs.index_column,
                                                  vs.top_k,
                                                  metric,
+                                                 corpus_refresh_ms,
                                                  std::move(input_cols),
                                                  std::move(vector_cols),
                                                  std::move(schema));

@@ -334,6 +334,41 @@ TEST(SqlAiPhysical, VectorSearchLowersToVectorSearchRow) {
     EXPECT_FALSE(op->params.at("vector_table.schema_columns").empty());
     // The raw connector name is not leaked as a bare param.
     EXPECT_EQ(op->params.count("vector_table_connector"), 0u);
+    // No corpus refresh requested -> the param is absent (fixed corpus at open).
+    EXPECT_EQ(op->params.count("corpus_refresh_ms"), 0u);
+}
+
+TEST(SqlAiPhysical, VectorSearchThreadsCorpusRefreshOption) {
+    Catalog cat;
+    register_json(cat, "queries", "(id BIGINT, emb DOUBLE PRECISION ARRAY)");
+    register_json(cat, "docs", "(doc_id BIGINT, vec DOUBLE PRECISION ARRAY)");
+    register_json(cat,
+                  "out",
+                  "(id BIGINT, emb DOUBLE PRECISION ARRAY, doc_id BIGINT, vec DOUBLE "
+                  "PRECISION ARRAY, score DOUBLE PRECISION)");
+    auto plan = bind_insert(cat,
+                            "INSERT INTO out SELECT * FROM VECTOR_SEARCH(TABLE queries, emb, docs, "
+                            "DESCRIPTOR(vec), 5, corpus_refresh_ms='60000')");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* op = find_op(spec, "vector_search_row");
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->params.at("corpus_refresh_ms"), "60000");
+}
+
+TEST(SqlAiBind, VectorSearchRejectsNegativeCorpusRefresh) {
+    Catalog cat;
+    register_json(cat, "queries", "(id BIGINT, emb DOUBLE PRECISION ARRAY)");
+    register_json(cat, "docs", "(doc_id BIGINT, vec DOUBLE PRECISION ARRAY)");
+    register_json(cat,
+                  "out",
+                  "(id BIGINT, emb DOUBLE PRECISION ARRAY, doc_id BIGINT, vec DOUBLE "
+                  "PRECISION ARRAY, score DOUBLE PRECISION)");
+    EXPECT_THROW((void)bind_insert(cat,
+                                   "INSERT INTO out SELECT * FROM VECTOR_SEARCH("
+                                   "TABLE queries, emb, docs, DESCRIPTOR(vec), 5, "
+                                   "corpus_refresh_ms='-1')"),
+                 TranslationError);
 }
 
 }  // namespace clink::sql

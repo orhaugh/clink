@@ -1439,6 +1439,9 @@ std::string compile_node(const LogicalPlan& node,
         op.params["index_column"] = vs.index_column();
         op.params["top_k"] = std::to_string(vs.top_k());
         op.params["metric"] = vs.metric();
+        if (vs.corpus_refresh_ms() > 0) {
+            op.params["corpus_refresh_ms"] = std::to_string(vs.corpus_refresh_ms());
+        }
         op.params["vector_columns"] = csv(vs.vector_columns());
         std::string id = op.id;
         spec.ops.push_back(std::move(op));

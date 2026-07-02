@@ -20,6 +20,11 @@ using clink::sql::vector_from_row;
 using clink::sql::VectorCell;
 
 void VectorSearchOperator::open() {
+    rebuild_corpus_();
+    last_build_ = std::chrono::steady_clock::now();
+}
+
+void VectorSearchOperator::rebuild_corpus_() {
     auto& reg = clink::cluster::OperatorRegistry::default_instance();
     const auto* sf = reg.find_source(cfg_.source_factory, std::string{"row"});
     if (sf == nullptr) {
@@ -40,7 +45,9 @@ void VectorSearchOperator::open() {
     }
 
     // A one-shot in-process scan of the bounded corpus (the analyze_table pattern):
-    // each corpus row contributes its index vector + the projected emit columns.
+    // each corpus row contributes its index vector + the projected emit columns. Clear
+    // any prior corpus first so a refresh replaces (not appends to) the old set.
+    corpus_payloads_.clear();
     std::vector<std::vector<float>> corpus_vectors;
     clink::Dag dag;
     auto handle = dag.add_source<Row>(source);
@@ -80,6 +87,16 @@ void VectorSearchOperator::open() {
 void VectorSearchOperator::process(const clink::StreamElement<Row>& element,
                                    clink::Emitter<Row>& out) {
     if (element.is_data()) {
+        // Periodic corpus refresh: rebuild the index inline (on this operator thread)
+        // when the configured interval has elapsed, so a slowly-changing reference table
+        // is picked up without a job restart. One row's processing pays the rebuild.
+        if (cfg_.corpus_refresh_ms > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_build_ >= std::chrono::milliseconds{cfg_.corpus_refresh_ms}) {
+                rebuild_corpus_();
+                last_build_ = now;
+            }
+        }
         clink::Batch<Row> emit_batch;
         for (const auto& rec : element.as_data()) {
             const Row& in = rec.value();

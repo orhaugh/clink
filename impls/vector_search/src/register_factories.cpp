@@ -77,6 +77,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             cfg.vector_columns = split_csv(ctx.param_or("vector_columns", ""));
             cfg.score_column = ctx.param_or("score_column", "score");
             cfg.top_k = param_size(ctx, "top_k", 10);
+            cfg.corpus_refresh_ms =
+                static_cast<std::int64_t>(param_size(ctx, "corpus_refresh_ms", 0));
             cfg.index.metric = parse_metric(ctx.param_or("metric", "cosine"));
             cfg.index.kind = ctx.param_or("index", "auto");
             cfg.index.dim = param_size(ctx, "dim", 0);
