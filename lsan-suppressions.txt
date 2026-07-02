@@ -17,3 +17,13 @@
 # module. Mirrors the existing `thread:libarrow.so` TSan suppression for
 # the very same subsystem.
 leak:libarrow.so
+
+# The vendored DataStax cpp-driver (clink::cassandra impl) leaks a little (256
+# bytes in 3 allocs) inside its OWN cluster/session connect-FAILURE path - hit by
+# CassandraSink.OpenAgainstDeadEndpointFailsCleanly, which deliberately opens
+# against a dead endpoint to check clink reports the error cleanly. The whole
+# allocation stack is datastax::internal::core:: (Future::internal_set_error via
+# SessionBase::notify_connect_failed / ClusterConnector::finish), with no clink
+# frame: the driver drops a few Future / error-string allocations on the error
+# path. clink surfaces the failure cleanly - the leak is the driver's, not ours.
+leak:datastax
