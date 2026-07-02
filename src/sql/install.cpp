@@ -1,7 +1,9 @@
 #include "clink/sql/install.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <coroutine>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/async/completion_executor.hpp"
 #include "clink/cep/cep_operator.hpp"
 #include "clink/cep/pattern.hpp"
 #include "clink/config/json.hpp"
@@ -7585,6 +7588,71 @@ void install(clink::plugin::PluginRegistry& reg) {
                     "ml_predict_row: model has no 'provider' (set it in CREATE MODEL WITH)");
             }
             auto provider = ModelProviderRegistry::global().create(it->second, opts);
+            // An async provider (a slow-I/O model such as an HTTP endpoint) drives many
+            // inferences at once on the AsyncLookupOperator; a synchronous provider (a
+            // CPU-bound local model) uses the one-at-a-time flatmap. The provider knows
+            // which it is (is_async()), so the choice is made here at build time and the
+            // physical plan stays provider-agnostic.
+            if (provider->is_async()) {
+                const std::size_t max_in_flight =
+                    static_cast<std::size_t>(ctx.param_int64_or("max_in_flight", 64));
+                const bool ordered = ctx.param_or("ordered", "true") != "false";
+                const std::size_t pool_threads =
+                    static_cast<std::size_t>(ctx.param_int64_or("async_threads", 16));
+                // The operator owns the pool; predict() is run on it with many calls in
+                // flight (the provider guarantees predict() is concurrency-safe when
+                // is_async()). shared_ptr so every in-flight coroutine keeps it alive.
+                auto pool = std::make_shared<clink::async::ThreadPoolCompletionExecutor>(
+                    pool_threads == 0 ? 1 : pool_threads);
+                auto lookup = [provider, pool, feature_cols, output_cols](
+                                  const Row& in_ref) -> clink::async::Task<Row> {
+                    // Copy the input row before the coroutine can suspend: the source
+                    // record does not outlive process(), but the coroutine is driven
+                    // later, so nothing may reference `in_ref` past the first co_await.
+                    Row row = in_ref;
+                    Row features;
+                    for (const auto& c : feature_cols) {
+                        auto fit = row.values.find(c);
+                        if (fit != row.values.end()) {
+                            features.values[c] = fit->second;
+                        }
+                    }
+                    // Run the blocking inference on the pool and await it nudge-safely:
+                    // the worker flips ready (release), the OPERATOR thread (the only one
+                    // that resumes this coroutine) polls it (acquire) via suspend_always,
+                    // so there is no cross-thread coroutine resume and no nested-coroutine
+                    // hazard. This is a single coroutine, driven directly by the operator.
+                    struct Call {
+                        std::atomic<bool> ready{false};
+                        Row result;
+                        std::exception_ptr err;
+                    };
+                    auto call = std::make_shared<Call>();
+                    pool->submit_blocking([provider, call, features]() {
+                        try {
+                            call->result = provider->predict(features);
+                        } catch (...) {
+                            call->err = std::current_exception();
+                        }
+                        call->ready.store(true, std::memory_order_release);
+                    });
+                    while (!call->ready.load(std::memory_order_acquire)) {
+                        co_await std::suspend_always{};
+                    }
+                    if (call->err) {
+                        std::rethrow_exception(call->err);
+                    }
+                    for (const auto& oc : output_cols) {
+                        auto pit = call->result.values.find(oc);
+                        row.values[oc] = pit != call->result.values.end()
+                                             ? pit->second
+                                             : clink::config::JsonValue{};
+                    }
+                    co_return row;
+                };
+                return std::make_shared<AsyncLookupOperator<Row, Row>>(
+                    std::move(lookup), max_in_flight, ordered, "async_ml_predict_row");
+            }
             return std::make_shared<MlPredictRowOp>(std::move(provider), feature_cols, output_cols);
         });
 

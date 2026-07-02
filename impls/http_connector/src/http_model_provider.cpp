@@ -69,16 +69,44 @@ public:
                       std::vector<std::string> output_columns,
                       std::string response_path,
                       std::string content_type)
-        : req_(std::move(http_opts)),
+        : http_opts_(std::move(http_opts)),
           path_(std::move(path)),
           output_columns_(std::move(output_columns)),
           response_path_(std::move(response_path)),
           content_type_(std::move(content_type)) {}
 
+    // Inference is a blocking network round-trip, so the HTTP provider is async: the
+    // ml_predict_row factory drives predict() on a thread pool with many requests in
+    // flight instead of one blocking call at a time.
+    [[nodiscard]] bool is_async() const override { return true; }
+
+    // Concurrency-safe as the async contract requires: each call builds its OWN
+    // HttpRequest (its own client + socket). cpp-httplib's keep-alive Client holds a
+    // single connection and is not safe for concurrent posts, so a shared client could
+    // not fan out; a fresh client per call is the price of concurrency (no keep-alive
+    // reuse across calls, which a connection-pooling client would restore - a follow-on).
     clink::sql::Row predict(const clink::sql::Row& features) override {
+        HttpRequest req(http_opts_);
+        return post_and_extract_(
+            req, path_, content_type_, output_columns_, response_path_, features);
+    }
+
+    [[nodiscard]] std::string name() const override { return "http"; }
+
+private:
+    // POST the feature row as JSON and map the response object into the OUTPUT columns.
+    // Shared by the synchronous predict() (a persistent keep-alive client) and the async
+    // path (a fresh per-call client), so both agree byte-for-byte on the request/response
+    // handling.
+    static clink::sql::Row post_and_extract_(HttpRequest& req,
+                                             const std::string& path,
+                                             const std::string& content_type,
+                                             const std::vector<std::string>& output_columns,
+                                             const std::string& response_path,
+                                             const clink::sql::Row& features) {
         const std::string body =
             clink::config::JsonValue{clink::config::JsonObject{features.values}}.serialize(0);
-        HttpResponse resp = req_.post(path_, body, content_type_);
+        HttpResponse resp = req.post(path, body, content_type);
         if (resp.status == 0) {
             throw std::runtime_error("ML_PREDICT http provider: transport error: " + resp.error);
         }
@@ -88,14 +116,14 @@ public:
         }
         clink::config::JsonValue parsed = clink::config::parse(resp.body);
         const clink::config::JsonValue* root = &parsed;
-        if (!response_path_.empty() && parsed.is_object() &&
-            parsed.as_object().find(response_path_) != parsed.as_object().end()) {
-            root = &parsed.at(response_path_);
+        if (!response_path.empty() && parsed.is_object() &&
+            parsed.as_object().find(response_path) != parsed.as_object().end()) {
+            root = &parsed.at(response_path);
         }
         clink::sql::Row out;
         if (root->is_object()) {
             const auto& obj = root->as_object();
-            for (const auto& oc : output_columns_) {
+            for (const auto& oc : output_columns) {
                 const auto it = obj.find(oc);
                 if (it != obj.end()) {
                     out.values[oc] = it->second;
@@ -105,10 +133,7 @@ public:
         return out;
     }
 
-    [[nodiscard]] std::string name() const override { return "http"; }
-
-private:
-    HttpRequest req_;
+    HttpRequest::Options http_opts_;
     std::string path_;
     std::vector<std::string> output_columns_;
     std::string response_path_;

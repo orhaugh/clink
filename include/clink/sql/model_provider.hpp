@@ -43,6 +43,19 @@ public:
     virtual ~ModelProvider() = default;
     virtual Row predict(const Row& features) = 0;
     [[nodiscard]] virtual std::string name() const { return "model_provider"; }
+
+    // Async inference. A provider whose inference is a slow I/O call (an HTTP endpoint)
+    // overrides is_async() to return true; the ml_predict_row factory then drives it on
+    // the AsyncLookupOperator, running predict() on a thread pool with many inferences in
+    // flight at once, instead of the one-at-a-time sync flatmap. CPU-bound providers
+    // (local ONNX) stay synchronous. The default is a synchronous provider.
+    //
+    // CONTRACT: when is_async() is true, predict() MUST be safe to call concurrently from
+    // multiple threads (the pool fans it out). A provider with per-call mutable state (an
+    // HTTP client holding one socket) must therefore build that state per call. The
+    // async operator owns the pool and the nudge-safe polling coroutine, so the provider
+    // exposes only the plain synchronous predict().
+    [[nodiscard]] virtual bool is_async() const { return false; }
 };
 
 // A ModelProvider backed by a std::function - the "closure SPI". Lets a user (or a
@@ -62,6 +75,29 @@ private:
 inline std::shared_ptr<ModelProvider> make_closure_provider(std::string name,
                                                             std::function<Row(const Row&)> fn) {
     return std::make_shared<ClosureModelProvider>(std::move(name), std::move(fn));
+}
+
+// An async ModelProvider backed by a std::function: is_async() is true, so the async
+// operator drives predict() on its thread pool with many closures in flight at once. The
+// closure must be safe to call concurrently (a pure function is). Used to exercise the
+// async ML_PREDICT path in tests, and as the minimal template for a real async provider.
+class AsyncClosureModelProvider final : public ModelProvider {
+public:
+    AsyncClosureModelProvider(std::string name, std::function<Row(const Row&)> fn)
+        : name_(std::move(name)), fn_(std::move(fn)) {}
+
+    Row predict(const Row& features) override { return fn_(features); }
+    [[nodiscard]] bool is_async() const override { return true; }
+    [[nodiscard]] std::string name() const override { return name_; }
+
+private:
+    std::string name_;
+    std::function<Row(const Row&)> fn_;
+};
+
+inline std::shared_ptr<ModelProvider> make_async_closure_provider(
+    std::string name, std::function<Row(const Row&)> fn) {
+    return std::make_shared<AsyncClosureModelProvider>(std::move(name), std::move(fn));
 }
 
 // Registry of provider factories keyed by the `provider` WITH-option value (e.g.

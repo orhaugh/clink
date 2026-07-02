@@ -138,6 +138,43 @@ void ensure_sql_installed_once() {
                     return out;
                 });
             });
+        // Same model, but async: exercises the AsyncLookupOperator ML_PREDICT path
+        // (many inferences in flight on a thread pool). Same doubling logic, so a query
+        // against it produces identical results to test_double, order preserved.
+        ModelProviderRegistry::global().register_provider(
+            "test_double_async", [](const std::map<std::string, std::string>& opts) {
+                auto split = [](const std::string& s) {
+                    std::vector<std::string> out;
+                    std::size_t start = 0;
+                    while (start <= s.size()) {
+                        auto comma = s.find(',', start);
+                        auto end = comma == std::string::npos ? s.size() : comma;
+                        if (end > start)
+                            out.push_back(s.substr(start, end - start));
+                        if (comma == std::string::npos)
+                            break;
+                        start = comma + 1;
+                    }
+                    return out;
+                };
+                auto feats = split(opts.count("feature_columns") ? opts.at("feature_columns") : "");
+                auto outs = split(opts.count("output_columns") ? opts.at("output_columns") : "");
+                return make_async_closure_provider(
+                    "test_double_async", [feats, outs](const Row& f) -> Row {
+                        double v = 0.0;
+                        if (!feats.empty()) {
+                            auto it = f.values.find(feats[0]);
+                            if (it != f.values.end() && it->second.is_number())
+                                v = it->second.as_number();
+                        }
+                        Row out;
+                        if (!outs.empty())
+                            out.values[outs[0]] = clink::config::JsonValue{v * 2.0};
+                        if (outs.size() >= 2)
+                            out.values[outs[1]] = clink::config::JsonValue{std::string("ok")};
+                        return out;
+                    });
+            });
         return true;
     }();
     (void)done;
@@ -11102,6 +11139,73 @@ TEST(SqlRuntime, MlPredictAppendsModelOutputEndToEnd) {
     EXPECT_EQ(doubled_by_id[2], 20);  // 10 * 2
     EXPECT_EQ(tag_by_id[1], "ok");
     EXPECT_EQ(tag_by_id[2], "ok");
+    std::filesystem::remove(in);
+    std::filesystem::remove(out);
+}
+
+// SQL-native AI, async path: an async provider (is_async()=true) drives ML_PREDICT on
+// the AsyncLookupOperator with many inferences in flight on a thread pool, rather than
+// one blocking call at a time. The result is identical to the sync path and input order
+// is preserved (ordered emit). Uses the in-process "test_double_async" provider.
+TEST(SqlRuntime, MlPredictAsyncProviderAppendsModelOutputEndToEnd) {
+    ensure_sql_installed_once();
+    const auto in = std::filesystem::temp_directory_path() / "clink_mlpa_in.ndjson";
+    const auto out = std::filesystem::temp_directory_path() / "clink_mlpa_out.ndjson";
+    std::filesystem::remove(in);
+    std::filesystem::remove(out);
+    // Several rows so more than one inference is in flight through the pool at once.
+    write_lines(in,
+                {R"({"id":1,"n":21})",
+                 R"({"id":2,"n":10})",
+                 R"({"id":3,"n":5})",
+                 R"({"id":4,"n":100})",
+                 R"({"id":5,"n":0})",
+                 R"({"id":6,"n":7})"});
+
+    Catalog cat;
+    auto model_ddl = parse(
+        "CREATE MODEL adoubler INPUT (n BIGINT) OUTPUT (doubled DOUBLE PRECISION, tag TEXT) "
+        "WITH (provider='test_double_async')");
+    cat.register_model(std::get<ast::CreateModelStmt>(model_ddl.statements[0]));
+    auto ddl =
+        parse(std::string{"CREATE TABLE anums (id BIGINT, n BIGINT) "
+                          "WITH (connector='file', format='json', path='"} +
+              in.string() +
+              "');"
+              "CREATE TABLE amlout (id BIGINT, n BIGINT, doubled DOUBLE PRECISION, tag TEXT) "
+              "WITH (connector='file', format='json', path='" +
+              out.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(
+        cat,
+        "INSERT INTO amlout SELECT * FROM ML_PREDICT(TABLE anums, MODEL adoubler, DESCRIPTOR(n))");
+
+    InProcessCluster cluster("tm-sql-mlpa", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out);
+    ASSERT_EQ(lines.size(), 6U);
+    // Emit order preserves input order (ordered=true).
+    std::vector<std::int64_t> id_order;
+    std::map<std::int64_t, double> doubled_by_id;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        const auto id = static_cast<std::int64_t>(js.at("id").as_number());
+        id_order.push_back(id);
+        doubled_by_id[id] = js.at("doubled").as_number();
+        EXPECT_EQ(js.at("tag").as_string(), "ok");
+    }
+    EXPECT_EQ(id_order, (std::vector<std::int64_t>{1, 2, 3, 4, 5, 6}));
+    EXPECT_EQ(doubled_by_id[1], 42);
+    EXPECT_EQ(doubled_by_id[4], 200);
+    EXPECT_EQ(doubled_by_id[5], 0);
+    EXPECT_EQ(doubled_by_id[6], 14);
     std::filesystem::remove(in);
     std::filesystem::remove(out);
 }

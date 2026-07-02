@@ -672,8 +672,9 @@ Advanced and extensibility (each a documented v1 subset)
   MATERIALIZED VIEW`; `partition_by` writes a per-partition set swapped atomically
 - SQL-native AI: `CREATE MODEL name INPUT (...) OUTPUT (...) WITH (provider=...)`
   registers a model, and `ML_PREDICT(TABLE t, MODEL m, DESCRIPTOR(cols))` applies
-  it per row (a built-in HTTP inference provider, a local ONNX Runtime provider, and
-  a C++-closure provider SPI); `VECTOR_SEARCH(TABLE t, query_col, vec_table,
+  it per row (a built-in HTTP inference provider that runs async with many inferences
+  in flight, a local ONNX Runtime provider, and a C++-closure provider SPI);
+  `VECTOR_SEARCH(TABLE t, query_col, vec_table,
   DESCRIPTOR(idx), top_k [, metric])` returns each row's top-K nearest vectors + a
   score, with SIMD distance kernels (SimSIMD) and exact-flat or approximate-HNSW
   (usearch) indexing
