@@ -95,9 +95,8 @@ public:
 
 private:
     // POST the feature row as JSON and map the response object into the OUTPUT columns.
-    // Shared by the synchronous predict() (a persistent keep-alive client) and the async
-    // path (a fresh per-call client), so both agree byte-for-byte on the request/response
-    // handling.
+    // Takes the HttpRequest by reference so predict() can hand it a fresh per-call client
+    // (the async operator fans predict() out across threads, so no client is shared).
     static clink::sql::Row post_and_extract_(HttpRequest& req,
                                              const std::string& path,
                                              const std::string& content_type,
