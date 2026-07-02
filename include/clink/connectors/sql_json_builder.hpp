@@ -158,4 +158,65 @@ inline std::string build_insert_head_values(const std::string& table,
     return sql;
 }
 
+// Build a DELETE that removes the rows matching a batch of changelog-delete keys:
+//   single key column:  DELETE FROM <t> WHERE <k> IN (v1, v2, ...)
+//   composite key:      DELETE FROM <t> WHERE (<k1>,<k2>) IN ((a,b), (c,d), ...)
+// `key_columns` is the primary key; each row must carry a non-null value for every
+// key column (a changelog delete without its full key is a bug - fail loud). Used
+// by the changelog-aware upsert sinks to apply delete/update_before tombstones.
+inline std::string build_delete_by_keys_sql(const std::string& table,
+                                            const std::vector<std::string>& key_columns,
+                                            const std::vector<std::string>& json_rows,
+                                            const EscapeFn& esc,
+                                            const Dialect& d) {
+    if (key_columns.empty()) {
+        throw std::runtime_error(std::string(d.name) + ": delete requires key_columns");
+    }
+    const bool composite = key_columns.size() > 1;
+    std::string sql = "DELETE FROM " + quote_ident(table, d) + " WHERE ";
+    if (composite) {
+        sql += "(";
+        for (std::size_t i = 0; i < key_columns.size(); ++i) {
+            sql += quote_ident(key_columns[i], d);
+            if (i + 1 < key_columns.size()) {
+                sql += ",";
+            }
+        }
+        sql += ") IN (";
+    } else {
+        sql += quote_ident(key_columns[0], d) + " IN (";
+    }
+    for (std::size_t r = 0; r < json_rows.size(); ++r) {
+        const auto j = clink::config::parse(json_rows[r]);
+        if (!j.is_object()) {
+            throw std::runtime_error(std::string(d.name) +
+                                     ": delete row is not a JSON object: " + json_rows[r]);
+        }
+        const auto& obj = j.as_object();
+        if (composite) {
+            sql += "(";
+        }
+        for (std::size_t i = 0; i < key_columns.size(); ++i) {
+            auto it = obj.find(key_columns[i]);
+            if (it == obj.end() || it->second.is_null()) {
+                throw std::runtime_error(std::string(d.name) +
+                                         ": changelog delete row missing key '" + key_columns[i] +
+                                         "': " + json_rows[r]);
+            }
+            sql += json_value_to_sql_literal(it->second, esc, d);
+            if (i + 1 < key_columns.size()) {
+                sql += ",";
+            }
+        }
+        if (composite) {
+            sql += ")";
+        }
+        if (r + 1 < json_rows.size()) {
+            sql += ",";
+        }
+    }
+    sql += ")";
+    return sql;
+}
+
 }  // namespace clink::sqljson

@@ -27,6 +27,16 @@ inline std::vector<std::string> columns_from_schema(const std::string& schema) {
     return sqljson::columns_from_schema(schema);
 }
 
+// Build a DELETE ... WHERE <pk> IN (...) for a batch of changelog-delete rows
+// (the changelog-aware upsert sink applies tombstones by primary key).
+inline std::string build_delete_sql(const std::string& table,
+                                    const std::vector<std::string>& key_columns,
+                                    const std::vector<std::string>& json_rows,
+                                    const EscapeFn& esc) {
+    return sqljson::build_delete_by_keys_sql(
+        table, key_columns, json_rows, esc, sqljson::kPostgres);
+}
+
 // Whether a column is in the conflict-target set.
 inline bool in_set(const std::vector<std::string>& set, const std::string& c) {
     for (const auto& x : set) {

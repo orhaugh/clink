@@ -34,6 +34,12 @@ TEST(PostgresFactoryRegistration, PostgresExactlyOnceSinkIsRegistered) {
     EXPECT_NE(rr.find_sink("postgres_2pc_sink", "string"), nullptr);
 }
 
+TEST(PostgresFactoryRegistration, PostgresUpsertSinkIsRegistered) {
+    // The changelog-aware upsert sink selected by mode='upsert'.
+    const auto& rr = RunnerRegistry::default_instance();
+    EXPECT_NE(rr.find_sink("postgres_upsert_sink", "string"), nullptr);
+}
+
 TEST(PostgresFactoryRegistration, PostgresJsonSourceIsRegistered) {
     // M3: the JSON source on the string channel (delimited postgres_text_source
     // kept for back-compat).

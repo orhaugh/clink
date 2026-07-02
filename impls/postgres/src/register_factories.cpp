@@ -25,6 +25,7 @@
 #include "clink/connectors/postgres_cdc_source.hpp"
 #include "clink/connectors/postgres_json_sink.hpp"
 #include "clink/connectors/postgres_json_sink_2pc.hpp"
+#include "clink/connectors/postgres_json_upsert_sink.hpp"
 #include "clink/connectors/postgres_row.hpp"
 #include "clink/connectors/postgres_source.hpp"
 #include "clink/connectors/postgres_sql.hpp"
@@ -508,6 +509,31 @@ void install(clink::plugin::PluginRegistry& reg) {
                 sink->set_commit_group(cg);
             }
             return sink;
+        });
+
+    // postgres_upsert_sink: changelog-aware, mode='upsert'. Maintains a table by
+    // PRIMARY KEY - insert/update_after upsert (INSERT ON CONFLICT DO UPDATE),
+    // delete/update_before DELETE by key. Effectively-once on the sink table for a
+    // stable PK (keyed idempotent ops). Lets a retracting SQL query maintain a
+    // Postgres table. params:
+    //   conninfo (required), table (required)
+    //   columns       - full projection; on the SQL Row path defaults to schema_columns
+    //   key_columns   - the PRIMARY KEY (conflict target + delete key); on the SQL
+    //                   path threaded from the table's PRIMARY KEY
+    //   batch_records (default 1000)
+    reg.register_sink<std::string>(
+        "postgres_upsert_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            PostgresJsonUpsertSinkOptions o;
+            o.conninfo = ctx.param_or("conninfo");
+            o.table = ctx.param_or("table");
+            o.columns = split_csv(ctx.param_or("columns", ""));
+            if (o.columns.empty()) {
+                o.columns = pgsql::columns_from_schema(ctx.param_or("schema_columns", ""));
+            }
+            o.key_columns = split_csv(ctx.param_or("key_columns", ""));
+            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 1000));
+            o.name = "postgres_upsert_sink";
+            return std::make_shared<PostgresJsonUpsertSink>(std::move(o));
         });
 }
 

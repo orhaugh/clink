@@ -450,9 +450,18 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
             return RowConnectorBinding{"postgres_2pc_sink", kChannelString, "row_to_json_string"};
         }
         if (upsert) {
-            unsupported(
-                "connector='postgres' sink does not implement mode='upsert' (changelog deletes); "
-                "use on_conflict='update' with conflict_columns for idempotent upsert by key");
+            // Changelog-aware upsert: maintain the table by PRIMARY KEY (upsert on
+            // insert/update_after, DELETE on delete/update_before). Effectively-once
+            // on the sink table for a stable PK. The binder has already checked a
+            // PRIMARY KEY is declared and projected. Thread it as key_columns.
+            std::string keys;
+            for (std::size_t i = 0; i < table.primary_key.size(); ++i) {
+                keys += (i ? "," : "") + table.primary_key[i];
+            }
+            return RowConnectorBinding{"postgres_upsert_sink",
+                                       kChannelString,
+                                       "row_to_json_string",
+                                       {{"key_columns", keys}}};
         }
         return RowConnectorBinding{"postgres_sink", kChannelString, "row_to_json_string"};
     }

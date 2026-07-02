@@ -1980,6 +1980,27 @@ TEST(SqlPhysical, PostgresExactlyOnceSinkSelected) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
 }
 
+TEST(SqlPhysical, PostgresUpsertSinkSelected) {
+    // mode='upsert' + a PRIMARY KEY selects the changelog-aware upsert sink and
+    // threads the key columns through as key_columns.
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE pup (k BIGINT, v BIGINT) "
+        "WITH (connector='postgres', conninfo='host=localhost', mode='upsert', primary_key='k')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO pup SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* sink = find_op(spec, "postgres_upsert_sink");
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(sink->params.at("key_columns"), "k");
+    EXPECT_EQ(find_op(spec, "postgres_sink"), nullptr);
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+}
+
 TEST(SqlPhysical, CommitGroupThreadsThroughToSinkParams) {
     // commit_group property on the table flows through the
     // physical planner into OperatorSpec.params, where sink factories
