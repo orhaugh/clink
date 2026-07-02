@@ -138,13 +138,13 @@ TEST(ParquetSink2PC, CommitMovesStagingToCommittedAndIsExternallyTyped) {
     // Pre-commit: file staged, state tracks it, nothing committed yet.
     EXPECT_EQ(count_parquet(dir / "staging"), 1u);
     EXPECT_EQ(count_parquet(dir / "committed"), 0u);
-    EXPECT_TRUE(state.get(OperatorId{42}, "_2pc_pending_sub0_11").has_value());
+    EXPECT_TRUE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_11").has_value());
 
     sink->on_commit(11);
 
     // Post-commit: file under committed/, staging file gone, state cleared.
     EXPECT_EQ(count_parquet(dir / "committed"), 1u);
-    EXPECT_FALSE(state.get(OperatorId{42}, "_2pc_pending_sub0_11").has_value());
+    EXPECT_FALSE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_11").has_value());
 
     const auto committed_file = dir / "committed" / "sub0-11.parquet";
     ASSERT_TRUE(std::filesystem::exists(committed_file));
@@ -189,7 +189,7 @@ TEST(ParquetSink2PC, BarrierWithoutCommitLeavesStagingAndState) {
 
     EXPECT_EQ(count_parquet(dir / "staging"), 1u);
     EXPECT_EQ(count_parquet(dir / "committed"), 0u);
-    EXPECT_TRUE(state.get(OperatorId{42}, "_2pc_pending_sub0_7").has_value());
+    EXPECT_TRUE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_7").has_value());
 
     std::filesystem::remove_all(dir);
 }
@@ -220,7 +220,7 @@ TEST(ParquetSink2PC, FreshSinkRecoversPendingOnOpen) {
     sink2->open();  // recover_pending_ commits sub0-5.parquet
 
     EXPECT_EQ(count_parquet(dir / "committed"), 1u);
-    EXPECT_FALSE(state.get(OperatorId{42}, "_2pc_pending_sub0_5").has_value());
+    EXPECT_FALSE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_5").has_value());
 
     const auto got = read_committed(dir / "committed" / "sub0-5.parquet");
     ASSERT_EQ(got.size(), kExpected.size());
@@ -249,7 +249,7 @@ TEST(ParquetSink2PC, AbortRemovesStagingAndCommitIsThenNoop) {
     sink->on_abort(3);
     EXPECT_EQ(count_parquet(dir / "staging"), 0u);
     EXPECT_EQ(count_parquet(dir / "committed"), 0u);
-    EXPECT_FALSE(state.get(OperatorId{42}, "_2pc_pending_sub0_3").has_value());
+    EXPECT_FALSE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_3").has_value());
 
     // Commit after abort is a no-op (nothing tracked in state).
     EXPECT_NO_THROW(sink->on_commit(3));

@@ -116,14 +116,14 @@ TEST(ParquetFsSink2PC, CommitPromotesStagingToCommittedAndIsReadable) {
     // Pre-commit: staged, state tracks it, nothing committed yet.
     EXPECT_EQ(count_parquet(base / "staging"), 1u);
     EXPECT_EQ(count_parquet(base / "committed"), 0u);
-    EXPECT_TRUE(state.get(OperatorId{42}, "_2pc_pending_sub0_11").has_value());
+    EXPECT_TRUE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_11").has_value());
 
     sink->on_commit(11);
 
     // Post-commit: under committed/, staging gone, state cleared.
     EXPECT_EQ(count_parquet(base / "committed"), 1u);
     EXPECT_EQ(count_parquet(base / "staging"), 0u);
-    EXPECT_FALSE(state.get(OperatorId{42}, "_2pc_pending_sub0_11").has_value());
+    EXPECT_FALSE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_11").has_value());
 
     EXPECT_EQ(read_committed(base), (std::vector<std::int64_t>{10, 20, 30}));
     std::filesystem::remove_all(base);
@@ -141,7 +141,7 @@ TEST(ParquetFsSink2PC, BarrierWithoutCommitLeavesStagingAndState) {
 
     EXPECT_EQ(count_parquet(base / "staging"), 1u);
     EXPECT_EQ(count_parquet(base / "committed"), 0u);
-    EXPECT_TRUE(state.get(OperatorId{7}, "_2pc_pending_sub0_7").has_value());
+    EXPECT_TRUE(state.get_operator_state(OperatorId{7}, "_xo_pending_sub0_7").has_value());
     EXPECT_TRUE(read_committed(base).empty());
     std::filesystem::remove_all(base);
 }
@@ -167,7 +167,7 @@ TEST(ParquetFsSink2PC, FreshSinkCommitsPendingOnOpen) {
         sink2->open();  // recovery commits the pending staging object
     }
     EXPECT_EQ(count_parquet(base / "committed"), 1u);
-    EXPECT_FALSE(state.get(OperatorId{5}, "_2pc_pending_sub0_5").has_value());
+    EXPECT_FALSE(state.get_operator_state(OperatorId{5}, "_xo_pending_sub0_5").has_value());
     EXPECT_EQ(read_committed(base), (std::vector<std::int64_t>{100, 200}));
     std::filesystem::remove_all(base);
 }
@@ -186,7 +186,7 @@ TEST(ParquetFsSink2PC, AbortDeletesStagingAndClearsState) {
     sink->on_abort(9);
     EXPECT_EQ(count_parquet(base / "staging"), 0u);
     EXPECT_EQ(count_parquet(base / "committed"), 0u);
-    EXPECT_FALSE(state.get(OperatorId{9}, "_2pc_pending_sub0_9").has_value());
+    EXPECT_FALSE(state.get_operator_state(OperatorId{9}, "_xo_pending_sub0_9").has_value());
     std::filesystem::remove_all(base);
 }
 

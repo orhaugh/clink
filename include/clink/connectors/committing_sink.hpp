@@ -128,6 +128,35 @@ public:
 protected:
     std::uint32_t subtask_idx() const noexcept { return subtask_idx_; }
 
+    // One-time upgrade bridge for sinks migrated from the pre-framework 2PC
+    // implementation, which persisted the committable via a RAW put() under
+    // "<legacy_prefix>sub<N>_<ckpt>" (no operator-state reserved byte, so the
+    // base's recover-at-open scan does not see it). Call from on_open(): it
+    // finalises each legacy handle through the same recover() verb and clears
+    // the raw key. Handles written by this framework use the operator-state
+    // path and are picked up by recover_all_() instead, so the two never
+    // double-process (disjoint key spaces). A no-op when there is nothing left
+    // from an older binary, so it is safe to leave in place indefinitely.
+    void recover_legacy_handles(std::string_view legacy_prefix) {
+        auto* state = state_backend_();
+        if (state == nullptr)
+            return;
+        const std::string prefix = std::string(legacy_prefix) + sub_prefix_(subtask_idx_) + "_";
+        std::vector<std::string> keys;
+        std::vector<std::string> blobs;
+        state->scan(this->id(), [&](StateBackend::KeyView k, StateBackend::ValueView v) {
+            const std::string key{k};
+            if (key.rfind(prefix, 0) != 0)
+                return;  // not a legacy handle for this subtask (skips new-format keys)
+            keys.push_back(key);
+            blobs.emplace_back(v);
+        });
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            recover(deserialize(blobs[i]));
+            state->erase(this->id(), keys[i]);  // raw erase (matches the legacy raw put)
+        }
+    }
+
 private:
     static std::string sub_prefix_(std::uint32_t sub) { return "sub" + std::to_string(sub); }
     std::string key_prefix_() const { return "_xo_pending_" + sub_prefix_(subtask_idx_) + "_"; }

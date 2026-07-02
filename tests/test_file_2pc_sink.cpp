@@ -104,15 +104,15 @@ TEST(FileSink2PC, AbortRemovesStagingFileAndClearsState) {
     sink->open();
     sink->on_data(batch_of({"x", "y", "z"}));
     sink->on_barrier(CheckpointBarrier{CheckpointId{11}});
-    // Staging file exists, state tracks it.
+    // Staging file exists, state tracks it (operator-state key).
     EXPECT_TRUE(std::filesystem::exists(out / "staging" / "sub0-11.dat"));
-    EXPECT_TRUE(state.get(OperatorId{42}, "_2pc_pending_sub0_11").has_value());
+    EXPECT_TRUE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_11").has_value());
 
     sink->on_abort(11);
 
     // Staging file is gone; state cleared.
     EXPECT_FALSE(std::filesystem::exists(out / "staging" / "sub0-11.dat"));
-    EXPECT_FALSE(state.get(OperatorId{42}, "_2pc_pending_sub0_11").has_value());
+    EXPECT_FALSE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_11").has_value());
     // committed/ untouched - we never committed.
     EXPECT_FALSE(std::filesystem::exists(out / "committed" / "sub0-11.dat"));
 }
@@ -169,7 +169,7 @@ TEST(FileSink2PC, ClampDownsCommitsAtomically) {
     ASSERT_TRUE(std::filesystem::exists(committed));
     EXPECT_EQ(read_lines(committed), (std::vector<std::string>{"a", "b", "c"}));
     // State key cleared after commit.
-    EXPECT_FALSE(state.get(OperatorId{42}, "_2pc_pending_sub0_1").has_value());
+    EXPECT_FALSE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_1").has_value());
 }
 
 TEST(FileSink2PC, UncommittedBarrierLeavesStagingFile) {
@@ -185,15 +185,16 @@ TEST(FileSink2PC, UncommittedBarrierLeavesStagingFile) {
 
     EXPECT_TRUE(std::filesystem::exists(out / "staging" / "sub0-7.dat"));
     EXPECT_FALSE(std::filesystem::exists(out / "committed" / "sub0-7.dat"));
-    EXPECT_TRUE(state.get(OperatorId{42}, "_2pc_pending_sub0_7").has_value());
+    EXPECT_TRUE(state.get_operator_state(OperatorId{42}, "_xo_pending_sub0_7").has_value());
 }
 
 TEST(FileSink2PC, RecoveryCommitsPreStagedFile) {
     const auto out = mktmpdir("recover");
-    // Simulate post-crash state: a previous JM had pre-committed
-    // checkpoint 5 (staging file exists, state tracks it) but crashed
-    // before broadcasting CommitCheckpoint. On restart the sink's
-    // open() runs recover_pending_() and promotes the file.
+    // Simulate post-crash state written by the PRE-FRAMEWORK sink: a raw
+    // "_2pc_pending_" state key (not the operator-state "_xo_pending_" one this
+    // framework now uses) points at a staging file for checkpoint 5. On restart
+    // on_open()'s legacy bridge (recover_legacy_handles) must promote the file,
+    // proving upgrade compatibility with handles left by an older binary.
     std::filesystem::create_directories(out / "staging");
     const auto staging_path = out / "staging" / "sub0-5.dat";
     {
@@ -217,10 +218,9 @@ TEST(FileSink2PC, RecoveryCommitsPreStagedFile) {
 }
 
 TEST(FileSink2PC, RecoveryIsNoOpWhenStagingFileAlreadyCommitted) {
-    // The previous JM successfully committed (renamed) but crashed
-    // BEFORE clearing the state key. On restart the staging file is
-    // gone; recover_pending_ should silently clear the stale state
-    // entry rather than throw.
+    // The pre-framework sink committed (renamed) but crashed BEFORE clearing its
+    // raw "_2pc_pending_" state key. On restart the staging file is gone; the
+    // legacy bridge should silently clear the stale key rather than throw.
     const auto out = mktmpdir("recover_noop");
     std::filesystem::create_directories(out / "staging");
     std::filesystem::create_directories(out / "committed");

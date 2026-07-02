@@ -2,17 +2,18 @@
 
 // ParquetFsSink2PC<T> - a two-phase-commit Parquet sink over an Arrow filesystem.
 //
-// The object-store counterpart to the local ParquetSink2PC: same staging/ +
-// committed/ protocol and the same exactly-once contract, but the I/O runs
-// through an arrow::fs::FileSystem (S3FileSystem, GcsFileSystem, AzureFileSystem
-// or LocalFileSystem) instead of std::filesystem, so one implementation gives
-// every object-store Parquet connector exactly-once. The filesystem is built
-// lazily in open() via a factory callback (keeping Arrow S3/GCS/Azure init on
-// the runner thread), the same seam MultiObjectParquetSource uses.
+// The object-store counterpart to the local ParquetSink2PC, riding the same
+// generic CommittingSink base (verbs only). Same staging/ + committed/ protocol
+// and exactly-once contract, but the I/O runs through an arrow::fs::FileSystem
+// (S3FileSystem, GcsFileSystem, AzureFileSystem or LocalFileSystem) instead of
+// std::filesystem, so one implementation gives every object-store Parquet
+// connector exactly-once. The filesystem is built lazily in on_open() via a
+// factory callback (keeping Arrow S3/GCS/Azure init on the runner thread), the
+// same seam MultiObjectParquetSource uses.
 //
 // One Parquet file spans one checkpoint interval: records since the last barrier
-// accumulate as row groups in an in-memory Arrow buffer; on_barrier finalises
-// them into one complete, self-describing Parquet object.
+// accumulate as row groups in an in-memory Arrow buffer; prepare_commit
+// finalises them into one complete, self-describing Parquet object.
 //
 // Layout under `base`:
 //   <base>/staging/sub<N>-<ckpt>.parquet     pre-committed (one per subtask, ckpt)
@@ -20,21 +21,24 @@
 // Point a reader (e.g. MultiObjectParquetSource) at <base>/committed to read the
 // exactly-once output.
 //
-// Lifecycle:
-//   open()        - build the filesystem, ensure staging/ + committed/ exist, run
-//                   recovery (commit any staging object still tracked in state).
-//   on_data       - write the batch as a row group into the in-memory writer.
-//   on_barrier(b) - finalise the writer and upload the buffer to the staging
-//                   object (OpenOutputStream + Write + Close is atomic on object
-//                   stores: the object appears whole or not at all). Record the
-//                   staging key in operator state.
-//   on_commit(id) - copy staging -> committed (streamed via OpenInputFile +
-//                   OpenOutputStream, which every Arrow filesystem supports; the
-//                   committed object appears atomically), delete staging, erase
-//                   state. Idempotent: a missing staging object is a no-op.
-//   on_abort(id)  - DeleteFile staging, erase state.
+// The committable is the staging object key; commit() derives the committed key
+// from its basename.
+//
+// Lifecycle (base -> verb):
+//   open()        - on_open() builds the filesystem, ensures staging/ + committed/
+//                   exist and bridges any pre-framework handle; then the base
+//                   recovers any handle left prepared-but-uncommitted.
+//   on_data       - write() writes the batch as a row group into the in-memory writer.
+//   on_barrier(b) - prepare_commit(b) finalises the writer and uploads the buffer
+//                   to the staging object (OpenOutputStream + Write + Close is
+//                   atomic on object stores), returning the staging key.
+//   on_commit(id) - commit(handle) copies staging -> committed (streamed via
+//                   OpenInputFile + OpenOutputStream, which every Arrow filesystem
+//                   supports; the committed object appears atomically) then
+//                   deletes staging. Idempotent: a missing staging object is a no-op.
+//   on_abort(id)  - abort(handle) DeleteFiles staging.
 //   flush/close   - drop an in-progress (non-barriered) interval; its bytes were
-//                   never staged or state-tracked, so there is nothing to commit.
+//                   never staged or persisted, so there is nothing to commit.
 //
 // Exactly-once per the engine's 2PC contract: a committed object exists iff its
 // checkpoint completed globally. Durability is the object store's (no fsync).
@@ -45,11 +49,11 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 #ifndef CLINK_HAS_PARQUET
 #error "ParquetFsSink2PC<T> requires CLINK_BUILD_ARROW=ON (Parquet ships alongside Arrow)."
@@ -61,15 +65,14 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/properties.h>
 
+#include "clink/connectors/committing_sink.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/operator_base.hpp"
-#include "clink/runtime/runtime_context.hpp"
-#include "clink/state/state_backend.hpp"
 
 namespace clink {
 
 template <typename T>
-class ParquetFsSink2PC final : public Sink<T> {
+class ParquetFsSink2PC final : public CommittingSink<T, std::string> {
 public:
     using FileSystemFactory = std::function<std::shared_ptr<arrow::fs::FileSystem>()>;
 
@@ -83,7 +86,8 @@ public:
                      Options opts,
                      ArrowBatcher<T> batcher,
                      std::string name = "parquet_fs_2pc_sink")
-        : fs_factory_(std::move(fs_factory)),
+        : CommittingSink<T, std::string>(static_cast<std::uint32_t>(opts.subtask_idx)),
+          fs_factory_(std::move(fs_factory)),
           opts_(std::move(opts)),
           batcher_(std::move(batcher)),
           name_(std::move(name)) {
@@ -99,7 +103,7 @@ public:
         }
     }
 
-    void open() override {
+    void on_open() override {
         fs_ = fs_factory_();
         if (!fs_) {
             throw std::runtime_error("ParquetFsSink2PC: filesystem factory returned null");
@@ -107,10 +111,10 @@ public:
         // Object stores treat prefixes as implicit; LocalFileSystem needs the dirs.
         (void)fs_->CreateDir(staging_prefix_(), /*recursive=*/true);
         (void)fs_->CreateDir(committed_prefix_(), /*recursive=*/true);
-        recover_pending_();
+        this->recover_legacy_handles("_2pc_pending_");
     }
 
-    void on_data(const Batch<T>& batch) override {
+    void write(const Batch<T>& batch) override {
         if (batch.empty()) {
             return;
         }
@@ -120,19 +124,18 @@ public:
             throw std::runtime_error("ParquetFsSink2PC: ArrowBatcher.build returned null");
         }
         if (auto s = writer_->WriteRecordBatch(*record_batch); !s.ok()) {
-            throw std::runtime_error("ParquetFsSink2PC::on_data: WriteRecordBatch: " +
-                                     s.ToString());
+            throw std::runtime_error("ParquetFsSink2PC::write: WriteRecordBatch: " + s.ToString());
         }
     }
 
-    void on_barrier(CheckpointBarrier b) override {
-        const auto ckpt = b.id().value();
-        // Open the writer even with no records this interval, so every (subtask, ckpt)
-        // yields a uniform staging object for recovery to find.
+    // Finalise the writer and upload the buffer to the staging object. Opens the
+    // writer even with no records this interval, so every (subtask, ckpt) yields
+    // a uniform staging object for recovery to find.
+    std::optional<std::string> prepare_commit(std::uint64_t checkpoint_id) override {
         ensure_writer_open_();
         auto buffer = finalize_writer_();
 
-        const std::string staging_key = staging_key_(ckpt);
+        const std::string staging_key = staging_key_(checkpoint_id);
         auto out = fs_->OpenOutputStream(staging_key);
         if (!out.ok()) {
             throw std::runtime_error("ParquetFsSink2PC: OpenOutputStream(" + staging_key +
@@ -146,40 +149,18 @@ public:
             throw std::runtime_error("ParquetFsSink2PC: close staging(" + staging_key +
                                      "): " + s.ToString());
         }
-        write_pending_state_(ckpt, staging_key);
+        return staging_key;
     }
 
-    void on_commit(std::uint64_t checkpoint_id) override {
-        auto* state = state_backend_();
-        if (state == nullptr) {
-            return;
-        }
-        const auto key = state_key_(checkpoint_id);
-        auto stored = state->get(this->id(), key);
-        if (!stored.has_value()) {
-            return;  // already committed (idempotent)
-        }
-        const std::string staging_key(reinterpret_cast<const char*>(stored->data()),
-                                      stored->size());
-        commit_one_(staging_key, committed_key_(checkpoint_id));
-        state->erase(this->id(), key);
+    bool commit(const std::string& staging_key) override {
+        commit_one_(staging_key, committed_key_for_(staging_key));
+        return true;
     }
 
-    void on_abort(std::uint64_t checkpoint_id) override {
-        auto* state = state_backend_();
-        if (state == nullptr) {
-            return;
-        }
-        const auto key = state_key_(checkpoint_id);
-        auto stored = state->get(this->id(), key);
-        if (!stored.has_value()) {
-            return;
-        }
-        const std::string staging_key(reinterpret_cast<const char*>(stored->data()),
-                                      stored->size());
-        delete_if_exists_(staging_key);
-        state->erase(this->id(), key);
-    }
+    void abort(const std::string& staging_key) override { delete_if_exists_(staging_key); }
+
+    std::string serialize(const std::string& staging_key) const override { return staging_key; }
+    std::string deserialize(std::string_view bytes) const override { return std::string(bytes); }
 
     void flush() override { abandon_writer_(); }
     void close() override { abandon_writer_(); }
@@ -193,11 +174,12 @@ private:
     std::string staging_key_(std::uint64_t ckpt) const {
         return staging_prefix_() + "/" + sub_prefix_() + "-" + std::to_string(ckpt) + ".parquet";
     }
-    std::string committed_key_(std::uint64_t ckpt) const {
-        return committed_prefix_() + "/" + sub_prefix_() + "-" + std::to_string(ckpt) + ".parquet";
-    }
-    std::string state_key_(std::uint64_t ckpt) const {
-        return "_2pc_pending_" + sub_prefix_() + "_" + std::to_string(ckpt);
+    // The committed key for a staging key: same basename under committed/.
+    std::string committed_key_for_(const std::string& staging_key) const {
+        const auto pos = staging_key.rfind('/');
+        const std::string base =
+            pos == std::string::npos ? staging_key : staging_key.substr(pos + 1);
+        return committed_prefix_() + "/" + base;
     }
 
     void ensure_writer_open_() {
@@ -302,47 +284,6 @@ private:
             }
             throw std::runtime_error("ParquetFsSink2PC: DeleteFile(" + key + "): " + s.ToString());
         }
-    }
-
-    void write_pending_state_(std::uint64_t ckpt, const std::string& staging_key) {
-        auto* state = state_backend_();
-        if (state == nullptr) {
-            return;
-        }
-        state->put(
-            this->id(), state_key_(ckpt), std::string_view{staging_key.data(), staging_key.size()});
-    }
-
-    // Recovery: commit every staging object still tracked in state (a crash between
-    // pre-commit-ack and commit, or between copy and delete, re-runs idempotently).
-    void recover_pending_() {
-        auto* state = state_backend_();
-        if (state == nullptr) {
-            return;
-        }
-        const std::string prefix = "_2pc_pending_" + sub_prefix_() + "_";
-        std::vector<std::pair<std::string, std::string>> to_commit;
-        state->scan(this->id(), [&](StateBackend::KeyView k, StateBackend::ValueView v) {
-            const std::string key{k};
-            if (key.rfind(prefix, 0) != 0) {
-                return;
-            }
-            to_commit.emplace_back(key, std::string{v});
-        });
-        for (const auto& [key, staging_key] : to_commit) {
-            std::uint64_t ckpt = 0;
-            try {
-                ckpt = std::stoull(key.substr(prefix.size()));
-            } catch (...) {
-                continue;
-            }
-            commit_one_(staging_key, committed_key_(ckpt));
-            state->erase(this->id(), key);
-        }
-    }
-
-    StateBackend* state_backend_() const noexcept {
-        return this->runtime() != nullptr ? this->runtime()->state_backend() : nullptr;
     }
 
     FileSystemFactory fs_factory_;
