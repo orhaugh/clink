@@ -1909,6 +1909,7 @@ int run_jm(int argc, char** argv) {
                               << advertise_host << ":" << bound << "\n";
                     std::cout.flush();
                     jm.recover_persisted_jobs();
+#ifdef CLINK_LINKED_SQL
                     // Reload the persisted catalog (the previous leader may have
                     // created materialized views after this node's startup load) and
                     // resume every full-refresh view's schedule on this new leader.
@@ -1918,6 +1919,9 @@ int run_jm(int argc, char** argv) {
                         session.catalog.load_from_dir(sql_catalog_dir);
                     }
                     reregister_full_refresh_views(jm);
+#else
+                    (void)sql_catalog_dir;
+#endif
                 } catch (const std::exception& e) {
                     std::cerr << "JM HA takeover failed: " << e.what() << "\n";
                 }
@@ -2392,6 +2396,7 @@ int run_jm(int argc, char** argv) {
     (void)http_bind;
 #endif
 
+#ifdef CLINK_LINKED_SQL
     // Full-refresh materialized views recompute on their FRESHNESS cadence: the
     // scheduler fires each registered view's recompute + atomic overwrite. Views are
     // registered by handle_sql when a full-refresh CREATE is submitted on this node
@@ -2402,6 +2407,7 @@ int run_jm(int argc, char** argv) {
     if (ha_dir.empty()) {
         reregister_full_refresh_views(jm);
     }
+#endif
 
     // Run until either the user-requested duration elapses or the
     // process catches SIGTERM/SIGINT (handler set in main()). The JM
@@ -2409,7 +2415,9 @@ int run_jm(int argc, char** argv) {
     const auto max_duration = duration_str.empty() ? std::chrono::seconds{0}
                                                    : std::chrono::seconds{std::stoi(duration_str)};
     wait_for_shutdown(max_duration);
+#ifdef CLINK_LINKED_SQL
     refresh_scheduler().stop();  // join the scheduler thread before tearing down the JM
+#endif
 #ifdef CLINK_HAS_HTTP
     if (http_srv) {
         http_srv->stop();
