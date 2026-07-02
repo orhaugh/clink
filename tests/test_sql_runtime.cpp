@@ -254,6 +254,13 @@ void ensure_sql_installed_once() {
                     split(opts.count("output_columns") ? opts.at("output_columns") : ""),
                     mb);
             });
+        // A provider whose every inference throws - to exercise the on_error policy.
+        ModelProviderRegistry::global().register_provider(
+            "test_boom", [](const std::map<std::string, std::string>&) {
+                return make_closure_provider("test_boom", [](const Row&) -> Row {
+                    throw std::runtime_error("test_boom: inference always fails");
+                });
+            });
         return true;
     }();
     (void)done;
@@ -11353,6 +11360,101 @@ TEST(SqlRuntime, MlPredictBatchedProviderEndToEnd) {
     // The batching operator grouped rows: with 6 rows and max_batch_size 4, at least one
     // predict_batch saw more than one row.
     EXPECT_GT(max_batch_seen().load(), 1U);
+    std::filesystem::remove(in);
+    std::filesystem::remove(out);
+}
+
+// on_error='null': a model whose inference always fails does NOT kill the job; each row
+// is emitted with null OUTPUT columns. The provider is the always-throwing test_boom.
+TEST(SqlRuntime, MlPredictOnErrorNullEmitsNullOutputs) {
+    ensure_sql_installed_once();
+    const auto in = std::filesystem::temp_directory_path() / "clink_mlperr_in.ndjson";
+    const auto out = std::filesystem::temp_directory_path() / "clink_mlperr_out.ndjson";
+    std::filesystem::remove(in);
+    std::filesystem::remove(out);
+    write_lines(in, {R"({"id":1,"n":21})", R"({"id":2,"n":10})"});
+
+    Catalog cat;
+    cat.register_model(std::get<ast::CreateModelStmt>(
+        parse("CREATE MODEL flaky INPUT (n BIGINT) OUTPUT (doubled DOUBLE PRECISION, tag TEXT) "
+              "WITH (provider='test_boom', on_error='null')")
+            .statements[0]));
+    auto ddl =
+        parse(std::string{"CREATE TABLE enums (id BIGINT, n BIGINT) "
+                          "WITH (connector='file', format='json', path='"} +
+              in.string() +
+              "');"
+              "CREATE TABLE emlout (id BIGINT, n BIGINT, doubled DOUBLE PRECISION, tag TEXT) "
+              "WITH (connector='file', format='json', path='" +
+              out.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(
+        cat,
+        "INSERT INTO emlout SELECT * FROM ML_PREDICT(TABLE enums, MODEL flaky, DESCRIPTOR(n))");
+
+    InProcessCluster cluster("tm-sql-mlperr", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    // The job SUCCEEDS despite every inference failing (on_error='null').
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out);
+    ASSERT_EQ(lines.size(), 2U);
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        // Input columns survive; OUTPUT columns are null (inference failed).
+        EXPECT_TRUE(js.at("id").is_number());
+        EXPECT_TRUE(js.at("doubled").is_null());
+        EXPECT_TRUE(js.at("tag").is_null());
+    }
+    std::filesystem::remove(in);
+    std::filesystem::remove(out);
+}
+
+// on_error defaults to 'fail': the same always-failing model fails the job.
+TEST(SqlRuntime, MlPredictOnErrorFailPropagates) {
+    ensure_sql_installed_once();
+    const auto in = std::filesystem::temp_directory_path() / "clink_mlpfail_in.ndjson";
+    const auto out = std::filesystem::temp_directory_path() / "clink_mlpfail_out.ndjson";
+    std::filesystem::remove(in);
+    std::filesystem::remove(out);
+    write_lines(in, {R"({"id":1,"n":21})"});
+
+    Catalog cat;
+    cat.register_model(std::get<ast::CreateModelStmt>(
+        parse("CREATE MODEL flaky2 INPUT (n BIGINT) OUTPUT (doubled DOUBLE PRECISION, tag TEXT) "
+              "WITH (provider='test_boom')")  // no on_error -> 'fail'
+            .statements[0]));
+    auto ddl =
+        parse(std::string{"CREATE TABLE fnums (id BIGINT, n BIGINT) "
+                          "WITH (connector='file', format='json', path='"} +
+              in.string() +
+              "');"
+              "CREATE TABLE fmlout (id BIGINT, n BIGINT, doubled DOUBLE PRECISION, tag TEXT) "
+              "WITH (connector='file', format='json', path='" +
+              out.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(
+        cat,
+        "INSERT INTO fmlout SELECT * FROM ML_PREDICT(TABLE fnums, MODEL flaky2, DESCRIPTOR(n))");
+
+    InProcessCluster cluster("tm-sql-mlpfail", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    (void)submitter.submit(spec.to_json(), {}, opts);
+    // Default on_error='fail': the failing inference propagates out of the operator, so
+    // (unlike on_error='null') NO row is emitted with clean output - the batch aborts
+    // before the emit. Contrast the null case above, which emitted 2 null rows.
+    auto fail_lines = read_lines(out);
+    EXPECT_TRUE(fail_lines.empty())
+        << "got " << fail_lines.size()
+        << " lines; first=" << (fail_lines.empty() ? "" : fail_lines[0]);
     std::filesystem::remove(in);
     std::filesystem::remove(out);
 }

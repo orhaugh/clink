@@ -6903,10 +6903,12 @@ class MlPredictRowOp final : public Operator<Row, Row> {
 public:
     MlPredictRowOp(std::shared_ptr<ModelProvider> provider,
                    std::vector<std::string> feature_columns,
-                   std::vector<std::string> output_columns)
+                   std::vector<std::string> output_columns,
+                   bool null_on_error)
         : provider_(std::move(provider)),
           feature_columns_(std::move(feature_columns)),
-          output_columns_(std::move(output_columns)) {}
+          output_columns_(std::move(output_columns)),
+          null_on_error_(null_on_error) {}
 
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (element.is_data()) {
@@ -6921,7 +6923,17 @@ public:
                         features.values[c] = it->second;
                     }
                 }
-                const Row prediction = provider_->predict(features);
+                // on_error='null': a failed inference yields null OUTPUT columns (an empty
+                // prediction merges to nulls below) instead of failing the job; 'fail'
+                // (default) lets the exception propagate.
+                Row prediction;
+                try {
+                    prediction = provider_->predict(features);
+                } catch (const std::exception&) {
+                    if (!null_on_error_) {
+                        throw;
+                    }
+                }
                 Row out_row = in;  // carry input columns + __row_kind through
                 for (const auto& oc : output_columns_) {
                     auto it = prediction.values.find(oc);
@@ -6952,6 +6964,7 @@ private:
     std::shared_ptr<ModelProvider> provider_;
     std::vector<std::string> feature_columns_;
     std::vector<std::string> output_columns_;
+    bool null_on_error_;
 };
 
 // Batched ML_PREDICT: buffers up to max_batch_size input rows and applies the model to
@@ -6964,11 +6977,13 @@ public:
     MlPredictBatchRowOp(std::shared_ptr<ModelProvider> provider,
                         std::vector<std::string> feature_columns,
                         std::vector<std::string> output_columns,
-                        std::size_t max_batch_size)
+                        std::size_t max_batch_size,
+                        bool null_on_error)
         : provider_(std::move(provider)),
           feature_columns_(std::move(feature_columns)),
           output_columns_(std::move(output_columns)),
-          max_batch_size_(max_batch_size < 1 ? 1 : max_batch_size) {}
+          max_batch_size_(max_batch_size < 1 ? 1 : max_batch_size),
+          null_on_error_(null_on_error) {}
 
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (element.is_data()) {
@@ -7013,8 +7028,17 @@ private:
             features_batch.push_back(std::move(features));
         }
         // One request for the whole buffer. Contract: one prediction per input row, same
-        // order (a shortfall leaves the tail rows with null OUTPUT columns).
-        const std::vector<Row> preds = provider_->predict_batch(features_batch);
+        // order (a shortfall leaves the tail rows with null OUTPUT columns). on_error=
+        // 'null' turns a failed batch request into null OUTPUT columns for every buffered
+        // row (an empty preds vector) instead of failing the job.
+        std::vector<Row> preds;
+        try {
+            preds = provider_->predict_batch(features_batch);
+        } catch (const std::exception&) {
+            if (!null_on_error_) {
+                throw;
+            }
+        }
         Batch<Row> emit_batch;
         for (std::size_t i = 0; i < buffer_.size(); ++i) {
             Row out_row = buffer_[i].value();  // input columns (and __row_kind) through
@@ -7041,6 +7065,7 @@ private:
     std::vector<std::string> feature_columns_;
     std::vector<std::string> output_columns_;
     std::size_t max_batch_size_;
+    bool null_on_error_;
     std::vector<Record<Row>> buffer_;
 };
 
@@ -7678,6 +7703,12 @@ void install(clink::plugin::PluginRegistry& reg) {
                     "ml_predict_row: model has no 'provider' (set it in CREATE MODEL WITH)");
             }
             auto provider = ModelProviderRegistry::global().create(it->second, opts);
+            // on_error policy (model WITH-option): 'fail' (default) lets a failed
+            // inference propagate and fail the job; 'null' emits the row with null OUTPUT
+            // columns instead so a flaky endpoint does not kill a long-running job.
+            // Applies uniformly to all three ml_predict operators.
+            const bool null_on_error =
+                opts.find("on_error") != opts.end() && opts.at("on_error") == "null";
             // Batching takes priority: a model declaring max_batch_size > 1 sends the
             // whole buffer in one request (best for a batch-capable endpoint), which
             // beats many concurrent single requests. Then the async path (concurrent
@@ -7686,7 +7717,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             if (provider->max_batch_size() > 1) {
                 const std::size_t mb = provider->max_batch_size();
                 return std::make_shared<MlPredictBatchRowOp>(
-                    std::move(provider), feature_cols, output_cols, mb);
+                    std::move(provider), feature_cols, output_cols, mb, null_on_error);
             }
             // An async provider (a slow-I/O model such as an HTTP endpoint) drives many
             // inferences at once on the AsyncLookupOperator; a synchronous provider (a
@@ -7704,7 +7735,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 // is_async()). shared_ptr so every in-flight coroutine keeps it alive.
                 auto pool = std::make_shared<clink::async::ThreadPoolCompletionExecutor>(
                     pool_threads == 0 ? 1 : pool_threads);
-                auto lookup = [provider, pool, feature_cols, output_cols](
+                auto lookup = [provider, pool, feature_cols, output_cols, null_on_error](
                                   const Row& in_ref) -> clink::async::Task<Row> {
                     // Copy the input row before the coroutine can suspend: the source
                     // record does not outlive process(), but the coroutine is driven
@@ -7739,9 +7770,11 @@ void install(clink::plugin::PluginRegistry& reg) {
                     while (!call->ready.load(std::memory_order_acquire)) {
                         co_await std::suspend_always{};
                     }
-                    if (call->err) {
+                    if (call->err && !null_on_error) {
                         std::rethrow_exception(call->err);
                     }
+                    // On error under the 'null' policy, call->result stays empty, so every
+                    // OUTPUT column merges to null below.
                     for (const auto& oc : output_cols) {
                         auto pit = call->result.values.find(oc);
                         row.values[oc] = pit != call->result.values.end()
@@ -7753,7 +7786,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                 return std::make_shared<AsyncLookupOperator<Row, Row>>(
                     std::move(lookup), max_in_flight, ordered, "async_ml_predict_row");
             }
-            return std::make_shared<MlPredictRowOp>(std::move(provider), feature_cols, output_cols);
+            return std::make_shared<MlPredictRowOp>(
+                std::move(provider), feature_cols, output_cols, null_on_error);
         });
 
     // async_lookup_row. Drives a registered

@@ -1,7 +1,10 @@
 #include "clink/http_connector/http_model_provider.hpp"
 
+#include <chrono>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -64,18 +67,25 @@ std::vector<std::string> split_csv(const std::string& s) {
 
 class HttpModelProvider final : public clink::sql::ModelProvider {
 public:
+    struct RetryPolicy {
+        int max_retries = 2;   // extra attempts after the first, on a transient failure
+        int backoff_ms = 100;  // base backoff; doubles each retry (exponential)
+    };
+
     HttpModelProvider(HttpRequest::Options http_opts,
                       std::string path,
                       std::vector<std::string> output_columns,
                       std::string response_path,
                       std::string content_type,
-                      std::size_t max_batch_size)
+                      std::size_t max_batch_size,
+                      RetryPolicy retry)
         : http_opts_(std::move(http_opts)),
           path_(std::move(path)),
           output_columns_(std::move(output_columns)),
           response_path_(std::move(response_path)),
           content_type_(std::move(content_type)),
-          max_batch_size_(max_batch_size < 1 ? 1 : max_batch_size) {}
+          max_batch_size_(max_batch_size < 1 ? 1 : max_batch_size),
+          retry_(retry) {}
 
     // Inference is a blocking network round-trip, so the HTTP provider is async: the
     // ml_predict_row factory drives predict() on a thread pool with many requests in
@@ -142,7 +152,20 @@ private:
     // hand it a fresh per-call client (predict() is fanned across threads; predict_batch
     // runs on the single operator thread).
     clink::config::JsonValue post_and_root_(HttpRequest& req, const std::string& body) const {
-        HttpResponse resp = req.post(path_, body, content_type_);
+        // Retry transient failures (transport error / 5xx / 429) with exponential
+        // backoff; a 4xx (other than 429) is a client error and is not retried. Inference
+        // servers are flaky under load, so a few retries turn most blips into successes
+        // instead of a hard failure the on_error policy then has to absorb.
+        HttpResponse resp;
+        for (int attempt = 0;; ++attempt) {
+            resp = req.post(path_, body, content_type_);
+            const bool transient = resp.status == 0 || resp.status == 429 || resp.status >= 500;
+            if (!transient || attempt >= retry_.max_retries) {
+                break;
+            }
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds{retry_.backoff_ms * (1 << attempt)});
+        }
         if (resp.status == 0) {
             throw std::runtime_error("ML_PREDICT http provider: transport error: " + resp.error);
         }
@@ -180,6 +203,7 @@ private:
     std::string response_path_;
     std::string content_type_;
     std::size_t max_batch_size_;
+    RetryPolicy retry_;
 };
 
 }  // namespace
@@ -211,12 +235,22 @@ std::shared_ptr<clink::sql::ModelProvider> make_http_model_provider(
     // max_batch_size > 1 opts the model into the batching operator (one request per
     // buffered batch, array in / array out). Default 1 = per-row requests.
     const auto max_batch_size = static_cast<std::size_t>(opt_int(opts, "max_batch_size", 1));
+    HttpModelProvider::RetryPolicy retry;
+    retry.max_retries = opt_int(opts, "max_retries", 2);
+    if (retry.max_retries < 0) {
+        retry.max_retries = 0;
+    }
+    retry.backoff_ms = opt_int(opts, "retry_backoff_ms", 100);
+    if (retry.backoff_ms < 0) {
+        retry.backoff_ms = 0;
+    }
     return std::make_shared<HttpModelProvider>(std::move(http),
                                                std::move(path),
                                                split_csv(opt_str(opts, "output_columns", "")),
                                                opt_str(opts, "response_path", ""),
                                                opt_str(opts, "content_type", "application/json"),
-                                               max_batch_size);
+                                               max_batch_size,
+                                               retry);
 }
 
 }  // namespace clink::http_connector

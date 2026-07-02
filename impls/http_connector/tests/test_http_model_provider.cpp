@@ -1,8 +1,10 @@
 // The HTTP model-inference provider against a local httplib stub: it POSTs the
 // feature columns as JSON, and maps the JSON response into the model's OUTPUT columns.
 
+#include <atomic>
 #include <chrono>
 #include <httplib.h>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -36,6 +38,26 @@ public:
         });
         svr_.Post("/boom",
                   [](const httplib::Request&, httplib::Response& res) { res.status = 500; });
+        // POST /flaky returns 503 on the first call and 200 (echo) after, so a provider
+        // with retries recovers rather than surfacing the transient failure.
+        svr_.Post("/flaky",
+                  [calls = flaky_calls_](const httplib::Request& req, httplib::Response& res) {
+                      if (calls->fetch_add(1) == 0) {
+                          res.status = 503;
+                          return;
+                      }
+                      auto parsed = clink::config::parse(req.body);
+                      std::string text;
+                      if (parsed.is_object() &&
+                          parsed.as_object().find("text") != parsed.as_object().end()) {
+                          text = parsed.at("text").as_string();
+                      }
+                      clink::config::JsonObject o;
+                      o["label"] = clink::config::JsonValue{text};
+                      res.set_content(clink::config::JsonValue{std::move(o)}.serialize(0),
+                                      "application/json");
+                      res.status = 200;
+                  });
         // POST /infer_batch takes a JSON array of feature objects and returns a JSON
         // array of predictions in the same order (one per input row).
         svr_.Post("/infer_batch", [](const httplib::Request& req, httplib::Response& res) {
@@ -71,7 +93,10 @@ public:
     }
     [[nodiscard]] std::string url() const { return "http://127.0.0.1:" + std::to_string(port_); }
 
+    [[nodiscard]] int flaky_call_count() const { return flaky_calls_->load(); }
+
 private:
+    std::shared_ptr<std::atomic<int>> flaky_calls_ = std::make_shared<std::atomic<int>>(0);
     httplib::Server svr_;
     int port_{0};
     std::thread thread_;
@@ -129,6 +154,23 @@ TEST(HttpModelProvider, PredictBatchRoundTripsArray) {
     EXPECT_EQ(out[1].values.at("label").as_string(), "b");
     EXPECT_EQ(out[2].values.at("label").as_string(), "c");
     EXPECT_NEAR(out[2].values.at("conf").as_number(), 0.9, 1e-9);
+}
+
+TEST(HttpModelProvider, RetriesTransientFailure) {
+    InferStub stub;
+    std::map<std::string, std::string> opts;
+    opts["endpoint"] = stub.url() + "/flaky";
+    opts["output_columns"] = "label";
+    opts["max_retries"] = "2";
+    opts["retry_backoff_ms"] = "1";  // keep the test fast
+    auto provider = clink::http_connector::make_http_model_provider(opts);
+
+    clink::sql::Row features;
+    features.values["text"] = clink::config::JsonValue{std::string("hi")};
+    // First attempt is 503, the retry hits 200 - predict succeeds instead of throwing.
+    const clink::sql::Row out = provider->predict(features);
+    EXPECT_EQ(out.values.at("label").as_string(), "hi");
+    EXPECT_GE(stub.flaky_call_count(), 2);  // at least one retry happened
 }
 
 TEST(HttpModelProvider, MissingEndpointRejected) {
