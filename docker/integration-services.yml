@@ -1,18 +1,23 @@
-# Sidecar services for the connector LIVE integration tests (Elasticsearch +
-# Kinesis-over-LocalStack). These tests are SKIPPED unless their endpoint env var
-# is set, so the normal build/test run never needs this.
+# Sidecar services for the connector LIVE integration tests. These tests are
+# SKIPPED unless their endpoint env var is set, so the normal build/test run
+# never needs this.
 #
-# Usage:
-#   docker compose -f docker/integration-services.yml up -d
+# The one-command path is scripts/run-all-live.sh, which brings these up, builds
+# clink in the pinned toolchain image, runs the suite with the live tests active
+# (pointed at the services over the compose network), and tears down.
+#
+# Manual usage (host, published ports):
+#   docker compose -f docker/integration-services.yml up -d --wait
 #   export CLINK_ELASTICSEARCH_TEST_ENDPOINT=http://localhost:9200
 #   export CLINK_KINESIS_TEST_ENDPOINT=http://localhost:4566
+#   export CLINK_S3_TEST_ENDPOINT=http://localhost:4566 CLINK_S3_TEST_BUCKET=clink-live-test
 #   export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1
 #   export CLINK_REDIS_TEST_URL=redis://localhost:6379
 #   export CLINK_MYSQL_TEST_DSN="host=localhost port=3306 user=root password=mysql database=test"
-#   ctest --test-dir build -L http_connector -R Live --output-on-failure
-#   ctest --test-dir build -L aws          -R Live --output-on-failure
-#   ctest --test-dir build -L redis        -R Live --output-on-failure
-#   ctest --test-dir build -L mysql        -R Live --output-on-failure
+#   export CLINK_POSTGRES_CDC_TEST_DSN="host=localhost port=5432 user=postgres password=postgres dbname=postgres"
+#   export CLINK_CASSANDRA_TEST_CONTACT_POINTS=127.0.0.1
+#   export CLINK_PUBSUB_EMULATOR_HOST=localhost:8085
+#   ctest --test-dir build -R Live --output-on-failure
 #   docker compose -f docker/integration-services.yml down -v
 #
 # (LocalStack accepts any credentials; the dummy test/test keys above just let
@@ -37,7 +42,7 @@ services:
   localstack:
     image: localstack/localstack:3
     environment:
-      - SERVICES=kinesis
+      - SERVICES=kinesis,s3
     ports:
       - "4566:4566"
     healthcheck:
