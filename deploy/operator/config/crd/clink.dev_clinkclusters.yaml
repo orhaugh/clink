@@ -1,0 +1,376 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: clinkclusters.clink.dev
+spec:
+  group: clink.dev
+  names:
+    kind: ClinkCluster
+    listKind: ClinkClusterList
+    plural: clinkclusters
+    shortNames:
+    - clink
+    - cc
+    singular: clinkcluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.taskManagersReady
+      name: TMs-Ready
+      type: integer
+    - jsonPath: .spec.taskManager.replicas
+      name: Desired-TMs
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ClinkCluster is a clink stream-processing cluster (a JobManager plus a set of
+          TaskManagers) managed declaratively by the clink operator.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ClinkClusterSpec is the desired state of a clink cluster.
+            properties:
+              ha:
+                description: |-
+                  HASpec turns on multi-JobManager high availability with file-coordinator
+                  leader election over a shared RWX volume.
+                properties:
+                  enabled:
+                    type: boolean
+                  mountPath:
+                    default: /var/lib/clink/ha
+                    type: string
+                  replicas:
+                    default: 2
+                    format: int32
+                    minimum: 2
+                    type: integer
+                  size:
+                    default: 1Gi
+                    type: string
+                  storageClassName:
+                    description: StorageClassName for the shared HA PVC (must support
+                      ReadWriteMany).
+                    type: string
+                type: object
+              image:
+                description: ImageSpec pins the clink runtime image the JobManager
+                  + TaskManagers run.
+                properties:
+                  pullPolicy:
+                    default: IfNotPresent
+                    description: PullPolicy describes a policy for if/when to pull
+                      a container image
+                    enum:
+                    - Always
+                    - IfNotPresent
+                    - Never
+                    type: string
+                  repository:
+                    default: clink-runtime
+                    type: string
+                  tag:
+                    default: latest
+                    type: string
+                type: object
+              imagePullSecrets:
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
+              jobManager:
+                description: JobManagerSpec configures the JobManager role.
+                properties:
+                  controlPort:
+                    default: 6123
+                    format: int32
+                    type: integer
+                  extraArgs:
+                    description: ExtraArgs are appended verbatim to the JobManager
+                      command line.
+                    items:
+                      type: string
+                    type: array
+                  httpPort:
+                    default: 8081
+                    format: int32
+                    type: integer
+                  resources:
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This is an alpha field and requires enabling the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                  stateBackend:
+                    description: StateBackend passes --state-backend when set (e.g.
+                      "rocksdb").
+                    type: string
+                type: object
+              serviceAccountName:
+                type: string
+              taskManager:
+                description: TaskManagerSpec configures the TaskManager role.
+                properties:
+                  extraArgs:
+                    items:
+                      type: string
+                    type: array
+                  httpPort:
+                    default: 8082
+                    format: int32
+                    type: integer
+                  replicas:
+                    default: 2
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  resources:
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This is an alpha field and requires enabling the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                  slots:
+                    default: 4
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  terminationGracePeriodSeconds:
+                    default: 30
+                    format: int64
+                    type: integer
+                type: object
+            type: object
+          status:
+            description: ClinkClusterStatus is the observed state of a clink cluster.
+            properties:
+              conditions:
+                description: Conditions follow the standard k8s condition convention.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              jobManagerReplicas:
+                description: JobManagerReplicas is the desired JobManager replica
+                  count (1, or ha.replicas).
+                format: int32
+                type: integer
+              observedGeneration:
+                description: ObservedGeneration is the .metadata.generation last reconciled.
+                format: int64
+                type: integer
+              phase:
+                description: 'Phase is a coarse lifecycle summary: Pending, Running
+                  or Failed.'
+                type: string
+              taskManagersReady:
+                description: |-
+                  TaskManagersReady is the number of TaskManagers currently registered with
+                  the JobManager (read from its /api/v1/tms endpoint).
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

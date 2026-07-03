@@ -1,0 +1,19 @@
+apiVersion: clink.dev/v1alpha1
+kind: ClinkCluster
+metadata:
+  name: demo
+spec:
+  image:
+    repository: clink-runtime
+    tag: latest
+    pullPolicy: IfNotPresent
+  jobManager:
+    controlPort: 6123
+    httpPort: 8081
+  taskManager:
+    replicas: 2
+    slots: 4
+    httpPort: 8082
+  # ha:
+  #   enabled: true
+  #   replicas: 2

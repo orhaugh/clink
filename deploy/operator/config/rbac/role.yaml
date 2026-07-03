@@ -1,0 +1,67 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: clink-operator-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  - serviceaccounts
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - clink.dev
+  resources:
+  - clinkclusters
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - clink.dev
+  resources:
+  - clinkclusters/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - clink.dev
+  resources:
+  - clinkclusters/status
+  verbs:
+  - get
+  - patch
+  - update

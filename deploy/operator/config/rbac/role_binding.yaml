@@ -1,0 +1,14 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: clink-operator-rolebinding
+  labels:
+    app.kubernetes.io/name: clink-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: clink-operator-role
+subjects:
+- kind: ServiceAccount
+  name: clink-operator-controller
+  namespace: clink-operator-system
