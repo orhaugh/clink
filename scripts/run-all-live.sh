@@ -47,11 +47,10 @@
 #                  builds. The test creates its own stream; localstack's healthcheck
 #                  is enough (no extra probe). If clink_aws_tests is ever absent (an
 #                  image without those SDK components) it reports BLOCKED, not a pass.
-#   iceberg      - runs IcebergRestLive (REST catalog over an S3 warehouse). Uses two
-#                  services: localstack (the S3 warehouse) + iceberg-rest. The sibling
-#                  IcebergS3Live (local SQLite catalog over S3) is NOT run: it SEGFAULTS
-#                  even with the bucket pre-created - a pre-existing bug in that test,
-#                  not a wiring gap. Re-add it to the filter once that crash is fixed.
+#   iceberg      - runs BOTH IcebergRestLive (REST catalog over an S3 warehouse) and
+#                  IcebergS3Live (local SQLite catalog over S3). Uses two services:
+#                  localstack (the S3 warehouse) + iceberg-rest. The probe pre-creates the
+#                  warehouse bucket.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -89,7 +88,7 @@ CONNECTORS=(
   "gcs@@gcs@@clink_gcs_tests@@GcsParquetLive"
   "azure@@azurite@@clink_azure_tests@@AzureParquetLive"
   "webhdfs@@webhdfs@@clink_webhdfs_tests@@WebHdfsParquetLive"
-  "iceberg@@localstack iceberg-rest@@clink_iceberg_tests@@IcebergRestLive"
+  "iceberg@@localstack iceberg-rest@@clink_iceberg_tests@@IcebergRestLive|IcebergS3Live"
   "etcd@@etcd@@clink_etcd_tests@@EtcdHaCoordinator"
   # Reported BLOCKED unless the image gains the SDK components (see header):
   "aws-kinesis@@localstack@@clink_aws_tests@@KinesisLive"

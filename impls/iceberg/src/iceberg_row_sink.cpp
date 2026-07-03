@@ -65,7 +65,11 @@ std::unique_ptr<::iceberg::FileIO> MakeLocalFileIO();
 // MakeS3FileIO self-initialises Arrow's S3 subsystem (EnsureS3Initialized) on first use.
 // We init through clink's single S3 lifecycle owner just before calling it, so this lazy
 // init no-ops and there is exactly one InitializeS3 / one atexit FinalizeS3 per process.
-std::unique_ptr<::iceberg::FileIO> MakeS3FileIO(
+// NOTE: unlike MakeLocalFileIO, this returns Result<unique_ptr<FileIO>> (see
+// iceberg/arrow/arrow_io_util.h). The return type is not part of the mangled name, so
+// declaring it as a plain unique_ptr links fine but reads a garbage pointer back (the
+// Result is returned via a hidden sret) - a SIGSEGV when that FileIO is first used.
+::iceberg::Result<std::unique_ptr<::iceberg::FileIO>> MakeS3FileIO(
     const std::unordered_map<std::string, std::string>& properties);
 // Registers the arrow-fs-local + arrow-fs-s3 FileIO factories in the FileIORegistry. The
 // SQLite-catalog path builds FileIO directly, but the REST catalog resolves it by name via
@@ -288,12 +292,16 @@ public:
                     ": an s3:// warehouse requires an explicit local catalog_uri (the SQLite "
                     "catalog cannot live on S3; or use a REST catalog)");
             }
-            // Init Arrow S3 through the single engine-wide owner first (suppresses OpenSSL's
-            // atexit + sets a quiet log level); MakeS3FileIO's own lazy EnsureS3Initialized
-            // then sees it is already up and no-ops.
-            clink::connectors::ensure_arrow_s3_initialised();
+            // Let iceberg-cpp's MakeS3FileIO own the Arrow S3 bring-up (it guards
+            // InitializeS3 to once per process). Do NOT pre-init via clink's owner here:
+            // 0.3.0's MakeS3FileIO calls arrow::fs::InitializeS3, which RETURNS AN ERROR if
+            // S3 was already initialized (unlike EnsureS3Initialized) - so a clink pre-init
+            // makes it fail "S3 was already initialized". ensure_registered() above already
+            // suppressed OpenSSL's atexit before any S3 bring-up, and the process finalises S3
+            // once at exit (finalize_arrow_s3 / the s3-finalizing test main). This mirrors the
+            // REST-catalog path, which likewise lets iceberg resolve + initialise its own S3 IO.
             file_io_ = std::shared_ptr<ice::FileIO>(
-                ice::arrow::MakeS3FileIO(opts_.file_io_props).release());
+                unwrap(ice::arrow::MakeS3FileIO(opts_.file_io_props), "make s3 file io").release());
         } else {
             file_io_ = std::shared_ptr<ice::FileIO>(ice::arrow::MakeLocalFileIO().release());
         }
@@ -316,20 +324,25 @@ public:
         id_.ns = ns;
         id_.name = opts_.table;
 
-        // Local-FS table location (warehouse/<ns>/<table>); REST + S3 let the catalog/server
-        // assign it (pass empty so the server decides). Only a local-FS warehouse needs the
-        // dirs pre-created (iceberg-cpp's local Arrow FileIO does not mkdir parents).
+        // Table location (warehouse/<ns>/<table>). A REST catalog lets the server assign it
+        // (pass empty). A SQL catalog - local-FS OR S3 - must be given an EXPLICIT location:
+        // iceberg-cpp's SqlCatalog::CreateTable does not derive one from the warehouse, so an
+        // empty location makes it write the initial metadata to an empty path, dereferencing a
+        // null output stream (SIGSEGV in TableMetadataUtil::Write). Only a local-FS warehouse
+        // needs the dirs pre-created (Arrow's local FileIO does not mkdir parents; S3 has none).
         const bool local_fs = !rest && !s3;
         std::string location;
-        if (local_fs) {
+        if (!rest) {
             location = opts_.warehouse;
             for (const auto& level : opts_.namespace_levels) {
                 location += "/" + level;
             }
             location += "/" + opts_.table;
-            std::error_code ec;
-            std::filesystem::create_directories(location + "/metadata", ec);
-            std::filesystem::create_directories(location + "/data", ec);
+            if (local_fs) {
+                std::error_code ec;
+                std::filesystem::create_directories(location + "/metadata", ec);
+                std::filesystem::create_directories(location + "/data", ec);
+            }
         }
 
         if (auto ex = catalog_->TableExists(id_); ex.has_value() && !ex.value()) {
