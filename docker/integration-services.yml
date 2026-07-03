@@ -231,3 +231,34 @@ services:
       timeout: 10s
       retries: 40
       start_period: 20s
+
+  # fake-gcs-server for the GCS Parquet live IT (Arrow GcsFileSystem, anonymous,
+  # scheme=http). The test creates its own bucket. -public-host must match the
+  # in-container authority so upload redirects resolve. CLINK_GCS_TEST_ENDPOINT: "gcs:4443"
+  gcs:
+    image: fsouza/fake-gcs-server
+    command: ["-scheme", "http", "-host", "0.0.0.0", "-port", "4443", "-public-host", "gcs:4443"]
+    ports:
+      - "4443:4443"
+
+  # Azurite (Azure Storage emulator) for the Azure Parquet live IT. Bind the blob
+  # service on 0.0.0.0 so a networked client reaches it; the test uses Azurite's
+  # well-known devstoreaccount1 account + key. CLINK_AZURE_TEST_ENDPOINT: "azurite:10000"
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    command: ["azurite", "--blobHost", "0.0.0.0", "--blobPort", "10000"]
+    ports:
+      - "10000:10000"
+
+  # Single-container pseudo-distributed HDFS for the WebHDFS Parquet live IT. The
+  # baked Cmd ends in an interactive bash (exits without a TTY), so override it to
+  # start dfs and stay up. A fresh namenode boots in safemode; the readiness probe
+  # in run-all-live.sh leaves safemode and ensures a writable /tmp. WebHDFS namenode
+  # is on 50070, datanode 50075 (Hadoop 2.x). CLINK_WEBHDFS_TEST_ENDPOINT: "http://webhdfs:50070"
+  webhdfs:
+    image: mdouchement/hdfs
+    hostname: webhdfs
+    command: ["/bin/sh", "-c", "service ssh start && start-dfs.sh && tail -f /dev/null"]
+    ports:
+      - "50070:50070"
+      - "50075:50075"
