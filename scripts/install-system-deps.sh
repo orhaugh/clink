@@ -61,7 +61,9 @@ apt-get update && apt-get install -y --no-install-recommends \
 # Homebrew builds Arrow against the system SDK). Build exactly the components Arrow's S3
 # resolves (config, s3, transfer, identity-management -> pulls cognito-identity, sts,
 # core), pinned to AWS_SDK_CPP_TAG so it tracks the host's Homebrew aws-sdk. impls/s3 and
-# the Iceberg S3 FileIO ride the same SDK. ~15-25 min first build, Docker-layer-cached.
+# the Iceberg S3 FileIO ride the same SDK; the kinesis/firehose/dynamodb components serve
+# impls/aws (the Kinesis source/sink + Firehose/DynamoDB sinks). ~20-30 min first build,
+# Docker-layer-cached.
 if [ ! -f "/usr/local/lib/libaws-cpp-sdk-s3.so" ] && \
    [ ! -f "/usr/local/lib/libaws-cpp-sdk-s3.a" ]; then
     echo "▶ Building aws-sdk-cpp ${AWS_SDK_CPP_TAG} (Arrow S3 components) from source..."
@@ -72,7 +74,7 @@ if [ ! -f "/usr/local/lib/libaws-cpp-sdk-s3.so" ] && \
     cmake -S "$WORK_DIR/aws-sdk-cpp" -B "$WORK_DIR/aws-sdk-cpp/build" \
           -DCMAKE_INSTALL_PREFIX=/usr/local \
           -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-          -DBUILD_ONLY="config;s3;transfer;identity-management;sts" \
+          -DBUILD_ONLY="config;s3;transfer;identity-management;sts;kinesis;firehose;dynamodb" \
           -DBUILD_SHARED_LIBS=ON \
           -DENABLE_TESTING=OFF \
           -DAUTORUN_UNIT_TESTS=OFF

@@ -41,12 +41,12 @@
 #   CTEST_TIMEOUT=300          per-test timeout (seconds)
 #
 # Registry notes:
-#   aws-kinesis  - IS in the default run, but reports BLOCKED: the aws-cpp-sdk
-#                  kinesis/firehose/dynamodb components are not in the image
-#                  (install-system-deps.sh BUILD_ONLY excludes them), so
-#                  clink_aws_tests is never built. It is kept in the registry so the
-#                  gap is surfaced every run rather than forgotten; add the SDK
-#                  components + rebuild the image to turn it green.
+#   aws-kinesis  - runs KinesisLive against localstack (SERVICES=kinesis,s3). The
+#                  aws-cpp-sdk kinesis/firehose/dynamodb components are now built into
+#                  the image (install-system-deps.sh BUILD_ONLY), so clink_aws_tests
+#                  builds. The test creates its own stream; localstack's healthcheck
+#                  is enough (no extra probe). If clink_aws_tests is ever absent (an
+#                  image without those SDK components) it reports BLOCKED, not a pass.
 #   iceberg      - runs IcebergRestLive (REST catalog over an S3 warehouse). Uses two
 #                  services: localstack (the S3 warehouse) + iceberg-rest. The sibling
 #                  IcebergS3Live (local SQLite catalog over S3) is NOT run: it SEGFAULTS
