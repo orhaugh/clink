@@ -2,39 +2,55 @@
 #
 # run-all-live.sh - the definitive connector LIVE integration run.
 #
-# Brings up the dockerised dependency services, builds clink with every
-# connector + the multi-process integration suite in the pinned toolchain image,
-# and runs the test suite with the LIVE tests ACTIVE - pointed at the services
-# over the compose network - then tears the services down.
+# Runs each connector's live tests SEQUENTIALLY, provisioning ONLY the docker
+# service(s) that connector needs, running its tests, then tearing those services
+# down before moving to the next. Never more than one connector's services are up
+# at a time, so the machine is never asked to host all ten dependency containers
+# at once (that oversubscribes RAM and OOM-kills the build).
+#
+# Shape:
+#   1. Build ONCE with NO services running, so the compile has the whole machine
+#      (this is what previously OOM'd - the build competed with ten containers).
+#      Only the connector test binaries are built, not the full suite.
+#   2. Capture the registered-test list once. A connector whose binary was not
+#      produced (e.g. its client lib is missing from the image) has ZERO matching
+#      tests - it is reported BLOCKED, never a silent phantom pass.
+#   3. For each connector: bring up its service(s) (--wait on healthchecks, plus a
+#      readiness probe where "healthy" is not the same as "ready"), run its exact
+#      named test suites, then stop+remove just those services.
+#
+# Because each connector is filtered by its exact gtest suite names, there is no
+# broad "-R Live" sweep - so the old GatewayParity ("Liveness") false match and the
+# under-gated IcebergS3Live crash simply cannot be swept in.
 #
 # The normal build/test run skips every live test (their endpoint env vars are
 # unset); this script is how you get end-to-end confidence that the connectors
 # actually work against real servers, not just that their logic compiles.
 #
-# Services wired so far (docker/integration-services.yml):
-#   postgres, mysql, redis, cassandra, elasticsearch, aws/kinesis + s3
-#   (localstack), pubsub, mongodb, nats, mqtt. Kafka needs no service - it is
-#   tested against an in-process librdkafka mock. Connectors without a service yet
-#   (pulsar, influxdb, gcs, azure, webhdfs, iceberg-REST, etcd) self-skip; they
-#   will activate as their services are added here.
-#
-# Everything runs inside IMAGE (the pinned toolchain image) on the compose
-# network, so it needs no host toolchain and reaches services by DNS name.
+# Everything runs inside IMAGE (the pinned toolchain image) on the compose network,
+# so it needs no host toolchain and reaches services by DNS name.
 #
 # Env knobs:
 #   IMAGE=clink-build:latest   toolchain image to build + run in
 #   BUILD_DIR=build-live       build dir (under the repo, which is mounted)
-#   FULL=1                     run the WHOLE suite; default runs the connector live tests
-#   WITH_SQL=1                 also build + test the SQL frontend
-#   KEEP_SERVICES=1            leave the services up at the end
+#   BUILD_JOBS=6               compile parallelism (capped - rocksdb TUs are large)
+#   ONLY="mongodb mqtt"        run only these connectors (default: all runnable)
+#   WITH_SQL=1                 also configure the SQL frontend
+#   SKIP_BUILD=1               reuse an existing BUILD_DIR (skip the build step)
+#   KEEP_SERVICES=1            leave the last connector's services up at the end
 #   CTEST_TIMEOUT=300          per-test timeout (seconds)
-#   LIVE_EXCLUDE=<regex>       override the default ctest -E exclusion (below)
 #
-# Default exclusions (LIVE_EXCLUDE): GatewayParity is a multi-process integration
-# test falsely matched by the "Live" filter (its name contains "Liveness"), not a
-# connector test; IcebergS3Live is under-gated (it activates on the S3 endpoint
-# alone but needs an Iceberg REST catalog that is not wired here, and crashes
-# rather than skipping) - drop both until Iceberg's catalog is added.
+# Registry notes:
+#   aws-kinesis  - IS in the default run, but reports BLOCKED: the aws-cpp-sdk
+#                  kinesis/firehose/dynamodb components are not in the image
+#                  (install-system-deps.sh BUILD_ONLY excludes them), so
+#                  clink_aws_tests is never built. It is kept in the registry so the
+#                  gap is surfaced every run rather than forgotten; add the SDK
+#                  components + rebuild the image to turn it green.
+#   iceberg-s3   - deliberately NOT in the registry: IcebergS3Live activates on
+#                  CLINK_S3_TEST_ENDPOINT alone but needs an Iceberg REST catalog + a
+#                  pre-created bucket, and crashes rather than skipping when they are
+#                  absent. Add it once the REST catalog service is wired.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -45,7 +61,58 @@ PROJECT="clink-live"
 NETWORK="${PROJECT}_default"
 IMAGE="${IMAGE:-clink-build:latest}"
 BUILD_DIR="${BUILD_DIR:-build-live}"
+BUILD_JOBS="${BUILD_JOBS:-6}"
 CTEST_TIMEOUT="${CTEST_TIMEOUT:-300}"
+
+# --- connector registry -----------------------------------------------------
+# One entry per connector, run in this order (light/fast services first so a
+# problem surfaces early; the slow-to-start cassandra + elasticsearch are last).
+# Fields, separated by '@@':  name @@ compose-services @@ test-target @@ ctest-regex
+# The ctest-regex is the exact gtest suite name(s) whose tests require the live
+# service; '|' inside it is regex alternation.
+CONNECTORS=(
+  "redis@@redis@@clink_redis_tests@@RedisLive|RedisUpsertSinkLive"
+  "mongodb@@mongodb@@clink_mongodb_tests@@MongoLive"
+  "nats@@nats@@clink_nats_tests@@NatsLive"
+  "mqtt@@mqtt@@clink_mqtt_tests@@MqttLive"
+  "postgres@@postgres-cdc@@clink_postgres_tests@@PostgresCdcLive|PostgresJsonSinkLive|PostgresSink2PCLive|PostgresUpsertSinkLive"
+  "mysql@@mysql@@clink_mysql_tests@@MysqlLive|MysqlCdcLive|MysqlUpsertSinkLive"
+  "s3@@localstack@@clink_s3_tests@@S3Sink2PCLive|S3MaterializationStore.RoundTripAgainstLiveEndpoint|StateParquetExportS3.PartitionedExportReadableBackFromS3|S3SnapshotStore.CheckpointDirRoundTripAgainstLiveEndpoint|S3SnapshotStore.CacheServesImmutableSstOnSecondFetch|S3CasSnapshotStore|S3RemotePool"
+  "rocksdb-s3@@localstack@@clink_rocksdb_s3_tests@@S3RocksdbSchemes"
+  "elasticsearch@@elasticsearch@@clink_http_connector_tests@@ElasticsearchLive"
+  "pubsub@@pubsub@@clink_http_connector_tests@@PubSubLive"
+  "cassandra@@cassandra@@clink_cassandra_tests@@CassandraLive|CassandraUpsertSinkLive"
+  # Reported BLOCKED unless the image gains the SDK components (see header):
+  "aws-kinesis@@localstack@@clink_aws_tests@@KinesisLive"
+)
+
+# All connector test targets we try to build (intersected with what actually
+# configures, so a connector missing its client lib is simply skipped, not fatal).
+WANT_TARGETS="clink_redis_tests clink_mongodb_tests clink_nats_tests clink_mqtt_tests \
+clink_postgres_tests clink_mysql_tests clink_s3_tests clink_rocksdb_s3_tests \
+clink_http_connector_tests clink_cassandra_tests clink_aws_tests"
+
+AWS_ENV=(-e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test
+         -e AWS_DEFAULT_REGION=us-east-1 -e AWS_EC2_METADATA_DISABLED=true)
+
+# Per-connector env, pointing at the services by their compose DNS names (the test
+# container joins the same network). LocalStack accepts the dummy AWS creds.
+set_env() {
+  ENVARGS=()
+  case "$1" in
+    redis)         ENVARGS=(-e "CLINK_REDIS_TEST_URL=redis://redis:6379") ;;
+    mongodb)       ENVARGS=(-e "CLINK_MONGODB_TEST_URI=mongodb://mongodb:27017/?replicaSet=rs0") ;;
+    nats)          ENVARGS=(-e "CLINK_NATS_TEST_ENDPOINT=nats://nats:4222") ;;
+    mqtt)          ENVARGS=(-e "CLINK_MQTT_TEST_URL=mqtt://mqtt:1883") ;;
+    postgres)      ENVARGS=(-e "CLINK_POSTGRES_CDC_TEST_DSN=host=postgres-cdc port=5432 user=postgres password=postgres dbname=postgres") ;;
+    mysql)         ENVARGS=(-e "CLINK_MYSQL_TEST_DSN=host=mysql port=3306 user=root password=mysql database=test") ;;
+    cassandra)     ENVARGS=(-e "CLINK_CASSANDRA_TEST_CONTACT_POINTS=cassandra") ;;
+    elasticsearch) ENVARGS=(-e "CLINK_ELASTICSEARCH_TEST_ENDPOINT=http://elasticsearch:9200") ;;
+    pubsub)        ENVARGS=(-e "CLINK_PUBSUB_EMULATOR_HOST=pubsub:8085") ;;
+    s3|rocksdb-s3) ENVARGS=(-e "CLINK_S3_TEST_ENDPOINT=http://localstack:4566" -e "CLINK_S3_TEST_BUCKET=clink-live-test" "${AWS_ENV[@]}") ;;
+    aws-kinesis)   ENVARGS=(-e "CLINK_KINESIS_TEST_ENDPOINT=http://localstack:4566" "${AWS_ENV[@]}") ;;
+  esac
+}
 
 if ! docker info >/dev/null 2>&1; then
   echo "▶ Docker is not running." >&2
@@ -54,124 +121,179 @@ fi
 
 cleanup() {
   if [[ -z "${KEEP_SERVICES:-}" ]]; then
-    echo "▶ Tearing down services..."
     docker compose -f "$COMPOSE" -p "$PROJECT" down -v >/dev/null 2>&1 || true
   else
-    echo "▶ KEEP_SERVICES set - services left up."
-    echo "  Stop them with: docker compose -f $COMPOSE -p $PROJECT down -v"
+    echo "▶ KEEP_SERVICES set - services left up. Stop with:"
+    echo "  docker compose -f $COMPOSE -p $PROJECT down -v"
   fi
 }
 trap cleanup EXIT
 
-echo "▶ Bringing up dependency services and waiting for healthchecks"
-echo "  (Cassandra + Elasticsearch take ~30-60s to become healthy)..."
-docker compose -f "$COMPOSE" -p "$PROJECT" up -d --wait
+# --- readiness probes (where compose "healthy" is not the same as "ready") ---
+compose() { docker compose -f "$COMPOSE" -p "$PROJECT" "$@"; }
 
-# Cassandra reports "healthy" (its native transport answers a SELECT on
-# system.local) well before it can reliably serve DDL. The connector tests
-# create a keyspace + table, so wait until a create/drop round-trip actually
-# succeeds - otherwise a fast (cached) build races Cassandra's warm-up.
-if docker compose -f "$COMPOSE" -p "$PROJECT" ps --services --filter status=running 2>/dev/null | grep -qx cassandra; then
-  echo "▶ Waiting for Cassandra to accept DDL (healthy != ready)..."
-  cass_ready=""
-  for i in $(seq 1 40); do
-    if docker compose -f "$COMPOSE" -p "$PROJECT" exec -T cassandra cqlsh -e \
-         "CREATE KEYSPACE IF NOT EXISTS clink_probe WITH replication = {'class':'SimpleStrategy','replication_factor':1}; DROP KEYSPACE clink_probe" \
-         >/dev/null 2>&1; then
-      echo "  Cassandra ready (DDL round-trip ok after ${i} attempt(s))."
-      cass_ready=1
-      break
-    fi
-    sleep 3
-  done
-  [[ -z "$cass_ready" ]] && echo "  WARNING: Cassandra never accepted DDL in ~120s; its tests may fail."
-fi
-
-# MongoDB: the change-stream source needs a replica set. Initiate the single-node
-# set (member host = the service DNS name so the driver on the compose network
-# discovers it), then wait for it to elect a PRIMARY.
-if docker compose -f "$COMPOSE" -p "$PROJECT" ps --services --filter status=running 2>/dev/null | grep -qx mongodb; then
-  echo "▶ Initiating MongoDB replica set + waiting for PRIMARY..."
-  docker compose -f "$COMPOSE" -p "$PROJECT" exec -T mongodb mongosh --quiet --eval \
-    "try { rs.status() } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongodb:27017'}]}) }" \
-    >/dev/null 2>&1 || true
-  for i in $(seq 1 40); do
-    if docker compose -f "$COMPOSE" -p "$PROJECT" exec -T mongodb mongosh --quiet --eval \
-         "db.hello().isWritablePrimary" 2>/dev/null | grep -qx true; then
-      echo "  MongoDB replica set PRIMARY ready (after ${i} attempt(s))."
-      break
-    fi
-    sleep 3
-  done
-fi
-
-# NATS (JetStream) + MQTT readiness on their published ports (the nats image has
-# no shell for a container healthcheck; mqtt just needs its listener up).
-wait_http() {  # $1=url $2=name
-  for _ in $(seq 1 40); do
-    if curl -fsS "$1" >/dev/null 2>&1; then echo "  $2 ready."; return 0; fi
-    sleep 2
-  done
-  echo "  WARNING: $2 not ready ($1); its tests may fail."
-}
-wait_tcp() {  # $1=host $2=port $3=name
+wait_tcp() {  # host port name
   for _ in $(seq 1 40); do
     if (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null; then exec 3>&- 3<&-; echo "  $3 ready."; return 0; fi
     sleep 2
   done
   echo "  WARNING: $3 not ready ($1:$2); its tests may fail."
 }
-echo "▶ Waiting for NATS JetStream + MQTT..."
-wait_http "http://localhost:8222/healthz" "NATS JetStream"
-wait_tcp localhost 1883 "MQTT"
 
-# Live-test env, pointing at the services by their compose DNS names (the test
-# container joins the same network). LocalStack accepts the dummy AWS creds.
-declare -a env_args=(
-  -e "CLINK_POSTGRES_CDC_TEST_DSN=host=postgres-cdc port=5432 user=postgres password=postgres dbname=postgres"
-  -e "CLINK_MYSQL_TEST_DSN=host=mysql port=3306 user=root password=mysql database=test"
-  -e "CLINK_REDIS_TEST_URL=redis://redis:6379"
-  -e "CLINK_CASSANDRA_TEST_CONTACT_POINTS=cassandra"
-  -e "CLINK_ELASTICSEARCH_TEST_ENDPOINT=http://elasticsearch:9200"
-  -e "CLINK_KINESIS_TEST_ENDPOINT=http://localstack:4566"
-  -e "CLINK_S3_TEST_ENDPOINT=http://localstack:4566"
-  -e "CLINK_S3_TEST_BUCKET=clink-live-test"
-  -e "CLINK_PUBSUB_EMULATOR_HOST=pubsub:8085"
-  -e "CLINK_MONGODB_TEST_URI=mongodb://mongodb:27017/?replicaSet=rs0"
-  -e "CLINK_NATS_TEST_ENDPOINT=nats://nats:4222"
-  -e "CLINK_MQTT_TEST_URL=mqtt://mqtt:1883"
-  -e "AWS_ACCESS_KEY_ID=test"
-  -e "AWS_SECRET_ACCESS_KEY=test"
-  -e "AWS_DEFAULT_REGION=us-east-1"
-  -e "AWS_EC2_METADATA_DISABLED=true"
-)
+probe() {  # connector-name
+  case "$1" in
+    mongodb)
+      # The change-stream source needs a replica set; initiate the single-node set
+      # (member host = the service DNS name) and wait for it to elect a PRIMARY.
+      compose exec -T mongodb mongosh --quiet --eval \
+        "try { rs.status() } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongodb:27017'}]}) }" >/dev/null 2>&1 || true
+      for i in $(seq 1 40); do
+        if compose exec -T mongodb mongosh --quiet --eval "db.hello().isWritablePrimary" 2>/dev/null | grep -qx true; then
+          echo "  mongodb PRIMARY ready (attempt $i)."; return 0; fi
+        sleep 3
+      done
+      echo "  WARNING: mongodb never elected PRIMARY; its tests may fail." ;;
+    cassandra)
+      # Cassandra answers a SELECT on system.local well before it can serve DDL;
+      # the tests create a keyspace, so wait for a CREATE/DROP round-trip.
+      for i in $(seq 1 40); do
+        if compose exec -T cassandra cqlsh -e \
+             "CREATE KEYSPACE IF NOT EXISTS clink_probe WITH replication = {'class':'SimpleStrategy','replication_factor':1}; DROP KEYSPACE clink_probe" \
+             >/dev/null 2>&1; then
+          echo "  cassandra ready (DDL round-trip ok after $i attempt(s))."; return 0; fi
+        sleep 3
+      done
+      echo "  WARNING: cassandra never accepted DDL; its tests may fail." ;;
+    mysql)
+      # mysqladmin ping (the compose healthcheck) passes during the entrypoint's
+      # temporary init server AND across the restart into the real server, so a
+      # test connecting to mysql:3306 right after "healthy" hits "Can't connect".
+      # Wait for a real TCP query round-trip against the running server.
+      for i in $(seq 1 40); do
+        if compose exec -T mysql mysql -h127.0.0.1 -uroot -pmysql -e "SELECT 1" >/dev/null 2>&1; then
+          echo "  mysql ready (SELECT 1 over TCP ok after $i attempt(s))."; return 0; fi
+        sleep 3
+      done
+      echo "  WARNING: mysql never answered a TCP query; its tests may fail." ;;
+    pubsub)
+      # The emulator binds :8085 (TCP up) seconds before it actually SERVES the
+      # REST admin API, so a port probe is not enough - wait for a real HTTP reply.
+      for i in $(seq 1 40); do
+        # curl -w prints "000" (and exits non-zero) when it cannot connect, so
+        # swallow the exit with '|| true' - do NOT append another 000.
+        code="$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8085/v1/projects/clink-test/topics" 2>/dev/null || true)"
+        if [[ -n "$code" && "$code" != "000" ]]; then echo "  pubsub serving (HTTP $code after $i attempt(s))."; return 0; fi
+        sleep 2
+      done
+      echo "  WARNING: pubsub never served HTTP; its tests may fail." ;;
+    s3|rocksdb-s3)
+      # localstack is torn down between connectors, so each localstack-backed
+      # connector gets a fresh, empty S3 - create the bucket the tests write to.
+      # (Some suites create their own bucket; rocksdb-s3's snapshot store does not.)
+      compose exec -T localstack awslocal s3 mb s3://clink-live-test >/dev/null 2>&1 || true
+      echo "  localstack bucket clink-live-test ensured." ;;
+    *) : ;;  # compose --wait on the service healthcheck was sufficient
+  esac
+}
+
+# --- resolve the run list ---------------------------------------------------
+declare -a RUN_LIST
+if [[ -n "${ONLY:-}" ]]; then
+  for want in $ONLY; do
+    found=""
+    for entry in "${CONNECTORS[@]}"; do
+      [[ "${entry%%@@*}" == "$want" ]] && { RUN_LIST+=("$entry"); found=1; break; }
+    done
+    [[ -z "$found" ]] && echo "▶ WARNING: unknown connector '$want' (ignored)."
+  done
+else
+  # Default: every registered connector. aws-kinesis stays in and reports BLOCKED
+  # (its binary is not built in the image) rather than being silently dropped.
+  RUN_LIST=("${CONNECTORS[@]}")
+fi
+[[ ${#RUN_LIST[@]} -eq 0 ]] && { echo "▶ nothing to run."; exit 0; }
 
 sql_flag="-DCLINK_BUILD_SQL=OFF"
 [[ -n "${WITH_SQL:-}" ]] && sql_flag="-DCLINK_BUILD_SQL=ON"
-# Default: the connector live tests. FULL=1 runs the whole suite.
-ctest_filter="-R Live"
-[[ -n "${FULL:-}" ]] && ctest_filter=""
-exclude_re="${LIVE_EXCLUDE:-GatewayParity|IcebergS3Live}"
 
-echo "▶ Building + running in $IMAGE on network $NETWORK (BUILD_DIR=$BUILD_DIR)"
-rc=0
-docker run --rm \
-  --network "$NETWORK" \
-  -v "$(pwd)":/workspace -w /workspace \
-  -e IN_DOCKER=1 -e CLINK_DEPS_PREFIX=/usr/local \
-  "${env_args[@]}" \
-  "$IMAGE" bash -c "
-    set -e
-    cmake -S . -B '$BUILD_DIR' -DCLINK_BUILD_TESTS=ON -DCLINK_INTEGRATION_TESTS=ON $sql_flag
-    cmake --build '$BUILD_DIR' -j\$(( \$(nproc) / 2 ))
-    cd '$BUILD_DIR'
-    ctest --output-on-failure --timeout $CTEST_TIMEOUT $ctest_filter -E '$exclude_re'
-  " || rc=$?
-
-echo ""
-if [[ $rc -eq 0 ]]; then
-  echo "✅ Live suite passed."
+# --- 1. build once, no services running -------------------------------------
+if [[ -z "${SKIP_BUILD:-}" ]]; then
+  echo "▶ Building connector test targets in $IMAGE (no services up, BUILD_DIR=$BUILD_DIR, -j$BUILD_JOBS)..."
+  docker run --rm \
+    -v "$(pwd)":/workspace -w /workspace \
+    -e IN_DOCKER=1 -e CLINK_DEPS_PREFIX=/usr/local \
+    "$IMAGE" bash -c "
+      set -e
+      cmake -S . -B '$BUILD_DIR' -DCLINK_BUILD_TESTS=ON -DCLINK_INTEGRATION_TESTS=ON $sql_flag >/dev/null
+      avail=\$(cmake --build '$BUILD_DIR' --target help 2>/dev/null | grep -oE 'clink_[a-z0-9_]+_tests' | sort -u)
+      build=''
+      for t in $WANT_TARGETS; do echo \"\$avail\" | grep -qx \"\$t\" && build=\"\$build \$t\"; done
+      echo \"▶ building:\$build\"
+      cmake --build '$BUILD_DIR' --target \$build -j$BUILD_JOBS
+    "
 else
-  echo "❌ Live suite reported failures (exit $rc). See the ctest output above."
+  echo "▶ SKIP_BUILD set - reusing $BUILD_DIR."
 fi
-exit $rc
+
+# --- 2. capture which connector test binaries were actually built ----------
+# Detect BLOCKED from the BINARY, not `ctest -N`: gtest_discover_tests runs the
+# exe at enumeration time and can transiently fail, so ctest -N is not a reliable
+# "was it built" signal. A missing binary means the impl compiled to a stub
+# (client lib absent from the image) - that is the real BLOCKED condition.
+echo "▶ Enumerating built connector test binaries..."
+BUILT="$(docker run --rm -v "$(pwd)":/workspace -w "/workspace/$BUILD_DIR" \
+  "$IMAGE" bash -c "find . -type f -name 'clink_*_tests' -exec basename {} ';'" 2>/dev/null | sort -u || true)"
+
+# --- 3. per-connector: provision -> probe -> test -> teardown ---------------
+declare -a SUMMARY
+overall=0
+for entry in "${RUN_LIST[@]}"; do
+  name="${entry%%@@*}";        rest="${entry#*@@}"
+  services="${rest%%@@*}";     rest="${rest#*@@}"
+  target="${rest%%@@*}";       regex="${rest#*@@}"
+
+  # BLOCKED: the connector's test binary was not built (its client lib is absent
+  # from the image, so the impl compiled to a stub). Report it - never provision
+  # services or record a phantom pass for a connector whose tests do not exist.
+  if ! grep -qx "$target" <<<"$BUILT"; then
+    echo ""
+    echo "▶ $name: BLOCKED - test binary $target was not built (missing image client lib?)."
+    SUMMARY+=("$(printf '%-14s BLOCKED (%s not built - missing image dep)' "$name" "$target")")
+    continue
+  fi
+
+  echo ""
+  echo "▶ $name: up [$services] -> test -> down"
+  compose up -d --wait $services
+  probe "$name"
+  set_env "$name"
+
+  rc=0
+  docker run --rm --network "$NETWORK" \
+    -v "$(pwd)":/workspace -w "/workspace/$BUILD_DIR" \
+    -e IN_DOCKER=1 -e CLINK_DEPS_PREFIX=/usr/local \
+    ${ENVARGS[@]+"${ENVARGS[@]}"} \
+    "$IMAGE" ctest --output-on-failure --timeout "$CTEST_TIMEOUT" -R "$regex" || rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    SUMMARY+=("$(printf '%-14s PASS' "$name")")
+  else
+    SUMMARY+=("$(printf '%-14s FAIL (exit %s)' "$name" "$rc")")
+    overall=1
+  fi
+
+  # Tear down just this connector's services before the next one.
+  compose rm -sf $services >/dev/null 2>&1 || true
+done
+
+# --- summary ----------------------------------------------------------------
+echo ""
+echo "================ per-connector live results ================"
+for line in "${SUMMARY[@]}"; do echo "  $line"; done
+echo "============================================================"
+if [[ $overall -eq 0 ]]; then
+  echo "✅ All run connectors passed (BLOCKED = binary not built in image; not a failure)."
+else
+  echo "❌ One or more connectors failed. See the ctest output above."
+fi
+exit $overall

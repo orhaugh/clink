@@ -2,26 +2,21 @@
 # SKIPPED unless their endpoint env var is set, so the normal build/test run
 # never needs this.
 #
-# The one-command path is scripts/run-all-live.sh, which brings these up, builds
-# clink in the pinned toolchain image, runs the suite with the live tests active
-# (pointed at the services over the compose network), and tears down.
+# The one-command path is scripts/run-all-live.sh. It does NOT bring all of these
+# up at once - it builds clink once (no services running), then for EACH connector
+# brings up ONLY that connector's service(s), runs its live tests, and tears them
+# down before the next. So this compose file is the menu of services the runner
+# draws from per connector, not a set to start together.
 #
-# Manual usage (host, published ports):
-#   docker compose -f docker/integration-services.yml up -d --wait
-#   export CLINK_ELASTICSEARCH_TEST_ENDPOINT=http://localhost:9200
-#   export CLINK_KINESIS_TEST_ENDPOINT=http://localhost:4566
-#   export CLINK_S3_TEST_ENDPOINT=http://localhost:4566 CLINK_S3_TEST_BUCKET=clink-live-test
-#   export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1
+# Manual usage for ONE connector (host, published ports) - e.g. redis:
+#   docker compose -f docker/integration-services.yml up -d --wait redis
 #   export CLINK_REDIS_TEST_URL=redis://localhost:6379
-#   export CLINK_MYSQL_TEST_DSN="host=localhost port=3306 user=root password=mysql database=test"
-#   export CLINK_POSTGRES_CDC_TEST_DSN="host=localhost port=5432 user=postgres password=postgres dbname=postgres"
-#   export CLINK_CASSANDRA_TEST_CONTACT_POINTS=127.0.0.1
-#   export CLINK_PUBSUB_EMULATOR_HOST=localhost:8085
-#   ctest --test-dir build -R Live --output-on-failure
-#   docker compose -f docker/integration-services.yml down -v
+#   ctest --test-dir build -R 'RedisLive|RedisUpsertSinkLive' --output-on-failure
+#   docker compose -f docker/integration-services.yml rm -sf redis
+# Or just run one connector through the orchestrator: ONLY=redis scripts/run-all-live.sh
 #
-# (LocalStack accepts any credentials; the dummy test/test keys above just let
-#  the AWS SDK sign requests.)
+# (LocalStack accepts any credentials; the dummy test/test keys the runner sets
+#  just let the AWS SDK sign requests.)
 
 services:
   elasticsearch:
