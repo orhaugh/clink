@@ -82,6 +82,9 @@ CONNECTORS=(
   "elasticsearch@@elasticsearch@@clink_http_connector_tests@@ElasticsearchLive"
   "pubsub@@pubsub@@clink_http_connector_tests@@PubSubLive"
   "cassandra@@cassandra@@clink_cassandra_tests@@CassandraLive|CassandraUpsertSinkLive"
+  "influxdb@@influxdb@@clink_http_connector_tests@@InfluxDbLive"
+  "rabbitmq@@rabbitmq@@clink_rabbitmq_tests@@RabbitMqLive"
+  "pulsar@@pulsar@@clink_pulsar_tests@@PulsarLive"
   # Reported BLOCKED unless the image gains the SDK components (see header):
   "aws-kinesis@@localstack@@clink_aws_tests@@KinesisLive"
 )
@@ -90,7 +93,8 @@ CONNECTORS=(
 # configures, so a connector missing its client lib is simply skipped, not fatal).
 WANT_TARGETS="clink_redis_tests clink_mongodb_tests clink_nats_tests clink_mqtt_tests \
 clink_postgres_tests clink_mysql_tests clink_s3_tests clink_rocksdb_s3_tests \
-clink_http_connector_tests clink_cassandra_tests clink_aws_tests"
+clink_http_connector_tests clink_cassandra_tests clink_pulsar_tests clink_rabbitmq_tests \
+clink_aws_tests"
 
 AWS_ENV=(-e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test
          -e AWS_DEFAULT_REGION=us-east-1 -e AWS_EC2_METADATA_DISABLED=true)
@@ -107,6 +111,9 @@ set_env() {
     postgres)      ENVARGS=(-e "CLINK_POSTGRES_CDC_TEST_DSN=host=postgres-cdc port=5432 user=postgres password=postgres dbname=postgres") ;;
     mysql)         ENVARGS=(-e "CLINK_MYSQL_TEST_DSN=host=mysql port=3306 user=root password=mysql database=test") ;;
     cassandra)     ENVARGS=(-e "CLINK_CASSANDRA_TEST_CONTACT_POINTS=cassandra") ;;
+    influxdb)      ENVARGS=(-e "CLINK_INFLUXDB_TEST_ENDPOINT=http://influxdb:8086" -e "CLINK_INFLUXDB_TEST_ORG=clink" -e "CLINK_INFLUXDB_TEST_BUCKET=clink" -e "CLINK_INFLUXDB_TEST_TOKEN=clink-token") ;;
+    rabbitmq)      ENVARGS=(-e "CLINK_RABBITMQ_TEST_ENDPOINT=rabbitmq" -e "CLINK_RABBITMQ_TEST_USER=clink" -e "CLINK_RABBITMQ_TEST_PASSWORD=clink") ;;
+    pulsar)        ENVARGS=(-e "CLINK_PULSAR_TEST_ENDPOINT=pulsar://pulsar:6650") ;;
     elasticsearch) ENVARGS=(-e "CLINK_ELASTICSEARCH_TEST_ENDPOINT=http://elasticsearch:9200") ;;
     pubsub)        ENVARGS=(-e "CLINK_PUBSUB_EMULATOR_HOST=pubsub:8085") ;;
     s3|rocksdb-s3) ENVARGS=(-e "CLINK_S3_TEST_ENDPOINT=http://localstack:4566" -e "CLINK_S3_TEST_BUCKET=clink-live-test" "${AWS_ENV[@]}") ;;
@@ -186,6 +193,33 @@ probe() {  # connector-name
         sleep 2
       done
       echo "  WARNING: pubsub never served HTTP; its tests may fail." ;;
+    pulsar)
+      # Pulsar standalone is slow to come up; wait for the broker admin health.
+      for i in $(seq 1 60); do
+        code="$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8080/admin/v2/brokers/health" 2>/dev/null || true)"
+        if [[ "$code" == "200" ]]; then echo "  pulsar broker healthy (after $i attempt(s))."; return 0; fi
+        sleep 2
+      done
+      echo "  WARNING: pulsar broker never reported healthy; its tests may fail." ;;
+    influxdb)
+      # v2 init "setup" mode double-starts like mysql (temp server -> setup ->
+      # real server), so `influx ping` can pass before the org/token exist. Verify
+      # the token actually authenticates against the created org.
+      for i in $(seq 1 40); do
+        code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Token clink-token" "http://localhost:8086/api/v2/buckets?org=clink" 2>/dev/null || true)"
+        if [[ "$code" == "200" ]]; then echo "  influxdb ready (org+token live after $i attempt(s))."; return 0; fi
+        sleep 2
+      done
+      echo "  WARNING: influxdb setup not confirmed; its tests may fail." ;;
+    rabbitmq)
+      # ping (the healthcheck) means the node is up; also confirm the AMQP port
+      # is actually accepting before the test declares a queue over it.
+      for i in $(seq 1 40); do
+        if compose exec -T rabbitmq rabbitmq-diagnostics -q check_port_connectivity >/dev/null 2>&1; then
+          echo "  rabbitmq ready (port connectivity ok after $i attempt(s))."; return 0; fi
+        sleep 2
+      done
+      echo "  WARNING: rabbitmq not fully ready; its tests may fail." ;;
     s3|rocksdb-s3)
       # localstack is torn down between connectors, so each localstack-backed
       # connector gets a fresh, empty S3 - create the bucket the tests write to.
