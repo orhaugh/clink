@@ -142,3 +142,40 @@ services:
       - --host-port=0.0.0.0:8085
     ports:
       - "8085:8085"
+
+  # MongoDB as a single-node REPLICA SET (the CDC change-stream source requires
+  # one). scripts/run-all-live.sh runs rs.initiate after startup with the member
+  # host set to the service DNS name, so the driver on the compose network
+  # discovers it. CLINK_MONGODB_TEST_URI: "mongodb://mongodb:27017/?replicaSet=rs0"
+  mongodb:
+    image: mongo:7
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # NATS with JetStream enabled (the sink/source use JetStream streams).
+  # Monitoring on 8222 gives a /healthz readiness probe (the nats image has no
+  # shell, so no container healthcheck; run-all-live.sh probes /healthz).
+  # CLINK_NATS_TEST_ENDPOINT: "nats://nats:4222"
+  nats:
+    image: nats:2.10
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+  # Mosquitto MQTT broker, anonymous plain 1883 (see docker/mosquitto.conf).
+  # CLINK_MQTT_TEST_URL: "mqtt://mqtt:1883"
+  mqtt:
+    image: eclipse-mosquitto:2
+    command: ["mosquitto", "-c", "/mosquitto/config/mosquitto.conf"]
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    ports:
+      - "1883:1883"

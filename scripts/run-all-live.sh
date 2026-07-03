@@ -13,10 +13,10 @@
 #
 # Services wired so far (docker/integration-services.yml):
 #   postgres, mysql, redis, cassandra, elasticsearch, aws/kinesis + s3
-#   (localstack), pubsub. Kafka needs no service - it is tested against an
-#   in-process librdkafka mock. Connectors without a service yet (mongodb, nats,
-#   mqtt, pulsar, influxdb, gcs, azure, webhdfs, iceberg-REST, etcd) self-skip;
-#   they will activate as their services are added here.
+#   (localstack), pubsub, mongodb, nats, mqtt. Kafka needs no service - it is
+#   tested against an in-process librdkafka mock. Connectors without a service yet
+#   (pulsar, influxdb, gcs, azure, webhdfs, iceberg-REST, etcd) self-skip; they
+#   will activate as their services are added here.
 #
 # Everything runs inside IMAGE (the pinned toolchain image) on the compose
 # network, so it needs no host toolchain and reaches services by DNS name.
@@ -87,6 +87,44 @@ if docker compose -f "$COMPOSE" -p "$PROJECT" ps --services --filter status=runn
   [[ -z "$cass_ready" ]] && echo "  WARNING: Cassandra never accepted DDL in ~120s; its tests may fail."
 fi
 
+# MongoDB: the change-stream source needs a replica set. Initiate the single-node
+# set (member host = the service DNS name so the driver on the compose network
+# discovers it), then wait for it to elect a PRIMARY.
+if docker compose -f "$COMPOSE" -p "$PROJECT" ps --services --filter status=running 2>/dev/null | grep -qx mongodb; then
+  echo "▶ Initiating MongoDB replica set + waiting for PRIMARY..."
+  docker compose -f "$COMPOSE" -p "$PROJECT" exec -T mongodb mongosh --quiet --eval \
+    "try { rs.status() } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongodb:27017'}]}) }" \
+    >/dev/null 2>&1 || true
+  for i in $(seq 1 40); do
+    if docker compose -f "$COMPOSE" -p "$PROJECT" exec -T mongodb mongosh --quiet --eval \
+         "db.hello().isWritablePrimary" 2>/dev/null | grep -qx true; then
+      echo "  MongoDB replica set PRIMARY ready (after ${i} attempt(s))."
+      break
+    fi
+    sleep 3
+  done
+fi
+
+# NATS (JetStream) + MQTT readiness on their published ports (the nats image has
+# no shell for a container healthcheck; mqtt just needs its listener up).
+wait_http() {  # $1=url $2=name
+  for _ in $(seq 1 40); do
+    if curl -fsS "$1" >/dev/null 2>&1; then echo "  $2 ready."; return 0; fi
+    sleep 2
+  done
+  echo "  WARNING: $2 not ready ($1); its tests may fail."
+}
+wait_tcp() {  # $1=host $2=port $3=name
+  for _ in $(seq 1 40); do
+    if (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null; then exec 3>&- 3<&-; echo "  $3 ready."; return 0; fi
+    sleep 2
+  done
+  echo "  WARNING: $3 not ready ($1:$2); its tests may fail."
+}
+echo "▶ Waiting for NATS JetStream + MQTT..."
+wait_http "http://localhost:8222/healthz" "NATS JetStream"
+wait_tcp localhost 1883 "MQTT"
+
 # Live-test env, pointing at the services by their compose DNS names (the test
 # container joins the same network). LocalStack accepts the dummy AWS creds.
 declare -a env_args=(
@@ -99,6 +137,9 @@ declare -a env_args=(
   -e "CLINK_S3_TEST_ENDPOINT=http://localstack:4566"
   -e "CLINK_S3_TEST_BUCKET=clink-live-test"
   -e "CLINK_PUBSUB_EMULATOR_HOST=pubsub:8085"
+  -e "CLINK_MONGODB_TEST_URI=mongodb://mongodb:27017/?replicaSet=rs0"
+  -e "CLINK_NATS_TEST_ENDPOINT=nats://nats:4222"
+  -e "CLINK_MQTT_TEST_URL=mqtt://mqtt:1883"
   -e "AWS_ACCESS_KEY_ID=test"
   -e "AWS_SECRET_ACCESS_KEY=test"
   -e "AWS_DEFAULT_REGION=us-east-1"
