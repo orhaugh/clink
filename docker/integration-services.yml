@@ -262,3 +262,31 @@ services:
     ports:
       - "50070:50070"
       - "50075:50075"
+
+  # Apache Iceberg REST catalog (ASF fixture) for the iceberg REST + S3 live ITs.
+  # It keeps the table pointers in an in-container SQLite catalog but its WAREHOUSE
+  # is S3 (localstack) via S3FileIO, so metadata + data files land on S3 exactly as
+  # a production REST+S3 lakehouse would. The clink test creates its own namespace +
+  # table over REST. The warehouse bucket (clink-iceberg-rest) is pre-created by the
+  # readiness probe. CLINK_ICEBERG_REST_URI: "http://iceberg-rest:8181"
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:latest
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      - CATALOG_WAREHOUSE=s3://clink-iceberg-rest/wh
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://localstack:4566
+      - CATALOG_S3_PATH__STYLE__ACCESS=true
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_REGION=us-east-1
+    ports:
+      - "8181:8181"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8181/v1/config || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s

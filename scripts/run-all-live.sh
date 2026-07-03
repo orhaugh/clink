@@ -47,10 +47,11 @@
 #                  clink_aws_tests is never built. It is kept in the registry so the
 #                  gap is surfaced every run rather than forgotten; add the SDK
 #                  components + rebuild the image to turn it green.
-#   iceberg-s3   - deliberately NOT in the registry: IcebergS3Live activates on
-#                  CLINK_S3_TEST_ENDPOINT alone but needs an Iceberg REST catalog + a
-#                  pre-created bucket, and crashes rather than skipping when they are
-#                  absent. Add it once the REST catalog service is wired.
+#   iceberg      - runs IcebergRestLive (REST catalog over an S3 warehouse). Uses two
+#                  services: localstack (the S3 warehouse) + iceberg-rest. The sibling
+#                  IcebergS3Live (local SQLite catalog over S3) is NOT run: it SEGFAULTS
+#                  even with the bucket pre-created - a pre-existing bug in that test,
+#                  not a wiring gap. Re-add it to the filter once that crash is fixed.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -88,6 +89,7 @@ CONNECTORS=(
   "gcs@@gcs@@clink_gcs_tests@@GcsParquetLive"
   "azure@@azurite@@clink_azure_tests@@AzureParquetLive"
   "webhdfs@@webhdfs@@clink_webhdfs_tests@@WebHdfsParquetLive"
+  "iceberg@@localstack iceberg-rest@@clink_iceberg_tests@@IcebergRestLive"
   # Reported BLOCKED unless the image gains the SDK components (see header):
   "aws-kinesis@@localstack@@clink_aws_tests@@KinesisLive"
 )
@@ -97,7 +99,7 @@ CONNECTORS=(
 WANT_TARGETS="clink_redis_tests clink_mongodb_tests clink_nats_tests clink_mqtt_tests \
 clink_postgres_tests clink_mysql_tests clink_s3_tests clink_rocksdb_s3_tests \
 clink_http_connector_tests clink_cassandra_tests clink_pulsar_tests clink_rabbitmq_tests \
-clink_gcs_tests clink_azure_tests clink_webhdfs_tests clink_aws_tests"
+clink_gcs_tests clink_azure_tests clink_webhdfs_tests clink_iceberg_tests clink_aws_tests"
 
 AWS_ENV=(-e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test
          -e AWS_DEFAULT_REGION=us-east-1 -e AWS_EC2_METADATA_DISABLED=true)
@@ -120,6 +122,7 @@ set_env() {
     gcs)           ENVARGS=(-e "CLINK_GCS_TEST_ENDPOINT=gcs:4443") ;;
     azure)         ENVARGS=(-e "CLINK_AZURE_TEST_ENDPOINT=azurite:10000") ;;
     webhdfs)       ENVARGS=(-e "CLINK_WEBHDFS_TEST_ENDPOINT=http://webhdfs:50070" -e "CLINK_WEBHDFS_TEST_USER=root") ;;
+    iceberg)       ENVARGS=(-e "CLINK_ICEBERG_REST_URI=http://iceberg-rest:8181" -e "CLINK_ICEBERG_REST_WAREHOUSE=s3://clink-iceberg-rest/wh" -e "CLINK_S3_TEST_ENDPOINT=http://localstack:4566" -e "CLINK_S3_TEST_BUCKET=clink-iceberg-rest" "${AWS_ENV[@]}") ;;
     elasticsearch) ENVARGS=(-e "CLINK_ELASTICSEARCH_TEST_ENDPOINT=http://elasticsearch:9200") ;;
     pubsub)        ENVARGS=(-e "CLINK_PUBSUB_EMULATOR_HOST=pubsub:8085") ;;
     s3|rocksdb-s3) ENVARGS=(-e "CLINK_S3_TEST_ENDPOINT=http://localstack:4566" -e "CLINK_S3_TEST_BUCKET=clink-live-test" "${AWS_ENV[@]}") ;;
@@ -268,6 +271,18 @@ probe() {  # connector-name
       done
       compose exec -T webhdfs bash -lc "hdfs dfsadmin -safemode leave; hdfs dfs -mkdir -p /tmp; hdfs dfs -chmod 1777 /tmp" >/dev/null 2>&1 || true
       echo "  webhdfs ready (live datanode + safemode left, /tmp writable)." ;;
+    iceberg)
+      # Pre-create the warehouse bucket (localstack is torn down between connectors,
+      # so it starts empty; neither the REST catalog nor IcebergS3Live creates it).
+      compose exec -T localstack awslocal s3 mb s3://clink-iceberg-rest >/dev/null 2>&1 || true
+      # Wait for the REST catalog to actually serve (its container has a healthcheck,
+      # but belt-and-braces since it starts a JVM after localstack is healthy).
+      for i in $(seq 1 40); do
+        code="$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8181/v1/config" 2>/dev/null || true)"
+        if [[ "$code" == "200" ]]; then echo "  iceberg-rest serving (HTTP 200 after $i attempt(s)), bucket ensured."; return 0; fi
+        sleep 2
+      done
+      echo "  WARNING: iceberg-rest catalog never served /v1/config; its tests may fail." ;;
     *) : ;;  # compose --wait on the service healthcheck was sufficient
   esac
 }
