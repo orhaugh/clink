@@ -129,9 +129,19 @@ TEST(EtcdHaCoordinator, OnlyOneOfTwoCoordinatorsWinsTheElection) {
     ASSERT_NE(coord_a->is_leader(), coord_b->is_leader())
         << "both or neither became leader simultaneously";
 
-    // The loser still reads the winner's endpoint via etcd.
+    // The loser still reads the winner's endpoint via etcd. Poll briefly: the
+    // winner writes the leader key atomically on acquire, but the loser observes
+    // it via its own client, so allow a moment for the read to reflect it (same
+    // tolerance the leadership check above already uses).
     auto* loser = coord_a->is_leader() ? coord_b.get() : coord_a.get();
-    auto winner_ep = loser->current_leader_endpoint();
+    std::optional<LeaderEndpoint> winner_ep;
+    const auto ep_deadline = std::chrono::steady_clock::now() + 3s;
+    while (std::chrono::steady_clock::now() < ep_deadline) {
+        winner_ep = loser->current_leader_endpoint();
+        if (winner_ep.has_value())
+            break;
+        std::this_thread::sleep_for(50ms);
+    }
     ASSERT_TRUE(winner_ep.has_value());
     EXPECT_TRUE(winner_ep->host == "10.0.0.1" || winner_ep->host == "10.0.0.2");
 

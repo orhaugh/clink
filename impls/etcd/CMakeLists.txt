@@ -24,17 +24,18 @@ if(CLINK_WITH_ETCD STREQUAL "OFF")
     return()
 endif()
 
-# etcd-cpp-apiv3 ships an etcd-cpp-apiv3 CMake package; CMake config
-# may also be named "etcd". Try both.
-find_package(etcd-cpp-apiv3 CONFIG QUIET)
-if(NOT etcd-cpp-apiv3_FOUND)
+# etcd-cpp-apiv3 installs a CMake config package named "etcd-cpp-api" (NOT
+# -apiv3), which exports the IMPORTED target "etcd-cpp-api". Some builds also
+# name it plain "etcd"; try both.
+find_package(etcd-cpp-api CONFIG QUIET)
+if(NOT etcd-cpp-api_FOUND)
     find_package(etcd CONFIG QUIET)
 endif()
-if(NOT etcd-cpp-apiv3_FOUND AND NOT etcd_FOUND)
+if(NOT etcd-cpp-api_FOUND AND NOT etcd_FOUND)
     if(CLINK_WITH_ETCD STREQUAL "ON")
         message(FATAL_ERROR "CLINK_WITH_ETCD=ON but etcd-cpp-apiv3 not found")
     endif()
-    message(STATUS "clink::etcd - etcd-cpp-apiv3 not found; target not defined")
+    message(STATUS "clink::etcd - etcd-cpp-api not found; target not defined")
     return()
 endif()
 
@@ -58,7 +59,7 @@ clink_set_warnings(clink_etcd)
 clink_install_impl(
     TARGET   clink_etcd
     NAME     etcd
-    FIND_DEP "find_dependency(etcd-cpp-apiv3 CONFIG)")
+    FIND_DEP "find_dependency(etcd-cpp-api CONFIG)")
 
 if(CLINK_BUILD_TESTS)
     add_subdirectory(tests)

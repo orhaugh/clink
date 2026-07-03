@@ -90,6 +90,7 @@ CONNECTORS=(
   "azure@@azurite@@clink_azure_tests@@AzureParquetLive"
   "webhdfs@@webhdfs@@clink_webhdfs_tests@@WebHdfsParquetLive"
   "iceberg@@localstack iceberg-rest@@clink_iceberg_tests@@IcebergRestLive"
+  "etcd@@etcd@@clink_etcd_tests@@EtcdHaCoordinator"
   # Reported BLOCKED unless the image gains the SDK components (see header):
   "aws-kinesis@@localstack@@clink_aws_tests@@KinesisLive"
 )
@@ -99,7 +100,8 @@ CONNECTORS=(
 WANT_TARGETS="clink_redis_tests clink_mongodb_tests clink_nats_tests clink_mqtt_tests \
 clink_postgres_tests clink_mysql_tests clink_s3_tests clink_rocksdb_s3_tests \
 clink_http_connector_tests clink_cassandra_tests clink_pulsar_tests clink_rabbitmq_tests \
-clink_gcs_tests clink_azure_tests clink_webhdfs_tests clink_iceberg_tests clink_aws_tests"
+clink_gcs_tests clink_azure_tests clink_webhdfs_tests clink_iceberg_tests clink_etcd_tests \
+clink_aws_tests"
 
 AWS_ENV=(-e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test
          -e AWS_DEFAULT_REGION=us-east-1 -e AWS_EC2_METADATA_DISABLED=true)
@@ -123,6 +125,7 @@ set_env() {
     azure)         ENVARGS=(-e "CLINK_AZURE_TEST_ENDPOINT=azurite:10000") ;;
     webhdfs)       ENVARGS=(-e "CLINK_WEBHDFS_TEST_ENDPOINT=http://webhdfs:50070" -e "CLINK_WEBHDFS_TEST_USER=root") ;;
     iceberg)       ENVARGS=(-e "CLINK_ICEBERG_REST_URI=http://iceberg-rest:8181" -e "CLINK_ICEBERG_REST_WAREHOUSE=s3://clink-iceberg-rest/wh" -e "CLINK_S3_TEST_ENDPOINT=http://localstack:4566" -e "CLINK_S3_TEST_BUCKET=clink-iceberg-rest" "${AWS_ENV[@]}") ;;
+    etcd)          ENVARGS=(-e "CLINK_ETCD_ENDPOINT=http://etcd:2379") ;;
     elasticsearch) ENVARGS=(-e "CLINK_ELASTICSEARCH_TEST_ENDPOINT=http://elasticsearch:9200") ;;
     pubsub)        ENVARGS=(-e "CLINK_PUBSUB_EMULATOR_HOST=pubsub:8085") ;;
     s3|rocksdb-s3) ENVARGS=(-e "CLINK_S3_TEST_ENDPOINT=http://localstack:4566" -e "CLINK_S3_TEST_BUCKET=clink-live-test" "${AWS_ENV[@]}") ;;

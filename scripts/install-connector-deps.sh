@@ -38,7 +38,13 @@ apt-get update && apt-get install -y --no-install-recommends \
     liburing-dev \
     librabbitmq-dev \
     libnats-dev \
-    libmosquitto-dev
+    libmosquitto-dev \
+    libgrpc++-dev \
+    libgrpc-dev \
+    protobuf-compiler-grpc \
+    libprotobuf-dev \
+    protobuf-compiler \
+    libcpprest-dev
 
 # Kafka mock-broker tests rely on rdkafka_mock.h, which ships with
 # librdkafka >= 1.3. Debian trixie has 2.x - verify so future image
@@ -100,6 +106,26 @@ if [ ! -f "/usr/local/lib/cmake/mongocxx-${MONGO_CXX_DRIVER_VERSION}/mongocxxCon
         -DENABLE_TESTS=OFF -DBUILD_SHARED_AND_STATIC_LIBS=OFF
     cmake --build "${_mongo_tmp}/build-cxx" --target install -j "${_mongo_jobs}"
     rm -rf "${_mongo_tmp}"
+    ldconfig
+fi
+
+# -- etcd-cpp-apiv3 (etcd HaCoordinator connector) --
+# Not in Debian apt, so build from source into /usr/local like the mongo drivers.
+# Its gRPC / Protobuf / cpprestsdk deps ARE apt packages (in the apt block above);
+# c-ares and RE2, pulled transitively by grpc, are already in the image. The
+# installed CMake config package is named "etcd-cpp-api" (impls/etcd/CMakeLists.txt
+# find_package(etcd-cpp-api CONFIG) matches it).
+if [ ! -f "/usr/local/lib/cmake/etcd-cpp-api/etcd-cpp-api-config.cmake" ]; then
+    echo "▶ Building etcd-cpp-apiv3 ${ETCD_CPP_APIV3_VERSION} from source..."
+    _etcd_jobs="${CLINK_BUILD_JOBS:-$(nproc)}"
+    _etcd_tmp="$(mktemp -d)"
+    git clone --depth 1 --branch "v${ETCD_CPP_APIV3_VERSION}" \
+        https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git "${_etcd_tmp}/src"
+    cmake -S "${_etcd_tmp}/src" -B "${_etcd_tmp}/build" \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_ETCD_TESTS=OFF
+    cmake --build "${_etcd_tmp}/build" --target install -j "${_etcd_jobs}"
+    rm -rf "${_etcd_tmp}"
     ldconfig
 fi
 
