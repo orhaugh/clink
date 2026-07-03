@@ -37,7 +37,8 @@ apt-get update && apt-get install -y --no-install-recommends \
     libmariadb-dev \
     liburing-dev \
     librabbitmq-dev \
-    libnats-dev
+    libnats-dev \
+    libmosquitto-dev
 
 # Kafka mock-broker tests rely on rdkafka_mock.h, which ships with
 # librdkafka >= 1.3. Debian trixie has 2.x - verify so future image
@@ -66,6 +67,39 @@ if [ ! -f "/usr/lib/libpulsar.so" ] && [ ! -f "/usr/lib/$(dpkg-architecture -qDE
     apt-get update >/dev/null 2>&1 || true
     dpkg -i "${_pulsar_tmp}/client.deb" "${_pulsar_tmp}/client-dev.deb" || apt-get install -y -f
     rm -rf "${_pulsar_tmp}"
+    ldconfig
+fi
+
+# -- MongoDB C and C++ drivers (mongodb connector) --
+# mongo-cxx-driver was dropped from Debian, so unlike the apt libs above we build both drivers
+# from source (pinned in versions.env) into /usr/local: the C++ driver (mongocxx/bsoncxx) links
+# the C driver (libmongoc/libbson). impls/mongodb discovers the result via the mongocxx CONFIG
+# package it installs. Slow, but it is a from-source build in the CHEAP layer so it stays cached
+# and never re-runs the expensive Arrow/aws layer above.
+if [ ! -f "/usr/local/lib/cmake/mongocxx-${MONGO_CXX_DRIVER_VERSION}/mongocxxConfig.cmake" ] \
+   && [ ! -f "/usr/local/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null)/cmake/mongocxx-${MONGO_CXX_DRIVER_VERSION}/mongocxxConfig.cmake" ]; then
+    echo "▶ Building mongo-c-driver ${MONGO_C_DRIVER_VERSION} + mongo-cxx-driver ${MONGO_CXX_DRIVER_VERSION} from source..."
+    _mongo_jobs="${CLINK_BUILD_JOBS:-$(nproc)}"
+    _mongo_tmp="$(mktemp -d)"
+    # C driver (libmongoc / libbson). BUILD_VERSION is required for a tarball build (no git).
+    curl -fsSL "https://github.com/mongodb/mongo-c-driver/releases/download/${MONGO_C_DRIVER_VERSION}/mongo-c-driver-${MONGO_C_DRIVER_VERSION}.tar.gz" \
+        | tar xz -C "${_mongo_tmp}"
+    cmake -S "${_mongo_tmp}/mongo-c-driver-${MONGO_C_DRIVER_VERSION}" -B "${_mongo_tmp}/build-c" \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_VERSION="${MONGO_C_DRIVER_VERSION}" \
+        -DENABLE_TESTS=OFF -DENABLE_EXAMPLES=OFF -DENABLE_STATIC=OFF
+    cmake --build "${_mongo_tmp}/build-c" --target install -j "${_mongo_jobs}"
+    ldconfig
+    # C++ driver (mongocxx / bsoncxx), against the C driver just installed.
+    curl -fsSL "https://github.com/mongodb/mongo-cxx-driver/releases/download/r${MONGO_CXX_DRIVER_VERSION}/mongo-cxx-driver-r${MONGO_CXX_DRIVER_VERSION}.tar.gz" \
+        | tar xz -C "${_mongo_tmp}"
+    cmake -S "${_mongo_tmp}/mongo-cxx-driver-r${MONGO_CXX_DRIVER_VERSION}" -B "${_mongo_tmp}/build-cxx" \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_PREFIX_PATH=/usr/local -DCMAKE_CXX_STANDARD=17 \
+        -DBUILD_VERSION="${MONGO_CXX_DRIVER_VERSION}" \
+        -DENABLE_TESTS=OFF -DBUILD_SHARED_AND_STATIC_LIBS=OFF
+    cmake --build "${_mongo_tmp}/build-cxx" --target install -j "${_mongo_jobs}"
+    rm -rf "${_mongo_tmp}"
     ldconfig
 fi
 
