@@ -1,0 +1,163 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: clinkjobs.clink.dev
+spec:
+  group: clink.dev
+  names:
+    kind: ClinkJob
+    listKind: ClinkJobList
+    plural: clinkjobs
+    shortNames:
+    - cj
+    singular: clinkjob
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.clusterName
+      name: Cluster
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.jobID
+      name: JobID
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ClinkJob is a job (compiled .so plugin) run on a ClinkCluster, with
+          declarative savepoint-on-upgrade: changing the spec drains the running job to a
+          savepoint and restarts it restored from that savepoint.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ClinkJobSpec is the desired state of a job running on a ClinkCluster.
+            properties:
+              args:
+                description: Args are extra `clink run` flags (e.g. --parallelism).
+                  Rarely needed.
+                items:
+                  type: string
+                type: array
+              checkpointIntervalMs:
+                default: 0
+                description: |-
+                  CheckpointIntervalMs enables periodic checkpointing (0 = off). Must be > 0
+                  for upgradeMode=savepoint to preserve state.
+                format: int64
+                type: integer
+              clusterName:
+                description: ClusterName is the ClinkCluster (same namespace) to run
+                  this job on.
+                type: string
+              env:
+                description: |-
+                  Env are extra environment variables passed to the job at submit (KEY=VALUE).
+                  Changing Env or JobSo triggers an upgrade.
+                items:
+                  type: string
+                type: array
+              jobName:
+                default: job
+                type: string
+              jobSo:
+                description: JobSo is the path to the compiled job plugin (.so) inside
+                  the runtime image.
+                type: string
+              upgradeMode:
+                default: savepoint
+                description: |-
+                  UpgradeMode selects how a spec change is rolled out:
+                    savepoint - trigger a savepoint, cancel, resubmit with --restore-from-dir
+                    stateless - cancel and resubmit fresh (no state carried over)
+                enum:
+                - savepoint
+                - stateless
+                type: string
+            required:
+            - clusterName
+            - jobSo
+            type: object
+          status:
+            description: ClinkJobStatus is the observed state of a job.
+            properties:
+              jobID:
+                description: JobID is the JobManager-assigned id of the currently-running
+                  job.
+                format: int64
+                type: integer
+              lastSavepoint:
+                description: LastSavepoint is the savepoint taken on the most recent
+                  upgrade.
+                properties:
+                  checkpointId:
+                    format: int64
+                    type: integer
+                  dir:
+                    type: string
+                type: object
+              message:
+                description: Message is a short human-readable status detail.
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the .metadata.generation last reconciled.
+                format: int64
+                type: integer
+              phase:
+                description: |-
+                  Phase: Pending (cluster not ready), Submitting, Running, Upgrading,
+                  Completed, Failed, Cancelled.
+                type: string
+              specHash:
+                description: |-
+                  SpecHash is a hash of the running job's inputs (JobSo+Env+Args); a change
+                  versus the current spec is what triggers an upgrade.
+                type: string
+              upgradeRestore:
+                description: |-
+                  UpgradeRestore is the savepoint the in-flight upgrade will restore from
+                  (nil for a stateless upgrade). Held across resubmit retries.
+                properties:
+                  checkpointId:
+                    format: int64
+                    type: integer
+                  dir:
+                    type: string
+                type: object
+              upgradeToHash:
+                description: |-
+                  UpgradeToHash is the target spec hash of an in-flight upgrade. It is set
+                  once the savepoint + cancel of the old job have completed, so a slow or
+                  retried resubmit does not re-take a savepoint on the already-cancelled
+                  job. Cleared when the new job reaches Running.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

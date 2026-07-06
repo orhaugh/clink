@@ -60,6 +60,28 @@ type HASpec struct {
 	Size string `json:"size,omitempty"`
 }
 
+// CheckpointStorageSpec mounts a shared volume into every JobManager and
+// TaskManager pod at MountPath, so checkpoints and savepoints written by one pod
+// are readable by another (required for savepoint-on-upgrade restore, where the
+// resubmitted job's TaskManagers must read the savepoint the old job wrote). A
+// ClinkJob points its --checkpoint-dir under this path.
+type CheckpointStorageSpec struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// +kubebuilder:default="/var/lib/clink/checkpoints"
+	MountPath string `json:"mountPath,omitempty"`
+	// +kubebuilder:validation:Enum=pvc;hostPath
+	// +kubebuilder:default=pvc
+	Type string `json:"type,omitempty"`
+	// StorageClassName for the shared PVC (must support ReadWriteMany).
+	StorageClassName *string `json:"storageClassName,omitempty"`
+	// +kubebuilder:default="2Gi"
+	Size string `json:"size,omitempty"`
+	// HostPath is used when Type=hostPath (single-node clusters e.g. kind, where
+	// all pods share the node filesystem). Ignored for Type=pvc.
+	// +kubebuilder:default="/var/lib/clink-checkpoints"
+	HostPath string `json:"hostPath,omitempty"`
+}
+
 // ClinkClusterSpec is the desired state of a clink cluster.
 type ClinkClusterSpec struct {
 	Image              ImageSpec                     `json:"image,omitempty"`
@@ -68,6 +90,7 @@ type ClinkClusterSpec struct {
 	JobManager         JobManagerSpec                `json:"jobManager,omitempty"`
 	TaskManager        TaskManagerSpec               `json:"taskManager,omitempty"`
 	HA                 HASpec                        `json:"ha,omitempty"`
+	CheckpointStorage  CheckpointStorageSpec         `json:"checkpointStorage,omitempty"`
 }
 
 // ClinkClusterStatus is the observed state of a clink cluster.

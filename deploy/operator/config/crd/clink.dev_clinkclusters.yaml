@@ -57,6 +57,39 @@ spec:
           spec:
             description: ClinkClusterSpec is the desired state of a clink cluster.
             properties:
+              checkpointStorage:
+                description: |-
+                  CheckpointStorageSpec mounts a shared volume into every JobManager and
+                  TaskManager pod at MountPath, so checkpoints and savepoints written by one pod
+                  are readable by another (required for savepoint-on-upgrade restore, where the
+                  resubmitted job's TaskManagers must read the savepoint the old job wrote). A
+                  ClinkJob points its --checkpoint-dir under this path.
+                properties:
+                  enabled:
+                    type: boolean
+                  hostPath:
+                    default: /var/lib/clink-checkpoints
+                    description: |-
+                      HostPath is used when Type=hostPath (single-node clusters e.g. kind, where
+                      all pods share the node filesystem). Ignored for Type=pvc.
+                    type: string
+                  mountPath:
+                    default: /var/lib/clink/checkpoints
+                    type: string
+                  size:
+                    default: 2Gi
+                    type: string
+                  storageClassName:
+                    description: StorageClassName for the shared PVC (must support
+                      ReadWriteMany).
+                    type: string
+                  type:
+                    default: pvc
+                    enum:
+                    - pvc
+                    - hostPath
+                    type: string
+                type: object
               ha:
                 description: |-
                   HASpec turns on multi-JobManager high availability with file-coordinator

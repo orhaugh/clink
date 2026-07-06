@@ -65,6 +65,11 @@ func (r *ClinkClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, err
 		}
 	}
+	if cc.Spec.CheckpointStorage.Enabled && cc.Spec.CheckpointStorage.Type == "pvc" {
+		if err := r.reconcileCheckpointPVC(ctx, &cc); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if err := r.reconcileJMService(ctx, &cc); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -143,6 +148,20 @@ func applyDefaults(cc *clinkv1alpha1.ClinkCluster) {
 			s.HA.Size = "1Gi"
 		}
 	}
+	if s.CheckpointStorage.Enabled {
+		if s.CheckpointStorage.MountPath == "" {
+			s.CheckpointStorage.MountPath = "/var/lib/clink/checkpoints"
+		}
+		if s.CheckpointStorage.Type == "" {
+			s.CheckpointStorage.Type = "pvc"
+		}
+		if s.CheckpointStorage.Size == "" {
+			s.CheckpointStorage.Size = "2Gi"
+		}
+		if s.CheckpointStorage.HostPath == "" {
+			s.CheckpointStorage.HostPath = "/var/lib/clink-checkpoints"
+		}
+	}
 }
 
 // ---- naming + labels -------------------------------------------------------
@@ -158,6 +177,27 @@ func (r *ClinkClusterReconciler) tmHeadlessName(cc *clinkv1alpha1.ClinkCluster) 
 }
 func (r *ClinkClusterReconciler) haPVCName(cc *clinkv1alpha1.ClinkCluster) string {
 	return cc.Name + "-ha"
+}
+func (r *ClinkClusterReconciler) checkpointPVCName(cc *clinkv1alpha1.ClinkCluster) string {
+	return cc.Name + "-checkpoints"
+}
+
+// checkpointVolume returns the shared checkpoint volume + mount for a JM/TM pod,
+// or ok=false when checkpoint storage is disabled.
+func (r *ClinkClusterReconciler) checkpointVolume(cc *clinkv1alpha1.ClinkCluster) (corev1.Volume, corev1.VolumeMount, bool) {
+	cs := cc.Spec.CheckpointStorage
+	if !cs.Enabled {
+		return corev1.Volume{}, corev1.VolumeMount{}, false
+	}
+	mount := corev1.VolumeMount{Name: "checkpoints", MountPath: cs.MountPath}
+	var src corev1.VolumeSource
+	if cs.Type == "hostPath" {
+		hpType := corev1.HostPathDirectoryOrCreate
+		src = corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: cs.HostPath, Type: &hpType}}
+	} else {
+		src = corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: r.checkpointPVCName(cc)}}
+	}
+	return corev1.Volume{Name: "checkpoints", VolumeSource: src}, mount, true
 }
 func (r *ClinkClusterReconciler) serviceAccountName(cc *clinkv1alpha1.ClinkCluster) string {
 	if cc.Spec.ServiceAccountName != "" {
@@ -217,6 +257,27 @@ func (r *ClinkClusterReconciler) reconcileHAPVC(ctx context.Context, cc *clinkv1
 	pvc.Spec = corev1.PersistentVolumeClaimSpec{
 		AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
 		StorageClassName: cc.Spec.HA.StorageClassName,
+		Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: qty}},
+	}
+	if err := controllerutil.SetControllerReference(cc, pvc, r.Scheme); err != nil {
+		return err
+	}
+	return r.Create(ctx, pvc)
+}
+
+func (r *ClinkClusterReconciler) reconcileCheckpointPVC(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) error {
+	qty, err := resource.ParseQuantity(cc.Spec.CheckpointStorage.Size)
+	if err != nil {
+		return fmt.Errorf("invalid checkpointStorage.size %q: %w", cc.Spec.CheckpointStorage.Size, err)
+	}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: r.checkpointPVCName(cc), Namespace: cc.Namespace}}
+	if err := r.Get(ctx, types.NamespacedName{Name: pvc.Name, Namespace: cc.Namespace}, pvc); err == nil {
+		return nil // PVC spec is largely immutable; create-once
+	}
+	pvc.Labels = baseLabels(cc)
+	pvc.Spec = corev1.PersistentVolumeClaimSpec{
+		AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+		StorageClassName: cc.Spec.CheckpointStorage.StorageClassName,
 		Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: qty}},
 	}
 	if err := controllerutil.SetControllerReference(cc, pvc, r.Scheme); err != nil {
@@ -300,12 +361,18 @@ func (r *ClinkClusterReconciler) reconcileJMDeployment(ctx context.Context, cc *
 			Resources:      cc.Spec.JobManager.Resources,
 		}
 		var volumes []corev1.Volume
+		var mounts []corev1.VolumeMount
 		if cc.Spec.HA.Enabled {
-			c.VolumeMounts = []corev1.VolumeMount{{Name: "ha", MountPath: cc.Spec.HA.MountPath}}
-			volumes = []corev1.Volume{{Name: "ha", VolumeSource: corev1.VolumeSource{
+			mounts = append(mounts, corev1.VolumeMount{Name: "ha", MountPath: cc.Spec.HA.MountPath})
+			volumes = append(volumes, corev1.Volume{Name: "ha", VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: r.haPVCName(cc)},
-			}}}
+			}})
 		}
+		if v, m, ok := r.checkpointVolume(cc); ok {
+			mounts = append(mounts, m)
+			volumes = append(volumes, v)
+		}
+		c.VolumeMounts = mounts
 		dep.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: componentLabels(cc, "jobmanager")},
 			Spec: corev1.PodSpec{
@@ -363,15 +430,19 @@ func (r *ClinkClusterReconciler) reconcileTMStatefulSet(ctx context.Context, cc 
 			Ports:     []corev1.ContainerPort{{Name: "http", ContainerPort: cc.Spec.TaskManager.HTTPPort}},
 			Resources: cc.Spec.TaskManager.Resources,
 		}
-		var volumeMounts []corev1.VolumeMount
 		var volumes []corev1.Volume
+		var mounts []corev1.VolumeMount
 		if cc.Spec.HA.Enabled {
-			volumeMounts = []corev1.VolumeMount{{Name: "ha", MountPath: cc.Spec.HA.MountPath}}
-			volumes = []corev1.Volume{{Name: "ha", VolumeSource: corev1.VolumeSource{
+			mounts = append(mounts, corev1.VolumeMount{Name: "ha", MountPath: cc.Spec.HA.MountPath})
+			volumes = append(volumes, corev1.Volume{Name: "ha", VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: r.haPVCName(cc)},
-			}}}
-			tm.VolumeMounts = volumeMounts
+			}})
 		}
+		if v, m, ok := r.checkpointVolume(cc); ok {
+			mounts = append(mounts, m)
+			volumes = append(volumes, v)
+		}
+		tm.VolumeMounts = mounts
 		ss.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: componentLabels(cc, "taskmanager")},
 			Spec: corev1.PodSpec{

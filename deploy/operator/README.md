@@ -85,15 +85,77 @@ deploy/operator/kind-operator-smoke.sh
 deploy/operator/kind-operator-smoke.sh --cleanup
 ```
 
+`kind-clinkjob-smoke.sh` covers the `ClinkJob` path (submit, savepoint-on-upgrade,
+cancel-on-delete) on top of the same kind setup.
+
+## Jobs (ClinkJob + savepoint-on-upgrade)
+
+A `ClinkJob` runs a compiled job plugin (`.so`, baked into the runtime image) on a
+`ClinkCluster` and manages its lifecycle declaratively. The controller submits the
+job by exec'ing the in-image `clink` CLI inside a JobManager pod and tracks it over
+the JobManager HTTP API.
+
+```yaml
+apiVersion: clink.dev/v1alpha1
+kind: ClinkJob
+metadata:
+  name: wordcount
+spec:
+  clusterName: demo
+  jobSo: /opt/clink/jobs/rescale_test_job.so
+  jobName: wordcount
+  upgradeMode: savepoint        # savepoint | stateless
+  checkpointIntervalMs: 2000    # > 0 enables checkpointing (required for savepoint upgrades)
+  env:
+    - CLINK_RESCALE_COUNT=20000000
+```
+
+Changing the spec (`jobSo`, `env`, or `args` - hashed into `.status.specHash`)
+triggers an **upgrade**. In `savepoint` mode the controller runs a two-stage,
+reconcile-safe rollout:
+
+1. **drain** - trigger a savepoint on the running job, then cancel it. Recorded in
+   `.status.lastSavepoint` and guarded by `.status.upgradeToHash` so it happens
+   exactly once even if the next stage is slow or retried;
+2. **restore** - resubmit the job with `--restore-from-dir`/`--restore-from-checkpoint-id`
+   pointing at that savepoint, retried until a new job id appears (adopting an
+   already-submitted job so a retry never leaks a second one).
+
+`stateless` mode skips the savepoint and resubmits fresh. Deleting the `ClinkJob`
+cancels the running job via a finalizer.
+
+Savepoints must be readable by the pod that restores them, so enable shared
+checkpoint storage on the `ClinkCluster` (a `ReadWriteMany` PVC in production, or
+`hostPath` on a single-node kind):
+
+```yaml
+spec:
+  checkpointStorage:
+    enabled: true
+    type: pvc                 # pvc | hostPath
+    mountPath: /var/lib/clink/checkpoints
+    storageClassName: nfs     # a ReadWriteMany class
+    size: 10Gi
+```
+
+```
+$ kubectl get clinkjob
+NAME        CLUSTER   PHASE     JOBID   AGE
+wordcount   demo      Running   2       90s
+```
+
+`kind-clinkjob-smoke.sh` exercises the whole path end to end: submit -> Running ->
+force an upgrade -> assert a savepoint was taken and a new job id restored from it ->
+delete -> assert the finalizer cancelled it.
+
 ## Scope
 
-v1 covers the cluster lifecycle: create, scale, HA, status and garbage collection.
+v1 covers the cluster lifecycle (create, scale, HA, status, garbage collection) and
+jobs (`ClinkJob` submit, status, savepoint-on-upgrade, cancel-on-delete).
 
-Not yet implemented (roadmap): declaring a job in the CR (the JobManager submit API
-takes an uploaded `.so`; a `ClinkJob` CR would exec the in-image plugin), and
-savepoint-on-upgrade (drain + savepoint + redeploy when the image or job changes).
-Both build on capabilities clink already has (savepoints, rescale) but are out of
-scope for the lifecycle-focused v1.
+Not yet implemented (roadmap): HA leader-targeting for job exec (v1 targets any ready
+JobManager pod, correct for single-JM clusters), and image-driven upgrades (rolling
+the runtime image as an upgrade trigger).
 
 ## Develop
 

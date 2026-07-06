@@ -27,6 +27,12 @@ rules:
   - list
   - watch
 - apiGroups:
+  - ""
+  resources:
+  - pods/exec
+  verbs:
+  - create
+- apiGroups:
   - apps
   resources:
   - deployments
@@ -43,6 +49,7 @@ rules:
   - clink.dev
   resources:
   - clinkclusters
+  - clinkjobs
   verbs:
   - create
   - delete
@@ -55,12 +62,14 @@ rules:
   - clink.dev
   resources:
   - clinkclusters/finalizers
+  - clinkjobs/finalizers
   verbs:
   - update
 - apiGroups:
   - clink.dev
   resources:
   - clinkclusters/status
+  - clinkjobs/status
   verbs:
   - get
   - patch
