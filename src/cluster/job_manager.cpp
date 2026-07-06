@@ -715,6 +715,10 @@ void JobManager::handle_client_loop_(std::shared_ptr<network::Connection> conn) 
         }
         MessageReader r(std::move(*frame));
         const auto kind = static_cast<MessageKind>(r.read_u8());
+        // Every handled client->JM kind returns via `continue`. Do not let a
+        // handler fall through to the next `if`: MessageKind values must be
+        // distinct, but a missing `continue` here would still double-dispatch
+        // a frame to two handlers and read past its payload.
         if (kind == MessageKind::SubmitJob) {
             handle_submit_(*conn, r);
             continue;
@@ -729,7 +733,9 @@ void JobManager::handle_client_loop_(std::shared_ptr<network::Connection> conn) 
         }
         if (kind == MessageKind::RescaleOperator) {
             handle_rescale_operator_(*conn, r);
-        } else if (kind == MessageKind::RescaleJob) {
+            continue;
+        }
+        if (kind == MessageKind::RescaleJob) {
             handle_rescale_job_(*conn, r);
             continue;
         }

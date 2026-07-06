@@ -1,5 +1,7 @@
 #include "clink/runtime/network/connection.hpp"
 
+#include <mutex>
+
 #include "clink/runtime/network/network_socket.hpp"
 
 namespace clink::network {
@@ -14,7 +16,15 @@ public:
     PlainTcpConnection(const PlainTcpConnection&) = delete;
     PlainTcpConnection& operator=(const PlainTcpConnection&) = delete;
 
+    // Serialize sends: a single connection is written from multiple threads (the
+    // JM sends TriggerCheckpoint from both the periodic checkpoint loop and the
+    // client-triggered savepoint path, plus deploy/cancel/heartbeat). Without this
+    // lock two frames interleave byte-wise on the socket, the peer reads a
+    // misframed stream, and a decode throws "MessageReader: truncated payload"
+    // (uncaught -> the process aborts). recv is single-reader per connection so it
+    // needs no lock; send + recv are independent directions.
     bool send_all(const std::byte* buf, std::size_t len) override {
+        std::lock_guard<std::mutex> lk(send_mu_);
         if (fd_ < 0)
             return false;
         return NetworkSocket::send_all(fd_, buf, len);
@@ -47,6 +57,7 @@ public:
 
 private:
     int fd_;
+    std::mutex send_mu_;
 };
 
 }  // namespace

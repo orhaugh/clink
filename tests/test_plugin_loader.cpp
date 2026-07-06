@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/cluster/job_bundle.hpp"
 #include "clink/cluster/plugin_loader.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/type_registry.hpp"
@@ -126,6 +127,39 @@ TEST(PluginLoader, LoadIsIdempotent) {
     EXPECT_TRUE(a.ok);
     EXPECT_TRUE(b.ok);
     EXPECT_EQ(a.plugin.dl_handle, b.plugin.dl_handle);
+}
+
+// load_into must give each call a FRESH module instance so a .so's
+// per-instance, call_once-gated registration (CLINK_REGISTER_JOB build_fn)
+// re-runs into THIS caller's bundle. A long-lived JobManager loads the same
+// .so once per submitted job into a different per-job bundle; if the second
+// load reused the first's dlopen handle, the once-gate would have already
+// fired and the second bundle would resolve no factories (plan_job then
+// rejects "no source factory registered"). Two load_into calls for the same
+// path must therefore yield distinct handles and each populate its own bundle.
+TEST(PluginLoader, LoadIntoGivesEachBundleAFreshInstance) {
+    const auto path = hello_plugin_path();
+    if (!std::filesystem::exists(path)) {
+        GTEST_SKIP() << "hello_plugin not built";
+    }
+    auto& loader = clink::cluster::PluginLoader::default_instance();
+
+    clink::cluster::JobBundle bundle_a;
+    auto preg_a = bundle_a.as_plugin_registry();
+    auto a = loader.load_into(path.string(), preg_a);
+    ASSERT_TRUE(a.ok) << a.error;
+    EXPECT_NE(bundle_a.runner_registry().find_source("hello.GreetingSource", "hello.Greeting"),
+              nullptr);
+
+    clink::cluster::JobBundle bundle_b;
+    auto preg_b = bundle_b.as_plugin_registry();
+    auto b = loader.load_into(path.string(), preg_b);
+    ASSERT_TRUE(b.ok) << b.error;
+    EXPECT_NE(bundle_b.runner_registry().find_source("hello.GreetingSource", "hello.Greeting"),
+              nullptr)
+        << "reload must re-register into the second bundle, not reuse the first";
+    EXPECT_NE(a.plugin.dl_handle, b.plugin.dl_handle)
+        << "each load_into must dlopen a distinct module instance";
 }
 
 TEST(PluginLoader, MissingFileFailsCleanly) {

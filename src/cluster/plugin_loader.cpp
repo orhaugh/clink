@@ -1,11 +1,15 @@
 #include "clink/cluster/plugin_loader.hpp"
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/operator_registry.hpp"  // SelectorRegistry
@@ -134,10 +138,48 @@ PluginLoadResult PluginLoader::load_into(const std::string& so_path,
     // (e.g. "int64") that the built-ins own.
     ensure_built_ins_registered();
 
+    // Each load_into MUST get a fresh module instance so the .so's
+    // per-instance, call_once-gated registration (CLINK_REGISTER_JOB's
+    // build_fn) re-runs into THIS caller's registry. dlopen() refcounts by
+    // inode: opening the same path twice returns the same instance whose
+    // call_once has already fired, so a second caller's registry (e.g. a
+    // long-lived JobManager planning a second job, or resubmitting the same
+    // .so on a savepoint-driven upgrade) would get NO factories and plan_job
+    // rejects with "no source factory registered". We sidestep that by
+    // dlopening a unique per-load copy: a distinct inode is a distinct
+    // instance with fresh static state - a fresh once_flag AND a fresh
+    // inline-name counter, so build_fn re-mints the same deterministic op
+    // names the submitter's graph_json references. The copy is unlinked
+    // immediately after dlopen (the mapping stays valid); handles live for
+    // the process lifetime (see LoadedPlugin), so the on-disk file is not
+    // needed past the open.
+    std::string instance_path;
+    {
+        static std::atomic<std::uint64_t> load_counter{0};
+        const auto n = load_counter.fetch_add(1, std::memory_order_relaxed);
+        std::filesystem::path unique{so_path};
+        unique += ".inst." + std::to_string(static_cast<long>(::getpid())) + "." +
+                  std::to_string(n) + ".so";
+        std::error_code ec;
+        std::filesystem::copy_file(
+            so_path, unique, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            result.error = "plugin instance copy failed: " + ec.message();
+            return result;
+        }
+        instance_path = unique.string();
+    }
+
     // RTLD_LOCAL keeps the plugin's symbols out of the global
     // namespace; RTLD_NOW resolves all relocations up front so we
     // catch missing dependencies at load rather than first call.
-    void* handle = ::dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    void* handle = ::dlopen(instance_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    // Drop the on-disk copy now: the loaded mapping remains valid, and this
+    // stops the plugin cache dir from accumulating one instance file per load.
+    {
+        std::error_code ec;
+        std::filesystem::remove(instance_path, ec);
+    }
     if (handle == nullptr) {
         result.error = "dlopen failed: " + current_dlerror();
         return result;

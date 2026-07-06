@@ -52,14 +52,17 @@ enum class MessageKind : std::uint8_t {
     // moves Idle -> Preparing and the rest of the dual-run
     // choreography (BeginRescale dispatch, drain, cutover) runs.
     RescaleOperator = 12,
-    // Savepoint (kind 12) is a client-initiated request: trigger a
+    // Savepoint (kind 13) is a client-initiated request: trigger a
     // one-off checkpoint synchronously and return a handle the user
     // can feed back into a future SubmitJob's restore_from_dir/
-    // restore_from_checkpoint_id. Clink's  analogue of
-    // ` savepoint <jobid>`. The handle is the same (dir, id)
+    // restore_from_checkpoint_id. The handle is the same (dir, id)
     // pair the periodic checkpoint machinery already produces - no
     // file relocation is performed; the user can copy elsewhere.
-    Savepoint = 12,
+    // Must NOT share a value with any other client->JM kind: the JM
+    // dispatch matches on kind, so a duplicate silently routes the
+    // frame to the wrong handler (this previously collided with
+    // RescaleOperator=12 and aborted the JM on every savepoint).
+    Savepoint = 13,
     // CancelJob (kind 103) is overloaded for the client→JM direction:
     // the client sends it to ask the JM to cancel a running job. The
     // JM responds with CancelJobAck.

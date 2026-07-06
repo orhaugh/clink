@@ -1,5 +1,6 @@
 #include "clink/runtime/network/tls_connection.hpp"
 
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -17,7 +18,12 @@ public:
     TlsConnectionImpl(const TlsConnectionImpl&) = delete;
     TlsConnectionImpl& operator=(const TlsConnectionImpl&) = delete;
 
+    // Serialize sends: the JM writes a single connection from multiple threads
+    // (periodic checkpoint loop + client-triggered savepoint, deploy, cancel).
+    // Concurrent SSL_write on one SSL* is undefined and interleaves records;
+    // this lock makes each frame's send atomic. See PlainTcpConnection::send_all.
     bool send_all(const std::byte* buf, std::size_t len) override {
+        std::lock_guard<std::mutex> lk(send_mu_);
         return sock_.send_all(buf, len);
     }
 
@@ -39,6 +45,7 @@ public:
 
 private:
     TlsSocket sock_;
+    std::mutex send_mu_;
     // Holds the SSL_CTX shared_ptr alive for as long as this connection
     // exists. Without it, a TlsServerContext / TlsClientContext destroyed
     // before its accepted/connected sockets would free SSL_CTX while

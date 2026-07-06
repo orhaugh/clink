@@ -606,3 +606,30 @@ TEST(RecoveryDefaults, EffectiveMaxRestartsResolution) {
     fixed.max_restarts_on_tm_loss = 3;
     EXPECT_EQ(effective_max_restarts(fixed), 3u);
 }
+
+// The JM's client-loop dispatch matches on the MessageKind byte, so every
+// client->JM request kind MUST have a distinct value. A collision routes a
+// frame to the wrong handler: Savepoint (13) once shared value 12 with
+// RescaleOperator, so a savepoint frame decoded as a RescaleOperatorMsg and
+// then, with no `continue`, fell through to the savepoint handler on an
+// already-consumed reader - throwing "truncated payload" and aborting the JM.
+TEST(WireProtocol, ClientRequestKindsAreDistinct) {
+    const std::vector<std::pair<const char*, MessageKind>> kinds{
+        {"HelloClient", MessageKind::HelloClient},
+        {"SubmitJob", MessageKind::SubmitJob},
+        {"ListJobs", MessageKind::ListJobs},
+        {"CancelJob", MessageKind::CancelJob},
+        {"RescaleJob", MessageKind::RescaleJob},
+        {"RescaleOperator", MessageKind::RescaleOperator},
+        {"Savepoint", MessageKind::Savepoint},
+    };
+    for (std::size_t i = 0; i < kinds.size(); ++i) {
+        for (std::size_t j = i + 1; j < kinds.size(); ++j) {
+            EXPECT_NE(static_cast<int>(kinds[i].second), static_cast<int>(kinds[j].second))
+                << kinds[i].first << " and " << kinds[j].first << " share a MessageKind value";
+        }
+    }
+    // Pin the specific pair that regressed.
+    EXPECT_NE(static_cast<int>(MessageKind::Savepoint),
+              static_cast<int>(MessageKind::RescaleOperator));
+}
