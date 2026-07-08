@@ -88,3 +88,9 @@ benchmarks/prod_compare/*/rocksdb:/
 !/docs/consumer-examples/
 !/docs/connectors/
 !/docs/internals/
+
+# Python package artifacts (pyclink)
+__pycache__/
+*.egg-info/
+python/dist/
+python/build/

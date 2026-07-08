@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyclink"
+version = "0.1.0"
+description = "Embed the clink stream engine in Python: run streaming SQL in-process, read results as Arrow"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["pyarrow>=14"]
+
+[tool.setuptools.packages.find]
+include = ["pyclink*"]

@@ -129,6 +129,15 @@ after the engine is gone (it keeps its queue alive). Collect is
 append-only in v1: a retracting (changelog) SELECT is rejected at bind so
 retractions are never silently flattened into inserts.
 
+pyclink (`python/pyclink/`) is pure Python over this ABI: ctypes bindings,
+no compiled extension, with collect streams imported straight into
+`pyarrow.RecordBatchReader`. One load-order constraint is made structural
+there: pyclink imports pyarrow before it ever loads libclink, because
+libclink carries its own libarrow and loading it first makes pyarrow's
+bundled Arrow resolve symbols against the already-resident copy (an abseil
+symbol clash on macOS). A self-contained libclink (static, hidden-symbol
+Arrow) is the packaging follow-on that removes the hazard entirely.
+
 ### What embedded mode does not change
 
 The session catalog behaves exactly like `clink_submit_sql`'s

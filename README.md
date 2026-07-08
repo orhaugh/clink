@@ -355,6 +355,28 @@ See [docs/internals/embedded.md](docs/internals/embedded.md) for the
 semantics (one consumer per collect table, end-of-stream and cancellation
 rules, append-only v1).
 
+### pyclink: the same engine from Python
+
+Pure Python over the C ABI (ctypes, no compiled extension), results as
+pyarrow - pandas and polars follow for free. `pip install ./python`, point
+`CLINK_LIB` at the built library, and:
+
+```python
+import pyclink
+
+with pyclink.Engine() as e:
+    e.execute("""
+        CREATE TABLE orders (usr VARCHAR, amount BIGINT)
+          WITH (connector='file', format='json', path='/tmp/orders.ndjson');
+        CREATE TABLE totals (usr VARCHAR, total BIGINT) WITH (connector='collect');
+        INSERT INTO totals SELECT usr, SUM(amount) AS total FROM orders GROUP BY usr
+    """)
+    table = e.collect("totals").read_all()   # pyarrow.Table, zero-copy
+    e.await_all()
+```
+
+See [python/README.md](python/README.md).
+
 A complete set of consumer-facing examples - every core feature wired up as
 its own standalone executable, all built by a single `find_package`-based
 `CMakeLists.txt` - lives in [`docs/consumer-examples/`](docs/consumer-examples/).
