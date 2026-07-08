@@ -1,40 +1,25 @@
 // clink_submit_sql: SQL-to-JobGraphSpec compiler.
 //
-// Reads a SQL file (or inline -e expression), processes statements:
-//   * CREATE TABLE: registers in an in-memory catalog
-//   * INSERT INTO ... SELECT: binds + compiles to a JobGraphSpec
-//                              and prints the JSON to stdout
-//
-// Submission to a running JM is NOT yet wired (a future HTTP submit
-// path will take the JSON spec directly). For now, pipe the JSON to a
-// separate submit tool or use it for inspection.
+// Reads a SQL file (or inline -e expression) and runs it through the
+// shared SQL script runner (clink/sql/script_runner.hpp):
+//   * DDL statements fold into an in-memory (optionally persistent) catalog
+//   * INSERT INTO ... SELECT compiles to a JobGraphSpec, printed to stdout
+//     or POSTed to a running JM with --jm-host/--jm-port
 //
 // Usage:
 //   clink_submit_sql --file path/to/job.sql
 //   clink_submit_sql -e "CREATE TABLE ...; INSERT INTO ..."
 //   clink_submit_sql --explain --file job.sql   (prints LogicalPlan tree)
 
-#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <variant>
 
-#include "clink/cluster/built_in_factories.hpp"
-#include "clink/http/http_client.hpp"
-#include "clink/plugin/plugin.hpp"
-#include "clink/sql/analyze.hpp"
-#include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
-#include "clink/sql/install.hpp"
-#include "clink/sql/materialized_view.hpp"
-#include "clink/sql/optimizer.hpp"
-#include "clink/sql/parser.hpp"
-#include "clink/sql/physical_plan.hpp"
-#include "clink/sql/view.hpp"
+#include "clink/sql/script_runner.hpp"
 
 namespace {
 
@@ -49,26 +34,6 @@ struct Args {
     bool explain = false;
     std::uint32_t parallelism = 1;  // uniform op parallelism (>1 fans the plan out)
 };
-
-// Percent-encode a query-param value (RFC 3986 unreserved chars pass through).
-// A state-backend URI can carry its own "://" and even a "?a=1&b=2" query, so
-// it must be encoded to survive the JM's query parsing; the server decodes it.
-std::string url_encode(const std::string& s) {
-    static const char* kHex = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(s.size() * 3);
-    for (char ch : s) {
-        const auto c = static_cast<unsigned char>(ch);
-        if (std::isalnum(c) != 0 || c == '-' || c == '_' || c == '.' || c == '~') {
-            out += ch;
-        } else {
-            out += '%';
-            out += kHex[c >> 4];
-            out += kHex[c & 0x0FU];
-        }
-    }
-    return out;
-}
 
 void print_usage() {
     std::cerr
@@ -199,268 +164,16 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    clink::sql::Binder binder(catalog);
-    clink::sql::PhysicalPlanner planner;
 
-    try {
-        auto script = clink::sql::parse(sql);
-        bool produced_spec = false;
-        // Lazily register the SQL operator/source factories into the host
-        // registry (default_instance) so ANALYZE's in-process scan can build the
-        // table's Row source. Once per process; the registrations outlive the
-        // temporary PluginRegistry (which binds to OperatorRegistry::default).
-        auto ensure_local_ops_installed = [installed = false]() mutable {
-            if (installed) {
-                return;
-            }
-            installed = true;
-            clink::cluster::ensure_built_ins_registered();
-            clink::plugin::PluginRegistry reg;
-            clink::sql::install(reg);
-        };
-        // Submit a compiled JobGraphSpec to the JM (or print it when no JM host
-        // is configured). Shared by the INSERT and CREATE MATERIALIZED VIEW
-        // paths. Returns 0 on success, non-zero on a transport / JM error.
-        // Fan the compiled plan out to `args.parallelism` subtasks per op. The
-        // planner emits everything at parallelism 1; setting it uniformly here
-        // lets the runtime hash-partition keyed ops by key and split Kafka
-        // partitions across source subtasks. Assumes a parallelizable plan (no
-        // forced-singleton op); the common Nexmark/SQL shapes qualify.
-        auto apply_parallelism = [&](clink::cluster::JobGraphSpec& spec) {
-            if (args.parallelism <= 1) {
-                return;
-            }
-            for (auto& op : spec.ops) {
-                op.parallelism = args.parallelism;
-            }
-        };
-        auto submit_or_print = [&](const std::string& json, const std::string& name) -> int {
-            if (!args.jm_host.empty() && args.jm_port != 0) {
-                clink::http::HttpClient client(args.jm_host, args.jm_port);
-                std::string path = "/api/v1/jobs/spec";
-                char sep = '?';
-                auto add_param = [&](const std::string& key, const std::string& value) {
-                    if (value.empty()) {
-                        return;
-                    }
-                    path += sep;
-                    path += key + "=" + url_encode(value);
-                    sep = '&';
-                };
-                add_param("name", name);
-                add_param("state_backend", args.state_backend);
-                auto resp = client.post(path, json);
-                if (resp.status == 0) {
-                    std::cerr << "error: HTTP transport failure: " << resp.error << "\n";
-                    return 1;
-                }
-                std::cout << resp.body << "\n";
-                if (resp.status != 200) {
-                    std::cerr << "error: JM returned status " << resp.status << "\n";
-                    return 1;
-                }
-            } else {
-                std::cout << json << "\n";
-            }
-            return 0;
-        };
-        for (auto& stmt : script.statements) {
-            if (std::holds_alternative<std::unique_ptr<clink::sql::ast::ExplainStmt>>(stmt)) {
-                const auto& exp = *std::get<std::unique_ptr<clink::sql::ast::ExplainStmt>>(stmt);
-                if (std::holds_alternative<clink::sql::ast::InsertStmt>(exp.query)) {
-                    auto plan =
-                        binder.bind_insert(std::get<clink::sql::ast::InsertStmt>(exp.query));
-                    std::cout << plan->explain();
-                } else if (std::holds_alternative<clink::sql::ast::SelectStmt>(exp.query)) {
-                    auto plan =
-                        binder.bind_select(std::get<clink::sql::ast::SelectStmt>(exp.query));
-                    std::cout << plan->explain();
-                } else {
-                    std::cerr << "error: EXPLAIN only supports SELECT / INSERT INTO\n";
-                    return 1;
-                }
-                produced_spec = true;
-                continue;
-            }
-            if (std::holds_alternative<clink::sql::ast::CreateTableStmt>(stmt)) {
-                catalog.register_table(std::get<clink::sql::ast::CreateTableStmt>(stmt));
-                continue;
-            }
-            if (std::holds_alternative<clink::sql::ast::CreateModelStmt>(stmt)) {
-                // SQL-native AI: CREATE MODEL is pure catalog registration (no job).
-                // ML_PREDICT reads the model's OUTPUT columns + provider properties
-                // from the catalog when it binds.
-                catalog.register_model(std::get<clink::sql::ast::CreateModelStmt>(stmt));
-                continue;
-            }
-            if (std::holds_alternative<clink::sql::ast::CreateViewStmt>(stmt)) {
-                // A logical view is pure catalog registration (no storage, no
-                // job): bind the defining query for its columns and store it; a
-                // reference to the view is expanded inline at bind time.
-                clink::sql::register_view(
-                    catalog, std::move(std::get<clink::sql::ast::CreateViewStmt>(stmt)));
-                continue;
-            }
-            if (std::holds_alternative<clink::sql::ast::AlterTableStmt>(stmt)) {
-                // ALTER TABLE mutates the catalog declaration (column add/drop);
-                // a streaming table has no stored data to rewrite.
-                catalog.alter_table(std::get<clink::sql::ast::AlterTableStmt>(stmt));
-                continue;
-            }
-            if (std::holds_alternative<clink::sql::ast::RenameStmt>(stmt)) {
-                // ALTER TABLE RENAME TO / RENAME COLUMN: a catalog rename, rejected
-                // (and rolled back) if it would break a dependent logical view.
-                clink::sql::rename_object(catalog, std::get<clink::sql::ast::RenameStmt>(stmt));
-                continue;
-            }
-            if (std::holds_alternative<clink::sql::ast::CreateMaterializedViewStmt>(stmt)) {
-                // MATTBL: register the backing table and submit the continuous
-                // maintenance job (INSERT INTO <view> <SELECT>). The original
-                // statement text is stored on the backing table for future
-                // restart re-binding; passing the whole script is a v1
-                // approximation (single-statement submits are the common case).
-                auto& mv = std::get<clink::sql::ast::CreateMaterializedViewStmt>(stmt);
-                auto mvplan = clink::sql::plan_materialized_view(std::move(mv), catalog, sql);
-                const std::string view_name = mvplan.backing.name;
-                const bool full_refresh = mvplan.arm == clink::sql::RefreshArm::Full;
-                auto plan = clink::sql::optimize(std::move(mvplan.maintenance));
-                if (args.explain) {
-                    std::cout << plan->explain();
-                } else {
-                    const auto& sink = static_cast<const clink::sql::LogicalSink&>(*plan);
-                    auto spec = planner.compile(sink);
-                    apply_parallelism(spec);
-                    // Continuous: a live maintenance job (mv_<name>). Full-refresh: a
-                    // one-shot bounded initial population (refresh_<name>) - it runs to
-                    // completion and the overwrite sink atomically publishes; a later
-                    // REFRESH MATERIALIZED VIEW re-runs the same recompute.
-                    const std::string default_name =
-                        (full_refresh ? "refresh_" : "mv_") + view_name;
-                    const std::string name = args.job_name.empty() ? default_name : args.job_name;
-                    if (int rc = submit_or_print(spec.to_json(), name); rc != 0) {
-                        return rc;
-                    }
-                }
-                produced_spec = true;
-                continue;
-            }
-            if (std::holds_alternative<clink::sql::ast::RefreshMatViewStmt>(stmt)) {
-                // REFRESH MATERIALIZED VIEW <name>: recompute the full-refresh backing
-                // as a bounded INSERT that atomically overwrites it. Runs the same
-                // recompute the initial population + a scheduler tick would.
-                const auto& rf = std::get<clink::sql::ast::RefreshMatViewStmt>(stmt);
-                auto plan = clink::sql::optimize(
-                    clink::sql::plan_materialized_view_refresh(rf.view_name, catalog));
-                if (args.explain) {
-                    std::cout << plan->explain();
-                } else {
-                    const auto& sink = static_cast<const clink::sql::LogicalSink&>(*plan);
-                    auto spec = planner.compile(sink);
-                    apply_parallelism(spec);
-                    const std::string name =
-                        args.job_name.empty() ? ("refresh_" + rf.view_name) : args.job_name;
-                    if (int rc = submit_or_print(spec.to_json(), name); rc != 0) {
-                        return rc;
-                    }
-                }
-                produced_spec = true;
-                continue;
-            }
-            if (std::holds_alternative<clink::sql::ast::DropTableStmt>(stmt)) {
-                const auto& drop = std::get<clink::sql::ast::DropTableStmt>(stmt);
-                const char* kind_noun =
-                    drop.object_kind == clink::sql::ast::DropKind::MaterializedView
-                        ? "materialized view"
-                        : (drop.object_kind == clink::sql::ast::DropKind::View ? "view" : "table");
-                bool failed = false;
-                for (const auto& tbl : drop.table_names) {
-                    switch (catalog.drop_object(tbl, drop.object_kind)) {
-                        case clink::sql::Catalog::DropResult::Dropped:
-                            break;
-                        case clink::sql::Catalog::DropResult::NotFound:
-                            if (!drop.if_exists) {
-                                std::cerr << "error: " << kind_noun << " does not exist: " << tbl
-                                          << "\n";
-                                failed = true;
-                            }
-                            break;
-                        case clink::sql::Catalog::DropResult::KindMismatch:
-                            std::cerr << "error: \"" << tbl << "\" is not a " << kind_noun << "\n";
-                            failed = true;
-                            break;
-                    }
-                }
-                if (failed) {
-                    return 1;
-                }
-                continue;
-            }
-            if (std::holds_alternative<clink::sql::ast::ShowTablesStmt>(stmt)) {
-                auto names = catalog.list_tables();
-                for (const auto& name : names) {
-                    std::cout << name << "\n";
-                }
-                continue;
-            }
-            if (std::holds_alternative<clink::sql::ast::AnalyzeStmt>(stmt)) {
-                // ANALYZE runs a local in-process bounded scan, so the SQL source
-                // factories must be registered here (the submit tool otherwise
-                // only builds specs for the JM). Install once, lazily.
-                ensure_local_ops_installed();
-                const auto& an = std::get<clink::sql::ast::AnalyzeStmt>(stmt);
-                try {
-                    clink::sql::analyze_table(catalog, an.table, an.columns);
-                } catch (const std::exception& e) {
-                    std::cerr << "error: ANALYZE " << an.table << ": " << e.what() << "\n";
-                    return 1;
-                }
-                std::cout << "analyzed " << an.table << "\n";
-                continue;
-            }
-            if (std::holds_alternative<clink::sql::ast::InsertStmt>(stmt)) {
-                auto plan = binder.bind_insert(std::get<clink::sql::ast::InsertStmt>(stmt));
-                plan = clink::sql::optimize(std::move(plan));
-                if (args.explain) {
-                    std::cout << plan->explain();
-                } else {
-                    const auto& sink = static_cast<const clink::sql::LogicalSink&>(*plan);
-                    auto spec = planner.compile(sink);
-                    apply_parallelism(spec);
-                    if (int rc = submit_or_print(spec.to_json(), args.job_name); rc != 0) {
-                        return rc;
-                    }
-                }
-                produced_spec = true;
-                continue;
-            }
-            if (std::holds_alternative<clink::sql::ast::SelectStmt>(stmt)) {
-                auto plan = binder.bind_select(std::get<clink::sql::ast::SelectStmt>(stmt));
-                if (args.explain) {
-                    std::cout << plan->explain();
-                } else {
-                    std::cerr << "error: bare SELECT must be wrapped in INSERT INTO ... "
-                              << "SELECT (no print-to-stdout sink yet); "
-                              << "use --explain to inspect the LogicalPlan\n";
-                    return 1;
-                }
-                produced_spec = true;
-                continue;
-            }
-        }
-        if (!produced_spec) {
-            std::cerr << "warning: no INSERT / SELECT statement found; " << script.statements.size()
-                      << " statement(s) processed\n";
-        }
-        return 0;
-    } catch (const clink::sql::ParseError& e) {
-        std::cerr << "parse error at position " << e.cursor_position() << ": " << e.what() << "\n";
-        return 1;
-    } catch (const clink::sql::TranslationError& e) {
-        std::cerr << "compile error at position " << e.cursor_position() << ": " << e.what()
-                  << "\n";
-        return 1;
-    } catch (const std::exception& e) {
-        std::cerr << "error: " << e.what() << "\n";
-        return 1;
-    }
+    clink::sql::ScriptRunOptions opts;
+    opts.explain = args.explain;
+    opts.parallelism = args.parallelism;
+    opts.job_name = args.job_name;
+
+    clink::sql::ScriptIO io{&std::cout, &std::cerr};
+    auto submit = (!args.jm_host.empty() && args.jm_port != 0)
+                      ? clink::sql::make_http_submit(
+                            args.jm_host, args.jm_port, args.state_backend, std::cout, std::cerr)
+                      : clink::sql::make_print_submit(std::cout);
+    return clink::sql::run_script(sql, catalog, opts, io, submit);
 }

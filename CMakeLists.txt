@@ -576,6 +576,7 @@ if(CLINK_BUILD_SQL)
         src/sql/view.cpp
         src/sql/optimizer.cpp
         src/sql/analyze.cpp
+        src/sql/script_runner.cpp
         src/sql/install.cpp
         src/sql/async_function_registry.cpp
         src/sql/table_api.cpp
@@ -602,6 +603,17 @@ if(CLINK_BUILD_SQL)
     clink_set_warnings(clink_submit_sql)
     install(TARGETS clink_submit_sql
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+    # clink::embed - the whole runtime in one process (in-process JM + TM
+    # driving the shared SQL script runner). The execution core behind
+    # `clink run <file>.sql`; the embeddable C ABI wraps the same class.
+    add_library(clink_embed STATIC src/embed/embedded_engine.cpp)
+    add_library(clink::embed ALIAS clink_embed)
+    set_target_properties(clink_embed PROPERTIES EXPORT_NAME embed)
+    target_compile_features(clink_embed PUBLIC cxx_std_23)
+    target_link_libraries(clink_embed PUBLIC clink::sql)
+    clink_set_warnings(clink_embed)
+    message(STATUS "clink::embed - embedded engine enabled")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -677,6 +689,14 @@ add_library(clink_cli_cmds OBJECT
     tools/clink_list.cpp
 )
 target_link_libraries(clink_cli_cmds PUBLIC clink::core)
+# `clink run <file>.sql` needs the SQL frontend + embedded engine; a
+# SQL-off build links a stub that errors with a rebuild hint instead.
+if(TARGET clink::embed)
+    target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql.cpp)
+    target_link_libraries(clink_cli_cmds PUBLIC clink::embed)
+else()
+    target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql_stub.cpp)
+endif()
 if(TARGET clink::tls)
     target_compile_definitions(clink_cli_cmds PUBLIC CLINK_LINKED_TLS)
 endif()

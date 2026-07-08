@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cmath>
 #include <coroutine>
+#include <cstdio>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -7419,6 +7420,43 @@ void install(clink::plugin::PluginRegistry& reg) {
     reg.register_sink<Row>(
         "blackhole_sink_row", [](const BuildContext& /*ctx*/) -> std::shared_ptr<Sink<Row>> {
             return std::make_shared<FunctionSink<Row>>([](const Row&) {}, "blackhole_sink_row");
+        });
+
+    // print_sink_row: line-per-record JSON to stdout - the demo/debug sink
+    // behind the embedded runner's bare-SELECT output. connector='print' maps
+    // here (row_sink_binding_for). Append rows print as plain JSON objects;
+    // changelog rows stay readable: a non-insert __row_kind prefixes the line
+    // (-U / +U / -D) and the marker field itself is stripped from the printed
+    // object. One fwrite per line keeps concurrent subtasks' lines whole, and
+    // each record flushes immediately (a demo sink favours promptness over
+    // throughput). No params.
+    reg.register_sink<Row>(
+        "print_sink_row", [](const BuildContext& /*ctx*/) -> std::shared_ptr<Sink<Row>> {
+            return std::make_shared<FunctionSink<Row>>(
+                [](const Row& row) {
+                    std::string prefix;
+                    auto vals = row.values;
+                    if (auto it = vals.find(std::string{kRowKindField}); it != vals.end()) {
+                        const std::string kind =
+                            it->second.is_string() ? it->second.as_string() : std::string{};
+                        if (kind == kRowKindDelete) {
+                            prefix = "-D ";
+                        } else if (kind == kRowKindUpdateBefore) {
+                            prefix = "-U ";
+                        } else if (kind == kRowKindUpdateAfter) {
+                            prefix = "+U ";
+                        }
+                        vals.erase(it);
+                    }
+                    const std::string line =
+                        prefix +
+                        clink::config::serialize_output(
+                            clink::config::JsonValue{clink::config::JsonObject{std::move(vals)}}) +
+                        "\n";
+                    std::fwrite(line.data(), 1, line.size(), stdout);
+                    std::fflush(stdout);
+                },
+                "print_sink_row");
         });
 
     // ---- Operators ----

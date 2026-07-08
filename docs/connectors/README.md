@@ -65,6 +65,17 @@ is reachable through the programmatic API only.
 | --- | --- | --- | --- | --- |
 | [Apache Avro](avro.md) | encoding (codecs) | Avro C++ | system pkg | - |
 
+## Built-in sinks (no dependency)
+
+Compiled into the SQL frontend itself; always available when
+`CLINK_BUILD_SQL=ON`. One shared page: [built-in sinks](builtin.md).
+
+| Sink | I/O | SQL `connector=` |
+| --- | --- | --- |
+| [Blackhole (discard)](builtin.md#blackhole) | sink | `blackhole` |
+| [Changelog netting](builtin.md#changelog) | sink | `changelog` |
+| [Print (stdout)](builtin.md#print) | sink | `print` |
+
 ## Notes on delivery semantics
 
 Guarantees vary by connector and are stated on each page. In summary:

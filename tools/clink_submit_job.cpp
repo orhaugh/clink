@@ -65,9 +65,13 @@ void usage() {
         << "                          [--wait-timeout-s=N] [--name=<label>]\n"
         << "                          [--state-backend=<scheme>[:<path>]]\n"
         << "                          [--checkpoint-interval-ms=N] [--max-restarts-on-tm-loss=N]\n"
+        << "       clink run <file>.sql | -e \"<sql>\"   (embedded SQL: run with --help for "
+           "flags)\n"
         << "\n"
         << "Submit a clink job (a shared library built with CLINK_REGISTER_JOB)\n"
-        << "to a running JobManager.\n"
+        << "to a running JobManager. A .sql argument instead runs the script\n"
+        << "EMBEDDED in this process (no cluster), or submits it to a JM when\n"
+        << "--jm-host/--jm-port are given.\n"
         << "\n"
         << "State backend selection:\n"
         << "  --state-backend=memory           in-memory keyed state (default; no persistence)\n"
@@ -107,7 +111,24 @@ std::optional<std::string> compose_state_backend_uri(const std::string& spec) {
 
 }  // namespace
 
+// SQL front door (tools/clink_run_sql.cpp, or its stub when the build has
+// no SQL frontend). `clink run` dispatches there on the argument shape.
+int clink_cmd_run_sql(int argc, char** argv);
+
 int clink_cmd_run(int argc, char** argv) {
+    // SQL mode: `clink run pipeline.sql` / `clink run -e "SELECT ..."`.
+    // Dispatch on the argument shape so the compiled-job (.so) path below
+    // stays untouched: any positional ending .sql, or -e / --file present.
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view a = argv[i];
+        if (a == "-e" || a == "--file" || a.starts_with("--file=")) {
+            return clink_cmd_run_sql(argc, argv);
+        }
+        if (!a.starts_with("-") && a.ends_with(".sql")) {
+            return clink_cmd_run_sql(argc, argv);
+        }
+    }
+
     if (has_flag(argc, argv, "help") || argc < 2) {
         usage();
         return argc < 2 ? 1 : 0;

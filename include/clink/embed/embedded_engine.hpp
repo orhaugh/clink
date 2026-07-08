@@ -1,0 +1,118 @@
+#pragma once
+
+// EmbeddedEngine: the whole clink runtime in one process, no daemons.
+//
+// Construction starts an in-process JobManager + TaskManager pair
+// (control plane on an ephemeral loopback port, exactly the topology the
+// SqlRuntime end-to-end suite proves). execute_script() runs a SQL
+// script through the shared script runner (clink/sql/script_runner.hpp):
+// DDL folds into the engine's session catalog and every compiled INSERT /
+// materialized-view job is submitted straight to the in-process
+// JobManager - no HTTP, no cluster. await_all() blocks until the
+// submitted jobs finish, with a caller-polled cancellation hook so a
+// front end (Ctrl-C in `clink run`) can stop an unbounded pipeline and
+// drain it cleanly.
+//
+// This is the execution core behind `clink run <file>.sql`; the
+// embeddable C ABI (libclink) wraps the same class.
+
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "clink/cluster/job_manager.hpp"
+#include "clink/sql/catalog.hpp"
+
+namespace clink::cluster {
+class TaskManager;
+}
+
+namespace clink::embed {
+
+struct EngineOptions {
+    // Uniform op parallelism applied to every compiled job (>1 fans out).
+    std::uint32_t parallelism = 1;
+    // TaskManager slot count. Slots are placement bookkeeping, not threads,
+    // so a generous default costs nothing and keeps deep plans deployable.
+    std::size_t slots = 64;
+    // Per-job state backend URI (e.g. "rocksdb:///tmp/state",
+    // "remote-read://bucket/job"). Empty keeps the legacy resolution:
+    // memory, or file when checkpoint_dir is set.
+    std::string state_backend_uri;
+    // Checkpoint root directory. Empty disables checkpointing.
+    std::string checkpoint_dir;
+    // Periodic checkpoint cadence, applied only when checkpoint_dir is set.
+    std::int64_t checkpoint_interval_ms = 10'000;
+    // Optional persistent catalog directory (loaded at construction;
+    // CREATE TABLE auto-saves). Empty keeps a session-only catalog.
+    std::string catalog_dir;
+    // Job-name override for submitted jobs (empty = per-statement defaults).
+    std::string job_name;
+    // Print LogicalPlans instead of submitting.
+    bool explain = false;
+    // Compile a bare top-level SELECT into a synthesised connector='print'
+    // sink so results land on stdout (the `clink run -e "SELECT ..."` UX).
+    bool bare_select_to_print = true;
+    // Statement output and diagnostics. Must be non-null.
+    std::ostream* out = &std::cout;
+    std::ostream* err = &std::cerr;
+};
+
+class EmbeddedEngine {
+public:
+    // Starts the in-process cluster; throws std::runtime_error if the
+    // TaskManager fails to register (or the catalog dir fails to load).
+    explicit EmbeddedEngine(EngineOptions opts);
+    ~EmbeddedEngine();
+
+    EmbeddedEngine(const EmbeddedEngine&) = delete;
+    EmbeddedEngine& operator=(const EmbeddedEngine&) = delete;
+    EmbeddedEngine(EmbeddedEngine&&) = delete;
+    EmbeddedEngine& operator=(EmbeddedEngine&&) = delete;
+
+    // Process every statement of `sql` (see script_runner.hpp for the
+    // statement surface). Compiled jobs are submitted immediately and
+    // tracked; call await_all() to block on them. Returns 0 on success,
+    // non-zero on the first failing statement.
+    int execute_script(const std::string& sql);
+
+    // Block until every submitted job reaches a terminal state. The
+    // optional `cancel_requested` hook is polled between waits; the first
+    // time it returns true every running job is cancelled and the drain
+    // continues (bounded, so a wedged cancel cannot hang the caller).
+    // Returns true when all jobs completed and either produced no errors
+    // or the caller requested the stop (a user stop is a normal outcome
+    // for an unbounded pipeline; teardown errors are reported as notes).
+    bool await_all(const std::function<bool()>& cancel_requested = {});
+
+    // Cancel every tracked job now (idempotent; await_all still drains).
+    void cancel_all();
+
+    // Aggregated job errors collected by await_all (name-prefixed).
+    [[nodiscard]] const std::vector<std::string>& errors() const { return errors_; }
+
+    [[nodiscard]] std::size_t job_count() const { return jobs_.size(); }
+    [[nodiscard]] sql::Catalog& catalog() { return catalog_; }
+    [[nodiscard]] bool user_cancelled() const { return user_cancelled_; }
+
+private:
+    struct JobEntry {
+        cluster::JobId id{};
+        std::string name;
+    };
+
+    EngineOptions opts_;
+    sql::Catalog catalog_;
+    cluster::JobManager jm_;
+    std::uint16_t jm_port_{};
+    std::unique_ptr<cluster::TaskManager> tm_;
+    std::vector<JobEntry> jobs_;
+    std::vector<std::string> errors_;
+    bool user_cancelled_ = false;
+};
+
+}  // namespace clink::embed

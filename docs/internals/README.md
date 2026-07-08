@@ -56,6 +56,7 @@ then follow the links into each subsystem.
 | Page | What it covers |
 | --- | --- |
 | [SQL frontend internals](sql-frontend.md) | How a SQL statement becomes an operator DAG: preparse shim, libpg_query parse, AST, binder, rule-based optimiser, and physical planner producing a JobGraphSpec. |
+| [Embedded execution](embedded.md) | How `clink run <file>.sql` runs the whole engine in one process with no daemons: the EmbeddedEngine's in-process JM + TM pair, the shared SQL script runner, bare-SELECT-to-print, and Ctrl-C drain semantics. |
 
 ## Observability
 

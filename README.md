@@ -585,8 +585,28 @@ branch of [`docs/consumer-examples/CMakeLists.txt`](docs/consumer-examples/CMake
 ## SQL frontend
 
 Built when `CLINK_BUILD_SQL=ON` (default off; flip it on to opt in). Compiles a
-PostgreSQL-shaped subset of SQL to a `JobGraphSpec` and submits it to a running
+PostgreSQL-shaped subset of SQL to a `JobGraphSpec` and either runs it EMBEDDED
+(the whole engine in one process, no daemons) or submits it to a running
 cluster through the same HTTP path as a compiled job plugin.
+
+Embedded execution is the fastest way to run a pipeline:
+
+```bash
+# One process, no cluster: a bare SELECT prints its rows to stdout.
+clink run -e "CREATE TABLE orders (usr VARCHAR, amount BIGINT) \
+                WITH (connector='file', format='json', path='/tmp/orders.ndjson'); \
+              SELECT usr, SUM(amount) AS total FROM orders GROUP BY usr"
+
+# The same script file, unchanged, on a real cluster: add one flag.
+clink run pipeline.sql
+clink run pipeline.sql --jm-host=jm.prod --jm-port=8081
+```
+
+First result row lands on stdout in under ~100 ms of process start (Debug
+build, file source). Ctrl-C stops an unbounded pipeline and drains it
+cleanly; `--checkpoint-dir` / `--state-backend` / `--parallelism` behave as
+they do on a cluster. See
+[docs/internals/embedded.md](docs/internals/embedded.md).
 
 Pipeline: `libpg_query` parses the input; an AST builder normalises
 the parse tree into a parser-agnostic AST under `clink::sql::ast`;

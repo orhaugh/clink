@@ -4321,11 +4321,12 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
     } else if (produces_changelog) {
         // A changelog SELECT also lands in a sink that natively consumes a
         // changelog: the netting sink (connector='changelog', nets +/- by full
-        // row) or a discard sink (connector='blackhole', counts and drops). Any
-        // other append-only sink rejects.
+        // row), a discard sink (connector='blackhole', counts and drops), or
+        // the stdout sink (connector='print', prints each change with its
+        // kind prefixed). Any other append-only sink rejects.
         auto cit = sink.properties.find("connector");
         const std::string conn = cit != sink.properties.end() ? cit->second : std::string{};
-        if (conn != "changelog" && conn != "blackhole") {
+        if (conn != "changelog" && conn != "blackhole" && conn != "print") {
             bind_error("sink " + sink.name +
                            " is append-only but the SELECT produces a changelog stream; declare "
                            "mode='upsert' (and primary_key='...'), or use connector='changelog'",
