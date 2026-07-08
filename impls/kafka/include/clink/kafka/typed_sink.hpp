@@ -33,6 +33,8 @@ struct KafkaSinkOptions {
     std::string client_id;
     std::string acks = "all";
     std::string compression;
+    // Producer linger.ms; empty keeps the connector default (5ms).
+    std::string linger_ms;
 };
 
 inline clink::api::SinkDescriptor make_text_sink_descriptor(const KafkaSinkOptions& opts) {
@@ -45,6 +47,9 @@ inline clink::api::SinkDescriptor make_text_sink_descriptor(const KafkaSinkOptio
     }
     if (!opts.compression.empty()) {
         b.compression(opts.compression);
+    }
+    if (!opts.linger_ms.empty()) {
+        b.linger_ms(opts.linger_ms);
     }
     return b.build();
 }
@@ -74,6 +79,9 @@ inline void message_sink(clink::api::DataStream<clink::KafkaMessage> stream,
     }
     if (!opts.compression.empty()) {
         d.params["compression"] = opts.compression;
+    }
+    if (!opts.linger_ms.empty()) {
+        d.params["linger_ms"] = opts.linger_ms;
     }
     stream.sink(std::move(d), std::move(id));
 }

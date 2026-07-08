@@ -151,8 +151,89 @@ Any number printed without that full clause is the documented landmine and is
 blocked. The outcome is unknown going in; the goal is a defensible number in either
 direction, not a predetermined result.
 
+## Latency axis (second measured axis)
+
+Throughput above asks "how fast can the engine drain a backlog". The latency axis
+asks a different question: "under a sustained load both engines can comfortably
+handle, how long does one record take to get through, and what does the tail look
+like". This section pins the latency premise the same way the sections above pin
+throughput. A latency number printed without this premise holding is not quotable.
+
+1. **Workload**: q0 only in v1 (the stateless pass-through), the SAME relation as
+   the throughput q0. It measures the record path: source decode, engine wire,
+   sink encode, Kafka produce. It deliberately has no windows, so nothing in the
+   number is watermark- or trigger-timing; it is pure pipeline latency.
+
+2. **Input discipline (differs from throughput by design)**: the same canonical
+   deterministic `bid.ndjson` is REPLAYED at a paced wall-clock rate onto an EMPTY
+   1-partition input topic created with `message.timestamp.type=LogAppendTime`,
+   while the engine job is already deployed and polling. Each engine gets its own
+   fresh input topic and its own replay of the same file, in the same order, at
+   the same target rate, sequentially. The topic being empty at job start means
+   deploy time creates no backlog; the engine meets each record at arrival.
+
+3. **Load level**: the paced rate must sit well below BOTH engines' gated q0
+   Kafka-sink throughput at the same parallelism (par=1: clink ~452k/s, Flink
+   ~211k/s), so the number is latency-under-load, not saturation queueing. Default
+   50,000 events/s (~24% of the slower engine's ceiling). The harness computes the
+   achieved input rate from broker append times and HALTS if it missed the target
+   by more than 5% (a lagging pacer invalidates the run).
+
+4. **Definition**: latency of the record at position N = broker append time of
+   output record N minus broker append time of input record N. Both topics are
+   LogAppendTime on the SAME single broker, so both timestamps come from one clock
+   and no host/producer clock skew can enter. Resolution is Kafka's millisecond
+   timestamp granularity; sub-ms differences do not resolve, which is disclosed
+   and acceptable because the axis targets tail effects (10ms-class and up).
+
+5. **Positional join validity**: v1 is par=1, 1-partition in and out, and q0 is an
+   order-preserving pass-through on both engines, so output position N corresponds
+   to input position N. This is not assumed; it is verified: the count gate
+   (output count == input count) plus a per-position content check (auction,
+   price, datetime compared on EVERY record) must both pass, else the run HALTS
+   with no number. par>1 latency needs correlation-id injection and is out of v1.
+
+6. **Sink batching pinned**: the engine's output producer linger is 0ms on BOTH
+   (clink `linger_ms='0'` - librdkafka's default is 5ms; Flink
+   `properties.linger.ms='0'` - the Java default is already 0, set explicitly).
+   Without this, clink pays up to 5ms of pure producer batching per record that
+   Flink does not, and the number measures configuration, not engines. All other
+   producer/consumer settings stay at each engine's defaults (librdkafka vs Java
+   client), which is the engines-as-shipped premise; the defaults that matter
+   (fetch.min.bytes=1 semantics on both) do not add latency under continuous
+   flow. The pacer's own producer linger (2ms) shapes arrival identically for
+   both engines and cannot touch the measurement: input timestamps are broker
+   append times, stamped on arrival.
+
+7. **Steady window**: drop the first 20% and the last 5% of positions on both
+   engines identically. The head trim absorbs consumer-group assignment residue
+   and Flink's JIT warm-up; the tail trim keeps end-of-input drain effects out.
+   The result JSON records a per-5-second-bucket p99 series so trim adequacy is
+   inspectable after the fact rather than trusted.
+
+8. **Reported**: p50 / p90 / p99 / p99.9 / max / mean milliseconds over the steady
+   window, the achieved input rate, and the gates (count, order/content, pacer
+   rate). Cross-engine comparison quotes the percentiles side by side; there is
+   no single-ratio headline because a latency distribution does not reduce to one
+   number honestly.
+
+### The only honest latency headline
+
+> On Nexmark q0 (stateless pass-through, the same gated relation as the throughput
+> run), with each engine reading a paced replay of the same deterministic dataset
+> at R events/s (well below both engines' measured capacity) from an empty
+> 1-partition LogAppendTime topic and writing to a 1-partition LogAppendTime topic
+> with producer linger pinned to 0 on both, per-record broker-append-to-broker-append
+> latency over the steady window was: clink p50/p99/p99.9 = A/B/C ms, Flink
+> p50/p99/p99.9 = X/Y/Z ms, on <hardware>, ms resolution, count- and
+> content-gated.
+
+Out of v1, deliberately: windowed-emission latency (needs its own defensible
+trigger-time definition before any number is quoted), par>1 (positional join
+breaks; needs id injection), and a durable-config (checkpoints-on) latency matrix.
+
 ## Status
 
-This harness is being built increment by increment (see `README.md`). No
-cross-engine ratio exists yet; the premise above is the contract every future
-number is held to.
+This harness is built increment by increment (see `README.md`, which also holds
+the gated results for both axes). The premise above is the contract every
+quoted number is held to.

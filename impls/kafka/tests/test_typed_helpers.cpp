@@ -84,7 +84,9 @@ TEST(KafkaTypedHelpers, MessageSinkConsumesMessageStream) {
     auto stream = clink::kafka::message_source(
         env, clink::kafka::KafkaSourceOptions{.brokers = "b:9092", .topic = "in"});
     clink::kafka::message_sink(
-        stream, clink::kafka::KafkaSinkOptions{.brokers = "b:9092", .topic = "out", .acks = "all"});
+        stream,
+        clink::kafka::KafkaSinkOptions{
+            .brokers = "b:9092", .topic = "out", .acks = "all", .linger_ms = "0"});
 
     const auto& g = env.graph();
     ASSERT_EQ(g.ops.size(), 2u);
@@ -93,4 +95,5 @@ TEST(KafkaTypedHelpers, MessageSinkConsumesMessageStream) {
     EXPECT_EQ(g.ops[1].params.at("brokers"), "b:9092");
     EXPECT_EQ(g.ops[1].params.at("topic"), "out");
     EXPECT_EQ(g.ops[1].params.at("acks"), "all");
+    EXPECT_EQ(g.ops[1].params.at("linger_ms"), "0");
 }

@@ -13,6 +13,7 @@
 // Plugins that need the full KafkaMessage (key/headers/partition) can
 // register their own KafkaMessage-typed sources/sinks via the same API.
 
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -35,6 +36,25 @@
 namespace clink::kafka {
 
 namespace {
+
+// Optional 'linger_ms' param -> producer linger (librdkafka linger.ms).
+// Absent keeps the KafkaSink::Options default; garbage throws.
+void apply_linger_ms(const plugin::BuildContext& ctx, KafkaSink::Options& opts) {
+    const auto v = ctx.param_or("linger_ms", "");
+    if (v.empty()) {
+        return;
+    }
+    try {
+        const auto ms = std::stoll(v);
+        if (ms < 0) {
+            throw std::invalid_argument("negative");
+        }
+        opts.linger_ms = std::chrono::milliseconds{ms};
+    } catch (const std::exception&) {
+        throw std::runtime_error("kafka sink: invalid 'linger_ms' value '" + v +
+                                 "' (want a non-negative integer of milliseconds)");
+    }
+}
 
 // Forwarding emitter: convert KafkaMessage batches to string batches;
 // pass watermarks/barriers through.
@@ -312,6 +332,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.client_id = ctx.param_or("client_id", "clink-sink");
             opts.acks = ctx.param_or("acks", "all");
             opts.compression_type = ctx.param_or("compression", "none");
+            apply_linger_ms(ctx, opts);
             populate_kafka_security_conf(ctx, opts.conf);
             if (opts.brokers.empty()) {
                 throw std::runtime_error("kafka_message_sink: 'brokers' is required");
@@ -360,6 +381,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         opts.client_id = ctx.param_or("client_id", "clink-sink");
         opts.acks = ctx.param_or("acks", "all");
         opts.compression_type = ctx.param_or("compression", "none");
+        apply_linger_ms(ctx, opts);
         populate_kafka_security_conf(ctx, opts.conf);
         if (opts.brokers.empty()) {
             throw std::runtime_error("kafka sink: 'brokers' is required");
@@ -389,6 +411,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.client_id = ctx.param_or("client_id", "clink-sink-2pc");
             opts.compression_type = ctx.param_or("compression", "none");
             opts.transactional_id = ctx.param_or("transactional_id", "");
+            apply_linger_ms(ctx, opts);
             populate_kafka_security_conf(ctx, opts.conf);
             if (opts.brokers.empty()) {
                 throw std::runtime_error("kafka_2pc_sink_string: 'brokers' is required");
@@ -429,6 +452,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.client_id = ctx.param_or("client_id", "clink-sink");
             opts.acks = ctx.param_or("acks", "all");
             opts.compression_type = ctx.param_or("compression", "none");
+            apply_linger_ms(ctx, opts);
             populate_kafka_security_conf(ctx, opts.conf);
             if (opts.brokers.empty()) {
                 throw std::runtime_error("kafka_upsert_sink_string: 'brokers' is required");

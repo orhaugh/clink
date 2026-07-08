@@ -1,6 +1,8 @@
 #include "clink/kafka/pipeline_loader.hpp"
 
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -85,6 +87,8 @@ KafkaSink::Options kafka_sink_opts_from(const JsonValue& params) {
     opts.client_id = params.string_or("client_id", opts.client_id);
     opts.acks = params.string_or("acks", opts.acks);
     opts.compression_type = params.string_or("compression_type", opts.compression_type);
+    opts.linger_ms = std::chrono::milliseconds{
+        params.int_or("linger_ms", static_cast<std::int64_t>(opts.linger_ms.count()))};
     opts.metric_prefix = params.string_or("metric_prefix", opts.metric_prefix);
     if (opts.brokers.empty() || opts.topic.empty()) {
         throw std::runtime_error("KafkaPipelineLoader: kafka_sink requires 'brokers' and 'topic'");

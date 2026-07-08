@@ -95,6 +95,10 @@ public:
             compression_ = std::move(v);
             return *this;
         }
+        Builder& linger_ms(std::string v) {
+            linger_ms_ = std::move(v);
+            return *this;
+        }
 
         SinkDescriptor build() const {
             SinkDescriptor d;
@@ -111,6 +115,9 @@ public:
             if (!compression_.empty()) {
                 d.params["compression"] = compression_;
             }
+            if (!linger_ms_.empty()) {
+                d.params["linger_ms"] = linger_ms_;
+            }
             return d;
         }
 
@@ -120,6 +127,7 @@ public:
         std::string client_id_;
         std::string acks_;
         std::string compression_;
+        std::string linger_ms_;
     };
 
     static Builder builder() { return Builder{}; }

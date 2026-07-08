@@ -69,12 +69,13 @@ The `KafkaSource::Options` struct also carries `poll_timeout` (100 ms), `max_bat
 | `client_id` | No | `clink-sink` | librdkafka client id. |
 | `acks` | No | `all` | Producer acknowledgement mode: `all`, `1` or `0`. |
 | `compression` | No | `none` | Compression codec: `none`, `gzip`, `snappy`, `lz4` or `zstd`. |
+| `linger_ms` | No | `5` | Producer batching delay (librdkafka `linger.ms`), a non-negative integer of milliseconds. `0` sends as soon as the producer loop runs, trading batching efficiency for per-record latency. An invalid value fails the deploy with a clear error. |
 
-The `KafkaSink::Options` struct additionally carries `linger_ms` (5 ms), `produce_timeout` (30000 ms), `flush_timeout` (30000 ms), `fixed_partition` (unset) and `metric_prefix` (`default`), which are not parsed from `BuildContext` parameters and take their struct defaults.
+The `KafkaSink::Options` struct additionally carries `produce_timeout` (30000 ms), `flush_timeout` (30000 ms), `fixed_partition` (unset) and `metric_prefix` (`default`), which are not parsed from `BuildContext` parameters and take their struct defaults.
 
 ### Transactional sink (`kafka_2pc_sink_string`)
 
-Accepts `brokers`, `topic`, `client_id` (default `clink-sink-2pc`) and `compression`, plus:
+Accepts `brokers`, `topic`, `client_id` (default `clink-sink-2pc`), `compression` and `linger_ms`, plus:
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -85,7 +86,7 @@ This factory does not parse `acks`; the transactional producer is configured wit
 
 ### Upsert sink (`kafka_upsert_sink_string`)
 
-Accepts `brokers`, `topic`, `client_id` (default `clink-sink`), `acks` and `compression`, plus:
+Accepts `brokers`, `topic`, `client_id` (default `clink-sink`), `acks`, `compression` and `linger_ms`, plus:
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |

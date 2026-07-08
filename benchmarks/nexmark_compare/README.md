@@ -46,6 +46,9 @@ output-row counts (a mismatch HALTS that query, no ratio), and prints the
 scoreboard under the matched-premise banner. The results table below is the
 default par=1; see the Parallelism>1 section for the par=4 run.
 
+`./latency.sh` is the second axis: per-record end-to-end latency under a paced
+sustained load (see the Latency section below).
+
 ## Build increments (all done for the v1 deliverable)
 
 - [x] **INC 0** - premise doc (`pipeline.md`) + scaffold.
@@ -74,6 +77,9 @@ default par=1; see the Parallelism>1 section for the par=4 run.
   (assumed exactly 2). Added `SubtaskEdge.input_index` so the same-type co-op
   groups each side's N bridges correctly. q8 gate-exact (1,056) and q6 correct
   (5,223 sellers) at par=4. See the Parallelism section.
+- [x] **Latency axis** (`latency.sh`): per-record end-to-end latency under
+  sustained paced load, gated on count + positional content + pacer rate. See
+  the Latency section below and the "Latency axis" premise in `pipeline.md`.
 - [ ] A true multi-machine distributed run (out of scope on one host).
 
 ## Results (parallelism 1, 1-partition, hot-path)
@@ -165,6 +171,64 @@ number incl. each engine's baseline overhead, not a compute-kernel ratio (see th
 results note). The throughput geomean covers the two input-scale queries (q0
 stateless, q12 windowed-agg); q8
 (windowed-join) is a correctness gate; q6 is a SQL-only capability.
+
+## Latency (the second measured axis)
+
+Throughput asks how fast an engine drains a backlog; the latency axis asks how
+long ONE record takes under a load both engines handle comfortably, and what the
+tail looks like. Premise: `pipeline.md`, "Latency axis". One command:
+
+```bash
+./latency.sh                                     # 3.68M bids paced at 50k ev/s
+RATE=100000 EVENTS=8000000 ./latency.sh          # heavier point
+BUILD_DIR=$PWD/../../build-release ./latency.sh  # explicit clink build
+```
+
+Mechanics: the engine's q0 job (same relation as the gated throughput q0) is
+deployed against an EMPTY 1-partition LogAppendTime topic, then the same
+deterministic `bid.ndjson` is replayed at a paced wall-clock rate; per-record
+latency = output broker-append minus input broker-append (one broker clock, ms
+resolution). The positional in/out join is verified by a per-record content
+check, producer linger is pinned to 0 on both sinks (the clink Kafka sink
+gained a `linger_ms` option for this), and the run gates on exact count, zero
+content mismatches, and the pacer hitting its target within 5%. Warm-up and
+drain are trimmed (head 20% / tail 5%), with a per-5s-bucket p50/p99 series in
+the result JSON so the trim is inspectable rather than trusted.
+
+### Results (par=1, 50k ev/s, 3.68M bids, hot path, Release+LTO clink vs Flink 2.2.0)
+
+All gates passed on both engines (3,680,000 = 3,680,000, zero mismatches,
+pace within 0.01%):
+
+| engine | p50 | p90 | p99 | p99.9 | max | mean |
+|---|---|---|---|---|---|---|
+| clink | 4 ms | 9 ms | **30 ms** | **67 ms** | **84 ms** | 5.67 ms |
+| flink | **2 ms** | **4 ms** | 39 ms | 77 ms | 94 ms | 2.91 ms |
+
+Two honest readings, one per direction:
+
+- **clink owns the tail.** Every tail percentile is lower (p99 30 vs 39, p99.9
+  67 vs 77, max 84 vs 94), and the per-bucket series explains why: Flink's p99
+  decays from 525 ms to steady over its first ~25 s (JIT warm-up, absorbed by
+  the head trim) and shows GC-class spikes inside the steady window (a 231 ms
+  p99 bucket late in the run); clink's buckets are flat end to end - no
+  warm-up phase and no pause-class spikes. For a latency SLO (the p99.9 you
+  can promise), clink is the better engine here and the gap is structural.
+- **Flink owns the median, and the reason is a clink artefact, not a Flink
+  win.** clink's Kafka source fills a fixed 256-record batch before emitting
+  downstream (`max_batch_size=256`; the fill loop breaks only on a 100 ms
+  quiet timeout), so at 50k ev/s every record pays ~5.1 ms of batch formation
+  - which is almost exactly the p50/p90 gap. The 25k ev/s smoke run confirmed
+  the scaling: clink's p50 was 9 ms there (256/rate seconds of fill). This is
+  a documented engine follow-on: a bounded batch-wait (emit a partial batch
+  after N ms) would collapse clink's median toward Flink's without touching
+  the tail, and this harness is the before/after instrument for it.
+
+Caveats: ms timestamp resolution (sub-ms differences do not resolve; the p50
+2 vs 4 is real but coarse), single box, par=1 v1 (the positional join needs
+correlation-id injection before par>1 latency is measurable), and short runs
+overstate Flink's tail (JIT dominates a thin steady window) - quote only
+full-length gated runs.
 
 ## A real clink bug the gate caught: multi-partition watermarks
 
