@@ -430,6 +430,31 @@ if(CLINK_BUILD_SQL)
         DISCOVERY_MODE PRE_TEST
         PROPERTIES TIMEOUT 30 LABELS sql
     )
+
+    # libclink C ABI. The gtest suite links ONLY the shared library (plus
+    # Arrow C++ to import the C stream on the consumer side) - the engine,
+    # its registries and every connector live inside libclink, mirroring a
+    # real embedding. The pure-C smoke proves the header compiles as C and
+    # the whole open/exec/collect/close flow runs with no C++ consumer.
+    add_executable(clink_c_abi_tests test_clink_c_abi.cpp)
+    target_include_directories(clink_c_abi_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    target_link_libraries(clink_c_abi_tests PRIVATE
+        clink_shared
+        Arrow::arrow_shared
+        GTest::gtest_main
+    )
+    clink_set_warnings(clink_c_abi_tests)
+    gtest_discover_tests(clink_c_abi_tests
+        DISCOVERY_MODE PRE_TEST
+        PROPERTIES TIMEOUT 60 LABELS sql
+    )
+
+    enable_language(C)
+    add_executable(clink_c_smoke test_clink_c_smoke.c)
+    target_include_directories(clink_c_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    target_link_libraries(clink_c_smoke PRIVATE clink_shared)
+    add_test(NAME ClinkCSmoke COMMAND clink_c_smoke)
+    set_tests_properties(ClinkCSmoke PROPERTIES TIMEOUT 60 LABELS sql)
 endif()
 
 # SQL-on-disaggregated-state end-to-end. Needs both the SQL frontend and the

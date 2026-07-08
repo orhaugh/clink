@@ -1,7 +1,8 @@
 # Embedded execution
 
 > How `clink run <file>.sql` runs the whole engine in one process with no
-> daemons, and the EmbeddedEngine class behind it.
+> daemons; the EmbeddedEngine class behind it; and libclink, the pure-C
+> embedding ABI with collect-to-Arrow results.
 
 ## Overview
 
@@ -26,6 +27,14 @@ dominated by post-completion teardown, not startup.
 - `include/clink/embed/embedded_engine.hpp`, `src/embed/embedded_engine.cpp` -
   `EmbeddedEngine`: the in-process JM + TM pair plus the script-execution and
   await/cancel surface. The `clink::embed` CMake target.
+- `include/clink/embed/clink.h`, `src/embed/clink_c.cpp` - libclink: the
+  pure-C ABI over EmbeddedEngine (`clink_shared` CMake target, artifact
+  `libclink.so` / `.dylib` with the engine and every built connector linked
+  in statically).
+- `include/clink/embed/collect_hub.hpp`, `src/embed/collect_hub.cpp` - the
+  `connector='collect'` plumbing: per-engine queues of typed Arrow batches,
+  the process-wide scope registry that lets process-wide sink factories find
+  per-engine queues, and the `collect_sink_row` factory.
 - `include/clink/sql/script_runner.hpp`, `src/sql/script_runner.cpp` -
   `run_script`: the statement-processing loop shared by `clink_submit_sql`,
   the embedded runner, and any future front door. DDL folds into the caller's
@@ -82,6 +91,44 @@ rows print with their kind prefixed (`-U` / `+U` / `-D`) and the
 submission rejects a bare SELECT: its print sink would write to a
 TaskManager's stdout, not the user's terminal.
 
+### libclink and the collect sink
+
+libclink is one shared library plus one pure-C header (compiles as C99; the
+Arrow C data/stream interface structs are reproduced verbatim so the header
+stands alone). The surface is handle-based: `clink_engine_open` starts an
+EmbeddedEngine, `clink_exec` runs a script, `clink_job_wait` /
+`clink_await_all` / `clink_cancel_all` control the submitted jobs, and
+`clink_last_error` carries diagnostics - in library mode the engine's err
+stream is captured into the handle rather than written to stderr. ABI
+compatibility is guarded by `clink_abi_version()`.
+
+Rows reach the host through `connector='collect'`: the sink converts each
+Row batch to a typed Arrow RecordBatch with the same schema-driven batcher
+the wire uses (`make_row_columnar_arrow_batcher`; declared column types,
+utf8 fallback for shapes outside its set, and the batcher's prepended
+engine event-time column stripped so the host sees exactly the declared
+SELECT columns). Batches land in a per-table queue owned by the engine's
+CollectHub, and `clink_collect_stream` exports the queue as an
+`ArrowArrayStream` via `arrow::ExportRecordBatchReader` - zero-copy into
+pyarrow, DuckDB, polars, or Arrow C++.
+
+The factory-to-engine binding works by scope stamping: sink factories are
+process-wide, queues are per-engine, so each engine registers its
+CollectHub under a fresh scope token and stamps that token onto every
+`collect_sink_row` op at submit time; the sink resolves its hub through the
+registry at open(). This is also what makes collect embedded-only: a
+cluster submit carries no scope (and cluster TaskManagers have no factory),
+so it fails loudly rather than silently writing nowhere.
+
+Stream semantics: one consumer per table; `get_next` blocks until a batch
+arrives; end-of-stream fires when the producing job's sink subtasks have
+all closed (completion, failure and cancellation all close, so a reader
+never waits on a dead job); closing the engine wakes blocked readers with a
+cancelled status, and an exported stream stays safe to drain and release
+after the engine is gone (it keeps its queue alive). Collect is
+append-only in v1: a retracting (changelog) SELECT is rejected at bind so
+retractions are never silently flattened into inserts.
+
 ### What embedded mode does not change
 
 The session catalog behaves exactly like `clink_submit_sql`'s
@@ -95,6 +142,12 @@ TaskManager's slots.
 
 `tests/test_embedded_engine.cpp`: a bounded file-to-file GROUP BY end to end,
 bare-SELECT print output captured at the fd level, a retracting TOP-N
-printing kind prefixes, cancel-while-running, pure-DDL scripts, and the
-script-runner's synthesis and rejection paths. The full SQL suite exercises
-the shared script runner through `clink_submit_sql`'s CLI tests.
+printing kind prefixes, cancel-while-running, pure-DDL scripts, the
+collect reader (typed batches, end-of-stream, single-consumer, changelog
+rejection), and the script-runner's synthesis and rejection paths.
+`tests/test_clink_c_abi.cpp` drives the C ABI end to end while linking ONLY
+the shared library (the registries live inside libclink, mirroring a real
+embedding), importing the collect stream through Arrow C++ and asserting
+values; `tests/test_clink_c_smoke.c` is a pure-C consumer (compiled as C)
+that drains the stream through the raw callbacks. The full SQL suite
+exercises the shared script runner through `clink_submit_sql`'s CLI tests.

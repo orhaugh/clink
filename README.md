@@ -323,6 +323,38 @@ After `find_package(clink REQUIRED)` succeeds, `clink_AVAILABLE_IMPLS` is set
 to the semicolon-separated list of impls that were built and installed - gate
 optional features on it (e.g. `if("kafka" IN_LIST clink_AVAILABLE_IMPLS)`).
 
+### libclink: embed from any language (pure-C ABI)
+
+When the SQL frontend is built, `libclink.so`/`.dylib` packages the whole
+engine - runtime, SQL, every built connector - behind one pure-C header
+(`clink/embed/clink.h`). Open an engine (in this process, no daemons), run
+SQL, and read a `connector='collect'` table's rows as typed Arrow batches
+through the Arrow C stream interface - zero-copy into pyarrow, DuckDB,
+polars, or Arrow C++:
+
+```c
+#include <clink/embed/clink.h>
+
+clink_engine* e = clink_engine_open(NULL);
+clink_exec(e,
+    "CREATE TABLE orders (user_id BIGINT, amount BIGINT)"
+    "  WITH (connector='file', format='json', path='/tmp/orders.ndjson');"
+    "CREATE TABLE results (user_id BIGINT, amount BIGINT)"
+    "  WITH (connector='collect');"
+    "INSERT INTO results SELECT user_id, amount FROM orders");
+
+struct ArrowArrayStream s;
+clink_collect_stream(e, "results", &s);   /* blocks per get_next; ends when the job does */
+/* ... drain via the Arrow C stream callbacks, or import into Arrow C++ /
+   pyarrow / DuckDB ... */
+s.release(&s);
+clink_engine_close(e);
+```
+
+See [docs/internals/embedded.md](docs/internals/embedded.md) for the
+semantics (one consumer per collect table, end-of-stream and cancellation
+rules, append-only v1).
+
 A complete set of consumer-facing examples - every core feature wired up as
 its own standalone executable, all built by a single `find_package`-based
 `CMakeLists.txt` - lives in [`docs/consumer-examples/`](docs/consumer-examples/).

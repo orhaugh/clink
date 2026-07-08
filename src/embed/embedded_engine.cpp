@@ -8,8 +8,10 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/task_manager.hpp"
+#include "clink/embed/collect_hub.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/sql/install.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/script_runner.hpp"
 
 namespace clink::embed {
@@ -18,18 +20,44 @@ namespace {
 
 // The in-process TaskManager materialises compiled chains through the
 // process-wide registries, so the built-ins plus the SQL operator set
-// must be installed before the first submit. Once per process.
+// (and the embedded-only collect sink) must be installed before the
+// first submit. Once per process.
 void ensure_factories_installed_once() {
     static std::once_flag flag;
     std::call_once(flag, [] {
         clink::cluster::ensure_built_ins_registered();
         clink::plugin::PluginRegistry reg;
         clink::sql::install(reg);
+        install_collect_sink();
     });
 }
 
 // Distinct TM ids across engine instances (tests run several per process).
 std::atomic<int> g_engine_seq{0};
+
+// A RecordBatchReader over one collect table's queue: ReadNext blocks
+// until a batch, nullptr at end-of-stream, Cancelled after abort. Holds
+// the queue alive so draining stays safe after the engine is destroyed.
+class CollectReader final : public arrow::RecordBatchReader {
+public:
+    CollectReader(std::shared_ptr<arrow::Schema> schema, std::shared_ptr<CollectQueue> queue)
+        : schema_(std::move(schema)), queue_(std::move(queue)) {}
+
+    [[nodiscard]] std::shared_ptr<arrow::Schema> schema() const override { return schema_; }
+
+    arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch>* out) override {
+        auto r = queue_->next();
+        if (!r.ok()) {
+            return r.status();
+        }
+        *out = *r;
+        return arrow::Status::OK();
+    }
+
+private:
+    std::shared_ptr<arrow::Schema> schema_;
+    std::shared_ptr<CollectQueue> queue_;
+};
 
 }  // namespace
 
@@ -39,6 +67,8 @@ EmbeddedEngine::EmbeddedEngine(EngineOptions opts) : opts_(std::move(opts)) {
         catalog_.load_from_dir(opts_.catalog_dir);
         catalog_.set_persistence_dir(opts_.catalog_dir);
     }
+    collect_hub_ = std::make_shared<CollectHub>();
+    collect_scope_ = CollectScopeRegistry::instance().register_hub(collect_hub_);
     const std::string tm_id = "embedded-tm-" + std::to_string(g_engine_seq.fetch_add(1));
     jm_port_ = jm_.start();  // ephemeral loopback port
     jm_.expect_tms({tm_id});
@@ -47,11 +77,18 @@ EmbeddedEngine::EmbeddedEngine(EngineOptions opts) : opts_(std::move(opts)) {
     tm_ = std::make_unique<cluster::TaskManager>(tm_id, "127.0.0.1", cfg);
     tm_->connect_to_jm("127.0.0.1", jm_port_);
     if (!jm_.await_registrations(std::chrono::milliseconds{10'000})) {
+        CollectScopeRegistry::instance().unregister(collect_scope_);
         throw std::runtime_error("EmbeddedEngine: in-process TaskManager failed to register");
     }
 }
 
 EmbeddedEngine::~EmbeddedEngine() {
+    // Wake any blocked collect readers first: they hold their queues alive
+    // and see Cancelled; new sink instances can no longer resolve the scope.
+    CollectScopeRegistry::instance().unregister(collect_scope_);
+    if (collect_hub_) {
+        collect_hub_->abort_all();
+    }
     if (tm_) {
         tm_->stop();
     }
@@ -72,9 +109,21 @@ int EmbeddedEngine::execute_script(const std::string& sql) {
             ckpt.interval_ms = opts_.checkpoint_interval_ms;
         }
         ckpt.state_backend_uri = opts_.state_backend_uri;
+        // Stamp this engine's scope token onto every collect sink so its
+        // instances resolve THIS engine's queues (the factory is
+        // process-wide, the queues are per-engine).
+        cluster::JobGraphSpec stamped = spec;
+        for (auto& op : stamped.ops) {
+            if (op.type == "collect_sink_row") {
+                op.params["collect_scope"] = collect_scope_;
+            }
+        }
         try {
-            const auto id = jm_.submit_job(
-                spec, cluster::OperatorRegistry::default_instance(), {}, std::move(ckpt), nullptr);
+            const auto id = jm_.submit_job(stamped,
+                                           cluster::OperatorRegistry::default_instance(),
+                                           {},
+                                           std::move(ckpt),
+                                           nullptr);
             jobs_.push_back(JobEntry{id, name.empty() ? ("job_" + std::to_string(id)) : name});
         } catch (const std::exception& e) {
             *opts_.err << "error: submit failed: " << e.what() << "\n";
@@ -83,6 +132,67 @@ int EmbeddedEngine::execute_script(const std::string& sql) {
         return 0;
     };
     return sql::run_script(sql, catalog_, ropts, io, submit);
+}
+
+std::vector<cluster::JobId> EmbeddedEngine::job_ids() const {
+    std::vector<cluster::JobId> ids;
+    ids.reserve(jobs_.size());
+    for (const auto& j : jobs_) {
+        ids.push_back(j.id);
+    }
+    return ids;
+}
+
+bool EmbeddedEngine::await_job(cluster::JobId id, std::chrono::milliseconds timeout) {
+    return jm_.await_job_completion(id, timeout);
+}
+
+void EmbeddedEngine::cancel_job(cluster::JobId id) {
+    try {
+        jm_.cancel_job(id);
+    } catch (const std::exception& e) {
+        *opts_.err << "warning: cancel of job " << id << " failed: " << e.what() << "\n";
+    }
+}
+
+std::vector<std::string> EmbeddedEngine::job_errors(cluster::JobId id) const {
+    return jm_.job_errors(id);
+}
+
+arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> EmbeddedEngine::collect_reader(
+    const std::string& table) {
+    const auto* def = catalog_.get_table(table);
+    if (def == nullptr) {
+        return arrow::Status::KeyError(
+            "collect_reader: no table named '", table, "' in the engine catalog");
+    }
+    const auto conn = def->properties.find("connector");
+    if (conn == def->properties.end() || conn->second != "collect") {
+        return arrow::Status::Invalid(
+            "collect_reader: table '", table, "' is not a connector='collect' table");
+    }
+    // The reader's schema must be byte-identical to what the sink builds:
+    // both come from the same schema-driven batcher over the declared
+    // columns (which maps unsupported column types to their utf8 fallback),
+    // and both strip the batcher's prepended engine event-time column so
+    // the host sees exactly the declared SELECT columns.
+    std::vector<sql::RowColumn> cols;
+    cols.reserve(def->columns.size());
+    for (const auto& c : def->columns) {
+        cols.push_back(sql::RowColumn{c.name, c.type});
+    }
+    auto schema_r = sql::make_row_columnar_arrow_batcher(cols).schema()->RemoveField(0);
+    if (!schema_r.ok()) {
+        return schema_r.status();
+    }
+    auto schema = *schema_r;
+    auto queue = collect_hub_->queue(table);
+    if (!queue->claim_consumer()) {
+        return arrow::Status::Invalid(
+            "collect_reader: table '", table, "' already has a consumer (one reader per table)");
+    }
+    return std::static_pointer_cast<arrow::RecordBatchReader>(
+        std::make_shared<CollectReader>(std::move(schema), std::move(queue)));
 }
 
 void EmbeddedEngine::cancel_all() {

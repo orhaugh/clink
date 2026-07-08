@@ -733,6 +733,15 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         // The demo/debug sink behind the embedded runner's bare-SELECT output.
         return RowConnectorBinding{"print_sink_row", kChannelRow, {}};
     }
+    if (connector == "collect") {
+        // In-process collect sink (embedded execution / libclink): batches
+        // land in a per-engine queue and reach the host as typed Arrow via
+        // the Arrow C stream interface. The embedded engine stamps its scope
+        // token onto this op at submit; without one (a cluster submit) the
+        // factory refuses to build - collect is embedded-only by design.
+        return RowConnectorBinding{
+            "collect_sink_row", kChannelRow, "", {{"collect_table", table.name}}};
+    }
     if (connector == "changelog") {
         // Nets a changelog stream (insert/delete/update_*) into its final
         // relation by full-row multiplicity (no primary key), writing survivors
@@ -743,8 +752,8 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     unsupported(
         "format='json' sink requires connector='file', 'kafka', 'clickhouse', 'postgres', "
         "'parquet', 'http', 'pubsub', 'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', "
-        "'kinesis', 'redis', 'mysql', 'firehose', 'dynamodb', 'blackhole', 'print' or 'changelog' "
-        "(got '" +
+        "'kinesis', 'redis', 'mysql', 'firehose', 'dynamodb', 'blackhole', 'print', 'collect' or "
+        "'changelog' (got '" +
         connector + "')");
 }
 

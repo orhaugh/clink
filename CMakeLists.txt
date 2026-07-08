@@ -607,7 +607,10 @@ if(CLINK_BUILD_SQL)
     # clink::embed - the whole runtime in one process (in-process JM + TM
     # driving the shared SQL script runner). The execution core behind
     # `clink run <file>.sql`; the embeddable C ABI wraps the same class.
-    add_library(clink_embed STATIC src/embed/embedded_engine.cpp)
+    add_library(clink_embed STATIC
+        src/embed/embedded_engine.cpp
+        src/embed/collect_hub.cpp
+    )
     add_library(clink::embed ALIAS clink_embed)
     set_target_properties(clink_embed PROPERTIES EXPORT_NAME embed)
     target_compile_features(clink_embed PUBLIC cxx_std_23)
@@ -631,6 +634,20 @@ add_library(clink_all INTERFACE)
 target_link_libraries(clink_all INTERFACE clink::core clink::impls_all)
 add_library(clink::clink ALIAS clink_all)
 set_target_properties(clink_all PROPERTIES EXPORT_NAME clink)
+
+# libclink - the embeddable C ABI (include/clink/embed/clink.h) over
+# EmbeddedEngine, with connector='collect' results exported through the
+# Arrow C stream interface. Links the whole engine plus every built impl
+# statically into one shared library, so an embedding process needs only
+# the C header and this artifact.
+if(TARGET clink::embed)
+    add_library(clink_shared SHARED src/embed/clink_c.cpp)
+    set_target_properties(clink_shared PROPERTIES OUTPUT_NAME clink EXPORT_NAME shared)
+    target_link_libraries(clink_shared PRIVATE clink::embed clink::clink)
+    clink_set_warnings(clink_shared)
+    install(TARGETS clink_shared LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    message(STATUS "libclink - embeddable C ABI enabled")
+endif()
 
 # ---------------------------------------------------------------------------
 # Tools

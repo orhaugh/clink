@@ -1,13 +1,15 @@
-# Built-in sinks (blackhole, changelog, print)
+# Built-in sinks (blackhole, changelog, print, collect)
 
-Three Row-channel sinks compiled into the SQL frontend itself - no client
-library, no `CLINK_WITH_*` knob, always available when `CLINK_BUILD_SQL=ON`.
-They are registered by `clink::sql::install()` (`src/sql/install.cpp`) and
-selected by connector name in `CREATE TABLE ... WITH (connector='...')`; none
-of them takes any further option.
+Row-channel sinks compiled into the engine itself - no client library, no
+`CLINK_WITH_*` knob, always available when `CLINK_BUILD_SQL=ON`. They are
+selected by connector name in `CREATE TABLE ... WITH (connector='...')` and
+take no further option. blackhole, changelog and print are registered by
+`clink::sql::install()` (`src/sql/install.cpp`); collect is registered by the
+embedded engine and only works there.
 
-All three natively accept changelog streams (retracting GROUP BY, Top-N,
-outer joins), which append-only sinks reject.
+blackhole, changelog and print natively accept changelog streams (retracting
+GROUP BY, Top-N, outer joins), which append-only sinks reject; collect is
+append-only in v1.
 
 ## `blackhole`
 
@@ -44,3 +46,25 @@ stripped from the printed object.
 Lines are written with a single `fwrite` each, so concurrent subtasks at
 parallelism above 1 interleave whole lines, never fragments. Row order
 across subtasks is not defined, same as any parallel sink.
+
+## `collect` (embedded only)
+
+Delivers the table's rows to the HOST PROCESS as typed Arrow record batches
+- the results surface of the embedded engine and libclink. Read it in C++
+via `EmbeddedEngine::collect_reader(table)` or from any language through
+`clink_collect_stream()` (the Arrow C stream interface; zero-copy into
+pyarrow, DuckDB, polars). One consumer per table; reads block until data,
+end after the producing job finishes, and cancel when the engine closes.
+Append-only in v1: a retracting (changelog) SELECT is rejected at bind.
+Embedded-only by design - on a cluster there is no host process to deliver
+to, and the submit fails loudly. See
+[embedded execution](../internals/embedded.md).
+
+```sql
+CREATE TABLE results (user_id BIGINT, total BIGINT) WITH (connector='collect');
+INSERT INTO results SELECT user_id, SUM(amount) FROM orders GROUP BY user_id;
+```
+
+(An unbounded GROUP BY emits the running total per input row - the last
+batch row per key is the final answer, the same convention as the file
+sink.)

@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include <arrow/api.h>
 #include <gtest/gtest.h>
 
 #include "clink/config/json.hpp"
@@ -216,6 +217,85 @@ TEST(EmbeddedEngine, ChangelogSelectPrintsKindPrefixes) {
     EXPECT_TRUE(saw_plain_insert);
     fs::remove(in_path);
     fs::remove(cap_path);
+}
+
+TEST(EmbeddedEngine, CollectReaderDeliversTypedBatchesAndEos) {
+    const auto in_path = fs::temp_directory_path() / "clink_embed_collect_in.ndjson";
+    fs::remove(in_path);
+    write_orders(in_path);
+
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    // DDL first so the collect table is in the catalog...
+    ASSERT_EQ(engine.execute_script(orders_ddl(in_path) +
+                                    "CREATE TABLE results (user_id BIGINT, amount BIGINT) "
+                                    "WITH (connector='collect')"),
+              0)
+        << err.str();
+
+    // ...then the reader, requested BEFORE the producing job exists: valid,
+    // blocks until batches arrive.
+    auto reader_r = engine.collect_reader("results");
+    ASSERT_TRUE(reader_r.ok()) << reader_r.status().ToString();
+    auto reader = *reader_r;
+    ASSERT_EQ(reader->schema()->num_fields(), 2);
+    EXPECT_EQ(reader->schema()->field(0)->name(), "user_id");
+    EXPECT_TRUE(reader->schema()->field(0)->type()->Equals(arrow::int64()));
+    EXPECT_TRUE(reader->schema()->field(1)->type()->Equals(arrow::int64()));
+
+    // One consumer per table.
+    auto second = engine.collect_reader("results");
+    EXPECT_FALSE(second.ok());
+
+    ASSERT_EQ(engine.execute_script("INSERT INTO results SELECT user_id, amount FROM orders"), 0)
+        << err.str();
+
+    std::int64_t rows = 0;
+    std::int64_t amount_sum = 0;
+    while (true) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        auto st = reader->ReadNext(&batch);
+        ASSERT_TRUE(st.ok()) << st.ToString();
+        if (!batch) {
+            break;  // end of stream: the bounded job's sinks closed
+        }
+        ASSERT_TRUE(batch->schema()->Equals(*reader->schema()));
+        rows += batch->num_rows();
+        const auto& amounts = static_cast<const arrow::Int64Array&>(*batch->column(1));
+        for (std::int64_t i = 0; i < amounts.length(); ++i) {
+            amount_sum += amounts.Value(i);
+        }
+    }
+    EXPECT_EQ(rows, 5);
+    EXPECT_EQ(amount_sum, 72);
+    EXPECT_TRUE(engine.await_all()) << err.str();
+    fs::remove(in_path);
+}
+
+TEST(EmbeddedEngine, CollectRejectsChangelogSelect) {
+    // connector='collect' is append-only in v1: the typed batches carry no
+    // changelog kind, so a retracting SELECT must be rejected at bind, not
+    // silently flattened into inserts.
+    const auto in_path = fs::temp_directory_path() / "clink_embed_collect_cl_in.ndjson";
+    fs::remove(in_path);
+    write_orders(in_path);
+
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    const std::string script =
+        orders_ddl(in_path) +
+        "CREATE TABLE topn (user_id BIGINT, amount BIGINT) "
+        "WITH (connector='collect');"
+        "INSERT INTO topn SELECT * FROM ("
+        "  SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY amount DESC) AS rn "
+        "  FROM orders) ranked WHERE rn <= 1";
+    EXPECT_NE(engine.execute_script(script), 0);
+    EXPECT_NE(err.str().find("append-only"), std::string::npos) << err.str();
+    fs::remove(in_path);
 }
 
 TEST(EmbeddedEngine, PureDdlScriptSubmitsNothing) {

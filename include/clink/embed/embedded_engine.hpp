@@ -24,6 +24,8 @@
 #include <string>
 #include <vector>
 
+#include <arrow/api.h>
+
 #include "clink/cluster/job_manager.hpp"
 #include "clink/sql/catalog.hpp"
 
@@ -32,6 +34,8 @@ class TaskManager;
 }
 
 namespace clink::embed {
+
+class CollectHub;
 
 struct EngineOptions {
     // Uniform op parallelism applied to every compiled job (>1 fans out).
@@ -92,6 +96,23 @@ public:
     // Cancel every tracked job now (idempotent; await_all still drains).
     void cancel_all();
 
+    // Per-job control (the libclink C surface builds on these).
+    [[nodiscard]] std::vector<cluster::JobId> job_ids() const;
+    // True when the job reached a terminal state within the timeout.
+    bool await_job(cluster::JobId id, std::chrono::milliseconds timeout);
+    void cancel_job(cluster::JobId id);
+    [[nodiscard]] std::vector<std::string> job_errors(cluster::JobId id) const;
+
+    // A blocking reader over a connector='collect' table's typed Arrow
+    // batches (see collect_hub.hpp for the semantics: ReadNext blocks until
+    // a batch, ends when the producing job's sinks close, and returns
+    // Cancelled after the engine closes). Exactly one reader per table;
+    // a second request errors. Valid before or after the producing job is
+    // submitted. The reader stays safe to drain after the engine is
+    // destroyed (it holds the queue alive; pending reads see Cancelled).
+    arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> collect_reader(
+        const std::string& table);
+
     // Aggregated job errors collected by await_all (name-prefixed).
     [[nodiscard]] const std::vector<std::string>& errors() const { return errors_; }
 
@@ -113,6 +134,10 @@ private:
     std::vector<JobEntry> jobs_;
     std::vector<std::string> errors_;
     bool user_cancelled_ = false;
+    // connector='collect' plumbing: this engine's hub plus its token in the
+    // process-wide scope registry (stamped onto collect ops at submit).
+    std::shared_ptr<CollectHub> collect_hub_;
+    std::string collect_scope_;
 };
 
 }  // namespace clink::embed

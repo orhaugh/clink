@@ -75,6 +75,7 @@ Compiled into the SQL frontend itself; always available when
 | [Blackhole (discard)](builtin.md#blackhole) | sink | `blackhole` |
 | [Changelog netting](builtin.md#changelog) | sink | `changelog` |
 | [Print (stdout)](builtin.md#print) | sink | `print` |
+| [Collect (Arrow to host, embedded only)](builtin.md#collect-embedded-only) | sink | `collect` |
 
 ## Notes on delivery semantics
 
