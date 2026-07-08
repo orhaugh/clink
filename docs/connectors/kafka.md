@@ -57,6 +57,7 @@ Options are read from `BuildContext` parameters in `impls/kafka/src/register_fac
 | `group_id` | No | `clink` | Consumer group id. |
 | `client_id` | No | `clink-source` | librdkafka client id. |
 | `auto_offset_reset` | No | `earliest` | Where to start when no committed/restored offset exists: `earliest`, `latest` or `none`. |
+| `batch_max_wait_ms` | No | `5` | Bounds TOTAL batch formation time in the source's poll loop. Waiting for the first record of a batch still blocks up to `poll_timeout` (idle stays cheap); once a batch has begun, the fill loop stops when this bound elapses and emits a partial batch instead of waiting to accumulate `max_batch_size` records. Keeps per-record latency on a paced or trickling input proportional to this bound rather than `max_batch_size / input-rate`; a saturated consumer queue fills `max_batch_size` well inside the bound, so throughput at the ceiling is unaffected. `0` disables the bound. |
 
 The `KafkaSource::Options` struct also carries `poll_timeout` (100 ms), `max_batch_size` (256), `commit_mode` (`Auto`), `enable_debug` (false) and `metric_prefix` (`default`). These are not parsed from `BuildContext` parameters in the registered factories, so they take their struct defaults unless the typed class is constructed directly.
 

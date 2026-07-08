@@ -37,10 +37,13 @@ namespace clink::kafka {
 
 namespace {
 
-// Optional 'linger_ms' param -> producer linger (librdkafka linger.ms).
-// Absent keeps the KafkaSink::Options default; garbage throws.
-void apply_linger_ms(const plugin::BuildContext& ctx, KafkaSink::Options& opts) {
-    const auto v = ctx.param_or("linger_ms", "");
+// Optional millisecond param -> a chrono field on an Options struct
+// (e.g. 'linger_ms' -> sink linger, 'batch_max_wait_ms' -> source batch
+// formation bound). Absent keeps the Options default; garbage throws.
+void apply_ms_param(const plugin::BuildContext& ctx,
+                    const char* key,
+                    std::chrono::milliseconds& target) {
+    const auto v = ctx.param_or(key, "");
     if (v.empty()) {
         return;
     }
@@ -49,11 +52,19 @@ void apply_linger_ms(const plugin::BuildContext& ctx, KafkaSink::Options& opts) 
         if (ms < 0) {
             throw std::invalid_argument("negative");
         }
-        opts.linger_ms = std::chrono::milliseconds{ms};
+        target = std::chrono::milliseconds{ms};
     } catch (const std::exception&) {
-        throw std::runtime_error("kafka sink: invalid 'linger_ms' value '" + v +
+        throw std::runtime_error(std::string{"kafka: invalid '"} + key + "' value '" + v +
                                  "' (want a non-negative integer of milliseconds)");
     }
+}
+
+void apply_linger_ms(const plugin::BuildContext& ctx, KafkaSink::Options& opts) {
+    apply_ms_param(ctx, "linger_ms", opts.linger_ms);
+}
+
+void apply_batch_max_wait(const plugin::BuildContext& ctx, KafkaSource::Options& opts) {
+    apply_ms_param(ctx, "batch_max_wait_ms", opts.batch_max_wait);
 }
 
 // Forwarding emitter: convert KafkaMessage batches to string batches;
@@ -314,6 +325,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.group_id = ctx.param_or("group_id", "clink");
             opts.client_id = ctx.param_or("client_id", "clink-source");
             opts.auto_offset_reset = ctx.param_or("auto_offset_reset", "earliest");
+            apply_batch_max_wait(ctx, opts);
             populate_kafka_security_conf(ctx, opts.conf);
             if (opts.brokers.empty()) {
                 throw std::runtime_error("kafka_message_source: 'brokers' is required");
@@ -362,6 +374,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         opts.group_id = ctx.param_or("group_id", "clink");
         opts.client_id = ctx.param_or("client_id", "clink-source");
         opts.auto_offset_reset = ctx.param_or("auto_offset_reset", "earliest");
+        apply_batch_max_wait(ctx, opts);
         populate_kafka_security_conf(ctx, opts.conf);
         if (opts.brokers.empty()) {
             throw std::runtime_error("kafka source: 'brokers' is required");

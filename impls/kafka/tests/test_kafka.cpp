@@ -213,6 +213,86 @@ TEST(Kafka, SinkProducesAndSourceConsumes) {
     }
 }
 
+TEST(Kafka, ProduceEmitsPartialBatchWithinBatchMaxWait) {
+    // batch_max_wait bounds TOTAL batch formation time: on a paced input
+    // whose inter-arrival is far below poll_timeout (so the quiet-break
+    // never fires), produce() must emit a PARTIAL batch once the bound
+    // elapses instead of accumulating max_batch_size records. Without the
+    // bound, every paced call would return a full 256-record batch after
+    // ~256 * inter-arrival of waiting - the per-record latency defect the
+    // nexmark latency axis measured.
+    MockCluster mock;
+    const std::string topic = "paced-batching";
+    mock.create_topic(topic);
+
+    KafkaSink::Options sink_opts;
+    sink_opts.brokers = mock.brokers();
+    sink_opts.topic = topic;
+    sink_opts.linger_ms = std::chrono::milliseconds{0};  // per-send delivery, no clumping
+    SinkHarness sink_h(sink_opts);
+
+    // Paced background producer: one record every ~2ms, enough records
+    // (15000 = ~30s) to outlast the worst-case subscribe/assignment prime
+    // (10s) plus the whole check window (8s); stopped early via the flag
+    // as soon as the check completes.
+    std::atomic<bool> stop{false};
+    std::thread producer([&] {
+        for (int i = 0; i < 15000 && !stop.load(std::memory_order_acquire); ++i) {
+            Batch<KafkaMessage> b;
+            b.emplace(KafkaMessage{"r-" + std::to_string(i)});
+            sink_h.sink->on_data(b);
+            std::this_thread::sleep_for(2ms);
+        }
+    });
+
+    KafkaSource::Options src_opts;
+    src_opts.brokers = mock.brokers();
+    src_opts.topic = topic;
+    src_opts.group_id = "paced-group";
+    src_opts.auto_offset_reset = "earliest";
+    src_opts.batch_max_wait = std::chrono::milliseconds{20};
+    SourceHarness src_h(src_opts);
+
+    // Prime past subscribe/assignment (can take seconds on the mock); the
+    // records produced meanwhile sit in the local consumer queue as a
+    // backlog, so the first calls may legitimately return full batches.
+    (void)drain(*src_h.source, 1, 10s);
+
+    // Property: while records keep arriving every ~2ms, some produce() call
+    // must return a partial batch (backlog drained -> bound fires). Without
+    // batch_max_wait no paced call ever returns partial.
+    BoundedChannel<StreamElement<KafkaMessage>> ch(8);
+    Emitter<KafkaMessage> em(&ch);
+    bool saw_partial = false;
+    std::chrono::steady_clock::duration partial_elapsed{};
+    const auto deadline = std::chrono::steady_clock::now() + 8s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto t0 = std::chrono::steady_clock::now();
+        src_h.source->produce(em);
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        std::size_t got = 0;
+        while (auto el = ch.try_pop()) {
+            if (el->is_data()) {
+                got += el->as_data().size();
+            }
+        }
+        if (got >= 1 && got < src_opts.max_batch_size) {
+            saw_partial = true;
+            partial_elapsed = elapsed;
+            break;
+        }
+    }
+    stop.store(true, std::memory_order_release);
+    producer.join();
+
+    ASSERT_TRUE(saw_partial) << "produce() never emitted a partial batch on a paced input";
+    // The partial call is deadline-bound: first record may block up to
+    // poll_timeout (100ms), the fill window adds batch_max_wait (20ms).
+    // 400ms leaves generous scheduler/sanitizer headroom while staying far
+    // below the unbounded fill (~256 records * 2ms > 500ms).
+    EXPECT_LT(partial_elapsed, 400ms);
+}
+
 TEST(Kafka, KeysAndHeadersRoundTrip) {
     MockCluster mock;
     const std::string topic = "with-meta";

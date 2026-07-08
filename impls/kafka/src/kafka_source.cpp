@@ -275,12 +275,28 @@ bool KafkaSource::produce(Emitter<KafkaMessage>& out) {
     }
     Batch<KafkaMessage> batch;
     std::uint64_t bytes_read = 0;
+    // batch_max_wait bounds TOTAL fill time: the first record may block up
+    // to poll_timeout (idle stays cheap), but once the batch is non-empty
+    // the remaining fill window shrinks to the deadline, so a paced or
+    // trickling input gets a prompt partial batch instead of waiting for
+    // max_batch_size records to accumulate.
+    const auto wait_bound = impl_->opts.batch_max_wait;
+    const auto fill_deadline = std::chrono::steady_clock::now() + wait_bound;
     for (std::size_t i = 0; i < impl_->opts.max_batch_size; ++i) {
         if (impl_->cancelled.load(std::memory_order_acquire)) {
             break;
         }
-        std::unique_ptr<RdKafka::Message> msg(
-            impl_->consumer->consume(static_cast<int>(impl_->opts.poll_timeout.count())));
+        int timeout_ms = static_cast<int>(impl_->opts.poll_timeout.count());
+        if (!batch.empty() && wait_bound > std::chrono::milliseconds::zero()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= fill_deadline) {
+                break;
+            }
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(fill_deadline - now);
+            timeout_ms = std::min(timeout_ms, static_cast<int>(remaining.count()) + 1);
+        }
+        std::unique_ptr<RdKafka::Message> msg(impl_->consumer->consume(timeout_ms));
         const auto err = msg->err();
         if (err == RdKafka::ERR__TIMED_OUT) {
             break;

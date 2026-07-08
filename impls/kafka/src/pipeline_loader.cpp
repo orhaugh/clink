@@ -72,6 +72,8 @@ KafkaSource::Options kafka_source_opts_from(const JsonValue& params) {
     opts.group_id = params.string_or("group_id", opts.group_id);
     opts.client_id = params.string_or("client_id", opts.client_id);
     opts.auto_offset_reset = params.string_or("auto_offset_reset", opts.auto_offset_reset);
+    opts.batch_max_wait = std::chrono::milliseconds{
+        params.int_or("batch_max_wait_ms", static_cast<std::int64_t>(opts.batch_max_wait.count()))};
     opts.metric_prefix = params.string_or("metric_prefix", opts.metric_prefix);
     if (opts.brokers.empty() || opts.topic.empty()) {
         throw std::runtime_error(

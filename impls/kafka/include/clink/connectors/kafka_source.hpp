@@ -47,6 +47,17 @@ public:
         std::string auto_offset_reset = "earliest";
         std::chrono::milliseconds poll_timeout = std::chrono::milliseconds{100};
         std::size_t max_batch_size = 256;
+        // Bounds TOTAL batch formation time in produce(). Waiting for the
+        // FIRST record of a batch still blocks up to poll_timeout (idle
+        // stays cheap); once a batch has begun, the fill loop stops when
+        // this bound elapses, emitting a partial batch instead of waiting
+        // to reach max_batch_size. Keeps per-record latency on a paced or
+        // trickling input proportional to this bound rather than
+        // max_batch_size / input-rate, and costs a saturated consumer
+        // nothing (a full local queue fills max_batch_size well inside
+        // the bound). 0 disables the bound (fill until max_batch_size or
+        // a poll_timeout-quiet break).
+        std::chrono::milliseconds batch_max_wait = std::chrono::milliseconds{5};
         CommitMode commit_mode = CommitMode::Auto;
         // When true, librdkafka's debug log channel is enabled - verbose
         // but useful when triaging connection issues.

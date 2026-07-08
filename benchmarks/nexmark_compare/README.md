@@ -198,36 +198,50 @@ the result JSON so the trim is inspectable rather than trusted.
 ### Results (par=1, 50k ev/s, 3.68M bids, hot path, Release+LTO clink vs Flink 2.2.0)
 
 All gates passed on both engines (3,680,000 = 3,680,000, zero mismatches,
-pace within 0.01%):
+pace within 0.01%), same run, same conditions:
 
 | engine | p50 | p90 | p99 | p99.9 | max | mean |
 |---|---|---|---|---|---|---|
-| clink | 4 ms | 9 ms | **30 ms** | **67 ms** | **84 ms** | 5.67 ms |
-| flink | **2 ms** | **4 ms** | 39 ms | 77 ms | 94 ms | 2.91 ms |
+| clink | 2 ms | 7 ms | **8 ms** | **18 ms** | **32 ms** | 2.82 ms |
+| flink | 1 ms | 2 ms | 51 ms | 198 ms | 220 ms | 2.82 ms |
 
-Two honest readings, one per direction:
+The medians sit at the millisecond-resolution floor on both engines and the
+means are identical; the distributions part company in the tail: clink's
+p99.9 is ~11x lower, and its per-5s bucket series is ruler-flat (p99 = 8 ms
+in every steady bucket) where Flink's shows a JIT warm-up decay over the
+first ~25 s (absorbed by the head trim) and GC-class spikes inside the steady
+window. Flink's tail also swings run to run - p99.9 was 77 ms in one
+full-length run and 198 ms in another under identical conditions - which is
+itself the finding: the tail is scheduled by the garbage collector, not by
+load. clink's post-fix tail reproduced flat across runs. For a latency SLO
+(the p99.9 you can promise), the gap is structural: no JVM, no warm-up phase,
+no pause-class spikes.
 
-- **clink owns the tail.** Every tail percentile is lower (p99 30 vs 39, p99.9
-  67 vs 77, max 84 vs 94), and the per-bucket series explains why: Flink's p99
-  decays from 525 ms to steady over its first ~25 s (JIT warm-up, absorbed by
-  the head trim) and shows GC-class spikes inside the steady window (a 231 ms
-  p99 bucket late in the run); clink's buckets are flat end to end - no
-  warm-up phase and no pause-class spikes. For a latency SLO (the p99.9 you
-  can promise), clink is the better engine here and the gap is structural.
-- **Flink owns the median, and the reason is a clink artefact, not a Flink
-  win.** clink's Kafka source fills a fixed 256-record batch before emitting
-  downstream (`max_batch_size=256`; the fill loop breaks only on a 100 ms
-  quiet timeout), so at 50k ev/s every record pays ~5.1 ms of batch formation
-  - which is almost exactly the p50/p90 gap. The 25k ev/s smoke run confirmed
-  the scaling: clink's p50 was 9 ms there (256/rate seconds of fill). This is
-  a documented engine follow-on: a bounded batch-wait (emit a partial batch
-  after N ms) would collapse clink's median toward Flink's without touching
-  the tail, and this harness is the before/after instrument for it.
+### The bench earned its keep on day one: the batch-fill defect it caught
 
-Caveats: ms timestamp resolution (sub-ms differences do not resolve; the p50
-2 vs 4 is real but coarse), single box, par=1 v1 (the positional join needs
-correlation-id injection before par>1 latency is measurable), and short runs
-overstate Flink's tail (JIT dominates a thin steady window) - quote only
+The FIRST gated run told a different story: clink p50/p99/p99.9/max was
+4/30/67/84 ms - behind Flink at the median. The per-bucket series and the
+25k ev/s smoke run localised the cause precisely: clink's Kafka source filled
+a fixed 256-record batch before emitting downstream (the fill loop broke only
+on a 100 ms quiet timeout), so every record paid ~`256/rate` seconds of batch
+formation (~5 ms at 50k ev/s, ~10 ms at 25k ev/s - the measured p50s), and
+early records rode hostage in the clump, coupling the tail to arrival jitter.
+
+The fix is `batch_max_wait` (`KafkaSource::Options`, default 5 ms, WITH-option
+`batch_max_wait_ms`): once a batch has begun, the fill loop stops when the
+bound elapses and emits a partial batch. Idle stays cheap (the first record
+still blocks up to `poll_timeout`), and a saturated consumer queue fills 256
+records well inside the bound, so the throughput ceiling is untouched: the
+post-fix gated q0 run measured 606k ev/s steady (documented pre-fix figure
+452k; rate is run-to-run noisy and partly broker-bound, so read this as "no
+regression", not "the fix sped it up"). Post-fix, the whole clink latency
+distribution collapsed: 4/30/67/84 -> 2/8/18/32 ms. That before/after is
+exactly what this harness exists to measure.
+
+Caveats: ms timestamp resolution (sub-ms differences do not resolve; p50
+1 vs 2 is not a meaningful gap), single box, par=1 v1 (the positional join
+needs correlation-id injection before par>1 latency is measurable), and short
+runs overstate Flink's tail (JIT dominates a thin steady window) - quote only
 full-length gated runs.
 
 ## A real clink bug the gate caught: multi-partition watermarks
