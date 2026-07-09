@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -198,6 +199,70 @@ inline std::optional<std::pair<CaptureFileHeader, std::size_t>> decode_capture_h
     }
     pos += 8;
     return std::make_pair(h, pos);
+}
+
+// ---- the op-spec sidecar (op.json) -----------------------------------------
+//
+// Replay needs to REBUILD the captured operator offline, so the capture
+// layer writes each armed operator's build spec next to its epochs:
+// <capture_dir>/op-<id>/subtask-<idx>/op.json holding the factory type,
+// params, channels and uid. Written once per runner arm (best-effort,
+// like the epochs). The format is a flat JSON object with string values -
+// exactly the OperatorSpec params model.
+
+struct OpSpecSidecar {
+    std::string op_type;
+    std::string in_channel;
+    std::string out_channel;
+    std::string uid;
+    std::map<std::string, std::string> params;
+};
+
+inline void write_op_spec(const std::filesystem::path& capture_dir,
+                          OperatorId op,
+                          std::size_t subtask_idx,
+                          const OpSpecSidecar& spec) noexcept {
+    try {
+        const auto subdir = capture_dir / ("op-" + std::to_string(op.value())) /
+                            ("subtask-" + std::to_string(subtask_idx));
+        std::filesystem::create_directories(subdir);
+        auto esc = [](const std::string& s) {
+            std::string out;
+            out.reserve(s.size() + 8);
+            for (const char c : s) {
+                switch (c) {
+                    case '"':
+                        out += "\\\"";
+                        break;
+                    case '\\':
+                        out += "\\\\";
+                        break;
+                    case '\n':
+                        out += "\\n";
+                        break;
+                    default:
+                        out += c;
+                }
+            }
+            return out;
+        };
+        std::string json = "{\"op_type\":\"" + esc(spec.op_type) + "\",\"in_channel\":\"" +
+                           esc(spec.in_channel) + "\",\"out_channel\":\"" + esc(spec.out_channel) +
+                           "\",\"uid\":\"" + esc(spec.uid) + "\",\"params\":{";
+        bool first = true;
+        for (const auto& [k, v] : spec.params) {
+            if (!first) {
+                json += ",";
+            }
+            first = false;
+            json += "\"" + esc(k) + "\":\"" + esc(v) + "\"";
+        }
+        json += "}}";
+        std::ofstream out(subdir / "op.json", std::ios::binary | std::ios::trunc);
+        out.write(json.data(), static_cast<std::streamsize>(json.size()));
+    } catch (const std::exception&) {
+        // Best-effort, like every capture write.
+    }
 }
 
 // ---- the per-runner epoch buffer -------------------------------------------

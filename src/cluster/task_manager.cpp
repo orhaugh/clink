@@ -1539,6 +1539,23 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             // op_id<->node mapping (clink_op_info). The DagBuilder doesn't carry
             // the chain identity, so do it here where co.id/co.uid are known.
             dag.set_runner_identity(handle.runner_index, co.id, co.uid);
+            // Record-capture op-spec sidecar: persist each chained op's build
+            // spec next to its epochs so `clink replay` can rebuild it offline.
+            // NOTE: set_runner_identity above can re-derive the OperatorId from
+            // the uid, so read the id AFTER stamping.
+            if (!capture_dir.empty()) {
+                clink::capture::write_op_spec(
+                    capture_dir,
+                    clink::OperatorId{dag.runner_id_at(handle.runner_index)},
+                    chain.subtask_idx,
+                    clink::capture::OpSpecSidecar{
+                        .op_type = co.type,
+                        .in_channel = co.in_channel,
+                        .out_channel = co.out_channel,
+                        .uid = co.uid,
+                        .params = co.params,
+                    });
+            }
             prev = std::move(handle.main_handle);
         }
 

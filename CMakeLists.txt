@@ -707,13 +707,15 @@ add_library(clink_cli_cmds OBJECT
     tools/clink_list.cpp
 )
 target_link_libraries(clink_cli_cmds PUBLIC clink::core)
-# `clink run <file>.sql` needs the SQL frontend + embedded engine; a
-# SQL-off build links a stub that errors with a rebuild hint instead.
+# `clink run <file>.sql` and `clink replay` need the SQL frontend +
+# embedded engine; a SQL-off build links stubs that error with a rebuild
+# hint instead.
 if(TARGET clink::embed)
-    target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql.cpp)
+    target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql.cpp tools/clink_replay.cpp)
     target_link_libraries(clink_cli_cmds PUBLIC clink::embed)
 else()
-    target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql_stub.cpp)
+    target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql_stub.cpp
+                                          tools/clink_replay_stub.cpp)
 endif()
 if(TARGET clink::tls)
     target_compile_definitions(clink_cli_cmds PUBLIC CLINK_LINKED_TLS)

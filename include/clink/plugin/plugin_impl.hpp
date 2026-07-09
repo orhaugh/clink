@@ -528,6 +528,21 @@ void PluginRegistry::register_operator(
             clink::Dag dag;
             auto h0 = clink::cluster::build_typed_input_stage<In>(dag, rctx.in_bridges);
             auto h1 = dag.template add_operator<In, Out>(h0, op, capture_codec);
+            // Record-capture op-spec sidecar: persist this op's build spec
+            // next to its epochs so `clink replay` can rebuild it offline.
+            if (capture_codec && !rctx.capture_dir.empty() && !chain.ops.empty()) {
+                const auto& co = chain.ops[0];
+                clink::capture::write_op_spec(rctx.capture_dir,
+                                              clink::OperatorId{dag.runner_id_at(h1.runner_index)},
+                                              chain.subtask_idx,
+                                              clink::capture::OpSpecSidecar{
+                                                  .op_type = co.type,
+                                                  .in_channel = co.in_channel,
+                                                  .out_channel = co.out_channel,
+                                                  .uid = co.uid,
+                                                  .params = co.params,
+                                              });
+            }
             clink::cluster::attach_typed_output_groups<Out>(
                 dag,
                 h1,

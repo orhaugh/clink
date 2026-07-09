@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/config/json.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/operators/map_operator.hpp"
 #include "clink/operators/sink_operator.hpp"
@@ -175,5 +176,32 @@ TEST(RecordCapture, RunnerTeeWritesEpochsEndToEnd) {
         EXPECT_EQ(recs[static_cast<std::size_t>(i)].value(),
                   i + 1);  // input, not the mapped output
     }
+    fs::remove_all(dir);
+}
+
+TEST(RecordCapture, OpSpecSidecarWritesParseableJson) {
+    const auto dir = fs::temp_directory_path() / "clink_capture_spec";
+    fs::remove_all(dir);
+    capture::OpSpecSidecar spec;
+    spec.op_type = "aggregate_row";
+    spec.in_channel = "row";
+    spec.out_channel = "row";
+    spec.uid = "agg-1";
+    spec.params = {{"group_keys", "usr"}, {"aggregates", R"([{"fn":"sum"}])"}};
+    capture::write_op_spec(dir, OperatorId{42}, /*subtask=*/3, spec);
+
+    const auto path = dir / "op-42" / "subtask-3" / "op.json";
+    ASSERT_TRUE(fs::exists(path));
+    std::ifstream in(path, std::ios::binary);
+    std::string text{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+    auto js = clink::config::parse(text);
+    ASSERT_TRUE(js.is_object());
+    EXPECT_EQ(js.at("op_type").as_string(), "aggregate_row");
+    EXPECT_EQ(js.at("in_channel").as_string(), "row");
+    EXPECT_EQ(js.at("uid").as_string(), "agg-1");
+    ASSERT_TRUE(js.at("params").is_object());
+    EXPECT_EQ(js.at("params").at("group_keys").as_string(), "usr");
+    // The quoted-JSON param survives escaping.
+    EXPECT_EQ(js.at("params").at("aggregates").as_string(), R"([{"fn":"sum"}])");
     fs::remove_all(dir);
 }
