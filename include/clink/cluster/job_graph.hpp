@@ -88,6 +88,27 @@ struct OperatorSpec {
     std::vector<SideOutputDecl> side_outputs;
 };
 
+// A SQL-declared scalar function the job's expressions call, shipped with
+// the spec so every TaskManager can register it at deploy time (the module
+// path in `definitions` is only readable where the CREATE FUNCTION ran).
+// Types are Arrow ToString() names ("int64", "double", ...); the module
+// payload is base64 so the spec stays valid JSON. Registration on the TM is
+// process-wide and idempotent (a re-deploy replaces the same name), matching
+// how C++-registered UDFs from a job plugin behave.
+struct UdfSpec {
+    std::string name;
+    std::string language;
+    std::vector<std::string> arg_types;
+    std::string return_type;
+    std::vector<std::string> definitions;
+    std::string module_b64;
+};
+
+// Pack/unpack a UDF list as a JSON array string - the single-string form
+// carried by the DeployMsg wire field (and embedded raw in the spec JSON).
+std::string pack_udf_specs(const std::vector<UdfSpec>& udfs);
+std::vector<UdfSpec> unpack_udf_specs(std::string_view packed);
+
 // JobGraphSpec is the wire-shaped logical description of a job (
 // JobGraph). The clink JM translates it into a JobPlan (
 // ExecutionGraph) by applying placement and parallelism expansion.
@@ -116,6 +137,13 @@ struct JobGraphSpec {
     // restore). Empty for jobs that declare nothing. Serialized as a
     // single packed string in to_json/from_json.
     StateVersionMap expected_state_versions;
+
+    // SQL-declared scalar functions (CREATE FUNCTION ... LANGUAGE ...)
+    // this job's expressions call, module payloads included. The JM
+    // threads them to every TaskManager in the DeployMsg; a TM registers
+    // each before running the job's subtasks. Empty for jobs that use
+    // none. Survives HA restart with the rest of the spec.
+    std::vector<UdfSpec> udfs;
 
     // Compact line-based format. Preserved for the round-trip tests in
     // tests/test_job_graph.cpp and for terse hand-written specs. JSON is

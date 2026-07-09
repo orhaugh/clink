@@ -24,10 +24,12 @@
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/service_discovery.hpp"
 #include "clink/cluster/type_registry.hpp"
+#include "clink/core/base64.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/metrics/process_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/operators/udf_language_registry.hpp"
 #include "clink/plugin/plugin.hpp"       // BuildContext
 #include "clink/plugin/plugin_impl.hpp"  // make_subtask_job_config
 #include "clink/runtime/dag.hpp"
@@ -42,6 +44,37 @@
 namespace clink::cluster {
 
 namespace {
+
+// Register the job's shipped UDF declarations (DeployMsg.udfs_packed) into
+// the process-wide registries via each declaration's LANGUAGE loader. The
+// module payload travels base64 in the spec; the local path in
+// `definitions` is only meaningful where the CREATE FUNCTION ran, so the
+// decoded bytes are what the loader instantiates from. Throws on an
+// unknown language, a bad payload, or a loader failure - the caller
+// surfaces that as the subtask's error.
+void register_shipped_udfs(const std::string& packed) {
+    for (const auto& u : unpack_udf_specs(packed)) {
+        UdfLanguageRegistry::FunctionDecl decl;
+        decl.name = u.name;
+        decl.arg_types.reserve(u.arg_types.size());
+        for (const auto& t : u.arg_types) {
+            decl.arg_types.push_back(udf_type_from_wire_name(t));
+        }
+        if (!u.return_type.empty()) {
+            decl.return_type = udf_type_from_wire_name(u.return_type);
+        }
+        decl.definitions = u.definitions;
+        if (!u.module_b64.empty()) {
+            const auto bytes = base64_decode(u.module_b64);
+            if (!bytes) {
+                throw std::runtime_error("UDF deploy: invalid base64 module payload for '" +
+                                         u.name + "'");
+            }
+            decl.module_bytes.assign(bytes->begin(), bytes->end());
+        }
+        UdfLanguageRegistry::global().load(u.language, decl);
+    }
+}
 
 std::optional<std::vector<std::byte>> read_frame(network::Connection& conn) {
     std::array<std::byte, 4> hdr{};
@@ -799,6 +832,7 @@ void TaskManager::handle_deploy_(MessageReader& r) {
         const std::uint64_t restore_id = msg.restore_from_checkpoint_id;
         const bool unaligned = msg.unaligned_checkpoints;
         const std::string expected_versions = msg.expected_state_versions_packed;
+        const std::string udfs = msg.udfs_packed;
         task_threads_.emplace_back([this,
                                     jid,
                                     task = std::move(task),
@@ -806,8 +840,10 @@ void TaskManager::handle_deploy_(MessageReader& r) {
                                     restore_dir,
                                     restore_id,
                                     unaligned,
-                                    expected_versions] {
-            run_task_(jid, task, ckpt_dir, restore_dir, restore_id, unaligned, expected_versions);
+                                    expected_versions,
+                                    udfs] {
+            run_task_(
+                jid, task, ckpt_dir, restore_dir, restore_id, unaligned, expected_versions, udfs);
         });
     }
 }
@@ -877,11 +913,20 @@ void TaskManager::run_task_(JobId job_id,
                             const std::string& restore_from_dir,
                             std::uint64_t restore_from_checkpoint_id,
                             bool unaligned_checkpoints,
-                            const std::string& expected_state_versions_packed) {
+                            const std::string& expected_state_versions_packed,
+                            const std::string& udfs_packed) {
     metrics::tm::subtask_started();
     bool had_error = false;
     std::string err_msg;
     try {
+        // SQL-declared UDFs shipped with the job: register each before any
+        // operator runs so expression evaluation resolves them. Process-wide
+        // and idempotent (same-name re-registration replaces), so subtasks
+        // racing here is harmless; a failure (unknown language, bad module)
+        // fails this subtask with the loader's message.
+        if (!udfs_packed.empty()) {
+            register_shipped_udfs(udfs_packed);
+        }
         if (task.role == kGenericSubtaskRole) {
             run_generic_subtask_(job_id,
                                  task,

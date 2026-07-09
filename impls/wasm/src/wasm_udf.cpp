@@ -102,10 +102,25 @@ const char* kind_name(wasm_valkind_t k) {
     }
 }
 
+// Read a module file into bytes. No size cap here: loading a large module
+// locally is legitimate; only SHIPPING one with a job is capped (see the
+// packager in install()).
+std::vector<std::uint8_t> read_module_file(const std::string& module_path) {
+    std::ifstream in(module_path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("wasm UDF: cannot open module " + module_path);
+    }
+    return std::vector<std::uint8_t>{std::istreambuf_iterator<char>{in},
+                                     std::istreambuf_iterator<char>{}};
+}
+
 // One loaded UDF: store + instance + resolved export, serialised by mu_.
+// `origin` is only for error messages: the module path locally, or a
+// shipped-module marker when the bytes arrived with a job deploy.
 class WasmScalarFunction {
 public:
-    WasmScalarFunction(const std::string& module_path,
+    WasmScalarFunction(const std::vector<std::uint8_t>& bytes,
+                       const std::string& origin,
                        const std::string& export_name,
                        std::vector<wasm_valkind_t> param_kinds,
                        wasm_valkind_t result_kind,
@@ -113,21 +128,13 @@ public:
         : param_kinds_(std::move(param_kinds)),
           result_kind_(result_kind),
           fuel_limit_(fuel_limit == 0 ? kDefaultFuelPerCall : fuel_limit) {
-        // Read the module bytes.
-        std::ifstream in(module_path, std::ios::binary);
-        if (!in) {
-            throw std::runtime_error("wasm UDF: cannot open module " + module_path);
-        }
-        std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>{in},
-                                        std::istreambuf_iterator<char>{}};
-
         store_ = wasmtime_store_new(shared_engine(), nullptr, nullptr);
         context_ = wasmtime_store_context(store_);
 
         wasmtime_module_t* module = nullptr;
         if (auto* err = wasmtime_module_new(shared_engine(), bytes.data(), bytes.size(), &module);
             err != nullptr) {
-            throw_wasmtime(("wasm UDF: compile failed for " + module_path).c_str(), err, nullptr);
+            throw_wasmtime(("wasm UDF: compile failed for " + origin).c_str(), err, nullptr);
         }
         // No imports: a UDF module must be self-contained (no WASI, no host
         // functions) - that is the sandbox contract.
@@ -135,7 +142,7 @@ public:
         if (auto* err = wasmtime_instance_new(context_, module, nullptr, 0, &instance_, &trap);
             err != nullptr || trap != nullptr) {
             wasmtime_module_delete(module);
-            throw_wasmtime(("wasm UDF: instantiate failed for " + module_path +
+            throw_wasmtime(("wasm UDF: instantiate failed for " + origin +
                             " (imports are not supported - the module must be self-contained)")
                                .c_str(),
                            err,
@@ -147,12 +154,12 @@ public:
         if (!wasmtime_instance_export_get(
                 context_, &instance_, export_name.data(), export_name.size(), &item) ||
             item.kind != WASMTIME_EXTERN_FUNC) {
-            throw std::runtime_error("wasm UDF: module " + module_path +
-                                     " has no exported function '" + export_name + "'");
+            throw std::runtime_error("wasm UDF: module " + origin + " has no exported function '" +
+                                     export_name + "'");
         }
         func_ = item.of.func;
 
-        validate_signature_(module_path, export_name);
+        validate_signature_(origin, export_name);
     }
 
     ~WasmScalarFunction() {
@@ -236,13 +243,13 @@ public:
 private:
     // Compare the export's actual (params -> result) against the declared
     // SQL signature, once at load. Mismatches fail CREATE FUNCTION, not rows.
-    void validate_signature_(const std::string& module_path, const std::string& export_name) {
+    void validate_signature_(const std::string& origin, const std::string& export_name) {
         wasm_functype_t* ft = wasmtime_func_type(context_, &func_);
         const wasm_valtype_vec_t* params = wasm_functype_params(ft);
         const wasm_valtype_vec_t* results = wasm_functype_results(ft);
         auto fail = [&](const std::string& detail) {
             wasm_functype_delete(ft);
-            throw std::runtime_error("wasm UDF: export '" + export_name + "' of " + module_path +
+            throw std::runtime_error("wasm UDF: export '" + export_name + "' of " + origin +
                                      " does not match the declared signature: " + detail);
         };
         if (params->size != param_kinds_.size()) {
@@ -290,12 +297,17 @@ std::vector<std::uint8_t> wat_to_wasm(const std::string& wat) {
     return bytes;
 }
 
-void register_wasm_udf(const std::string& name,
-                       const std::vector<std::shared_ptr<arrow::DataType>>& arg_types,
-                       const std::shared_ptr<arrow::DataType>& return_type,
-                       const std::string& module_path,
-                       const std::string& export_name,
-                       std::uint64_t fuel_limit) {
+namespace {
+
+// Shared registration body: compile + instantiate + validate from bytes,
+// then publish the closure. `origin` labels errors (path or shipped marker).
+void register_wasm_udf_bytes(const std::string& name,
+                             const std::vector<std::shared_ptr<arrow::DataType>>& arg_types,
+                             const std::shared_ptr<arrow::DataType>& return_type,
+                             const std::vector<std::uint8_t>& bytes,
+                             const std::string& origin,
+                             const std::string& export_name,
+                             std::uint64_t fuel_limit) {
     std::vector<wasm_valkind_t> param_kinds;
     param_kinds.reserve(arg_types.size());
     for (const auto& t : arg_types) {
@@ -305,26 +317,77 @@ void register_wasm_udf(const std::string& name,
     // Construction validates everything (module, export, signature); the
     // shared_ptr keeps the instance alive inside the registry closure.
     auto fn = std::make_shared<WasmScalarFunction>(
-        module_path, export_name, std::move(param_kinds), result_kind, fuel_limit);
+        bytes, origin, export_name, std::move(param_kinds), result_kind, fuel_limit);
     ScalarFunctionRegistry::global().register_function(
         name, return_type, [fn](const std::vector<config::JsonValue>& args) {
             return fn->call(args);
         });
 }
 
+// Cap on the payload a CREATE FUNCTION ships with a job. Protects the
+// control plane (the module travels base64 inside the spec JSON and every
+// DeployMsg); real UDF modules are a few KB to a few MB.
+constexpr std::size_t kMaxShippedModuleBytes = 32ull * 1024 * 1024;
+
+}  // namespace
+
+void register_wasm_udf(const std::string& name,
+                       const std::vector<std::shared_ptr<arrow::DataType>>& arg_types,
+                       const std::shared_ptr<arrow::DataType>& return_type,
+                       const std::string& module_path,
+                       const std::string& export_name,
+                       std::uint64_t fuel_limit) {
+    register_wasm_udf_bytes(name,
+                            arg_types,
+                            return_type,
+                            read_module_file(module_path),
+                            module_path,
+                            export_name,
+                            fuel_limit);
+}
+
 void install(clink::plugin::PluginRegistry& /*reg*/) {
     // CREATE FUNCTION ... LANGUAGE wasm AS '<module.wasm>'[, '<export>'].
-    // The export name defaults to the function name.
+    // The export name defaults to the function name. A declaration that
+    // arrived with a job deploy carries the module bytes instead of a
+    // readable path - prefer them (the path only exists where the CREATE
+    // ran). The packager is the other half: it turns a locally-declared
+    // function into those shippable bytes.
     UdfLanguageRegistry::global().register_language(
-        "wasm", [](const UdfLanguageRegistry::FunctionDecl& decl) {
+        "wasm",
+        [](const UdfLanguageRegistry::FunctionDecl& decl) {
             if (decl.definitions.empty()) {
                 throw std::runtime_error("LANGUAGE wasm requires AS '<module.wasm>'");
             }
             const std::string& module_path = decl.definitions[0];
             const std::string export_name =
                 decl.definitions.size() > 1 ? decl.definitions[1] : decl.name;
+            if (!decl.module_bytes.empty()) {
+                register_wasm_udf_bytes(decl.name,
+                                        decl.arg_types,
+                                        decl.return_type,
+                                        decl.module_bytes,
+                                        "shipped module '" + module_path + "'",
+                                        export_name,
+                                        /*fuel_limit=*/0);
+                return;
+            }
             register_wasm_udf(
                 decl.name, decl.arg_types, decl.return_type, module_path, export_name);
+        },
+        [](const UdfLanguageRegistry::FunctionDecl& decl) -> std::vector<std::uint8_t> {
+            if (decl.definitions.empty()) {
+                return {};
+            }
+            auto bytes = read_module_file(decl.definitions[0]);
+            if (bytes.size() > kMaxShippedModuleBytes) {
+                throw std::runtime_error(
+                    "wasm UDF: module " + decl.definitions[0] + " is " +
+                    std::to_string(bytes.size()) +
+                    " bytes; modules over 32 MiB cannot ship with a job (keep the module "
+                    "lean, or register it out of band on every node)");
+            }
+            return bytes;
         });
 }
 

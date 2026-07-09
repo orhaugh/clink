@@ -107,7 +107,86 @@ std::string escape_json_string(std::string_view s) {
     return out;
 }
 
+// Rebuild a UDF list from its parsed JSON array (shared by from_json and
+// unpack_udf_specs). Throws on a malformed entry so a bad spec fails at the
+// parse site, consistent with from_json's auto-validate posture.
+std::vector<UdfSpec> udf_specs_from_value(const config::JsonValue& arr) {
+    std::vector<UdfSpec> out;
+    out.reserve(arr.as_array().size());
+    for (const auto& v : arr.as_array()) {
+        if (!v.is_object()) {
+            throw std::runtime_error("udfs: each entry must be a JSON object");
+        }
+        UdfSpec u;
+        u.name = v.string_or("name", "");
+        u.language = v.string_or("language", "");
+        if (u.name.empty() || u.language.empty()) {
+            throw std::runtime_error("udfs: entries need non-empty 'name' and 'language'");
+        }
+        if (v.contains("arg_types") && v.at("arg_types").is_array()) {
+            for (const auto& t : v.at("arg_types").as_array()) {
+                u.arg_types.push_back(t.as_string());
+            }
+        }
+        u.return_type = v.string_or("return_type", "");
+        if (v.contains("definitions") && v.at("definitions").is_array()) {
+            for (const auto& d : v.at("definitions").as_array()) {
+                u.definitions.push_back(d.as_string());
+            }
+        }
+        u.module_b64 = v.string_or("module_b64", "");
+        out.push_back(std::move(u));
+    }
+    return out;
+}
+
 }  // namespace
+
+std::string pack_udf_specs(const std::vector<UdfSpec>& udfs) {
+    std::string out = "[";
+    for (std::size_t i = 0; i < udfs.size(); ++i) {
+        const auto& u = udfs[i];
+        if (i != 0) {
+            out += ',';
+        }
+        out += "{\"name\":";
+        out += escape_json_string(u.name);
+        out += ",\"language\":";
+        out += escape_json_string(u.language);
+        out += ",\"arg_types\":[";
+        for (std::size_t k = 0; k < u.arg_types.size(); ++k) {
+            if (k != 0) {
+                out += ',';
+            }
+            out += escape_json_string(u.arg_types[k]);
+        }
+        out += "],\"return_type\":";
+        out += escape_json_string(u.return_type);
+        out += ",\"definitions\":[";
+        for (std::size_t k = 0; k < u.definitions.size(); ++k) {
+            if (k != 0) {
+                out += ',';
+            }
+            out += escape_json_string(u.definitions[k]);
+        }
+        out += "],\"module_b64\":";
+        out += escape_json_string(u.module_b64);
+        out += '}';
+    }
+    out += ']';
+    return out;
+}
+
+std::vector<UdfSpec> unpack_udf_specs(std::string_view packed) {
+    if (packed.empty()) {
+        return {};
+    }
+    const auto v = config::parse(packed);
+    if (!v.is_array()) {
+        throw std::runtime_error("unpack_udf_specs: expected a JSON array");
+    }
+    return udf_specs_from_value(v);
+}
 
 std::string JobGraphSpec::to_json() const {
     std::string out = "{";
@@ -193,6 +272,12 @@ std::string JobGraphSpec::to_json() const {
     if (!expected_state_versions.empty()) {
         out += ",\"expected_state_versions\":";
         out += escape_json_string(expected_state_versions.pack());
+    }
+    // Shipped UDF declarations: pack_udf_specs emits a JSON array, so it
+    // nests raw (like column_lineage below). Emitted only when non-empty.
+    if (!udfs.empty()) {
+        out += ",\"udfs\":";
+        out += pack_udf_specs(udfs);
     }
     // column_lineage is already a JSON object string; emit it raw (not as an
     // escaped string) so it nests in the spec and parses back as an object.
@@ -326,6 +411,10 @@ JobGraphSpec JobGraphSpec::from_json(std::string_view json_text) {
     // spec carries one (absent for jobs that declare nothing).
     if (const auto packed = root.string_or("expected_state_versions", ""); !packed.empty()) {
         spec.expected_state_versions = StateVersionMap::unpack(packed);
+    }
+    // Shipped UDF declarations (absent for jobs that use none).
+    if (root.contains("udfs") && root.at("udfs").is_array()) {
+        spec.udfs = udf_specs_from_value(root.at("udfs"));
     }
     // Auto-validate so callers parsing untrusted JSON get the same
     // invariant checks the planner would run (unique ids, inputs

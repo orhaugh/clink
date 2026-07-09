@@ -142,7 +142,8 @@ private:
                    const std::string& restore_from_dir,
                    std::uint64_t restore_from_checkpoint_id,
                    bool unaligned_checkpoints,
-                   const std::string& expected_state_versions_packed);
+                   const std::string& expected_state_versions_packed,
+                   const std::string& udfs_packed = {});
     void run_generic_subtask_(JobId job_id,
                               const DeploymentTask& task,
                               const std::string& checkpoint_dir,

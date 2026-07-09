@@ -61,6 +61,14 @@ public:
         return fns_.find(name) != fns_.end();
     }
 
+    // Drop a registration (no-op when absent). Lookups already in flight
+    // keep their copied Entry, so this is safe against the query path; it
+    // exists for tests and future DROP FUNCTION, not for routine use.
+    void remove(const std::string& name) {
+        std::lock_guard<std::mutex> lk(mu_);
+        fns_.erase(name);
+    }
+
     // Copy the entry out (registration is one-shot at load, so this is race
     // free against concurrent reads on the query path). nullopt if absent.
     [[nodiscard]] std::optional<Entry> lookup(const std::string& name) const {

@@ -482,6 +482,12 @@ private:
         // subtask's LocalExecutor migrates restored state to the declared
         // schema. Empty when the job declared no versions.
         std::string expected_state_versions_packed;
+        // Packed UDF declarations (pack_udf_specs) for this job, captured
+        // at deploy from the JobGraphSpec. Re-sent verbatim on every
+        // Deploy (initial + rescale/recovery re-deploy) so each TM
+        // registers the functions before running subtasks. Empty when the
+        // job uses none.
+        std::string udfs_packed;
         // Per-task records keyed by "role:subtask_idx" so a retry can
         // re-send the original Deploy entry to the original TM.
         std::unordered_map<std::string, std::pair<std::string, DeploymentTask>> task_records;
@@ -779,7 +785,8 @@ private:
                            std::vector<PluginBinary> plugins,
                            CheckpointConfig checkpoint,
                            std::unique_ptr<JobBundle> bundle,
-                           std::string expected_state_versions_packed = {});
+                           std::string expected_state_versions_packed = {},
+                           std::string udfs_packed = {});
     void handle_subtask_checkpointed_(MessageReader& r);
     // A bounded source at clean EOS requested a final coordinated checkpoint.
     // Assigns (once per job) the final id, seeds its pending ack set, broadcasts

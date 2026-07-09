@@ -604,6 +604,13 @@ if(CLINK_BUILD_SQL)
     # JSON; Phase 2 added an HTTP submit path.
     add_executable(clink_submit_sql tools/clink_submit_sql.cpp)
     target_link_libraries(clink_submit_sql PRIVATE clink::sql)
+    # CREATE FUNCTION ... LANGUAGE wasm executes client-side (the script
+    # runner loads + packages the module before the spec is POSTed), so the
+    # submitting CLI needs the loader installed, not just the cluster.
+    if(TARGET clink::wasm)
+        target_link_libraries(clink_submit_sql PRIVATE clink::wasm)
+        target_compile_definitions(clink_submit_sql PRIVATE CLINK_LINKED_WASM)
+    endif()
     clink_set_warnings(clink_submit_sql)
     install(TARGETS clink_submit_sql
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -722,6 +729,12 @@ target_link_libraries(clink_cli_cmds PUBLIC clink::core)
 if(TARGET clink::embed)
     target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql.cpp tools/clink_replay.cpp)
     target_link_libraries(clink_cli_cmds PUBLIC clink::embed)
+    # `clink run --jm-host` bypasses EmbeddedEngine (which installs the wasm
+    # loader itself), so the CLI installs it for the remote-submit path.
+    if(TARGET clink::wasm)
+        target_link_libraries(clink_cli_cmds PUBLIC clink::wasm)
+        target_compile_definitions(clink_cli_cmds PUBLIC CLINK_LINKED_WASM)
+    endif()
 else()
     target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql_stub.cpp
                                           tools/clink_replay_stub.cpp)

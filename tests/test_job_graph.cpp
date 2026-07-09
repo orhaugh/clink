@@ -402,3 +402,42 @@ TEST(JobGraphSpec, ComplexFanOutGraphRoundTrips) {
     });
     EXPECT_TRUE(round_trip_equal(s));
 }
+
+TEST(JobGraphSpec, UdfSpecsRoundTripJsonAndPack) {
+    // Shipped UDF declarations ride the spec JSON (HTTP submit, HA
+    // manifest) and, packed, the DeployMsg wire string. Both forms must
+    // preserve every field, including the base64 module payload.
+    JobGraphSpec s;
+    s.ops.push_back(OperatorSpec{.type = "int64_range_source", .id = "src"});
+    UdfSpec u;
+    u.name = "double_it";
+    u.language = "wasm";
+    u.arg_types = {"int64", "double"};
+    u.return_type = "int64";
+    u.definitions = {"/tmp/mod.wasm", "dbl"};
+    u.module_b64 = "AGFzbQEAAAA=";  // wasm magic + version
+    s.udfs.push_back(u);
+
+    const auto reparsed = JobGraphSpec::from_json(s.to_json());
+    ASSERT_EQ(reparsed.udfs.size(), 1u);
+    EXPECT_EQ(reparsed.udfs[0].name, "double_it");
+    EXPECT_EQ(reparsed.udfs[0].language, "wasm");
+    EXPECT_EQ(reparsed.udfs[0].arg_types, (std::vector<std::string>{"int64", "double"}));
+    EXPECT_EQ(reparsed.udfs[0].return_type, "int64");
+    EXPECT_EQ(reparsed.udfs[0].definitions, (std::vector<std::string>{"/tmp/mod.wasm", "dbl"}));
+    EXPECT_EQ(reparsed.udfs[0].module_b64, "AGFzbQEAAAA=");
+
+    const auto unpacked = unpack_udf_specs(pack_udf_specs(s.udfs));
+    ASSERT_EQ(unpacked.size(), 1u);
+    EXPECT_EQ(unpacked[0].name, "double_it");
+    EXPECT_EQ(unpacked[0].module_b64, "AGFzbQEAAAA=");
+    EXPECT_EQ(unpacked[0].arg_types, s.udfs[0].arg_types);
+
+    // Absent stays absent: a spec without UDFs emits no field and parses
+    // back empty, and the empty packed string unpacks to nothing.
+    JobGraphSpec bare;
+    bare.ops.push_back(OperatorSpec{.type = "int64_range_source", .id = "src"});
+    EXPECT_EQ(bare.to_json().find("udfs"), std::string::npos);
+    EXPECT_TRUE(JobGraphSpec::from_json(bare.to_json()).udfs.empty());
+    EXPECT_TRUE(unpack_udf_specs("").empty());
+}

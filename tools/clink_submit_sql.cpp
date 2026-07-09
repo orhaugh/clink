@@ -20,6 +20,9 @@
 
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/script_runner.hpp"
+#ifdef CLINK_LINKED_WASM
+#include "clink/wasm/install.hpp"
+#endif
 
 namespace {
 
@@ -152,6 +155,16 @@ std::string read_file(const std::string& path) {
 int main(int argc, char** argv) {
     auto args = parse_args(argc, argv);
     std::string sql = args.file.empty() ? args.inline_sql : read_file(args.file);
+
+#ifdef CLINK_LINKED_WASM
+    // CREATE FUNCTION ... LANGUAGE wasm executes here, client-side: the
+    // loader validates the module and packages its bytes into the spec the
+    // JM receives, so the cluster needs no access to the local path.
+    {
+        clink::plugin::PluginRegistry reg;
+        clink::wasm::install(reg);
+    }
+#endif
 
     clink::sql::Catalog catalog;
     if (!args.catalog_dir.empty()) {

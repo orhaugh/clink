@@ -228,6 +228,11 @@ struct DeployMsg {
     // there). Trailing wire fields - old TMs see EOF and leave capture off.
     std::string capture_dir;
     std::uint64_t capture_records{0};
+    // SQL-declared UDFs the job's expressions call, packed as a JSON array
+    // (pack_udf_specs, module payloads base64 inside). The TM registers
+    // each before running the job's subtasks. Trailing wire field - old
+    // TMs see EOF and leave it empty (no deploy-time registration).
+    std::string udfs_packed;
 };
 
 struct StartJobMsg {

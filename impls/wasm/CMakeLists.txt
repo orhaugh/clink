@@ -104,6 +104,11 @@ target_link_libraries(clink_wasm
     PRIVATE ${WASMTIME_LIBRARY}
 )
 clink_set_warnings(clink_wasm)
+
+clink_install_impl(
+    TARGET clink_wasm
+    NAME   wasm)
+
 message(STATUS "clink::wasm - enabled (WebAssembly scalar UDFs)")
 
 if(CLINK_BUILD_TESTS)

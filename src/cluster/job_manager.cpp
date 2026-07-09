@@ -1637,12 +1637,14 @@ JobId JobManager::submit_job(const JobGraphSpec& graph,
     // them into the JobState.
     const auto plugins_copy = plugins;
     const auto checkpoint_copy = checkpoint;
-    const auto job_id = deploy_internal_(plan,
-                                         notify_client_conn,
-                                         std::move(plugins),
-                                         std::move(checkpoint),
-                                         std::move(bundle),
-                                         graph.expected_state_versions.pack());
+    const auto job_id =
+        deploy_internal_(plan,
+                         notify_client_conn,
+                         std::move(plugins),
+                         std::move(checkpoint),
+                         std::move(bundle),
+                         graph.expected_state_versions.pack(),
+                         graph.udfs.empty() ? std::string{} : pack_udf_specs(graph.udfs));
     // Derive commit-group memberships from sink-op params
     // and stash them on JobState so handle_subtask_checkpointed_ can
     // gate CommitCheckpoint broadcasts on the group's collective ack.
@@ -1773,7 +1775,8 @@ JobId JobManager::deploy_internal_(const JobPlan& plan,
                                    std::vector<PluginBinary> plugins,
                                    CheckpointConfig checkpoint,
                                    std::unique_ptr<JobBundle> bundle,
-                                   std::string expected_state_versions_packed) {
+                                   std::string expected_state_versions_packed,
+                                   std::string udfs_packed) {
     // Resolve per-task placement (greedy first-fit). The plan's
     // data_port values are taken as-is: 0 means "the TM will bind
     // ephemerally and report via SubtaskListening", a non-zero port
@@ -1833,6 +1836,7 @@ JobId JobManager::deploy_internal_(const JobPlan& plan,
     job->topology_version = 1;  // initial deploy is version 1
     job->bundle = std::move(bundle);
     job->expected_state_versions_packed = std::move(expected_state_versions_packed);
+    job->udfs_packed = std::move(udfs_packed);
     // Only generic-role subtasks send SubtaskListening. Custom-role
     // (test-harness) tasks pre-bind their ports and never report.
     job->expected_listenings = 0;
@@ -1959,6 +1963,7 @@ JobId JobManager::deploy_internal_(const JobPlan& plan,
         deploy_msg.restore_from_checkpoint_id = checkpoint.restore_from_checkpoint_id;
         deploy_msg.unaligned_checkpoints = checkpoint.alignment == CheckpointAlignment::Unaligned;
         deploy_msg.expected_state_versions_packed = job->expected_state_versions_packed;
+        deploy_msg.udfs_packed = job->udfs_packed;
         const auto frame = encode_frame(MessageKind::Deploy, deploy_msg);
         if (!conn->conn || !send_frame(*conn->conn, frame)) {
             throw std::runtime_error("JobManager::deploy: send failed for " + tm_id);
@@ -2709,6 +2714,7 @@ std::vector<JobManager::PendingDeploy> JobManager::restart_job_locked_(JobState&
         deploy_msg.unaligned_checkpoints =
             job.checkpoint.alignment == CheckpointAlignment::Unaligned;
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;
+        deploy_msg.udfs_packed = job.udfs_packed;
         out.push_back({tm_it->second->conn.get(), encode_frame(MessageKind::Deploy, deploy_msg)});
     }
     return out;
@@ -2905,6 +2911,7 @@ void JobManager::dispatch_cutover_deploy_locked_(JobState& job,
         deploy_msg.unaligned_checkpoints =
             job.checkpoint.alignment == CheckpointAlignment::Unaligned;
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;
+        deploy_msg.udfs_packed = job.udfs_packed;
         out.push_back({tm_it->second->conn.get(), encode_frame(MessageKind::Deploy, deploy_msg)});
     }
 }

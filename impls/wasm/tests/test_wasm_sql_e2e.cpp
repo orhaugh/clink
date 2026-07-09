@@ -1,20 +1,33 @@
 // CREATE FUNCTION ... LANGUAGE wasm, end to end through the embedded
 // engine: compile a WAT module in-process, declare it in SQL, use it in a
 // SELECT expression, and assert the pipeline output - the exact path
-// `clink run` drives. Also covers CREATE OR REPLACE and the
-// duplicate-name rejection.
+// `clink run` drives. Also covers CREATE OR REPLACE, the duplicate-name
+// rejection, and cluster module shipping (the compiled spec carries the
+// declaration + module bytes; a TaskManager that never saw the CREATE
+// registers it at deploy).
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
+#include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/job_manager.hpp"
+#include "clink/cluster/operator_registry.hpp"
+#include "clink/cluster/task_manager.hpp"
 #include "clink/config/json.hpp"
 #include "clink/embed/embedded_engine.hpp"
+#include "clink/operators/scalar_function_registry.hpp"
+#include "clink/plugin/plugin.hpp"
+#include "clink/sql/catalog.hpp"
+#include "clink/sql/install.hpp"
+#include "clink/sql/script_runner.hpp"
 #include "clink/wasm/install.hpp"
 
 namespace fs = std::filesystem;
@@ -130,4 +143,127 @@ TEST(WasmSqlE2E, UnknownLanguageErrorsClearly) {
               0);
     EXPECT_NE(err.str().find("no loader registered for LANGUAGE 'cobol'"), std::string::npos)
         << err.str();
+}
+
+TEST(WasmSqlE2E, CreateFunctionShipsModuleWithTheJob) {
+    // The cluster path. CREATE FUNCTION registers where the script runs,
+    // but the job's expressions evaluate on TaskManagers that never saw
+    // the statement (and cannot read the module path). The compiled spec
+    // must carry the declaration + module bytes, and the TM must register
+    // them at deploy. Proven by REMOVING the local registration between
+    // compile and submit: only deploy-time registration can make the job
+    // pass. A stripped-spec control shows the test would catch a broken
+    // ship (that job fails with the evaluator's unknown-op error).
+    clink::cluster::ensure_built_ins_registered();
+    clink::plugin::PluginRegistry reg;
+    clink::sql::install(reg);
+    clink::wasm::install(reg);
+
+    const auto mod = write_wasm("clink_wasm_e2e_ship.wasm", R"((module
+        (func (export "ship_dbl") (param i64) (result i64)
+            local.get 0
+            i64.const 2
+            i64.mul)))");
+    const auto in_path = fs::temp_directory_path() / "clink_wasm_ship_in.ndjson";
+    const auto out_path = fs::temp_directory_path() / "clink_wasm_ship_out.ndjson";
+    fs::remove(in_path);
+    fs::remove(out_path);
+    {
+        std::ofstream out(in_path, std::ios::trunc);
+        out << R"({"user_id":1,"amount":21})" << "\n"
+            << R"({"user_id":2,"amount":5})" << "\n";
+    }
+
+    // Compile the script, capturing the spec instead of running it.
+    clink::sql::Catalog catalog;
+    std::ostringstream out, err;
+    clink::sql::ScriptIO io{&out, &err};
+    std::vector<clink::cluster::JobGraphSpec> captured;
+    auto capture = [&](const clink::cluster::JobGraphSpec& spec, const std::string&) -> int {
+        captured.push_back(spec);
+        return 0;
+    };
+    const std::string script =
+        "CREATE FUNCTION ship_dbl(x BIGINT) RETURNS BIGINT LANGUAGE wasm AS '" + mod.string() +
+        "';"
+        "CREATE TABLE evt (user_id BIGINT, amount BIGINT) "
+        "WITH (connector='file', format='json', path='" +
+        in_path.string() +
+        "');"
+        "CREATE TABLE out_t (user_id BIGINT, doubled BIGINT) "
+        "WITH (connector='file', format='json', path='" +
+        out_path.string() +
+        "');"
+        "INSERT INTO out_t SELECT user_id, ship_dbl(amount) AS doubled FROM evt";
+    ASSERT_EQ(clink::sql::run_script(script, catalog, {}, io, capture), 0) << err.str();
+    ASSERT_EQ(captured.size(), 1u);
+    auto spec = captured[0];
+    ASSERT_EQ(spec.udfs.size(), 1u);
+    EXPECT_EQ(spec.udfs[0].name, "ship_dbl");
+    EXPECT_EQ(spec.udfs[0].language, "wasm");
+    EXPECT_EQ(spec.udfs[0].return_type, "int64");
+    EXPECT_FALSE(spec.udfs[0].module_b64.empty());
+
+    // Simulate the remote cluster: this process no longer knows the
+    // function; only the spec payload can bring it back.
+    clink::ScalarFunctionRegistry::global().remove("ship_dbl");
+    ASSERT_FALSE(clink::ScalarFunctionRegistry::global().contains("ship_dbl"));
+
+    // In-process JM + TM over loopback: the Deploy travels the real wire.
+    clink::cluster::JobManager jm;
+    const auto port = jm.start();
+    jm.expect_tms({"wasm-ship-tm"});
+    clink::cluster::TaskManager::Config cfg;
+    cfg.slot_count = 8;
+    clink::cluster::TaskManager tm("wasm-ship-tm", "127.0.0.1", cfg);
+    tm.connect_to_jm("127.0.0.1", port);
+    ASSERT_TRUE(jm.await_registrations(std::chrono::milliseconds{10'000}));
+
+    // Control: the declaration stripped -> the job must FAIL with the
+    // evaluator's unknown-op error, proving the positive leg below cannot
+    // pass by accident.
+    {
+        auto stripped = spec;
+        stripped.udfs.clear();
+        const auto id = jm.submit_job(stripped,
+                                      clink::cluster::OperatorRegistry::default_instance(),
+                                      {},
+                                      clink::cluster::CheckpointConfig{},
+                                      nullptr);
+        ASSERT_TRUE(jm.await_job_completion(id, std::chrono::milliseconds{20'000}));
+        const auto errors = jm.job_errors(id);
+        ASSERT_FALSE(errors.empty());
+        EXPECT_NE(errors[0].find("unknown op"), std::string::npos) << errors[0];
+        ASSERT_FALSE(clink::ScalarFunctionRegistry::global().contains("ship_dbl"));
+    }
+    fs::remove(out_path);
+
+    // The real submit: the TM registers ship_dbl from the shipped payload
+    // and the pipeline produces the doubled values.
+    {
+        const auto id = jm.submit_job(spec,
+                                      clink::cluster::OperatorRegistry::default_instance(),
+                                      {},
+                                      clink::cluster::CheckpointConfig{},
+                                      nullptr);
+        ASSERT_TRUE(jm.await_job_completion(id, std::chrono::milliseconds{20'000}));
+        const auto errors = jm.job_errors(id);
+        EXPECT_TRUE(errors.empty()) << errors[0];
+    }
+    EXPECT_TRUE(clink::ScalarFunctionRegistry::global().contains("ship_dbl"));
+    std::map<std::int64_t, std::int64_t> got;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        ASSERT_TRUE(js.is_object()) << l;
+        got[static_cast<std::int64_t>(js.at("user_id").as_number())] =
+            static_cast<std::int64_t>(js.at("doubled").as_number());
+    }
+    EXPECT_EQ(got[1], 42);
+    EXPECT_EQ(got[2], 10);
+
+    tm.stop();
+    jm.stop();
+    fs::remove(in_path);
+    fs::remove(out_path);
+    fs::remove(mod);
 }

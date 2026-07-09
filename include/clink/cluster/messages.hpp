@@ -96,6 +96,9 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
     // Trailing record-capture config. Older TMs see EOF and leave it off.
     b.put_string(m.capture_dir);
     b.put_u64_be(m.capture_records);
+    // Trailing packed UDF declarations. Older TMs see EOF and leave it
+    // empty (no deploy-time registration).
+    b.put_string(m.udfs_packed);
 }
 
 inline void encode_body(MessageBuilder& b, const StartJobMsg& m) {
@@ -392,6 +395,11 @@ inline DeployMsg decode_deploy(MessageReader& r) {
     }
     if (!r.eof()) {
         m.capture_records = r.read_u64_be();
+    }
+    // Trailing packed UDF declarations. Absent from older JM peers ->
+    // empty (no deploy-time registration).
+    if (!r.eof()) {
+        m.udfs_packed = r.read_string();
     }
     return m;
 }

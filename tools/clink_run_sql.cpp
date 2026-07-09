@@ -29,6 +29,9 @@
 #include "clink/embed/embedded_engine.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/script_runner.hpp"
+#ifdef CLINK_LINKED_WASM
+#include "clink/wasm/install.hpp"
+#endif
 
 namespace {
 
@@ -199,6 +202,15 @@ int clink_cmd_run_sql(int argc, char** argv) {
             std::cerr << "error: --jm-host requires --jm-port\n";
             return 2;
         }
+#ifdef CLINK_LINKED_WASM
+        // CREATE FUNCTION ... LANGUAGE wasm executes here, client-side (the
+        // loader validates the module and packages its bytes into the spec);
+        // the embedded branch below gets this via EmbeddedEngine instead.
+        {
+            clink::plugin::PluginRegistry reg;
+            clink::wasm::install(reg);
+        }
+#endif
         clink::sql::Catalog catalog;
         if (!args.catalog_dir.empty()) {
             try {

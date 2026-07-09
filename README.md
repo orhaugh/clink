@@ -766,8 +766,10 @@ Advanced and extensibility (each a documented v1 subset)
   self-contained (imports rejected), every call runs under a fuel budget so
   runaway code fails instead of hanging, NULL in is NULL out, and the export's
   signature is validated against the declared SQL types at load. v1 value
-  model is BIGINT/INTEGER/DOUBLE/REAL; embedded execution (`clink run`,
-  libclink) end to end, cluster module shipping is a follow-on
+  model is BIGINT/INTEGER/DOUBLE/REAL. Works embedded (`clink run`, libclink)
+  and on a cluster: a submitted job ships the module bytes in its spec and
+  every TaskManager registers the function at deploy, no shared filesystem
+  needed
 - Programmatic Table API (v1): a fluent C++ builder, `from(...)` then optional
   `filter(...)` then either `select(...)` or `group_by(...).agg(...)` then
   `insert_into(...)`, sharing the binder's lowering so it produces a

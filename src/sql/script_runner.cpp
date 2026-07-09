@@ -5,6 +5,7 @@
 #include <variant>
 
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/core/base64.hpp"
 #include "clink/http/http_client.hpp"
 #include "clink/operators/scalar_function_registry.hpp"
 #include "clink/operators/udf_language_registry.hpp"
@@ -129,6 +130,34 @@ int run_script(const std::string& sql,
                 op.parallelism = opts.parallelism;
             }
         };
+        // SQL-declared UDFs this script created, as shippable specs (module
+        // payload included when the language packages one). A registration
+        // is process-local, so a job submitted to a remote cluster carries
+        // the declarations it references and every TaskManager registers
+        // them at deploy. Referenced = the function name appears in an op
+        // param (lowered expressions embed the call as {"op":"<name>",...});
+        // a substring match over-approximates, which only ships an unused
+        // declaration, never misses a used one.
+        std::vector<cluster::UdfSpec> session_udfs;
+        auto attach_udfs = [&](cluster::JobGraphSpec& spec) {
+            for (const auto& u : session_udfs) {
+                bool referenced = false;
+                for (const auto& op : spec.ops) {
+                    for (const auto& [key, value] : op.params) {
+                        if (value.find(u.name) != std::string::npos) {
+                            referenced = true;
+                            break;
+                        }
+                    }
+                    if (referenced) {
+                        break;
+                    }
+                }
+                if (referenced) {
+                    spec.udfs.push_back(u);
+                }
+            }
+        };
         // Bind + optimize + compile an INSERT, then submit (or explain).
         auto handle_insert = [&](const ast::InsertStmt& ins) -> int {
             auto plan = binder.bind_insert(ins);
@@ -140,6 +169,7 @@ int run_script(const std::string& sql,
             const auto& sink = static_cast<const LogicalSink&>(*plan);
             auto spec = planner.compile(sink);
             apply_parallelism(spec);
+            attach_udfs(spec);
             return submit(spec, opts.job_name);
         };
         for (auto& stmt : script.statements) {
@@ -200,6 +230,30 @@ int run_script(const std::string& sql,
                                                  "FUNCTION to replace it)");
                     }
                     UdfLanguageRegistry::global().load(cf.language, decl);
+                    // Package the declaration so later submits in this script
+                    // can carry it to a cluster (the AS path is only readable
+                    // here). A language without a packager ships nothing and
+                    // stays local-only, the pre-shipping behaviour. A
+                    // packaging failure (unreadable module, over the ship
+                    // cap) fails the statement here, not a later deploy.
+                    if (auto payload = UdfLanguageRegistry::global().package(cf.language, decl);
+                        !payload.empty()) {
+                        cluster::UdfSpec u;
+                        u.name = cf.function_name;
+                        u.language = cf.language;
+                        u.arg_types.reserve(decl.arg_types.size());
+                        for (const auto& t : decl.arg_types) {
+                            u.arg_types.push_back(t->ToString());
+                        }
+                        u.return_type =
+                            decl.return_type != nullptr ? decl.return_type->ToString() : "";
+                        u.definitions = cf.definitions;
+                        u.module_b64 = clink::base64_encode(std::string_view{
+                            reinterpret_cast<const char*>(payload.data()), payload.size()});
+                        std::erase_if(session_udfs,
+                                      [&](const cluster::UdfSpec& e) { return e.name == u.name; });
+                        session_udfs.push_back(std::move(u));
+                    }
                 } catch (const std::exception& e) {
                     err << "error: CREATE FUNCTION " << cf.function_name << ": " << e.what()
                         << "\n";
@@ -238,6 +292,7 @@ int run_script(const std::string& sql,
                     const auto& sink = static_cast<const LogicalSink&>(*plan);
                     auto spec = planner.compile(sink);
                     apply_parallelism(spec);
+                    attach_udfs(spec);
                     // Continuous: a live maintenance job (mv_<name>). Full-refresh: a
                     // one-shot bounded initial population (refresh_<name>) - it runs to
                     // completion and the overwrite sink atomically publishes; a later
@@ -264,6 +319,7 @@ int run_script(const std::string& sql,
                     const auto& sink = static_cast<const LogicalSink&>(*plan);
                     auto spec = planner.compile(sink);
                     apply_parallelism(spec);
+                    attach_udfs(spec);
                     const std::string name =
                         opts.job_name.empty() ? ("refresh_" + rf.view_name) : opts.job_name;
                     if (int rc = submit(spec, name); rc != 0) {
