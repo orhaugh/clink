@@ -678,9 +678,29 @@ void JobManager::handle_register_(std::unique_ptr<network::Connection> conn, Mes
         return;
     }
 
+    // A re-registration under an existing id (a restarted TM with a stable
+    // name, e.g. a StatefulSet pod) replaces the old TmConnection. Its reader
+    // thread must be joined before the object can be destroyed - destroying a
+    // joinable std::thread is std::terminate - and the join must happen HERE,
+    // off the reader thread (the reader lambda holds a shared_ptr to its own
+    // TmConnection, so letting the map drop the last map-held reference hands
+    // destruction to the exiting reader itself: self-join, terminate).
+    std::shared_ptr<TmConnection> replaced;
     {
         std::lock_guard lock(mu_);
+        if (auto it = registered_.find(reg.tm_id); it != registered_.end()) {
+            replaced = it->second;
+        }
         registered_[reg.tm_id] = tm;
+    }
+    if (replaced) {
+        if (replaced->conn) {
+            replaced->conn->shutdown_read();  // wake a reader parked in read_frame
+        }
+        if (replaced->reader.joinable()) {
+            replaced->reader.join();
+        }
+        log::info("jm.register", "tm=" + reg.tm_id + " re-registered; previous session retired");
     }
     cv_.notify_all();
 

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -252,6 +253,65 @@ TEST(Cluster, WatchdogDetectsLostTaskManager) {
     EXPECT_NE(errs[0].find("heartbeat timeout"), std::string::npos);
 
     tm.stop();
+    jm.stop();
+}
+
+// A TM that re-registers under the SAME id (a restarted process with a stable
+// name - the Kubernetes StatefulSet pattern) replaces its old TmConnection in
+// the JM. The old connection's reader thread must be joined during that
+// replacement: destroying a joinable std::thread is std::terminate, and the
+// reader lambda holds a shared_ptr to its own TmConnection, so dropping the
+// map's reference without joining hands destruction to the exiting reader
+// itself. Before the fix this test crashed the process.
+TEST(Cluster, TaskManagerReRegistrationUnderSameIdRetiresOldSession) {
+    JobManager::Config jm_cfg;
+    jm_cfg.watchdog_interval = 50ms;
+    jm_cfg.heartbeat_timeout = 60s;  // watchdog quiet; the test drives the churn
+    JobManager jm(jm_cfg);
+    const std::uint16_t jm_port = jm.start();
+    jm.expect_tms({"stable-tm"});
+
+    // Session 1: register, then die ungracefully (stop() closes the conn;
+    // the JM-side reader returns but its thread stays joinable).
+    auto tm1 = std::make_unique<TaskManager>("stable-tm", "127.0.0.1");
+    tm1->connect_to_jm("127.0.0.1", jm_port);
+    ASSERT_TRUE(jm.await_registrations(2s));
+    tm1->stop();
+    tm1.reset();
+
+    // Session 2: the restarted TM re-registers under the same id. Pre-fix:
+    // std::terminate in handle_register_ replacing the old TmConnection.
+    auto tm2 = std::make_unique<TaskManager>("stable-tm", "127.0.0.1");
+    tm2->connect_to_jm("127.0.0.1", jm_port);
+
+    // The JM must still be alive and serving: the re-registered TM is
+    // schedulable (registration visible), proven by a successful deploy.
+    bool ran = false;
+    std::mutex m;
+    std::condition_variable cv;
+    tm2->register_role("noop", [&](const DeploymentTask&) {
+        {
+            std::lock_guard lk(m);
+            ran = true;
+        }
+        cv.notify_all();
+    });
+    JobPlan plan;
+    plan.tasks.push_back(PlannedTask{
+        .tm_id = "stable-tm",
+        .role = "noop",
+        .subtask_idx = 0,
+        .data_port = 0,
+        .peer_refs = {},
+        .extra_config = "",
+    });
+    jm.deploy(plan);
+    {
+        std::unique_lock lk(m);
+        ASSERT_TRUE(cv.wait_for(lk, 5s, [&] { return ran; }));
+    }
+
+    tm2->stop();
     jm.stop();
 }
 

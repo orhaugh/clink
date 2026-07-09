@@ -2624,13 +2624,16 @@ int run_tm(int argc, char** argv) {
               << discovered_jm_port << "\n";
     std::cout.flush();
 
-    // Idle until SIGTERM/SIGINT - or, when --ha-dir is set, until the
-    // JM disconnects. On disconnect we exit non-zero so a supervisor
-    // restarts this TM; the next process reads active-leader.json and
-    // picks up whatever JM has taken over leadership.
-    const bool ha_mode = !ha_dir.empty();
+    // Idle until SIGTERM/SIGINT - or until the JM disconnects, in EVERY
+    // mode, not just HA. A disconnected TM is useless (there is no TM-side
+    // re-register path), so staying up just zombies the process; under a
+    // supervisor (k8s restartPolicy, compose restart, the HA wrapper)
+    // exiting is what triggers the restart + re-registration that heals the
+    // cluster. In HA the next process reads active-leader.json and follows
+    // whatever JM holds leadership; in non-HA it reconnects to the same
+    // address. Exit code 2 marks a restart-me exit, not a clean shutdown.
     while (!g_shutdown_requested.load(std::memory_order_acquire)) {
-        if (ha_mode && tm.disconnected()) {
+        if (tm.disconnected()) {
             std::cerr << "TM " << tm_id << ": JM disconnected; exiting for restart\n";
             break;
         }
@@ -2642,7 +2645,7 @@ int run_tm(int argc, char** argv) {
     }
 #endif
     tm.stop();
-    return (ha_mode && tm.disconnected() && !g_shutdown_requested.load()) ? 2 : 0;
+    return (tm.disconnected() && !g_shutdown_requested.load()) ? 2 : 0;
 }
 
 }  // namespace
