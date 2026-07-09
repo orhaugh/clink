@@ -5,10 +5,12 @@
 // at load, the self-contained (no imports) sandbox contract, and the
 // per-call fuel budget stopping a runaway loop.
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <arrow/api.h>
@@ -350,4 +352,71 @@ TEST(WasmUdfString, TextWireTypeNameRoundTrips) {
     // The ship path carries UDF types as Arrow ToString() names; the TM
     // maps them back without the SQL frontend. Pin the TEXT agreement.
     EXPECT_TRUE(clink::udf_type_from_wire_name(arrow::utf8()->ToString())->Equals(arrow::utf8()));
+}
+
+TEST(WasmUdf, ConcurrentCallsFromManyThreads) {
+    // The instance pool: 8 threads hammer ONE registered UDF. Every call
+    // borrows an instance exclusively, so results must all be correct
+    // (before the pool, a per-UDF mutex serialised these; now they run in
+    // parallel). Also mixes a string UDF into half the threads so the
+    // guest-memory path is exercised concurrently too.
+    const auto add_mod = write_module("clink_wasm_conc_add.wasm", R"((module
+        (func (export "add7") (param i64) (result i64)
+            local.get 0
+            i64.const 7
+            i64.add)))");
+    clink::wasm::register_wasm_udf(
+        "wasm_conc_add", {arrow::int64()}, arrow::int64(), add_mod.string(), "add7");
+    const auto echo_mod = write_module("clink_wasm_conc_echo.wasm", R"((module
+        (memory (export "memory") 1)
+        (global $heap (mut i32) (i32.const 1024))
+        (func $alloc (export "alloc") (param $size i32) (result i32)
+            (local $p i32)
+            global.get $heap
+            local.set $p
+            global.get $heap
+            local.get $size
+            i32.add
+            global.set $heap
+            local.get $p)
+        (func (export "echo") (param $ptr i32) (param $len i32) (result i64)
+            local.get $ptr
+            i64.extend_i32_u
+            i64.const 32
+            i64.shl
+            local.get $len
+            i64.extend_i32_u
+            i64.or)))");
+    clink::wasm::register_wasm_udf(
+        "wasm_conc_echo", {arrow::utf8()}, arrow::utf8(), echo_mod.string(), "echo");
+
+    constexpr int kThreads = 8;
+    constexpr int kCalls = 200;
+    std::atomic<int> wrong{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([t, &wrong] {
+            for (int i = 0; i < kCalls; ++i) {
+                if (t % 2 == 0) {
+                    auto r = call("wasm_conc_add", {JsonValue{static_cast<double>(i)}});
+                    if (!r.is_number() || static_cast<int>(r.as_number()) != i + 7) {
+                        ++wrong;
+                    }
+                } else {
+                    const std::string s = "t" + std::to_string(t) + "i" + std::to_string(i);
+                    auto r = call("wasm_conc_echo", {JsonValue{s}});
+                    if (!r.is_string() || r.as_string() != s) {
+                        ++wrong;
+                    }
+                }
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+    EXPECT_EQ(wrong.load(), 0);
+    fs::remove(add_mod);
+    fs::remove(echo_mod);
 }

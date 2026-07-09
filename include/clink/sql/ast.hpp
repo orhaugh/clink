@@ -659,6 +659,15 @@ struct CreateFunctionStmt {
     Loc loc;
 };
 
+// DROP FUNCTION [IF EXISTS] f [, g ...]. Functions are name-unique in
+// clink (no overloading), so any argument list in the statement is
+// accepted and ignored.
+struct DropFunctionStmt {
+    std::vector<std::string> function_names;
+    bool if_exists = false;
+    Loc loc;
+};
+
 struct ExplainStmt;
 
 using Statement = std::variant<CreateTableStmt,
@@ -671,6 +680,7 @@ using Statement = std::variant<CreateTableStmt,
                                RefreshMatViewStmt,
                                CreateViewStmt,
                                CreateFunctionStmt,
+                               DropFunctionStmt,
                                AlterTableStmt,
                                RenameStmt,
                                AnalyzeStmt,

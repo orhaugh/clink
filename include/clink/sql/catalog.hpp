@@ -164,6 +164,23 @@ struct ModelDef {
     }
 };
 
+// A scalar UDF declared via CREATE FUNCTION ... LANGUAGE. Like a model it is
+// pure declaration: the runnable closure lives in ScalarFunctionRegistry
+// (loaded through the language's UdfLanguageRegistry loader); the catalog
+// holds what is needed to re-load it after a restart and to ship it with a
+// job - the signature as Arrow ToString() type names, the AS definitions
+// verbatim, and the packaged module payload (base64), so a reload never
+// depends on the original module path still existing. Functions persist to
+// a `functions/` subdir of the catalog dir.
+struct FunctionDef {
+    std::string name;
+    std::string language;
+    std::vector<std::string> arg_types;    // Arrow ToString() names
+    std::string return_type;               // Arrow ToString() name
+    std::vector<std::string> definitions;  // CREATE ... AS strings, verbatim
+    std::string module_b64;                // packaged payload; may be empty
+};
+
 class Catalog {
 public:
     Catalog() = default;
@@ -289,6 +306,20 @@ public:
     [[nodiscard]] static std::string to_json(const ModelDef& def);
     [[nodiscard]] static ModelDef model_from_json(const std::string& text);
 
+    // Scalar UDF declarations (CREATE FUNCTION). Functions occupy their own
+    // namespace (call syntax cannot collide with a table or model). When a
+    // persistence dir is set they persist to functions/<name>.json and
+    // reload with load_from_dir; the script runner re-registers them into
+    // the runtime registries at script start.
+    void register_function(FunctionDef def, bool or_replace);
+    [[nodiscard]] const FunctionDef* get_function(const std::string& name) const;
+    bool drop_function(const std::string& name);
+    [[nodiscard]] std::vector<std::string> list_functions() const;
+
+    // Round-trip a single function's JSON form (the persisted format).
+    [[nodiscard]] static std::string to_json(const FunctionDef& def);
+    [[nodiscard]] static FunctionDef function_from_json(const std::string& text);
+
 private:
     std::unordered_map<std::string, TableDef> tables_;
     // Defining SELECT for each logical view (view_kind='logical' in tables_).
@@ -299,6 +330,9 @@ private:
     // SQL-native AI models (CREATE MODEL). In-memory only in v1.
     std::unordered_map<std::string, ModelDef> models_;
     std::vector<std::string> models_order_;  // registration order, for list_models
+    // Scalar UDF declarations (CREATE FUNCTION).
+    std::unordered_map<std::string, FunctionDef> functions_;
+    std::vector<std::string> functions_order_;  // registration order
 };
 
 }  // namespace clink::sql

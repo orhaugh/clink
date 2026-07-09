@@ -374,3 +374,116 @@ TEST(WasmSqlE2E, TextUdfRunsInPipeline) {
     fs::remove(out_path);
     fs::remove(mod);
 }
+
+TEST(WasmSqlE2E, FunctionPersistsAcrossEngineRestart) {
+    // CREATE FUNCTION in a catalog-backed engine survives a restart: the
+    // declaration (module payload included) persists to functions/ and a
+    // fresh engine re-registers it at script start. The module FILE is
+    // deleted in between, so only the persisted payload can explain the
+    // reload working.
+    const auto cat_dir = fs::temp_directory_path() / "clink_wasm_cat_persist";
+    fs::remove_all(cat_dir);
+    fs::create_directories(cat_dir);
+    const auto mod = write_wasm("clink_wasm_persist.wasm", R"((module
+        (func (export "persist_dbl") (param i64) (result i64)
+            local.get 0
+            i64.const 2
+            i64.mul)))");
+    const auto in_path = fs::temp_directory_path() / "clink_wasm_persist_in.ndjson";
+    const auto out_path = fs::temp_directory_path() / "clink_wasm_persist_out.ndjson";
+    fs::remove(in_path);
+    fs::remove(out_path);
+    {
+        std::ofstream out(in_path, std::ios::trunc);
+        out << R"({"user_id":1,"amount":21})" << "\n";
+    }
+
+    {
+        clink::embed::EngineOptions opts;
+        opts.catalog_dir = cat_dir.string();
+        std::ostringstream err;
+        opts.err = &err;
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        const std::string script =
+            "CREATE FUNCTION persist_dbl(x BIGINT) RETURNS BIGINT LANGUAGE wasm AS '" +
+            mod.string() +
+            "';"
+            "CREATE TABLE pevt (user_id BIGINT, amount BIGINT) "
+            "WITH (connector='file', format='json', path='" +
+            in_path.string() +
+            "');"
+            "CREATE TABLE pout (user_id BIGINT, doubled BIGINT) "
+            "WITH (connector='file', format='json', path='" +
+            out_path.string() + "')";
+        ASSERT_EQ(engine.execute_script(script), 0) << err.str();
+    }
+    EXPECT_TRUE(fs::exists(cat_dir / "functions" / "persist_dbl.json"));
+
+    // Simulate a fresh process: the module file is gone and this process
+    // forgot the registration.
+    fs::remove(mod);
+    clink::ScalarFunctionRegistry::global().remove("persist_dbl");
+    ASSERT_FALSE(clink::ScalarFunctionRegistry::global().contains("persist_dbl"));
+
+    {
+        clink::embed::EngineOptions opts;
+        opts.catalog_dir = cat_dir.string();
+        std::ostringstream err;
+        opts.err = &err;
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        // No re-declare: table and function both come from the catalog.
+        ASSERT_EQ(engine.execute_script(
+                      "INSERT INTO pout SELECT user_id, persist_dbl(amount) AS doubled FROM pevt"),
+                  0)
+            << err.str();
+        ASSERT_TRUE(engine.await_all()) << err.str();
+    }
+    const auto lines = read_lines(out_path);
+    ASSERT_EQ(lines.size(), 1u);
+    auto js = clink::config::parse(lines[0]);
+    EXPECT_EQ(static_cast<std::int64_t>(js.at("doubled").as_number()), 42);
+    fs::remove(in_path);
+    fs::remove(out_path);
+    fs::remove_all(cat_dir);
+}
+
+TEST(WasmSqlE2E, DropFunctionRemovesRegistrationAndPersistence) {
+    const auto cat_dir = fs::temp_directory_path() / "clink_wasm_cat_drop";
+    fs::remove_all(cat_dir);
+    fs::create_directories(cat_dir);
+    const auto mod = write_wasm("clink_wasm_dropfn.wasm", R"((module
+        (func (export "dropme") (param i64) (result i64) local.get 0)))");
+
+    clink::embed::EngineOptions opts;
+    opts.catalog_dir = cat_dir.string();
+    std::ostringstream err;
+    opts.err = &err;
+    std::ostringstream out;
+    opts.out = &out;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    ASSERT_EQ(
+        engine.execute_script("CREATE FUNCTION dropme(x BIGINT) RETURNS BIGINT LANGUAGE wasm AS '" +
+                              mod.string() + "'"),
+        0)
+        << err.str();
+    ASSERT_TRUE(clink::ScalarFunctionRegistry::global().contains("dropme"));
+    ASSERT_TRUE(fs::exists(cat_dir / "functions" / "dropme.json"));
+
+    // DROP removes the registration and the persisted file.
+    ASSERT_EQ(engine.execute_script("DROP FUNCTION dropme"), 0) << err.str();
+    EXPECT_NE(out.str().find("dropped function dropme"), std::string::npos);
+    EXPECT_FALSE(clink::ScalarFunctionRegistry::global().contains("dropme"));
+    EXPECT_FALSE(fs::exists(cat_dir / "functions" / "dropme.json"));
+
+    // A second DROP errors; IF EXISTS is silent; re-CREATE works again.
+    EXPECT_NE(engine.execute_script("DROP FUNCTION dropme"), 0);
+    EXPECT_NE(err.str().find("does not exist"), std::string::npos) << err.str();
+    EXPECT_EQ(engine.execute_script("DROP FUNCTION IF EXISTS dropme"), 0) << err.str();
+    EXPECT_EQ(
+        engine.execute_script("CREATE FUNCTION dropme(x BIGINT) RETURNS BIGINT LANGUAGE wasm AS '" +
+                              mod.string() + "'"),
+        0)
+        << err.str();
+    fs::remove(mod);
+    fs::remove_all(cat_dir);
+}

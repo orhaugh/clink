@@ -771,7 +771,10 @@ Advanced and extensibility (each a documented v1 subset)
   optional `dealloc` the host calls after copy-out; all guest pointers are
   bounds-checked). Works embedded (`clink run`, libclink) and on a cluster: a
   submitted job ships the module bytes in its spec and every TaskManager
-  registers the function at deploy, no shared filesystem needed
+  registers the function at deploy, no shared filesystem needed. Declarations
+  persist in the catalog (payload included, so a restart never needs the
+  original module path) and `DROP FUNCTION [IF EXISTS]` removes them; calls
+  run against a pool of instances, so parallel plans do not serialise
 - Programmatic Table API (v1): a fluent C++ builder, `from(...)` then optional
   `filter(...)` then either `select(...)` or `group_by(...).agg(...)` then
   `insert_into(...)`, sharing the binder's lowering so it produces a

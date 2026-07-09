@@ -33,6 +33,14 @@ fs::path model_json_path(const std::string& dir, const std::string& name) {
     return models_dir(dir) / (name + ".json");
 }
 
+// Scalar UDF declarations persist under `functions/`, same scheme as models.
+fs::path functions_dir(const std::string& dir) {
+    return fs::path(dir) / "functions";
+}
+fs::path function_json_path(const std::string& dir, const std::string& name) {
+    return functions_dir(dir) / (name + ".json");
+}
+
 void write_file_atomic(const fs::path& target, const std::string& text) {
     // <target>.tmp then rename - survives crashes mid-write.
     auto tmp = target;
@@ -472,6 +480,8 @@ void Catalog::load_from_dir(const std::string& dir) {
     order_.clear();
     models_.clear();
     models_order_.clear();
+    functions_.clear();
+    functions_order_.clear();
     fs::path root(dir);
     if (!fs::exists(root))
         return;  // empty catalog is a valid initial state
@@ -511,6 +521,24 @@ void Catalog::load_from_dir(const std::string& dir) {
             std::string name = def.name;
             models_.emplace(name, std::move(def));
             models_order_.push_back(std::move(name));
+        }
+    }
+
+    // Scalar UDF declarations live in `functions/`, same scheme.
+    const fs::path fdir = functions_dir(dir);
+    if (fs::is_directory(fdir)) {
+        std::vector<fs::path> fents;
+        for (auto& e : fs::directory_iterator(fdir)) {
+            if (e.is_regular_file() && e.path().extension() == ".json") {
+                fents.push_back(e.path());
+            }
+        }
+        std::sort(fents.begin(), fents.end());
+        for (const auto& p : fents) {
+            auto def = function_from_json(read_file(p));
+            std::string name = def.name;
+            functions_.emplace(name, std::move(def));
+            functions_order_.push_back(std::move(name));
         }
     }
 }
@@ -617,6 +645,98 @@ std::string Catalog::to_json(const ModelDef& def) {
     root["output_columns"] = JsonValue{columns_to_json(def.output_columns)};
     root["properties"] = JsonValue{std::move(props)};
     return JsonValue{std::move(root)}.serialize(2);
+}
+
+void Catalog::register_function(FunctionDef def, bool or_replace) {
+    if (!or_replace && functions_.find(def.name) != functions_.end()) {
+        throw TranslationError("function already exists: " + def.name, 0);
+    }
+    std::string name = def.name;
+    if (!persistence_dir_.empty()) {
+        fs::create_directories(functions_dir(persistence_dir_));
+        write_file_atomic(function_json_path(persistence_dir_, name), to_json(def));
+    }
+    const bool existed = functions_.find(name) != functions_.end();
+    functions_[name] = std::move(def);
+    if (!existed) {
+        functions_order_.push_back(std::move(name));
+    }
+}
+
+const FunctionDef* Catalog::get_function(const std::string& name) const {
+    auto it = functions_.find(name);
+    return it == functions_.end() ? nullptr : &it->second;
+}
+
+bool Catalog::drop_function(const std::string& name) {
+    auto it = functions_.find(name);
+    if (it == functions_.end()) {
+        return false;
+    }
+    functions_.erase(it);
+    auto pos = std::find(functions_order_.begin(), functions_order_.end(), name);
+    if (pos != functions_order_.end()) {
+        functions_order_.erase(pos);
+    }
+    if (!persistence_dir_.empty()) {
+        std::error_code ec;
+        fs::remove(function_json_path(persistence_dir_, name), ec);
+    }
+    return true;
+}
+
+std::vector<std::string> Catalog::list_functions() const {
+    return functions_order_;
+}
+
+std::string Catalog::to_json(const FunctionDef& def) {
+    JsonArray args;
+    args.reserve(def.arg_types.size());
+    for (const auto& t : def.arg_types) {
+        args.emplace_back(t);
+    }
+    JsonArray defs;
+    defs.reserve(def.definitions.size());
+    for (const auto& d : def.definitions) {
+        defs.emplace_back(d);
+    }
+    JsonObject root;
+    root["name"] = JsonValue{def.name};
+    root["language"] = JsonValue{def.language};
+    root["arg_types"] = JsonValue{std::move(args)};
+    root["return_type"] = JsonValue{def.return_type};
+    root["definitions"] = JsonValue{std::move(defs)};
+    root["module_b64"] = JsonValue{def.module_b64};
+    return JsonValue{std::move(root)}.serialize(2);
+}
+
+FunctionDef Catalog::function_from_json(const std::string& text) {
+    auto j = clink::config::parse(text);
+    if (!j.is_object()) {
+        throw std::runtime_error("catalog: FunctionDef JSON must be an object");
+    }
+    FunctionDef def;
+    if (!j.contains("name") || !j.at("name").is_string()) {
+        throw std::runtime_error("catalog: FunctionDef JSON missing name");
+    }
+    def.name = j.at("name").as_string();
+    if (!j.contains("language") || !j.at("language").is_string()) {
+        throw std::runtime_error("catalog: FunctionDef JSON missing language");
+    }
+    def.language = j.at("language").as_string();
+    if (j.contains("arg_types") && j.at("arg_types").is_array()) {
+        for (const auto& t : j.at("arg_types").as_array()) {
+            def.arg_types.push_back(t.as_string());
+        }
+    }
+    def.return_type = j.string_or("return_type", "");
+    if (j.contains("definitions") && j.at("definitions").is_array()) {
+        for (const auto& d : j.at("definitions").as_array()) {
+            def.definitions.push_back(d.as_string());
+        }
+    }
+    def.module_b64 = j.string_or("module_b64", "");
+    return def;
 }
 
 ModelDef Catalog::model_from_json(const std::string& text) {

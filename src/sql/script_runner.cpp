@@ -130,21 +130,25 @@ int run_script(const std::string& sql,
                 op.parallelism = opts.parallelism;
             }
         };
-        // SQL-declared UDFs this script created, as shippable specs (module
-        // payload included when the language packages one). A registration
+        // SQL-declared UDFs live in the catalog (CREATE FUNCTION registers
+        // them there, persisted when the catalog has a dir). A registration
         // is process-local, so a job submitted to a remote cluster carries
-        // the declarations it references and every TaskManager registers
-        // them at deploy. Referenced = the function name appears in an op
-        // param (lowered expressions embed the call as {"op":"<name>",...});
-        // a substring match over-approximates, which only ships an unused
-        // declaration, never misses a used one.
-        std::vector<cluster::UdfSpec> session_udfs;
+        // the declarations it references (module payload included) and
+        // every TaskManager registers them at deploy. Referenced = the
+        // function name appears in an op param (lowered expressions embed
+        // the call as {"op":"<name>",...}); a substring match
+        // over-approximates, which only ships an unused declaration, never
+        // misses a used one.
         auto attach_udfs = [&](cluster::JobGraphSpec& spec) {
-            for (const auto& u : session_udfs) {
+            for (const auto& fname : catalog.list_functions()) {
+                const auto* f = catalog.get_function(fname);
+                if (f == nullptr || f->module_b64.empty()) {
+                    continue;  // nothing shippable (language has no packager)
+                }
                 bool referenced = false;
                 for (const auto& op : spec.ops) {
                     for (const auto& [key, value] : op.params) {
-                        if (value.find(u.name) != std::string::npos) {
+                        if (value.find(f->name) != std::string::npos) {
                             referenced = true;
                             break;
                         }
@@ -154,10 +158,50 @@ int run_script(const std::string& sql,
                     }
                 }
                 if (referenced) {
-                    spec.udfs.push_back(u);
+                    spec.udfs.push_back(cluster::UdfSpec{f->name,
+                                                         f->language,
+                                                         f->arg_types,
+                                                         f->return_type,
+                                                         f->definitions,
+                                                         f->module_b64});
                 }
             }
         };
+        // Persisted CREATE FUNCTION declarations: re-register any this
+        // process does not know yet (a fresh process, a JM after failover)
+        // so binding and evaluation resolve them without a re-CREATE. A
+        // failure warns rather than fails the script: a function the script
+        // never calls must not block it (e.g. its language impl is not
+        // linked here); using it then errors as an unknown function.
+        for (const auto& fname : catalog.list_functions()) {
+            const auto* f = catalog.get_function(fname);
+            if (f == nullptr || ScalarFunctionRegistry::global().contains(f->name)) {
+                continue;
+            }
+            try {
+                UdfLanguageRegistry::FunctionDecl decl;
+                decl.name = f->name;
+                decl.arg_types.reserve(f->arg_types.size());
+                for (const auto& t : f->arg_types) {
+                    decl.arg_types.push_back(udf_type_from_wire_name(t));
+                }
+                if (!f->return_type.empty()) {
+                    decl.return_type = udf_type_from_wire_name(f->return_type);
+                }
+                decl.definitions = f->definitions;
+                if (!f->module_b64.empty()) {
+                    const auto bytes = clink::base64_decode(f->module_b64);
+                    if (!bytes) {
+                        throw std::runtime_error("invalid persisted module payload");
+                    }
+                    decl.module_bytes.assign(bytes->begin(), bytes->end());
+                }
+                UdfLanguageRegistry::global().load(f->language, decl);
+            } catch (const std::exception& e) {
+                err << "warning: persisted function '" << fname
+                    << "' was not re-registered: " << e.what() << "\n";
+            }
+        }
         // Bind + optimize + compile an INSERT, then submit (or explain).
         auto handle_insert = [&](const ast::InsertStmt& ins) -> int {
             auto plan = binder.bind_insert(ins);
@@ -230,30 +274,32 @@ int run_script(const std::string& sql,
                                                  "FUNCTION to replace it)");
                     }
                     UdfLanguageRegistry::global().load(cf.language, decl);
-                    // Package the declaration so later submits in this script
-                    // can carry it to a cluster (the AS path is only readable
-                    // here). A language without a packager ships nothing and
-                    // stays local-only, the pre-shipping behaviour. A
-                    // packaging failure (unreadable module, over the ship
-                    // cap) fails the statement here, not a later deploy.
+                    // Record the declaration in the catalog (persisted when
+                    // the catalog has a dir, so it survives a restart like a
+                    // table or model). The packaged payload makes the reload
+                    // and any cluster submit independent of the AS path;
+                    // packaging failures (unreadable module, over the ship
+                    // cap) fail the statement here, not a later deploy. A
+                    // language without a packager stays declaration-only.
+                    FunctionDef fdef;
+                    fdef.name = cf.function_name;
+                    fdef.language = cf.language;
+                    fdef.arg_types.reserve(decl.arg_types.size());
+                    for (const auto& t : decl.arg_types) {
+                        fdef.arg_types.push_back(t->ToString());
+                    }
+                    fdef.return_type =
+                        decl.return_type != nullptr ? decl.return_type->ToString() : "";
+                    fdef.definitions = cf.definitions;
                     if (auto payload = UdfLanguageRegistry::global().package(cf.language, decl);
                         !payload.empty()) {
-                        cluster::UdfSpec u;
-                        u.name = cf.function_name;
-                        u.language = cf.language;
-                        u.arg_types.reserve(decl.arg_types.size());
-                        for (const auto& t : decl.arg_types) {
-                            u.arg_types.push_back(t->ToString());
-                        }
-                        u.return_type =
-                            decl.return_type != nullptr ? decl.return_type->ToString() : "";
-                        u.definitions = cf.definitions;
-                        u.module_b64 = clink::base64_encode(std::string_view{
+                        fdef.module_b64 = clink::base64_encode(std::string_view{
                             reinterpret_cast<const char*>(payload.data()), payload.size()});
-                        std::erase_if(session_udfs,
-                                      [&](const cluster::UdfSpec& e) { return e.name == u.name; });
-                        session_udfs.push_back(std::move(u));
                     }
+                    // The duplicate gate above ran against the runtime
+                    // registry (which the catalog pass pre-seeded), so the
+                    // catalog write is always a replace.
+                    catalog.register_function(std::move(fdef), /*or_replace=*/true);
                 } catch (const std::exception& e) {
                     err << "error: CREATE FUNCTION " << cf.function_name << ": " << e.what()
                         << "\n";
@@ -261,6 +307,29 @@ int run_script(const std::string& sql,
                 }
                 out << "created function " << cf.function_name << " (language " << cf.language
                     << ")\n";
+                continue;
+            }
+            if (std::holds_alternative<ast::DropFunctionStmt>(stmt)) {
+                const auto& df = std::get<ast::DropFunctionStmt>(stmt);
+                for (const auto& fname : df.function_names) {
+                    const bool known = ScalarFunctionRegistry::global().contains(fname) ||
+                                       catalog.get_function(fname) != nullptr;
+                    if (!known) {
+                        if (df.if_exists) {
+                            out << "function " << fname << " does not exist, skipping\n";
+                            continue;
+                        }
+                        err << "error: DROP FUNCTION: function '" << fname << "' does not exist\n";
+                        return 1;
+                    }
+                    // Drops the declaration (and its persisted file) plus
+                    // THIS process's registration. TaskManagers that
+                    // registered it from an earlier deploy keep theirs for
+                    // the process lifetime, like C++-registered UDFs.
+                    ScalarFunctionRegistry::global().remove(fname);
+                    catalog.drop_function(fname);
+                    out << "dropped function " << fname << "\n";
+                }
                 continue;
             }
             if (std::holds_alternative<ast::AlterTableStmt>(stmt)) {

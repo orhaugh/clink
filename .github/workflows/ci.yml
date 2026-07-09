@@ -34,7 +34,10 @@ jobs:
             librdkafka-dev libssl-dev pkg-config python3 git
       - name: Configure + build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON
+          # CLINK_WITH_WASM=ON fetches the pinned wasmtime c-api for this
+          # platform, so the wasm UDF impl and its tests build on Linux too.
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON \
+            -DCLINK_WITH_WASM=ON
           cmake --build build -j
       - name: Unit tests
         run: ctest --test-dir build --output-on-failure -j 4

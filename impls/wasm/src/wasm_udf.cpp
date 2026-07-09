@@ -22,6 +22,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -148,7 +149,17 @@ std::vector<std::uint8_t> read_module_file(const std::string& module_path) {
                                      std::istreambuf_iterator<char>{}};
 }
 
-// One loaded UDF: store + instance + resolved export, serialised by mu_.
+// One loaded UDF: a compiled module plus a pool of instances. wasmtime
+// stores are single-threaded, so concurrency comes from INSTANCES: a call
+// borrows an idle instance (or instantiates a fresh one from the compiled
+// module - the JIT work happened once, at compile), runs the whole guest
+// sequence on it exclusively, and returns it to the pool. A call that
+// fails discards its instance instead of returning it, so a trapped or
+// fuel-exhausted module (whose allocator state is now suspect) can never
+// poison later calls. The pool never shrinks; its size is bounded by the
+// peak number of concurrent callers. Instances are interchangeable by
+// contract: a UDF is a pure function and must not rely on cross-call
+// global state.
 // `origin` is only for error messages: the module path locally, or a
 // shipped-module marker when the bytes arrived with a job deploy.
 class WasmScalarFunction {
@@ -159,54 +170,32 @@ public:
                        std::vector<ValueSpec> param_specs,
                        ValueSpec result_spec,
                        std::uint64_t fuel_limit)
-        : param_specs_(std::move(param_specs)),
+        : origin_(origin),
+          export_name_(export_name),
+          param_specs_(std::move(param_specs)),
           expanded_param_kinds_(expand_param_kinds(param_specs_)),
           result_spec_(result_spec),
+          uses_strings_(result_spec_.is_string ||
+                        std::any_of(param_specs_.begin(),
+                                    param_specs_.end(),
+                                    [](const ValueSpec& p) { return p.is_string; })),
           fuel_limit_(fuel_limit == 0 ? kDefaultFuelPerCall : fuel_limit) {
-        store_ = wasmtime_store_new(shared_engine(), nullptr, nullptr);
-        context_ = wasmtime_store_context(store_);
-
-        wasmtime_module_t* module = nullptr;
-        if (auto* err = wasmtime_module_new(shared_engine(), bytes.data(), bytes.size(), &module);
+        if (auto* err = wasmtime_module_new(shared_engine(), bytes.data(), bytes.size(), &module_);
             err != nullptr) {
-            throw_wasmtime(("wasm UDF: compile failed for " + origin).c_str(), err, nullptr);
+            throw_wasmtime(("wasm UDF: compile failed for " + origin_).c_str(), err, nullptr);
         }
-        // No imports: a UDF module must be self-contained (no WASI, no host
-        // functions) - that is the sandbox contract.
-        wasm_trap_t* trap = nullptr;
-        if (auto* err = wasmtime_instance_new(context_, module, nullptr, 0, &instance_, &trap);
-            err != nullptr || trap != nullptr) {
-            wasmtime_module_delete(module);
-            throw_wasmtime(("wasm UDF: instantiate failed for " + origin +
-                            " (imports are not supported - the module must be self-contained)")
-                               .c_str(),
-                           err,
-                           trap);
-        }
-        wasmtime_module_delete(module);
-
-        wasmtime_extern_t item{};
-        if (!wasmtime_instance_export_get(
-                context_, &instance_, export_name.data(), export_name.size(), &item) ||
-            item.kind != WASMTIME_EXTERN_FUNC) {
-            throw std::runtime_error("wasm UDF: module " + origin + " has no exported function '" +
-                                     export_name + "'");
-        }
-        func_ = item.of.func;
-
-        const bool uses_strings =
-            result_spec_.is_string || std::any_of(param_specs_.begin(),
-                                                  param_specs_.end(),
-                                                  [](const ValueSpec& p) { return p.is_string; });
-        if (uses_strings) {
-            resolve_string_abi_(origin);
-        }
-        validate_signature_(origin, export_name);
+        // The first instance validates everything at load time: exports,
+        // string ABI, signature. Later instances skip validation - the
+        // compiled module cannot change.
+        auto first = make_instance_();
+        validate_signature_(*first);
+        idle_.push_back(std::move(first));
     }
 
     ~WasmScalarFunction() {
-        if (store_ != nullptr) {
-            wasmtime_store_delete(store_);
+        idle_.clear();  // instances first, then their module
+        if (module_ != nullptr) {
+            wasmtime_module_delete(module_);
         }
     }
 
@@ -225,7 +214,7 @@ public:
                 return config::JsonValue{nullptr};
             }
         }
-        // Type-check before touching the guest.
+        // Type-check before touching any guest.
         for (std::size_t i = 0; i < param_specs_.size(); ++i) {
             if (param_specs_[i].is_string) {
                 if (!args[i].is_string()) {
@@ -241,13 +230,170 @@ public:
                                          " is not numeric");
             }
         }
+        auto inst = borrow_();
+        // A throw from run_ lets `inst` die here: a failed call's instance
+        // is discarded, never returned to the pool.
+        auto out = run_(*inst, args);
+        give_back_(std::move(inst));
+        return out;
+    }
 
-        // The whole guest sequence - argument allocs, the call, deallocs -
-        // is serialised (the store is single-threaded) and runs under ONE
-        // fuel budget, so a hostile alloc cannot spin any more than the
-        // function itself can.
-        std::lock_guard lk(mu_);
-        if (auto* err = wasmtime_context_set_fuel(context_, fuel_limit_); err != nullptr) {
+private:
+    // The per-store state one borrowed call runs against. Export handles
+    // are per store, so each instance resolves its own.
+    struct Instance {
+        wasmtime_store_t* store{nullptr};
+        wasmtime_context_t* context{nullptr};
+        wasmtime_instance_t instance{};
+        wasmtime_func_t func{};
+        wasmtime_memory_t memory{};
+        wasmtime_func_t alloc{};
+        wasmtime_func_t dealloc{};
+        bool has_dealloc{false};
+
+        Instance() = default;
+        Instance(const Instance&) = delete;
+        Instance& operator=(const Instance&) = delete;
+        ~Instance() {
+            if (store != nullptr) {
+                wasmtime_store_delete(store);
+            }
+        }
+    };
+
+    std::unique_ptr<Instance> borrow_() {
+        {
+            std::lock_guard lk(pool_mu_);
+            if (!idle_.empty()) {
+                auto inst = std::move(idle_.back());
+                idle_.pop_back();
+                return inst;
+            }
+        }
+        return make_instance_();
+    }
+
+    void give_back_(std::unique_ptr<Instance> inst) {
+        std::lock_guard lk(pool_mu_);
+        idle_.push_back(std::move(inst));
+    }
+
+    // Instantiate from the compiled module and resolve the exports this
+    // UDF uses.
+    std::unique_ptr<Instance> make_instance_() {
+        auto inst = std::make_unique<Instance>();
+        inst->store = wasmtime_store_new(shared_engine(), nullptr, nullptr);
+        inst->context = wasmtime_store_context(inst->store);
+        // No imports: a UDF module must be self-contained (no WASI, no host
+        // functions) - that is the sandbox contract.
+        wasm_trap_t* trap = nullptr;
+        if (auto* err =
+                wasmtime_instance_new(inst->context, module_, nullptr, 0, &inst->instance, &trap);
+            err != nullptr || trap != nullptr) {
+            throw_wasmtime(("wasm UDF: instantiate failed for " + origin_ +
+                            " (imports are not supported - the module must be self-contained)")
+                               .c_str(),
+                           err,
+                           trap);
+        }
+        wasmtime_extern_t item{};
+        if (!wasmtime_instance_export_get(
+                inst->context, &inst->instance, export_name_.data(), export_name_.size(), &item) ||
+            item.kind != WASMTIME_EXTERN_FUNC) {
+            throw std::runtime_error("wasm UDF: module " + origin_ + " has no exported function '" +
+                                     export_name_ + "'");
+        }
+        inst->func = item.of.func;
+        if (uses_strings_) {
+            resolve_string_abi_(*inst);
+        }
+        return inst;
+    }
+
+    // Resolve the exports the string ABI needs: the linear memory, the
+    // required alloc, and the optional dealloc. Runs per instance (handles
+    // are store-local); a module missing them fails the first instance, at
+    // CREATE FUNCTION time, with an actionable message.
+    void resolve_string_abi_(Instance& inst) {
+        wasmtime_extern_t item{};
+        if (!wasmtime_instance_export_get(inst.context, &inst.instance, "memory", 6, &item) ||
+            item.kind != WASMTIME_EXTERN_MEMORY) {
+            throw std::runtime_error("wasm UDF: " + origin_ +
+                                     " declares TEXT but exports no linear memory named "
+                                     "'memory' (add (memory (export \"memory\") 1))");
+        }
+        inst.memory = item.of.memory;
+        if (!wasmtime_instance_export_get(inst.context, &inst.instance, "alloc", 5, &item) ||
+            item.kind != WASMTIME_EXTERN_FUNC) {
+            throw std::runtime_error("wasm UDF: " + origin_ +
+                                     " declares TEXT but exports no 'alloc' function; the "
+                                     "host needs alloc(i32 size) -> i32 ptr to place "
+                                     "argument bytes in guest memory");
+        }
+        inst.alloc = item.of.func;
+        {
+            wasm_functype_t* ft = wasmtime_func_type(inst.context, &inst.alloc);
+            const auto* ps = wasm_functype_params(ft);
+            const auto* rs = wasm_functype_results(ft);
+            const bool ok = ps->size == 1 && wasm_valtype_kind(ps->data[0]) == WASM_I32 &&
+                            rs->size == 1 && wasm_valtype_kind(rs->data[0]) == WASM_I32;
+            wasm_functype_delete(ft);
+            if (!ok) {
+                throw std::runtime_error("wasm UDF: " + origin_ +
+                                         " exports 'alloc' but not as (i32 size) -> i32 ptr");
+            }
+        }
+        if (wasmtime_instance_export_get(inst.context, &inst.instance, "dealloc", 7, &item) &&
+            item.kind == WASMTIME_EXTERN_FUNC) {
+            wasm_functype_t* ft = wasmtime_func_type(inst.context, &item.of.func);
+            const auto* ps = wasm_functype_params(ft);
+            const auto* rs = wasm_functype_results(ft);
+            const bool ok = ps->size == 2 && wasm_valtype_kind(ps->data[0]) == WASM_I32 &&
+                            wasm_valtype_kind(ps->data[1]) == WASM_I32 && rs->size == 0;
+            wasm_functype_delete(ft);
+            if (!ok) {
+                throw std::runtime_error("wasm UDF: " + origin_ +
+                                         " exports 'dealloc' but not as (i32 ptr, i32 size) -> ()");
+            }
+            inst.dealloc = item.of.func;
+            inst.has_dealloc = true;
+        }
+    }
+
+    // Guest calls used by the string ABI. The instance is exclusively
+    // borrowed; both draw from the fuel budget set at the start of run_.
+    static std::uint32_t call_alloc_(Instance& inst, std::uint32_t size) {
+        wasmtime_val_t p{};
+        p.kind = WASMTIME_I32;
+        p.of.i32 = static_cast<std::int32_t>(size);
+        wasmtime_val_t r{};
+        wasm_trap_t* trap = nullptr;
+        if (auto* err = wasmtime_func_call(inst.context, &inst.alloc, &p, 1, &r, 1, &trap);
+            err != nullptr || trap != nullptr) {
+            throw_wasmtime("wasm UDF: guest alloc failed", err, trap);
+        }
+        return static_cast<std::uint32_t>(r.of.i32);
+    }
+
+    static void call_dealloc_(Instance& inst, std::uint32_t ptr, std::uint32_t size) {
+        wasmtime_val_t p[2]{};
+        p[0].kind = WASMTIME_I32;
+        p[0].of.i32 = static_cast<std::int32_t>(ptr);
+        p[1].kind = WASMTIME_I32;
+        p[1].of.i32 = static_cast<std::int32_t>(size);
+        wasm_trap_t* trap = nullptr;
+        if (auto* err = wasmtime_func_call(inst.context, &inst.dealloc, p, 2, nullptr, 0, &trap);
+            err != nullptr || trap != nullptr) {
+            throw_wasmtime("wasm UDF: guest dealloc failed", err, trap);
+        }
+    }
+
+    // The whole guest sequence for one call, against an exclusively
+    // borrowed instance: fuel, argument allocs + writes, the call, result
+    // decode, deallocs - one fuel budget covers it all, so a hostile alloc
+    // cannot spin any more than the function itself can.
+    config::JsonValue run_(Instance& inst, const std::vector<config::JsonValue>& args) {
+        if (auto* err = wasmtime_context_set_fuel(inst.context, fuel_limit_); err != nullptr) {
             throw_wasmtime("wasm UDF: set_fuel failed", err, nullptr);
         }
 
@@ -267,13 +413,13 @@ public:
             any_string_arg = true;
             const auto len = static_cast<std::uint32_t>(args[i].as_string().size());
             if (len != 0) {
-                arg_bufs[i] = GuestBuf{call_alloc_(len), len};
+                arg_bufs[i] = GuestBuf{call_alloc_(inst, len), len};
             }
         }
         // 2. Write the argument bytes through one post-alloc data pointer.
         if (any_string_arg) {
-            auto* base = wasmtime_memory_data(context_, &memory_);
-            const auto size = wasmtime_memory_data_size(context_, &memory_);
+            auto* base = wasmtime_memory_data(inst.context, &inst.memory);
+            const auto size = wasmtime_memory_data_size(inst.context, &inst.memory);
             for (std::size_t i = 0; i < param_specs_.size(); ++i) {
                 const auto [ptr, len] = arg_bufs[i];
                 if (len == 0) {
@@ -327,7 +473,7 @@ public:
         {
             wasm_trap_t* trap = nullptr;
             if (auto* err = wasmtime_func_call(
-                    context_, &func_, params.data(), params.size(), &result, 1, &trap);
+                    inst.context, &inst.func, params.data(), params.size(), &result, 1, &trap);
                 err != nullptr || trap != nullptr) {
                 throw_wasmtime("wasm UDF: call failed (fuel exhausted or trapped)", err, trap);
             }
@@ -345,16 +491,16 @@ public:
             const auto ptr = static_cast<std::uint32_t>(packed >> 32);
             const auto len = static_cast<std::uint32_t>(packed & 0xFFFFFFFFull);
             // Re-fetch: the call may have grown the memory.
-            const auto* base = wasmtime_memory_data(context_, &memory_);
-            const auto size = wasmtime_memory_data_size(context_, &memory_);
+            const auto* base = wasmtime_memory_data(inst.context, &inst.memory);
+            const auto size = wasmtime_memory_data_size(inst.context, &inst.memory);
             if (static_cast<std::uint64_t>(ptr) + len > size) {
                 throw std::runtime_error("wasm UDF: result (ptr " + std::to_string(ptr) + ", len " +
                                          std::to_string(len) +
                                          ") is out of the guest memory's bounds");
             }
             out = config::JsonValue{std::string(reinterpret_cast<const char*>(base) + ptr, len)};
-            if (has_dealloc_ && len != 0) {
-                call_dealloc_(ptr, len);
+            if (inst.has_dealloc && len != 0) {
+                call_dealloc_(inst, ptr, len);
             }
         } else {
             switch (result.kind) {
@@ -375,104 +521,26 @@ public:
             }
         }
         // 6. Return the argument buffers to the guest allocator.
-        if (has_dealloc_) {
+        if (inst.has_dealloc) {
             for (const auto& [ptr, len] : arg_bufs) {
                 if (len != 0) {
-                    call_dealloc_(ptr, len);
+                    call_dealloc_(inst, ptr, len);
                 }
             }
         }
         return out;
     }
 
-private:
-    // Resolve the exports the string ABI needs: the linear memory, the
-    // required alloc, and the optional dealloc. Load-time, so a module
-    // missing them fails the CREATE FUNCTION with an actionable message.
-    void resolve_string_abi_(const std::string& origin) {
-        wasmtime_extern_t item{};
-        if (!wasmtime_instance_export_get(context_, &instance_, "memory", 6, &item) ||
-            item.kind != WASMTIME_EXTERN_MEMORY) {
-            throw std::runtime_error("wasm UDF: " + origin +
-                                     " declares TEXT but exports no linear memory named "
-                                     "'memory' (add (memory (export \"memory\") 1))");
-        }
-        memory_ = item.of.memory;
-        if (!wasmtime_instance_export_get(context_, &instance_, "alloc", 5, &item) ||
-            item.kind != WASMTIME_EXTERN_FUNC) {
-            throw std::runtime_error("wasm UDF: " + origin +
-                                     " declares TEXT but exports no 'alloc' function; the "
-                                     "host needs alloc(i32 size) -> i32 ptr to place "
-                                     "argument bytes in guest memory");
-        }
-        alloc_ = item.of.func;
-        {
-            wasm_functype_t* ft = wasmtime_func_type(context_, &alloc_);
-            const auto* ps = wasm_functype_params(ft);
-            const auto* rs = wasm_functype_results(ft);
-            const bool ok = ps->size == 1 && wasm_valtype_kind(ps->data[0]) == WASM_I32 &&
-                            rs->size == 1 && wasm_valtype_kind(rs->data[0]) == WASM_I32;
-            wasm_functype_delete(ft);
-            if (!ok) {
-                throw std::runtime_error("wasm UDF: " + origin +
-                                         " exports 'alloc' but not as (i32 size) -> i32 ptr");
-            }
-        }
-        if (wasmtime_instance_export_get(context_, &instance_, "dealloc", 7, &item) &&
-            item.kind == WASMTIME_EXTERN_FUNC) {
-            wasm_functype_t* ft = wasmtime_func_type(context_, &item.of.func);
-            const auto* ps = wasm_functype_params(ft);
-            const auto* rs = wasm_functype_results(ft);
-            const bool ok = ps->size == 2 && wasm_valtype_kind(ps->data[0]) == WASM_I32 &&
-                            wasm_valtype_kind(ps->data[1]) == WASM_I32 && rs->size == 0;
-            wasm_functype_delete(ft);
-            if (!ok) {
-                throw std::runtime_error("wasm UDF: " + origin +
-                                         " exports 'dealloc' but not as (i32 ptr, i32 size) -> ()");
-            }
-            dealloc_ = item.of.func;
-            has_dealloc_ = true;
-        }
-    }
-
-    // Guest calls used by the string ABI. mu_ must be held; both draw from
-    // the fuel budget set at the start of call().
-    std::uint32_t call_alloc_(std::uint32_t size) {
-        wasmtime_val_t p{};
-        p.kind = WASMTIME_I32;
-        p.of.i32 = static_cast<std::int32_t>(size);
-        wasmtime_val_t r{};
-        wasm_trap_t* trap = nullptr;
-        if (auto* err = wasmtime_func_call(context_, &alloc_, &p, 1, &r, 1, &trap);
-            err != nullptr || trap != nullptr) {
-            throw_wasmtime("wasm UDF: guest alloc failed", err, trap);
-        }
-        return static_cast<std::uint32_t>(r.of.i32);
-    }
-
-    void call_dealloc_(std::uint32_t ptr, std::uint32_t size) {
-        wasmtime_val_t p[2]{};
-        p[0].kind = WASMTIME_I32;
-        p[0].of.i32 = static_cast<std::int32_t>(ptr);
-        p[1].kind = WASMTIME_I32;
-        p[1].of.i32 = static_cast<std::int32_t>(size);
-        wasm_trap_t* trap = nullptr;
-        if (auto* err = wasmtime_func_call(context_, &dealloc_, p, 2, nullptr, 0, &trap);
-            err != nullptr || trap != nullptr) {
-            throw_wasmtime("wasm UDF: guest dealloc failed", err, trap);
-        }
-    }
-
     // Compare the export's actual (params -> result) against the declared
     // SQL signature (string expansion applied), once at load. Mismatches
     // fail CREATE FUNCTION, not rows.
-    void validate_signature_(const std::string& origin, const std::string& export_name) {
-        wasm_functype_t* ft = wasmtime_func_type(context_, &func_);
+    void validate_signature_(Instance& inst) {
+        wasm_functype_t* ft = wasmtime_func_type(inst.context, &inst.func);
         const wasm_valtype_vec_t* params = wasm_functype_params(ft);
         const wasm_valtype_vec_t* results = wasm_functype_results(ft);
         auto fail = [&](const std::string& detail) {
             wasm_functype_delete(ft);
-            throw std::runtime_error("wasm UDF: export '" + export_name + "' of " + origin +
+            throw std::runtime_error("wasm UDF: export '" + export_name_ + "' of " + origin_ +
                                      " does not match the declared signature: " + detail);
         };
         if (params->size != expanded_param_kinds_.size()) {
@@ -502,19 +570,16 @@ private:
         wasm_functype_delete(ft);
     }
 
+    std::string origin_;
+    std::string export_name_;
     std::vector<ValueSpec> param_specs_;
     std::vector<wasm_valkind_t> expanded_param_kinds_;
     ValueSpec result_spec_;
+    bool uses_strings_{false};
     std::uint64_t fuel_limit_;
-    wasmtime_store_t* store_{nullptr};
-    wasmtime_context_t* context_{nullptr};
-    wasmtime_instance_t instance_{};
-    wasmtime_func_t func_{};
-    wasmtime_memory_t memory_{};
-    wasmtime_func_t alloc_{};
-    wasmtime_func_t dealloc_{};
-    bool has_dealloc_{false};
-    std::mutex mu_;
+    wasmtime_module_t* module_{nullptr};
+    std::mutex pool_mu_;
+    std::vector<std::unique_ptr<Instance>> idle_;
 };
 
 }  // namespace

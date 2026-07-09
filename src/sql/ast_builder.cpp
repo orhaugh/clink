@@ -1350,6 +1350,36 @@ ast::InsertStmt translate_insert_stmt(const JsonValue& body) {
     return stmt;
 }
 
+// DROP FUNCTION [IF EXISTS] f [, g]. Each object is an ObjectWithArgs
+// whose objname is a (possibly schema-qualified) name list; clink
+// functions are name-unique, so an argument list is accepted and ignored
+// and only the last name component is kept.
+ast::DropFunctionStmt translate_drop_function_stmt(const JsonValue& body) {
+    ast::DropFunctionStmt stmt;
+    stmt.loc = loc_from(body);
+    if (body.contains("missing_ok") && body.at("missing_ok").is_bool()) {
+        stmt.if_exists = body.at("missing_ok").as_bool();
+    }
+    if (!body.contains("objects") || !body.at("objects").is_array() ||
+        body.at("objects").as_array().empty()) {
+        unsupported("DROP FUNCTION missing objects", stmt.loc.pos);
+    }
+    for (const auto& object : body.at("objects").as_array()) {
+        auto [obj_kind, obj_body] = node_wrapper(object);
+        if (obj_kind != "ObjectWithArgs") {
+            unsupported("DROP FUNCTION object must be an ObjectWithArgs, got " + obj_kind,
+                        stmt.loc.pos);
+        }
+        if (!obj_body->contains("objname") || !obj_body->at("objname").is_array() ||
+            obj_body->at("objname").as_array().empty()) {
+            unsupported("DROP FUNCTION object missing a name", stmt.loc.pos);
+        }
+        const auto& names = obj_body->at("objname").as_array();
+        stmt.function_names.push_back(string_atom(names[names.size() - 1]));
+    }
+    return stmt;
+}
+
 ast::DropTableStmt translate_drop_stmt(const JsonValue& body) {
     ast::DropTableStmt stmt;
     stmt.loc = loc_from(body);
@@ -1840,6 +1870,12 @@ ast::Statement translate_statement(const JsonValue& outer_stmt) {
         return ast::Statement{translate_insert_stmt(*body)};
     }
     if (kind == "DropStmt") {
+        // PG's DropStmt covers every object kind; functions take their own
+        // AST shape (their objects are ObjectWithArgs, not name Lists).
+        if (body->contains("removeType") && body->at("removeType").is_string() &&
+            body->at("removeType").as_string() == "OBJECT_FUNCTION") {
+            return ast::Statement{translate_drop_function_stmt(*body)};
+        }
         return ast::Statement{translate_drop_stmt(*body)};
     }
     if (kind == "VariableShowStmt") {
