@@ -65,6 +65,8 @@
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/remote_pool.hpp"
 #include "clink/state/remote_read_backend.hpp"
+#include "clink/state_processor/savepoint.hpp"
+#include "clink/state_processor/state_diff.hpp"
 
 using namespace clink;
 using namespace std::chrono_literals;
@@ -564,6 +566,122 @@ TEST(SqlRuntime, GroupByAutoActivatesAsyncOnDeferringBackend) {
     EXPECT_EQ(auto2, 25);
     EXPECT_GE(rrb->remote_loads(), 2u)
         << "auto-on did not route GROUP BY state through the deferring backend";
+}
+
+// The default (non-async) GROUP BY path holds its accumulators in operator
+// memory; durability rides a write-behind flush into the "agg" KeyedState
+// slot at snapshot time plus a reload at open(). This drives the exact
+// runner checkpoint sequence (process -> snapshot_timers -> backend
+// snapshot) mid-stream, restores a FRESH operator instance from that
+// snapshot, and asserts the running totals carry the pre-checkpoint
+// contributions. Before the fix the snapshot held no aggregate state and
+// the restored totals silently restarted from zero.
+TEST(SqlRuntime, GroupByInMemoryStateSurvivesSnapshotRestore) {
+    ensure_sql_installed_once();
+
+    Catalog cat;
+    auto ddl = parse(
+        std::string{"CREATE TABLE orders (user_id BIGINT, amount BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/agg_restore_in.ndjson');"
+                    "CREATE TABLE out_t (user_id BIGINT, total BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/agg_restore_out.ndjson')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT user_id, SUM(amount) AS total "
+                        "FROM orders GROUP BY user_id");
+    std::map<std::string, std::string> agg_params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "aggregate_row") {
+            agg_params = op.params;
+        }
+    }
+    ASSERT_FALSE(agg_params.empty());
+
+    auto build_agg = [&]() {
+        const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+            "aggregate_row", std::string{kChannelRow}, std::string{kChannelRow});
+        EXPECT_NE(factory, nullptr);
+        cluster::OperatorBuildContext octx;
+        octx.params = agg_params;
+        return std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+    };
+    auto mk = [](std::int64_t uid, std::int64_t amount) {
+        Row r;
+        r.values["user_id"] = clink::config::JsonValue{static_cast<double>(uid)};
+        r.values["amount"] = clink::config::JsonValue{static_cast<double>(amount)};
+        return Record<Row>{std::move(r)};
+    };
+    auto feed = [](Operator<Row, Row>& op, std::vector<Record<Row>> recs) {
+        Batch<Row> b;
+        for (auto& r : recs) {
+            b.push(std::move(r));
+        }
+        BoundedChannel<StreamElement<Row>> ch(64);
+        Emitter<Row> em(&ch);
+        op.process(StreamElement<Row>::data(std::move(b)), em);
+        // Last emitted running total per user id.
+        std::map<std::int64_t, std::int64_t> totals;
+        while (auto el = ch.try_pop()) {
+            if (!el->is_data()) {
+                continue;
+            }
+            for (const auto& rec : el->as_data()) {
+                const Row& row = rec.value();
+                totals[static_cast<std::int64_t>(row.values.at("user_id").as_number())] =
+                    static_cast<std::int64_t>(row.values.at("total").as_number());
+            }
+        }
+        return totals;
+    };
+
+    const OperatorId op_id{4242};
+    MetricsRegistry metrics;
+    auto backend = std::make_shared<InMemoryStateBackend>();
+
+    // Phase A: process a first batch, then take a checkpoint EXACTLY as the
+    // runner does: snapshot_timers (the pre-snapshot flush hook), then the
+    // backend snapshot.
+    Snapshot snap;
+    {
+        auto op = build_agg();
+        RuntimeContext ctx{op_id, "agg", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        auto totals = feed(*op, {mk(1, 10), mk(2, 20), mk(1, 5)});
+        EXPECT_EQ(totals[1], 15);
+        EXPECT_EQ(totals[2], 20);
+        op->snapshot_timers(*backend, op_id);
+        snap = backend->snapshot(CheckpointId{1});
+        op->close();
+    }
+
+    // The snapshot must actually CARRY the accumulators - inspect it with the
+    // state-diff primitive (the play-4 tool that exposed the gap): the "agg"
+    // slot holds both group buckets.
+    {
+        auto sp = state_processor::Savepoint::load_from_snapshot(
+            Snapshot{.checkpoint_id = snap.checkpoint_id, .bytes = snap.bytes});
+        auto entries = state_processor::collect_entries(sp);
+        ASSERT_EQ(entries.count(op_id), 1u) << "snapshot has no state for the aggregate";
+        ASSERT_EQ(entries.at(op_id).count("agg"), 1u);
+        EXPECT_EQ(entries.at(op_id).at("agg").size(), 2u);
+    }
+
+    // Phase B: restore a FRESH backend + FRESH operator from the snapshot and
+    // continue. The running totals must include the pre-checkpoint state.
+    {
+        auto restored = std::make_shared<InMemoryStateBackend>();
+        restored->restore(snap);
+        auto op = build_agg();
+        RuntimeContext ctx{op_id, "agg", restored.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();  // loads the "agg" slot back into the in-memory buckets
+        auto totals = feed(*op, {mk(1, 7), mk(2, 5)});
+        EXPECT_EQ(totals[1], 22) << "restored total lost pre-checkpoint contributions (10+5+7)";
+        EXPECT_EQ(totals[2], 25) << "restored total lost pre-checkpoint contributions (20+5)";
+        op->close();
+    }
 }
 
 // SELECT DISTINCT dedups end-to-end AND rides the checkpointed KeyedState path,

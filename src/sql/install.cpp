@@ -3573,6 +3573,7 @@ public:
                     }
                     fold_into_(
                         sit->second, rows[static_cast<std::size_t>(idxs.back())], emit_batch);
+                    mark_dirty_(group_keys[g]);
                 }
                 if (!emit_batch.empty()) {
                     out.emit_data(std::move(emit_batch));
@@ -3670,6 +3671,7 @@ public:
             }
             vectorised_fold_slice(aggregates_, agg_cols, idxs, sit->second.agg_states);
             emit_group_(sit->second, /*input_was_changelog=*/false, emit_batch);
+            mark_dirty_(group_keys[g]);
         }
         if (!emit_batch.empty()) {
             out.emit_data(std::move(emit_batch));
@@ -3688,6 +3690,17 @@ public:
         effective_async_state_ =
             async_state_ || (this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                              this->runtime()->state_backend()->supports_async_get());
+        // Durability for the in-memory path: when a state backend is attached
+        // but the KeyedState paths are not active, the buckets are flushed to
+        // the "agg" slot at snapshot time (see mark_dirty_/flush_dirty_) and
+        // reloaded here after a restore. Same slot + codec as the async
+        // paths, so a job can move between storage modes across restarts.
+        persist_inmem_ = !effective_async_state_ && this->runtime() != nullptr &&
+                         this->runtime()->has_state_backend();
+        if (persist_inmem_ && state_.empty()) {
+            keyed_state_().scan(
+                [&](const std::string& key, const AggBucket& bucket) { state_[key] = bucket; });
+        }
         // WS3: within-batch group-by is eligible only for append-mode GROUP BY
         // whose every aggregate is batch-foldable (commutative, no per-value
         // memory). Static decision; the per-batch insert-only check is in
@@ -3702,6 +3715,17 @@ public:
     }
 
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_state_; }
+
+    // The runner's pre-snapshot hook: called on every checkpoint/savepoint
+    // barrier BEFORE the backend snapshot is taken, on every runner flavour.
+    // Flush the dirty in-memory buckets into KeyedState here so the snapshot
+    // captures the aggregate's accumulators.
+    void snapshot_timers(StateBackend& backend,
+                         OperatorId op_id,
+                         const std::string& slot = "") override {
+        Operator<Row, Row>::snapshot_timers(backend, op_id, slot);
+        flush_dirty_();
+    }
 
     // Opt into ASYNC-10 read coalescing: each record's process_async issues one
     // get_async for its group key, so a batch of records reading many distinct
@@ -3852,6 +3876,37 @@ private:
             it = state_.emplace(key, init_bucket_(row)).first;
         }
         fold_into_(it->second, row, out);
+        mark_dirty_(key);
+    }
+
+    // The in-memory buckets are the WORKING SET; durability rides the
+    // StateBackend via a write-behind flush at snapshot time. Every mutation
+    // site (per-record, WS3 within-batch fold, WS6 vectorised fold) marks its
+    // group dirty; snapshot_timers() - the runner's pre-snapshot hook - puts
+    // the dirty buckets into the "agg" KeyedState slot so the checkpoint
+    // captures them, and open() loads them back after a restore. Without
+    // this, the default (non-async) GROUP BY held its accumulators ONLY in
+    // operator memory: checkpoints carried no aggregate state, and any
+    // restore (failover self-heal, savepoint upgrade, park/resume) silently
+    // dropped every pre-checkpoint contribution from the running totals.
+    void mark_dirty_(const std::string& key) {
+        if (persist_inmem_) {
+            dirty_.insert(key);
+        }
+    }
+
+    void flush_dirty_() {
+        if (!persist_inmem_ || dirty_.empty()) {
+            return;
+        }
+        auto kv = keyed_state_();
+        for (const auto& key : dirty_) {
+            auto it = state_.find(key);
+            if (it != state_.end()) {
+                kv.put(key, it->second);
+            }
+        }
+        dirty_.clear();
     }
 
     KeyedState<std::string, AggBucket> keyed_state_() {
@@ -3876,6 +3931,11 @@ private:
     // batch-foldable, so process_columnar can probe state once per distinct
     // group per (insert-only) batch instead of once per row.
     bool batch_fold_eligible_ = false;
+    // Set in open(): the in-memory buckets must be flushed to KeyedState at
+    // snapshot time (backend attached, KeyedState paths not active).
+    bool persist_inmem_ = false;
+    // Group keys mutated since the last flush (write-behind working set).
+    std::unordered_set<std::string> dirty_;
     clink::FlatMap<std::string, AggBucket> state_;
     // Columns the columnar ingest reads from each input row (group keys, agg
     // inputs, __row_kind); precomputed in the ctor.
