@@ -109,6 +109,8 @@ int EmbeddedEngine::execute_script(const std::string& sql) {
             ckpt.interval_ms = opts_.checkpoint_interval_ms;
         }
         ckpt.state_backend_uri = opts_.state_backend_uri;
+        ckpt.capture_dir = opts_.capture_dir;
+        ckpt.capture_records = opts_.capture_records;
         // Stamp this engine's scope token onto every collect sink so its
         // instances resolve THIS engine's queues (the factory is
         // process-wide, the queues are per-engine).

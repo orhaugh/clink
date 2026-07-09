@@ -224,6 +224,10 @@ struct DeployMsg {
     // backend URI (legacy). v1 trailing field - old TMs see EOF and leave
     // it empty.
     std::string state_backend_uri;
+    // Record-capture flight recorder, echoed from CheckpointConfig (see
+    // there). Trailing wire fields - old TMs see EOF and leave capture off.
+    std::string capture_dir;
+    std::uint64_t capture_records{0};
 };
 
 struct StartJobMsg {
@@ -418,6 +422,15 @@ struct CheckpointConfig {
     // (remote-read, s3+rocksdb, changelog+s3) usable in a cluster job
     // without the JM writing markers to a non-filesystem path.
     std::string state_backend_uri;
+
+    // Record-capture flight recorder (time-travel debugging). When
+    // capture_dir is non-empty, every single-input operator subtask tees
+    // its input records into per-checkpoint-epoch .cap files under
+    // <capture_dir>/op-<id>/subtask-<idx>/ (see runtime/record_capture.hpp).
+    // capture_records bounds each epoch (0 = built-in default). Trailing
+    // wire fields - old peers see EOF and leave capture off.
+    std::string capture_dir;
+    std::uint64_t capture_records{0};
 };
 
 // Resolve max_restarts_on_tm_loss to its effective value (see the field +

@@ -67,6 +67,19 @@ struct JobConfig {
     // use the embedded path verbatim (same-location restart).
     std::string restore_base;
 
+    // Record-capture flight recorder (time-travel debugging). When non-empty,
+    // operator runners whose registration supplied an input codec tee every
+    // input record into per-checkpoint-epoch .cap files under
+    // <capture_dir>/op-<id>/subtask-<idx>/ (see record_capture.hpp).
+    // Best-effort debug facility: a write failure disarms that runner's
+    // capture, never the job. capture_records bounds each epoch's stored
+    // records (0 = the built-in default cap).
+    std::string capture_dir;
+    std::size_t capture_records{0};
+    // Names the subtask subdirectory capture files land in (cluster path:
+    // the chain's subtask index; in-process default 0).
+    std::size_t capture_subtask_idx{0};
+
     // State schema evolution: the versions the live job expects, per
     // (op, state_type). When set, the executor (a) on a restore,
     // migrates the restored state up to these versions before any

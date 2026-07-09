@@ -110,6 +110,12 @@ void LocalExecutor::start() {
         // Ambient DLQ: a connector routes a poison record here instead of dropping
         // it silently. Same instance on every context (it is thread-safe).
         contexts_.back()->set_dead_letter_queue(dlq);
+        // Record-capture flight recorder: arm runners whose registration
+        // supplied an input codec (no-op for the rest).
+        if (!config_.capture_dir.empty()) {
+            contexts_.back()->set_capture(
+                config_.capture_dir, config_.capture_records, config_.capture_subtask_idx);
+        }
         auto* ctx_ptr = contexts_.back().get();
         auto run_fn = runner.run;
         auto cancel_fn = runner.cancel;

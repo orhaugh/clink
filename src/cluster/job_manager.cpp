@@ -1953,6 +1953,8 @@ JobId JobManager::deploy_internal_(const JobPlan& plan,
         deploy_msg.plugins = plugins;
         deploy_msg.checkpoint_dir = checkpoint.checkpoint_dir;
         deploy_msg.state_backend_uri = checkpoint.state_backend_uri;
+        deploy_msg.capture_dir = checkpoint.capture_dir;
+        deploy_msg.capture_records = checkpoint.capture_records;
         deploy_msg.restore_from_dir = checkpoint.restore_from_dir;
         deploy_msg.restore_from_checkpoint_id = checkpoint.restore_from_checkpoint_id;
         deploy_msg.unaligned_checkpoints = checkpoint.alignment == CheckpointAlignment::Unaligned;
@@ -2698,6 +2700,8 @@ std::vector<JobManager::PendingDeploy> JobManager::restart_job_locked_(JobState&
         deploy_msg.plugins = job.plugins;
         deploy_msg.checkpoint_dir = job.checkpoint.checkpoint_dir;
         deploy_msg.state_backend_uri = job.checkpoint.state_backend_uri;
+        deploy_msg.capture_dir = job.checkpoint.capture_dir;
+        deploy_msg.capture_records = job.checkpoint.capture_records;
         // Restart point: use the JM's own checkpoint dir as the
         // restore source, last completed checkpoint id we acknowledged.
         deploy_msg.restore_from_dir = job.checkpoint.checkpoint_dir;
@@ -2890,6 +2894,8 @@ void JobManager::dispatch_cutover_deploy_locked_(JobState& job,
         deploy_msg.plugins = job.plugins;
         deploy_msg.checkpoint_dir = job.checkpoint.checkpoint_dir;
         deploy_msg.state_backend_uri = job.checkpoint.state_backend_uri;
+        deploy_msg.capture_dir = job.checkpoint.capture_dir;
+        deploy_msg.capture_records = job.checkpoint.capture_records;
         // The new subtasks restore from the cutover checkpoint, NOT
         // the latest. This is the key difference from restart_job_locked_:
         // we use the coordinator-chosen cutover_checkpoint so all new

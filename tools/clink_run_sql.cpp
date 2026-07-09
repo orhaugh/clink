@@ -51,6 +51,8 @@ struct SqlRunArgs {
     std::string state_backend;
     std::string checkpoint_dir;
     std::int64_t checkpoint_interval_ms = 10'000;
+    std::string capture_dir;
+    std::size_t capture_records = 0;
     std::uint32_t parallelism = 1;
     std::size_t slots = 64;
     bool explain = false;
@@ -72,6 +74,11 @@ void usage() {
               << "  --checkpoint-dir=<dir>      Enable checkpointing under this root.\n"
               << "  --checkpoint-interval-ms=<n>  Periodic checkpoint cadence (default 10000;\n"
               << "                              used only with --checkpoint-dir).\n"
+              << "  --capture-dir=<dir>         Record-capture flight recorder: tee each\n"
+              << "                              operator's input records into per-checkpoint\n"
+              << "                              epoch files under this dir (time-travel\n"
+              << "                              debugging; inspect with clink capture-cat).\n"
+              << "  --capture-records=<n>       Per-epoch record cap (default 10000).\n"
               << "  --catalog-dir=<dir>         Persistent catalog (CREATE TABLE auto-saves).\n"
               << "  --slots=<n>                 In-process TaskManager slots (default 64).\n"
               << "  --name=<job>                Job-name override for submitted jobs.\n"
@@ -131,6 +138,10 @@ bool parse_args(int argc, char** argv, SqlRunArgs& a) {
             a.checkpoint_dir = v;
         } else if (value_of(i, arg, "--checkpoint-interval-ms", &v)) {
             a.checkpoint_interval_ms = std::stoll(v);
+        } else if (value_of(i, arg, "--capture-dir", &v)) {
+            a.capture_dir = v;
+        } else if (value_of(i, arg, "--capture-records", &v)) {
+            a.capture_records = static_cast<std::size_t>(std::stoull(v));
         } else if (value_of(i, arg, "--parallelism", &v) || value_of(i, arg, "-p", &v)) {
             a.parallelism = static_cast<std::uint32_t>(std::stoul(v));
             if (a.parallelism < 1) {
@@ -219,6 +230,8 @@ int clink_cmd_run_sql(int argc, char** argv) {
     eopts.state_backend_uri = args.state_backend;
     eopts.checkpoint_dir = args.checkpoint_dir;
     eopts.checkpoint_interval_ms = args.checkpoint_interval_ms;
+    eopts.capture_dir = args.capture_dir;
+    eopts.capture_records = args.capture_records;
     eopts.catalog_dir = args.catalog_dir;
     eopts.job_name = args.job_name;
     try {

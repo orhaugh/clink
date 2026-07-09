@@ -129,6 +129,22 @@ public:
     void log_warn(std::string_view message) const { log(LogSeverity::Warn, message); }
     void log_error(std::string_view message) const { log(LogSeverity::Error, message); }
 
+    // Record-capture flight recorder (time-travel debugging). When
+    // capture_dir is non-empty AND the operator's registration supplied an
+    // input codec, the operator runner tees every input record into
+    // per-checkpoint-epoch .cap files under
+    // <capture_dir>/op-<id>/subtask-<idx>/ (see record_capture.hpp).
+    // capture_records bounds each epoch's stored records (0 = the default
+    // cap); the subtask index names this runner's subdirectory.
+    void set_capture(std::string dir, std::size_t max_records, std::size_t subtask_idx) noexcept {
+        capture_dir_ = std::move(dir);
+        capture_records_ = max_records;
+        capture_subtask_idx_ = subtask_idx;
+    }
+    const std::string& capture_dir() const noexcept { return capture_dir_; }
+    std::size_t capture_records() const noexcept { return capture_records_; }
+    std::size_t capture_subtask_idx() const noexcept { return capture_subtask_idx_; }
+
     // Dead-letter queue seam. The executor hands every subtask one shared DLQ (the
     // default logs bad records; a job may swap in a null or sink-backed one). A
     // connector that must drop a poison record - a source decode failure, a sink
@@ -398,6 +414,10 @@ private:
     std::uint64_t attributed_op_id_{0};
     spdlog::logger* host_logger_{nullptr};
     DeadLetterQueue* dlq_{nullptr};
+    // Record-capture flight recorder (see set_capture above).
+    std::string capture_dir_;
+    std::size_t capture_records_{0};
+    std::size_t capture_subtask_idx_{0};
     TimerService timer_service_{};
     SideOutputChannelMap side_outputs_;
     CheckpointAckFn ack_fn_;

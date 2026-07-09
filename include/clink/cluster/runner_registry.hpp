@@ -97,6 +97,11 @@ struct RunnerContext {
     std::string checkpoint_dir;
     std::string restore_from_dir;
     std::uint64_t restore_from_checkpoint_id{0};
+    // Record-capture flight recorder (echoed from DeployMsg via the TM's
+    // per-job checkpoint state); empty = capture off. Copied onto
+    // JobConfig by make_subtask_job_config.
+    std::string capture_dir;
+    std::uint64_t capture_records{0};
     // Per-subtask state-backend URI, decoupled from checkpoint_dir. When
     // non-empty, make_subtask_job_config uses it as the StateBackendSpec
     // uri (so the factory builds a remote/disaggregated backend) and

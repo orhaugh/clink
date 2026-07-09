@@ -95,6 +95,12 @@ inline const clink::cluster::TypeOps& require_type_ops(const clink::cluster::Typ
 // legacy behaviour where checkpoint_dir doubles as the backend URI.
 inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerContext& rctx) {
     clink::JobConfig cfg;
+    // Record-capture flight recorder: thread the job's capture config through
+    // to the runner contexts (the operator runner tees input records into
+    // per-epoch .cap files when armed - see runtime/record_capture.hpp).
+    cfg.capture_dir = rctx.capture_dir;
+    cfg.capture_records = static_cast<std::size_t>(rctx.capture_records);
+    cfg.capture_subtask_idx = rctx.chain.subtask_idx;
     clink::StateBackendSpec spec;
     spec.uri = rctx.state_backend_uri.empty() ? rctx.checkpoint_dir : rctx.state_backend_uri;
     spec.subtask_idx = rctx.chain.subtask_idx;
@@ -506,8 +512,14 @@ void PluginRegistry::register_operator(
         throw std::runtime_error(
             "register_operator<In, Out>: Out not registered (call register_type<Out> first)");
     }
+    // Capture codec: the operator runner's record-capture tee encodes input
+    // records with the channel's registered Codec<In>. Resolved once here at
+    // registration; null (unregistered codec) leaves capture unavailable for
+    // this op type rather than failing registration.
+    auto capture_codec = codec_for<In>();
     clink::cluster::SubtaskRunner runner =
-        [factory, &type_registry = type_registry_](const clink::cluster::RunnerContext& rctx) {
+        [factory, capture_codec, &type_registry = type_registry_](
+            const clink::cluster::RunnerContext& rctx) {
             auto op = factory(detail::build_ctx_from(rctx));
             detail::apply_chain_identity(op, rctx);
             const auto& chain = rctx.chain;
@@ -515,7 +527,7 @@ void PluginRegistry::register_operator(
             const auto& ops = detail::require_type_ops(type_registry, out_channel);
             clink::Dag dag;
             auto h0 = clink::cluster::build_typed_input_stage<In>(dag, rctx.in_bridges);
-            auto h1 = dag.template add_operator<In, Out>(h0, op);
+            auto h1 = dag.template add_operator<In, Out>(h0, op, capture_codec);
             clink::cluster::attach_typed_output_groups<Out>(
                 dag,
                 h1,
@@ -553,9 +565,9 @@ void PluginRegistry::register_operator(
     };
     operator_registry_.register_operator(op_type, std::move(op_factory));
 
-    auto db = [factory](clink::Dag& dag,
-                        const std::vector<std::any>& upstream,
-                        const BuildContext& ctx) -> clink::cluster::DagOpHandle {
+    auto db = [factory, capture_codec](clink::Dag& dag,
+                                       const std::vector<std::any>& upstream,
+                                       const BuildContext& ctx) -> clink::cluster::DagOpHandle {
         if (upstream.size() != 1) {
             throw std::runtime_error(
                 "DagBuilder<operator>: expected exactly one upstream edge, got " +
@@ -582,7 +594,10 @@ void PluginRegistry::register_operator(
         }
         auto in_handle = std::any_cast<clink::StageHandle<In>>(upstream[0]);
         auto op = factory(ctx);
-        auto h = dag.template add_operator<In, Out>(in_handle, op);
+        // capture_codec arms the record-capture tee for this op when the
+        // job names a capture_dir (the chain-dispatch path builds ops
+        // through this DagBuilder, so chained subtasks capture too).
+        auto h = dag.template add_operator<In, Out>(in_handle, op, capture_codec);
         return clink::cluster::DagOpHandle{std::any{h}, h.runner_index, /*parallelism=*/1};
     };
     // Bundle-scoped write so the TM chain dispatcher's per-job

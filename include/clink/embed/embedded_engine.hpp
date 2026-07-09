@@ -51,6 +51,13 @@ struct EngineOptions {
     std::string checkpoint_dir;
     // Periodic checkpoint cadence, applied only when checkpoint_dir is set.
     std::int64_t checkpoint_interval_ms = 10'000;
+    // Record-capture flight recorder: when non-empty, operator subtasks tee
+    // their input records into per-checkpoint-epoch .cap files under this
+    // directory (see runtime/record_capture.hpp). Pair with checkpoint_dir
+    // so epochs align with restorable checkpoints. capture_records bounds
+    // each epoch's stored records (0 = built-in default).
+    std::string capture_dir;
+    std::size_t capture_records = 0;
     // Optional persistent catalog directory (loaded at construction;
     // CREATE TABLE auto-saves). Empty keeps a session-only catalog.
     std::string catalog_dir;

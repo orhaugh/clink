@@ -93,6 +93,9 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
     // Trailing state-backend URI. Older TMs see EOF before this string and
     // leave it empty, so checkpoint_dir doubles as the backend URI.
     b.put_string(m.state_backend_uri);
+    // Trailing record-capture config. Older TMs see EOF and leave it off.
+    b.put_string(m.capture_dir);
+    b.put_u64_be(m.capture_records);
 }
 
 inline void encode_body(MessageBuilder& b, const StartJobMsg& m) {
@@ -182,6 +185,9 @@ inline void encode_body(MessageBuilder& b, const SubmitJobMsg& m) {
     // JMs see EOF before this string and leave it empty, so checkpoint_dir
     // doubles as the backend URI (legacy behaviour).
     b.put_string(m.checkpoint.state_backend_uri);
+    // Trailing record-capture config. Older JMs see EOF and leave it off.
+    b.put_string(m.checkpoint.capture_dir);
+    b.put_u64_be(m.checkpoint.capture_records);
 }
 
 inline void encode_body(MessageBuilder& b, const SubmitJobAckMsg& m) {
@@ -380,6 +386,13 @@ inline DeployMsg decode_deploy(MessageReader& r) {
     if (!r.eof()) {
         m.state_backend_uri = r.read_string();
     }
+    // Trailing record-capture config. Absent from older JM peers -> off.
+    if (!r.eof()) {
+        m.capture_dir = r.read_string();
+    }
+    if (!r.eof()) {
+        m.capture_records = r.read_u64_be();
+    }
     return m;
 }
 
@@ -529,6 +542,13 @@ inline SubmitJobMsg decode_submit_job(MessageReader& r) {
         // Trailing state-backend URI. Absent from older clients -> stays
         // empty (checkpoint_dir is the backend URI).
         m.checkpoint.state_backend_uri = r.read_string();
+    }
+    // Trailing record-capture config. Absent from older clients -> off.
+    if (!r.eof()) {
+        m.checkpoint.capture_dir = r.read_string();
+    }
+    if (!r.eof()) {
+        m.checkpoint.capture_records = r.read_u64_be();
     }
     return m;
 }

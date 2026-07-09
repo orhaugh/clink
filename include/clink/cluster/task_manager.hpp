@@ -243,6 +243,9 @@ private:
         // Per-subtask state-backend URI (decoupled from checkpoint_dir).
         // Empty -> checkpoint_dir is the backend URI (legacy).
         std::string state_backend_uri;
+        // Record-capture flight recorder (echoed from DeployMsg); empty = off.
+        std::string capture_dir;
+        std::uint64_t capture_records{0};
     };
     std::unordered_map<JobId, JobCheckpointState> per_job_checkpoint_;
 

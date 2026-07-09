@@ -28,6 +28,7 @@
 #include "clink/runtime/gated_timer_fire.hpp"
 #include "clink/runtime/multi_input_alignment.hpp"
 #include "clink/runtime/output_tag.hpp"
+#include "clink/runtime/record_capture.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/runtime/sharded_keyed_stage.hpp"
 #include "clink/runtime/snapshot_worker.hpp"
@@ -433,7 +434,15 @@ public:
 
     // ---- Operator (single-input single-output) --------------------------
     template <typename In, typename Out>
-    StageHandle<Out> add_operator(StageHandle<In> upstream, std::shared_ptr<Operator<In, Out>> op) {
+    // `capture_codec` (optional) arms the record-capture flight recorder for
+    // this operator: when the executor's JobConfig also names a capture_dir,
+    // the runner tees every input record into per-checkpoint-epoch .cap
+    // files (see record_capture.hpp). nullptr = capture unavailable for this
+    // operator (the default for direct in-process construction; the cluster
+    // registration path passes the channel's registered codec).
+    StageHandle<Out> add_operator(StageHandle<In> upstream,
+                                  std::shared_ptr<Operator<In, Out>> op,
+                                  std::shared_ptr<const Codec<In>> capture_codec = nullptr) {
         auto out_channel =
             std::make_shared<BoundedChannel<StreamElement<Out>>>(default_channel_capacity_);
         const OperatorId id = derive_id_with_uid_(*op);
@@ -459,9 +468,23 @@ public:
         // Dag::side_output() calls made between add_operator and run()
         // are observed by the closure at runtime.
         auto side_channels = side_channels_ptr_(runners_.size());
-        runner.run = [op, in_channel, out_channel, side_channels, id, owner_flag](
+        runner.run = [op, in_channel, out_channel, side_channels, id, owner_flag, capture_codec](
                          RuntimeContext& ctx, const std::function<bool()>& should_stop) {
             using namespace std::chrono_literals;
+            // Record-capture flight recorder (see record_capture.hpp): armed
+            // only when the job names a capture_dir AND this operator's input
+            // codec was supplied at registration. Tees data before the
+            // operator sees it; flushes an epoch file as each barrier passes;
+            // flushes the post-last-barrier tail at teardown.
+            std::unique_ptr<capture::EpochCaptureBuffer<In>> recorder;
+            if (capture_codec && !ctx.capture_dir().empty()) {
+                recorder =
+                    std::make_unique<capture::EpochCaptureBuffer<In>>(ctx.capture_dir(),
+                                                                      id,
+                                                                      ctx.capture_subtask_idx(),
+                                                                      ctx.capture_records(),
+                                                                      capture_codec);
+            }
             // ASYNC-10 transparent read coalescing (opt-in). BEFORE the operator
             // binds its KeyedState in open(), swap the backend for a
             // CoalescingBackend so the per-record get_async calls in one
@@ -696,6 +719,15 @@ public:
                     if (maybe->is_data()) {
                         clink::metrics::op::records_in_inc(
                             ctx.metrics(), id.value(), maybe->as_data().size());
+                        if (recorder) {
+                            recorder->on_data(maybe->as_data());
+                        }
+                    }
+                    if (recorder && maybe->is_barrier()) {
+                        // Close the capture epoch AT the barrier, before the
+                        // op processes it: epoch-<N>.cap = records between
+                        // checkpoint N-1 and N.
+                        recorder->on_barrier(maybe->as_barrier().id().value());
                     }
                     if (maybe->is_barrier() && ctx.has_state_backend()) {
                         // Snapshot the operator's state slice as the
@@ -909,6 +941,11 @@ public:
             if (async_mode && ctx.has_state_backend()) {
                 ctx.state_backend()->set_async_resume_scheduler({});
                 ctx.state_backend()->set_deadline_resume_scheduler({});  // ASYNC-12
+            }
+            if (recorder) {
+                // The records consumed after the last barrier - the moments a
+                // post-mortem cares about most.
+                recorder->flush_final();
             }
             op->close();
             op->attach_runtime(nullptr);
@@ -1496,86 +1533,15 @@ public:
     template <typename T>
     static std::vector<std::byte> serialize_records_(const std::vector<Record<T>>& records,
                                                      const Codec<T>& codec) {
-        std::vector<std::byte> out;
-        const auto put_u32 = [&](std::uint32_t v) {
-            for (int i = 0; i < 4; ++i) {
-                out.push_back(static_cast<std::byte>((v >> (i * 8)) & 0xFF));
-            }
-        };
-        const auto put_i64 = [&](std::int64_t v) {
-            const auto u = static_cast<std::uint64_t>(v);
-            for (int i = 0; i < 8; ++i) {
-                out.push_back(static_cast<std::byte>((u >> (i * 8)) & 0xFF));
-            }
-        };
-        put_u32(static_cast<std::uint32_t>(records.size()));
-        for (const auto& r : records) {
-            const bool has_t = r.event_time().has_value();
-            out.push_back(static_cast<std::byte>(has_t ? 1 : 0));
-            if (has_t) {
-                put_i64(r.event_time()->millis());
-            }
-            auto bytes = codec.encode(r.value());
-            put_u32(static_cast<std::uint32_t>(bytes.size()));
-            out.insert(out.end(), bytes.begin(), bytes.end());
-        }
-        return out;
+        // Shared framing with the record-capture flight recorder (which reads
+        // these bytes back for replay) - one implementation, two consumers.
+        return capture::serialize_records(records, codec);
     }
 
     template <typename T>
     static std::vector<Record<T>> deserialize_records_(std::span<const std::byte> in,
                                                        const Codec<T>& codec) {
-        std::vector<Record<T>> out;
-        std::size_t pos = 0;
-        const auto read_u32 = [&]() -> std::uint32_t {
-            std::uint32_t v = 0;
-            for (int i = 0; i < 4; ++i) {
-                v |= static_cast<std::uint32_t>(static_cast<std::uint8_t>(in[pos + i])) << (i * 8);
-            }
-            pos += 4;
-            return v;
-        };
-        const auto read_i64 = [&]() -> std::int64_t {
-            std::uint64_t u = 0;
-            for (int i = 0; i < 8; ++i) {
-                u |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(in[pos + i])) << (i * 8);
-            }
-            pos += 8;
-            return static_cast<std::int64_t>(u);
-        };
-        if (in.size() < 4) {
-            return out;
-        }
-        const auto count = read_u32();
-        out.reserve(count);
-        for (std::uint32_t r = 0; r < count; ++r) {
-            if (pos >= in.size()) {
-                break;
-            }
-            const bool has_t = static_cast<std::uint8_t>(in[pos++]) != 0;
-            std::optional<EventTime> t;
-            if (has_t) {
-                t = EventTime{read_i64()};
-            }
-            if (pos + 4 > in.size()) {
-                break;
-            }
-            const auto v_len = read_u32();
-            if (pos + v_len > in.size()) {
-                break;
-            }
-            auto decoded = codec.decode(in.subspan(pos, v_len));
-            pos += v_len;
-            if (!decoded.has_value()) {
-                continue;
-            }
-            if (t.has_value()) {
-                out.emplace_back(std::move(*decoded), *t);
-            } else {
-                out.emplace_back(std::move(*decoded));
-            }
-        }
-        return out;
+        return capture::deserialize_records(in, codec);
     }
 
     template <typename T>

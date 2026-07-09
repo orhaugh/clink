@@ -160,6 +160,7 @@ add_executable(clink_core_tests
     test_process_function.cpp
     test_cep.cpp
     test_state_processor.cpp
+    test_record_capture.cpp
     test_queryable_state.cpp
     test_changelog_state_backend.cpp
     test_operator_uid.cpp

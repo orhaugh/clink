@@ -27,6 +27,7 @@
 #include <string_view>
 #include <vector>
 
+#include "clink/runtime/record_capture.hpp"
 #include "clink/state_processor/savepoint.hpp"
 #include "clink/state_processor/state_diff.hpp"
 
@@ -418,6 +419,171 @@ int clink_cmd_state_cat(int argc, char** argv) {
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "clink state-cat: " << e.what() << "\n";
+        return 2;
+    }
+}
+
+// ---- clink capture-cat ------------------------------------------------------
+
+namespace {
+
+void capture_cat_usage() {
+    std::cerr << "Usage: clink capture-cat --file=<epoch-N.cap> [--max-rows=N]\n"
+              << "       clink capture-cat --dir=<capture-root>\n"
+              << "\n"
+              << "Inspects record-capture flight-recorder files (written when a job\n"
+              << "runs with a capture dir; see clink run --capture-dir). --file dumps\n"
+              << "one epoch's records (event time + value bytes rendered as\n"
+              << "int64/text/hex; the framing is codec-agnostic). --dir lists every\n"
+              << "captured epoch under a capture root with counts.\n"
+              << "\n"
+              << "Exit codes: 0 = ok, 2 = error.\n";
+}
+
+std::vector<std::byte> read_bytes(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("cannot open " + path.string());
+    }
+    std::vector<std::byte> bytes;
+    std::istreambuf_iterator<char> it{in}, end;
+    for (; it != end; ++it) {
+        bytes.push_back(static_cast<std::byte>(*it));
+    }
+    return bytes;
+}
+
+// Codec-agnostic walk of the capture framing: [u32 count] then per record
+// [u8 has_t][i64 t?][u32 len][len bytes]. Returns rendered rows.
+struct WalkedRecord {
+    bool has_event_time{false};
+    std::int64_t event_time_ms{0};
+    std::string value;  // raw bytes
+};
+
+std::vector<WalkedRecord> walk_capture_payload(std::span<const std::byte> in) {
+    std::vector<WalkedRecord> out;
+    std::size_t pos = 0;
+    auto read_u32 = [&]() -> std::uint32_t {
+        std::uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) {
+            v |= static_cast<std::uint32_t>(static_cast<std::uint8_t>(in[pos + i])) << (i * 8);
+        }
+        pos += 4;
+        return v;
+    };
+    auto read_i64 = [&]() -> std::int64_t {
+        std::uint64_t u = 0;
+        for (int i = 0; i < 8; ++i) {
+            u |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(in[pos + i])) << (i * 8);
+        }
+        pos += 8;
+        return static_cast<std::int64_t>(u);
+    };
+    if (in.size() < 4) {
+        return out;
+    }
+    const auto count = read_u32();
+    for (std::uint32_t r = 0; r < count && pos < in.size(); ++r) {
+        WalkedRecord rec;
+        rec.has_event_time = static_cast<std::uint8_t>(in[pos++]) != 0;
+        if (rec.has_event_time) {
+            if (pos + 8 > in.size()) {
+                break;
+            }
+            rec.event_time_ms = read_i64();
+        }
+        if (pos + 4 > in.size()) {
+            break;
+        }
+        const auto len = read_u32();
+        if (pos + len > in.size()) {
+            break;
+        }
+        rec.value.assign(reinterpret_cast<const char*>(in.data() + pos), len);
+        pos += len;
+        out.push_back(std::move(rec));
+    }
+    return out;
+}
+
+}  // namespace
+
+int clink_cmd_capture_cat(int argc, char** argv) {
+    if (has_flag(argc, argv, "help")) {
+        capture_cat_usage();
+        return 0;
+    }
+    const auto file = get_arg(argc, argv, "file");
+    const auto dir = get_arg(argc, argv, "dir");
+    std::size_t max_rows = 50;
+    if (const auto v = get_arg(argc, argv, "max-rows"); !v.empty()) {
+        max_rows = static_cast<std::size_t>(std::stoull(v));
+    }
+    try {
+        if (!file.empty()) {
+            const auto bytes = read_bytes(file);
+            auto hdr = clink::capture::decode_capture_header(
+                std::span<const std::byte>{bytes.data(), bytes.size()});
+            if (!hdr.has_value()) {
+                std::cerr << "clink capture-cat: not a capture file (bad magic): " << file << "\n";
+                return 2;
+            }
+            const auto& [h, payload_off] = *hdr;
+            auto records = walk_capture_payload(
+                std::span<const std::byte>{bytes.data() + payload_off, bytes.size() - payload_off});
+            std::cout << "capture-cat: " << file << "\n"
+                      << "records stored: " << records.size()
+                      << ", seen in epoch: " << h.records_seen
+                      << (h.truncated ? " (TRUNCATED at the cap)" : "") << "\n";
+            std::size_t shown = 0;
+            for (const auto& r : records) {
+                if (max_rows != 0 && shown >= max_rows) {
+                    std::cout << "  ... " << (records.size() - shown)
+                              << " more (raise --max-rows)\n";
+                    break;
+                }
+                ++shown;
+                std::cout << "  ";
+                if (r.has_event_time) {
+                    std::cout << "t=" << r.event_time_ms << " ";
+                }
+                std::cout << render_bytes(r.value, 96) << "\n";
+            }
+            return 0;
+        }
+        if (!dir.empty()) {
+            std::cout << "capture-cat: " << dir << "\n";
+            bool any = false;
+            std::vector<fs::path> files;
+            for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".cap") {
+                    files.push_back(entry.path());
+                }
+            }
+            std::sort(files.begin(), files.end());
+            for (const auto& f : files) {
+                any = true;
+                const auto bytes = read_bytes(f);
+                auto hdr = clink::capture::decode_capture_header(
+                    std::span<const std::byte>{bytes.data(), bytes.size()});
+                if (!hdr.has_value()) {
+                    std::cout << "  " << f.string() << "  (not a capture file)\n";
+                    continue;
+                }
+                std::cout << "  " << fs::relative(f, dir).string()
+                          << "  seen=" << hdr->first.records_seen
+                          << (hdr->first.truncated ? " truncated" : "") << "\n";
+            }
+            if (!any) {
+                std::cout << "(no .cap files)\n";
+            }
+            return 0;
+        }
+        capture_cat_usage();
+        return 2;
+    } catch (const std::exception& e) {
+        std::cerr << "clink capture-cat: " << e.what() << "\n";
         return 2;
     }
 }

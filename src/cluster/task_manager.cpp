@@ -788,6 +788,8 @@ void TaskManager::handle_deploy_(MessageReader& r) {
             .restore_from_dir = msg.restore_from_dir,
             .restore_from_checkpoint_id = msg.restore_from_checkpoint_id,
             .state_backend_uri = msg.state_backend_uri,
+            .capture_dir = msg.capture_dir,
+            .capture_records = msg.capture_records,
         };
     }
     for (auto& task : msg.tasks) {
@@ -961,6 +963,9 @@ void TaskManager::run_generic_subtask_(JobId job_id,
     // Per-subtask state-backend URI (decoupled from checkpoint_dir). Empty
     // keeps the legacy behaviour where checkpoint_dir is the backend URI.
     std::string state_backend_uri;
+    // Record-capture flight recorder (empty = off).
+    std::string capture_dir;
+    std::uint64_t capture_records = 0;
     {
         std::lock_guard lock(mu_);
         auto it = per_job_bundle_.find(job_id);
@@ -972,6 +977,8 @@ void TaskManager::run_generic_subtask_(JobId job_id,
         }
         if (auto ck = per_job_checkpoint_.find(job_id); ck != per_job_checkpoint_.end()) {
             state_backend_uri = ck->second.state_backend_uri;
+            capture_dir = ck->second.capture_dir;
+            capture_records = ck->second.capture_records;
         }
     }
     const auto& bundle_tr = *job_tr;
@@ -1322,6 +1329,8 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 .checkpoint_dir = checkpoint_dir,
                 .restore_from_dir = restore_from_dir,
                 .restore_from_checkpoint_id = restore_from_checkpoint_id,
+                .capture_dir = capture_dir,
+                .capture_records = capture_records,
                 .state_backend_uri = state_backend_uri,
                 // Build the backend through the HOST's factory (this TU is
                 // clink_node, whose singleton has the dynamically-registered
@@ -1648,6 +1657,8 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             .checkpoint_dir = checkpoint_dir,
             .restore_from_dir = restore_from_dir,
             .restore_from_checkpoint_id = restore_from_checkpoint_id,
+            .capture_dir = capture_dir,
+            .capture_records = capture_records,
             .state_backend_uri = state_backend_uri,
             // Host-captured logger + metrics (this is the clink_node TU), carried
             // across the dlopen boundary by data. See RunnerContext::logger.
