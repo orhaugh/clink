@@ -155,3 +155,199 @@ TEST(WasmUdf, LanguageLoaderRegistersViaCreateFunctionDecl) {
     EXPECT_EQ(static_cast<std::int64_t>(r.as_number()), 42);
     fs::remove(mod);
 }
+
+// Shared WAT prelude for string fixtures: an exported linear memory plus a
+// trivial bump allocator (no dealloc; freeing variants add their own).
+namespace {
+constexpr const char* kStringPrelude = R"(
+    (memory (export "memory") 1)
+    (global $heap (mut i32) (i32.const 1024))
+    (func $alloc (export "alloc") (param $size i32) (result i32)
+        (local $p i32)
+        global.get $heap
+        local.set $p
+        global.get $heap
+        local.get $size
+        i32.add
+        global.set $heap
+        local.get $p))";
+}  // namespace
+
+TEST(WasmUdfString, UpperRoundTripsAndEmptyStringWorks) {
+    // TEXT -> TEXT: the host places the argument via the exported alloc,
+    // the function writes an upper-cased copy and returns (ptr << 32) | len.
+    const auto mod = write_module("clink_wasm_upper.wasm",
+                                  std::string{"(module"} + kStringPrelude +
+                                      R"(
+        (func (export "upper") (param $ptr i32) (param $len i32) (result i64)
+            (local $i i32) (local $c i32) (local $out i32)
+            local.get $len
+            call $alloc
+            local.set $out
+            block $done
+                loop $l
+                    local.get $i
+                    local.get $len
+                    i32.ge_u
+                    br_if $done
+                    local.get $ptr
+                    local.get $i
+                    i32.add
+                    i32.load8_u
+                    local.set $c
+                    local.get $c
+                    i32.const 97
+                    i32.ge_u
+                    local.get $c
+                    i32.const 122
+                    i32.le_u
+                    i32.and
+                    if
+                        local.get $c
+                        i32.const 32
+                        i32.sub
+                        local.set $c
+                    end
+                    local.get $out
+                    local.get $i
+                    i32.add
+                    local.get $c
+                    i32.store8
+                    local.get $i
+                    i32.const 1
+                    i32.add
+                    local.set $i
+                    br $l
+                end
+            end
+            local.get $out
+            i64.extend_i32_u
+            i64.const 32
+            i64.shl
+            local.get $len
+            i64.extend_i32_u
+            i64.or)))");
+    clink::wasm::register_wasm_udf(
+        "wasm_upper", {arrow::utf8()}, arrow::utf8(), mod.string(), "upper");
+    auto r = call("wasm_upper", {JsonValue{std::string{"hello, clink 42!"}}});
+    ASSERT_TRUE(r.is_string());
+    EXPECT_EQ(r.as_string(), "HELLO, CLINK 42!");
+    // Empty in, empty out (no guest allocation happens for a 0-length arg).
+    auto e = call("wasm_upper", {JsonValue{std::string{}}});
+    ASSERT_TRUE(e.is_string());
+    EXPECT_EQ(e.as_string(), "");
+    // NULL in, NULL out, without entering the module.
+    EXPECT_TRUE(call("wasm_upper", {JsonValue{nullptr}}).is_null());
+    // Declared return type reaches the binder's view.
+    EXPECT_TRUE(
+        clink::ScalarFunctionRegistry::global().return_type("wasm_upper")->Equals(arrow::utf8()));
+    fs::remove(mod);
+}
+
+TEST(WasmUdfString, StringAndNumericArgsMix) {
+    // (TEXT, BIGINT) -> BIGINT expands to wasm (i32, i32, i64) -> i64.
+    const auto mod =
+        write_module("clink_wasm_lenplus.wasm", std::string{"(module"} + kStringPrelude + R"(
+        (func (export "len_plus") (param $ptr i32) (param $len i32) (param $n i64) (result i64)
+            local.get $len
+            i64.extend_i32_u
+            local.get $n
+            i64.add)))");
+    clink::wasm::register_wasm_udf(
+        "wasm_len_plus", {arrow::utf8(), arrow::int64()}, arrow::int64(), mod.string(), "len_plus");
+    auto r = call("wasm_len_plus", {JsonValue{std::string{"clink"}}, JsonValue{37.0}});
+    ASSERT_TRUE(r.is_number());
+    EXPECT_EQ(static_cast<std::int64_t>(r.as_number()), 42);
+    fs::remove(mod);
+}
+
+TEST(WasmUdfString, OutOfBoundsResultIsRejectedNotRead) {
+    // A hostile function returns a (ptr, len) far outside its memory; the
+    // host must fail the call cleanly instead of reading out of bounds.
+    const auto mod = write_module("clink_wasm_oob.wasm",
+                                  std::string{"(module"} + kStringPrelude +
+                                      R"(
+        (func (export "evil") (param $ptr i32) (param $len i32) (result i64)
+            i64.const 0x7FFFFF0000001000)))");
+    clink::wasm::register_wasm_udf(
+        "wasm_oob", {arrow::utf8()}, arrow::utf8(), mod.string(), "evil");
+    try {
+        call("wasm_oob", {JsonValue{std::string{"x"}}});
+        FAIL() << "out-of-bounds result must throw";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("out of the guest memory's bounds"), std::string::npos)
+            << e.what();
+    }
+    fs::remove(mod);
+}
+
+TEST(WasmUdfString, MissingAllocOrMemoryFailsAtLoad) {
+    // TEXT declared but no alloc export.
+    const auto no_alloc = write_module("clink_wasm_noalloc.wasm", R"((module
+        (memory (export "memory") 1)
+        (func (export "f") (param i32) (param i32) (result i64)
+            i64.const 0)))");
+    try {
+        clink::wasm::register_wasm_udf(
+            "wasm_no_alloc", {arrow::utf8()}, arrow::int64(), no_alloc.string(), "f");
+        FAIL() << "missing alloc must fail the load";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("alloc"), std::string::npos) << e.what();
+    }
+    // TEXT declared but no exported linear memory.
+    const auto no_mem = write_module("clink_wasm_nomem.wasm", R"((module
+        (func (export "alloc") (param i32) (result i32)
+            i32.const 0)
+        (func (export "f") (param i32) (param i32) (result i64)
+            i64.const 0)))");
+    try {
+        clink::wasm::register_wasm_udf(
+            "wasm_no_mem", {arrow::utf8()}, arrow::int64(), no_mem.string(), "f");
+        FAIL() << "missing memory must fail the load";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("memory"), std::string::npos) << e.what();
+    }
+    fs::remove(no_alloc);
+    fs::remove(no_mem);
+}
+
+TEST(WasmUdfString, DeallocIsCalledForArgAndResultBuffers) {
+    // The module counts dealloc calls and returns the count as a digit.
+    // Per call the host frees the argument buffer AND the copied-out result
+    // buffer, so the counter advances by 2 between calls: "0" then "2".
+    const auto mod =
+        write_module("clink_wasm_dealloc.wasm", std::string{"(module"} + kStringPrelude + R"(
+        (global $dcount (mut i32) (i32.const 0))
+        (func (export "dealloc") (param i32) (param i32)
+            global.get $dcount
+            i32.const 1
+            i32.add
+            global.set $dcount)
+        (func (export "dcount_str") (param $ptr i32) (param $len i32) (result i64)
+            (local $out i32)
+            i32.const 1
+            call $alloc
+            local.set $out
+            local.get $out
+            global.get $dcount
+            i32.const 48
+            i32.add
+            i32.store8
+            local.get $out
+            i64.extend_i32_u
+            i64.const 32
+            i64.shl
+            i64.const 1
+            i64.or)))");
+    clink::wasm::register_wasm_udf(
+        "wasm_dcount", {arrow::utf8()}, arrow::utf8(), mod.string(), "dcount_str");
+    EXPECT_EQ(call("wasm_dcount", {JsonValue{std::string{"a"}}}).as_string(), "0");
+    EXPECT_EQ(call("wasm_dcount", {JsonValue{std::string{"b"}}}).as_string(), "2");
+    fs::remove(mod);
+}
+
+TEST(WasmUdfString, TextWireTypeNameRoundTrips) {
+    // The ship path carries UDF types as Arrow ToString() names; the TM
+    // maps them back without the SQL frontend. Pin the TEXT agreement.
+    EXPECT_TRUE(clink::udf_type_from_wire_name(arrow::utf8()->ToString())->Equals(arrow::utf8()));
+}

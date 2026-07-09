@@ -267,3 +267,110 @@ TEST(WasmSqlE2E, CreateFunctionShipsModuleWithTheJob) {
     fs::remove(out_path);
     fs::remove(mod);
 }
+
+TEST(WasmSqlE2E, TextUdfRunsInPipeline) {
+    // TEXT in SQL rides the guest-memory ABI: CREATE FUNCTION shout(s TEXT)
+    // RETURNS TEXT, applied to a string column, lands upper-cased in the
+    // sink. Covers the string path binder-to-evaluator, not just the
+    // registry unit tests.
+    const auto mod = write_wasm("clink_wasm_e2e_shout.wasm", R"((module
+        (memory (export "memory") 1)
+        (global $heap (mut i32) (i32.const 1024))
+        (func $alloc (export "alloc") (param $size i32) (result i32)
+            (local $p i32)
+            global.get $heap
+            local.set $p
+            global.get $heap
+            local.get $size
+            i32.add
+            global.set $heap
+            local.get $p)
+        (func (export "shout") (param $ptr i32) (param $len i32) (result i64)
+            (local $i i32) (local $c i32) (local $out i32)
+            local.get $len
+            call $alloc
+            local.set $out
+            block $done
+                loop $l
+                    local.get $i
+                    local.get $len
+                    i32.ge_u
+                    br_if $done
+                    local.get $ptr
+                    local.get $i
+                    i32.add
+                    i32.load8_u
+                    local.set $c
+                    local.get $c
+                    i32.const 97
+                    i32.ge_u
+                    local.get $c
+                    i32.const 122
+                    i32.le_u
+                    i32.and
+                    if
+                        local.get $c
+                        i32.const 32
+                        i32.sub
+                        local.set $c
+                    end
+                    local.get $out
+                    local.get $i
+                    i32.add
+                    local.get $c
+                    i32.store8
+                    local.get $i
+                    i32.const 1
+                    i32.add
+                    local.set $i
+                    br $l
+                end
+            end
+            local.get $out
+            i64.extend_i32_u
+            i64.const 32
+            i64.shl
+            local.get $len
+            i64.extend_i32_u
+            i64.or)))");
+    const auto in_path = fs::temp_directory_path() / "clink_wasm_shout_in.ndjson";
+    const auto out_path = fs::temp_directory_path() / "clink_wasm_shout_out.ndjson";
+    fs::remove(in_path);
+    fs::remove(out_path);
+    {
+        std::ofstream out(in_path, std::ios::trunc);
+        out << R"({"user_id":1,"word":"hello"})" << "\n"
+            << R"({"user_id":2,"word":"clink"})" << "\n";
+    }
+
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    const std::string script = "CREATE FUNCTION shout(s TEXT) RETURNS TEXT LANGUAGE wasm AS '" +
+                               mod.string() +
+                               "';"
+                               "CREATE TABLE evt (user_id BIGINT, word TEXT) "
+                               "WITH (connector='file', format='json', path='" +
+                               in_path.string() +
+                               "');"
+                               "CREATE TABLE out_t (user_id BIGINT, loud TEXT) "
+                               "WITH (connector='file', format='json', path='" +
+                               out_path.string() +
+                               "');"
+                               "INSERT INTO out_t SELECT user_id, shout(word) AS loud FROM evt";
+    ASSERT_EQ(engine.execute_script(script), 0) << err.str();
+    ASSERT_TRUE(engine.await_all()) << err.str();
+
+    std::map<std::int64_t, std::string> got;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        ASSERT_TRUE(js.is_object()) << l;
+        got[static_cast<std::int64_t>(js.at("user_id").as_number())] = js.at("loud").as_string();
+    }
+    EXPECT_EQ(got[1], "HELLO");
+    EXPECT_EQ(got[2], "CLINK");
+    fs::remove(in_path);
+    fs::remove(out_path);
+    fs::remove(mod);
+}

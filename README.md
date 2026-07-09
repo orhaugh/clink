@@ -765,11 +765,13 @@ Advanced and extensibility (each a documented v1 subset)
   a WebAssembly sandbox (wasmtime, opt-in `CLINK_WITH_WASM`). Modules must be
   self-contained (imports rejected), every call runs under a fuel budget so
   runaway code fails instead of hanging, NULL in is NULL out, and the export's
-  signature is validated against the declared SQL types at load. v1 value
-  model is BIGINT/INTEGER/DOUBLE/REAL. Works embedded (`clink run`, libclink)
-  and on a cluster: a submitted job ships the module bytes in its spec and
-  every TaskManager registers the function at deploy, no shared filesystem
-  needed
+  signature is validated against the declared SQL types at load. Value model:
+  BIGINT/INTEGER/DOUBLE/REAL, plus TEXT via guest memory (argument = ptr+len
+  pair, result = packed i64; the module exports `memory` and `alloc`, with an
+  optional `dealloc` the host calls after copy-out; all guest pointers are
+  bounds-checked). Works embedded (`clink run`, libclink) and on a cluster: a
+  submitted job ships the module bytes in its spec and every TaskManager
+  registers the function at deploy, no shared filesystem needed
 - Programmatic Table API (v1): a fluent C++ builder, `from(...)` then optional
   `filter(...)` then either `select(...)` or `group_by(...).agg(...)` then
   `insert_into(...)`, sharing the binder's lowering so it produces a
