@@ -14,6 +14,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -99,6 +100,13 @@ func (r *ClinkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	wantHash := specHash(&cj)
 
+	// Scale-to-zero: an in-flight or requested park/wake takes precedence
+	// over submit/upgrade/refresh. Handled first so a Resuming job can never
+	// fall through to a fresh (state-dropping) initial submit.
+	if done, res, err := r.reconcileSuspend(ctx, &cj, &cc, pod, wantHash); done {
+		return res, err
+	}
+
 	// Decide: initial submit, upgrade, or steady-state status refresh.
 	switch {
 	case cj.Status.JobID == 0:
@@ -106,8 +114,198 @@ func (r *ClinkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	case cj.Status.SpecHash != wantHash:
 		return r.upgrade(ctx, &cj, &cc, pod, wantHash)
 	default:
-		return r.refreshStatus(ctx, &cj, &cc)
+		return r.refreshStatus(ctx, &cj, &cc, pod)
 	}
+}
+
+// ---- scale-to-zero (park / wake) --------------------------------------------
+
+const (
+	suspendReasonManual = "Manual"
+	suspendReasonIdle   = "Idle"
+)
+
+// reconcileSuspend owns every park/wake transition. Returns done=false only
+// when the job is active with no suspend intent, letting the normal
+// submit/upgrade/refresh flow proceed.
+func (r *ClinkJobReconciler) reconcileSuspend(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, pod, wantHash string) (bool, ctrl.Result, error) {
+	parking := cj.Status.Phase == "Suspending"
+	// Resuming counts as parked: its restore point is still staged, and only
+	// the resume path may submit (an initial submit would drop the state).
+	parked := cj.Status.Phase == "Suspended" || cj.Status.Phase == "Resuming"
+
+	// Finish an in-flight park (stage 2: cancel) before honouring any new
+	// intent - the savepoint is already persisted.
+	if parking {
+		res, err := r.parkCancelStage(ctx, cj, cc, pod)
+		return true, res, err
+	}
+
+	if cj.Spec.Suspend {
+		switch {
+		case parked:
+			// A resume submit may have landed just before the re-suspend;
+			// adopt it so the park path can drain it rather than leak it.
+			if id := r.runningJobID(ctx, cc); id > 0 && id > cj.Status.JobID {
+				cj.Status.JobID = id
+				res, err := r.setPhase(ctx, cj, "Running", "adopted resumed job before re-suspend", time.Second)
+				return true, res, err
+			}
+			if cj.Status.SuspendReason != suspendReasonManual {
+				cj.Status.SuspendReason = suspendReasonManual // manual now owns the park
+			}
+			res, err := r.setPhase(ctx, cj, "Suspended", "suspended (manual)", 60*time.Second)
+			return true, res, err
+		case cj.Status.JobID != 0:
+			res, err := r.park(ctx, cj, cc, pod, suspendReasonManual)
+			return true, res, err
+		default:
+			// Suspended before ever submitting: nothing to drain.
+			cj.Status.SuspendReason = suspendReasonManual
+			res, err := r.setPhase(ctx, cj, "Suspended", "suspended before first submit", 60*time.Second)
+			return true, res, err
+		}
+	}
+
+	if parked {
+		// Wake rules: an interrupted resume always finishes; a manual park
+		// wakes when spec.suspend clears (this branch); an Idle park wakes
+		// when its auto-park policy is removed or the wake policy fires.
+		if cj.Status.Phase == "Resuming" || cj.Status.SuspendReason == suspendReasonManual ||
+			cj.Spec.SuspendPolicy == nil || cj.Spec.SuspendPolicy.IdleAfterSeconds <= 0 {
+			res, err := r.resume(ctx, cj, cc, pod, wantHash)
+			return true, res, err
+		}
+		wake, detail, poll := r.wakeDue(ctx, cj)
+		if wake {
+			res, err := r.resume(ctx, cj, cc, pod, wantHash)
+			return true, res, err
+		}
+		res, err := r.setPhase(ctx, cj, "Suspended", "parked (idle); "+detail, poll)
+		return true, res, err
+	}
+
+	return false, ctrl.Result{}, nil
+}
+
+// park drains the running job to a savepoint (upgradeMode=savepoint) and
+// persists it BEFORE cancelling, so a crash between the two never loses the
+// restore point. The cancel is stage 2 (parkCancelStage) on the next
+// reconcile, keyed off the Suspending phase.
+func (r *ClinkJobReconciler) park(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, pod, reason string) (ctrl.Result, error) {
+	lg := log.FromContext(ctx)
+	// A park landing mid-upgrade (old job already drained + cancelled, new
+	// one not yet up) adopts the upgrade's savepoint instead of trying to
+	// savepoint the already-cancelled job.
+	if cj.Status.UpgradeToHash != "" {
+		cj.Status.SuspendSavepoint = cj.Status.UpgradeRestore
+		cj.Status.UpgradeToHash = ""
+		cj.Status.UpgradeRestore = nil
+		cj.Status.SuspendReason = reason
+		cj.Status.JobID = 0
+		now := metav1.Now()
+		cj.Status.SuspendedAt = &now
+		return r.setPhase(ctx, cj, "Suspended", "parked mid-upgrade ("+reason+")", 30*time.Second)
+	}
+	if cj.Spec.UpgradeMode == "savepoint" && cj.Status.SuspendSavepoint == nil {
+		sp, err := r.triggerSavepoint(ctx, cc, pod, cj.Status.JobID)
+		if err != nil {
+			lg.Info("suspend savepoint failed; will retry", "err", err.Error())
+			return r.setPhase(ctx, cj, cj.Status.Phase, "suspend savepoint failed: "+err.Error(), 10*time.Second)
+		}
+		cj.Status.SuspendSavepoint = sp
+		cj.Status.LastSavepoint = sp
+	}
+	cj.Status.SuspendReason = reason
+	return r.setPhase(ctx, cj, "Suspending", "drained to savepoint; cancelling", time.Second)
+}
+
+// parkCancelStage completes a park: cancel the job (tolerating failure - the
+// job may already be gone), free its slots, and mark Suspended.
+func (r *ClinkJobReconciler) parkCancelStage(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, pod string) (ctrl.Result, error) {
+	lg := log.FromContext(ctx)
+	if cj.Status.JobID != 0 {
+		if _, stderr, err := r.execClink(ctx, cc.Namespace, pod, r.cancelArgs(cc, cj.Status.JobID)); err != nil {
+			lg.Info("cancel during park failed; continuing", "err", err.Error(), "stderr", stderr)
+		}
+		cj.Status.JobID = 0
+	}
+	now := metav1.Now()
+	cj.Status.SuspendedAt = &now
+	reason := cj.Status.SuspendReason
+	if reason == "" {
+		reason = suspendReasonManual
+	}
+	msg := "parked (" + reason + "); slots freed"
+	if sp := cj.Status.SuspendSavepoint; sp != nil {
+		msg += fmt.Sprintf("; savepoint %s@%d", sp.Dir, sp.CheckpointID)
+	}
+	return r.setPhase(ctx, cj, "Suspended", msg, 15*time.Second)
+}
+
+// resume resubmits the job restored from the park savepoint. Retried until a
+// new job id appears; adopts a submit that raced status recording.
+func (r *ClinkJobReconciler) resume(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, pod, wantHash string) (ctrl.Result, error) {
+	if id := r.runningJobID(ctx, cc); id > 0 && id > cj.Status.JobID {
+		msg := fmt.Sprintf("resumed as job %d (adopted)", id)
+		r.clearSuspend(cj, wantHash, id)
+		return r.setPhase(ctx, cj, "Running", msg, 20*time.Second)
+	}
+	restore := cj.Status.SuspendSavepoint
+	before := r.maxJobID(ctx, cc)
+	if ok, detail := r.doSubmit(ctx, cc, cj, pod, restore); !ok {
+		return r.setPhase(ctx, cj, "Resuming", "resume submit rejected: "+detail, 10*time.Second)
+	}
+	id := r.awaitNewJob(ctx, cc, before)
+	if id == 0 {
+		return r.setPhase(ctx, cj, "Resuming", "resubmitted; awaiting job id", 5*time.Second)
+	}
+	msg := fmt.Sprintf("resumed as job %d", id)
+	if restore != nil {
+		msg += fmt.Sprintf(" restored from %s@%d", restore.Dir, restore.CheckpointID)
+	}
+	r.clearSuspend(cj, wantHash, id)
+	return r.setPhase(ctx, cj, "Running", msg, 20*time.Second)
+}
+
+// clearSuspend resets park bookkeeping once the resumed job is Running. The
+// activity clock restarts so an idle policy grants the fresh job a full
+// window before re-parking.
+func (r *ClinkJobReconciler) clearSuspend(cj *clinkv1alpha1.ClinkJob, wantHash string, id int64) {
+	cj.Status.JobID = id
+	cj.Status.SpecHash = wantHash
+	cj.Status.SuspendSavepoint = nil
+	cj.Status.SuspendReason = ""
+	cj.Status.SuspendedAt = nil
+	now := metav1.Now()
+	cj.Status.ActivityCount = 0
+	cj.Status.LastActivityTime = &now
+}
+
+// wakeDue evaluates the wake policy for an Idle-parked job. Returns whether
+// to wake, a human-readable detail for status, and the poll cadence.
+func (r *ClinkJobReconciler) wakeDue(ctx context.Context, cj *clinkv1alpha1.ClinkJob) (bool, string, time.Duration) {
+	wp := cj.Spec.WakePolicy
+	if wp == nil || wp.KafkaLag == nil {
+		return false, "no wake policy; awaiting manual resume or policy removal", 60 * time.Second
+	}
+	k := wp.KafkaLag
+	threshold := k.LagThreshold
+	if threshold <= 0 {
+		threshold = 1
+	}
+	poll := time.Duration(k.PollIntervalSeconds) * time.Second
+	if poll < 5*time.Second {
+		poll = 15 * time.Second
+	}
+	lag, err := kafkaGroupLag(ctx, k)
+	if err != nil {
+		return false, "lag poll failed: " + firstLine(err.Error()), poll
+	}
+	if lag >= threshold {
+		return true, fmt.Sprintf("lag %d >= threshold %d", lag, threshold), poll
+	}
+	return false, fmt.Sprintf("lag %d < threshold %d", lag, threshold), poll
 }
 
 // ---- state transitions -----------------------------------------------------
@@ -194,7 +392,7 @@ func (r *ClinkJobReconciler) upgrade(ctx context.Context, cj *clinkv1alpha1.Clin
 	return r.setPhase(ctx, cj, "Running", msg, 20*time.Second)
 }
 
-func (r *ClinkJobReconciler) refreshStatus(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster) (ctrl.Result, error) {
+func (r *ClinkJobReconciler) refreshStatus(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, pod string) (ctrl.Result, error) {
 	js, found := r.jobSummary(ctx, cc, cj.Status.JobID)
 	phase, msg := "Running", fmt.Sprintf("job %d running", cj.Status.JobID)
 	switch {
@@ -208,7 +406,70 @@ func (r *ClinkJobReconciler) refreshStatus(ctx context.Context, cj *clinkv1alpha
 	case js.CancelRequested:
 		phase, msg = "Cancelled", fmt.Sprintf("job %d cancelling", cj.Status.JobID)
 	}
+
+	// Idle auto-park: a healthy Running job with the policy armed parks once
+	// no operator has processed a record for the window. Activity = the sum
+	// of per-operator records_in; any change resets the clock.
+	if found && phase == "Running" && cj.Spec.SuspendPolicy != nil && cj.Spec.SuspendPolicy.IdleAfterSeconds > 0 {
+		idleAfter := time.Duration(cj.Spec.SuspendPolicy.IdleAfterSeconds) * time.Second
+		if count, ok := r.jobActivity(ctx, cc, cj.Status.JobID); ok {
+			now := metav1.Now()
+			if count != cj.Status.ActivityCount || cj.Status.LastActivityTime == nil {
+				cj.Status.ActivityCount = count
+				cj.Status.LastActivityTime = &now
+			} else if now.Time.Sub(cj.Status.LastActivityTime.Time) >= idleAfter {
+				return r.park(ctx, cj, cc, pod, suspendReasonIdle)
+			}
+			msg += fmt.Sprintf("; idle %ds/%ds",
+				int(now.Time.Sub(cj.Status.LastActivityTime.Time).Seconds()),
+				int(idleAfter.Seconds()))
+		}
+		// Poll fast enough to catch the window promptly without hammering.
+		requeue := idleAfter / 2
+		if requeue > 20*time.Second {
+			requeue = 20 * time.Second
+		}
+		if requeue < 5*time.Second {
+			requeue = 5 * time.Second
+		}
+		return r.setPhase(ctx, cj, phase, msg, requeue)
+	}
 	return r.setPhase(ctx, cj, phase, msg, 20*time.Second)
+}
+
+// jobActivity sums per-operator records_in for a job from the JobManager's
+// per-operator stats endpoint. false when the endpoint is unreachable or the
+// body does not parse (the idle clock then simply does not advance).
+func (r *ClinkJobReconciler) jobActivity(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, id int64) (int64, bool) {
+	reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	url := fmt.Sprintf("%s/api/v1/jobs/%d/operators", r.jmBaseURL(cc), id)
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, false
+	}
+	resp, err := (&http.Client{Timeout: 4 * time.Second}).Do(httpReq)
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, false
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	var wrapper struct {
+		Operators []struct {
+			RecordsIn int64 `json:"records_in"`
+		} `json:"operators"`
+	}
+	if json.Unmarshal(body, &wrapper) != nil || wrapper.Operators == nil {
+		return 0, false
+	}
+	var sum int64
+	for _, o := range wrapper.Operators {
+		sum += o.RecordsIn
+	}
+	return sum, true
 }
 
 func (r *ClinkJobReconciler) setPhase(ctx context.Context, cj *clinkv1alpha1.ClinkJob, phase, msg string, requeue time.Duration) (ctrl.Result, error) {

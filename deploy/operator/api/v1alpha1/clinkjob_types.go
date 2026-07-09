@@ -27,6 +27,58 @@ type ClinkJobSpec struct {
 	// +kubebuilder:validation:Enum=savepoint;stateless
 	// +kubebuilder:default=savepoint
 	UpgradeMode string `json:"upgradeMode,omitempty"`
+	// Suspend parks the job when true: the operator drains it to a savepoint
+	// (upgradeMode=savepoint), cancels it, and frees its TaskManager slots;
+	// state waits in the savepoint. Setting it back to false resubmits the
+	// job restored from that savepoint. Manual suspension is absolute: a
+	// wakePolicy never overrides it.
+	// +kubebuilder:default=false
+	Suspend bool `json:"suspend,omitempty"`
+	// SuspendPolicy parks the job automatically (scale-to-zero on idle).
+	SuspendPolicy *SuspendPolicySpec `json:"suspendPolicy,omitempty"`
+	// WakePolicy resumes an auto-parked (reason Idle) job when new work
+	// appears. Ignored while spec.suspend is true.
+	WakePolicy *WakePolicySpec `json:"wakePolicy,omitempty"`
+}
+
+// SuspendPolicySpec configures automatic parking.
+type SuspendPolicySpec struct {
+	// IdleAfterSeconds parks the job once NO operator has processed a record
+	// for this long (observed via the JobManager's per-operator records_in
+	// counters). 0 disables auto-park. Pair with a wakePolicy, or the job
+	// stays parked until this policy is removed or suspend is toggled.
+	// +kubebuilder:validation:Minimum=0
+	IdleAfterSeconds int64 `json:"idleAfterSeconds,omitempty"`
+}
+
+// WakePolicySpec configures automatic wake-up of an Idle-parked job.
+type WakePolicySpec struct {
+	// KafkaLag wakes the job when consumer-group lag on the named topics
+	// reaches a threshold.
+	KafkaLag *KafkaLagWakeSpec `json:"kafkaLag,omitempty"`
+}
+
+// KafkaLagWakeSpec: while the job is parked, the operator polls the total
+// pending records for a consumer group (end offsets minus the group's
+// committed offsets; a partition the group never committed counts from its
+// start offset) and resumes the job at the threshold.
+type KafkaLagWakeSpec struct {
+	// Brokers is the bootstrap list, comma-separated (host:port,...).
+	Brokers string `json:"brokers"`
+	// Topics to measure.
+	// +kubebuilder:validation:MinItems=1
+	Topics []string `json:"topics"`
+	// GroupID whose committed offsets define the lag baseline - the group
+	// the job's Kafka source consumes with.
+	GroupID string `json:"groupId"`
+	// LagThreshold is the total pending-record count that wakes the job.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	LagThreshold int64 `json:"lagThreshold,omitempty"`
+	// PollIntervalSeconds is the lag poll cadence while parked.
+	// +kubebuilder:default=15
+	// +kubebuilder:validation:Minimum=5
+	PollIntervalSeconds int64 `json:"pollIntervalSeconds,omitempty"`
 }
 
 // SavepointRef records a savepoint the operator took (dir + checkpoint id).
@@ -38,7 +90,7 @@ type SavepointRef struct {
 // ClinkJobStatus is the observed state of a job.
 type ClinkJobStatus struct {
 	// Phase: Pending (cluster not ready), Submitting, Running, Upgrading,
-	// Completed, Failed, Cancelled.
+	// Suspending, Suspended, Completed, Failed, Cancelled.
 	Phase string `json:"phase,omitempty"`
 	// JobID is the JobManager-assigned id of the currently-running job.
 	JobID int64 `json:"jobID,omitempty"`
@@ -59,6 +111,20 @@ type ClinkJobStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 	// Message is a short human-readable status detail.
 	Message string `json:"message,omitempty"`
+	// SuspendReason records why the job is parked: Manual (spec.suspend) or
+	// Idle (suspendPolicy). Cleared on resume.
+	SuspendReason string `json:"suspendReason,omitempty"`
+	// SuspendSavepoint is the savepoint a resume will restore from (nil for
+	// a stateless park). Held until the resumed job reaches Running.
+	SuspendSavepoint *SavepointRef `json:"suspendSavepoint,omitempty"`
+	// SuspendedAt is when the park completed.
+	SuspendedAt *metav1.Time `json:"suspendedAt,omitempty"`
+	// ActivityCount is the last observed sum of per-operator records_in for
+	// the running job; LastActivityTime is when it last changed. Together
+	// they drive suspendPolicy.idleAfterSeconds.
+	ActivityCount int64 `json:"activityCount,omitempty"`
+	// LastActivityTime - see ActivityCount.
+	LastActivityTime *metav1.Time `json:"lastActivityTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true

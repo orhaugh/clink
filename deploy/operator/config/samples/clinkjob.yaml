@@ -1,0 +1,24 @@
+apiVersion: clink.dev/v1alpha1
+kind: ClinkJob
+metadata:
+  name: wordcount
+spec:
+  clusterName: demo
+  jobSo: /opt/clink/jobs/rescale_test_job.so
+  jobName: wordcount
+  upgradeMode: savepoint      # spec changes drain to a savepoint + restore
+  checkpointIntervalMs: 2000  # > 0 required for savepoint upgrades / parks
+  env:
+    - CLINK_RESCALE_COUNT=20000000
+  # Scale-to-zero (all optional):
+  # suspend: true             # manual park: savepoint -> cancel -> slots freed;
+  #                           # false resumes restored from that savepoint.
+  # suspendPolicy:
+  #   idleAfterSeconds: 600   # auto-park after 10min with no records processed
+  # wakePolicy:
+  #   kafkaLag:               # auto-wake an Idle-parked job on pending records
+  #     brokers: kafka:9092
+  #     topics: [orders]
+  #     groupId: orders-job
+  #     lagThreshold: 100
+  #     pollIntervalSeconds: 15

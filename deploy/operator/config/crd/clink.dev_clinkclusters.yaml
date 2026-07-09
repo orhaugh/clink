@@ -158,6 +158,15 @@ spec:
                     default: 6123
                     format: int32
                     type: integer
+                  env:
+                    description: |-
+                      Env sets extra environment variables (KEY=VALUE) on the JobManager
+                      container. Job plugins dlopen'd in this process read their build-time
+                      configuration from process env, so this is how per-cluster job env is
+                      supplied (ClinkJob.env only reaches the submit-side build).
+                    items:
+                      type: string
+                    type: array
                   extraArgs:
                     description: ExtraArgs are appended verbatim to the JobManager
                       command line.
@@ -238,6 +247,15 @@ spec:
               taskManager:
                 description: TaskManagerSpec configures the TaskManager role.
                 properties:
+                  env:
+                    description: |-
+                      Env sets extra environment variables (KEY=VALUE) on every TaskManager
+                      container. Job plugins dlopen'd on the TaskManagers read their
+                      build-time configuration from process env (registered factory closures
+                      capture it), so runtime-side job env belongs here, not on ClinkJob.
+                    items:
+                      type: string
+                    type: array
                   extraArgs:
                     items:
                       type: string

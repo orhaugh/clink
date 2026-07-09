@@ -88,6 +88,29 @@ spec:
                 description: JobSo is the path to the compiled job plugin (.so) inside
                   the runtime image.
                 type: string
+              suspend:
+                default: false
+                description: |-
+                  Suspend parks the job when true: the operator drains it to a savepoint
+                  (upgradeMode=savepoint), cancels it, and frees its TaskManager slots;
+                  state waits in the savepoint. Setting it back to false resubmits the
+                  job restored from that savepoint. Manual suspension is absolute: a
+                  wakePolicy never overrides it.
+                type: boolean
+              suspendPolicy:
+                description: SuspendPolicy parks the job automatically (scale-to-zero
+                  on idle).
+                properties:
+                  idleAfterSeconds:
+                    description: |-
+                      IdleAfterSeconds parks the job once NO operator has processed a record
+                      for this long (observed via the JobManager's per-operator records_in
+                      counters). 0 disables auto-park. Pair with a wakePolicy, or the job
+                      stays parked until this policy is removed or suspend is toggled.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                type: object
               upgradeMode:
                 default: savepoint
                 description: |-
@@ -98,6 +121,51 @@ spec:
                 - savepoint
                 - stateless
                 type: string
+              wakePolicy:
+                description: |-
+                  WakePolicy resumes an auto-parked (reason Idle) job when new work
+                  appears. Ignored while spec.suspend is true.
+                properties:
+                  kafkaLag:
+                    description: |-
+                      KafkaLag wakes the job when consumer-group lag on the named topics
+                      reaches a threshold.
+                    properties:
+                      brokers:
+                        description: Brokers is the bootstrap list, comma-separated
+                          (host:port,...).
+                        type: string
+                      groupId:
+                        description: |-
+                          GroupID whose committed offsets define the lag baseline - the group
+                          the job's Kafka source consumes with.
+                        type: string
+                      lagThreshold:
+                        default: 1
+                        description: LagThreshold is the total pending-record count
+                          that wakes the job.
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      pollIntervalSeconds:
+                        default: 15
+                        description: PollIntervalSeconds is the lag poll cadence while
+                          parked.
+                        format: int64
+                        minimum: 5
+                        type: integer
+                      topics:
+                        description: Topics to measure.
+                        items:
+                          type: string
+                        minItems: 1
+                        type: array
+                    required:
+                    - brokers
+                    - groupId
+                    - topics
+                    type: object
+                type: object
             required:
             - clusterName
             - jobSo
@@ -105,11 +173,22 @@ spec:
           status:
             description: ClinkJobStatus is the observed state of a job.
             properties:
+              activityCount:
+                description: |-
+                  ActivityCount is the last observed sum of per-operator records_in for
+                  the running job; LastActivityTime is when it last changed. Together
+                  they drive suspendPolicy.idleAfterSeconds.
+                format: int64
+                type: integer
               jobID:
                 description: JobID is the JobManager-assigned id of the currently-running
                   job.
                 format: int64
                 type: integer
+              lastActivityTime:
+                description: LastActivityTime - see ActivityCount.
+                format: date-time
+                type: string
               lastSavepoint:
                 description: LastSavepoint is the savepoint taken on the most recent
                   upgrade.
@@ -130,12 +209,32 @@ spec:
               phase:
                 description: |-
                   Phase: Pending (cluster not ready), Submitting, Running, Upgrading,
-                  Completed, Failed, Cancelled.
+                  Suspending, Suspended, Completed, Failed, Cancelled.
                 type: string
               specHash:
                 description: |-
                   SpecHash is a hash of the running job's inputs (JobSo+Env+Args); a change
                   versus the current spec is what triggers an upgrade.
+                type: string
+              suspendReason:
+                description: |-
+                  SuspendReason records why the job is parked: Manual (spec.suspend) or
+                  Idle (suspendPolicy). Cleared on resume.
+                type: string
+              suspendSavepoint:
+                description: |-
+                  SuspendSavepoint is the savepoint a resume will restore from (nil for
+                  a stateless park). Held until the resumed job reaches Running.
+                properties:
+                  checkpointId:
+                    format: int64
+                    type: integer
+                  dir:
+                    type: string
+                type: object
+              suspendedAt:
+                description: SuspendedAt is when the park completed.
+                format: date-time
                 type: string
               upgradeRestore:
                 description: |-

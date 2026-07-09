@@ -25,8 +25,13 @@ type JobManagerSpec struct {
 	// StateBackend passes --state-backend when set (e.g. "rocksdb").
 	StateBackend string `json:"stateBackend,omitempty"`
 	// ExtraArgs are appended verbatim to the JobManager command line.
-	ExtraArgs []string                     `json:"extraArgs,omitempty"`
-	Resources corev1.ResourceRequirements  `json:"resources,omitempty"`
+	ExtraArgs []string                    `json:"extraArgs,omitempty"`
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+	// Env sets extra environment variables (KEY=VALUE) on the JobManager
+	// container. Job plugins dlopen'd in this process read their build-time
+	// configuration from process env, so this is how per-cluster job env is
+	// supplied (ClinkJob.env only reaches the submit-side build).
+	Env []string `json:"env,omitempty"`
 }
 
 // TaskManagerSpec configures the TaskManager role.
@@ -43,6 +48,11 @@ type TaskManagerSpec struct {
 	TerminationGracePeriodSeconds int64                       `json:"terminationGracePeriodSeconds,omitempty"`
 	ExtraArgs                     []string                    `json:"extraArgs,omitempty"`
 	Resources                     corev1.ResourceRequirements `json:"resources,omitempty"`
+	// Env sets extra environment variables (KEY=VALUE) on every TaskManager
+	// container. Job plugins dlopen'd on the TaskManagers read their
+	// build-time configuration from process env (registered factory closures
+	// capture it), so runtime-side job env belongs here, not on ClinkJob.
+	Env []string `json:"env,omitempty"`
 }
 
 // HASpec turns on multi-JobManager high availability with file-coordinator

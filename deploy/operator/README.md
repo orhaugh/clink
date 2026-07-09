@@ -66,6 +66,12 @@ spec:
 Scaling is declarative: edit `spec.taskManager.replicas` and re-apply; the
 StatefulSet is reconciled in place. See `config/samples/clinkcluster.yaml`.
 
+`spec.taskManager.env` / `spec.jobManager.env` set extra `KEY=VALUE`
+environment variables on the pods. Job plugins dlopen'd on the TaskManagers
+read their build-time configuration from process env (registered factory
+closures capture it at dlopen), so runtime-side job env belongs on the
+CLUSTER; `ClinkJob.env` only reaches the submit-side spec build.
+
 ## HA
 
 `spec.ha.enabled: true` runs `spec.ha.replicas` JobManagers that elect a leader via
@@ -147,6 +153,51 @@ wordcount   demo      Running   2       90s
 `kind-clinkjob-smoke.sh` exercises the whole path end to end: submit -> Running ->
 force an upgrade -> assert a savepoint was taken and a new job id restored from it ->
 delete -> assert the finalizer cancelled it.
+
+## Scale-to-zero (suspend / resume)
+
+A parked job costs nothing: the operator drains it to a savepoint, cancels it
+(freeing its TaskManager slots for other jobs), and the state waits on shared
+storage. Waking is a resubmit restored from that savepoint - seconds-class,
+exactly-once. Three triggers:
+
+```yaml
+spec:
+  suspend: true                # 1. manual park (kubectl patch / GitOps).
+                               #    Absolute: no wake policy overrides it.
+  suspendPolicy:               # 2. auto-park when the job goes idle:
+    idleAfterSeconds: 600      #    no operator processed a record for 10min
+                               #    (watched via the JM's per-op records_in).
+  wakePolicy:                  # 3. auto-wake an Idle-parked job:
+    kafkaLag:                  #    poll consumer-group lag while parked,
+      brokers: kafka:9092      #    resume when pending records reach the
+      topics: [orders]         #    threshold. A never-committed group counts
+      groupId: orders-job      #    from the topic start offsets.
+      lagThreshold: 100
+      pollIntervalSeconds: 15
+```
+
+`.status.phase` moves Running -> Suspending -> Suspended (with
+`.status.suspendReason` Manual or Idle and the restore point in
+`.status.suspendSavepoint`) -> Resuming -> Running. The park is two-stage and
+crash-safe: the savepoint is persisted to status before the cancel, and a
+`Resuming` job can only finish resuming (it can never fall through to a fresh,
+state-dropping submit). Setting `suspend: true` on an Idle-parked job hands the
+park to Manual; removing `suspendPolicy` from an Idle-parked job wakes it.
+Manual wake is `suspend: false`. Idle detection and lag polling both live in
+the operator - the engine is untouched.
+
+One property to design for: a lag-woken job should be the consumer of the lag
+it wakes on (the normal case - the group id is the job's own). If the woken
+job never reduces that lag, the idle policy re-parks it and the lag policy
+re-wakes it, cycling at the idle window - the same feedback rule as any
+lag-driven autoscaler.
+
+`kind-suspend-smoke.sh` proves all four paths end to end: manual park (savepoint
+recorded, job cancelled on the JM) -> manual wake (restored, latency printed) ->
+idle auto-park (slow-tick job) -> lag wake against an in-cluster single-node
+KRaft Kafka, including the negative check (empty topic keeps it parked, status
+reporting `lag 0 < threshold`).
 
 ## Scope
 

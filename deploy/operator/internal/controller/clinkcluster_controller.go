@@ -345,6 +345,7 @@ func (r *ClinkClusterReconciler) reconcileJMDeployment(ctx context.Context, cc *
 			args = append(args, "--state-backend="+cc.Spec.JobManager.StateBackend)
 		}
 		args = append(args, cc.Spec.JobManager.ExtraArgs...)
+		env = append(env, parseEnvKVs(cc.Spec.JobManager.Env)...)
 
 		c := corev1.Container{
 			Name:            "jobmanager",
@@ -421,11 +422,11 @@ func (r *ClinkClusterReconciler) reconcileTMStatefulSet(ctx context.Context, cc 
 			Name:            "taskmanager",
 			Image:           r.image(cc),
 			ImagePullPolicy: cc.Spec.Image.PullPolicy,
-			Env: []corev1.EnvVar{
+			Env: append([]corev1.EnvVar{
 				{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
 				{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
 				{Name: "CLINK_DATA_BIND_HOST", Value: "0.0.0.0"},
-			},
+			}, parseEnvKVs(cc.Spec.TaskManager.Env)...),
 			Args:      args,
 			Ports:     []corev1.ContainerPort{{Name: "http", ContainerPort: cc.Spec.TaskManager.HTTPPort}},
 			Resources: cc.Spec.TaskManager.Resources,
@@ -472,6 +473,18 @@ func httpProbe(path, port string, initialDelay, period, failureThreshold int32) 
 		TimeoutSeconds:      2,
 		FailureThreshold:    failureThreshold,
 	}
+}
+
+// parseEnvKVs turns KEY=VALUE strings (the ClinkCluster env format) into
+// container env vars; malformed entries (no '=') are skipped.
+func parseEnvKVs(kvs []string) []corev1.EnvVar {
+	var out []corev1.EnvVar
+	for _, kv := range kvs {
+		if k, v, ok := strings.Cut(kv, "="); ok && k != "" {
+			out = append(out, corev1.EnvVar{Name: k, Value: v})
+		}
+	}
+	return out
 }
 
 // ---- JobManager HTTP (status + job submission) -----------------------------
