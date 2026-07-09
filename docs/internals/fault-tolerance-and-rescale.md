@@ -139,6 +139,14 @@ A savepoint is a checkpoint taken on demand and intended to be restored from lat
 
 Because the format is shared, clink also exposes an offline State Processor API (`include/clink/state_processor/savepoint.hpp`). `Savepoint::load_from_file` reads a `.snap` blob into an in-memory backend; typed `keyed_state<K, V>(op, slot, kc, vc)` views read and mutate the stored entries; `write_to_file` persists a new savepoint a later job can restore from. This is the path for bulk state migration across a schema change, offline inspection or audit, and seeding a fresh job with pre-populated state. The v1 scope is deliberately tight: keyed state only (broadcast and operator-list state are not surfaced, and timers live in the timer service, not the backend), the whole savepoint is materialised in RAM while open, and there is no schema check on the codec pair, so the codecs must match the originating job's.
 
+### State diff and inspection (time travel)
+
+`include/clink/state_processor/state_diff.hpp` layers a comparison primitive over the Savepoint: `collect_entries` scans a savepoint into a structured `op -> slot -> (key -> entry)` model (parsing the stored-key layout `[key-group byte][slot]['|'][user-key bytes]`), `merge_entries` unions the per-subtask files of one checkpoint (key groups are disjoint across subtasks), and `diff_entries` reports per-slot added/removed/changed keys with bounded concrete samples, alongside `diff_versions` for state-schema stamp changes.
+
+Two CLI verbs ride it. `clink state-diff --a=<f.snap> --b=<f.snap>` (or `--dir=<checkpoint-root> --from=N --to=M`, merging every subtask file per id) prints exactly which keys appeared, vanished or changed between two checkpoints or savepoints of a job - keys and values rendered readably (an 8-byte key doubles as its little-endian int64 reading, printable bytes as text, the rest as hex), `--json` for machines, exit code 0 identical / 1 differs / 2 error, diff(1)-style. `clink state-cat` dumps one snapshot's contents the same way. Both read the InMemoryStateBackend-format blobs (checkpoints and savepoints from the file-backed default); RocksDB's native SST checkpoints are a different format and are rejected with a clear error.
+
+Its first demonstration exposed a real restore-correctness gap - the default (non-async) SQL `GROUP BY` held its accumulators only in operator memory, so checkpoints carried no aggregate state and any restore silently zeroed the running totals - fixed by the write-behind flush described in the SQL frontend's aggregate operator (dirty buckets persist to the `agg` KeyedState slot in the runner's pre-snapshot hook, and reload at `open()`).
+
 ## Key types and APIs
 
 | Type / function | Responsibility |

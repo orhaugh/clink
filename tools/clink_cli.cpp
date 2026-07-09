@@ -19,6 +19,8 @@ int clink_cmd_run_application(int argc, char** argv);
 int clink_cmd_cancel(int argc, char** argv);
 int clink_cmd_savepoint(int argc, char** argv);
 int clink_cmd_check_savepoint(int argc, char** argv);
+int clink_cmd_state_diff(int argc, char** argv);
+int clink_cmd_state_cat(int argc, char** argv);
 int clink_cmd_rescale(int argc, char** argv);
 int clink_cmd_rescale_op(int argc, char** argv);
 int clink_cmd_list(int argc, char** argv);
@@ -37,6 +39,8 @@ void usage() {
         << "  cancel            Cancel an active job by id (alias of  cancel).\n"
         << "  savepoint         Trigger a synchronous savepoint (alias of  savepoint).\n"
         << "  check-savepoint   Inspect state-schema version stamps inside a savepoint file.\n"
+        << "  state-diff        Compare the keyed state of two checkpoints/savepoints.\n"
+        << "  state-cat         Dump a checkpoint/savepoint's keyed state.\n"
         << "  rescale           Change a running job's per-role parallelism.\n"
         << "  rescale-op        Rescale ONE operator within a job to a new parallelism.\n"
         << "  list              List active and recently-completed jobs (alias of  list).\n"
@@ -81,6 +85,12 @@ int main(int argc, char** argv) {
     }
     if (cmd == "check-savepoint") {
         return clink_cmd_check_savepoint(sub_argc, sub_argv);
+    }
+    if (cmd == "state-diff") {
+        return clink_cmd_state_diff(sub_argc, sub_argv);
+    }
+    if (cmd == "state-cat") {
+        return clink_cmd_state_cat(sub_argc, sub_argv);
     }
     if (cmd == "rescale") {
         return clink_cmd_rescale(sub_argc, sub_argv);

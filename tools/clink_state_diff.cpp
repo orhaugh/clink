@@ -1,0 +1,423 @@
+// clink state-diff / clink state-cat - time-travel inspection of keyed state.
+//
+// state-diff compares two snapshots of a job's keyed state and reports, per
+// (operator, slot), exactly which keys appeared, vanished or changed - plus
+// any state-schema version-stamp changes. state-cat dumps one snapshot's
+// contents. Both read the InMemoryStateBackend-format `.snap` blobs that
+// FileBackedStateBackend writes for checkpoints and savepoints (RocksDB's
+// native SST checkpoints are a different format and are rejected clearly).
+//
+// Inputs:
+//   * two explicit files:       state-diff --a=<f.snap> --b=<f.snap>
+//   * one checkpoint dir + ids: state-diff --dir=<root> --from=N --to=M
+//     The dir form merges every per-subtask file (<root>/<subtask>/
+//     checkpoint-<id>.snap, plus <root>/checkpoint-<id>.snap for the
+//     single-subtask flat layout); key groups are disjoint across subtasks
+//     so the merge is a clean union.
+//
+// Exit codes (diff): 0 = identical, 1 = differences found, 2 = error.
+// Exit codes (cat):  0 = ok, 2 = error.
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "clink/state_processor/savepoint.hpp"
+#include "clink/state_processor/state_diff.hpp"
+
+namespace {
+
+namespace fs = std::filesystem;
+using clink::state_processor::collect_entries;
+using clink::state_processor::diff_entries;
+using clink::state_processor::diff_versions;
+using clink::state_processor::EntryDelta;
+using clink::state_processor::merge_entries;
+using clink::state_processor::render_bytes;
+using clink::state_processor::Savepoint;
+using clink::state_processor::StateDiffReport;
+using clink::state_processor::StateEntries;
+
+std::string get_arg(int argc,
+                    char** argv,
+                    std::string_view flag,
+                    std::string_view default_value = {}) {
+    const std::string prefix = "--" + std::string{flag} + "=";
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a.starts_with(prefix)) {
+            return a.substr(prefix.size());
+        }
+    }
+    return std::string{default_value};
+}
+
+bool has_flag(int argc, char** argv, std::string_view flag) {
+    const std::string needle = "--" + std::string{flag};
+    for (int i = 1; i < argc; ++i) {
+        if (std::string{argv[i]} == needle) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Collect the snapshot files that make up checkpoint `id` under `root`:
+// every <root>/<subtask>/checkpoint-<id>.snap, plus <root>/checkpoint-
+// <id>.snap when root itself is a subtask dir. Sorted for determinism.
+std::vector<fs::path> checkpoint_files(const fs::path& root, std::uint64_t id) {
+    const std::string name = "checkpoint-" + std::to_string(id) + ".snap";
+    std::vector<fs::path> files;
+    if (fs::exists(root / name)) {
+        files.push_back(root / name);
+    }
+    if (fs::is_directory(root)) {
+        for (const auto& entry : fs::directory_iterator(root)) {
+            if (entry.is_directory() && fs::exists(entry.path() / name)) {
+                files.push_back(entry.path() / name);
+            }
+        }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+// Load one side of the comparison: either an explicit .snap file, or a
+// checkpoint dir + id merged across subtask files. Also returns the loaded
+// Savepoints so version stamps stay inspectable (versions ride the backend,
+// not the entry model). Throws with a clear message on any failure.
+struct LoadedSide {
+    std::string label;
+    StateEntries entries;
+    std::vector<Savepoint> savepoints;
+};
+
+LoadedSide load_file(const std::string& path) {
+    LoadedSide side;
+    side.label = path;
+    side.savepoints.push_back(Savepoint::load_from_file(path));
+    side.entries = collect_entries(side.savepoints.back());
+    return side;
+}
+
+LoadedSide load_dir(const std::string& dir, std::uint64_t id) {
+    LoadedSide side;
+    side.label = dir + " @ checkpoint " + std::to_string(id);
+    const auto files = checkpoint_files(dir, id);
+    if (files.empty()) {
+        throw std::runtime_error("no checkpoint-" + std::to_string(id) + ".snap under " + dir +
+                                 " (or its subtask subdirectories)");
+    }
+    for (const auto& f : files) {
+        side.savepoints.push_back(Savepoint::load_from_file(f));
+        merge_entries(side.entries, collect_entries(side.savepoints.back()));
+    }
+    return side;
+}
+
+const char* kind_symbol(EntryDelta::Kind k) {
+    switch (k) {
+        case EntryDelta::Kind::Added:
+            return "+";
+        case EntryDelta::Kind::Removed:
+            return "-";
+        case EntryDelta::Kind::Changed:
+            return "~";
+    }
+    return "?";
+}
+
+std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (const char c : s) {
+        switch (c) {
+            case '"':
+                out += "\\\"";
+                break;
+            case '\\':
+                out += "\\\\";
+                break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+void print_diff_text(const LoadedSide& a, const LoadedSide& b, const StateDiffReport& report) {
+    std::cout << "state-diff\n  A: " << a.label << " (" << report.total_entries_a
+              << " entries)\n  B: " << b.label << " (" << report.total_entries_b << " entries)\n";
+    if (report.identical()) {
+        std::cout << "identical: no keyed-state or schema-version differences\n";
+        return;
+    }
+    for (const auto& d : report.slots) {
+        std::cout << "\nop " << d.op.value() << " slot \"" << d.slot << "\": +" << d.added << " -"
+                  << d.removed << " ~" << d.changed << " (" << d.unchanged << " unchanged)\n";
+        for (const auto& s : d.samples) {
+            std::cout << "  " << kind_symbol(s.kind) << " kg=" << static_cast<int>(s.key_group)
+                      << " key " << render_bytes(s.user_key, 32);
+            switch (s.kind) {
+                case EntryDelta::Kind::Added:
+                    std::cout << "  -> " << render_bytes(s.value_b);
+                    break;
+                case EntryDelta::Kind::Removed:
+                    std::cout << "  was " << render_bytes(s.value_a);
+                    break;
+                case EntryDelta::Kind::Changed:
+                    std::cout << "  " << render_bytes(s.value_a) << " -> "
+                              << render_bytes(s.value_b);
+                    break;
+            }
+            std::cout << "\n";
+        }
+        const auto shown = d.samples.size();
+        const auto total = d.added + d.removed + d.changed;
+        if (shown < total) {
+            std::cout << "  ... " << (total - shown) << " more (raise --max-rows)\n";
+        }
+    }
+    for (const auto& v : report.versions) {
+        std::cout << "version: op " << v.op.value() << " type \"" << v.state_type << "\": v"
+                  << v.version_a << " -> v" << v.version_b << " (0 = absent)\n";
+    }
+}
+
+void print_diff_json(const LoadedSide& a, const LoadedSide& b, const StateDiffReport& report) {
+    std::cout << "{\"a\":\"" << json_escape(a.label) << "\",\"b\":\"" << json_escape(b.label)
+              << "\",\"entries_a\":" << report.total_entries_a
+              << ",\"entries_b\":" << report.total_entries_b
+              << ",\"identical\":" << (report.identical() ? "true" : "false") << ",\"slots\":[";
+    bool first_slot = true;
+    for (const auto& d : report.slots) {
+        if (!first_slot) {
+            std::cout << ",";
+        }
+        first_slot = false;
+        std::cout << "{\"op\":" << d.op.value() << ",\"slot\":\"" << json_escape(d.slot)
+                  << "\",\"added\":" << d.added << ",\"removed\":" << d.removed
+                  << ",\"changed\":" << d.changed << ",\"unchanged\":" << d.unchanged
+                  << ",\"samples\":[";
+        bool first_sample = true;
+        for (const auto& s : d.samples) {
+            if (!first_sample) {
+                std::cout << ",";
+            }
+            first_sample = false;
+            std::cout << "{\"kind\":\"" << kind_symbol(s.kind)
+                      << "\",\"key_group\":" << static_cast<int>(s.key_group) << ",\"key\":\""
+                      << json_escape(render_bytes(s.user_key, 32)) << "\",\"value_a\":\""
+                      << json_escape(render_bytes(s.value_a)) << "\",\"value_b\":\""
+                      << json_escape(render_bytes(s.value_b)) << "\"}";
+        }
+        std::cout << "]}";
+    }
+    std::cout << "],\"versions\":[";
+    bool first_v = true;
+    for (const auto& v : report.versions) {
+        if (!first_v) {
+            std::cout << ",";
+        }
+        first_v = false;
+        std::cout << "{\"op\":" << v.op.value() << ",\"state_type\":\"" << json_escape(v.state_type)
+                  << "\",\"version_a\":" << v.version_a << ",\"version_b\":" << v.version_b << "}";
+    }
+    std::cout << "]}\n";
+}
+
+void diff_usage() {
+    std::cerr << "Usage: clink state-diff --a=<f.snap> --b=<f.snap> [--json] [--max-rows=N]\n"
+              << "       clink state-diff --dir=<checkpoint-root> --from=N --to=M [--json] "
+                 "[--max-rows=N]\n"
+              << "\n"
+              << "Compares the keyed state of two snapshots (checkpoints or savepoints)\n"
+              << "and reports added / removed / changed keys per operator state slot,\n"
+              << "plus state-schema version-stamp changes. The --dir form merges every\n"
+              << "per-subtask snapshot file of each checkpoint id.\n"
+              << "\n"
+              << "  --max-rows=N   samples shown per slot (default 20, 0 = all)\n"
+              << "  --json         machine-readable report on stdout\n"
+              << "\n"
+              << "Exit codes: 0 = identical, 1 = differences found, 2 = error.\n";
+}
+
+void cat_usage() {
+    std::cerr << "Usage: clink state-cat --file=<f.snap> [--json] [--max-rows=N]\n"
+              << "       clink state-cat --dir=<checkpoint-root> --id=N [--json] [--max-rows=N]\n"
+              << "\n"
+              << "Dumps a snapshot's keyed state: operators, slots, and entries\n"
+              << "(keys and values rendered as int64 / text / hex).\n"
+              << "\n"
+              << "  --max-rows=N   entries shown per slot (default 50, 0 = all)\n"
+              << "\n"
+              << "Exit codes: 0 = ok, 2 = error.\n";
+}
+
+}  // namespace
+
+int clink_cmd_state_diff(int argc, char** argv) {
+    if (has_flag(argc, argv, "help")) {
+        diff_usage();
+        return 0;
+    }
+    const auto file_a = get_arg(argc, argv, "a");
+    const auto file_b = get_arg(argc, argv, "b");
+    const auto dir = get_arg(argc, argv, "dir");
+    const auto from = get_arg(argc, argv, "from");
+    const auto to = get_arg(argc, argv, "to");
+    const bool json = has_flag(argc, argv, "json");
+    std::size_t max_rows = 20;
+    if (const auto v = get_arg(argc, argv, "max-rows"); !v.empty()) {
+        max_rows = static_cast<std::size_t>(std::stoull(v));
+    }
+
+    try {
+        LoadedSide a;
+        LoadedSide b;
+        if (!file_a.empty() && !file_b.empty()) {
+            a = load_file(file_a);
+            b = load_file(file_b);
+        } else if (!dir.empty() && !from.empty() && !to.empty()) {
+            a = load_dir(dir, std::stoull(from));
+            b = load_dir(dir, std::stoull(to));
+        } else {
+            diff_usage();
+            return 2;
+        }
+
+        auto report = diff_entries(a.entries, b.entries, max_rows);
+        // Version stamps: for the dir form, stamps ride each subtask file;
+        // merge the deltas (same stamp on every subtask, so first-file
+        // comparison suffices for the common case; compare pairwise by index
+        // to stay honest when subtask counts match).
+        const auto pairs = std::min(a.savepoints.size(), b.savepoints.size());
+        for (std::size_t i = 0; i < pairs; ++i) {
+            for (auto& v : diff_versions(a.savepoints[i], b.savepoints[i])) {
+                const bool seen =
+                    std::any_of(report.versions.begin(), report.versions.end(), [&](const auto& e) {
+                        return e.op.value() == v.op.value() && e.state_type == v.state_type;
+                    });
+                if (!seen) {
+                    report.versions.push_back(std::move(v));
+                }
+            }
+        }
+
+        if (json) {
+            print_diff_json(a, b, report);
+        } else {
+            print_diff_text(a, b, report);
+        }
+        return report.identical() ? 0 : 1;
+    } catch (const std::exception& e) {
+        std::cerr << "clink state-diff: " << e.what() << "\n";
+        return 2;
+    }
+}
+
+int clink_cmd_state_cat(int argc, char** argv) {
+    if (has_flag(argc, argv, "help")) {
+        cat_usage();
+        return 0;
+    }
+    const auto file = get_arg(argc, argv, "file");
+    const auto dir = get_arg(argc, argv, "dir");
+    const auto id = get_arg(argc, argv, "id");
+    const bool json = has_flag(argc, argv, "json");
+    std::size_t max_rows = 50;
+    if (const auto v = get_arg(argc, argv, "max-rows"); !v.empty()) {
+        max_rows = static_cast<std::size_t>(std::stoull(v));
+    }
+
+    try {
+        LoadedSide side;
+        if (!file.empty()) {
+            side = load_file(file);
+        } else if (!dir.empty() && !id.empty()) {
+            side = load_dir(dir, std::stoull(id));
+        } else {
+            cat_usage();
+            return 2;
+        }
+
+        if (json) {
+            std::cout << "{\"source\":\"" << json_escape(side.label) << "\",\"operators\":[";
+            bool first_op = true;
+            for (const auto& [op, slots] : side.entries) {
+                if (!first_op) {
+                    std::cout << ",";
+                }
+                first_op = false;
+                std::cout << "{\"op\":" << op.value() << ",\"slots\":[";
+                bool first_slot = true;
+                for (const auto& [slot, entries] : slots) {
+                    if (!first_slot) {
+                        std::cout << ",";
+                    }
+                    first_slot = false;
+                    std::cout << "{\"slot\":\"" << json_escape(slot)
+                              << "\",\"count\":" << entries.size() << ",\"entries\":[";
+                    bool first_e = true;
+                    std::size_t shown = 0;
+                    for (const auto& [key, entry] : entries) {
+                        if (max_rows != 0 && shown++ >= max_rows) {
+                            break;
+                        }
+                        if (!first_e) {
+                            std::cout << ",";
+                        }
+                        first_e = false;
+                        std::cout << "{\"key_group\":" << static_cast<int>(entry.key_group)
+                                  << ",\"key\":\"" << json_escape(render_bytes(key, 32))
+                                  << "\",\"value\":\"" << json_escape(render_bytes(entry.value))
+                                  << "\"}";
+                    }
+                    std::cout << "]}";
+                }
+                std::cout << "]}";
+            }
+            std::cout << "]}\n";
+            return 0;
+        }
+
+        std::cout << "state-cat: " << side.label << "\n";
+        if (side.entries.empty()) {
+            std::cout << "(no keyed state)\n";
+            return 0;
+        }
+        for (const auto& [op, slots] : side.entries) {
+            for (const auto& [slot, entries] : slots) {
+                std::cout << "\nop " << op.value() << " slot \"" << slot << "\" (" << entries.size()
+                          << " entries)\n";
+                std::size_t shown = 0;
+                for (const auto& [key, entry] : entries) {
+                    if (max_rows != 0 && shown >= max_rows) {
+                        std::cout << "  ... " << (entries.size() - shown)
+                                  << " more (raise --max-rows)\n";
+                        break;
+                    }
+                    ++shown;
+                    std::cout << "  kg=" << static_cast<int>(entry.key_group) << " key "
+                              << render_bytes(key, 32) << " = " << render_bytes(entry.value)
+                              << "\n";
+                }
+            }
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "clink state-cat: " << e.what() << "\n";
+        return 2;
+    }
+}

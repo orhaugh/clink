@@ -24,6 +24,7 @@
 #include "clink/runtime/local_executor.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state_processor/savepoint.hpp"
+#include "clink/state_processor/state_diff.hpp"
 
 using namespace clink;
 using namespace clink::state_processor;
@@ -266,4 +267,110 @@ TEST(StateProcessor, SeedFreshJobFromOfflineSavepoint) {
     auto collected = sink->collected();
     std::sort(collected.begin(), collected.end());
     EXPECT_EQ(collected, (std::vector<std::int64_t>{1001, 2002}));
+}
+
+// ---- state_diff.hpp (the time-travel diff primitive) -----------------------
+
+TEST(StateDiff, CollectEntriesPreservesStructure) {
+    auto sp = Savepoint::create();
+    auto counts = sp.keyed_state<std::string, std::int64_t>(
+        OperatorId{7}, "counts", string_codec(), int64_codec());
+    counts.put("alpha", 1);
+    counts.put("beta", 2);
+    auto totals = sp.keyed_state<std::int64_t, std::int64_t>(
+        OperatorId{7}, "totals", int64_codec(), int64_codec());
+    totals.put(42, 100);
+
+    auto entries = collect_entries(sp);
+    ASSERT_EQ(entries.size(), 1u);
+    const auto& slots = entries.at(OperatorId{7});
+    ASSERT_EQ(slots.size(), 2u);
+    EXPECT_EQ(slots.at("counts").size(), 2u);
+    EXPECT_EQ(slots.at("totals").size(), 1u);
+    // The user key is the raw codec bytes after the '|' separator: the
+    // string codec stores the text itself.
+    EXPECT_EQ(slots.at("counts").count("alpha"), 1u);
+    EXPECT_EQ(slots.at("counts").count("beta"), 1u);
+}
+
+TEST(StateDiff, DiffReportsAddedRemovedChanged) {
+    auto a = Savepoint::create();
+    auto b = Savepoint::create();
+    auto ka =
+        a.keyed_state<std::string, std::int64_t>(OperatorId{9}, "s", string_codec(), int64_codec());
+    auto kb =
+        b.keyed_state<std::string, std::int64_t>(OperatorId{9}, "s", string_codec(), int64_codec());
+    ka.put("stays", 1);
+    kb.put("stays", 1);  // unchanged
+    ka.put("mutates", 10);
+    kb.put("mutates", 20);  // changed
+    ka.put("vanishes", 5);  // removed
+    kb.put("appears", 7);   // added
+
+    auto report = diff_entries(collect_entries(a), collect_entries(b));
+    ASSERT_EQ(report.slots.size(), 1u);
+    const auto& d = report.slots[0];
+    EXPECT_EQ(d.op.value(), 9u);
+    EXPECT_EQ(d.slot, "s");
+    EXPECT_EQ(d.added, 1u);
+    EXPECT_EQ(d.removed, 1u);
+    EXPECT_EQ(d.changed, 1u);
+    EXPECT_EQ(d.unchanged, 1u);
+    ASSERT_EQ(d.samples.size(), 3u);
+    EXPECT_EQ(report.total_entries_a, 3u);
+    EXPECT_EQ(report.total_entries_b, 3u);
+    EXPECT_FALSE(report.identical());
+
+    // Identical inputs -> identical report.
+    auto same = diff_entries(collect_entries(a), collect_entries(a));
+    EXPECT_TRUE(same.identical());
+    EXPECT_EQ(same.slots.size(), 0u);
+}
+
+TEST(StateDiff, MaxSamplesBoundsSamplesNotCounts) {
+    auto a = Savepoint::create();
+    auto b = Savepoint::create();
+    auto kb = b.keyed_state<std::int64_t, std::int64_t>(
+        OperatorId{3}, "grow", int64_codec(), int64_codec());
+    for (std::int64_t i = 0; i < 50; ++i) {
+        kb.put(i, i);
+    }
+    auto report = diff_entries(collect_entries(a), collect_entries(b), /*max_samples=*/5);
+    ASSERT_EQ(report.slots.size(), 1u);
+    EXPECT_EQ(report.slots[0].added, 50u);
+    EXPECT_EQ(report.slots[0].samples.size(), 5u);
+    // 0 = unbounded.
+    auto full = diff_entries(collect_entries(a), collect_entries(b), /*max_samples=*/0);
+    EXPECT_EQ(full.slots[0].samples.size(), 50u);
+}
+
+TEST(StateDiff, MergeEntriesUnionsDisjointSubtasks) {
+    auto sub0 = Savepoint::create();
+    auto sub1 = Savepoint::create();
+    sub0.keyed_state<std::string, std::int64_t>(OperatorId{5}, "s", string_codec(), int64_codec())
+        .put("left", 1);
+    sub1.keyed_state<std::string, std::int64_t>(OperatorId{5}, "s", string_codec(), int64_codec())
+        .put("right", 2);
+
+    auto merged = collect_entries(sub0);
+    merge_entries(merged, collect_entries(sub1));
+    EXPECT_EQ(merged.at(OperatorId{5}).at("s").size(), 2u);
+}
+
+TEST(StateDiff, RenderBytesFormats) {
+    // Printable text renders quoted.
+    EXPECT_EQ(render_bytes("hello"), "\"hello\"");
+    // 8-byte buffers additionally show the little-endian int64 reading.
+    std::string eight(8, '\0');
+    eight[0] = 42;
+    const auto rendered = render_bytes(eight);
+    EXPECT_NE(rendered.find("(int64 42)"), std::string::npos);
+    // Non-printable, non-8-byte renders as hex.
+    std::string raw;
+    raw.push_back('\x01');
+    raw.push_back('\x02');
+    EXPECT_EQ(render_bytes(raw), "0x0102");
+    // Truncation marker carries the true size.
+    const std::string longtext(100, 'a');
+    EXPECT_NE(render_bytes(longtext, 16).find("[100 bytes]"), std::string::npos);
 }
