@@ -25,6 +25,7 @@
 // each new reduce subtask reads its assigned key-group slice from
 // the appropriate parent's checkpoint file.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -123,8 +124,24 @@ public:
             out.emit_watermark(clink::Watermark::max());
             return false;
         }
+        // Sleep the tick in short slices, RETURNING between them, so the
+        // runner regains control and can inject checkpoint/savepoint
+        // barriers (and observe cancel) at ~100ms latency however large the
+        // tick is. A single sleep_for(tick) would hold the runner hostage:
+        // a savepoint against a 10-minute tick could not begin until the
+        // sleep ended.
         if (tick_ms_ > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds{tick_ms_});
+            const auto now = std::chrono::steady_clock::now();
+            if (next_emit_ == std::chrono::steady_clock::time_point{}) {
+                next_emit_ = now + std::chrono::milliseconds{tick_ms_};
+            }
+            if (now < next_emit_) {
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(next_emit_ - now);
+                std::this_thread::sleep_for(std::min(remaining, std::chrono::milliseconds{100}));
+                return true;  // no emit yet; runner may inject barriers
+            }
+            next_emit_ = now + std::chrono::milliseconds{tick_ms_};
         }
         clink::Batch<std::int64_t> b;
         b.push(clink::Record<std::int64_t>{state_});
@@ -143,6 +160,7 @@ private:
     std::int64_t count_;
     std::int64_t tick_ms_;
     std::int64_t parallelism_;
+    std::chrono::steady_clock::time_point next_emit_{};
 };
 
 inline std::shared_ptr<clink::Source<std::int64_t>> make_slow_source(std::int64_t count,
