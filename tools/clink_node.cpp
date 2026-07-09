@@ -149,6 +149,9 @@
 #ifdef CLINK_LINKED_ONNX
 #include "clink/onnx/install.hpp"
 #endif
+#ifdef CLINK_LINKED_WASM
+#include "clink/wasm/install.hpp"
+#endif
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/rocksdb/install.hpp"
 #endif
@@ -2737,6 +2740,11 @@ void install_linked_impls() {
     // SQL-native AI: the local ONNX Runtime ML_PREDICT provider (provider='onnx').
     // Registered into the process-wide ModelProviderRegistry like the HTTP provider.
     clink::onnx::install(reg);
+#endif
+#ifdef CLINK_LINKED_WASM
+    // WebAssembly scalar UDFs: registers the 'wasm' loader behind
+    // CREATE FUNCTION ... LANGUAGE wasm (UdfLanguageRegistry).
+    clink::wasm::install(reg);
 #endif
 #endif
 }

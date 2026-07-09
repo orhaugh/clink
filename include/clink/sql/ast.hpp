@@ -642,6 +642,23 @@ struct CreateViewStmt {
     Loc loc;
 };
 
+// CREATE [OR REPLACE] FUNCTION name(arg TYPE, ...) RETURNS TYPE
+//   LANGUAGE lang AS 'definition'[, 'definition2'].
+// Declares a scalar UDF whose implementation an installed language loader
+// provides (see operators/udf_language_registry.hpp). For LANGUAGE wasm
+// the definitions are the module path and (optionally) the export name.
+// Argument names are carried for diagnostics only; calls bind positionally.
+struct CreateFunctionStmt {
+    std::string function_name;
+    std::vector<std::string> arg_names;  // may hold empty entries (unnamed args)
+    std::vector<TypeName> arg_types;
+    TypeName return_type;
+    std::string language;
+    std::vector<std::string> definitions;  // the AS strings, verbatim
+    bool or_replace = false;
+    Loc loc;
+};
+
 struct ExplainStmt;
 
 using Statement = std::variant<CreateTableStmt,
@@ -653,6 +670,7 @@ using Statement = std::variant<CreateTableStmt,
                                CreateMaterializedViewStmt,
                                RefreshMatViewStmt,
                                CreateViewStmt,
+                               CreateFunctionStmt,
                                AlterTableStmt,
                                RenameStmt,
                                AnalyzeStmt,

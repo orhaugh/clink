@@ -13,6 +13,9 @@
 #include "clink/sql/install.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/script_runner.hpp"
+#ifdef CLINK_EMBED_LINKED_WASM
+#include "clink/wasm/install.hpp"
+#endif
 
 namespace clink::embed {
 
@@ -29,6 +32,11 @@ void ensure_factories_installed_once() {
         clink::plugin::PluginRegistry reg;
         clink::sql::install(reg);
         install_collect_sink();
+#ifdef CLINK_EMBED_LINKED_WASM
+        // CREATE FUNCTION ... LANGUAGE wasm in embedded execution: register
+        // the wasm loader so the script runner can resolve the language.
+        clink::wasm::install(reg);
+#endif
     });
 }
 

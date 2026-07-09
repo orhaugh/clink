@@ -1513,6 +1513,78 @@ ast::CreateViewStmt translate_view_stmt(const JsonValue& body) {
     return stmt;
 }
 
+// CREATE [OR REPLACE] FUNCTION name(arg TYPE, ...) RETURNS TYPE LANGUAGE lang
+// AS 'def'[, 'def2'] parses as a PG CreateFunctionStmt: the name under
+// `funcname` (String list), typed args under `parameters` (FunctionParameter
+// nodes with argType TypeNames), the return under `returnType`, and LANGUAGE /
+// AS as DefElem options (`language` a String arg; `as` a List of Strings).
+// Only default-mode (IN) parameters are supported; OUT/INOUT/VARIADIC and
+// function bodies via sql_body are rejected.
+ast::CreateFunctionStmt translate_create_function_stmt(const JsonValue& body) {
+    ast::CreateFunctionStmt stmt;
+    stmt.loc = loc_from(body);
+    if (!body.contains("funcname") || !body.at("funcname").is_array() ||
+        body.at("funcname").as_array().empty()) {
+        unsupported("CREATE FUNCTION missing name", stmt.loc.pos);
+    }
+    stmt.function_name = string_atom(body.at("funcname").as_array().back());
+    if (body.contains("replace") && body.at("replace").is_bool()) {
+        stmt.or_replace = body.at("replace").as_bool();
+    }
+    if (body.contains("parameters") && body.at("parameters").is_array()) {
+        for (const auto& p : body.at("parameters").as_array()) {
+            auto [pkind, pbody] = node_wrapper(p);
+            if (pkind != "FunctionParameter") {
+                unsupported("CREATE FUNCTION parameter kind " + pkind, stmt.loc.pos);
+            }
+            const std::string mode = pbody->contains("mode") && pbody->at("mode").is_string()
+                                         ? pbody->at("mode").as_string()
+                                         : std::string{"FUNC_PARAM_DEFAULT"};
+            if (mode != "FUNC_PARAM_DEFAULT" && mode != "FUNC_PARAM_IN") {
+                unsupported("CREATE FUNCTION only supports IN parameters", stmt.loc.pos);
+            }
+            stmt.arg_names.push_back(pbody->contains("name") && pbody->at("name").is_string()
+                                         ? pbody->at("name").as_string()
+                                         : std::string{});
+            if (!pbody->contains("argType") || !pbody->at("argType").is_object()) {
+                unsupported("CREATE FUNCTION parameter missing type", stmt.loc.pos);
+            }
+            stmt.arg_types.push_back(translate_type_name(pbody->at("argType")));
+        }
+    }
+    if (!body.contains("returnType") || !body.at("returnType").is_object()) {
+        unsupported("CREATE FUNCTION requires RETURNS <type>", stmt.loc.pos);
+    }
+    stmt.return_type = translate_type_name(body.at("returnType"));
+    if (body.contains("options") && body.at("options").is_array()) {
+        for (const auto& opt : body.at("options").as_array()) {
+            auto [okind, obody] = node_wrapper(opt);
+            if (okind != "DefElem" || !obody->contains("defname")) {
+                continue;
+            }
+            const auto defname = obody->at("defname").as_string();
+            if (defname == "language" && obody->contains("arg")) {
+                stmt.language = string_atom(obody->at("arg"));
+            } else if (defname == "as" && obody->contains("arg") && obody->at("arg").is_object() &&
+                       obody->at("arg").contains("List")) {
+                const auto& items = obody->at("arg").at("List");
+                if (items.contains("items") && items.at("items").is_array()) {
+                    for (const auto& item : items.at("items").as_array()) {
+                        stmt.definitions.push_back(string_atom(item));
+                    }
+                }
+            }
+        }
+    }
+    if (stmt.language.empty()) {
+        unsupported("CREATE FUNCTION requires LANGUAGE <name>", stmt.loc.pos);
+    }
+    if (stmt.definitions.empty()) {
+        unsupported("CREATE FUNCTION requires AS '<definition>'", stmt.loc.pos);
+    }
+    return stmt;
+}
+
 // ALTER TABLE [IF EXISTS] <name> <cmd>, ... parses as a PG AlterTableStmt with a
 // list of AlterTableCmd nodes. v1 supports ADD COLUMN / DROP COLUMN (column-level
 // schema evolution of the catalog declaration); other actions (SET options,
@@ -1754,6 +1826,9 @@ ast::Statement translate_statement(const JsonValue& outer_stmt) {
     }
     if (kind == "ViewStmt") {
         return ast::Statement{translate_view_stmt(*body)};
+    }
+    if (kind == "CreateFunctionStmt") {
+        return ast::Statement{translate_create_function_stmt(*body)};
     }
     if (kind == "AlterTableStmt") {
         return ast::Statement{translate_alter_table_stmt(*body)};

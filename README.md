@@ -760,6 +760,14 @@ Advanced and extensibility (each a documented v1 subset)
 - Scalar UDFs and aggregate UDFs (UDAFs): C++-registered closures invoked by
   name (a UDAF needs `retract` for changelog GROUP BY and `merge` for SESSION
   windows)
+- `CREATE FUNCTION f(x BIGINT) RETURNS BIGINT LANGUAGE wasm AS
+  '/path/module.wasm'`: scalar UDFs declared in SQL itself, run in-process in
+  a WebAssembly sandbox (wasmtime, opt-in `CLINK_WITH_WASM`). Modules must be
+  self-contained (imports rejected), every call runs under a fuel budget so
+  runaway code fails instead of hanging, NULL in is NULL out, and the export's
+  signature is validated against the declared SQL types at load. v1 value
+  model is BIGINT/INTEGER/DOUBLE/REAL; embedded execution (`clink run`,
+  libclink) end to end, cluster module shipping is a follow-on
 - Programmatic Table API (v1): a fluent C++ builder, `from(...)` then optional
   `filter(...)` then either `select(...)` or `group_by(...).agg(...)` then
   `insert_into(...)`, sharing the binder's lowering so it produces a

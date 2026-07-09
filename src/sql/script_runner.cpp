@@ -6,6 +6,8 @@
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/http/http_client.hpp"
+#include "clink/operators/scalar_function_registry.hpp"
+#include "clink/operators/udf_language_registry.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/sql/analyze.hpp"
 #include "clink/sql/binder.hpp"
@@ -14,6 +16,7 @@
 #include "clink/sql/optimizer.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/physical_plan.hpp"
+#include "clink/sql/type.hpp"
 #include "clink/sql/view.hpp"
 
 namespace clink::sql {
@@ -171,6 +174,39 @@ int run_script(const std::string& sql,
                 // job): bind the defining query for its columns and store it; a
                 // reference to the view is expanded inline at bind time.
                 register_view(catalog, std::move(std::get<ast::CreateViewStmt>(stmt)));
+                continue;
+            }
+            if (std::holds_alternative<ast::CreateFunctionStmt>(stmt)) {
+                // Scalar UDF declaration: resolve the LANGUAGE's installed
+                // loader (e.g. 'wasm' from clink::wasm) and hand it the
+                // declared signature + AS definitions; the loader validates
+                // and registers the runnable closure into
+                // ScalarFunctionRegistry, where the binder and evaluator
+                // already find it. No job is submitted.
+                const auto& cf = std::get<ast::CreateFunctionStmt>(stmt);
+                try {
+                    UdfLanguageRegistry::FunctionDecl decl;
+                    decl.name = cf.function_name;
+                    decl.return_type = sql_type_to_arrow(cf.return_type);
+                    decl.arg_types.reserve(cf.arg_types.size());
+                    for (const auto& t : cf.arg_types) {
+                        decl.arg_types.push_back(sql_type_to_arrow(t));
+                    }
+                    decl.definitions = cf.definitions;
+                    if (!cf.or_replace &&
+                        ScalarFunctionRegistry::global().contains(cf.function_name)) {
+                        throw std::runtime_error("function '" + cf.function_name +
+                                                 "' already exists (use CREATE OR REPLACE "
+                                                 "FUNCTION to replace it)");
+                    }
+                    UdfLanguageRegistry::global().load(cf.language, decl);
+                } catch (const std::exception& e) {
+                    err << "error: CREATE FUNCTION " << cf.function_name << ": " << e.what()
+                        << "\n";
+                    return 1;
+                }
+                out << "created function " << cf.function_name << " (language " << cf.language
+                    << ")\n";
                 continue;
             }
             if (std::holds_alternative<ast::AlterTableStmt>(stmt)) {
