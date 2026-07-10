@@ -36,6 +36,7 @@ then follow the links into each subsystem.
 | [Time, watermarks, windows and CEP](time-and-windowing.md) | How clink tracks event-time progress with watermarks, fires keyed tumbling/sliding/session/evicting windows via pluggable triggers and allowed-lateness, and matches patterns with the NFA-based CEP operator. |
 | [Keyed state and state backends](state-and-backends.md) | How operators store per-key and per-operator state over Codec<T>, the pluggable backends (in-memory, sharded, file, changelog, RocksDB, remote-read), the Arrow IPC snapshot format vs RocksDB native SST checkpoints, queryable state, and the two-tier disaggregated RemoteReadBackend. |
 | [The state snapshot format (stable contract)](state-snapshot-format.md) | The Arrow IPC state-snapshot encoding as a stable public contract: the three-column schema, key encoding, format-version and state-version metadata, the changelog variant, derived Parquet/Iceberg/query projections, and the evolution policy. |
+| [The testing framework (clink::test)](testing-framework.md) | The public API for unit-testing user functions, operators and pipelines: OutputCapture, operator harnesses, deterministic manual time, and the fidelity-by-construction design that reuses production hooks instead of mocking them. |
 
 ## Reliability
 

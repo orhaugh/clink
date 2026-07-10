@@ -160,6 +160,7 @@ add_executable(clink_core_tests
     test_process_function.cpp
     test_cep.cpp
     test_state_processor.cpp
+    test_harness_framework.cpp
     test_record_capture.cpp
     test_queryable_state.cpp
     test_changelog_state_backend.cpp
@@ -186,7 +187,7 @@ add_executable(clink_core_tests
 target_link_libraries(clink_core_tests PRIVATE
     clink::core
     GTest::gtest_main
-)
+ clink::test_support)
 # test_logging.cpp constructs the spdlog-backed sinks directly. spdlog is
 # linked PRIVATE to clink_core (header-only) so its include path does not
 # reach this test exe; add it here. Harmless for the test binary (it is not a

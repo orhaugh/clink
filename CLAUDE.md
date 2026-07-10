@@ -47,6 +47,7 @@ docs current when a subsystem changes.
 | Embedded execution (`clink run <file>.sql`, EmbeddedEngine) | `include/clink/embed/`, `src/embed/`, `include/clink/sql/script_runner.hpp`, `tools/clink_run_sql.cpp` | `docs/internals/embedded.md` |
 | Data lineage (capture + pluggable export) | `include/clink/lineage/`, `src/lineage/` | `docs/internals/data-lineage.md` |
 | Connectors (sources/sinks/backends) | `impls/<name>/` | `docs/connectors/<name>.md` |
+| Testing framework (public, for library consumers) | `include/clink/test/` | `docs/internals/testing-framework.md` |
 
 ## Pinned toolchain (one-time bootstrap)
 

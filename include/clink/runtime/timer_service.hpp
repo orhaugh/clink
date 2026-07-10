@@ -143,6 +143,19 @@ public:
         event_timers_.clear();
     }
 
+    // Replace the clock. The operator test harness points this at its
+    // manual clock so an operator reading now_ms() sees deterministic
+    // time; the runner never calls it (it injects via the constructor).
+    void set_now_fn(NowFn now_fn) { now_fn_ = std::move(now_fn); }
+
+    // Non-destructive inspection of the registered timer sets, ordered by
+    // (timestamp, key) - the firing order, with lexicographic key order
+    // breaking timestamp ties. Diagnostics and the test harness read
+    // these; production firing goes through poll_due*.
+    using TimerSet = std::set<std::pair<std::int64_t, std::string>>;
+    const TimerSet& processing_time_timers() const noexcept { return timers_; }
+    const TimerSet& event_time_timers() const noexcept { return event_timers_; }
+
     // ---- Checkpointing -------------------------------------------------
     //
     // Serialize every registered timer (processing-time first, then
@@ -256,10 +269,10 @@ public:
     }
 
 private:
-    // std::set ordered by (timestamp, key) so peek/pop are O(log n) and
+    // Ordered by (timestamp, key) so peek/pop are O(log n) and
     // duplicates are naturally deduped.
-    std::set<std::pair<std::int64_t, std::string>> timers_;
-    std::set<std::pair<std::int64_t, std::string>> event_timers_;
+    TimerSet timers_;
+    TimerSet event_timers_;
     NowFn now_fn_;
 };
 

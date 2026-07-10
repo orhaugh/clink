@@ -743,6 +743,16 @@ endif()
 # below and the per-name back-compat shims. Bundle them into an
 # OBJECT library so each TU is compiled exactly once and linked into
 # both flavors.
+# clink::test_support - the public testing framework for library
+# consumers (operator harnesses, output capture, deterministic time;
+# docs/internals/testing-framework.md). Header-only over clink::core.
+# Production binaries must not link it; test executables do.
+add_library(clink_test_support INTERFACE)
+add_library(clink::test_support ALIAS clink_test_support)
+target_include_directories(clink_test_support INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(clink_test_support INTERFACE clink_core)
+target_compile_features(clink_test_support INTERFACE cxx_std_23)
+
 add_library(clink_cli_cmds OBJECT
     tools/clink_submit_job.cpp
     tools/clink_app.cpp
