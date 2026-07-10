@@ -300,8 +300,8 @@ public:
     // point-in-time view - NOT a checkpoint-consistent global cut (no
     // barrier alignment); use a savepoint where cross-subtask consistency
     // matters. Backends whose live view is complete override this; the
-    // default refuses (e.g. a disaggregated backend holds only a partial
-    // hot tier in memory).
+    // default refuses (e.g. a loader-only RemoteReadBackend has no
+    // enumerable durable tier behind its partial hot cache).
     [[nodiscard]] virtual std::vector<std::byte> export_arrow_snapshot() const {
         throw std::runtime_error("live state export not supported by this backend (" +
                                  description() + "); export from a checkpoint instead");

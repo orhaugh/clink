@@ -18,9 +18,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -93,6 +95,20 @@ public:
     // a no-op: same-location same-parallelism restore needs nothing (cp-restore_cp
     // already exists under this subtask's prefix and cold reads are lazy).
     virtual void prepare_restore(CheckpointId /*restore_cp*/, const KeyGroupRange& /*kg*/) {}
+
+    // State-as-data: enumerate EVERY (op, key, value) of committed
+    // checkpoint `id` - the primitive behind exporting the disaggregated
+    // tier as an open dataset (RemoteReadBackend::export_arrow_snapshot
+    // overlays the hot delta on top of this). A scan of an unknown /
+    // never-committed checkpoint visits nothing. Point-lookup-only pools
+    // may refuse (the default); in-tree pools implement it. May race a
+    // concurrent purge of `id` (retention drops superseded checkpoints),
+    // in which case the underlying storage error propagates.
+    using ScanVisitor =
+        std::function<void(OperatorId, const std::string& key, const StateBackend::Value&)>;
+    virtual void scan_checkpoint(CheckpointId /*id*/, const ScanVisitor& /*visit*/) const {
+        throw std::runtime_error("this RemotePool does not support checkpoint enumeration");
+    }
 };
 
 // In-memory RemotePool: each checkpoint is a full materialised key->value map
@@ -149,6 +165,22 @@ public:
     void purge(CheckpointId id) override {
         std::lock_guard<std::mutex> lk(mu_);
         ckpts_.erase(id.value());
+    }
+
+    void scan_checkpoint(CheckpointId id, const ScanVisitor& visit) const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto cit = ckpts_.find(id.value());
+        if (cit == ckpts_.end()) {
+            return;  // unknown / never-committed checkpoint: nothing to visit
+        }
+        for (const auto& [composed, value] : cit->second) {
+            const auto sep = composed.find('\x1f');
+            if (sep == std::string::npos) {
+                continue;
+            }
+            visit(
+                OperatorId{std::stoull(composed.substr(0, sep))}, composed.substr(sep + 1), value);
+        }
     }
 
     // Test instrumentation: pool round-trips. read_calls() counts single-key

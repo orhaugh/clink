@@ -571,3 +571,94 @@ TEST(RemoteReadBackend, DeadlineReadCarriesOrderKeyToDeadlineScheduler) {
         << "cold read did not route its completion through the deadline scheduler";
     EXPECT_EQ(*seen_order_key, 77u);  // the order_key carried read -> hand-back
 }
+
+// ----- state-as-data: the disaggregated live export -----
+
+#include "clink/state/in_memory_state_backend.hpp"
+
+namespace {
+
+// All (op -> key -> value) entries of a backend, via the format's
+// reference reader.
+std::map<std::string, std::string> restored_entries(const std::vector<std::byte>& bytes,
+                                                    OperatorId op) {
+    clink::InMemoryStateBackend ref;
+    clink::Snapshot snap;
+    snap.bytes = bytes;
+    ref.restore(snap);
+    std::map<std::string, std::string> out;
+    ref.scan(op,
+             [&](std::string_view k, std::string_view v) { out[std::string(k)] = std::string(v); });
+    return out;
+}
+
+}  // namespace
+
+// The pool-backed live export is the complete view: the committed pool
+// checkpoint, minus keys erased since, with dirty (uncommitted) writes
+// winning over their committed versions - exactly what get() serves.
+TEST(RemoteReadBackend, LiveExportMergesPoolAndHotDelta) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    const OperatorId op{7};
+    RemoteReadBackend b(pool);
+    b.put(op, sv("committed"), sv("v1"));
+    b.put(op, sv("updated"), sv("old"));
+    b.put(op, sv("erased"), sv("gone"));
+    b.snapshot(CheckpointId{1});  // all three durable in the pool
+
+    // Post-checkpoint delta, NOT yet committed anywhere.
+    b.put(op, sv("updated"), sv("new"));  // dirty overwrite of a committed key
+    b.put(op, sv("fresh"), sv("v2"));     // dirty new key
+    b.erase(op, sv("erased"));            // logically absent now
+
+    const auto got = restored_entries(b.export_arrow_snapshot(), op);
+    std::map<std::string, std::string> want{
+        {"committed", "v1"},  // from the pool checkpoint
+        {"updated", "new"},   // hot dirty value wins
+        {"fresh", "v2"},      // hot-only key present
+    };
+    EXPECT_EQ(got, want);  // and "erased" is absent
+
+    // After the next checkpoint commits the delta, the export agrees with
+    // the pool alone (hot still wins, values identical).
+    b.snapshot(CheckpointId{2});
+    EXPECT_EQ(restored_entries(b.export_arrow_snapshot(), op), want);
+}
+
+// Before any checkpoint, the export is the hot tier alone (nothing has
+// reached the pool); the loader-only construction still refuses.
+TEST(RemoteReadBackend, LiveExportBeforeFirstCheckpointAndLoaderOnlyRefusal) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    const OperatorId op{9};
+    RemoteReadBackend b(pool);
+    b.put(op, sv("only-hot"), sv("v"));
+    const auto got = restored_entries(b.export_arrow_snapshot(), op);
+    EXPECT_EQ(got.size(), 1u);
+    EXPECT_EQ(got.at(std::string("only-hot")), "v");
+
+    RemoteReadBackend loader_only(
+        [](OperatorId, const std::string&) { return std::optional<StateBackend::Value>{}; });
+    EXPECT_THROW((void)loader_only.export_arrow_snapshot(), std::runtime_error);
+}
+
+// The pool's enumeration primitive: every entry of a committed checkpoint
+// visits once; an unknown checkpoint visits nothing.
+TEST(RemoteReadBackend, PoolScanCheckpointEnumeratesCommittedState) {
+    InMemoryRemotePool pool;
+    const OperatorId op{3};
+    pool.commit(
+        CheckpointId{5},
+        CheckpointId{0},
+        {RemotePoolEntry{op, "k1", to_value("a")}, RemotePoolEntry{op, "k2", to_value("b")}},
+        {});
+    std::map<std::string, std::string> seen;
+    pool.scan_checkpoint(CheckpointId{5}, [&](OperatorId o, const std::string& k, const auto& v) {
+        EXPECT_EQ(o.value(), op.value());
+        seen[k] = std::string(reinterpret_cast<const char*>(v.data()), v.size());
+    });
+    EXPECT_EQ(seen, (std::map<std::string, std::string>{{"k1", "a"}, {"k2", "b"}}));
+    std::size_t visited = 0;
+    pool.scan_checkpoint(CheckpointId{99},
+                         [&](OperatorId, const std::string&, const auto&) { ++visited; });
+    EXPECT_EQ(visited, 0u);
+}

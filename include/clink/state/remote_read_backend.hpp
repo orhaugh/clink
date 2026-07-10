@@ -64,6 +64,7 @@
 #include "clink/metrics/disagg_metrics.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/remote_pool.hpp"
+#include "clink/state/snapshot_arrow_writer.hpp"
 #include "clink/state/state_backend.hpp"
 
 namespace clink {
@@ -257,6 +258,71 @@ public:
     void scan(OperatorId op, const ScanVisitor& visit) const override {
         std::lock_guard<std::mutex> lk(sync_mu_);
         hot_.scan(op, visit);
+    }
+
+    // State-as-data: the COMPLETE live view as the canonical Arrow stream,
+    // mirroring get()'s precedence exactly - the hot tier wins (it holds
+    // dirty writes and the pinned in-flight-persist window), erased keys
+    // mask the pool (deleted_ + persisting_deleted_), and the last
+    // durably-committed pool checkpoint fills the rest via
+    // RemotePool::scan_checkpoint. Pool-backed constructions only: the
+    // loader-only form has no enumerable durable tier and keeps the base
+    // refusal. Per-subtask atomic over the hot/deleted copy; the pool
+    // checkpoint is immutable (a concurrent retention purge of it
+    // surfaces as the pool's storage error).
+    [[nodiscard]] std::vector<std::byte> export_arrow_snapshot() const override {
+        if (!pool_) {
+            return StateBackend::export_arrow_snapshot();  // loader-only: refuse
+        }
+        struct HotEntryCopy {
+            std::uint64_t op;
+            std::string key;
+            Value value;
+        };
+        std::vector<HotEntryCopy> hot_entries;
+        std::set<std::pair<std::uint64_t, std::string>> hot_keys;
+        std::set<std::pair<std::uint64_t, std::string>> masked;
+        std::uint64_t ck = 0;
+        {
+            std::lock_guard<std::mutex> lk(sync_mu_);
+            for (const auto op : hot_.operator_ids()) {
+                hot_.scan(op, [&](std::string_view k, std::string_view v) {
+                    hot_entries.push_back(HotEntryCopy{
+                        op.value(),
+                        std::string(k),
+                        Value{reinterpret_cast<const std::byte*>(v.data()),
+                              reinterpret_cast<const std::byte*>(v.data() + v.size())}});
+                    hot_keys.emplace(op.value(), std::string(k));
+                });
+            }
+            masked = deleted_;
+            for (const auto& [k, pins] : persisting_deleted_) {
+                masked.insert(k);
+            }
+            ck = last_ckpt_.load(std::memory_order_relaxed);
+        }
+        SnapshotArrowWriter writer;
+        if (ck != 0) {
+            pool_->scan_checkpoint(
+                CheckpointId{ck},
+                [&](OperatorId op, const std::string& key, const StateBackend::Value& value) {
+                    const auto id = std::make_pair(op.value(), key);
+                    if (hot_keys.count(id) != 0 || masked.count(id) != 0) {
+                        return;  // hot value wins / logically erased
+                    }
+                    writer.append(op.value(),
+                                  key,
+                                  std::string_view(reinterpret_cast<const char*>(value.data()),
+                                                   value.size()));
+                });
+        }
+        for (const auto& e : hot_entries) {
+            writer.append(
+                e.op,
+                e.key,
+                std::string_view(reinterpret_cast<const char*>(e.value.data()), e.value.size()));
+        }
+        return writer.finish(restored_state_versions());
     }
 
     // Synchronous snapshot = capture (point-in-time delta on the operator

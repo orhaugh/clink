@@ -240,6 +240,41 @@ public:
         return object_gets_.load(std::memory_order_relaxed);
     }
 
+    // State-as-data: walk checkpoint `id`'s manifest and emit every
+    // entry. One object GET per DISTINCT content hash (the coalescing
+    // read_many uses); entries sharing a hash reuse the fetched bytes.
+    // Sequential fetches - this is offline/tooling bandwidth, not the
+    // record hot path. An unknown checkpoint (no manifest) visits nothing.
+    void scan_checkpoint(CheckpointId id, const ScanVisitor& visit) const override {
+        if (id.value() == 0) {
+            return;  // checkpoint 0 = nothing committed
+        }
+        Manifest m;
+        try {
+            m = manifest_for_(id);
+        } catch (...) {
+            return;  // no manifest for this id: nothing to visit
+        }
+        auto fs = fs_();
+        std::unordered_map<std::string, StateBackend::Value> by_hash;
+        for (const auto& [mk, mv] : m) {
+            const auto& hash = mv.first;
+            auto it = by_hash.find(hash);
+            if (it == by_hash.end()) {
+                object_gets_.fetch_add(1, std::memory_order_relaxed);
+                const std::string bytes = read_object_(*fs, object_path_(hash));
+                it = by_hash
+                         .emplace(
+                             hash,
+                             StateBackend::Value{
+                                 reinterpret_cast<const std::byte*>(bytes.data()),
+                                 reinterpret_cast<const std::byte*>(bytes.data() + bytes.size())})
+                         .first;
+            }
+            visit(OperatorId{mk.first}, mk.second, it->second);
+        }
+    }
+
     void purge(CheckpointId id) override {
         std::shared_ptr<arrow::fs::S3FileSystem> fs;
         try {

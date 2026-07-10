@@ -77,6 +77,7 @@ Restore replays the materialisation rows first, then applies the log rows in ord
 | `RocksDBStateBackend::export_arrow_snapshot` / `rocksdb_checkpoint_to_arrow` | Render RocksDB state to this format |
 | `clink state-export / state-cat / state-diff / state-query / check-savepoint` | CLI surface over the format |
 | Live export HTTP routes (`queryable_state/live_export.hpp`) | Serve a RUNNING job's merged live state as one stream (TM and JM; per-subtask atomic, not a global cut) |
+| `RemoteReadBackend::export_arrow_snapshot` + `RemotePool::scan_checkpoint` | Render the disaggregated tier (pool checkpoint + hot delta) to this format |
 
 ## Derived projections (not restorable)
 

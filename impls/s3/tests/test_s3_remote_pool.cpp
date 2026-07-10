@@ -567,3 +567,43 @@ TEST(S3RemotePoolScheme, HotMaxBytesUriProducesEvictingBackend) {
 
     rrb->purge_checkpoint(CheckpointId{1});
 }
+
+#include "clink/state/in_memory_state_backend.hpp"
+
+// State-as-data over the S3 tier: scan_checkpoint enumerates a committed
+// checkpoint's full contents (one GET per distinct content hash), and the
+// backend's live export - pool checkpoint + hot delta - restores through
+// the format's reference reader with the exact expected view.
+TEST(S3RemotePool, ScanCheckpointAndLiveExportOverS3) {
+    if (!s3_available()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET (MinIO/LocalStack)";
+    }
+    const std::string prefix = unique_prefix();
+    const OperatorId op{11};
+    auto pool = std::make_shared<S3RemotePool>(pool_opts(prefix));
+    RemoteReadBackend b(pool);
+    b.put(op, vv("committed"), vv("v1"));
+    b.put(op, vv("erased"), vv("gone"));
+    b.snapshot(CheckpointId{1});
+    b.put(op, vv("fresh"), vv("v2"));  // dirty, not yet committed
+    b.erase(op, vv("erased"));
+
+    // Pool enumeration sees exactly the COMMITTED view.
+    std::map<std::string, std::string> pool_view;
+    pool->scan_checkpoint(CheckpointId{1}, [&](OperatorId o, const std::string& k, const auto& v) {
+        ASSERT_EQ(o.value(), op.value());
+        pool_view[k] = std::string(reinterpret_cast<const char*>(v.data()), v.size());
+    });
+    EXPECT_EQ(pool_view,
+              (std::map<std::string, std::string>{{"committed", "v1"}, {"erased", "gone"}}));
+
+    // The live export overlays the delta: erased masked, fresh present.
+    clink::InMemoryStateBackend ref;
+    clink::Snapshot snap;
+    snap.bytes = b.export_arrow_snapshot();
+    ref.restore(snap);
+    std::map<std::string, std::string> live;
+    ref.scan(
+        op, [&](std::string_view k, std::string_view v) { live[std::string(k)] = std::string(v); });
+    EXPECT_EQ(live, (std::map<std::string, std::string>{{"committed", "v1"}, {"fresh", "v2"}}));
+}
