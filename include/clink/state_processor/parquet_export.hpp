@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -108,6 +109,150 @@ inline void write_state_parquet(const StateEntries& entries,
         schema = schema->WithMetadata(meta);
     }
     auto table = arrow::Table::Make(schema, {op_arr, kg_arr, slot_arr, key_arr, val_arr}, rows);
+
+    auto sink_result = arrow::io::FileOutputStream::Open(path.string());
+    if (!sink_result.ok())
+        throw_arrow("(open " + path.string() + ")", sink_result.status());
+    auto sink = *sink_result;
+    if (auto s = parquet::arrow::WriteTable(
+            *table, arrow::default_memory_pool(), sink, /*chunk_size=*/64 * 1024);
+        !s.ok()) {
+        throw_arrow("(write table)", s);
+    }
+    if (auto s = sink->Close(); !s.ok())
+        throw_arrow("(close)", s);
+}
+
+// The QUERY projection: like write_state_parquet but with the key and
+// value bytes RENDERED so `clink state-query` (and any SQL engine over
+// the file) can filter and read them as plain columns:
+//
+//   op_id     : int64    OperatorId bit-cast (exact, reversible)
+//   key_group : int64    leading key byte (>= 128 = operator state)
+//   slot      : utf8
+//   user_key  : utf8     printable bytes verbatim, else "0x" + hex
+//   key_int   : int64?   the user key's little-endian int64 reading
+//                        when it is exactly 8 bytes, else null
+//   value     : utf8     rendered like user_key
+//   value_int : int64?   rendered like key_int (counters/sums/offsets)
+//
+// The rendering is lossy for non-printable bytes (query convenience,
+// not fidelity); the Arrow/Parquet exports remain the exact forms.
+namespace parquet_export_detail {
+
+inline bool printable(const std::string& s) {
+    for (const unsigned char c : s) {
+        if (c < 0x20 || c > 0x7E) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline std::string render_text(const std::string& s) {
+    if (printable(s)) {
+        return s;
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out = "0x";
+    out.reserve(2 + s.size() * 2);
+    for (const unsigned char c : s) {
+        out.push_back(kHex[c >> 4]);
+        out.push_back(kHex[c & 0xF]);
+    }
+    return out;
+}
+
+inline std::optional<std::int64_t> int64_reading(const std::string& s) {
+    if (s.size() != 8) {
+        return std::nullopt;
+    }
+    std::uint64_t u = 0;
+    for (int i = 0; i < 8; ++i) {
+        u |= static_cast<std::uint64_t>(static_cast<unsigned char>(s[static_cast<std::size_t>(i)]))
+             << (i * 8);
+    }
+    return static_cast<std::int64_t>(u);
+}
+
+}  // namespace parquet_export_detail
+
+inline void write_state_query_parquet(const StateEntries& entries,
+                                      const std::filesystem::path& path) {
+    using parquet_export_detail::int64_reading;
+    using parquet_export_detail::render_text;
+    using parquet_export_detail::throw_arrow;
+
+    // Leading nullable event_time column: the layout the engine's Row
+    // parquet source (make_row_columnar_arrow_batcher) expects at
+    // position 0. State entries carry no event time, so it is all-null.
+    arrow::Int64Builder et_b;
+    arrow::Int64Builder op_b;
+    arrow::Int64Builder kg_b;
+    arrow::StringBuilder slot_b;
+    arrow::StringBuilder key_b;
+    arrow::Int64Builder key_int_b;
+    arrow::StringBuilder val_b;
+    arrow::Int64Builder val_int_b;
+
+    std::int64_t rows = 0;
+    for (const auto& [op, slots] : entries) {
+        for (const auto& [slot, slot_entries] : slots) {
+            for (const auto& [user_key, entry] : slot_entries) {
+                (void)et_b.AppendNull();
+                (void)op_b.Append(static_cast<std::int64_t>(op.value()));
+                (void)kg_b.Append(static_cast<std::int64_t>(entry.key_group));
+                (void)slot_b.Append(slot);
+                (void)key_b.Append(render_text(user_key));
+                if (auto k = int64_reading(user_key)) {
+                    (void)key_int_b.Append(*k);
+                } else {
+                    (void)key_int_b.AppendNull();
+                }
+                (void)val_b.Append(render_text(entry.value));
+                if (auto v = int64_reading(entry.value)) {
+                    (void)val_int_b.Append(*v);
+                } else {
+                    (void)val_int_b.AppendNull();
+                }
+                ++rows;
+            }
+        }
+    }
+
+    std::shared_ptr<arrow::Array> et_arr, op_arr, kg_arr, slot_arr, key_arr, key_int_arr, val_arr,
+        val_int_arr;
+    auto fin = [&](auto& b, std::shared_ptr<arrow::Array>& out, const char* what) {
+        if (auto st = b.Finish(&out); !st.ok()) {
+            throw_arrow(what, st);
+        }
+    };
+    fin(et_b, et_arr, "(finish event_time)");
+    fin(op_b, op_arr, "(finish op)");
+    fin(kg_b, kg_arr, "(finish key_group)");
+    fin(slot_b, slot_arr, "(finish slot)");
+    fin(key_b, key_arr, "(finish user_key)");
+    fin(key_int_b, key_int_arr, "(finish key_int)");
+    fin(val_b, val_arr, "(finish value)");
+    fin(val_int_b, val_int_arr, "(finish value_int)");
+
+    // Every field nullable: the Row parquet source's batcher declares its
+    // whole schema nullable and validates the file schema for equality,
+    // nullability included.
+    auto schema = arrow::schema({
+        arrow::field("event_time", arrow::int64(), /*nullable=*/true),
+        arrow::field("op_id", arrow::int64(), /*nullable=*/true),
+        arrow::field("key_group", arrow::int64(), /*nullable=*/true),
+        arrow::field("slot", arrow::utf8(), /*nullable=*/true),
+        arrow::field("user_key", arrow::utf8(), /*nullable=*/true),
+        arrow::field("key_int", arrow::int64(), /*nullable=*/true),
+        arrow::field("value", arrow::utf8(), /*nullable=*/true),
+        arrow::field("value_int", arrow::int64(), /*nullable=*/true),
+    });
+    auto table = arrow::Table::Make(
+        schema,
+        {et_arr, op_arr, kg_arr, slot_arr, key_arr, key_int_arr, val_arr, val_int_arr},
+        rows);
 
     auto sink_result = arrow::io::FileOutputStream::Open(path.string());
     if (!sink_result.ok())

@@ -35,6 +35,8 @@
 #include "clink/state_processor/savepoint.hpp"
 #include "clink/state_processor/state_diff.hpp"
 
+#include "state_tool_io.hpp"
+
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/state/rocksdb_state_backend.hpp"
 #endif
@@ -79,25 +81,9 @@ bool has_flag(int argc, char** argv, std::string_view flag) {
     return false;
 }
 
-// Collect the snapshot files that make up checkpoint `id` under `root`:
-// every <root>/<subtask>/checkpoint-<id>.snap, plus <root>/checkpoint-
-// <id>.snap when root itself is a subtask dir. Sorted for determinism.
-std::vector<fs::path> checkpoint_files(const fs::path& root, std::uint64_t id) {
-    const std::string name = "checkpoint-" + std::to_string(id) + ".snap";
-    std::vector<fs::path> files;
-    if (fs::exists(root / name)) {
-        files.push_back(root / name);
-    }
-    if (fs::is_directory(root)) {
-        for (const auto& entry : fs::directory_iterator(root)) {
-            if (entry.is_directory() && fs::exists(entry.path() / name)) {
-                files.push_back(entry.path() / name);
-            }
-        }
-    }
-    std::sort(files.begin(), files.end());
-    return files;
-}
+using clink_tools::canonical_bytes_for;
+using clink_tools::checkpoint_files;
+using clink_tools::is_rocksdb_checkpoint_dir;
 
 // Load one side of the comparison: either an explicit .snap file, or a
 // checkpoint dir + id merged across subtask files. Also returns the loaded
@@ -108,39 +94,6 @@ struct LoadedSide {
     StateEntries entries;
     std::vector<Savepoint> savepoints;
 };
-
-// A RocksDB checkpoint dir is a complete RocksDB instance; CURRENT is
-// its always-present manifest pointer, so it discriminates cleanly from
-// a clink checkpoint dir of .snap files.
-bool is_rocksdb_checkpoint_dir(const fs::path& p) {
-    return fs::is_directory(p) && fs::exists(p / "CURRENT");
-}
-
-// Canonical snapshot bytes for --from: a .snap/.arrows file verbatim, or
-// a RocksDB checkpoint dir rendered through the Arrow export (when the
-// CLI is built with RocksDB linked).
-std::vector<std::byte> canonical_bytes_for(const std::string& path) {
-    if (is_rocksdb_checkpoint_dir(path)) {
-#ifdef CLINK_LINKED_ROCKSDB
-        return clink::rocksdb_checkpoint_to_arrow(path);
-#else
-        throw std::runtime_error(
-            path +
-            " is a RocksDB checkpoint dir, but this clink build has no RocksDB "
-            "support; rebuild with the RocksDB impl linked");
-#endif
-    }
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        throw std::runtime_error("cannot open " + path);
-    }
-    std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    std::vector<std::byte> bytes(raw.size());
-    if (!raw.empty()) {
-        std::memcpy(bytes.data(), raw.data(), raw.size());
-    }
-    return bytes;
-}
 
 LoadedSide load_file(const std::string& path) {
     LoadedSide side;
@@ -703,33 +656,9 @@ int clink_cmd_state_export(int argc, char** argv) {
         return 2;
     }
     try {
-        std::vector<std::byte> bytes;
-        std::string source;
-        if (!from.empty()) {
-            bytes = canonical_bytes_for(from);
-            source = from;
-        } else {
-            // Multi-subtask form: merge every subtask's snapshot file for
-            // this checkpoint into one canonical stream - exactly the form a
-            // scale-down restore consumes (merge_snapshot_bytes preserves the
-            // first non-empty file's version metadata; the load below applies
-            // the operator-state collision policy). Key groups are disjoint
-            // across subtasks, so the keyed union is exact.
-            const auto id = std::stoull(id_str);
-            const auto files = checkpoint_files(dir, id);
-            if (files.empty()) {
-                throw std::runtime_error("no checkpoint-" + std::to_string(id) + ".snap under " +
-                                         dir + " (or its subtask subdirectories)");
-            }
-            std::vector<std::vector<std::byte>> parts;
-            parts.reserve(files.size());
-            for (const auto& f : files) {
-                parts.push_back(canonical_bytes_for(f.string()));
-            }
-            bytes = clink::InMemoryStateBackend::merge_snapshot_bytes(parts);
-            source = dir + " @ checkpoint " + std::to_string(id) + " (" +
-                     std::to_string(files.size()) + " subtask files)";
-        }
+        auto resolved = clink_tools::resolve_state_input(from, dir, id_str);
+        auto& bytes = resolved.bytes;
+        const auto& source = resolved.label;
 
         // Validate + summarise by loading what we are about to write: a
         // malformed input fails HERE, not in the consumer's reader.

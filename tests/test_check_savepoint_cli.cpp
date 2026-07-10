@@ -281,3 +281,51 @@ TEST(StateExportCli, DirFormMergesSubtaskFiles) {
     fs::remove(out);
     fs::remove(pq);
 }
+
+// ----- state-query (SQL over a snapshot) -----
+
+// A savepoint's keyed state is queryable with SQL through the embedded
+// engine: filters see rendered keys and int64 value readings, and a
+// GROUP BY (a retracting plan) prints its final netted row. Skips on
+// builds whose CLI lacks the SQL frontend.
+TEST(StateQueryCli, FiltersAndAggregatesOverSavepoint) {
+    namespace fs = std::filesystem;
+    clink::InMemoryStateBackend backend;
+    auto put_count = [&](const std::string& key, std::int64_t v) {
+        const std::string keyed = std::string{"\x05"} + "counts|" + key;
+        std::string val(8, '\0');
+        for (int i = 0; i < 8; ++i) {
+            val[static_cast<std::size_t>(i)] = static_cast<char>((v >> (i * 8)) & 0xFF);
+        }
+        backend.put(clink::OperatorId{7}, std::string_view{keyed}, std::string_view{val});
+    };
+    put_count("alpha", 1);
+    put_count("beta", 22);
+    put_count("gamma", 333);
+    auto snap = backend.snapshot(clink::CheckpointId{1});
+    auto path = write_savepoint_file(snap, "query" + std::to_string(getpid()));
+
+    auto probe = run_cli("state-query --help");
+    if (probe.stderr_text.find("requires a build") != std::string::npos) {
+        GTEST_SKIP() << "CLI built without the SQL frontend";
+    }
+
+    auto filtered = run_cli("state-query --from=" + path.string() +
+                            " '--sql=SELECT user_key, value_int FROM state "
+                            "WHERE slot='\\''counts'\\'' AND value_int > 10'");
+    ASSERT_EQ(filtered.exit_code, 0) << filtered.stderr_text;
+    EXPECT_NE(filtered.stdout_text.find("\"user_key\":\"beta\",\"value_int\":22"),
+              std::string::npos)
+        << filtered.stdout_text;
+    EXPECT_NE(filtered.stdout_text.find("\"user_key\":\"gamma\",\"value_int\":333"),
+              std::string::npos);
+    EXPECT_EQ(filtered.stdout_text.find("alpha"), std::string::npos);
+
+    auto agg = run_cli("state-query --from=" + path.string() +
+                       " '--sql=SELECT slot, count(*) AS n FROM state GROUP BY slot'");
+    ASSERT_EQ(agg.exit_code, 0) << agg.stderr_text;
+    EXPECT_NE(agg.stdout_text.find("\"n\":3,\"slot\":\"counts\""), std::string::npos)
+        << agg.stdout_text;
+
+    fs::remove(path);
+}

@@ -758,7 +758,8 @@ target_link_libraries(clink_cli_cmds PUBLIC clink::core)
 # embedded engine; a SQL-off build links stubs that error with a rebuild
 # hint instead.
 if(TARGET clink::embed)
-    target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql.cpp tools/clink_replay.cpp)
+    target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql.cpp tools/clink_replay.cpp
+                                          tools/clink_state_query.cpp)
     target_link_libraries(clink_cli_cmds PUBLIC clink::embed)
     # `clink run --jm-host` bypasses EmbeddedEngine (which installs the wasm
     # loader itself), so the CLI installs it for the remote-submit path.
@@ -768,7 +769,8 @@ if(TARGET clink::embed)
     endif()
 else()
     target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql_stub.cpp
-                                          tools/clink_replay_stub.cpp)
+                                          tools/clink_replay_stub.cpp
+                                          tools/clink_state_query_stub.cpp)
 endif()
 if(TARGET clink::tls)
     target_compile_definitions(clink_cli_cmds PUBLIC CLINK_LINKED_TLS)
