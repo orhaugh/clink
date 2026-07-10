@@ -41,7 +41,9 @@ class ColumnarRowFilterOperator final : public Operator<sql::Row, sql::Row> {
 public:
     explicit ColumnarRowFilterOperator(std::shared_ptr<clink::config::JsonValue> predicate,
                                        std::string name = "filter_row_predicate")
-        : predicate_(std::move(predicate)), name_(std::move(name)) {}
+        : predicate_(std::move(predicate)),
+          compiled_(clink::operators::CompiledPredicate::compile(*predicate_)),
+          name_(std::move(name)) {}
 
     [[nodiscard]] bool supports_columnar() const noexcept override { return true; }
 
@@ -104,7 +106,8 @@ public:
                     return sql::row_columnar_detail::read_cell(
                         rb->schema()->field(idx)->type(), *rb->column(idx), i);
                 };
-                const bool keep = clink::operators::evaluate_json_predicate(*predicate_, resolve);
+                const clink::operators::ColumnLookup lookup{resolve};
+                const bool keep = compiled_.evaluate(lookup);
                 mask_b.UnsafeAppend(keep);
                 kept += keep ? 1 : 0;
             }
@@ -153,7 +156,8 @@ public:
                     }
                     return it->second;
                 };
-                if (clink::operators::evaluate_json_predicate(*predicate_, resolve)) {
+                const clink::operators::ColumnLookup lookup{resolve};
+                if (compiled_.evaluate(lookup)) {
                     out_batch.push(record);
                 }
             }
@@ -177,6 +181,10 @@ public:
 
 private:
     std::shared_ptr<clink::config::JsonValue> predicate_;
+    // The predicate compiled once at build; both the row path and the
+    // columnar row-interpreter fallback evaluate it per record. The JSON
+    // IR in predicate_ is kept for the typed columnar program's compile.
+    clink::operators::CompiledPredicate compiled_;
     std::string name_;
     // WS1 typed predicate program, compiled and cached per input schema. An
     // empty optional means the predicate is not fully representable as a typed

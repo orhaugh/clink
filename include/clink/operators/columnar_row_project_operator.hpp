@@ -46,7 +46,12 @@ public:
 
     explicit ColumnarRowProjectOperator(std::vector<Output> outputs,
                                         std::string name = "project_row")
-        : outputs_(std::move(outputs)), name_(std::move(name)) {}
+        : outputs_(std::move(outputs)), name_(std::move(name)) {
+        compiled_.reserve(outputs_.size());
+        for (const auto& [out_name, expr] : outputs_) {
+            compiled_.push_back(clink::operators::CompiledValueExpr::compile(expr));
+        }
+    }
 
     [[nodiscard]] bool supports_columnar() const noexcept override { return true; }
 
@@ -140,10 +145,10 @@ public:
                     }
                     return it->second;
                 };
+                const clink::operators::ColumnLookup lookup{resolve};
                 sql::Row projected;
-                for (const auto& [name, expr] : outputs_) {
-                    projected.values[name] =
-                        clink::operators::evaluate_json_value_expr(expr, resolve);
+                for (std::size_t i = 0; i < outputs_.size(); ++i) {
+                    projected.values[outputs_[i].first] = compiled_[i].evaluate(lookup);
                 }
                 sql::copy_row_kind(r, projected);
                 Record<sql::Row> rec(std::move(projected));
@@ -169,6 +174,9 @@ public:
 
 private:
     std::vector<Output> outputs_;
+    // One compiled program per output, parallel to outputs_. The JSON IR in
+    // outputs_ is kept for the columnar fast path's shape checks.
+    std::vector<clink::operators::CompiledValueExpr> compiled_;
     std::string name_;
 };
 

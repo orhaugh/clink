@@ -8326,8 +8326,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                     pattern->next(name);
                 }
                 if (auto it = var_pred.find(name); it != var_pred.end()) {
-                    auto pj = it->second;
-                    pattern->where([pj](const Row& r) -> bool {
+                    auto compiled = clink::operators::CompiledPredicate::compile(*it->second);
+                    pattern->where([compiled](const Row& r) -> bool {
                         auto resolve = [&](const std::string& nm) -> clink::config::JsonValue {
                             auto vit = r.values.find(nm);
                             if (vit == r.values.end()) {
@@ -8335,7 +8335,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                             }
                             return vit->second;
                         };
-                        return clink::operators::evaluate_json_predicate(*pj, resolve);
+                        const clink::operators::ColumnLookup lookup{resolve};
+                        return compiled.evaluate(lookup);
                     });
                 }
                 if (minc == 0 && maxc == 1) {

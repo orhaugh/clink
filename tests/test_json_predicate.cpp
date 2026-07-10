@@ -217,4 +217,22 @@ TEST(JsonPredicate, InWithNullValueIsUnknownOnMiss) {
     EXPECT_TRUE(eval(R"({"op":"in","col":"x","values":[1,2,null]})", JsonValue{std::int64_t{1}}));
 }
 
+// ----- Compiled-program contract -----
+
+// A malformed sub-predicate behind an AND short-circuit only throws if
+// a record actually reaches it (compile defers the error into the node).
+TEST(JsonPredicate, MalformedSubPredicateBehindShortCircuitIsLazy) {
+    auto pred = clink::config::parse(
+        R"({"op": "and", "args": [{"op": "eq", "col": "x", "literal": 1}, {"op": "bogus"}]})");
+    auto compiled = clink::operators::CompiledPredicate::compile(pred);
+    // First conjunct False: short-circuit before the malformed node.
+    auto resolve_false = [](const std::string&) { return clink::config::JsonValue{2.0}; };
+    const clink::operators::ColumnLookup miss{resolve_false};
+    EXPECT_FALSE(compiled.evaluate(miss));
+    // First conjunct True: the malformed node is reached and throws.
+    auto resolve_true = [](const std::string&) { return clink::config::JsonValue{1.0}; };
+    const clink::operators::ColumnLookup hit{resolve_true};
+    EXPECT_THROW(compiled.evaluate(hit), std::runtime_error);
+}
+
 }  // namespace clink::operators

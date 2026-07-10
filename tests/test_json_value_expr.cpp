@@ -548,4 +548,46 @@ TEST(JsonValueExpr, MakeArrayAndElementAt) {
     EXPECT_TRUE(eval(R"({"op":"element_at","args":[)" + arr + R"(,{"col":"missing"}]})").is_null());
 }
 
+// ----- Compiled-program contract -----
+
+// A CASE branch that is never taken must never throw, even when its
+// then-expression carries an unknown op. Pins the compile-to-deferred-
+// throw design: errors surface where the interpreter surfaced them
+// (on evaluation of the faulty node), not at compile time.
+TEST(JsonValueExpr, CaseDeadBranchWithUnknownOpNeverThrows) {
+    const std::string text = R"({
+        "op": "case",
+        "branches": [
+            {"when": {"op": "eq", "col": "x", "literal": 1}, "then": {"lit": "taken"}},
+            {"when": {"op": "eq", "col": "x", "literal": 2},
+             "then": {"op": "no_such_op", "args": []}}
+        ],
+        "else": {"lit": "fallback"}
+    })";
+    EXPECT_EQ(eval(text, {{"x", JsonValue{1.0}}}).as_string(), "taken");
+    EXPECT_EQ(eval(text, {{"x", JsonValue{3.0}}}).as_string(), "fallback");
+    // The faulty branch taken: the deferred error fires.
+    EXPECT_THROW(eval(text, {{"x", JsonValue{2.0}}}), std::runtime_error);
+}
+
+// Compile once, evaluate across many rows: the program must be pure
+// (no state bleeding between evaluations) and reusable.
+TEST(JsonValueExpr, CompileOnceEvaluateManyRows) {
+    auto expr = clink::config::parse(
+        R"({"op": "add", "args": [{"col": "a"}, {"op": "mul", "args": [{"col": "b"}, {"lit": 2}]}]})");
+    auto program = clink::operators::CompiledValueExpr::compile(expr);
+    for (double a = 0; a < 5; ++a) {
+        for (double b = 0; b < 5; ++b) {
+            std::map<std::string, JsonValue> row{{"a", JsonValue{a}}, {"b", JsonValue{b}}};
+            auto resolve = resolver_from(std::move(row));
+            const clink::operators::ColumnLookup lookup{resolve};
+            EXPECT_EQ(program.evaluate(lookup).as_number(), a + b * 2);
+        }
+    }
+}
+
+TEST(JsonValueExpr, UnknownOpThrowsOnEvaluation) {
+    EXPECT_THROW(eval(R"({"op": "definitely_not_registered", "args": []})"), std::runtime_error);
+}
+
 }  // namespace clink::operators

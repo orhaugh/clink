@@ -1,10 +1,13 @@
 #pragma once
 
 #include <concepts>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "clink/config/decimal.hpp"
 #include "clink/config/json.hpp"
@@ -12,6 +15,21 @@
 // JSON predicate evaluator. Used by filter_string_predicate
 // (single-TEXT column) and filter_row_predicate (multi-column Row
 // records).
+//
+// Evaluation is COMPILED: CompiledPredicate::compile() walks the
+// predicate JSON once and builds a small node tree (op names resolved
+// to node kinds, literals and patterns extracted), so the per-record
+// eval is virtual dispatch over that tree with no JSON probing and no
+// op-name string comparisons. Build an operator's predicate once and
+// evaluate it per record. The template evaluate_json_predicate[_tri]
+// entry points below keep the original one-shot signature (they
+// compile then evaluate) for tests and non-hot callers.
+//
+// Malformed predicate shapes (missing keys, unknown ops) compile to a
+// node that throws WHEN EVALUATED, not at compile time. This
+// preserves the interpreter's lazy-error semantics exactly: a
+// malformed sub-predicate behind an AND/OR short-circuit only throws
+// if a record actually reaches it.
 //
 // SQL-standard three-valued logic. Comparisons with NULL on either
 // side yield Unknown (not False); AND / OR / NOT follow the
@@ -206,100 +224,330 @@ constexpr TriBool or_tri(TriBool a, TriBool b) {
 
 }  // namespace detail
 
-template <ColumnResolver Resolver>
-TriBool evaluate_json_predicate_tri(const clink::config::JsonValue& pred, Resolver& resolve) {
-    if (!pred.is_object() || !pred.contains("op")) {
-        throw std::runtime_error("json_predicate: missing 'op'");
-    }
-    const auto& op = pred.at("op").as_string();
+// Non-owning reference to a column resolver: any callable mapping a
+// column name to its JsonValue for the record under evaluation.
+// Compiled programs take this instead of a template Resolver so the
+// node tree is a concrete (non-template) type; the cost is one
+// function-pointer call per column reference. The referenced resolver
+// must outlive the ColumnLookup (call sites construct it per record
+// or per batch around a local lambda).
+class ColumnLookup {
+public:
+    template <ColumnResolver R>
+    ColumnLookup(R& r)
+        : obj_(&r), fn_([](void* o, const std::string& n) -> clink::config::JsonValue {
+              return (*static_cast<R*>(o))(n);
+          }) {}
 
-    if (op == "and") {
+    clink::config::JsonValue operator()(const std::string& name) const { return fn_(obj_, name); }
+
+private:
+    void* obj_;
+    clink::config::JsonValue (*fn_)(void*, const std::string&);
+};
+
+namespace pred_detail {
+
+class PredNode {
+public:
+    PredNode() = default;
+    PredNode(const PredNode&) = delete;
+    PredNode& operator=(const PredNode&) = delete;
+    virtual ~PredNode() = default;
+    virtual TriBool eval(const ColumnLookup& resolve) const = 0;
+};
+
+using PredNodePtr = std::unique_ptr<const PredNode>;
+
+// Malformed shape: the error is deferred to evaluation so a bad
+// sub-predicate behind a short-circuit keeps the interpreter's
+// never-reached-never-thrown behaviour.
+class PredThrowNode final : public PredNode {
+public:
+    explicit PredThrowNode(std::string msg) : msg_(std::move(msg)) {}
+    [[noreturn]] TriBool eval(const ColumnLookup&) const override {
+        throw std::runtime_error(msg_);
+    }
+
+private:
+    std::string msg_;
+};
+
+class AndNode final : public PredNode {
+public:
+    explicit AndNode(std::vector<PredNodePtr> children) : children_(std::move(children)) {}
+    TriBool eval(const ColumnLookup& resolve) const override {
         TriBool acc = TriBool::True;
-        for (const auto& sub : pred.at("args").as_array()) {
-            acc = detail::and_tri(acc, evaluate_json_predicate_tri(sub, resolve));
+        for (const auto& c : children_) {
+            acc = detail::and_tri(acc, c->eval(resolve));
             if (acc == TriBool::False)
                 return acc;
         }
         return acc;
     }
-    if (op == "or") {
+
+private:
+    std::vector<PredNodePtr> children_;
+};
+
+class OrNode final : public PredNode {
+public:
+    explicit OrNode(std::vector<PredNodePtr> children) : children_(std::move(children)) {}
+    TriBool eval(const ColumnLookup& resolve) const override {
         TriBool acc = TriBool::False;
-        for (const auto& sub : pred.at("args").as_array()) {
-            acc = detail::or_tri(acc, evaluate_json_predicate_tri(sub, resolve));
+        for (const auto& c : children_) {
+            acc = detail::or_tri(acc, c->eval(resolve));
             if (acc == TriBool::True)
                 return acc;
         }
         return acc;
     }
-    if (op == "not") {
-        return detail::not_tri(evaluate_json_predicate_tri(pred.at("arg"), resolve));
+
+private:
+    std::vector<PredNodePtr> children_;
+};
+
+class NotNode final : public PredNode {
+public:
+    explicit NotNode(PredNodePtr child) : child_(std::move(child)) {}
+    TriBool eval(const ColumnLookup& resolve) const override {
+        return detail::not_tri(child_->eval(resolve));
     }
-    // IS NULL / IS NOT NULL are always two-valued (their purpose is
-    // to test for NULL deterministically).
-    if (op == "is_null") {
-        return detail::from_bool(resolve(pred.at("col").as_string()).is_null());
+
+private:
+    PredNodePtr child_;
+};
+
+// IS NULL / IS NOT NULL are always two-valued (their purpose is to
+// test for NULL deterministically).
+class IsNullNode final : public PredNode {
+public:
+    IsNullNode(std::string col, bool negate) : col_(std::move(col)), negate_(negate) {}
+    TriBool eval(const ColumnLookup& resolve) const override {
+        const bool is_null = resolve(col_).is_null();
+        return detail::from_bool(negate_ ? !is_null : is_null);
     }
-    if (op == "is_not_null") {
-        return detail::from_bool(!resolve(pred.at("col").as_string()).is_null());
-    }
-    if (op == "like") {
-        auto val = resolve(pred.at("col").as_string());
+
+private:
+    std::string col_;
+    bool negate_;
+};
+
+class LikeNode final : public PredNode {
+public:
+    LikeNode(std::string col, std::string pattern)
+        : col_(std::move(col)), pattern_(std::move(pattern)) {}
+    TriBool eval(const ColumnLookup& resolve) const override {
+        auto val = resolve(col_);
         if (val.is_null())
             return TriBool::Unknown;
-        const auto& pattern = pred.at("pattern").as_string();
-        return detail::from_bool(detail::like_match(pattern, detail::to_text(val)));
+        return detail::from_bool(detail::like_match(pattern_, detail::to_text(val)));
     }
-    // x IN (v1, v2, ...). Three-valued semantics: NULL on
-    // the column side is Unknown; if no value matches but at least one
-    // value is NULL, the result is Unknown (matches SQL's `x IN (1,
-    // NULL)` returning Unknown when x != 1).
-    if (op == "in") {
-        auto val = resolve(pred.at("col").as_string());
+
+private:
+    std::string col_;
+    std::string pattern_;
+};
+
+// x IN (v1, v2, ...). Three-valued semantics: NULL on the column side
+// is Unknown; if no value matches but at least one value is NULL, the
+// result is Unknown (matches SQL's `x IN (1, NULL)` returning Unknown
+// when x != 1). NULL list entries are stripped at compile time into
+// the has_null flag.
+class InNode final : public PredNode {
+public:
+    InNode(std::string col, std::vector<clink::config::JsonValue> values, bool has_null)
+        : col_(std::move(col)), values_(std::move(values)), has_null_(has_null) {}
+    TriBool eval(const ColumnLookup& resolve) const override {
+        auto val = resolve(col_);
         if (val.is_null())
             return TriBool::Unknown;
-        const auto& values = pred.at("values").as_array();
-        bool saw_null = false;
-        for (const auto& v : values) {
-            if (v.is_null()) {
-                saw_null = true;
-                continue;
-            }
+        for (const auto& v : values_) {
             auto cmp = detail::compare(val, v);
             if (cmp.has_value() && *cmp == 0)
                 return TriBool::True;
         }
-        return saw_null ? TriBool::Unknown : TriBool::False;
+        return has_null_ ? TriBool::Unknown : TriBool::False;
     }
-    // Comparison: typed-aware. The RHS is a literal value or another column of
-    // the same row (column-vs-column, e.g. a post-join residual a.x >= b.y).
-    // NULL on either side -> Unknown.
-    auto col_val = resolve(pred.at("col").as_string());
-    clink::config::JsonValue rhs_val;
-    if (pred.contains("rhs_col")) {
-        rhs_val = resolve(pred.at("rhs_col").as_string());
-    } else if (pred.contains("literal")) {
-        rhs_val = pred.at("literal");
+
+private:
+    std::string col_;
+    std::vector<clink::config::JsonValue> values_;
+    bool has_null_;
+};
+
+// Comparison: typed-aware. The RHS is a literal value or another
+// column of the same row (column-vs-column, e.g. a post-join residual
+// a.x >= b.y). NULL on either side -> Unknown.
+class CmpNode final : public PredNode {
+public:
+    enum class Op { Eq, Ne, Lt, Le, Gt, Ge };
+    CmpNode(Op op,
+            std::string col,
+            std::optional<std::string> rhs_col,
+            clink::config::JsonValue literal)
+        : op_(op),
+          col_(std::move(col)),
+          rhs_col_(std::move(rhs_col)),
+          literal_(std::move(literal)) {}
+    TriBool eval(const ColumnLookup& resolve) const override {
+        auto col_val = resolve(col_);
+        clink::config::JsonValue rhs_resolved;
+        const clink::config::JsonValue* rhs = &literal_;
+        if (rhs_col_) {
+            rhs_resolved = resolve(*rhs_col_);
+            rhs = &rhs_resolved;
+        }
+        if (col_val.is_null() || rhs->is_null())
+            return TriBool::Unknown;
+        auto cmp = detail::compare(col_val, *rhs);
+        if (!cmp.has_value())
+            return TriBool::Unknown;
+        switch (op_) {
+            case Op::Eq:
+                return detail::from_bool(*cmp == 0);
+            case Op::Ne:
+                return detail::from_bool(*cmp != 0);
+            case Op::Lt:
+                return detail::from_bool(*cmp < 0);
+            case Op::Le:
+                return detail::from_bool(*cmp <= 0);
+            case Op::Gt:
+                return detail::from_bool(*cmp > 0);
+            case Op::Ge:
+                return detail::from_bool(*cmp >= 0);
+        }
+        return TriBool::Unknown;  // unreachable
+    }
+
+private:
+    Op op_;
+    std::string col_;
+    std::optional<std::string> rhs_col_;
+    clink::config::JsonValue literal_;
+};
+
+inline PredNodePtr compile_pred(const clink::config::JsonValue& pred) {
+    using clink::config::JsonValue;
+    auto malformed = [](std::string msg) -> PredNodePtr {
+        return std::make_unique<PredThrowNode>(std::move(msg));
+    };
+    if (!pred.is_object() || !pred.contains("op")) {
+        return malformed("json_predicate: missing 'op'");
+    }
+    const JsonValue& opv = pred.at("op");
+    if (!opv.is_string()) {
+        return malformed("json_predicate: 'op' must be a string");
+    }
+    const std::string& op = opv.as_string();
+
+    if (op == "and" || op == "or") {
+        if (!pred.contains("args") || !pred.at("args").is_array()) {
+            return malformed("json_predicate: '" + op + "' needs an 'args' array");
+        }
+        std::vector<PredNodePtr> children;
+        children.reserve(pred.at("args").as_array().size());
+        for (const auto& sub : pred.at("args").as_array()) {
+            children.push_back(compile_pred(sub));
+        }
+        if (op == "and") {
+            return std::make_unique<AndNode>(std::move(children));
+        }
+        return std::make_unique<OrNode>(std::move(children));
+    }
+    if (op == "not") {
+        if (!pred.contains("arg")) {
+            return malformed("json_predicate: 'not' needs 'arg'");
+        }
+        return std::make_unique<NotNode>(compile_pred(pred.at("arg")));
+    }
+
+    if (!pred.contains("col") || !pred.at("col").is_string()) {
+        return malformed("json_predicate: '" + op + "' needs a 'col' string");
+    }
+    const std::string& col = pred.at("col").as_string();
+
+    if (op == "is_null" || op == "is_not_null") {
+        return std::make_unique<IsNullNode>(col, op == "is_not_null");
+    }
+    if (op == "like") {
+        if (!pred.contains("pattern") || !pred.at("pattern").is_string()) {
+            return malformed("json_predicate: 'like' needs a 'pattern' string");
+        }
+        return std::make_unique<LikeNode>(col, pred.at("pattern").as_string());
+    }
+    if (op == "in") {
+        if (!pred.contains("values") || !pred.at("values").is_array()) {
+            return malformed("json_predicate: 'in' needs a 'values' array");
+        }
+        std::vector<JsonValue> values;
+        bool has_null = false;
+        for (const auto& v : pred.at("values").as_array()) {
+            if (v.is_null()) {
+                has_null = true;
+            } else {
+                values.push_back(v);
+            }
+        }
+        return std::make_unique<InNode>(col, std::move(values), has_null);
+    }
+
+    CmpNode::Op cmp_op;
+    if (op == "eq") {
+        cmp_op = CmpNode::Op::Eq;
+    } else if (op == "ne") {
+        cmp_op = CmpNode::Op::Ne;
+    } else if (op == "lt") {
+        cmp_op = CmpNode::Op::Lt;
+    } else if (op == "le") {
+        cmp_op = CmpNode::Op::Le;
+    } else if (op == "gt") {
+        cmp_op = CmpNode::Op::Gt;
+    } else if (op == "ge") {
+        cmp_op = CmpNode::Op::Ge;
     } else {
-        throw std::runtime_error("json_predicate: '" + op + "' needs 'literal' or 'rhs_col'");
+        return malformed("json_predicate: unknown op '" + op + "'");
     }
-    if (col_val.is_null() || rhs_val.is_null())
-        return TriBool::Unknown;
-    auto cmp = detail::compare(col_val, rhs_val);
-    if (!cmp.has_value())
-        return TriBool::Unknown;
-    if (op == "eq")
-        return detail::from_bool(*cmp == 0);
-    if (op == "ne")
-        return detail::from_bool(*cmp != 0);
-    if (op == "lt")
-        return detail::from_bool(*cmp < 0);
-    if (op == "le")
-        return detail::from_bool(*cmp <= 0);
-    if (op == "gt")
-        return detail::from_bool(*cmp > 0);
-    if (op == "ge")
-        return detail::from_bool(*cmp >= 0);
-    throw std::runtime_error("json_predicate: unknown op '" + op + "'");
+    if (pred.contains("rhs_col")) {
+        if (!pred.at("rhs_col").is_string()) {
+            return malformed("json_predicate: 'rhs_col' must be a string");
+        }
+        return std::make_unique<CmpNode>(
+            cmp_op, col, pred.at("rhs_col").as_string(), JsonValue{nullptr});
+    }
+    if (pred.contains("literal")) {
+        return std::make_unique<CmpNode>(cmp_op, col, std::nullopt, pred.at("literal"));
+    }
+    return malformed("json_predicate: '" + op + "' needs 'literal' or 'rhs_col'");
+}
+
+}  // namespace pred_detail
+
+// A predicate compiled to a node tree. Compile once at operator build,
+// evaluate per record. Copyable (the immutable tree is shared), so it
+// can be captured in std::function-based operator closures.
+class CompiledPredicate {
+public:
+    static CompiledPredicate compile(const clink::config::JsonValue& pred) {
+        return CompiledPredicate{pred_detail::compile_pred(pred)};
+    }
+
+    TriBool evaluate_tri(const ColumnLookup& resolve) const { return root_->eval(resolve); }
+    bool evaluate(const ColumnLookup& resolve) const {
+        return root_->eval(resolve) == TriBool::True;
+    }
+
+private:
+    explicit CompiledPredicate(pred_detail::PredNodePtr root) : root_(std::move(root)) {}
+    std::shared_ptr<const pred_detail::PredNode> root_;
+};
+
+// One-shot convenience entry points (compile then evaluate). Per-record
+// callers should compile once and reuse the CompiledPredicate instead.
+template <ColumnResolver Resolver>
+TriBool evaluate_json_predicate_tri(const clink::config::JsonValue& pred, Resolver& resolve) {
+    const ColumnLookup lookup{resolve};
+    return pred_detail::compile_pred(pred)->eval(lookup);
 }
 
 // Two-valued wrapper used by WHERE filters: keep the row only when

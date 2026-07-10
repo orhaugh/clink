@@ -261,17 +261,18 @@ void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
             if (pred_text.empty()) {
                 throw std::runtime_error("filter_string_predicate: 'predicate' param is required");
             }
-            auto pred_json =
-                std::make_shared<clink::config::JsonValue>(clink::config::parse(pred_text));
+            auto compiled =
+                clink::operators::CompiledPredicate::compile(clink::config::parse(pred_text));
             return std::make_shared<clink::FilterOperator<std::string>>(
-                [pred_json](const std::string& v) -> bool {
+                [compiled](const std::string& v) -> bool {
                     // Single-string-column path: every column lookup returns the
                     // input record as a JsonValue{string}. NULL doesn't apply here
                     // since clink's per-record string channel can't carry NULL.
                     auto resolve = [&](const std::string&) -> clink::config::JsonValue {
                         return clink::config::JsonValue{v};
                     };
-                    return clink::operators::evaluate_json_predicate(*pred_json, resolve);
+                    const clink::operators::ColumnLookup lookup{resolve};
+                    return compiled.evaluate(lookup);
                 },
                 "filter_string_predicate");
         });
