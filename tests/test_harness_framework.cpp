@@ -298,3 +298,96 @@ TEST(TestFramework, ProcessFunctionFactoryDrivesNonKeyedFunction) {
     h.process_element(21);
     EXPECT_EQ(h.output_values(), (std::vector<std::int64_t>{42}));
 }
+
+// ---- Increment 3: two-input harness with real watermark combination ----
+
+#include "clink/test/two_input_harness.hpp"
+
+namespace {
+
+// A join-ish co-operator: buffers left values in keyed state per key,
+// emits "l+r" pairs on right arrivals; registers an event-time timer
+// per left record which emits "expired:<key>" when fired.
+class PairJoiner final : public CoOperator<std::int64_t, std::int64_t, std::string> {
+public:
+    void process_element1(const StreamElement<std::int64_t>& e,
+                          Emitter<std::string>& out) override {
+        if (!e.is_data()) {
+            return;
+        }
+        for (const auto& rec : e.as_data()) {
+            left_.push_back(rec.value());
+            const auto ts = rec.event_time() ? rec.event_time()->millis() : 0;
+            runtime()->timer_service()->register_event_time_timer(ts + 500,
+                                                                  std::to_string(rec.value()));
+        }
+        (void)out;
+    }
+    void process_element2(const StreamElement<std::int64_t>& e,
+                          Emitter<std::string>& out) override {
+        if (!e.is_data()) {
+            return;
+        }
+        Batch<std::string> b;
+        for (const auto& rec : e.as_data()) {
+            for (const auto l : left_) {
+                b.emplace(std::to_string(l) + "+" + std::to_string(rec.value()));
+            }
+        }
+        if (!b.empty()) {
+            out.emit_data(std::move(b));
+        }
+    }
+    void on_event_time_timer(std::int64_t,
+                             const std::string& key,
+                             Emitter<std::string>& out) override {
+        Batch<std::string> b;
+        b.emplace("expired:" + key);
+        out.emit_data(std::move(b));
+    }
+    std::string name() const override { return "pair-joiner"; }
+
+private:
+    std::vector<std::int64_t> left_;
+};
+
+}  // namespace
+
+TEST(TestFramework, TwoInputHarnessCombinesWatermarksAsTheRunningMinimum) {
+    auto h = test::TwoInputOperatorHarness<std::int64_t, std::int64_t, std::string>::create(
+        PairJoiner{});
+    h.open();
+
+    h.process_left(1, 1000);  // event-time timer @1500 key "1"
+    h.process_right(7);
+    EXPECT_EQ(h.output_values(), (std::vector<std::string>{"1+7"}));
+    h.output().clear();
+
+    // Left watermark alone: combined min is still the right input's
+    // Watermark::min() - nothing forwards, no timer fires.
+    EXPECT_EQ(h.process_left_watermark(2000), std::nullopt);
+    EXPECT_EQ(h.current_watermark_ms(), std::nullopt);
+    EXPECT_TRUE(h.output().watermarks().empty());
+    ASSERT_EQ(h.event_time_timers().size(), 1u);
+
+    // Right watermark: min(2000, 1600) = 1600 - forwards, fires @1500.
+    auto combined = h.process_right_watermark(1600);
+    ASSERT_TRUE(combined.has_value());
+    EXPECT_EQ(combined->timestamp().millis(), 1600);
+    EXPECT_EQ(h.current_watermark_ms(), std::optional<std::int64_t>{1600});
+    EXPECT_EQ(h.output_values(), (std::vector<std::string>{"expired:1"}));
+    ASSERT_EQ(h.output().watermarks().size(), 1u);
+    EXPECT_EQ(h.output().watermarks()[0].timestamp().millis(), 1600);
+    h.output().clear();
+
+    // One input running ahead: right jumps to 5000; combined follows the
+    // slower left (2000).
+    combined = h.process_right_watermark(5000);
+    ASSERT_TRUE(combined.has_value());
+    EXPECT_EQ(combined->timestamp().millis(), 2000);
+
+    // Idleness: left going idle releases the minimum to the right's 5000.
+    combined = h.mark_left_idle();
+    ASSERT_TRUE(combined.has_value());
+    EXPECT_EQ(combined->timestamp().millis(), 5000);
+}
