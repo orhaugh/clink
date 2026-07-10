@@ -609,6 +609,11 @@ void export_usage() {
               << "                    <root>/<subtask>/checkpoint-N.snap (and the flat\n"
               << "                    <root>/checkpoint-N.snap) into ONE export - key groups\n"
               << "                    are disjoint across subtasks, so the union is exact\n"
+              << "  --job=<id> [--jm=host:port]\n"
+              << "                    instead of --from: fetch a RUNNING job's whole keyed\n"
+              << "                    state from the JM's live-export route (per-subtask\n"
+              << "                    atomic view, not a checkpoint-consistent cut;\n"
+              << "                    default JM 127.0.0.1:8081)\n"
               << "  --out=<file>      output file (arrow / parquet formats)\n"
               << "  --format=arrow    the canonical Arrow IPC stream (op_id, key_bytes,\n"
               << "                    value_bytes) - exact fidelity, restorable, readable by\n"
@@ -636,6 +641,8 @@ int clink_cmd_state_export(int argc, char** argv) {
     const auto from = get_arg(argc, argv, "from");
     const auto dir = get_arg(argc, argv, "dir");
     const auto id_str = get_arg(argc, argv, "id");
+    const auto job = get_arg(argc, argv, "job");
+    const auto jm = get_arg(argc, argv, "jm");
     const auto out = get_arg(argc, argv, "out");
     std::string format = get_arg(argc, argv, "format");
     if (format.empty()) {
@@ -645,18 +652,19 @@ int clink_cmd_state_export(int argc, char** argv) {
         std::cerr << "state-export: unknown --format '" << format << "' (arrow|parquet|iceberg)\n";
         return 2;
     }
-    // Input: --from XOR (--dir + --id). File formats need --out; the
-    // iceberg format targets a catalogued table instead.
+    // Input: exactly one of --from, --dir+--id, or --job. File formats
+    // need --out; the iceberg format targets a catalogued table instead.
     const bool dir_form = !dir.empty() || !id_str.empty();
     const bool dir_form_complete = !dir.empty() && !id_str.empty();
-    if (from.empty() == !dir_form ||             // neither or both input forms
+    const int input_forms = (!from.empty() ? 1 : 0) + (dir_form ? 1 : 0) + (!job.empty() ? 1 : 0);
+    if (input_forms != 1 ||                      // exactly one input form
         (dir_form && !dir_form_complete) ||      // --dir without --id or vice versa
         (format != "iceberg" && out.empty())) {  // file formats need --out
         export_usage();
         return 2;
     }
     try {
-        auto resolved = clink_tools::resolve_state_input(from, dir, id_str);
+        auto resolved = clink_tools::resolve_state_input(from, dir, id_str, job, jm);
         auto& bytes = resolved.bytes;
         const auto& source = resolved.label;
 

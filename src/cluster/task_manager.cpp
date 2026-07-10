@@ -39,6 +39,7 @@
 #include "clink/runtime/logging.hpp"
 #include "clink/runtime/network/network_bridge.hpp"
 #include "clink/runtime/network/network_socket.hpp"
+#include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/state_backend_factory.hpp"
 
 namespace clink::cluster {
@@ -1950,6 +1951,43 @@ void TaskManager::stop() {
     }
     task_threads_.clear();
     conn_.reset();
+}
+
+std::optional<TaskManager::JobStateExport> TaskManager::export_job_state_arrow(JobId job_id) const {
+    // Copy the backend handles out under the lock, export outside it: a
+    // backend export takes the backend's own locks and can be slow (a
+    // RocksDB iteration), and must not block deploys or heartbeats.
+    std::vector<std::shared_ptr<StateBackend>> backends;
+    {
+        std::lock_guard lock(mu_);
+        auto it = per_job_backends_.find(job_id);
+        if (it == per_job_backends_.end() || it->second.empty()) {
+            return std::nullopt;
+        }
+        backends.reserve(it->second.size());
+        for (const auto& [subtask, backend] : it->second) {
+            if (backend) {
+                backends.push_back(backend);
+            }
+        }
+    }
+    if (backends.empty()) {
+        return std::nullopt;
+    }
+    JobStateExport out;
+    std::vector<std::vector<std::byte>> parts;
+    parts.reserve(backends.size());
+    for (const auto& backend : backends) {
+        try {
+            parts.push_back(backend->export_arrow_snapshot());
+        } catch (const std::exception&) {
+            // A backend without a complete live view (disaggregated hot
+            // tier) refuses; report it rather than silently omitting.
+            ++out.skipped_subtasks;
+        }
+    }
+    out.bytes = InMemoryStateBackend::merge_snapshot_bytes(parts);
+    return out;
 }
 
 TmSnapshot TaskManager::snapshot_tm() const {

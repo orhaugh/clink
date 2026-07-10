@@ -66,6 +66,9 @@ public:
     // write), fused on the operator thread. The async path drives the two
     // halves separately so the slow write lands on the snapshot worker.
     Snapshot snapshot(CheckpointId id) override { return persist(capture(id)); }
+    [[nodiscard]] std::vector<std::byte> export_arrow_snapshot() const override {
+        return inner_.export_arrow_snapshot();
+    }
 
     // FileBacked supports the async split: its capture() is already a
     // fully detached byte blob, so the durable write moves off-thread

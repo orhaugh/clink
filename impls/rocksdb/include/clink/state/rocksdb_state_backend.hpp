@@ -138,7 +138,7 @@ public:
     // set_state_versions), so check-savepoint and migrate-at-restore see
     // real stamps on exported RocksDB state. The native SST checkpoint
     // path is unchanged - this is an export, not a replacement.
-    [[nodiscard]] std::vector<std::byte> export_arrow_snapshot() const;
+    [[nodiscard]] std::vector<std::byte> export_arrow_snapshot() const override;
 
 private:
     struct Impl;

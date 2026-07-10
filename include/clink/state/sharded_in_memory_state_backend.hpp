@@ -62,6 +62,15 @@ public:
     // Merge the per-shard snapshots into one canonical Arrow IPC blob, so the
     // bytes are interchangeable with InMemoryStateBackend. Shard 0 is first,
     // so its schema metadata (the state-version map) heads the merged stream.
+    [[nodiscard]] std::vector<std::byte> export_arrow_snapshot() const override {
+        std::vector<std::vector<std::byte>> parts;
+        parts.reserve(shards_.size());
+        for (const auto& shard : shards_) {
+            parts.push_back(shard.export_arrow_snapshot());
+        }
+        return InMemoryStateBackend::merge_snapshot_bytes(parts);
+    }
+
     Snapshot snapshot(CheckpointId id) override {
         std::vector<std::vector<std::byte>> blobs;
         blobs.reserve(kNumShards);

@@ -66,8 +66,7 @@ std::optional<std::int64_t> as_offset_i64(const StateBackend::Value& v) {
 
 }  // namespace
 
-Snapshot InMemoryStateBackend::snapshot(CheckpointId id) {
-    const auto t0 = std::chrono::steady_clock::now();
+std::vector<std::byte> InMemoryStateBackend::export_arrow_snapshot() const {
     std::lock_guard lock(mu_);
 
     // Count rows so the writer reserves exactly once on each builder.
@@ -91,7 +90,13 @@ Snapshot InMemoryStateBackend::snapshot(CheckpointId id) {
                           std::string_view(reinterpret_cast<const char*>(v.data()), v.size()));
         }
     }
-    auto bytes = writer.finish(state_versions_);
+    return writer.finish(state_versions_);
+}
+
+Snapshot InMemoryStateBackend::snapshot(CheckpointId id) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto bytes = export_arrow_snapshot();
+    std::lock_guard lock(mu_);
     const auto dt =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
             .count();

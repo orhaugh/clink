@@ -129,6 +129,19 @@ public:
     // Same shape as the JM side: take mu_ briefly, copy state into a
     // plain value-type, release. Handlers serialize outside the lock.
     TmSnapshot snapshot_tm() const;
+
+    // State-as-data: merge every hosted subtask backend's LIVE Arrow
+    // export for `job_id` into one canonical state-snapshot stream (see
+    // docs/internals/state-snapshot-format.md). Per-subtask atomic, NOT
+    // a checkpoint-consistent global cut. Backends that refuse a live
+    // export (e.g. the disaggregated backend's partial hot tier) are
+    // counted in skipped_subtasks rather than silently omitted. nullopt
+    // when this TM hosts no state backends for the job.
+    struct JobStateExport {
+        std::vector<std::byte> bytes;
+        std::size_t skipped_subtasks{0};
+    };
+    [[nodiscard]] std::optional<JobStateExport> export_job_state_arrow(JobId job_id) const;
     std::vector<SubtaskRecord> snapshot_subtasks() const;
     Config config_snapshot() const { return cfg_; }
 

@@ -82,6 +82,7 @@ void query_usage() {
         << "  --from=<path>   a .snap/.arrows snapshot file, or a RocksDB checkpoint\n"
         << "                  directory (RocksDB-linked builds)\n"
         << "  --dir/--id      merge a multi-subtask checkpoint instead of --from\n"
+        << "  --job/--jm      query a RUNNING job's live state via the JM route\n"
         << "  --sql=<query>   the SELECT to run against `state`\n";
 }
 
@@ -95,10 +96,13 @@ int clink_cmd_state_query(int argc, char** argv) {
     const auto from = get_arg(argc, argv, "from");
     const auto dir = get_arg(argc, argv, "dir");
     const auto id_str = get_arg(argc, argv, "id");
+    const auto job = get_arg(argc, argv, "job");
+    const auto jm = get_arg(argc, argv, "jm");
     const auto sql = get_arg(argc, argv, "sql");
     const bool dir_form = !dir.empty() || !id_str.empty();
     const bool dir_form_complete = !dir.empty() && !id_str.empty();
-    if (sql.empty() || from.empty() == !dir_form || (dir_form && !dir_form_complete)) {
+    const int input_forms = (!from.empty() ? 1 : 0) + (dir_form ? 1 : 0) + (!job.empty() ? 1 : 0);
+    if (sql.empty() || input_forms != 1 || (dir_form && !dir_form_complete)) {
         query_usage();
         return 2;
     }
@@ -107,7 +111,7 @@ int clink_cmd_state_query(int argc, char** argv) {
     const auto out_path = fs::temp_directory_path() / ("clink_state_query_out_" + tag + ".ndjson");
     try {
         // 1. Snapshot -> decoded entries -> the query-projection Parquet.
-        auto resolved = clink_tools::resolve_state_input(from, dir, id_str);
+        auto resolved = clink_tools::resolve_state_input(from, dir, id_str, job, jm);
         clink::Snapshot snap;
         snap.bytes = std::move(resolved.bytes);
         auto sp = clink::state_processor::Savepoint::load_from_snapshot(std::move(snap));

@@ -129,6 +129,10 @@ public:
     // to keep Arrow headers out of the widely-included
     // in_memory_state_backend.hpp.
     Snapshot snapshot(CheckpointId id) override;
+    // Live export: the same canonical bytes snapshot() produces, without
+    // the checkpoint bookkeeping/metrics (see StateBackend for the
+    // consistency caveat).
+    [[nodiscard]] std::vector<std::byte> export_arrow_snapshot() const override;
     void restore(const Snapshot& snap, const KeyGroupRange& kg_filter = {}) override;
     // Merge several InMemory snapshots into one (scale-down): folds the
     // IPC streams via merge_snapshot_bytes.

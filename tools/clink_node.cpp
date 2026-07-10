@@ -74,6 +74,7 @@
 #include "clink/metrics/system_metrics.hpp"
 #include "clink/queryable_state/arrow_scan.hpp"
 #include "clink/queryable_state/jm_routes.hpp"
+#include "clink/queryable_state/live_export.hpp"
 #include "clink/queryable_state/registry.hpp"
 #include "clink/queryable_state/server.hpp"
 #endif
@@ -1984,6 +1985,9 @@ int run_jm(int argc, char** argv) {
         // serving route (fan-out proxy), and the Arrow bulk scan.
         clink::queryable_state::register_jm_routes(*http_srv, jm);
         clink::queryable_state::register_jm_arrow_scan_route(*http_srv, jm);
+        // Live whole-job state export: fan out across the job's TMs and
+        // merge into one canonical Arrow snapshot stream.
+        clink::queryable_state::register_jm_state_export_route(*http_srv, jm);
         http_srv->get("/api/v1/health", [start_time, jm_ptr](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
             resp.body = make_health_body("jm", start_time, jm_ptr->bound_port());
@@ -2575,6 +2579,9 @@ int run_tm(int argc, char** argv) {
                                                 clink::queryable_state::Registry::global());
         clink::queryable_state::register_arrow_scan_route(
             *http_srv, clink::queryable_state::Registry::global());
+        // Live whole-job state export: this TM's share of a job's keyed
+        // state as one canonical Arrow snapshot stream.
+        clink::queryable_state::register_tm_state_export_route(*http_srv, tm);
         http_srv->get("/api/v1/health", [start_time, &http_bound](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
             resp.body = make_health_body("tm", start_time, http_bound);

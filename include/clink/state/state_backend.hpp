@@ -294,6 +294,19 @@ public:
     virtual void set_state_versions(StateVersionMap /*versions*/) {}
     virtual StateVersionMap restored_state_versions() const { return {}; }
 
+    // State-as-data: render the backend's LIVE contents as the canonical
+    // Arrow IPC state-snapshot stream (op_id / key_bytes / value_bytes;
+    // see docs/internals/state-snapshot-format.md). A per-backend atomic
+    // point-in-time view - NOT a checkpoint-consistent global cut (no
+    // barrier alignment); use a savepoint where cross-subtask consistency
+    // matters. Backends whose live view is complete override this; the
+    // default refuses (e.g. a disaggregated backend holds only a partial
+    // hot tier in memory).
+    [[nodiscard]] virtual std::vector<std::byte> export_arrow_snapshot() const {
+        throw std::runtime_error("live state export not supported by this backend (" +
+                                 description() + "); export from a checkpoint instead");
+    }
+
     // FOUND-3 (relocatable savepoints): tell the backend where the savepoint's
     // artefacts now live, so restore() can rebase references that embed a
     // capture-time absolute path. Default ignore - backends whose handles are

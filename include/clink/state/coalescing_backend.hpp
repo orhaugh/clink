@@ -60,6 +60,9 @@ public:
     void erase(OperatorId op, KeyView key) override { inner_->erase(op, key); }
     void scan(OperatorId op, const ScanVisitor& visit) const override { inner_->scan(op, visit); }
     Snapshot snapshot(CheckpointId id) override { return inner_->snapshot(id); }
+    [[nodiscard]] std::vector<std::byte> export_arrow_snapshot() const override {
+        return inner_->export_arrow_snapshot();
+    }
     void restore(const Snapshot& snap, const KeyGroupRange& kg = {}) override {
         inner_->restore(snap, kg);
     }

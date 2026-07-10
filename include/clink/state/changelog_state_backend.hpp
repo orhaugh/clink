@@ -131,6 +131,12 @@ public:
     // Implementation in src/state/changelog_state_backend.cpp to keep
     // Arrow headers out of this header.
     Snapshot snapshot(CheckpointId id) override;
+    // Live export = the INNER backend's current view (reads pass through
+    // to it, so it holds the up-to-date state); the write-ahead log is a
+    // durability artefact, not part of the live contents.
+    [[nodiscard]] std::vector<std::byte> export_arrow_snapshot() const override {
+        return inner_->export_arrow_snapshot();
+    }
     void restore(const Snapshot& snap, const KeyGroupRange& kg_filter = {}) override;
 
     // Asynchronous checkpoint split. Only worthwhile when a working dir is

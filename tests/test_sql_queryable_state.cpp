@@ -272,3 +272,122 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
     fs::remove(in_path);
     fs::remove(out_path);
 }
+
+#include "clink/queryable_state/live_export.hpp"
+#include "clink/state/in_memory_state_backend.hpp"
+
+// Live whole-job state export: while a checkpointing job runs, the JM
+// route returns ONE canonical Arrow snapshot stream of the job's state
+// backends (fanned across TMs, merged), restorable by the format's
+// reference reader. The TM route serves this TM's share directly.
+TEST(SqlQueryableState, LiveWholeJobStateExportOverHttp) {
+    clink::cluster::ensure_built_ins_registered();
+    clink::plugin::PluginRegistry reg;
+    clink::sql::install(reg);
+
+    const auto in_path = fs::temp_directory_path() / "clink_qs_export_in.ndjson";
+    const auto out_path = fs::temp_directory_path() / "clink_qs_export_out.ndjson";
+    const auto ckpt_dir = fs::temp_directory_path() / "clink_qs_export_ckpt";
+    fs::remove(in_path);
+    fs::remove(out_path);
+    fs::remove_all(ckpt_dir);
+    {
+        std::ofstream out(in_path, std::ios::trunc);
+        for (int i = 0; i < 900'000; ++i) {
+            out << R"({"usr":"alice","amount":1})" << "\n";
+        }
+        for (int i = 0; i < 600'000; ++i) {
+            out << R"({"usr":"bob","amount":2})" << "\n";
+        }
+    }
+
+    clink::sql::Catalog catalog;
+    std::ostringstream out_s, err_s;
+    clink::sql::ScriptIO io{&out_s, &err_s};
+    std::vector<clink::cluster::JobGraphSpec> captured;
+    auto capture = [&](const clink::cluster::JobGraphSpec& spec, const std::string&) -> int {
+        captured.push_back(spec);
+        return 0;
+    };
+    const std::string script =
+        "CREATE TABLE xevt (usr TEXT, amount BIGINT) "
+        "WITH (connector='file', format='json', path='" +
+        in_path.string() +
+        "');"
+        "CREATE TABLE xout (usr TEXT, total BIGINT) "
+        "WITH (connector='file', format='json', path='" +
+        out_path.string() +
+        "', mode='upsert', primary_key='usr');"
+        "INSERT INTO xout SELECT usr, SUM(amount) AS total FROM xevt GROUP BY usr";
+    ASSERT_EQ(clink::sql::run_script(script, catalog, {}, io, capture), 0) << err_s.str();
+    ASSERT_EQ(captured.size(), 1u);
+
+    clink::cluster::JobManager jm;
+    const auto rpc_port = jm.start();
+    clink::http::HttpServer jm_http;
+    clink::queryable_state::register_jm_state_export_route(jm_http, jm);
+    const auto jm_http_port = jm_http.start("127.0.0.1", 0);
+    jm.expect_tms({"qs-export-tm"});
+    clink::cluster::TaskManager::Config cfg;
+    cfg.slot_count = 8;
+    clink::cluster::TaskManager tm("qs-export-tm", "127.0.0.1", cfg);
+    clink::http::HttpServer tm_http;
+    clink::queryable_state::register_tm_state_export_route(tm_http, tm);
+    const auto tm_http_port = tm_http.start("127.0.0.1", 0);
+    tm.set_advertised_http_port(tm_http_port);
+    tm.connect_to_jm("127.0.0.1", rpc_port);
+    ASSERT_TRUE(jm.await_registrations(std::chrono::milliseconds{10'000}));
+
+    // Checkpointing ON so the job gets a state backend (file://) and the
+    // source persists offsets as operator-state at every barrier.
+    clink::cluster::CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = ckpt_dir.string();
+    ckpt.interval_ms = 100;
+    const auto id = jm.submit_job(
+        captured[0], clink::cluster::OperatorRegistry::default_instance(), {}, ckpt, nullptr);
+
+    clink::http::HttpClient jm_client("127.0.0.1", jm_http_port);
+    clink::http::HttpClient tm_client("127.0.0.1", tm_http_port);
+    std::size_t live_entries = 0;
+    std::string live_body;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto resp = jm_client.get("/api/v1/state/export/job/" + std::to_string(id));
+        if (resp.status == 200 && !resp.body.empty()) {
+            clink::Snapshot snap;
+            snap.bytes.resize(resp.body.size());
+            std::memcpy(snap.bytes.data(), resp.body.data(), resp.body.size());
+            clink::InMemoryStateBackend restored;
+            restored.restore(snap);
+            std::size_t entries = 0;
+            for (const auto op : restored.operator_ids()) {
+                restored.scan(op, [&](std::string_view, std::string_view) { ++entries; });
+            }
+            if (entries > 0) {
+                live_entries = entries;
+                live_body = resp.body;
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    ASSERT_GE(live_entries, 1u) << "live export never returned restorable state "
+                                << "(job may have finished before the first checkpoint)";
+
+    // The TM route serves the same share directly.
+    auto tm_resp = tm_client.get("/api/v1/state/export/job/" + std::to_string(id));
+    if (tm_resp.status == 200) {
+        EXPECT_FALSE(tm_resp.body.empty());
+    }
+
+    ASSERT_TRUE(jm.await_job_completion(id, std::chrono::milliseconds{120'000}));
+    EXPECT_TRUE(jm.job_errors(id).empty());
+
+    tm.stop();
+    jm.stop();
+    tm_http.stop();
+    jm_http.stop();
+    fs::remove(in_path);
+    fs::remove(out_path);
+    fs::remove_all(ckpt_dir);
+}

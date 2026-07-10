@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "clink/http/http_client.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 
 #ifdef CLINK_LINKED_ROCKSDB
@@ -88,10 +89,43 @@ struct ResolvedInput {
     std::string label;
 };
 
+// Fetch a RUNNING job's whole keyed state from the JM's live-export
+// route (one canonical stream, fanned across the job's TMs and merged
+// JM-side). `jm` is "host:port" (default port 8081 when omitted).
+// Live-view caveat: per-subtask atomic, not a checkpoint-consistent cut.
+inline std::vector<std::byte> fetch_live_job_state(const std::string& jm,
+                                                   const std::string& job_id) {
+    std::string host = jm.empty() ? "127.0.0.1" : jm;
+    std::uint16_t port = 8081;
+    if (const auto colon = host.rfind(':'); colon != std::string::npos) {
+        port = static_cast<std::uint16_t>(std::stoul(host.substr(colon + 1)));
+        host = host.substr(0, colon);
+    }
+    clink::http::HttpClient client(host, port);
+    auto resp = client.get("/api/v1/state/export/job/" + job_id);
+    if (resp.status != 200) {
+        throw std::runtime_error("live export from " + host + ":" + std::to_string(port) +
+                                 " failed (" + std::to_string(resp.status) + ")" +
+                                 (resp.body.empty() ? "" : ": " + resp.body));
+    }
+    std::vector<std::byte> bytes(resp.body.size());
+    if (!resp.body.empty()) {
+        std::memcpy(bytes.data(), resp.body.data(), resp.body.size());
+    }
+    return bytes;
+}
+
 inline ResolvedInput resolve_state_input(const std::string& from,
                                          const std::string& dir,
-                                         const std::string& id_str) {
+                                         const std::string& id_str,
+                                         const std::string& job = {},
+                                         const std::string& jm = {}) {
     ResolvedInput out;
+    if (!job.empty()) {
+        out.bytes = fetch_live_job_state(jm, job);
+        out.label = "live job " + job + " @ " + (jm.empty() ? "127.0.0.1:8081" : jm);
+        return out;
+    }
     if (!from.empty()) {
         out.bytes = canonical_bytes_for(from);
         out.label = from;
