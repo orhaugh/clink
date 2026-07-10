@@ -375,4 +375,43 @@ TEST(RocksDbMaterializationStore, FactoryChangelogRocksdbScaleDownMergesParents)
     std::filesystem::remove_all(root);
 }
 
+// ----- state-as-data: canonicalising external-store snapshots -----
+
+#include "clink/state/snapshot_canonicalise.hpp"
+
+// A changelog+rocksdb external-mode snapshot (row_kind=3 handle rows)
+// canonicalises to the standard 3-column stream when the store is
+// supplied - the seam behind `clink state-* --materialisation-store` -
+// and refuses with the backend's clear error without one.
+TEST(RocksDbMaterializationStore, ExternalSnapshotCanonicalisesViaStore) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "clink_clog_store_canon";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    auto store = std::make_shared<clink::rocksdb::RocksDbMaterializationStore>(dir / "store");
+
+    auto inner = std::make_shared<clink::InMemoryStateBackend>();
+    clink::ChangelogStateBackend cl(inner, store);
+    const clink::OperatorId op{6};
+    cl.put(op, "a", std::string_view{"v1"});
+    cl.put(op, "b", std::string_view{"v2"});
+    cl.materialize_now();                     // inner snapshot -> STORE, handle kept
+    cl.put(op, "c", std::string_view{"v3"});  // log delta on top
+    auto snap = cl.snapshot(clink::CheckpointId{9});
+
+    // With the store: the handle resolves and the full view replays.
+    auto canonical = clink::canonicalise_state_snapshot(snap.bytes, store);
+    clink::InMemoryStateBackend ref;
+    ref.restore(clink::Snapshot{.checkpoint_id = clink::CheckpointId{0}, .bytes = canonical});
+    std::map<std::string, std::string> got;
+    ref.scan(op,
+             [&](std::string_view k, std::string_view v) { got[std::string(k)] = std::string(v); });
+    EXPECT_EQ(got, (std::map<std::string, std::string>{{"a", "v1"}, {"b", "v2"}, {"c", "v3"}}));
+
+    // Without the store: the replay refuses clearly (never a partial view).
+    EXPECT_THROW((void)clink::canonicalise_state_snapshot(snap.bytes), std::runtime_error);
+
+    fs::remove_all(dir);
+}
+
 #endif  // __has_include

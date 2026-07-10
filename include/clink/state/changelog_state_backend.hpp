@@ -131,6 +131,18 @@ public:
     // Implementation in src/state/changelog_state_backend.cpp to keep
     // Arrow headers out of this header.
     Snapshot snapshot(CheckpointId id) override;
+    // Schema-evolution stamps forward to the INNER backend: it owns the
+    // materialisation payload (its snapshot bytes carry the stamps - the
+    // in-memory inner's Arrow metadata, RocksDB's reserved default-CF
+    // key), so a restore that replays a materialisation recovers them.
+    // A restore of a log-only snapshot (no materialisation yet) has no
+    // stamps to recover, matching a fresh backend.
+    void set_state_versions(StateVersionMap versions) override {
+        inner_->set_state_versions(std::move(versions));
+    }
+    [[nodiscard]] StateVersionMap restored_state_versions() const override {
+        return inner_->restored_state_versions();
+    }
     // Live export = the INNER backend's current view (reads pass through
     // to it, so it holds the up-to-date state); the write-ahead log is a
     // durability artefact, not part of the live contents.

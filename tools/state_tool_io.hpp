@@ -17,8 +17,10 @@
 
 #include "clink/http/http_client.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+#include "clink/state/snapshot_canonicalise.hpp"
 
 #ifdef CLINK_LINKED_ROCKSDB
+#include "clink/rocksdb/rocksdb_materialization_store.hpp"
 #include "clink/state/rocksdb_state_backend.hpp"
 #endif
 
@@ -31,10 +33,29 @@ inline bool is_rocksdb_checkpoint_dir(const std::filesystem::path& p) {
     return std::filesystem::is_directory(p) && std::filesystem::exists(p / "CURRENT");
 }
 
+// Build the --materialisation-store flag's ExternalMaterializationStore
+// (a RocksDB path; changelog+rocksdb external-mode snapshots resolve
+// their row_kind=3 handles through it). Empty path = none.
+inline std::shared_ptr<clink::ExternalMaterializationStore> materialisation_store_for(
+    const std::string& path) {
+    if (path.empty()) {
+        return nullptr;
+    }
+#ifdef CLINK_LINKED_ROCKSDB
+    return std::make_shared<clink::rocksdb::RocksDbMaterializationStore>(path);
+#else
+    throw std::runtime_error("--materialisation-store requires a RocksDB-linked clink build");
+#endif
+}
+
 // Canonical snapshot bytes for a --from path: a .snap/.arrows file
-// verbatim, or a RocksDB checkpoint dir rendered through the Arrow
-// export (when the CLI is built with RocksDB linked).
-inline std::vector<std::byte> canonical_bytes_for(const std::string& path) {
+// (changelog snapshots replayed to the canonical form, external
+// materialisation handles resolved via `store`), or a RocksDB
+// checkpoint dir rendered through the Arrow export (when the CLI is
+// built with RocksDB linked).
+inline std::vector<std::byte> canonical_bytes_for(
+    const std::string& path,
+    const std::shared_ptr<clink::ExternalMaterializationStore>& store = nullptr) {
     if (is_rocksdb_checkpoint_dir(path)) {
 #ifdef CLINK_LINKED_ROCKSDB
         return clink::rocksdb_checkpoint_to_arrow(path);
@@ -54,7 +75,7 @@ inline std::vector<std::byte> canonical_bytes_for(const std::string& path) {
     if (!raw.empty()) {
         std::memcpy(bytes.data(), raw.data(), raw.size());
     }
-    return bytes;
+    return clink::canonicalise_state_snapshot(std::move(bytes), store);
 }
 
 // Collect the snapshot files that make up checkpoint `id` under `root`:
@@ -115,11 +136,13 @@ inline std::vector<std::byte> fetch_live_job_state(const std::string& jm,
     return bytes;
 }
 
-inline ResolvedInput resolve_state_input(const std::string& from,
-                                         const std::string& dir,
-                                         const std::string& id_str,
-                                         const std::string& job = {},
-                                         const std::string& jm = {}) {
+inline ResolvedInput resolve_state_input(
+    const std::string& from,
+    const std::string& dir,
+    const std::string& id_str,
+    const std::string& job = {},
+    const std::string& jm = {},
+    const std::shared_ptr<clink::ExternalMaterializationStore>& store = nullptr) {
     ResolvedInput out;
     if (!job.empty()) {
         out.bytes = fetch_live_job_state(jm, job);
@@ -127,7 +150,7 @@ inline ResolvedInput resolve_state_input(const std::string& from,
         return out;
     }
     if (!from.empty()) {
-        out.bytes = canonical_bytes_for(from);
+        out.bytes = canonical_bytes_for(from, store);
         out.label = from;
         return out;
     }
@@ -140,7 +163,7 @@ inline ResolvedInput resolve_state_input(const std::string& from,
     std::vector<std::vector<std::byte>> parts;
     parts.reserve(files.size());
     for (const auto& f : files) {
-        parts.push_back(canonical_bytes_for(f.string()));
+        parts.push_back(canonical_bytes_for(f.string(), store));
     }
     out.bytes = clink::InMemoryStateBackend::merge_snapshot_bytes(parts);
     out.label = dir + " @ checkpoint " + std::to_string(id) + " (" + std::to_string(files.size()) +

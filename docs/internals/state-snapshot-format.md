@@ -78,6 +78,7 @@ Restore replays the materialisation rows first, then applies the log rows in ord
 | `clink state-export / state-cat / state-diff / state-query / check-savepoint` | CLI surface over the format |
 | Live export HTTP routes (`queryable_state/live_export.hpp`) | Serve a RUNNING job's merged live state as one stream (TM and JM; per-subtask atomic, not a global cut) |
 | `RemoteReadBackend::export_arrow_snapshot` + `RemotePool::scan_checkpoint` | Render the disaggregated tier (pool checkpoint + hot delta) to this format |
+| `canonicalise_state_snapshot` (`include/clink/state/snapshot_canonicalise.hpp`) | Render ANY snapshot blob to the canonical form: canonical passthrough; changelog variant replayed (external materialisation handles resolved via the supplied store) |
 
 ## Derived projections (not restorable)
 

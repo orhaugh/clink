@@ -329,3 +329,24 @@ TEST(StateQueryCli, FiltersAndAggregatesOverSavepoint) {
 
     fs::remove(path);
 }
+
+#include "clink/state/changelog_state_backend.hpp"
+
+// The state verbs accept changelog snapshots: an in-blob changelog
+// checkpoint file replays to the canonical form on load, so state-cat
+// prints its entries like any other snapshot.
+TEST(StateExportCli, StateCatReadsChangelogSnapshots) {
+    auto inner = std::make_shared<clink::InMemoryStateBackend>();
+    clink::ChangelogStateBackend cl(inner);
+    cl.put(
+        clink::OperatorId{4}, std::string{"\x05"} + "counts|alpha", std::string_view{"forty-two"});
+    cl.materialize_now();
+    auto snap = cl.snapshot(clink::CheckpointId{3});
+    auto path = write_savepoint_file(snap, "clog" + std::to_string(getpid()));
+
+    auto result = run_cli("state-cat --file=" + path.string());
+    EXPECT_EQ(result.exit_code, 0) << result.stderr_text;
+    EXPECT_NE(result.stdout_text.find("alpha"), std::string::npos) << result.stdout_text;
+    EXPECT_NE(result.stdout_text.find("forty-two"), std::string::npos);
+    std::filesystem::remove(path);
+}

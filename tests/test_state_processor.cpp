@@ -503,3 +503,56 @@ TEST(StateSnapshotFormat, StreamsCarryTheFormatVersionMarker) {
     ASSERT_TRUE(reader2->schema()->metadata() != nullptr);
     EXPECT_TRUE(reader2->schema()->metadata()->Get(kSnapshotFormatVersionKey).ok());
 }
+
+#include "clink/state/changelog_state_backend.hpp"
+#include "clink/state/snapshot_canonicalise.hpp"
+
+// canonicalise_state_snapshot: a canonical stream passes through
+// unchanged; a changelog snapshot (in-blob) replays - materialisation
+// plus log, erases applied - to the exact canonical view; junk throws.
+TEST(SnapshotCanonicalise, ChangelogReplaysToCanonicalForm) {
+    auto inner = std::make_shared<InMemoryStateBackend>();
+    ChangelogStateBackend cl(inner);
+    const OperatorId op{5};
+    cl.put(op, "a", std::string_view{"v1"});
+    cl.put(op, "b", std::string_view{"v2"});
+    cl.materialize_now();                     // materialisation rows
+    cl.put(op, "c", std::string_view{"v3"});  // log rows on top
+    cl.erase(op, "b");
+    auto snap = cl.snapshot(CheckpointId{4});
+
+    auto canonical = canonicalise_state_snapshot(snap.bytes);
+    InMemoryStateBackend ref;
+    ref.restore(Snapshot{.checkpoint_id = CheckpointId{0}, .bytes = canonical});
+    std::map<std::string, std::string> got;
+    ref.scan(op,
+             [&](std::string_view k, std::string_view v) { got[std::string(k)] = std::string(v); });
+    EXPECT_EQ(got, (std::map<std::string, std::string>{{"a", "v1"}, {"c", "v3"}}));
+
+    // Canonical input: byte-identical passthrough.
+    auto again = canonicalise_state_snapshot(canonical);
+    EXPECT_EQ(again, canonical);
+
+    // Junk: a clear error, not a misread.
+    std::vector<std::byte> junk(16, std::byte{0x42});
+    EXPECT_THROW((void)canonicalise_state_snapshot(junk), std::runtime_error);
+}
+
+// Version stamps forward through the changelog wrapper to its inner
+// backend, ride the materialisation payload, and survive the replay.
+TEST(SnapshotCanonicalise, ChangelogCarriesVersionStampsThroughReplay) {
+    auto inner = std::make_shared<InMemoryStateBackend>();
+    ChangelogStateBackend cl(inner);
+    StateVersionMap versions;
+    versions.set(OperatorId{5}, "CounterState", 3);
+    cl.set_state_versions(versions);
+    EXPECT_EQ(cl.restored_state_versions().pack(), versions.pack());
+    cl.put(OperatorId{5}, "k", std::string_view{"v"});
+    cl.materialize_now();
+    auto snap = cl.snapshot(CheckpointId{1});
+
+    auto canonical = canonicalise_state_snapshot(snap.bytes);
+    InMemoryStateBackend ref;
+    ref.restore(Snapshot{.checkpoint_id = CheckpointId{0}, .bytes = canonical});
+    EXPECT_EQ(ref.restored_state_versions().pack(), versions.pack());
+}

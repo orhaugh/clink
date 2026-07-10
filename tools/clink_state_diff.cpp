@@ -95,24 +95,24 @@ struct LoadedSide {
     std::vector<Savepoint> savepoints;
 };
 
-LoadedSide load_file(const std::string& path) {
+LoadedSide load_file(const std::string& path,
+                     const std::shared_ptr<clink::ExternalMaterializationStore>& store = nullptr) {
     LoadedSide side;
     side.label = path;
-    if (is_rocksdb_checkpoint_dir(path)) {
-        // Render the RocksDB checkpoint as the canonical Arrow stream and
-        // load that - state-cat/state-diff then treat it exactly like a
-        // .snap file.
-        clink::Snapshot snap;
-        snap.bytes = canonical_bytes_for(path);
-        side.savepoints.push_back(Savepoint::load_from_snapshot(std::move(snap)));
-    } else {
-        side.savepoints.push_back(Savepoint::load_from_file(path));
-    }
+    // canonical_bytes_for handles every input shape: a canonical .snap
+    // verbatim, a changelog snapshot replayed to canonical form (external
+    // materialisation handles resolved via `store`), or a RocksDB
+    // checkpoint dir rendered through the Arrow export.
+    clink::Snapshot snap;
+    snap.bytes = canonical_bytes_for(path, store);
+    side.savepoints.push_back(Savepoint::load_from_snapshot(std::move(snap)));
     side.entries = collect_entries(side.savepoints.back());
     return side;
 }
 
-LoadedSide load_dir(const std::string& dir, std::uint64_t id) {
+LoadedSide load_dir(const std::string& dir,
+                    std::uint64_t id,
+                    const std::shared_ptr<clink::ExternalMaterializationStore>& store = nullptr) {
     LoadedSide side;
     side.label = dir + " @ checkpoint " + std::to_string(id);
     const auto files = checkpoint_files(dir, id);
@@ -121,7 +121,9 @@ LoadedSide load_dir(const std::string& dir, std::uint64_t id) {
                                  " (or its subtask subdirectories)");
     }
     for (const auto& f : files) {
-        side.savepoints.push_back(Savepoint::load_from_file(f));
+        clink::Snapshot snap;
+        snap.bytes = canonical_bytes_for(f.string(), store);
+        side.savepoints.push_back(Savepoint::load_from_snapshot(std::move(snap)));
         merge_entries(side.entries, collect_entries(side.savepoints.back()));
     }
     return side;
@@ -294,11 +296,15 @@ int clink_cmd_state_diff(int argc, char** argv) {
         LoadedSide a;
         LoadedSide b;
         if (!file_a.empty() && !file_b.empty()) {
-            a = load_file(file_a);
-            b = load_file(file_b);
+            const auto mat_store = clink_tools::materialisation_store_for(
+                get_arg(argc, argv, "materialisation-store"));
+            a = load_file(file_a, mat_store);
+            b = load_file(file_b, mat_store);
         } else if (!dir.empty() && !from.empty() && !to.empty()) {
-            a = load_dir(dir, std::stoull(from));
-            b = load_dir(dir, std::stoull(to));
+            const auto mat_store = clink_tools::materialisation_store_for(
+                get_arg(argc, argv, "materialisation-store"));
+            a = load_dir(dir, std::stoull(from), mat_store);
+            b = load_dir(dir, std::stoull(to), mat_store);
         } else {
             diff_usage();
             return 2;
@@ -342,6 +348,8 @@ int clink_cmd_state_cat(int argc, char** argv) {
     const auto file = get_arg(argc, argv, "file");
     const auto dir = get_arg(argc, argv, "dir");
     const auto id = get_arg(argc, argv, "id");
+    const auto mat_store =
+        clink_tools::materialisation_store_for(get_arg(argc, argv, "materialisation-store"));
     const bool json = has_flag(argc, argv, "json");
     std::size_t max_rows = 50;
     if (const auto v = get_arg(argc, argv, "max-rows"); !v.empty()) {
@@ -351,9 +359,9 @@ int clink_cmd_state_cat(int argc, char** argv) {
     try {
         LoadedSide side;
         if (!file.empty()) {
-            side = load_file(file);
+            side = load_file(file, mat_store);
         } else if (!dir.empty() && !id.empty()) {
-            side = load_dir(dir, std::stoull(id));
+            side = load_dir(dir, std::stoull(id), mat_store);
         } else {
             cat_usage();
             return 2;
@@ -643,6 +651,7 @@ int clink_cmd_state_export(int argc, char** argv) {
     const auto id_str = get_arg(argc, argv, "id");
     const auto job = get_arg(argc, argv, "job");
     const auto jm = get_arg(argc, argv, "jm");
+    const auto mat_store_path = get_arg(argc, argv, "materialisation-store");
     const auto out = get_arg(argc, argv, "out");
     std::string format = get_arg(argc, argv, "format");
     if (format.empty()) {
@@ -664,7 +673,8 @@ int clink_cmd_state_export(int argc, char** argv) {
         return 2;
     }
     try {
-        auto resolved = clink_tools::resolve_state_input(from, dir, id_str, job, jm);
+        auto resolved = clink_tools::resolve_state_input(
+            from, dir, id_str, job, jm, clink_tools::materialisation_store_for(mat_store_path));
         auto& bytes = resolved.bytes;
         const auto& source = resolved.label;
 

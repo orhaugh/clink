@@ -98,6 +98,7 @@ int clink_cmd_state_query(int argc, char** argv) {
     const auto id_str = get_arg(argc, argv, "id");
     const auto job = get_arg(argc, argv, "job");
     const auto jm = get_arg(argc, argv, "jm");
+    const auto mat_store_path = get_arg(argc, argv, "materialisation-store");
     const auto sql = get_arg(argc, argv, "sql");
     const bool dir_form = !dir.empty() || !id_str.empty();
     const bool dir_form_complete = !dir.empty() && !id_str.empty();
@@ -111,7 +112,8 @@ int clink_cmd_state_query(int argc, char** argv) {
     const auto out_path = fs::temp_directory_path() / ("clink_state_query_out_" + tag + ".ndjson");
     try {
         // 1. Snapshot -> decoded entries -> the query-projection Parquet.
-        auto resolved = clink_tools::resolve_state_input(from, dir, id_str, job, jm);
+        auto resolved = clink_tools::resolve_state_input(
+            from, dir, id_str, job, jm, clink_tools::materialisation_store_for(mat_store_path));
         clink::Snapshot snap;
         snap.bytes = std::move(resolved.bytes);
         auto sp = clink::state_processor::Savepoint::load_from_snapshot(std::move(snap));
