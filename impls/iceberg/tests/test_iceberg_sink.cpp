@@ -18,6 +18,7 @@
 
 #include <arrow/api.h>
 #include <gtest/gtest.h>
+#include <parquet/arrow/reader.h>
 
 #include "clink/config/json.hpp"
 #include "clink/core/record.hpp"
@@ -588,4 +589,93 @@ TEST(IcebergS3Live, WritesToS3AndReopens) {
     if (keep == nullptr) {
         fs::remove(cat);
     }
+}
+
+// ----- state-as-data: Iceberg export -----
+
+#include "clink/iceberg/state_export.hpp"
+#include "clink/state_processor/savepoint.hpp"
+#include "clink/state_processor/state_diff.hpp"
+
+// Exporting a collected state model commits one Iceberg snapshot whose
+// Parquet data file carries the decoded five-column entry table; a
+// second export into the same table appends a second snapshot.
+TEST(IcebergStateExport, CommitsDecodedEntriesAndAppendsOnReExport) {
+    namespace sp = clink::state_processor;
+    auto wh = fs::temp_directory_path() / ("clink_ice_state_export_" + std::to_string(getpid()));
+    fs::remove_all(wh);
+    fs::create_directories(wh);
+
+    auto save = sp::Savepoint::create();
+    auto ks = save.keyed_state<std::string, std::int64_t>(
+        clink::OperatorId{7}, "counts", clink::string_codec(), clink::int64_codec());
+    ks.put("alpha", 1);
+    ks.put("beta", 22);
+    const std::string op_key = std::string{"\xFF"} + "offsets|p0";
+    save.backend().put(clink::OperatorId{9}, std::string_view{op_key}, std::string_view{"12345"});
+    const auto entries = sp::collect_entries(save);
+
+    clink::iceberg::IcebergStateExportOptions o;
+    o.warehouse = wh.string();
+    o.table = "job_state";
+    auto res = clink::iceberg::export_state_iceberg(entries, o);
+    EXPECT_EQ(res.rows, 3);
+    ASSERT_FALSE(res.table_location.empty());
+
+    // On-disk Iceberg structure: catalog + metadata + exactly one data file.
+    EXPECT_TRUE(fs::exists(wh / "catalog.db"));
+    const fs::path table_dir{res.table_location};
+    ASSERT_TRUE(fs::is_directory(table_dir / "data"));
+    std::size_t data_files = 0;
+    for (const auto& e : fs::directory_iterator(table_dir / "data")) {
+        data_files += e.path().extension() == ".parquet" ? 1 : 0;
+    }
+    EXPECT_EQ(data_files, 1u);
+
+    // Read the data file back: five decoded columns, three rows, the
+    // operator-state row carrying its reserved prefix byte.
+    fs::path data_file;
+    for (const auto& e : fs::directory_iterator(table_dir / "data")) {
+        if (e.path().extension() == ".parquet") {
+            data_file = e.path();
+        }
+    }
+    auto open_result = arrow::io::ReadableFile::Open(data_file.string());
+    ASSERT_TRUE(open_result.ok());
+    auto reader_result = parquet::arrow::OpenFile(*open_result, arrow::default_memory_pool());
+    ASSERT_TRUE(reader_result.ok()) << reader_result.status().ToString();
+    std::shared_ptr<arrow::Table> table;
+    ASSERT_TRUE((*reader_result)->ReadTable(&table).ok());
+    ASSERT_EQ(table->num_rows(), 3);
+    ASSERT_EQ(table->num_columns(), 5);
+    EXPECT_EQ(table->schema()->field(0)->name(), "op_id");
+    EXPECT_EQ(table->schema()->field(4)->name(), "value_bytes");
+    auto combined = *table->CombineChunks(arrow::default_memory_pool());
+    const auto& kg_col = static_cast<const arrow::Int32Array&>(*combined->column(1)->chunk(0));
+    const auto& slot_col = static_cast<const arrow::StringArray&>(*combined->column(2)->chunk(0));
+    bool saw_op_state = false;
+    for (int64_t i = 0; i < combined->num_rows(); ++i) {
+        if (kg_col.Value(i) == 0xFF) {
+            saw_op_state = true;
+            EXPECT_EQ(std::string{slot_col.GetView(i)}, "offsets");
+        }
+    }
+    EXPECT_TRUE(saw_op_state);
+
+    // Re-export: appends a SECOND snapshot (and a second data file).
+    auto res2 = clink::iceberg::export_state_iceberg(entries, o);
+    EXPECT_EQ(res2.rows, 3);
+    data_files = 0;
+    for (const auto& e : fs::directory_iterator(table_dir / "data")) {
+        data_files += e.path().extension() == ".parquet" ? 1 : 0;
+    }
+    EXPECT_EQ(data_files, 2u);
+    std::size_t snapshots = 0;
+    for (const auto& e : fs::directory_iterator(table_dir / "metadata")) {
+        const auto name = e.path().filename().string();
+        snapshots += name.rfind("snap-", 0) == 0 ? 1 : 0;
+    }
+    EXPECT_EQ(snapshots, 2u);
+
+    fs::remove_all(wh);
 }

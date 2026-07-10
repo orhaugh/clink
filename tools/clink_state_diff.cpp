@@ -38,6 +38,9 @@
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/state/rocksdb_state_backend.hpp"
 #endif
+#ifdef CLINK_LINKED_ICEBERG
+#include "clink/iceberg/state_export.hpp"
+#endif
 
 namespace {
 
@@ -641,14 +644,14 @@ int clink_cmd_capture_cat(int argc, char** argv) {
 namespace {
 
 void export_usage() {
-    std::cout << "usage: clink state-export --from=<path> --out=<file> [--format=arrow|parquet]\n"
+    std::cout << "usage: clink state-export --from=<path> [--out=<file>] [--format=...]\n"
               << "\n"
               << "Write a checkpoint/savepoint's keyed state as an open dataset.\n"
               << "\n"
               << "  --from=<path>     a .snap/.arrows snapshot file, or a RocksDB checkpoint\n"
               << "                    directory (rendered via the Arrow export; requires a\n"
               << "                    RocksDB-linked build)\n"
-              << "  --out=<file>      output file to write\n"
+              << "  --out=<file>      output file (arrow / parquet formats)\n"
               << "  --format=arrow    the canonical Arrow IPC stream (op_id, key_bytes,\n"
               << "                    value_bytes) - exact fidelity, restorable, readable by\n"
               << "                    every clink state tool and any Arrow consumer\n"
@@ -656,6 +659,11 @@ void export_usage() {
               << "                    user_key, value_bytes) as one Parquet file - the\n"
               << "                    analytics projection, directly queryable in DuckDB /\n"
               << "                    Spark / pyarrow\n"
+              << "  --format=iceberg  commit the decoded entry table as ONE snapshot of an\n"
+              << "                    Apache Iceberg table (created when missing; repeated\n"
+              << "                    exports accumulate as snapshots). Takes --warehouse and\n"
+              << "                    --table (plus optional --namespace, --catalog-uri)\n"
+              << "                    instead of --out. Requires an Iceberg-linked build.\n"
               << "\n"
               << "Default format: parquet when --out ends in .parquet, else arrow.\n";
 }
@@ -669,16 +677,17 @@ int clink_cmd_state_export(int argc, char** argv) {
     }
     const auto from = get_arg(argc, argv, "from");
     const auto out = get_arg(argc, argv, "out");
-    if (from.empty() || out.empty()) {
-        export_usage();
-        return 2;
-    }
     std::string format = get_arg(argc, argv, "format");
     if (format.empty()) {
         format = out.ends_with(".parquet") ? "parquet" : "arrow";
     }
-    if (format != "arrow" && format != "parquet") {
-        std::cerr << "state-export: unknown --format '" << format << "' (arrow|parquet)\n";
+    if (format != "arrow" && format != "parquet" && format != "iceberg") {
+        std::cerr << "state-export: unknown --format '" << format << "' (arrow|parquet|iceberg)\n";
+        return 2;
+    }
+    // File formats need --out; the iceberg format targets a catalogued table.
+    if (from.empty() || (format != "iceberg" && out.empty())) {
+        export_usage();
         return 2;
     }
     try {
@@ -698,6 +707,40 @@ int clink_cmd_state_export(int argc, char** argv) {
             }
         }
 
+        if (format == "iceberg") {
+#ifdef CLINK_LINKED_ICEBERG
+            clink::iceberg::IcebergStateExportOptions io;
+            io.warehouse = get_arg(argc, argv, "warehouse");
+            io.table = get_arg(argc, argv, "table");
+            io.catalog_uri = get_arg(argc, argv, "catalog-uri");
+            if (const auto ns = get_arg(argc, argv, "namespace"); !ns.empty()) {
+                io.namespace_levels.clear();
+                std::size_t start = 0;
+                while (start <= ns.size()) {
+                    const auto dot = ns.find('.', start);
+                    if (dot == std::string::npos) {
+                        io.namespace_levels.push_back(ns.substr(start));
+                        break;
+                    }
+                    io.namespace_levels.push_back(ns.substr(start, dot - start));
+                    start = dot + 1;
+                }
+            }
+            if (io.warehouse.empty() || io.table.empty()) {
+                std::cerr << "state-export: --format=iceberg needs --warehouse and --table\n";
+                return 2;
+            }
+            const auto res = clink::iceberg::export_state_iceberg(entries, std::move(io));
+            std::cout << "state-export: " << from << " -> iceberg table at " << res.table_location
+                      << " (1 snapshot, " << res.rows << " rows, " << entries.size()
+                      << " operators, " << slots << " slots)\n";
+            return 0;
+#else
+            std::cerr << "state-export: this clink build has no Iceberg support; rebuild "
+                         "with the Iceberg impl linked\n";
+            return 2;
+#endif
+        }
         std::uintmax_t written = 0;
         if (format == "parquet") {
             // The analytics projection: the decoded entry table, one row

@@ -132,6 +132,10 @@ sink->close();                                          // commits the tail inte
 
 To resolve the sink through the plugin registry instead, look up the `iceberg_row_sink` factory and supply `warehouse`, `table`, `namespace` and `schema_columns` as `BuildContext` params (the form the SQL frontend uses).
 
+## State export
+
+`clink state-export --format=iceberg --from=<snapshot-or-rocksdb-dir> --warehouse=<wh> --table=<name> [--namespace=a.b] [--catalog-uri=...]` commits a checkpoint/savepoint's keyed state as one snapshot of an Iceberg table (the state-as-data analytics projection: `op_id: long`, `key_group: int`, `slot: string`, `user_key: binary`, `value_bytes: binary`). The library entry point is `clink::iceberg::export_state_iceberg` (`impls/iceberg/include/clink/iceberg/state_export.hpp`); it shares the sink's catalog selection (SQLite local/S3, or REST) and write path. The table is created when missing and appended to when present (column names must match); each export is one `FastAppend` snapshot tagged `clink.state-export`. `StateVersionMap` stamps are not carried in this format.
+
 ## Delivery semantics
 
 The sink stages data on the checkpoint barrier and commits the snapshot only on `on_commit`, after the checkpoint is globally durable. The commit is idempotent: each snapshot is tagged with a `clink.checkpoint-id` summary property, so a redelivered commit or a recovery replay never double-commits.

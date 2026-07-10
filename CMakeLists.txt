@@ -779,6 +779,12 @@ if(TARGET clink::rocksdb)
     target_link_libraries(clink_cli_cmds PUBLIC clink::rocksdb)
     target_compile_definitions(clink_cli_cmds PUBLIC CLINK_LINKED_ROCKSDB)
 endif()
+# `clink state-export --format=iceberg` commits state as an Iceberg
+# table snapshot when the Iceberg impl is in the build.
+if(TARGET clink::iceberg)
+    target_link_libraries(clink_cli_cmds PUBLIC clink::iceberg)
+    target_compile_definitions(clink_cli_cmds PUBLIC CLINK_LINKED_ICEBERG)
+endif()
 clink_set_warnings(clink_cli_cmds)
 
 # `clink` - client CLI. One binary, multiple

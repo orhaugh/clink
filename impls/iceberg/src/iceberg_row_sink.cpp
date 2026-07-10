@@ -24,6 +24,7 @@
 
 #include "clink/config/json.hpp"
 #include "clink/connectors/arrow_s3_lifecycle.hpp"
+#include "clink/iceberg/state_export.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/row_kind.hpp"
@@ -136,6 +137,9 @@ std::shared_ptr<ice::Type> arrow_to_ice_type(const arrow::DataType& t) {
         case arrow::Type::STRING:
         case arrow::Type::LARGE_STRING:
             return ice::string();
+        case arrow::Type::BINARY:
+        case arrow::Type::LARGE_BINARY:
+            return ice::binary();
         case arrow::Type::DATE32:
             return ice::date();
         case arrow::Type::TIMESTAMP:
@@ -185,6 +189,140 @@ std::string make_uuid() {
 
 // Concrete MergingSnapshotUpdate so the upsert path can commit data files AND v2 equality-
 // delete files in one snapshot (iceberg-cpp 0.3.0 ships no public RowDelta; the base's
+// Catalog + table open, shared by the streaming sink and the state export.
+// Selects the catalog by catalog_uri scheme (http(s):// = REST, otherwise
+// SQLite SQL catalog with a local or S3 FileIO), best-effort-creates the
+// namespace, creates the table when missing (with an explicit location for
+// SQL catalogs - see the comment inside) and loads it.
+struct CatalogTargetSpec {
+    std::string warehouse;
+    std::string table;
+    std::string catalog_uri;
+    std::string rest_auth_token;
+    std::string name;  // error-message prefix
+    std::vector<std::string> namespace_levels;
+    std::unordered_map<std::string, std::string> file_io_props;
+};
+
+struct OpenedCatalogTable {
+    std::shared_ptr<ice::FileIO> file_io;
+    std::shared_ptr<ice::Catalog> catalog;
+    ice::TableIdentifier id;
+    std::shared_ptr<ice::Table> table;
+};
+
+OpenedCatalogTable open_catalog_table(const CatalogTargetSpec& t,
+                                      const std::shared_ptr<ice::Schema>& ice_schema,
+                                      const std::shared_ptr<ice::PartitionSpec>& spec) {
+    OpenedCatalogTable out;
+    // Catalog selection by catalog_uri scheme:
+    //   http(s)://  -> REST catalog (resolves its own FileIO, e.g. S3, from /config +
+    //                  the io props; the table location is server-assigned).
+    //   otherwise   -> SQLite SQL catalog + an explicit local/S3 FileIO.
+    const bool rest =
+        t.catalog_uri.rfind("http://", 0) == 0 || t.catalog_uri.rfind("https://", 0) == 0;
+    const bool s3 = t.warehouse.rfind("s3://", 0) == 0;
+
+    if (rest) {
+        std::unordered_map<std::string, std::string> props;
+        props["uri"] = t.catalog_uri;
+        props["name"] = "clink";
+        if (!t.warehouse.empty()) {
+            props["warehouse"] = t.warehouse;
+        }
+        // Pass FileIO props (s3.endpoint/region/credentials/path-style) through so the
+        // catalog-resolved FileIO can reach the object store.
+        for (const auto& [k, v] : t.file_io_props) {
+            props[k] = v;
+        }
+        if (!t.rest_auth_token.empty()) {
+            props["header.Authorization"] = "Bearer " + t.rest_auth_token;
+        }
+        // RestCatalog::Make does a synchronous GET /config here; a bad/unreachable
+        // endpoint surfaces as a clear error (open() is otherwise local-only).
+        out.catalog = unwrap(ice::rest::RestCatalog::Make(
+                                 ice::rest::RestCatalogProperties::FromMap(std::move(props))),
+                             "make rest catalog");
+    } else if (s3) {
+        // The SQLite catalog file cannot live on S3, so an s3:// warehouse needs an
+        // explicit LOCAL catalog_uri (or use a REST catalog for full-S3).
+        if (t.catalog_uri.empty()) {
+            throw std::runtime_error(
+                t.name +
+                ": an s3:// warehouse requires an explicit local catalog_uri (the SQLite "
+                "catalog cannot live on S3; or use a REST catalog)");
+        }
+        // Let iceberg-cpp's MakeS3FileIO own the Arrow S3 bring-up (it guards
+        // InitializeS3 to once per process). Do NOT pre-init via clink's owner here:
+        // 0.3.0's MakeS3FileIO calls arrow::fs::InitializeS3, which RETURNS AN ERROR if
+        // S3 was already initialized (unlike EnsureS3Initialized) - so a clink pre-init
+        // makes it fail "S3 was already initialized". ensure_registered() already
+        // suppressed OpenSSL's atexit before any S3 bring-up, and the process finalises S3
+        // once at exit (finalize_arrow_s3 / the s3-finalizing test main). This mirrors the
+        // REST-catalog path, which likewise lets iceberg resolve + initialise its own S3 IO.
+        out.file_io = std::shared_ptr<ice::FileIO>(
+            unwrap(ice::arrow::MakeS3FileIO(t.file_io_props), "make s3 file io").release());
+    } else {
+        out.file_io = std::shared_ptr<ice::FileIO>(ice::arrow::MakeLocalFileIO().release());
+    }
+
+    if (!rest) {
+        ice::sql::SqlCatalogConfig cfg_;
+        cfg_.name = "clink";
+        cfg_.warehouse_location = t.warehouse;
+        cfg_.uri = t.catalog_uri.empty() ? (t.warehouse + "/catalog.db") : t.catalog_uri;
+        out.catalog = unwrap(ice::sql::SqlCatalog::MakeSqliteCatalog(cfg_, out.file_io),
+                             "make sqlite catalog");
+    }
+
+    ice::Namespace ns;
+    ns.levels = t.namespace_levels;
+    if (auto ex = out.catalog->NamespaceExists(ns); ex.has_value() && !ex.value()) {
+        (void)out.catalog->CreateNamespace(ns, {});  // best-effort
+    }
+    out.id.ns = ns;
+    out.id.name = t.table;
+
+    // Table location (warehouse/<ns>/<table>). A REST catalog lets the server assign it
+    // (pass empty). A SQL catalog - local-FS OR S3 - must be given an EXPLICIT location:
+    // iceberg-cpp's SqlCatalog::CreateTable does not derive one from the warehouse, so an
+    // empty location makes it write the initial metadata to an empty path, dereferencing a
+    // null output stream (SIGSEGV in TableMetadataUtil::Write). Only a local-FS warehouse
+    // needs the dirs pre-created (Arrow's local FileIO does not mkdir parents; S3 has none).
+    const bool local_fs = !rest && !s3;
+    std::string location;
+    if (!rest) {
+        location = t.warehouse;
+        for (const auto& level : t.namespace_levels) {
+            location += "/" + level;
+        }
+        location += "/" + t.table;
+        if (local_fs) {
+            std::error_code ec;
+            std::filesystem::create_directories(location + "/metadata", ec);
+            std::filesystem::create_directories(location + "/data", ec);
+        }
+    }
+
+    if (auto ex = out.catalog->TableExists(out.id); ex.has_value() && !ex.value()) {
+        (void)unwrap(out.catalog->CreateTable(
+                         out.id, ice_schema, spec, ice::SortOrder::Unsorted(), location, {}),
+                     "create table");
+    }
+    out.table = unwrap(out.catalog->LoadTable(out.id), "load table");
+
+    // REST: the table carries the catalog-resolved FileIO (e.g. S3) - adopt it for the
+    // data-file writer. For an existing local table, ensure its data/metadata dirs exist.
+    if (rest) {
+        out.file_io = out.table->io();
+    } else if (local_fs) {
+        std::error_code ec;
+        std::filesystem::create_directories(std::string(out.table->location()) + "/metadata", ec);
+        std::filesystem::create_directories(std::string(out.table->location()) + "/data", ec);
+    }
+    return out;
+}
+
 // AddDataFile/AddDeleteFile are protected, so a thin subclass exposes them - the pattern
 // the in-tree merging_snapshot_update_test uses). operation() = overwrite.
 class RowDelta : public ice::MergingSnapshotUpdate {
@@ -255,112 +393,22 @@ public:
             key_ice_schema_ = std::make_shared<ice::Schema>(std::move(kf));
         }
 
-        // Catalog selection by catalog_uri scheme:
-        //   http(s)://  -> REST catalog (resolves its own FileIO, e.g. S3, from /config +
-        //                  the io props; the table location is server-assigned).
-        //   otherwise   -> SQLite SQL catalog + an explicit local/S3 FileIO.
-        const bool rest = opts_.catalog_uri.rfind("http://", 0) == 0 ||
-                          opts_.catalog_uri.rfind("https://", 0) == 0;
-        const bool s3 = opts_.warehouse.rfind("s3://", 0) == 0;
-
-        if (rest) {
-            std::unordered_map<std::string, std::string> props;
-            props["uri"] = opts_.catalog_uri;
-            props["name"] = "clink";
-            if (!opts_.warehouse.empty()) {
-                props["warehouse"] = opts_.warehouse;
-            }
-            // Pass FileIO props (s3.endpoint/region/credentials/path-style) through so the
-            // catalog-resolved FileIO can reach the object store.
-            for (const auto& [k, v] : opts_.file_io_props) {
-                props[k] = v;
-            }
-            if (!opts_.rest_auth_token.empty()) {
-                props["header.Authorization"] = "Bearer " + opts_.rest_auth_token;
-            }
-            // RestCatalog::Make does a synchronous GET /config here; a bad/unreachable
-            // endpoint surfaces as a clear error (open() is otherwise local-only).
-            catalog_ = unwrap(ice::rest::RestCatalog::Make(
-                                  ice::rest::RestCatalogProperties::FromMap(std::move(props))),
-                              "make rest catalog");
-        } else if (s3) {
-            // The SQLite catalog file cannot live on S3, so an s3:// warehouse needs an
-            // explicit LOCAL catalog_uri (or use a REST catalog for full-S3).
-            if (opts_.catalog_uri.empty()) {
-                throw std::runtime_error(
-                    opts_.name +
-                    ": an s3:// warehouse requires an explicit local catalog_uri (the SQLite "
-                    "catalog cannot live on S3; or use a REST catalog)");
-            }
-            // Let iceberg-cpp's MakeS3FileIO own the Arrow S3 bring-up (it guards
-            // InitializeS3 to once per process). Do NOT pre-init via clink's owner here:
-            // 0.3.0's MakeS3FileIO calls arrow::fs::InitializeS3, which RETURNS AN ERROR if
-            // S3 was already initialized (unlike EnsureS3Initialized) - so a clink pre-init
-            // makes it fail "S3 was already initialized". ensure_registered() above already
-            // suppressed OpenSSL's atexit before any S3 bring-up, and the process finalises S3
-            // once at exit (finalize_arrow_s3 / the s3-finalizing test main). This mirrors the
-            // REST-catalog path, which likewise lets iceberg resolve + initialise its own S3 IO.
-            file_io_ = std::shared_ptr<ice::FileIO>(
-                unwrap(ice::arrow::MakeS3FileIO(opts_.file_io_props), "make s3 file io").release());
-        } else {
-            file_io_ = std::shared_ptr<ice::FileIO>(ice::arrow::MakeLocalFileIO().release());
-        }
-
-        if (!rest) {
-            ice::sql::SqlCatalogConfig cfg_;
-            cfg_.name = "clink";
-            cfg_.warehouse_location = opts_.warehouse;
-            cfg_.uri =
-                opts_.catalog_uri.empty() ? (opts_.warehouse + "/catalog.db") : opts_.catalog_uri;
-            catalog_ = unwrap(ice::sql::SqlCatalog::MakeSqliteCatalog(cfg_, file_io_),
-                              "make sqlite catalog");
-        }
-
-        ice::Namespace ns;
-        ns.levels = opts_.namespace_levels;
-        if (auto ex = catalog_->NamespaceExists(ns); ex.has_value() && !ex.value()) {
-            (void)catalog_->CreateNamespace(ns, {});  // best-effort
-        }
-        id_.ns = ns;
-        id_.name = opts_.table;
-
-        // Table location (warehouse/<ns>/<table>). A REST catalog lets the server assign it
-        // (pass empty). A SQL catalog - local-FS OR S3 - must be given an EXPLICIT location:
-        // iceberg-cpp's SqlCatalog::CreateTable does not derive one from the warehouse, so an
-        // empty location makes it write the initial metadata to an empty path, dereferencing a
-        // null output stream (SIGSEGV in TableMetadataUtil::Write). Only a local-FS warehouse
-        // needs the dirs pre-created (Arrow's local FileIO does not mkdir parents; S3 has none).
-        const bool local_fs = !rest && !s3;
-        std::string location;
-        if (!rest) {
-            location = opts_.warehouse;
-            for (const auto& level : opts_.namespace_levels) {
-                location += "/" + level;
-            }
-            location += "/" + opts_.table;
-            if (local_fs) {
-                std::error_code ec;
-                std::filesystem::create_directories(location + "/metadata", ec);
-                std::filesystem::create_directories(location + "/data", ec);
-            }
-        }
-
-        if (auto ex = catalog_->TableExists(id_); ex.has_value() && !ex.value()) {
-            (void)unwrap(catalog_->CreateTable(
-                             id_, ice_schema_, spec, ice::SortOrder::Unsorted(), location, {}),
-                         "create table");
-        }
-        table_ = unwrap(catalog_->LoadTable(id_), "load table");
-
-        // REST: the table carries the catalog-resolved FileIO (e.g. S3) - adopt it for the
-        // data-file writer. For an existing local table, ensure its data/metadata dirs exist.
-        if (rest) {
-            file_io_ = table_->io();
-        } else if (local_fs) {
-            std::error_code ec;
-            std::filesystem::create_directories(std::string(table_->location()) + "/metadata", ec);
-            std::filesystem::create_directories(std::string(table_->location()) + "/data", ec);
-        }
+        // Catalog + table open, shared with the state export (see
+        // open_catalog_table above): REST / S3-SQLite / local-SQLite
+        // selection, namespace + table create-if-missing, LoadTable.
+        CatalogTargetSpec target;
+        target.warehouse = opts_.warehouse;
+        target.table = opts_.table;
+        target.catalog_uri = opts_.catalog_uri;
+        target.rest_auth_token = opts_.rest_auth_token;
+        target.name = opts_.name;
+        target.namespace_levels = opts_.namespace_levels;
+        target.file_io_props = opts_.file_io_props;
+        auto opened = open_catalog_table(target, ice_schema_, spec);
+        file_io_ = std::move(opened.file_io);
+        catalog_ = std::move(opened.catalog);
+        id_ = std::move(opened.id);
+        table_ = std::move(opened.table);
 
         // Exactly-once recovery: commit any data files staged before a crash whose
         // checkpoint completed globally (idempotent - skips checkpoints already snapshotted).
@@ -1160,6 +1208,151 @@ std::shared_ptr<Sink<clink::sql::Row>> make_iceberg_row_sink(IcebergRowSinkOptio
     auto sink = std::make_shared<IcebergRowSink>(std::move(opts));
     sink->set_uid(uid);
     return sink;
+}
+
+IcebergStateExportResult export_state_iceberg(const clink::state_processor::StateEntries& entries,
+                                              IcebergStateExportOptions options) {
+    if (options.warehouse.empty()) {
+        throw std::runtime_error("iceberg state export: 'warehouse' is required");
+    }
+    if (options.table.empty()) {
+        throw std::runtime_error("iceberg state export: 'table' is required");
+    }
+    ensure_registered();
+
+    // The decoded entry schema (see state_export.hpp). op_id is bit-cast
+    // to signed long: Iceberg has no unsigned types, and the cast is
+    // exact and reversible.
+    auto arrow_schema = arrow::schema({
+        arrow::field("op_id", arrow::int64(), /*nullable=*/false),
+        arrow::field("key_group", arrow::int32(), /*nullable=*/false),
+        arrow::field("slot", arrow::utf8(), /*nullable=*/false),
+        arrow::field("user_key", arrow::binary(), /*nullable=*/false),
+        arrow::field("value_bytes", arrow::binary(), /*nullable=*/false),
+    });
+    auto ice_schema = arrow_schema_to_ice(*arrow_schema);
+
+    CatalogTargetSpec target;
+    target.warehouse = options.warehouse;
+    target.table = options.table;
+    target.catalog_uri = options.catalog_uri;
+    target.rest_auth_token = options.rest_auth_token;
+    target.name = "iceberg state export";
+    target.namespace_levels = options.namespace_levels;
+    target.file_io_props = options.file_io_props;
+    auto opened = open_catalog_table(target, ice_schema, ice::PartitionSpec::Unpartitioned());
+
+    // Appending to an existing table: its column names must match ours,
+    // else refuse rather than commit a file the table schema disagrees with.
+    {
+        const auto existing = unwrap(opened.table->schema(), "table schema");
+        const auto& fields = existing->fields();
+        bool ok = fields.size() == 5;
+        static constexpr const char* kNames[5] = {
+            "op_id", "key_group", "slot", "user_key", "value_bytes"};
+        for (std::size_t i = 0; ok && i < fields.size(); ++i) {
+            ok = fields[i].name() == kNames[i];
+        }
+        if (!ok) {
+            throw std::runtime_error("iceberg state export: table '" + options.table +
+                                     "' exists with a different schema; export into a fresh table");
+        }
+    }
+
+    // One Parquet data file, written in bounded chunks.
+    const std::string data_path =
+        std::string(opened.table->location()) + "/data/" + make_uuid() + ".parquet";
+    ice::WriterOptions wopts;
+    wopts.path = data_path;
+    wopts.schema = ice_schema;
+    wopts.io = opened.file_io;
+    auto writer = unwrap(ice::WriterFactoryRegistry::Open(ice::FileFormatType::kParquet, wopts),
+                         "open parquet writer");
+
+    constexpr std::size_t kChunkRows = 64 * 1024;
+    std::int64_t total_rows = 0;
+    arrow::Int64Builder op_b;
+    arrow::Int32Builder kg_b;
+    arrow::StringBuilder slot_b;
+    arrow::BinaryBuilder key_b;
+    arrow::BinaryBuilder val_b;
+    std::size_t pending = 0;
+
+    auto flush_chunk = [&]() {
+        if (pending == 0) {
+            return;
+        }
+        std::shared_ptr<arrow::Array> op_arr, kg_arr, slot_arr, key_arr, val_arr;
+        auto fin = [&](auto& b, std::shared_ptr<arrow::Array>& out, const char* what) {
+            if (auto st = b.Finish(&out); !st.ok()) {
+                throw std::runtime_error(std::string("iceberg state export: ") + what + ": " +
+                                         st.ToString());
+            }
+        };
+        fin(op_b, op_arr, "finish op_id");
+        fin(kg_b, kg_arr, "finish key_group");
+        fin(slot_b, slot_arr, "finish slot");
+        fin(key_b, key_arr, "finish user_key");
+        fin(val_b, val_arr, "finish value_bytes");
+        auto rb = arrow::RecordBatch::Make(arrow_schema,
+                                           static_cast<std::int64_t>(pending),
+                                           {op_arr, kg_arr, slot_arr, key_arr, val_arr});
+        ArrowArray c_arr{};
+        if (auto st = arrow::ExportRecordBatch(*rb, &c_arr); !st.ok()) {
+            throw std::runtime_error("iceberg state export: ExportRecordBatch: " + st.ToString());
+        }
+        // Writer::Write MOVES c_arr on success; on failure ownership stays
+        // with us (see write_group_ above for the full contract).
+        auto wst = writer->Write(&c_arr);
+        if (c_arr.release != nullptr) {
+            c_arr.release(&c_arr);
+        }
+        ensure_ok(wst, "writer Write");
+        total_rows += static_cast<std::int64_t>(pending);
+        pending = 0;
+    };
+
+    for (const auto& [op, slots] : entries) {
+        for (const auto& [slot, slot_entries] : slots) {
+            for (const auto& [user_key, entry] : slot_entries) {
+                (void)op_b.Append(static_cast<std::int64_t>(op.value()));
+                (void)kg_b.Append(static_cast<std::int32_t>(entry.key_group));
+                (void)slot_b.Append(slot);
+                (void)key_b.Append(reinterpret_cast<const uint8_t*>(user_key.data()),
+                                   static_cast<int32_t>(user_key.size()));
+                (void)val_b.Append(reinterpret_cast<const uint8_t*>(entry.value.data()),
+                                   static_cast<int32_t>(entry.value.size()));
+                if (++pending >= kChunkRows) {
+                    flush_chunk();
+                }
+            }
+        }
+    }
+    flush_chunk();
+    ensure_ok(writer->Close(), "writer Close");
+    const auto file_size = unwrap(writer->length(), "writer length");
+
+    // One snapshot for the whole export, tagged for provenance.
+    auto df = std::make_shared<ice::DataFile>();
+    df->file_path = data_path;
+    df->file_format = ice::FileFormatType::kParquet;
+    df->record_count = total_rows;
+    df->file_size_in_bytes = file_size;
+    df->partition_spec_id = ice::PartitionSpec::kInitialSpecId;
+    df->content = ice::DataFile::Content::kData;
+    auto fa = unwrap(opened.table->NewFastAppend(), "new fast append");
+    fa->AppendFile(df);
+    fa->Set("clink.state-export", "true");
+    auto cst = fa->Commit();
+    if (!cst.has_value()) {
+        (void)opened.file_io->DeleteFile(data_path);  // do not strand the orphan
+        throw std::runtime_error("iceberg state export: commit snapshot: " + cst.error().message);
+    }
+
+    IcebergStateExportResult result;
+    result.table_location = std::string(opened.table->location());
+    result.rows = total_rows;
+    return result;
 }
 
 }  // namespace clink::iceberg
