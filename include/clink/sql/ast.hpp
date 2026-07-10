@@ -643,8 +643,12 @@ struct CreateViewStmt {
 };
 
 // CREATE [OR REPLACE] FUNCTION name(arg TYPE, ...) RETURNS TYPE
-//   LANGUAGE lang AS 'definition'[, 'definition2'].
-// Declares a scalar UDF whose implementation an installed language loader
+//   LANGUAGE lang AS 'definition'[, 'definition2']
+// and its aggregate sibling (is_aggregate = true)
+// CREATE [OR REPLACE] AGGREGATE name(TYPE, ...)
+//   (language = 'lang', module = 'definition', result_type = 'TYPE'
+//    [, export = 'definition2']).
+// Both declare a UDF whose implementation an installed language loader
 // provides (see operators/udf_language_registry.hpp). For LANGUAGE wasm
 // the definitions are the module path and (optionally) the export name.
 // Argument names are carried for diagnostics only; calls bind positionally.
@@ -656,6 +660,7 @@ struct CreateFunctionStmt {
     std::string language;
     std::vector<std::string> definitions;  // the AS strings, verbatim
     bool or_replace = false;
+    bool is_aggregate = false;  // CREATE AGGREGATE (UDAF) vs scalar
     Loc loc;
 };
 

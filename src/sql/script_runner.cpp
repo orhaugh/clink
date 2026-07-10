@@ -7,6 +7,7 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/core/base64.hpp"
 #include "clink/http/http_client.hpp"
+#include "clink/operators/agg_function_registry.hpp"
 #include "clink/operators/scalar_function_registry.hpp"
 #include "clink/operators/udf_language_registry.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -163,7 +164,8 @@ int run_script(const std::string& sql,
                                                          f->arg_types,
                                                          f->return_type,
                                                          f->definitions,
-                                                         f->module_b64});
+                                                         f->module_b64,
+                                                         f->kind});
                 }
             }
         };
@@ -175,12 +177,19 @@ int run_script(const std::string& sql,
         // linked here); using it then errors as an unknown function.
         for (const auto& fname : catalog.list_functions()) {
             const auto* f = catalog.get_function(fname);
-            if (f == nullptr || ScalarFunctionRegistry::global().contains(f->name)) {
+            if (f == nullptr) {
+                continue;
+            }
+            const bool is_aggregate = f->kind == "aggregate";
+            const bool already = is_aggregate ? AggFunctionRegistry::global().contains(f->name)
+                                              : ScalarFunctionRegistry::global().contains(f->name);
+            if (already) {
                 continue;
             }
             try {
                 UdfLanguageRegistry::FunctionDecl decl;
                 decl.name = f->name;
+                decl.is_aggregate = is_aggregate;
                 decl.arg_types.reserve(f->arg_types.size());
                 for (const auto& t : f->arg_types) {
                     decl.arg_types.push_back(udf_type_from_wire_name(t));
@@ -258,20 +267,26 @@ int run_script(const std::string& sql,
                 // ScalarFunctionRegistry, where the binder and evaluator
                 // already find it. No job is submitted.
                 const auto& cf = std::get<ast::CreateFunctionStmt>(stmt);
+                const char* noun = cf.is_aggregate ? "aggregate" : "function";
                 try {
                     UdfLanguageRegistry::FunctionDecl decl;
                     decl.name = cf.function_name;
+                    decl.is_aggregate = cf.is_aggregate;
                     decl.return_type = sql_type_to_arrow(cf.return_type);
                     decl.arg_types.reserve(cf.arg_types.size());
                     for (const auto& t : cf.arg_types) {
                         decl.arg_types.push_back(sql_type_to_arrow(t));
                     }
                     decl.definitions = cf.definitions;
-                    if (!cf.or_replace &&
-                        ScalarFunctionRegistry::global().contains(cf.function_name)) {
-                        throw std::runtime_error("function '" + cf.function_name +
-                                                 "' already exists (use CREATE OR REPLACE "
-                                                 "FUNCTION to replace it)");
+                    const bool exists =
+                        cf.is_aggregate
+                            ? AggFunctionRegistry::global().contains(cf.function_name)
+                            : ScalarFunctionRegistry::global().contains(cf.function_name);
+                    if (!cf.or_replace && exists) {
+                        throw std::runtime_error(std::string{noun} + " '" + cf.function_name +
+                                                 "' already exists (use CREATE OR REPLACE " +
+                                                 (cf.is_aggregate ? "AGGREGATE" : "FUNCTION") +
+                                                 " to replace it)");
                     }
                     UdfLanguageRegistry::global().load(cf.language, decl);
                     // Record the declaration in the catalog (persisted when
@@ -291,6 +306,7 @@ int run_script(const std::string& sql,
                     fdef.return_type =
                         decl.return_type != nullptr ? decl.return_type->ToString() : "";
                     fdef.definitions = cf.definitions;
+                    fdef.kind = cf.is_aggregate ? "aggregate" : "";
                     if (auto payload = UdfLanguageRegistry::global().package(cf.language, decl);
                         !payload.empty()) {
                         fdef.module_b64 = clink::base64_encode(std::string_view{
@@ -301,11 +317,11 @@ int run_script(const std::string& sql,
                     // catalog write is always a replace.
                     catalog.register_function(std::move(fdef), /*or_replace=*/true);
                 } catch (const std::exception& e) {
-                    err << "error: CREATE FUNCTION " << cf.function_name << ": " << e.what()
-                        << "\n";
+                    err << "error: CREATE " << (cf.is_aggregate ? "AGGREGATE " : "FUNCTION ")
+                        << cf.function_name << ": " << e.what() << "\n";
                     return 1;
                 }
-                out << "created function " << cf.function_name << " (language " << cf.language
+                out << "created " << noun << " " << cf.function_name << " (language " << cf.language
                     << ")\n";
                 continue;
             }
@@ -313,6 +329,7 @@ int run_script(const std::string& sql,
                 const auto& df = std::get<ast::DropFunctionStmt>(stmt);
                 for (const auto& fname : df.function_names) {
                     const bool known = ScalarFunctionRegistry::global().contains(fname) ||
+                                       AggFunctionRegistry::global().contains(fname) ||
                                        catalog.get_function(fname) != nullptr;
                     if (!known) {
                         if (df.if_exists) {
@@ -323,10 +340,13 @@ int run_script(const std::string& sql,
                         return 1;
                     }
                     // Drops the declaration (and its persisted file) plus
-                    // THIS process's registration. TaskManagers that
-                    // registered it from an earlier deploy keep theirs for
-                    // the process lifetime, like C++-registered UDFs.
+                    // THIS process's registration - scalar or aggregate
+                    // (DROP FUNCTION and DROP AGGREGATE share semantics).
+                    // TaskManagers that registered it from an earlier deploy
+                    // keep theirs for the process lifetime, like
+                    // C++-registered UDFs.
                     ScalarFunctionRegistry::global().remove(fname);
+                    AggFunctionRegistry::global().remove(fname);
                     catalog.drop_function(fname);
                     out << "dropped function " << fname << "\n";
                 }

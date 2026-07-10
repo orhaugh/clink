@@ -34,6 +34,22 @@ void register_wasm_udf(const std::string& name,
                        const std::string& export_name,
                        std::uint64_t fuel_limit = 0);
 
+// Load a WebAssembly module and register the UDAF `name` in
+// AggFunctionRegistry from exports `<export_prefix>_init` /
+// `<export_prefix>_accumulate` / `<export_prefix>_result` (plus optional
+// `_retract` / `_merge`). The accumulator is opaque guest bytes: an
+// argument pair (i32 ptr, i32 len) into each export, a packed i64
+// ((ptr << 32) | len) out; the host carries it between calls as a base64
+// string, so it checkpoints like built-in aggregate state. `memory` and
+// `alloc` exports are required. CREATE AGGREGATE reaches this through the
+// language loader.
+void register_wasm_udaf(const std::string& name,
+                        const std::vector<std::shared_ptr<arrow::DataType>>& arg_types,
+                        const std::shared_ptr<arrow::DataType>& return_type,
+                        const std::string& module_path,
+                        const std::string& export_prefix,
+                        std::uint64_t fuel_limit = 0);
+
 // Compile WebAssembly text format to binary (a thin wrapper over
 // wasmtime's wat2wasm). For tests and tooling. Throws on invalid WAT.
 std::vector<std::uint8_t> wat_to_wasm(const std::string& wat);

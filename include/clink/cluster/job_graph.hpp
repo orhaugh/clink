@@ -102,6 +102,9 @@ struct UdfSpec {
     std::string return_type;
     std::vector<std::string> definitions;
     std::string module_b64;
+    // "scalar" (default; absent on the wire for back-compat) or
+    // "aggregate" (CREATE AGGREGATE: registers an accumulator).
+    std::string kind;
 };
 
 // Pack/unpack a UDF list as a JSON array string - the single-string form

@@ -135,6 +135,7 @@ std::vector<UdfSpec> udf_specs_from_value(const config::JsonValue& arr) {
             }
         }
         u.module_b64 = v.string_or("module_b64", "");
+        u.kind = v.string_or("kind", "");
         out.push_back(std::move(u));
     }
     return out;
@@ -171,6 +172,10 @@ std::string pack_udf_specs(const std::vector<UdfSpec>& udfs) {
         }
         out += "],\"module_b64\":";
         out += escape_json_string(u.module_b64);
+        if (!u.kind.empty()) {
+            out += ",\"kind\":";
+            out += escape_json_string(u.kind);
+        }
         out += '}';
     }
     out += ']';

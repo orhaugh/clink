@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/config/json.hpp"
+#include "clink/operators/agg_function_registry.hpp"
 #include "clink/operators/scalar_function_registry.hpp"
 #include "clink/operators/udf_language_registry.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -419,4 +420,164 @@ TEST(WasmUdf, ConcurrentCallsFromManyThreads) {
     EXPECT_EQ(wrong.load(), 0);
     fs::remove(add_mod);
     fs::remove(echo_mod);
+}
+
+// A WAT sum UDAF over the guest-bytes accumulator ABI: acc = 8 bytes
+// (little-endian i64). Shared by the registry-level tests below.
+namespace {
+constexpr const char* kWsumWat = R"((module
+    (memory (export "memory") 1)
+    (global $heap (mut i32) (i32.const 1024))
+    (func $alloc (export "alloc") (param $size i32) (result i32)
+        (local $p i32)
+        global.get $heap
+        local.set $p
+        global.get $heap
+        local.get $size
+        i32.add
+        global.set $heap
+        local.get $p)
+    (func $pack (param $p i32) (param $l i32) (result i64)
+        local.get $p
+        i64.extend_i32_u
+        i64.const 32
+        i64.shl
+        local.get $l
+        i64.extend_i32_u
+        i64.or)
+    (func $boxed (param $v i64) (result i64)
+        (local $out i32)
+        i32.const 8
+        call $alloc
+        local.set $out
+        local.get $out
+        local.get $v
+        i64.store
+        local.get $out
+        i32.const 8
+        call $pack)
+    (func (export "wsum_init") (result i64)
+        i64.const 0
+        call $boxed)
+    (func (export "wsum_accumulate") (param $ap i32) (param $al i32) (param $x i64) (result i64)
+        local.get $ap
+        i64.load
+        local.get $x
+        i64.add
+        call $boxed)
+    (func (export "wsum_retract") (param $ap i32) (param $al i32) (param $x i64) (result i64)
+        local.get $ap
+        i64.load
+        local.get $x
+        i64.sub
+        call $boxed)
+    (func (export "wsum_merge") (param $ap i32) (param $al i32) (param $bp i32) (param $bl i32) (result i64)
+        local.get $ap
+        i64.load
+        local.get $bp
+        i64.load
+        i64.add
+        call $boxed)
+    (func (export "wsum_result") (param $ap i32) (param $al i32) (result i64)
+        local.get $ap
+        i64.load)))";
+}  // namespace
+
+TEST(WasmUdaf, SumAccumulatesRetractsMergesThroughRegistry) {
+    const auto mod = write_module("clink_wasm_udaf_sum.wasm", kWsumWat);
+    clink::wasm::register_wasm_udaf(
+        "wasm_wsum", {arrow::int64()}, arrow::int64(), mod.string(), "wsum");
+
+    auto entry = clink::AggFunctionRegistry::global().lookup("wasm_wsum");
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_TRUE(entry->has_retract());
+    EXPECT_TRUE(entry->has_merge());
+    EXPECT_TRUE(entry->return_type->Equals(arrow::int64()));
+
+    auto acc = entry->init();
+    ASSERT_TRUE(acc.is_string());  // opaque packed state
+    acc = entry->accumulate(std::move(acc), {JsonValue{10.0}});
+    acc = entry->accumulate(std::move(acc), {JsonValue{20.0}});
+    acc = entry->accumulate(std::move(acc), {JsonValue{12.0}});
+    EXPECT_EQ(static_cast<std::int64_t>(entry->result(acc).as_number()), 42);
+
+    // Retraction inverts a row (changelog input).
+    acc = entry->retract(std::move(acc), {JsonValue{12.0}});
+    EXPECT_EQ(static_cast<std::int64_t>(entry->result(acc).as_number()), 30);
+
+    // A NULL argument leaves the accumulator unchanged (SQL null row).
+    const auto before = acc.as_string();
+    acc = entry->accumulate(std::move(acc), {JsonValue{nullptr}});
+    EXPECT_EQ(acc.as_string(), before);
+
+    // Merge combines two accumulators (SESSION-window merge).
+    auto other = entry->init();
+    other = entry->accumulate(std::move(other), {JsonValue{5.0}});
+    const auto merged = entry->merge(std::move(acc), std::move(other));
+    EXPECT_EQ(static_cast<std::int64_t>(entry->result(merged).as_number()), 35);
+    fs::remove(mod);
+}
+
+TEST(WasmUdaf, OptionalExportsAndMissingRequiredOnes) {
+    // Without _retract/_merge the registry entry reports no such
+    // capability (the aggregate operator's checks then reject retracting /
+    // SESSION input up front instead of miscomputing).
+    const auto minimal = write_module("clink_wasm_udaf_min.wasm", R"((module
+        (memory (export "memory") 1)
+        (global $heap (mut i32) (i32.const 1024))
+        (func $alloc (export "alloc") (param $size i32) (result i32)
+            (local $p i32)
+            global.get $heap
+            local.set $p
+            global.get $heap
+            local.get $size
+            i32.add
+            global.set $heap
+            local.get $p)
+        (func $boxed (param $v i64) (result i64)
+            (local $out i32)
+            i32.const 8
+            call $alloc
+            local.set $out
+            local.get $out
+            local.get $v
+            i64.store
+            local.get $out
+            i64.extend_i32_u
+            i64.const 32
+            i64.shl
+            i64.const 8
+            i64.or)
+        (func (export "cnt_init") (result i64)
+            i64.const 0
+            call $boxed)
+        (func (export "cnt_accumulate") (param $ap i32) (param $al i32) (param $x i64) (result i64)
+            local.get $ap
+            i64.load
+            i64.const 1
+            i64.add
+            call $boxed)
+        (func (export "cnt_result") (param $ap i32) (param $al i32) (result i64)
+            local.get $ap
+            i64.load)))");
+    clink::wasm::register_wasm_udaf(
+        "wasm_cnt", {arrow::int64()}, arrow::int64(), minimal.string(), "cnt");
+    auto entry = clink::AggFunctionRegistry::global().lookup("wasm_cnt");
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_FALSE(entry->has_retract());
+    EXPECT_FALSE(entry->has_merge());
+    auto acc = entry->init();
+    acc = entry->accumulate(std::move(acc), {JsonValue{99.0}});
+    acc = entry->accumulate(std::move(acc), {JsonValue{1.0}});
+    EXPECT_EQ(static_cast<std::int64_t>(entry->result(acc).as_number()), 2);
+
+    // A module missing a REQUIRED export fails at registration, not rows.
+    try {
+        clink::wasm::register_wasm_udaf(
+            "wasm_bad_agg", {arrow::int64()}, arrow::int64(), minimal.string(), "nope");
+        FAIL() << "missing _init export must fail the load";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("nope_init"), std::string::npos) << e.what();
+    }
+    fs::remove(minimal);
 }

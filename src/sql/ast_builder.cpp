@@ -1,5 +1,6 @@
 #include "clink/sql/ast_builder.hpp"
 
+#include <cctype>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -1615,6 +1616,102 @@ ast::CreateFunctionStmt translate_create_function_stmt(const JsonValue& body) {
     return stmt;
 }
 
+// CREATE [OR REPLACE] AGGREGATE name(TYPE, ...) (language='x',
+// module='...', result_type='TYPE' [, export='...']) parses as PG's
+// DefineStmt (kind OBJECT_AGGREGATE). PG's aggregate grammar has no
+// RETURNS clause, so the result type rides the definition list as the
+// `result_type` element; `language`/`module`/`export` mirror CREATE
+// FUNCTION's LANGUAGE and AS parts. Translated into the same
+// CreateFunctionStmt shape with is_aggregate set.
+ast::CreateFunctionStmt translate_define_aggregate_stmt(const JsonValue& body) {
+    ast::CreateFunctionStmt stmt;
+    stmt.is_aggregate = true;
+    stmt.loc = loc_from(body);
+    if (!body.contains("defnames") || !body.at("defnames").is_array() ||
+        body.at("defnames").as_array().empty()) {
+        unsupported("CREATE AGGREGATE missing name", stmt.loc.pos);
+    }
+    stmt.function_name = string_atom(body.at("defnames").as_array().back());
+    if (body.contains("replace") && body.at("replace").is_bool()) {
+        stmt.or_replace = body.at("replace").as_bool();
+    }
+    // args = [List of FunctionParameter, Integer(numdirectargs)] in the
+    // new-style grammar; tolerate a flattened FunctionParameter too.
+    auto add_parameter = [&](const JsonValue& p) {
+        auto [pkind, pbody] = node_wrapper(p);
+        if (pkind != "FunctionParameter") {
+            unsupported("CREATE AGGREGATE parameter kind " + pkind, stmt.loc.pos);
+        }
+        stmt.arg_names.push_back(pbody->contains("name") && pbody->at("name").is_string()
+                                     ? pbody->at("name").as_string()
+                                     : std::string{});
+        if (!pbody->contains("argType") || !pbody->at("argType").is_object()) {
+            unsupported("CREATE AGGREGATE parameter missing type", stmt.loc.pos);
+        }
+        stmt.arg_types.push_back(translate_type_name(pbody->at("argType")));
+    };
+    if (body.contains("args") && body.at("args").is_array()) {
+        for (const auto& a : body.at("args").as_array()) {
+            auto [akind, abody] = node_wrapper(a);
+            if (akind == "List") {
+                if (abody->contains("items") && abody->at("items").is_array()) {
+                    for (const auto& item : abody->at("items").as_array()) {
+                        add_parameter(item);
+                    }
+                }
+            } else if (akind == "FunctionParameter") {
+                add_parameter(a);
+            }
+            // Integer(numdirectargs) and anything else: not meaningful here.
+        }
+    }
+    std::string result_type;
+    if (body.contains("definition") && body.at("definition").is_array()) {
+        for (const auto& opt : body.at("definition").as_array()) {
+            auto [okind, obody] = node_wrapper(opt);
+            if (okind != "DefElem" || !obody->contains("defname")) {
+                continue;
+            }
+            const auto defname = obody->at("defname").as_string();
+            if (!obody->contains("arg")) {
+                continue;
+            }
+            if (defname == "language") {
+                stmt.language = string_atom(obody->at("arg"));
+            } else if (defname == "module") {
+                if (stmt.definitions.empty()) {
+                    stmt.definitions.push_back(string_atom(obody->at("arg")));
+                } else {
+                    stmt.definitions.insert(stmt.definitions.begin(),
+                                            string_atom(obody->at("arg")));
+                }
+            } else if (defname == "export") {
+                stmt.definitions.push_back(string_atom(obody->at("arg")));
+            } else if (defname == "result_type") {
+                result_type = string_atom(obody->at("arg"));
+            } else {
+                unsupported("CREATE AGGREGATE: unknown option '" + defname +
+                                "' (supported: language, module, result_type, export)",
+                            stmt.loc.pos);
+            }
+        }
+    }
+    if (stmt.language.empty()) {
+        unsupported("CREATE AGGREGATE requires language = '<name>'", stmt.loc.pos);
+    }
+    if (stmt.definitions.empty()) {
+        unsupported("CREATE AGGREGATE requires module = '<definition>'", stmt.loc.pos);
+    }
+    if (result_type.empty()) {
+        unsupported("CREATE AGGREGATE requires result_type = '<sql type>'", stmt.loc.pos);
+    }
+    for (auto& c : result_type) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    stmt.return_type.name = result_type;
+    return stmt;
+}
+
 // ALTER TABLE [IF EXISTS] <name> <cmd>, ... parses as a PG AlterTableStmt with a
 // list of AlterTableCmd nodes. v1 supports ADD COLUMN / DROP COLUMN (column-level
 // schema evolution of the catalog declaration); other actions (SET options,
@@ -1870,13 +1967,23 @@ ast::Statement translate_statement(const JsonValue& outer_stmt) {
         return ast::Statement{translate_insert_stmt(*body)};
     }
     if (kind == "DropStmt") {
-        // PG's DropStmt covers every object kind; functions take their own
-        // AST shape (their objects are ObjectWithArgs, not name Lists).
+        // PG's DropStmt covers every object kind; functions and aggregates
+        // take their own AST shape (their objects are ObjectWithArgs, not
+        // name Lists) and share DROP semantics.
         if (body->contains("removeType") && body->at("removeType").is_string() &&
-            body->at("removeType").as_string() == "OBJECT_FUNCTION") {
+            (body->at("removeType").as_string() == "OBJECT_FUNCTION" ||
+             body->at("removeType").as_string() == "OBJECT_AGGREGATE")) {
             return ast::Statement{translate_drop_function_stmt(*body)};
         }
         return ast::Statement{translate_drop_stmt(*body)};
+    }
+    if (kind == "DefineStmt") {
+        // PG's generic CREATE <object> (...) statement; aggregates are the
+        // only supported kind.
+        if (body->contains("kind") && body->at("kind").is_string() &&
+            body->at("kind").as_string() == "OBJECT_AGGREGATE") {
+            return ast::Statement{translate_define_aggregate_stmt(*body)};
+        }
     }
     if (kind == "VariableShowStmt") {
         return ast::Statement{translate_show_stmt(*body)};

@@ -23,6 +23,7 @@
 #include "clink/cluster/task_manager.hpp"
 #include "clink/config/json.hpp"
 #include "clink/embed/embedded_engine.hpp"
+#include "clink/operators/agg_function_registry.hpp"
 #include "clink/operators/scalar_function_registry.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/sql/catalog.hpp"
@@ -485,5 +486,126 @@ TEST(WasmSqlE2E, DropFunctionRemovesRegistrationAndPersistence) {
         0)
         << err.str();
     fs::remove(mod);
+    fs::remove_all(cat_dir);
+}
+
+TEST(WasmSqlE2E, CreateAggregateRunsGroupByAndPersists) {
+    // CREATE AGGREGATE ... (language='wasm', ...) end to end: declared in
+    // one catalog-backed engine, used from a SECOND engine (the module
+    // file deleted in between, so the persisted payload and the aggregate
+    // kind flag both prove themselves), driving an unbounded GROUP BY into
+    // an upsert file sink.
+    const auto cat_dir = fs::temp_directory_path() / "clink_wasm_cat_agg";
+    fs::remove_all(cat_dir);
+    fs::create_directories(cat_dir);
+    const auto mod = write_wasm("clink_wasm_agg_e2e.wasm", R"((module
+        (memory (export "memory") 1)
+        (global $heap (mut i32) (i32.const 1024))
+        (func $alloc (export "alloc") (param $size i32) (result i32)
+            (local $p i32)
+            global.get $heap
+            local.set $p
+            global.get $heap
+            local.get $size
+            i32.add
+            global.set $heap
+            local.get $p)
+        (func $boxed (param $v i64) (result i64)
+            (local $out i32)
+            i32.const 8
+            call $alloc
+            local.set $out
+            local.get $out
+            local.get $v
+            i64.store
+            local.get $out
+            i64.extend_i32_u
+            i64.const 32
+            i64.shl
+            i64.const 8
+            i64.or)
+        (func (export "wsum_init") (result i64)
+            i64.const 0
+            call $boxed)
+        (func (export "wsum_accumulate") (param $ap i32) (param $al i32) (param $x i64) (result i64)
+            local.get $ap
+            i64.load
+            local.get $x
+            i64.add
+            call $boxed)
+        (func (export "wsum_retract") (param $ap i32) (param $al i32) (param $x i64) (result i64)
+            local.get $ap
+            i64.load
+            local.get $x
+            i64.sub
+            call $boxed)
+        (func (export "wsum_result") (param $ap i32) (param $al i32) (result i64)
+            local.get $ap
+            i64.load)))");
+    const auto in_path = fs::temp_directory_path() / "clink_wasm_agg_in.ndjson";
+    const auto out_path = fs::temp_directory_path() / "clink_wasm_agg_out.ndjson";
+    fs::remove(in_path);
+    fs::remove(out_path);
+    {
+        std::ofstream out(in_path, std::ios::trunc);
+        out << R"({"usr":"a","amount":10})" << "\n"
+            << R"({"usr":"b","amount":5})" << "\n"
+            << R"({"usr":"a","amount":20})" << "\n"
+            << R"({"usr":"a","amount":12})" << "\n";
+    }
+
+    {
+        clink::embed::EngineOptions opts;
+        opts.catalog_dir = cat_dir.string();
+        std::ostringstream err, out;
+        opts.err = &err;
+        opts.out = &out;
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        ASSERT_EQ(engine.execute_script(
+                      "CREATE AGGREGATE wsum_e2e(BIGINT) (language = 'wasm', module = '" +
+                      mod.string() + "', result_type = 'BIGINT', export = 'wsum')"),
+                  0)
+            << err.str();
+        EXPECT_NE(out.str().find("created aggregate wsum_e2e"), std::string::npos);
+        ASSERT_EQ(engine.execute_script("CREATE TABLE aevt (usr TEXT, amount BIGINT) "
+                                        "WITH (connector='file', format='json', path='" +
+                                        in_path.string() +
+                                        "');"
+                                        "CREATE TABLE aout (usr TEXT, total BIGINT) "
+                                        "WITH (connector='file', format='json', path='" +
+                                        out_path.string() + "', mode='upsert', primary_key='usr')"),
+                  0)
+            << err.str();
+    }
+    ASSERT_TRUE(fs::exists(cat_dir / "functions" / "wsum_e2e.json"));
+
+    // A fresh process: no module file, no registration - only the catalog.
+    fs::remove(mod);
+    clink::AggFunctionRegistry::global().remove("wsum_e2e");
+    ASSERT_FALSE(clink::AggFunctionRegistry::global().contains("wsum_e2e"));
+
+    {
+        clink::embed::EngineOptions opts;
+        opts.catalog_dir = cat_dir.string();
+        std::ostringstream err;
+        opts.err = &err;
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        ASSERT_EQ(engine.execute_script(
+                      "INSERT INTO aout SELECT usr, wsum_e2e(amount) AS total FROM aevt "
+                      "GROUP BY usr"),
+                  0)
+            << err.str();
+        ASSERT_TRUE(engine.await_all()) << err.str();
+    }
+    std::map<std::string, std::int64_t> got;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        ASSERT_TRUE(js.is_object()) << l;
+        got[js.at("usr").as_string()] = static_cast<std::int64_t>(js.at("total").as_number());
+    }
+    EXPECT_EQ(got["a"], 42);
+    EXPECT_EQ(got["b"], 5);
+    fs::remove(in_path);
+    fs::remove(out_path);
     fs::remove_all(cat_dir);
 }

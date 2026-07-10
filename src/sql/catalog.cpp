@@ -707,6 +707,9 @@ std::string Catalog::to_json(const FunctionDef& def) {
     root["return_type"] = JsonValue{def.return_type};
     root["definitions"] = JsonValue{std::move(defs)};
     root["module_b64"] = JsonValue{def.module_b64};
+    if (!def.kind.empty()) {
+        root["kind"] = JsonValue{def.kind};
+    }
     return JsonValue{std::move(root)}.serialize(2);
 }
 
@@ -736,6 +739,7 @@ FunctionDef Catalog::function_from_json(const std::string& text) {
         }
     }
     def.module_b64 = j.string_or("module_b64", "");
+    def.kind = j.string_or("kind", "");
     return def;
 }
 

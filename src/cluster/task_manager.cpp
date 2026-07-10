@@ -64,6 +64,7 @@ void register_shipped_udfs(const std::string& packed) {
             decl.return_type = udf_type_from_wire_name(u.return_type);
         }
         decl.definitions = u.definitions;
+        decl.is_aggregate = u.kind == "aggregate";
         if (!u.module_b64.empty()) {
             const auto bytes = base64_decode(u.module_b64);
             if (!bytes) {

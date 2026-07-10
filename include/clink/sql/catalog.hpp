@@ -179,6 +179,8 @@ struct FunctionDef {
     std::string return_type;               // Arrow ToString() name
     std::vector<std::string> definitions;  // CREATE ... AS strings, verbatim
     std::string module_b64;                // packaged payload; may be empty
+    // "scalar" (default when absent) or "aggregate" (CREATE AGGREGATE).
+    std::string kind;
 };
 
 class Catalog {

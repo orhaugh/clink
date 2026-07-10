@@ -43,6 +43,10 @@ public:
         // When non-empty a loader must prefer it over any path definition:
         // the path is only meaningful on the machine that ran the CREATE.
         std::vector<std::uint8_t> module_bytes;
+        // CREATE AGGREGATE (UDAF) vs scalar: an aggregate loader registers
+        // an accumulator (init/accumulate/result [, retract][, merge]) into
+        // AggFunctionRegistry instead of a scalar closure.
+        bool is_aggregate{false};
     };
 
     // Loads the declared function and registers it (into

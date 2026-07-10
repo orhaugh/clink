@@ -774,7 +774,13 @@ Advanced and extensibility (each a documented v1 subset)
   registers the function at deploy, no shared filesystem needed. Declarations
   persist in the catalog (payload included, so a restart never needs the
   original module path) and `DROP FUNCTION [IF EXISTS]` removes them; calls
-  run against a pool of instances, so parallel plans do not serialise
+  run against a pool of instances, so parallel plans do not serialise.
+  Aggregates too: `CREATE AGGREGATE f(BIGINT) (language='wasm',
+  module='/path.wasm', result_type='BIGINT')` maps `_init` / `_accumulate` /
+  `_result` (+ optional `_retract` / `_merge`) exports onto the UDAF
+  machinery, with the accumulator as opaque guest bytes that checkpoint like
+  built-in aggregate state - usable in plain and windowed GROUP BY,
+  changelog retraction, and SESSION merge
 - Programmatic Table API (v1): a fluent C++ builder, `from(...)` then optional
   `filter(...)` then either `select(...)` or `group_by(...).agg(...)` then
   `insert_into(...)`, sharing the binder's lowering so it produces a
