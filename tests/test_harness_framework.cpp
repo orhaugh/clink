@@ -658,3 +658,94 @@ TEST(TestFramework, TransactionalTestSinkModelsTheTwoPhaseCommitLifecycle) {
     EXPECT_EQ(sink.commits(), (std::vector<std::uint64_t>{1, 3}));
     EXPECT_EQ(sink.aborts(), (std::vector<std::uint64_t>{2}));
 }
+
+// ---- Increment 6: LocalTestEnvironment and MiniCluster ----
+
+#include <filesystem>
+#include <fstream>
+
+#include "clink/operators/map_operator.hpp"
+#include "clink/test/local_environment.hpp"
+#include "clink/test/mini_cluster.hpp"
+
+TEST(TestFramework, LocalTestEnvironmentRunsAPipelineOnTheRealRuntime) {
+    test::LocalTestEnvironment env;
+    auto src = std::make_shared<test::TestSource<std::int64_t>>();
+    src->emit(1, 1000).emit(2, 2000).watermark(2500).emit(3, 3000);
+    auto doubler = std::make_shared<MapOperator<std::int64_t, std::int64_t>>(
+        [](const std::int64_t& v) { return v * 2; }, "doubler");
+    auto sink = std::make_shared<test::CollectSink<std::int64_t>>();
+
+    auto h0 = env.dag().add_source<std::int64_t>(src);
+    auto h1 = env.dag().add_operator<std::int64_t, std::int64_t>(h0, doubler);
+    env.dag().add_sink<std::int64_t>(h1, sink);
+
+    env.execute();  // bounded source: runs to completion
+
+    EXPECT_EQ(sink->values(), (std::vector<std::int64_t>{2, 4, 6}));
+    // Event times and the scripted watermark rode the real channels.
+    EXPECT_EQ(sink->records()[0].event_time_ms, std::optional<std::int64_t>{1000});
+    EXPECT_FALSE(sink->watermarks().empty());
+    EXPECT_TRUE(env.errors().empty());
+}
+
+TEST(TestFramework, LocalTestEnvironmentSurfacesOperatorFailures) {
+    test::LocalTestEnvironment env;
+    auto src =
+        std::make_shared<test::TestSource<std::int64_t>>(std::vector<std::int64_t>{1, 2, 3, 4});
+    auto sink = std::make_shared<test::FailingSink<std::int64_t>>(/*pass_first=*/2);
+    auto h0 = env.dag().add_source<std::int64_t>(src);
+    env.dag().add_sink<std::int64_t>(h0, sink);
+
+    const auto errors = env.execute_collecting_errors();
+    ASSERT_EQ(errors.size(), 1u);
+    EXPECT_NE(errors[0].second.find("injected failure"), std::string::npos);
+    EXPECT_EQ(sink->values(), (std::vector<std::int64_t>{1, 2}));  // what landed pre-crash
+
+    // The throwing form raises PipelineFailure with the same detail.
+    test::LocalTestEnvironment env2;
+    auto src2 = std::make_shared<test::TestSource<std::int64_t>>(std::vector<std::int64_t>{1});
+    auto sink2 = std::make_shared<test::FailingSink<std::int64_t>>(0);
+    env2.dag().add_sink<std::int64_t>(env2.dag().add_source<std::int64_t>(src2), sink2);
+    EXPECT_THROW(env2.execute(), test::PipelineFailure);
+}
+
+TEST(TestFramework, MiniClusterRunsAJobGraphSpecToCompletion) {
+    test::MiniCluster mini({.task_managers = 1, .slots_per_task_manager = 4});
+
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_test_framework_mini_cluster.txt";
+    std::filesystem::remove(out_path);
+
+    cluster::JobGraphSpec g;
+    cluster::OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    src.parallelism = 1;
+    src.out_channel = std::string{cluster::kChannelInt64};
+    src.params = {{"count", "5"}};  // 1..5 (start defaults to 1)
+    g.ops.push_back(src);
+    cluster::OperatorSpec snk;
+    snk.type = "file_int64_sink";
+    snk.id = "snk";
+    snk.inputs = {"src"};
+    snk.parallelism = 1;
+    snk.out_channel = std::string{cluster::kChannelInt64};
+    snk.params = {{"path", out_path.string()}};
+    g.ops.push_back(snk);
+
+    mini.execute(g);  // submit + await + assert no job errors
+
+    std::ifstream in(out_path);
+    ASSERT_TRUE(in.good());
+    std::vector<std::int64_t> written;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty()) {
+            written.push_back(std::stoll(line));
+        }
+    }
+    std::sort(written.begin(), written.end());
+    EXPECT_EQ(written, (std::vector<std::int64_t>{1, 2, 3, 4, 5}));
+    std::filesystem::remove(out_path);
+}

@@ -18,6 +18,8 @@ Link the `clink::test_support` CMake target from test executables only; producti
 | `include/clink/test/two_input_harness.hpp` | `TwoInputOperatorHarness<In1, In2, Out>` and its keyed variant: `CoOperator` testing with the engine's real watermark combination |
 | `include/clink/test/failure_injection.hpp` | `FailurePlan`, `FailurePoint`, `InjectedFailure`: deterministic failure injection at the harness's mediation points |
 | `include/clink/test/sources_and_sinks.hpp` | `TestSource<T>` (scripted, checkpointable), `CollectSink<T>`, `FailingSink<T>`, `TransactionalTestSink<T>` (2PC lifecycle recorder) |
+| `include/clink/test/local_environment.hpp` | `LocalTestEnvironment`: complete pipelines on the real local runtime, run to completion, failures surfaced |
+| `include/clink/test/mini_cluster.hpp` | `MiniCluster`: a real JobManager + N real TaskManagers over loopback RPC, in one process |
 | `tests/test_harness_framework.cpp` | The framework's own contract tests |
 
 ## Testing a stateless function
@@ -124,6 +126,33 @@ src.emit(e1, 1000).emit(e2, 2000).watermark(2500).emit(e3, 3000);
 - **`FailingSink<T>`** - accepts N records, then throws `InjectedFailure` once: the sink-side crash for recovery tests.
 - **`TransactionalTestSink<T>`** - records the full two-phase-commit lifecycle: `on_data` fills the current epoch, `on_barrier` stages it under the checkpoint id (a terminal barrier also commits immediately, the engine's bounded-stream contract), `on_commit` promotes it (idempotently), `on_abort` discards it. `committed_values()` is exactly what an external system would durably hold; `pending_checkpoints()`, `uncommitted_values()`, `commits()` and `aborts()` expose the intermediate states.
 
+## Testing complete pipelines: LocalTestEnvironment
+
+The integration tier above the harnesses: the same `Dag`, channels, operator runners, watermark propagation and terminal barriers production uses, driven over bounded test sources so the run terminates deterministically.
+
+```cpp
+clink::test::LocalTestEnvironment env;
+auto src  = std::make_shared<clink::test::TestSource<std::int64_t>>(std::vector<std::int64_t>{1, 2, 3});
+auto sink = std::make_shared<clink::test::CollectSink<std::int64_t>>();
+auto h0 = env.dag().add_source<std::int64_t>(src);
+env.dag().add_sink<std::int64_t>(h0, sink);
+env.execute();  // runs to completion; throws PipelineFailure on operator errors
+EXPECT_EQ(sink->values(), (std::vector<std::int64_t>{1, 2, 3}));
+```
+
+`env.dag()` is the production `Dag` - everything it offers (operators, splits, unions, joins) is available. `execute()` throws a `PipelineFailure` listing every `(operator, error)` pair if any operator thread failed; `execute_collecting_errors()` returns them instead, for tests where the crash is the point. `Options` sets the state backend (a fresh in-memory one by default, inspectable via `state_backend()`), the execution mode, and `restore_from` (a `Snapshot`) for pipeline-level recovery tests. One-shot: each environment executes once.
+
+## Testing on a real cluster: MiniCluster
+
+The smallest true distributed deployment, in one process: a real `JobManager` and N real `TaskManagers` wired over loopback RPC, registration awaited before the constructor returns. Everything - planning, deployment, slots, checkpoint coordination, failover - is the production cluster code.
+
+```cpp
+clink::test::MiniCluster mini({.task_managers = 2, .slots_per_task_manager = 4});
+mini.execute(spec);  // submit a JobGraphSpec + await completion; throws on job errors
+```
+
+`submit()`/`await_completion()`/`errors()` decompose `execute()` for finer control; `job_manager()`/`task_manager(i)` are escape hatches to the real pieces; `Options::checkpoint` carries a `cluster::CheckpointConfig` for distributed-checkpointing jobs. Specs come from the fluent environment, a SQL capture, or by hand. Use this tier only for behaviour a single process cannot exhibit - operator logic belongs on the harnesses, pipeline wiring on `LocalTestEnvironment`.
+
 ## Design rules
 
 - Deterministic: no sleeps, no polling loops, no wall clock.
@@ -139,7 +168,7 @@ src.emit(e1, 1000).emit(e2, 2000).watermark(2500).emit(e3, 3000);
 3. Two-input harnesses (co-process, joins, connected streams) with the engine's real two-input watermark combination - DONE.
 4. Snapshot/restore (the real backend + `snapshot_timers` cycle), failure injection, lifecycle log - DONE.
 5. Test sources and sinks (scripted, replayable, transactional) - DONE.
-6. `LocalTestEnvironment` (full pipelines over the local runtime) and `MiniCluster` (the in-process JM+TM fixture).
+6. `LocalTestEnvironment` (full pipelines over the local runtime) and `MiniCluster` (the in-process JM+TM fixture) - DONE.
 7. Assertions, sequence/property-testing support, compiling documentation examples, and migration of representative core tests onto the framework.
 
 ## Related
