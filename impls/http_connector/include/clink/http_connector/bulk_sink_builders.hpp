@@ -188,7 +188,7 @@ inline std::shared_ptr<Sink<std::string>> make_es_bulk_sink(EsBulkOptions o) {
         }
         clink::config::JsonObject action;
         action["index"] = clink::config::JsonValue{std::move(meta)};
-        out += clink::config::JsonValue{std::move(action)}.serialize(0);
+        clink::config::JsonValue{std::move(action)}.serialize_into(out);
         out += '\n';
         out += rec;  // source doc; the Ndjson framing appends the trailing '\n'
     };

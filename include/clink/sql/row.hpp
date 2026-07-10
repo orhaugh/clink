@@ -88,17 +88,18 @@ inline clink::Codec<Row> row_json_codec() {
             return out;
         },
         .decode = [](BytesView b) -> std::optional<Row> {
-            std::string text(reinterpret_cast<const char*>(b.data()), b.size());
-            try {
-                auto j = clink::config::parse(text);
-                if (!j.is_object())
-                    return std::nullopt;
-                Row r;
-                r.values = j.as_object();
-                return r;
-            } catch (...) {
+            // parse_object decodes the wire bytes straight into the row's
+            // JsonObject: no intermediate std::string, no generic JsonValue
+            // root, no exception round-trip on a malformed record. nullopt
+            // covers exactly the malformed / non-object cases the previous
+            // try-parse-catch skipped.
+            auto obj = clink::config::parse_object(
+                std::string_view(reinterpret_cast<const char*>(b.data()), b.size()));
+            if (!obj)
                 return std::nullopt;
-            }
+            Row r;
+            r.values = std::move(*obj);
+            return r;
         },
         .encode_into = body,
     };
@@ -138,12 +139,13 @@ inline clink::Codec<std::vector<Row>> row_list_json_codec() {
                 }
                 std::vector<Row> rows;
                 rows.reserve(j.as_array().size());
-                for (const auto& e : j.as_array()) {
+                for (auto& e : j.as_array()) {
                     if (!e.is_object()) {
                         return std::nullopt;
                     }
                     Row r;
-                    r.values = e.as_object();
+                    // j is local: gut each element instead of copying it.
+                    r.values = std::move(e.as_object());
                     rows.push_back(std::move(r));
                 }
                 return rows;
@@ -168,16 +170,13 @@ inline clink::TextFormat<Row> row_json_text_format() {
         .decode = [](std::string_view line) -> std::optional<Row> {
             if (line.empty())
                 return std::nullopt;
-            try {
-                auto j = clink::config::parse(line);
-                if (!j.is_object())
-                    return std::nullopt;
-                Row r;
-                r.values = j.as_object();
-                return r;
-            } catch (...) {
+            // Direct object decode; see row_json_codec above.
+            auto obj = clink::config::parse_object(line);
+            if (!obj)
                 return std::nullopt;
-            }
+            Row r;
+            r.values = std::move(*obj);
+            return r;
         },
         .encode = [](const Row& r) -> std::string {
             // #56: render dec-strings as clean unquoted JSON numbers for

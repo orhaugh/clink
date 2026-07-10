@@ -116,7 +116,7 @@ inline std::string pubsub_ack_body(const std::vector<std::string>& ack_ids) {
             b.push_back(',');
         }
         first = false;
-        b += clink::config::JsonValue{id}.serialize(0);
+        clink::config::JsonValue{id}.serialize_into(b);
     }
     b += "]}";
     return b;

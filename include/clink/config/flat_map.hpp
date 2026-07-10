@@ -60,6 +60,45 @@ public:
         }
     }
 
+    // Bulk build: adopt `entries`, establishing the sorted-unique
+    // invariant in one pass when the input is already key-sorted (the
+    // common case for machine-produced JSON, where every record lists
+    // its keys in one consistent order), otherwise via an in-place
+    // stable insertion sort (rows are small; no allocation) followed by
+    // first-wins deduplication. The JSON decode path uses this instead
+    // of per-key sorted insertion, which memmoves the tail on every
+    // out-of-order key.
+    static FlatMap from_entries(std::vector<value_type>&& entries) {
+        FlatMap m;
+        m.data_ = std::move(entries);
+        auto& d = m.data_;
+        bool sorted_unique = true;
+        for (std::size_t i = 1; i < d.size(); ++i) {
+            if (!(d[i - 1].first < d[i].first)) {
+                sorted_unique = false;
+                break;
+            }
+        }
+        if (!sorted_unique) {
+            // Stable insertion sort: equal keys keep input order, so the
+            // FIRST occurrence ends up first and the dedupe below keeps it.
+            for (std::size_t i = 1; i < d.size(); ++i) {
+                std::size_t j = i;
+                while (j > 0 && d[j].first < d[j - 1].first) {
+                    std::swap(d[j], d[j - 1]);
+                    --j;
+                }
+            }
+            d.erase(std::unique(d.begin(),
+                                d.end(),
+                                [](const value_type& a, const value_type& b) {
+                                    return a.first == b.first;
+                                }),
+                    d.end());
+        }
+        return m;
+    }
+
     iterator begin() noexcept { return data_.begin(); }
     iterator end() noexcept { return data_.end(); }
     const_iterator begin() const noexcept { return data_.begin(); }

@@ -6,10 +6,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <simdjson.h>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace clink::config {
 
@@ -31,12 +33,14 @@ JsonValue from_dom(const simdjson::dom::element& e) {
     switch (e.type()) {
         case simdjson::dom::element_type::OBJECT: {
             const auto o = simdjson::dom::object(e);
-            JsonObject obj;
-            obj.reserve(o.size());
+            std::vector<JsonObject::value_type> entries;
+            entries.reserve(o.size());
             for (auto [key, value] : o) {
-                obj.emplace(key, from_dom(value));
+                entries.emplace_back(std::string(key), from_dom(value));
             }
-            return JsonValue{std::move(obj)};
+            // from_entries keeps the FIRST duplicate (documented parse
+            // semantics) and is O(n) for already-key-sorted documents.
+            return JsonValue{JsonObject::from_entries(std::move(entries))};
         }
         case simdjson::dom::element_type::ARRAY: {
             JsonArray arr;
@@ -277,7 +281,9 @@ void JsonValue::serialize_into(std::string& out) const {
     serialize_append(out, *this, 0, 0);
 }
 
-JsonValue parse(std::string_view input) {
+namespace {
+
+simdjson::dom::parser& thread_parser() {
     // One parser per thread: its internal padded buffer and structural
     // tape are reused across calls, so a hot decode loop allocates only
     // for the JsonValue tree itself. parse() copies the input into the
@@ -288,11 +294,38 @@ JsonValue parse(std::string_view input) {
     // against the rest of teardown, and reclaiming one per-thread buffer
     // is the OS's job at exit anyway.
     thread_local auto* parser = new simdjson::dom::parser();
-    auto result = parser->parse(input.data(), input.size());
+    return *parser;
+}
+
+}  // namespace
+
+JsonValue parse(std::string_view input) {
+    auto result = thread_parser().parse(input.data(), input.size());
     if (result.error() != simdjson::SUCCESS) {
         throw ParseError(simdjson::error_message(result.error()));
     }
     return from_dom(result.value_unsafe());
+}
+
+std::optional<JsonObject> parse_object(std::string_view input) {
+    // The row-decode fast path: parse and build the top-level object
+    // directly, skipping the generic JsonValue root and the exception
+    // round-trip for malformed input. Returns nullopt where the generic
+    // path would throw ParseError or yield a non-object, so callers that
+    // previously did try { parse() } catch -> skip keep identical
+    // behaviour. Duplicate keys keep the FIRST occurrence, as in parse().
+    auto result = thread_parser().parse(input.data(), input.size());
+    if (result.error() != simdjson::SUCCESS ||
+        result.value_unsafe().type() != simdjson::dom::element_type::OBJECT) {
+        return std::nullopt;
+    }
+    const auto o = simdjson::dom::object(result.value_unsafe());
+    std::vector<JsonObject::value_type> entries;
+    entries.reserve(o.size());
+    for (auto [key, value] : o) {
+        entries.emplace_back(std::string(key), from_dom(value));
+    }
+    return JsonObject::from_entries(std::move(entries));
 }
 
 }  // namespace clink::config

@@ -395,7 +395,7 @@ inline clink::Codec<AggBucket> agg_bucket_codec() {
             try {
                 auto j = clink::config::parse(gv_text);
                 if (j.is_object())
-                    b.group_values.values = j.as_object();
+                    b.group_values.values = std::move(j.as_object());
             } catch (...) {
                 return std::nullopt;
             }
@@ -413,7 +413,7 @@ inline clink::Codec<AggBucket> agg_bucket_codec() {
                     auto j = clink::config::parse(pe_text);
                     Row pr;
                     if (j.is_object())
-                        pr.values = j.as_object();
+                        pr.values = std::move(j.as_object());
                     b.prior_emitted = std::move(pr);
                 } catch (...) {
                     return std::nullopt;
@@ -1165,7 +1165,7 @@ inline bool decode_bucket(agg_codec_detail::Reader& r, WindowBucket& b) {
     try {
         auto j = clink::config::parse(gv_text);
         if (j.is_object()) {
-            b.group_values.values = j.as_object();
+            b.group_values.values = std::move(j.as_object());
         }
     } catch (...) {
         return false;
@@ -2602,7 +2602,7 @@ private:
                     try {
                         auto j = clink::config::parse(gv_text);
                         if (j.is_object()) {
-                            s.group_values.values = j.as_object();
+                            s.group_values.values = std::move(j.as_object());
                         }
                     } catch (...) {
                         return std::nullopt;
@@ -3106,7 +3106,7 @@ private:
             try {
                 auto j = clink::config::parse(t);
                 if (j.is_object()) {
-                    r.values = j.as_object();
+                    r.values = std::move(j.as_object());
                 }
             } catch (...) {
             }

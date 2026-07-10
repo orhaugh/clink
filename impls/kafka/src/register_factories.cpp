@@ -266,7 +266,7 @@ private:
                 key += '\x1f';
             auto it = obj.find(primary_key_[i]);
             if (it != obj.end() && !it->second.is_null()) {
-                key += it->second.serialize(0);
+                it->second.serialize_into(key);
             }
         }
         // Row kinds:

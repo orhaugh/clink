@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -94,5 +95,12 @@ public:
 
 // Parse a JSON document. Throws ParseError on malformed input.
 JsonValue parse(std::string_view input);
+
+// Row-decode fast path: parse a document whose root must be an object
+// and build the JsonObject directly (no generic JsonValue root, no
+// exception on malformed input). Returns nullopt for malformed input
+// or a non-object root - exactly the cases where a
+// try { parse() } catch -> skip caller would drop the record.
+std::optional<JsonObject> parse_object(std::string_view input);
 
 }  // namespace clink::config

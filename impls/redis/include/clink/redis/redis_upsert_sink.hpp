@@ -142,7 +142,7 @@ private:
                 throw std::runtime_error(opts_.name + ": changelog row missing primary key '" + kc +
                                          "': " + json);
             }
-            key += it->second.serialize(0);
+            it->second.serialize_into(key);
             key.push_back('\x1f');
         }
 

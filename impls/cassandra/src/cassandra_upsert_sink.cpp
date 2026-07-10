@@ -160,7 +160,7 @@ void CassandraUpsertSink::on_data(const Batch<std::string>& batch) {
                 throw std::runtime_error(
                     impl_->opts.name + ": changelog row missing primary key '" + kc + "': " + json);
             }
-            key += it->second.serialize(0);
+            it->second.serialize_into(key);
             key.push_back('\x1f');
         }
         // Strip the synthetic marker: `INSERT INTO t JSON ?` rejects a JSON object

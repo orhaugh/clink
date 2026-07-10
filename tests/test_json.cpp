@@ -334,3 +334,50 @@ TEST(Json, DoubleRenderingMatchesOstreamGeneralFormat) {
     EXPECT_EQ(render(42.0), "42");  // integral fast path
     EXPECT_EQ(render(-9007199254740992.0), "-9007199254740992");
 }
+
+// ----- from_entries + parse_object (the row-decode fast path) -----
+
+TEST(FlatMap, FromEntriesSortedInputIsAdoptedVerbatim) {
+    std::vector<JsonObject::value_type> entries;
+    entries.emplace_back("a", JsonValue{1.0});
+    entries.emplace_back("b", JsonValue{2.0});
+    auto m = JsonObject::from_entries(std::move(entries));
+    EXPECT_EQ(m.size(), 2u);
+    EXPECT_EQ(m.at("a").as_number(), 1.0);
+    EXPECT_EQ(m.at("b").as_number(), 2.0);
+}
+
+TEST(FlatMap, FromEntriesUnsortedInputIsSortedFirstWins) {
+    std::vector<JsonObject::value_type> entries;
+    entries.emplace_back("z", JsonValue{1.0});
+    entries.emplace_back("a", JsonValue{2.0});
+    entries.emplace_back("z", JsonValue{3.0});  // duplicate: first wins
+    entries.emplace_back("m", JsonValue{4.0});
+    auto m = JsonObject::from_entries(std::move(entries));
+    EXPECT_EQ(m.size(), 3u);
+    std::string order;
+    for (const auto& [k, v] : m)
+        order += k;
+    EXPECT_EQ(order, "amz");
+    EXPECT_EQ(m.at("z").as_number(), 1.0);
+}
+
+TEST(FlatMap, FromEntriesEmpty) {
+    EXPECT_TRUE(JsonObject::from_entries({}).empty());
+}
+
+TEST(Json, ParseObjectMatchesParseForObjects) {
+    const std::string text = R"({"z": 1, "a": {"nested": [1, 2]}, "z": 99, "m": "x"})";
+    auto direct = parse_object(text);
+    ASSERT_TRUE(direct.has_value());
+    // Identical to the generic path, including first-duplicate-wins.
+    EXPECT_TRUE(JsonValue{*direct} == parse(text));
+    EXPECT_EQ(direct->at("z").as_number(), 1.0);
+}
+
+TEST(Json, ParseObjectRejectsNonObjectAndMalformed) {
+    EXPECT_FALSE(parse_object("[1, 2]").has_value());
+    EXPECT_FALSE(parse_object("42").has_value());
+    EXPECT_FALSE(parse_object("{broken").has_value());
+    EXPECT_FALSE(parse_object("").has_value());
+}
