@@ -219,6 +219,11 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
     if (connector == "file" || connector == "filesystem") {
         return RowConnectorBinding{"file_json_source", kChannelRow, {}};
     }
+    if (connector == "queryable_state") {
+        // State-as-table: a bounded snapshot of another job's live
+        // queryable state, read over the JM's HTTP scan route.
+        return RowConnectorBinding{"queryable_state_row_source", kChannelRow, {}};
+    }
     if (connector == "kafka") {
         // Wave 2 inc1: an opt-in WITH-option swaps the row-form JSON bridge for
         // the columnar one, which attaches an Arrow sidecar so the downstream

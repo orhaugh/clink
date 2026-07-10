@@ -23,6 +23,7 @@
 #include "clink/async/completion_executor.hpp"
 #include "clink/cep/cep_operator.hpp"
 #include "clink/cep/pattern.hpp"
+#include "clink/cluster/job_planner.hpp"
 #include "clink/config/json.hpp"
 #include "clink/connectors/directory_file_source.hpp"
 #include "clink/connectors/file_2pc_sink.hpp"
@@ -32,6 +33,7 @@
 #include "clink/connectors/parquet_sink.hpp"
 #include "clink/connectors/parquet_source.hpp"
 #include "clink/core/hash_map.hpp"
+#include "clink/http/http_client.hpp"
 #include "clink/operators/agg_function_registry.hpp"
 #include "clink/operators/async_lookup_operator.hpp"
 #include "clink/operators/columnar_row_filter_operator.hpp"
@@ -3752,13 +3754,23 @@ public:
                     if (it == state_.end()) {
                         return std::nullopt;
                     }
-                    Row result = it->second.group_values;
-                    for (std::size_t i = 0; i < aggregates_.size(); ++i) {
-                        result.values[aggregates_[i].output_name] =
-                            finalize_agg(it->second.agg_states[i], aggregates_[i]);
+                    return serving_row_json_(it->second);
+                });
+            // Bounded whole-slot scan: state-as-table. Holds the serving
+            // lock for its duration; the route layer clamps the limit.
+            clink::queryable_state::Registry::global().register_json_scan(
+                queryable_slot_,
+                [this](std::size_t limit) -> clink::queryable_state::JsonScanResult {
+                    clink::queryable_state::JsonScanResult out;
+                    std::lock_guard lk(serving_mu_);
+                    for (const auto& [key, bucket] : state_) {
+                        if (out.entries.size() >= limit) {
+                            out.truncated = true;
+                            break;
+                        }
+                        out.entries.emplace_back(key, serving_row_json_(bucket));
                     }
-                    return clink::config::JsonValue{clink::config::JsonObject{result.values}}
-                        .serialize(0);
+                    return out;
                 });
         }
     }
@@ -3768,6 +3780,7 @@ public:
     void close() override {
         if (!queryable_slot_.empty()) {
             clink::queryable_state::Registry::global().unregister_json_slot(queryable_slot_);
+            clink::queryable_state::Registry::global().unregister_json_scan(queryable_slot_);
             queryable_slot_.clear();
         }
     }
@@ -3947,6 +3960,18 @@ private:
     // operator memory: checkpoints carried no aggregate state, and any
     // restore (failover self-heal, savepoint upgrade, park/resume) silently
     // dropped every pre-checkpoint contribution from the running totals.
+    // The serving form of one bucket: the FINALISED output row (group
+    // columns + aggregate results) as a JSON document. Caller holds
+    // serving_mu_.
+    std::string serving_row_json_(const AggBucket& bucket) const {
+        Row result = bucket.group_values;
+        for (std::size_t i = 0; i < aggregates_.size(); ++i) {
+            result.values[aggregates_[i].output_name] =
+                finalize_agg(bucket.agg_states[i], aggregates_[i]);
+        }
+        return clink::config::JsonValue{clink::config::JsonObject{result.values}}.serialize(0);
+    }
+
     void mark_dirty_(const std::string& key) {
         if (persist_inmem_) {
             dirty_.insert(key);
@@ -7195,6 +7220,81 @@ private:
     std::vector<Record<Row>> buffer_;
 };
 
+// connector='queryable_state': state-as-table. A bounded source that
+// snapshots another job's live queryable state through the JM's JSON scan
+// route and emits one Row per entry (the served value document's fields
+// become the row's columns). A SELECT or join over it reads the CURRENT
+// aggregate values with no sink round-trip: one job's state is another
+// job's table. The snapshot is taken once, at the first produce() - a
+// bounded read of a moving target, consistent per subtask scan.
+class QueryableStateSource final : public Source<Row> {
+public:
+    QueryableStateSource(std::string jm_host,
+                         std::uint16_t jm_port,
+                         std::string job_id,
+                         std::string role,
+                         std::string slot,
+                         std::size_t limit,
+                         std::size_t batch_size)
+        : jm_host_(std::move(jm_host)),
+          jm_port_(jm_port),
+          job_id_(std::move(job_id)),
+          role_(std::move(role)),
+          slot_(std::move(slot)),
+          limit_(limit),
+          batch_size_(batch_size == 0 ? 256 : batch_size) {}
+
+    [[nodiscard]] bool is_bounded() const noexcept override { return true; }
+
+    bool produce(Emitter<Row>& out) override {
+        if (done_) {
+            return false;
+        }
+        done_ = true;
+        clink::http::HttpClient client(jm_host_, jm_port_);
+        auto resp = client.get("/api/v1/queryable_state/job/" + job_id_ + "/op/" + role_ +
+                               "/json/" + slot_ + "/scan?limit=" + std::to_string(limit_));
+        if (resp.status != 200) {
+            throw std::runtime_error("queryable_state source: JM scan for job " + job_id_ + " op " +
+                                     role_ + " returned status " + std::to_string(resp.status) +
+                                     (resp.body.empty() ? std::string{} : (": " + resp.body)));
+        }
+        auto js = clink::config::parse(resp.body);
+        if (!js.is_object() || !js.contains("entries") || !js.at("entries").is_array()) {
+            throw std::runtime_error("queryable_state source: malformed scan response");
+        }
+        Batch<Row> batch;
+        std::size_t in_batch = 0;
+        for (const auto& entry : js.at("entries").as_array()) {
+            if (!entry.is_object() || !entry.contains("value") || !entry.at("value").is_object()) {
+                continue;
+            }
+            Row row;
+            row.values = entry.at("value").as_object();
+            batch.push(Record<Row>{std::move(row)});
+            if (++in_batch >= batch_size_) {
+                out.emit_data(std::move(batch));
+                batch = Batch<Row>{};
+                in_batch = 0;
+            }
+        }
+        if (in_batch != 0) {
+            out.emit_data(std::move(batch));
+        }
+        return false;  // bounded: one snapshot, then EOS
+    }
+
+private:
+    std::string jm_host_;
+    std::uint16_t jm_port_;
+    std::string job_id_;
+    std::string role_;
+    std::string slot_;
+    std::size_t limit_;
+    std::size_t batch_size_;
+    bool done_{false};
+};
+
 void install(clink::plugin::PluginRegistry& reg) {
     // ---- Channel type ----
     // The Row wire batcher preserves columnar data across TM boundaries: a
@@ -7221,6 +7321,47 @@ void install(clink::plugin::PluginRegistry& reg) {
     });
 
     // ---- Sources ----
+
+    // queryable_state_row_source: state-as-table (see QueryableStateSource).
+    //   jm_port (required): the JobManager's HTTP port
+    //   job_id (required): the job whose state to read
+    //   jm_host (default 127.0.0.1), role (default the generic subtask
+    //   role), slot (default 'agg'), limit (default 100000, the route cap),
+    //   batch_size (default 256)
+    reg.register_source<Row>(
+        "queryable_state_row_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<Row>> {
+            auto jm_host = ctx.param_or("jm_host");
+            if (jm_host.empty()) {
+                jm_host = "127.0.0.1";
+            }
+            const auto jm_port = ctx.param_int64_or("jm_port", 0);
+            if (jm_port <= 0 || jm_port > 65535) {
+                throw std::runtime_error(
+                    "queryable_state source: 'jm_port' param is required (the JobManager's "
+                    "HTTP port)");
+            }
+            auto job_id = ctx.param_or("job_id");
+            if (job_id.empty()) {
+                throw std::runtime_error("queryable_state source: 'job_id' param is required");
+            }
+            auto role = ctx.param_or("role");
+            if (role.empty()) {
+                role = clink::cluster::kGenericSubtaskRole;
+            }
+            auto slot = ctx.param_or("slot");
+            if (slot.empty()) {
+                slot = "agg";
+            }
+            const auto limit = ctx.param_int64_or("limit", 100'000);
+            const auto batch_size = ctx.param_int64_or("batch_size", 256);
+            return std::make_shared<QueryableStateSource>(std::move(jm_host),
+                                                          static_cast<std::uint16_t>(jm_port),
+                                                          std::move(job_id),
+                                                          std::move(role),
+                                                          std::move(slot),
+                                                          static_cast<std::size_t>(limit),
+                                                          static_cast<std::size_t>(batch_size));
+        });
 
     // file_json_source: read NDJSON, emit one Row per line. When `path` names a
     // directory it reads every file directly under it (a DirectoryFileSource) in a

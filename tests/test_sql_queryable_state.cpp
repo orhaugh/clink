@@ -43,8 +43,8 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
     const auto out_path = fs::temp_directory_path() / "clink_qs_out.ndjson";
     fs::remove(in_path);
     fs::remove(out_path);
-    constexpr int kAliceRows = 600'000;
-    constexpr int kBobRows = 400'000;
+    constexpr int kAliceRows = 900'000;
+    constexpr int kBobRows = 600'000;
     {
         std::ofstream out(in_path, std::ios::trunc);
         for (int i = 0; i < kAliceRows; ++i) {
@@ -147,6 +147,85 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
     auto missing = jm_client.get("/api/v1/queryable_state/job/" + std::to_string(id) + "/op/" +
                                  role + "/json/agg?key=nobody");
     EXPECT_EQ(missing.status, 404);
+
+    // Scan route: the state-as-table transport. Entries for the live keys
+    // come back with the truncation contract honoured.
+    auto scan = jm_client.get("/api/v1/queryable_state/job/" + std::to_string(id) + "/op/" + role +
+                              "/json/agg/scan?limit=10");
+    ASSERT_EQ(scan.status, 200) << scan.body;
+    std::size_t live_keys = 0;
+    {
+        auto sj = clink::config::parse(scan.body);
+        ASSERT_TRUE(sj.at("entries").is_array()) << scan.body;
+        live_keys = sj.at("entries").as_array().size();
+        EXPECT_GE(live_keys, 1u);
+        EXPECT_FALSE(sj.at("truncated").as_bool());
+        const auto& first_entry = sj.at("entries").as_array()[0];
+        EXPECT_TRUE(first_entry.at("value").is_object()) << scan.body;
+    }
+    if (live_keys >= 2) {
+        // With more keys than the limit, the scan says so.
+        auto lim = jm_client.get("/api/v1/queryable_state/job/" + std::to_string(id) + "/op/" +
+                                 role + "/json/agg/scan?limit=1");
+        ASSERT_EQ(lim.status, 200) << lim.body;
+        auto lj = clink::config::parse(lim.body);
+        EXPECT_EQ(lj.at("entries").as_array().size(), 1u);
+        EXPECT_TRUE(lj.at("truncated").as_bool());
+    }
+
+    // State-as-table: job B SELECTs job A's LIVE aggregate state through
+    // connector='queryable_state' and lands the snapshot in a file - one
+    // job's state is another job's table, no sink round-trip.
+    const auto b_out = fs::temp_directory_path() / "clink_qs_b_out.ndjson";
+    fs::remove(b_out);
+    {
+        clink::sql::Catalog catalog_b;
+        std::ostringstream out_b, err_b;
+        clink::sql::ScriptIO io_b{&out_b, &err_b};
+        std::vector<clink::cluster::JobGraphSpec> captured_b;
+        auto capture_b = [&](const clink::cluster::JobGraphSpec& spec, const std::string&) -> int {
+            captured_b.push_back(spec);
+            return 0;
+        };
+        const std::string script_b =
+            "CREATE TABLE live_totals (usr TEXT, total BIGINT) "
+            "WITH (connector='queryable_state', format='json', jm_host='127.0.0.1', jm_port='" +
+            std::to_string(jm_http_port) + "', job_id='" + std::to_string(id) +
+            "');"
+            "CREATE TABLE snap (usr TEXT, total BIGINT) "
+            "WITH (connector='file', format='json', path='" +
+            b_out.string() +
+            "');"
+            "INSERT INTO snap SELECT usr, total FROM live_totals";
+        ASSERT_EQ(clink::sql::run_script(script_b, catalog_b, {}, io_b, capture_b), 0)
+            << err_b.str();
+        ASSERT_EQ(captured_b.size(), 1u);
+        const auto id_b = jm.submit_job(captured_b[0],
+                                        clink::cluster::OperatorRegistry::default_instance(),
+                                        {},
+                                        clink::cluster::CheckpointConfig{},
+                                        nullptr);
+        ASSERT_TRUE(jm.await_job_completion(id_b, std::chrono::milliseconds{20'000}));
+        const auto errors_b = jm.job_errors(id_b);
+        EXPECT_TRUE(errors_b.empty()) << errors_b[0];
+    }
+    {
+        std::ifstream in(b_out);
+        std::string line;
+        bool saw_alice = false;
+        while (std::getline(in, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            auto rj = clink::config::parse(line);
+            if (rj.at("usr").as_string() == "alice") {
+                saw_alice = true;
+                EXPECT_GE(static_cast<std::int64_t>(rj.at("total").as_number()), 1);
+            }
+        }
+        EXPECT_TRUE(saw_alice) << "job B's snapshot has no alice row";
+    }
+    fs::remove(b_out);
 
     ASSERT_TRUE(jm.await_job_completion(id, std::chrono::milliseconds{60'000}));
     EXPECT_TRUE(jm.job_errors(id).empty());

@@ -107,7 +107,7 @@ correctness caveat, the caveat is stated in the row.
 | Fsync durability           | `write_fsync_rename` fsyncs file + directory before checkpoint ack; toggle off with `CLINK_STATE_FSYNC=0` for fsync-hostile CI or throughput benchmarks |
 | State schema evolution     | migrate-at-restore via a migration registry; version map carried in `JobGraphSpec`; pre-deploy compatibility gate (best-effort, real enforcement at restore time) |
 | Savepoint / state-processor| offline savepoint read + transform API (`state_processor/savepoint.hpp`); tested |
-| Queryable state            | Live keyed state as a serving surface: a SQL GROUP BY exposes its running aggregates automatically, and `GET /api/v1/queryable_state/job/:id/op/:role/json/agg?key=alice` on the JobManager returns the key's current finalised row as JSON - no sink round-trip, no user code, readable mid-run. Byte-level slots + JM key routing remain for custom operators; `RemoteReadBackend` offers two-tier reads (hot in-memory tier + remote tier) |
+| Queryable state            | Live keyed state as a serving surface: a SQL GROUP BY exposes its running aggregates automatically, and `GET /api/v1/queryable_state/job/:id/op/:role/json/agg?key=alice` on the JobManager returns the key's current finalised row as JSON - no sink round-trip, no user code, readable mid-run. Whole-slot scans back state-as-table: `connector='queryable_state'` lets one job SELECT from (or join against) another job's live state. Byte-level slots + JM key routing remain for custom operators; `RemoteReadBackend` offers two-tier reads (hot in-memory tier + remote tier) |
 
 ### Distributed and cluster
 

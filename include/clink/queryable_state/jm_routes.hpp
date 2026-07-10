@@ -39,11 +39,13 @@
 // Empty list response (still 200) for: job not found, job has no
 // running subtasks yet, or every hosting TM has dropped HTTP.
 
+#include <algorithm>
 #include <cstdint>
 #include <span>
 #include <string>
 
 #include "clink/cluster/job_manager.hpp"
+#include "clink/config/json.hpp"
 #include "clink/http/http_client.hpp"
 #include "clink/http/http_server.hpp"
 #include "clink/queryable_state/server.hpp"  // hex_decode, json_escape
@@ -219,6 +221,107 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
                    }
                    resp.status = 404;
                    resp.body = "{\"error\":\"key not found\"}";
+                   return resp;
+               });
+
+    // JSON scan route - state-as-table in one call. Concatenates bounded
+    // scans from every subtask of the role (in subtask order), stopping
+    // at ?limit=N (default 1000, clamped to 100000). `truncated` is true
+    // when any subtask truncated or the limit cut the fan-out short.
+    // The SQL connector='queryable_state' source reads this route.
+    server.get("/api/v1/queryable_state/job/:job_id/op/:role/json/:slot/scan",
+               [&jm](const http::HttpRequest& req) -> http::HttpResponse {
+                   http::HttpResponse resp;
+                   auto job_it = req.path_params.find("job_id");
+                   auto role_it = req.path_params.find("role");
+                   auto slot_it = req.path_params.find("slot");
+                   if (job_it == req.path_params.end() || role_it == req.path_params.end() ||
+                       slot_it == req.path_params.end()) {
+                       resp.status = 400;
+                       resp.body = "{\"error\":\"missing job_id / role / slot\"}";
+                       return resp;
+                   }
+                   cluster::JobId job{};
+                   try {
+                       job = static_cast<cluster::JobId>(std::stoull(job_it->second));
+                   } catch (...) {
+                       resp.status = 400;
+                       resp.body = "{\"error\":\"malformed job_id\"}";
+                       return resp;
+                   }
+                   std::size_t limit = 1000;
+                   if (auto it = req.query.find("limit"); it != req.query.end()) {
+                       try {
+                           limit = static_cast<std::size_t>(std::stoull(it->second));
+                       } catch (...) {
+                           resp.status = 400;
+                           resp.body = "{\"error\":\"malformed limit\"}";
+                           return resp;
+                       }
+                   }
+                   limit = std::min<std::size_t>(limit, 100'000);
+                   const auto targets = jm.subtask_targets_for_role(job, role_it->second);
+                   if (targets.empty()) {
+                       resp.status = 404;
+                       resp.body =
+                           "{\"error\":\"job or role not found (or no hosting TM "
+                           "exposes HTTP)\"}";
+                       return resp;
+                   }
+                   // Merge the subtasks' entry arrays. Each TM body is
+                   // {"entries":[...],"truncated":bool}; parse and re-emit rather
+                   // than splice text, so entry counting is exact regardless of
+                   // what the value documents contain.
+                   std::string body = "{\"entries\":[";
+                   bool truncated = false;
+                   bool any_slot = false;
+                   std::size_t taken = 0;
+                   bool first = true;
+                   for (const auto& t : targets) {
+                       if (taken >= limit) {
+                           truncated = true;
+                           break;
+                       }
+                       http::HttpClient client(t.host, t.port);
+                       auto tm_resp = client.get("/api/v1/queryable_state/op/" + role_it->second +
+                                                 "/subtask/" + std::to_string(t.subtask_idx) +
+                                                 "/json/" + slot_it->second +
+                                                 "/scan?limit=" + std::to_string(limit - taken));
+                       if (tm_resp.status != 200) {
+                           continue;  // subtask without the slot (or gone): skip
+                       }
+                       try {
+                           auto js = clink::config::parse(tm_resp.body);
+                           any_slot = true;
+                           for (const auto& entry : js.at("entries").as_array()) {
+                               if (taken >= limit) {
+                                   truncated = true;
+                                   break;
+                               }
+                               if (!first) {
+                                   body.push_back(',');
+                               }
+                               body += entry.serialize(0);
+                               first = false;
+                               ++taken;
+                           }
+                           if (js.contains("truncated") && js.at("truncated").is_bool() &&
+                               js.at("truncated").as_bool()) {
+                               truncated = true;
+                           }
+                       } catch (...) {
+                           continue;  // malformed TM body: skip that subtask
+                       }
+                   }
+                   if (!any_slot) {
+                       resp.status = 404;
+                       resp.body = "{\"error\":\"slot not registered on any subtask\"}";
+                       return resp;
+                   }
+                   body += "],\"truncated\":";
+                   body += truncated ? "true" : "false";
+                   body += "}";
+                   resp.body = std::move(body);
                    return resp;
                });
 

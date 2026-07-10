@@ -62,6 +62,17 @@ using Lookup = std::function<std::optional<std::vector<std::byte>>(std::span<con
 // a JSON object out, consumable by anything that speaks HTTP.
 using JsonLookup = std::function<std::optional<std::string>(const std::string&)>;
 
+// JSON scan closure: up to `limit` (key, value JSON) entries of a slot,
+// truncated flag set when more existed. Order is unspecified. Scans hold
+// the operator's serving lock for their duration, so the route layer
+// clamps `limit` (see server.hpp) - state-as-table reads are bounded
+// snapshots, not cursors; a continuation token is a follow-on.
+struct JsonScanResult {
+    std::vector<std::pair<std::string, std::string>> entries;
+    bool truncated{false};
+};
+using JsonScan = std::function<JsonScanResult(std::size_t)>;
+
 class Registry {
 public:
     // Register or replace the lookup for `slot`. Repeated registration
@@ -155,6 +166,35 @@ public:
         return out;
     }
 
+    // JSON scans: bounded whole-slot reads for state-as-table. Same
+    // lifecycle and locking discipline as the lookups.
+    void register_json_scan(const std::string& slot, JsonScan scan) {
+        std::unique_lock lock(mu_);
+        json_scan_by_slot_[slot] = std::move(scan);
+    }
+
+    void unregister_json_scan(const std::string& slot) {
+        std::unique_lock lock(mu_);
+        json_scan_by_slot_.erase(slot);
+    }
+
+    [[nodiscard]] std::optional<JsonScanResult> scan_json(const std::string& slot,
+                                                          std::size_t limit) const {
+        std::shared_lock lock(mu_);
+        auto it = json_scan_by_slot_.find(slot);
+        if (it == json_scan_by_slot_.end()) {
+            return std::nullopt;
+        }
+        auto fn = it->second;  // copy out, run outside the lock
+        lock.unlock();
+        return fn(limit);
+    }
+
+    [[nodiscard]] bool has_json_scan(const std::string& slot) const {
+        std::shared_lock lock(mu_);
+        return json_scan_by_slot_.find(slot) != json_scan_by_slot_.end();
+    }
+
     // The process-wide instance the TaskManager's HTTP routes serve and
     // operators bind into (test harnesses construct their own).
     static Registry& global() {
@@ -166,6 +206,7 @@ private:
     mutable std::shared_mutex mu_;
     std::unordered_map<std::string, Lookup> by_slot_;
     std::unordered_map<std::string, JsonLookup> json_by_slot_;
+    std::unordered_map<std::string, JsonScan> json_scan_by_slot_;
 };
 
 }  // namespace clink::queryable_state

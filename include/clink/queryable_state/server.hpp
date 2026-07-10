@@ -25,6 +25,7 @@
 // errors. Pick one and stick with it - clients in this header
 // support both.
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 
@@ -235,6 +236,66 @@ inline void register_routes(http::HttpServer& server,
                    }
                    resp.body = "{\"key\":" + detail::json_escape(key_it->second) +
                                ",\"value\":" + *value + "}";
+                   return resp;
+               });
+
+    // JSON scan route (subtask-scoped): up to ?limit=N (default 1000,
+    // clamped to 100000) entries of the slot as
+    //   {"entries":[{"key":"...","value":{...}}, ...],"truncated":bool}.
+    // Order unspecified. The scan holds the operator's serving lock for
+    // its duration - hence the clamp; state-as-table reads are bounded
+    // snapshots, not cursors.
+    server.get("/api/v1/queryable_state/op/:role/subtask/:subtask/json/:slot/scan",
+               [&registry](const http::HttpRequest& req) -> http::HttpResponse {
+                   http::HttpResponse resp;
+                   auto role_it = req.path_params.find("role");
+                   auto sub_it = req.path_params.find("subtask");
+                   auto slot_it = req.path_params.find("slot");
+                   if (role_it == req.path_params.end() || sub_it == req.path_params.end() ||
+                       slot_it == req.path_params.end()) {
+                       resp.status = 400;
+                       resp.body = "{\"error\":\"missing role / subtask / slot\"}";
+                       return resp;
+                   }
+                   std::uint32_t subtask_idx = 0;
+                   try {
+                       subtask_idx = static_cast<std::uint32_t>(std::stoul(sub_it->second));
+                   } catch (...) {
+                       resp.status = 400;
+                       resp.body = "{\"error\":\"malformed subtask\"}";
+                       return resp;
+                   }
+                   std::size_t limit = 1000;
+                   if (auto it = req.query.find("limit"); it != req.query.end()) {
+                       try {
+                           limit = static_cast<std::size_t>(std::stoull(it->second));
+                       } catch (...) {
+                           resp.status = 400;
+                           resp.body = "{\"error\":\"malformed limit\"}";
+                           return resp;
+                       }
+                   }
+                   limit = std::min<std::size_t>(limit, 100'000);
+                   const std::string composed =
+                       compose_subtask_slot(role_it->second, subtask_idx, slot_it->second);
+                   auto result = registry.scan_json(composed, limit);
+                   if (!result.has_value()) {
+                       resp.status = 404;
+                       resp.body = "{\"error\":\"slot not registered\"}";
+                       return resp;
+                   }
+                   std::string body = "{\"entries\":[";
+                   for (std::size_t i = 0; i < result->entries.size(); ++i) {
+                       if (i > 0) {
+                           body.push_back(',');
+                       }
+                       body += "{\"key\":" + detail::json_escape(result->entries[i].first) +
+                               ",\"value\":" + result->entries[i].second + "}";
+                   }
+                   body += "],\"truncated\":";
+                   body += result->truncated ? "true" : "false";
+                   body += "}";
+                   resp.body = std::move(body);
                    return resp;
                });
 
