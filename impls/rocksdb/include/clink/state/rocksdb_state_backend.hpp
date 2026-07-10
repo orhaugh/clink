@@ -117,9 +117,33 @@ public:
     // support. Useful for tests that want to skip when the dep is missing.
     static bool is_real_implementation();
 
+    // State-as-data: render the backend's LIVE contents as the engine's
+    // canonical Arrow IPC state-snapshot stream (op_id / key_bytes /
+    // value_bytes - the exact format the in-memory family snapshots in),
+    // so RocksDB-held state is readable by any Arrow consumer and by
+    // every snapshot-format tool (state-cat, state-diff, the State
+    // Processor, InMemoryStateBackend::restore). Point-in-time view (a
+    // RocksDB snapshot pins the iteration); buffered writes are flushed
+    // first. Operators are emitted in ascending op-id order and keys in
+    // RocksDB's byte order, so the output is deterministic. RocksDB
+    // checkpoints carry no StateVersionMap, so the exported schema has
+    // no versions metadata (readers treat that as "no stamps recorded").
+    // The native SST checkpoint path is unchanged - this is an export,
+    // not a replacement.
+    [[nodiscard]] std::vector<std::byte> export_arrow_snapshot() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// Offline companion to export_arrow_snapshot(): open a RocksDB
+// checkpoint directory (as produced by RocksDBStateBackend::snapshot -
+// a complete read-only RocksDB instance) WITHOUT a live backend and
+// render its contents as the same canonical Arrow IPC stream. The dir
+// is opened read-only, so a checkpoint shared with a running job is
+// never mutated or locked. Throws when the dir is not an openable
+// RocksDB instance or the build lacks RocksDB support.
+std::vector<std::byte> rocksdb_checkpoint_to_arrow(const std::string& checkpoint_dir);
 
 }  // namespace clink

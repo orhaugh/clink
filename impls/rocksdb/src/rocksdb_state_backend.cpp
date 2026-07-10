@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/state/snapshot_arrow_writer.hpp"
 #include "clink/state/snapshot_store.hpp"
 
 #ifdef CLINK_HAS_ROCKSDB
@@ -759,6 +760,94 @@ std::string RocksDBStateBackend::description() const {
     return "rocksdb state backend at " + impl_->path;
 }
 
+namespace {
+
+// Shared iterate-and-encode core for the live and checkpoint-dir Arrow
+// exports. Walks the op_* column families in ascending op-id order
+// (deterministic output) and appends every row to the canonical writer.
+// `read_opts` lets the live path pin a RocksDB snapshot for the walk.
+std::vector<std::byte> export_cfs_to_arrow(
+    rocksdb::DB& db,
+    const std::vector<std::pair<std::uint64_t, rocksdb::ColumnFamilyHandle*>>& cfs,
+    const rocksdb::ReadOptions& read_opts) {
+    auto sorted = cfs;
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+    SnapshotArrowWriter writer;
+    for (const auto& [op_id, cf] : sorted) {
+        std::unique_ptr<rocksdb::Iterator> it(db.NewIterator(read_opts, cf));
+        for (it->SeekToFirst(); it->Valid(); it->Next()) {
+            const auto k = it->key();
+            const auto v = it->value();
+            writer.append(
+                op_id, std::string_view(k.data(), k.size()), std::string_view(v.data(), v.size()));
+        }
+    }
+    // RocksDB checkpoints carry no StateVersionMap: emit the bare schema.
+    return writer.finish();
+}
+
+}  // namespace
+
+std::vector<std::byte> RocksDBStateBackend::export_arrow_snapshot() const {
+    // Drain buffered writes so the export sees the post-write view, then
+    // pin a RocksDB snapshot so the walk is a consistent point in time
+    // even while the operator keeps writing.
+    {
+        std::lock_guard lock(impl_->buffer_mu_);
+        impl_->flush_write_batch_locked();
+    }
+    const rocksdb::Snapshot* snap = impl_->db->GetSnapshot();
+    rocksdb::ReadOptions ro;
+    ro.snapshot = snap;
+    std::vector<std::pair<std::uint64_t, rocksdb::ColumnFamilyHandle*>> cfs;
+    {
+        std::shared_lock lk(impl_->cf_mu_);
+        cfs.reserve(impl_->cfs_.size());
+        for (const auto& [op_id, cf] : impl_->cfs_) {
+            cfs.emplace_back(op_id, cf);
+        }
+    }
+    std::vector<std::byte> bytes;
+    try {
+        bytes = export_cfs_to_arrow(*impl_->db, cfs, ro);
+    } catch (...) {
+        impl_->db->ReleaseSnapshot(snap);
+        throw;
+    }
+    impl_->db->ReleaseSnapshot(snap);
+    return bytes;
+}
+
+std::vector<std::byte> rocksdb_checkpoint_to_arrow(const std::string& checkpoint_dir) {
+    std::unique_ptr<rocksdb::DB> db;
+    std::vector<rocksdb::ColumnFamilyHandle*> handles;
+    std::vector<std::string> names;
+    open_readonly_with_all_cfs(checkpoint_dir, db, handles, names);
+
+    std::vector<std::pair<std::uint64_t, rocksdb::ColumnFamilyHandle*>> cfs;
+    cfs.reserve(handles.size());
+    for (std::size_t i = 0; i < handles.size(); ++i) {
+        if (auto op = op_from_cf_name(names[i])) {
+            cfs.emplace_back(op->value(), handles[i]);
+        }
+    }
+    std::vector<std::byte> bytes;
+    try {
+        bytes = export_cfs_to_arrow(*db, cfs, rocksdb::ReadOptions{});
+    } catch (...) {
+        for (auto* h : handles) {
+            (void)db->DestroyColumnFamilyHandle(h);
+        }
+        throw;
+    }
+    for (auto* h : handles) {
+        (void)db->DestroyColumnFamilyHandle(h);
+    }
+    return bytes;
+}
+
 #else  // !CLINK_HAS_ROCKSDB
 
 // ---------------------------------------------------------------------------
@@ -807,6 +896,14 @@ Snapshot RocksDBStateBackend::combine_snapshots(std::vector<Snapshot>) const {
 }
 std::string RocksDBStateBackend::description() const {
     return "rocksdb state backend (stub)";
+}
+std::vector<std::byte> RocksDBStateBackend::export_arrow_snapshot() const {
+    throw std::runtime_error("RocksDBStateBackend: unavailable in this build");
+}
+std::vector<std::byte> rocksdb_checkpoint_to_arrow(const std::string& /*checkpoint_dir*/) {
+    throw std::runtime_error(
+        "rocksdb_checkpoint_to_arrow: built without RocksDB support. Install rocksdb and "
+        "reconfigure cmake with CLINK_WITH_ROCKSDB=ON.");
 }
 
 #endif

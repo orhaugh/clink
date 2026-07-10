@@ -253,6 +253,7 @@ add_library(clink_core STATIC
     src/runtime/network/connection.cpp
     src/runtime/network/network_socket.cpp
     src/state/in_memory_state_backend.cpp
+    src/state/snapshot_arrow_writer.cpp
     src/state/changelog_state_backend.cpp
     src/state/state_backend_factory.cpp
     src/state/schema_version.cpp
@@ -771,6 +772,12 @@ else()
 endif()
 if(TARGET clink::tls)
     target_compile_definitions(clink_cli_cmds PUBLIC CLINK_LINKED_TLS)
+endif()
+# `clink state-cat` / `state-export` render RocksDB checkpoint dirs
+# through the Arrow export when the RocksDB impl is in the build.
+if(TARGET clink::rocksdb)
+    target_link_libraries(clink_cli_cmds PUBLIC clink::rocksdb)
+    target_compile_definitions(clink_cli_cmds PUBLIC CLINK_LINKED_ROCKSDB)
 endif()
 clink_set_warnings(clink_cli_cmds)
 

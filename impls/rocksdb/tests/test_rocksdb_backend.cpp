@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
@@ -12,6 +13,7 @@
 // nowhere in the binary.
 #if __has_include("clink/state/rocksdb_state_backend.hpp")
 #include "clink/rocksdb/install.hpp"
+#include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/rocksdb_state_backend.hpp"
 #include "clink/state/state_backend_factory.hpp"
 
@@ -525,6 +527,109 @@ TEST(RocksDBStateBackend, RestoreMergesMultipleCheckpointsThenFilters) {
     EXPECT_TRUE(merged.get_operator_state(op, sv(std::string{"offB"})).has_value());
 
     std::filesystem::remove_all(base);
+}
+
+// ----- state-as-data: the Arrow export -----
+
+namespace {
+
+// Collect every (op, key, value) triple a backend reports via scan for
+// the given operators, as a sorted flat list (comparison-friendly).
+std::vector<std::string> collect_triples(const StateBackend& b,
+                                         const std::vector<OperatorId>& ops) {
+    std::vector<std::string> out;
+    for (const auto op : ops) {
+        b.scan(op, [&](std::string_view k, std::string_view v) {
+            out.push_back(std::to_string(op.value()) + "\x1e" + std::string(k) + "\x1e" +
+                          std::string(v));
+        });
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+}  // namespace
+
+// The live Arrow export must carry the backend's exact contents in the
+// canonical snapshot format: restoring the exported bytes into an
+// InMemoryStateBackend (the format's reference reader) reproduces every
+// keyed and operator-state entry.
+TEST(RocksDBStateBackend, ArrowExportRoundTripsThroughInMemoryRestore) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    auto dir = std::filesystem::temp_directory_path() / "clink_rocks_arrow_export";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    RocksDBStateBackend backend(
+        RocksDBStateBackend::Options{.path = (dir / "db").string(), .create_if_missing = true});
+
+    const OperatorId op_a{1}, op_b{2};
+    const std::string k1 = std::string{"\x05"} + "slot|alpha";
+    const std::string k2 = std::string{"\x21"} + "slot|beta";
+    const std::string v1 = "value-one", v2 = "value-two";
+    backend.put(op_a, sv(k1), sv(v1));
+    backend.put(op_a, sv(k2), sv(v2));
+    backend.put(op_b, sv(k1), sv(v2));
+    // Operator-state row (reserved prefix >= kNumKeyGroups) must export too.
+    const std::string op_key = std::string{"\xFF"} + "offsets|p0";
+    backend.put(op_b, sv(op_key), sv(v1));
+
+    const auto bytes = backend.export_arrow_snapshot();
+    ASSERT_FALSE(bytes.empty());
+
+    InMemoryStateBackend reference;
+    reference.restore(Snapshot{.checkpoint_id = CheckpointId{0}, .bytes = bytes});
+    EXPECT_EQ(collect_triples(reference, {op_a, op_b}), collect_triples(backend, {op_a, op_b}));
+}
+
+// The offline checkpoint-dir converter must produce the same stream as
+// the live export taken at the same point (deterministic order: ops
+// ascending, keys in RocksDB byte order).
+TEST(RocksDBStateBackend, CheckpointDirExportMatchesLiveExport) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    auto dir = std::filesystem::temp_directory_path() / "clink_rocks_arrow_cpdir";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    RocksDBStateBackend backend(
+        RocksDBStateBackend::Options{.path = (dir / "db").string(), .create_if_missing = true});
+
+    const OperatorId op{7};
+    for (int i = 0; i < 100; ++i) {
+        const std::string k = std::string{static_cast<char>(i % 64)} + "s|k" + std::to_string(i);
+        const std::string v = "v" + std::to_string(i * i);
+        backend.put(op, sv(k), sv(v));
+    }
+    const auto live = backend.export_arrow_snapshot();
+
+    const auto snap = backend.snapshot(CheckpointId{42});
+    std::string cp_dir(snap.bytes.size(), '\0');
+    std::memcpy(cp_dir.data(), snap.bytes.data(), snap.bytes.size());
+    const auto offline = rocksdb_checkpoint_to_arrow(cp_dir);
+
+    EXPECT_EQ(live, offline);
+}
+
+// An empty backend exports a VALID zero-row stream (schema + EOS), so
+// downstream readers need no special-casing.
+TEST(RocksDBStateBackend, EmptyBackendExportsValidStream) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    auto dir = std::filesystem::temp_directory_path() / "clink_rocks_arrow_empty";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    RocksDBStateBackend backend(
+        RocksDBStateBackend::Options{.path = (dir / "db").string(), .create_if_missing = true});
+    const auto bytes = backend.export_arrow_snapshot();
+    ASSERT_FALSE(bytes.empty());  // schema + EOS, not zero bytes
+    InMemoryStateBackend reference;
+    reference.restore(Snapshot{.checkpoint_id = CheckpointId{0}, .bytes = bytes});
+    std::size_t rows = 0;
+    reference.scan(OperatorId{7}, [&](std::string_view, std::string_view) { ++rows; });
+    EXPECT_EQ(rows, 0u);
 }
 
 #endif  // __has_include rocksdb_state_backend.hpp

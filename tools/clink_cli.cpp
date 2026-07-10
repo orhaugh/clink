@@ -21,6 +21,7 @@ int clink_cmd_savepoint(int argc, char** argv);
 int clink_cmd_check_savepoint(int argc, char** argv);
 int clink_cmd_state_diff(int argc, char** argv);
 int clink_cmd_state_cat(int argc, char** argv);
+int clink_cmd_state_export(int argc, char** argv);
 int clink_cmd_capture_cat(int argc, char** argv);
 int clink_cmd_replay(int argc, char** argv);
 int clink_cmd_rescale(int argc, char** argv);
@@ -43,6 +44,7 @@ void usage() {
         << "  check-savepoint   Inspect state-schema version stamps inside a savepoint file.\n"
         << "  state-diff        Compare the keyed state of two checkpoints/savepoints.\n"
         << "  state-cat         Dump a checkpoint/savepoint's keyed state.\n"
+        << "  state-export      Write keyed state as one Arrow IPC stream file.\n"
         << "  capture-cat       Inspect record-capture flight-recorder epochs.\n"
         << "  replay            Replay a captured epoch through one operator offline.\n"
         << "  rescale           Change a running job's per-role parallelism.\n"
@@ -95,6 +97,9 @@ int main(int argc, char** argv) {
     }
     if (cmd == "state-cat") {
         return clink_cmd_state_cat(sub_argc, sub_argv);
+    }
+    if (cmd == "state-export") {
+        return clink_cmd_state_export(sub_argc, sub_argv);
     }
     if (cmd == "capture-cat") {
         return clink_cmd_capture_cat(sub_argc, sub_argv);

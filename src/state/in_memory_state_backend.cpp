@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "clink/metrics/state_metrics.hpp"
+#include "clink/state/snapshot_arrow_writer.hpp"
 
 #ifndef CLINK_HAS_ARROW
 #error \
@@ -43,19 +44,6 @@ std::shared_ptr<arrow::Schema> snapshot_schema() {
     return schema;
 }
 
-constexpr const char kStateVersionsMetadataKey[] = "clink.state_versions";
-
-std::shared_ptr<arrow::Schema> snapshot_schema_with_versions(const StateVersionMap& versions) {
-    auto schema = snapshot_schema();
-    if (versions.empty()) {
-        return schema;
-    }
-    auto packed = versions.pack();
-    auto meta = std::make_shared<arrow::KeyValueMetadata>();
-    meta->Append(kStateVersionsMetadataKey, packed);
-    return schema->WithMetadata(meta);
-}
-
 [[noreturn]] void throw_arrow(const std::string& where, const arrow::Status& s) {
     throw std::runtime_error("InMemoryStateBackend " + where + ": " + s.ToString());
 }
@@ -82,87 +70,28 @@ Snapshot InMemoryStateBackend::snapshot(CheckpointId id) {
     const auto t0 = std::chrono::steady_clock::now();
     std::lock_guard lock(mu_);
 
-    // Count rows so we can reserve exactly once on each builder.
+    // Count rows so the writer reserves exactly once on each builder.
     std::size_t total_rows = 0;
     for (const auto& [op, kv] : state_) {
         total_rows += kv.size();
     }
 
-    arrow::UInt64Builder op_b;
-    arrow::BinaryBuilder key_b;
-    arrow::BinaryBuilder val_b;
-    if (auto s = op_b.Reserve(static_cast<int64_t>(total_rows)); !s.ok()) {
-        throw_arrow("snapshot (reserve op)", s);
-    }
-    if (auto s = key_b.Reserve(static_cast<int64_t>(total_rows)); !s.ok()) {
-        throw_arrow("snapshot (reserve key)", s);
-    }
-    if (auto s = val_b.Reserve(static_cast<int64_t>(total_rows)); !s.ok()) {
-        throw_arrow("snapshot (reserve val)", s);
-    }
-
+    // The canonical writer emits a complete Arrow IPC stream (schema +
+    // record-batch + EOS): the canonical Arrow blob any standard consumer
+    // (pyarrow, duckdb, polars, ...) can open directly. Version stamps
+    // registered before this snapshot fired ride the schema metadata so
+    // (a) any Arrow reader sees them, and (b) the restore path reloads
+    // them into state_versions_ for the control plane.
+    SnapshotArrowWriter writer(total_rows);
     for (const auto& [op, kv] : state_) {
         const auto op_id_val = op.value();
         for (const auto& [k, v] : kv) {
-            if (auto s = op_b.Append(op_id_val); !s.ok()) {
-                throw_arrow("snapshot (append op)", s);
-            }
-            if (auto s = key_b.Append(reinterpret_cast<const uint8_t*>(k.data()),
-                                      static_cast<int32_t>(k.size()));
-                !s.ok()) {
-                throw_arrow("snapshot (append key)", s);
-            }
-            if (auto s = val_b.Append(reinterpret_cast<const uint8_t*>(v.data()),
-                                      static_cast<int32_t>(v.size()));
-                !s.ok()) {
-                throw_arrow("snapshot (append val)", s);
-            }
+            writer.append(op_id_val,
+                          std::string_view(k.data(), k.size()),
+                          std::string_view(reinterpret_cast<const char*>(v.data()), v.size()));
         }
     }
-
-    std::shared_ptr<arrow::Array> op_arr, key_arr, val_arr;
-    if (auto s = op_b.Finish(&op_arr); !s.ok())
-        throw_arrow("snapshot (finish op)", s);
-    if (auto s = key_b.Finish(&key_arr); !s.ok())
-        throw_arrow("snapshot (finish key)", s);
-    if (auto s = val_b.Finish(&val_arr); !s.ok())
-        throw_arrow("snapshot (finish val)", s);
-
-    // If the operator pipeline registered version stamps before this
-    // snapshot fired, embed them in the Arrow schema metadata so that
-    // (a) any pyarrow/duckdb reader sees them, and (b) the restore
-    // path can reload them into state_versions_ for the control plane.
-    const auto schema = snapshot_schema_with_versions(state_versions_);
-    auto batch = arrow::RecordBatch::Make(
-        schema, static_cast<int64_t>(total_rows), {op_arr, key_arr, val_arr});
-
-    // Write a complete Arrow IPC stream (schema + record-batch + EOS).
-    // Stream format is the canonical Arrow blob: any standard Arrow
-    // consumer (pyarrow, duckdb, polars, ...) can open it directly.
-    auto sink_result = arrow::io::BufferOutputStream::Create();
-    if (!sink_result.ok())
-        throw_arrow("snapshot (create sink)", sink_result.status());
-    auto sink = *sink_result;
-
-    auto writer_result = arrow::ipc::MakeStreamWriter(sink, schema);
-    if (!writer_result.ok())
-        throw_arrow("snapshot (make writer)", writer_result.status());
-    auto writer = *writer_result;
-    if (auto s = writer->WriteRecordBatch(*batch); !s.ok()) {
-        throw_arrow("snapshot (write batch)", s);
-    }
-    if (auto s = writer->Close(); !s.ok())
-        throw_arrow("snapshot (close writer)", s);
-
-    auto buf_result = sink->Finish();
-    if (!buf_result.ok())
-        throw_arrow("snapshot (finish sink)", buf_result.status());
-    auto buf = *buf_result;
-
-    std::vector<std::byte> bytes(static_cast<std::size_t>(buf->size()));
-    if (buf->size() > 0) {
-        std::memcpy(bytes.data(), buf->data(), static_cast<std::size_t>(buf->size()));
-    }
+    auto bytes = writer.finish(state_versions_);
     const auto dt =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
             .count();
@@ -391,9 +320,7 @@ std::vector<std::byte> InMemoryStateBackend::extract_operator_state_bytes(
     std::span<const std::byte> snapshot_bytes) {
     const auto schema = snapshot_schema();
 
-    arrow::UInt64Builder op_b;
-    arrow::BinaryBuilder key_b;
-    arrow::BinaryBuilder val_b;
+    SnapshotArrowWriter writer;
 
     if (!snapshot_bytes.empty()) {
         auto buffer =
@@ -426,46 +353,19 @@ std::vector<std::byte> InMemoryStateBackend::extract_operator_state_bytes(
                     continue;
                 int32_t vlen = 0;
                 const uint8_t* vptr = val_arr->GetValue(i, &vlen);
-                if (auto s = op_b.Append(op_arr->Value(i)); !s.ok())
-                    throw_arrow("extract_operator_state (append op)", s);
-                if (auto s = key_b.Append(kptr, klen); !s.ok())
-                    throw_arrow("extract_operator_state (append key)", s);
-                if (auto s = val_b.Append(vptr, vlen); !s.ok())
-                    throw_arrow("extract_operator_state (append val)", s);
+                writer.append(op_arr->Value(i),
+                              std::string_view(reinterpret_cast<const char*>(kptr),
+                                               static_cast<std::size_t>(klen)),
+                              std::string_view(reinterpret_cast<const char*>(vptr),
+                                               static_cast<std::size_t>(vlen)));
             }
         }
     }
 
-    std::shared_ptr<arrow::Array> op_arr, key_arr, val_arr;
-    if (auto s = op_b.Finish(&op_arr); !s.ok())
-        throw_arrow("extract_operator_state (finish op)", s);
-    if (auto s = key_b.Finish(&key_arr); !s.ok())
-        throw_arrow("extract_operator_state (finish key)", s);
-    if (auto s = val_b.Finish(&val_arr); !s.ok())
-        throw_arrow("extract_operator_state (finish val)", s);
-
-    auto batch = arrow::RecordBatch::Make(schema, op_arr->length(), {op_arr, key_arr, val_arr});
-    auto sink_result = arrow::io::BufferOutputStream::Create();
-    if (!sink_result.ok())
-        throw_arrow("extract_operator_state (create sink)", sink_result.status());
-    auto sink = *sink_result;
-    auto writer_result = arrow::ipc::MakeStreamWriter(sink, schema);
-    if (!writer_result.ok())
-        throw_arrow("extract_operator_state (make writer)", writer_result.status());
-    auto writer = *writer_result;
-    if (auto s = writer->WriteRecordBatch(*batch); !s.ok())
-        throw_arrow("extract_operator_state (write batch)", s);
-    if (auto s = writer->Close(); !s.ok())
-        throw_arrow("extract_operator_state (close writer)", s);
-    auto buf_result = sink->Finish();
-    if (!buf_result.ok())
-        throw_arrow("extract_operator_state (finish sink)", buf_result.status());
-    auto buf = *buf_result;
-    std::vector<std::byte> bytes(static_cast<std::size_t>(buf->size()));
-    if (buf->size() > 0) {
-        std::memcpy(bytes.data(), buf->data(), static_cast<std::size_t>(buf->size()));
-    }
-    return bytes;
+    // Bare schema (no versions metadata), matching the historic output of
+    // this path: the extracted operator-state rows feed a rescale merge,
+    // which takes its version map from the primary parent snapshot.
+    return writer.finish();
 }
 
 }  // namespace clink

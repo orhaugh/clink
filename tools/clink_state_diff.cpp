@@ -21,8 +21,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -30,6 +33,10 @@
 #include "clink/runtime/record_capture.hpp"
 #include "clink/state_processor/savepoint.hpp"
 #include "clink/state_processor/state_diff.hpp"
+
+#ifdef CLINK_LINKED_ROCKSDB
+#include "clink/state/rocksdb_state_backend.hpp"
+#endif
 
 namespace {
 
@@ -98,10 +105,52 @@ struct LoadedSide {
     std::vector<Savepoint> savepoints;
 };
 
+// A RocksDB checkpoint dir is a complete RocksDB instance; CURRENT is
+// its always-present manifest pointer, so it discriminates cleanly from
+// a clink checkpoint dir of .snap files.
+bool is_rocksdb_checkpoint_dir(const fs::path& p) {
+    return fs::is_directory(p) && fs::exists(p / "CURRENT");
+}
+
+// Canonical snapshot bytes for --from: a .snap/.arrows file verbatim, or
+// a RocksDB checkpoint dir rendered through the Arrow export (when the
+// CLI is built with RocksDB linked).
+std::vector<std::byte> canonical_bytes_for(const std::string& path) {
+    if (is_rocksdb_checkpoint_dir(path)) {
+#ifdef CLINK_LINKED_ROCKSDB
+        return clink::rocksdb_checkpoint_to_arrow(path);
+#else
+        throw std::runtime_error(
+            path +
+            " is a RocksDB checkpoint dir, but this clink build has no RocksDB "
+            "support; rebuild with the RocksDB impl linked");
+#endif
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("cannot open " + path);
+    }
+    std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::vector<std::byte> bytes(raw.size());
+    if (!raw.empty()) {
+        std::memcpy(bytes.data(), raw.data(), raw.size());
+    }
+    return bytes;
+}
+
 LoadedSide load_file(const std::string& path) {
     LoadedSide side;
     side.label = path;
-    side.savepoints.push_back(Savepoint::load_from_file(path));
+    if (is_rocksdb_checkpoint_dir(path)) {
+        // Render the RocksDB checkpoint as the canonical Arrow stream and
+        // load that - state-cat/state-diff then treat it exactly like a
+        // .snap file.
+        clink::Snapshot snap;
+        snap.bytes = canonical_bytes_for(path);
+        side.savepoints.push_back(Savepoint::load_from_snapshot(std::move(snap)));
+    } else {
+        side.savepoints.push_back(Savepoint::load_from_file(path));
+    }
     side.entries = collect_entries(side.savepoints.back());
     return side;
 }
@@ -584,6 +633,71 @@ int clink_cmd_capture_cat(int argc, char** argv) {
         return 2;
     } catch (const std::exception& e) {
         std::cerr << "clink capture-cat: " << e.what() << "\n";
+        return 2;
+    }
+}
+
+namespace {
+
+void export_usage() {
+    std::cout << "usage: clink state-export --from=<path> --out=<file>\n"
+              << "\n"
+              << "Write a checkpoint/savepoint's keyed state as one canonical Arrow IPC\n"
+              << "stream (op_id: uint64, key_bytes: binary, value_bytes: binary), openable\n"
+              << "directly by pyarrow / DuckDB / Polars and by every clink state tool.\n"
+              << "\n"
+              << "  --from=<path>   a .snap/.arrows snapshot file (validated + copied), or\n"
+              << "                  a RocksDB checkpoint directory (rendered via the Arrow\n"
+              << "                  export; requires a RocksDB-linked build)\n"
+              << "  --out=<file>    output file to write\n";
+}
+
+}  // namespace
+
+int clink_cmd_state_export(int argc, char** argv) {
+    if (has_flag(argc, argv, "help")) {
+        export_usage();
+        return 0;
+    }
+    const auto from = get_arg(argc, argv, "from");
+    const auto out = get_arg(argc, argv, "out");
+    if (from.empty() || out.empty()) {
+        export_usage();
+        return 2;
+    }
+    try {
+        auto bytes = canonical_bytes_for(from);
+
+        // Validate + summarise by loading what we are about to write: a
+        // malformed input fails HERE, not in the consumer's reader.
+        clink::Snapshot snap;
+        snap.bytes = bytes;
+        auto sp = Savepoint::load_from_snapshot(std::move(snap));
+        const auto entries = collect_entries(sp);
+        std::size_t slots = 0, rows = 0;
+        for (const auto& [op, slot_map] : entries) {
+            slots += slot_map.size();
+            for (const auto& [slot, kv] : slot_map) {
+                rows += kv.size();
+            }
+        }
+
+        std::ofstream sink(out, std::ios::binary | std::ios::trunc);
+        if (!sink) {
+            throw std::runtime_error("cannot open " + out + " for writing");
+        }
+        sink.write(reinterpret_cast<const char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+        sink.flush();
+        if (!sink) {
+            throw std::runtime_error("write to " + out + " failed");
+        }
+        std::cout << "state-export: " << from << " -> " << out << " (" << bytes.size() << " bytes, "
+                  << entries.size() << " operators, " << slots << " slots, " << rows
+                  << " keyed entries)\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "state-export: " << e.what() << "\n";
         return 2;
     }
 }
