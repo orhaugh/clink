@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -77,6 +78,17 @@ public:
     bool enabled() const { return enabled_.load(std::memory_order_acquire); }
 
 private:
+    // Diagnostic kill-switch: CLINK_DISABLE_LOCAL_DATA_PLANE=1 forces every
+    // co-located edge onto the socket+codec path, so the fast path's
+    // contribution can be measured A/B on an unmodified binary (and the
+    // cross-process wire exercised inside one process).
+    LocalDataPlane() {
+        const char* off = std::getenv("CLINK_DISABLE_LOCAL_DATA_PLANE");
+        if (off != nullptr && off[0] == '1') {
+            enabled_.store(false, std::memory_order_release);
+        }
+    }
+
     struct Entry {
         std::shared_ptr<void> channel;
         std::type_index type;
