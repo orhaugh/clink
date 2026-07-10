@@ -374,3 +374,90 @@ TEST(StateDiff, RenderBytesFormats) {
     const std::string longtext(100, 'a');
     EXPECT_NE(render_bytes(longtext, 16).find("[100 bytes]"), std::string::npos);
 }
+
+// ----- Parquet export (the analytics projection) -----
+
+#include <arrow/table.h>
+#include <parquet/arrow/reader.h>
+
+#include "clink/state_processor/parquet_export.hpp"
+
+// write_state_parquet writes the decoded entry model as one Parquet
+// table; reading it back with the standard Parquet reader reproduces
+// every column of every entry, including operator-state rows (key
+// group >= 128) and binary values.
+TEST(StateExportParquet, RoundTripsAllColumns) {
+    auto sp = Savepoint::create();
+    auto ks = sp.keyed_state<std::string, std::int64_t>(
+        OperatorId{7}, "counts", string_codec(), int64_codec());
+    ks.put("alpha", 1);
+    ks.put("beta", 22);
+    // A second slot on another operator.
+    auto ks2 = sp.keyed_state<std::string, std::string>(
+        OperatorId{9}, "names", string_codec(), string_codec());
+    ks2.put("k", "value-bytes");
+    // An operator-state row (reserved prefix byte, no key group).
+    const std::string op_key = std::string{"\xFF"} + "offsets|p0";
+    const std::string op_val = "12345678";
+    sp.backend().put(OperatorId{9}, std::string_view{op_key}, std::string_view{op_val});
+
+    const auto entries = collect_entries(sp);
+    const auto path = std::filesystem::temp_directory_path() / "clink_state_export_test.parquet";
+    std::filesystem::remove(path);
+    write_state_parquet(entries, {}, path);
+
+    // Read back with the standard Parquet reader.
+    auto open_result = arrow::io::ReadableFile::Open(path.string());
+    ASSERT_TRUE(open_result.ok()) << open_result.status().ToString();
+    auto reader_result = parquet::arrow::OpenFile(*open_result, arrow::default_memory_pool());
+    ASSERT_TRUE(reader_result.ok()) << reader_result.status().ToString();
+    std::shared_ptr<arrow::Table> table;
+    ASSERT_TRUE((*reader_result)->ReadTable(&table).ok());
+
+    ASSERT_EQ(table->num_columns(), 5);
+    EXPECT_EQ(table->schema()->field(0)->name(), "op_id");
+    EXPECT_EQ(table->schema()->field(1)->name(), "key_group");
+    EXPECT_EQ(table->schema()->field(2)->name(), "slot");
+    EXPECT_EQ(table->schema()->field(3)->name(), "user_key");
+    EXPECT_EQ(table->schema()->field(4)->name(), "value_bytes");
+
+    // Row count = every keyed entry plus the operator-state row.
+    std::size_t expected_rows = 0;
+    for (const auto& [op, slots] : entries) {
+        for (const auto& [slot, kv] : slots) {
+            expected_rows += kv.size();
+        }
+    }
+    ASSERT_EQ(static_cast<std::size_t>(table->num_rows()), expected_rows);
+    ASSERT_GE(expected_rows, 4u);
+
+    // Spot-check content: rebuild the (op, slot, user_key -> value) view
+    // from the table and compare against the collected model.
+    auto combined = table->CombineChunks(arrow::default_memory_pool());
+    ASSERT_TRUE(combined.ok());
+    table = *combined;
+    const auto& op_col = static_cast<const arrow::UInt64Array&>(*table->column(0)->chunk(0));
+    const auto& kg_col = static_cast<const arrow::UInt8Array&>(*table->column(1)->chunk(0));
+    const auto& slot_col = static_cast<const arrow::StringArray&>(*table->column(2)->chunk(0));
+    const auto& key_col = static_cast<const arrow::BinaryArray&>(*table->column(3)->chunk(0));
+    const auto& val_col = static_cast<const arrow::BinaryArray&>(*table->column(4)->chunk(0));
+    for (int64_t i = 0; i < table->num_rows(); ++i) {
+        const OperatorId op{op_col.Value(i)};
+        const std::string slot{slot_col.GetView(i)};
+        const std::string user_key{key_col.GetView(i)};
+        const auto it = entries.at(op).at(slot).find(user_key);
+        ASSERT_NE(it, entries.at(op).at(slot).end());
+        EXPECT_EQ(std::string{val_col.GetView(i)}, it->second.value);
+        EXPECT_EQ(kg_col.Value(i), it->second.key_group);
+    }
+    // The operator-state row surfaced with its reserved prefix byte.
+    bool saw_op_state = false;
+    for (int64_t i = 0; i < table->num_rows(); ++i) {
+        if (kg_col.Value(i) == 0xFF) {
+            saw_op_state = true;
+            EXPECT_EQ(std::string{slot_col.GetView(i)}, "offsets");
+            EXPECT_EQ(std::string{val_col.GetView(i)}, "12345678");
+        }
+    }
+    EXPECT_TRUE(saw_op_state);
+}

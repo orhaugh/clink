@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "clink/runtime/record_capture.hpp"
+#include "clink/state_processor/parquet_export.hpp"
 #include "clink/state_processor/savepoint.hpp"
 #include "clink/state_processor/state_diff.hpp"
 
@@ -640,16 +641,23 @@ int clink_cmd_capture_cat(int argc, char** argv) {
 namespace {
 
 void export_usage() {
-    std::cout << "usage: clink state-export --from=<path> --out=<file>\n"
+    std::cout << "usage: clink state-export --from=<path> --out=<file> [--format=arrow|parquet]\n"
               << "\n"
-              << "Write a checkpoint/savepoint's keyed state as one canonical Arrow IPC\n"
-              << "stream (op_id: uint64, key_bytes: binary, value_bytes: binary), openable\n"
-              << "directly by pyarrow / DuckDB / Polars and by every clink state tool.\n"
+              << "Write a checkpoint/savepoint's keyed state as an open dataset.\n"
               << "\n"
-              << "  --from=<path>   a .snap/.arrows snapshot file (validated + copied), or\n"
-              << "                  a RocksDB checkpoint directory (rendered via the Arrow\n"
-              << "                  export; requires a RocksDB-linked build)\n"
-              << "  --out=<file>    output file to write\n";
+              << "  --from=<path>     a .snap/.arrows snapshot file, or a RocksDB checkpoint\n"
+              << "                    directory (rendered via the Arrow export; requires a\n"
+              << "                    RocksDB-linked build)\n"
+              << "  --out=<file>      output file to write\n"
+              << "  --format=arrow    the canonical Arrow IPC stream (op_id, key_bytes,\n"
+              << "                    value_bytes) - exact fidelity, restorable, readable by\n"
+              << "                    every clink state tool and any Arrow consumer\n"
+              << "  --format=parquet  the DECODED entry table (op_id, key_group, slot,\n"
+              << "                    user_key, value_bytes) as one Parquet file - the\n"
+              << "                    analytics projection, directly queryable in DuckDB /\n"
+              << "                    Spark / pyarrow\n"
+              << "\n"
+              << "Default format: parquet when --out ends in .parquet, else arrow.\n";
 }
 
 }  // namespace
@@ -663,6 +671,14 @@ int clink_cmd_state_export(int argc, char** argv) {
     const auto out = get_arg(argc, argv, "out");
     if (from.empty() || out.empty()) {
         export_usage();
+        return 2;
+    }
+    std::string format = get_arg(argc, argv, "format");
+    if (format.empty()) {
+        format = out.ends_with(".parquet") ? "parquet" : "arrow";
+    }
+    if (format != "arrow" && format != "parquet") {
+        std::cerr << "state-export: unknown --format '" << format << "' (arrow|parquet)\n";
         return 2;
     }
     try {
@@ -682,18 +698,28 @@ int clink_cmd_state_export(int argc, char** argv) {
             }
         }
 
-        std::ofstream sink(out, std::ios::binary | std::ios::trunc);
-        if (!sink) {
-            throw std::runtime_error("cannot open " + out + " for writing");
+        std::uintmax_t written = 0;
+        if (format == "parquet") {
+            // The analytics projection: the decoded entry table, one row
+            // per (op, slot, user_key), straight into a Parquet file.
+            clink::state_processor::write_state_parquet(
+                entries, sp.backend().restored_state_versions(), out);
+            written = fs::file_size(out);
+        } else {
+            std::ofstream sink(out, std::ios::binary | std::ios::trunc);
+            if (!sink) {
+                throw std::runtime_error("cannot open " + out + " for writing");
+            }
+            sink.write(reinterpret_cast<const char*>(bytes.data()),
+                       static_cast<std::streamsize>(bytes.size()));
+            sink.flush();
+            if (!sink) {
+                throw std::runtime_error("write to " + out + " failed");
+            }
+            written = bytes.size();
         }
-        sink.write(reinterpret_cast<const char*>(bytes.data()),
-                   static_cast<std::streamsize>(bytes.size()));
-        sink.flush();
-        if (!sink) {
-            throw std::runtime_error("write to " + out + " failed");
-        }
-        std::cout << "state-export: " << from << " -> " << out << " (" << bytes.size() << " bytes, "
-                  << entries.size() << " operators, " << slots << " slots, " << rows
+        std::cout << "state-export: " << from << " -> " << out << " (" << format << ", " << written
+                  << " bytes, " << entries.size() << " operators, " << slots << " slots, " << rows
                   << " keyed entries)\n";
         return 0;
     } catch (const std::exception& e) {
