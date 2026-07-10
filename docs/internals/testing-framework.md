@@ -17,6 +17,7 @@ Link the `clink::test_support` CMake target from test executables only; producti
 | `include/clink/test/keyed_harness.hpp` | `KeyedOneInputOperatorHarness<In, Out, K>` (typed state inspection, key-scoped timers), `default_codec<T>`, and the `ProcessFunction` factories |
 | `include/clink/test/two_input_harness.hpp` | `TwoInputOperatorHarness<In1, In2, Out>` and its keyed variant: `CoOperator` testing with the engine's real watermark combination |
 | `include/clink/test/failure_injection.hpp` | `FailurePlan`, `FailurePoint`, `InjectedFailure`: deterministic failure injection at the harness's mediation points |
+| `include/clink/test/sources_and_sinks.hpp` | `TestSource<T>` (scripted, checkpointable), `CollectSink<T>`, `FailingSink<T>`, `TransactionalTestSink<T>` (2PC lifecycle recorder) |
 | `tests/test_harness_framework.cpp` | The framework's own contract tests |
 
 ## Testing a stateless function
@@ -109,6 +110,20 @@ Points: `BeforeProcessElement`, `AfterProcessElement` (the "crash after the effe
 
 The harness also keeps a lifecycle log of what it drove, in order - `h.transitions()` yields `"open"`, `"process"`, `"watermark"`, `"snapshot"`, `"close"` - for asserting lifecycle ordering without instrumenting the operator.
 
+## Test sources and sinks
+
+Deterministic stream endpoints implementing the engine's real `Source<T>`/`Sink<T>` contracts, so they compose with harnesses, the local runtime and the cluster alike:
+
+```cpp
+clink::test::TestSource<Event> src;
+src.emit(e1, 1000).emit(e2, 2000).watermark(2500).emit(e3, 3000);
+```
+
+- **`TestSource<T>`** - a scripted, bounded source. `produce()` emits exactly one script entry per call, so checkpoint barriers can land between any two entries. Its cursor is checkpointable through the production `snapshot_offset`/`restore_offset` hooks: a restored source with the same script resumes after the last checkpointed entry - nothing re-emitted, nothing skipped - which is what makes exactly-once recovery testable.
+- **`CollectSink<T>`** - collects records (with event times) and watermarks, thread-safely; keep a `shared_ptr` to it and read `values()`/`records()` after the pipeline runs.
+- **`FailingSink<T>`** - accepts N records, then throws `InjectedFailure` once: the sink-side crash for recovery tests.
+- **`TransactionalTestSink<T>`** - records the full two-phase-commit lifecycle: `on_data` fills the current epoch, `on_barrier` stages it under the checkpoint id (a terminal barrier also commits immediately, the engine's bounded-stream contract), `on_commit` promotes it (idempotently), `on_abort` discards it. `committed_values()` is exactly what an external system would durably hold; `pending_checkpoints()`, `uncommitted_values()`, `commits()` and `aborts()` expose the intermediate states.
+
 ## Design rules
 
 - Deterministic: no sleeps, no polling loops, no wall clock.
@@ -123,7 +138,7 @@ The harness also keeps a lifecycle log of what it drove, in order - `h.transitio
 2. Keyed harness (typed state inspection, key-scoped timers, key selectors) + `ProcessFunction` factory helpers - DONE.
 3. Two-input harnesses (co-process, joins, connected streams) with the engine's real two-input watermark combination - DONE.
 4. Snapshot/restore (the real backend + `snapshot_timers` cycle), failure injection, lifecycle log - DONE.
-5. Test sources and sinks (controllable, replayable; transactional over the committing-sink framework).
+5. Test sources and sinks (scripted, replayable, transactional) - DONE.
 6. `LocalTestEnvironment` (full pipelines over the local runtime) and `MiniCluster` (the in-process JM+TM fixture).
 7. Assertions, sequence/property-testing support, compiling documentation examples, and migration of representative core tests onto the framework.
 

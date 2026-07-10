@@ -546,3 +546,115 @@ TEST(TestFramework, TwoInputSnapshotRestoreAndFailureInjection) {
     EXPECT_THROW(h2.process_right(9), test::InjectedFailure);
     EXPECT_EQ(h2.failures().injected_count(), 1u);
 }
+
+// ---- Increment 5: test sources and sinks ----
+
+#include "clink/test/sources_and_sinks.hpp"
+
+TEST(TestFramework, TestSourceEmitsItsScriptOneEntryPerProduce) {
+    test::TestSource<std::int64_t> src;
+    src.emit(1, 1000).watermark(1500).emit(2);
+    ASSERT_EQ(src.script_size(), 3u);
+    EXPECT_TRUE(src.is_bounded());
+
+    test::OutputCapture<std::int64_t> cap;
+    EXPECT_TRUE(src.produce(cap.emitter()));   // value 1
+    EXPECT_TRUE(src.produce(cap.emitter()));   // watermark
+    EXPECT_TRUE(src.produce(cap.emitter()));   // value 2
+    EXPECT_FALSE(src.produce(cap.emitter()));  // exhausted
+
+    EXPECT_EQ(cap.values(), (std::vector<std::int64_t>{1, 2}));
+    const auto recs = cap.records();
+    EXPECT_EQ(recs[0].event_time_ms, std::optional<std::int64_t>{1000});
+    EXPECT_EQ(recs[1].event_time_ms, std::nullopt);
+    ASSERT_EQ(cap.watermarks().size(), 1u);
+    EXPECT_EQ(cap.watermarks()[0].timestamp().millis(), 1500);
+
+    // cancel() ends the stream regardless of remaining script.
+    test::TestSource<std::int64_t> cancelled({7, 8});
+    cancelled.cancel();
+    EXPECT_FALSE(cancelled.produce(cap.emitter()));
+}
+
+TEST(TestFramework, TestSourceOffsetRoundTripResumesAfterTheCheckpoint) {
+    InMemoryStateBackend backend;
+    test::TestSource<std::int64_t> src({1, 2, 3, 4});
+    test::OutputCapture<std::int64_t> cap;
+    src.produce(cap.emitter());
+    src.produce(cap.emitter());
+    src.snapshot_offset(backend, OperatorId{42}, CheckpointId{1});
+
+    // Recovery: a fresh source with the same script resumes after the
+    // checkpointed cursor - nothing is re-emitted, nothing is skipped.
+    test::TestSource<std::int64_t> resumed({1, 2, 3, 4});
+    EXPECT_TRUE(resumed.restore_offset(backend, OperatorId{42}));
+    test::OutputCapture<std::int64_t> cap2;
+    while (resumed.produce(cap2.emitter())) {
+    }
+    EXPECT_EQ(cap2.values(), (std::vector<std::int64_t>{3, 4}));
+
+    // No checkpointed offset for a different operator id.
+    test::TestSource<std::int64_t> other({1});
+    EXPECT_FALSE(other.restore_offset(backend, OperatorId{7}));
+}
+
+TEST(TestFramework, CollectSinkGathersRecordsAndFailingSinkThrowsAfterN) {
+    test::CollectSink<std::int64_t> sink;
+    Batch<std::int64_t> b;
+    b.emplace(1, EventTime{100});
+    b.emplace(2);
+    sink.on_data(b);
+    sink.on_watermark(Watermark{EventTime{500}});
+
+    EXPECT_EQ(sink.values(), (std::vector<std::int64_t>{1, 2}));
+    EXPECT_EQ(sink.value_count(), 2u);
+    EXPECT_EQ(sink.records()[0].event_time_ms, std::optional<std::int64_t>{100});
+    EXPECT_EQ(sink.watermarks(), (std::vector<std::int64_t>{500}));
+
+    test::FailingSink<std::int64_t> failing(/*pass_first=*/2);
+    Batch<std::int64_t> c;
+    c.emplace(10);
+    c.emplace(11);
+    c.emplace(12);
+    EXPECT_THROW(failing.on_data(c), test::InjectedFailure);
+    EXPECT_EQ(failing.values(), (std::vector<std::int64_t>{10, 11}));  // crash on the third
+    EXPECT_TRUE(failing.failed());
+}
+
+TEST(TestFramework, TransactionalTestSinkModelsTheTwoPhaseCommitLifecycle) {
+    test::TransactionalTestSink<std::int64_t> sink;
+
+    Batch<std::int64_t> e1;
+    e1.emplace(1);
+    e1.emplace(2);
+    sink.on_data(e1);
+    sink.on_barrier(CheckpointBarrier{CheckpointId{1}});  // stage epoch 1
+    Batch<std::int64_t> e2;
+    e2.emplace(3);
+    sink.on_data(e2);
+    sink.on_barrier(CheckpointBarrier{CheckpointId{2}});  // stage epoch 2
+
+    // Nothing is durable until the commit phase.
+    EXPECT_TRUE(sink.committed_values().empty());
+    EXPECT_EQ(sink.pending_checkpoints(), (std::vector<std::uint64_t>{1, 2}));
+
+    sink.on_commit(1);
+    EXPECT_EQ(sink.committed_values(), (std::vector<std::int64_t>{1, 2}));
+    sink.on_commit(1);  // idempotent, as the engine requires
+    EXPECT_EQ(sink.committed_values(), (std::vector<std::int64_t>{1, 2}));
+
+    sink.on_abort(2);  // epoch 2 rolls back; its records never commit
+    EXPECT_EQ(sink.committed_values(), (std::vector<std::int64_t>{1, 2}));
+    EXPECT_TRUE(sink.pending_checkpoints().empty());
+
+    // A TERMINAL barrier commits its epoch immediately (bounded-stream
+    // contract: no JM round-trip after end-of-stream).
+    Batch<std::int64_t> e3;
+    e3.emplace(4);
+    sink.on_data(e3);
+    EXPECT_EQ(sink.uncommitted_values(), (std::vector<std::int64_t>{4}));
+    sink.on_barrier(CheckpointBarrier{CheckpointId{3}, /*terminal=*/true});
+    EXPECT_EQ(sink.committed_values(), (std::vector<std::int64_t>{1, 2, 4}));
+    EXPECT_EQ(sink.commits(), (std::vector<std::uint64_t>{1, 3}));
+    EXPECT_EQ(sink.aborts(), (std::vector<std::uint64_t>{2}));
+}
