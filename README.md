@@ -48,6 +48,7 @@ section below.
   - [Cluster job plugin (StreamExecutionEnvironment)](#cluster-job-plugin-streamexecutionenvironment)
 - [SQL frontend](#sql-frontend)
 - [Time-travel debugging](#time-travel-debugging)
+- [State as data](#state-as-data)
 - [Running the in-tree examples](#running-the-in-tree-examples)
 - [Linting & formatting](#linting--formatting)
 - [Repository layout](#repository-layout)
@@ -909,6 +910,36 @@ from a sampled one). Per-record operators (GROUP BY, filter/project,
 DISTINCT, TOP-N) replay exactly; windowed operators replay data-only in
 v1 (watermark-driven fires do not occur). Details:
 [docs/internals/fault-tolerance-and-rescale.md](docs/internals/fault-tolerance-and-rescale.md).
+
+## State as data
+
+A pipeline's state is an open dataset, not a black box. Snapshots are
+plain Apache Arrow IPC streams (a documented, stable format - see
+`docs/internals/state-snapshot-format.md`), so a checkpoint is readable
+by pyarrow, DuckDB or Polars directly, and the CLI closes the loop for
+every backend, RocksDB's native checkpoints included:
+
+```bash
+# Any checkpoint, savepoint or RocksDB checkpoint dir -> an open file.
+$ clink state-export --from=ckpt/0/checkpoint-9.snap --out=state.parquet
+state-export: ckpt/0/checkpoint-9.snap -> state.parquet (parquet, ...)
+
+# Or straight into a catalogued Apache Iceberg table (one snapshot per
+# export, so the lake table time-travels across them).
+$ clink state-export --from=ckpt/0/checkpoint-9.snap --format=iceberg \
+    --warehouse=/data/warehouse --table=job_state
+
+# Or query it in place - the engine's own SQL over the snapshot,
+# results as NDJSON. GROUP BY and DISTINCT net to their final rows.
+$ clink state-query --from=ckpt/0/checkpoint-9.snap \
+    --sql="SELECT slot, count(*) AS keys FROM state GROUP BY slot"
+{"keys":184,"slot":"counts"}
+```
+
+Multi-subtask checkpoints merge with `--dir=<root> --id=N`. Schema
+version stamps ride the snapshots (all backends), so
+`clink check-savepoint` can gate a deploy against a savepoint's actual
+state versions before anything restores.
 
 ## Running the in-tree examples
 

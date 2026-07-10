@@ -461,3 +461,45 @@ TEST(StateExportParquet, RoundTripsAllColumns) {
     }
     EXPECT_TRUE(saw_op_state);
 }
+
+#include <arrow/io/memory.h>
+#include <arrow/ipc/api.h>
+
+#include "clink/state/snapshot_arrow_writer.hpp"
+
+// The format contract (docs/internals/state-snapshot-format.md): every
+// stream the canonical writer produces is stamped clink.format_version=1,
+// and version stamps ride clink.state_versions when present.
+TEST(StateSnapshotFormat, StreamsCarryTheFormatVersionMarker) {
+    InMemoryStateBackend backend;
+    backend.put(OperatorId{1}, "k", std::string_view{"v"});
+    StateVersionMap versions;
+    versions.set(OperatorId{1}, "CounterState", 2);
+    backend.set_state_versions(versions);
+    auto snap = backend.snapshot(CheckpointId{1});
+
+    auto buffer =
+        std::make_shared<arrow::Buffer>(reinterpret_cast<const uint8_t*>(snap.bytes.data()),
+                                        static_cast<int64_t>(snap.bytes.size()));
+    auto reader = *arrow::ipc::RecordBatchStreamReader::Open(
+        std::make_shared<arrow::io::BufferReader>(buffer));
+    const auto& meta = reader->schema()->metadata();
+    ASSERT_TRUE(meta != nullptr);
+    auto v = meta->Get(kSnapshotFormatVersionKey);
+    ASSERT_TRUE(v.ok());
+    EXPECT_EQ(*v, std::string{kSnapshotFormatVersion});
+    auto sv = meta->Get(kStateVersionsMetadataKey);
+    ASSERT_TRUE(sv.ok());
+    EXPECT_EQ(StateVersionMap::unpack(*sv).pack(), versions.pack());
+
+    // An empty-versions stream still carries the format marker.
+    InMemoryStateBackend bare;
+    auto snap2 = bare.snapshot(CheckpointId{2});
+    auto buffer2 =
+        std::make_shared<arrow::Buffer>(reinterpret_cast<const uint8_t*>(snap2.bytes.data()),
+                                        static_cast<int64_t>(snap2.bytes.size()));
+    auto reader2 = *arrow::ipc::RecordBatchStreamReader::Open(
+        std::make_shared<arrow::io::BufferReader>(buffer2));
+    ASSERT_TRUE(reader2->schema()->metadata() != nullptr);
+    EXPECT_TRUE(reader2->schema()->metadata()->Get(kSnapshotFormatVersionKey).ok());
+}

@@ -89,9 +89,12 @@ std::vector<std::byte> SnapshotArrowWriter::finish(const StateVersionMap& versio
     }
 
     auto schema = canonical_schema();
-    if (!versions.empty()) {
+    {
         auto meta = std::make_shared<arrow::KeyValueMetadata>();
-        meta->Append(kStateVersionsMetadataKey, versions.pack());
+        meta->Append(kSnapshotFormatVersionKey, kSnapshotFormatVersion);
+        if (!versions.empty()) {
+            meta->Append(kStateVersionsMetadataKey, versions.pack());
+        }
         schema = schema->WithMetadata(meta);
     }
     auto batch = arrow::RecordBatch::Make(schema, impl_->rows, {op_arr, key_arr, val_arr});

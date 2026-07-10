@@ -90,6 +90,8 @@ flowchart TD
 
 ### The Arrow IPC snapshot format
 
+The format is a stable public contract, documented in full (key encoding, metadata, derived projections, evolution policy) in [./state-snapshot-format.md](./state-snapshot-format.md); this section summarises it.
+
 InMemory, Sharded, FileBacked and Changelog all share one on-disk snapshot encoding. `InMemoryStateBackend::snapshot()` writes an Arrow IPC stream of one RecordBatch with three columns:
 
 ```

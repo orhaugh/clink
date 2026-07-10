@@ -32,6 +32,14 @@ namespace clink {
 // Shared by the writer and every restore/inspection path that reads it.
 inline constexpr char kStateVersionsMetadataKey[] = "clink.state_versions";
 
+// Schema-metadata key carrying the snapshot FORMAT version, stamped on
+// every stream this writer produces. Readers treat absence as version 1
+// (streams written before the marker existed). The format contract and
+// its evolution policy live in docs/internals/state-snapshot-format.md;
+// the current version is 1.
+inline constexpr char kSnapshotFormatVersionKey[] = "clink.format_version";
+inline constexpr char kSnapshotFormatVersion[] = "1";
+
 class SnapshotArrowWriter {
 public:
     // `reserve_rows` pre-sizes the column builders (0 = grow on demand).
