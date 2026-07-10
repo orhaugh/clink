@@ -145,6 +145,18 @@ public:
     std::size_t capture_records() const noexcept { return capture_records_; }
     std::size_t capture_subtask_idx() const noexcept { return capture_subtask_idx_; }
 
+    // Queryable-state identity: the DeploymentTask role and global subtask
+    // index this operator runs as. An operator that exposes a state slot
+    // for external lookup binds it under exactly this (role, subtask) pair
+    // - the address the JM routes clients to. Empty role in in-process /
+    // legacy paths: operators skip queryable binding there.
+    void set_runner_identity(std::string role, std::size_t subtask_idx) noexcept {
+        runner_role_ = std::move(role);
+        runner_subtask_idx_ = subtask_idx;
+    }
+    const std::string& runner_role() const noexcept { return runner_role_; }
+    std::size_t runner_subtask_idx() const noexcept { return runner_subtask_idx_; }
+
     // Dead-letter queue seam. The executor hands every subtask one shared DLQ (the
     // default logs bad records; a job may swap in a null or sink-backed one). A
     // connector that must drop a poison record - a source decode failure, a sink
@@ -418,6 +430,8 @@ private:
     std::string capture_dir_;
     std::size_t capture_records_{0};
     std::size_t capture_subtask_idx_{0};
+    std::string runner_role_;
+    std::size_t runner_subtask_idx_{0};
     TimerService timer_service_{};
     SideOutputChannelMap side_outputs_;
     CheckpointAckFn ack_fn_;

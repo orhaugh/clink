@@ -409,6 +409,7 @@ if(CLINK_BUILD_SQL)
         test_table_api.cpp
         test_sql_preparse.cpp
         test_sql_ai.cpp
+        test_sql_queryable_state.cpp
         test_embedded_engine.cpp
     )
     target_link_libraries(clink_sql_tests PRIVATE

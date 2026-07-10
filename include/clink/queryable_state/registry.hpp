@@ -56,6 +56,12 @@ inline std::string compose_subtask_slot(const std::string& role,
 // nullopt for missing keys.
 using Lookup = std::function<std::optional<std::vector<std::byte>>(std::span<const std::byte>)>;
 
+// JSON lookup closure: given the key's plain string form, return the
+// value as a JSON document, or nullopt for missing keys. The serving
+// surface for SQL state: no codec agreement, no hex - a key string in,
+// a JSON object out, consumable by anything that speaks HTTP.
+using JsonLookup = std::function<std::optional<std::string>(const std::string&)>;
+
 class Registry {
 public:
     // Register or replace the lookup for `slot`. Repeated registration
@@ -110,9 +116,56 @@ public:
         return out;
     }
 
+    // JSON slots: the parallel, serving-oriented map. Same lifecycle
+    // and locking discipline as the byte slots.
+    void register_json_slot(const std::string& slot, JsonLookup lookup) {
+        std::unique_lock lock(mu_);
+        json_by_slot_[slot] = std::move(lookup);
+    }
+
+    void unregister_json_slot(const std::string& slot) {
+        std::unique_lock lock(mu_);
+        json_by_slot_.erase(slot);
+    }
+
+    [[nodiscard]] std::optional<std::string> lookup_json(const std::string& slot,
+                                                         const std::string& key) const {
+        std::shared_lock lock(mu_);
+        auto it = json_by_slot_.find(slot);
+        if (it == json_by_slot_.end()) {
+            return std::nullopt;
+        }
+        auto fn = it->second;  // copy out, run outside the lock
+        lock.unlock();
+        return fn(key);
+    }
+
+    [[nodiscard]] bool has_json_slot(const std::string& slot) const {
+        std::shared_lock lock(mu_);
+        return json_by_slot_.find(slot) != json_by_slot_.end();
+    }
+
+    [[nodiscard]] std::vector<std::string> json_slots() const {
+        std::shared_lock lock(mu_);
+        std::vector<std::string> out;
+        out.reserve(json_by_slot_.size());
+        for (const auto& [k, _] : json_by_slot_) {
+            out.push_back(k);
+        }
+        return out;
+    }
+
+    // The process-wide instance the TaskManager's HTTP routes serve and
+    // operators bind into (test harnesses construct their own).
+    static Registry& global() {
+        static Registry instance;
+        return instance;
+    }
+
 private:
     mutable std::shared_mutex mu_;
     std::unordered_map<std::string, Lookup> by_slot_;
+    std::unordered_map<std::string, JsonLookup> json_by_slot_;
 };
 
 }  // namespace clink::queryable_state

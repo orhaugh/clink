@@ -341,6 +341,15 @@ public:
                                                  const std::string& role,
                                                  std::span<const std::byte> key_bytes) const;
 
+    // Every (host, http_port, subtask_idx) currently hosting a subtask of
+    // `role` for `job_id`, in subtask order. TMs that are lost or expose
+    // no HTTP port are skipped. Used by the queryable-state JSON serving
+    // route to fan a key lookup out across the role's subtasks - correct
+    // at any parallelism without reproducing the shuffle's key hashing on
+    // the JM (the key-group fast path is route_key_for_job).
+    [[nodiscard]] std::vector<RouteTarget> subtask_targets_for_role(JobId job_id,
+                                                                    const std::string& role) const;
+
     // Per-job topology version. Returns 0 if the job is unknown.
     // Incremented at initial deploy (-> 1) and on every successful
     // rescale. Used by Queryable State clients to invalidate cached

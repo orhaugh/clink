@@ -80,6 +80,14 @@ struct JobConfig {
     // the chain's subtask index; in-process default 0).
     std::size_t capture_subtask_idx{0};
 
+    // Queryable-state identity: the DeploymentTask role and global subtask
+    // index this runner executes as, threaded into every RuntimeContext so
+    // operators can bind state slots under the exact (role, subtask)
+    // address external clients query (see queryable_state/). Empty role in
+    // in-process / legacy paths - operators then skip queryable binding.
+    std::string runner_role;
+    std::size_t runner_subtask_idx{0};
+
     // State schema evolution: the versions the live job expects, per
     // (op, state_type). When set, the executor (a) on a restore,
     // migrates the restored state up to these versions before any

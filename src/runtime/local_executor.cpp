@@ -116,6 +116,11 @@ void LocalExecutor::start() {
             contexts_.back()->set_capture(
                 config_.capture_dir, config_.capture_records, config_.capture_subtask_idx);
         }
+        // Queryable-state identity (cluster path): lets operators bind
+        // state slots under the (role, subtask) address clients query.
+        if (!config_.runner_role.empty()) {
+            contexts_.back()->set_runner_identity(config_.runner_role, config_.runner_subtask_idx);
+        }
         auto* ctx_ptr = contexts_.back().get();
         auto run_fn = runner.run;
         auto cancel_fn = runner.cancel;

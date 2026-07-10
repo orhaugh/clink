@@ -136,12 +136,23 @@ Hot-tier eviction makes working state genuinely exceed RAM. With a non-zero `hot
 
 ### Queryable state
 
-Queryable state lets an operator expose a keyed-state slot for external reads over HTTP. The pieces:
+Queryable state exposes keyed operator state for external reads over HTTP - a serving surface for live state, not just plumbing. Two tiers:
 
-- `queryable_state::Registry` (`registry.hpp`): a process-wide map from slot name to a byte-level `Lookup` closure (`key bytes -> optional value bytes`). `register_slot` / `unregister_slot` / `lookup` / `has_slot` / `slots`, guarded by a shared mutex; the closure is copied out before it runs so it can take its own locks.
+**Byte-level slots** (custom operators, codecs agreed out of band):
+
+- `queryable_state::Registry` (`registry.hpp`): a process-wide map from slot name to a byte-level `Lookup` closure (`key bytes -> optional value bytes`). `register_slot` / `unregister_slot` / `lookup` / `has_slot` / `slots`, guarded by a shared mutex; the closure is copied out before it runs so it can take its own locks. `Registry::global()` is the instance the TaskManager's routes serve; operators bind into it.
 - `bind_keyed_state` (`bind.hpp`): wires a `KeyedState<K,V>` into a registry slot; the closure decodes the inbound key bytes via the K codec, hits the slot through the operator's encode-key path, and encodes the value back via the V codec. `bind_keyed_state_for_subtask` composes a `(role, subtask_idx, slot)` triple so subtasks of one op on the same TM do not collide.
-- `register_routes` (`server.hpp`): adds TM HTTP routes. `GET /api/v1/queryable_state` lists slots; `GET /api/v1/queryable_state/:slot?key=<hex>` looks one up; a subtask-scoped route mirrors it under `/op/:role/subtask/:subtask/slot/:slot`. Key and value bytes are lowercase-hex on the wire; codecs are agreed out of band.
+- `register_routes` (`server.hpp`): adds TM HTTP routes. `GET /api/v1/queryable_state` lists byte and JSON slots; `GET /api/v1/queryable_state/:slot?key=<hex>` looks one up; a subtask-scoped route mirrors it under `/op/:role/subtask/:subtask/slot/:slot`. Key and value bytes are lowercase-hex on the wire.
 - `register_jm_routes` (`jm_routes.hpp`): JM-side discovery and key routing. `/job/:job_id/tms` lists the TMs hosting the job; `/job/:job_id/op/:role/route?key=<hex>` computes `key_group_for_key` and returns the single subtask responsible (host, port, subtask_idx) plus a `topology_version`; `/job/:job_id/topology_version` is a cheap poll clients use to detect rescales and invalidate cached routes.
+
+**JSON serving slots** (the zero-code surface SQL state uses):
+
+- `Registry` holds a parallel map of `JsonLookup` closures (`key string -> optional JSON document`): `register_json_slot` / `lookup_json` and friends. No codec agreement, no hex.
+- The SQL `aggregate_row` operator (unbounded GROUP BY, in-memory path) **binds automatically**: at `open()` it registers a JSON slot at `(deployment role, global subtask, "agg")` when the runner identity is present, and unregisters at `close()`. The served value is the key's current FINALISED output row (group columns + aggregate results) - what a downstream consumer would see - built on demand from the live bucket. Lookups run on the TM's HTTP thread against operator-thread state, so the fold paths and the closure share a serving mutex the hot path takes once per batch (not per record). Keys are the operator's composite group-key string; for the common single-TEXT-key GROUP BY the closure also accepts the bare string (it retries it JSON-quoted).
+- TM route: `GET /api/v1/queryable_state/op/:role/subtask/:subtask/json/:slot?key=<string>` returns `{"key":"...","value":{...}}`.
+- JM one-call serving route: `GET /api/v1/queryable_state/job/:job_id/op/:role/json/:slot?key=<string>` fans the lookup out across the role's subtasks (in subtask order) and relays the first hit - correct at any parallelism without reproducing the shuffle's key hashing JM-side; the key-group `/route` fast path remains for latency-sensitive clients. Keys must be URL-safe.
+- Identity plumbing: the DeploymentTask role + global subtask index travel `RunnerContext.runner_role` -> `JobConfig` -> `RuntimeContext::set_runner_identity`, so an operator binds under exactly the address the JM routes clients to. In-process/legacy paths carry no role and operators skip binding.
+- Production wiring: `clink_node` registers the TM routes (against `Registry::global()`) and the JM routes whenever `--http-port` is set.
 
 ## Key types and APIs
 

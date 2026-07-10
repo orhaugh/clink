@@ -11,6 +11,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -42,6 +43,7 @@
 #include "clink/operators/operator_base.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/watermark_assigner_operator.hpp"
+#include "clink/queryable_state/registry.hpp"
 #include "clink/runtime/async_execution_controller.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/async_function_registry.hpp"
@@ -3436,6 +3438,11 @@ public:
 
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (element.is_data()) {
+            // Batch-granularity serving lock: external queryable-state
+            // lookups read the live buckets from the TM's HTTP thread.
+            // Uncontended in the steady state, so the fold path pays one
+            // lock per batch, not per record.
+            std::lock_guard serving_lock(serving_mu_);
             Batch<Row> emit_batch;
             if (effective_async_state_) {
                 // KeyedState (synchronous) path: used when async is on but the
@@ -3484,6 +3491,8 @@ public:
         if (!rb) {
             return false;
         }
+        // Same serving lock as process(): one acquisition per batch.
+        std::lock_guard serving_lock(serving_mu_);
         const std::int64_t n = rb->num_rows();
         // WS6 Increment 1: the fully-columnar vectorised fold (COUNT / SUM-int /
         // AVG-int over a pure-append batch) builds NO per-record Row, so it beats
@@ -3712,6 +3721,55 @@ public:
                 break;
             }
         }
+        // Queryable state: expose the live buckets for external JSON lookup
+        // (the serving surface - see queryable_state/). In-memory path only;
+        // the closure reads state_ under serving_mu_, which the processing
+        // paths hold at batch granularity. The slot address is the exact
+        // (deployment role, global subtask, "agg") triple the JM routes
+        // clients to, and the served value is the FINALISED output row for
+        // the key - what a downstream consumer would see - not the raw
+        // accumulators. Keys are the operator's composite group-key string
+        // (JSON-serialised values joined by \x1f); for the common
+        // single-TEXT-key GROUP BY the closure also accepts the bare string
+        // and retries it JSON-quoted.
+        if (!effective_async_state_ && this->runtime() != nullptr &&
+            !this->runtime()->runner_role().empty()) {
+            queryable_slot_ = clink::queryable_state::compose_subtask_slot(
+                this->runtime()->runner_role(),
+                static_cast<std::uint32_t>(this->runtime()->runner_subtask_idx()),
+                "agg");
+            clink::queryable_state::Registry::global().register_json_slot(
+                queryable_slot_, [this](const std::string& key) -> std::optional<std::string> {
+                    std::lock_guard lk(serving_mu_);
+                    auto it = state_.find(key);
+                    if (it == state_.end() && key.find('\x1f') == std::string::npos &&
+                        (key.empty() || key.front() != '"')) {
+                        // UX fallback: a bare string key retried in its
+                        // JSON-serialised form (group_key_ stores values as
+                        // their JSON literals, so TEXT keys carry quotes).
+                        it = state_.find(clink::config::JsonValue{key}.serialize(0));
+                    }
+                    if (it == state_.end()) {
+                        return std::nullopt;
+                    }
+                    Row result = it->second.group_values;
+                    for (std::size_t i = 0; i < aggregates_.size(); ++i) {
+                        result.values[aggregates_[i].output_name] =
+                            finalize_agg(it->second.agg_states[i], aggregates_[i]);
+                    }
+                    return clink::config::JsonValue{clink::config::JsonObject{result.values}}
+                        .serialize(0);
+                });
+        }
+    }
+
+    // Unbind the queryable slot before the buckets go away: the registry
+    // is process-wide and outlives this operator.
+    void close() override {
+        if (!queryable_slot_.empty()) {
+            clink::queryable_state::Registry::global().unregister_json_slot(queryable_slot_);
+            queryable_slot_.clear();
+        }
     }
 
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_state_; }
@@ -3899,6 +3957,9 @@ private:
         if (!persist_inmem_ || dirty_.empty()) {
             return;
         }
+        // Serving lock: a queryable lookup must not observe buckets while
+        // this thread iterates them (same discipline as the fold paths).
+        std::lock_guard serving_lock(serving_mu_);
         auto kv = keyed_state_();
         for (const auto& key : dirty_) {
             auto it = state_.find(key);
@@ -3931,6 +3992,10 @@ private:
     // batch-foldable, so process_columnar can probe state once per distinct
     // group per (insert-only) batch instead of once per row.
     bool batch_fold_eligible_ = false;
+    // Queryable-state serving: the slot this operator bound (empty = not
+    // bound) and the lock external lookups share with the fold paths.
+    std::string queryable_slot_;
+    mutable std::mutex serving_mu_;
     // Set in open(): the in-memory buckets must be flushed to KeyedState at
     // snapshot time (backend attached, KeyedState paths not active).
     bool persist_inmem_ = false;

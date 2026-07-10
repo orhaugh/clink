@@ -1115,6 +1115,35 @@ std::optional<JobManager::RouteTarget> JobManager::route_key_for_job(
     return std::nullopt;
 }
 
+std::vector<JobManager::RouteTarget> JobManager::subtask_targets_for_role(
+    JobId job_id, const std::string& role) const {
+    std::vector<RouteTarget> out;
+    std::lock_guard lock(mu_);
+    auto job_it = jobs_.find(job_id);
+    if (job_it == jobs_.end()) {
+        return out;
+    }
+    for (const auto& [tm_id, tasks] : job_it->second->tasks_by_tm) {
+        auto reg_it = registered_.find(tm_id);
+        if (reg_it == registered_.end()) {
+            continue;
+        }
+        const auto& tm = *reg_it->second;
+        if (tm.lost || tm.http_port == 0) {
+            continue;
+        }
+        for (const auto& task : tasks) {
+            if (task.role == role) {
+                out.push_back(RouteTarget{tm.data_host, tm.http_port, task.subtask_idx});
+            }
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const RouteTarget& a, const RouteTarget& b) {
+        return a.subtask_idx < b.subtask_idx;
+    });
+    return out;
+}
+
 CancelJobAckMsg JobManager::cancel_job(JobId job_id) {
     CancelJobAckMsg ack;
     ack.job_id = job_id;

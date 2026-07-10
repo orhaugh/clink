@@ -217,6 +217,14 @@ struct RunnerContext {
     // on the runner's stack. nullptr in legacy/in-process paths that
     // don't go through the TaskManager.
     std::shared_ptr<std::atomic<bool>> cancel_token;
+
+    // The DeploymentTask role this runner executes as - the same string
+    // the JM tracks in task_records and targets when routing
+    // queryable-state lookups. Threaded (with chain.subtask_idx) through
+    // JobConfig into each RuntimeContext so operators can bind state
+    // under the exact (role, subtask) slot external clients address.
+    // Empty in in-process / legacy paths (operators skip binding).
+    std::string runner_role;
 };
 
 // A SubtaskRunner is a type-erased closure that knows the concrete C++

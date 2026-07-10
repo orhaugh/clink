@@ -1402,6 +1402,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 .register_abort_callbacks = std::move(register_aborts),
                 .register_drain_callbacks = std::move(register_drains),
                 .register_checkpoint_backend = std::move(register_backend),
+                .runner_role = task.role,
             };
             // Register the cancel token (created above so the EOS waits could
             // capture it) under mu_ before the runner starts, so the CancelJob
@@ -1755,6 +1756,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                     m.error = std::move(error);
                     send_frame_(encode_frame(MessageKind::SubtaskCheckpointed, m));
                 },
+            .runner_role = task.role,
         };
         LocalExecutor exec(std::move(dag), clink::plugin::detail::make_subtask_job_config(rctx));
         exec.run();

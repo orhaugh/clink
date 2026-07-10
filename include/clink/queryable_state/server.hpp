@@ -125,6 +125,15 @@ inline void register_routes(http::HttpServer& server,
                        first = false;
                        body += detail::json_escape(s);
                    }
+                   body += "],\"json_slots\":[";
+                   first = true;
+                   for (const auto& s : registry.json_slots()) {
+                       if (!first) {
+                           body.push_back(',');
+                       }
+                       first = false;
+                       body += detail::json_escape(s);
+                   }
                    body += "]}";
                    resp.body = std::move(body);
                    return resp;
@@ -177,6 +186,57 @@ inline void register_routes(http::HttpServer& server,
             resp.body = "{\"value_hex\":\"" + hex + "\"}";
             return resp;
         });
+
+    // JSON serving route (subtask-scoped). The serving-surface variant:
+    // the key is a plain (URL-encoded) string, the response body carries
+    // the value as a nested JSON document - no codecs, no hex. Backed by
+    // the registry's JSON slots (register_json_slot), which SQL aggregate
+    // operators bind automatically.
+    //   200 -> {"key":"...","value":{...}}
+    //   404 -> slot not registered / key not found
+    server.get("/api/v1/queryable_state/op/:role/subtask/:subtask/json/:slot",
+               [&registry](const http::HttpRequest& req) -> http::HttpResponse {
+                   http::HttpResponse resp;
+                   auto role_it = req.path_params.find("role");
+                   auto sub_it = req.path_params.find("subtask");
+                   auto slot_it = req.path_params.find("slot");
+                   if (role_it == req.path_params.end() || sub_it == req.path_params.end() ||
+                       slot_it == req.path_params.end()) {
+                       resp.status = 400;
+                       resp.body = "{\"error\":\"missing role / subtask / slot\"}";
+                       return resp;
+                   }
+                   std::uint32_t subtask_idx = 0;
+                   try {
+                       subtask_idx = static_cast<std::uint32_t>(std::stoul(sub_it->second));
+                   } catch (...) {
+                       resp.status = 400;
+                       resp.body = "{\"error\":\"malformed subtask\"}";
+                       return resp;
+                   }
+                   const std::string composed =
+                       compose_subtask_slot(role_it->second, subtask_idx, slot_it->second);
+                   if (!registry.has_json_slot(composed)) {
+                       resp.status = 404;
+                       resp.body = "{\"error\":\"slot not registered\"}";
+                       return resp;
+                   }
+                   auto key_it = req.query.find("key");
+                   if (key_it == req.query.end()) {
+                       resp.status = 400;
+                       resp.body = "{\"error\":\"missing key=<string> query param\"}";
+                       return resp;
+                   }
+                   auto value = registry.lookup_json(composed, key_it->second);
+                   if (!value.has_value()) {
+                       resp.status = 404;
+                       resp.body = "{\"error\":\"key not found\"}";
+                       return resp;
+                   }
+                   resp.body = "{\"key\":" + detail::json_escape(key_it->second) +
+                               ",\"value\":" + *value + "}";
+                   return resp;
+               });
 
     // Subtask-scoped route. Same payload shape as /api/v1/queryable_state/:slot
     // but composes the registry lookup key from (role, subtask_idx, slot)

@@ -44,8 +44,9 @@
 #include <string>
 
 #include "clink/cluster/job_manager.hpp"
+#include "clink/http/http_client.hpp"
 #include "clink/http/http_server.hpp"
-#include "clink/queryable_state/server.hpp"  // hex_decode
+#include "clink/queryable_state/server.hpp"  // hex_decode, json_escape
 
 namespace clink::queryable_state {
 
@@ -159,6 +160,67 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
             resp.body = std::move(body);
             return resp;
         });
+
+    // JSON serving route - the one-call lookup a consumer actually uses:
+    //   GET /api/v1/queryable_state/job/:job_id/op/:role/json/:slot?key=<string>
+    // The JM fans the lookup out across the role's subtasks (in subtask
+    // order) and relays the first hit verbatim, so the client needs no
+    // codec, no hex, and no TM discovery. Fan-out is correct at any
+    // parallelism without reproducing the shuffle's key hashing here; the
+    // key-group fast path (/route + a direct TM call) remains available
+    // to latency-sensitive clients. Keys must be URL-safe (percent-encode
+    // anything else); the raw query value is forwarded verbatim.
+    //   200 -> the owning TM's body: {"key":"...","value":{...}}
+    //   404 -> job/role unknown, no TM exposes HTTP, or key not found
+    server.get("/api/v1/queryable_state/job/:job_id/op/:role/json/:slot",
+               [&jm](const http::HttpRequest& req) -> http::HttpResponse {
+                   http::HttpResponse resp;
+                   auto job_it = req.path_params.find("job_id");
+                   auto role_it = req.path_params.find("role");
+                   auto slot_it = req.path_params.find("slot");
+                   if (job_it == req.path_params.end() || role_it == req.path_params.end() ||
+                       slot_it == req.path_params.end()) {
+                       resp.status = 400;
+                       resp.body = "{\"error\":\"missing job_id / role / slot\"}";
+                       return resp;
+                   }
+                   cluster::JobId job{};
+                   try {
+                       job = static_cast<cluster::JobId>(std::stoull(job_it->second));
+                   } catch (...) {
+                       resp.status = 400;
+                       resp.body = "{\"error\":\"malformed job_id\"}";
+                       return resp;
+                   }
+                   auto key_it = req.query.find("key");
+                   if (key_it == req.query.end()) {
+                       resp.status = 400;
+                       resp.body = "{\"error\":\"missing key=<string> query param\"}";
+                       return resp;
+                   }
+                   const auto targets = jm.subtask_targets_for_role(job, role_it->second);
+                   if (targets.empty()) {
+                       resp.status = 404;
+                       resp.body =
+                           "{\"error\":\"job or role not found (or no hosting TM "
+                           "exposes HTTP)\"}";
+                       return resp;
+                   }
+                   for (const auto& t : targets) {
+                       http::HttpClient client(t.host, t.port);
+                       auto tm_resp =
+                           client.get("/api/v1/queryable_state/op/" + role_it->second +
+                                      "/subtask/" + std::to_string(t.subtask_idx) + "/json/" +
+                                      slot_it->second + "?key=" + key_it->second);
+                       if (tm_resp.status == 200) {
+                           resp.body = tm_resp.body;
+                           return resp;
+                       }
+                   }
+                   resp.status = 404;
+                   resp.body = "{\"error\":\"key not found\"}";
+                   return resp;
+               });
 
     server.get("/api/v1/queryable_state/job/:job_id/topology_version",
                [&jm](const http::HttpRequest& req) -> http::HttpResponse {
