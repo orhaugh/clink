@@ -23,20 +23,23 @@ namespace {
 class FanOutOperator final : public Operator<std::int64_t, std::int64_t> {
 public:
     void process(const StreamElement<std::int64_t>& element, Emitter<std::int64_t>& out) override {
-        if (!element.is_data()) {
-            return;
-        }
-        Batch<std::int64_t> b;
-        for (const auto& rec : element.as_data()) {
-            if (rec.event_time()) {
-                b.emplace(rec.value(), *rec.event_time());
-                b.emplace(rec.value() * 10, *rec.event_time());
-            } else {
-                b.emplace(rec.value());
-                b.emplace(rec.value() * 10);
+        if (element.is_data()) {
+            Batch<std::int64_t> b;
+            for (const auto& rec : element.as_data()) {
+                if (rec.event_time()) {
+                    b.emplace(rec.value(), *rec.event_time());
+                    b.emplace(rec.value() * 10, *rec.event_time());
+                } else {
+                    b.emplace(rec.value());
+                    b.emplace(rec.value() * 10);
+                }
             }
+            out.emit_data(std::move(b));
+        } else if (element.is_watermark()) {
+            this->on_watermark(element.as_watermark(), out);
+        } else {
+            this->on_barrier(element.as_barrier(), out);
         }
-        out.emit_data(std::move(b));
     }
     std::string name() const override { return "fan-out"; }
 };
@@ -48,17 +51,19 @@ public:
 class TimerOperator final : public Operator<std::int64_t, std::int64_t> {
 public:
     void process(const StreamElement<std::int64_t>& element, Emitter<std::int64_t>& out) override {
-        if (!element.is_data()) {
-            return;
+        if (element.is_data()) {
+            for (const auto& rec : element.as_data()) {
+                const auto ts = rec.event_time() ? rec.event_time()->millis() : 0;
+                runtime()->timer_service()->register_event_time_timer(ts + 100,
+                                                                      std::to_string(rec.value()));
+                runtime()->timer_service()->register_processing_time_timer(
+                    runtime()->timer_service()->now_ms() + 50, std::to_string(rec.value()));
+            }
+        } else if (element.is_watermark()) {
+            this->on_watermark(element.as_watermark(), out);
+        } else {
+            this->on_barrier(element.as_barrier(), out);
         }
-        for (const auto& rec : element.as_data()) {
-            const auto ts = rec.event_time() ? rec.event_time()->millis() : 0;
-            runtime()->timer_service()->register_event_time_timer(ts + 100,
-                                                                  std::to_string(rec.value()));
-            runtime()->timer_service()->register_processing_time_timer(
-                runtime()->timer_service()->now_ms() + 50, std::to_string(rec.value()));
-        }
-        (void)out;
     }
     void on_event_time_timer(std::int64_t ts,
                              const std::string& key,
@@ -748,4 +753,140 @@ TEST(TestFramework, MiniClusterRunsAJobGraphSpecToCompletion) {
     std::sort(written.begin(), written.end());
     EXPECT_EQ(written, (std::vector<std::int64_t>{1, 2, 3, 4, 5}));
     std::filesystem::remove(out_path);
+}
+
+// ---- Increment 7: assertions, sequences, side outputs, dogfooding ----
+
+#include "clink/operators/tumbling_window_operator.hpp"
+#include "clink/test/assertions.hpp"
+#include "clink/test/sequence.hpp"
+
+namespace {
+
+using KV = std::pair<std::string, std::int64_t>;
+
+std::shared_ptr<TumblingWindowOperator<std::string, std::int64_t, std::int64_t>> make_sum_window() {
+    return std::make_shared<TumblingWindowOperator<std::string, std::int64_t, std::int64_t>>(
+        std::chrono::milliseconds{1000},
+        []() -> std::int64_t { return 0; },
+        [](const std::int64_t& acc, const std::int64_t& v) { return acc + v; },
+        string_codec(),
+        int64_codec());
+}
+
+}  // namespace
+
+TEST(TestFramework, AssertionHelpersReportPreciseFailures) {
+    test::OutputCapture<std::int64_t> cap;
+    Batch<std::int64_t> b;
+    b.emplace(1);
+    b.emplace(2);
+    cap.emitter().emit_data(std::move(b));
+    cap.emitter().emit_watermark(Watermark{EventTime{100}});
+    cap.emitter().emit_watermark(Watermark{EventTime{50}});  // regression
+
+    EXPECT_TRUE(test::values_are(cap, {1, 2}));
+    const auto wrong_order = test::values_are(cap, {2, 1});
+    EXPECT_FALSE(wrong_order.ok);
+    EXPECT_NE(wrong_order.message.find("expected values"), std::string::npos);
+
+    EXPECT_TRUE(test::values_are_unordered(cap, {2, 1}));
+    EXPECT_FALSE(test::values_are_unordered(cap, {1, 1}).ok);
+
+    EXPECT_TRUE(test::contains_value(cap, std::int64_t{2}));
+    EXPECT_FALSE(test::contains_value(cap, std::int64_t{9}).ok);
+
+    const auto mono = test::watermarks_are_monotonic(cap);
+    EXPECT_FALSE(mono.ok);
+    EXPECT_NE(mono.message.find("regressed"), std::string::npos);
+}
+
+// Dogfood: the framework testing a real production operator - the
+// keyed event-time tumbling window - through every phase: on-time
+// firing, in-lateness re-fire, past-lateness side output, end-of-input
+// flush. This is the acceptance proof that the harness drives
+// production semantics, not a parallel mock runtime.
+TEST(TestFramework, DogfoodTumblingWindowThroughTheHarness) {
+    OutputTag<std::int64_t> late{"late"};
+    auto window = make_sum_window();
+    window->allowed_lateness(std::chrono::milliseconds{500});
+    window->late_output_tag(late);
+
+    auto h = test::OneInputOperatorHarness<KV, KV>::create(window);
+    h.register_side_output(late);
+    h.open();
+
+    h.process_element({"alice", 5}, 100);
+    h.process_element({"bob", 7}, 900);
+    h.process_element({"alice", 6}, 1100);  // next window [1000, 2000)
+
+    h.process_watermark(999);  // window [0, 1000) not yet complete
+    EXPECT_TRUE(h.output_values().empty());
+
+    h.process_watermark(1000);  // fires [0, 1000)
+    auto fired = test::values_are_unordered(h.output(), {KV{"alice", 5}, KV{"bob", 7}});
+    EXPECT_TRUE(fired) << fired.message;
+    h.output().clear();
+
+    // Within allowed lateness: the aggregate updates and re-emits.
+    h.process_element({"alice", 100}, 500);
+    auto refired = test::values_are(h.output(), {KV{"alice", 105}});
+    EXPECT_TRUE(refired) << refired.message;
+    EXPECT_TRUE(h.side_output_values(late).empty());
+    h.output().clear();
+
+    // Past window_end + lateness the window purges; a later record for
+    // it routes to the late side output (value-typed), not the stream.
+    h.process_watermark(1500);
+    h.output().clear();
+    h.process_element({"carol", 1}, 200);
+    EXPECT_TRUE(h.output_values().empty());
+    EXPECT_EQ(h.side_output_values(late), (std::vector<std::int64_t>{1}));
+
+    // End of input drains the open window [1000, 2000).
+    h.flush();
+    auto flushed = test::values_are(h.output(), {KV{"alice", 6}});
+    EXPECT_TRUE(flushed) << flushed.message;
+}
+
+// Dogfood: the real window operator's state rides HarnessSnapshot -
+// a fresh operator restored from the checkpoint converges to the same
+// result as the original.
+TEST(TestFramework, DogfoodWindowStateSurvivesSnapshotRestore) {
+    auto h = test::OneInputOperatorHarness<KV, KV>::create(make_sum_window());
+    h.open();
+    h.process_element({"alice", 5}, 100);
+    const auto checkpoint = h.snapshot(1);
+    h.process_element({"alice", 7}, 200);
+    h.process_watermark(1000);
+    EXPECT_EQ(h.output_values(), (std::vector<KV>{KV{"alice", 12}}));
+
+    auto h2 = test::OneInputOperatorHarness<KV, KV>::restore(make_sum_window(), checkpoint);
+    h2.open();
+    h2.process_element({"alice", 7}, 200);  // replay the post-checkpoint input
+    h2.process_watermark(1000);
+    EXPECT_EQ(h2.output_values(), (std::vector<KV>{KV{"alice", 12}}));
+}
+
+// Property test: the window aggregate is insensitive to arrival order
+// within a window. deterministic_shuffle makes every seed reproducible
+// on every platform.
+TEST(TestFramework, PropertyWindowAggregateIsOrderInsensitive) {
+    const std::vector<KV> inputs = {{"a", 1}, {"a", 2}, {"b", 3}, {"a", 4}, {"b", 5}};
+
+    for (std::uint64_t seed = 0; seed < 10; ++seed) {
+        auto h = test::OneInputOperatorHarness<KV, KV>::create(make_sum_window());
+        h.open();
+        test::TestSequence<KV> seq;
+        for (const auto& p : test::deterministic_shuffle(inputs, seed)) {
+            seq.element(p, 100);
+        }
+        seq.watermark(1000);
+        seq.replay(h);
+        auto r = test::values_are_unordered(h.output(), {KV{"a", 7}, KV{"b", 8}});
+        EXPECT_TRUE(r) << "seed " << seed << ": " << r.message;
+    }
+
+    // The shuffle itself is deterministic: same items + seed, same order.
+    EXPECT_EQ(test::deterministic_shuffle(inputs, 3), test::deterministic_shuffle(inputs, 3));
 }

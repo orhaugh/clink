@@ -39,6 +39,7 @@
 #include "clink/test/failure_injection.hpp"
 #include "clink/test/keyed_harness.hpp"
 #include "clink/test/output_capture.hpp"
+#include "clink/test/side_output_capture.hpp"
 
 namespace clink::test {
 
@@ -217,6 +218,18 @@ public:
     }
 
     FailurePlan& failures() noexcept { return core_->failures; }
+
+    // ---- Side outputs (as on the one-input harness) ----
+
+    template <typename T>
+    void register_side_output(const OutputTag<T>& tag, std::size_t capacity = 4096) {
+        require_state_(Lifecycle::Created, "register_side_output()");
+        register_side_output_channel(core_->ctx, tag, capacity);
+    }
+    template <typename T>
+    std::vector<T> side_output_values(const OutputTag<T>& tag) {
+        return drain_side_output(core_->ctx, tag);
+    }
 
     // ---- End of input ----
 

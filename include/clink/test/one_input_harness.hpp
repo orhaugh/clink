@@ -45,6 +45,7 @@
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/test/failure_injection.hpp"
 #include "clink/test/output_capture.hpp"
+#include "clink/test/side_output_capture.hpp"
 
 namespace clink::test {
 
@@ -184,10 +185,14 @@ public:
         core_->op->process(element, capture_.emitter());
     }
 
-    // The operator's real watermark path: the base implementation fires
-    // due event-time timers, then forwards the watermark; overriding
-    // operators (windows, the ProcessFunction adapter) run their own
-    // production logic.
+    // The runner's real watermark delivery: the watermark travels as a
+    // stream element through the operator's process(), whose dispatch
+    // (the base idiom: non-data routes to on_watermark) runs the
+    // production logic - the base hook fires due event-time timers then
+    // forwards; overriding operators (windows, the ProcessFunction
+    // adapter) run their own paths. An operator whose process() drops
+    // control elements loses watermarks here exactly as it would in a
+    // deployed job.
     void process_watermark(std::int64_t timestamp_ms) {
         process_watermark(Watermark{EventTime{timestamp_ms}});
     }
@@ -200,16 +205,17 @@ public:
                 core_->failures.check(FailurePoint::OnEventTimeTimer);
             }
         }
-        core_->op->on_watermark(wm, capture_.emitter());
+        core_->op->process(StreamElement<In>::watermark(wm), capture_.emitter());
         record_("watermark");
         if (!wm.is_idle()) {
             core_->last_watermark_ms = wm.timestamp().millis();
         }
     }
 
+    // Barriers likewise ride process(), as the runner delivers them.
     void process_barrier(CheckpointBarrier barrier) {
         require_state_(Lifecycle::Open, "process_barrier()");
-        core_->op->on_barrier(barrier, capture_.emitter());
+        core_->op->process(StreamElement<In>::barrier(barrier), capture_.emitter());
     }
 
     // End-of-input residuals (windows, sorts, joins): the operator's
@@ -264,6 +270,23 @@ public:
         auto snap = core_->backend->snapshot(CheckpointId{checkpoint_id});
         record_("snapshot");
         return HarnessSnapshot{std::move(snap)};
+    }
+
+    // ---- Side outputs ----
+
+    // Register a typed side-output channel (what the executor's Dag
+    // wiring does in production) so the operator's
+    // runtime()->side_output<T>(tag) works. Call BEFORE open().
+    template <typename T>
+    void register_side_output(const OutputTag<T>& tag, std::size_t capacity = 4096) {
+        require_state_(Lifecycle::Created, "register_side_output()");
+        register_side_output_channel(core_->ctx, tag, capacity);
+    }
+
+    // Drain everything emitted to `tag` since the last drain.
+    template <typename T>
+    std::vector<T> side_output_values(const OutputTag<T>& tag) {
+        return drain_side_output(core_->ctx, tag);
     }
 
     // ---- Failure injection (see failure_injection.hpp) ----

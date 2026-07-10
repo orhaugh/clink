@@ -20,7 +20,10 @@ Link the `clink::test_support` CMake target from test executables only; producti
 | `include/clink/test/sources_and_sinks.hpp` | `TestSource<T>` (scripted, checkpointable), `CollectSink<T>`, `FailingSink<T>`, `TransactionalTestSink<T>` (2PC lifecycle recorder) |
 | `include/clink/test/local_environment.hpp` | `LocalTestEnvironment`: complete pipelines on the real local runtime, run to completion, failures surfaced |
 | `include/clink/test/mini_cluster.hpp` | `MiniCluster`: a real JobManager + N real TaskManagers over loopback RPC, in one process |
-| `tests/test_harness_framework.cpp` | The framework's own contract tests |
+| `include/clink/test/assertions.hpp` | Framework-neutral checks (`values_are`, `values_are_unordered`, `contains_value`, `watermarks_are_monotonic`) returning `CheckResult` |
+| `include/clink/test/sequence.hpp` | `TestSequence<In>` (replayable input scripts) and `deterministic_shuffle` (platform-stable property-test shuffling) |
+| `include/clink/test/side_output_capture.hpp` | Typed side-output registration + drains for harnesses |
+| `tests/test_harness_framework.cpp` | The framework's own contract tests - and the compiled source of every snippet in this page |
 
 ## Testing a stateless function
 
@@ -45,7 +48,7 @@ h.open();
 h.process_element(in);              // un-timestamped
 h.process_element(in, 1000);        // event time (ms)
 h.process_batch(batch);             // batch-first, like the engine
-h.process_watermark(2000);          // production path: fires due event-time timers, then forwards
+h.process_watermark(2000);          // delivered THROUGH process(), as the runner delivers it
 h.advance_processing_time_to(5000); // manual clock + due processing-time timers
 h.flush();                          // end-of-input residuals (windows, sorts)
 
@@ -53,6 +56,7 @@ EXPECT_EQ(h.output_values(), expected);
 h.close();                          // or let the destructor close
 ```
 
+- **Watermarks and barriers ride `process()`**: the runner delivers every element kind through the operator's `process()`, whose dispatch (the base idiom: non-data routes to `on_watermark`/`on_barrier`) runs the production logic - so the harness does exactly that. An operator whose `process()` drops control elements loses watermarks on the harness precisely as it would in a deployed job; the harness surfaces that bug rather than masking it.
 - **Lifecycle is enforced**: processing before `open()` or after `close()` throws `std::logic_error` with a clear message; double open/close throws; the destructor closes an open operator (best-effort - assert teardown explicitly via `close()` when it matters).
 - **Time is manual**: `processing_time_ms()`, `set_processing_time()` (position without firing), `advance_processing_time_to/by()` (fire due timers). Time never moves backwards. Nothing in the framework reads the wall clock.
 - **Timer determinism**: due timers fire in `(timestamp, key)` order - lexicographic key order breaks timestamp ties. A timer registered during a fire is deferred to the next advance (production `poll_due` semantics, preventing starvation).
@@ -153,6 +157,50 @@ mini.execute(spec);  // submit a JobGraphSpec + await completion; throws on job 
 
 `submit()`/`await_completion()`/`errors()` decompose `execute()` for finer control; `job_manager()`/`task_manager(i)` are escape hatches to the real pieces; `Options::checkpoint` carries a `cluster::CheckpointConfig` for distributed-checkpointing jobs. Specs come from the fluent environment, a SQL capture, or by hand. Use this tier only for behaviour a single process cannot exhibit - operator logic belongs on the harnesses, pipeline wiring on `LocalTestEnvironment`.
 
+## Side outputs
+
+Register a typed `OutputTag` channel on a harness before `open()` (what the executor's Dag wiring does in production), and the operator's `runtime()->side_output<T>(tag)` works; drain what it emitted at any point:
+
+```cpp
+OutputTag<std::int64_t> late{"late"};
+h.register_side_output(late);   // BEFORE open()
+h.open();
+// ...
+EXPECT_EQ(h.side_output_values(late), (std::vector<std::int64_t>{1}));
+```
+
+## Assertions
+
+Framework-neutral checks over a capture, each returning a `CheckResult` (pass/fail plus a diagnostic) that composes with any test framework:
+
+```cpp
+auto r = clink::test::values_are_unordered(h.output(), {KV{"alice", 5}, KV{"bob", 7}});
+EXPECT_TRUE(r) << r.message;
+```
+
+`values_are` (exact order), `values_are_unordered` (same multiset, needs `operator==` only), `contains_value`, `watermarks_are_monotonic`.
+
+## Sequences and property testing
+
+`TestSequence<In>` scripts a reusable input (elements with optional timestamps, watermarks, processing-time advances, flush) and `replay(harness)` drives any one-input harness through it. `deterministic_shuffle(items, seed)` is a platform-stable Fisher-Yates (splitmix64-fed, unlike `std::shuffle` whose output is unspecified across standard libraries), so order-insensitivity properties are reproducible per seed forever:
+
+```cpp
+for (std::uint64_t seed = 0; seed < 10; ++seed) {
+    auto h = clink::test::OneInputOperatorHarness<KV, KV>::create(make_sum_window());
+    h.open();
+    clink::test::TestSequence<KV> seq;
+    for (const auto& p : clink::test::deterministic_shuffle(inputs, seed)) seq.element(p, 100);
+    seq.watermark(1000);
+    seq.replay(h);
+    auto r = clink::test::values_are_unordered(h.output(), expected);
+    EXPECT_TRUE(r) << "seed " << seed << ": " << r.message;
+}
+```
+
+## Dogfooding
+
+The framework's acceptance proof is that it tests clink's own production operators. `tests/test_harness_framework.cpp` drives the real keyed event-time tumbling window through the harness - on-time firing, in-lateness re-fire and re-emit, past-lateness routing to the late side output, end-of-input flush, and a snapshot/restore round trip where a fresh operator restored from a `HarnessSnapshot` converges to the same result as the original. Every snippet on this page compiles and runs there.
+
 ## Design rules
 
 - Deterministic: no sleeps, no polling loops, no wall clock.
@@ -169,7 +217,9 @@ mini.execute(spec);  // submit a JobGraphSpec + await completion; throws on job 
 4. Snapshot/restore (the real backend + `snapshot_timers` cycle), failure injection, lifecycle log - DONE.
 5. Test sources and sinks (scripted, replayable, transactional) - DONE.
 6. `LocalTestEnvironment` (full pipelines over the local runtime) and `MiniCluster` (the in-process JM+TM fixture) - DONE.
-7. Assertions, sequence/property-testing support, compiling documentation examples, and migration of representative core tests onto the framework.
+7. Assertions, sequence/property-testing support, side-output capture, compiling documentation examples, and dogfood tests over production operators - DONE.
+
+All seven increments are complete; the framework is the supported public testing API.
 
 ## Related
 

@@ -49,6 +49,7 @@ section below.
 - [SQL frontend](#sql-frontend)
 - [Time-travel debugging](#time-travel-debugging)
 - [State as data](#state-as-data)
+- [Testing your pipelines](#testing-your-pipelines)
 - [Running the in-tree examples](#running-the-in-tree-examples)
 - [Linting & formatting](#linting--formatting)
 - [Repository layout](#repository-layout)
@@ -941,6 +942,38 @@ version stamps ride the snapshots (all backends), so
 `clink check-savepoint` can gate a deploy against a savepoint's actual
 state versions before anything restores.
 
+## Testing your pipelines
+
+`clink::test` (link the test-only `clink::test_support` CMake target) is
+the supported public API for unit-testing everything you build on clink -
+deterministically, in-process, no threads, no wall clock, milliseconds
+per test. The harnesses do not mock the engine: they compose the same
+production pieces an operator runner would (a real `RuntimeContext`, the
+operator's own `TimerService` on a manual clock, the engine's `Emitter`)
+and deliver elements exactly as the runner delivers them.
+
+```cpp
+#include "clink/test/keyed_harness.hpp"
+
+auto h = clink::test::make_keyed_process_function_harness(
+    CountPerUser{}, [](const Purchase& p) { return p.user; });
+h.open();
+h.process_element(Purchase{"alice", 10}, /*event_time_ms=*/1000);
+h.process_watermark(2500);                                    // fires due timers
+EXPECT_EQ(h.state_value<std::int64_t>("alice", "count"), 1);  // production read path
+```
+
+One-input, keyed, and two-input harnesses (the latter with the engine's
+real watermark combination and idleness); typed state inspection and
+seeding; side-output capture; snapshot/restore round trips through the
+production checkpoint cycle; deterministic failure injection; scripted
+`TestSource`/`CollectSink`/`TransactionalTestSink` endpoints;
+`LocalTestEnvironment` for whole pipelines on the real local runtime;
+an in-process `MiniCluster` (real JobManager + TaskManagers); assertion
+helpers and platform-stable property-testing shuffles. The framework's
+own suite dogfoods it against clink's production window operator. Full
+guide: [`docs/internals/testing-framework.md`](docs/internals/testing-framework.md).
+
 ## Running the in-tree examples
 
 The examples bundled with the source tree are built into `build/examples/`:
@@ -1003,6 +1036,7 @@ include/clink/
     sql/             # AST, catalog, binder, optimizer, planner, Table API
     state/           # state backend interface + in-memory/file/rocksdb/changelog
     state_processor/ # offline savepoint read + transform API
+    test/            # public testing framework (harnesses, test sources/sinks)
     time/            # event time, watermark, timers
 src/                 # out-of-line impls: application, async, checkpoint, cluster,
                      #   config, http, metrics, runtime, sql, state
