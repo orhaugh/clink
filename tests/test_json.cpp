@@ -304,3 +304,33 @@ TEST(FlatMap, EqualityComparesKeysAndValues) {
     EXPECT_TRUE(a == b);
     EXPECT_TRUE(a != c);
 }
+
+// ----- serialize_into + double-format contract -----
+//
+// Group/join keys are built by appending serialize_into output, and the
+// state key format must stay byte-stable across releases. These pin
+// (a) serialize_into == serialize(0) appended, and (b) the exact double
+// rendering (ostream-default general format, precision 6) the writer
+// reproduces without an ostream.
+
+TEST(Json, SerializeIntoAppendsCompactForm) {
+    auto v = parse(R"({"b": [1, 2.5, "x\n"], "a": null})");
+    std::string out = "prefix|";
+    v.serialize_into(out);
+    EXPECT_EQ(out, "prefix|" + v.serialize(0));
+}
+
+TEST(Json, DoubleRenderingMatchesOstreamGeneralFormat) {
+    auto render = [](double d) {
+        JsonValue v{d};
+        return v.serialize(0);
+    };
+    EXPECT_EQ(render(0.5), "0.5");
+    EXPECT_EQ(render(-0.5), "-0.5");
+    EXPECT_EQ(render(0.123456789), "0.123457");   // precision 6, rounded
+    EXPECT_EQ(render(1234567.5), "1.23457e+06");  // switches to scientific
+    EXPECT_EQ(render(1e300), "1e+300");
+    EXPECT_EQ(render(-2.5e-08), "-2.5e-08");
+    EXPECT_EQ(render(42.0), "42");  // integral fast path
+    EXPECT_EQ(render(-9007199254740992.0), "-9007199254740992");
+}

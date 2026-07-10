@@ -73,6 +73,11 @@ public:
     // Stringify back to JSON text. `indent_width = 0` produces compact
     // output; > 0 produces pretty-printed output.
     std::string serialize(int indent_width = 0) const;
+    // Append the compact form to `out` (no clear). The zero-temporary
+    // seam for hot per-record callers building composite strings -
+    // group/join keys append each key column's value in place instead
+    // of materialising an intermediate string via serialize(0).
+    void serialize_into(std::string& out) const;
 
     // Deep structural equality (recurses through arrays and objects).
     bool operator==(const JsonValue& other) const = default;

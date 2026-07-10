@@ -1,11 +1,12 @@
 #include "clink/config/json.hpp"
 
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <simdjson.h>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -60,59 +61,63 @@ JsonValue from_dom(const simdjson::dom::element& e) {
     throw ParseError("unhandled JSON element type");
 }
 
-void escape_string(std::ostringstream& out, const std::string& s) {
-    out.put('"');
+// Serialisation builds directly into a std::string. This runs on hot
+// per-record paths (group/join key building, DISTINCT, changelog
+// payloads), so there is deliberately no ostream layer; the output is
+// byte-identical to the previous ostringstream-based writer, including
+// the double rendering ("%g" is the printf conversion that ostream's
+// default general float format is specified in terms of).
+void escape_string(std::string& out, const std::string& s) {
+    out.push_back('"');
     for (const char c : s) {
         switch (c) {
             case '"':
-                out << "\\\"";
+                out += "\\\"";
                 break;
             case '\\':
-                out << "\\\\";
+                out += "\\\\";
                 break;
             case '\b':
-                out << "\\b";
+                out += "\\b";
                 break;
             case '\f':
-                out << "\\f";
+                out += "\\f";
                 break;
             case '\n':
-                out << "\\n";
+                out += "\\n";
                 break;
             case '\r':
-                out << "\\r";
+                out += "\\r";
                 break;
             case '\t':
-                out << "\\t";
+                out += "\\t";
                 break;
             default:
                 if (static_cast<unsigned char>(c) < 0x20) {
                     char buf[8];
                     std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                    out << buf;
+                    out += buf;
                 } else {
-                    out.put(c);
+                    out.push_back(c);
                 }
         }
     }
-    out.put('"');
+    out.push_back('"');
 }
 
-void serialize_to(std::ostringstream& out, const JsonValue& v, int indent_width, int depth) {
+void serialize_append(std::string& out, const JsonValue& v, int indent_width, int depth) {
     auto indent = [&](int n) {
         if (indent_width > 0) {
-            for (int i = 0; i < n * indent_width; ++i) {
-                out.put(' ');
-            }
+            out.append(static_cast<std::size_t>(n) * static_cast<std::size_t>(indent_width), ' ');
         }
     };
 
     switch (v.type()) {
         case JsonValue::Type::Null:
-            out << "null";
+            out += "null";
             return;
         case JsonValue::Type::Bool:
-            out << (v.as_bool() ? "true" : "false");
+            out += v.as_bool() ? "true" : "false";
             return;
         case JsonValue::Type::String:
             escape_string(out, v.as_string());
@@ -125,73 +130,76 @@ void serialize_to(std::ostringstream& out, const JsonValue& v, int indent_width,
             // 2^63 is exactly representable as a double, so the upper bound is '<'.
             constexpr double kInt64Lo = -9223372036854775808.0;          // -2^63
             constexpr double kInt64HiExclusive = 9223372036854775808.0;  //  2^63
+            char buf[32];
             if (std::isfinite(d) && d >= kInt64Lo && d < kInt64HiExclusive &&
                 d == static_cast<double>(static_cast<std::int64_t>(d))) {
-                out << static_cast<std::int64_t>(d);
+                auto res = std::to_chars(buf, buf + sizeof(buf), static_cast<std::int64_t>(d));
+                out.append(buf, static_cast<std::size_t>(res.ptr - buf));
             } else {
-                out << d;
+                const int n = std::snprintf(buf, sizeof(buf), "%g", d);
+                out.append(buf, static_cast<std::size_t>(n));
             }
             return;
         }
         case JsonValue::Type::Array: {
             const auto& arr = v.as_array();
             if (arr.empty()) {
-                out << "[]";
+                out += "[]";
                 return;
             }
-            out.put('[');
+            out.push_back('[');
             for (std::size_t i = 0; i < arr.size(); ++i) {
                 if (indent_width > 0) {
-                    out.put('\n');
+                    out.push_back('\n');
                     indent(depth + 1);
                 }
-                serialize_to(out, arr[i], indent_width, depth + 1);
+                serialize_append(out, arr[i], indent_width, depth + 1);
                 if (i + 1 < arr.size()) {
-                    out.put(',');
+                    out.push_back(',');
                     if (indent_width > 0) {
-                        out.put(' ');
+                        out.push_back(' ');
                     }
                 }
             }
             if (indent_width > 0) {
-                out.put('\n');
+                out.push_back('\n');
                 indent(depth);
             }
-            out.put(']');
+            out.push_back(']');
             return;
         }
         case JsonValue::Type::Object: {
             const auto& obj = v.as_object();
             if (obj.empty()) {
-                out << "{}";
+                out += "{}";
                 return;
             }
-            out.put('{');
+            out.push_back('{');
             std::size_t i = 0;
             for (const auto& [k, val] : obj) {
                 if (indent_width > 0) {
-                    out.put('\n');
+                    out.push_back('\n');
                     indent(depth + 1);
                 }
                 escape_string(out, k);
-                out.put(':');
+                out.push_back(':');
                 if (indent_width > 0) {
-                    out.put(' ');
+                    out.push_back(' ');
                 }
-                serialize_to(out, val, indent_width, depth + 1);
+                serialize_append(out, val, indent_width, depth + 1);
                 if (i + 1 < obj.size()) {
-                    out.put(',');
+                    out.push_back(',');
                     if (indent_width > 0) {
-                        out.put(' ');
+                        out.push_back(' ');
                     }
                 }
                 ++i;
             }
             if (indent_width > 0) {
-                out.put('\n');
+                out.push_back('\n');
                 indent(depth);
             }
-            out.put('}');
+            out.push_back('}');
             return;
         }
     }
@@ -260,9 +268,13 @@ bool JsonValue::bool_or(std::string_view key, bool fallback) const {
 }
 
 std::string JsonValue::serialize(int indent_width) const {
-    std::ostringstream out;
-    serialize_to(out, *this, indent_width, 0);
-    return out.str();
+    std::string out;
+    serialize_append(out, *this, indent_width, 0);
+    return out;
+}
+
+void JsonValue::serialize_into(std::string& out) const {
+    serialize_append(out, *this, 0, 0);
 }
 
 JsonValue parse(std::string_view input) {

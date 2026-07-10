@@ -1127,7 +1127,7 @@ inline std::string columnar_group_key(const arrow::RecordBatch& rb,
         if (idx >= 0) {
             const auto& arr = *rb.column(idx);
             if (!arr.IsNull(i)) {
-                key += row_columnar_detail::read_cell(key_cols[k].second, arr, i).serialize(0);
+                row_columnar_detail::read_cell(key_cols[k].second, arr, i).serialize_into(key);
             }
         }
     }
@@ -1616,7 +1616,7 @@ private:
                 key += '\x1f';
             auto vit = row.values.find(group_keys_[i]);
             if (vit != row.values.end() && !vit->second.is_null()) {
-                key += vit->second.serialize(0);
+                vit->second.serialize_into(key);
             }
         }
         return key;
@@ -2208,7 +2208,7 @@ private:
                 key += '\x1f';
             auto vit = row.values.find(group_keys_[i]);
             if (vit != row.values.end() && !vit->second.is_null()) {
-                key += vit->second.serialize(0);
+                vit->second.serialize_into(key);
             }
         }
         return key;
@@ -2931,7 +2931,7 @@ private:
                 key += '\x1f';
             auto it = row.values.find(partition_columns_[i]);
             if (it != row.values.end() && !it->second.is_null())
-                key += it->second.serialize(0);
+                it->second.serialize_into(key);
         }
         return key;
     }
@@ -3276,7 +3276,7 @@ private:
                 key += '\x1f';
             auto it = row.values.find(partition_columns_[i]);
             if (it != row.values.end() && !it->second.is_null())
-                key += it->second.serialize(0);
+                it->second.serialize_into(key);
         }
         return key;
     }
@@ -3847,7 +3847,7 @@ private:
                 key += '\x1f';
             auto vit = row.values.find(group_keys_[i]);
             if (vit != row.values.end() && !vit->second.is_null()) {
-                key += vit->second.serialize(0);
+                vit->second.serialize_into(key);
             }
         }
         return key;
@@ -5577,7 +5577,7 @@ private:
                 key += '\x1f';
             auto it = row.values.find(primary_key_[i]);
             if (it != row.values.end() && !it->second.is_null()) {
-                key += it->second.serialize(0);
+                it->second.serialize_into(key);
             }
         }
         return key;
@@ -5938,7 +5938,7 @@ private:
                 key += '\x1f';
             auto it = row.values.find(partition_columns_[i]);
             if (it != row.values.end() && !it->second.is_null()) {
-                key += it->second.serialize(0);
+                it->second.serialize_into(key);
             }
         }
         return key;
@@ -6348,7 +6348,7 @@ private:
                 key += '\x1f';
             auto vit = row.values.find(columns_[i]);
             if (vit != row.values.end() && !vit->second.is_null()) {
-                key += vit->second.serialize(0);
+                vit->second.serialize_into(key);
             }
         }
         return key;
@@ -8169,7 +8169,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                     }
                     auto vit = row.values.find(cols[i]);
                     if (vit != row.values.end() && !vit->second.is_null()) {
-                        key += vit->second.serialize(0);
+                        vit->second.serialize_into(key);
                     }
                 }
                 return key;  // "" when unpartitioned (single per-subtask key)
