@@ -186,6 +186,20 @@ public:
         return 1;
     }
 
+    // Keep only the entries for which keep(entry) is true, compacting
+    // in ONE pass: each survivor moves at most once, versus the
+    // erase-per-key loop that memmoves the tail for every removal.
+    // Removal preserves relative order, so the sorted-unique invariant
+    // holds by construction. Returns the number of entries removed.
+    template <typename Pred>
+    size_type retain(Pred&& keep) {
+        auto tail = std::remove_if(
+            data_.begin(), data_.end(), [&](const value_type& e) { return !keep(e); });
+        const auto removed = static_cast<size_type>(data_.end() - tail);
+        data_.erase(tail, data_.end());
+        return removed;
+    }
+
     void swap(FlatMap& other) noexcept { data_.swap(other.data_); }
 
     friend bool operator==(const FlatMap& a, const FlatMap& b) { return a.data_ == b.data_; }

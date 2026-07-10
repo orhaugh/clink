@@ -381,3 +381,15 @@ TEST(Json, ParseObjectRejectsNonObjectAndMalformed) {
     EXPECT_FALSE(parse_object("{broken").has_value());
     EXPECT_FALSE(parse_object("").has_value());
 }
+
+TEST(Json, ParseObjectFilteredKeepsOnlyListedKeys) {
+    const std::vector<std::string> keep{"b", "z"};
+    auto obj = parse_object(R"({"a": 1, "b": {"n": [1, 2]}, "m": "drop", "z": 9, "b": 99})", keep);
+    ASSERT_TRUE(obj.has_value());
+    EXPECT_EQ(obj->size(), 2u);
+    EXPECT_EQ(obj->at("z").as_number(), 9.0);
+    // Nested value under a kept key is intact; duplicate kept key first-wins.
+    EXPECT_EQ(obj->at("b").at("n").as_array().size(), 2u);
+    EXPECT_FALSE(obj->contains("a"));
+    EXPECT_FALSE(obj->contains("m"));
+}

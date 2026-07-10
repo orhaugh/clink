@@ -180,4 +180,51 @@ TEST(SqlRow, NewKindsRoundTrip) {
     EXPECT_EQ(row_kind_of(r), std::string{kRowKindUpdateBefore});
 }
 
+// ----- projected decode (filtered parse) -----
+
+// Construction-path symmetry: decoding with the in-parse keep-list must
+// produce exactly what the reference path (full decode, then
+// project_row) produces - including the __row_kind marker surviving,
+// decimal requantisation on surviving columns, and absent projected
+// columns simply not appearing.
+TEST(RowProjectedFormat, FilteredDecodeMatchesDecodeThenProject) {
+    std::map<std::string, int> decimals{{"price", 2}};
+    const std::vector<std::string> projected{"auction", "price"};
+
+    auto filtered = row_json_text_format_projected(decimals, projected);
+    auto reference = row_json_text_format_with_decimals(decimals);
+
+    const std::string lines[] = {
+        R"({"auction": 7, "bidder": "bob", "price": 1.239, "channel": "web", "ts": 5})",
+        R"({"auction": 8, "price": 2.5, "__row_kind": "-U"})",
+        R"({"bidder": "eve", "channel": "app"})",  // no projected columns at all
+        R"({"auction": 9})",                       // partial row
+    };
+    for (const auto& line : lines) {
+        auto got = filtered.decode(line);
+        auto want = reference.decode(line);
+        ASSERT_TRUE(want.has_value());
+        project_row(*want, std::set<std::string>(projected.begin(), projected.end()));
+        ASSERT_TRUE(got.has_value());
+        EXPECT_TRUE(got->values == want->values) << line;
+    }
+    // Malformed / non-object / empty lines are skipped identically.
+    EXPECT_FALSE(filtered.decode("{broken").has_value());
+    EXPECT_FALSE(filtered.decode("[1,2]").has_value());
+    EXPECT_FALSE(filtered.decode("").has_value());
+}
+
+TEST(RowProjectedFormat, RetainCompactsInOnePassPreservingOrder) {
+    Row r;
+    r.values.emplace("a", clink::config::JsonValue{1.0});
+    r.values.emplace("b", clink::config::JsonValue{2.0});
+    r.values.emplace("c", clink::config::JsonValue{3.0});
+    r.values.emplace("d", clink::config::JsonValue{4.0});
+    project_row(r, std::set<std::string>{"b", "d"});
+    std::string order;
+    for (const auto& [k, v] : r.values)
+        order += k;
+    EXPECT_EQ(order, "bd");
+}
+
 }  // namespace clink::sql

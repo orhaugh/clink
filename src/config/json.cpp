@@ -328,4 +328,32 @@ std::optional<JsonObject> parse_object(std::string_view input) {
     return JsonObject::from_entries(std::move(entries));
 }
 
+std::optional<JsonObject> parse_object(std::string_view input,
+                                       std::span<const std::string> keep_keys) {
+    auto result = thread_parser().parse(input.data(), input.size());
+    if (result.error() != simdjson::SUCCESS ||
+        result.value_unsafe().type() != simdjson::dom::element_type::OBJECT) {
+        return std::nullopt;
+    }
+    auto keep = [&](std::string_view key) {
+        for (const auto& k : keep_keys) {
+            if (k == key) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto o = simdjson::dom::object(result.value_unsafe());
+    std::vector<JsonObject::value_type> entries;
+    entries.reserve(keep_keys.size());
+    for (auto [key, value] : o) {
+        // A dropped key's value is never built - projection pushdown does
+        // no work for columns the query does not carry.
+        if (keep(key)) {
+            entries.emplace_back(std::string(key), from_dom(value));
+        }
+    }
+    return JsonObject::from_entries(std::move(entries));
+}
+
 }  // namespace clink::config

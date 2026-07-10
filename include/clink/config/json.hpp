@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -102,5 +103,14 @@ JsonValue parse(std::string_view input);
 // or a non-object root - exactly the cases where a
 // try { parse() } catch -> skip caller would drop the record.
 std::optional<JsonObject> parse_object(std::string_view input);
+
+// As above, keeping ONLY the top-level keys listed in `keep_keys`: a
+// key not in the list is skipped before its value is built, so
+// projection pushdown never materialises dropped columns. Membership
+// is a linear scan - the list is expected to be small (a query's
+// projected columns). Duplicate kept keys keep the first occurrence,
+// as in parse().
+std::optional<JsonObject> parse_object(std::string_view input,
+                                       std::span<const std::string> keep_keys);
 
 }  // namespace clink::config

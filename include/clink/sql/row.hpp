@@ -253,15 +253,14 @@ inline clink::TextFormat<Row> row_json_text_format_with_decimals(
 inline void project_row(Row& r, const std::set<std::string>& want) {
     if (want.empty())
         return;
-    for (auto it = r.values.begin(); it != r.values.end();) {
+    r.values.retain([&](const clink::config::JsonObject::value_type& e) {
         // Always preserve the synthetic "__row_kind" changelog marker (see
         // row_kind.hpp kRowKindField, not includable here without a cycle): it
         // rides on a source row but is never a declared column, so it is absent
         // from the projected set. Dropping it would turn a changelog source into
         // a plain insert stream and break retraction.
-        const bool keep_it = it->first == "__row_kind" || want.count(it->first) != 0;
-        it = keep_it ? std::next(it) : r.values.erase(it);
-    }
+        return e.first == "__row_kind" || want.count(e.first) != 0;
+    });
 }
 
 // Convenience overload taking the keep list as a vector (builds the set once).
@@ -273,22 +272,34 @@ inline void project_row(Row& r, const std::vector<std::string>& keep) {
 }
 
 // Schema-aware NDJSON format that ALSO narrows each decoded row to the projected
-// columns (the optimizer's projected_columns hint). Projection runs AFTER
-// decimal requantisation, so a surviving DECIMAL column keeps its exact tag.
+// columns (the optimizer's projected_columns hint). The keep-list is applied
+// INSIDE the parse (config::parse_object's filtered overload), so a dropped
+// column's value is never materialised at all. Decimal requantisation runs on
+// the surviving columns - byte-identical to requantise-then-project, since
+// requantisation only rewrites columns it finds and projection only removes.
 // Encode is unchanged (the sink writes whatever columns the row carries).
 inline clink::TextFormat<Row> row_json_text_format_projected(
     std::map<std::string, int> decimal_scales, std::vector<std::string> projected) {
     if (projected.empty())
         return row_json_text_format_with_decimals(std::move(decimal_scales));
-    auto base = row_json_text_format_with_decimals(std::move(decimal_scales));
-    // Build the keep set ONCE and capture it (mirrors the decimal closure), so
-    // the per-row decode path does no container allocation.
-    std::set<std::string> want(projected.begin(), projected.end());
+    auto base = row_json_text_format_with_decimals(decimal_scales);
+    // The keep-list is built ONCE and captured. It always includes the
+    // synthetic "__row_kind" changelog marker (see project_row above): it
+    // rides on a source row but is never a declared column, and dropping it
+    // would turn a changelog source into a plain insert stream.
+    projected.push_back("__row_kind");
     return clink::TextFormat<Row>{
-        .decode = [base, want = std::move(want)](std::string_view line) -> std::optional<Row> {
-            auto r = base.decode(line);
-            if (r)
-                project_row(*r, want);
+        .decode = [decimal_scales = std::move(decimal_scales),
+                   keep = std::move(projected)](std::string_view line) -> std::optional<Row> {
+            if (line.empty())
+                return std::nullopt;
+            auto obj = clink::config::parse_object(line, keep);
+            if (!obj)
+                return std::nullopt;
+            Row r;
+            r.values = std::move(*obj);
+            if (!decimal_scales.empty())
+                requantise_row_decimals(r, decimal_scales);
             return r;
         },
         .encode = base.encode,
