@@ -1,12 +1,13 @@
 #pragma once
 
 #include <cstdint>
-#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
+
+#include "clink/config/flat_map.hpp"
 
 namespace clink::config {
 
@@ -15,14 +16,16 @@ namespace clink::config {
 //
 //   * Numbers are stored as double; the exact-integer/floating distinction
 //     isn't preserved on round-trip.
-//   * Object key order is sorted lexicographically (std::map). Tools that
-//     care about authoring order will produce slightly different output.
+//   * Object key order is sorted lexicographically (FlatMap, a sorted
+//     contiguous container - see flat_map.hpp for the semantics it
+//     guarantees and the iterator-invalidation rule it does not). Tools
+//     that care about authoring order will produce different output.
 //   * No comments, no trailing commas (strict JSON), no streaming parser.
 //
 // Throws ParseError on malformed input.
 class JsonValue;
 
-using JsonObject = std::map<std::string, JsonValue>;
+using JsonObject = FlatMap<JsonValue>;
 using JsonArray = std::vector<JsonValue>;
 
 class JsonValue {
@@ -70,6 +73,9 @@ public:
     // Stringify back to JSON text. `indent_width = 0` produces compact
     // output; > 0 produces pretty-printed output.
     std::string serialize(int indent_width = 0) const;
+
+    // Deep structural equality (recurses through arrays and objects).
+    bool operator==(const JsonValue& other) const = default;
 
 private:
     using Storage = std::variant<std::monostate, bool, double, std::string, JsonArray, JsonObject>;

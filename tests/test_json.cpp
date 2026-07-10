@@ -218,3 +218,89 @@ TEST(Json, ConfigStyleDocumentRoundTrips) {
     EXPECT_EQ(v.at("pipeline").at("stages").as_array()[1].at("params").at("fn").as_string(),
               "uppercase");
 }
+
+// ----- FlatMap container semantics -----
+//
+// JsonObject is a FlatMap (sorted contiguous storage). These pin the
+// std::map-compatible contract the engine relies on, independently of
+// the parse/serialize behaviour above.
+
+TEST(FlatMap, IterationIsSortedRegardlessOfInsertOrder) {
+    JsonObject o;
+    o.emplace("zeta", JsonValue{1.0});
+    o.emplace("alpha", JsonValue{2.0});
+    o.emplace("mid", JsonValue{3.0});
+    std::string keys;
+    for (const auto& [k, v] : o) {
+        keys += k;
+        keys += ',';
+    }
+    EXPECT_EQ(keys, "alpha,mid,zeta,");
+}
+
+TEST(FlatMap, EmplaceKeepsFirstDuplicate) {
+    JsonObject o;
+    auto [it1, fresh1] = o.emplace("k", JsonValue{std::string{"first"}});
+    auto [it2, fresh2] = o.emplace("k", JsonValue{std::string{"second"}});
+    EXPECT_TRUE(fresh1);
+    EXPECT_FALSE(fresh2);
+    EXPECT_EQ(it2->second.as_string(), "first");
+    EXPECT_EQ(o.size(), 1u);
+}
+
+TEST(FlatMap, InitializerListDeduplicatesFirstWins) {
+    JsonObject o{{"a", JsonValue{1.0}}, {"a", JsonValue{2.0}}, {"b", JsonValue{3.0}}};
+    EXPECT_EQ(o.size(), 2u);
+    EXPECT_EQ(o.at("a").as_number(), 1.0);
+    EXPECT_EQ(o.at("b").as_number(), 3.0);
+}
+
+TEST(FlatMap, OperatorBracketInsertsNullThenOverwrites) {
+    JsonObject o;
+    EXPECT_TRUE(o["fresh"].is_null());
+    o["fresh"] = JsonValue{true};
+    EXPECT_TRUE(o.at("fresh").as_bool());
+    EXPECT_EQ(o.size(), 1u);
+}
+
+TEST(FlatMap, HeterogeneousLookupNeedsNoTemporaryString) {
+    JsonObject o;
+    o.emplace("key", JsonValue{4.0});
+    const std::string_view probe{"key"};
+    EXPECT_TRUE(o.contains(probe));
+    EXPECT_EQ(o.count(probe), 1u);
+    EXPECT_EQ(o.find(probe)->second.as_number(), 4.0);
+    EXPECT_EQ(o.find(std::string_view{"nope"}), o.end());
+    EXPECT_THROW(o.at("nope"), std::out_of_range);
+}
+
+TEST(FlatMap, EraseByKeyAndByIteratorWhileIterating) {
+    JsonObject o;
+    o.emplace("a", JsonValue{1.0});
+    o.emplace("b", JsonValue{2.0});
+    o.emplace("c", JsonValue{3.0});
+    EXPECT_EQ(o.erase("b"), 1u);
+    EXPECT_EQ(o.erase("b"), 0u);
+    // erase(iterator) returns the next iterator (erase-while-iterate).
+    for (auto it = o.begin(); it != o.end();) {
+        it = (it->first == "a") ? o.erase(it) : std::next(it);
+    }
+    EXPECT_EQ(o.size(), 1u);
+    EXPECT_TRUE(o.contains("c"));
+}
+
+TEST(FlatMap, InsertOrAssignOverwritesExisting) {
+    JsonObject o;
+    o.insert_or_assign("k", JsonValue{1.0});
+    o.insert_or_assign("k", JsonValue{2.0});
+    EXPECT_EQ(o.size(), 1u);
+    EXPECT_EQ(o.at("k").as_number(), 2.0);
+}
+
+TEST(FlatMap, EqualityComparesKeysAndValues) {
+    JsonObject a{{"x", JsonValue{1.0}}};
+    JsonObject b{{"x", JsonValue{1.0}}};
+    JsonObject c{{"x", JsonValue{2.0}}};
+    EXPECT_TRUE(a == b);
+    EXPECT_TRUE(a != c);
+}

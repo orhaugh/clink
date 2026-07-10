@@ -29,9 +29,11 @@ namespace {
 JsonValue from_dom(const simdjson::dom::element& e) {
     switch (e.type()) {
         case simdjson::dom::element_type::OBJECT: {
+            const auto o = simdjson::dom::object(e);
             JsonObject obj;
-            for (auto [key, value] : simdjson::dom::object(e)) {
-                obj.emplace(std::string(key), from_dom(value));
+            obj.reserve(o.size());
+            for (auto [key, value] : o) {
+                obj.emplace(key, from_dom(value));
             }
             return JsonValue{std::move(obj)};
         }
@@ -201,14 +203,14 @@ bool JsonValue::contains(std::string_view key) const {
     if (!is_object()) {
         throw std::runtime_error("JsonValue::contains: not an object");
     }
-    return as_object().find(std::string{key}) != as_object().end();
+    return as_object().contains(key);
 }
 
 const JsonValue& JsonValue::at(std::string_view key) const {
     if (!is_object()) {
         throw std::runtime_error("JsonValue::at: not an object");
     }
-    auto it = as_object().find(std::string{key});
+    auto it = as_object().find(key);
     if (it == as_object().end()) {
         throw std::runtime_error("JsonValue::at: missing key '" + std::string{key} + "'");
     }
