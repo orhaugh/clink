@@ -47,6 +47,7 @@ section below.
   - [Interval join across two streams](#interval-join-across-two-streams)
   - [Cluster job plugin (StreamExecutionEnvironment)](#cluster-job-plugin-streamexecutionenvironment)
 - [SQL frontend](#sql-frontend)
+- [Time-travel debugging](#time-travel-debugging)
 - [Running the in-tree examples](#running-the-in-tree-examples)
 - [Linting & formatting](#linting--formatting)
 - [Repository layout](#repository-layout)
@@ -831,6 +832,83 @@ submitter.submit(spec.to_json(), /*plugins=*/{}, opts);
 End-to-end coverage lives in `tests/test_sql_runtime.cpp`: compiles
 SQL, submits to an in-process JM + TM pair, and asserts the sink file
 content across the supported feature surface.
+
+## Time-travel debugging
+
+When a running total looks wrong, you should not have to re-run the job
+with print statements. clink records enough at runtime to answer "why is
+this value what it is" offline: checkpoints double as queryable state
+snapshots, and an opt-in flight recorder (`--capture-dir`) tees the
+records each operator consumed into per-checkpoint-epoch files. Three CLI
+verbs close the loop: `state-diff` finds WHO moved and WHEN, `capture-cat`
+shows WHAT the operator saw, and `replay` re-executes the operator over
+exactly those records - deterministically, offline, no cluster.
+
+The transcript below is real. A 1.4M-order pipeline computes per-user
+totals, and alice's comes out roughly five times everyone else's:
+
+```bash
+$ clink run orders.sql --checkpoint-dir=ckpt --checkpoint-interval-ms=400 \
+    --capture-dir=capture --capture-records=2000000
+$ cat totals.ndjson
+{"total":12332536,"usr":"alice"}
+{"total":2332647,"usr":"bob"}
+{"total":2334163,"usr":"carol"}
+```
+
+**1. What did the flight recorder capture?** One `.cap` file per operator
+per checkpoint epoch; epoch N holds exactly the records between
+checkpoints N-1 and N:
+
+```bash
+$ clink capture-cat --dir=capture
+  op-5824225372086884863/subtask-1/epoch-1.cap  seen=121344
+  op-5824225372086884863/subtask-1/epoch-2.cap  seen=99840
+  ...
+  op-5824225372086884863/subtask-1/epoch-9.cap  seen=100096
+  ...
+```
+
+**2. Which checkpoint window did alice move in?** Diff consecutive
+checkpoints. Keys render readably; values are the operator's raw
+accumulator bytes, and between checkpoints 8 and 9 only alice's bucket
+changes magnitude (the little-endian f64 inside reads 1,374,339 before
+and 11,540,851 after - a 10.17M jump against ~168k of normal flow):
+
+```bash
+$ clink state-diff --dir=ckpt --from=8 --to=9
+  ~ kg=31 key ""alice""  0x...83f8344100... [108 bytes] -> 0x...2e03664100... [109 bytes]
+  ...
+```
+
+**3. What did the aggregate consume in epoch 9?** The culprit is one
+grep away, sitting at record 24,915 of the epoch:
+
+```bash
+$ clink capture-cat --file=capture/op-5824225372086884863/subtask-1/epoch-9.cap \
+    --max-rows=0 | grep 9999999
+  "{"__key":-5626395697980741632,"amount":9999999,"usr":"alice"}"
+```
+
+**4. Prove it.** Replay the epoch: rebuild the operator from its capture
+sidecar, restore its keyed state from checkpoint 8, feed exactly the
+captured records, and print every emission. The jump lands at precisely
+that record - and running it twice produces 100,102 byte-identical
+emissions:
+
+```bash
+$ clink replay --capture-dir=capture --checkpoint-dir=ckpt \
+    --op=5824225372086884863 --subtask=1 --epoch=9 --max-rows=0 | sed -n '24916,24917p'
+{"total":1416073,"usr":"alice"}
+{"total":11416072,"usr":"alice"}
+```
+
+Capture is best-effort and bounded (`--capture-records` per epoch; the
+file header records truncation, so a replay can tell a complete epoch
+from a sampled one). Per-record operators (GROUP BY, filter/project,
+DISTINCT, TOP-N) replay exactly; windowed operators replay data-only in
+v1 (watermark-driven fires do not occur). Details:
+[docs/internals/fault-tolerance-and-rescale.md](docs/internals/fault-tolerance-and-rescale.md).
 
 ## Running the in-tree examples
 
