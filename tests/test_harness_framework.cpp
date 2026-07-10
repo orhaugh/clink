@@ -204,3 +204,97 @@ TEST(TestFramework, LifecycleIsEnforcedAndDestructorCloses) {
     EXPECT_THROW(h2.process_element(1), std::logic_error);  // after close
     EXPECT_THROW(h2.close(), std::logic_error);             // double close
 }
+
+// ---- Increment 2: keyed harness + ProcessFunction factories ----
+
+#include "clink/test/keyed_harness.hpp"
+
+namespace {
+
+struct Purchase {
+    std::string user;
+    std::int64_t amount;
+};
+
+// Counts purchases per user in keyed state; registers an event-time
+// timer 1000ms after each record which emits "<user>:<count>" when it
+// fires. The canonical keyed stateful pattern.
+class CountPerUser final : public clink::KeyedProcessFunction<std::string, Purchase, std::string> {
+public:
+    void open(RuntimeContext& ctx) override {
+        counts_.emplace(
+            ctx.keyed_state<std::string, std::int64_t>("count", string_codec(), int64_codec()));
+    }
+    void process_element(const Purchase& p,
+                         clink::ProcessFunctionContext<std::string>& ctx,
+                         Collector<std::string>& out) override {
+        const auto next = counts_->get(p.user).value_or(0) + 1;
+        counts_->put(p.user, next);
+        const auto ts = ctx.timestamp() ? ctx.timestamp()->millis() : 0;
+        ctx.timer_service()->register_event_time_timer(ts + 1000, p.user);
+        (void)out;
+    }
+    void on_timer(std::int64_t ts,
+                  clink::OnTimerContext<std::string>& ctx,
+                  Collector<std::string>& out) override {
+        (void)ts;
+        (void)ctx;
+        out.collect(current_key() + ":" + std::to_string(counts_->get(current_key()).value_or(0)));
+    }
+
+private:
+    std::optional<KeyedState<std::string, std::int64_t>> counts_;
+};
+
+}  // namespace
+
+TEST(TestFramework, KeyedHarnessIsolatesStatePerKeyAndFiresKeyScopedTimers) {
+    auto h = test::make_keyed_process_function_harness(
+        CountPerUser{},
+        [](const Purchase& p) { return p.user; },
+        [](const std::string& timer_key) { return timer_key; });  // timer key IS the user key
+    h.open();
+
+    h.process_element(Purchase{"alice", 10}, 1000);
+    h.process_element(Purchase{"bob", 20}, 1100);
+    h.process_element(Purchase{"alice", 30}, 1200);
+
+    // State isolated per key, inspected through the production read path.
+    EXPECT_EQ(h.state_value<std::int64_t>("alice", "count"), 3 - 1);  // 2 purchases
+    EXPECT_EQ(h.state_value<std::int64_t>("bob", "count"), 1);
+    EXPECT_EQ(h.state_value<std::int64_t>("carol", "count"), std::nullopt);
+    EXPECT_EQ((h.known_keys<std::int64_t>("count")), (std::vector<std::string>{"alice", "bob"}));
+
+    // Key-scoped timer queries.
+    EXPECT_TRUE(h.has_event_time_timer(2000, "alice"));
+    EXPECT_TRUE(h.has_event_time_timer(2100, "bob"));
+    EXPECT_EQ(h.event_time_timers_for("alice"), (std::vector<std::int64_t>{2000, 2200}));
+
+    // Watermark past alice's timers only: two fires, both routed to
+    // alice's key (current_key recovered from the timer key).
+    h.process_watermark(2050);
+    EXPECT_EQ(h.output_values(), (std::vector<std::string>{"alice:2"}));
+    h.output().clear();
+    h.process_watermark(3000);
+    EXPECT_EQ(h.output_values(), (std::vector<std::string>{"bob:1", "alice:2"}));
+
+    // Seeding + clearing state through the harness.
+    h.seed_state<std::int64_t>("dave", "count", 41);
+    EXPECT_EQ(h.state_value<std::int64_t>("dave", "count"), 41);
+    h.clear_state("dave", "count");
+    EXPECT_EQ(h.state_value<std::int64_t>("dave", "count"), std::nullopt);
+}
+
+TEST(TestFramework, ProcessFunctionFactoryDrivesNonKeyedFunction) {
+    struct Doubler final : clink::ProcessFunction<std::int64_t, std::int64_t> {
+        void process_element(const std::int64_t& v,
+                             clink::ProcessFunctionContext<std::int64_t>&,
+                             Collector<std::int64_t>& out) override {
+            out.collect(v * 2);
+        }
+    };
+    auto h = test::make_process_function_harness(Doubler{});
+    h.open();
+    h.process_element(21);
+    EXPECT_EQ(h.output_values(), (std::vector<std::int64_t>{42}));
+}

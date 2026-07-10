@@ -150,6 +150,9 @@ private:
 template <typename I, typename O>
 class ProcessFunction {
 public:
+    using input_type = I;
+    using output_type = O;
+
     virtual ~ProcessFunction() = default;
 
     virtual void open(RuntimeContext& /*ctx*/) {}
@@ -179,6 +182,8 @@ public:
 template <typename K, typename I, typename O>
 class KeyedProcessFunction : public ProcessFunction<I, O> {
 public:
+    using key_type = K;
+
     // The key of the record currently being processed. Inside
     // on_timer, the key of the timer that fired. Adapter sets this
     // immediately before each call.
