@@ -93,6 +93,14 @@ public:
     [[nodiscard]] bool supports_async_persist() const noexcept override;
     CaptureHandle capture(CheckpointId id) override;
     Snapshot persist(CaptureHandle handle) override;
+    // Schema-evolution version stamps. Persisted under a reserved key in
+    // the DEFAULT column family (never touched by the keyed path), so
+    // every checkpoint carries them: restore recovers the stamps from
+    // the checkpoint dir, and the Arrow exports embed them in the
+    // stream's schema metadata. Previously RocksDB checkpoints carried
+    // no StateVersionMap, so a restore treated any stored state as v1.
+    void set_state_versions(StateVersionMap versions) override;
+    [[nodiscard]] StateVersionMap restored_state_versions() const override;
     void restore(const Snapshot& snap, const KeyGroupRange& kg_filter = {}) override;
     // FOUND-3: set the relocated savepoint directory used to rebase cp-dir
     // references on the next restore (see Options::restore_base).
@@ -125,11 +133,11 @@ public:
     // Processor, InMemoryStateBackend::restore). Point-in-time view (a
     // RocksDB snapshot pins the iteration); buffered writes are flushed
     // first. Operators are emitted in ascending op-id order and keys in
-    // RocksDB's byte order, so the output is deterministic. RocksDB
-    // checkpoints carry no StateVersionMap, so the exported schema has
-    // no versions metadata (readers treat that as "no stamps recorded").
-    // The native SST checkpoint path is unchanged - this is an export,
-    // not a replacement.
+    // RocksDB's byte order, so the output is deterministic. The backend's
+    // StateVersionMap rides the stream's schema metadata (see
+    // set_state_versions), so check-savepoint and migrate-at-restore see
+    // real stamps on exported RocksDB state. The native SST checkpoint
+    // path is unchanged - this is an export, not a replacement.
     [[nodiscard]] std::vector<std::byte> export_arrow_snapshot() const;
 
 private:

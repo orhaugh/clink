@@ -632,4 +632,70 @@ TEST(RocksDBStateBackend, EmptyBackendExportsValidStream) {
     EXPECT_EQ(rows, 0u);
 }
 
+// ----- schema-evolution version stamps -----
+
+// Version stamps set on the live backend ride every checkpoint (a
+// reserved key in the default CF) and are recovered by restore - so the
+// pre-deploy compatibility check and migrate-at-restore see real stamps
+// on RocksDB, not the previous "no stamps recorded" blank.
+TEST(RocksDBStateBackend, StateVersionsSurviveSnapshotAndRestore) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    auto dir = std::filesystem::temp_directory_path() / "clink_rocks_versions";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    RocksDBStateBackend backend(
+        RocksDBStateBackend::Options{.path = (dir / "db").string(), .create_if_missing = true});
+
+    StateVersionMap versions;
+    versions.set(OperatorId{1}, "CounterState", 2);
+    versions.set(OperatorId{9}, "WindowAgg", 4);
+    backend.set_state_versions(versions);
+    EXPECT_EQ(backend.restored_state_versions().pack(), versions.pack());
+
+    backend.put(OperatorId{1}, sv(std::string{"\x05"} + "s|k"), sv(std::string{"v"}));
+    const auto snap = backend.snapshot(CheckpointId{11});
+
+    RocksDBStateBackend fresh(
+        RocksDBStateBackend::Options{.path = (dir / "db2").string(), .create_if_missing = true});
+    EXPECT_TRUE(fresh.restored_state_versions().empty());
+    fresh.restore(snap);
+    EXPECT_EQ(fresh.restored_state_versions().pack(), versions.pack());
+}
+
+// Both Arrow exports embed the stamps in the stream's schema metadata,
+// so an exported RocksDB checkpoint restored into the in-memory
+// reference reader carries them - and check-savepoint on the exported
+// stream sees real versions.
+TEST(RocksDBStateBackend, ArrowExportsCarryStateVersions) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    auto dir = std::filesystem::temp_directory_path() / "clink_rocks_versions_export";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    RocksDBStateBackend backend(
+        RocksDBStateBackend::Options{.path = (dir / "db").string(), .create_if_missing = true});
+    StateVersionMap versions;
+    versions.set(OperatorId{7}, "AggBucket", 3);
+    backend.set_state_versions(versions);
+    backend.put(OperatorId{7}, sv(std::string{"\x05"} + "s|k"), sv(std::string{"v"}));
+
+    // Live export.
+    InMemoryStateBackend ref;
+    ref.restore(
+        Snapshot{.checkpoint_id = CheckpointId{0}, .bytes = backend.export_arrow_snapshot()});
+    EXPECT_EQ(ref.restored_state_versions().pack(), versions.pack());
+
+    // Offline checkpoint-dir export.
+    const auto snap = backend.snapshot(CheckpointId{21});
+    std::string cp_dir(snap.bytes.size(), '\0');
+    std::memcpy(cp_dir.data(), snap.bytes.data(), snap.bytes.size());
+    InMemoryStateBackend ref2;
+    ref2.restore(
+        Snapshot{.checkpoint_id = CheckpointId{0}, .bytes = rocksdb_checkpoint_to_arrow(cp_dir)});
+    EXPECT_EQ(ref2.restored_state_versions().pack(), versions.pack());
+}
+
 #endif  // __has_include rocksdb_state_backend.hpp

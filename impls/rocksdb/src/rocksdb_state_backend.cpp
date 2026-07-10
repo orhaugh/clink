@@ -74,6 +74,15 @@ namespace {
     return OperatorId{v};
 }
 
+// Reserved key in the DEFAULT column family carrying the packed
+// StateVersionMap. The keyed path never writes the default CF, so the
+// key cannot collide with state. Written through set_state_versions,
+// it rides every checkpoint (capture flushes memtables), so restore
+// and the offline Arrow export recover the stamps from any checkpoint
+// dir - closing the schema-evolution gap where RocksDB checkpoints
+// carried no versions and a restore treated any stored state as v1.
+constexpr const char* kStateVersionsKey = "__clink.state_versions";
+
 // List SST basenames currently in a RocksDB instance. RocksDB names
 // every SST file <N>.sst where N is a monotonically-increasing
 // integer; the same file appears in every checkpoint dir for as long
@@ -196,6 +205,26 @@ struct RocksDBStateBackend::Impl {
     // last_snapshot_stats().
     std::mutex snap_mu;
     std::optional<SnapshotStats> last_stats;
+
+    // The state-version stamps (schema evolution). Authoritative copy in
+    // memory; persisted under kStateVersionsKey in the default CF so
+    // every checkpoint carries it. Guarded by versions_mu (set by the
+    // control plane, read by snapshot/export/restore paths).
+    mutable std::mutex versions_mu;
+    StateVersionMap versions;
+
+    // Read the persisted stamps from the default CF (empty when absent).
+    [[nodiscard]] StateVersionMap read_persisted_versions() const {
+        if (default_cf_ == nullptr) {
+            return {};
+        }
+        std::string out;
+        auto st = db->Get(rocksdb::ReadOptions{}, default_cf_, kStateVersionsKey, &out);
+        if (!st.ok()) {
+            return {};
+        }
+        return StateVersionMap::unpack(out);
+    }
 
     [[nodiscard]] rocksdb::ColumnFamilyHandle* cf_for(OperatorId op) {
         const auto key = op.value();
@@ -362,6 +391,8 @@ RocksDBStateBackend::RocksDBStateBackend(Options opts) : impl_(std::make_unique<
     impl_->store = opts.snapshot_store ? std::move(opts.snapshot_store)
                                        : std::make_shared<LocalSnapshotStore>();
     impl_->restore_base = std::move(opts.restore_base);
+    // A restart over an existing working dir recovers the persisted stamps.
+    impl_->versions = impl_->read_persisted_versions();
 }
 
 void RocksDBStateBackend::set_restore_base(const std::string& dir) {
@@ -478,6 +509,29 @@ bool RocksDBStateBackend::supports_async_persist() const noexcept {
     // Split snapshot into capture (local, op-thread) + persist (publish,
     // off-thread) only when the store's publish is a slow durable write.
     return impl_->store && impl_->store->defers_durable_write();
+}
+
+void RocksDBStateBackend::set_state_versions(StateVersionMap versions) {
+    std::lock_guard lock(impl_->versions_mu);
+    impl_->versions = std::move(versions);
+    if (impl_->default_cf_ == nullptr) {
+        return;
+    }
+    // Write through immediately so the NEXT checkpoint carries the stamps
+    // (capture flushes memtables, so the key lands in the checkpoint's
+    // SSTs). An empty map still writes (its packed form), so clearing
+    // stamps propagates too.
+    auto st = impl_->db->Put(
+        keyed_state_write_options(), impl_->default_cf_, kStateVersionsKey, impl_->versions.pack());
+    if (!st.ok()) {
+        throw std::runtime_error("RocksDBStateBackend::set_state_versions failed: " +
+                                 st.ToString());
+    }
+}
+
+StateVersionMap RocksDBStateBackend::restored_state_versions() const {
+    std::lock_guard lock(impl_->versions_mu);
+    return impl_->versions;
 }
 
 CaptureHandle RocksDBStateBackend::capture(CheckpointId id) {
@@ -655,6 +709,12 @@ void RocksDBStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg_
         }
     }
     impl_->path = working_path;
+    {
+        // Recover the version stamps the restored checkpoint carries (the
+        // first/primary parent; scale-down parents share one job-level map).
+        std::lock_guard vlock(impl_->versions_mu);
+        impl_->versions = impl_->read_persisted_versions();
+    }
 
     // Scale-down: merge any additional parent checkpoints into the live DB.
     // Each is opened read-only and its rows copied in; the kg-filter below
@@ -769,7 +829,8 @@ namespace {
 std::vector<std::byte> export_cfs_to_arrow(
     rocksdb::DB& db,
     const std::vector<std::pair<std::uint64_t, rocksdb::ColumnFamilyHandle*>>& cfs,
-    const rocksdb::ReadOptions& read_opts) {
+    const rocksdb::ReadOptions& read_opts,
+    const StateVersionMap& versions) {
     auto sorted = cfs;
     std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
         return a.first < b.first;
@@ -784,8 +845,7 @@ std::vector<std::byte> export_cfs_to_arrow(
                 op_id, std::string_view(k.data(), k.size()), std::string_view(v.data(), v.size()));
         }
     }
-    // RocksDB checkpoints carry no StateVersionMap: emit the bare schema.
-    return writer.finish();
+    return writer.finish(versions);
 }
 
 }  // namespace
@@ -809,9 +869,14 @@ std::vector<std::byte> RocksDBStateBackend::export_arrow_snapshot() const {
             cfs.emplace_back(op_id, cf);
         }
     }
+    StateVersionMap versions;
+    {
+        std::lock_guard lock(impl_->versions_mu);
+        versions = impl_->versions;
+    }
     std::vector<std::byte> bytes;
     try {
-        bytes = export_cfs_to_arrow(*impl_->db, cfs, ro);
+        bytes = export_cfs_to_arrow(*impl_->db, cfs, ro, versions);
     } catch (...) {
         impl_->db->ReleaseSnapshot(snap);
         throw;
@@ -828,14 +893,21 @@ std::vector<std::byte> rocksdb_checkpoint_to_arrow(const std::string& checkpoint
 
     std::vector<std::pair<std::uint64_t, rocksdb::ColumnFamilyHandle*>> cfs;
     cfs.reserve(handles.size());
+    StateVersionMap versions;
     for (std::size_t i = 0; i < handles.size(); ++i) {
         if (auto op = op_from_cf_name(names[i])) {
             cfs.emplace_back(op->value(), handles[i]);
+        } else if (names[i] == rocksdb::kDefaultColumnFamilyName) {
+            // The checkpoint's persisted version stamps ride the default CF.
+            std::string out;
+            if (db->Get(rocksdb::ReadOptions{}, handles[i], kStateVersionsKey, &out).ok()) {
+                versions = StateVersionMap::unpack(out);
+            }
         }
     }
     std::vector<std::byte> bytes;
     try {
-        bytes = export_cfs_to_arrow(*db, cfs, rocksdb::ReadOptions{});
+        bytes = export_cfs_to_arrow(*db, cfs, rocksdb::ReadOptions{}, versions);
     } catch (...) {
         for (auto* h : handles) {
             (void)db->DestroyColumnFamilyHandle(h);
@@ -899,6 +971,10 @@ std::string RocksDBStateBackend::description() const {
 }
 std::vector<std::byte> RocksDBStateBackend::export_arrow_snapshot() const {
     throw std::runtime_error("RocksDBStateBackend: unavailable in this build");
+}
+void RocksDBStateBackend::set_state_versions(StateVersionMap /*versions*/) {}
+StateVersionMap RocksDBStateBackend::restored_state_versions() const {
+    return {};
 }
 std::vector<std::byte> rocksdb_checkpoint_to_arrow(const std::string& /*checkpoint_dir*/) {
     throw std::runtime_error(
