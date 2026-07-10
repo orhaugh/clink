@@ -133,16 +133,24 @@ TEST(CompletionExecutor, SizedPoolOverlapsWork) {
 }
 
 TEST(CompletionExecutor, ZeroThreadsClampsToOne) {
-    ThreadPoolCompletionExecutor exec(0);
-    EXPECT_EQ(exec.thread_count(), 1u);
-    std::atomic<bool> ran{false};
+    // Synchronisation state is declared BEFORE the executor so the
+    // executor's destructor (which joins the worker) runs before the
+    // condvar/mutex are destroyed, and the flag flips UNDER the mutex so
+    // the waiter cannot satisfy its predicate while the worker is still
+    // touching the condvar. The original shape (flag set outside the
+    // lock, cv declared after exec) let the test body end - destroying
+    // the condvar - while the worker was inside notify_one (TSan:
+    // pthread_cond_signal vs pthread_cond_destroy).
     std::mutex m;
     std::condition_variable cv;
+    bool ran = false;
+    ThreadPoolCompletionExecutor exec(0);
+    EXPECT_EQ(exec.thread_count(), 1u);
     exec.submit_blocking([&] {
-        ran = true;
         std::lock_guard<std::mutex> lk(m);
+        ran = true;
         cv.notify_one();
     });
     std::unique_lock<std::mutex> lk(m);
-    EXPECT_TRUE(cv.wait_for(lk, 5s, [&] { return ran.load(); }));
+    EXPECT_TRUE(cv.wait_for(lk, 5s, [&] { return ran; }));
 }

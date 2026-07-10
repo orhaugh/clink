@@ -53,3 +53,34 @@ race:arrow::StringBuilder
 # the OS reclaims the threads at exit. We deliberately do NOT call
 # FinalizeS3 (it races S3FileSystem destructors at shutdown).
 thread:libarrow.so
+
+# libpulsar tears its client down from its own IO/executor threads;
+# ExecutorService's destructor races its condvar broadcast internally
+# (pthread_cond_destroy vs pthread_cond_broadcast), and Client::subscribe's
+# synchronous wait trips TSan's unlocked-mutex check inside the library's
+# own condvar use. Surfaces on the dead-endpoint open tests, where the
+# failed connect destroys the client while its executor threads wind
+# down. Library-internal; no clink frame in any report. The mutex rule is
+# scoped to pulsar:: frames so clink's own condvar misuse cannot hide
+# behind it.
+race:libpulsar.so
+called_from_lib:libpulsar.so
+mutex:pulsar::
+# The C-API sync wrappers (pulsar_client_create_producer / subscribe)
+# carry NO symbolised libpulsar frame in their reports - the wait
+# collapses onto the calling test line - so the only stable frame to
+# scope by is the test itself. These two tests exercise nothing but the
+# libpulsar connect path, so the scope masks no clink logic.
+mutex:OpenAgainstDeadEndpointFailsCleanly
+
+# The etcd client (etcd-cpp-apiv3) rides gRPC + abseil, neither built
+# with TSan. abseil's deadlock-detection graph (GraphCycles::GetId) and
+# grpc_core::Thread creation trip memmove races inside those libraries
+# during the EtcdHaCoordinator tests' connection probe - which, under
+# halt_on_error, aborts the test before it can self-skip when no etcd
+# server is reachable. Every frame is third-party.
+race:libabsl_
+race:libgrpc
+race:libgpr
+called_from_lib:libgrpc.so
+called_from_lib:libgpr.so
