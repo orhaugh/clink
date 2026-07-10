@@ -36,15 +36,27 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "clink/core/stream_element.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+#include "clink/test/failure_injection.hpp"
 #include "clink/test/output_capture.hpp"
 
 namespace clink::test {
+
+// A captured harness checkpoint: the operator's keyed/operator state
+// AND its registered timers. Timers ride the state through the
+// operator's own snapshot_timers path, exactly as they do in a real
+// checkpoint. Self-contained and independent of the harness that
+// produced it - restore any number of times, into any number of fresh
+// harnesses, via OneInputOperatorHarness::restore.
+struct HarnessSnapshot {
+    Snapshot state;
+};
 
 template <typename In, typename Out>
 class OneInputOperatorHarness {
@@ -72,6 +84,41 @@ public:
         return OneInputOperatorHarness(std::make_shared<Op>(std::move(op)), std::move(options));
     }
 
+    // Build a harness whose operator restores from `snapshot`: the state
+    // backend is restored now, and open() replays the checkpointed timers
+    // through the production restore_timers path BEFORE the operator's
+    // own open() runs - the runner's exact ordering, so open() sees the
+    // restored timer set.
+    static OneInputOperatorHarness restore(std::shared_ptr<Operator<In, Out>> op,
+                                           const HarnessSnapshot& snapshot,
+                                           Options options = {}) {
+        auto h = create(std::move(op), std::move(options));
+        h.core_->backend->restore(snapshot.state);
+        h.core_->restore_timers_on_open = true;
+        return h;
+    }
+
+    template <typename Op>
+        requires std::derived_from<Op, Operator<In, Out>>
+    static OneInputOperatorHarness restore(Op op,
+                                           const HarnessSnapshot& snapshot,
+                                           Options options = {}) {
+        return restore(std::make_shared<Op>(std::move(op)), snapshot, std::move(options));
+    }
+
+    // Same restore semantics on an already-created (not yet opened)
+    // harness - composes with every creation path, including the keyed
+    // subclasses and the ProcessFunction factories:
+    //
+    //   auto h2 = make_keyed_process_function_harness(MyFn{}, key_fn);
+    //   h2.restore_from(snapshot);
+    //   h2.open();
+    void restore_from(const HarnessSnapshot& snapshot) {
+        require_state_(Lifecycle::Created, "restore_from()");
+        core_->backend->restore(snapshot.state);
+        core_->restore_timers_on_open = true;
+    }
+
     OneInputOperatorHarness(OneInputOperatorHarness&&) noexcept = default;
     OneInputOperatorHarness& operator=(OneInputOperatorHarness&&) noexcept = default;
     OneInputOperatorHarness(const OneInputOperatorHarness&) = delete;
@@ -93,8 +140,12 @@ public:
     void open() {
         require_state_(Lifecycle::Created, "open()");
         core_->op->attach_runtime(&core_->ctx);
+        if (core_->restore_timers_on_open) {
+            core_->op->restore_timers(*core_->backend, core_->ctx.operator_id());
+        }
         core_->op->open();
         core_->state = Lifecycle::Open;
+        record_("open");
     }
 
     void close() {
@@ -102,6 +153,7 @@ public:
         core_->op->close();
         core_->op->attach_runtime(nullptr);
         core_->state = Lifecycle::Closed;
+        record_("close");
     }
 
     // ---- Input ----
@@ -120,7 +172,10 @@ public:
 
     void process_batch(Batch<In> batch) {
         require_state_(Lifecycle::Open, "process_batch()");
+        core_->failures.check(FailurePoint::BeforeProcessElement);
         core_->op->process(StreamElement<In>::data(std::move(batch)), capture_.emitter());
+        record_("process");
+        core_->failures.check(FailurePoint::AfterProcessElement);
     }
 
     // Full generality: hand the operator any stream element.
@@ -139,7 +194,14 @@ public:
 
     void process_watermark(Watermark wm) {
         require_state_(Lifecycle::Open, "process_watermark()");
+        if (!wm.is_idle()) {
+            const auto& due = event_time_timers();
+            if (!due.empty() && due.begin()->first <= wm.timestamp().millis()) {
+                core_->failures.check(FailurePoint::OnEventTimeTimer);
+            }
+        }
         core_->op->on_watermark(wm, capture_.emitter());
+        record_("watermark");
         if (!wm.is_idle()) {
             core_->last_watermark_ms = wm.timestamp().millis();
         }
@@ -177,15 +239,43 @@ public:
         require_monotonic_(now_ms);
         *core_->now_ms = now_ms;
         auto& out = capture_.emitter();
-        core_->ctx.timer_service()->poll_due(now_ms,
-                                             [this, &out](std::int64_t ts, const std::string& key) {
-                                                 core_->op->on_processing_time_timer(ts, key, out);
-                                             });
+        core_->ctx.timer_service()->poll_due(
+            now_ms, [this, &out](std::int64_t ts, const std::string& key) {
+                core_->failures.check(FailurePoint::OnProcessingTimeTimer);
+                core_->op->on_processing_time_timer(ts, key, out);
+            });
     }
 
     void advance_processing_time_by(std::int64_t delta_ms) {
         advance_processing_time_to(*core_->now_ms + delta_ms);
     }
+
+    // ---- Checkpointing (the production snapshot cycle) ----
+
+    // Capture the operator's state AND timers as of now. Timers are
+    // serialised into the backend by the operator's own snapshot_timers
+    // (exactly what the runner does at a barrier), then the backend
+    // snapshots. The result is self-contained; restore it any number of
+    // times via restore().
+    HarnessSnapshot snapshot(std::uint64_t checkpoint_id) {
+        require_state_(Lifecycle::Open, "snapshot()");
+        core_->failures.check(FailurePoint::DuringSnapshot);
+        core_->op->snapshot_timers(*core_->backend, core_->ctx.operator_id());
+        auto snap = core_->backend->snapshot(CheckpointId{checkpoint_id});
+        record_("snapshot");
+        return HarnessSnapshot{std::move(snap)};
+    }
+
+    // ---- Failure injection (see failure_injection.hpp) ----
+
+    FailurePlan& failures() noexcept { return core_->failures; }
+
+    // ---- Lifecycle log ----
+
+    // Every transition the harness drove, in order: "open", "process",
+    // "watermark", "snapshot", "close". Use it to assert lifecycle
+    // ordering without instrumenting the operator.
+    const std::vector<std::string>& transitions() const noexcept { return core_->transitions; }
 
     // ---- Inspection ----
 
@@ -242,10 +332,15 @@ private:
         RuntimeContext ctx;
         Lifecycle state{Lifecycle::Created};
         std::optional<std::int64_t> last_watermark_ms;
+        bool restore_timers_on_open{false};
+        FailurePlan failures;
+        std::vector<std::string> transitions;
     };
 
     OneInputOperatorHarness(std::shared_ptr<Operator<In, Out>> op, Options opts)
         : core_(std::make_unique<Core>(std::move(op), std::move(opts))) {}
+
+    void record_(const char* what) { core_->transitions.emplace_back(what); }
 
     void require_state_(Lifecycle expected, const char* what) const {
         if (core_->state != expected) {

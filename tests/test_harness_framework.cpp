@@ -3,6 +3,7 @@
 // lifecycle enforcement. These pin the framework's own contract; the
 // user-facing guide lives in docs/internals/testing-framework.md.
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -263,7 +264,11 @@ TEST(TestFramework, KeyedHarnessIsolatesStatePerKeyAndFiresKeyScopedTimers) {
     EXPECT_EQ(h.state_value<std::int64_t>("alice", "count"), 3 - 1);  // 2 purchases
     EXPECT_EQ(h.state_value<std::int64_t>("bob", "count"), 1);
     EXPECT_EQ(h.state_value<std::int64_t>("carol", "count"), std::nullopt);
-    EXPECT_EQ((h.known_keys<std::int64_t>("count")), (std::vector<std::string>{"alice", "bob"}));
+    // known_keys follows the backend's key encoding (key-group order), so
+    // sort before comparing.
+    auto keys = h.known_keys<std::int64_t>("count");
+    std::sort(keys.begin(), keys.end());
+    EXPECT_EQ(keys, (std::vector<std::string>{"alice", "bob"}));
 
     // Key-scoped timer queries.
     EXPECT_TRUE(h.has_event_time_timer(2000, "alice"));
@@ -390,4 +395,154 @@ TEST(TestFramework, TwoInputHarnessCombinesWatermarksAsTheRunningMinimum) {
     combined = h.mark_left_idle();
     ASSERT_TRUE(combined.has_value());
     EXPECT_EQ(combined->timestamp().millis(), 5000);
+}
+
+// ---- Increment 4: snapshot/restore, failure injection, lifecycle log ----
+
+TEST(TestFramework, SnapshotRestoreRoundTripsStateAndTimers) {
+    const auto key_fn = [](const Purchase& p) { return p.user; };
+    const auto timer_key_fn = [](const std::string& k) { return k; };
+    auto h = test::make_keyed_process_function_harness(CountPerUser{}, key_fn, timer_key_fn);
+    h.open();
+    h.process_element(Purchase{"alice", 10}, 1000);  // timer @2000
+    h.process_element(Purchase{"bob", 20}, 1100);    // timer @2100
+    h.process_element(Purchase{"alice", 30}, 1200);  // timer @2200
+
+    const auto snap = h.snapshot(1);
+
+    // Divergence after the snapshot must not leak into the restore.
+    h.process_element(Purchase{"alice", 99}, 1300);
+    EXPECT_EQ(h.state_value<std::int64_t>("alice", "count"), 3);
+
+    // Restore into a FRESH harness around a fresh function instance -
+    // the recovery model: state and timers come from the snapshot alone.
+    auto h2 = test::make_keyed_process_function_harness(CountPerUser{}, key_fn, timer_key_fn);
+    h2.restore_from(snap);
+    h2.open();
+
+    EXPECT_EQ(h2.state_value<std::int64_t>("alice", "count"), 2);
+    EXPECT_EQ(h2.state_value<std::int64_t>("bob", "count"), 1);
+    EXPECT_EQ(h2.event_time_timers().size(), 3u);
+    EXPECT_TRUE(h2.has_event_time_timer(2000, "alice"));
+    EXPECT_TRUE(h2.has_event_time_timer(2100, "bob"));
+
+    // The restored timers FIRE with the restored state behind them.
+    h2.process_watermark(2100);
+    EXPECT_EQ(h2.output_values(), (std::vector<std::string>{"alice:2", "bob:1"}));
+}
+
+TEST(TestFramework, StaticRestoreRebuildsAPlainHarness) {
+    auto h = test::OneInputOperatorHarness<std::int64_t, std::int64_t>::create(TimerOperator{});
+    h.open();
+    h.process_element(4, 1000);  // event-time timer @1100, proc timer @50
+    const auto snap = h.snapshot(7);
+
+    auto h2 =
+        test::OneInputOperatorHarness<std::int64_t, std::int64_t>::restore(TimerOperator{}, snap);
+    h2.open();
+    ASSERT_EQ(h2.event_time_timers().size(), 1u);
+    h2.process_watermark(1100);
+    EXPECT_EQ(h2.output_values(), (std::vector<std::int64_t>{-(1100 * 1000 + 4)}));
+}
+
+TEST(TestFramework, FailureInjectionBeforeProcessLeavesTheElementUnprocessed) {
+    auto h = test::OneInputOperatorHarness<std::int64_t, std::int64_t>::create(FanOutOperator{});
+    h.open();
+    h.failures().fail_once(test::FailurePoint::BeforeProcessElement);
+
+    EXPECT_THROW(h.process_element(1), test::InjectedFailure);
+    EXPECT_TRUE(h.output().empty());  // the operator never saw the element
+
+    h.process_element(2);  // one-shot rule is exhausted
+    EXPECT_EQ(h.output_values(), (std::vector<std::int64_t>{2, 20}));
+    EXPECT_EQ(h.failures().injected_count(), 1u);
+}
+
+TEST(TestFramework, FailureInjectionAfterProcessFailsWithTheEffectApplied) {
+    auto h = test::OneInputOperatorHarness<std::int64_t, std::int64_t>::create(FanOutOperator{});
+    h.open();
+    h.failures().fail_on_nth(test::FailurePoint::AfterProcessElement, 2);
+
+    h.process_element(1);
+    EXPECT_THROW(h.process_element(2), test::InjectedFailure);
+    // The second element WAS processed before the failure - the
+    // "crash after the effect" shape used to test replay/idempotence.
+    EXPECT_EQ(h.output_values(), (std::vector<std::int64_t>{1, 10, 2, 20}));
+}
+
+TEST(TestFramework, FailureInjectionOnTimersAndSnapshots) {
+    auto h = test::OneInputOperatorHarness<std::int64_t, std::int64_t>::create(TimerOperator{});
+    h.open();
+    h.process_element(3, 1000);  // event-time @1100, processing-time @50
+
+    // An armed event-time-timer failure throws BEFORE the fire: the
+    // timer stays registered, so the retry fires it.
+    h.failures().fail_once(test::FailurePoint::OnEventTimeTimer);
+    EXPECT_THROW(h.process_watermark(1100), test::InjectedFailure);
+    ASSERT_EQ(h.event_time_timers().size(), 1u);
+    h.process_watermark(1100);
+    EXPECT_EQ(h.output_values(), (std::vector<std::int64_t>{-(1100 * 1000 + 3)}));
+    h.output().clear();
+
+    h.failures().fail_once(test::FailurePoint::OnProcessingTimeTimer);
+    EXPECT_THROW(h.advance_processing_time_to(50), test::InjectedFailure);
+
+    h.failures().fail_once(test::FailurePoint::DuringSnapshot);
+    EXPECT_THROW(h.snapshot(1), test::InjectedFailure);
+    (void)h.snapshot(2);  // next attempt succeeds
+}
+
+TEST(TestFramework, CheckpointRecoveryLoopReplaysToTheSameState) {
+    const auto key_fn = [](const Purchase& p) { return p.user; };
+
+    // First run: checkpoint mid-stream, then crash before the next element.
+    auto h = test::make_keyed_process_function_harness(CountPerUser{}, key_fn);
+    h.open();
+    h.process_element(Purchase{"alice", 10}, 1000);
+    const auto checkpoint = h.snapshot(1);
+    h.failures().fail_once(test::FailurePoint::BeforeProcessElement);
+    EXPECT_THROW(h.process_element(Purchase{"alice", 20}, 2000), test::InjectedFailure);
+
+    // Recovery: restore the checkpoint, replay from after it.
+    auto h2 = test::make_keyed_process_function_harness(CountPerUser{}, key_fn);
+    h2.restore_from(checkpoint);
+    h2.open();
+    h2.process_element(Purchase{"alice", 20}, 2000);
+
+    EXPECT_EQ(h2.state_value<std::int64_t>("alice", "count"), 2);
+}
+
+TEST(TestFramework, TransitionsLogRecordsWhatTheHarnessDrove) {
+    auto h = test::OneInputOperatorHarness<std::int64_t, std::int64_t>::create(FanOutOperator{});
+    h.open();
+    h.process_element(1);
+    h.process_watermark(100);
+    (void)h.snapshot(1);
+    h.close();
+    EXPECT_EQ(h.transitions(),
+              (std::vector<std::string>{"open", "process", "watermark", "snapshot", "close"}));
+}
+
+TEST(TestFramework, TwoInputSnapshotRestoreAndFailureInjection) {
+    auto h = test::TwoInputOperatorHarness<std::int64_t, std::int64_t, std::string>::create(
+        PairJoiner{});
+    h.open();
+    h.process_left(1, 1000);  // event-time timer @1500 key "1"
+    const auto snap = h.snapshot(1);
+
+    // PairJoiner's left buffer is a member (not keyed state), so only
+    // the TIMER travels through the snapshot - which is exactly what
+    // this pins: restored timers fire on the restored co-operator.
+    auto h2 = test::TwoInputOperatorHarness<std::int64_t, std::int64_t, std::string>::restore(
+        PairJoiner{}, snap);
+    h2.open();
+    ASSERT_EQ(h2.event_time_timers().size(), 1u);
+    h2.process_left_watermark(2000);
+    auto combined = h2.process_right_watermark(2000);
+    ASSERT_TRUE(combined.has_value());
+    EXPECT_EQ(h2.output_values(), (std::vector<std::string>{"expired:1"}));
+
+    h2.failures().fail_once(test::FailurePoint::BeforeProcessElement);
+    EXPECT_THROW(h2.process_right(9), test::InjectedFailure);
+    EXPECT_EQ(h2.failures().injected_count(), 1u);
 }

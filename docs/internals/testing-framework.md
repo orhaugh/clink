@@ -13,7 +13,10 @@ Link the `clink::test_support` CMake target from test executables only; producti
 | Path | What |
 | --- | --- |
 | `include/clink/test/output_capture.hpp` | `OutputCapture<T>`: the typed emission log + a real `Emitter<T>`; doubles as the stateless-function collector |
-| `include/clink/test/one_input_harness.hpp` | `OneInputOperatorHarness<In, Out>`: lifecycle-enforced single-input operator harness with manual time |
+| `include/clink/test/one_input_harness.hpp` | `OneInputOperatorHarness<In, Out>`: lifecycle-enforced single-input operator harness with manual time, snapshots and failure injection |
+| `include/clink/test/keyed_harness.hpp` | `KeyedOneInputOperatorHarness<In, Out, K>` (typed state inspection, key-scoped timers), `default_codec<T>`, and the `ProcessFunction` factories |
+| `include/clink/test/two_input_harness.hpp` | `TwoInputOperatorHarness<In1, In2, Out>` and its keyed variant: `CoOperator` testing with the engine's real watermark combination |
+| `include/clink/test/failure_injection.hpp` | `FailurePlan`, `FailurePoint`, `InjectedFailure`: deterministic failure injection at the harness's mediation points |
 | `tests/test_harness_framework.cpp` | The framework's own contract tests |
 
 ## Testing a stateless function
@@ -54,6 +57,58 @@ h.close();                          // or let the destructor close
 
 `Options` configures the operator name/id, the clock's starting point, and an overriding state backend.
 
+## Testing keyed, stateful functions
+
+`make_keyed_process_function_harness` builds a harness over a `KeyedProcessFunction` through the same adapter the production fluent API uses; `make_process_function_harness` does the non-keyed equivalent. The keyed harness adds typed state inspection over the production read/write paths:
+
+```cpp
+auto h = clink::test::make_keyed_process_function_harness(
+    CountPerUser{},
+    [](const Purchase& p) { return p.user; },                 // key selector
+    [](const std::string& timer_key) { return timer_key; });  // timer key -> K (needed iff timers)
+h.open();
+h.process_element(Purchase{"alice", 10}, 1000);
+
+EXPECT_EQ(h.state_value<std::int64_t>("alice", "count"), 1);  // production read path
+h.seed_state<std::int64_t>("bob", "count", 41);               // arrange-phase setup
+EXPECT_TRUE(h.has_event_time_timer(2000, "alice"));           // key-scoped timer query
+```
+
+Codecs resolve through `clink::test::default_codec<T>` (`std::string` and `std::int64_t` are pre-wired; specialise it for your own types, or pass codecs explicitly). `known_keys<V>(slot)` lists a slot's keys in the backend's key encoding order (key-group first) - sort before comparing. Raw operators keyed some other way get the same surface via `KeyedOneInputOperatorHarness<In, Out, K>::create`.
+
+## Testing two-input operators
+
+`TwoInputOperatorHarness<In1, In2, Out>` drives a `CoOperator` with the engine's real two-input watermark semantics: each per-input watermark feeds the production `MultiInputAlignment`, and the operator only sees the combined watermark - the running minimum over both inputs - when the aligner says it advanced. `process_left/right(v[, ts])`, `process_left/right_watermark(ts)` (returns the combined watermark delivered, or `nullopt` when the minimum did not move), `mark_left/right_idle()` (an idle input stops constraining the minimum; a rejoining one clamps to the emitted global watermark). `KeyedTwoInputOperatorHarness` adds the keyed-state inspection surface.
+
+## Snapshots, restore and recovery testing
+
+`h.snapshot(checkpoint_id)` captures the operator's state AND timers as a self-contained `HarnessSnapshot`: timers are serialised into the backend by the operator's own `snapshot_timers` (what the runner does at a barrier), then the backend snapshots. Restore either statically (`OneInputOperatorHarness::restore(op, snapshot)`) or on any created-but-not-opened harness - including the keyed subclasses and factories - via `restore_from`:
+
+```cpp
+auto checkpoint = h.snapshot(1);
+// ... h diverges or "crashes" ...
+auto h2 = clink::test::make_keyed_process_function_harness(CountPerUser{}, key_fn);
+h2.restore_from(checkpoint);
+h2.open();  // timers replay through restore_timers BEFORE open(), the runner's ordering
+```
+
+The restored harness has the snapshot's state behind the production read path and its timers registered and firing. The canonical recovery test is: process, snapshot, fail, restore into a fresh harness, replay the post-checkpoint input, assert the same result.
+
+## Failure injection
+
+Failures are injected at the harness's mediation points - deterministic, explicit and observable, with no hooks in production code. Arm a `FailurePlan` and the harness throws `InjectedFailure` at the armed point:
+
+```cpp
+h.failures().fail_once(clink::test::FailurePoint::BeforeProcessElement);
+EXPECT_THROW(h.process_element(x), clink::test::InjectedFailure);
+EXPECT_TRUE(h.output().empty());               // the operator never saw it
+EXPECT_EQ(h.failures().injected_count(), 1);
+```
+
+Points: `BeforeProcessElement`, `AfterProcessElement` (the "crash after the effect" shape for replay/idempotence tests), `OnEventTimeTimer` / `OnProcessingTimeTimer` (before the fire - the timer stays registered, so a retry fires it), `DuringSnapshot`. Rules: `fail_once(point)`, `fail_on_nth(point, n)`, `fail_when(point, predicate)`.
+
+The harness also keeps a lifecycle log of what it drove, in order - `h.transitions()` yields `"open"`, `"process"`, `"watermark"`, `"snapshot"`, `"close"` - for asserting lifecycle ordering without instrumenting the operator.
+
 ## Design rules
 
 - Deterministic: no sleeps, no polling loops, no wall clock.
@@ -65,9 +120,9 @@ h.close();                          // or let the destructor close
 ## Roadmap (implemented incrementally)
 
 1. Foundation: capture, one-input harness, manual time, lifecycle - DONE.
-2. Keyed harness (`state_for`, `timers_for`, key selectors) + `ProcessFunction` factory helpers.
-3. Two-input harnesses (co-process, joins, broadcast) with the engine's real two-input watermark combination.
-4. Snapshot/restore (the real backend + `snapshot_timers` cycle), failure injection, lifecycle recorder.
+2. Keyed harness (typed state inspection, key-scoped timers, key selectors) + `ProcessFunction` factory helpers - DONE.
+3. Two-input harnesses (co-process, joins, connected streams) with the engine's real two-input watermark combination - DONE.
+4. Snapshot/restore (the real backend + `snapshot_timers` cycle), failure injection, lifecycle log - DONE.
 5. Test sources and sinks (controllable, replayable; transactional over the committing-sink framework).
 6. `LocalTestEnvironment` (full pipelines over the local runtime) and `MiniCluster` (the in-process JM+TM fixture).
 7. Assertions, sequence/property-testing support, compiling documentation examples, and migration of representative core tests onto the framework.

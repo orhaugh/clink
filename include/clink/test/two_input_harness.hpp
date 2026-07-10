@@ -36,6 +36,7 @@
 #include "clink/runtime/multi_input_alignment.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+#include "clink/test/failure_injection.hpp"
 #include "clink/test/keyed_harness.hpp"
 #include "clink/test/output_capture.hpp"
 
@@ -62,6 +63,34 @@ public:
         return TwoInputOperatorHarness(std::make_shared<Op>(std::move(op)), std::move(options));
     }
 
+    // Restore semantics identical to OneInputOperatorHarness::restore:
+    // backend restored now, timers replayed on open() before the
+    // operator's own open().
+    static TwoInputOperatorHarness restore(std::shared_ptr<CoOperator<In1, In2, Out>> op,
+                                           const HarnessSnapshot& snapshot,
+                                           Options options = {}) {
+        auto h = create(std::move(op), std::move(options));
+        h.core_->backend->restore(snapshot.state);
+        h.core_->restore_timers_on_open = true;
+        return h;
+    }
+
+    template <typename Op>
+        requires std::derived_from<Op, CoOperator<In1, In2, Out>>
+    static TwoInputOperatorHarness restore(Op op,
+                                           const HarnessSnapshot& snapshot,
+                                           Options options = {}) {
+        return restore(std::make_shared<Op>(std::move(op)), snapshot, std::move(options));
+    }
+
+    // Restore on an already-created (not yet opened) harness; composes
+    // with the keyed subclass.
+    void restore_from(const HarnessSnapshot& snapshot) {
+        require_state_(Lifecycle::Created, "restore_from()");
+        core_->backend->restore(snapshot.state);
+        core_->restore_timers_on_open = true;
+    }
+
     TwoInputOperatorHarness(TwoInputOperatorHarness&&) noexcept = default;
     TwoInputOperatorHarness& operator=(TwoInputOperatorHarness&&) noexcept = default;
     TwoInputOperatorHarness(const TwoInputOperatorHarness&) = delete;
@@ -81,6 +110,9 @@ public:
     void open() {
         require_state_(Lifecycle::Created, "open()");
         core_->op->attach_runtime(&core_->ctx);
+        if (core_->restore_timers_on_open) {
+            core_->op->restore_timers(*core_->backend, core_->ctx.operator_id());
+        }
         core_->op->open();
         core_->state = Lifecycle::Open;
     }
@@ -106,7 +138,9 @@ public:
     }
     void process_left_batch(Batch<In1> batch) {
         require_state_(Lifecycle::Open, "process_left_batch()");
+        core_->failures.check(FailurePoint::BeforeProcessElement);
         core_->op->process_element1(StreamElement<In1>::data(std::move(batch)), capture_.emitter());
+        core_->failures.check(FailurePoint::AfterProcessElement);
     }
 
     void process_right(In2 value) {
@@ -121,7 +155,9 @@ public:
     }
     void process_right_batch(Batch<In2> batch) {
         require_state_(Lifecycle::Open, "process_right_batch()");
+        core_->failures.check(FailurePoint::BeforeProcessElement);
         core_->op->process_element2(StreamElement<In2>::data(std::move(batch)), capture_.emitter());
+        core_->failures.check(FailurePoint::AfterProcessElement);
     }
 
     // ---- Watermarks: the engine's real two-input combination ----
@@ -160,14 +196,27 @@ public:
         }
         *core_->now_ms = now_ms;
         auto& out = capture_.emitter();
-        core_->ctx.timer_service()->poll_due(now_ms,
-                                             [this, &out](std::int64_t ts, const std::string& key) {
-                                                 core_->op->on_processing_time_timer(ts, key, out);
-                                             });
+        core_->ctx.timer_service()->poll_due(
+            now_ms, [this, &out](std::int64_t ts, const std::string& key) {
+                core_->failures.check(FailurePoint::OnProcessingTimeTimer);
+                core_->op->on_processing_time_timer(ts, key, out);
+            });
     }
     void advance_processing_time_by(std::int64_t delta_ms) {
         advance_processing_time_to(*core_->now_ms + delta_ms);
     }
+
+    // ---- Checkpointing + failure injection (as on the one-input harness) ----
+
+    HarnessSnapshot snapshot(std::uint64_t checkpoint_id) {
+        require_state_(Lifecycle::Open, "snapshot()");
+        core_->failures.check(FailurePoint::DuringSnapshot);
+        core_->op->snapshot_timers(*core_->backend, core_->ctx.operator_id());
+        auto snap = core_->backend->snapshot(CheckpointId{checkpoint_id});
+        return HarnessSnapshot{std::move(snap)};
+    }
+
+    FailurePlan& failures() noexcept { return core_->failures; }
 
     // ---- End of input ----
 
@@ -223,6 +272,8 @@ private:
         MultiInputAlignment alignment;
         Lifecycle state{Lifecycle::Created};
         std::optional<std::int64_t> combined_wm_ms;
+        bool restore_timers_on_open{false};
+        FailurePlan failures;
     };
 
     TwoInputOperatorHarness(std::shared_ptr<CoOperator<In1, In2, Out>> op, Options opts)
