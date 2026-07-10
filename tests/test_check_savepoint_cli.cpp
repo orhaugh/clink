@@ -200,3 +200,84 @@ TEST(CheckSavepointCli, ExpectedRejectsIncompatibleSavepoint) {
 
     std::filesystem::remove(path);
 }
+
+// ----- state-export --dir/--id (multi-subtask merge) -----
+
+// Two subtask snapshot files under one checkpoint root export as ONE
+// merged stream: the keyed union is exact (disjoint key groups), the
+// duplicated operator-state offset row resolves to the greater value
+// (the scale-down restore collision policy), and the exported bytes
+// restore cleanly into the format's reference reader.
+TEST(StateExportCli, DirFormMergesSubtaskFiles) {
+    namespace fs = std::filesystem;
+    const auto tag = std::to_string(getpid());
+    const auto root = fs::temp_directory_path() / ("state_export_dir_" + tag);
+    fs::remove_all(root);
+    fs::create_directories(root / "0");
+    fs::create_directories(root / "1");
+
+    auto write_subtask = [&](int subtask, const std::string& key, std::int64_t offset) {
+        clink::InMemoryStateBackend b;
+        const std::string keyed = std::string{"\x05"} + "slot|" + key;
+        b.put(clink::OperatorId{1}, std::string_view{keyed}, std::string_view{"v-" + key});
+        // The same operator-state key in both subtasks, different offsets.
+        const std::string op_key = std::string{"\xFF"} + "offsets|p0";
+        std::string off(8, '\0');
+        for (int i = 0; i < 8; ++i) {
+            off[static_cast<std::size_t>(i)] = static_cast<char>((offset >> (i * 8)) & 0xFF);
+        }
+        b.put(clink::OperatorId{2}, std::string_view{op_key}, std::string_view{off});
+        auto snap = b.snapshot(clink::CheckpointId{5});
+        std::ofstream f(root / std::to_string(subtask) / "checkpoint-5.snap", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(snap.bytes.data()),
+                static_cast<std::streamsize>(snap.bytes.size()));
+    };
+    write_subtask(0, "alpha", 100);
+    write_subtask(1, "beta", 700);
+
+    const auto out = fs::temp_directory_path() / ("state_export_dir_out_" + tag + ".arrows");
+    fs::remove(out);
+    auto result = run_cli("state-export --dir=" + root.string() + " --id=5 --out=" + out.string() +
+                          " --format=arrow");
+    ASSERT_EQ(result.exit_code, 0) << result.stderr_text;
+    EXPECT_NE(result.stdout_text.find("2 subtask files"), std::string::npos) << result.stdout_text;
+
+    // Restore the export and verify the merged view.
+    std::ifstream in(out, std::ios::binary);
+    std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    clink::Snapshot snap;
+    snap.bytes.resize(raw.size());
+    std::memcpy(snap.bytes.data(), raw.data(), raw.size());
+    clink::InMemoryStateBackend merged;
+    merged.restore(snap);
+
+    std::size_t keyed_rows = 0;
+    merged.scan(clink::OperatorId{1}, [&](std::string_view, std::string_view) { ++keyed_rows; });
+    EXPECT_EQ(keyed_rows, 2u);  // alpha + beta, both subtasks' keys
+    // The colliding offset row kept the GREATER value (700).
+    const std::string op_key = std::string{"\xFF"} + "offsets|p0";
+    auto v = merged.get(clink::OperatorId{2}, std::string_view{op_key});
+    ASSERT_TRUE(v.has_value());
+    std::int64_t got = 0;
+    for (int i = 0; i < 8; ++i) {
+        got |= static_cast<std::int64_t>(
+                   std::to_integer<std::uint8_t>((*v)[static_cast<std::size_t>(i)]))
+               << (i * 8);
+    }
+    EXPECT_EQ(got, 700);
+
+    // The parquet dir-form works too (summary only; content pinned elsewhere).
+    const auto pq = fs::temp_directory_path() / ("state_export_dir_out_" + tag + ".parquet");
+    fs::remove(pq);
+    auto result2 = run_cli("state-export --dir=" + root.string() + " --id=5 --out=" + pq.string());
+    ASSERT_EQ(result2.exit_code, 0) << result2.stderr_text;
+    EXPECT_TRUE(fs::exists(pq));
+
+    // Mutually exclusive input forms are rejected.
+    auto bad = run_cli("state-export --from=x --dir=y --id=1 --out=z");
+    EXPECT_EQ(bad.exit_code, 2);
+
+    fs::remove_all(root);
+    fs::remove(out);
+    fs::remove(pq);
+}

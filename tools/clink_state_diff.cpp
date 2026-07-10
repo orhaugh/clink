@@ -651,6 +651,11 @@ void export_usage() {
               << "  --from=<path>     a .snap/.arrows snapshot file, or a RocksDB checkpoint\n"
               << "                    directory (rendered via the Arrow export; requires a\n"
               << "                    RocksDB-linked build)\n"
+              << "  --dir=<root> --id=N\n"
+              << "                    instead of --from: merge every subtask's\n"
+              << "                    <root>/<subtask>/checkpoint-N.snap (and the flat\n"
+              << "                    <root>/checkpoint-N.snap) into ONE export - key groups\n"
+              << "                    are disjoint across subtasks, so the union is exact\n"
               << "  --out=<file>      output file (arrow / parquet formats)\n"
               << "  --format=arrow    the canonical Arrow IPC stream (op_id, key_bytes,\n"
               << "                    value_bytes) - exact fidelity, restorable, readable by\n"
@@ -676,6 +681,8 @@ int clink_cmd_state_export(int argc, char** argv) {
         return 0;
     }
     const auto from = get_arg(argc, argv, "from");
+    const auto dir = get_arg(argc, argv, "dir");
+    const auto id_str = get_arg(argc, argv, "id");
     const auto out = get_arg(argc, argv, "out");
     std::string format = get_arg(argc, argv, "format");
     if (format.empty()) {
@@ -685,13 +692,44 @@ int clink_cmd_state_export(int argc, char** argv) {
         std::cerr << "state-export: unknown --format '" << format << "' (arrow|parquet|iceberg)\n";
         return 2;
     }
-    // File formats need --out; the iceberg format targets a catalogued table.
-    if (from.empty() || (format != "iceberg" && out.empty())) {
+    // Input: --from XOR (--dir + --id). File formats need --out; the
+    // iceberg format targets a catalogued table instead.
+    const bool dir_form = !dir.empty() || !id_str.empty();
+    const bool dir_form_complete = !dir.empty() && !id_str.empty();
+    if (from.empty() == !dir_form ||             // neither or both input forms
+        (dir_form && !dir_form_complete) ||      // --dir without --id or vice versa
+        (format != "iceberg" && out.empty())) {  // file formats need --out
         export_usage();
         return 2;
     }
     try {
-        auto bytes = canonical_bytes_for(from);
+        std::vector<std::byte> bytes;
+        std::string source;
+        if (!from.empty()) {
+            bytes = canonical_bytes_for(from);
+            source = from;
+        } else {
+            // Multi-subtask form: merge every subtask's snapshot file for
+            // this checkpoint into one canonical stream - exactly the form a
+            // scale-down restore consumes (merge_snapshot_bytes preserves the
+            // first non-empty file's version metadata; the load below applies
+            // the operator-state collision policy). Key groups are disjoint
+            // across subtasks, so the keyed union is exact.
+            const auto id = std::stoull(id_str);
+            const auto files = checkpoint_files(dir, id);
+            if (files.empty()) {
+                throw std::runtime_error("no checkpoint-" + std::to_string(id) + ".snap under " +
+                                         dir + " (or its subtask subdirectories)");
+            }
+            std::vector<std::vector<std::byte>> parts;
+            parts.reserve(files.size());
+            for (const auto& f : files) {
+                parts.push_back(canonical_bytes_for(f.string()));
+            }
+            bytes = clink::InMemoryStateBackend::merge_snapshot_bytes(parts);
+            source = dir + " @ checkpoint " + std::to_string(id) + " (" +
+                     std::to_string(files.size()) + " subtask files)";
+        }
 
         // Validate + summarise by loading what we are about to write: a
         // malformed input fails HERE, not in the consumer's reader.
@@ -731,7 +769,7 @@ int clink_cmd_state_export(int argc, char** argv) {
                 return 2;
             }
             const auto res = clink::iceberg::export_state_iceberg(entries, std::move(io));
-            std::cout << "state-export: " << from << " -> iceberg table at " << res.table_location
+            std::cout << "state-export: " << source << " -> iceberg table at " << res.table_location
                       << " (1 snapshot, " << res.rows << " rows, " << entries.size()
                       << " operators, " << slots << " slots)\n";
             return 0;
@@ -761,9 +799,9 @@ int clink_cmd_state_export(int argc, char** argv) {
             }
             written = bytes.size();
         }
-        std::cout << "state-export: " << from << " -> " << out << " (" << format << ", " << written
-                  << " bytes, " << entries.size() << " operators, " << slots << " slots, " << rows
-                  << " keyed entries)\n";
+        std::cout << "state-export: " << source << " -> " << out << " (" << format << ", "
+                  << written << " bytes, " << entries.size() << " operators, " << slots
+                  << " slots, " << rows << " keyed entries)\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "state-export: " << e.what() << "\n";
