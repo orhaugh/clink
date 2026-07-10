@@ -206,6 +206,31 @@ if(CLINK_USE_FLAT_HASH_MAP)
     include_directories(SYSTEM ${unordered_dense_SOURCE_DIR}/include)
 endif()
 
+# simdjson backs config::parse (the JSON decode on every Row-channel hop:
+# source decode AND each network-bridge wire decode), replacing the
+# hand-rolled recursive parser. Pinned tag, source-only fetch: the
+# AMALGAMATED single TU (singleheader/simdjson.cpp) is compiled directly
+# into clink_core under clink's own flags rather than as a CMake
+# subproject - the subproject build intermittently corrupted the heap on
+# macOS arm64 (mfm_alloc/mfm_free aborts under the xzone allocator; the
+# same version amalgamated under our flags is clean, verified with 20-run
+# loops of the parser-heavy suites either way). The header stays PRIVATE
+# to src/config/json.cpp, off the public surface and the plugin ABI.
+set(CLINK_SIMDJSON_TAG "v3.12.2" CACHE STRING "simdjson version tag")
+include(FetchContent)
+FetchContent_Declare(
+    simdjson_src
+    GIT_REPOSITORY https://github.com/simdjson/simdjson.git
+    GIT_TAG ${CLINK_SIMDJSON_TAG}
+    GIT_SHALLOW TRUE
+    SYSTEM
+)
+FetchContent_GetProperties(simdjson_src)
+if(NOT simdjson_src_POPULATED)
+    FetchContent_Populate(simdjson_src)
+endif()
+set(CLINK_SIMDJSON_AMALGAMATED_DIR "${simdjson_src_SOURCE_DIR}/singleheader")
+
 # ---------------------------------------------------------------------------
 # Core library - no external connector/state-backend deps.
 #
@@ -284,6 +309,11 @@ target_compile_features(clink_core PUBLIC cxx_std_23)
 
 find_package(Threads REQUIRED)
 target_link_libraries(clink_core PUBLIC Threads::Threads)
+# simdjson is an implementation detail of src/config/json.cpp: the
+# amalgamated TU is a clink_core source (see the fetch block above) and
+# only json.cpp sees the header.
+target_sources(clink_core PRIVATE ${CLINK_SIMDJSON_AMALGAMATED_DIR}/simdjson.cpp)
+target_include_directories(clink_core SYSTEM PRIVATE ${CLINK_SIMDJSON_AMALGAMATED_DIR})
 if(CLINK_BUILD_HTTP)
     # httplib is header-only - PRIVATE link only adds the include path
     # for clink_core.cpp files that need it (just http_server.cpp).
