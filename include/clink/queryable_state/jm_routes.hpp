@@ -43,6 +43,8 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "clink/cluster/job_manager.hpp"
 #include "clink/config/json.hpp"
@@ -71,6 +73,57 @@ inline std::string json_string(const std::string& s) {
         }
     }
     out.push_back('"');
+    return out;
+}
+
+// One fanned-out scan over every subtask of (job, role): the JSON scan
+// route and the Arrow scan route (arrow_scan.hpp) share this.
+struct FannedScan {
+    std::vector<std::pair<std::string, std::string>> entries;  // key -> value JSON
+    bool truncated{false};
+    bool any_target{false};  // the role resolved to at least one HTTP TM
+    bool any_slot{false};    // at least one subtask served the slot
+};
+
+inline FannedScan fan_out_scan(cluster::JobManager& jm,
+                               cluster::JobId job,
+                               const std::string& role,
+                               const std::string& slot,
+                               std::size_t limit) {
+    FannedScan out;
+    const auto targets = jm.subtask_targets_for_role(job, role);
+    out.any_target = !targets.empty();
+    for (const auto& t : targets) {
+        if (out.entries.size() >= limit) {
+            out.truncated = true;
+            break;
+        }
+        http::HttpClient client(t.host, t.port);
+        auto tm_resp = client.get("/api/v1/queryable_state/op/" + role + "/subtask/" +
+                                  std::to_string(t.subtask_idx) + "/json/" + slot +
+                                  "/scan?limit=" + std::to_string(limit - out.entries.size()));
+        if (tm_resp.status != 200) {
+            continue;  // subtask without the slot (or gone): skip
+        }
+        try {
+            auto js = clink::config::parse(tm_resp.body);
+            out.any_slot = true;
+            for (const auto& entry : js.at("entries").as_array()) {
+                if (out.entries.size() >= limit) {
+                    out.truncated = true;
+                    break;
+                }
+                out.entries.emplace_back(entry.at("key").as_string(),
+                                         entry.at("value").serialize(0));
+            }
+            if (js.contains("truncated") && js.at("truncated").is_bool() &&
+                js.at("truncated").as_bool()) {
+                out.truncated = true;
+            }
+        } catch (...) {
+            continue;  // malformed TM body: skip that subtask
+        }
+    }
     return out;
 }
 
@@ -229,6 +282,11 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
     // at ?limit=N (default 1000, clamped to 100000). `truncated` is true
     // when any subtask truncated or the limit cut the fan-out short.
     // The SQL connector='queryable_state' source reads this route.
+    // JSON scan route - state-as-table in one call. Concatenates bounded
+    // scans from every subtask of the role (in subtask order), stopping
+    // at ?limit=N (default 1000, clamped to 100000). `truncated` is true
+    // when any subtask truncated or the limit cut the fan-out short.
+    // The SQL connector='queryable_state' source reads this route.
     server.get("/api/v1/queryable_state/job/:job_id/op/:role/json/:slot/scan",
                [&jm](const http::HttpRequest& req) -> http::HttpResponse {
                    http::HttpResponse resp;
@@ -260,66 +318,30 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
                        }
                    }
                    limit = std::min<std::size_t>(limit, 100'000);
-                   const auto targets = jm.subtask_targets_for_role(job, role_it->second);
-                   if (targets.empty()) {
+                   const auto scan =
+                       detail::fan_out_scan(jm, job, role_it->second, slot_it->second, limit);
+                   if (!scan.any_target) {
                        resp.status = 404;
                        resp.body =
                            "{\"error\":\"job or role not found (or no hosting TM "
                            "exposes HTTP)\"}";
                        return resp;
                    }
-                   // Merge the subtasks' entry arrays. Each TM body is
-                   // {"entries":[...],"truncated":bool}; parse and re-emit rather
-                   // than splice text, so entry counting is exact regardless of
-                   // what the value documents contain.
-                   std::string body = "{\"entries\":[";
-                   bool truncated = false;
-                   bool any_slot = false;
-                   std::size_t taken = 0;
-                   bool first = true;
-                   for (const auto& t : targets) {
-                       if (taken >= limit) {
-                           truncated = true;
-                           break;
-                       }
-                       http::HttpClient client(t.host, t.port);
-                       auto tm_resp = client.get("/api/v1/queryable_state/op/" + role_it->second +
-                                                 "/subtask/" + std::to_string(t.subtask_idx) +
-                                                 "/json/" + slot_it->second +
-                                                 "/scan?limit=" + std::to_string(limit - taken));
-                       if (tm_resp.status != 200) {
-                           continue;  // subtask without the slot (or gone): skip
-                       }
-                       try {
-                           auto js = clink::config::parse(tm_resp.body);
-                           any_slot = true;
-                           for (const auto& entry : js.at("entries").as_array()) {
-                               if (taken >= limit) {
-                                   truncated = true;
-                                   break;
-                               }
-                               if (!first) {
-                                   body.push_back(',');
-                               }
-                               body += entry.serialize(0);
-                               first = false;
-                               ++taken;
-                           }
-                           if (js.contains("truncated") && js.at("truncated").is_bool() &&
-                               js.at("truncated").as_bool()) {
-                               truncated = true;
-                           }
-                       } catch (...) {
-                           continue;  // malformed TM body: skip that subtask
-                       }
-                   }
-                   if (!any_slot) {
+                   if (!scan.any_slot) {
                        resp.status = 404;
                        resp.body = "{\"error\":\"slot not registered on any subtask\"}";
                        return resp;
                    }
+                   std::string body = "{\"entries\":[";
+                   for (std::size_t i = 0; i < scan.entries.size(); ++i) {
+                       if (i > 0) {
+                           body.push_back(',');
+                       }
+                       body += "{\"key\":" + detail::json_escape(scan.entries[i].first) +
+                               ",\"value\":" + scan.entries[i].second + "}";
+                   }
                    body += "],\"truncated\":";
-                   body += truncated ? "true" : "false";
+                   body += scan.truncated ? "true" : "false";
                    body += "}";
                    resp.body = std::move(body);
                    return resp;

@@ -14,6 +14,9 @@
 #include <thread>
 #include <vector>
 
+#include <arrow/api.h>
+#include <arrow/io/api.h>
+#include <arrow/ipc/api.h>
 #include <gtest/gtest.h>
 
 #include "clink/cluster/built_in_factories.hpp"
@@ -24,6 +27,7 @@
 #include "clink/http/http_client.hpp"
 #include "clink/http/http_server.hpp"
 #include "clink/plugin/plugin.hpp"
+#include "clink/queryable_state/arrow_scan.hpp"
 #include "clink/queryable_state/jm_routes.hpp"
 #include "clink/queryable_state/registry.hpp"
 #include "clink/queryable_state/server.hpp"
@@ -82,10 +86,13 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
     const auto rpc_port = jm.start();
     clink::http::HttpServer jm_http;
     clink::queryable_state::register_jm_routes(jm_http, jm);
+    clink::queryable_state::register_jm_arrow_scan_route(jm_http, jm);
     const auto jm_http_port = jm_http.start("127.0.0.1", 0);
     jm.expect_tms({"qs-tm"});
     clink::http::HttpServer tm_http;
     clink::queryable_state::register_routes(tm_http, clink::queryable_state::Registry::global());
+    clink::queryable_state::register_arrow_scan_route(tm_http,
+                                                      clink::queryable_state::Registry::global());
     const auto tm_http_port = tm_http.start("127.0.0.1", 0);
     clink::cluster::TaskManager::Config cfg;
     cfg.slot_count = 8;
@@ -171,6 +178,29 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
         auto lj = clink::config::parse(lim.body);
         EXPECT_EQ(lj.at("entries").as_array().size(), 1u);
         EXPECT_TRUE(lj.at("truncated").as_bool());
+    }
+
+    // Arrow bulk scan: the same live state as ONE Arrow IPC stream over
+    // plain HTTP - state-as-DataFrame, readable by pyarrow/polars/duckdb
+    // straight from the response body, no clink client code, no gRPC.
+    {
+        auto arrow_scan = jm_client.get("/api/v1/queryable_state/job/" + std::to_string(id) +
+                                        "/op/" + role + "/json/agg/scan.arrow?limit=10");
+        ASSERT_EQ(arrow_scan.status, 200) << arrow_scan.body;
+        auto buf = arrow::Buffer::FromString(arrow_scan.body);
+        auto reader_r = arrow::ipc::RecordBatchStreamReader::Open(
+            std::make_shared<arrow::io::BufferReader>(buf));
+        ASSERT_TRUE(reader_r.ok()) << reader_r.status().ToString();
+        auto table_r = (*reader_r)->ToTable();
+        ASSERT_TRUE(table_r.ok()) << table_r.status().ToString();
+        const auto& table = *table_r;
+        EXPECT_GE(table->num_rows(), 1);
+        const auto schema = table->schema();
+        ASSERT_GE(schema->GetFieldIndex("__key"), 0);
+        ASSERT_GE(schema->GetFieldIndex("usr"), 0);
+        const auto total_idx = schema->GetFieldIndex("total");
+        ASSERT_GE(total_idx, 0);
+        EXPECT_TRUE(schema->field(total_idx)->type()->Equals(arrow::float64()));
     }
 
     // State-as-table: job B SELECTs job A's LIVE aggregate state through
