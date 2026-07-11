@@ -26,6 +26,7 @@
 #include "clink/core/codec.hpp"
 #include "clink/core/record.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 
 using namespace clink;
@@ -286,6 +287,70 @@ TEST(ParquetConnector, SourceReplaysFromSnapshottedBatch) {
     std::sort(seen.begin(), seen.end());
     EXPECT_EQ(seen, (std::vector<std::int64_t>{10, 20, 30, 40, 50}))
         << "every record must appear exactly once across the restart";
+
+    std::filesystem::remove(path);
+}
+
+// ---- Column projection (schema-on-read) ----
+
+TEST(ParquetConnector, ProjectedReadSkipsAndReordersColumns) {
+    // Write a 3-column Row file, read it back with a batcher naming a
+    // REORDERED 2-column subset: the source must resolve the columns by
+    // name, read only those, and remap to the batcher's order.
+    const auto path = tmp_parquet("projected");
+    using clink::sql::Row;
+    using clink::sql::RowColumn;
+
+    const std::vector<RowColumn> full{
+        {"a", arrow::int64()}, {"b", arrow::utf8()}, {"c", arrow::int64()}};
+    {
+        ParquetSink<Row> sink(path, clink::sql::make_row_columnar_arrow_batcher(full));
+        sink.open();
+        Batch<Row> b;
+        for (std::int64_t i = 0; i < 3; ++i) {
+            Row r;
+            r.values["a"] = clink::config::JsonValue{static_cast<double>(i)};
+            r.values["b"] = clink::config::JsonValue{std::string("s") + std::to_string(i)};
+            r.values["c"] = clink::config::JsonValue{static_cast<double>(i * 10)};
+            b.emplace(std::move(r));
+        }
+        sink.on_data(b);
+        sink.close();
+    }
+
+    const std::vector<RowColumn> narrowed{{"c", arrow::int64()}, {"a", arrow::int64()}};
+    ParquetSource<Row> source(path, clink::sql::make_row_columnar_arrow_batcher(narrowed));
+    source.open();
+    CapturedBatches<Row> captured;
+    auto emitter = make_capturing_emitter(captured);
+    while (source.produce(emitter)) {
+    }
+    source.close();
+
+    std::vector<Row> rows;
+    for (const auto& batch : captured.batches) {
+        for (const auto& rec : batch) {
+            rows.push_back(rec.value());
+        }
+    }
+    ASSERT_EQ(rows.size(), 3u);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        EXPECT_EQ(rows[i].values.count("b"), 0u) << "unprojected column must not materialise";
+        EXPECT_EQ(static_cast<std::int64_t>(rows[i].values.at("a").as_number()),
+                  static_cast<std::int64_t>(i));
+        EXPECT_EQ(static_cast<std::int64_t>(rows[i].values.at("c").as_number()),
+                  static_cast<std::int64_t>(i) * 10);
+    }
+
+    // A batcher column missing from the file errors, naming the column.
+    const std::vector<RowColumn> missing{{"nope", arrow::int64()}};
+    ParquetSource<Row> bad(path, clink::sql::make_row_columnar_arrow_batcher(missing));
+    try {
+        bad.open();
+        FAIL() << "expected missing-column error";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("nope"), std::string::npos) << e.what();
+    }
 
     std::filesystem::remove(path);
 }

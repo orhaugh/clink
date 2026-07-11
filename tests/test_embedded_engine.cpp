@@ -461,3 +461,61 @@ TEST(ScriptRunner, BareSelectStillRejectedWhenSugarOff) {
 }
 
 }  // namespace
+
+TEST(EmbeddedEngine, ParquetProjectedReadEndToEnd) {
+    // json -> parquet (3 columns), then a one-column SELECT back out of
+    // the parquet table: the optimizer's projected-columns hint narrows
+    // the parquet read to that column (plus nothing else), and the values
+    // survive the round trip.
+    const auto in_path = fs::temp_directory_path() / "clink_embed_pq_in.ndjson";
+    const auto pq_path = fs::temp_directory_path() / "clink_embed_pq.parquet";
+    fs::remove(in_path);
+    fs::remove(pq_path);
+    write_lines(in_path,
+                {R"({"user_id":1,"name":"a","amount":10})",
+                 R"({"user_id":2,"name":"b","amount":20})",
+                 R"({"user_id":3,"name":"c","amount":30})"});
+
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    ASSERT_EQ(engine.execute_script("CREATE TABLE evt (user_id BIGINT, name TEXT, amount BIGINT) "
+                                    "WITH (connector='file', format='json', path='" +
+                                    in_path.string() +
+                                    "');"
+                                    "CREATE TABLE pq (user_id BIGINT, name TEXT, amount BIGINT) "
+                                    "WITH (connector='parquet', path='" +
+                                    pq_path.string() +
+                                    "');"
+                                    "INSERT INTO pq SELECT user_id, name, amount FROM evt"),
+              0)
+        << err.str();
+    ASSERT_TRUE(engine.await_all()) << err.str();
+
+    ASSERT_EQ(engine.execute_script("CREATE TABLE out_amounts (user_id BIGINT, amount BIGINT) "
+                                    "WITH (connector='collect');"
+                                    "INSERT INTO out_amounts SELECT user_id, amount FROM pq"),
+              0)
+        << err.str();
+    auto reader = engine.collect_reader("out_amounts").ValueOrDie();
+    std::int64_t sum = 0;
+    std::int64_t rows = 0;
+    while (true) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        ASSERT_TRUE(reader->ReadNext(&batch).ok());
+        if (!batch) {
+            break;
+        }
+        const auto& amounts = static_cast<const arrow::Int64Array&>(*batch->column(1));
+        for (std::int64_t i = 0; i < amounts.length(); ++i) {
+            sum += amounts.Value(i);
+            ++rows;
+        }
+    }
+    EXPECT_EQ(rows, 3);
+    EXPECT_EQ(sum, 60);
+    EXPECT_TRUE(engine.await_all()) << err.str();
+    fs::remove(in_path);
+    fs::remove(pq_path);
+}

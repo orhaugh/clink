@@ -7482,17 +7482,51 @@ void install(clink::plugin::PluginRegistry& reg) {
     // column schema in the "schema_columns" param (see row_columnar_batcher).
 
     // parquet_row_source: read a typed-columnar Parquet file into Rows.
-    //   path (required), schema_columns (required for typed columns)
+    //   path (required), schema_columns (required for typed columns),
+    //   projected_columns (optional, from the optimizer's projection
+    //   pushdown): narrows the batcher to those columns, and the source
+    //   reads ONLY them from the file - true Parquet column-skip.
     reg.register_source<Row>(
         "parquet_row_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<Row>> {
             auto path = ctx.param_or("path");
             if (path.empty()) {
                 throw std::runtime_error("parquet_row_source: 'path' param is required");
             }
+            auto cols = parse_row_schema(ctx.param_or("schema_columns"));
+            if (const auto csv = ctx.param_or("projected_columns"); !csv.empty()) {
+                std::set<std::string> wanted;
+                std::size_t pos = 0;
+                while (pos <= csv.size()) {
+                    auto end = csv.find(',', pos);
+                    if (end == std::string::npos) {
+                        end = csv.size();
+                    }
+                    if (auto c = csv.substr(pos, end - pos); !c.empty()) {
+                        wanted.insert(std::move(c));
+                    }
+                    if (end == csv.size()) {
+                        break;
+                    }
+                    pos = end + 1;
+                }
+                if (!wanted.empty()) {
+                    std::vector<RowColumn> narrowed;
+                    narrowed.reserve(cols.size());
+                    for (auto& c : cols) {
+                        if (wanted.count(c.name) != 0) {
+                            narrowed.push_back(std::move(c));
+                        }
+                    }
+                    // Only narrow when every projected column resolved against
+                    // the declared schema; otherwise keep the full read (the
+                    // downstream projection still applies).
+                    if (narrowed.size() == wanted.size()) {
+                        cols = std::move(narrowed);
+                    }
+                }
+            }
             return std::make_shared<ParquetSource<Row>>(
-                path,
-                make_row_columnar_arrow_batcher(parse_row_schema(ctx.param_or("schema_columns"))),
-                "parquet_row_source");
+                path, make_row_columnar_arrow_batcher(std::move(cols)), "parquet_row_source");
         });
 
     // parquet_row_sink: write Rows as one typed Parquet file per subtask.

@@ -83,14 +83,59 @@ public:
             throw std::runtime_error("ParquetSource: get schema: " + s.ToString());
         }
         auto expected = batcher_.schema();
-        if (!file_schema->Equals(*expected, /*check_metadata=*/false)) {
-            throw std::runtime_error("ParquetSource: schema mismatch - file has " +
-                                     file_schema->ToString() + "; ArrowBatcher expects " +
-                                     expected->ToString());
-        }
-
-        if (auto s = reader_->GetRecordBatchReader(&batch_reader_); !s.ok()) {
-            throw std::runtime_error("ParquetSource: get RecordBatchReader: " + s.ToString());
+        if (file_schema->Equals(*expected, /*check_metadata=*/false)) {
+            // Exact match: read every column, no projection needed.
+            if (auto s = reader_->GetRecordBatchReader(&batch_reader_); !s.ok()) {
+                throw std::runtime_error("ParquetSource: get RecordBatchReader: " + s.ToString());
+            }
+        } else {
+            // Column projection (schema-on-read): the batcher's schema names
+            // a SUBSET of the file's columns - resolve each by name (types
+            // must match exactly) and read ONLY those columns. This is what
+            // makes a narrowed query skip unread Parquet columns entirely,
+            // and what lets a declared-narrower table read a wider file. A
+            // batcher column absent from the file is an error naming it.
+            std::vector<int> indices;
+            indices.reserve(static_cast<std::size_t>(expected->num_fields()));
+            for (const auto& field : expected->fields()) {
+                const int idx = file_schema->GetFieldIndex(field->name());
+                if (idx < 0) {
+                    throw std::runtime_error("ParquetSource: file " + path_.string() +
+                                             " has no column '" + field->name() +
+                                             "' (file schema: " + file_schema->ToString() + ")");
+                }
+                if (!file_schema->field(idx)->type()->Equals(*field->type())) {
+                    throw std::runtime_error("ParquetSource: column '" + field->name() + "' is " +
+                                             file_schema->field(idx)->type()->ToString() +
+                                             " in the file but " + field->type()->ToString() +
+                                             " in the declared schema");
+                }
+                indices.push_back(idx);
+            }
+            std::vector<int> row_groups;
+            row_groups.reserve(static_cast<std::size_t>(reader_->num_row_groups()));
+            for (int rg = 0; rg < reader_->num_row_groups(); ++rg) {
+                row_groups.push_back(rg);
+            }
+            if (auto s = reader_->GetRecordBatchReader(row_groups, indices, &batch_reader_);
+                !s.ok()) {
+                throw std::runtime_error("ParquetSource: get projected RecordBatchReader: " +
+                                         s.ToString());
+            }
+            // The projected reader yields columns in file order; remap to the
+            // batcher's order when they differ so parse() sees its schema.
+            const auto got = batch_reader_->schema();
+            if (!got->Equals(*expected, /*check_metadata=*/false)) {
+                reorder_.reserve(static_cast<std::size_t>(expected->num_fields()));
+                for (const auto& field : expected->fields()) {
+                    const int idx = got->GetFieldIndex(field->name());
+                    if (idx < 0) {
+                        throw std::runtime_error("ParquetSource: projected read lost column '" +
+                                                 field->name() + "'");
+                    }
+                    reorder_.push_back(idx);
+                }
+            }
         }
         // #57: source replay. RecordBatch boundaries are deterministic for a
         // given file, and produce() emits exactly one batch per call, so
@@ -119,6 +164,15 @@ public:
             return false;  // EOF
         }
         ++batches_emitted_;  // #57: count emitted batches for replay
+        if (!reorder_.empty()) {
+            auto reordered = rb->SelectColumns(reorder_);
+            if (!reordered.ok()) {
+                throw std::runtime_error("ParquetSource: column reorder: " +
+                                         reordered.status().ToString());
+            }
+            rb = arrow::RecordBatch::Make(
+                batcher_.schema(), (*reordered)->num_rows(), (*reordered)->columns());
+        }
         auto parsed = batcher_.parse(*rb);
         if (!parsed.has_value()) {
             throw std::runtime_error("ParquetSource: ArrowBatcher.parse returned nullopt");
@@ -180,6 +234,9 @@ private:
     std::shared_ptr<arrow::io::ReadableFile> in_;
     std::unique_ptr<parquet::arrow::FileReader> reader_;
     std::shared_ptr<arrow::RecordBatchReader> batch_reader_;
+    // Non-empty when a projected read yields file-order columns that must
+    // remap to the batcher's order (indices into the projected batch).
+    std::vector<int> reorder_;
     std::uint64_t batches_emitted_ = 0;  // #57: replay cursor (next-batch index)
 };
 
