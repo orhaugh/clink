@@ -694,6 +694,16 @@ public:
             while (!should_stop()) {
                 // Fire any timers whose deadline has passed before
                 // waiting on input.
+                if (recorder) {
+                    // A due deadline means the fire below runs timer callbacks:
+                    // record the clock position IN the event stream so replay
+                    // re-fires them at exactly this point between inputs. Quiet
+                    // loops (nothing due) record nothing.
+                    if (const auto next = op->next_timer_deadline_ms();
+                        next.has_value() && *next <= timers->now_ms()) {
+                        recorder->on_clock(timers->now_ms());
+                    }
+                }
                 if (aec) {
                     fire_due_async();
                 } else {
@@ -722,6 +732,13 @@ public:
                         if (recorder) {
                             recorder->on_data(maybe->as_data());
                         }
+                    }
+                    if (recorder && maybe->is_watermark()) {
+                        // Watermarks ride the capture stream IN ORDER with the
+                        // data so replay reproduces watermark-driven fires
+                        // (windows, event-time timers) at their true positions.
+                        const auto wm = maybe->as_watermark();
+                        recorder->on_watermark(wm.timestamp().millis(), wm.is_idle());
                     }
                     if (recorder && maybe->is_barrier()) {
                         // Close the capture epoch AT the barrier, before the

@@ -467,15 +467,21 @@ std::vector<std::byte> read_bytes(const fs::path& path) {
     return bytes;
 }
 
-// Codec-agnostic walk of the capture framing: [u32 count] then per record
-// [u8 has_t][i64 t?][u32 len][len bytes]. Returns rendered rows.
+// Codec-agnostic walk of the capture framing. v1 payload: [u32 count] then
+// per record [u8 has_t][i64 t?][u32 len][len bytes]. v2 payload: [u32 count]
+// then per EVENT a tag byte - 0 = record (v1 record shape), 1 = watermark
+// [i64 ts][u8 idle], 2 = clock [i64 now]. Returns rendered rows.
 struct WalkedRecord {
+    enum class Kind { Data, Watermark, Clock };
+    Kind kind{Kind::Data};
     bool has_event_time{false};
-    std::int64_t event_time_ms{0};
-    std::string value;  // raw bytes
+    std::int64_t event_time_ms{0};  // record event time / watermark ts / clock now
+    bool idle{false};               // watermark only
+    std::string value;              // raw bytes (data records only)
 };
 
-std::vector<WalkedRecord> walk_capture_payload(std::span<const std::byte> in) {
+std::vector<WalkedRecord> walk_capture_payload(std::span<const std::byte> in,
+                                               std::uint32_t version) {
     std::vector<WalkedRecord> out;
     std::size_t pos = 0;
     auto read_u32 = [&]() -> std::uint32_t {
@@ -500,6 +506,34 @@ std::vector<WalkedRecord> walk_capture_payload(std::span<const std::byte> in) {
     const auto count = read_u32();
     for (std::uint32_t r = 0; r < count && pos < in.size(); ++r) {
         WalkedRecord rec;
+        if (version >= 2) {
+            const auto tag = static_cast<std::uint8_t>(in[pos++]);
+            if (tag == 1) {  // watermark
+                if (pos + 9 > in.size()) {
+                    break;
+                }
+                rec.kind = WalkedRecord::Kind::Watermark;
+                rec.event_time_ms = read_i64();
+                rec.idle = static_cast<std::uint8_t>(in[pos++]) != 0;
+                out.push_back(std::move(rec));
+                continue;
+            }
+            if (tag == 2) {  // clock
+                if (pos + 8 > in.size()) {
+                    break;
+                }
+                rec.kind = WalkedRecord::Kind::Clock;
+                rec.event_time_ms = read_i64();
+                out.push_back(std::move(rec));
+                continue;
+            }
+            if (tag != 0) {
+                break;  // unknown tag: stop rather than misparse
+            }
+            if (pos >= in.size()) {
+                break;
+            }
+        }
         rec.has_event_time = static_cast<std::uint8_t>(in[pos++]) != 0;
         if (rec.has_event_time) {
             if (pos + 8 > in.size()) {
@@ -545,10 +579,27 @@ int clink_cmd_capture_cat(int argc, char** argv) {
             }
             const auto& [h, payload_off] = *hdr;
             auto records = walk_capture_payload(
-                std::span<const std::byte>{bytes.data() + payload_off, bytes.size() - payload_off});
-            std::cout << "capture-cat: " << file << "\n"
-                      << "records stored: " << records.size()
-                      << ", seen in epoch: " << h.records_seen
+                std::span<const std::byte>{bytes.data() + payload_off, bytes.size() - payload_off},
+                h.version);
+            std::size_t data_n = 0;
+            std::size_t wm_n = 0;
+            std::size_t clock_n = 0;
+            for (const auto& r : records) {
+                switch (r.kind) {
+                    case WalkedRecord::Kind::Data:
+                        ++data_n;
+                        break;
+                    case WalkedRecord::Kind::Watermark:
+                        ++wm_n;
+                        break;
+                    case WalkedRecord::Kind::Clock:
+                        ++clock_n;
+                        break;
+                }
+            }
+            std::cout << "capture-cat: " << file << " (format v" << h.version << ")\n"
+                      << "records stored: " << data_n << ", seen in epoch: " << h.records_seen
+                      << ", watermarks: " << wm_n << ", clock advances: " << clock_n
                       << (h.truncated ? " (TRUNCATED at the cap)" : "") << "\n";
             std::size_t shown = 0;
             for (const auto& r : records) {
@@ -558,6 +609,15 @@ int clink_cmd_capture_cat(int argc, char** argv) {
                     break;
                 }
                 ++shown;
+                if (r.kind == WalkedRecord::Kind::Watermark) {
+                    std::cout << "  [watermark t=" << r.event_time_ms << (r.idle ? " idle" : "")
+                              << "]\n";
+                    continue;
+                }
+                if (r.kind == WalkedRecord::Kind::Clock) {
+                    std::cout << "  [clock now=" << r.event_time_ms << "]\n";
+                    continue;
+                }
                 std::cout << "  ";
                 if (r.has_event_time) {
                     std::cout << "t=" << r.event_time_ms << " ";

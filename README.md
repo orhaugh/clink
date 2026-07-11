@@ -907,9 +907,11 @@ $ clink replay --capture-dir=capture --checkpoint-dir=ckpt \
 
 Capture is best-effort and bounded (`--capture-records` per epoch; the
 file header records truncation, so a replay can tell a complete epoch
-from a sampled one). Per-record operators (GROUP BY, filter/project,
-DISTINCT, TOP-N) replay exactly; windowed operators replay data-only in
-v1 (watermark-driven fires do not occur). Details:
+from a sampled one). The captured epoch is a full event stream - data
+records, watermarks, and timer-fire clock positions in observed order -
+so windowed and timer-driven operators replay their fires at the exact
+production positions, not just the per-record path (captures from older
+builds replay data-only, and the tool says so). Details:
 [docs/internals/fault-tolerance-and-rescale.md](docs/internals/fault-tolerance-and-rescale.md).
 
 ## State as data
