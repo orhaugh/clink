@@ -1,0 +1,148 @@
+// End-to-end determinism gate for `clink replay` (the incident-replay
+// loop): run a windowed SQL job with the flight recorder armed, then
+// replay the tumbling-window operator's captured epoch through the CLI
+// and require (a) the emissions to equal the live job's sink output and
+// (b) --verify to pass (two runs byte-identical). This is the
+// executable form of docs/internals/replay-determinism.md.
+
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "clink/config/json.hpp"
+
+namespace fs = std::filesystem;
+
+namespace {
+
+struct CmdResult {
+    int exit_code{-1};
+    std::string output;  // stdout + stderr
+};
+
+CmdResult run_cmd(const std::string& cmd) {
+    CmdResult r;
+    FILE* pipe = popen((cmd + " 2>&1").c_str(), "r");
+    if (pipe == nullptr) {
+        return r;
+    }
+    std::array<char, 4096> buf{};
+    while (fgets(buf.data(), buf.size(), pipe) != nullptr) {
+        r.output += buf.data();
+    }
+    const int status = pclose(pipe);
+    r.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    return r;
+}
+
+std::string read_file(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+}  // namespace
+
+TEST(ReplayCli, WindowedEpochReplaysTheLiveEmissionsAndVerifiesDeterministic) {
+    const std::string cli = CLINK_CLI_BINARY;
+    const auto dir = fs::temp_directory_path() / "clink_replay_cli_e2e";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    // Input spanning two event-time windows for two keys.
+    {
+        std::ofstream in(dir / "in.jsonl");
+        in << R"({"usr":"alice","ts":100,"amount":10})" << "\n"
+           << R"({"usr":"alice","ts":400,"amount":5})" << "\n"
+           << R"({"usr":"bob","ts":700,"amount":7})" << "\n"
+           << R"({"usr":"alice","ts":1200,"amount":100})" << "\n"
+           << R"({"usr":"bob","ts":1500,"amount":50})" << "\n";
+    }
+    {
+        std::ofstream sql(dir / "job.sql");
+        sql << "CREATE TABLE evt (usr TEXT, ts BIGINT, amount BIGINT) WITH (connector='file', "
+               "format='json', path='"
+            << (dir / "in.jsonl").string() << "', event_time_column='ts');\n"
+            << "CREATE TABLE totals (usr TEXT, total BIGINT) WITH (connector='file', "
+               "format='json', path='"
+            << (dir / "out.jsonl").string() << "');\n"
+            << "INSERT INTO totals SELECT usr, SUM(amount) AS total FROM evt "
+               "GROUP BY TUMBLE(ts, 1000), usr;\n";
+    }
+
+    // Live run with the flight recorder armed.
+    const auto run = run_cmd(cli + " run " + (dir / "job.sql").string() + " --checkpoint-dir=" +
+                             (dir / "ckpt").string() + " --checkpoint-interval-ms=200" +
+                             " --capture-dir=" + (dir / "capture").string());
+    ASSERT_EQ(run.exit_code, 0) << run.output;
+    const auto live_out = read_file(dir / "out.jsonl");
+    ASSERT_FALSE(live_out.empty());
+
+    // Find the tumbling-window operator's capture by its op.json type.
+    std::string window_op;
+    for (const auto& entry : fs::directory_iterator(dir / "capture")) {
+        const auto op_json = entry.path() / "subtask-1" / "op.json";
+        if (!fs::exists(op_json)) {
+            continue;
+        }
+        auto js = clink::config::parse(read_file(op_json));
+        if (js.is_object() && js.at("op_type").is_string() &&
+            js.at("op_type").as_string() == "tumbling_window_row") {
+            window_op = entry.path().filename().string().substr(3);  // strip "op-"
+        }
+    }
+    ASSERT_FALSE(window_op.empty()) << "no tumbling_window_row capture found";
+
+    const std::string replay_base = cli + " replay --capture-dir=" + (dir / "capture").string() +
+                                    " --checkpoint-dir=" + (dir / "ckpt").string() +
+                                    " --op=" + window_op + " --epoch=1";
+
+    // The replayed emissions must be exactly the live job's output rows
+    // (same rows, same order - the sink wrote what this operator emitted).
+    const auto replay = run_cmd(replay_base + " --max-rows=0");
+    ASSERT_EQ(replay.exit_code, 0) << replay.output;
+    std::vector<std::string> replay_rows;
+    {
+        std::istringstream is(replay.output);
+        std::string line;
+        bool in_body = false;
+        while (std::getline(is, line)) {
+            if (line == "---") {
+                in_body = !in_body;
+                continue;
+            }
+            if (in_body && !line.empty() && line.front() == '{') {
+                replay_rows.push_back(line);
+            }
+        }
+    }
+    std::vector<std::string> live_rows;
+    {
+        std::istringstream is(live_out);
+        std::string line;
+        while (std::getline(is, line)) {
+            if (!line.empty()) {
+                live_rows.push_back(line);
+            }
+        }
+    }
+    EXPECT_EQ(replay_rows, live_rows)
+        << "replayed emissions differ from the live sink output\nreplay:\n"
+        << replay.output << "\nlive:\n"
+        << live_out;
+
+    // And the determinism gate: two runs byte-identical.
+    const auto verify = run_cmd(replay_base + " --verify");
+    EXPECT_EQ(verify.exit_code, 0) << verify.output;
+    EXPECT_NE(verify.output.find("deterministic:"), std::string::npos) << verify.output;
+
+    fs::remove_all(dir);
+}

@@ -179,7 +179,7 @@ public:
 
     void process(const StreamElement<std::pair<Key, Value>>& element,
                  Emitter<std::pair<Key, Agg>>& out) override {
-        ctx_.set_processing_time(detail::now_processing_time_ms());
+        ctx_.set_processing_time(processing_now_ms_());
 
         if (element.is_data()) {
             for (const auto& record : element.as_data()) {
@@ -244,7 +244,7 @@ public:
             // All guards passed BEFORE any ingest_one_ (which may emit late
             // panes); a false return here never half-processed the batch, so the
             // runner's fallback to process() cannot double-count.
-            ctx_.set_processing_time(detail::now_processing_time_ms());
+            ctx_.set_processing_time(processing_now_ms_());
             const std::int64_t n = rb->num_rows();
             for (std::int64_t i = 0; i < n; ++i) {
                 const std::optional<EventTime> et =
@@ -309,7 +309,17 @@ public:
     // operator; callers invoke this immediately before the per-record
     // loop. Doing the clock read per record (~hundreds of ns each on
     // macOS) shows up loud on the 10M-record bench.
-    void begin_batch() { ctx_.set_processing_time(detail::now_processing_time_ms()); }
+    void begin_batch() { ctx_.set_processing_time(processing_now_ms_()); }
+
+    // Processing time through the operator's TimerService when attached -
+    // its default NowFn is the wall clock, so production behaviour is
+    // unchanged, while a manual clock (tests, deterministic replay)
+    // governs this operator's processing-time view too. Falls back to the
+    // wall clock pre-attach.
+    [[nodiscard]] std::int64_t processing_now_ms_() const noexcept {
+        auto* rt = this->runtime();
+        return rt != nullptr ? rt->timer_service()->now_ms() : detail::now_processing_time_ms();
+    }
 
     // Per-record entry point: skip the projected-batch allocation
     // that the public process() data path uses. Caller has already

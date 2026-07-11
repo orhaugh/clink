@@ -133,7 +133,7 @@ public:
 
     void process(const StreamElement<std::pair<Key, Value>>& element,
                  Emitter<std::pair<Key, Agg>>& out) override {
-        ctx_.set_processing_time(detail::now_processing_time_ms());
+        ctx_.set_processing_time(processing_now_ms_());
 
         if (element.is_data()) {
             for (const auto& record : element.as_data()) {
@@ -195,7 +195,7 @@ public:
             }
             // Guards all passed BEFORE any ingest_one_ (which may emit); a false
             // return never half-processed the batch.
-            ctx_.set_processing_time(detail::now_processing_time_ms());
+            ctx_.set_processing_time(processing_now_ms_());
             const std::int64_t n = rb->num_rows();
             for (std::int64_t i = 0; i < n; ++i) {
                 const std::optional<EventTime> et =
@@ -217,6 +217,14 @@ public:
 private:
     using StateKey = std::pair<std::int64_t, Key>;
     using Entry = WindowEntry<Agg>;
+
+    // Processing time through the operator's TimerService when attached
+    // (wall clock by default; a manual clock under tests/replay governs
+    // this operator too), wall clock pre-attach.
+    [[nodiscard]] std::int64_t processing_now_ms_() const noexcept {
+        auto* rt = this->runtime();
+        return rt != nullptr ? rt->timer_service()->now_ms() : detail::now_processing_time_ms();
+    }
 
     // Per-record ingest: window fan-out + late-data side-output routing +
     // dispatch to handle_record_ per covering window. Shared verbatim by the

@@ -412,6 +412,7 @@ if(CLINK_BUILD_SQL)
         test_sql_ai.cpp
         test_sql_queryable_state.cpp
         test_embedded_engine.cpp
+        test_replay_cli.cpp
     )
     target_link_libraries(clink_sql_tests PRIVATE
         clink::sql
@@ -426,8 +427,9 @@ if(CLINK_BUILD_SQL)
     endif()
     target_compile_definitions(clink_sql_tests PRIVATE
         CLINK_SUBMIT_SQL_BINARY=\"$<TARGET_FILE:clink_submit_sql>\"
-        CLINK_NODE_BINARY=\"$<TARGET_FILE:clink_node>\")
-    add_dependencies(clink_sql_tests clink_submit_sql clink_node)
+        CLINK_NODE_BINARY=\"$<TARGET_FILE:clink_node>\"
+        CLINK_CLI_BINARY=\"$<TARGET_FILE:clink>\")
+    add_dependencies(clink_sql_tests clink_submit_sql clink_node clink)
     clink_set_warnings(clink_sql_tests)
     gtest_discover_tests(clink_sql_tests
         DISCOVERY_MODE PRE_TEST

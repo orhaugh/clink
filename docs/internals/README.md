@@ -37,6 +37,7 @@ then follow the links into each subsystem.
 | [Keyed state and state backends](state-and-backends.md) | How operators store per-key and per-operator state over Codec<T>, the pluggable backends (in-memory, sharded, file, changelog, RocksDB, remote-read), the Arrow IPC snapshot format vs RocksDB native SST checkpoints, queryable state, and the two-tier disaggregated RemoteReadBackend. |
 | [The state snapshot format (stable contract)](state-snapshot-format.md) | The Arrow IPC state-snapshot encoding as a stable public contract: the three-column schema, key encoding, format-version and state-version metadata, the changelog variant, derived Parquet/Iceberg/query projections, and the evolution policy. |
 | [The testing framework (clink::test)](testing-framework.md) | The public API for unit-testing user functions, operators and pipelines: one-input/keyed/two-input harnesses over production hooks, deterministic manual time, state inspection, side outputs, snapshot/restore, failure injection, test sources/sinks (incl. transactional), LocalTestEnvironment, MiniCluster, assertions and property-testing support. |
+| [The replay determinism contract](replay-determinism.md) | What `clink replay` guarantees (byte-identical replay-replay via `--verify`; live-replay equivalence for untruncated v2 captures), the clock-ownership model behind it, the documented approximations, and what is rejected loudly. |
 
 ## Reliability
 

@@ -397,7 +397,13 @@ private:
         rt->timer_service()->register_processing_time_timer(now_ms_() + probe_ms, kIdleProbeKey);
     }
 
-    static std::int64_t now_ms_() {
+    // Processing time through the operator's TimerService when attached
+    // (wall clock by default; a manual clock under tests/replay governs
+    // the idleness probe too), wall clock pre-attach.
+    std::int64_t now_ms_() const {
+        if (auto* rt = this->runtime(); rt != nullptr) {
+            return rt->timer_service()->now_ms();
+        }
         return std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::system_clock::now().time_since_epoch())
             .count();

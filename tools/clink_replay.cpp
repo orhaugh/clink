@@ -93,6 +93,7 @@ void usage() {
         << "Usage: clink replay --capture-dir=<dir> --checkpoint-dir=<dir>\n"
         << "                    --op=<operator id> --epoch=<N|final>\n"
         << "                    [--subtask=S] [--state-from=<ckpt id>] [--max-rows=N] [--flush]\n"
+        << "                    [--verify]\n"
         << "\n"
         << "Rebuilds one operator from its op.json capture sidecar, restores its\n"
         << "keyed state from checkpoint N-1, feeds it epoch-N.cap's captured\n"
@@ -102,7 +103,12 @@ void usage() {
         << "watermark-driven window fires and processing-time timer fires at\n"
         << "their production positions; v1 captures replay data records only.\n"
         << "\n"
-        << "Exit codes: 0 = ok, 2 = error.\n";
+        << "--verify replays the epoch TWICE from the same snapshot and event\n"
+        << "stream and byte-compares the emissions: the determinism check\n"
+        << "(docs/internals/replay-determinism.md). Prints the first divergence\n"
+        << "when they differ.\n"
+        << "\n"
+        << "Exit codes: 0 = ok, 1 = --verify found a divergence, 2 = error.\n";
 }
 
 // Minimal reader for the op.json sidecar (written by write_op_spec).
@@ -174,9 +180,9 @@ void ensure_row_factories_installed() {
     });
 }
 
-// Print one emitted Row like the print sink does: changelog kinds
+// Render one emitted Row like the print sink does: changelog kinds
 // prefixed, the marker stripped.
-void print_row(const Row& row) {
+std::string format_row(const Row& row) {
     std::string prefix;
     auto vals = row.values;
     if (auto it = vals.find(std::string{clink::sql::kRowKindField}); it != vals.end()) {
@@ -190,10 +196,8 @@ void print_row(const Row& row) {
         }
         vals.erase(it);
     }
-    std::cout << prefix
-              << clink::config::serialize_output(
-                     clink::config::JsonValue{clink::config::JsonObject{std::move(vals)}})
-              << "\n";
+    return prefix + clink::config::serialize_output(
+                        clink::config::JsonValue{clink::config::JsonObject{std::move(vals)}});
 }
 
 }  // namespace
@@ -210,6 +214,7 @@ int clink_cmd_replay(int argc, char** argv) {
     const auto subtask_str = get_arg(argc, argv, "subtask", "");
     const auto state_from_str = get_arg(argc, argv, "state-from");
     const bool do_flush = has_flag(argc, argv, "flush");
+    const bool do_verify = has_flag(argc, argv, "verify");
     std::size_t max_rows = 100;
     if (const auto v = get_arg(argc, argv, "max-rows"); !v.empty()) {
         max_rows = static_cast<std::size_t>(std::stoull(v));
@@ -285,8 +290,10 @@ int clink_cmd_replay(int argc, char** argv) {
             }
         }
 
-        // State: checkpoint N-1 (or --state-from), fresh for epoch 1.
-        auto backend = std::make_shared<clink::InMemoryStateBackend>();
+        // State: checkpoint N-1 (or --state-from), fresh for epoch 1. The
+        // snapshot BYTES are held so every run restores a fresh backend -
+        // what makes run-twice verification meaningful.
+        std::optional<std::vector<std::byte>> snap_bytes;
         std::string state_desc = "fresh state";
         std::uint64_t state_id = 0;
         if (!state_from_str.empty()) {
@@ -303,25 +310,16 @@ int clink_cmd_replay(int argc, char** argv) {
                                          " requires --checkpoint-dir");
             }
             const auto snap_path = find_snapshot(ckpt_dir, subtask, state_id);
-            const auto snap_bytes = read_bytes_file(snap_path);
-            clink::Snapshot snap{.checkpoint_id = clink::CheckpointId{state_id},
-                                 .bytes = snap_bytes};
-            backend->restore(snap);
+            snap_bytes = read_bytes_file(snap_path);
             state_desc = "state from " + snap_path.string();
         }
 
-        // Rebuild the operator from its sidecar spec via the registry.
+        // The operator factory from the sidecar spec via the registry.
         const auto* factory = clink::cluster::OperatorRegistry::default_instance().find_operator(
             spec.op_type, spec.in_channel, spec.out_channel);
         if (factory == nullptr) {
             throw std::runtime_error("no registered factory for op type '" + spec.op_type + "' (" +
                                      spec.in_channel + "->" + spec.out_channel + ")");
-        }
-        clink::cluster::OperatorBuildContext bctx;
-        bctx.params = spec.params;
-        auto op = std::static_pointer_cast<clink::Operator<Row, Row>>(factory->build(bctx));
-        if (!spec.uid.empty()) {
-            op->set_uid(spec.uid);
         }
 
         std::cout << "replay: op " << op_str << " (" << spec.op_type << ") subtask " << subtask
@@ -329,69 +327,110 @@ int clink_cmd_replay(int argc, char** argv) {
                   << ": " << data_count << " records stored, " << hdr->first.records_seen
                   << " seen, " << wm_count << " watermarks, " << clock_count << " clock advances"
                   << (hdr->first.truncated ? ", TRUNCATED - replaying the stored prefix" : "")
-                  << ")\n  " << state_desc << "\n---\n";
+                  << ")\n  " << state_desc << "\n";
         if (hdr->first.version < 2) {
             std::cerr << "note: v1 capture (records only) - watermark-driven fires do not "
                          "occur in this replay\n";
         }
 
-        // Drive the operator exactly as the runner does: attach, put the
-        // TimerService on a manual clock (positioned by the captured clock
-        // events), restore timers, open, then feed the event stream.
-        clink::MetricsRegistry metrics;
-        clink::RuntimeContext ctx{clink::OperatorId{op_id}, spec.op_type, backend.get(), &metrics};
-        auto replay_now = std::make_shared<std::int64_t>(0);
-        ctx.timer_service()->set_now_fn([replay_now] { return *replay_now; });
-        op->attach_runtime(&ctx);
-        op->restore_timers(*backend, clink::OperatorId{op_id});
-        op->open();
+        // One complete replay run: fresh backend (snapshot restored), fresh
+        // operator, manual clock, then the event stream through the
+        // production paths. Returns the rendered emissions in order.
+        auto run_once = [&]() -> std::vector<std::string> {
+            auto backend = std::make_shared<clink::InMemoryStateBackend>();
+            if (snap_bytes.has_value()) {
+                clink::Snapshot snap{.checkpoint_id = clink::CheckpointId{state_id},
+                                     .bytes = *snap_bytes};
+                backend->restore(snap);
+            }
+            clink::cluster::OperatorBuildContext bctx;
+            bctx.params = spec.params;
+            auto op = std::static_pointer_cast<clink::Operator<Row, Row>>(factory->build(bctx));
+            if (!spec.uid.empty()) {
+                op->set_uid(spec.uid);
+            }
+            clink::MetricsRegistry metrics;
+            clink::RuntimeContext ctx{
+                clink::OperatorId{op_id}, spec.op_type, backend.get(), &metrics};
+            auto replay_now = std::make_shared<std::int64_t>(0);
+            ctx.timer_service()->set_now_fn([replay_now] { return *replay_now; });
+            op->attach_runtime(&ctx);
+            op->restore_timers(*backend, clink::OperatorId{op_id});
+            op->open();
 
-        clink::BoundedChannel<clink::StreamElement<Row>> out_ch(4096);
-        clink::Emitter<Row> emitter(&out_ch);
-        std::size_t emitted = 0;
-        std::size_t shown = 0;
-        auto drain = [&] {
-            while (auto el = out_ch.try_pop()) {
-                if (el->is_data()) {
-                    for (const auto& rec : el->as_data()) {
-                        ++emitted;
-                        if (max_rows == 0 || shown < max_rows) {
-                            ++shown;
-                            print_row(rec.value());
-                        }
+            std::vector<std::string> rows;
+            clink::Emitter<Row> emitter([&rows](clink::StreamElement<Row> el) {
+                if (el.is_data()) {
+                    for (const auto& rec : el.as_data()) {
+                        rows.push_back(format_row(rec.value()));
                     }
                 }
+                return true;
+            });
+            for (const auto& e : events) {
+                if (const auto* rec = std::get_if<clink::Record<Row>>(&e)) {
+                    clink::Batch<Row> b;
+                    b.push(*rec);
+                    op->process(clink::StreamElement<Row>::data(std::move(b)), emitter);
+                } else if (const auto* wm = std::get_if<clink::capture::WatermarkEvent>(&e)) {
+                    // The runner delivers watermarks through process(); the
+                    // operator's own dispatch runs its production watermark
+                    // path.
+                    const auto mark =
+                        wm->idle ? clink::Watermark{clink::EventTime{wm->ts_ms}, /*idle=*/true}
+                                 : clink::Watermark{clink::EventTime{wm->ts_ms}};
+                    op->process(clink::StreamElement<Row>::watermark(mark), emitter);
+                } else {
+                    // A captured timer-fire position: move the manual clock
+                    // there and fire due processing-time timers - the runner's
+                    // between-pops poll reproduced at the captured position.
+                    *replay_now = std::get<clink::capture::ClockEvent>(e).now_ms;
+                    op->fire_due_timers(emitter, *replay_now);
+                }
             }
+            if (do_flush) {
+                op->flush(emitter);
+            }
+            op->close();
+            return rows;
         };
-        for (auto& e : events) {
-            if (auto* rec = std::get_if<clink::Record<Row>>(&e)) {
-                clink::Batch<Row> b;
-                b.push(std::move(*rec));
-                op->process(clink::StreamElement<Row>::data(std::move(b)), emitter);
-            } else if (const auto* wm = std::get_if<clink::capture::WatermarkEvent>(&e)) {
-                // The runner delivers watermarks through process(); the
-                // operator's own dispatch runs its production watermark path.
-                const auto mark = wm->idle
-                                      ? clink::Watermark{clink::EventTime{wm->ts_ms}, /*idle=*/true}
-                                      : clink::Watermark{clink::EventTime{wm->ts_ms}};
-                op->process(clink::StreamElement<Row>::watermark(mark), emitter);
-            } else {
-                // A captured timer-fire position: move the manual clock there
-                // and fire due processing-time timers, the runner's
-                // between-pops poll reproduced at the captured position.
-                *replay_now = std::get<clink::capture::ClockEvent>(e).now_ms;
-                op->fire_due_timers(emitter, *replay_now);
+
+        if (do_verify) {
+            // Determinism check: two complete runs from the same snapshot
+            // and event stream must be byte-identical.
+            const auto a = run_once();
+            const auto b = run_once();
+            if (a == b) {
+                std::cout << "deterministic: " << a.size()
+                          << " emissions identical across 2 runs\n";
+                return 0;
             }
-            drain();
+            std::cout << "NON-DETERMINISTIC: run 1 emitted " << a.size() << ", run 2 emitted "
+                      << b.size() << "\n";
+            const auto n = std::min(a.size(), b.size());
+            for (std::size_t i = 0; i < n; ++i) {
+                if (a[i] != b[i]) {
+                    std::cout << "first divergence at emission " << i << ":\n  run 1: " << a[i]
+                              << "\n  run 2: " << b[i] << "\n";
+                    break;
+                }
+            }
+            return 1;
         }
-        if (do_flush) {
-            op->flush(emitter);
-            drain();
+
+        std::cout << "---\n";
+        const auto rows = run_once();
+        std::size_t shown = 0;
+        for (const auto& r : rows) {
+            if (max_rows != 0 && shown >= max_rows) {
+                break;
+            }
+            ++shown;
+            std::cout << r << "\n";
         }
-        op->close();
         std::cout << "---\nreplayed " << data_count << " records, " << wm_count << " watermarks, "
-                  << clock_count << " clock advances -> " << emitted << " emissions";
-        if (shown < emitted) {
+                  << clock_count << " clock advances -> " << rows.size() << " emissions";
+        if (shown < rows.size()) {
             std::cout << " (" << shown << " shown; raise --max-rows)";
         }
         std::cout << "\n";
