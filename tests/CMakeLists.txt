@@ -28,6 +28,7 @@ add_executable(clink_core_tests
     test_periodic_checkpoint.cpp
     test_file_connector.cpp
     test_arrow_batcher.cpp
+    test_arrow_fs_uri.cpp
     test_columnar_batcher.cpp
     test_columnar_nested.cpp
     test_row_columnar_batcher.cpp

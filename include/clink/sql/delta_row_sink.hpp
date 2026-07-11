@@ -44,6 +44,7 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/properties.h>
 
+#include "clink/connectors/arrow_fs_uri.hpp"
 #include "clink/connectors/arrow_s3_lifecycle.hpp"
 #include "clink/connectors/delta_log.hpp"
 #include "clink/core/arrow_batcher.hpp"
@@ -140,11 +141,15 @@ private:
     void resolve_filesystem_() {
         if (opts_.table_root.find("://") != std::string::npos) {
             object_store_ = true;
-            if (opts_.table_root.rfind("s3://", 0) == 0) {
-                clink::connectors::ensure_arrow_s3_initialised();
+            // Registry-free open: FileSystemFromUri is unusable in binaries
+            // that carry duplicated Arrow filesystem statics (see
+            // arrow_fs_uri.hpp). The helper runs the S3 lifecycle init
+            // itself for s3:// roots.
+            try {
+                fs_ = clink::connectors::filesystem_from_uri(opts_.table_root, &base_path_);
+            } catch (const std::exception& e) {
+                throw std::runtime_error("delta: " + std::string{e.what()});
             }
-            fs_ = value_or_throw_(arrow::fs::FileSystemFromUri(opts_.table_root, &base_path_),
-                                  "FileSystemFromUri");
         } else {
             fs_ = std::make_shared<arrow::fs::LocalFileSystem>();
             base_path_ = std::filesystem::absolute(opts_.table_root).string();

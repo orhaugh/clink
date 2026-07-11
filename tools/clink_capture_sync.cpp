@@ -18,14 +18,21 @@
 // "reproduce THIS incident" and the narrow push for retention policies
 // that keep interesting epochs only.
 //
-// Known cosmetic wart: on builds where the pinned iceberg-cpp statically
-// bundles Arrow's s3fs objects, the process carries TWO copies of Arrow's
-// S3 lifecycle state (the binary's and libarrow.dylib's). This tool
-// initialises and finalises ITS copy correctly; the other copy can still
-// print Arrow's "FinalizeS3 was not called" warning at exit. Harmless
-// here (verified: transfers complete, exit codes correct, our instance
-// finalises clean) - the duplicated-statics ABI wart is tracked with the
-// iceberg S3 FileIO notes in impls/iceberg.
+// Duplicated-Arrow-statics wart: on builds where the pinned iceberg-cpp
+// statically bundles Arrow's filesystem objects, the process carries TWO
+// copies of Arrow's filesystem/S3 state (the binary's and libarrow.dylib's).
+// Consequences and how this tool handles them:
+//   - arrow::fs::FileSystemFromUri is UNUSABLE in such binaries: both copies
+//     queue built-in factory registrations, the coalesced registry rejects
+//     the duplicate 'file' scheme on first use, and every call fails with
+//     "Key error: ... scheme 'file' ... already registered". This tool
+//     therefore opens filesystems through the registry-free
+//     clink::connectors::filesystem_from_uri helper (arrow_fs_uri.hpp).
+//   - S3 lifecycle: this tool initialises and finalises ITS copy correctly;
+//     the other copy can still print Arrow's "FinalizeS3 was not called"
+//     warning at exit. Harmless (transfers complete, exit codes correct).
+// The underlying ABI wart is tracked with the iceberg S3 FileIO notes in
+// impls/iceberg.
 //
 // Exit codes: 0 = ok, 2 = error.
 
@@ -47,6 +54,7 @@
 #include <arrow/io/interfaces.h>
 #include <arrow/result.h>
 
+#include "clink/connectors/arrow_fs_uri.hpp"
 #include "clink/connectors/arrow_s3_lifecycle.hpp"
 #endif
 
@@ -116,16 +124,9 @@ bool want_file(const std::string& rel, const std::string& epoch) {
 #ifdef CLINK_HAS_ARROW
 
 std::shared_ptr<arrow::fs::FileSystem> open_remote(const std::string& uri, std::string* prefix) {
-    if (uri.starts_with("s3://")) {
-        // One init per process, finalised explicitly before returning - the
-        // lifecycle every S3-touching piece of clink funnels through.
-        clink::connectors::ensure_arrow_s3_initialised();
-    }
-    auto result = arrow::fs::FileSystemFromUri(uri, prefix);
-    if (!result.ok()) {
-        throw std::runtime_error("cannot open " + uri + ": " + result.status().ToString());
-    }
-    return result.MoveValueUnsafe();
+    // Registry-free open (see the duplicated-Arrow-statics note at the top of
+    // this file). Handles the S3 lifecycle init itself for s3:// URIs.
+    return clink::connectors::filesystem_from_uri(uri, prefix);
 }
 
 void copy_local_to_remote(const fs::path& local,
