@@ -92,6 +92,13 @@ void usage() {
         << "                    operator rebuilds from a CANDIDATE build - then\n"
         << "                    diff two --out dumps with `clink replay-diff`\n"
         << "\n"
+        << "Incident -> regression test:\n"
+        << "  --emit-test=<dir> materialise a self-contained bundle: the epoch's\n"
+        << "                    capture + starting state + golden emissions + a\n"
+        << "                    generated gtest source (one call into\n"
+        << "                    clink::sql::run_replay_regression). Add the .cpp\n"
+        << "                    to a test target linking clink::sql.\n"
+        << "\n"
         << "Exit codes: 0 = ok, 1 = --verify found a divergence, 2 = error.\n";
 }
 
@@ -105,6 +112,7 @@ struct Options {
     bool verify{false};
     std::size_t max_rows{100};
     std::string out_path;
+    std::string emit_test_dir;
 };
 
 clink::sql::ReplayRequest to_request(const Options& o, std::uint64_t op_id) {
@@ -157,6 +165,15 @@ int verify_one(const clink::sql::EpochReplay& replay, bool print_pass) {
 }
 
 int replay_single(const Options& o, std::uint64_t op_id) {
+    if (!o.emit_test_dir.empty()) {
+        const auto n = clink::sql::emit_replay_regression(to_request(o, op_id), o.emit_test_dir);
+        std::cout << "emitted regression bundle: " << o.emit_test_dir << "\n"
+                  << "  capture + state + golden.ndjson (" << n
+                  << " emissions) + replay_regression_test.cpp\n"
+                  << "add replay_regression_test.cpp to a test target linking clink::sql;\n"
+                  << "it replays the bundle and asserts the golden emissions, byte for byte.\n";
+        return 0;
+    }
     const auto replay = clink::sql::EpochReplay::load(to_request(o, op_id));
     announce(replay.info());
     if (o.verify) {
@@ -270,6 +287,7 @@ int clink_cmd_replay(int argc, char** argv) {
         o.max_rows = static_cast<std::size_t>(std::stoull(v));
     }
     o.out_path = get_arg(argc, argv, "out");
+    o.emit_test_dir = get_arg(argc, argv, "emit-test");
     const auto op_str = get_arg(argc, argv, "op");
     const auto plugin_path = get_arg(argc, argv, "plugin");
     if (o.capture_dir.empty() || o.epoch.empty()) {
@@ -290,8 +308,8 @@ int clink_cmd_replay(int argc, char** argv) {
                       << plugin_path << ")\n";
         }
         if (op_str.empty()) {
-            if (!o.out_path.empty()) {
-                throw std::runtime_error("--out needs --op (single-operator mode)");
+            if (!o.out_path.empty() || !o.emit_test_dir.empty()) {
+                throw std::runtime_error("--out/--emit-test need --op (single-operator mode)");
             }
             return replay_whole_job(o);
         }

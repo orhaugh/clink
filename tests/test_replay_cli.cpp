@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/config/json.hpp"
+#include "clink/sql/replay.hpp"
 
 namespace fs = std::filesystem;
 
@@ -176,6 +177,28 @@ TEST(ReplayCli, WindowedEpochReplaysTheLiveEmissionsAndVerifiesDeterministic) {
                               (dir / "c.ndjson").string());
     EXPECT_EQ(diff.exit_code, 1) << diff.output;
     EXPECT_NE(diff.output.find("differing emission"), std::string::npos) << diff.output;
+
+    // Incident -> regression test: emit a self-contained bundle, then run
+    // it through the library exactly as the generated gtest does. The
+    // bundle must pass against its own golden, the artefacts must all
+    // exist, and a doctored golden must fail with the divergence located.
+    const auto bundle = dir / "bundle";
+    const auto emit = run_cmd(replay_base + " --emit-test=" + bundle.string());
+    ASSERT_EQ(emit.exit_code, 0) << emit.output;
+    EXPECT_TRUE(fs::exists(bundle / "bundle.json"));
+    EXPECT_TRUE(fs::exists(bundle / "golden.ndjson"));
+    EXPECT_TRUE(fs::exists(bundle / "replay_regression_test.cpp"));
+    EXPECT_EQ(clink::sql::run_replay_regression(bundle.string()), "");
+    {
+        auto golden = read_file(bundle / "golden.ndjson");
+        const auto pos = golden.find(":15");
+        ASSERT_NE(pos, std::string::npos) << golden;
+        golden.replace(pos, 3, ":99");
+        std::ofstream out(bundle / "golden.ndjson", std::ios::binary | std::ios::trunc);
+        out << golden;
+    }
+    const auto regression_error = clink::sql::run_replay_regression(bundle.string());
+    EXPECT_NE(regression_error.find("first divergence"), std::string::npos) << regression_error;
 
     fs::remove_all(dir);
 }

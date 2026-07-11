@@ -161,6 +161,8 @@ Omitting `--op` replays the WHOLE JOB: every captured operator (and every subtas
 
 Cross-version A/B ("what would the fix have produced?"): `--out=<file>` dumps every emission one-per-line, `--plugin=<so>` dlopens a candidate job plugin first (ABI-gated by the same `PluginLoader` a cluster deploy uses) so the operator rebuilds from THAT build, and `clink replay-diff <a> <b>` compares two dumps - identical (exit 0) or the first divergence plus every differing emission index (exit 1). Replay the epoch through the current build and through the candidate, diff, and the behavioural delta of the change on real production bytes is explicit before anything deploys.
 
+Incident to regression test in one command: `--emit-test=<dir>` materialises a SELF-CONTAINED bundle - the epoch's capture, the starting snapshot, the golden emissions as of now, a `bundle.json` manifest, and a generated gtest source whose whole body is one call to `clink::sql::run_replay_regression(bundle_dir)`, so the emitted test can never drift from the replay implementation. Check the bundle in, add the `.cpp` to a test target linking `clink::sql`, and the production incident is a permanent, byte-exact regression test.
+
 Scope and honesty: Row-channel operators (the SQL frontend's set - GROUP BY, windowed GROUP BY, filter, project, DISTINCT, TOP-N, the keyer). v2 captures replay watermark-driven window fires and processing-time timer fires at their production positions; v1 captures (recorded by older builds) replay data records only, and the tool says so. A truncated epoch replays its stored prefix and says so. Multi-input operators (joins) and non-Row channels are rejected with a clear message. `--flush` opts into the end-of-stream flush.
 
 ## Key types and APIs

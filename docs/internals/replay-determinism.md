@@ -36,9 +36,13 @@ Determinism therefore rests on three pillars:
 
 Determinism is what makes version comparison meaningful: if replay were noisy, a diff between two builds would be noise too. `clink replay --out=<file>` dumps a run's emissions; `--plugin=<so>` rebuilds the operator from a candidate build first (ABI-gated like a cluster deploy); `clink replay-diff <a> <b>` then reports `identical` or the exact differing emissions. Same epoch, same state, two builds - the behavioural delta of a change on real production bytes, before it deploys.
 
+## Incident to regression test
+
+`clink replay --emit-test=<dir>` freezes an epoch into a self-contained bundle (capture + starting state + golden emissions + manifest) with a generated gtest whose body is one call to `clink::sql::run_replay_regression` - determinism is what makes the golden meaningful: the bundle passes forever on a correct build and locates the first divergence on a regressing one.
+
 ## The executable form
 
-`tests/test_replay_cli.cpp` runs a windowed SQL job with capture armed, replays the tumbling-window operator's epoch through the CLI, and requires: the replayed emissions to equal the live sink output; `--verify` to pass (single-op and whole-job); two `--out` dumps to `replay-diff` as identical; and a doctored dump to diff as different with the emission located - the contract, enforced in CI.
+`tests/test_replay_cli.cpp` runs a windowed SQL job with capture armed, replays the tumbling-window operator's epoch through the CLI, and requires: the replayed emissions to equal the live sink output; `--verify` to pass (single-op and whole-job); two `--out` dumps to `replay-diff` as identical; a doctored dump to diff as different with the emission located; and an emitted regression bundle to pass through `run_replay_regression` (and fail, divergence located, once its golden is doctored) - the contract, enforced in CI.
 
 ## Related
 

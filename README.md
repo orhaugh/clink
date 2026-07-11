@@ -929,7 +929,10 @@ And the cross-version question - "what would the fix have produced on
 last night's bytes?" - is one diff: replay the epoch through two builds
 (`--plugin=<candidate.so>` for compiled jobs) with `--out=<file>`, then
 `clink replay-diff a.ndjson b.ndjson` reports the first divergence, or
-`identical`.
+`identical`. `--emit-test=<dir>` goes one further and freezes the epoch
+into a self-contained regression bundle (capture + state + golden
+emissions + a generated gtest source): the incident becomes a permanent,
+byte-exact test in one command.
 
 Details:
 [docs/internals/fault-tolerance-and-rescale.md](docs/internals/fault-tolerance-and-rescale.md).

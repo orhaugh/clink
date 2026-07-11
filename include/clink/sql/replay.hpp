@@ -52,7 +52,8 @@ struct ReplayInfo {
     std::size_t data_count{0};
     std::size_t watermark_count{0};
     std::size_t clock_count{0};
-    std::string state_desc;  // "fresh state" or the snapshot path
+    std::string state_desc;           // "fresh state" or the snapshot path
+    std::string state_snapshot_path;  // resolved snapshot file; empty = fresh
 };
 
 class EpochReplay {
@@ -86,6 +87,28 @@ struct CapturedOp {
     std::uint64_t subtask{0};
 };
 std::vector<CapturedOp> list_captured_ops(const std::string& capture_dir);
+
+// ---- Regression bundles (incident -> test in one command) -------------
+//
+// emit_replay_regression materialises a SELF-CONTAINED bundle under
+// `out_dir`: the op's capture (op.json + the epoch file), the starting
+// snapshot, the golden emissions of the replay as of NOW, a
+// bundle.json manifest, and a generated gtest source whose body is one
+// call to run_replay_regression - so the emitted test never drifts
+// from the library. Returns the golden emission count.
+//
+//   <out_dir>/bundle.json                      manifest (op, subtask, epoch, ...)
+//   <out_dir>/capture/op-<id>/subtask-<s>/...  the epoch + sidecar, copied
+//   <out_dir>/state/<s>/checkpoint-<N>.snap    the starting state (if any)
+//   <out_dir>/golden.ndjson                    the expected emissions
+//   <out_dir>/replay_regression_test.cpp       add to a test target linking clink::sql
+std::size_t emit_replay_regression(const ReplayRequest& request, const std::string& out_dir);
+
+// Replay the bundle at `bundle_dir` and compare to its golden file.
+// Returns an empty string on success, otherwise a human-readable
+// failure (first divergence / count mismatch / load error). The body
+// of every generated regression test.
+std::string run_replay_regression(const std::string& bundle_dir);
 
 // Render one emitted Row like the print sink does (changelog kinds
 // prefixed, the marker stripped).
