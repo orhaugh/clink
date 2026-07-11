@@ -24,6 +24,8 @@ int clink_cmd_state_cat(int argc, char** argv);
 int clink_cmd_state_export(int argc, char** argv);
 int clink_cmd_state_query(int argc, char** argv);
 int clink_cmd_capture_cat(int argc, char** argv);
+int clink_cmd_capture_push(int argc, char** argv);
+int clink_cmd_capture_fetch(int argc, char** argv);
 int clink_cmd_replay(int argc, char** argv);
 int clink_cmd_replay_diff(int argc, char** argv);
 int clink_cmd_rescale(int argc, char** argv);
@@ -49,6 +51,8 @@ void usage() {
         << "  state-export      Write keyed state as one Arrow IPC stream file.\n"
         << "  state-query       Run SQL over a checkpoint/savepoint's keyed state.\n"
         << "  capture-cat       Inspect record-capture flight-recorder epochs.\n"
+        << "  capture-push      Upload a capture tree to object storage (retention).\n"
+        << "  capture-fetch     Download a pushed capture tree for local replay.\n"
         << "  replay            Replay a captured epoch offline (one operator or whole job).\n"
         << "  replay-diff       Diff two replay emission dumps (first divergence).\n"
         << "  rescale           Change a running job's per-role parallelism.\n"
@@ -110,6 +114,12 @@ int main(int argc, char** argv) {
     }
     if (cmd == "capture-cat") {
         return clink_cmd_capture_cat(sub_argc, sub_argv);
+    }
+    if (cmd == "capture-push") {
+        return clink_cmd_capture_push(sub_argc, sub_argv);
+    }
+    if (cmd == "capture-fetch") {
+        return clink_cmd_capture_fetch(sub_argc, sub_argv);
     }
     if (cmd == "replay") {
         return clink_cmd_replay(sub_argc, sub_argv);

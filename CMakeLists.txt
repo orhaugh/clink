@@ -763,6 +763,7 @@ add_library(clink_cli_cmds OBJECT
     tools/clink_savepoint.cpp
     tools/clink_check_savepoint.cpp
     tools/clink_state_diff.cpp
+    tools/clink_capture_sync.cpp
     tools/clink_list.cpp
 )
 target_link_libraries(clink_cli_cmds PUBLIC clink::core)

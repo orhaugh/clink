@@ -932,7 +932,10 @@ last night's bytes?" - is one diff: replay the epoch through two builds
 `identical`. `--emit-test=<dir>` goes one further and freezes the epoch
 into a self-contained regression bundle (capture + state + golden
 emissions + a generated gtest source): the incident becomes a permanent,
-byte-exact test in one command.
+byte-exact test in one command. `clink capture-push` / `capture-fetch`
+ship capture trees to object storage beside the checkpoints and pull
+them back (optionally one epoch) onto any machine - so "reproduce the
+3am incident locally, in a debugger" starts with a fetch.
 
 Details:
 [docs/internals/fault-tolerance-and-rescale.md](docs/internals/fault-tolerance-and-rescale.md).

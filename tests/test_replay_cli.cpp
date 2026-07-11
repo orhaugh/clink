@@ -200,5 +200,22 @@ TEST(ReplayCli, WindowedEpochReplaysTheLiveEmissionsAndVerifiesDeterministic) {
     const auto regression_error = clink::sql::run_replay_regression(bundle.string());
     EXPECT_NE(regression_error.find("first divergence"), std::string::npos) << regression_error;
 
+    // Retention round trip: push the capture tree to an Arrow-filesystem
+    // remote (file:// exercises the same machinery as s3://), fetch it
+    // back, and replay the fetched tree - still deterministic.
+    const auto pushed = run_cmd(cli + " capture-push --dir=" + (dir / "capture").string() +
+                                " --to=file://" + (dir / "remote").string());
+    ASSERT_EQ(pushed.exit_code, 0) << pushed.output;
+    const auto fetched = run_cmd(cli + " capture-fetch --from=file://" + (dir / "remote").string() +
+                                 " --dir=" + (dir / "fetched").string() + " --epoch=1");
+    ASSERT_EQ(fetched.exit_code, 0) << fetched.output;
+    const auto refetch_verify =
+        run_cmd(cli + " replay --capture-dir=" + (dir / "fetched").string() +
+                " --checkpoint-dir=" + (dir / "ckpt").string() + " --epoch=1 --verify");
+    EXPECT_EQ(refetch_verify.exit_code, 0) << refetch_verify.output;
+    EXPECT_NE(refetch_verify.output.find("every replayed operator byte-identical"),
+              std::string::npos)
+        << refetch_verify.output;
+
     fs::remove_all(dir);
 }
