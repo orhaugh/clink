@@ -93,6 +93,8 @@ Bind timing and counters are recorded through `clink::metrics::sql` (`clink_sql_
 
 The optimiser never throws on a valid bound plan. A pass that throws is a planner bug: `optimize()` catches it, increments `clink_sql_optimize_errors_total`, logs a warning, and returns the un- or partially-optimised plan (still valid and runnable). The single residual case, a `std::bad_alloc` mid-reorder that leaves a null child, is rejected later by the physical planner's null-child backstop as a clean compile error rather than a crash.
 
+The whole stats-to-cost chain is observable through `EXPLAIN` (the statement or `--explain`): the plan is optimised first, so the output shows the tree that would actually run (join reorders and pushdowns applied), and `explain_with_estimates` (`cardinality.hpp`) suffixes every node with its estimated output rows - exactly the numbers the join reorderer compared. A scan whose table declares no statistics is flagged `no declared stats` (its default cardinality is a relative-comparison placeholder, not a measurement); run `ANALYZE TABLE <t>` (`src/sql/analyze.cpp`, bounded relations - exact row count, per-column NDV, equi-width histograms, MCVs written back to the catalog's WITH options) or declare `row_count` / `ndv_<col>` to ground the estimates.
+
 ### Stage 6: the physical planner
 
 `PhysicalPlanner::compile(const LogicalSink&)` (`src/sql/physical_plan.cpp`) walks the logical tree and emits a `cluster::JobGraphSpec`. It first runs `require_no_null_children` as a backstop, then `decide_channel` picks the wire channel from the source-side scan and cross-checks it against the sink, then `compile_node` recurses, then `mark_changelog_producers` runs a post-pass, then `spec.validate()`.

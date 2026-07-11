@@ -133,6 +133,38 @@ TEST(SqlCli, ExplainPrintsLogicalPlanTree) {
     EXPECT_NE(result.stdout_text.find("VARCHAR"), std::string::npos);
 }
 
+// EXPLAIN annotates every node with its estimated output rows (the numbers
+// the cost-based join reorderer compares); a scan with no declared statistics
+// is flagged so the default placeholder is not mistaken for a measurement.
+TEST(SqlCli, ExplainAnnotatesCardinalities) {
+    auto result = run_compiler(
+        "--explain -e \"CREATE TABLE s (line TEXT) WITH (connector='file', path='/x'); "
+        "CREATE TABLE d (line TEXT) WITH (connector='file', path='/y'); "
+        "INSERT INTO d SELECT line FROM s\"");
+    EXPECT_EQ(result.exit_code, 0) << "stderr: " << result.stderr_text;
+    EXPECT_NE(result.stdout_text.find("(rows="), std::string::npos) << result.stdout_text;
+    EXPECT_NE(result.stdout_text.find("no declared stats"), std::string::npos)
+        << result.stdout_text;
+}
+
+// With declared statistics the scan shows the declared cardinality (no flag)
+// and a WHERE shows the selectivity-reduced estimate on the Filter node.
+TEST(SqlCli, ExplainShowsDeclaredStatsEstimates) {
+    auto result = run_compiler(
+        "--explain -e \"CREATE TABLE ev (k BIGINT, v BIGINT) WITH (connector='file', "
+        "format='json', path='/x', row_count='1000', ndv_k='10'); "
+        "CREATE TABLE out_t (k BIGINT, v BIGINT) WITH (connector='file', format='json', "
+        "path='/y'); "
+        "INSERT INTO out_t SELECT k, v FROM ev WHERE k = 3\"");
+    EXPECT_EQ(result.exit_code, 0) << "stderr: " << result.stderr_text;
+    // Scan: the declared 1000 rows, unflagged. Filter: k = 3 with NDV(k)=10
+    // estimates 1000/10 = 100 rows.
+    EXPECT_NE(result.stdout_text.find("(rows=1000)"), std::string::npos) << result.stdout_text;
+    EXPECT_NE(result.stdout_text.find("(rows=100)"), std::string::npos) << result.stdout_text;
+    EXPECT_EQ(result.stdout_text.find("no declared stats"), std::string::npos)
+        << result.stdout_text;
+}
+
 TEST(SqlCli, ParseErrorExitsNonZeroWithDiagnostic) {
     auto result = run_compiler("-e \"SELECT FROM WHERE\"");
     EXPECT_NE(result.exit_code, 0);

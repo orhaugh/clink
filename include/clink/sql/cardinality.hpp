@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,7 @@
 #include "clink/config/json.hpp"
 #include "clink/sql/logical_plan.hpp"
 #include "clink/sql/statistics.hpp"
+#include "clink/sql/type.hpp"
 
 namespace clink::sql {
 
@@ -410,6 +412,65 @@ inline RelStats estimate_stats(const LogicalPlan& node) {
 // Convenience: estimated output row count of a plan node.
 inline double estimate_rows(const LogicalPlan& node) {
     return estimate_stats(node).row_count;
+}
+
+namespace cardinality_detail {
+
+// Render an estimated row count for EXPLAIN: integral formatting for the
+// realistic range, scientific for the astronomically large products a chain
+// of default estimates can produce.
+inline std::string fmt_rows(double r) {
+    if (!(r >= 0.0)) {
+        r = 0.0;  // NaN / negative: clamp for display
+    }
+    std::ostringstream os;
+    if (r >= 1e15) {
+        os.setf(std::ios::scientific, std::ios::floatfield);
+        os.precision(2);
+        os << r;
+    } else {
+        os << static_cast<long long>(std::llround(r));
+    }
+    return os.str();
+}
+
+}  // namespace cardinality_detail
+
+// EXPLAIN rendering with cardinality annotations: the same tree layout as
+// LogicalPlan::explain(), each node suffixed with its estimated output rows
+// from estimate_stats() - exactly the numbers the cost-based join reorderer
+// compared, so a reorder (or its absence) can be understood from the output.
+// A scan whose table declares no statistics is flagged: its default
+// cardinality is a placeholder for relative comparison, not a measurement
+// (run ANALYZE TABLE or declare row_count to ground it).
+inline std::string explain_with_estimates(const LogicalPlan& node, int indent = 0) {
+    std::ostringstream out;
+    out << std::string(static_cast<std::size_t>(indent) * 2, ' ') << node.kind();
+    auto s = node.schema();
+    if (s) {
+        out << "  [";
+        for (int i = 0; i < s->num_fields(); ++i) {
+            if (i > 0) {
+                out << ", ";
+            }
+            out << s->field(i)->name() << " " << arrow_to_sql_type_string(*s->field(i)->type());
+        }
+        out << "]";
+    }
+    out << "  (rows=" << cardinality_detail::fmt_rows(estimate_rows(node));
+    if (node.kind() == "Scan") {
+        const auto& scan = static_cast<const LogicalScan&>(node);
+        if (!table_stats_from(scan.table()).row_count_known()) {
+            out << ", no declared stats";
+        }
+    }
+    out << ")\n";
+    for (const auto* child : node.inputs()) {
+        if (child != nullptr) {
+            out << explain_with_estimates(*child, indent + 1);
+        }
+    }
+    return out.str();
 }
 
 }  // namespace clink::sql

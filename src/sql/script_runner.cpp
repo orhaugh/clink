@@ -15,6 +15,7 @@
 #include "clink/plugin/plugin.hpp"
 #include "clink/sql/analyze.hpp"
 #include "clink/sql/binder.hpp"
+#include "clink/sql/cardinality.hpp"
 #include "clink/sql/install.hpp"
 #include "clink/sql/materialized_view.hpp"
 #include "clink/sql/optimizer.hpp"
@@ -222,7 +223,7 @@ int run_script(const std::string& sql,
             auto plan = binder.bind_insert(ins);
             plan = optimize(std::move(plan));
             if (opts.explain) {
-                out << plan->explain();
+                out << explain_with_estimates(*plan);
                 return 0;
             }
             const auto& sink = static_cast<const LogicalSink&>(*plan);
@@ -235,11 +236,13 @@ int run_script(const std::string& sql,
             if (std::holds_alternative<std::unique_ptr<ast::ExplainStmt>>(stmt)) {
                 const auto& exp = *std::get<std::unique_ptr<ast::ExplainStmt>>(stmt);
                 if (std::holds_alternative<ast::InsertStmt>(exp.query)) {
-                    auto plan = binder.bind_insert(std::get<ast::InsertStmt>(exp.query));
-                    out << plan->explain();
+                    // Optimize before rendering so EXPLAIN shows the plan that
+                    // would actually run (join reorders, pushdowns applied).
+                    auto plan = optimize(binder.bind_insert(std::get<ast::InsertStmt>(exp.query)));
+                    out << explain_with_estimates(*plan);
                 } else if (std::holds_alternative<ast::SelectStmt>(exp.query)) {
-                    auto plan = binder.bind_select(std::get<ast::SelectStmt>(exp.query));
-                    out << plan->explain();
+                    auto plan = optimize(binder.bind_select(std::get<ast::SelectStmt>(exp.query)));
+                    out << explain_with_estimates(*plan);
                 } else {
                     err << "error: EXPLAIN only supports SELECT / INSERT INTO\n";
                     return 1;
@@ -384,7 +387,7 @@ int run_script(const std::string& sql,
                 const bool full_refresh = mvplan.arm == RefreshArm::Full;
                 auto plan = optimize(std::move(mvplan.maintenance));
                 if (opts.explain) {
-                    out << plan->explain();
+                    out << explain_with_estimates(*plan);
                 } else {
                     const auto& sink = static_cast<const LogicalSink&>(*plan);
                     auto spec = planner.compile(sink);
@@ -411,7 +414,7 @@ int run_script(const std::string& sql,
                 const auto& rf = std::get<ast::RefreshMatViewStmt>(stmt);
                 auto plan = optimize(plan_materialized_view_refresh(rf.view_name, catalog));
                 if (opts.explain) {
-                    out << plan->explain();
+                    out << explain_with_estimates(*plan);
                 } else {
                     const auto& sink = static_cast<const LogicalSink&>(*plan);
                     auto spec = planner.compile(sink);
@@ -486,8 +489,8 @@ int run_script(const std::string& sql,
             if (std::holds_alternative<ast::SelectStmt>(stmt)) {
                 auto& sel = std::get<ast::SelectStmt>(stmt);
                 if (opts.explain) {
-                    auto plan = binder.bind_select(sel);
-                    out << plan->explain();
+                    auto plan = optimize(binder.bind_select(sel));
+                    out << explain_with_estimates(*plan);
                 } else if (opts.bare_select_to_collect != nullptr) {
                     // Bind the SELECT for its output schema and synthesise a
                     // connector='collect' sink table carrying that schema -
