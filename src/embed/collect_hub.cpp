@@ -8,6 +8,7 @@
 #include "clink/plugin/plugin.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
+#include "clink/sql/row_kind.hpp"
 
 namespace clink::embed {
 
@@ -133,8 +134,14 @@ namespace {
 // alike, so a reader never waits on a dead job.
 class CollectSink final : public Sink<sql::Row> {
 public:
-    CollectSink(std::string scope, std::string table, ArrowBatcher<sql::Row> batcher)
-        : scope_(std::move(scope)), table_(std::move(table)), batcher_(std::move(batcher)) {}
+    CollectSink(std::string scope,
+                std::string table,
+                ArrowBatcher<sql::Row> batcher,
+                bool changelog)
+        : scope_(std::move(scope)),
+          table_(std::move(table)),
+          batcher_(std::move(batcher)),
+          changelog_(changelog) {}
 
     void open() override {
         auto hub = CollectScopeRegistry::instance().find(scope_);
@@ -152,6 +159,35 @@ public:
         if (batch.empty() || !queue_) {
             return;
         }
+        if (changelog_) {
+            // Surface each row's changelog kind as the declared leading
+            // row_kind column (insert when unmarked) so the host sees the
+            // changelog instead of a silent flatten into inserts.
+            Batch<sql::Row> tagged;
+            for (const auto& rec : batch) {
+                sql::Row row = rec.value();
+                row.values["row_kind"] = config::JsonValue{sql::row_kind_of(row)};
+                if (rec.event_time().has_value()) {
+                    tagged.emplace(std::move(row), *rec.event_time());
+                } else {
+                    tagged.emplace(std::move(row));
+                }
+            }
+            push_batch_(tagged);
+            return;
+        }
+        push_batch_(batch);
+    }
+
+    void close() override {
+        if (queue_) {
+            queue_->producer_close();
+            queue_.reset();
+        }
+    }
+
+private:
+    void push_batch_(const Batch<sql::Row>& batch) {
         if (auto rb = batcher_.build(batch)) {
             // The schema-driven batcher prepends the engine's event-time
             // column (the wire layout); the host must see exactly the
@@ -164,17 +200,10 @@ public:
         }
     }
 
-    void close() override {
-        if (queue_) {
-            queue_->producer_close();
-            queue_.reset();
-        }
-    }
-
-private:
     std::string scope_;
     std::string table_;
     ArrowBatcher<sql::Row> batcher_;
+    bool changelog_{false};
     std::shared_ptr<CollectQueue> queue_;
 };
 
@@ -197,9 +226,15 @@ void install_collect_sink() {
                 if (table.empty()) {
                     throw std::runtime_error("collect_sink_row: 'collect_table' is required");
                 }
-                auto batcher = sql::make_row_columnar_arrow_batcher(
-                    sql::parse_row_schema(ctx.param_or("schema_columns")));
-                return std::make_shared<CollectSink>(scope, table, std::move(batcher));
+                const bool changelog = ctx.param_or("collect_changelog", "") == "true";
+                auto cols = sql::parse_row_schema(ctx.param_or("schema_columns"));
+                if (changelog) {
+                    // The leading changelog-kind column the host sees; the
+                    // reader prepends the identical field to its schema.
+                    cols.insert(cols.begin(), sql::RowColumn{"row_kind", arrow::utf8()});
+                }
+                auto batcher = sql::make_row_columnar_arrow_batcher(std::move(cols));
+                return std::make_shared<CollectSink>(scope, table, std::move(batcher), changelog);
             });
     });
 }

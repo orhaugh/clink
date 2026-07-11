@@ -744,8 +744,23 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         // the Arrow C stream interface. The embedded engine stamps its scope
         // token onto this op at submit; without one (a cluster submit) the
         // factory refuses to build - collect is embedded-only by design.
-        return RowConnectorBinding{
-            "collect_sink_row", kChannelRow, "", {{"collect_table", table.name}}};
+        // changelog='true' opts the table into retracting SELECTs: the sink
+        // prepends a row_kind utf8 column (insert / delete / update_before /
+        // update_after) so the host sees the changelog rather than a silent
+        // flatten; the reader prepends the same column to its schema.
+        std::map<std::string, std::string> params{{"collect_table", table.name}};
+        auto chit = table.properties.find("changelog");
+        if (chit != table.properties.end() && chit->second == "true") {
+            for (const auto& c : table.columns) {
+                if (c.name == "row_kind") {
+                    unsupported(
+                        "connector='collect' with changelog='true' reserves the leading "
+                        "'row_kind' column; rename the declared 'row_kind' column");
+                }
+            }
+            params.emplace("collect_changelog", "true");
+        }
+        return RowConnectorBinding{"collect_sink_row", kChannelRow, "", std::move(params)};
     }
     if (connector == "changelog") {
         // Nets a changelog stream (insert/delete/update_*) into its final

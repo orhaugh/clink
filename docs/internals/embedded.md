@@ -125,9 +125,19 @@ arrives; end-of-stream fires when the producing job's sink subtasks have
 all closed (completion, failure and cancellation all close, so a reader
 never waits on a dead job); closing the engine wakes blocked readers with a
 cancelled status, and an exported stream stays safe to drain and release
-after the engine is gone (it keeps its queue alive). Collect is
-append-only in v1: a retracting (changelog) SELECT is rejected at bind so
-retractions are never silently flattened into inserts.
+after the engine is gone (it keeps its queue alive).
+
+Changelog semantics: a plain collect table is append-only - a retracting
+(changelog) SELECT is rejected at bind so retractions are never silently
+flattened into inserts. Declaring the table with `changelog='true'` opts
+in: the Arrow stream then carries a leading `row_kind` utf8 column
+(`insert` / `delete` / `update_before` / `update_after`) ahead of the
+declared columns, populated by the sink from each row's changelog kind
+(unmarked rows are inserts), and the host applies the changelog itself -
+add on insert/update_after, remove on delete/update_before. The reader
+prepends the identical field to its schema, so both sides stay
+byte-identical; a declared column named `row_kind` is rejected as
+reserved in this mode.
 
 pyclink (`python/pyclink/`) is pure Python over this ABI: ctypes bindings,
 no compiled extension, with collect streams imported straight into

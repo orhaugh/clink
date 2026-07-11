@@ -187,7 +187,14 @@ arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> EmbeddedEngine::collect
     // and both strip the batcher's prepended engine event-time column so
     // the host sees exactly the declared SELECT columns.
     std::vector<sql::RowColumn> cols;
-    cols.reserve(def->columns.size());
+    cols.reserve(def->columns.size() + 1);
+    auto chit = def->properties.find("changelog");
+    if (chit != def->properties.end() && chit->second == "true") {
+        // Changelog-aware collect: the sink prepends the row-kind column
+        // (insert / delete / update_before / update_after) - mirror it here
+        // so both schemas stay byte-identical.
+        cols.push_back(sql::RowColumn{"row_kind", arrow::utf8()});
+    }
     for (const auto& c : def->columns) {
         cols.push_back(sql::RowColumn{c.name, c.type});
     }

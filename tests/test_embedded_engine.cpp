@@ -274,10 +274,80 @@ TEST(EmbeddedEngine, CollectReaderDeliversTypedBatchesAndEos) {
     fs::remove(in_path);
 }
 
+TEST(EmbeddedEngine, CollectChangelogStreamsRowKinds) {
+    // connector='collect' with changelog='true' accepts a retracting SELECT
+    // and prepends a row_kind utf8 column to the Arrow stream. TOP-1 per
+    // user: user 1's best improves 10 -> 30, so retractions must appear,
+    // and applying the changelog reconstructs the final TOP-1 relation.
+    const auto in_path = fs::temp_directory_path() / "clink_embed_collect_clog_in.ndjson";
+    fs::remove(in_path);
+    write_orders(in_path);
+
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    ASSERT_EQ(engine.execute_script(orders_ddl(in_path) +
+                                    "CREATE TABLE topn (user_id BIGINT, amount BIGINT) "
+                                    "WITH (connector='collect', changelog='true')"),
+              0)
+        << err.str();
+
+    auto reader_r = engine.collect_reader("topn");
+    ASSERT_TRUE(reader_r.ok()) << reader_r.status().ToString();
+    auto reader = *reader_r;
+    ASSERT_EQ(reader->schema()->num_fields(), 3);
+    EXPECT_EQ(reader->schema()->field(0)->name(), "row_kind");
+    EXPECT_TRUE(reader->schema()->field(0)->type()->Equals(arrow::utf8()));
+    EXPECT_EQ(reader->schema()->field(1)->name(), "user_id");
+
+    ASSERT_EQ(engine.execute_script(
+                  "INSERT INTO topn SELECT user_id, amount FROM ("
+                  "  SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY amount DESC) AS "
+                  "rn FROM orders) ranked WHERE rn <= 1"),
+              0)
+        << err.str();
+
+    // Apply the changelog: add on insert/update_after, remove on
+    // delete/update_before. The surviving relation is the final TOP-1.
+    std::map<std::pair<std::int64_t, std::int64_t>, int> relation;  // (user, amount) -> count
+    bool saw_retraction = false;
+    while (true) {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        auto st = reader->ReadNext(&batch);
+        ASSERT_TRUE(st.ok()) << st.ToString();
+        if (!batch) {
+            break;
+        }
+        ASSERT_TRUE(batch->schema()->Equals(*reader->schema()));
+        const auto& kinds = static_cast<const arrow::StringArray&>(*batch->column(0));
+        const auto& users = static_cast<const arrow::Int64Array&>(*batch->column(1));
+        const auto& amounts = static_cast<const arrow::Int64Array&>(*batch->column(2));
+        for (std::int64_t i = 0; i < batch->num_rows(); ++i) {
+            const auto kind = kinds.GetString(i);
+            const auto key = std::make_pair(users.Value(i), amounts.Value(i));
+            if (kind == "insert" || kind == "update_after") {
+                ++relation[key];
+            } else {
+                ASSERT_TRUE(kind == "delete" || kind == "update_before") << kind;
+                saw_retraction = true;
+                if (--relation[key] == 0) {
+                    relation.erase(key);
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(saw_retraction);
+    const std::map<std::pair<std::int64_t, std::int64_t>, int> expected{{{1, 30}, 1}, {{2, 20}, 1}};
+    EXPECT_EQ(relation, expected);
+    EXPECT_TRUE(engine.await_all()) << err.str();
+    fs::remove(in_path);
+}
+
 TEST(EmbeddedEngine, CollectRejectsChangelogSelect) {
-    // connector='collect' is append-only in v1: the typed batches carry no
-    // changelog kind, so a retracting SELECT must be rejected at bind, not
-    // silently flattened into inserts.
+    // connector='collect' WITHOUT changelog='true' stays append-only: the
+    // typed batches carry no changelog kind, so a retracting SELECT must be
+    // rejected at bind, not silently flattened into inserts.
     const auto in_path = fs::temp_directory_path() / "clink_embed_collect_cl_in.ndjson";
     fs::remove(in_path);
     write_orders(in_path);
