@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -80,6 +81,34 @@ pid_t spawn_proc(const std::vector<std::string>& argv, const std::filesystem::pa
     raw.push_back(nullptr);
     pid_t pid = -1;
     const auto rc = posix_spawn(&pid, binary.c_str(), nullptr, nullptr, raw.data(), environ);
+    return rc == 0 ? pid : -1;
+}
+
+// Like spawn_proc, but redirects the child's stdout AND stderr to `log_path`.
+// A spawned JM/TM/submitter otherwise INHERITS the harness's stdout. Under a
+// captured-pipe harness (ctest) that is a real hazard: a long-lived child holds
+// the pipe's write end open, so the reader never sees EOF and the test's own
+// process is reported as a hang/timeout even after it finishes - and a child
+// blocked writing to a momentarily-full pipe can stall the job itself. Writing
+// each child's output to its own file removes both hazards and keeps the logs
+// available for diagnosing a failure. (The bench harness does the same thing;
+// this is a local copy so the 2PC ITs need no shared header.)
+pid_t spawn_proc_logged(const std::vector<std::string>& argv,
+                        const std::filesystem::path& binary,
+                        const std::filesystem::path& log_path) {
+    std::vector<char*> raw;
+    raw.reserve(argv.size() + 1);
+    for (const auto& s : argv)
+        raw.push_back(const_cast<char*>(s.c_str()));
+    raw.push_back(nullptr);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(
+        &fa, STDOUT_FILENO, log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    posix_spawn_file_actions_adddup2(&fa, STDOUT_FILENO, STDERR_FILENO);
+    pid_t pid = -1;
+    const auto rc = posix_spawn(&pid, binary.c_str(), &fa, nullptr, raw.data(), environ);
+    posix_spawn_file_actions_destroy(&fa);
     return rc == 0 ? pid : -1;
 }
 
@@ -410,4 +439,164 @@ TEST(TwoPhaseCommit, RecoveryCommitsPreCommittedFilesOnRestart) {
     EXPECT_EQ(distinct.size(), lines.size())
         << "duplicate committed records after restart (" << lines.size() << " lines, "
         << distinct.size() << " distinct): the source re-emitted instead of resuming";
+}
+
+// F1 - end-to-end exactly-once INVARIANCE across an AUTOMATIC (JM-driven)
+// TaskManager-loss failover. This is the gap the two tests above each leave
+// half-covered:
+//   * RecoveryCommitsPreCommittedFilesOnRestart uses a MANUAL restore into a
+//     FRESH cluster and explicitly WAIVES no-loss (a fresh JM resets its
+//     checkpoint counter, so run-2's committed filenames can collide with
+//     run-1's - it can only assert no-duplicates + progress, not full count).
+//   * test_tm_crash_recovery drives the automatic failover but asserts nothing
+//     about the sink output.
+// Here the JM SURVIVES (only the TM hosting the job is SIGKILLed), so the JM's
+// per-job checkpoint counter stays monotonic across the redeploy (verified:
+// next_checkpoint_id is only ever ++'d, never reset, and rides the surviving
+// job state). Monotonic ids mean the 2PC sink's committed/sub<N>-<ckpt>.dat
+// filenames never collide, so the committed set is the union of pre- and
+// post-crash checkpoints with no overwrite. We can therefore assert the
+// strongest property: the committed output equals an uninterrupted run as an
+// exact multiset - every record-0..N-1 present EXACTLY once.
+//
+// Why this catches both exactly-once failure modes:
+//   * DUPLICATE (source restored offset 0 and replayed pre-crash records, or
+//     the sink committed at the barrier instead of at checkpoint-complete):
+//     lines.size() > N and distinct.size() < lines.size().
+//   * LOSS (an uncommitted record was skipped on resume): lines.size() < N and
+//     distinct != golden.
+// Mutation checks that MUST turn this red (proving it is not trivially green):
+//   (a) make BoundedSlowStringSource::restore_offset return false / force
+//       counter_ = 0 -> replay-from-0 -> duplicates;
+//   (b) move the file_2pc sink's staging->committed rename from on_commit
+//       (checkpoint-complete) to on_barrier (prepare) -> early commit of the
+//       uncommitted tail -> duplicates on resume.
+// The uninterrupted golden itself is established empirically by
+// HappyPathExactlyOnceCommittedFiles above (an uncrashed run commits exactly
+// {record-0..record-(N-1)}); the source is deterministic, so that set is the
+// golden this test compares against.
+TEST(TwoPhaseCommit, TmKillMidStreamIsExactlyOnce) {
+    const auto submit = submit_binary_path();
+    const auto job_so = two_phase_commit_job_path();
+    const auto node = node_binary_path();
+    if (!std::filesystem::exists(submit) || !std::filesystem::exists(job_so) ||
+        !std::filesystem::exists(node)) {
+        GTEST_SKIP() << "cluster binaries / 2pc job not built (need -DCLINK_INTEGRATION_TESTS=ON)";
+    }
+
+    constexpr int kTotal = 80;
+    const auto out_dir = mktmpdir("eo_out");
+    const auto ckpt_dir = mktmpdir("eo_ckpt");
+    const auto log_dir = mktmpdir("eo_log");
+    ::setenv("CLINK_2PC_OUT_DIR", out_dir.c_str(), 1);
+    ::setenv("CLINK_2PC_TOTAL", std::to_string(kTotal).c_str(), 1);
+    ::setenv("CLINK_2PC_TICK_MS", "30", 1);  // ~2.4s of clean runtime
+
+    // JM with a short-but-safe loss window (well above the TM's 500ms
+    // heartbeat interval so a healthy TM is never wrongly declared lost). All
+    // spawns redirect their output to per-process log files under log_dir (see
+    // spawn_proc_logged): a JM/TM inheriting a captured stdout pipe would hang
+    // the harness.
+    const auto port = probe_free_port();
+    const pid_t jm = spawn_proc_logged({"clink_node",
+                                        "--role=jm",
+                                        "--port=" + std::to_string(port),
+                                        "--bind-host=127.0.0.1",
+                                        "--heartbeat-timeout-ms=1500",
+                                        "--watchdog-interval-ms=100"},
+                                       node,
+                                       log_dir / "jm.log");
+    ASSERT_GT(jm, 0);
+    ASSERT_TRUE(await_port_open(port, 2s));
+
+    auto spawn_tm = [&](const std::string& id) {
+        return spawn_proc_logged({"clink_node",
+                                  "--role=tm",
+                                  "--id=" + id,
+                                  "--jm-host=127.0.0.1",
+                                  "--jm-port=" + std::to_string(port),
+                                  "--slots=4"},
+                                 node,
+                                 log_dir / (id + ".log"));
+    };
+
+    // ONE TM at submit time, so both subtasks deterministically land on it
+    // and the later kill is guaranteed to hit the TM hosting the job.
+    const pid_t tm_a = spawn_tm("tm-eo-A");
+    ASSERT_GT(tm_a, 0);
+    std::this_thread::sleep_for(500ms);  // tm-A registers
+
+    const pid_t submit_pid = spawn_proc_logged({"clink_submit_job",
+                                                "--job=" + job_so.string(),
+                                                "--jm-host=127.0.0.1",
+                                                "--jm-port=" + std::to_string(port),
+                                                "--wait-timeout-s=60",
+                                                "--checkpoint-dir=" + ckpt_dir.string(),
+                                                "--checkpoint-interval-ms=100",
+                                                "--max-restarts-on-tm-loss=3"},
+                                               submit,
+                                               log_dir / "submit.log");
+    ASSERT_GT(submit_pid, 0);
+
+    // Precondition: at least one checkpoint completes before the kill, so the
+    // source has a durable offset to resume from. Without this gate a kill
+    // could land before any state exists and the run would prove nothing.
+    const auto ckpt_deadline = std::chrono::steady_clock::now() + 8s;
+    while (std::chrono::steady_clock::now() < ckpt_deadline &&
+           latest_completed_checkpoint(ckpt_dir) == 0) {
+        std::this_thread::sleep_for(25ms);
+    }
+    const auto ckpt_before = latest_completed_checkpoint(ckpt_dir);
+    ASSERT_GT(ckpt_before, 0u) << "no checkpoint completed before the kill";
+
+    // Bring up the survivor (so a free slot exists for the redeploy), then
+    // SIGKILL the TM hosting the job. Watchdog -> tm lost -> redeploy onto
+    // tm-B, restoring from the last completed checkpoint.
+    const pid_t tm_b = spawn_tm("tm-eo-B");
+    ASSERT_GT(tm_b, 0);
+    std::this_thread::sleep_for(500ms);  // tm-B registers
+    kill_quietly(tm_a);
+
+    // Wait past the submitter's own --wait-timeout-s=60 so its exit code is
+    // the authoritative signal: on recovery it exits 0; if the job never
+    // recovers it self-times-out and exits non-zero (a clean assertion below,
+    // not a harness timeout).
+    int submit_exit = -1;
+    const bool exited = wait_for_exit(submit_pid, 70s, &submit_exit);
+
+    // Absorb the terminal staging->committed flush lag: the submitter can see
+    // JobCompleted a hair before the final rename is on disk.
+    std::vector<std::string> lines;
+    const auto poll = std::chrono::steady_clock::now() + 10s;
+    do {
+        lines = read_all_committed_lines(out_dir);
+        if (lines.size() >= static_cast<std::size_t>(kTotal))
+            break;
+        std::this_thread::sleep_for(50ms);
+    } while (std::chrono::steady_clock::now() < poll);
+
+    const auto ckpt_after = latest_completed_checkpoint(ckpt_dir);
+    kill_quietly(tm_b);
+    kill_quietly(jm);
+
+    ASSERT_TRUE(exited) << "submitter never exited after the TM kill";
+    EXPECT_EQ(submit_exit, 0) << "job did not recover from the SIGKILL";
+    EXPECT_GT(ckpt_after, ckpt_before) << "no NEW checkpoint after restart - job did not resume";
+
+    std::set<std::string> golden;
+    for (int i = 0; i < kTotal; ++i)
+        golden.insert("record-" + std::to_string(i));
+    const std::set<std::string> distinct(lines.begin(), lines.end());
+
+    // (count) exact cardinality: a duplicate pushes it above N, a loss below.
+    EXPECT_EQ(lines.size(), static_cast<std::size_t>(kTotal))
+        << "committed record count != " << kTotal << " across the kill (duplicate or loss)";
+    // (no duplicate) no record committed twice.
+    EXPECT_EQ(distinct.size(), lines.size())
+        << "a record was committed twice across the kill - not exactly-once (source replayed, "
+           "or the sink committed before the checkpoint was durable)";
+    // (multiset equality) load-bearing: no loss, no unexpected record, vs the
+    // uninterrupted golden run.
+    EXPECT_EQ(distinct, golden)
+        << "committed set differs from the uninterrupted run - a record was lost or unexpected";
 }
