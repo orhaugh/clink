@@ -367,10 +367,15 @@ TEST(SqlPreparse, MatchRecognizeRejections) {
     EXPECT_THROW((void)parse("SELECT * FROM e MATCH_RECOGNIZE (ORDER BY ts PATTERN (a) "
                              "DEFINE a AS x>0)"),
                  TranslationError);
-    // ALL ROWS PER MATCH not supported
-    EXPECT_THROW((void)parse("SELECT * FROM e MATCH_RECOGNIZE (PARTITION BY k ORDER BY ts "
-                             "ALL ROWS PER MATCH PATTERN (a) DEFINE a AS x>0)"),
-                 TranslationError);
+    // ALL ROWS PER MATCH parses and sets the flag (accepted since v2)
+    {
+        auto script = parse(
+            "SELECT * FROM e MATCH_RECOGNIZE (PARTITION BY k ORDER BY ts "
+            "ALL ROWS PER MATCH PATTERN (a) DEFINE a AS x>0)");
+        const auto& sel = std::get<ast::SelectStmt>(script.statements[0]);
+        const auto& mrc = *std::get<std::unique_ptr<ast::MatchRecognizeClause>>(sel.from_items[0]);
+        EXPECT_TRUE(mrc.all_rows);
+    }
     // MEASURES item without AS
     EXPECT_THROW((void)parse("SELECT * FROM e MATCH_RECOGNIZE (PARTITION BY k ORDER BY ts "
                              "MEASURES LAST(a.x) PATTERN (a) DEFINE a AS x>0)"),

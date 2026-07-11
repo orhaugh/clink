@@ -2647,6 +2647,144 @@ TEST(SqlRuntime, MatchRecognizeMatchesEndToEnd) {
     EXPECT_EQ(static_cast<std::int64_t>(r.values.at("final_price").as_number()), 250);
 }
 
+TEST(SqlRuntime, MatchRecognizePrevInDefineMatchesTheClassicV) {
+    // The canonical PREV pattern: a fall then a rise. down rows must be
+    // strictly below the PREVIOUS row, up rows strictly above - only
+    // expressible with PREV(), which v1 rejected.
+    ensure_sql_installed_once();
+
+    Catalog cat;
+    auto ddl = parse(
+        std::string{"CREATE TABLE events (user_id BIGINT, ts BIGINT, price BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/mr_prev_ev.ndjson');"
+                    "CREATE TABLE out_mr (user_id BIGINT, s BIGINT, bottom BIGINT, top BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/mr_prev_out.ndjson')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat,
+                        "INSERT INTO out_mr SELECT * FROM events MATCH_RECOGNIZE ("
+                        "  PARTITION BY user_id ORDER BY ts"
+                        "  MEASURES FIRST(strt.price) AS s, LAST(down.price) AS bottom, "
+                        "           LAST(up.price) AS top"
+                        "  PATTERN (strt down+ up)"
+                        "  DEFINE down AS price < PREV(price), up AS price > PREV(price))");
+
+    std::map<std::string, std::string> params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "match_recognize_row") {
+            params = op.params;
+        }
+    }
+    ASSERT_FALSE(params.empty());
+    EXPECT_EQ(params.at("rows_per_match"), "one");
+
+    const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+        "match_recognize_row", std::string{kChannelRow}, std::string{kChannelRow});
+    ASSERT_NE(factory, nullptr);
+    cluster::OperatorBuildContext octx;
+    octx.params = params;
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+
+    auto mk = [](std::int64_t uid, std::int64_t ts, std::int64_t price) {
+        Row r;
+        r.values["user_id"] = clink::config::JsonValue{static_cast<double>(uid)};
+        r.values["ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        r.values["price"] = clink::config::JsonValue{static_cast<double>(price)};
+        return Record<Row>{std::move(r)};
+    };
+
+    Dag dag;
+    auto src = std::make_shared<VectorSource<Row>>(
+        std::vector<Record<Row>>{mk(1, 1, 100), mk(1, 2, 90), mk(1, 3, 80), mk(1, 4, 95)});
+    auto h_src = dag.add_source<Row>(src);
+    auto h_op = dag.add_operator<Row, Row>(h_src, op);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_op, sink);
+
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    auto out = sink->collected();
+    ASSERT_EQ(out.size(), 1u) << "prices 100,90,80,95 hold exactly one V";
+    const auto& r = out.front();
+    EXPECT_EQ(static_cast<std::int64_t>(r.values.at("s").as_number()), 100);
+    EXPECT_EQ(static_cast<std::int64_t>(r.values.at("bottom").as_number()), 80);
+    EXPECT_EQ(static_cast<std::int64_t>(r.values.at("top").as_number()), 95);
+}
+
+TEST(SqlRuntime, MatchRecognizeAllRowsPerMatchEmitsEachRowWithClassifier) {
+    // ALL ROWS PER MATCH: every matched input row comes out, carrying its
+    // own CLASSIFIER() (the pattern variable that matched it) plus the
+    // match's measures.
+    ensure_sql_installed_once();
+
+    Catalog cat;
+    auto ddl = parse(
+        std::string{"CREATE TABLE events (user_id BIGINT, ts BIGINT, price BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/mr_all_ev.ndjson');"
+                    "CREATE TABLE out_mr (user_id BIGINT, ts BIGINT, price BIGINT, var_name TEXT) "
+                    "WITH (connector='file', format='json', path='/tmp/mr_all_out.ndjson')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat,
+                        "INSERT INTO out_mr SELECT user_id, ts, price, var_name "
+                        "FROM events MATCH_RECOGNIZE ("
+                        "  PARTITION BY user_id ORDER BY ts"
+                        "  MEASURES CLASSIFIER() AS var_name"
+                        "  ALL ROWS PER MATCH"
+                        "  PATTERN (a b)"
+                        "  DEFINE a AS price > 100, b AS price > 200)");
+
+    std::map<std::string, std::string> params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "match_recognize_row") {
+            params = op.params;
+        }
+    }
+    ASSERT_FALSE(params.empty());
+    EXPECT_EQ(params.at("rows_per_match"), "all");
+
+    const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+        "match_recognize_row", std::string{kChannelRow}, std::string{kChannelRow});
+    ASSERT_NE(factory, nullptr);
+    cluster::OperatorBuildContext octx;
+    octx.params = params;
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+
+    auto mk = [](std::int64_t uid, std::int64_t ts, std::int64_t price) {
+        Row r;
+        r.values["user_id"] = clink::config::JsonValue{static_cast<double>(uid)};
+        r.values["ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        r.values["price"] = clink::config::JsonValue{static_cast<double>(price)};
+        return Record<Row>{std::move(r)};
+    };
+
+    Dag dag;
+    auto src =
+        std::make_shared<VectorSource<Row>>(std::vector<Record<Row>>{mk(1, 1, 150), mk(1, 2, 250)});
+    auto h_src = dag.add_source<Row>(src);
+    auto h_op = dag.add_operator<Row, Row>(h_src, op);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_op, sink);
+
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    auto out = sink->collected();
+    ASSERT_EQ(out.size(), 2u) << "one output row per matched input row";
+    EXPECT_EQ(static_cast<std::int64_t>(out[0].values.at("price").as_number()), 150);
+    EXPECT_EQ(out[0].values.at("var_name").as_string(), "a");
+    EXPECT_EQ(static_cast<std::int64_t>(out[1].values.at("price").as_number()), 250);
+    EXPECT_EQ(out[1].values.at("var_name").as_string(), "b");
+    EXPECT_EQ(static_cast<std::int64_t>(out[1].values.at("ts").as_number()), 2);
+}
+
 // --- retracting aggregate ------------------------------
 
 TEST(SqlRuntime, AggregateRetractsOnDeleteTaggedInput) {

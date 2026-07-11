@@ -8361,17 +8361,46 @@ void install(clink::plugin::PluginRegistry& reg) {
                 }
                 if (auto it = var_pred.find(name); it != var_pred.end()) {
                     auto compiled = clink::operators::CompiledPredicate::compile(*it->second);
-                    pattern->where([compiled](const Row& r) -> bool {
-                        auto resolve = [&](const std::string& nm) -> clink::config::JsonValue {
-                            auto vit = r.values.find(nm);
-                            if (vit == r.values.end()) {
-                                return clink::config::JsonValue{nullptr};
+                    // Step order for PREV resolution: the previous input row
+                    // is the LAST row of the match so far (exact under the v1
+                    // strict-contiguity patterns).
+                    std::vector<std::string> step_order;
+                    step_order.reserve(steps.size());
+                    for (const auto& st : steps) {
+                        step_order.push_back(st.at("name").as_string());
+                    }
+                    pattern->where(
+                        [compiled, step_order](
+                            const Row& r, const clink::cep::PatternMatch<Row>& so_far) -> bool {
+                            const Row* prev = nullptr;
+                            for (const auto& sn : step_order) {
+                                auto mit = so_far.find(sn);
+                                if (mit != so_far.end() && !mit->second.empty()) {
+                                    prev = &mit->second.back();
+                                }
                             }
-                            return vit->second;
-                        };
-                        const clink::operators::ColumnLookup lookup{resolve};
-                        return compiled.evaluate(lookup);
-                    });
+                            auto resolve = [&](const std::string& nm) -> clink::config::JsonValue {
+                                if (nm.rfind("__prev_", 0) == 0) {
+                                    // PREV(col): the previous row's value; NULL at
+                                    // the start of a match (SQL PREV semantics).
+                                    if (prev == nullptr) {
+                                        return clink::config::JsonValue{nullptr};
+                                    }
+                                    auto pit = prev->values.find(nm.substr(7));
+                                    if (pit == prev->values.end()) {
+                                        return clink::config::JsonValue{nullptr};
+                                    }
+                                    return pit->second;
+                                }
+                                auto vit = r.values.find(nm);
+                                if (vit == r.values.end()) {
+                                    return clink::config::JsonValue{nullptr};
+                                }
+                                return vit->second;
+                            };
+                            const clink::operators::ColumnLookup lookup{resolve};
+                            return compiled.evaluate(lookup);
+                        });
                 }
                 if (minc == 0 && maxc == 1) {
                     pattern->optional();
@@ -8383,6 +8412,11 @@ void install(clink::plugin::PluginRegistry& reg) {
                     pattern->times(minc, maxc);
                 }
             }
+
+            // The MR contract is AFTER MATCH SKIP PAST LAST ROW: a completed
+            // match consumes its rows, so an overlapping second match (easy to
+            // produce under quantifiers) never emits.
+            pattern->after_match_skip(clink::cep::SkipStrategy::skip_past_last_event());
 
             std::vector<std::string> part_cols;
             for (std::size_t a = 0, b = 0; a <= partition_keys.size(); ++a) {
@@ -8408,8 +8442,97 @@ void install(clink::plugin::PluginRegistry& reg) {
                                                m.at("column").as_string()});
             }
 
+            // Pattern-order step names, shared by the emit paths (map
+            // iteration over PatternMatch is name-ordered, not step-ordered).
+            std::vector<std::string> step_order;
+            step_order.reserve(steps.size());
+            for (const auto& st : steps) {
+                step_order.push_back(st.at("name").as_string());
+            }
+
+            // The pattern variable that matched LAST (for CLASSIFIER() under
+            // ONE ROW PER MATCH).
+            auto last_var =
+                [step_order](
+                    const clink::cep::PatternMatch<Row>& match) -> clink::config::JsonValue {
+                std::string last;
+                for (const auto& sn : step_order) {
+                    auto mit = match.find(sn);
+                    if (mit != match.end() && !mit->second.empty()) {
+                        last = sn;
+                    }
+                }
+                if (last.empty()) {
+                    return clink::config::JsonValue{nullptr};
+                }
+                return clink::config::JsonValue{last};
+            };
+
+            auto measure_values = [measures, last_var](const clink::cep::PatternMatch<Row>& match,
+                                                       Row& out) {
+                for (const auto& ms : measures) {
+                    if (ms.fn == "classifier") {
+                        out.values[ms.name] = last_var(match);
+                        continue;
+                    }
+                    auto vit = match.find(ms.var);
+                    if (vit == match.end() || vit->second.empty()) {
+                        out.values[ms.name] = clink::config::JsonValue{nullptr};
+                        continue;
+                    }
+                    const Row& src = (ms.fn == "first") ? vit->second.front() : vit->second.back();
+                    auto cit = src.values.find(ms.column);
+                    out.values[ms.name] =
+                        (cit != src.values.end()) ? cit->second : clink::config::JsonValue{nullptr};
+                }
+            };
+
+            auto key_fn = [](const Row& r) -> std::int64_t {
+                auto it = r.values.find(kRowKeyField);
+                if (it == r.values.end()) {
+                    return 0;
+                }
+                if (it->second.is_number()) {
+                    return static_cast<std::int64_t>(it->second.as_number());
+                }
+                return hash_json_value(it->second);
+            };
+
+            if (ctx.param_or("rows_per_match", "one") == "all") {
+                // ALL ROWS PER MATCH: every matched input row, in pattern
+                // order, each carrying its own CLASSIFIER() and the match's
+                // FINAL measures.
+                auto flat_select =
+                    [measures, step_order, last_var, measure_values](
+                        const clink::cep::PatternMatch<Row>& match) -> std::vector<Row> {
+                    std::vector<Row> out_rows;
+                    for (const auto& sn : step_order) {
+                        auto mit = match.find(sn);
+                        if (mit == match.end()) {
+                            continue;
+                        }
+                        for (const auto& src : mit->second) {
+                            Row out = src;
+                            measure_values(match, out);
+                            for (const auto& ms : measures) {
+                                if (ms.fn == "classifier") {
+                                    out.values[ms.name] = clink::config::JsonValue{sn};
+                                }
+                            }
+                            out_rows.push_back(std::move(out));
+                        }
+                    }
+                    return out_rows;
+                };
+                return std::make_shared<clink::cep::CepOperator<Row, Row>>(std::move(*pattern),
+                                                                           row_json_codec(),
+                                                                           key_fn,
+                                                                           flat_select,
+                                                                           "match_recognize_row");
+            }
+
             auto select_fn = [part_cols,
-                              measures](const clink::cep::PatternMatch<Row>& match) -> Row {
+                              measure_values](const clink::cep::PatternMatch<Row>& match) -> Row {
                 Row out;
                 // Partition keys are identical across the match; take from any
                 // matched event.
@@ -8427,29 +8550,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                         }
                     }
                 }
-                for (const auto& ms : measures) {
-                    auto vit = match.find(ms.var);
-                    if (vit == match.end() || vit->second.empty()) {
-                        out.values[ms.name] = clink::config::JsonValue{nullptr};
-                        continue;
-                    }
-                    const Row& src = (ms.fn == "first") ? vit->second.front() : vit->second.back();
-                    auto cit = src.values.find(ms.column);
-                    out.values[ms.name] =
-                        (cit != src.values.end()) ? cit->second : clink::config::JsonValue{nullptr};
-                }
+                measure_values(match, out);
                 return out;
-            };
-
-            auto key_fn = [](const Row& r) -> std::int64_t {
-                auto it = r.values.find(kRowKeyField);
-                if (it == r.values.end()) {
-                    return 0;
-                }
-                if (it->second.is_number()) {
-                    return static_cast<std::int64_t>(it->second.as_number());
-                }
-                return hash_json_value(it->second);
             };
 
             return std::make_shared<clink::cep::CepOperator<Row, Row>>(

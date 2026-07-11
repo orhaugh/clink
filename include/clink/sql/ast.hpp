@@ -327,6 +327,7 @@ struct MatchRecognizeClause {
     std::vector<MrMeasure> measures;
     std::vector<PatternVar> pattern;
     std::vector<MrDefine> define;
+    bool all_rows{false};              // ALL ROWS PER MATCH (default ONE ROW)
     std::optional<std::string> alias;  // FROM ... MATCH_RECOGNIZE (...) AS m
     Loc loc;
 };

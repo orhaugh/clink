@@ -296,7 +296,7 @@ struct MrDefineSpec {
 };
 struct MrMeasureSpec {
     std::string output_name;
-    std::string fn;      // "first" | "last"
+    std::string fn;      // "first" | "last" | "classifier"
     std::string var;     // pattern variable
     std::string column;  // input column
     std::shared_ptr<arrow::DataType> type;
@@ -310,14 +310,20 @@ public:
                           std::vector<MrPatternStep> pattern,
                           std::vector<MrDefineSpec> defines,
                           std::vector<MrMeasureSpec> measures,
-                          std::shared_ptr<arrow::Schema> schema)
+                          std::shared_ptr<arrow::Schema> schema,
+                          bool all_rows = false)
         : input_(std::move(input)),
           partition_columns_(std::move(partition_columns)),
           order_column_(std::move(order_column)),
           pattern_(std::move(pattern)),
           defines_(std::move(defines)),
           measures_(std::move(measures)),
-          schema_(std::move(schema)) {}
+          schema_(std::move(schema)),
+          all_rows_(all_rows) {}
+
+    // ALL ROWS PER MATCH: emit every matched input row (plus measures and
+    // any CLASSIFIER()), not one summary row per match.
+    [[nodiscard]] bool all_rows() const noexcept { return all_rows_; }
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
     [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
@@ -340,6 +346,7 @@ private:
     std::vector<MrPatternStep> pattern_;
     std::vector<MrDefineSpec> defines_;
     std::vector<MrMeasureSpec> measures_;
+    bool all_rows_{false};
     std::shared_ptr<arrow::Schema> schema_;
 };
 

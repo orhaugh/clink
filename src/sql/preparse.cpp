@@ -509,13 +509,12 @@ ast::MatchRecognizeClause parse_match_recognize(std::string_view input_table,
         throw TranslationError("MATCH_RECOGNIZE: DEFINE clause is required", 0);
     }
     if (p_all != npos) {
-        throw TranslationError(
-            "MATCH_RECOGNIZE: ALL ROWS PER MATCH is not supported in v1 (ONE ROW PER MATCH only)",
-            0);
+        (void)expect_words(body, p_all, {"all", "rows", "per", "match"});
+        c.all_rows = true;
     }
 
     std::vector<std::size_t> markers;
-    for (const auto m : {p_part, p_order, p_meas, p_one, p_after, p_pat, p_def}) {
+    for (const auto m : {p_part, p_order, p_meas, p_one, p_all, p_after, p_pat, p_def}) {
         if (m != npos) {
             markers.push_back(m);
         }

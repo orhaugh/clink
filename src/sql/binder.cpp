@@ -1970,6 +1970,70 @@ void strip_pattern_var_qualifiers(ast::Expression& e, const std::vector<std::str
     // literals and other leaves: nothing to rewrite.
 }
 
+// Rewrite PREV(col) / PREV(var.col) in a DEFINE predicate to a reference to
+// the synthetic column "__prev_<col>", which the match_recognize_row op
+// resolves from the row IMMEDIATELY BEFORE the candidate within the match so
+// far (exact under the v1 strict-contiguity patterns, where the match rows
+// are physically consecutive input rows). PREV with an offset argument is
+// rejected. Runs BEFORE qualifier stripping / lowering.
+void rewrite_mr_prev(ast::Expression& e, const std::vector<std::string>& vars, int pos) {
+    if (auto* fc = std::get_if<std::unique_ptr<ast::FunctionCall>>(&e)) {
+        if ((*fc)->name == "prev") {
+            if ((*fc)->args.size() != 1 ||
+                !std::holds_alternative<ast::ColumnRef>((*fc)->args[0])) {
+                throw TranslationError(
+                    "MATCH_RECOGNIZE: PREV expects a single column argument (offsets are not "
+                    "supported in v1)",
+                    pos);
+            }
+            auto& cr = std::get<ast::ColumnRef>((*fc)->args[0]);
+            std::string col = cr.parts.back();
+            if (cr.parts.size() == 2 && !is_pattern_var(vars, cr.parts[0])) {
+                throw TranslationError(
+                    "MATCH_RECOGNIZE: PREV references unknown pattern variable: " + cr.parts[0],
+                    pos);
+            }
+            ast::ColumnRef prev_ref;
+            prev_ref.parts = {"__prev_" + col};
+            e = std::move(prev_ref);
+            return;
+        }
+        for (auto& x : (*fc)->args) {
+            rewrite_mr_prev(x, vars, pos);
+        }
+        return;
+    }
+    if (auto* b = std::get_if<std::unique_ptr<ast::BinaryOp>>(&e)) {
+        rewrite_mr_prev((*b)->left, vars, pos);
+        rewrite_mr_prev((*b)->right, vars, pos);
+        return;
+    }
+    if (auto* l = std::get_if<std::unique_ptr<ast::LogicalOp>>(&e)) {
+        for (auto& a : (*l)->args) {
+            rewrite_mr_prev(a, vars, pos);
+        }
+        return;
+    }
+    if (auto* n = std::get_if<std::unique_ptr<ast::NotOp>>(&e)) {
+        rewrite_mr_prev((*n)->arg, vars, pos);
+        return;
+    }
+    if (auto* in = std::get_if<std::unique_ptr<ast::IsNullOp>>(&e)) {
+        rewrite_mr_prev((*in)->arg, vars, pos);
+        return;
+    }
+    if (auto* a = std::get_if<std::unique_ptr<ast::ArithOp>>(&e)) {
+        for (auto& x : (*a)->args) {
+            rewrite_mr_prev(x, vars, pos);
+        }
+        return;
+    }
+    if (auto* c = std::get_if<std::unique_ptr<ast::CastOp>>(&e)) {
+        rewrite_mr_prev((*c)->arg, vars, pos);
+        return;
+    }
+}
+
 // Parse a single SQL expression fragment ("price > 100", "LAST(a.price)") by
 // wrapping it in a SELECT and extracting the projected expression.
 ast::Expression parse_mr_expr(const std::string& expr_sql, int pos) {
@@ -2021,6 +2085,14 @@ std::unique_ptr<LogicalPlan> Binder::bind_match_recognize(
         steps.push_back(MrPatternStep{pv.name, pv.min_count, pv.max_count});
     }
 
+    // DEFINE predicates lower against the source EXTENDED with a synthetic
+    // "__prev_<col>" twin per column, so PREV(col) rewrites type-check and
+    // resolve like ordinary columns (the op supplies them from the previous
+    // matched row at evaluation time).
+    TableDef define_source = source;
+    for (const auto& col : source.columns) {
+        define_source.columns.push_back(ColumnSpec{"__prev_" + col.name, col.type});
+    }
     std::vector<MrDefineSpec> defines;
     for (const auto& d : mrc.define) {
         if (!is_pattern_var(vars, d.var)) {
@@ -2028,8 +2100,9 @@ std::unique_ptr<LogicalPlan> Binder::bind_match_recognize(
                        mrc.loc.pos);
         }
         ast::Expression pred = parse_mr_expr(d.predicate_sql, mrc.loc.pos);
+        rewrite_mr_prev(pred, vars, mrc.loc.pos);
         strip_pattern_var_qualifiers(pred, vars);
-        defines.push_back(MrDefineSpec{d.var, lower_predicate(pred, source).serialize(0)});
+        defines.push_back(MrDefineSpec{d.var, lower_predicate(pred, define_source).serialize(0)});
     }
 
     std::vector<MrMeasureSpec> measures;
@@ -2047,9 +2120,20 @@ std::unique_ptr<LogicalPlan> Binder::bind_match_recognize(
         } else if (fn == "last_value") {
             fn = "last";
         }
+        if (fn == "classifier") {
+            // CLASSIFIER(): the pattern variable that matched. ONE ROW PER
+            // MATCH yields the last matched variable; ALL ROWS PER MATCH
+            // yields each row's own variable.
+            if (!fc.args.empty()) {
+                bind_error("MATCH_RECOGNIZE: CLASSIFIER() takes no arguments", mrc.loc.pos);
+            }
+            measures.push_back(MrMeasureSpec{m.alias, "classifier", "", "", arrow::utf8()});
+            continue;
+        }
         if (fn != "first" && fn != "last") {
-            bind_error("MATCH_RECOGNIZE: MEASURES v1 supports only FIRST / LAST, got: " + fc.name,
-                       mrc.loc.pos);
+            bind_error(
+                "MATCH_RECOGNIZE: MEASURES supports FIRST / LAST / CLASSIFIER, got: " + fc.name,
+                mrc.loc.pos);
         }
         if (fc.args.size() != 1 || !std::holds_alternative<ast::ColumnRef>(fc.args[0])) {
             bind_error("MATCH_RECOGNIZE: MEASURES function expects one 'var.col' argument",
@@ -2072,14 +2156,29 @@ std::unique_ptr<LogicalPlan> Binder::bind_match_recognize(
         measures.push_back(MrMeasureSpec{m.alias, fn, var, column, ct});
     }
 
-    // Output schema: the partition-key columns (ONE ROW PER MATCH) then the
-    // measure columns, in declaration order.
+    // Output schema. ONE ROW PER MATCH: the partition-key columns then the
+    // measure columns. ALL ROWS PER MATCH: every input column (each matched
+    // row is emitted) then the measure columns.
     arrow::FieldVector fields;
-    fields.reserve(mrc.partition_by.size() + measures.size());
-    for (const auto& pc : mrc.partition_by) {
-        fields.push_back(arrow::field(pc, col_type_in(pc)));
+    if (mrc.all_rows) {
+        fields.reserve(source.columns.size() + measures.size());
+        for (const auto& col : source.columns) {
+            fields.push_back(arrow::field(col.name, col.type));
+        }
+    } else {
+        fields.reserve(mrc.partition_by.size() + measures.size());
+        for (const auto& pc : mrc.partition_by) {
+            fields.push_back(arrow::field(pc, col_type_in(pc)));
+        }
     }
     for (const auto& ms : measures) {
+        for (const auto& f : fields) {
+            if (f->name() == ms.output_name) {
+                bind_error("MATCH_RECOGNIZE: measure alias '" + ms.output_name +
+                               "' collides with an output column",
+                           mrc.loc.pos);
+            }
+        }
         fields.push_back(arrow::field(ms.output_name, ms.type));
     }
     auto out_schema = arrow::schema(fields);
@@ -2091,7 +2190,8 @@ std::unique_ptr<LogicalPlan> Binder::bind_match_recognize(
                                                    std::move(steps),
                                                    std::move(defines),
                                                    std::move(measures),
-                                                   out_schema);
+                                                   out_schema,
+                                                   mrc.all_rows);
 }
 
 std::unique_ptr<LogicalPlan> Binder::bind_process_table_function(
