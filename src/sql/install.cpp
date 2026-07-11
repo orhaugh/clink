@@ -1168,16 +1168,39 @@ inline void vectorised_fold_slice(const std::vector<AggSpec>& aggs,
             }
         } else {
             const bool variance = is_variance_fn(a.fn);
+            const bool integral = ac.i64 != nullptr || ac.i32 != nullptr;
             if (ac.base != nullptr) {
                 for (const std::int64_t i : idxs) {
-                    if (!ac.base->IsNull(i)) {
-                        const double d = ac.value(i);
-                        st.running_sum += d;
-                        if (variance) {
-                            st.running_sum_sq += d * d;
-                        }
-                        ++st.running_count;
+                    if (ac.base->IsNull(i)) {
+                        continue;
                     }
+                    const double d = ac.value(i);
+                    st.running_sum += d;
+                    if (variance) {
+                        st.running_sum_sq += d * d;
+                    } else if (integral) {
+                        // Exact integer SUM: accumulate the int64 into the 128-bit
+                        // accumulator (scale 0), mirroring the row path, so the
+                        // shared finalize emits an exact int64 past 2^53 instead
+                        // of the running double.
+                        const std::int64_t iv = ac.i64 != nullptr
+                                                    ? ac.i64->Value(i)
+                                                    : static_cast<std::int64_t>(ac.i32->Value(i));
+                        const clink::config::Decimal dv{arrow::Decimal128(iv), 0};
+                        if (!st.sum_dec_started) {
+                            st.running_sum_dec = dv;
+                            st.sum_dec_started = true;
+                        } else if (auto s = clink::config::dec_add(st.running_sum_dec, dv)) {
+                            st.running_sum_dec = *s;
+                        } else {
+                            st.sum_dec_complete = false;  // 128-bit overflow -> double result
+                        }
+                    } else {
+                        // A float/double column: the exact accumulator cannot stay
+                        // exact (matches the row path's non-integral-double case).
+                        st.sum_dec_complete = false;
+                    }
+                    ++st.running_count;
                 }
             }
         }

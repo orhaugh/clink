@@ -10654,6 +10654,99 @@ TEST(SqlRuntime, ColumnarParquetGroupByMultiAggregateBatchFold) {
         std::filesystem::remove(p);
 }
 
+// The vectorised BIGINT SUM fold must stay integer-exact past the 2^53 double
+// mantissa. A columnar Parquet source feeds GROUP BY region, SUM(amount) where
+// one group's rows sum to 9007199254740995 - a value no double can represent
+// (it rounds to ...996). The within-batch fold reads the int64 cells straight
+// and accumulates them exactly (running_sum_dec), so the output is the true
+// integer, AND batch_materialize_counter must not move (the fold ran, not a row
+// fallback). SumBigintIsExactPastDoubleMantissa is the row-path twin.
+TEST(SqlRuntime, ColumnarParquetBigintSumExactPastDoubleMantissa) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_ws3big_in.ndjson";
+    const auto pq_path = tmp / "clink_sql_ws3big.parquet";
+    const auto out_path = tmp / "clink_sql_ws3big_out.ndjson";
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+
+    // big: 2^53 + 2 + 1 = 9007199254740995 (exact int; the nearest double is
+    // 9007199254740996). sml: 3 + 4 = 7 (a small control group).
+    write_lines(in_path,
+                {
+                    R"({"region":"big","amount":9007199254740992})",
+                    R"({"region":"sml","amount":3})",
+                    R"({"region":"big","amount":2})",
+                    R"({"region":"sml","amount":4})",
+                    R"({"region":"big","amount":1})",
+                });
+    const std::string cols = "(region VARCHAR, amount BIGINT)";
+
+    // Job 1: NDJSON -> typed-columnar Parquet (amount as an INT64 column).
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE ev "} + cols +
+                         " WITH (connector='file', format='json', path='" + in_path.string() +
+                         "');"
+                         "CREATE TABLE pq " +
+                         cols + " WITH (connector='parquet', path='" + pq_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat, "INSERT INTO pq SELECT region, amount FROM ev");
+        InProcessCluster cluster("tm-ws3big-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    // Job 2: columnar Parquet source -> GROUP BY region, SUM(amount) (within-batch
+    // vectorised fold - the int64 SUM path exercised by the inc5b columnar fix).
+    const std::uint64_t mat_before =
+        clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
+    {
+        Catalog cat;
+        auto ddl = parse(std::string{"CREATE TABLE pq_in "} + cols +
+                         " WITH (connector='parquet', path='" + pq_path.string() +
+                         "');"
+                         "CREATE TABLE agg_out (region VARCHAR, total BIGINT)"
+                         " WITH (connector='file', format='json', path='" +
+                         out_path.string() + "')");
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+        auto spec = compile(cat,
+                            "INSERT INTO agg_out SELECT region, SUM(amount) AS total "
+                            "FROM pq_in GROUP BY region");
+        InProcessCluster cluster("tm-ws3big-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    // The vectorised fold reads Arrow int64 cells directly - no row materialise.
+    EXPECT_EQ(clink::detail::batch_materialize_counter().load(std::memory_order_relaxed),
+              mat_before);
+
+    std::map<std::string, std::int64_t> fa;
+    for (const auto& line : read_lines(out_path)) {
+        auto js = clink::config::parse(line);
+        ASSERT_TRUE(js.is_object()) << "bad output line: " << line;
+        ASSERT_TRUE(js.at("total").is_integral_number()) << "SUM lost its integer type: " << line;
+        fa[js.at("region").as_string()] = js.at("total").as_int();
+    }
+    ASSERT_EQ(fa.size(), 2u);
+    EXPECT_EQ(fa["big"], 9007199254740995LL);  // exact; a double would give ...996
+    EXPECT_EQ(fa["sml"], 7);
+
+    for (const auto& p : {in_path, pq_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // WS6 increment 2: a columnar Parquet source feeds a GROUP BY whose aggregates
 // are SUM / AVG / VAR_POP / STDDEV_POP over a DOUBLE column plus COUNT(*) - all
 // vectorisable, so AggregateRowOp::process_columnar takes the column-at-a-time
