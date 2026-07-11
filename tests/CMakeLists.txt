@@ -449,9 +449,13 @@ if(CLINK_BUILD_SQL)
             GTest::gtest_main
         )
         clink_set_warnings(clink_flight_tests)
+        # 120s like the integration tier: the test spawns an embedded
+        # JM+TM plus a gRPC server, and under a parallel full-suite run
+        # (heavy multi-process SQL ITs saturating every core) the 60s
+        # guard produced a false Timeout; solo the test runs in ~1s.
         gtest_discover_tests(clink_flight_tests
             DISCOVERY_MODE PRE_TEST
-            PROPERTIES TIMEOUT 60 LABELS "sql;flight"
+            PROPERTIES TIMEOUT 120 LABELS "sql;flight"
         )
     endif()
 

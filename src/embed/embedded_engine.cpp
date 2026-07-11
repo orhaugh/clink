@@ -9,6 +9,7 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/task_manager.hpp"
+#include "clink/embed/arrow_pool_pin.hpp"
 #include "clink/embed/collect_hub.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/sql/install.hpp"
@@ -71,6 +72,11 @@ private:
 }  // namespace
 
 EmbeddedEngine::EmbeddedEngine(EngineOptions opts) : opts_(std::move(opts)) {
+    // Before any Arrow allocation: embedded-family binaries carry two Arrow
+    // copies (dylib + iceberg-cpp's statically bundled objects), and the
+    // default bundled-mimalloc pool wedges/corrupts in that configuration
+    // (see arrow_pool_pin.hpp for the observed failures).
+    pin_embedded_arrow_pool_once();
     ensure_factories_installed_once();
     if (!opts_.catalog_dir.empty()) {
         catalog_.load_from_dir(opts_.catalog_dir);
