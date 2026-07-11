@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -160,5 +161,18 @@ std::optional<JsonObject> parse_object(std::string_view input);
 // as in parse().
 std::optional<JsonObject> parse_object(std::string_view input,
                                        std::span<const std::string> keep_keys);
+
+// Exact source text of the named top-level fields that are JSON number
+// literals, keyed by field name. The generic parse rounds a number to an IEEE
+// double, so a DECIMAL column fed a numeral past ~15-17 significant digits
+// loses precision; capturing the raw token lets the caller ingest the original
+// digits exactly. Only numeric fields present in `fields` are returned (string,
+// object, boolean, null, and absent keys are skipped). Each returned string is
+// the bare numeral (sign, digits, '.', exponent), trimmed of any trailing
+// structural bytes. `input` must be a JSON object; a non-object or malformed
+// line yields an empty map. `fields` is treated as a set of names (any mapped
+// value is ignored), so a decimal-scale map can be passed directly.
+std::map<std::string, std::string> raw_number_tokens(std::string_view input,
+                                                     const std::map<std::string, int>& fields);
 
 }  // namespace clink::config

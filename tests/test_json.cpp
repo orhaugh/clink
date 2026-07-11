@@ -4,6 +4,7 @@
 // a subset of full JSON; the goal is that the subset is correct.
 
 #include <cstdint>
+#include <map>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -428,4 +429,36 @@ TEST(Json, ParseObjectFilteredKeepsOnlyListedKeys) {
     EXPECT_EQ(obj->at("b").at("n").as_array().size(), 2u);
     EXPECT_FALSE(obj->contains("a"));
     EXPECT_FALSE(obj->contains("m"));
+}
+
+TEST(Json, RawNumberTokensReturnsExactSourceTextForNamedNumericFields) {
+    const std::map<std::string, int> fields{{"price", 2}, {"qty", 0}, {"note", 0}, {"absent", 0}};
+    // price carries more significant digits than a double can hold; the raw
+    // token must be the untruncated numeral, not a re-rendered double.
+    auto raw = raw_number_tokens(
+        R"({"price": 12345678901234567.89, "qty": 42, "note": "hi", "flag": true})", fields);
+    ASSERT_EQ(raw.size(), 2u);
+    EXPECT_EQ(raw.at("price"), "12345678901234567.89");
+    EXPECT_EQ(raw.at("qty"), "42");
+    // A string field is not a number literal, so it is skipped (no quotes leak).
+    EXPECT_EQ(raw.count("note"), 0u);
+    // A field named in the set but absent from the line is skipped.
+    EXPECT_EQ(raw.count("absent"), 0u);
+    // A numeric field not named in the set is never captured.
+    EXPECT_EQ(raw.count("flag"), 0u);
+}
+
+TEST(Json, RawNumberTokensHandlesExponentSignAndTrailingStructure) {
+    const std::map<std::string, int> fields{{"a", 0}, {"b", 0}, {"c", 0}};
+    auto raw = raw_number_tokens(R"({"a":-1.5e-9,"b":6.02e23,"c":-0.0})", fields);
+    EXPECT_EQ(raw.at("a"), "-1.5e-9");  // trailing comma trimmed
+    EXPECT_EQ(raw.at("b"), "6.02e23");
+    EXPECT_EQ(raw.at("c"), "-0.0");  // trailing brace trimmed
+}
+
+TEST(Json, RawNumberTokensEmptyForNonObjectOrNoFields) {
+    const std::map<std::string, int> fields{{"x", 0}};
+    EXPECT_TRUE(raw_number_tokens("[1,2,3]", fields).empty());
+    EXPECT_TRUE(raw_number_tokens("not json", fields).empty());
+    EXPECT_TRUE(raw_number_tokens(R"({"x":1})", {}).empty());  // empty field set
 }

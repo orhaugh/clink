@@ -199,9 +199,11 @@ inline std::string double_to_fixed_text(double d) {
 // #56: re-quantise a row's named DECIMAL columns to their declared scale
 // (HALF_UP), tagging the value as an exact dec-string. Used on BOTH the
 // schema-aware source (born exact at ingestion) and the sink (the value is
-// quantised to the column scale on assignment, per SQL). Within double
-// precision: source values beyond ~15-17 significant digits are limited by the
-// generic JSON parse to double - documented v1 boundary.
+// quantised to the column scale on assignment, per SQL). A value that is
+// already a dec-string or a plain string is rescaled from its exact text; a
+// still-numeric value came from a numeral inside double range (the JSON decode
+// substitutes the exact raw token for wider numerals before this runs, see
+// row_json_text_format_with_decimals).
 inline void requantise_row_decimals(Row& r, const std::map<std::string, int>& decimal_scales) {
     for (const auto& [col, scale] : decimal_scales) {
         auto it = r.values.find(col);
@@ -222,9 +224,30 @@ inline void requantise_row_decimals(Row& r, const std::map<std::string, int>& de
     }
 }
 
-// Schema-aware NDJSON format: the named DECIMAL columns are re-quantised on
-// both decode (source ingestion) and encode (sink output, then rendered as a
-// clean unquoted number via serialize_output).
+// Recover exact digits for any DECIMAL column that decoded to a (lossy) JSON
+// number: the generic parse rounds a numeral to a double, so re-read the
+// untruncated token straight from the source `line` and carry it as an exact
+// dec-string. Run at ingestion, BEFORE requantise_row_decimals rescales to the
+// column scale. A column already carried as a dec-string (or absent, or not a
+// number literal) is left untouched.
+inline void ingest_exact_decimals(Row& r,
+                                  std::string_view line,
+                                  const std::map<std::string, int>& decimal_scales) {
+    if (decimal_scales.empty())
+        return;
+    for (auto& [col, txt] : clink::config::raw_number_tokens(line, decimal_scales)) {
+        auto it = r.values.find(col);
+        if (it == r.values.end() || !it->second.is_number())
+            continue;
+        if (auto d = clink::config::dec_parse(txt))
+            it->second = clink::config::make_dec_value(*d);
+    }
+}
+
+// Schema-aware NDJSON format: the named DECIMAL columns are ingested exactly
+// (raw token, not the rounded double) and re-quantised to their declared scale
+// on decode; on encode the value is quantised and rendered as a clean unquoted
+// number via serialize_output.
 inline clink::TextFormat<Row> row_json_text_format_with_decimals(
     std::map<std::string, int> decimal_scales) {
     if (decimal_scales.empty())
@@ -233,8 +256,10 @@ inline clink::TextFormat<Row> row_json_text_format_with_decimals(
     return clink::TextFormat<Row>{
         .decode = [decimal_scales, base](std::string_view line) -> std::optional<Row> {
             auto r = base.decode(line);
-            if (r)
+            if (r) {
+                ingest_exact_decimals(*r, line, decimal_scales);
                 requantise_row_decimals(*r, decimal_scales);
+            }
             return r;
         },
         .encode = [decimal_scales](const Row& r) -> std::string {
@@ -298,8 +323,10 @@ inline clink::TextFormat<Row> row_json_text_format_projected(
                 return std::nullopt;
             Row r;
             r.values = std::move(*obj);
-            if (!decimal_scales.empty())
+            if (!decimal_scales.empty()) {
+                ingest_exact_decimals(r, line, decimal_scales);
                 requantise_row_decimals(r, decimal_scales);
+            }
             return r;
         },
         .encode = base.encode,

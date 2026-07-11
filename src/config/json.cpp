@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <optional>
 #include <simdjson.h>
 #include <stdexcept>
@@ -375,6 +376,77 @@ std::optional<JsonObject> parse_object(std::string_view input,
         }
     }
     return JsonObject::from_entries(std::move(entries));
+}
+
+namespace {
+
+simdjson::ondemand::parser& thread_ondemand_parser() {
+    // A separate thread-local parser for raw-token extraction. Same lifetime
+    // rationale as thread_parser(): reused per thread, never destroyed.
+    thread_local auto* parser = new simdjson::ondemand::parser();
+    return *parser;
+}
+
+// The bare numeric prefix of a raw token: sign, digits, decimal point, exponent.
+// On-demand raw_json_token() can carry trailing structural bytes (a comma or
+// closing brace) or whitespace for a scalar, so trim to the numeral before it
+// is handed to the decimal parser.
+std::string_view numeric_prefix(std::string_view tok) {
+    std::size_t n = 0;
+    while (n < tok.size()) {
+        const char c = tok[n];
+        const bool numeric =
+            (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.' || c == 'e' || c == 'E';
+        if (!numeric) {
+            break;
+        }
+        ++n;
+    }
+    return tok.substr(0, n);
+}
+
+}  // namespace
+
+std::map<std::string, std::string> raw_number_tokens(std::string_view input,
+                                                     const std::map<std::string, int>& fields) {
+    std::map<std::string, std::string> out;
+    if (fields.empty()) {
+        return out;
+    }
+    // On-demand needs SIMDJSON_PADDING readable bytes past the end; padded_string
+    // owns a padded copy, so raw_json_token() views stay valid until it drops.
+    simdjson::padded_string padded(input);
+    auto doc = thread_ondemand_parser().iterate(padded);
+    if (doc.error()) {
+        return out;
+    }
+    auto obj = doc.value_unsafe().get_object();
+    if (obj.error()) {
+        return out;
+    }
+    for (auto field : obj.value_unsafe()) {
+        auto key = field.unescaped_key();
+        if (key.error()) {
+            continue;
+        }
+        std::string name(key.value_unsafe());
+        if (fields.find(name) == fields.end()) {
+            continue;
+        }
+        auto value = field.value();
+        if (value.error()) {
+            continue;
+        }
+        auto type = value.value_unsafe().type();
+        if (type.error() || type.value_unsafe() != simdjson::ondemand::json_type::number) {
+            continue;
+        }
+        const std::string_view num = numeric_prefix(value.value_unsafe().raw_json_token());
+        if (!num.empty()) {
+            out.emplace(std::move(name), std::string(num));
+        }
+    }
+    return out;
 }
 
 }  // namespace clink::config

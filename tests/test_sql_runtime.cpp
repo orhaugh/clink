@@ -7422,6 +7422,48 @@ TEST(SqlRuntime, DecimalArithmeticExactInProjection) {
     std::filesystem::remove(out_path);
 }
 
+// A DECIMAL column fed a JSON number literal with more significant digits than a
+// double can hold must ingest the exact digits, not a rounded double. The source
+// decode captures the raw numeral (raw_number_tokens) and carries it as an exact
+// dec-string, so the value survives verbatim to the sink.
+TEST(SqlRuntime, DecimalIngestExactPastDoublePrecision) {
+    ensure_sql_installed_once();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_decing_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_decing_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+    // 19 significant digits: the nearest double is 12345678901234568, so a
+    // double-parsed ingest would emit ...568.00, losing the ...567.89 tail.
+    write_lines(in_path, {R"({"id":1,"amount":12345678901234567.89})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE t (id BIGINT, amount DECIMAL(38,2)) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (amount DECIMAL(38,2)) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    for (const auto& st : ddl.statements)
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    auto spec = compile(cat, "INSERT INTO out_t SELECT amount FROM t");
+    InProcessCluster cluster("tm-sql-decing", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    auto lines = read_lines(out_path);
+    ASSERT_EQ(lines.size(), 1U);
+    EXPECT_EQ(lines[0].find('\x01'), std::string::npos) << lines[0];  // no sentinel leak
+    EXPECT_NE(lines[0].find("\"amount\":12345678901234567.89"), std::string::npos)
+        << "lost precision on ingest: " << lines[0];
+    EXPECT_EQ(lines[0].find("12345678901234568"), std::string::npos)
+        << "double-rounded value leaked: " << lines[0];
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // CAST to DECIMAL with HALF_UP division rounding, and overflow past the
 // declared precision yielding NULL.
 TEST(SqlRuntime, DecimalDivisionAndOverflow) {
