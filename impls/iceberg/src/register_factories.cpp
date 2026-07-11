@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "clink/iceberg/iceberg_row_sink.hpp"
+#include "clink/iceberg/iceberg_row_source.hpp"
 #include "clink/iceberg/install.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -124,6 +125,55 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.subtask_idx = ctx.subtask_idx;
             o.name = "iceberg_row_sink";
             return make_iceberg_row_sink(std::move(o));
+        });
+
+    // iceberg_row_source: bounded snapshot scan of an Iceberg table into Rows
+    // (see iceberg_row_source.hpp). Same catalog / warehouse / S3 params as
+    // the sink; projected_columns (from the optimizer's projection pushdown)
+    // narrows both the scan and the data-file reads to those columns.
+    reg.register_source<Row>(
+        "iceberg_row_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<Row>> {
+            clink::iceberg::IcebergRowSourceOptions o;
+            o.warehouse = ctx.param_or("warehouse", "");
+            if (o.warehouse.empty()) {
+                o.warehouse = ctx.param_or("path", "");
+            }
+            o.table = ctx.param_or("table", "");
+            o.namespace_levels = split_namespace(ctx.param_or("namespace", "default"));
+            o.catalog_uri = ctx.param_or("catalog_uri", "");
+            o.rest_auth_token = ctx.param_or("rest_auth_token", "");
+            auto put_s3 = [&](const char* param, const char* ice_key) {
+                std::string v = ctx.param_or(param, "");
+                if (!v.empty()) {
+                    o.file_io_props[ice_key] = std::move(v);
+                }
+            };
+            put_s3("s3_endpoint", "s3.endpoint");
+            put_s3("s3_region", "s3.region");
+            put_s3("s3_access_key", "s3.access-key-id");
+            put_s3("s3_secret_key", "s3.secret-access-key");
+            put_s3("s3_session_token", "s3.session-token");
+            put_s3("s3_path_style", "s3.path-style-access");
+            auto cols = clink::sql::parse_row_schema(ctx.param_or("schema_columns"));
+            if (const auto projected = split_csv(ctx.param_or("projected_columns", ""));
+                !projected.empty()) {
+                std::vector<clink::sql::RowColumn> narrowed;
+                narrowed.reserve(cols.size());
+                for (auto& c : cols) {
+                    for (const auto& want : projected) {
+                        if (c.name == want) {
+                            narrowed.push_back(std::move(c));
+                            break;
+                        }
+                    }
+                }
+                if (narrowed.size() == projected.size()) {
+                    cols = std::move(narrowed);
+                }
+            }
+            o.columns = std::move(cols);
+            o.name = "iceberg_row_source";
+            return make_iceberg_row_source(std::move(o));
         });
 }
 

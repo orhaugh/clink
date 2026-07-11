@@ -255,6 +255,11 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // column. The Row batcher is built from the schema_columns param.
         return RowConnectorBinding{"parquet_row_source", kChannelRow, {}};
     }
+    if (connector == "iceberg") {
+        // Apache Iceberg snapshot scan (bounded): catalog-resolved table,
+        // typed-columnar data-file reads with column pruning.
+        return RowConnectorBinding{"iceberg_row_source", kChannelRow, {}};
+    }
     if (connector == "nexmark") {
         // Synthetic Nexmark event generator (benchmark). The factory is
         // registered out-of-tree by the Nexmark harness; here we only map the

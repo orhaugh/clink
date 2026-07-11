@@ -33,6 +33,7 @@ cmake -S . -B build -DCLINK_WITH_ICEBERG=ON -DCMAKE_PREFIX_PATH=/path/to/iceberg
 | Factory name | Direction | Record type |
 | --- | --- | --- |
 | `iceberg_row_sink` | Sink | `clink::sql::Row` |
+| `iceberg_row_source` | Source | `clink::sql::Row` |
 
 ## Configuration
 
@@ -56,6 +57,10 @@ All options are parsed in `impls/iceberg/src/register_factories.cpp` from the `B
 | `s3_path_style` | No | (unset) | Path-style access (`s3.path-style-access`); set `true` for MinIO. |
 
 Any S3 property left unset falls back to the standard AWS environment and credential chain (including `AWS_ENDPOINT_URL`). The `subtask_idx` is supplied by the runtime, not a user param; only subtask 0 writes.
+
+### The source (`iceberg_row_source`)
+
+A BOUNDED snapshot scan: `open()` loads the table through the catalog (same `warehouse` / `catalog_uri` / `namespace` / REST / S3 options as the sink, but LOAD-ONLY - a missing table is an error, never created), pins the current snapshot, plans the file-scan tasks with iceberg-cpp and streams every data file's Arrow batches as Rows. Column projection pushes down twice: the scan selects only the queried columns (the planner's `projected_columns` hint narrows `schema_columns`), and each Parquet data file is read with that projection using the table's real field ids. Exactly-once replay: the source checkpoints `(snapshot id, task index, batch index)` through the standard offset hooks; recovery re-plans the SAME pinned snapshot and skips to the recorded position, so nothing re-emits and nothing skips even if the table gained snapshots meanwhile. Not in v1: delete-file application (a snapshot with positional/equality deletes is rejected loudly - compact first), incremental/changelog scans, filter pushdown.
 
 ## SQL usage
 

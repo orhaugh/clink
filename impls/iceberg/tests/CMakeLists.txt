@@ -7,6 +7,7 @@ add_executable(clink_iceberg_tests
     register.cpp
     test_factory_registration.cpp
     test_iceberg_sink.cpp
+    test_iceberg_source.cpp
     # Finalises Arrow/AWS S3 before static destruction (joins the AWS CRT threads
     # off the static-destruction path); see the file.
     ${CMAKE_SOURCE_DIR}/tests/test_helpers/s3_finalizing_gtest_main.cpp

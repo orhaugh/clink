@@ -14,12 +14,13 @@
 //   close():    releases the reader + file.
 //
 // Design notes:
-//   * Schema check: at open() the file's schema must match the
-//     batcher's expected schema (modulo metadata). Mismatch throws
-//     immediately - better to fail at startup than silently emit
-//     garbage rows. This is how ParquetReader behaves too.
-//   * No column pushdown / projection. Reading the full row group
-//     is correct for v1; column pruning is a perf knob for later.
+//   * Schema contract at open(): an exact file/batcher schema match
+//     reads every column (the historical path, byte-identical). When
+//     the batcher names a SUBSET of the file's columns, the source
+//     resolves them by name (types must match exactly) and reads ONLY
+//     those columns - Parquet column pruning, driven for SQL by the
+//     planner's projected_columns hint. A batcher column missing from
+//     the file throws at open(), naming the column.
 //   * Bounded source: returns false on EOF without emitting a
 //     terminal barrier (the source-runner emits it for us).
 

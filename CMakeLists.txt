@@ -857,6 +857,12 @@ if(TARGET clink::iceberg)
     target_link_libraries(clink_cli_cmds PUBLIC clink::iceberg)
     target_compile_definitions(clink_cli_cmds PUBLIC CLINK_LINKED_ICEBERG)
 endif()
+# The embedded runner (`clink run <file>.sql`, `clink flight-sql`) installs
+# every linked connector via install_defaults, so embedded SQL reaches the
+# same connector catalogue a cluster does. The final binary links
+# clink::clink anyway; this hands the object lib's TUs the CLINK_HAS_*
+# defines + include paths so the header-inline install sees them.
+target_link_libraries(clink_cli_cmds PUBLIC clink::clink)
 clink_set_warnings(clink_cli_cmds)
 
 # `clink` - client CLI. One binary, multiple

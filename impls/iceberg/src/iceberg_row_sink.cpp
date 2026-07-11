@@ -21,15 +21,19 @@
 
 #include <arrow/api.h>
 #include <arrow/c/bridge.h>  // ExportRecordBatch (defines the shared ArrowArray first)
+#include <arrow/c/bridge.h>
 
 #include "clink/config/json.hpp"
 #include "clink/connectors/arrow_s3_lifecycle.hpp"
+#include "clink/iceberg/iceberg_row_source.hpp"
 #include "clink/iceberg/state_export.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 #include "clink/runtime/runtime_context.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/row_kind.hpp"
 #include "clink/state/state_backend.hpp"
 
+#include "iceberg/arrow_c_data.h"
 #include "iceberg/catalog.h"
 #include "iceberg/catalog/rest/catalog_properties.h"
 #include "iceberg/catalog/rest/rest_catalog.h"
@@ -39,6 +43,7 @@
 #include "iceberg/expression/literal.h"
 #include "iceberg/file_format.h"
 #include "iceberg/file_io.h"
+#include "iceberg/file_reader.h"
 #include "iceberg/file_writer.h"
 #include "iceberg/manifest/manifest_entry.h"
 #include "iceberg/partition_field.h"
@@ -50,6 +55,7 @@
 #include "iceberg/sort_order.h"
 #include "iceberg/table.h"
 #include "iceberg/table_identifier.h"
+#include "iceberg/table_scan.h"
 #include "iceberg/transaction.h"
 #include "iceberg/transform.h"
 #include "iceberg/type.h"
@@ -277,11 +283,28 @@ OpenedCatalogTable open_catalog_table(const CatalogTargetSpec& t,
 
     ice::Namespace ns;
     ns.levels = t.namespace_levels;
-    if (auto ex = out.catalog->NamespaceExists(ns); ex.has_value() && !ex.value()) {
-        (void)out.catalog->CreateNamespace(ns, {});  // best-effort
+    // A null ice_schema selects LOAD-ONLY mode (the source path): never
+    // create the namespace or the table - a missing table is the user's
+    // error, not a fresh empty table.
+    const bool load_only = ice_schema == nullptr;
+    if (!load_only) {
+        if (auto ex = out.catalog->NamespaceExists(ns); ex.has_value() && !ex.value()) {
+            (void)out.catalog->CreateNamespace(ns, {});  // best-effort
+        }
     }
     out.id.ns = ns;
     out.id.name = t.table;
+    if (load_only) {
+        if (auto ex = out.catalog->TableExists(out.id); ex.has_value() && !ex.value()) {
+            throw std::runtime_error(t.name + ": iceberg table '" + t.table +
+                                     "' does not exist in this catalog");
+        }
+        out.table = unwrap(out.catalog->LoadTable(out.id), "load table");
+        if (rest) {
+            out.file_io = out.table->io();
+        }
+        return out;
+    }
 
     // Table location (warehouse/<ns>/<table>). A REST catalog lets the server assign it
     // (pass empty). A SQL catalog - local-FS OR S3 - must be given an EXPLICIT location:
@@ -1353,6 +1376,270 @@ IcebergStateExportResult export_state_iceberg(const clink::state_processor::Stat
     result.table_location = std::string(opened.table->location());
     result.rows = total_rows;
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// IcebergRowSource - the bounded snapshot-scan source (iceberg_row_source.hpp)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+class IcebergRowSource final : public Source<clink::sql::Row> {
+public:
+    explicit IcebergRowSource(IcebergRowSourceOptions o) : o_(std::move(o)) {
+        if (o_.warehouse.empty()) {
+            throw std::runtime_error(o_.name + ": 'warehouse' (or path) is required");
+        }
+        if (o_.table.empty()) {
+            throw std::runtime_error(o_.name + ": 'table' is required");
+        }
+        if (o_.columns.empty()) {
+            throw std::runtime_error(o_.name + ": declared columns are required");
+        }
+        batcher_ = clink::sql::make_row_columnar_arrow_batcher(o_.columns);
+    }
+
+    [[nodiscard]] bool is_bounded() const noexcept override { return true; }
+
+    void open() override {
+        ensure_registered();
+        CatalogTargetSpec t;
+        t.warehouse = o_.warehouse;
+        t.catalog_uri = o_.catalog_uri;
+        t.rest_auth_token = o_.rest_auth_token;
+        t.name = o_.name;
+        t.namespace_levels = o_.namespace_levels;
+        t.table = o_.table;
+        t.file_io_props = o_.file_io_props;
+        opened_ = open_catalog_table(t, /*ice_schema=*/nullptr, /*spec=*/nullptr);
+
+        // Pin the snapshot: a fresh run pins the CURRENT snapshot; a restore
+        // re-pins the checkpointed one, so replay plans the identical task
+        // list even if the table gained snapshots meanwhile.
+        if (snapshot_id_ == 0) {
+            auto snap = opened_.table->current_snapshot();
+            if (!snap.has_value() || !snap.value()) {
+                tasks_.clear();  // empty table (no snapshot yet): nothing to read
+                return;
+            }
+            snapshot_id_ = snap.value()->snapshot_id;
+        }
+
+        std::vector<std::string> names;
+        names.reserve(o_.columns.size());
+        for (const auto& c : o_.columns) {
+            names.push_back(c.name);
+        }
+        auto builder = unwrap(opened_.table->NewScan(), "new scan");
+        builder->Select(names);
+        builder->UseSnapshot(snapshot_id_);
+        auto scan = unwrap(builder->Build(), "build scan");
+        tasks_ = unwrap(scan->PlanFiles(), "plan files");
+        for (const auto& task : tasks_) {
+            if (!task->delete_files().empty()) {
+                throw std::runtime_error(
+                    o_.name + ": table '" + o_.table +
+                    "' has delete files in the scanned snapshot; v1 reads append-only "
+                    "snapshots (compact the table first)");
+            }
+        }
+
+        // The projection schema for the data-file readers: the TABLE's own
+        // fields (real field ids - Parquet projection resolves by id)
+        // filtered to the selected names.
+        auto full = unwrap(opened_.table->schema(), "table schema");
+        std::vector<ice::SchemaField> proj_fields;
+        proj_fields.reserve(names.size());
+        for (const auto& name : names) {
+            bool found = false;
+            for (const auto& f : full->fields()) {
+                if (f.name() == name) {
+                    proj_fields.push_back(f);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                throw std::runtime_error(o_.name + ": table '" + o_.table + "' has no column '" +
+                                         name + "'");
+            }
+        }
+        proj_schema_ = std::make_shared<ice::Schema>(std::move(proj_fields), full->schema_id());
+
+        // Resume: skip whole tasks, then skip batches inside the first open
+        // task (open_reader_ consumes skip_batches_).
+        skip_batches_ = batch_i_;
+        batch_i_ = 0;
+    }
+
+    bool produce(Emitter<clink::sql::Row>& out) override {
+        while (true) {
+            if (this->cancelled()) {
+                return false;
+            }
+            if (!reader_) {
+                if (task_i_ >= tasks_.size()) {
+                    return false;  // scan exhausted
+                }
+                open_reader_();
+                continue;
+            }
+            auto next = unwrap(reader_->Next(), "read data file");
+            if (!next.has_value()) {
+                (void)reader_->Close();
+                reader_.reset();
+                ++task_i_;
+                batch_i_ = 0;
+                continue;
+            }
+            ArrowArray arr = std::move(*next);
+            auto rb_r = arrow::ImportRecordBatch(&arr, reader_schema_);
+            if (!rb_r.ok()) {
+                throw std::runtime_error(o_.name + ": import batch: " + rb_r.status().ToString());
+            }
+            ++batch_i_;
+            auto batch = emit_shape_(*rb_r);
+            auto parsed = batcher_.parse(*batch);
+            if (!parsed.has_value()) {
+                throw std::runtime_error(o_.name + ": row batcher rejected a data-file batch");
+            }
+            if (!parsed->empty()) {
+                out.emit_data(std::move(*parsed));
+            }
+            return true;
+        }
+    }
+
+    void close() override {
+        if (reader_) {
+            (void)reader_->Close();
+            reader_.reset();
+        }
+        opened_ = {};
+    }
+
+    // Exactly-once replay position: (snapshot id, task index, batch index).
+    void snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId /*ckpt*/) override {
+        std::array<std::byte, 24> bytes{};
+        auto put = [&](std::size_t at, std::uint64_t v) {
+            for (int i = 0; i < 8; ++i) {
+                bytes[at + static_cast<std::size_t>(i)] =
+                    static_cast<std::byte>((v >> (i * 8)) & 0xFF);
+            }
+        };
+        put(0, static_cast<std::uint64_t>(snapshot_id_));
+        put(8, task_i_);
+        put(16, batch_i_);
+        backend.put_operator_state(
+            op_id,
+            StateBackend::KeyView{kOffsetKey_, std::strlen(kOffsetKey_)},
+            StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+    }
+
+    bool restore_offset(StateBackend& backend, OperatorId op_id) override {
+        auto v = backend.get_operator_state(
+            op_id, StateBackend::KeyView{kOffsetKey_, std::strlen(kOffsetKey_)});
+        if (!v.has_value() || v->size() < 24) {
+            return false;
+        }
+        auto get = [&](std::size_t at) {
+            std::uint64_t u = 0;
+            for (int i = 0; i < 8; ++i) {
+                u |= static_cast<std::uint64_t>(static_cast<std::uint8_t>((*v)[at + i])) << (i * 8);
+            }
+            return u;
+        };
+        snapshot_id_ = static_cast<std::int64_t>(get(0));
+        task_i_ = get(8);
+        batch_i_ = get(16);
+        return true;
+    }
+
+    std::string name() const override { return o_.name; }
+
+private:
+    void open_reader_() {
+        const auto& task = *tasks_[task_i_];
+        const auto& df = *task.data_file();
+        ice::ReaderOptions ro;
+        ro.path = df.file_path;
+        ro.io = opened_.file_io;
+        ro.projection = proj_schema_;
+        reader_ = unwrap(ice::ReaderFactoryRegistry::Open(df.file_format, ro), "open data file");
+        auto cschema = unwrap(reader_->Schema(), "data-file schema");
+        auto imported = arrow::ImportSchema(&cschema);
+        if (!imported.ok()) {
+            throw std::runtime_error(o_.name + ": import schema: " + imported.status().ToString());
+        }
+        reader_schema_ = *imported;
+        // Per-task column mapping (name-resolved) + type check against the
+        // declared columns, so a mismatch errors clearly at the first file.
+        col_map_.clear();
+        col_map_.reserve(o_.columns.size());
+        for (const auto& c : o_.columns) {
+            const int idx = reader_schema_->GetFieldIndex(c.name);
+            if (idx < 0) {
+                throw std::runtime_error(o_.name + ": data file " + df.file_path +
+                                         " has no column '" + c.name + "'");
+            }
+            if (!reader_schema_->field(idx)->type()->Equals(*c.type)) {
+                throw std::runtime_error(o_.name + ": column '" + c.name + "' is " +
+                                         reader_schema_->field(idx)->type()->ToString() +
+                                         " in the table but " + c.type->ToString() +
+                                         " in the declared schema");
+            }
+            col_map_.push_back(idx);
+        }
+        // Resume mid-task: burn the already-emitted batches.
+        for (std::uint64_t skipped = 0; skipped < skip_batches_; ++skipped) {
+            auto next = unwrap(reader_->Next(), "replay skip");
+            if (!next.has_value()) {
+                break;  // file shorter than the restored offset
+            }
+            ArrowArray arr = std::move(*next);
+            arr.release(&arr);  // discard without importing
+        }
+        batch_i_ = skip_batches_;
+        skip_batches_ = 0;
+    }
+
+    // Shape a data-file batch for the row batcher: prepend the engine's
+    // null event-time column and order the value columns as declared.
+    std::shared_ptr<arrow::RecordBatch> emit_shape_(
+        const std::shared_ptr<arrow::RecordBatch>& rb) const {
+        arrow::ArrayVector columns;
+        columns.reserve(o_.columns.size() + 1);
+        auto evt = arrow::MakeArrayOfNull(arrow::int64(), rb->num_rows());
+        if (!evt.ok()) {
+            throw std::runtime_error(o_.name + ": event-time column: " + evt.status().ToString());
+        }
+        columns.push_back(*evt);
+        for (const int idx : col_map_) {
+            columns.push_back(rb->column(idx));
+        }
+        return arrow::RecordBatch::Make(batcher_.schema(), rb->num_rows(), std::move(columns));
+    }
+
+    static constexpr const char* kOffsetKey_ = "iceberg_source.cursor";
+
+    IcebergRowSourceOptions o_;
+    ArrowBatcher<clink::sql::Row> batcher_;
+    OpenedCatalogTable opened_;
+    std::shared_ptr<ice::Schema> proj_schema_;
+    std::vector<std::shared_ptr<ice::FileScanTask>> tasks_;
+    std::unique_ptr<ice::Reader> reader_;
+    std::shared_ptr<arrow::Schema> reader_schema_;
+    std::vector<int> col_map_;
+    std::int64_t snapshot_id_{0};
+    std::uint64_t task_i_{0};
+    std::uint64_t batch_i_{0};
+    std::uint64_t skip_batches_{0};
+};
+
+}  // namespace
+
+std::shared_ptr<Source<clink::sql::Row>> make_iceberg_row_source(IcebergRowSourceOptions opts) {
+    return std::make_shared<IcebergRowSource>(std::move(opts));
 }
 
 }  // namespace clink::iceberg

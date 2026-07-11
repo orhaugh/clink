@@ -7,7 +7,12 @@
 ## Overview
 
 Embedded execution packages the full runtime - JobManager, TaskManager, the SQL
-frontend, and every linked connector - inside a single process. `clink run
+frontend, and every linked connector - inside a single process. The connector
+catalogue is installed through `clink::plugin::install_defaults` at the front
+doors (`clink run`'s tool TU and libclink's `clink_engine_open`), whose
+`CLINK_HAS_*` guards resolve in a TU that links the impls - so embedded SQL
+reaches the same connectors a cluster node does (Kafka, Iceberg, Postgres, ...),
+not just the built-ins. `clink run
 pipeline.sql` starts an in-process JobManager and TaskManager pair connected
 over an ephemeral loopback port, folds the script's DDL into a session catalog,
 compiles each `INSERT INTO ... SELECT` (or materialized-view statement) to a

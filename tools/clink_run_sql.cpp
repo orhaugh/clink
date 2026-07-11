@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "clink/embed/embedded_engine.hpp"
+#include "clink/plugin/install_defaults.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/script_runner.hpp"
 #ifdef CLINK_LINKED_WASM
@@ -247,6 +248,11 @@ int clink_cmd_run_sql(int argc, char** argv) {
     eopts.catalog_dir = args.catalog_dir;
     eopts.job_name = args.job_name;
     try {
+        // Embedded execution reaches every linked connector, same as a
+        // cluster node: install the impls' factories before the engine
+        // materialises any job (idempotent).
+        clink::plugin::PluginRegistry impl_reg;
+        clink::plugin::install_defaults(impl_reg);
         clink::embed::EmbeddedEngine engine{std::move(eopts)};
         if (int rc = engine.execute_script(sql); rc != 0) {
             return rc;

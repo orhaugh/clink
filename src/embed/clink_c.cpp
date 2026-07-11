@@ -19,6 +19,7 @@
 
 #include "clink/embed/clink.h"
 #include "clink/embed/embedded_engine.hpp"
+#include "clink/plugin/install_defaults.hpp"
 
 namespace {
 
@@ -92,6 +93,12 @@ void pin_embedded_arrow_pool_once() {
 
 clink_engine* clink_engine_open(const clink_engine_options* options) {
     pin_embedded_arrow_pool_once();
+    // libclink links every built connector statically; install their
+    // factories so embedded SQL reaches the full catalogue (idempotent).
+    {
+        clink::plugin::PluginRegistry impl_reg;
+        clink::plugin::install_defaults(impl_reg);
+    }
     auto handle = std::make_unique<clink_engine>();
     clink::embed::EngineOptions opts;
     if (options != nullptr) {
