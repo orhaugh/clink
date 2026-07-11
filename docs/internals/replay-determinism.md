@@ -32,9 +32,13 @@ Determinism therefore rests on three pillars:
 - **Non-Row channels.** Replay's operator rebuilding is wired for the SQL frontend's row-channel factories.
 - **v1 captures** (records only, written by older builds) replay data-only: per-record operators replay exactly; watermark-driven fires do not occur. The tool prints a note.
 
+## Cross-version A/B
+
+Determinism is what makes version comparison meaningful: if replay were noisy, a diff between two builds would be noise too. `clink replay --out=<file>` dumps a run's emissions; `--plugin=<so>` rebuilds the operator from a candidate build first (ABI-gated like a cluster deploy); `clink replay-diff <a> <b>` then reports `identical` or the exact differing emissions. Same epoch, same state, two builds - the behavioural delta of a change on real production bytes, before it deploys.
+
 ## The executable form
 
-`tests/test_replay_cli.cpp` runs a windowed SQL job with capture armed, replays the tumbling-window operator's epoch through the CLI, and requires the replayed emissions to equal the live sink output AND `--verify` to pass - the contract, enforced in CI.
+`tests/test_replay_cli.cpp` runs a windowed SQL job with capture armed, replays the tumbling-window operator's epoch through the CLI, and requires: the replayed emissions to equal the live sink output; `--verify` to pass (single-op and whole-job); two `--out` dumps to `replay-diff` as identical; and a doctored dump to diff as different with the emission located - the contract, enforced in CI.
 
 ## Related
 

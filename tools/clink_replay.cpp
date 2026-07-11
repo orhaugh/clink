@@ -25,12 +25,14 @@
 
 #include <cstdint>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "clink/cluster/plugin_loader.hpp"
 #include "clink/sql/replay.hpp"
 
 namespace {
@@ -83,6 +85,13 @@ void usage() {
         << "emissions: the determinism gate\n"
         << "(docs/internals/replay-determinism.md).\n"
         << "\n"
+        << "Cross-version A/B:\n"
+        << "  --out=<file>      write ALL emissions to <file>, one per line\n"
+        << "                    (single-op mode; ignores --max-rows)\n"
+        << "  --plugin=<so>     dlopen a job plugin before replaying, so the\n"
+        << "                    operator rebuilds from a CANDIDATE build - then\n"
+        << "                    diff two --out dumps with `clink replay-diff`\n"
+        << "\n"
         << "Exit codes: 0 = ok, 1 = --verify found a divergence, 2 = error.\n";
 }
 
@@ -95,6 +104,7 @@ struct Options {
     bool flush{false};
     bool verify{false};
     std::size_t max_rows{100};
+    std::string out_path;
 };
 
 clink::sql::ReplayRequest to_request(const Options& o, std::uint64_t op_id) {
@@ -151,6 +161,20 @@ int replay_single(const Options& o, std::uint64_t op_id) {
     announce(replay.info());
     if (o.verify) {
         return verify_one(replay, /*print_pass=*/true);
+    }
+    if (!o.out_path.empty()) {
+        // Emission dump for cross-version diffing (`clink replay-diff`):
+        // every emission, one per line, no truncation.
+        const auto rows = replay.run();
+        std::ofstream out(o.out_path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("cannot open --out file " + o.out_path);
+        }
+        for (const auto& r : rows) {
+            out << r << "\n";
+        }
+        std::cout << "wrote " << rows.size() << " emissions to " << o.out_path << "\n";
+        return 0;
     }
     std::cout << "---\n";
     const auto rows = replay.run();
@@ -245,18 +269,127 @@ int clink_cmd_replay(int argc, char** argv) {
     if (const auto v = get_arg(argc, argv, "max-rows"); !v.empty()) {
         o.max_rows = static_cast<std::size_t>(std::stoull(v));
     }
+    o.out_path = get_arg(argc, argv, "out");
     const auto op_str = get_arg(argc, argv, "op");
+    const auto plugin_path = get_arg(argc, argv, "plugin");
     if (o.capture_dir.empty() || o.epoch.empty()) {
         usage();
         return 2;
     }
     try {
+        if (!plugin_path.empty()) {
+            // Candidate-build A/B: load the job plugin so the operator
+            // factories resolve from THAT .so (ABI-gated like a cluster
+            // deploy), then replay production bytes through it.
+            auto loaded = clink::cluster::PluginLoader::default_instance().load(plugin_path);
+            if (!loaded.ok) {
+                throw std::runtime_error("cannot load --plugin " + plugin_path + ": " +
+                                         loaded.error);
+            }
+            std::cout << "plugin: " << loaded.plugin.name << " " << loaded.plugin.version << " ("
+                      << plugin_path << ")\n";
+        }
         if (op_str.empty()) {
+            if (!o.out_path.empty()) {
+                throw std::runtime_error("--out needs --op (single-operator mode)");
+            }
             return replay_whole_job(o);
         }
         return replay_single(o, std::stoull(op_str));
     } catch (const std::exception& e) {
         std::cerr << "clink replay: " << e.what() << "\n";
+        return 2;
+    }
+}
+
+// ---- clink replay-diff ------------------------------------------------------
+
+namespace {
+
+void diff_usage() {
+    std::cerr << "Usage: clink replay-diff <a> <b> [--max-diffs=N]\n"
+              << "\n"
+              << "Compare two replay emission dumps (written with clink replay\n"
+              << "--out=<file>, one emission per line) - the cross-version A/B:\n"
+              << "replay the same epoch through two builds (e.g. --plugin with a\n"
+              << "candidate .so, or two engine versions), dump both, diff. Reports\n"
+              << "the first divergence and up to N differing lines (default 10).\n"
+              << "\n"
+              << "Exit codes: 0 = identical, 1 = different, 2 = error.\n";
+}
+
+std::vector<std::string> read_lines(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("cannot open " + path);
+    }
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(in, line)) {
+        lines.push_back(line);
+    }
+    return lines;
+}
+
+}  // namespace
+
+int clink_cmd_replay_diff(int argc, char** argv) {
+    if (has_flag(argc, argv, "help")) {
+        diff_usage();
+        return 0;
+    }
+    std::vector<std::string> paths;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (!a.starts_with("--")) {
+            paths.push_back(a);
+        }
+    }
+    std::size_t max_diffs = 10;
+    if (const auto v = get_arg(argc, argv, "max-diffs"); !v.empty()) {
+        max_diffs = static_cast<std::size_t>(std::stoull(v));
+    }
+    if (paths.size() != 2) {
+        diff_usage();
+        return 2;
+    }
+    try {
+        const auto a = read_lines(paths[0]);
+        const auto b = read_lines(paths[1]);
+        if (a == b) {
+            std::cout << "identical: " << a.size() << " emissions\n";
+            return 0;
+        }
+        std::cout << "different: " << paths[0] << " has " << a.size() << " emissions, " << paths[1]
+                  << " has " << b.size() << "\n";
+        const auto n = std::min(a.size(), b.size());
+        std::size_t shown = 0;
+        std::size_t differing = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (a[i] == b[i]) {
+                continue;
+            }
+            ++differing;
+            if (max_diffs == 0 || shown < max_diffs) {
+                ++shown;
+                std::cout << "emission " << i << ":\n  a: " << a[i] << "\n  b: " << b[i] << "\n";
+            }
+        }
+        if (a.size() != b.size()) {
+            const auto& longer = a.size() > b.size() ? a : b;
+            const char side = a.size() > b.size() ? 'a' : 'b';
+            const auto extra = longer.size() - n;
+            std::cout << extra << " extra emission(s) in " << side << ", first: " << longer[n]
+                      << "\n";
+        }
+        std::cout << differing << " differing emission(s) in the common prefix";
+        if (shown < differing) {
+            std::cout << " (" << shown << " shown; raise --max-diffs)";
+        }
+        std::cout << "\n";
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "clink replay-diff: " << e.what() << "\n";
         return 2;
     }
 }

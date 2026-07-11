@@ -25,6 +25,7 @@ int clink_cmd_state_export(int argc, char** argv);
 int clink_cmd_state_query(int argc, char** argv);
 int clink_cmd_capture_cat(int argc, char** argv);
 int clink_cmd_replay(int argc, char** argv);
+int clink_cmd_replay_diff(int argc, char** argv);
 int clink_cmd_rescale(int argc, char** argv);
 int clink_cmd_rescale_op(int argc, char** argv);
 int clink_cmd_list(int argc, char** argv);
@@ -48,7 +49,8 @@ void usage() {
         << "  state-export      Write keyed state as one Arrow IPC stream file.\n"
         << "  state-query       Run SQL over a checkpoint/savepoint's keyed state.\n"
         << "  capture-cat       Inspect record-capture flight-recorder epochs.\n"
-        << "  replay            Replay a captured epoch through one operator offline.\n"
+        << "  replay            Replay a captured epoch offline (one operator or whole job).\n"
+        << "  replay-diff       Diff two replay emission dumps (first divergence).\n"
         << "  rescale           Change a running job's per-role parallelism.\n"
         << "  rescale-op        Rescale ONE operator within a job to a new parallelism.\n"
         << "  list              List active and recently-completed jobs (alias of  list).\n"
@@ -111,6 +113,9 @@ int main(int argc, char** argv) {
     }
     if (cmd == "replay") {
         return clink_cmd_replay(sub_argc, sub_argv);
+    }
+    if (cmd == "replay-diff") {
+        return clink_cmd_replay_diff(sub_argc, sub_argv);
     }
     if (cmd == "rescale") {
         return clink_cmd_rescale(sub_argc, sub_argv);

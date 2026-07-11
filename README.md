@@ -925,6 +925,12 @@ replay: 3 captured operator(s), epoch 9, verifying determinism (2 runs each)
 deterministic: every replayed operator byte-identical across 2 runs
 ```
 
+And the cross-version question - "what would the fix have produced on
+last night's bytes?" - is one diff: replay the epoch through two builds
+(`--plugin=<candidate.so>` for compiled jobs) with `--out=<file>`, then
+`clink replay-diff a.ndjson b.ndjson` reports the first divergence, or
+`identical`.
+
 Details:
 [docs/internals/fault-tolerance-and-rescale.md](docs/internals/fault-tolerance-and-rescale.md).
 

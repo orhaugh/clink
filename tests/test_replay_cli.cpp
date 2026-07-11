@@ -154,5 +154,28 @@ TEST(ReplayCli, WindowedEpochReplaysTheLiveEmissionsAndVerifiesDeterministic) {
     EXPECT_NE(whole.output.find("every replayed operator byte-identical"), std::string::npos)
         << whole.output;
 
+    // Cross-version A/B plumbing: two --out dumps diff identical (exit 0);
+    // a doctored dump diffs different (exit 1) with the emission located.
+    const auto dump_a = run_cmd(replay_base + " --out=" + (dir / "a.ndjson").string());
+    const auto dump_b = run_cmd(replay_base + " --out=" + (dir / "b.ndjson").string());
+    ASSERT_EQ(dump_a.exit_code, 0) << dump_a.output;
+    ASSERT_EQ(dump_b.exit_code, 0) << dump_b.output;
+    const auto same = run_cmd(cli + " replay-diff " + (dir / "a.ndjson").string() + " " +
+                              (dir / "b.ndjson").string());
+    EXPECT_EQ(same.exit_code, 0) << same.output;
+    EXPECT_NE(same.output.find("identical:"), std::string::npos) << same.output;
+    {
+        auto doctored = read_file(dir / "a.ndjson");
+        const auto pos = doctored.find(":15");  // alice's first-window total
+        ASSERT_NE(pos, std::string::npos) << doctored;
+        doctored.replace(pos, 3, ":16");
+        std::ofstream out(dir / "c.ndjson", std::ios::binary);
+        out << doctored;
+    }
+    const auto diff = run_cmd(cli + " replay-diff " + (dir / "a.ndjson").string() + " " +
+                              (dir / "c.ndjson").string());
+    EXPECT_EQ(diff.exit_code, 1) << diff.output;
+    EXPECT_NE(diff.output.find("differing emission"), std::string::npos) << diff.output;
+
     fs::remove_all(dir);
 }
