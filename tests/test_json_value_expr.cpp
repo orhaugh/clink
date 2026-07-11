@@ -45,13 +45,16 @@ TEST(JsonValueExpr, ColumnRefViaResolver) {
 }
 
 TEST(JsonValueExpr, ArithmeticBasics) {
+    // Integer operands compute exactly in int64 (result is an integral number).
     auto v = eval(R"({"op":"add","args":[{"lit":3},{"lit":4}]})");
     ASSERT_TRUE(v.is_number());
-    EXPECT_EQ(v.as_number(), 7.0);
-    EXPECT_EQ(eval(R"({"op":"sub","args":[{"lit":10},{"lit":3}]})").as_number(), 7.0);
-    EXPECT_EQ(eval(R"({"op":"mul","args":[{"lit":3},{"lit":4}]})").as_number(), 12.0);
-    EXPECT_EQ(eval(R"({"op":"div","args":[{"lit":10},{"lit":4}]})").as_number(), 2.5);
-    EXPECT_EQ(eval(R"({"op":"mod","args":[{"lit":10},{"lit":3}]})").as_number(), 1.0);
+    EXPECT_TRUE(v.is_integral_number());
+    EXPECT_EQ(v.as_int(), 7);
+    EXPECT_EQ(eval(R"({"op":"sub","args":[{"lit":10},{"lit":3}]})").as_int(), 7);
+    EXPECT_EQ(eval(R"({"op":"mul","args":[{"lit":3},{"lit":4}]})").as_int(), 12);
+    // Integer division truncates toward zero (was 2.5 under the old double model).
+    EXPECT_EQ(eval(R"({"op":"div","args":[{"lit":10},{"lit":4}]})").as_int(), 2);
+    EXPECT_EQ(eval(R"({"op":"mod","args":[{"lit":10},{"lit":3}]})").as_int(), 1);
 }
 
 TEST(JsonValueExpr, ArithmeticNullPropagates) {
@@ -59,10 +62,39 @@ TEST(JsonValueExpr, ArithmeticNullPropagates) {
     EXPECT_TRUE(eval(R"({"op":"mul","args":[{"lit":1},{"col":"missing"}]})").is_null());
 }
 
-TEST(JsonValueExpr, DivByZeroIsNan) {
-    auto v = eval(R"({"op":"div","args":[{"lit":1},{"lit":0}]})");
+TEST(JsonValueExpr, IntegerDivAndModByZeroAreNull) {
+    // Integer div/mod by zero resolve to NULL (the old double path returned NaN).
+    EXPECT_TRUE(eval(R"({"op":"div","args":[{"lit":1},{"lit":0}]})").is_null());
+    EXPECT_TRUE(eval(R"({"op":"mod","args":[{"lit":1},{"lit":0}]})").is_null());
+}
+
+TEST(JsonValueExpr, IntegerDivisionTruncatesTowardZero) {
+    EXPECT_EQ(eval(R"({"op":"div","args":[{"lit":7},{"lit":2}]})").as_int(), 3);
+    EXPECT_EQ(eval(R"({"op":"div","args":[{"lit":-7},{"lit":2}]})").as_int(), -3);
+    EXPECT_EQ(eval(R"({"op":"div","args":[{"lit":7},{"lit":-2}]})").as_int(), -3);
+}
+
+TEST(JsonValueExpr, IntegerArithmeticIsExactPastDoubleMantissa) {
+    // 2^53 + 3 = ...995; the double path would round to ...996.
+    auto v = eval(R"({"op":"add","args":[{"lit":9007199254740992},{"lit":3}]})");
+    ASSERT_TRUE(v.is_integral_number());
+    EXPECT_EQ(v.as_int(), 9007199254740995LL);
+}
+
+TEST(JsonValueExpr, IntegerOverflowIsNull) {
+    // Add/sub/mul overflow and unary-neg of INT64_MIN all resolve to NULL.
+    EXPECT_TRUE(eval(R"({"op":"add","args":[{"lit":9223372036854775807},{"lit":1}]})").is_null());
+    EXPECT_TRUE(eval(R"({"op":"sub","args":[{"lit":-9223372036854775808},{"lit":1}]})").is_null());
+    EXPECT_TRUE(eval(R"({"op":"mul","args":[{"lit":3037000500},{"lit":3037000500}]})").is_null());
+    EXPECT_TRUE(eval(R"({"op":"neg","args":[{"lit":-9223372036854775808}]})").is_null());
+}
+
+TEST(JsonValueExpr, MixedIntAndDoubleStaysDouble) {
+    // A genuine double operand (here from a column) demotes to the double path.
+    auto v = eval(R"({"op":"add","args":[{"lit":7},{"col":"x"}]})", {{"x", JsonValue{2.5}}});
     ASSERT_TRUE(v.is_number());
-    EXPECT_TRUE(std::isnan(v.as_number()));
+    EXPECT_FALSE(v.is_integral_number());
+    EXPECT_DOUBLE_EQ(v.as_number(), 9.5);
 }
 
 TEST(JsonValueExpr, Concat) {

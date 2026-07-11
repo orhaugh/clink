@@ -665,6 +665,53 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
             return value_expr_detail::null_value();  // overflow / div-by-zero -> NULL
         return clink::config::make_dec_value(*r);
     };
+    // Exact integer arithmetic: when BOTH operands are exact integers (and
+    // neither is a decimal), compute in int64 with checked overflow. Keeps
+    // BIGINT arithmetic exact past 2^53 and gives SQL integer division. Any
+    // genuine double operand demotes to the double path below. Overflow and
+    // divide/mod-by-zero resolve to NULL, matching the decimal contract.
+    auto int_binop = [&]() -> std::optional<JsonValue> {
+        if (args.size() != 2)
+            return std::nullopt;
+        if (clink::config::is_dec_string(args[0]) || clink::config::is_dec_string(args[1]))
+            return std::nullopt;
+        if (!args[0].is_integral_number() || !args[1].is_integral_number())
+            return std::nullopt;
+        const std::int64_t a = args[0].as_int();
+        const std::int64_t b = args[1].as_int();
+        std::int64_t r = 0;
+        switch (op) {
+            case ValueOp::Add:
+                if (__builtin_add_overflow(a, b, &r))
+                    return value_expr_detail::null_value();
+                break;
+            case ValueOp::Sub:
+                if (__builtin_sub_overflow(a, b, &r))
+                    return value_expr_detail::null_value();
+                break;
+            case ValueOp::Mul:
+                if (__builtin_mul_overflow(a, b, &r))
+                    return value_expr_detail::null_value();
+                break;
+            case ValueOp::Div:
+                // div-by-zero -> NULL; INT64_MIN / -1 overflows -> NULL. Else
+                // C++ integer division truncates toward zero (7/2=3, -7/2=-3).
+                if (b == 0 || (a == INT64_MIN && b == -1))
+                    return value_expr_detail::null_value();
+                r = a / b;
+                break;
+            case ValueOp::Mod:
+                // mod-by-zero -> NULL; INT64_MIN % -1 is 0 (side-steps the CPU
+                // trap the division form has).
+                if (b == 0)
+                    return value_expr_detail::null_value();
+                r = (a == INT64_MIN && b == -1) ? 0 : a % b;
+                break;
+            default:
+                return std::nullopt;
+        }
+        return JsonValue{r};
+    };
     auto numeric_binop = [&](auto fn) -> JsonValue {
         if (args.size() != 2) {
             throw std::runtime_error("json_value_expr: '" + name + "' takes two args");
@@ -682,6 +729,8 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
         op == ValueOp::Mod) {
         if (auto d = decimal_binop())
             return *d;
+        if (auto i = int_binop())
+            return *i;
     }
     if (op == ValueOp::Add)
         return numeric_binop([](double a, double b) { return a + b; });
@@ -710,6 +759,12 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
             if (auto d = clink::config::as_decimal(args[0]))
                 return clink::config::make_dec_value(clink::config::dec_negate(*d));
             return value_expr_detail::null_value();
+        }
+        if (args[0].is_integral_number()) {
+            const std::int64_t v = args[0].as_int();
+            if (v == INT64_MIN)  // -INT64_MIN overflows int64 -> NULL
+                return value_expr_detail::null_value();
+            return JsonValue{-v};
         }
         auto n = value_expr_detail::numeric_as_double(args[0]);
         if (!n)
