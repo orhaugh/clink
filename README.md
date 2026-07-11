@@ -665,10 +665,11 @@ clink run pipeline.sql
 clink run pipeline.sql --jm-host=jm.prod --jm-port=8081
 ```
 
-First result row lands on stdout in under ~100 ms of process start (Debug
-build, file source). Ctrl-C stops an unbounded pipeline and drains it
-cleanly; `--checkpoint-dir` / `--state-backend` / `--parallelism` behave as
-they do on a cluster. See
+First result row lands on stdout well under half a second from process
+start (~0.4 s measured on a Debug build with a file source - engine
+bring-up dominates; the operator chain barely registers). Ctrl-C stops an
+unbounded pipeline and drains it cleanly; `--checkpoint-dir` /
+`--state-backend` / `--parallelism` behave as they do on a cluster. See
 [docs/internals/embedded.md](docs/internals/embedded.md).
 
 Pipeline: `libpg_query` parses the input; an AST builder normalises
@@ -689,8 +690,9 @@ DDL and basics
 - `CREATE TABLE t (col TYPE, ...) WITH (connector=..., format='json', path=...,
   bootstrap=..., topic=..., event_time_column=..., watermark_lag_ms=...)`
 - `INSERT INTO sink SELECT ... FROM source`
-- `SHOW TABLES`, `DROP TABLE [IF EXISTS]`, persistent JSON catalog under
-  `~/.clink/catalog/`
+- `SHOW TABLES`, `DROP TABLE [IF EXISTS]`; the catalog is session-scoped by
+  default and persists as one JSON file per table when a catalog directory
+  is set (`--sql-catalog-dir` on `clink_node`, `--catalog-dir` on `clink run`)
 - `EXPLAIN <stmt>` prints the OPTIMIZED `LogicalPlan` tree (the plan that
   would run, join reorders and pushdowns applied), each node annotated with
   its estimated output rows; a scan with no declared statistics is flagged

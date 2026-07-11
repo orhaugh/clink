@@ -20,10 +20,9 @@ namespace clink::cluster {
 inline constexpr const char* kGenericSubtaskRole = "__clink_subtask";
 
 // Description of how one op behaves in a chain, used by the generic
-// subtask role on the TM. v1: each subtask hosts exactly one op (no
-// in-process operator chaining yet), so a chain has length 1. The format
-// is forward-compatible with multi-op chains: just extend the encoding to
-// list multiple ops in the same subtask.
+// subtask role on the TM. The planner groups fusable adjacent ops into
+// one chain per subtask (see the chain-grouping pass in job_planner.cpp),
+// so a chain may hold one op or several fused ones.
 enum class OperatorKind : std::uint8_t {
     Source,
     Operator,
@@ -165,14 +164,14 @@ struct OperatorChainSpec {
 };
 
 // Plan a JobGraphSpec into a JobPlan against the supplied snapshot of
-// registered TMs. Validates the graph, expands per-op parallelism (v1:
-// must be 1), assigns each resulting subtask a unique subtask_idx under
+// registered TMs. Validates the graph, expands each op into its
+// `parallelism` subtasks (routing edges as forward / rebalance / hash by
+// adjacency), assigns each resulting subtask a unique subtask_idx under
 // kGenericSubtaskRole, and packs an OperatorChainSpec into each task's
 // extra_config.
 //
 // Throws std::runtime_error if:
 //   - the graph fails JobGraphSpec::validate (missing ids, cycle, ...)
-//   - parallelism > 1 on any op (v1 limit)
 //   - an op's type is not registered in `registry`
 //   - the union of TM slot capacities is too small to host the job
 //

@@ -35,8 +35,12 @@
 //     committed checkpoint; snapshot commits only the delta since the last
 //     checkpoint (state is off the checkpoint-barrier path); restore is LAZY
 //     (cold reads serve the restored checkpoint, nothing is loaded eagerly),
-//     which is the fast-recovery / fast-rescale win. v1 bounds: same-parallelism
-//     restore (rescale deferred) and no hot-tier eviction yet.
+//     which is the fast-recovery / fast-rescale win. Restore honours a
+//     key-group filter (prepare_restore) so rescaled subtasks adopt their
+//     slice, and the hot tier evicts CLEAN keys under an LRU budget
+//     (default 25% of physical RAM; dirty or persisting keys are never
+//     evicted) so a working set beyond RAM spills reads to the pool
+//     instead of growing unbounded.
 
 #include <atomic>
 #include <chrono>

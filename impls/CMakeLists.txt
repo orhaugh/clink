@@ -15,27 +15,11 @@
 # migration. New code should link the explicit per-impl targets it
 # actually needs.
 #
-# THIS DIRECTORY IS A DRAFT. None of the source files referenced by the
-# child CMakeLists exist yet - they live under src/connectors/ and
-# src/state/. The migration steps that need to happen before the parent
-# CMakeLists.txt calls add_subdirectory(impls) are listed in the audit
-# response, repeated here for completeness:
-#
-#   1. Move connector .cpp files from src/connectors/<x>_*.cpp into
-#      impls/<x>/src/. Adapter helpers currently in
-#      src/cluster/built_in_factories.cpp (StringKafkaSource etc.) move
-#      to the same place.
-#   2. Move connector headers from include/clink/connectors/<x>_*.hpp
-#      into impls/<x>/include/clink/connectors/.
-#   3. Move RocksDB backend (header + .cpp) into impls/rocksdb/.
-#   4. Move TLS socket (header + .cpp) into impls/tls/.
-#   5. Extract per-impl registration from built_in_factories.cpp into
-#      a register_factories.cpp inside each impl directory.
-#   6. Templatise (or relocate) src/config/pipeline_loader.cpp -
-#      currently hardcoded to KafkaMessage.
-#   7. Split include/clink/api/builtin_connectors.hpp: file/int64/range
-#      builders stay in core; Kafka/Postgres/ClickHouse/S3 builders move
-#      into impls/<x>/include/clink/api/<x>_builders.hpp.
+# Layout per impl: impls/<x>/include/clink/... (public headers),
+# impls/<x>/src/ (sources incl. register_factories.cpp), impls/<x>/tests/
+# (the per-impl gtest exe, labelled for `ctest -L <x>`). Adding a
+# connector means adding a subdirectory in this shape and an
+# add_subdirectory line below; docs/connectors/<x>.md documents it.
 
 add_subdirectory(kafka)
 add_subdirectory(postgres)

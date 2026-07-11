@@ -40,6 +40,6 @@ workload shape than the single-pane tumbling bench.
 ## Status
 
   - Spec: this file.
-  - clink job: TODO
-  - Flink job: TODO
-  - Runner: TODO
+  - clink job: `clink-job/` (built and run by the runner).
+  - Flink job: `flink-job/` (Maven project, same workload).
+  - Runner: `run.sh` (drives both sides; latest logs under `results/`).

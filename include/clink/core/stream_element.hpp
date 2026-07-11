@@ -10,17 +10,17 @@
 
 namespace clink {
 
-// Drain marker for adaptive rescaling.
+// Drain marker for rescaling.
 //
-// Carried in-band on the operator wire (StreamElement::Drain). When
-// an operator's run() loop is asked to rescale out (29c/d will wire
-// the dispatch), it emits a DrainMarker downstream announcing that
-// THIS upstream subtask is winding down and routing for its
-// key-groups is moving to peer subtasks (at target_parallelism).
-// Downstream operators consume the marker as a signal to expect a
-// fresh stream from the new subtask set; the old upstream's
-// subsequent records (if any, before its shutdown) still flow as
-// the last of its tail.
+// Carried in-band on the operator wire (StreamElement::Drain). When an
+// upstream subtask is asked to rescale out, it emits a DrainMarker
+// downstream announcing that THIS subtask is winding down and routing
+// for its key-groups is moving to peer subtasks (at
+// target_parallelism). Every operator runner (single-input, co-op,
+// union, interval-join, and the cross-TM bridge) consumes the marker as
+// a signal to expect a fresh stream from the new subtask set; the old
+// upstream's subsequent records (if any, before its shutdown) still
+// flow as the last of its tail.
 //
 // Why in-band: a drain signal must respect ordering with respect to
 // data and checkpoints. An out-of-band rescale-coordination message
@@ -34,7 +34,7 @@ struct DrainMarker {
     std::uint32_t subtask_idx{0};
     // Target parallelism the rescale is moving towards. Informational
     // for downstream metrics / logs; the actual routing change is
-    // owned by the JM's RescaleCoordinator (29c/d).
+    // owned by the JobManager's RescaleCoordinator.
     std::uint32_t target_parallelism{0};
 
     constexpr bool operator==(const DrainMarker&) const noexcept = default;

@@ -23,9 +23,13 @@ checkpointing machinery. Adding `--jm-host`/`--jm-port` to the same command
 compiles the same file and submits it to a running cluster instead - one verb
 from laptop to cluster.
 
-Measured on a Debug build: under ~100 ms from process start to the first
-result row on stdout for a file-source query, with total process lifetime
-dominated by post-completion teardown, not startup.
+Measured on a Debug build (2026-07-11, 12-core Apple Silicon): ~0.4 s from
+process start to the first result row on stdout for a file-source query,
+identical for a plain projection and a GROUP BY - engine bring-up
+dominates, the operator chain barely registers - with total process
+lifetime dominated by post-completion teardown, not startup. (An earlier
+~100 ms figure predated the full connector registry and no longer
+reproduces; re-measure on a Release build before quoting a number.)
 
 ## Where it lives
 
