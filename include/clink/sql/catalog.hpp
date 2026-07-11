@@ -175,6 +175,7 @@ struct ModelDef {
 struct FunctionDef {
     std::string name;
     std::string language;
+    std::vector<std::string> arg_names;    // parallel to arg_types; may be empty
     std::vector<std::string> arg_types;    // Arrow ToString() names
     std::string return_type;               // Arrow ToString() name
     std::vector<std::string> definitions;  // CREATE ... AS strings, verbatim

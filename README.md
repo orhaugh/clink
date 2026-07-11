@@ -769,6 +769,11 @@ Advanced and extensibility (each a documented v1 subset)
 - Scalar UDFs and aggregate UDFs (UDAFs): C++-registered closures invoked by
   name (a UDAF needs `retract` for changelog GROUP BY and `merge` for SESSION
   windows)
+- `CREATE FUNCTION with_tax(amount BIGINT) RETURNS BIGINT AS 'amount + amount
+  / 10' LANGUAGE SQL`: expression-bodied scalar UDFs written in SQL itself, no
+  module or extra build flag. The body is any SELECT expression over the named
+  parameters; it is lowered and compiled once at CREATE and ships to the
+  cluster as text
 - `CREATE FUNCTION f(x BIGINT) RETURNS BIGINT LANGUAGE wasm AS
   '/path/module.wasm'`: scalar UDFs declared in SQL itself, run in-process in
   a WebAssembly sandbox (wasmtime, opt-in `CLINK_WITH_WASM`). Modules must be

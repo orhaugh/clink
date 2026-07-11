@@ -98,6 +98,7 @@ struct OperatorSpec {
 struct UdfSpec {
     std::string name;
     std::string language;
+    std::vector<std::string> arg_names;  // parallel to arg_types; may be empty
     std::vector<std::string> arg_types;
     std::string return_type;
     std::vector<std::string> definitions;

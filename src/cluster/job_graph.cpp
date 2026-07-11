@@ -123,6 +123,11 @@ std::vector<UdfSpec> udf_specs_from_value(const config::JsonValue& arr) {
         if (u.name.empty() || u.language.empty()) {
             throw std::runtime_error("udfs: entries need non-empty 'name' and 'language'");
         }
+        if (v.contains("arg_names") && v.at("arg_names").is_array()) {
+            for (const auto& t : v.at("arg_names").as_array()) {
+                u.arg_names.push_back(t.as_string());
+            }
+        }
         if (v.contains("arg_types") && v.at("arg_types").is_array()) {
             for (const auto& t : v.at("arg_types").as_array()) {
                 u.arg_types.push_back(t.as_string());
@@ -154,7 +159,14 @@ std::string pack_udf_specs(const std::vector<UdfSpec>& udfs) {
         out += escape_json_string(u.name);
         out += ",\"language\":";
         out += escape_json_string(u.language);
-        out += ",\"arg_types\":[";
+        out += ",\"arg_names\":[";
+        for (std::size_t k = 0; k < u.arg_names.size(); ++k) {
+            if (k != 0) {
+                out += ',';
+            }
+            out += escape_json_string(u.arg_names[k]);
+        }
+        out += "],\"arg_types\":[";
         for (std::size_t k = 0; k < u.arg_types.size(); ++k) {
             if (k != 0) {
                 out += ',';

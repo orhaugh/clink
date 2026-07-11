@@ -519,3 +519,53 @@ TEST(EmbeddedEngine, ParquetProjectedReadEndToEnd) {
     fs::remove(in_path);
     fs::remove(pq_path);
 }
+
+TEST(EmbeddedEngine, CreateFunctionLanguageSqlRunsEndToEnd) {
+    // Expression-bodied scalar UDF: declared in SQL, interpreted by the
+    // engine's own expression evaluator, usable like any function.
+    const auto in_path = fs::temp_directory_path() / "clink_embed_udf_in.ndjson";
+    const auto out_path = fs::temp_directory_path() / "clink_embed_udf_out.ndjson";
+    fs::remove(in_path);
+    fs::remove(out_path);
+    write_orders(in_path);
+
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    ASSERT_EQ(engine.execute_script(
+                  "CREATE OR REPLACE FUNCTION with_tax(amount BIGINT) RETURNS BIGINT "
+                  "AS 'amount + amount / 10' LANGUAGE SQL;" +
+                  orders_ddl(in_path) +
+                  "CREATE TABLE taxed (user_id BIGINT, total BIGINT) "
+                  "WITH (connector='file', format='json', path='" +
+                  out_path.string() +
+                  "');"
+                  "INSERT INTO taxed SELECT user_id, with_tax(amount) AS total FROM orders"),
+              0)
+        << err.str();
+    ASSERT_TRUE(engine.await_all()) << err.str();
+
+    const auto lines = read_lines(out_path);
+    ASSERT_EQ(lines.size(), 5u);
+    std::int64_t sum = 0;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        sum += static_cast<std::int64_t>(js.at("total").as_number());
+    }
+    // amounts 10,20,30,5,7 -> with_tax: 11,22,33,5,7 (integer division) = 78
+    EXPECT_EQ(sum, 78);
+
+    // A body referencing an unnamed/unknown parameter fails loudly.
+    std::ostringstream err2;
+    clink::embed::EngineOptions opts2;
+    opts2.err = &err2;
+    clink::embed::EmbeddedEngine engine2{std::move(opts2)};
+    EXPECT_NE(engine2.execute_script("CREATE FUNCTION broken(x BIGINT) RETURNS BIGINT "
+                                     "AS 'y * 2' LANGUAGE SQL"),
+              0);
+    EXPECT_FALSE(err2.str().empty());
+
+    fs::remove(in_path);
+    fs::remove(out_path);
+}

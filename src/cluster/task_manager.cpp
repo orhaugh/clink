@@ -57,6 +57,7 @@ void register_shipped_udfs(const std::string& packed) {
     for (const auto& u : unpack_udf_specs(packed)) {
         UdfLanguageRegistry::FunctionDecl decl;
         decl.name = u.name;
+        decl.arg_names = u.arg_names;
         decl.arg_types.reserve(u.arg_types.size());
         for (const auto& t : u.arg_types) {
             decl.arg_types.push_back(udf_type_from_wire_name(t));

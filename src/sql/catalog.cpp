@@ -690,6 +690,11 @@ std::vector<std::string> Catalog::list_functions() const {
 }
 
 std::string Catalog::to_json(const FunctionDef& def) {
+    JsonArray names;
+    names.reserve(def.arg_names.size());
+    for (const auto& n : def.arg_names) {
+        names.emplace_back(n);
+    }
     JsonArray args;
     args.reserve(def.arg_types.size());
     for (const auto& t : def.arg_types) {
@@ -703,6 +708,7 @@ std::string Catalog::to_json(const FunctionDef& def) {
     JsonObject root;
     root["name"] = JsonValue{def.name};
     root["language"] = JsonValue{def.language};
+    root["arg_names"] = JsonValue{std::move(names)};
     root["arg_types"] = JsonValue{std::move(args)};
     root["return_type"] = JsonValue{def.return_type};
     root["definitions"] = JsonValue{std::move(defs)};
@@ -727,6 +733,11 @@ FunctionDef Catalog::function_from_json(const std::string& text) {
         throw std::runtime_error("catalog: FunctionDef JSON missing language");
     }
     def.language = j.at("language").as_string();
+    if (j.contains("arg_names") && j.at("arg_names").is_array()) {
+        for (const auto& n : j.at("arg_names").as_array()) {
+            def.arg_names.push_back(n.as_string());
+        }
+    }
     if (j.contains("arg_types") && j.at("arg_types").is_array()) {
         for (const auto& t : j.at("arg_types").as_array()) {
             def.arg_types.push_back(t.as_string());

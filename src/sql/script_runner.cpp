@@ -145,8 +145,10 @@ int run_script(const std::string& sql,
         auto attach_udfs = [&](cluster::JobGraphSpec& spec) {
             for (const auto& fname : catalog.list_functions()) {
                 const auto* f = catalog.get_function(fname);
-                if (f == nullptr || f->module_b64.empty()) {
-                    continue;  // nothing shippable (language has no packager)
+                // Shippable = a packaged module (wasm), or a language whose
+                // definitions ARE the implementation (sql expression bodies).
+                if (f == nullptr || (f->module_b64.empty() && f->language != "sql")) {
+                    continue;
                 }
                 bool referenced = false;
                 for (const auto& op : spec.ops) {
@@ -163,6 +165,7 @@ int run_script(const std::string& sql,
                 if (referenced) {
                     spec.udfs.push_back(cluster::UdfSpec{f->name,
                                                          f->language,
+                                                         f->arg_names,
                                                          f->arg_types,
                                                          f->return_type,
                                                          f->definitions,
@@ -191,6 +194,7 @@ int run_script(const std::string& sql,
             try {
                 UdfLanguageRegistry::FunctionDecl decl;
                 decl.name = f->name;
+                decl.arg_names = f->arg_names;
                 decl.is_aggregate = is_aggregate;
                 decl.arg_types.reserve(f->arg_types.size());
                 for (const auto& t : f->arg_types) {
@@ -273,6 +277,7 @@ int run_script(const std::string& sql,
                 try {
                     UdfLanguageRegistry::FunctionDecl decl;
                     decl.name = cf.function_name;
+                    decl.arg_names = cf.arg_names;
                     decl.is_aggregate = cf.is_aggregate;
                     decl.return_type = sql_type_to_arrow(cf.return_type);
                     decl.arg_types.reserve(cf.arg_types.size());
@@ -301,6 +306,7 @@ int run_script(const std::string& sql,
                     FunctionDef fdef;
                     fdef.name = cf.function_name;
                     fdef.language = cf.language;
+                    fdef.arg_names = cf.arg_names;
                     fdef.arg_types.reserve(decl.arg_types.size());
                     for (const auto& t : decl.arg_types) {
                         fdef.arg_types.push_back(t->ToString());

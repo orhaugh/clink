@@ -35,6 +35,10 @@ public:
     // defaulting to the function name).
     struct FunctionDecl {
         std::string name;
+        // Parameter names (parallel to arg_types; may hold empty entries for
+        // unnamed parameters). LANGUAGE sql bodies reference parameters by
+        // name; wasm resolves by position and ignores these.
+        std::vector<std::string> arg_names;
         std::vector<std::shared_ptr<arrow::DataType>> arg_types;
         std::shared_ptr<arrow::DataType> return_type;
         std::vector<std::string> definitions;

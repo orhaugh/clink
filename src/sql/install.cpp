@@ -43,15 +43,19 @@
 #include "clink/operators/json_value_expr.hpp"
 #include "clink/operators/map_operator.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/operators/scalar_function_registry.hpp"
 #include "clink/operators/sink_operator.hpp"
+#include "clink/operators/udf_language_registry.hpp"
 #include "clink/operators/watermark_assigner_operator.hpp"
 #include "clink/queryable_state/registry.hpp"
 #include "clink/runtime/async_execution_controller.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/async_function_registry.hpp"
 #include "clink/sql/delta_row_sink.hpp"
+#include "clink/sql/expr_lowering.hpp"
 #include "clink/sql/json_string_to_row_columnar.hpp"
 #include "clink/sql/model_provider.hpp"
+#include "clink/sql/parser.hpp"
 #include "clink/sql/ptf_registry.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
@@ -5898,7 +5902,7 @@ private:
 // RANK leaves a gap after a tie group (rank = 1 + number of strictly-
 // better rows); DENSE_RANK leaves no gap (rank = 1 + number of
 // strictly-better distinct sort keys).
-enum class RankKind { RowNumber, Rank, DenseRank };
+enum class OverRankKind { RowNumber, Rank, DenseRank };
 
 class TopNPerKeyRowOp final : public Operator<Row, Row> {
 public:
@@ -5906,7 +5910,7 @@ public:
                     std::vector<std::string> sort_columns,
                     std::vector<bool> sort_descending,
                     std::int64_t count,
-                    RankKind rank_kind = RankKind::RowNumber)
+                    OverRankKind rank_kind = OverRankKind::RowNumber)
         : partition_columns_(std::move(partition_columns)),
           sort_columns_(std::move(sort_columns)),
           sort_descending_(std::move(sort_descending)),
@@ -5998,13 +6002,13 @@ private:
             }
             std::int64_t rank = 0;
             switch (rank_kind_) {
-                case RankKind::RowNumber:
+                case OverRankKind::RowNumber:
                     rank = static_cast<std::int64_t>(i) + 1;
                     break;
-                case RankKind::Rank:
+                case OverRankKind::Rank:
                     rank = static_cast<std::int64_t>(group_start) + 1;
                     break;
-                case RankKind::DenseRank:
+                case OverRankKind::DenseRank:
                     rank = group_idx + 1;
                     break;
             }
@@ -6061,7 +6065,7 @@ private:
     std::vector<std::string> sort_columns_;
     std::vector<bool> sort_descending_;
     std::int64_t count_;
-    RankKind rank_kind_;
+    OverRankKind rank_kind_;
     clink::FlatMap<std::string, std::vector<Row>> state_;
 };
 
@@ -7296,6 +7300,74 @@ private:
 };
 
 void install(clink::plugin::PluginRegistry& reg) {
+    // ---- CREATE FUNCTION ... LANGUAGE SQL ----
+    // Expression-bodied scalar UDFs interpreted by the engine's own
+    // expression evaluator - no wasm module, no C++ registration:
+    //
+    //   CREATE FUNCTION with_tax(amount BIGINT) RETURNS BIGINT
+    //     AS 'amount + amount / 10' LANGUAGE SQL;
+    //
+    // The body parses through the normal expression path, lowers against a
+    // synthetic table whose columns are the named parameters, compiles once
+    // to the json_value_expr program, and registers as an ordinary scalar
+    // function. The definition text IS the implementation, so it ships to
+    // TaskManagers verbatim (no packager) and reloads from the catalog.
+    UdfLanguageRegistry::global().register_language(
+        "sql", [](const UdfLanguageRegistry::FunctionDecl& decl) {
+            if (decl.is_aggregate) {
+                throw std::runtime_error(
+                    "LANGUAGE sql supports scalar functions only (aggregates need a native "
+                    "or wasm implementation)");
+            }
+            if (decl.definitions.size() != 1) {
+                throw std::runtime_error("LANGUAGE sql expects exactly one AS '<expression>' body");
+            }
+            if (decl.arg_names.size() != decl.arg_types.size()) {
+                throw std::runtime_error("LANGUAGE sql: malformed parameter list");
+            }
+            TableDef params;
+            params.name = "__sql_udf_params";
+            params.columns.reserve(decl.arg_types.size());
+            for (std::size_t i = 0; i < decl.arg_types.size(); ++i) {
+                if (decl.arg_names[i].empty()) {
+                    throw std::runtime_error(
+                        "LANGUAGE sql: every parameter must be named (the body references "
+                        "parameters by name)");
+                }
+                params.columns.push_back(ColumnSpec{decl.arg_names[i], decl.arg_types[i]});
+            }
+            auto script = parse("SELECT " + decl.definitions[0]);
+            if (script.statements.size() != 1 ||
+                !std::holds_alternative<ast::SelectStmt>(script.statements[0])) {
+                throw std::runtime_error("LANGUAGE sql: could not parse the function body: " +
+                                         decl.definitions[0]);
+            }
+            auto& sel = std::get<ast::SelectStmt>(script.statements[0]);
+            if (sel.target_list.size() != 1) {
+                throw std::runtime_error("LANGUAGE sql: the body must be a single expression: " +
+                                         decl.definitions[0]);
+            }
+            auto ir = lowering::value_expr(sel.target_list[0].expr, params, "");
+            auto compiled = clink::operators::CompiledValueExpr::compile(ir);
+            auto names = std::make_shared<const std::vector<std::string>>(decl.arg_names);
+            ScalarFunctionRegistry::global().register_function(
+                decl.name,
+                decl.return_type,
+                [compiled, names](
+                    const std::vector<clink::config::JsonValue>& args) -> clink::config::JsonValue {
+                    auto resolve = [&](const std::string& nm) -> clink::config::JsonValue {
+                        for (std::size_t i = 0; i < names->size() && i < args.size(); ++i) {
+                            if ((*names)[i] == nm) {
+                                return args[i];
+                            }
+                        }
+                        return clink::config::JsonValue{nullptr};
+                    };
+                    const clink::operators::ColumnLookup lookup{resolve};
+                    return compiled.evaluate(lookup);
+                });
+        });
+
     // ---- Channel type ----
     // The Row wire batcher preserves columnar data across TM boundaries: a
     // columnar Batch<Row> ships its typed Arrow RecordBatch verbatim and is
@@ -9108,11 +9180,11 @@ void install(clink::plugin::PluginRegistry& reg) {
             for (const auto& d : descs)
                 sort_descending.push_back(d == "1" || d == "true");
             const auto rank_kind_str = ctx.param_or("rank_kind", "row_number");
-            RankKind rank_kind = RankKind::RowNumber;
+            OverRankKind rank_kind = OverRankKind::RowNumber;
             if (rank_kind_str == "rank")
-                rank_kind = RankKind::Rank;
+                rank_kind = OverRankKind::Rank;
             else if (rank_kind_str == "dense_rank")
-                rank_kind = RankKind::DenseRank;
+                rank_kind = OverRankKind::DenseRank;
             else if (rank_kind_str != "row_number")
                 throw std::runtime_error("top_n_per_key_row: unknown rank_kind '" + rank_kind_str +
                                          "'");
