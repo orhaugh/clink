@@ -157,7 +157,44 @@ TEST(SqlBinder, ArithmeticExpressionInSelect) {
     EXPECT_NE(project.outputs()[0].expr_json.find("\"op\":\"add\""), std::string::npos);
     EXPECT_NE(project.outputs()[0].expr_json.find("\"col\":\"user_id\""), std::string::npos);
     EXPECT_NE(project.outputs()[0].expr_json.find("\"lit\":1"), std::string::npos);
-    EXPECT_TRUE(project.outputs()[0].type->Equals(*arrow::float64()));
+    // Integer arithmetic types as exact int64 (was float64 under the double model).
+    EXPECT_TRUE(project.outputs()[0].type->Equals(*arrow::int64()));
+}
+
+TEST(SqlBinder, IntegerArithmeticTypesAsInt64) {
+    Catalog cat;
+    register_clicks(cat);  // user_id BIGINT
+    Binder b(cat);
+    auto out_type = [&](const std::string& sel) {
+        auto plan = b.bind_select(as_select(parse(sel)));
+        return static_cast<const LogicalProject&>(*plan).outputs()[0].type;
+    };
+    // Every integer arithmetic operator declares int64 (aligned with the
+    // evaluator's exact int64 path), including integer division.
+    EXPECT_TRUE(out_type("SELECT user_id * 2 AS x FROM clicks")->Equals(*arrow::int64()));
+    EXPECT_TRUE(out_type("SELECT user_id / 2 AS x FROM clicks")->Equals(*arrow::int64()));
+    EXPECT_TRUE(out_type("SELECT user_id % 3 AS x FROM clicks")->Equals(*arrow::int64()));
+    EXPECT_TRUE(out_type("SELECT -user_id AS x FROM clicks")->Equals(*arrow::int64()));
+    // int op decimal stays a decimal context (unchanged).
+    EXPECT_EQ(out_type("SELECT user_id + 1.5 AS x FROM clicks")->id(), arrow::Type::DECIMAL128);
+}
+
+TEST(SqlBinder, IntegerArithmeticAssignsToDoubleSinkColumn) {
+    // Integer arithmetic now yields int64; inserting it into a DOUBLE column is
+    // a valid widening coercion and must not be rejected, or a pipeline that
+    // targets a DOUBLE column (CREATE TABLE t(x DOUBLE); INSERT SELECT a+b) breaks.
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT, b BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE sink_d (v DOUBLE) "
+        "WITH (connector='file', format='json', path='/tmp/out.ndjson')");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    Binder b(cat);
+    auto plan = b.bind_insert(as_insert(parse("INSERT INTO sink_d SELECT a + b FROM src_t")));
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(plan->kind(), "Sink");
 }
 
 TEST(SqlBinder, FunctionCallAndConcatInSelect) {

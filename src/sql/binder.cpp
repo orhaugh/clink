@@ -401,6 +401,11 @@ bool is_decimal_type(const std::shared_ptr<arrow::DataType>& t) {
     return t && t->id() == arrow::Type::DECIMAL128;
 }
 
+bool is_integer_type(const std::shared_ptr<arrow::DataType>& t) {
+    return t && (t->id() == arrow::Type::INT64 || t->id() == arrow::Type::INT32 ||
+                 t->id() == arrow::Type::INT16 || t->id() == arrow::Type::INT8);
+}
+
 std::shared_ptr<arrow::DataType> make_decimal(int precision, int scale) {
     precision = std::min(std::max(precision, 1), 38);
     scale = std::min(std::max(scale, 0), precision);
@@ -521,16 +526,27 @@ std::shared_ptr<arrow::DataType> infer_expr_type(const ast::Expression& expr,
         const auto& a = *std::get<std::unique_ptr<ast::ArithOp>>(expr);
         if (a.op == ast::ArithKind::Concat)
             return arrow::utf8();
-        // #56: unary negation keeps a decimal operand's type.
+        // #56: unary negation keeps a decimal operand's type; an integer stays
+        // exact int64 (matches the evaluator's exact int neg).
         if (a.op == ast::ArithKind::Neg && a.args.size() == 1) {
             auto t = infer_expr_type(a.args[0], source);
-            return is_decimal_type(t) ? t : arrow::float64();
+            if (is_decimal_type(t))
+                return t;
+            if (is_integer_type(t))
+                return arrow::int64();
+            return arrow::float64();
         }
         if (a.args.size() == 2) {
-            auto dt = arith_decimal_type(
-                a.op, infer_expr_type(a.args[0], source), infer_expr_type(a.args[1], source));
+            auto lt = infer_expr_type(a.args[0], source);
+            auto rt = infer_expr_type(a.args[1], source);
+            auto dt = arith_decimal_type(a.op, lt, rt);
             if (dt != nullptr)
                 return dt;
+            // Both operands integral -> exact int64 (matches the evaluator's
+            // int_binop, incl. integer division). A float operand still demotes
+            // to double via the fallthrough below.
+            if (is_integer_type(lt) && is_integer_type(rt))
+                return arrow::int64();
         }
         return arrow::float64();
     }
@@ -1053,11 +1069,13 @@ void check_sink_compatibility(const TableDef& sink, const arrow::Schema& source_
         // governs: struct field names + types, map key/item types, list
         // elements must match). A composite into a non-matching column falls to
         // the generic mismatch message, which renders both sides in SQL terms.
-        // #56: implicit assignment coercions for DECIMAL. A DECIMAL source is
-        // assignable to a DECIMAL sink column of ANY precision/scale (the value
-        // keeps its own scale in v1; no sink-side re-quantise) or to a
-        // DOUBLE/FLOAT column (lossy). An integer source is assignable to a
-        // DECIMAL column. Everything else stays strict.
+        // Implicit numeric assignment coercions. A DECIMAL source is assignable
+        // to a DECIMAL sink column of ANY precision/scale (the value keeps its
+        // own scale in v1; no sink-side re-quantise) or to a DOUBLE/FLOAT column
+        // (lossy). An INTEGER source is assignable to a DECIMAL column and - now
+        // that integer arithmetic yields exact int64 (F3) - to a DOUBLE/FLOAT
+        // column (widening), so `CREATE TABLE t (x DOUBLE); INSERT ... SELECT
+        // a + b` keeps working. Everything else stays strict.
         auto is_dec = [](const arrow::DataType& t) { return t.id() == arrow::Type::DECIMAL128; };
         auto is_real = [](const arrow::DataType& t) {
             return t.id() == arrow::Type::DOUBLE || t.id() == arrow::Type::FLOAT;
@@ -1066,9 +1084,9 @@ void check_sink_compatibility(const TableDef& sink, const arrow::Schema& source_
             return t.id() == arrow::Type::INT64 || t.id() == arrow::Type::INT32 ||
                    t.id() == arrow::Type::INT16 || t.id() == arrow::Type::INT8;
         };
-        const bool decimal_assignable = (is_dec(*src) && (is_dec(*dst) || is_real(*dst))) ||
-                                        (is_dec(*dst) && (is_dec(*src) || is_integral(*src)));
-        if (!src->Equals(*dst) && !decimal_assignable) {
+        const bool numeric_assignable = (is_dec(*src) && (is_dec(*dst) || is_real(*dst))) ||
+                                        (is_integral(*src) && (is_dec(*dst) || is_real(*dst)));
+        if (!src->Equals(*dst) && !numeric_assignable) {
             std::ostringstream msg;
             msg << "INSERT INTO " << sink.name << " column " << i << " ("
                 << sink.columns[static_cast<std::size_t>(i)].name << ") expects "
