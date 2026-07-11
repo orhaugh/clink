@@ -825,12 +825,6 @@ if(TARGET clink::embed)
     target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql.cpp tools/clink_replay.cpp
                                           tools/clink_state_query.cpp)
     target_link_libraries(clink_cli_cmds PUBLIC clink::embed)
-    if(TARGET clink::flightsql)
-        target_sources(clink_cli_cmds PRIVATE tools/clink_flight.cpp)
-        target_link_libraries(clink_cli_cmds PUBLIC clink::flightsql)
-    else()
-        target_sources(clink_cli_cmds PRIVATE tools/clink_flight_stub.cpp)
-    endif()
     # `clink run --jm-host` bypasses EmbeddedEngine (which installs the wasm
     # loader itself), so the CLI installs it for the remote-submit path.
     if(TARGET clink::wasm)
@@ -841,6 +835,17 @@ else()
     target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql_stub.cpp
                                           tools/clink_replay_stub.cpp
                                           tools/clink_state_query_stub.cpp)
+endif()
+# Flight SQL is independent of the embed gate. clink::flightsql exists only
+# when the embedded engine is built AND Arrow ships Flight SQL, so it is
+# always absent in a SQL-off build - which must still link the stub (it used
+# to be nested in the embed branch, so a SQL-off `clink` failed to link on
+# the undefined clink_cmd_flight_sql).
+if(TARGET clink::flightsql)
+    target_sources(clink_cli_cmds PRIVATE tools/clink_flight.cpp)
+    target_link_libraries(clink_cli_cmds PUBLIC clink::flightsql)
+else()
+    target_sources(clink_cli_cmds PRIVATE tools/clink_flight_stub.cpp)
 endif()
 if(TARGET clink::tls)
     target_compile_definitions(clink_cli_cmds PUBLIC CLINK_LINKED_TLS)
