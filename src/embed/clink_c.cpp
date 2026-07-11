@@ -5,6 +5,7 @@
 // place rather than written to stderr, since this is a library.
 
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include <arrow/c/bridge.h>
+#include <arrow/memory_pool.h>
 
 #include "clink/embed/clink.h"
 #include "clink/embed/embedded_engine.hpp"
@@ -62,7 +64,34 @@ int32_t clink_abi_version(void) {
     return CLINK_EMBED_ABI_VERSION;
 }
 
+namespace {
+
+// Bind THIS library's Arrow copy to the system memory pool, once, before
+// any Arrow allocation. libclink links Arrow statically, and Arrow's
+// default mimalloc pool corrupts when a host process carries a second
+// Arrow with its own mimalloc (pyarrow): loading libclink first then
+// importing pyarrow crashed inside mi_malloc during schema export. The
+// env var is set only around the first default_memory_pool() call in
+// OUR copy and then restored, so a host Arrow's allocator choice is
+// untouched. An explicit ARROW_DEFAULT_MEMORY_POOL is respected.
+void pin_embedded_arrow_pool_once() {
+    static std::once_flag flag;
+    std::call_once(flag, [] {
+        const char* prior = std::getenv("ARROW_DEFAULT_MEMORY_POOL");
+        if (prior == nullptr) {
+            setenv("ARROW_DEFAULT_MEMORY_POOL", "system", /*overwrite=*/0);
+        }
+        (void)arrow::default_memory_pool();  // binds our copy's pool NOW
+        if (prior == nullptr) {
+            unsetenv("ARROW_DEFAULT_MEMORY_POOL");
+        }
+    });
+}
+
+}  // namespace
+
 clink_engine* clink_engine_open(const clink_engine_options* options) {
+    pin_embedded_arrow_pool_once();
     auto handle = std::make_unique<clink_engine>();
     clink::embed::EngineOptions opts;
     if (options != nullptr) {

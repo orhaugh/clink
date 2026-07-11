@@ -692,7 +692,42 @@ set_target_properties(clink_all PROPERTIES EXPORT_NAME clink)
 if(TARGET clink::embed)
     add_library(clink_shared SHARED src/embed/clink_c.cpp)
     set_target_properties(clink_shared PROPERTIES OUTPUT_NAME clink EXPORT_NAME shared)
+    # Self-contained artifact: satisfy Arrow/Parquet symbols from the STATIC
+    # libraries (listed first, so the linker resolves from them) and strip
+    # the then-unreferenced libarrow/libparquet dylib load commands. The
+    # embedding process then carries its own private Arrow - no clash with a
+    # host that loads a different Arrow (pyarrow), in either load order.
+    if(TARGET Parquet::parquet_static AND TARGET Arrow::arrow_static)
+        target_link_libraries(clink_shared PRIVATE Parquet::parquet_static Arrow::arrow_static)
+        if(APPLE)
+            target_link_options(clink_shared PRIVATE "LINKER:-dead_strip_dylibs")
+        endif()
+        message(STATUS "libclink - self-contained (static Arrow/Parquet)")
+    else()
+        message(STATUS "libclink - static Arrow/Parquet unavailable; linking shared Arrow")
+    endif()
     target_link_libraries(clink_shared PRIVATE clink::embed clink::clink)
+    # Export ONLY the clink_* C API from the dynamic symbol table. Without
+    # this the artifact exports every engine / third-party symbol it links
+    # (~20k, including bundled Arrow objects and abseil), and a host that
+    # also loads its own Arrow (pyarrow!) can resolve symbols across copies
+    # - the load-order crash pyclink used to work around. With the trimmed
+    # table the C API is the whole contract and load order stops mattering.
+    if(APPLE)
+        set(_clink_exported_symbols "${CMAKE_CURRENT_BINARY_DIR}/libclink.exported_symbols")
+        file(WRITE "${_clink_exported_symbols}" "_clink_*\n")
+        target_link_options(clink_shared PRIVATE
+            "LINKER:-exported_symbols_list,${_clink_exported_symbols}")
+        set_target_properties(clink_shared PROPERTIES LINK_DEPENDS
+            "${_clink_exported_symbols}")
+    else()
+        set(_clink_version_script "${CMAKE_CURRENT_BINARY_DIR}/libclink.version")
+        file(WRITE "${_clink_version_script}" "{ global: clink_*; local: *; };\n")
+        target_link_options(clink_shared PRIVATE
+            "LINKER:--version-script=${_clink_version_script}")
+        set_target_properties(clink_shared PROPERTIES LINK_DEPENDS
+            "${_clink_version_script}")
+    endif()
     clink_set_warnings(clink_shared)
     install(TARGETS clink_shared LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
     message(STATUS "libclink - embeddable C ABI enabled")

@@ -32,12 +32,12 @@ import ctypes.util
 import os
 import time
 
-# Import pyarrow BEFORE any chance of loading libclink: libclink carries its
-# own libarrow, and on macOS loading it first makes pyarrow's bundled Arrow
-# resolve symbols against the already-resident copy (abseil symbol clash,
-# ImportError). pyarrow-first is safe in both directions and pyarrow is a
-# hard dependency anyway, so make the good order structural.
-import pyarrow as _pa  # noqa: F401  (imported for load order, used in collect)
+# pyarrow is a hard dependency (collect streams import into
+# pyarrow.RecordBatchReader). Load order against libclink no longer
+# matters: libclink is self-contained (its Arrow is statically linked
+# with only the clink_* C API exported, and its private Arrow uses the
+# system allocator), so either library can load first.
+import pyarrow as _pa  # noqa: F401  (used in collect)
 
 __all__ = ["Engine", "ClinkError"]
 

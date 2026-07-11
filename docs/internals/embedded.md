@@ -141,12 +141,21 @@ reserved in this mode.
 
 pyclink (`python/pyclink/`) is pure Python over this ABI: ctypes bindings,
 no compiled extension, with collect streams imported straight into
-`pyarrow.RecordBatchReader`. One load-order constraint is made structural
-there: pyclink imports pyarrow before it ever loads libclink, because
-libclink carries its own libarrow and loading it first makes pyarrow's
-bundled Arrow resolve symbols against the already-resident copy (an abseil
-symbol clash on macOS). A self-contained libclink (static, hidden-symbol
-Arrow) is the packaging follow-on that removes the hazard entirely.
+`pyarrow.RecordBatchReader`.
+
+libclink is SELF-CONTAINED: Arrow and Parquet link statically into the
+artifact (the then-unreferenced dylib load commands are stripped), and the
+dynamic symbol table exports ONLY the clink_* C API - macOS uses an
+exported-symbols list, Linux a version script - so ~20k engine and
+third-party symbols no longer leak into the host process. Two consequences:
+the artifact needs no Arrow install on the host, and load order against a
+host Arrow (pyarrow) no longer matters. The last co-residence hazard was
+allocator-level, not symbol-level: Arrow's default mimalloc pool corrupts
+when a second Arrow (pyarrow's) runs its own mimalloc in the same process,
+so `clink_engine_open` binds libclink's PRIVATE Arrow copy to the system
+memory pool once, before any Arrow allocation, restoring the environment so
+a host Arrow's allocator choice is untouched (an explicit
+`ARROW_DEFAULT_MEMORY_POOL` is always respected).
 
 ### What embedded mode does not change
 
