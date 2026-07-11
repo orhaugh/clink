@@ -1,5 +1,11 @@
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <random>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -87,6 +93,110 @@ TEST(JsonValueExpr, IntegerOverflowIsNull) {
     EXPECT_TRUE(eval(R"({"op":"sub","args":[{"lit":-9223372036854775808},{"lit":1}]})").is_null());
     EXPECT_TRUE(eval(R"({"op":"mul","args":[{"lit":3037000500},{"lit":3037000500}]})").is_null());
     EXPECT_TRUE(eval(R"({"op":"neg","args":[{"lit":-9223372036854775808}]})").is_null());
+}
+
+// Property test: exact int64 arithmetic against a 128-bit oracle. For every op
+// and every pair drawn from an edge-heavy set plus a deterministic random
+// stream, evaluate_json_value_expr must equal the __int128 reference - the exact
+// value when it fits int64, NULL on overflow / div-mod-by-zero / INT64_MIN
+// negation. This is the arbitrary-precision cross-check for the integer path.
+TEST(JsonValueExpr, IntegerArithmeticMatchesInt128Oracle) {
+    using i64 = std::int64_t;
+    constexpr i64 kMin = std::numeric_limits<i64>::min();
+    constexpr i64 kMax = std::numeric_limits<i64>::max();
+
+    auto lit = [](i64 x) { return JsonValue{clink::config::JsonObject{{"lit", JsonValue{x}}}}; };
+    auto binop = [](const std::string& op, JsonValue a, JsonValue b) {
+        return JsonValue{clink::config::JsonObject{
+            {"op", JsonValue{op}},
+            {"args", JsonValue{clink::config::JsonArray{std::move(a), std::move(b)}}}}};
+    };
+    auto empty_resolver = [](const std::string&) { return JsonValue{nullptr}; };
+
+    auto fits = [](__int128 v) -> std::optional<i64> {
+        if (v < static_cast<__int128>(kMin) || v > static_cast<__int128>(kMax))
+            return std::nullopt;
+        return static_cast<i64>(v);
+    };
+    // The 128-bit reference, mirroring int_binop's defined semantics exactly.
+    auto oracle = [&](const std::string& op, i64 a, i64 b) -> std::optional<i64> {
+        const auto x = static_cast<__int128>(a);
+        const auto y = static_cast<__int128>(b);
+        if (op == "add")
+            return fits(x + y);
+        if (op == "sub")
+            return fits(x - y);
+        if (op == "mul")
+            return fits(x * y);
+        if (op == "div") {
+            if (b == 0 || (a == kMin && b == -1))
+                return std::nullopt;         // by-zero and the one overflowing quotient
+            return static_cast<i64>(a / b);  // truncates toward zero
+        }
+        if (op == "mod") {
+            if (b == 0)
+                return std::nullopt;
+            if (a == kMin && b == -1)
+                return static_cast<i64>(0);  // remainder is 0, not UB
+            return static_cast<i64>(a % b);
+        }
+        ADD_FAILURE() << "unknown op " << op;
+        return std::nullopt;
+    };
+
+    std::vector<i64> vals{kMin,
+                          kMin + 1,
+                          -3037000500LL,
+                          -9007199254740992LL,
+                          -2147483648LL,
+                          -7,
+                          -2,
+                          -1,
+                          0,
+                          1,
+                          2,
+                          7,
+                          2147483647LL,
+                          3037000500LL,
+                          9007199254740992LL,
+                          9007199254740993LL,
+                          kMax - 1,
+                          kMax};
+    std::mt19937_64 rng(0xC1A1B2C3D4E5F607ULL);  // fixed seed -> deterministic
+    for (int i = 0; i < 80; ++i)
+        vals.push_back(static_cast<i64>(rng()));
+
+    const std::array<std::string, 5> ops{"add", "sub", "mul", "div", "mod"};
+    for (const auto& op : ops) {
+        for (const i64 a : vals) {
+            for (const i64 b : vals) {
+                auto expr = binop(op, lit(a), lit(b));
+                const JsonValue got = evaluate_json_value_expr(expr, empty_resolver);
+                const auto want = oracle(op, a, b);
+                if (want) {
+                    ASSERT_TRUE(got.is_integral_number())
+                        << op << "(" << a << "," << b << ") -> expected " << *want;
+                    EXPECT_EQ(got.as_int(), *want) << op << "(" << a << "," << b << ")";
+                } else {
+                    EXPECT_TRUE(got.is_null()) << op << "(" << a << "," << b << ") should be NULL";
+                }
+            }
+        }
+    }
+
+    // Unary negation: exact except INT64_MIN, which overflows to NULL.
+    for (const i64 a : vals) {
+        auto expr = JsonValue{
+            clink::config::JsonObject{{"op", JsonValue{std::string{"neg"}}},
+                                      {"args", JsonValue{clink::config::JsonArray{lit(a)}}}}};
+        const JsonValue got = evaluate_json_value_expr(expr, empty_resolver);
+        if (a == kMin) {
+            EXPECT_TRUE(got.is_null()) << "neg(INT64_MIN) should be NULL";
+        } else {
+            ASSERT_TRUE(got.is_integral_number()) << "neg(" << a << ")";
+            EXPECT_EQ(got.as_int(), -a) << "neg(" << a << ")";
+        }
+    }
 }
 
 TEST(JsonValueExpr, MixedIntAndDoubleStaysDouble) {
