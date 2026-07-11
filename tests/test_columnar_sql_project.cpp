@@ -135,26 +135,59 @@ TEST(ColumnarRowProject, ColumnPruningDropsUnreferenced) {
     EXPECT_FALSE(rows[0].has_column("region")) << "pruned column must be gone";
 }
 
-TEST(ColumnarRowProject, ComputedArithmeticRunsColumnar) {
-    // amt2 = amount * 2 over a numeric (int64) column: WS1 inc2 evaluates this
-    // column-at-a-time via the typed value program (float64 output), so it stays
-    // on the columnar fast path with no row decode and byte-identical results.
+TEST(ColumnarRowProject, ComputedRealArithmeticRunsColumnar) {
+    // amt2 = amount * 2.0: a real operand makes the result a double, so the typed
+    // value program evaluates it column-at-a-time (float64 output) with no row
+    // decode, byte-identical to the row path (which also widens amount to double).
     auto outs = std::vector<Output>{
-        {"amt2", clink::config::parse(R"({"op":"mul","args":[{"col":"amount"},{"lit":2}]})")}};
+        {"amt2", clink::config::parse(R"({"op":"mul","args":[{"col":"amount"},{"lit":2.0}]})")}};
     ColumnarRowProjectOperator op(outs);
     Capture cap;
     auto em = cap.emitter();
     const auto before = materialize_count();
     EXPECT_TRUE(
         op.process_columnar(StreamElement<Row>::data(make_columnar(sample(), schema2())), em))
-        << "numeric arithmetic projection runs on the columnar fast path";
+        << "real arithmetic projection runs on the columnar fast path";
     EXPECT_EQ(materialize_count() - before, 0u) << "columnar arithmetic must not decode rows";
     EXPECT_TRUE(cap.any_columnar()) << "output stays columnar";
     auto rows = cap.rows();  // materializing here is the test reading, not the op
     ASSERT_EQ(rows.size(), 3u);
-    EXPECT_EQ(static_cast<std::int64_t>(rows[0].values.at("amt2").as_number()), 20);   // 10*2
-    EXPECT_EQ(static_cast<std::int64_t>(rows[1].values.at("amt2").as_number()), 120);  // 60*2
-    EXPECT_EQ(static_cast<std::int64_t>(rows[2].values.at("amt2").as_number()), 100);  // 50*2
+    EXPECT_EQ(rows[0].values.at("amt2").as_number(), 20.0);   // 10*2.0
+    EXPECT_EQ(rows[1].values.at("amt2").as_number(), 120.0);  // 60*2.0
+    EXPECT_EQ(rows[2].values.at("amt2").as_number(), 100.0);  // 50*2.0
+}
+
+TEST(ColumnarRowProject, ComputedIntegerArithmeticDefersToRowPath) {
+    // amt2 = amount * 2 over an int64 column is exact integer arithmetic (exact
+    // past 2^53). The float64 value program cannot reproduce that, so it declines
+    // and the operator defers to the exact row path, which keeps the int64 type.
+    auto outs = std::vector<Output>{
+        {"amt2", clink::config::parse(R"({"op":"mul","args":[{"col":"amount"},{"lit":2}]})")}};
+    {
+        ColumnarRowProjectOperator op(outs);
+        Capture cap;
+        auto em = cap.emitter();
+        EXPECT_FALSE(
+            op.process_columnar(StreamElement<Row>::data(make_columnar(sample(), schema2())), em))
+            << "integer arithmetic must decline the columnar fast path";
+        EXPECT_TRUE(cap.elems.empty()) << "a declined columnar batch emits nothing";
+    }
+    {
+        // The runtime re-drives the SAME columnar batch through process() on a
+        // decline; materialising it reads the int64 column as an integral value,
+        // so the row evaluator applies exact integer arithmetic.
+        ColumnarRowProjectOperator op(outs);
+        Capture cap;
+        auto em = cap.emitter();
+        op.process(StreamElement<Row>::data(make_columnar(sample(), schema2())), em);
+        auto rows = cap.rows();
+        ASSERT_EQ(rows.size(), 3u);
+        // Exact int64 results, and the value keeps its integer type (no double).
+        EXPECT_TRUE(rows[0].values.at("amt2").is_integral_number());
+        EXPECT_EQ(rows[0].values.at("amt2").as_int(), 20);   // 10*2
+        EXPECT_EQ(rows[1].values.at("amt2").as_int(), 120);  // 60*2
+        EXPECT_EQ(rows[2].values.at("amt2").as_int(), 100);  // 50*2
+    }
 }
 
 TEST(ColumnarRowProject, UnsupportedComputedOutputFallsBack) {

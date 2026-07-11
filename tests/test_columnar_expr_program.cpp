@@ -269,24 +269,50 @@ void expect_value_parity(const JsonValue& expr, const arrow::RecordBatch& rb) {
     }
 }
 
+// Real-valued arithmetic (at least one double operand) compiles and stays
+// byte-identical to the row path: the float64 kernel and numeric_binop both
+// carry a double, and the row path widens any integer operand to double too.
 TEST(ColumnarValueProgram, ArithmeticParity) {
     auto rb = make_batch();  // price int64 (null at row 2), ratio float64
 
-    expect_value_parity(vop("add", JsonArray{vcol("price"), vcol("price")}), *rb);
     expect_value_parity(vop("mul", JsonArray{vcol("ratio"), vlit(JsonValue{2.0})}), *rb);
-    expect_value_parity(vop("sub", JsonArray{vcol("price"), vlit(JsonValue{std::int64_t{10}})}),
-                        *rb);
     expect_value_parity(vop("neg", JsonArray{vcol("ratio")}), *rb);
-    // div / mod by zero -> NaN on both paths; null operand (row 2) -> null.
-    expect_value_parity(vop("div", JsonArray{vcol("price"), vlit(JsonValue{std::int64_t{0}})}),
-                        *rb);
-    expect_value_parity(vop("mod", JsonArray{vcol("price"), vlit(JsonValue{std::int64_t{7}})}),
-                        *rb);
-    // Nested: (price * 2) + ratio.
+    // div / mod by zero -> NaN on both paths (real operands); null operand -> null.
+    expect_value_parity(vop("div", JsonArray{vcol("ratio"), vlit(JsonValue{0.0})}), *rb);
+    expect_value_parity(vop("mod", JsonArray{vcol("ratio"), vlit(JsonValue{2.0})}), *rb);
+    // Mixed: an integer column with a real operand is a real result; the row
+    // path widens price to double, so the float64 kernel matches.
+    expect_value_parity(vop("add", JsonArray{vcol("price"), vcol("ratio")}), *rb);
+    // Nested mixed: (price * 2.0) + ratio - the 2.0 makes the mul real.
     expect_value_parity(
         vop("add",
             JsonArray{vop("mul", JsonArray{vcol("price"), vlit(JsonValue{2.0})}), vcol("ratio")}),
         *rb);
+}
+
+// All-integer arithmetic is exact int64 on the row path (exact past 2^53,
+// truncating division, NULL on div/mod by zero and INT64_MIN negation), which a
+// float64 kernel cannot reproduce. compile() must decline so the projection
+// defers the output to the exact row path.
+TEST(ColumnarValueProgram, IntegerArithmeticDefersToRowPath) {
+    auto rb = make_batch();
+    auto declines = [&](const JsonValue& expr, const char* why) {
+        EXPECT_FALSE(ColumnarValueProgram::compile(expr, *rb->schema()).has_value()) << why;
+    };
+    declines(vop("add", JsonArray{vcol("price"), vcol("price")}), "int col + int col");
+    declines(vop("sub", JsonArray{vcol("price"), vlit(JsonValue{std::int64_t{10}})}),
+             "int col - int literal");
+    declines(vop("div", JsonArray{vcol("price"), vlit(JsonValue{std::int64_t{0}})}),
+             "int div (truncating / NULL on zero)");
+    declines(vop("mod", JsonArray{vcol("price"), vlit(JsonValue{std::int64_t{7}})}), "int mod");
+    declines(vop("neg", JsonArray{vcol("price")}), "neg of int col");
+    // A nested all-integer subtree taints the whole tree: (price * 2) is integer,
+    // so even adding a real ratio afterwards must defer (the integer intermediate
+    // needs exact int64).
+    declines(vop("add",
+                 JsonArray{vop("mul", JsonArray{vcol("price"), vlit(JsonValue{std::int64_t{2}})}),
+                           vcol("ratio")}),
+             "integer intermediate under a real add");
 }
 
 TEST(ColumnarValueProgram, NonNumericOperandsFallBack) {
@@ -366,11 +392,14 @@ TEST(ColumnarExprProgram, EventTimeColumnZeroNotResolvedAsValue) {
     auto schema = arrow::schema(
         {arrow::field("event_time", arrow::int64()), arrow::field("v", arrow::int64())});
 
-    // A genuine value column (index 1) resolves on both programs.
+    // A genuine value column (index 1) resolves on both programs. The value
+    // program is fed a real-valued expression (v * 2.0) so it compiles: pure
+    // integer arithmetic would instead defer to the exact row path.
     EXPECT_TRUE(
         ColumnarPredicateProgram::compile(cmp("gt", "v", JsonValue{std::int64_t{0}}), *schema)
             .has_value());
-    EXPECT_TRUE(ColumnarValueProgram::compile(vop("add", JsonArray{vcol("v"), vcol("v")}), *schema)
+    EXPECT_TRUE(ColumnarValueProgram::compile(
+                    vop("mul", JsonArray{vcol("v"), vlit(JsonValue{2.0})}), *schema)
                     .has_value());
 
     // The position-0 event-time column never resolves as a value column.

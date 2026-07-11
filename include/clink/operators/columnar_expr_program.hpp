@@ -497,16 +497,20 @@ private:
     int root_{-1};
 };
 
-// Typed columnar VALUE program (WS1 inc2): compiles a numeric SQL scalar
-// expression - arithmetic add/sub/mul/div/mod/neg over numeric columns
-// (int64/int32/double/float) and plain numeric literals - into a program that
-// produces a float64 output column byte-identical to evaluate_json_value_expr
-// (numeric_binop): a double result, NULL when any operand is null, NaN on
-// div/mod by zero. The binder already declares arithmetic outputs as float64,
-// so the produced column type matches the row path's downstream type too.
-// compile() returns nullopt for anything else (a decimal/string/bool operand, a
-// dec-string literal, casts, concat, CASE, functions, a bare column or literal
-// top-level), so the projection operator defers that output to the row path.
+// Typed columnar VALUE program (WS1 inc2): compiles a REAL-valued numeric SQL
+// scalar expression - arithmetic add/sub/mul/div/mod/neg producing a double -
+// into a program that yields a float64 output column byte-identical to
+// evaluate_json_value_expr (numeric_binop): a double result, NULL when any
+// operand is null, NaN on div/mod by zero. An arithmetic node whose operands are
+// ALL integer-typed (an int64/int32 column or an integral literal) is declined:
+// the row path evaluates it with exact int64 semantics (exact past 2^53,
+// truncating division, NULL on div/mod by zero or overflow) that a float64
+// kernel cannot reproduce, so compile() returns nullopt and the whole projection
+// defers to the exact row path. A mixed node (at least one real operand) stays -
+// the row path also widens its integer operand to double there, so the two
+// remain byte-identical. compile() likewise declines anything it cannot model (a
+// decimal/string/bool operand, a dec-string literal, casts, concat, CASE,
+// functions, a bare column or literal top-level).
 class ColumnarValueProgram {
 public:
     static std::optional<ColumnarValueProgram> compile(const clink::config::JsonValue& expr,
@@ -551,6 +555,11 @@ private:
         int col_idx{-1};
         arrow::Type::type arrow_type{};
         double lit{0.0};
+        // True when this node's SQL result type is integer (an int64/int32
+        // column, an integral literal, or arithmetic over all-integer operands).
+        // An all-integer arithmetic node is never built - compile_node_ declines
+        // it so the exact row path handles the integer semantics.
+        bool integer_result{false};
         std::vector<int> children;
     };
 
@@ -583,6 +592,7 @@ private:
             n.op = VOp::Col;
             n.col_idx = idx;
             n.arrow_type = t;
+            n.integer_result = (t == arrow::Type::INT64 || t == arrow::Type::INT32);
             return add_(std::move(n));
         }
         if (e.contains("lit")) {
@@ -593,6 +603,7 @@ private:
             Node n;
             n.op = VOp::Lit;
             n.lit = lit.as_number();
+            n.integer_result = lit.is_integral_number();
             return add_(std::move(n));
         }
         if (!e.contains("op")) {
@@ -606,6 +617,11 @@ private:
             }
             const int c = compile_node_(args.as_array()[0], schema);
             if (c < 0) {
+                return -1;
+            }
+            // neg over an integer operand is exact int64 (with INT64_MIN -> NULL)
+            // on the row path; a float64 kernel cannot reproduce that -> decline.
+            if (nodes_[static_cast<std::size_t>(c)].integer_result) {
                 return -1;
             }
             Node n;
@@ -633,6 +649,15 @@ private:
         const int a = compile_node_(args.as_array()[0], schema);
         const int b = compile_node_(args.as_array()[1], schema);
         if (a < 0 || b < 0) {
+            return -1;
+        }
+        // All-integer arithmetic is exact int64 on the row path (exact past
+        // 2^53, truncating division, NULL on div/mod by zero or overflow), which
+        // a float64 kernel cannot reproduce -> decline so the row path handles
+        // it. A mixed node is real: the row path also widens the integer operand
+        // to double, so the float64 result stays byte-identical.
+        if (nodes_[static_cast<std::size_t>(a)].integer_result &&
+            nodes_[static_cast<std::size_t>(b)].integer_result) {
             return -1;
         }
         Node n;

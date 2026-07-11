@@ -97,10 +97,12 @@ public:
             }
             // Computed numeric expression: a typed value program produces a
             // float64 column byte-identical to evaluate_json_value_expr
-            // (numeric_binop), matching the binder's declared arithmetic type.
-            // compile() declines anything it cannot model (decimal/string/bool
-            // operands, casts, concat, CASE, functions, a bare literal), so the
-            // WHOLE projection defers to the row path - we have not emitted yet.
+            // (numeric_binop). compile() only accepts REAL-valued arithmetic;
+            // it declines all-integer arithmetic (which the binder types int64
+            // and the row path evaluates with exact int64 semantics) and
+            // anything else it cannot model (decimal/string/bool operands, casts,
+            // concat, CASE, functions, a bare literal), so the WHOLE projection
+            // defers to the row path - we have not emitted yet.
             if (expr.is_object() && expr.contains("op")) {
                 auto vp = clink::operators::ColumnarValueProgram::compile(expr, *rb->schema());
                 if (!vp) {
