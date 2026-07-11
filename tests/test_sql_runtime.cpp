@@ -4632,8 +4632,12 @@ TEST(SqlRuntime, OuterEquiJoins) {
                   "WITH (connector='file', format='json', path='" +
                   o_path.string() +
                   "');"
+                  // changelog='true': an OUTER equi join retracts its
+                  // null-padded row when the match arrives, so the append
+                  // sink must declare it accepts rows carrying __row_kind
+                  // (the reader below nets them).
                   "CREATE TABLE out_t (c_id BIGINT, c_name TEXT, o_cust BIGINT, o_amt BIGINT) "
-                  "WITH (connector='file', format='json', path='" +
+                  "WITH (connector='file', format='json', changelog='true', path='" +
                   out_path.string() + "')");
         for (const auto& st : ddl.statements)
             cat.register_table(std::get<ast::CreateTableStmt>(st));
@@ -9141,8 +9145,13 @@ TEST(SqlRuntime, SetOperations) {
                          "WITH (connector='file', format='json', path='" +
                          b_path.string() +
                          "');"
+                         // changelog='true': INTERSECT / EXCEPT emit deletes
+                         // as the surviving set shrinks; the append sink must
+                         // declare it accepts rows carrying __row_kind (the
+                         // netting below replays them). Harmless for the
+                         // UNION arm, whose rows are all inserts.
                          "CREATE TABLE out_t (v BIGINT) "
-                         "WITH (connector='file', format='json', path='" +
+                         "WITH (connector='file', format='json', changelog='true', path='" +
                          out_path.string() + "')");
         for (const auto& st : ddl.statements)
             cat.register_table(std::get<ast::CreateTableStmt>(st));
@@ -9207,8 +9216,11 @@ TEST(SqlRuntime, SetOperationsAll) {
                          "WITH (connector='file', format='json', path='" +
                          b_path.string() +
                          "');"
+                         // changelog='true': the ALL set-op forms also shrink
+                         // via __row_kind=delete rows; declared so the append
+                         // sink accepts them (the netting below replays).
                          "CREATE TABLE out_t (v BIGINT) "
-                         "WITH (connector='file', format='json', path='" +
+                         "WITH (connector='file', format='json', changelog='true', path='" +
                          out_path.string() + "')");
         for (const auto& st : ddl.statements)
             cat.register_table(std::get<ast::CreateTableStmt>(st));
@@ -9267,8 +9279,10 @@ TEST(SqlRuntime, SetOpExceptRetractsDeletedLeftRow) {
                      "WITH (connector='file', format='json', path='" +
                      b_path.string() +
                      "');"
+                     // changelog='true': EXCEPT retracts, so the append sink
+                     // must declare it accepts __row_kind rows (netted below).
                      "CREATE TABLE out_t (v BIGINT) "
-                     "WITH (connector='file', format='json', path='" +
+                     "WITH (connector='file', format='json', changelog='true', path='" +
                      out_path.string() + "')");
     for (const auto& st : ddl.statements)
         cat.register_table(std::get<ast::CreateTableStmt>(st));

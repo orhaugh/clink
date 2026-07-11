@@ -1416,8 +1416,10 @@ TEST(SqlPhysical, PredicateNotPushedThroughOuterJoin) {
         "WITH (connector='file', format='json', path='/tmp/a.ndjson');"
         "CREATE TABLE b (k BIGINT, y BIGINT) "
         "WITH (connector='file', format='json', path='/tmp/b.ndjson');"
+        // changelog='true': an OUTER equi join produces a changelog, and the
+        // append-sink guard rejects it without the declaration.
         "CREATE TABLE out_t (a_k BIGINT, a_x BIGINT, b_k BIGINT, b_y BIGINT) "
-        "WITH (connector='file', format='json', path='/tmp/o.ndjson')");
+        "WITH (connector='file', format='json', changelog='true', path='/tmp/o.ndjson')");
     for (const auto& st : s.statements) {
         cat.register_table(std::get<ast::CreateTableStmt>(st));
     }
@@ -1728,8 +1730,10 @@ TEST(SqlPhysical, OuterEquiJoinEmitsJoinTypeAndColumns) {
         "WITH (connector='file', format='json', path='/tmp/a.ndjson');"
         "CREATE TABLE b (k BIGINT, w BIGINT) "
         "WITH (connector='file', format='json', path='/tmp/b.ndjson');"
+        // changelog='true': an OUTER equi join produces a changelog, and the
+        // append-sink guard rejects it without the declaration.
         "CREATE TABLE out_t (a_k BIGINT, a_v BIGINT, b_k BIGINT, b_w BIGINT) "
-        "WITH (connector='file', format='json', path='/tmp/out.ndjson')");
+        "WITH (connector='file', format='json', changelog='true', path='/tmp/out.ndjson')");
     for (const auto& stmt : s.statements) {
         cat.register_table(std::get<ast::CreateTableStmt>(stmt));
     }
@@ -1825,8 +1829,10 @@ Catalog set_op_physical_catalog() {
         "WITH (connector='file', format='json', path='/tmp/a.ndjson');"
         "CREATE TABLE b (id BIGINT) "
         "WITH (connector='file', format='json', path='/tmp/b.ndjson');"
+        // changelog='true': INTERSECT / EXCEPT produce a changelog, and the
+        // append-sink guard rejects them without the declaration.
         "CREATE TABLE out_t (id BIGINT) "
-        "WITH (connector='file', format='json', path='/tmp/out.ndjson')");
+        "WITH (connector='file', format='json', changelog='true', path='/tmp/out.ndjson')");
     for (const auto& stmt : s.statements) {
         cat.register_table(std::get<ast::CreateTableStmt>(stmt));
     }

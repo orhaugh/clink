@@ -1735,19 +1735,78 @@ std::optional<EquiJoinShape> match_equi_join(const ast::Expression& on,
     return std::nullopt;
 }
 
-// Walk a bound LogicalPlan tree and decide whether it
-// produces changelog records (rows tagged with __row_kind=delete
-// at runtime). Today only LogicalTopNPerKey is a producer; this
-// helper recurses through pass-through nodes so a Project wrapping
-// a TopN still classifies as changelog. Multi-input nodes inherit
-// from any child being changelog.
+// Changelog classification for the append-sink guard and the script
+// runner's collect synthesis lives just below (namespace-level, declared
+// in logical_plan.hpp).
 }  // namespace
 
-// Namespace-level (declared in logical_plan.hpp): the script runner's
-// changelog-aware collect synthesis classifies plans with it too.
-bool is_changelog_plan(const LogicalPlan& node) {
-    if (node.kind() == "TopNPerKey" || node.kind() == "LastNAgg") {
+// True when the subtree contains a stream that can RETRACT rows it has
+// already emitted once a changelog-consuming operator (equi join, stacked
+// aggregate) subscribes downstream. The unbounded (windowless) GROUP BY
+// belongs here: sink-adjacent it emits append-mode snapshots, but under a
+// consumer it emits a full changelog, which the consumer then turns into
+// join-result deletes. A windowed aggregate fires each window once
+// (append-only) and absorbs any upstream changelog, so the walk stops
+// there.
+static bool contains_updating_stream(const LogicalPlan& node) {
+    const auto k = node.kind();
+    if (k == "Aggregate" || k == "TopNPerKey" || k == "LastNAgg" || k == "SetOp") {
         return true;
+    }
+    if (k == "WindowAggregate") {
+        return false;
+    }
+    if (k == "EquiJoin" &&
+        static_cast<const LogicalEquiJoin&>(node).join_type() != JoinType::Inner) {
+        return true;
+    }
+    for (const auto* in : node.inputs()) {
+        if (in != nullptr && contains_updating_stream(*in)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Walk a bound LogicalPlan tree and decide whether the stream it hands
+// its consumer (for the sink guard: the sink) carries changelog records
+// (rows tagged __row_kind=delete at runtime).
+//
+//  - TopNPerKey / LastNAgg always retract.
+//  - SetOp (INTERSECT / EXCEPT, distinct and ALL forms) emits deletes as
+//    the surviving multiset shrinks.
+//  - An OUTER equi join retracts its null-padded row when the match
+//    later arrives; an INNER equi join propagates deletes whenever any
+//    input subtree is an updating stream (the join is a changelog
+//    consumer, and consuming an unbounded aggregate's updates produces
+//    join-result deletes).
+//  - Aggregates ABSORB an upstream changelog (retraction-aware
+//    accumulators) and re-emit append-mode snapshots, so a retractor
+//    below an aggregate never reaches the sink and the walk stops.
+//  - Interval joins are deliberately NOT classified: even their OUTER
+//    forms are append-only (unmatched rows null-pad exactly once at
+//    watermark eviction, no retraction).
+//
+// Pass-through nodes (Project, Filter, ...) preserve __row_kind, so the
+// default case recurses.
+bool is_changelog_plan(const LogicalPlan& node) {
+    const auto k = node.kind();
+    if (k == "TopNPerKey" || k == "LastNAgg" || k == "SetOp") {
+        return true;
+    }
+    if (k == "EquiJoin") {
+        if (static_cast<const LogicalEquiJoin&>(node).join_type() != JoinType::Inner) {
+            return true;
+        }
+        for (const auto* in : node.inputs()) {
+            if (in != nullptr && contains_updating_stream(*in)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (k == "Aggregate" || k == "WindowAggregate") {
+        return false;
     }
     for (const auto* in : node.inputs()) {
         if (in != nullptr && is_changelog_plan(*in))
@@ -4524,23 +4583,27 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
         // changelog: the netting sink (connector='changelog', nets +/- by full
         // row), a discard sink (connector='blackhole', counts and drops), the
         // stdout sink (connector='print', prints each change with its kind
-        // prefixed), or an embedded collect table that opted in with
-        // changelog='true' (the Arrow stream then carries a leading row_kind
-        // column). Any other append-only sink rejects.
+        // prefixed), or ANY sink table that opted in with changelog='true' -
+        // the rows are then written verbatim carrying their __row_kind marker
+        // (for a collect table the Arrow stream gains a leading row_kind
+        // column), and the reader owns the netting. Without the opt-in an
+        // append-only sink rejects: silently writing delete records as if
+        // they were data corrupts the table for any reader that does not
+        // know to net.
         auto cit = sink.properties.find("connector");
         const std::string conn = cit != sink.properties.end() ? cit->second : std::string{};
         auto chit = sink.properties.find("changelog");
-        const bool collect_changelog =
-            conn == "collect" && chit != sink.properties.end() && chit->second == "true";
-        if (conn != "changelog" && conn != "blackhole" && conn != "print" && !collect_changelog) {
-            bind_error(
-                "sink " + sink.name +
-                    " is append-only but the SELECT produces a changelog stream; declare "
-                    "mode='upsert' (and primary_key='...'), use connector='changelog'" +
-                    (conn == "collect" ? ", or add changelog='true' to the collect table so the "
-                                         "Arrow stream carries a row_kind column"
-                                       : ""),
-                stmt.loc.pos);
+        const bool declared_changelog = chit != sink.properties.end() && chit->second == "true";
+        if (conn != "changelog" && conn != "blackhole" && conn != "print" && !declared_changelog) {
+            bind_error("sink " + sink.name +
+                           " is append-only but the SELECT produces a changelog stream; declare "
+                           "mode='upsert' (and primary_key='...'), use connector='changelog', "
+                           "or add changelog='true' to the sink table so rows are written "
+                           "verbatim with their __row_kind marker" +
+                           (conn == "collect" ? " (the Arrow stream then carries a leading "
+                                                "row_kind column)"
+                                              : ""),
+                       stmt.loc.pos);
         }
     }
 

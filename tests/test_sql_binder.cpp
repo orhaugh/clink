@@ -1421,6 +1421,127 @@ TEST(SqlBinder, UpsertSinkAcceptsAppendStreamAsAllInserts) {
     ASSERT_NE(plan, nullptr);
 }
 
+// --- Changelog classification of joins and set ops ----------------
+//
+// An OUTER equi join retracts its null-padded row when the match later
+// arrives, INTERSECT / EXCEPT emit deletes as the surviving set shrinks,
+// and an equi join over an unbounded GROUP BY propagates that aggregate's
+// updates as join-result deletes. All of them must trip the append-sink
+// guard; declaring changelog='true' on the sink (rows written verbatim
+// with their __row_kind marker) or routing to an aggregate that absorbs
+// the changelog lifts it.
+
+namespace {
+// Two joinable sources and one append sink; `sink_with` appends extra
+// WITH options to the sink table (e.g. ", changelog='true'").
+Catalog join_guard_catalog(const std::string& sink_with = {}) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE a (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/a.ndjson');"
+        "CREATE TABLE b (k BIGINT, w BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/b.ndjson');"
+        "CREATE TABLE sink_append (a_k BIGINT, a_v BIGINT, b_k BIGINT, b_w BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/out.ndjson'" +
+        sink_with + ")");
+    for (const auto& st : s.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    return cat;
+}
+}  // namespace
+
+TEST(SqlBinder, AppendSinkRejectsOuterEquiJoinChangelog) {
+    Catalog cat = join_guard_catalog();
+    Binder b(cat);
+    EXPECT_THROW(b.bind_insert(as_insert(
+                     parse("INSERT INTO sink_append SELECT * FROM a LEFT JOIN b ON a.k = b.k"))),
+                 TranslationError);
+}
+
+TEST(SqlBinder, AppendSinkWithChangelogTrueAcceptsOuterEquiJoin) {
+    Catalog cat = join_guard_catalog(", changelog='true'");
+    Binder b(cat);
+    auto plan = b.bind_insert(
+        as_insert(parse("INSERT INTO sink_append SELECT * FROM a LEFT JOIN b ON a.k = b.k")));
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(plan->kind(), "Sink");
+}
+
+TEST(SqlBinder, AppendSinkAcceptsInnerEquiJoinOverAppendInputs) {
+    // No updating stream anywhere below: a plain INNER join is append-only
+    // and must NOT trip the guard (no false positive).
+    Catalog cat = join_guard_catalog();
+    Binder b(cat);
+    auto plan = b.bind_insert(
+        as_insert(parse("INSERT INTO sink_append SELECT * FROM a JOIN b ON a.k = b.k")));
+    ASSERT_NE(plan, nullptr);
+}
+
+TEST(SqlBinder, AppendSinkRejectsSetOpChangelog) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE a (id BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/a.ndjson');"
+        "CREATE TABLE b (id BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/b.ndjson');"
+        "CREATE TABLE sink_append (id BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/out.ndjson')");
+    for (const auto& st : s.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    Binder b(cat);
+    EXPECT_THROW(b.bind_insert(as_insert(
+                     parse("INSERT INTO sink_append SELECT id FROM a INTERSECT SELECT id FROM b"))),
+                 TranslationError);
+    EXPECT_THROW(b.bind_insert(as_insert(
+                     parse("INSERT INTO sink_append SELECT id FROM a EXCEPT SELECT id FROM b"))),
+                 TranslationError);
+}
+
+TEST(SqlBinder, ChangelogPlanClassifiesJoinOverUnboundedAggregate) {
+    // An INNER equi join consuming an unbounded GROUP BY turns the
+    // aggregate's updates into join-result deletes; the classification
+    // must see through the join input. A join over plain scans stays
+    // append-only.
+    Catalog cat = join_guard_catalog();
+    Binder b(cat);
+    auto updating = b.bind_select(
+        as_select(parse("SELECT * FROM (SELECT k, SUM(v) AS total FROM a GROUP BY k) t "
+                        "JOIN b ON t.k = b.k")));
+    ASSERT_NE(updating, nullptr);
+    EXPECT_TRUE(is_changelog_plan(*updating));
+
+    Binder b2(cat);
+    auto append_only = b2.bind_select(as_select(parse("SELECT * FROM a JOIN b ON a.k = b.k")));
+    ASSERT_NE(append_only, nullptr);
+    EXPECT_FALSE(is_changelog_plan(*append_only));
+}
+
+TEST(SqlBinder, AppendSinkAcceptsAggregateAbsorbingChangelog) {
+    // The aggregate consumes the outer join's retractions with
+    // retraction-aware accumulators and re-emits append-mode snapshots,
+    // so the sink-adjacent stream is NOT a changelog: binds without the
+    // changelog declaration.
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE a (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/a.ndjson');"
+        "CREATE TABLE b (k BIGINT, w BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/b.ndjson');"
+        "CREATE TABLE sink_counts (a_k BIGINT, n BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/out.ndjson')");
+    for (const auto& st : s.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    Binder b(cat);
+    auto plan = b.bind_insert(
+        as_insert(parse("INSERT INTO sink_counts SELECT a_k, COUNT(*) AS n FROM "
+                        "(SELECT * FROM a LEFT JOIN b ON a.k = b.k) j GROUP BY a_k")));
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(plan->kind(), "Sink");
+}
+
 // --- TOP-N-per-key pattern ----------------------------------------
 
 TEST(SqlBinder, RowNumberWhereLeBuildsLogicalTopNPerKey) {
