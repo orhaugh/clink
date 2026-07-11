@@ -1,6 +1,8 @@
 #include "clink/sql/script_runner.hpp"
 
+#include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <utility>
 #include <variant>
 
@@ -480,6 +482,32 @@ int run_script(const std::string& sql,
                 if (opts.explain) {
                     auto plan = binder.bind_select(sel);
                     out << plan->explain();
+                } else if (opts.bare_select_to_collect != nullptr) {
+                    // Bind the SELECT for its output schema and synthesise a
+                    // connector='collect' sink table carrying that schema -
+                    // changelog-aware, so a retracting plan streams with a
+                    // leading row_kind column instead of being rejected.
+                    auto plan = binder.bind_select(sel);
+                    const auto schema = plan->schema();
+                    TableDef def;
+                    static std::atomic<std::uint64_t> collect_table_seq{0};
+                    def.name = "__collect_" + std::to_string(collect_table_seq++);
+                    def.columns.reserve(static_cast<std::size_t>(schema->num_fields()));
+                    for (const auto& field : schema->fields()) {
+                        def.columns.push_back(ColumnSpec{field->name(), field->type()});
+                    }
+                    def.properties["connector"] = "collect";
+                    if (is_changelog_plan(*plan)) {
+                        def.properties["changelog"] = "true";
+                    }
+                    catalog.register_table(def);
+                    ast::InsertStmt ins;
+                    ins.target.name = def.name;
+                    ins.select = std::move(sel);
+                    if (int rc = handle_insert(ins); rc != 0) {
+                        return rc;
+                    }
+                    opts.bare_select_to_collect->push_back(def.name);
                 } else if (opts.bare_select_to_print) {
                     // Bind the SELECT for its output schema, synthesise a
                     // connector='print' sink table carrying that schema

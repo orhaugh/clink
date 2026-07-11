@@ -441,6 +441,19 @@ if(CLINK_BUILD_SQL)
     # its registries and every connector live inside libclink, mirroring a
     # real embedding. The pure-C smoke proves the header compiles as C and
     # the whole open/exec/collect/close flow runs with no C++ consumer.
+    if(TARGET clink::flightsql)
+        add_executable(clink_flight_tests test_flight_sql.cpp)
+        target_link_libraries(clink_flight_tests PRIVATE
+            clink::flightsql
+            GTest::gtest_main
+        )
+        clink_set_warnings(clink_flight_tests)
+        gtest_discover_tests(clink_flight_tests
+            DISCOVERY_MODE PRE_TEST
+            PROPERTIES TIMEOUT 60 LABELS "sql;flight"
+        )
+    endif()
+
     add_executable(clink_c_abi_tests test_clink_c_abi.cpp)
     target_include_directories(clink_c_abi_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
     target_link_libraries(clink_c_abi_tests PRIVATE

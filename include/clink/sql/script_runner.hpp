@@ -22,6 +22,7 @@
 #include <functional>
 #include <ostream>
 #include <string>
+#include <vector>
 
 #include "clink/cluster/job_graph.hpp"
 #include "clink/sql/catalog.hpp"
@@ -39,6 +40,12 @@ struct ScriptRunOptions {
     // Compile a bare top-level SELECT into a synthesised connector='print'
     // sink (see the header comment). Off = reject with the historical error.
     bool bare_select_to_print = false;
+    // Compile a bare top-level SELECT into a synthesised connector='collect'
+    // table instead (changelog='true' when the plan retracts, so the Arrow
+    // stream carries a leading row_kind column); each synthesised table name
+    // is appended here so the caller can attach a reader. Wins over
+    // bare_select_to_print when non-null.
+    std::vector<std::string>* bare_select_to_collect = nullptr;
 };
 
 struct ScriptIO {

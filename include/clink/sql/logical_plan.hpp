@@ -1134,4 +1134,9 @@ private:
     const TableDef* table_;
 };
 
+// True when the plan emits retractions (records tagged __row_kind=delete /
+// update_before) rather than a pure append stream - TopN-per-key and any
+// node wrapping one. Defined in binder.cpp.
+bool is_changelog_plan(const LogicalPlan& node);
+
 }  // namespace clink::sql

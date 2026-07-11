@@ -689,6 +689,22 @@ set_target_properties(clink_all PROPERTIES EXPORT_NAME clink)
 # Arrow C stream interface. Links the whole engine plus every built impl
 # statically into one shared library, so an embedding process needs only
 # the C header and this artifact.
+# Flight SQL endpoint over the embedded engine - enabled when the linked
+# Arrow ships Flight SQL (Homebrew and the Docker image both do).
+if(TARGET clink::embed)
+    find_package(ArrowFlightSql QUIET)
+    if(ArrowFlightSql_FOUND AND TARGET ArrowFlightSql::arrow_flight_sql_shared)
+        add_library(clink_flightsql STATIC src/embed/flight_sql_server.cpp)
+        target_link_libraries(clink_flightsql
+            PUBLIC clink::embed ArrowFlightSql::arrow_flight_sql_shared)
+        add_library(clink::flightsql ALIAS clink_flightsql)
+        clink_set_warnings(clink_flightsql)
+        message(STATUS "clink::flightsql - Flight SQL endpoint enabled")
+    else()
+        message(STATUS "clink::flightsql - Arrow Flight SQL not found; endpoint not built")
+    endif()
+endif()
+
 if(TARGET clink::embed)
     add_library(clink_shared SHARED src/embed/clink_c.cpp)
     set_target_properties(clink_shared PROPERTIES OUTPUT_NAME clink EXPORT_NAME shared)
@@ -809,6 +825,12 @@ if(TARGET clink::embed)
     target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql.cpp tools/clink_replay.cpp
                                           tools/clink_state_query.cpp)
     target_link_libraries(clink_cli_cmds PUBLIC clink::embed)
+    if(TARGET clink::flightsql)
+        target_sources(clink_cli_cmds PRIVATE tools/clink_flight.cpp)
+        target_link_libraries(clink_cli_cmds PUBLIC clink::flightsql)
+    else()
+        target_sources(clink_cli_cmds PRIVATE tools/clink_flight_stub.cpp)
+    endif()
     # `clink run --jm-host` bypasses EmbeddedEngine (which installs the wasm
     # loader itself), so the CLI installs it for the remote-submit path.
     if(TARGET clink::wasm)

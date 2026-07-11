@@ -120,6 +120,19 @@ public:
     arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> collect_reader(
         const std::string& table);
 
+    // Compile ONE bare SELECT into a fresh synthesised connector='collect'
+    // table and submit it as a job. The table is changelog-aware: a
+    // retracting plan's stream carries a leading row_kind utf8 column.
+    // Returns the synthesised table name to pass to collect_reader();
+    // errors carry the script runner's diagnostics. The seam behind the
+    // Flight SQL endpoint.
+    arrow::Result<std::string> submit_select_to_collect(const std::string& select_sql);
+
+    // Run a script capturing its diagnostics (no bare-SELECT synthesis:
+    // updates are DDL / INSERT statements), then await the jobs it
+    // submitted. The seam behind Flight SQL updates.
+    arrow::Status execute_update(const std::string& sql);
+
     // Aggregated job errors collected by await_all (name-prefixed).
     [[nodiscard]] const std::vector<std::string>& errors() const { return errors_; }
 
@@ -128,6 +141,8 @@ public:
     [[nodiscard]] bool user_cancelled() const { return user_cancelled_; }
 
 private:
+    int submit_spec_(const cluster::JobGraphSpec& spec, const std::string& name, std::ostream& err);
+
     struct JobEntry {
         cluster::JobId id{};
         std::string name;

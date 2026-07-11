@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -103,6 +104,37 @@ EmbeddedEngine::~EmbeddedEngine() {
     jm_.stop();
 }
 
+int EmbeddedEngine::submit_spec_(const cluster::JobGraphSpec& spec,
+                                 const std::string& name,
+                                 std::ostream& err) {
+    cluster::CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = opts_.checkpoint_dir;
+    if (!opts_.checkpoint_dir.empty()) {
+        ckpt.interval_ms = opts_.checkpoint_interval_ms;
+    }
+    ckpt.state_backend_uri = opts_.state_backend_uri;
+    ckpt.capture_dir = opts_.capture_dir;
+    ckpt.capture_records = opts_.capture_records;
+    // Stamp this engine's scope token onto every collect sink so its
+    // instances resolve THIS engine's queues (the factory is
+    // process-wide, the queues are per-engine).
+    cluster::JobGraphSpec stamped = spec;
+    for (auto& op : stamped.ops) {
+        if (op.type == "collect_sink_row") {
+            op.params["collect_scope"] = collect_scope_;
+        }
+    }
+    try {
+        const auto id = jm_.submit_job(
+            stamped, cluster::OperatorRegistry::default_instance(), {}, std::move(ckpt), nullptr);
+        jobs_.push_back(JobEntry{id, name.empty() ? ("job_" + std::to_string(id)) : name});
+    } catch (const std::exception& e) {
+        err << "error: submit failed: " << e.what() << "\n";
+        return 1;
+    }
+    return 0;
+}
+
 int EmbeddedEngine::execute_script(const std::string& sql) {
     sql::ScriptRunOptions ropts;
     ropts.explain = opts_.explain;
@@ -111,37 +143,58 @@ int EmbeddedEngine::execute_script(const std::string& sql) {
     ropts.bare_select_to_print = opts_.bare_select_to_print;
     sql::ScriptIO io{opts_.out, opts_.err};
     auto submit = [this](const cluster::JobGraphSpec& spec, const std::string& name) -> int {
-        cluster::CheckpointConfig ckpt;
-        ckpt.checkpoint_dir = opts_.checkpoint_dir;
-        if (!opts_.checkpoint_dir.empty()) {
-            ckpt.interval_ms = opts_.checkpoint_interval_ms;
-        }
-        ckpt.state_backend_uri = opts_.state_backend_uri;
-        ckpt.capture_dir = opts_.capture_dir;
-        ckpt.capture_records = opts_.capture_records;
-        // Stamp this engine's scope token onto every collect sink so its
-        // instances resolve THIS engine's queues (the factory is
-        // process-wide, the queues are per-engine).
-        cluster::JobGraphSpec stamped = spec;
-        for (auto& op : stamped.ops) {
-            if (op.type == "collect_sink_row") {
-                op.params["collect_scope"] = collect_scope_;
-            }
-        }
-        try {
-            const auto id = jm_.submit_job(stamped,
-                                           cluster::OperatorRegistry::default_instance(),
-                                           {},
-                                           std::move(ckpt),
-                                           nullptr);
-            jobs_.push_back(JobEntry{id, name.empty() ? ("job_" + std::to_string(id)) : name});
-        } catch (const std::exception& e) {
-            *opts_.err << "error: submit failed: " << e.what() << "\n";
-            return 1;
-        }
-        return 0;
+        return submit_spec_(spec, name, *opts_.err);
     };
     return sql::run_script(sql, catalog_, ropts, io, submit);
+}
+
+arrow::Result<std::string> EmbeddedEngine::submit_select_to_collect(const std::string& select_sql) {
+    sql::ScriptRunOptions ropts;
+    ropts.parallelism = opts_.parallelism;
+    ropts.job_name = opts_.job_name;
+    std::vector<std::string> tables;
+    ropts.bare_select_to_collect = &tables;
+    std::ostringstream out, err;
+    sql::ScriptIO io{&out, &err};
+    auto submit = [this, &err](const cluster::JobGraphSpec& spec, const std::string& name) -> int {
+        return submit_spec_(spec, name, err);
+    };
+    if (sql::run_script(select_sql, catalog_, ropts, io, submit) != 0) {
+        return arrow::Status::Invalid("SELECT failed: ", err.str());
+    }
+    if (tables.size() != 1) {
+        return arrow::Status::Invalid("expected exactly one bare SELECT statement, got ",
+                                      tables.size(),
+                                      " (DDL and INSERT belong in updates)");
+    }
+    return tables.front();
+}
+
+arrow::Status EmbeddedEngine::execute_update(const std::string& sql) {
+    sql::ScriptRunOptions ropts;
+    ropts.parallelism = opts_.parallelism;
+    ropts.job_name = opts_.job_name;
+    std::ostringstream out, err;
+    sql::ScriptIO io{&out, &err};
+    const auto jobs_before = jobs_.size();
+    auto submit = [this, &err](const cluster::JobGraphSpec& spec, const std::string& name) -> int {
+        return submit_spec_(spec, name, err);
+    };
+    if (sql::run_script(sql, catalog_, ropts, io, submit) != 0) {
+        return arrow::Status::Invalid("statement failed: ", err.str());
+    }
+    // An update that submitted jobs (INSERT INTO ...) completes them before
+    // returning - update semantics are synchronous. Streaming pipelines
+    // belong in queries, not updates.
+    if (jobs_.size() > jobs_before && !await_all()) {
+        std::string joined;
+        for (const auto& e : errors_) {
+            joined += e;
+            joined += "; ";
+        }
+        return arrow::Status::Invalid("update job failed: ", joined);
+    }
+    return arrow::Status::OK();
 }
 
 std::vector<cluster::JobId> EmbeddedEngine::job_ids() const {

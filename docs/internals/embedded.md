@@ -157,6 +157,24 @@ memory pool once, before any Arrow allocation, restoring the environment so
 a host Arrow's allocator choice is untouched (an explicit
 `ARROW_DEFAULT_MEMORY_POOL` is always respected).
 
+### The Flight SQL endpoint
+
+`clink flight-sql` (or `ClinkFlightSqlServer` from
+`include/clink/embed/flight_sql_server.hpp`, built when the linked Arrow
+ships Flight SQL) serves the embedded engine over Arrow Flight SQL, so any
+Flight SQL / ADBC / JDBC client - DBeaver, pandas via
+`adbc_driver_flightsql`, dbt adapters - speaks to clink over one wire
+protocol. Statement QUERIES compile a bare SELECT through the same
+synthesis the collect path uses (`ScriptRunOptions::bare_select_to_collect`
+-> `EmbeddedEngine::submit_select_to_collect`) and stream the typed Arrow
+batches back; a retracting plan's stream carries the leading `row_kind`
+column. Statement UPDATES run DDL / INSERT scripts synchronously
+(`EmbeddedEngine::execute_update` - submitted jobs complete before the call
+returns; streaming pipelines belong in queries). `GetTables` serves the
+engine catalog, with real per-table Arrow schemas when the client asks.
+v1 has no authentication (bind loopback, the default, or front with a
+proxy), no prepared statements and no transactions.
+
 ### What embedded mode does not change
 
 The session catalog behaves exactly like `clink_submit_sql`'s

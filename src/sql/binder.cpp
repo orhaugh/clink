@@ -1647,6 +1647,10 @@ std::optional<EquiJoinShape> match_equi_join(const ast::Expression& on,
 // helper recurses through pass-through nodes so a Project wrapping
 // a TopN still classifies as changelog. Multi-input nodes inherit
 // from any child being changelog.
+}  // namespace
+
+// Namespace-level (declared in logical_plan.hpp): the script runner's
+// changelog-aware collect synthesis classifies plans with it too.
 bool is_changelog_plan(const LogicalPlan& node) {
     if (node.kind() == "TopNPerKey" || node.kind() == "LastNAgg") {
         return true;
@@ -1658,7 +1662,7 @@ bool is_changelog_plan(const LogicalPlan& node) {
     return false;
 }
 
-}  // namespace
+namespace {}  // namespace
 
 // Make a plan node for `table_name`: if it matches a CTE in the
 // current scope, consume that plan (each CTE is at-most-once);

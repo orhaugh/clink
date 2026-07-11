@@ -335,6 +335,12 @@ SQL, and read a `connector='collect'` table's rows as typed Arrow batches
 through the Arrow C stream interface - zero-copy into pyarrow, DuckDB,
 polars, or Arrow C++:
 
+The same engine also serves **Arrow Flight SQL** (`clink flight-sql`):
+queries stream typed Arrow batches to any Flight SQL / ADBC / JDBC client
+(DBeaver, pandas, dbt adapters), updates run DDL and bounded INSERTs, and
+retracting queries carry a leading `row_kind` column - one wire protocol
+into the whole SQL surface, no client library required.
+
 ```c
 #include <clink/embed/clink.h>
 
