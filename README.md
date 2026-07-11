@@ -1124,6 +1124,14 @@ tools/               # clink (unified CLI), clink_node, clink_submit_sql, and
 3. `include/clink/runtime/dag.hpp` - how the DAG is built and run
 4. `tests/test_map_filter.cpp` - the smallest end-to-end integration
 
-## License
+## License and attribution
 
-Apache License 2.0. See [`LICENSE`](LICENSE).
+clink is licensed under the Apache License 2.0. See [`LICENSE`](LICENSE) and
+[`NOTICE`](NOTICE).
+
+You are free to use clink for any purpose, including in commercial and
+closed-source products, with no obligation beyond the licence. If you build on
+it, an attribution or a link back to this repository is genuinely appreciated.
+For academic or technical write-ups, please cite it using
+[`CITATION.cff`](CITATION.cff) - GitHub's "Cite this repository" button turns
+that file into a ready-made reference.

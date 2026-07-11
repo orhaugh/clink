@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: >-
+  If you use clink in your work, please cite this repository using the
+  metadata below.
+title: clink
+abstract: >-
+  A semantics-first, Arrow-native, stateful stream processing engine in
+  modern C++ (C++23).
+type: software
+authors:
+  - given-names: Ross
+    family-names: Haugh
+repository-code: "https://github.com/orhaugh/clink"
+url: "https://github.com/orhaugh/clink"
+license: Apache-2.0
+version: 0.0.1
+keywords:
+  - stream-processing
+  - dataflow
+  - arrow
+  - cpp
+  - event-time
