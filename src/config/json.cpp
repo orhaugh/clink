@@ -52,9 +52,18 @@ JsonValue from_dom(const simdjson::dom::element& e) {
         case simdjson::dom::element_type::STRING:
             return JsonValue{std::string(std::string_view(e))};
         case simdjson::dom::element_type::INT64:
-            return JsonValue{static_cast<double>(std::int64_t(e))};
-        case simdjson::dom::element_type::UINT64:
-            return JsonValue{static_cast<double>(std::uint64_t(e))};
+            // Integer tokens are carried EXACTLY as int64 (no double round-trip),
+            // so a BIGINT column survives past 2^53.
+            return JsonValue{std::int64_t(e)};
+        case simdjson::dom::element_type::UINT64: {
+            // Fits int64 -> exact; above INT64_MAX -> widen to double (lossy for
+            // very large unsigned values, but never wraps negative).
+            const std::uint64_t u = std::uint64_t(e);
+            if (u <= static_cast<std::uint64_t>(INT64_MAX)) {
+                return JsonValue{static_cast<std::int64_t>(u)};
+            }
+            return JsonValue{static_cast<double>(u)};
+        }
         case simdjson::dom::element_type::DOUBLE:
             return JsonValue{double(e)};
         case simdjson::dom::element_type::BOOL:
@@ -126,6 +135,14 @@ void serialize_append(std::string& out, const JsonValue& v, int indent_width, in
         case JsonValue::Type::String:
             escape_string(out, v.as_string());
             return;
+        case JsonValue::Type::Int: {
+            // Exact integer: render verbatim via to_chars (no double round-trip,
+            // so values past 2^53 print exactly).
+            char buf[32];
+            auto res = std::to_chars(buf, buf + sizeof(buf), v.as_int());
+            out.append(buf, static_cast<std::size_t>(res.ptr - buf));
+            return;
+        }
         case JsonValue::Type::Number: {
             const double d = v.as_number();
             // Render integers without trailing ".0" for nicer output. The range
@@ -248,6 +265,10 @@ std::int64_t JsonValue::int_or(std::string_view key, std::int64_t fallback) cons
     const auto& v = at(key);
     if (!v.is_number()) {
         throw std::runtime_error("JsonValue::int_or: '" + std::string{key} + "' is not a number");
+    }
+    // Exact integer: return it directly (no lossy double round-trip).
+    if (v.is_integral_number()) {
+        return v.as_int();
     }
     // A double->int64 cast is UB for NaN/Inf or a magnitude >= 2^63; such a value
     // cannot be represented as int64, so return the fallback rather than risk UB.

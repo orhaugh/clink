@@ -335,6 +335,42 @@ TEST(Json, DoubleRenderingMatchesOstreamGeneralFormat) {
     EXPECT_EQ(render(-9007199254740992.0), "-9007199254740992");
 }
 
+TEST(Json, IntegerTokensAreCarriedExactlyPastDoubleMantissa) {
+    // 2^53 + 1 is not representable as a double; the old double-backed value
+    // model rounded it to 2^53. It must now round-trip exactly.
+    const std::int64_t big = 9007199254740993LL;  // 2^53 + 1
+    auto v = parse("9007199254740993");
+    EXPECT_TRUE(v.is_number());
+    EXPECT_TRUE(v.is_integral_number());
+    EXPECT_EQ(v.as_int(), big);
+    EXPECT_EQ(v.serialize(0), "9007199254740993");  // no double rounding on the way out
+
+    // A fractional or out-of-range token stays a double (not integral).
+    auto d = parse("2.5");
+    EXPECT_TRUE(d.is_number());
+    EXPECT_FALSE(d.is_integral_number());
+    EXPECT_DOUBLE_EQ(d.as_number(), 2.5);
+}
+
+TEST(Json, NumbersCompareByValueAcrossIntAndDouble) {
+    // An int-constructed and a double-constructed value of the same magnitude
+    // are equal (the representation split must be invisible to equality).
+    EXPECT_EQ(JsonValue{std::int64_t{5}}, JsonValue{5.0});
+    EXPECT_EQ(JsonValue{5}, JsonValue{5.0});
+    EXPECT_NE(JsonValue{5}, JsonValue{6.0});
+    // Two exact integers past 2^53 compare exactly, not as widened doubles.
+    EXPECT_NE(JsonValue{std::int64_t{9007199254740993LL}},
+              JsonValue{std::int64_t{9007199254740992LL}});
+    // Nested numbers inside arrays/objects also compare by value.
+    EXPECT_EQ(parse("[1, 2, 3]"), parse("[1.0, 2.0, 3.0]"));
+}
+
+TEST(Json, IntConstructedValueSerialisesAsInteger) {
+    EXPECT_EQ((JsonValue{std::int64_t{9223372036854775807LL}}).serialize(0), "9223372036854775807");
+    EXPECT_EQ((JsonValue{-42}).serialize(0), "-42");
+    EXPECT_EQ((JsonValue{0}).serialize(0), "0");
+}
+
 // ----- from_entries + parse_object (the row-decode fast path) -----
 
 TEST(FlatMap, FromEntriesSortedInputIsAdoptedVerbatim) {

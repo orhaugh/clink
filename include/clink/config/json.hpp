@@ -16,8 +16,11 @@ namespace clink::config {
 // Minimal JSON value type. Sufficient for pipeline config files;
 // deliberately not a full-featured library:
 //
-//   * Numbers are stored as double; the exact-integer/floating distinction
-//     isn't preserved on round-trip.
+//   * Numbers are stored as either an exact int64 (integer tokens) or a
+//     double (fractional / out-of-int64-range tokens). is_number() is true
+//     for both; as_number() widens either to double for callers that do not
+//     care; as_int()/is_integral_number() read the exact integer. This keeps
+//     BIGINT values exact past 2^53 instead of rounding through double.
 //   * Object key order is sorted lexicographically (FlatMap, a sorted
 //     contiguous container - see flat_map.hpp for the semantics it
 //     guarantees and the iterator-invalidation rule it does not). Tools
@@ -32,13 +35,17 @@ using JsonArray = std::vector<JsonValue>;
 
 class JsonValue {
 public:
-    enum class Type { Null, Bool, Number, String, Array, Object };
+    // Int is appended LAST so the existing alternatives keep their indices
+    // (type() is static_cast<Type>(value_.index()), so the enum order and the
+    // variant order must stay in lock-step). Number = the double alternative,
+    // Int = the int64 alternative; is_number() covers both.
+    enum class Type { Null, Bool, Number, String, Array, Object, Int };
 
     JsonValue() = default;  // null
     JsonValue(std::nullptr_t) : value_(std::monostate{}) {}
     JsonValue(bool v) : value_(v) {}
-    JsonValue(int v) : value_(static_cast<double>(v)) {}
-    JsonValue(std::int64_t v) : value_(static_cast<double>(v)) {}
+    JsonValue(int v) : value_(static_cast<std::int64_t>(v)) {}
+    JsonValue(std::int64_t v) : value_(v) {}
     JsonValue(double v) : value_(v) {}
     JsonValue(const char* v) : value_(std::string{v}) {}
     JsonValue(std::string v) : value_(std::move(v)) {}
@@ -49,13 +56,34 @@ public:
 
     bool is_null() const noexcept { return type() == Type::Null; }
     bool is_bool() const noexcept { return type() == Type::Bool; }
-    bool is_number() const noexcept { return type() == Type::Number; }
+    bool is_number() const noexcept {
+        const Type t = type();
+        return t == Type::Number || t == Type::Int;
+    }
+    // True only for an exact integer (an integral token or an int-constructed
+    // value), not a double. Use with as_int() for the exact-arithmetic paths.
+    bool is_integral_number() const noexcept { return type() == Type::Int; }
     bool is_string() const noexcept { return type() == Type::String; }
     bool is_array() const noexcept { return type() == Type::Array; }
     bool is_object() const noexcept { return type() == Type::Object; }
 
     bool as_bool() const { return std::get<bool>(value_); }
-    double as_number() const { return std::get<double>(value_); }
+    // Widening read: an int64 value is returned as a double (lossy past 2^53),
+    // a double verbatim. The tolerant accessor almost all callers use.
+    double as_number() const {
+        if (const auto* i = std::get_if<std::int64_t>(&value_)) {
+            return static_cast<double>(*i);
+        }
+        return std::get<double>(value_);
+    }
+    // Exact integer read. A double value is truncated toward zero; callers on
+    // the exact path should gate on is_integral_number() first.
+    std::int64_t as_int() const {
+        if (const auto* i = std::get_if<std::int64_t>(&value_)) {
+            return *i;
+        }
+        return static_cast<std::int64_t>(std::get<double>(value_));
+    }
     const std::string& as_string() const { return std::get<std::string>(value_); }
     const JsonArray& as_array() const { return std::get<JsonArray>(value_); }
     const JsonObject& as_object() const { return std::get<JsonObject>(value_); }
@@ -81,11 +109,31 @@ public:
     // of materialising an intermediate string via serialize(0).
     void serialize_into(std::string& out) const;
 
-    // Deep structural equality (recurses through arrays and objects).
-    bool operator==(const JsonValue& other) const = default;
+    // Deep structural equality (recurses through arrays and objects). Numbers
+    // compare by VALUE across the int64/double split, so an int-constructed and
+    // a double-constructed value of the same magnitude are equal (e.g. after
+    // the representation change, JsonValue{5} == JsonValue{5.0}). Two integers
+    // compare exactly; any comparison involving a genuine double widens to
+    // double. Cannot be `= default`, which would compare the variant
+    // alternative and split int64 from double.
+    bool operator==(const JsonValue& other) const {
+        const bool a_num = is_number();
+        const bool b_num = other.is_number();
+        if (a_num != b_num) {
+            return false;
+        }
+        if (a_num) {
+            if (is_integral_number() && other.is_integral_number()) {
+                return as_int() == other.as_int();
+            }
+            return as_number() == other.as_number();
+        }
+        return value_ == other.value_;
+    }
 
 private:
-    using Storage = std::variant<std::monostate, bool, double, std::string, JsonArray, JsonObject>;
+    using Storage = std::
+        variant<std::monostate, bool, double, std::string, JsonArray, JsonObject, std::int64_t>;
     Storage value_;
 };
 
