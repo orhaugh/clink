@@ -911,7 +911,21 @@ from a sampled one). The captured epoch is a full event stream - data
 records, watermarks, and timer-fire clock positions in observed order -
 so windowed and timer-driven operators replay their fires at the exact
 production positions, not just the per-record path (captures from older
-builds replay data-only, and the tool says so). Details:
+builds replay data-only, and the tool says so). Omit `--op` to replay
+every captured operator of the job in one command, and add `--verify`
+to replay each epoch twice and byte-compare the emissions - the
+determinism gate
+([docs/internals/replay-determinism.md](docs/internals/replay-determinism.md)):
+
+```bash
+$ clink replay --capture-dir=capture --checkpoint-dir=ckpt --epoch=9 --verify
+replay: 3 captured operator(s), epoch 9, verifying determinism (2 runs each)
+  op 5824225372086884863 (aggregate_row) subtask 1: 100096 records, ... [deterministic]
+  ...
+deterministic: every replayed operator byte-identical across 2 runs
+```
+
+Details:
 [docs/internals/fault-tolerance-and-rescale.md](docs/internals/fault-tolerance-and-rescale.md).
 
 ## State as data

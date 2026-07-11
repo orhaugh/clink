@@ -613,6 +613,7 @@ if(CLINK_BUILD_SQL)
         src/sql/optimizer.cpp
         src/sql/analyze.cpp
         src/sql/script_runner.cpp
+        src/sql/replay.cpp
         src/sql/install.cpp
         src/sql/async_function_registry.cpp
         src/sql/table_api.cpp

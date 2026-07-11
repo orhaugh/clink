@@ -144,5 +144,15 @@ TEST(ReplayCli, WindowedEpochReplaysTheLiveEmissionsAndVerifiesDeterministic) {
     EXPECT_EQ(verify.exit_code, 0) << verify.output;
     EXPECT_NE(verify.output.find("deterministic:"), std::string::npos) << verify.output;
 
+    // Whole-job sweep (no --op): every captured operator replays and
+    // verifies deterministic in one command.
+    const auto whole =
+        run_cmd(cli + " replay --capture-dir=" + (dir / "capture").string() +
+                " --checkpoint-dir=" + (dir / "ckpt").string() + " --epoch=1 --verify");
+    EXPECT_EQ(whole.exit_code, 0) << whole.output;
+    EXPECT_NE(whole.output.find("skipped 0"), std::string::npos) << whole.output;
+    EXPECT_NE(whole.output.find("every replayed operator byte-identical"), std::string::npos)
+        << whole.output;
+
     fs::remove_all(dir);
 }

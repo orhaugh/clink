@@ -27,6 +27,10 @@ FetchContent_Declare(simsimd
     GIT_REPOSITORY https://github.com/ashvardanian/SimSIMD.git
     GIT_TAG ${CLINK_SIMSIMD_TAG}
     GIT_SHALLOW TRUE
+    # Never re-run the git update step on reconfigure: a shallow update can
+    # drift the checkout off the pinned tag (observed: v6.5.16 -> v7.7.0,
+    # which renames the headers and breaks the build).
+    UPDATE_DISCONNECTED TRUE
     SYSTEM)
 FetchContent_GetProperties(simsimd)
 if(NOT simsimd_POPULATED)
@@ -40,6 +44,8 @@ FetchContent_Declare(usearch
     GIT_REPOSITORY https://github.com/unum-cloud/usearch.git
     GIT_TAG ${CLINK_USEARCH_TAG}
     GIT_SHALLOW TRUE
+    # See simsimd above: no update step on reconfigure.
+    UPDATE_DISCONNECTED TRUE
     SYSTEM)
 FetchContent_GetProperties(usearch)
 if(NOT usearch_POPULATED)
