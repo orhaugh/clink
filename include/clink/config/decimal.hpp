@@ -232,6 +232,21 @@ inline double dec_to_double(const Decimal& a) {
     return a.unscaled.ToDouble(a.scale);
 }
 
+// Exact conversion to int64 when the value is a whole number (scale 0) that
+// fits int64; nullopt otherwise (a fractional value, or out of int64 range).
+// Lets an all-integer SUM emit an exact integer instead of rounding through a
+// double.
+inline std::optional<std::int64_t> dec_to_int64(const Decimal& a) {
+    if (a.scale != 0) {
+        return std::nullopt;
+    }
+    std::int64_t out = 0;
+    if (a.unscaled.ToInteger(&out).ok()) {
+        return out;
+    }
+    return std::nullopt;
+}
+
 // Rescale to a target scale, HALF_UP when scaling down, exact when scaling up.
 // nullopt on overflow.
 inline std::optional<Decimal> dec_rescale(const Decimal& a, int target_scale) {

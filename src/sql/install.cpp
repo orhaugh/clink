@@ -910,11 +910,20 @@ clink::config::JsonValue finalize_agg(const AggState& st, const AggSpec& spec) {
         return clink::config::JsonValue{out};
     }
     if (spec.fn == "sum") {
-        // #56: emit an EXACT decimal sum when a decimal was summed and the
-        // exact accumulation stayed complete; otherwise the running double
-        // (downstream coercion renders integers cleanly at the sink).
-        if (st.sum_saw_decimal && st.sum_dec_complete && st.sum_dec_started)
+        // The exact 128-bit accumulator (running_sum_dec) covers integers and
+        // decimals; it is authoritative unless a fractional double was summed
+        // or it overflowed 128-bit (either clears sum_dec_complete).
+        if (st.sum_dec_started && st.sum_dec_complete) {
+            if (st.sum_saw_decimal)
+                return clink::config::make_dec_value(st.running_sum_dec);  // exact decimal
+            // All-integer SUM: emit an exact int64 when it fits, else the exact
+            // decimal - never rounding the total through a double (past 2^53 the
+            // old running-double path lost precision).
+            if (auto i = clink::config::dec_to_int64(st.running_sum_dec))
+                return clink::config::JsonValue{*i};
             return clink::config::make_dec_value(st.running_sum_dec);
+        }
+        // A fractional double was summed: the double running_sum is the answer.
         return clink::config::JsonValue{st.running_sum};
     }
     if (spec.fn == "avg") {

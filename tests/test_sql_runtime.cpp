@@ -458,6 +458,65 @@ TEST(SqlRuntime, UnboundedGroupBySumRunsEndToEnd) {
     std::filesystem::remove(out_path);
 }
 
+TEST(SqlRuntime, SumBigintIsExactPastDoubleMantissa) {
+    ensure_sql_installed_once();
+
+    const auto in_path =
+        std::filesystem::temp_directory_path() / "clink_sql_e2e_sumexact_in.ndjson";
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_sql_e2e_sumexact_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    // 2^53 + 2 + 1: each addend is representable as a double, but a double
+    // accumulator cannot represent the 2^53+3 total (it lands on ...994/...996).
+    // The exact int64/decimal SUM accumulator must return 9007199254740995.
+    write_lines(in_path,
+                {
+                    R"({"g":1,"amount":9007199254740992})",
+                    R"({"g":1,"amount":2})",
+                    R"({"g":1,"amount":1})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE t (g BIGINT, amount BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (g BIGINT, total BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat, "INSERT INTO out_t SELECT g, SUM(amount) AS total FROM t GROUP BY g");
+
+    InProcessCluster cluster("tm-sql-e2e-sumexact", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    // Read the final running total exactly via as_int() (as_number() would
+    // reintroduce the double rounding this test is guarding against).
+    std::int64_t final_total = -1;
+    for (const auto& line : read_lines(out_path)) {
+        auto js = clink::config::parse(line);
+        ASSERT_TRUE(js.is_object()) << "bad output line: " << line;
+        if (static_cast<std::int64_t>(js.at("g").as_number()) == 1) {
+            ASSERT_TRUE(js.at("total").is_integral_number())
+                << "SUM emitted a non-integer: " << line;
+            final_total = js.at("total").as_int();
+        }
+    }
+    EXPECT_EQ(final_total, 9007199254740995LL);
+
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // Auto-on: a GROUP BY compiled WITHOUT set_async_state_for_aggregation still
 // rides the deferring async-state path when the bound backend can defer reads
 // (supports_async_get()). On a non-deferring backend the byte-for-byte
