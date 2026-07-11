@@ -1,5 +1,6 @@
 #include "clink/sql/binder.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <sstream>
@@ -137,10 +138,26 @@ std::string resolve_value_column_name(const ast::ColumnRef& ref,
         col_name = ref.parts[0];
     } else if (ref.parts.size() == 2) {
         const std::string& qualifier = ref.parts[0];
-        if (qualifier != source.name && qualifier != source_alias) {
-            bind_error("unknown table qualifier: " + qualifier, ref.loc.pos);
+        if (qualifier == source.name || qualifier == source_alias) {
+            col_name = ref.parts[1];
+        } else {
+            // Qualified ref over a flat derived table (the join wrapper names
+            // its output "<alias>_<col>"): `o.id` resolves to column `o_id`
+            // when the source has it, so alias.col works over a join without
+            // the user spelling the flat name.
+            const std::string flat = qualifier + "_" + ref.parts[1];
+            bool has_flat = false;
+            for (const auto& c : source.columns) {
+                if (c.name == flat) {
+                    has_flat = true;
+                    break;
+                }
+            }
+            if (!has_flat) {
+                bind_error("unknown table qualifier: " + qualifier, ref.loc.pos);
+            }
+            col_name = flat;
         }
-        col_name = ref.parts[1];
     } else {
         bind_error("schema-qualified column references not supported", ref.loc.pos);
     }
@@ -475,6 +492,15 @@ std::shared_ptr<arrow::DataType> infer_expr_type(const ast::Expression& expr,
     if (std::holds_alternative<ast::ColumnRef>(expr)) {
         const auto& ref = std::get<ast::ColumnRef>(expr);
         if (!ref.is_star && !ref.parts.empty()) {
+            // Qualified refs over a flat derived table type from the
+            // "<alias>_<col>" join-output column when it exists.
+            if (ref.parts.size() == 2) {
+                const std::string flat = ref.parts[0] + "_" + ref.parts[1];
+                for (const auto& c : source.columns) {
+                    if (c.name == flat)
+                        return c.type;
+                }
+            }
             const std::string& col_name = ref.parts.back();
             for (const auto& c : source.columns) {
                 if (c.name == col_name)
@@ -526,8 +552,16 @@ std::shared_ptr<arrow::DataType> infer_expr_type(const ast::Expression& expr,
     if (std::holds_alternative<std::unique_ptr<ast::FunctionCall>>(expr)) {
         const auto& fc = *std::get<std::unique_ptr<ast::FunctionCall>>(expr);
         if (fc.name == "length" || fc.name == "position" || fc.name == "char_length" ||
-            fc.name == "character_length" || fc.name == "ascii")
+            fc.name == "character_length" || fc.name == "ascii" || fc.name == "cardinality")
             return arrow::int64();
+        if (fc.name == "element" && fc.args.size() == 1) {
+            // ELEMENT(multiset) types as the collection's element type.
+            auto t = infer_expr_type(fc.args[0], source);
+            if (t->id() == arrow::Type::LIST) {
+                return std::static_pointer_cast<arrow::ListType>(t)->value_type();
+            }
+            return t;
+        }
         if (fc.name == "abs" || fc.name == "floor" || fc.name == "ceil" || fc.name == "ceiling" ||
             fc.name == "round" || fc.name == "sqrt" || fc.name == "exp" || fc.name == "ln" ||
             fc.name == "log10" || fc.name == "sign" || fc.name == "power" || fc.name == "pow" ||
@@ -687,7 +721,18 @@ std::unique_ptr<LogicalPlan> wrap_top_n_or_limit(std::unique_ptr<LogicalPlan> pl
             if (cr.is_star || cr.parts.empty()) {
                 bind_error("ORDER BY entry must be a bare column name", item.loc.pos);
             }
-            const std::string& col = cr.parts.back();
+            // A qualified ref prefers the flat "<alias>_<col>" join-output
+            // column when the SELECT output carries it; else the tail.
+            std::string col = cr.parts.back();
+            if (cr.parts.size() == 2) {
+                const std::string flat = cr.parts[0] + "_" + cr.parts[1];
+                for (int i = 0; i < schema->num_fields(); ++i) {
+                    if (schema->field(i)->name() == flat) {
+                        col = flat;
+                        break;
+                    }
+                }
+            }
             bool found = false;
             for (int i = 0; i < schema->num_fields(); ++i) {
                 if (schema->field(i)->name() == col) {
@@ -788,7 +833,19 @@ std::string resolve_column_name(const ast::Expression& expr, const TableDef& sou
     if (ref.is_star || ref.parts.empty()) {
         bind_error("WHERE predicate column reference is malformed", ref.loc.pos);
     }
-    const std::string& col_name = ref.parts.back();
+    // For a qualified ref, prefer the flat "<alias>_<col>" join-output column
+    // when the source has it (so `o.id` means `o_id` over a join); otherwise
+    // resolve on the column tail as before.
+    std::string col_name = ref.parts.back();
+    if (ref.parts.size() == 2) {
+        const std::string flat = ref.parts[0] + "_" + ref.parts[1];
+        for (const auto& c : source.columns) {
+            if (c.name == flat) {
+                col_name = flat;
+                break;
+            }
+        }
+    }
     int idx = -1;
     for (std::size_t i = 0; i < source.columns.size(); ++i) {
         if (source.columns[i].name == col_name) {
@@ -1033,7 +1090,7 @@ bool is_builtin_aggregate_name(const std::string& name) {
            name == "stddev" || name == "stddev_pop" || name == "stddev_samp" ||
            name == "variance" || name == "var_pop" || name == "var_samp" || name == "string_agg" ||
            name == "listagg" || name == "percentile" || name == "approx_percentile" ||
-           name == "array_agg";
+           name == "array_agg" || name == "collect";
 }
 
 bool is_aggregate_fn_name(const std::string& name) {
@@ -1166,9 +1223,37 @@ AggregateExtraction extract_aggregate(const ast::Expression& expr,
         const auto& fc = *std::get<std::unique_ptr<ast::FunctionCall>>(expr);
         if (is_aggregate_fn_name(fc.name)) {
             out.found = true;
-            // LISTAGG is an alias for clink's string_agg.
+            // LISTAGG is an alias for clink's string_agg; COLLECT (the SQL
+            // MULTISET constructor aggregate) rides the array_agg machinery -
+            // MULTISET and ARRAY share the list wire shape, so COLLECT(v)
+            // lands in a declared MULTISET<t> column (bag semantics: element
+            // multiplicity is preserved, arrival order is not meaningful).
             out.fn = (fc.name == "listagg") ? "string_agg" : fc.name;
+            if (out.fn == "collect") {
+                out.fn = "array_agg";
+            }
             out.distinct = fc.agg_distinct;
+            // A registered UDAF takes 0..N column-reference arguments (the
+            // accumulator closures receive the values in declaration order;
+            // the runtime skips a row when ANY argument is NULL) and accepts
+            // DISTINCT (dedup on the whole argument tuple). The columns join
+            // with ',' into input_column - the runtime splits the list back.
+            if (is_registered_udaf_name(out.fn)) {
+                std::string joined;
+                for (const auto& a : fc.args) {
+                    if (!std::holds_alternative<ast::ColumnRef>(a)) {
+                        bind_error(fc.name + ": UDAF arguments must be column references",
+                                   fc.loc.pos);
+                    }
+                    if (!joined.empty()) {
+                        joined += ',';
+                    }
+                    joined += resolve_value_column_name(
+                        std::get<ast::ColumnRef>(a), source, source_alias);
+                }
+                out.input_column = std::move(joined);
+                return out;
+            }
             // DISTINCT is only meaningful for COUNT, STRING_AGG and
             // ARRAY_AGG in this cut; reject it elsewhere rather than
             // silently drop.
@@ -1444,6 +1529,15 @@ std::shared_ptr<arrow::DataType> aggregate_output_type(const std::string& fn,
         fn == "variance" || fn == "var_pop" || fn == "var_samp" || fn == "percentile" ||
         fn == "approx_percentile")
         return arrow::float64();
+    // UDAF (SQLOPT-3): a registered aggregate UDF types as its declared return
+    // type regardless of arity (a no-arg / multi-arg UDAF must not fall into
+    // the built-in column-driven branches below). Built-in names precede in
+    // the checks above, so a built-in can never resolve here.
+    if (is_registered_udaf_name(fn)) {
+        if (auto rt = AggFunctionRegistry::global().return_type(fn); rt != nullptr) {
+            return rt;
+        }
+    }
     if (input_column.empty())
         return arrow::int64();
     for (const auto& c : source.columns) {
@@ -3492,9 +3586,9 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             // only `SELECT * FROM a JOIN b` worked), it is registered as a synthetic
             // derived table so the outer SELECT applies over the join output, just
             // like the MATCH_RECOGNIZE / PTF / subquery paths. Join output columns
-            // are the flat "<alias>_<col>" names; reference them by that flat name
-            // in the outer SELECT / WHERE (qualified `alias.col` is a follow-on, and
-            // is not supported by the derived-table wrapper today either).
+            // are the flat "<alias>_<col>" names; the outer SELECT / WHERE / GROUP
+            // BY / ORDER BY may reference them by that flat name or by the
+            // qualified `alias.col` (the resolvers fall back to the flat name).
             std::unique_ptr<LogicalPlan> join_plan;
             // Lookup (enrichment) join: one side is a connector='lookup'
             // table. Lower to LogicalLookupJoin - the probe stream enriched
@@ -3990,6 +4084,9 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             a.percentile = agg.percentile;
             a.output_name = item.alias.value_or(
                 a.agg_fn + (a.input_column.empty() ? std::string{"_star"} : "_" + a.input_column));
+            // A multi-arg UDAF's input_column is comma-joined; keep the
+            // default output name a plain identifier.
+            std::replace(a.output_name.begin(), a.output_name.end(), ',', '_');
             a.type = aggregate_output_type(a.agg_fn, source, a.input_column);
             aggregates.push_back(std::move(a));
             agg_target_indices.emplace_back(i, aggregates.back().output_name);

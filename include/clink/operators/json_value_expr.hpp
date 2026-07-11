@@ -427,6 +427,8 @@ enum class ValueOp {
     JsonQuery,
     JsonExists,
     JsonObjectFn,
+    Cardinality,
+    Element,
     Udf,  // not a built-in: resolved via ScalarFunctionRegistry at eval time
 };
 
@@ -499,6 +501,8 @@ inline std::optional<ValueOp> lookup_value_op(std::string_view name) {
         {"json_query", ValueOp::JsonQuery},
         {"json_exists", ValueOp::JsonExists},
         {"json_object", ValueOp::JsonObjectFn},
+        {"cardinality", ValueOp::Cardinality},
+        {"element", ValueOp::Element},
     };
     auto it = kOps.find(name);
     if (it == kOps.end()) {
@@ -900,6 +904,44 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
         }
         const auto idx = static_cast<std::size_t>(idx_d);
         return arr[idx - 1];
+    }
+
+    // CARDINALITY(collection): element count of an ARRAY / MULTISET (JSON
+    // array, multiplicity included) or MAP (JSON object) value. NULL or a
+    // non-collection base yields NULL (SQL-standard: no error).
+    if (op == ValueOp::Cardinality) {
+        if (args.size() != 1) {
+            throw std::runtime_error("json_value_expr: 'cardinality' takes one arg");
+        }
+        if (args[0].is_array()) {
+            return JsonValue{static_cast<std::int64_t>(args[0].as_array().size())};
+        }
+        if (args[0].is_object()) {
+            return JsonValue{static_cast<std::int64_t>(args[0].as_object().size())};
+        }
+        return value_expr_detail::null_value();
+    }
+    // ELEMENT(multiset): the sole element of a one-element MULTISET / ARRAY.
+    // An empty collection or a non-collection base yields NULL; more than one
+    // element is an error (SQL-standard: ELEMENT is defined only up to one).
+    if (op == ValueOp::Element) {
+        if (args.size() != 1) {
+            throw std::runtime_error("json_value_expr: 'element' takes one arg");
+        }
+        if (!args[0].is_array()) {
+            return value_expr_detail::null_value();
+        }
+        const auto& arr = args[0].as_array();
+        if (arr.empty()) {
+            return value_expr_detail::null_value();
+        }
+        if (arr.size() > 1) {
+            throw std::runtime_error(
+                "ELEMENT() requires a collection of at most one element, "
+                "got " +
+                std::to_string(arr.size()));
+        }
+        return arr[0];
     }
 
     // ROW(...) constructor (Wave 5c) -> a JSON object keyed by field name.

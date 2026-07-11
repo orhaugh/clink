@@ -119,6 +119,21 @@ std::set<std::string> pushdown_(LogicalPlan& node) {
         }
         return used;
     }
+    // A multi-arg UDAF's input_column is the comma-joined argument list; each
+    // argument column is a separate use (inserting the joined text whole would
+    // narrow the scan past the real arguments).
+    auto insert_agg_inputs = [&used](const std::string& input_column) {
+        std::size_t pos = 0;
+        while (pos <= input_column.size() && !input_column.empty()) {
+            const auto comma = input_column.find(',', pos);
+            if (comma == std::string::npos) {
+                used.insert(input_column.substr(pos));
+                break;
+            }
+            used.insert(input_column.substr(pos, comma - pos));
+            pos = comma + 1;
+        }
+    };
     if (node.kind() == "WindowAggregate") {
         auto& wa = static_cast<LogicalWindowAggregate&>(node);
         used.insert(wa.window().time_column);
@@ -126,7 +141,7 @@ std::set<std::string> pushdown_(LogicalPlan& node) {
             used.insert(gk);
         for (const auto& agg : wa.aggregates()) {
             if (!agg.input_column.empty())
-                used.insert(agg.input_column);
+                insert_agg_inputs(agg.input_column);
         }
         return used;
     }
@@ -136,7 +151,7 @@ std::set<std::string> pushdown_(LogicalPlan& node) {
             used.insert(gk);
         for (const auto& agg : wa.aggregates()) {
             if (!agg.input_column.empty())
-                used.insert(agg.input_column);
+                insert_agg_inputs(agg.input_column);
         }
         return used;
     }

@@ -4430,6 +4430,117 @@ TEST(SqlRuntime, JoinWithWhereAndProjection) {
     }
 }
 
+// Qualified alias.col over a join: the resolvers fall back to the flat
+// "<alias>_<col>" join-output column, so the outer SELECT / WHERE / GROUP BY
+// accept the natural qualified spelling instead of requiring the flat name.
+TEST(SqlRuntime, QualifiedColumnsOverJoin) {
+    ensure_sql_installed_once();
+    const auto a_path = std::filesystem::temp_directory_path() / "clink_sql_qcj_a.ndjson";
+    const auto b_path = std::filesystem::temp_directory_path() / "clink_sql_qcj_b.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_qcj_out.ndjson";
+    for (const auto& p : {a_path, b_path, out_path}) {
+        std::filesystem::remove(p);
+    }
+    write_lines(a_path, {R"({"user_id":1,"page":"home"})", R"({"user_id":1,"page":"docs"})"});
+    write_lines(b_path, {R"({"user_id":1,"amount":100})", R"({"user_id":1,"amount":30})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE clicks (user_id BIGINT, page TEXT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     a_path.string() +
+                     "');"
+                     "CREATE TABLE orders (user_id BIGINT, amount BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     b_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (page TEXT, amount BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    // Same shape as JoinWithWhereAndProjection but every outer reference is
+    // qualified. The unaliased projections default their output names to the
+    // column tail (page, amount).
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT c.page, o.amount FROM clicks c JOIN orders o "
+                        "ON c.user_id = o.user_id WHERE o.amount > 50");
+
+    InProcessCluster cluster("tm-sql-qcj", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    auto lines = read_lines(out_path);
+    ASSERT_EQ(lines.size(), 2u);
+    std::set<std::string> pages;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        EXPECT_EQ(static_cast<std::int64_t>(js.at("amount").as_number()), 100);
+        pages.insert(js.at("page").as_string());
+    }
+    EXPECT_EQ(pages, (std::set<std::string>{"home", "docs"}));
+    for (const auto& p : {a_path, b_path, out_path}) {
+        std::filesystem::remove(p);
+    }
+}
+
+// Qualified refs also work as GROUP BY keys and aggregate arguments over a
+// join (both resolve through the same flat-name fallback).
+TEST(SqlRuntime, QualifiedColumnsOverJoinGroupBy) {
+    ensure_sql_installed_once();
+    const auto a_path = std::filesystem::temp_directory_path() / "clink_sql_qcg_a.ndjson";
+    const auto b_path = std::filesystem::temp_directory_path() / "clink_sql_qcg_b.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_qcg_out.ndjson";
+    for (const auto& p : {a_path, b_path, out_path}) {
+        std::filesystem::remove(p);
+    }
+    write_lines(a_path, {R"({"user_id":1,"page":"home"})", R"({"user_id":1,"page":"docs"})"});
+    write_lines(b_path, {R"({"user_id":1,"amount":100})", R"({"user_id":1,"amount":30})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE clicks (user_id BIGINT, page TEXT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     a_path.string() +
+                     "');"
+                     "CREATE TABLE orders (user_id BIGINT, amount BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     b_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (page TEXT, total BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "', mode='upsert', primary_key='page')");
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT c.page AS page, SUM(o.amount) AS total "
+                        "FROM clicks c JOIN orders o ON c.user_id = o.user_id GROUP BY c.page");
+
+    InProcessCluster cluster("tm-sql-qcg", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    // Each page joins both orders: 100 + 30 = 130 per page.
+    auto lines = read_lines(out_path);
+    std::map<std::string, std::int64_t> totals;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        totals[js.at("page").as_string()] = static_cast<std::int64_t>(js.at("total").as_number());
+    }
+    EXPECT_EQ(totals, (std::map<std::string, std::int64_t>{{"home", 130}, {"docs", 130}}));
+    for (const auto& p : {a_path, b_path, out_path}) {
+        std::filesystem::remove(p);
+    }
+}
+
 // A GROUP BY aggregate over a join (previously silently dropped). Proves the
 // join output feeds the aggregate path like any source.
 TEST(SqlRuntime, JoinFeedsGroupByAggregate) {
@@ -8134,6 +8245,28 @@ void register_test_udafs() {
             return JsonValue{as_i64(acc) * as_i64(a[0])};
         },
         [as_i64](const JsonValue& acc) { return JsonValue{as_i64(acc)}; });
+    // Multi-arg UDAF: weighted sum over (value, weight) with full retraction.
+    clink::AggFunctionRegistry::global().register_function(
+        "t_wsum",
+        arrow::int64(),
+        []() { return JsonValue{static_cast<std::int64_t>(0)}; },
+        [as_i64](JsonValue acc, const std::vector<JsonValue>& a) {
+            return JsonValue{as_i64(acc) + as_i64(a[0]) * as_i64(a[1])};
+        },
+        [as_i64](const JsonValue& acc) { return JsonValue{as_i64(acc)}; },
+        [as_i64](JsonValue acc, const std::vector<JsonValue>& a) {
+            return JsonValue{as_i64(acc) - as_i64(a[0]) * as_i64(a[1])};
+        },
+        [as_i64](JsonValue x, JsonValue y) { return JsonValue{as_i64(x) + as_i64(y)}; });
+    // No-arg UDAF: counts rows (the argument vector arrives empty each call).
+    clink::AggFunctionRegistry::global().register_function(
+        "t_rows",
+        arrow::int64(),
+        []() { return JsonValue{static_cast<std::int64_t>(0)}; },
+        [as_i64](JsonValue acc, const std::vector<JsonValue>&) {
+            return JsonValue{as_i64(acc) + 1};
+        },
+        [as_i64](const JsonValue& acc) { return JsonValue{as_i64(acc)}; });
 }
 }  // namespace
 
@@ -8371,6 +8504,249 @@ TEST(SqlRuntime, UdafRetractionApplied) {
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec = compile(cat, "INSERT INTO out_t SELECT k, t_sum(v) AS total FROM evt GROUP BY k");
     InProcessCluster cluster("tm-sql-udaf-rt", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+    auto lines = read_lines(out_path);
+    ASSERT_FALSE(lines.empty());
+    EXPECT_EQ(static_cast<std::int64_t>(clink::config::parse(lines.back()).at("total").as_number()),
+              30);
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
+// MULTISET value path: COLLECT(v) builds a multiset (bag: multiplicity
+// preserved) that lands in a declared MULTISET<t> column; CARDINALITY and
+// ELEMENT access the value. COLLECT rides the array_agg machinery (MULTISET
+// and ARRAY share the list wire shape).
+TEST(SqlRuntime, MultisetCollectCardinalityAndElement) {
+    ensure_sql_installed_once();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_ms_in.ndjson";
+    const auto mid_path = std::filesystem::temp_directory_path() / "clink_sql_ms_mid.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_ms_out.ndjson";
+    const auto el_path = std::filesystem::temp_directory_path() / "clink_sql_ms_el.ndjson";
+    for (const auto& p : {in_path, mid_path, out_path, el_path}) {
+        std::filesystem::remove(p);
+    }
+    // k=1 collects {10,10,30} (multiplicity kept); k=2 collects {5}.
+    write_lines(
+        in_path,
+        {R"({"k":1,"v":10})", R"({"k":1,"v":10})", R"({"k":1,"v":30})", R"({"k":2,"v":5})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE evt (k BIGINT, v BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE mid (k BIGINT, vals MULTISET<BIGINT>) "
+                     "WITH (connector='file', format='json', path='" +
+                     mid_path.string() +
+                     "', mode='upsert', primary_key='k');"
+                     "CREATE TABLE mid_src (k BIGINT, vals MULTISET<BIGINT>) "
+                     "WITH (connector='file', format='json', path='" +
+                     mid_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (k BIGINT, n BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() +
+                     "');"
+                     "CREATE TABLE el_t (e BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     el_path.string() + "')");
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+
+    InProcessCluster cluster("tm-sql-ms", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+
+    // Job 1: COLLECT into the MULTISET column (upsert nets the changelog).
+    auto spec1 = compile(cat, "INSERT INTO mid SELECT k, COLLECT(v) AS vals FROM evt GROUP BY k");
+    auto r1 = submitter.submit(spec1.to_json(), {}, opts);
+    ASSERT_TRUE(r1.completed) << "reject: " << r1.reject_message;
+    ASSERT_TRUE(r1.ok) << "errors: " << (r1.errors.empty() ? "(none)" : r1.errors[0]);
+
+    // Job 2: CARDINALITY over the stored multiset (counts multiplicity).
+    auto spec2 = compile(cat, "INSERT INTO out_t SELECT k, CARDINALITY(vals) AS n FROM mid_src");
+    auto r2 = submitter.submit(spec2.to_json(), {}, opts);
+    ASSERT_TRUE(r2.completed) << "reject: " << r2.reject_message;
+    ASSERT_TRUE(r2.ok) << "errors: " << (r2.errors.empty() ? "(none)" : r2.errors[0]);
+    std::map<std::int64_t, std::int64_t> ns;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        ns[static_cast<std::int64_t>(js.at("k").as_number())] =
+            static_cast<std::int64_t>(js.at("n").as_number());
+    }
+    EXPECT_EQ(ns[1], 3);
+    EXPECT_EQ(ns[2], 1);
+
+    // Job 3: ELEMENT of the one-element multiset.
+    auto spec3 =
+        compile(cat, "INSERT INTO el_t SELECT ELEMENT(vals) AS e FROM mid_src WHERE k = 2");
+    auto r3 = submitter.submit(spec3.to_json(), {}, opts);
+    ASSERT_TRUE(r3.completed) << "reject: " << r3.reject_message;
+    ASSERT_TRUE(r3.ok) << "errors: " << (r3.errors.empty() ? "(none)" : r3.errors[0]);
+    auto el_lines = read_lines(el_path);
+    ASSERT_EQ(el_lines.size(), 1u);
+    EXPECT_EQ(static_cast<std::int64_t>(clink::config::parse(el_lines[0]).at("e").as_number()), 5);
+
+    for (const auto& p : {in_path, mid_path, out_path, el_path}) {
+        std::filesystem::remove(p);
+    }
+}
+
+// A multi-arg UDAF receives every argument column in declaration order; a row
+// with ANY null argument is skipped (the multi-column analogue of the
+// single-arg NULL-skip convention).
+TEST(SqlRuntime, UdafMultiArgWeightedSum) {
+    ensure_sql_installed_once();
+    register_test_udafs();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_udaf_ma_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_udaf_ma_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+    // (10*2) + (30*3) = 110; the null-weight row is skipped.
+    write_lines(
+        in_path,
+        {R"({"k":1,"v":10,"w":2})", R"({"k":1,"v":30,"w":3})", R"({"k":1,"v":99,"w":null})"});
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE evt (k BIGINT, v BIGINT, w BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (k BIGINT, total BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec =
+        compile(cat, "INSERT INTO out_t SELECT k, t_wsum(v, w) AS total FROM evt GROUP BY k");
+    InProcessCluster cluster("tm-sql-udaf-ma", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+    auto lines = read_lines(out_path);
+    ASSERT_FALSE(lines.empty());
+    EXPECT_EQ(static_cast<std::int64_t>(clink::config::parse(lines.back()).at("total").as_number()),
+              110);
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
+// A no-arg UDAF folds every row of the group (empty argument vector per call).
+TEST(SqlRuntime, UdafNoArgCountsRows) {
+    ensure_sql_installed_once();
+    register_test_udafs();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_udaf_na_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_udaf_na_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+    write_lines(in_path, {R"({"k":1,"v":10})", R"({"k":1,"v":30})", R"({"k":2,"v":5})"});
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE evt (k BIGINT, v BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (k BIGINT, n BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat, "INSERT INTO out_t SELECT k, t_rows() AS n FROM evt GROUP BY k");
+    InProcessCluster cluster("tm-sql-udaf-na", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+    std::map<std::int64_t, std::int64_t> got;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        got[static_cast<std::int64_t>(js.at("k").as_number())] =
+            static_cast<std::int64_t>(js.at("n").as_number());
+    }
+    EXPECT_EQ(got[1], 2);
+    EXPECT_EQ(got[2], 1);
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
+// DISTINCT UDAF folds each distinct argument tuple exactly once.
+TEST(SqlRuntime, UdafDistinctFoldsEachTupleOnce) {
+    ensure_sql_installed_once();
+    register_test_udafs();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_udaf_di_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_udaf_di_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+    // v=10 appears twice: DISTINCT folds it once -> 10 + 30 = 40.
+    write_lines(in_path, {R"({"k":1,"v":10})", R"({"k":1,"v":10})", R"({"k":1,"v":30})"});
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE evt (k BIGINT, v BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (k BIGINT, total BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec =
+        compile(cat, "INSERT INTO out_t SELECT k, t_sum(DISTINCT v) AS total FROM evt GROUP BY k");
+    InProcessCluster cluster("tm-sql-udaf-di", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+    auto lines = read_lines(out_path);
+    ASSERT_FALSE(lines.empty());
+    EXPECT_EQ(static_cast<std::int64_t>(clink::config::parse(lines.back()).at("total").as_number()),
+              40);
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
+// DISTINCT UDAF retraction: a delete only un-folds a tuple when its LAST live
+// occurrence goes (multiplicity-tracked, exactly like COUNT(DISTINCT)).
+TEST(SqlRuntime, UdafDistinctRetractsOnLastOccurrence) {
+    ensure_sql_installed_once();
+    register_test_udafs();
+    const auto in_path = std::filesystem::temp_directory_path() / "clink_sql_udaf_dr_in.ndjson";
+    const auto out_path = std::filesystem::temp_directory_path() / "clink_sql_udaf_dr_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+    // 10,10,30 folded distinct -> 40. First delete of 10 leaves one live
+    // occurrence (total stays 40); the second un-folds it (total 30).
+    write_lines(in_path,
+                {R"({"k":1,"v":10})",
+                 R"({"k":1,"v":10})",
+                 R"({"k":1,"v":30})",
+                 R"({"k":1,"v":10,"__row_kind":"delete"})",
+                 R"({"k":1,"v":10,"__row_kind":"delete"})"});
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE evt (k BIGINT, v BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (k BIGINT, total BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec =
+        compile(cat, "INSERT INTO out_t SELECT k, t_sum(DISTINCT v) AS total FROM evt GROUP BY k");
+    InProcessCluster cluster("tm-sql-udaf-dr", 8);
     application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;

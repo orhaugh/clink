@@ -86,9 +86,12 @@ struct AggSpec {
     // UDAF (SQLOPT-3): set when `fn` names a registered aggregate UDF. `udaf`
     // holds the resolved accumulator closures (shared so copying an AggSpec is
     // cheap). When set, update/retract/finalize/merge dispatch to the closures
-    // and the built-in AggState fields are untouched.
+    // and the built-in AggState fields are untouched. `input_columns` is the
+    // decoded argument list (input_column is the comma-joined form on the
+    // plan): a UDAF takes 0..N column arguments in declaration order.
     bool is_udaf = false;
     std::shared_ptr<const clink::AggFunctionRegistry::Entry> udaf;
+    std::vector<std::string> input_columns;
 };
 
 // Strict-weak ordering over JsonValue for the MIN / MAX multiset. Within
@@ -484,7 +487,7 @@ inline bool is_builtin_agg_fn(const std::string& fn) {
     return fn == "sum" || fn == "count" || fn == "min" || fn == "max" || fn == "avg" ||
            fn == "stddev" || fn == "stddev_pop" || fn == "stddev_samp" || fn == "variance" ||
            fn == "var_pop" || fn == "var_samp" || fn == "string_agg" || fn == "listagg" ||
-           fn == "percentile" || fn == "approx_percentile" || fn == "array_agg";
+           fn == "percentile" || fn == "approx_percentile" || fn == "array_agg" || fn == "collect";
 }
 
 inline void decode_agg_extras(const clink::config::JsonValue& entry, AggSpec& spec) {
@@ -495,14 +498,58 @@ inline void decode_agg_extras(const clink::config::JsonValue& entry, AggSpec& sp
     if (entry.contains("percentile") && entry.at("percentile").is_number())
         spec.percentile = entry.at("percentile").as_number();
     // UDAF (SQLOPT-3): resolve a registered aggregate UDF by name (single seam;
-    // every aggregate factory calls this right after setting spec.fn). Built-in
-    // names are never treated as UDAFs.
+    // every aggregate factory calls this right after setting spec.fn and
+    // spec.input_column). Built-in names are never treated as UDAFs.
     if (!is_builtin_agg_fn(spec.fn)) {
         if (auto e = clink::AggFunctionRegistry::global().lookup(spec.fn)) {
             spec.is_udaf = true;
             spec.udaf = std::make_shared<const clink::AggFunctionRegistry::Entry>(std::move(*e));
+            // Multi-arg UDAF: the binder joins the argument columns with ','
+            // into the plan's input_column; decode the list once here. A
+            // no-arg UDAF decodes to an empty list.
+            spec.input_columns.clear();
+            std::size_t pos = 0;
+            while (pos <= spec.input_column.size() && !spec.input_column.empty()) {
+                const auto comma = spec.input_column.find(',', pos);
+                if (comma == std::string::npos) {
+                    spec.input_columns.push_back(spec.input_column.substr(pos));
+                    break;
+                }
+                spec.input_columns.push_back(spec.input_column.substr(pos, comma - pos));
+                pos = comma + 1;
+            }
         }
     }
+}
+
+// Gather a UDAF's argument values from the row in declaration order. Returns
+// nullopt when any argument is NULL or missing: a multi-arg aggregate skips a
+// row when ANY aggregated expression is null (the multi-column analogue of
+// the single-arg NULL-skip convention). A no-arg UDAF returns an empty vector
+// for every row, so it folds each one.
+inline std::optional<std::vector<clink::config::JsonValue>> udaf_args_of(const AggSpec& spec,
+                                                                         const Row& row) {
+    std::vector<clink::config::JsonValue> args;
+    args.reserve(spec.input_columns.size());
+    for (const auto& col : spec.input_columns) {
+        auto it = row.values.find(col);
+        if (it == row.values.end() || it->second.is_null()) {
+            return std::nullopt;
+        }
+        args.push_back(it->second);
+    }
+    return args;
+}
+
+// Multiplicity-map key for DISTINCT UDAF dedup: the canonically serialised
+// argument tuple, so ("a", 1) and ("a1",) can never collide.
+inline std::string udaf_distinct_key(const std::vector<clink::config::JsonValue>& args) {
+    clink::config::JsonArray arr;
+    arr.reserve(args.size());
+    for (const auto& a : args) {
+        arr.push_back(a);
+    }
+    return clink::config::JsonValue{std::move(arr)}.serialize(0);
 }
 
 // Lazily initialise a UDAF accumulator the first time a group/window touches it,
@@ -566,10 +613,20 @@ void retract_agg(AggState& st, const AggSpec& spec, const Row& row) {
                 "closure or use it only on append-only / windowed input");
         }
         ensure_udaf_init(st, *spec.udaf);
-        auto it = row.values.find(spec.input_column);
-        if (it == row.values.end() || it->second.is_null())
+        auto args = udaf_args_of(spec, row);
+        if (!args.has_value())
             return;
-        st.udaf_acc = spec.udaf->retract(std::move(st.udaf_acc), {it->second});
+        if (spec.distinct) {
+            // The accumulator folded each distinct tuple exactly once, so
+            // retract only when the LAST live occurrence of the tuple goes.
+            auto vc = st.value_counts.find(udaf_distinct_key(*args));
+            if (vc == st.value_counts.end())
+                return;  // never accumulated; nothing to undo
+            if (--vc->second > 0)
+                return;  // other live occurrences keep the tuple folded
+            st.value_counts.erase(vc);
+        }
+        st.udaf_acc = spec.udaf->retract(std::move(st.udaf_acc), *args);
         return;
     }
     // Decrement the multiplicity map and erase a value at zero (used by
@@ -671,10 +728,16 @@ void retract_agg(AggState& st, const AggSpec& spec, const Row& row) {
 void update_agg(AggState& st, const AggSpec& spec, const Row& row) {
     if (spec.is_udaf) {
         ensure_udaf_init(st, *spec.udaf);
-        auto it = row.values.find(spec.input_column);
-        if (it == row.values.end() || it->second.is_null())
+        auto args = udaf_args_of(spec, row);
+        if (!args.has_value())
             return;  // NULL-skip, matching the built-in convention
-        st.udaf_acc = spec.udaf->accumulate(std::move(st.udaf_acc), {it->second});
+        if (spec.distinct) {
+            // Fold each distinct argument tuple exactly once; further
+            // occurrences only bump the multiplicity for retraction.
+            if (++st.value_counts[udaf_distinct_key(*args)] != 1)
+                return;
+        }
+        st.udaf_acc = spec.udaf->accumulate(std::move(st.udaf_acc), *args);
         return;
     }
     if (spec.fn == "count") {
@@ -2121,6 +2184,16 @@ private:
                             "UDAF '" + spec.fn +
                             "' used in a SESSION window but has no merge closure; register a merge "
                             "closure or use it only with TUMBLE/HOP/CUMULATE/GROUP BY");
+                    }
+                    // DISTINCT folded each side's tuples into its own opaque
+                    // accumulator; a tuple seen by both sides would be folded
+                    // twice by merge and cannot be un-folded. Reject rather
+                    // than miscount.
+                    if (spec.distinct) {
+                        throw std::runtime_error(
+                            "DISTINCT " + spec.fn +
+                            " cannot merge SESSION windows (cross-session dedup is not possible "
+                            "over an opaque accumulator); use TUMBLE/HOP/CUMULATE/GROUP BY");
                     }
                     a.udaf_acc = spec.udaf->merge(std::move(a.udaf_acc), b.udaf_acc);
                 }

@@ -481,9 +481,9 @@ TEST(SqlBinder, UdafBindsAsAggregate) {
     EXPECT_EQ(u->input_column, "v");
 }
 
-// DISTINCT and non-single-column-ref args are rejected for a UDAF, same as the
-// built-in default aggregates.
-TEST(SqlBinder, UdafDistinctAndArityRejected) {
+// A UDAF accepts DISTINCT and 0..N column-ref arguments (multi-arg columns
+// join with ',' into input_column); a non-column argument is still rejected.
+TEST(SqlBinder, UdafDistinctAndMultiArgAccepted) {
     clink::AggFunctionRegistry::global().register_function(
         "b_udaf2",
         arrow::int64(),
@@ -496,9 +496,43 @@ TEST(SqlBinder, UdafDistinctAndArityRejected) {
         "WITH (connector='file', format='json', path='/tmp/t.ndjson')");
     cat.register_table(std::get<ast::CreateTableStmt>(regs.statements[0]));
     Binder b(cat);
-    EXPECT_THROW(b.bind_select(as_select(parse("SELECT k, b_udaf2(DISTINCT v) FROM t GROUP BY k"))),
-                 TranslationError);
-    EXPECT_THROW(b.bind_select(as_select(parse("SELECT k, b_udaf2(v, v) FROM t GROUP BY k"))),
+
+    auto distinct_plan =
+        b.bind_select(as_select(parse("SELECT k, b_udaf2(DISTINCT v) AS u FROM t GROUP BY k")));
+    ASSERT_EQ(distinct_plan->kind(), "Aggregate");
+    {
+        const auto& agg = static_cast<const LogicalAggregate&>(*distinct_plan);
+        const AggregateOutput* u = nullptr;
+        for (const auto& a : agg.aggregates()) {
+            if (a.output_name == "u")
+                u = &a;
+        }
+        ASSERT_NE(u, nullptr);
+        EXPECT_TRUE(u->distinct);
+        EXPECT_EQ(u->input_column, "v");
+    }
+
+    auto multi_plan =
+        b.bind_select(as_select(parse("SELECT k, b_udaf2(v, k) AS u FROM t GROUP BY k")));
+    ASSERT_EQ(multi_plan->kind(), "Aggregate");
+    {
+        const auto& agg = static_cast<const LogicalAggregate&>(*multi_plan);
+        const AggregateOutput* u = nullptr;
+        for (const auto& a : agg.aggregates()) {
+            if (a.output_name == "u")
+                u = &a;
+        }
+        ASSERT_NE(u, nullptr);
+        EXPECT_EQ(u->input_column, "v,k");
+        EXPECT_TRUE(u->type->Equals(*arrow::int64()));
+    }
+
+    // A no-arg UDAF binds with an empty input_column.
+    auto noarg_plan = b.bind_select(as_select(parse("SELECT k, b_udaf2() AS u FROM t GROUP BY k")));
+    ASSERT_EQ(noarg_plan->kind(), "Aggregate");
+
+    // Non-column arguments stay rejected.
+    EXPECT_THROW(b.bind_select(as_select(parse("SELECT k, b_udaf2(v + 1) FROM t GROUP BY k"))),
                  TranslationError);
 }
 
