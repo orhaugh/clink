@@ -675,9 +675,11 @@ Pipeline: `libpg_query` parses the input; an AST builder normalises
 the parse tree into a parser-agnostic AST under `clink::sql::ast`;
 the binder type-checks against a `Catalog`, lowers expressions to
 JSON predicates / value-expressions, and emits `LogicalPlan` nodes;
-a small optimizer runs projection pushdown into the source's column
-hint; the physical planner lowers the logical tree to a `JobGraphSpec`
-of registered operators. All SQL ops live in `clink::sql::install(reg)`
+the optimizer runs predicate pushdown, cost-based join reordering
+(driven by `ANALYZE TABLE` statistics, DP-optimal order selection,
+never applied unless estimated cheaper), and projection pushdown into
+the source's column hint; the physical planner lowers the logical tree
+to a `JobGraphSpec` of registered operators. All SQL ops live in `clink::sql::install(reg)`
 which `clink_node` calls at startup when the SQL frontend is linked.
 
 Supported today:
@@ -689,7 +691,12 @@ DDL and basics
 - `INSERT INTO sink SELECT ... FROM source`
 - `SHOW TABLES`, `DROP TABLE [IF EXISTS]`, persistent JSON catalog under
   `~/.clink/catalog/`
-- `EXPLAIN <stmt>` prints the bound `LogicalPlan` tree
+- `EXPLAIN <stmt>` prints the OPTIMIZED `LogicalPlan` tree (the plan that
+  would run, join reorders and pushdowns applied), each node annotated with
+  its estimated output rows; a scan with no declared statistics is flagged
+- `ANALYZE TABLE t` scans a bounded table and writes exact statistics (row
+  count, per-column NDV, histograms, most-common values) into the catalog,
+  grounding the estimates the cost-based optimizer compares
 
 Projection and filtering
 
@@ -703,7 +710,11 @@ Projection and filtering
 Aggregation and windows
 
 - `GROUP BY` over `TUMBLE`, `HOP`, `SESSION`, `CUMULATE`, or plain columns
-  (unbounded upsert-style aggregate); `SUM` / `COUNT` / `MIN` / `MAX` / `AVG`
+  (unbounded upsert-style aggregate); `SUM` / `COUNT` / `MIN` / `MAX` / `AVG`,
+  the variance family (`STDDEV` / `VARIANCE` / `_POP` / `_SAMP`),
+  `PERCENTILE` / `APPROX_PERCENTILE`, `STRING_AGG` / `LISTAGG`, `ARRAY_AGG`,
+  `COLLECT`; `COUNT(DISTINCT ...)` and friends with retraction-exact
+  multiplicity tracking
 - `HAVING` referencing aggregate aliases or group columns
 - `OVER` aggregates (running `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`) with bounded
   `ROWS` / `RANGE <n> PRECEDING ... CURRENT ROW` frames (bounded frames are for
@@ -713,6 +724,12 @@ Aggregation and windows
 
 Joins
 
+- Stream-stream equi joins `JOIN ... ON a.k = b.k` in `INNER`, `LEFT`,
+  `RIGHT`, and `FULL OUTER` variants, with first-class `WHERE` / projection /
+  `GROUP BY` / `ORDER BY` over the join output; multi-way `INNER` join trees
+  are reordered cost-based when table statistics say a cheaper order exists
+- Join columns are referencable as the flat `<alias>_<col>` output names or
+  by the natural qualified `alias.col` spelling
 - Stream-stream interval joins `JOIN ... ON a.k = b.k AND a.ts BETWEEN b.ts +
   low AND b.ts + high`, in `INNER`, `LEFT`, `RIGHT`, and `FULL OUTER` variants
   (unmatched rows null-padded at watermark eviction, append-only)
@@ -727,6 +744,9 @@ Complex types and exact numerics
 - `ROW(...)` and `MAP(...)` construction, field access `(r).f`, element access
   `m['k']`; roundtrip as nested JSON. Whole ROW/MAP values flow to matching
   typed sink columns
+- `MULTISET<t>` columns built by the `COLLECT(x)` aggregate (bag semantics:
+  multiplicity preserved, retraction-correct), accessed with `CARDINALITY(x)`
+  and `ELEMENT(x)` (sole element of a one-element multiset)
 - Set operations `UNION` / `INTERSECT` / `EXCEPT` (and `ALL` multiset forms,
   per-key count model for retraction correctness)
 - Exact `DECIMAL(p, s)` 128-bit arithmetic (`+ - * / mod`, comparison, `CAST`,
@@ -746,8 +766,10 @@ Subqueries
 Advanced and extensibility (each a documented v1 subset)
 
 - `MATCH_RECOGNIZE (PARTITION BY ... ORDER BY ... PATTERN ... DEFINE ...
-  MEASURES ...)`: linear greedy patterns, simple DEFINE predicates, FIRST/LAST
-  measures, ONE ROW PER MATCH; lowered onto the CEP engine
+  MEASURES ...)`: linear greedy patterns, `PREV(col)` in DEFINE (compare
+  against the previous matched row), FIRST/LAST/CLASSIFIER measures, `ONE ROW
+  PER MATCH` or `ALL ROWS PER MATCH` (every matched row with its pattern
+  variable), `AFTER MATCH SKIP PAST LAST ROW`; lowered onto the CEP engine
 - `CREATE MATERIALIZED VIEW ... AS <SELECT>`: continuous maintenance (keyed GROUP
   BY auto-derives upsert mode and primary key), or a scheduled full-refresh arm via
   `WITH ('freshness'='1h')` that recomputes over bounded sources and atomically
@@ -767,8 +789,10 @@ Advanced and extensibility (each a documented v1 subset)
   Row>` callable as `fn(TABLE t PARTITION BY cols)` with isolated per-key state
   (v1 is timerless)
 - Scalar UDFs and aggregate UDFs (UDAFs): C++-registered closures invoked by
-  name (a UDAF needs `retract` for changelog GROUP BY and `merge` for SESSION
-  windows)
+  name. A UDAF takes 0..N column arguments (rows with any NULL argument are
+  skipped) and accepts `DISTINCT` (dedup on the argument tuple, retraction
+  kept exact by multiplicity tracking); it needs `retract` for changelog
+  GROUP BY and `merge` for SESSION windows
 - `CREATE FUNCTION with_tax(amount BIGINT) RETURNS BIGINT AS 'amount + amount
   / 10' LANGUAGE SQL`: expression-bodied scalar UDFs written in SQL itself, no
   module or extra build flag. The body is any SELECT expression over the named
