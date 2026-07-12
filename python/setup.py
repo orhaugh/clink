@@ -45,7 +45,13 @@ def _lib_filename() -> str:
     if sys.platform == "darwin":
         return "libclink.dylib"
     if sys.platform == "win32":
-        return "clink.dll"
+        # clink_shared has no Windows export path yet (the symbol trim is a GNU
+        # linker version-script; nothing dllexports clink_*), so no installable
+        # Windows wheel can be produced. Fail honestly rather than advertise one.
+        raise NotImplementedError(
+            "pyclink wheels are not built for Windows yet (libclink has no Windows "
+            "export path); build libclink from source and set CLINK_LIB."
+        )
     return "libclink.so"
 
 
@@ -63,22 +69,40 @@ def _build_libclink() -> Path:
     if env_lib and Path(env_lib).exists():
         return Path(env_lib)
 
+    # An sdist ships only the Python package, not the C++ tree, so there is
+    # nothing to cmake-build. Say so clearly instead of surfacing cmake's raw
+    # "does not appear to contain CMakeLists.txt".
+    if not (REPO / "CMakeLists.txt").exists():
+        raise RuntimeError(
+            f"pyclink cannot build libclink here: no CMakeLists.txt at {REPO}. This is "
+            "an sdist, which ships only the Python package. Install a platform wheel, or "
+            "build libclink from the clink repo and set CLINK_LIB."
+        )
+
     build_dir = Path(os.environ.get("CLINK_WHEEL_BUILD_DIR", REPO / "build-pyclink"))
     jobs = str(min(10, (os.cpu_count() or 4)))
-    subprocess.check_call(
-        [
-            "cmake",
-            "-S",
-            str(REPO),
-            "-B",
-            str(build_dir),
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DCLINK_BUILD_SQL=ON",
-            "-DCLINK_BUILD_IMPLS=OFF",
-            "-DCLINK_BUILD_TESTS=OFF",
-            "-DCLINK_BUILD_EXAMPLES=OFF",
-        ]
-    )
+    configure = [
+        "cmake",
+        "-S",
+        str(REPO),
+        "-B",
+        str(build_dir),
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCLINK_BUILD_SQL=ON",
+        "-DCLINK_BUILD_IMPLS=OFF",
+        "-DCLINK_BUILD_TESTS=OFF",
+        "-DCLINK_BUILD_EXAMPLES=OFF",
+    ]
+    floor = os.environ.get("MACOSX_DEPLOYMENT_TARGET")
+    if sys.platform == "darwin" and floor:
+        # Pin libclink's minos to the same floor the wheel tag will carry (the
+        # tag derives from MACOSX_DEPLOYMENT_TARGET), so a low-tagged wheel does
+        # not ship a libclink that needs a newer macOS. Only when the floor is
+        # set explicitly (CI): a bare local build keeps the host default, which
+        # the pinned Arrow static libs pin to anyway. Those Arrow libs must be
+        # built at or below this floor too (see scripts/build-arrow.sh).
+        configure.append(f"-DCMAKE_OSX_DEPLOYMENT_TARGET={floor}")
+    subprocess.check_call(configure)
     subprocess.check_call(
         ["cmake", "--build", str(build_dir), "--target", "clink_shared", "--parallel", jobs]
     )
@@ -90,6 +114,10 @@ class build_py_with_lib(build_py):
 
     def run(self) -> None:
         super().run()
+        # An editable install resolves libclink at runtime (CLINK_LIB / loader
+        # path) and never uses a bundled copy, so skip the heavy cmake build.
+        if getattr(self, "editable_mode", False):
+            return
         lib = _build_libclink()
         dst_dir = Path(self.build_lib) / "pyclink"
         dst_dir.mkdir(parents=True, exist_ok=True)
@@ -134,5 +162,5 @@ class platform_wheel(bdist_wheel):
 setup(
     distclass=BinaryDistribution,
     cmdclass={"build_py": build_py_with_lib, "bdist_wheel": platform_wheel},
-    package_data={"pyclink": ["libclink.dylib", "libclink.so", "clink.dll"]},
+    package_data={"pyclink": ["libclink.dylib", "libclink.so"]},
 )

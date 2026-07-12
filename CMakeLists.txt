@@ -784,7 +784,10 @@ if(TARGET clink::embed)
             "LINKER:-exported_symbols_list,${_clink_exported_symbols}")
         set_target_properties(clink_shared PROPERTIES LINK_DEPENDS
             "${_clink_exported_symbols}")
-    else()
+    elseif(UNIX)
+        # GNU-ld version script. Guarded to UNIX: MSVC's link.exe rejects it, and
+        # a Windows DLL would need a .def / WINDOWS_EXPORT_ALL_SYMBOLS instead -
+        # libclink has no Windows build path yet (see python/setup.py).
         set(_clink_version_script "${CMAKE_CURRENT_BINARY_DIR}/libclink.version")
         file(WRITE "${_clink_version_script}" "{ global: clink_*; local: *; };\n")
         target_link_options(clink_shared PRIVATE

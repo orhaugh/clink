@@ -5,9 +5,26 @@ Embed the clink stream engine in Python. Pure Python over libclink's C ABI
 process - no daemons, no cluster - and results stream back as Arrow record
 batches, zero-copy, straight into pyarrow (and from there pandas or polars).
 
-## Quickstart
+## Install
 
-Build libclink from the repo root (needs the SQL frontend):
+A prebuilt wheel bundles a self-contained libclink (statically linked
+Arrow/Parquet) next to the package, so nothing else is needed - no separate
+build, no `CLINK_LIB`:
+
+```bash
+pip install pyclink
+```
+
+Wheels are produced by `.github/workflows/wheels.yml`. macOS arm64 wheels are
+built and smoke-tested on every release tag. Linux wheels are opt-in and
+currently carry a high glibc floor (built on the project's toolchain image), so
+they are not broadly installable yet; on Linux, and on any platform without a
+wheel, use the build-from-source path below. There is no Windows wheel.
+
+## Build from source
+
+The supported path for local development, editable installs, and platforms
+without a wheel. Build libclink from the repo root (needs the SQL frontend):
 
 ```bash
 cmake -S . -B build -DCLINK_BUILD_SQL=ON
@@ -52,9 +69,8 @@ blocked reader with an error. Collect is append-only in v1 - a retracting
 `CLINK_LIB` environment variable). `await_all()` polls in slices, so Ctrl-C
 cancels the running jobs and drains before re-raising.
 
-Wheels that bundle the library are not built yet; the supported path is
-build-from-source plus `CLINK_LIB`. See `docs/internals/embedded.md` in the
-repo for the semantics underneath.
+See `docs/internals/embedded.md` in the repo for the semantics underneath and
+for how the wheel bundles libclink.
 
 ## Tests
 

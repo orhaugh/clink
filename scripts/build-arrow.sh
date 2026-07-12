@@ -65,6 +65,12 @@ fi
 EXTRA_ARGS=()
 if [ "$(uname -s)" = "Darwin" ]; then
     EXTRA_ARGS+=(-DCMAKE_PREFIX_PATH=/opt/homebrew)
+    # Pin the macOS floor when set (CI builds portable wheels): the static Arrow
+    # objects linked into a self-contained libclink must not pin minos above the
+    # wheel's tag. Unset locally keeps the host default.
+    if [ -n "${MACOSX_DEPLOYMENT_TARGET:-}" ]; then
+        EXTRA_ARGS+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET}")
+    fi
 fi
 
 echo "build-arrow: configuring (BUNDLED data-path deps, SYSTEM aws-sdk, Parquet+S3+Compute) -> ${PREFIX}"

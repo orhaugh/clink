@@ -6,9 +6,9 @@
 #
 # Reused two ways:
 #   * locally, to produce a libclink to point `python -m build` at via CLINK_LIB;
-#   * in CI, to stage libclink into python/ before cibuildwheel runs (the Linux
-#     cibuildwheel container mounts only the package dir, not the whole repo, so
-#     the library must be built OUTSIDE the wheel build and handed in).
+#   * in CI (.github/workflows/wheels.yml), to build the heavy library OUTSIDE the
+#     wheel build and hand it to setup.py via CLINK_LIB, so the wheel build just
+#     copies it rather than rebuilding clink_shared per platform.
 #
 # The pinned Arrow/Parquet toolchain must already exist (host ~/.clink-deps via
 # scripts/build-arrow.sh, or /usr/local in the build image).
@@ -21,12 +21,22 @@ BUILD="${CLINK_WHEEL_BUILD_DIR:-${ROOT}/build-libclink-wheel}"
 OUT="${1:-${CLINK_LIB:-${BUILD}/staged/libclink}}"
 JOBS="${CLINK_BUILD_JOBS:-8}"
 
+# Pin the macOS floor to match the wheel tag when MACOSX_DEPLOYMENT_TARGET is set
+# (CI). CMake ignores CMAKE_OSX_DEPLOYMENT_TARGET off Apple, but only pass it when
+# the floor is explicit so a bare local build keeps the host default. Written as a
+# single ${VAR:+...} word so an unset floor expands to nothing under `set -u` on
+# macOS's bash 3.2 (an empty "${ARR[@]}" would error there).
+OSX_ARG=""
+if [[ -n "${MACOSX_DEPLOYMENT_TARGET:-}" ]]; then
+    OSX_ARG="-DCMAKE_OSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET}"
+fi
 cmake -S "${ROOT}" -B "${BUILD}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCLINK_BUILD_SQL=ON \
     -DCLINK_BUILD_IMPLS=OFF \
     -DCLINK_BUILD_TESTS=OFF \
-    -DCLINK_BUILD_EXAMPLES=OFF
+    -DCLINK_BUILD_EXAMPLES=OFF \
+    ${OSX_ARG:+"${OSX_ARG}"}
 cmake --build "${BUILD}" --target clink_shared --parallel "${JOBS}"
 
 LIB="$(find "${BUILD}" \( -name libclink.dylib -o -name libclink.so \) -type f | head -1)"

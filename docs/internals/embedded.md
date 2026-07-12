@@ -166,6 +166,23 @@ memory pool once, before any Arrow allocation, restoring the environment so
 a host Arrow's allocator choice is untouched (an explicit
 `ARROW_DEFAULT_MEMORY_POOL` is always respected).
 
+### Packaging: pyclink wheels
+
+A pyclink wheel bundles one platform `libclink` next to the package
+(`pyclink/libclink.dylib` / `.so`); the loader (`_bundled_library`) finds it, so
+`pip install pyclink` needs no separate build and no `CLINK_LIB`. Because pyclink
+is ctypes with no CPython extension, the library carries no CPython ABI, and the
+wheel is tagged `py3-none-<arch>` - one wheel serves every Python 3 on a
+platform (`python/setup.py`, `platform_wheel.get_tag`). The build is lean:
+`clink_shared` with `CLINK_BUILD_IMPLS=OFF`, so libclink carries the SQL engine
+and the built-in file / collect / Parquet surfaces but no external-SDK
+connectors, keeping the only shared deps Arrow's own (curl, xml2, aws-sdk,
+openssl, lz4, zstd), which the repair step (delocate on macOS, auditwheel on
+Linux) vendors into the wheel. libclink is built once per platform outside the
+wheel build and handed to `setup.py` via `CLINK_LIB`
+(`scripts/build-libclink-wheel.sh`); the wheel then simply copies it. The CI
+that produces the wheels and their platform scope is `.github/workflows/wheels.yml`.
+
 ### The Flight SQL endpoint
 
 `clink flight-sql` (or `ClinkFlightSqlServer` from
