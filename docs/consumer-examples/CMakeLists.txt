@@ -28,6 +28,15 @@ foreach(_ex IN LISTS _core_examples)
     target_link_libraries(${_ex} PRIVATE clink::core)
 endforeach()
 
+# 09 links the public testing framework (clink::test_support) as well as
+# clink::core, and is a self-checking test: it returns non-zero on failure, so
+# it registers with CTest. This is the consumer-facing proof that the exported
+# test framework works from a plain find_package(clink) project.
+enable_testing()
+add_executable(09_testing_framework 09_testing_framework.cpp)
+target_link_libraries(09_testing_framework PRIVATE clink::core clink::test_support)
+add_test(NAME 09_testing_framework COMMAND 09_testing_framework)
+
 # 08 is a plugin .so (clink_submit_job loads it). It must be linked as
 # MODULE, not an executable. Built only when CLINK_BUILD_PLUGIN_EXAMPLE
 # is set, since most consumers don't need the cluster-submit flow.

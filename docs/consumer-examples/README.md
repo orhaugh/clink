@@ -58,6 +58,7 @@ cmake --build build --target 08_cluster_job_plugin --parallel 10
 | 06 | [`06_file_io.cpp`](06_file_io.cpp) | `FileSource<string>` + `FileSink<string>` against a `TextFormat<T>` codec. Word-count over newline-delimited input, written as TSV. |
 | 07 | [`07_parquet_io.cpp`](07_parquet_io.cpp) | `ParquetSink<T>` + `ParquetSource<T>` over the shared `ArrowBatcher<T>` seam. The resulting file is a vanilla Parquet stream - open it from pyarrow / duckdb / polars to confirm. |
 | 08 | [`08_cluster_job_plugin.cpp`](08_cluster_job_plugin.cpp) | Pipeline packaged as a job plugin `.so` using `StreamExecutionEnvironment` + `CLINK_REGISTER_JOB`. Submit to a running cluster via `clink run`. |
+| 09 | [`09_testing_framework.cpp`](09_testing_framework.cpp) | Testing a stateful operator with `clink::test_support` (the public testing framework): a `KeyedProcessFunction` driven through `make_keyed_process_function_harness`, per-key state inspected via the production read path, and a snapshot → restore round trip. Links `clink::test_support` and registers with CTest (it exits non-zero on failure). |
 
 ## Picking targets vs. linking everything
 
@@ -81,6 +82,15 @@ if("kafka" IN_LIST clink_AVAILABLE_IMPLS)
     target_link_libraries(my_pipeline PRIVATE clink::kafka)
 endif()
 ```
+
+For tests, link `clink::test_support` alongside `clink::core` to pull in the
+public testing framework (operator harnesses, state inspection, snapshot /
+restore, deterministic time) - example 09 shows the pattern.
+
+A lean install without any connectors is available: build clink with
+`-DCLINK_BUILD_IMPLS=OFF` and its `clinkConfig` requires only Arrow / Parquet /
+Threads (no connector SDKs), shipping `clink::core`, `clink::clink` and
+`clink::test_support` without the runnable `clink_node`.
 
 ## Where to go next
 

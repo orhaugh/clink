@@ -16,6 +16,12 @@ endif()
 
 option(CLINK_BUILD_TESTS    "Build clink tests"    ON)
 option(CLINK_BUILD_EXAMPLES "Build clink examples" ON)
+# Connector/backend impls (kafka, postgres, s3, rocksdb, ...). ON by default.
+# Turn OFF for a lean core + test-framework build: the install then carries only
+# clink::core / clink::clink / clink::test_support and a clinkConfig that
+# requires just Arrow/Parquet/Threads, so a downstream find_package(clink) needs
+# no connector SDKs.
+option(CLINK_BUILD_IMPLS    "Build the connector/backend impls" ON)
 option(CLINK_BUILD_BENCH    "Build clink benchmarks (placeholder)" OFF)
 option(CLINK_BUILD_HTTP     "Build the HTTP subsystem (cluster dashboard + JSON API)" ON)
 # SQL frontend: parser (libpg_query), binder, logical/physical planner,
@@ -204,6 +210,15 @@ if(CLINK_USE_FLAT_HASH_MAP)
     FetchContent_MakeAvailable(unordered_dense)
     add_compile_definitions(CLINK_USE_FLAT_HASH_MAP=1)
     include_directories(SYSTEM ${unordered_dense_SOURCE_DIR}/include)
+    # The container choice is part of the ABI: clink::FlatMap appears in public
+    # headers (InMemoryStateBackend::State), so a downstream find_package(clink)
+    # consumer MUST compile those headers with the same choice, or the library
+    # and the consumer disagree on the map layout (a crash, not a link error).
+    # Ship the single ankerl header alongside clink's so <ankerl/unordered_dense.h>
+    # resolves from the install prefix; the matching define is propagated as a
+    # PUBLIC compile definition on clink_core below.
+    install(DIRECTORY "${unordered_dense_SOURCE_DIR}/include/ankerl"
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
 
 # simdjson backs config::parse (the JSON decode on every Row-channel hop:
@@ -301,6 +316,15 @@ if(CLINK_BUILD_HTTP)
 endif()
 add_library(clink::core ALIAS clink_core)
 set_target_properties(clink_core PROPERTIES EXPORT_NAME core)
+
+# Propagate the FlatMap container choice as a PUBLIC (exported) compile
+# definition so a downstream find_package(clink) consumer compiles clink's
+# public headers with the SAME clink::FlatMap type the library was built with.
+# The build tree already gets this via add_compile_definitions above; this line
+# carries it across the install/export boundary (INTERFACE_COMPILE_DEFINITIONS).
+if(CLINK_USE_FLAT_HASH_MAP)
+    target_compile_definitions(clink_core PUBLIC CLINK_USE_FLAT_HASH_MAP=1)
+endif()
 
 target_include_directories(clink_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -436,13 +460,17 @@ target_include_directories(clink_core PRIVATE BEFORE
 # transitively (zstd::libzstd_* is created under its static-build branch),
 # but a shared-only Arrow skips that, so resolve the target explicitly and
 # fall back to Arrow's transitive link. PRIVATE - only the sink TU needs the
-# symbols.
+# symbols - and wrapped in $<BUILD_INTERFACE:> so the target is NOT recorded in
+# the installed clinkTargets.cmake (a static lib otherwise propagates its PRIVATE
+# deps as usage requirements, and a downstream find_package(clink) would then
+# demand a zstd:: imported target it has no find_dependency for). Consumers get
+# zstd transitively through Arrow (a find_dependency in clinkConfig).
 find_package(zstd QUIET)
 if(TARGET zstd::libzstd_shared)
-    target_link_libraries(clink_core PRIVATE zstd::libzstd_shared)
+    target_link_libraries(clink_core PRIVATE $<BUILD_INTERFACE:zstd::libzstd_shared>)
     message(STATUS "clink::core - zstd via zstd::libzstd_shared")
 elseif(TARGET zstd::libzstd_static)
-    target_link_libraries(clink_core PRIVATE zstd::libzstd_static)
+    target_link_libraries(clink_core PRIVATE $<BUILD_INTERFACE:zstd::libzstd_static>)
     message(STATUS "clink::core - zstd via zstd::libzstd_static")
 else()
     message(STATUS "clink::core - zstd target not found directly; relying on Arrow transitive link")
@@ -586,7 +614,9 @@ endif()
 # the tests for its own surface area under impls/<x>/tests/, built
 # automatically when CLINK_BUILD_TESTS is on.
 # ---------------------------------------------------------------------------
-add_subdirectory(impls)
+if(CLINK_BUILD_IMPLS)
+    add_subdirectory(impls)
+endif()
 
 # ---------------------------------------------------------------------------
 # clink_sql - SQL frontend (parser + binder + planner). Vendored
@@ -680,7 +710,11 @@ endif()
 # client binary can take it - see the clink executable
 # below.)
 add_library(clink_all INTERFACE)
-target_link_libraries(clink_all INTERFACE clink::core clink::impls_all)
+target_link_libraries(clink_all INTERFACE clink::core)
+if(CLINK_BUILD_IMPLS)
+    # clink::impls_all only exists when the impls subtree was added.
+    target_link_libraries(clink_all INTERFACE clink::impls_all)
+endif()
 add_library(clink::clink ALIAS clink_all)
 set_target_properties(clink_all PROPERTIES EXPORT_NAME clink)
 
@@ -752,6 +786,10 @@ endif()
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+# clink_node is the worker: it statically registers the connector/backend impls
+# at startup, so it is only built when the impls are. A lean CLINK_BUILD_IMPLS=OFF
+# build ships the library + client tools without the runnable node.
+if(CLINK_BUILD_IMPLS)
 add_executable(clink_node tools/clink_node.cpp)
 target_link_libraries(clink_node PRIVATE clink::clink)
 clink_set_warnings(clink_node)
@@ -790,6 +828,7 @@ if(TARGET clink::sql)
     target_link_libraries(clink_node PRIVATE clink::sql)
     target_compile_definitions(clink_node PRIVATE CLINK_LINKED_SQL)
 endif()
+endif()  # CLINK_BUILD_IMPLS (clink_node)
 
 # Subcommand entry points shared by both the unified `clink` CLI
 # below and the per-name back-compat shims. Bundle them into an
@@ -801,7 +840,15 @@ endif()
 # Production binaries must not link it; test executables do.
 add_library(clink_test_support INTERFACE)
 add_library(clink::test_support ALIAS clink_test_support)
-target_include_directories(clink_test_support INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# Export under the alias name so a downstream find_package(clink) links
+# clink::test_support (not clink::clink_test_support), matching the in-tree alias.
+set_target_properties(clink_test_support PROPERTIES EXPORT_NAME test_support)
+# BUILD_INTERFACE for in-tree consumers; INSTALL_INTERFACE so the exported
+# target points at the installed headers (not the absolute source path) and a
+# downstream find_package(clink) can link clink::test_support directly.
+target_include_directories(clink_test_support INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(clink_test_support INTERFACE clink_core)
 target_compile_features(clink_test_support INTERFACE cxx_std_23)
 
@@ -934,17 +981,36 @@ endif()
 # the public headers, and the generated headers, then finalizes the
 # package config under <prefix>/lib/cmake/clink/.
 # ---------------------------------------------------------------------------
-install(TARGETS clink_core clink_all
+# Export clink's own headers as NON-system includes (-I, not -isystem). CMake
+# marks imported-target includes as SYSTEM by default, which suppresses consumer
+# warnings AND, under Apple clang, mis-handles some of clink's headers (naming
+# TimerService::TimerSet from the test harness fails under -isystem but is clean
+# under -I). clink is the consumer's direct dependency, so its headers should be
+# first-class. EXPORT_NO_SYSTEM needs CMake >= 3.25; on older CMake the consumer
+# keeps the -isystem default (harmless except the Apple-clang harness case).
+if(NOT CMAKE_VERSION VERSION_LESS 3.25)
+    set_target_properties(clink_core clink_all clink_test_support
+        PROPERTIES EXPORT_NO_SYSTEM ON)
+endif()
+
+# clink_test_support is INTERFACE (header-only), so the ARCHIVE/LIBRARY/RUNTIME
+# destinations are inert for it - it is here to land in clinkTargets.cmake so a
+# downstream find_package(clink) can link clink::test_support.
+install(TARGETS clink_core clink_all clink_test_support
     EXPORT ${CLINK_EXPORT_NAME}
     ARCHIVE     DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY     DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME     DESTINATION ${CMAKE_INSTALL_BINDIR}
     INCLUDES    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
-install(TARGETS clink clink_node
+install(TARGETS clink
         clink_submit_job clink_app clink_cancel_job
         clink_rescale_job clink_savepoint
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# The worker node only exists (and installs) in an impls build.
+if(CLINK_BUILD_IMPLS)
+    install(TARGETS clink_node RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}

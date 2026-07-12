@@ -42,6 +42,7 @@
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/runtime_context.hpp"
+#include "clink/runtime/timer_service.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/test/failure_injection.hpp"
 #include "clink/test/output_capture.hpp"
