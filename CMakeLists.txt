@@ -975,6 +975,23 @@ if(CLINK_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
+# Embedded first-row latency regression gate (roadmap D5). RELEASE ONLY: a Debug
+# build is several times slower (measured ~0.5s vs ~0.15s), so a budget is
+# meaningless there. Needs the clink CLI and a Python 3 driver. The budget has
+# generous headroom over the measured Release median (~155 ms, first row to
+# stdout, 12-core Apple Silicon) so it catches a gross regression - the kind that
+# turned "~100 ms" into "~0.4 s" - without flaking on slower CI machines.
+if(CLINK_BUILD_TESTS AND CMAKE_BUILD_TYPE STREQUAL "Release" AND TARGET clink)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME embedded_first_row_budget
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/embedded_footprint.py"
+                "$<TARGET_FILE:clink>" --runs 10 --large 10000 --budget-ms 600)
+        set_tests_properties(embedded_first_row_budget PROPERTIES LABELS "bench")
+    endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # Examples
 # ---------------------------------------------------------------------------

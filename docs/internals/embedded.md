@@ -23,13 +23,16 @@ checkpointing machinery. Adding `--jm-host`/`--jm-port` to the same command
 compiles the same file and submits it to a running cluster instead - one verb
 from laptop to cluster.
 
-Measured on a Debug build (2026-07-11, 12-core Apple Silicon): ~0.4 s from
-process start to the first result row on stdout for a file-source query,
-identical for a plain projection and a GROUP BY - engine bring-up
-dominates, the operator chain barely registers - with total process
-lifetime dominated by post-completion teardown, not startup. (An earlier
-~100 ms figure predated the full connector registry and no longer
-reproduces; re-measure on a Release build before quoting a number.)
+Measured on a Release build (2026-07-12, 12-core Apple Silicon, 20 runs) with
+`benchmarks/embedded_footprint.py`: ~155 ms median (140 min, 166 max) from
+process start to the first result row on stdout for a file-source query - engine
+bring-up dominates, the operator chain barely registers. A Debug build is
+several times slower (~0.5 s), and an earlier "~100 ms" figure predated the full
+connector registry. `benchmarks/embedded_footprint.py` also reports memory:
+~48 MB peak RSS at startup (a small input), rising under load; the
+`embedded_first_row_budget` ctest (Release builds only) gates the first-row
+median against a budget with headroom for CI variance so the number cannot
+silently regress.
 
 ## Where it lives
 

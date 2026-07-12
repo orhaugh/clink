@@ -92,6 +92,11 @@ endif()
 # from inside the .so so we measure engine work (operator dispatch,
 # RocksDB writes, checkpoint serde) instead of Kafka throughput.
 #
+# The RocksDB-backed bench job plugins below all link clink::rocksdb, so they
+# only build when the rocksdb impl was built (a lean CLINK_BUILD_IMPLS=OFF tree
+# has no clink::rocksdb target).
+if(TARGET clink::rocksdb)
+
 # Links clink::rocksdb directly into the .so. The .so dlopens with
 # RTLD_LOCAL so its StateBackendFactory::default_instance() singleton
 # is private; the host's clink::rocksdb::install() registration never
@@ -153,3 +158,5 @@ set_target_properties(clink_parallel_bench_pipeline PROPERTIES
     PREFIX ""
     OUTPUT_NAME "parallel_bench_pipeline")
 clink_set_warnings(clink_parallel_bench_pipeline)
+
+endif()  # TARGET clink::rocksdb

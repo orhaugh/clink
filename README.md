@@ -665,11 +665,14 @@ clink run pipeline.sql
 clink run pipeline.sql --jm-host=jm.prod --jm-port=8081
 ```
 
-First result row lands on stdout well under half a second from process
-start (~0.4 s measured on a Debug build with a file source - engine
-bring-up dominates; the operator chain barely registers). Ctrl-C stops an
-unbounded pipeline and drains it cleanly; `--checkpoint-dir` /
-`--state-backend` / `--parallelism` behave as they do on a cluster. See
+First result row lands on stdout in ~155 ms from process start (median of 20
+runs, Release build, 12-core Apple Silicon, file-source query; engine bring-up
+dominates, the operator chain barely registers). A `Release`-only ctest,
+`embedded_first_row_budget`, gates that number against a budget so it cannot
+silently regress; `benchmarks/embedded_footprint.py` reproduces it and the
+memory figures. Ctrl-C stops an unbounded pipeline and drains it cleanly;
+`--checkpoint-dir` / `--state-backend` / `--parallelism` behave as they do on a
+cluster. See
 [docs/internals/embedded.md](docs/internals/embedded.md).
 
 Pipeline: `libpg_query` parses the input; an AST builder normalises
