@@ -50,6 +50,26 @@ std::string read_file(const fs::path& p) {
     return ss.str();
 }
 
+void write_file(const fs::path& p, const std::string& body) {
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    out << body;
+}
+
+// Run `clink run <dir>/job.sql` with the flight recorder and checkpointing armed.
+CmdResult run_captured(const std::string& cli, const fs::path& dir) {
+    return run_cmd(cli + " run " + (dir / "job.sql").string() +
+                   " --checkpoint-dir=" + (dir / "ckpt").string() +
+                   " --checkpoint-interval-ms=200 --capture-dir=" + (dir / "capture").string());
+}
+
+// Whole-job replay --verify over a capture tree (default the `capture` subdir).
+CmdResult whole_job_verify(const std::string& cli,
+                           const fs::path& dir,
+                           const std::string& capture_subdir = "capture") {
+    return run_cmd(cli + " replay --capture-dir=" + (dir / capture_subdir).string() +
+                   " --checkpoint-dir=" + (dir / "ckpt").string() + " --epoch=1 --verify");
+}
+
 }  // namespace
 
 TEST(ReplayCli, WindowedEpochReplaysTheLiveEmissionsAndVerifiesDeterministic) {
@@ -216,6 +236,122 @@ TEST(ReplayCli, WindowedEpochReplaysTheLiveEmissionsAndVerifiesDeterministic) {
     EXPECT_NE(refetch_verify.output.find("every replayed operator byte-identical"),
               std::string::npos)
         << refetch_verify.output;
+
+    fs::remove_all(dir);
+}
+
+// A job CONTAINING a stream-stream join: the single-input operators around the
+// join (timestamp assign, project, key_by) capture and replay deterministically,
+// and the whole-job sweep is byte-identical. The two-input join operator itself
+// is deliberately NOT captured/replayed (docs/internals/replay-determinism.md:
+// the two-input interleaving is not recorded); it is bracketed by its inputs'
+// and output's captures. This pins that boundary: replay never silently offers a
+// non-deterministic multi-input replay.
+TEST(ReplayCli, JoinContainingJobReplaysSingleInputOpsAndBracketsTheJoin) {
+    const std::string cli = CLINK_CLI_BINARY;
+    const auto dir = fs::temp_directory_path() / "clink_replay_cli_join";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    write_file(dir / "orders.jsonl",
+               R"({"id":1,"amount":10,"ts":100})"
+               "\n"
+               R"({"id":2,"amount":20,"ts":200})"
+               "\n"
+               R"({"id":1,"amount":5,"ts":300})"
+               "\n");
+    write_file(dir / "users.jsonl",
+               R"({"id":1,"region":"eu","ts":100})"
+               "\n"
+               R"({"id":2,"region":"us","ts":150})"
+               "\n");
+    write_file(dir / "job.sql",
+               "CREATE TABLE orders (id BIGINT, amount BIGINT, ts BIGINT) WITH (connector='file', "
+               "format='json', path='" +
+                   (dir / "orders.jsonl").string() +
+                   "', event_time_column='ts');\n"
+                   "CREATE TABLE users (id BIGINT, region TEXT, ts BIGINT) WITH (connector='file', "
+                   "format='json', path='" +
+                   (dir / "users.jsonl").string() +
+                   "', event_time_column='ts');\n"
+                   "CREATE TABLE joined (id BIGINT, amount BIGINT, region TEXT) WITH "
+                   "(connector='file', format='json', path='" +
+                   (dir / "joined.jsonl").string() +
+                   "');\n"
+                   "INSERT INTO joined SELECT o.id, o.amount, u.region FROM orders o JOIN users u "
+                   "ON o.id = u.id;\n");
+
+    const auto run = run_captured(cli, dir);
+    ASSERT_EQ(run.exit_code, 0) << run.output;
+
+    const auto verify = whole_job_verify(cli, dir);
+    EXPECT_EQ(verify.exit_code, 0) << verify.output;
+    EXPECT_NE(verify.output.find("every replayed operator byte-identical"), std::string::npos)
+        << verify.output;
+    EXPECT_NE(verify.output.find("skipped 0"), std::string::npos) << verify.output;
+    // The two-input join is bracketed, not replayed: the replayed operators are
+    // all single-input, and no co-operator / two-input op appears in the sweep.
+    EXPECT_EQ(verify.output.find("co_operator"), std::string::npos) << verify.output;
+    EXPECT_EQ(verify.output.find("interval_join"), std::string::npos) << verify.output;
+    EXPECT_NE(verify.output.find("[deterministic]"), std::string::npos) << verify.output;
+
+    fs::remove_all(dir);
+}
+
+// A byte-truncated capture (a crash mid-write, or a partial fetch) must not crash
+// the replayer: it replays the surviving prefix and stays deterministic across
+// two runs, so a truncated recording is degraded, never wrong. (The
+// recorder-driven truncation path - header records the true count and the tool
+// says so - is covered by docs/internals/replay-determinism.md; this pins the
+// robustness of the reader against an arbitrarily cut file.)
+TEST(ReplayCli, TruncatedCaptureReplaysSurvivingPrefixDeterministically) {
+    const std::string cli = CLINK_CLI_BINARY;
+    const auto dir = fs::temp_directory_path() / "clink_replay_cli_trunc";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    write_file(dir / "in.jsonl",
+               R"({"usr":"alice","ts":100,"amount":10})"
+               "\n"
+               R"({"usr":"alice","ts":400,"amount":5})"
+               "\n"
+               R"({"usr":"bob","ts":700,"amount":7})"
+               "\n"
+               R"({"usr":"alice","ts":1200,"amount":100})"
+               "\n");
+    write_file(dir / "job.sql",
+               "CREATE TABLE evt (usr TEXT, ts BIGINT, amount BIGINT) WITH (connector='file', "
+               "format='json', path='" +
+                   (dir / "in.jsonl").string() +
+                   "', event_time_column='ts');\n"
+                   "CREATE TABLE totals (usr TEXT, total BIGINT) WITH (connector='file', "
+                   "format='json', path='" +
+                   (dir / "out.jsonl").string() +
+                   "');\n"
+                   "INSERT INTO totals SELECT usr, SUM(amount) AS total FROM evt "
+                   "GROUP BY TUMBLE(ts, 1000), usr;\n");
+
+    const auto run = run_captured(cli, dir);
+    ASSERT_EQ(run.exit_code, 0) << run.output;
+
+    // Copy the capture tree and truncate the largest .cap to half its bytes.
+    const auto trunc = dir / "capture_trunc";
+    fs::copy(dir / "capture", trunc, fs::copy_options::recursive);
+    fs::path biggest;
+    std::uintmax_t biggest_sz = 0;
+    for (const auto& e : fs::recursive_directory_iterator(trunc)) {
+        if (e.path().extension() == ".cap" && e.file_size() > biggest_sz) {
+            biggest = e.path();
+            biggest_sz = e.file_size();
+        }
+    }
+    ASSERT_FALSE(biggest.empty()) << "no .cap files in the capture tree";
+    fs::resize_file(biggest, biggest_sz / 2);
+
+    // Replay must not crash and must still be deterministic on the prefix.
+    const auto verify = whole_job_verify(cli, dir, "capture_trunc");
+    EXPECT_EQ(verify.exit_code, 0) << verify.output;
+    EXPECT_NE(verify.output.find("deterministic"), std::string::npos) << verify.output;
 
     fs::remove_all(dir);
 }

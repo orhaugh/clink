@@ -42,7 +42,13 @@ Determinism is what makes version comparison meaningful: if replay were noisy, a
 
 ## The executable form
 
-`tests/test_replay_cli.cpp` runs a windowed SQL job with capture armed, replays the tumbling-window operator's epoch through the CLI, and requires: the replayed emissions to equal the live sink output; `--verify` to pass (single-op and whole-job); two `--out` dumps to `replay-diff` as identical; a doctored dump to diff as different with the emission located; and an emitted regression bundle to pass through `run_replay_regression` (and fail, divergence located, once its golden is doctored) - the contract, enforced in CI.
+`tests/test_replay_cli.cpp` (in `clink_sql_tests`, so it runs in CI) is an e2e matrix over the operator shapes that matter:
+
+- **Windowed** (the full-mechanics gate): a tumbling-window SQL job with capture armed; the replayed emissions equal the live sink output; `--verify` passes single-op and whole-job; two `--out` dumps `replay-diff` as identical and a doctored dump diffs as different with the emission located; an emitted regression bundle passes `run_replay_regression` and fails (divergence located) once its golden is doctored; and the capture round-trips through `capture-push` / `capture-fetch` and still verifies.
+- **Join-containing** (the multi-input boundary): a stream-stream join job; the single-input operators around the join (timestamp assign, project, key_by) capture and whole-job `--verify` byte-identical, and no two-input / co-operator appears in the sweep - the join is bracketed by its inputs' and output's captures, never silently replayed non-deterministically.
+- **Truncated capture** (reader robustness): a byte-truncated `.cap` does not crash the replayer - it replays the surviving prefix and stays deterministic across two runs, so a cut recording is degraded, never wrong.
+
+Cross-version A/B rides the same `--out` + `replay-diff` mechanics the windowed and join cases exercise (identical vs located-divergence); `--plugin` supplies the candidate build's operator.
 
 ## Related
 
