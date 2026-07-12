@@ -26,6 +26,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -34,6 +35,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <typeinfo>
 #include <unordered_map>
@@ -73,7 +75,22 @@ struct BuildContext {
 
     std::string param_or(const std::string& key, std::string fallback = {}) const {
         auto it = params.find(key);
-        return it == params.end() ? std::move(fallback) : it->second;
+        return it == params.end() ? std::move(fallback) : resolve_secret(it->second);
+    }
+
+    // A connector option may reference a secret indirectly as `env://VAR`
+    // instead of embedding it, so a job spec / catalog stores a reference rather
+    // than a plaintext password or key. Resolved at build (deploy) time from the
+    // environment; an unset variable yields empty (a clear failure, never a
+    // leak). A literal value not prefixed `env://` is returned verbatim.
+    static std::string resolve_secret(const std::string& value) {
+        constexpr std::string_view kEnvPrefix = "env://";
+        if (value.rfind(kEnvPrefix, 0) != 0) {
+            return value;
+        }
+        const std::string var = value.substr(kEnvPrefix.size());
+        const char* resolved = var.empty() ? nullptr : std::getenv(var.c_str());
+        return resolved != nullptr ? std::string(resolved) : std::string{};
     }
     std::int64_t param_int64_or(const std::string& key, std::int64_t fallback = 0) const {
         auto it = params.find(key);

@@ -4,6 +4,7 @@
 // correctly. A real plugin .so would produce the same registrations.
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 
@@ -350,4 +351,29 @@ TEST(PluginRegistry, InstallDefaultsRegistersBuiltIns) {
     // int64_range_source is a built-in registered by
     // ensure_built_ins_registered().
     EXPECT_NE(rr.find_source("int64_range_source", "int64"), nullptr);
+}
+
+// env:// secret indirection (roadmap F6): a connector option may reference a
+// secret as `env://VAR` so a spec / catalog stores a reference, not a plaintext
+// password. BuildContext::param_or resolves it from the environment at build
+// time; a literal is returned verbatim; an unset variable yields empty (a clear
+// failure, never a leak).
+TEST(BuildContextSecrets, EnvUriIsResolvedFromTheEnvironment) {
+    ::setenv("CLINK_TEST_SECRET", "hunter2", /*overwrite=*/1);
+    ::unsetenv("CLINK_TEST_UNSET");
+
+    clink::plugin::BuildContext ctx;
+    ctx.params["password"] = "env://CLINK_TEST_SECRET";
+    ctx.params["plain"] = "literal-value";
+    ctx.params["missing"] = "env://CLINK_TEST_UNSET";
+
+    EXPECT_EQ(ctx.param_or("password"), "hunter2");             // resolved from the env
+    EXPECT_EQ(ctx.param_or("plain"), "literal-value");          // non-env value verbatim
+    EXPECT_EQ(ctx.param_or("missing"), "");                     // unset -> empty, not a leak
+    EXPECT_EQ(ctx.param_or("absent", "fallback"), "fallback");  // fallback path intact
+
+    EXPECT_EQ(clink::plugin::BuildContext::resolve_secret("env://CLINK_TEST_SECRET"), "hunter2");
+    EXPECT_EQ(clink::plugin::BuildContext::resolve_secret("not-a-secret"), "not-a-secret");
+
+    ::unsetenv("CLINK_TEST_SECRET");
 }
