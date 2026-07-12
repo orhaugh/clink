@@ -102,3 +102,6 @@ Threads (no connector SDKs), shipping `clink::core`, `clink::clink` and
   more depth (watermarks, checkpoints, state, alignment, …).
 * [`examples/`](../../examples/) - additional in-tree examples that are
   built and run as part of the upstream test suite.
+* [`state_as_data/`](state_as_data/) - a CLI + Python workflow (not a C++ build
+  target): export a running job's keyed state as Parquet / Iceberg and query it
+  with DuckDB / pyarrow. Shows clink's open state format end to end.
