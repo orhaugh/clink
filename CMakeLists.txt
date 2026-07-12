@@ -749,6 +749,20 @@ if(TARGET clink::embed)
     # host that loads a different Arrow (pyarrow), in either load order.
     if(TARGET Parquet::parquet_static AND TARGET Arrow::arrow_static)
         target_link_libraries(clink_shared PRIVATE Parquet::parquet_static Arrow::arrow_static)
+        # Arrow's static bundle carries cloud-SDK objects with transitive system
+        # deps Arrow's interface does not declare: google-cloud-cpp (GCS) needs
+        # libcurl and Azure Storage needs libxml2. A full build only links because
+        # a connector impl (s3/aws/azure/gcs) drags them in; a lean build
+        # (CLINK_BUILD_IMPLS=OFF, e.g. the pyclink wheel) links no impls, so
+        # satisfy them explicitly whenever they are available.
+        find_package(CURL QUIET)
+        if(TARGET CURL::libcurl)
+            target_link_libraries(clink_shared PRIVATE CURL::libcurl)
+        endif()
+        find_package(LibXml2 QUIET)
+        if(TARGET LibXml2::LibXml2)
+            target_link_libraries(clink_shared PRIVATE LibXml2::LibXml2)
+        endif()
         if(APPLE)
             target_link_options(clink_shared PRIVATE "LINKER:-dead_strip_dylibs")
         endif()

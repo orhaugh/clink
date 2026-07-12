@@ -19,7 +19,8 @@ through the Arrow C stream interface.
         e.await_all()
 
 The library is located via the `lib_path` argument, the CLINK_LIB
-environment variable, or the system loader path, in that order. Reads on a
+environment variable, a copy bundled inside the installed wheel, or the
+system loader path, in that order. Reads on a
 collect stream block inside C and therefore do not respond to Ctrl-C until
 a batch arrives; `await_all` polls in slices so it stays interruptible and
 cancels the running jobs on KeyboardInterrupt.
@@ -69,6 +70,18 @@ class _ArrowArrayStream(ctypes.Structure):
     ]
 
 
+def _bundled_library() -> str | None:
+    """A libclink shipped inside the installed wheel, next to this module.
+    A wheel places the platform library here (libclink.dylib / .so / .dll), so
+    `pip install pyclink` needs no separate build or CLINK_LIB."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("libclink.dylib", "libclink.so", "clink.dll"):
+        cand = os.path.join(here, name)
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
 def _load_library(lib_path: str | None) -> ctypes.CDLL:
     candidates = []
     if lib_path:
@@ -76,6 +89,11 @@ def _load_library(lib_path: str | None) -> ctypes.CDLL:
     env = os.environ.get("CLINK_LIB")
     if env:
         candidates.append(env)
+    # A bundled wheel library wins over the system loader path (a matched pair),
+    # but stays below an explicit lib_path / CLINK_LIB override.
+    bundled = _bundled_library()
+    if bundled:
+        candidates.append(bundled)
     found = ctypes.util.find_library("clink")
     if found:
         candidates.append(found)
