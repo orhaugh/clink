@@ -123,6 +123,28 @@ flowchart TD
 
 Changing an operator's parallelism on a running job is coordinated by the `RescaleCoordinator` (`include/clink/cluster/rescale_coordinator.hpp`), a per-operator state machine: `Idle -> Preparing -> Draining -> CuttingOver -> Complete`, with `Aborted` reachable from any in-flight state. A request transitions the op to `Preparing`; the next checkpoint gates the cutover (`mark_checkpoint_ready` records the checkpoint id and moves to `Draining`); old subtasks emit a `DrainMarker` downstream and ack via `mark_old_drained`; once every old subtask has drained, new subtasks come online from the checkpoint and ack via `mark_new_ready`; when all are ready, `current_parallelism` is set to the target and the rescale is `Complete`. The coordinator is the state record; the actual dispatch (sending `BeginRescale`, deploying new subtasks, claiming and releasing slots) lives in the dispatch layer. An op participates in autoscaling only when it declares non-zero `[min, max]` bounds; manual rescale via the CLI works regardless. The state mechanics, key-group restore on the new parallelism, and the known limits live in `./fault-tolerance-and-rescale.md`.
 
+### Density envelope
+
+Each operator subtask runs on its own thread (`LocalExecutor`, one `std::jthread` per operator), so a job of `W` operator roles at parallelism `P` uses about `W * P` threads. On a machine with `C` physical cores, that is fine while `W * P <= C`; past it the threads oversubscribe the cores and throughput degrades - this is the thread-per-operator ceiling.
+
+Measured with `benchmarks/density_envelope.py` on a Release build (2026-07-12, 12-core Apple Silicon), a bounded keyed GROUP BY over a 2M-row file source (source + shuffle + aggregate + sink, so `W = 4` at `P > 1`) into a blackhole sink:
+
+| parallelism | threads | threads / core | throughput |
+|---|---|---|---|
+| 1 | 3 | 0.25x | 1.19M rows/s |
+| 2 | 8 | 0.67x | 1.39M rows/s (peak) |
+| 4 | 16 | 1.33x | 731k rows/s |
+| 8 | 32 | 2.67x | 316k rows/s |
+| 12 | 48 | 4.0x | 144k rows/s |
+| 16 | 64 | 5.33x | 84k rows/s |
+| 24 | 96 | 8.0x | rejected (needs 96 slots, 64 available) |
+
+Throughput peaks around `threads ~= cores` (here at parallelism 2, before the shuffle and thread overhead outweigh the gain on this light workload) and then falls off roughly in step with the oversubscription ratio - each doubling of parallelism past the cores roughly halves throughput. The embedded engine also has a fixed slot count (64), so a job whose `W * P` exceeds it is rejected up front rather than thrashing.
+
+The supported envelope, therefore: size total threads (`operators x parallelism`, summed across the chains placed on one machine) at or below that machine's physical cores. Scale beyond one machine's cores by adding TaskManagers - each subtask lands on a slot on some machine and runs its own thread there - not by raising parallelism on a single box. For an embedded or single-machine bounded workload the parallelism sweet spot is low (often 1-2); parallelism earns its keep when the per-key work is heavy enough that sharding it across cores repays the shuffle, and when the subtasks are spread across machines rather than stacked on one.
+
+Decision (roadmap C5): a cooperative / shared-thread scheduler is **not** built now. The current thread-per-operator model is optimal inside its envelope, and the target embedded-first and moderate-cluster workloads sit inside it (run parallelism up to roughly `cores / operators-per-chain` per machine and scale out with machines). A scheduler rewrite would only pay off for a workload that must stack many oversubscribed operators on a single box - which the data above says to avoid regardless - so it is deferred until such a workload is a real target, and would be measured against this benchmark before any code.
+
 ## Key types and APIs
 
 | Type / function | Responsibility |
