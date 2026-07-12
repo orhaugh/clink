@@ -30,6 +30,7 @@ from pathlib import Path
 
 from setuptools import setup
 from setuptools.command.build_py import build_py
+from setuptools.dist import Distribution
 
 try:  # setuptools >= 70 vendors bdist_wheel; older needs the wheel package
     from setuptools.command.bdist_wheel import bdist_wheel
@@ -97,13 +98,24 @@ class build_py_with_lib(build_py):
         self.announce(f"pyclink: bundled {lib} -> {dst}", level=2)
 
 
+class BinaryDistribution(Distribution):
+    """Force a platform (platlib) wheel with the package at the wheel root.
+
+    pyclink has a native library but no ext module; declaring has_ext_modules
+    makes setuptools build a platlib wheel (pyclink/ at the root), NOT route the
+    package through pyclink-*.data/purelib/. That placement matters: delocate /
+    auditwheel compute @loader_path/@rpath depth from the wheel layout, and the
+    extra .data/purelib/ levels would make the repaired dep paths wrong once the
+    install flattens them into site-packages.
+    """
+
+    def has_ext_modules(self) -> bool:  # noqa: D102
+        return True
+
+
 class platform_wheel(bdist_wheel):
     """A native library but no CPython ABI: tag py3-none-<platform> so one wheel
-    serves every Python 3 on the platform, and mark it non-pure for the tag."""
-
-    def finalize_options(self) -> None:
-        super().finalize_options()
-        self.root_is_pure = False
+    serves every Python 3 on the platform."""
 
     def get_tag(self):
         _python, _abi, plat = super().get_tag()
@@ -120,6 +132,7 @@ class platform_wheel(bdist_wheel):
 
 
 setup(
+    distclass=BinaryDistribution,
     cmdclass={"build_py": build_py_with_lib, "bdist_wheel": platform_wheel},
     package_data={"pyclink": ["libclink.dylib", "libclink.so", "clink.dll"]},
 )

@@ -16,7 +16,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="${CLINK_WHEEL_BUILD_DIR:-${ROOT}/build-libclink-wheel}"
-OUT="${1:-${CLINK_LIB:-${ROOT}/python/pyclink/libclink.staged}}"
+# Stage target: an explicit $1, else CLINK_LIB, else inside the (gitignored)
+# build dir - never the source tree, so a bare run leaves no stray artifact.
+OUT="${1:-${CLINK_LIB:-${BUILD}/staged/libclink}}"
 JOBS="${CLINK_BUILD_JOBS:-8}"
 
 cmake -S "${ROOT}" -B "${BUILD}" \
