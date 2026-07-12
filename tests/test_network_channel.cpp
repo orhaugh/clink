@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -509,4 +510,41 @@ TEST(NetworkChannel, PerOperatorBytesAttributed) {
         << "sink should attribute serialised bytes to the operator";
     EXPECT_GT(reg.counter(recv_name).value() - recv_before, 0u)
         << "source should attribute received bytes to the operator";
+}
+
+// Security: a frame header is attacker-controllable, so an unbounded
+// vector<byte>(frame_len) is a memory-amplification DoS - a peer that claims
+// 4 GiB makes the reader allocate 4 GiB and OOM the JobManager/TaskManager.
+// wire.hpp caps the frame length; the source must reject an oversized header
+// and drop the connection (so pop() drains to nullopt) rather than allocating
+// it or blocking forever on a body that never comes. Before the cap this test
+// would OOM or hang; after it, pop() returns promptly.
+TEST(NetworkChannel, OversizedFrameHeaderIsRejectedNotAllocated) {
+    using namespace clink::network;
+
+    NetworkChannelSource<std::int64_t> source(/*port*/ 0, int64_codec());
+    const std::uint16_t port = source.listen();
+
+    std::thread attacker([port] {
+        const int fd = NetworkSocket::connect_to("127.0.0.1", port);
+        if (fd < 0) {
+            return;
+        }
+        // A data-frame header claiming just over the frame cap, then no body.
+        std::vector<std::byte> hdr;
+        put_u32_be(hdr, kMaxFrameBytes + 1u);
+        NetworkSocket::send_all(fd, hdr.data(), hdr.size());
+        // Hold the connection briefly so the source processes the header, then
+        // close - the source should already have dropped its side.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        NetworkSocket::close(fd);
+    });
+
+    source.accept();
+    // Reader hits the cap, breaks, and closes: the stream drains to nullopt.
+    // (A hang here would mean the cap did not fire; an OOM would crash.)
+    const auto e = source.pop();
+    EXPECT_FALSE(e.has_value()) << "oversized frame must not yield a record";
+
+    attacker.join();
 }

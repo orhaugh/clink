@@ -112,6 +112,15 @@ enum class Kind : std::uint8_t {
 // memory pressure tolerance.
 inline constexpr std::uint32_t kInitialNetworkCredit = 2048;
 
+// Hard cap on a single wire frame's payload length. The 4-byte frame header is
+// attacker-controllable, so an unbounded `std::vector<std::byte>(frame_len)` is
+// a memory-amplification DoS: a peer that claims 4 GiB makes the reader allocate
+// 4 GiB and OOM the process. Any frame above this cap is rejected and the
+// connection dropped. 256 MiB sits far above a legitimate Arrow batch or control
+// frame, so a well-behaved peer never trips it; a workload that genuinely ships
+// larger single frames should raise it deliberately rather than run uncapped.
+inline constexpr std::uint32_t kMaxFrameBytes = 256u * 1024u * 1024u;
+
 inline void put_u32_be(std::vector<std::byte>& buf, std::uint32_t v) {
     for (int i = 3; i >= 0; --i) {
         buf.push_back(static_cast<std::byte>((v >> (i * 8)) & 0xFF));

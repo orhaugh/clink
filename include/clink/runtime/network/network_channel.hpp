@@ -324,7 +324,9 @@ private:
                 break;
             }
             const std::uint32_t frame_len = read_u32_be(header_buf.data());
-            if (frame_len == 0)
+            // Zero-length or over the frame cap (a hostile / corrupt header) ends
+            // the connection rather than allocating an attacker-chosen size.
+            if (frame_len == 0 || frame_len > kMaxFrameBytes)
                 break;
             std::vector<std::byte> body(frame_len);
             if (!NetworkSocket::recv_all(fd_, body.data(), body.size())) {
@@ -590,7 +592,13 @@ private:
                 break;
             }
             const std::uint32_t frame_len = read_u32_be(header_buf.data());
-            if (frame_len == 0) {
+            // Zero-length or over the frame cap (a hostile / corrupt header) ends
+            // the connection rather than allocating an attacker-chosen size - the
+            // memory-amplification DoS guard.
+            if (frame_len == 0 || frame_len > kMaxFrameBytes) {
+                if (frame_len > kMaxFrameBytes) {
+                    clink::metrics::net::recv_error();
+                }
                 break;
             }
             std::vector<std::byte> body(frame_len);
