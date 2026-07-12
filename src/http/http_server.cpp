@@ -97,6 +97,12 @@ void apply_response(const HttpResponse& src, httplib::Response& dst) {
 struct HttpServer::Impl {
     httplib::Server server;
     std::thread listen_thread;
+    // CORS + auth are both cross-cutting pre-routing concerns, but cpp-httplib
+    // allows only one pre_routing_handler, so both are stored here and a single
+    // combined handler is installed at start().
+    bool cors_enabled{false};
+    std::string cors_origin;
+    std::string auth_token;
 
     // Wrap a clink Handler so it adapts to httplib's signature
     // (void(const Request&, Response&)) with structured exception
@@ -208,29 +214,61 @@ void HttpServer::sse(const std::string& path, SseFactory factory) {
 }
 
 void HttpServer::enable_cors(const std::string& allow_origin) {
-    // A pre-routing handler runs before every request is routed. We stamp
-    // Access-Control-Allow-Origin on the (shared) response object so it
-    // survives into whatever the matched handler produces, and short-circuit
-    // OPTIONS preflight with 204 before routing (no Get/Post handler matches
-    // OPTIONS otherwise, so it would 404).
-    impl_->server.set_pre_routing_handler(
-        [origin = allow_origin](const httplib::Request& req, httplib::Response& res) {
+    // Config only; the combined pre-routing handler is installed at start().
+    impl_->cors_enabled = true;
+    impl_->cors_origin = allow_origin;
+}
+
+void HttpServer::set_auth_token(const std::string& token) {
+    // Config only; the combined pre-routing handler is installed at start().
+    impl_->auth_token = token;
+}
+
+namespace {
+// The single pre-routing handler doing CORS then auth. A pre-routing handler
+// runs before every request is routed. CORS headers are stamped on the shared
+// response so they survive into the matched handler; OPTIONS preflight is
+// short-circuited (and never requires auth, since browsers do not send
+// credentials on preflight); then, if a token is configured, any request
+// without a matching `Authorization: Bearer <token>` is answered 401 before its
+// handler runs.
+auto make_pre_routing(bool cors, std::string origin, std::string token) {
+    return [cors, origin = std::move(origin), token = std::move(token)](const httplib::Request& req,
+                                                                        httplib::Response& res) {
+        if (cors) {
             res.set_header("Access-Control-Allow-Origin", origin);
             res.set_header("Vary", "Origin");
-            if (req.method == "OPTIONS") {
+        }
+        if (req.method == "OPTIONS") {
+            if (cors) {
                 res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-                res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept");
+                res.set_header("Access-Control-Allow-Headers",
+                               "Content-Type, Accept, Authorization");
                 res.set_header("Access-Control-Max-Age", "86400");
                 res.status = 204;
                 return httplib::Server::HandlerResponse::Handled;
             }
             return httplib::Server::HandlerResponse::Unhandled;
-        });
+        }
+        if (!token.empty() && req.get_header_value("Authorization") != ("Bearer " + token)) {
+            res.status = 401;
+            res.set_header("WWW-Authenticate", "Bearer");
+            res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    };
 }
+}  // namespace
 
 std::uint16_t HttpServer::start(const std::string& host, std::uint16_t port) {
     if (running_.load(std::memory_order_acquire)) {
         return bound_port_;
+    }
+    // Install the combined CORS + auth pre-routing handler (if either is set).
+    if (impl_->cors_enabled || !impl_->auth_token.empty()) {
+        impl_->server.set_pre_routing_handler(
+            make_pre_routing(impl_->cors_enabled, impl_->cors_origin, impl_->auth_token));
     }
     // bind_to_any_port returns the OS-picked port when port==0; bind
     // ours otherwise. Bound port lookup matches the request - we read

@@ -1953,6 +1953,12 @@ int run_jm(int argc, char** argv) {
         if (const auto cors = get_arg(argc, argv, "http-cors-origin", ""); !cors.empty()) {
             http_srv->enable_cors(cors);
         }
+        // Shared-secret auth for exposing the control plane beyond a trusted
+        // network. The token rides an env var (not a flag - flags leak in `ps`);
+        // unset leaves auth off (backward compatible).
+        if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr && *tok != '\0') {
+            http_srv->set_auth_token(tok);
+        }
         // Disk volumes reported by /metrics: always the working dir, plus the
         // checkpoint/state mount (--metrics-disk-path, defaulting to the HA dir
         // where a leader persists checkpoints). Same-filesystem volumes are
@@ -2561,6 +2567,12 @@ int run_tm(int argc, char** argv) {
         http_srv = std::make_unique<clink::http::HttpServer>();
         if (const auto cors = get_arg(argc, argv, "http-cors-origin", ""); !cors.empty()) {
             http_srv->enable_cors(cors);
+        }
+        // Shared-secret auth for exposing the control plane beyond a trusted
+        // network. The token rides an env var (not a flag - flags leak in `ps`);
+        // unset leaves auth off (backward compatible).
+        if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr && *tok != '\0') {
+            http_srv->set_auth_token(tok);
         }
         // Disk volumes for /metrics: working dir + the TM's checkpoint/state
         // mount when the operator names one (--metrics-disk-path).

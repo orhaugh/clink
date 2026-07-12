@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <utility>
 #include <variant>
 
@@ -61,6 +62,11 @@ SubmitFn make_http_submit(std::string jm_host,
             &out,
             &err](const cluster::JobGraphSpec& spec, const std::string& name) -> int {
         clink::http::HttpClient client(jm_host, jm_port);
+        // Authenticated submission: present CLINK_AUTH_TOKEN if set, so a JM
+        // started with the same token accepts the job (401 otherwise).
+        if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr && *tok != '\0') {
+            client.set_bearer_token(tok);
+        }
         std::string path = "/api/v1/jobs/spec";
         char sep = '?';
         auto add_param = [&](const std::string& key, const std::string& value) {

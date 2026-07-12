@@ -27,6 +27,10 @@ public:
     HttpClient(std::string host, std::uint16_t port);
     ~HttpClient();
 
+    // Send `Authorization: Bearer <token>` on every subsequent request, so this
+    // client can talk to a server started with CLINK_AUTH_TOKEN. Empty clears it.
+    void set_bearer_token(const std::string& token);
+
     HttpClient(const HttpClient&) = delete;
     HttpClient& operator=(const HttpClient&) = delete;
     HttpClient(HttpClient&&) = delete;

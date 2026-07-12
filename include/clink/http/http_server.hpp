@@ -130,6 +130,15 @@ public:
     // same-origin deployments (the SPA served by the node) need no CORS.
     void enable_cors(const std::string& allow_origin);
 
+    // Require every request to carry `Authorization: Bearer <token>`; any request
+    // without a matching token gets 401 before its handler runs. A shared-secret
+    // gate for exposing the control plane / dashboard beyond a trusted network.
+    // Empty token (the default, or an unset CLINK_AUTH_TOKEN) leaves auth OFF -
+    // backward compatible. Call before start(). CORS preflight (OPTIONS) is
+    // always allowed through so a browser can present credentials on the real
+    // request.
+    void set_auth_token(const std::string& token);
+
     // Start listening on `host`:`port`. Spawns a background thread to
     // run the accept loop. Returns the actually-bound port (matches
     // `port` if non-zero; OS-picked otherwise). Throws on bind failure.

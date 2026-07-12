@@ -28,6 +28,14 @@ HttpClient::HttpClient(std::string host, std::uint16_t port)
 
 HttpClient::~HttpClient() = default;
 
+void HttpClient::set_bearer_token(const std::string& token) {
+    if (token.empty()) {
+        impl_->client.set_default_headers({});
+    } else {
+        impl_->client.set_default_headers({{"Authorization", "Bearer " + token}});
+    }
+}
+
 HttpClientResponse HttpClient::get(const std::string& path) {
     HttpClientResponse out;
     auto res = impl_->client.Get(path);

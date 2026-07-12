@@ -178,6 +178,16 @@ The same `.so` is therefore dlopen'd on every process that touches the job: the 
 
 `RTLD_LOCAL` keeps the plugin's symbols out of the global namespace. Because `clink_core` is statically linked into both the host and the `.so`, each side has its own copy of any process-wide singleton, so plugin registrations must be routed through the `PluginRegistry`/`JobBundle` view passed into `clink_plugin_register` rather than a `Registry::default_instance()` resolved inside the `.so`.
 
+### Security: the "safe to expose" baseline
+
+The default posture is loopback + plain TCP + no auth - correct for a trusted single host, unsafe on a shared or public network. The baseline that makes a cluster safe to expose:
+
+- **Frame caps.** Every wire frame is length-prefixed by an attacker-controllable `u32`. The readers cap it at `kMaxFrameBytes` (256 MiB, `network/wire.hpp`) and drop the connection on anything larger, closing the memory-amplification DoS where a peer that claims 4 GiB makes the reader allocate 4 GiB and OOM the process. Always on.
+- **Token auth on the HTTP control plane.** Set `CLINK_AUTH_TOKEN` on the node (`clink_node` reads it for both the JM and TM HTTP servers) and every request must carry `Authorization: Bearer <token>` or gets 401 before its handler runs - the dashboard, the `/api/v1` routes, and SQL submission over HTTP (`POST /api/v1/jobs/spec`). Clients present it automatically from the same env var (`clink run` / the SQL submitter and the queryable-state reader call `HttpClient::set_bearer_token`). Unset leaves auth off (backward compatible). The token rides an env var, not a flag, so it does not leak in `ps`; a CORS preflight (`OPTIONS`) is allowed through so a browser can present credentials on the real request.
+- **Control-plane TLS/mTLS.** The JM/TM control connections run through injectable accept/connect factories; a TLS factory (build-gated, `clink::tls`) encrypts and can mutually authenticate the control plane. Pair it with `bind_host=0.0.0.0` for multi-host.
+
+Remaining hardening, still trusted-network today: the inter-operator **data plane** reuses the same TLS-capable connection factories as the control plane but is not TLS by default; and connector **secrets** in a job spec are still inline (an `env://VAR` indirection so a spec references a secret by name rather than embedding it is the next step). Until both land, run the data plane on a trusted network segment and keep secrets out of shared specs. A concrete safe-to-expose recipe today: `CLINK_AUTH_TOKEN` set, control plane on TLS, data plane on a private network.
+
 ## Key types and APIs
 
 | Type / function | Responsibility |

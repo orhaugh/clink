@@ -5,6 +5,7 @@
 #include <cmath>
 #include <coroutine>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -7361,6 +7362,9 @@ public:
         }
         done_ = true;
         clink::http::HttpClient client(jm_host_, jm_port_);
+        if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr && *tok != '\0') {
+            client.set_bearer_token(tok);
+        }
         auto resp = client.get("/api/v1/queryable_state/job/" + job_id_ + "/op/" + role_ +
                                "/json/" + slot_ + "/scan?limit=" + std::to_string(limit_));
         if (resp.status != 200) {
