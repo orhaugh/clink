@@ -181,11 +181,19 @@ inline std::optional<Decimal> dec_div(const Decimal& a, const Decimal& b, int re
     arrow::Decimal256 num = dec_detail::widen(a.unscaled);
     if (shift >= 0) {
         // Guard against a SILENT Decimal256 wrap: arrow's IncreaseScaleBy does
-        // not bounds-check, so a.unscaled * 10^shift must fit in ~76 digits. If
-        // it cannot, the true quotient exceeds 38 digits anyway -> NULL (fail
+        // not bounds-check, so num * 10^shift must fit in ~76 digits. If it
+        // cannot, the true quotient exceeds 38 digits anyway -> NULL (fail
         // soft). 0 fits any precision, so 0 / x stays correct.
+        //
+        // The check MUST run on the widened Decimal256 `num`, not on the
+        // Decimal128 `a.unscaled`: kHeadroom - shift can exceed 38, and
+        // Decimal128::FitsInPrecision(>38) computes 10^n in a 128-bit type
+        // where it overflows to an architecture-dependent garbage threshold
+        // (it returned a spurious false, hence a spurious NULL, on x86_64
+        // while arm64 happened to be benign). Decimal256::FitsInPrecision
+        // validly accepts precisions up to ~76.
         const int kHeadroom = kMaxDecimalPrecision * 2;  // Decimal256 ~76 digits
-        if (shift > kHeadroom || !a.unscaled.FitsInPrecision(kHeadroom - shift)) {
+        if (shift > kHeadroom || !num.FitsInPrecision(kHeadroom - shift)) {
             return std::nullopt;
         }
         num = num.IncreaseScaleBy(shift);
