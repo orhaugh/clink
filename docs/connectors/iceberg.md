@@ -145,8 +145,8 @@ To resolve the sink through the plugin registry instead, look up the `iceberg_ro
 
 The sink stages data on the checkpoint barrier and commits the snapshot only on `on_commit`, after the checkpoint is globally durable. The commit is idempotent: each snapshot is tagged with a `clink.checkpoint-id` summary property, so a redelivered commit or a recovery replay never double-commits.
 
-- Wired into the engine's two-phase commit (with a state backend and job manager), delivery is exactly-once. `on_barrier` stages the Parquet data file without creating a snapshot; `on_commit` creates the snapshot; `on_abort` deletes the staged, unreferenced data file and creates no snapshot. A sink that staged a checkpoint and then crashed before `on_commit` commits the pending staged data when a replacement sink re-opens against the same state backend and operator id.
-- In standalone use (no state backend, no job manager), it falls back to at-least-once: the barrier commits immediately.
+- Wired into the engine's two-phase commit (with a state backend and coordinator), delivery is exactly-once. `on_barrier` stages the Parquet data file without creating a snapshot; `on_commit` creates the snapshot; `on_abort` deletes the staged, unreferenced data file and creates no snapshot. A sink that staged a checkpoint and then crashed before `on_commit` commits the pending staged data when a replacement sink re-opens against the same state backend and operator id.
+- In standalone use (no state backend, no coordinator), it falls back to at-least-once: the barrier commits immediately.
 
 A data file staged before a crash whose checkpoint never completed is an orphan until the engine's abort deletes it or Iceberg orphan-file maintenance reclaims it.
 

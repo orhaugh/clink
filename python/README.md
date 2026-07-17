@@ -12,14 +12,16 @@ Arrow/Parquet) next to the package, so nothing else is needed - no separate
 build, no `CLINK_LIB`:
 
 ```bash
-pip install pyclink
+pip install pyclink-<version>-py3-none-macosx_11_0_arm64.whl
 ```
 
-Wheels are produced by `.github/workflows/wheels.yml`. macOS arm64 wheels are
-built and smoke-tested on every release tag. Linux wheels are opt-in and
-currently carry a high glibc floor (built on the project's toolchain image), so
-they are not broadly installable yet; on Linux, and on any platform without a
-wheel, use the build-from-source path below. There is no Windows wheel.
+pyclink is not yet published to PyPI. Wheels are produced by
+`.github/workflows/wheels.yml` and attached to CI runs as artifacts: macOS
+arm64 wheels are built and smoke-tested on every release tag. Linux wheels
+are opt-in and currently carry a high glibc floor (built on the project's
+toolchain image), so they are not broadly installable yet; on Linux, and on
+any platform without a wheel, use the build-from-source path below. There is
+no Windows wheel.
 
 ## Build from source
 

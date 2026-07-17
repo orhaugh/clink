@@ -132,9 +132,9 @@ Both ends are at-least-once.
 
 ## Testing
 
-A factory-registration test (`tests/test_factory_registration.cpp`) checks that `install()` registers both string-channel factories. It runs without a broker.
+A factory-registration test (`impls/pulsar/tests/test_factory_registration.cpp`) checks that `install()` registers both string-channel factories. It runs without a broker.
 
-A live integration test (`tests/test_pulsar_live.cpp`, `PulsarLive.PublishThenConsumeRoundTrip`) drives the sink and source against a real broker. It is skipped unless the environment variable `CLINK_PULSAR_TEST_ENDPOINT` is set to a Pulsar service URL, for example:
+A live integration test (`impls/pulsar/tests/test_pulsar_live.cpp`, `PulsarLive.PublishThenConsumeRoundTrip`) drives the sink and source against a real broker. It is skipped unless the environment variable `CLINK_PULSAR_TEST_ENDPOINT` is set to a Pulsar service URL, for example:
 
 ```bash
 CLINK_PULSAR_TEST_ENDPOINT=pulsar://localhost:6650 ctest --test-dir build -L pulsar

@@ -10,7 +10,8 @@ CMake option (default `AUTO`: built when its client library is found, skipped
 otherwise; set `ON` to require it or `OFF` to exclude it). Most connectors link
 a system client library obtained via apt (Debian) or brew (macOS); a few ride
 the from-source toolchain (Apache Arrow/Parquet `24.0.0`, iceberg-cpp `v0.3.0`,
-aws-sdk-cpp `1.11.795`, Pulsar client `4.2.0`, DataStax cpp-driver `2.17.1`),
+aws-sdk-cpp `1.11.795`, Pulsar client `4.2.0`, DataStax cpp-driver `2.17.1`,
+clickhouse-cpp `2.5.1`),
 which is compiled at exact versions into `CLINK_DEPS_PREFIX` on both the host
 and the Debian image. Versions are recorded per connector and in
 [`scripts/versions.env`](../../scripts/versions.env).
@@ -38,7 +39,7 @@ is reachable through the programmatic API only.
 | [Google Cloud Storage](gcs-parquet.md) | source + sink | Arrow GcsFileSystem (`ARROW_GCS`) | Arrow `24.0.0` | `gcs_parquet` |
 | [Azure Blob Storage](azure-parquet.md) | source + sink | Arrow AzureFileSystem (`ARROW_AZURE`) | Arrow `24.0.0` | `azure_parquet` |
 | [WebHDFS / HttpFS](webhdfs-parquet.md) | source + sink | clink::http_connector (vendored httplib) | Arrow `24.0.0` | `webhdfs_parquet` |
-| [Apache Iceberg](iceberg.md) | sink | iceberg-cpp + Arrow | iceberg-cpp `v0.3.0`, Arrow `24.0.0` | `iceberg` |
+| [Apache Iceberg](iceberg.md) | source + sink | iceberg-cpp + Arrow | iceberg-cpp `v0.3.0`, Arrow `24.0.0` | `iceberg` |
 | [Local files and Parquet](local.md) | source + sink | core (Arrow for Parquet) | built in | `file`, `filesystem`, `parquet` |
 
 ## Databases and key-value stores
@@ -68,14 +69,15 @@ is reachable through the programmatic API only.
 ## Built-in sinks (no dependency)
 
 Compiled into the SQL frontend itself; always available when
-`CLINK_BUILD_SQL=ON`. One shared page: [built-in sinks](builtin.md).
+`CLINK_BUILD_SQL=ON`. One shared page: [built-in connectors](builtin.md).
 
-| Sink | I/O | SQL `connector=` |
+| Connector | I/O | SQL `connector=` |
 | --- | --- | --- |
 | [Blackhole (discard)](builtin.md#blackhole) | sink | `blackhole` |
 | [Changelog netting](builtin.md#changelog) | sink | `changelog` |
 | [Print (stdout)](builtin.md#print) | sink | `print` |
 | [Collect (Arrow to host, embedded only)](builtin.md#collect-embedded-only) | sink | `collect` |
+| [Queryable state (another job's live state)](builtin.md#queryable_state-source) | source | `queryable_state` |
 
 ## Notes on delivery semantics
 

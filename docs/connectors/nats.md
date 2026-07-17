@@ -39,7 +39,7 @@ When enabled, the build defines `CLINK_HAS_NATS` and produces the `clink::nats` 
 
 ## Configuration
 
-All options are parsed in `impls/nats/src/register_factories.cpp` and map onto the `NatsSource::Options` / `NatsSink::Options` structs (`include/clink/nats/nats_source.hpp`, `include/clink/nats/nats_sink.hpp`) and the shared `NatsConnParams` (`include/clink/nats/connection_params.hpp`).
+All options are parsed in `impls/nats/src/register_factories.cpp` and map onto the `NatsSource::Options` / `NatsSink::Options` structs (`impls/nats/include/clink/nats/nats_source.hpp`, `impls/nats/include/clink/nats/nats_sink.hpp`) and the shared `NatsConnParams` (`impls/nats/include/clink/nats/connection_params.hpp`).
 
 ### Connection (source and sink)
 

@@ -39,6 +39,7 @@ The target compiles only where the client library is present, defining `CLINK_HA
 | `mysql_source` | Source | `std::string` (JSON object per row) |
 | `mysql_cdc_source` | Source | `std::string` (flat JSON change row) |
 | `mysql_sink` | Sink | `std::string` (JSON object per row) |
+| `mysql_upsert_sink` | Sink | `Row` (changelog upsert/delete by PRIMARY KEY) |
 
 ## Configuration
 

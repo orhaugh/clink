@@ -18,7 +18,7 @@ Given a `ClinkCluster`, the controller creates and owns:
   a `wait-for-coordinator` initContainer) plus a headless Service,
 - a **ServiceAccount** (unless you supply one),
 - for HA, a shared **ReadWriteMany PVC** mounted at `ha.mountPath`, used by the
-  file-coordinator leader election.
+  file-based leader election.
 
 All owned objects carry an owner reference, so deleting the `ClinkCluster`
 garbage-collects the whole cluster. The controller then reports status by reading

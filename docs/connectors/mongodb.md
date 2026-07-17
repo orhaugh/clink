@@ -44,7 +44,7 @@ Both are registered on the `string` channel in `impls/mongodb/src/register_facto
 
 ### `mongo_cdc_source`
 
-Parsed in `register_factories.cpp` into `MongoCdcOptions` (`include/clink/mongodb/mongo_cdc_source.hpp`).
+Parsed in `register_factories.cpp` into `MongoCdcOptions` (`impls/mongodb/include/clink/mongodb/mongo_cdc_source.hpp`).
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -58,7 +58,7 @@ The source also receives `subtask_idx` and `parallelism` from the build context 
 
 ### `mongo_sink`
 
-Parsed in `register_factories.cpp` into `MongoSinkOptions` (`include/clink/mongodb/mongo_sink.hpp`).
+Parsed in `register_factories.cpp` into `MongoSinkOptions` (`impls/mongodb/include/clink/mongodb/mongo_sink.hpp`).
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |

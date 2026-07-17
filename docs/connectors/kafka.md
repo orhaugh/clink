@@ -81,7 +81,7 @@ Accepts `brokers`, `topic`, `client_id` (default `clink-sink-2pc`), `compression
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `transactional_id` | Yes | (none) | librdkafka `transactional.id`. Must be unique per producer instance. When `parallelism > 1` the factory appends the subtask index. |
-| `commit_group` | No | (none) | Declares commit-group membership so the job manager can gate this sink's commit on its group peers. |
+| `commit_group` | No | (none) | Declares commit-group membership so the coordinator can gate this sink's commit on its group peers. |
 
 This factory does not parse `acks`; the transactional producer is configured with `enable.idempotence=true` by the underlying sink.
 
@@ -185,7 +185,7 @@ When going through the plugin registry, call `clink::kafka::install(registry)` o
 
 - Source replay (exactly-once on the read side): the source records a per-partition next-offset map into the clink checkpoint via `snapshot_offset`, and on `restore_offset` it seeks each partition to the restored offset on assignment through a rebalance callback. This makes the clink checkpoint the source of truth for the consumer position on recovery rather than Kafka's own committed offset. The `StringKafkaSource` adapter delegates these hooks to the inner `KafkaSource` so the string and SQL paths retain replay.
 - Plain sink (`kafka_text_sink` / `kafka_sink_string`): at-least-once. Records are produced and flushed; on every successful broker ack a `delivered` counter increments, and delivery failures after retry increment `delivery_errors`. With `acks=all` writes are durable, but there is no transactional rollback, so a failure after a partial flush can leave records on the topic.
-- Transactional sink (`kafka_2pc_sink_string`): two-phase commit. Records are produced inside an open librdkafka transaction; a checkpoint barrier flushes and records the pending checkpoint id; the broker-side `commitTransaction` happens only when the job manager signals the checkpoint globally durable (`on_commit`). `on_abort` aborts the prepared transaction, and `close` aborts any still-open transaction so records are not left in the prepared state.
+- Transactional sink (`kafka_2pc_sink_string`): two-phase commit. Records are produced inside an open librdkafka transaction; a checkpoint barrier flushes and records the pending checkpoint id; the broker-side `commitTransaction` happens only when the coordinator signals the checkpoint globally durable (`on_commit`). `on_abort` aborts the prepared transaction, and `close` aborts any still-open transaction so records are not left in the prepared state.
 - Upsert sink (`kafka_upsert_sink_string`): keyed at-least-once with log-compaction semantics. Each row is keyed by the configured primary key, deletes become tombstones, and replacement relies on Kafka log compaction by key.
 
 ## Limitations

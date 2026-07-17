@@ -57,7 +57,7 @@ flowchart LR
   worker --> DAG --> CORE
 ```
 
-Everything below the control plane is the engine core. `clink::core` has no dependency on the cluster, the connectors, or SQL. The connectors and state backends in `impls/` depend on the core and register themselves with an operator registry. The cluster control plane sits above the core: it accepts a `JobGraphSpec`, decides how to lay it out across task managers, and hands each task manager a chain of operator descriptors that the task manager rebuilds into a `Dag` and runs with the very same `LocalExecutor` used for in-process jobs.
+Everything below the control plane is the engine core. `clink::core` has no dependency on the cluster, the connectors, or SQL. The connectors and state backends in `impls/` depend on the core and register themselves with an operator registry. The cluster control plane sits above the core: it accepts a `JobGraphSpec`, decides how to lay it out across workers, and hands each worker a chain of operator descriptors that the worker rebuilds into a `Dag` and runs with the very same `LocalExecutor` used for in-process jobs.
 
 ### The data plane: operators, channels, and the DAG
 
@@ -86,8 +86,8 @@ A job is described by a `JobGraphSpec` (`include/clink/cluster/job_graph.hpp`): 
 
 The control plane is two roles, both served by one binary, `clink_node` (`tools/clink_node.cpp`), selected with `--role=coordinator` or `--role=worker`:
 
-- `Coordinator` (`include/clink/cluster/coordinator.hpp`) is the cluster's source of truth. Task managers register with it; it accepts a submitted `JobGraphSpec`, plans it (`JobPlanner`, `include/clink/cluster/job_planner.hpp`) into a `JobPlan` of deployment tasks, places each task on a task manager with a free slot (greedy first-fit), assigns key-group ranges per subtask, sends `Deploy` messages, tracks completion and acks, coordinates checkpoints, and runs a watchdog that declares lost task managers on heartbeat timeout.
-- `Worker` (`include/clink/cluster/worker.hpp`) hosts execution slots. On `Deploy` it rebuilds the operator chain for its subtask, wiring inbound and outbound `NetworkBridgeSource`/`NetworkBridgeSink` stages for cross-process edges, then runs the chain through a `LocalExecutor`, exactly as in-process. It heartbeats the job manager and registers per-subtask callbacks for checkpoint commit, abort, and source-barrier injection.
+- `Coordinator` (`include/clink/cluster/coordinator.hpp`) is the cluster's source of truth. Workers register with it; it accepts a submitted `JobGraphSpec`, plans it (`JobPlanner`, `include/clink/cluster/job_planner.hpp`) into a `JobPlan` of deployment tasks, places each task on a worker with a free slot (greedy first-fit), assigns key-group ranges per subtask, sends `Deploy` messages, tracks completion and acks, coordinates checkpoints, and runs a watchdog that declares lost workers on heartbeat timeout.
+- `Worker` (`include/clink/cluster/worker.hpp`) hosts execution slots. On `Deploy` it rebuilds the operator chain for its subtask, wiring inbound and outbound `NetworkBridgeSource`/`NetworkBridgeSink` stages for cross-process edges, then runs the chain through a `LocalExecutor`, exactly as in-process. It heartbeats the coordinator and registers per-subtask callbacks for checkpoint commit, abort, and source-barrier injection.
 
 The two communicate over a binary, length-prefixed TCP protocol (`include/clink/cluster/protocol.hpp`, `messages.hpp`) carrying `Register`, `Deploy`, `Heartbeat`, `SubtaskFinished`, `TriggerCheckpoint`, `CommitCheckpoint`, `AbortCheckpoint`, `CancelJob`, `RescaleJob`, and `PeerUpdate` among others.
 
@@ -106,7 +106,7 @@ The two communicate over a binary, length-prefixed TCP protocol (`include/clink/
  10. finish      sources reach EOS, SubtaskFinished propagates, coordinator marks the job done
 ```
 
-A compiled job plugin (`CLINK_REGISTER_JOB`) is a `.so` that exports `clink_job_build`, which returns the `JobGraphSpec` JSON. The job manager dlopens the same `.so` on every task manager so user operator types resolve consistently. A spec-only job, such as one compiled by the SQL frontend, references only built-in operator factories already registered on every task manager and is submitted as JSON with no plugin (`POST /api/v1/jobs/spec`, or the `JobSubmitter` path).
+A compiled job plugin (`CLINK_REGISTER_JOB`) is a `.so` that exports `clink_job_build`, which returns the `JobGraphSpec` JSON. The coordinator dlopens the same `.so` on every worker so user operator types resolve consistently. A spec-only job, such as one compiled by the SQL frontend, references only built-in operator factories already registered on every worker and is submitted as JSON with no plugin (`POST /api/v1/jobs/spec`, or the `JobSubmitter` path).
 
 ### The SQL frontend
 
@@ -144,18 +144,18 @@ These set the shape of the stack. Subsystem-specific knobs are documented on the
 | `CLINK_BUILD_TESTS` / `CLINK_BUILD_EXAMPLES` | CMake | on | Build the test suites and in-tree examples. |
 | `CLINK_BUILD_BENCH` | CMake | off | Build the benchmarks. |
 | `CLINK_WITH_<NAME>` | CMake | `AUTO` | Per-impl gate: `AUTO` builds when the dep is found, `ON` makes a missing dep a hard error, `OFF` always skips. RocksDB is always built and cannot be turned off. |
-| `--role=coordinator|worker` | `clink_node` | (required) | Select job manager or task manager mode. |
+| `--role=coordinator|worker` | `clink_node` | (required) | Select coordinator or worker mode. |
 | `--port` | `clink_node` (coordinator) | `6123` (`kDefaultCoordinatorPort`) | Control-plane listener port. |
 | `--http-port` | `clink_node` | `0` (disabled) | Enable the HTTP API and dashboard on this port. |
 | `--heartbeat-timeout-ms` | `clink_node` (coordinator) | `5000` | How long without a heartbeat before a worker is declared lost. |
 | `--watchdog-interval-ms` | `clink_node` (coordinator) | `200` | Watchdog liveness re-evaluation cadence. |
 | Default channel capacity | `Dag` | `1024` | Per-channel queue depth; the backpressure threshold. |
 
-The job manager defaults shown are the `clink_node` command-line defaults; `Coordinator::Config` and `Worker::Config` carry their own in-code defaults used by the in-process and test paths.
+The coordinator defaults shown are the `clink_node` command-line defaults; `Coordinator::Config` and `Worker::Config` carry their own in-code defaults used by the in-process and test paths.
 
 ## Guarantees and caveats
 
-- The engine core is independent of the cluster, connectors, and SQL. In-process jobs run with no job manager or task manager.
+- The engine core is independent of the cluster, connectors, and SQL. In-process jobs run with no coordinator or worker.
 - The same `Dag`, operator runners, and `LocalExecutor` drive both in-process and per-subtask cluster execution, so behaviour does not fork between the two.
 - Exactly-once is provided by snapshot-on-barrier plus two-phase-commit sinks, and applies only to sinks that implement the 2PC contract (directly or via `CommittingSink`): the file, Parquet (local and object-store), raw-S3 multipart, Postgres `PREPARE TRANSACTION`, and transactional Kafka sinks. Other sinks are at-least-once, or effectively-once in `mode='upsert'`. See [./checkpointing.md](./checkpointing.md) and [./sink-committer-framework.md](./sink-committer-framework.md).
 - The failure posture is self-heal-by-default once checkpointing is configured: with a checkpoint directory set, `max_restarts_on_worker_loss` resolves to a bounded default (10) and the job restarts from its last completed checkpoint; without one the posture is fail-fast. An explicit value overrides either way. See [./fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md).
@@ -169,7 +169,7 @@ The job manager defaults shown are the `clink_node` command-line defaults; `Coor
 - [./operator-model.md](./operator-model.md) - the operator interfaces and the DAG builder in depth.
 - [./task-lifecycle.md](./task-lifecycle.md) - the per-subtask runtime and the operator runner loop.
 - [./jobs-and-scheduling.md](./jobs-and-scheduling.md) - parallelism, planning, and slot placement.
-- [./distributed-runtime.md](./distributed-runtime.md) - the job manager, task manager, and control protocol.
+- [./distributed-runtime.md](./distributed-runtime.md) - the coordinator, worker, and control protocol.
 - [./network-stack.md](./network-stack.md) - cross-process data exchange and bridges.
 - [./time-and-windowing.md](./time-and-windowing.md) - watermarks, windows, and CEP.
 - [./state-and-backends.md](./state-and-backends.md) - keyed state and the state backends.

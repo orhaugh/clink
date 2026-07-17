@@ -35,6 +35,8 @@ cmake -S . -B build -DCLINK_WITH_AZURE=ON
 | --- | --- | --- |
 | `azure_parquet_int64_sink` | Sink | `int64` |
 | `azure_parquet_string_sink` | Sink | `string` |
+| `azure_parquet_2pc_int64_sink` | Sink | `int64` (two-phase commit, one staged file per checkpoint) |
+| `azure_parquet_2pc_string_sink` | Sink | `string` (two-phase commit, one staged file per checkpoint) |
 | `azure_parquet_int64_source` | Source | `int64` |
 | `azure_parquet_string_source` | Source | `string` |
 

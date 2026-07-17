@@ -29,6 +29,8 @@ cmake -S . -B build -DCLINK_WITH_WEBHDFS=ON
 | --- | --- | --- |
 | `webhdfs_parquet_int64_sink` | sink | `int64` |
 | `webhdfs_parquet_string_sink` | sink | `string` |
+| `webhdfs_parquet_2pc_int64_sink` | sink | `int64` (two-phase commit, one staged file per checkpoint) |
+| `webhdfs_parquet_2pc_string_sink` | sink | `string` (two-phase commit, one staged file per checkpoint) |
 | `webhdfs_parquet_int64_source` | source | `int64` |
 | `webhdfs_parquet_string_source` | source | `string` |
 

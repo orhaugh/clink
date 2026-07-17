@@ -38,6 +38,8 @@ cmake --build build --parallel 10
 | --- | --- | --- |
 | `s3_parquet_int64_sink` | Sink | `int64` |
 | `s3_parquet_string_sink` | Sink | `string` |
+| `s3_parquet_2pc_int64_sink` | Sink | `int64` (two-phase commit, one staged file per checkpoint) |
+| `s3_parquet_2pc_string_sink` | Sink | `string` (two-phase commit, one staged file per checkpoint) |
 | `s3_parquet_int64_source` | Source | `int64` |
 | `s3_parquet_string_source` | Source | `string` |
 

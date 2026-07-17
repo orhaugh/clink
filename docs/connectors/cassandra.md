@@ -28,6 +28,7 @@ cmake -S . -B build -DCLINK_WITH_CASSANDRA=ON
 | Factory name | Direction | Record type |
 | --- | --- | --- |
 | `cassandra_sink_string` | sink | `std::string` (JSON object per record) |
+| `cassandra_upsert_sink_string` | sink | `Row` (changelog upsert/delete by PRIMARY KEY) |
 
 ## Configuration
 

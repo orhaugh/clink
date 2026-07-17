@@ -234,6 +234,5 @@ breaks; needs id injection), and a durable-config (checkpoints-on) latency matri
 
 ## Status
 
-This harness is built increment by increment (see `README.md`, which also holds
-the gated results for both axes). The premise above is the contract every
-quoted number is held to.
+See `README.md` for what the harness covers and the gated results for both
+axes. The premise above is the contract every quoted number is held to.

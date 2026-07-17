@@ -1,5 +1,9 @@
 # clink
 
+[![ci](https://github.com/orhaugh/clink/actions/workflows/ci.yml/badge.svg)](https://github.com/orhaugh/clink/actions/workflows/ci.yml)
+[![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+[![changelog](https://img.shields.io/badge/changelog-v0.1.0-lightgrey.svg)](CHANGELOG.md)
+
 `clink` is a semantics-first, Arrow-native, stateful stream
 processing engine in modern C++ (C++23).
 
@@ -30,6 +34,7 @@ section below.
 
 ## Contents
 
+- [Quick start](#quick-start)
 - [Status](#status)
 - [Build & test](#build--test)
   - [Reproducible build + sanitizer matrix](#reproducible-build--sanitizer-matrix)
@@ -54,7 +59,55 @@ section below.
 - [Linting & formatting](#linting--formatting)
 - [Repository layout](#repository-layout)
 - [Reading order (for new contributors)](#reading-order-for-new-contributors)
-- [License](#license)
+- [Versioning and stability](#versioning-and-stability)
+- [Getting help](#getting-help)
+- [License and attribution](#license-and-attribution)
+
+## Quick start
+
+Everything builds from source today (prebuilt images and wheels are
+planned). The one-time bootstrap compiles a pinned Apache Arrow into
+`~/.clink-deps` (20-40 minutes, cached across builds); the clink build
+itself is quick.
+
+```bash
+git clone https://github.com/orhaugh/clink && cd clink
+scripts/build-arrow.sh && scripts/build-iceberg-cpp.sh   # one-time (slow, cached)
+cmake -S . -B build -DCLINK_BUILD_SQL=ON
+cmake --build build --parallel 10
+```
+
+Run a first pipeline - one process, no daemons to set up:
+
+```bash
+printf '{"usr":"alice","amount":12}\n{"usr":"bob","amount":7}\n{"usr":"alice","amount":5}\n' > /tmp/orders.ndjson
+
+./build/clink run -e "CREATE TABLE orders (usr VARCHAR, amount BIGINT) \
+      WITH (connector='file', format='json', path='/tmp/orders.ndjson'); \
+    SELECT usr, SUM(amount) AS total FROM orders GROUP BY usr"
+```
+
+```
+{"total":12,"usr":"alice"}
+{"total":7,"usr":"bob"}
+{"total":17,"usr":"alice"}
+```
+
+Totals stream as they update; the last row per key is the current
+aggregate. From here:
+
+- a local distributed cluster with the dashboard:
+  `docker build -t clink-build:latest -f docker/Dockerfile .` then
+  `docker compose up --build`, and open <http://localhost:8081>
+  (see [docker-compose.yml](docker-compose.yml));
+- the same engine embedded in Python, results as Arrow:
+  [python/README.md](python/README.md);
+- the full C++ API: [Code examples](#code-examples) below and the
+  compileable [`docs/consumer-examples/`](docs/consumer-examples/).
+
+Supported platforms: macOS (Apple Silicon is the primary development
+platform) and Linux (Debian-family, exercised in CI). Windows is not
+supported.
 
 ## Status
 
@@ -168,9 +221,11 @@ Common test labels: `-L core` runs `clink_core_tests`; `-L kafka`, `-L postgres`
 `-L clickhouse`, `-L s3`, `-L rocksdb`, `-L tls`, `-L integration` hit the
 per-impl test exes.
 
-Required deps on the host: a C++23 compiler (Clang 17+ / GCC 13+ / MSVC 2022),
-CMake 3.24+, Apache Arrow + Parquet (always required). GoogleTest is pulled in
-via `FetchContent` so you don't have to install it.
+Required deps on the host: a C++23 compiler (Clang 17+ / GCC 13+), CMake
+3.24+, and Apache Arrow + Parquet at the pinned version - run
+`scripts/build-arrow.sh` once to build it into `~/.clink-deps`, where every
+configure finds it automatically. GoogleTest is pulled in via `FetchContent`
+so you don't have to install it.
 
 ### Reproducible build + sanitizer matrix
 
@@ -1126,6 +1181,24 @@ tools/               # clink (unified CLI), clink_node, clink_submit_sql, and
 2. `include/clink/core/stream_element.hpp` - the wire format between operators
 3. `include/clink/runtime/dag.hpp` - how the DAG is built and run
 4. `tests/test_map_filter.cpp` - the smallest end-to-end integration
+
+## Versioning and stability
+
+The current release is v0.1.0; changes land in the
+[CHANGELOG](CHANGELOG.md). clink is pre-1.0, so public C++ APIs may still
+change between minor releases - every such change is called out. Durable
+state is treated more conservatively: snapshots carry schema versions with a
+migrate-at-restore path (see
+[state snapshot format](docs/internals/state-snapshot-format.md) and
+[fault tolerance and rescale](docs/internals/fault-tolerance-and-rescale.md)),
+so an upgrade does not silently invalidate checkpoints or savepoints.
+
+## Getting help
+
+- Questions, bug reports, feature requests:
+  [GitHub issues](https://github.com/orhaugh/clink/issues).
+- Contributing a change: [CONTRIBUTING.md](CONTRIBUTING.md).
+- Reporting a security issue privately: [SECURITY.md](SECURITY.md).
 
 ## License and attribution
 

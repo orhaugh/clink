@@ -151,8 +151,8 @@ EXPECT_EQ(sink->values(), (std::vector<std::int64_t>{1, 2, 3}));
 The smallest true distributed deployment, in one process: a real `Coordinator` and N real `Workers` wired over loopback RPC, registration awaited before the constructor returns. Everything - planning, deployment, slots, checkpoint coordination, failover - is the production cluster code.
 
 ```cpp
-clink::test::TestCluster mini({.workers = 2, .slots_per_worker = 4});
-mini.execute(spec);  // submit a JobGraphSpec + await completion; throws on job errors
+clink::test::TestCluster cluster({.workers = 2, .slots_per_worker = 4});
+cluster.execute(spec);  // submit a JobGraphSpec + await completion; throws on job errors
 ```
 
 `submit()`/`await_completion()`/`errors()` decompose `execute()` for finer control; `coordinator()`/`worker(i)` are escape hatches to the real pieces; `Options::checkpoint` carries a `cluster::CheckpointConfig` for distributed-checkpointing jobs. Specs come from the fluent environment, a SQL capture, or by hand. Use this tier only for behaviour a single process cannot exhibit - operator logic belongs on the harnesses, pipeline wiring on `LocalTestEnvironment`.
@@ -209,17 +209,21 @@ The framework's acceptance proof is that it tests clink's own production operato
 - Typed: the output model is the engine's own `StreamElement<T>`; no `void*`, no string-keyed lookups.
 - RAII: the harness closes what it opened.
 
-## Roadmap (implemented incrementally)
+## Scope
 
-1. Foundation: capture, one-input harness, manual time, lifecycle - DONE.
-2. Keyed harness (typed state inspection, key-scoped timers, key selectors) + `ProcessFunction` factory helpers - DONE.
-3. Two-input harnesses (co-process, joins, connected streams) with the engine's real two-input watermark combination - DONE.
-4. Snapshot/restore (the real backend + `snapshot_timers` cycle), failure injection, lifecycle log - DONE.
-5. Test sources and sinks (scripted, replayable, transactional) - DONE.
-6. `LocalTestEnvironment` (full pipelines over the local runtime) and `TestCluster` (the in-process coordinator+worker fixture) - DONE.
-7. Assertions, sequence/property-testing support, side-output capture, compiling documentation examples, and dogfood tests over production operators - DONE.
-
-All seven increments are complete; the framework is the supported public testing API.
+The framework is the supported public testing API. It covers, in full:
+element capture with manual time and lifecycle control; the one-input,
+keyed (typed state inspection, key-scoped timers, key selectors), and
+two-input harnesses (co-process, joins, connected streams - with the
+engine's real two-input watermark combination); `ProcessFunction` factory
+helpers; snapshot/restore through the real backend plus the
+`snapshot_timers` cycle; deterministic failure injection and a lifecycle
+log; scripted, replayable, and transactional test sources and sinks;
+`LocalTestEnvironment` for full pipelines over the local runtime;
+`TestCluster` as the in-process coordinator+worker fixture; and assertion,
+sequence, and property-testing support with side-output capture. The
+framework's own suite dogfoods it against production operators, and the
+documentation examples compile as tests.
 
 ## Related
 

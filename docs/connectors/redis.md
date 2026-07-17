@@ -31,6 +31,7 @@ cmake -S . -B build -DCLINK_WITH_REDIS=ON
 | --- | --- | --- |
 | `redis_source` | Source | `std::string` |
 | `redis_sink` | Sink | `std::string` |
+| `redis_upsert_sink` | Sink | `Row` (SET/DEL by the PRIMARY-KEY-derived key) |
 
 (Registered in `impls/redis/src/register_factories.cpp`.)
 

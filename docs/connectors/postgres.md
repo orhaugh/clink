@@ -36,6 +36,8 @@ cmake --build build -j
 | `postgres_cdc_text_source` | Source | `std::string` (nested JSON line per CDC event) |
 | `postgres_cdc_event_source` | Source | `CdcEvent` (typed channel) |
 | `postgres_sink` | Sink | `std::string` (JSON object per row) |
+| `postgres_2pc_sink` | Sink | `std::string` (JSON object per row; two-phase commit via `PREPARE TRANSACTION`) |
+| `postgres_upsert_sink` | Sink | `Row` (changelog upsert/delete by PRIMARY KEY) |
 
 `postgres_source`, `postgres_text_source` and `postgres_row_source` are the SELECT source in three encodings. `postgres_cdc_source`, `postgres_cdc_text_source` and `postgres_cdc_event_source` are the logical-replication CDC source in three encodings. The typed `PostgresRow` and `CdcEvent` channels are registered with the registry by `install()` so pipelines can carry full row/event records without flattening to a string.
 

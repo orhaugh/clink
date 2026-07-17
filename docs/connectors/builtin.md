@@ -1,4 +1,4 @@
-# Built-in sinks (blackhole, changelog, print, collect)
+# Built-in connectors (blackhole, changelog, print, collect, queryable_state)
 
 Row-channel sinks compiled into the engine itself - no client library, no
 `CLINK_WITH_*` knob, always available when `CLINK_BUILD_SQL=ON`. They are

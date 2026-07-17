@@ -236,7 +236,7 @@ A `connector='http'` table must declare `format='json'` so the row is rendered t
 
 ## Example
 
-Programmatic use of the Elasticsearch sink, based on the live test (`tests/test_elasticsearch_sink_live.cpp`). Each record is already a JSON object string:
+Programmatic use of the Elasticsearch sink, based on the live test (`impls/http_connector/tests/test_elasticsearch_sink_live.cpp`). Each record is already a JSON object string:
 
 ```cpp
 #include "clink/http_connector/bulk_sink_builders.hpp"

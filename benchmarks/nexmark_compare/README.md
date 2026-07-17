@@ -50,38 +50,38 @@ default par=1; see the Parallelism>1 section for the par=4 run.
 `./latency.sh` is the second axis: per-record end-to-end latency under a paced
 sustained load (see the Latency section below).
 
-## Build increments (all done for the v1 deliverable)
+## What the harness covers
 
-- [x] **INC 0** - premise doc (`pipeline.md`) + scaffold.
-- [x] **INC 2** - shared-input producer (`nexmark_dump`): one canonical dataset,
-  deterministic (byte-identical on replay), 1:3:46 ratio.
-- [x] **INC 3** - clink Nexmark Kafka SQL job (also fixed the SQL Kafka
-  source/sink runtime wiring).
-- [x] **INC 4** - Flink Nexmark SQL job on the pinned Flink 2.2.0 image
-  (Table-API jar, Kafka SQL connector shaded in).
-- [x] **INC 8** - one-command `run.sh` + `scoreboard.py` (steady-state table +
+- **Premise doc** (`pipeline.md`): pins every dimension a quoted number
+  depends on.
+- **Shared-input producer** (`nexmark_dump`): one canonical dataset,
+  deterministic (byte-identical on replay), 1:3:46 person:auction:bid ratio.
+- **Both engines as SQL jobs**: clink over Kafka SQL, and the Flink Nexmark
+  SQL job on the pinned Flink 2.2.0 image (Table-API jar, Kafka SQL connector
+  shaded in).
+- **One-command run**: `run.sh` + `scoreboard.py` (steady-state table +
   geomean + banner + correctness gate).
-- [x] **q8** (windowed stream-stream join) - gate PASS (1,056=1,056), the
+- **q8** (windowed stream-stream join): gate PASS (1,056 = 1,056), the
   two-source-windowed-join-over-Kafka correctness milestone.
-- [x] **q6** (SQL-only capability) - clink runs it in SQL over Kafka (5,223
-  sellers); Flink has no SQL form (DataStream-only). Documented, not gated.
-- [x] **CPU normalisation** (Cores*Time): measured CPU per query (clink host
-  procs via `ps`, Flink containers via cgroup v2 `cpu.stat`); scoreboard adds an
-  events-per-CPU-second efficiency column (parallelism-independent), with the
-  baseline-overhead caveat below.
-- [x] **parallelism>1**: `clink_submit_sql --parallelism N` / `PARALLELISM=N
-  ./run.sh`; verified gate-exact at par=4 over 4-partition topics on both engines
-  (q0 460,000, q12 184,767). Single-box, so it shows scale-out correctness, not
-  true distributed throughput scaling.
-- [x] **q8/q6 at par>1**: found AND fixed a real clink bug - the distributed
-  two-input (Row,Row) co-operator mis-partitioned its input bridges at par>1
-  (assumed exactly 2). Added `SubtaskEdge.input_index` so the same-type co-op
-  groups each side's N bridges correctly. q8 gate-exact (1,056) and q6 correct
-  (5,223 sellers) at par=4. See the Parallelism section.
-- [x] **Latency axis** (`latency.sh`): per-record end-to-end latency under
+- **q6** (SQL-only capability): clink runs it in SQL over Kafka (5,223
+  sellers); the Flink reference suite has no SQL form for it. Documented, not
+  gated.
+- **CPU normalisation** (Cores*Time): measured CPU per query (clink host
+  procs via `ps`, Flink containers via cgroup v2 `cpu.stat`); the scoreboard
+  adds an events-per-CPU-second efficiency column (parallelism-independent),
+  with the baseline-overhead caveat below.
+- **Parallelism > 1**: `clink_submit_sql --parallelism N` / `PARALLELISM=N
+  ./run.sh`; verified gate-exact at par=4 over 4-partition topics on both
+  engines (q0 460,000, q12 184,767). Single-box, so it shows scale-out
+  correctness, not true distributed throughput scaling. Building this
+  surfaced and fixed a real clink bug: the distributed two-input (Row,Row)
+  co-operator mis-partitioned its input bridges at par>1 (assumed exactly 2);
+  `SubtaskEdge.input_index` now groups each side's N bridges correctly.
+- **Latency axis** (`latency.sh`): per-record end-to-end latency under
   sustained paced load, gated on count + positional content + pacer rate. See
   the Latency section below and the "Latency axis" premise in `pipeline.md`.
-- [ ] A true multi-machine distributed run (out of scope on one host).
+
+Not covered: a true multi-machine distributed run (out of scope on one host).
 
 ## Results (parallelism 1, 1-partition, hot-path)
 
@@ -479,7 +479,7 @@ at par>1 its output diverges because the multi-partition watermark refinement is
 yet on the SQL Kafka-source path - a documented gap, see the q12 template. The
 blackhole path sidesteps the output gate, so it compares at any par.)
 
-## Producer (INC 2)
+## Producer (`nexmark_dump`)
 
 ```bash
 cmake -S . -B build -DCLINK_BUILD_BENCH=ON -DCLINK_BUILD_SQL=ON
@@ -491,7 +491,7 @@ cmake --build build --target nexmark_dump -j
 ```
 
 Determinism + ratio are checked by running it twice and diffing, and counting
-per-type lines (≈ 1:3:46). The Kafka load (INC 3) ships the NDJSON to the three
+per-type lines (≈ 1:3:46). The Kafka load step ships the NDJSON to the three
 topics via the driver venv (`confluent_kafka`).
 
 ## Toolchain

@@ -36,6 +36,8 @@ cmake --build build -j
 | --- | --- | --- |
 | `gcs_parquet_int64_sink` | Sink | `int64` |
 | `gcs_parquet_string_sink` | Sink | `string` |
+| `gcs_parquet_2pc_int64_sink` | Sink | `int64` (two-phase commit, one staged file per checkpoint) |
+| `gcs_parquet_2pc_string_sink` | Sink | `string` (two-phase commit, one staged file per checkpoint) |
 | `gcs_parquet_int64_source` | Source | `int64` |
 | `gcs_parquet_string_source` | Source | `string` |
 

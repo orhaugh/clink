@@ -97,7 +97,7 @@ Authentication is handled by the AWS SDK's default credential provider chain (en
 
 ## SQL usage
 
-All four are mapped in `src/sql/physical_plan.cpp`. The Kinesis source binds `connector='kinesis'` to `kinesis_source` with a `json_string_to_row` bridge; the sinks bind `connector='kinesis'`, `connector='firehose'` and `connector='dynamodb'` to `kinesis_sink`, `firehose_sink` and `dynamodb_sink` respectively, each with a `row_to_json_string` bridge. All are at-least-once: `mode='exactly_once'` is rejected for all three sinks, and `mode='upsert'` is rejected for all three (the DynamoDB put is already an upsert by primary key, so setting `partition_key`/`sort_key` is the supported route).
+All four are mapped in `src/sql/physical_plan.cpp`. The Kinesis source binds `connector='kinesis'` to `kinesis_source` with a `json_string_to_row` bridge; the sinks bind `connector='kinesis'`, `connector='firehose'` and `connector='dynamodb'` to `kinesis_sink`, `firehose_sink` and `dynamodb_sink` respectively, each with a `row_to_json_string` bridge. All are at-least-once: `delivery_guarantee='exactly_once'` is rejected for all three sinks, and `mode='upsert'` is rejected for all three (the DynamoDB put is already an upsert by primary key, so setting `partition_key`/`sort_key` is the supported route).
 
 ```sql
 -- Source: read a Kinesis Data Stream
