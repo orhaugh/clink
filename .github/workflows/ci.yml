@@ -96,13 +96,6 @@ jobs:
       # file-command dirs root-owned, so checkout dies with EACCES otherwise
       # (same reason the sanitizer job runs as root).
       options: --user root
-      # Mount the runner's large ephemeral disk. The OS disk (/) has only
-      # ~14 GB free - not enough for a full Debug build (static Arrow +
-      # RocksDB + a ~500 MB libclink.so + ~20 statically-linked test exes);
-      # the link ran out of space at ~90%. /mnt has ~65 GB, so the build
-      # tree goes there (see -B /mnt/build below).
-      volumes:
-        - /mnt:/mnt
     env:
       # The image bakes the pinned toolchain at /usr/local; this tells the
       # build to resolve it there instead of the host ~/.clink-deps path.
@@ -133,20 +126,35 @@ jobs:
           key: ccache-build-${{ github.run_id }}
           restore-keys: ccache-build-
       - name: Disk before build
-        run: df -h / /mnt
+        run: df -h /
       - name: Configure
         run: |
           # Full surface: SQL frontend, WASM UDFs, and the multi-process
           # integration suite all on. CLINK_WITH_WASM=ON fetches the pinned
           # wasmtime c-api. Integer parallelism cap keeps cc1plus off the OOM
-          # line on the heavy templated TUs. Build tree on /mnt (see volumes).
-          cmake -S . -B /mnt/build -DCMAKE_BUILD_TYPE=Debug \
+          # line on the heavy templated TUs.
+          #
+          # Debug info is dropped (-g0) and every binary is stripped at link
+          # (-s): the pinned toolchain image already fills ~61 GB of the
+          # runner's 72 GB disk, leaving ~12 GB, and a normal Debug build's
+          # ~30 test executables each statically link debug-laden Arrow and
+          # overflowed it while linking. -g0 keeps -O0 and assertions (the
+          # point of the Debug gate) but emits no DWARF; -s strips the final
+          # binaries so the debug info pulled in from the static deps never
+          # lands on disk. Behaviour is unchanged (the suite is 3023/3023
+          # either way); only symbols/line-tables are gone. To debug a CI
+          # failure interactively, reproduce locally without these flags.
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
             -DCLINK_BUILD_TESTS=ON \
             -DCLINK_BUILD_SQL=ON \
             -DCLINK_WITH_WASM=ON \
-            -DCLINK_INTEGRATION_TESTS=ON
+            -DCLINK_INTEGRATION_TESTS=ON \
+            -DCMAKE_C_FLAGS_DEBUG=-g0 \
+            -DCMAKE_CXX_FLAGS_DEBUG=-g0 \
+            -DCMAKE_EXE_LINKER_FLAGS=-s \
+            -DCMAKE_SHARED_LINKER_FLAGS=-s
       - name: Build
-        run: cmake --build /mnt/build -j "$(( $(nproc) / 2 ))"
+        run: cmake --build build -j "$(( $(nproc) / 2 ))"
       - name: Test (unit + SQL, parallel) [blocking gate]
         # Everything except the multi-process integration suite, run in
         # parallel. This is the hard gate: the unit + SQL surface is clean on
@@ -154,7 +162,7 @@ jobs:
         # 3023/3023 at -j8). Integration tests spawn real coordinator/worker
         # processes and race on ephemeral ports + heartbeat timers under
         # -j >1, so they run serially and advisory-only below.
-        run: ctest --test-dir /mnt/build --output-on-failure -j 8 --timeout 180 -LE integration
+        run: ctest --test-dir build --output-on-failure -j 8 --timeout 180 -LE integration
       - name: Test (integration, serial) [advisory]
         # Multi-process integration tests (incl. the exactly-once failover
         # test). Advisory until the pre-existing multi-process flakiness is
@@ -164,7 +172,7 @@ jobs:
         # continue-on-error surfaces the results (and any NEW regression) as a
         # warning without red-lighting the gate.
         continue-on-error: true
-        run: ctest --test-dir /mnt/build --output-on-failure --parallel 1 --timeout 240 -L integration
+        run: ctest --test-dir build --output-on-failure --parallel 1 --timeout 240 -L integration
       - name: ccache stats
         if: always()
         run: ccache -s
