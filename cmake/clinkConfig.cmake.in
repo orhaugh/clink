@@ -27,4 +27,17 @@ include("${CMAKE_CURRENT_LIST_DIR}/clinkTargets.cmake")
 # usage of an optional connector.
 set(clink_AVAILABLE_IMPLS "@CLINK_AVAILABLE_IMPLS@")
 
+# Component names mirror the imported targets (core, clink, and every
+# installed impl). check_required_components() reads the per-component
+# _FOUND variables; without them any `COMPONENTS core` request would mark
+# the whole package NOT FOUND even though the target exists.
+foreach(_clink_comp ${clink_FIND_COMPONENTS})
+    if(TARGET clink::${_clink_comp})
+        set(clink_${_clink_comp}_FOUND TRUE)
+    else()
+        set(clink_${_clink_comp}_FOUND FALSE)
+    endif()
+endforeach()
+unset(_clink_comp)
+
 check_required_components(clink)
