@@ -100,6 +100,13 @@ jobs:
       # The image bakes the pinned toolchain at /usr/local; this tells the
       # build to resolve it there instead of the host ~/.clink-deps path.
       CLINK_DEPS_PREFIX: /usr/local
+      # Compiler cache: the FetchContent deps (RocksDB above all) and clink's
+      # own TUs rebuild from cold otherwise. CMake reads the launcher from the
+      # environment, so no script changes are needed.
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
     steps:
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git
@@ -108,6 +115,16 @@ jobs:
         # this every git call in the build (the plugin ABI hash reads the
         # HEAD SHA) fails with 'dubious ownership'.
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install ccache
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends ccache
+      - name: Restore compiler cache
+        # restore/save are split (not the combined action) so a FAILED run
+        # still saves its objects - that is what keeps fix iterations fast.
+        uses: actions/cache/restore@v4
+        with:
+          path: /root/.ccache
+          key: ccache-build-${{ github.run_id }}
+          restore-keys: ccache-build-
       - name: Configure
         run: |
           # Full surface: SQL frontend, WASM UDFs, and the multi-process
@@ -139,6 +156,15 @@ jobs:
         # warning without red-lighting the gate.
         continue-on-error: true
         run: ctest --test-dir build --output-on-failure --parallel 1 --timeout 240 -L integration
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /root/.ccache
+          key: ccache-build-${{ github.run_id }}
 
   install-smoke:
     name: Install + downstream consume
@@ -154,10 +180,22 @@ jobs:
       options: --user root
     env:
       CLINK_DEPS_PREFIX: /usr/local
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
     steps:
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install ccache
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends ccache
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /root/.ccache
+          key: ccache-install-${{ github.run_id }}
+          restore-keys: ccache-install-
       - name: Build + install clink
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -184,6 +222,12 @@ jobs:
           EOF
           cmake -S . -B build
           cmake --build build
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /root/.ccache
+          key: ccache-install-${{ github.run_id }}
 
   # The sanitizer matrix lives in its own manually-triggered workflow
   # (sanitizers.yml): a full asan/tsan/ubsan pass takes over an hour per mode

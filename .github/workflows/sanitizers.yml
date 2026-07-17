@@ -55,11 +55,35 @@ jobs:
       # are already in the container, so it must not try to re-`docker run`)
       # and CLINK_DEPS_PREFIX=/usr/local.
       IN_DOCKER: "1"
+      # Compiler cache (see ci.yml): CMake reads the launcher from the
+      # environment, so build_and_test.sh needs no changes. Keyed per mode -
+      # sanitizer flags differ, so the object caches are disjoint anyway.
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
     steps:
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git
         # Without this the plugin ABI-hash git calls fail with 'dubious
         # ownership' inside the container (see ci.yml).
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install ccache
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends ccache
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /root/.ccache
+          key: ccache-sanitizer-${{ matrix.mode }}-${{ github.run_id }}
+          restore-keys: ccache-sanitizer-${{ matrix.mode }}-
       - name: Sanitizer build + tests
         run: ./build_and_test.sh --sanitizer ${{ matrix.mode }}
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /root/.ccache
+          key: ccache-sanitizer-${{ matrix.mode }}-${{ github.run_id }}
