@@ -16,15 +16,12 @@
 #                     ctest run is the hard gate, the multi-process integration
 #                     run is advisory (see the step comments).           [gate + advisory step]
 #   install-smoke   - install + consume from an out-of-tree find_package. [gate]
-#   sanitizer       - asan / tsan / ubsan via build_and_test.sh (SQL off by
-#                     design: the SQL runtime ITs are not sanitizer-friendly).
-#                     Advisory - a pre-existing harness-level failure tail,
-#                     not memory bugs; see the job comment.              [advisory]
 #
 # So a green pipeline requires: the pinned image builds, the full tree builds,
-# the unit + SQL suite passes, and the install-smoke consumes clink. Integration
-# and sanitizers run and surface regressions but do not block until their
-# pre-existing tails are triaged.
+# the unit + SQL suite passes, and the install-smoke consumes clink. The
+# integration step runs advisory until its pre-existing timing tail is
+# triaged. The sanitizer matrix is a separate MANUAL workflow
+# (sanitizers.yml) - over an hour per mode, too heavy for every push.
 
 name: ci
 
@@ -188,44 +185,9 @@ jobs:
           cmake -S . -B build
           cmake --build build
 
-  # Sanitizers are ADVISORY, not a gate. The build now links cleanly under all
-  # three (the SQL-off link break that used to abort the whole matrix is fixed),
-  # and the normal leg is 2181/2181, but there is a pre-existing tail of
-  # sanitizer-harness failures that are NOT memory-safety bugs: ~24 under ASan,
-  # all tests that spawn the clink CLI subprocess (CheckSavepointCli /
-  # StateExportCli - the child's ASan diagnostics pollute the stdout they
-  # assert on), stand up an embedded HTTP server (HttpModelProvider / PubSub),
-  # or run an in-process cluster (InlineOpsE2E / TestCluster / Coordinator*).
-  # Until those are made sanitizer-clean (suppress child ASan output / exclude
-  # under sanitizers), continue-on-error keeps the legs running - so they still
-  # catch a NEW regression - without red-lighting the pipeline. Flip to blocking
-  # once the tail is triaged.
-  sanitizer:
-    name: Sanitizer (${{ matrix.mode }}) [advisory]
-    runs-on: ubuntu-24.04
-    needs: toolchain-image
-    if: ${{ !cancelled() && (needs.toolchain-image.result == 'success' || needs.toolchain-image.result == 'skipped') }}
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        mode: [asan, tsan, ubsan]
-    container:
-      image: ${{ needs.toolchain-image.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --user root
-    env:
-      # build_and_test.sh keys IN_DOCKER for both the recursion guard (we
-      # are already in the container, so it must not try to re-`docker run`)
-      # and CLINK_DEPS_PREFIX=/usr/local.
-      IN_DOCKER: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - name: Mark workspace safe for git
-        # See the build job: without this the plugin ABI-hash git calls fail
-        # with 'dubious ownership' inside the container.
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - name: Sanitizer build + tests
-        run: ./build_and_test.sh --sanitizer ${{ matrix.mode }}
+  # The sanitizer matrix lives in its own manually-triggered workflow
+  # (sanitizers.yml): a full asan/tsan/ubsan pass takes over an hour per mode
+  # on the hosted runners, far too heavy to pay on every push. Run it with
+  #   gh workflow run sanitizers.yml -f mode=all      (or asan|tsan|ubsan)
+  # or from the Actions tab, ideally before a release or after touching
+  # concurrency/memory-sensitive code.

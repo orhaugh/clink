@@ -1,0 +1,65 @@
+# Sanitizer matrix for clink - MANUAL trigger only.
+#
+# A full asan/tsan/ubsan pass takes over an hour per mode on the hosted
+# runners, so this is not part of the per-push ci pipeline. Run it:
+#
+#   gh workflow run sanitizers.yml -f mode=all        # all three, in parallel
+#   gh workflow run sanitizers.yml -f mode=asan       # one mode
+#
+# or from the Actions tab (Run workflow). It reuses the pinned toolchain
+# image that ci pushes as :main on every main build, so a run needs at least
+# one prior green toolchain-image job.
+#
+# Known pre-existing tail (NOT memory-safety bugs): ~24 failures under ASan,
+# all tests that spawn the clink CLI subprocess (CheckSavepointCli /
+# StateExportCli - the child's ASan diagnostics pollute the stdout they
+# assert on), stand up an embedded HTTP server (HttpModelProvider / PubSub),
+# or run an in-process cluster (InlineOpsE2E / TestCluster / Coordinator*).
+# Judge a run against that tail: NEW failures are the signal.
+
+name: sanitizers
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Which sanitizer(s) to run"
+        type: choice
+        options: [all, asan, tsan, ubsan]
+        default: all
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  sanitizer:
+    name: Sanitizer (${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ${{ fromJSON(inputs.mode == 'all' && '["asan","tsan","ubsan"]' || format('["{0}"]', inputs.mode)) }}
+    container:
+      # The :main moving tag is pushed by ci.yml's toolchain-image job on
+      # every push to main.
+      image: ghcr.io/${{ github.repository_owner }}/clink-build:main
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # root: the runner's mounted dirs are root-owned and the image's
+      # default user is non-root (see ci.yml).
+      options: --user root
+    env:
+      # build_and_test.sh keys IN_DOCKER for both the recursion guard (we
+      # are already in the container, so it must not try to re-`docker run`)
+      # and CLINK_DEPS_PREFIX=/usr/local.
+      IN_DOCKER: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mark workspace safe for git
+        # Without this the plugin ABI-hash git calls fail with 'dubious
+        # ownership' inside the container (see ci.yml).
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Sanitizer build + tests
+        run: ./build_and_test.sh --sanitizer ${{ matrix.mode }}
