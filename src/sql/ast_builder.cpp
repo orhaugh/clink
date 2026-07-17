@@ -200,7 +200,7 @@ ast::Expression translate_a_expr(const JsonValue& body) {
     // List of two items. Lower into a synthetic 3-arg function call
     // 'between(x, low, high)' so the binder can pattern-match it
     // without inventing a new AST variant.
-    if (kind_str == "AEXPR_BETWEEN") {
+    if (kind_str == "AEXPR_BETWEEN" || kind_str == "AEXPR_NOT_BETWEEN") {
         auto fc = std::make_unique<ast::FunctionCall>();
         fc->name = "between";
         fc->loc = loc;
@@ -216,6 +216,12 @@ ast::Expression translate_a_expr(const JsonValue& body) {
         }
         fc->args.push_back(translate_expression(rbody->at("items").as_array()[0]));
         fc->args.push_back(translate_expression(rbody->at("items").as_array()[1]));
+        if (kind_str == "AEXPR_NOT_BETWEEN") {
+            auto neg = std::make_unique<ast::NotOp>();
+            neg->loc = loc;
+            neg->arg = ast::Expression{std::move(fc)};
+            return ast::Expression{std::move(neg)};
+        }
         return ast::Expression{std::move(fc)};
     }
     // AEXPR_LIKE: PG encodes `col LIKE 'pat'` as op-name "~~"
@@ -887,6 +893,17 @@ ast::Expression translate_expression(const JsonValue& wrapper) {
             }
         }
         return ast::Expression{std::move(fc)};
+    }
+    if (kind == "SQLValueFunction") {
+        // CURRENT_TIMESTAMP / CURRENT_DATE / LOCALTIME keyword forms. Same
+        // stance as the function-call spellings (now() etc.), same message:
+        // wall-clock values are nondeterministic and clink keeps SQL
+        // results reproducible.
+        unsupported(
+            "CURRENT_TIMESTAMP / CURRENT_DATE and other wall-clock values are not "
+            "supported: clink keeps SQL deterministic; use the event-time column or "
+            "a windowing TVF",
+            loc_from(*body).pos);
     }
     unsupported("expression kind " + kind, loc_from(*body).pos);
 }

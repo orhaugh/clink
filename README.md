@@ -760,10 +760,13 @@ DDL and basics
 
 Projection and filtering
 
-- `WHERE` with `AND` / `OR` / `NOT`, `IS [NOT] NULL`, `LIKE`, three-valued null
-  semantics
-- Expression `SELECT`: arithmetic, concat (`||`), `UPPER` / `LOWER` / `LENGTH` /
-  `COALESCE`, `CAST(... AS BIGINT|DOUBLE|TEXT)`
+- `WHERE` with `AND` / `OR` / `NOT`, `IS [NOT] NULL`, `[NOT] LIKE`,
+  `[NOT] BETWEEN`, `[NOT] IN (...)`, three-valued null semantics
+- Expression `SELECT`: arithmetic, concat (`||` / `CONCAT`), `CASE WHEN`,
+  string functions (`UPPER` / `LOWER` / `LENGTH` / `SUBSTRING` / `TRIM` /
+  `REPLACE` / `POSITION`), numeric functions (`ABS` / `ROUND` / `CEIL` /
+  `FLOOR` / `MOD`), `COALESCE` / `NULLIF` / `GREATEST` / `LEAST`,
+  `CAST(... AS BIGINT|DOUBLE|TEXT)`
 - `SELECT DISTINCT` (dedupe across the run)
 - `ORDER BY` with `LIMIT n` / `OFFSET m` (sorted, emitted at end-of-stream)
 

@@ -163,6 +163,45 @@ TEST(EmbeddedEngine, BareSelectPrintsRowsToStdout) {
     fs::remove(cap_path);
 }
 
+TEST(EmbeddedEngine, BareSelectSingleColumnRunsOnRowChannel) {
+    // A one-column projection must not be mistaken for the single-TEXT-column
+    // string channel: the synthesised sink follows the plan's channel (it
+    // carries format='json'), so `SELECT amount FROM orders` runs rather than
+    // failing with a source/sink channel mismatch.
+    const auto in_path = fs::temp_directory_path() / "clink_embed_onecol_in.ndjson";
+    const auto cap_path = fs::temp_directory_path() / "clink_embed_onecol_stdout.txt";
+    fs::remove(in_path);
+    fs::remove(cap_path);
+    write_orders(in_path);
+
+    clink::embed::EngineOptions opts;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    const std::string script = orders_ddl(in_path) + "SELECT amount FROM orders";
+    int rc = -1;
+    bool ok = false;
+    {
+        CaptureStdoutToFile cap(cap_path);
+        rc = engine.execute_script(script);
+        ok = (rc == 0) && engine.await_all();
+    }
+    ASSERT_EQ(rc, 0) << err.str();
+    ASSERT_TRUE(ok) << err.str();
+
+    const auto lines = read_lines(cap_path);
+    ASSERT_EQ(lines.size(), 5u);
+    std::int64_t amount_sum = 0;
+    for (const auto& l : lines) {
+        auto js = clink::config::parse(l);
+        ASSERT_TRUE(js.is_object()) << l;
+        amount_sum += static_cast<std::int64_t>(js.at("amount").as_number());
+    }
+    EXPECT_EQ(amount_sum, 72);
+    fs::remove(in_path);
+    fs::remove(cap_path);
+}
+
 TEST(EmbeddedEngine, ChangelogSelectPrintsKindPrefixes) {
     // TOP-1 per user via ROW_NUMBER produces a changelog (displaced rows
     // retract); the binder admits connector='print' for changelog SELECTs

@@ -956,6 +956,34 @@ clink::config::JsonValue lower_predicate(const ast::Expression& expr, const Tabl
             obj["pattern"] = JsonValue{std::get<ast::StringLiteral>(fc.args[1]).value};
             return JsonValue{std::move(obj)};
         }
+        if (fc.name == "between") {
+            // x BETWEEN low AND high (ast_builder lowers the A_Expr into this
+            // synthetic 3-arg call; NOT BETWEEN arrives wrapped in NotOp).
+            // Rewrite to (x >= low AND x <= high) so it rides the existing
+            // comparison predicates - column or literal bounds both work.
+            if (fc.args.size() != 3) {
+                bind_error("BETWEEN requires a value and two bounds", fc.loc.pos);
+            }
+            const std::string col = resolve_column_name(fc.args[0], source);
+            auto bound = [&](const char* op, const ast::Expression& rhs) {
+                JsonObject cmp;
+                cmp["op"] = JsonValue{std::string{op}};
+                cmp["col"] = JsonValue{col};
+                if (std::holds_alternative<ast::ColumnRef>(rhs)) {
+                    cmp["rhs_col"] = JsonValue{resolve_column_name(rhs, source)};
+                } else {
+                    cmp["literal"] = literal_to_json(rhs);
+                }
+                return JsonValue{std::move(cmp)};
+            };
+            JsonObject obj;
+            obj["op"] = JsonValue{std::string{"and"}};
+            JsonArray args;
+            args.emplace_back(bound("ge", fc.args[1]));
+            args.emplace_back(bound("le", fc.args[2]));
+            obj["args"] = JsonValue{std::move(args)};
+            return JsonValue{std::move(obj)};
+        }
         if (fc.name == "in") {
             // WHERE x IN (lit, lit, ...). First arg is the
             // column reference; the rest are literal values (subquery

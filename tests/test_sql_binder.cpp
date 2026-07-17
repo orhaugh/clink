@@ -2835,6 +2835,44 @@ TEST(SqlBinder, WhereNotLikeWrapsInNot) {
     EXPECT_NE(filter.predicate_json().find("\"pattern\":\"%error%\""), std::string::npos);
 }
 
+TEST(SqlBinder, WhereBetweenLowersToRangeConjunction) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    auto plan =
+        b.bind_select(as_select(parse("SELECT url FROM clicks WHERE user_id BETWEEN 5 AND 10")));
+    const auto& filter =
+        static_cast<const LogicalFilter&>(static_cast<const LogicalProject&>(*plan).input());
+    EXPECT_NE(filter.predicate_json().find("\"op\":\"and\""), std::string::npos);
+    EXPECT_NE(filter.predicate_json().find("\"op\":\"ge\""), std::string::npos);
+    EXPECT_NE(filter.predicate_json().find("\"op\":\"le\""), std::string::npos);
+    EXPECT_NE(filter.predicate_json().find("\"col\":\"user_id\""), std::string::npos);
+}
+
+TEST(SqlBinder, WhereNotBetweenWrapsInNot) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    auto plan = b.bind_select(
+        as_select(parse("SELECT url FROM clicks WHERE user_id NOT BETWEEN 5 AND 10")));
+    const auto& filter =
+        static_cast<const LogicalFilter&>(static_cast<const LogicalProject&>(*plan).input());
+    EXPECT_NE(filter.predicate_json().find("\"op\":\"not\""), std::string::npos);
+    EXPECT_NE(filter.predicate_json().find("\"op\":\"ge\""), std::string::npos);
+    EXPECT_NE(filter.predicate_json().find("\"op\":\"le\""), std::string::npos);
+}
+
+TEST(SqlBinder, CurrentTimestampKeywordRejectedAsNondeterministic) {
+    // The keyword form (a SQLValueFunction parse node) gets the same
+    // principled message as the function-call spellings (now() etc.).
+    try {
+        parse("SELECT CURRENT_TIMESTAMP FROM clicks");
+        FAIL() << "expected TranslationError";
+    } catch (const TranslationError& e) {
+        EXPECT_NE(std::string(e.what()).find("deterministic"), std::string::npos) << e.what();
+    }
+}
+
 TEST(SqlBinder, WhereOnUnknownColumnRejected) {
     Catalog cat;
     register_clicks(cat);

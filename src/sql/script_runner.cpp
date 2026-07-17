@@ -49,6 +49,28 @@ std::string url_encode(const std::string& s) {
     return out;
 }
 
+// Whether the bound plan runs on the row channel. Mirrors the physical
+// planner's decision (follow the first input down to the scan; a scan is
+// row-channel when its table declares format='json' or has more than one
+// column). The synthesised bare-SELECT sink must sit on the same channel:
+// without format='json' a single-column result would be mistaken for the
+// single-TEXT-column string channel and rejected with a channel mismatch.
+bool plan_is_row_channel(const LogicalPlan& node) {
+    if (node.kind() == "Scan") {
+        const auto& table = static_cast<const LogicalScan&>(node).table();
+        auto fmt = table.properties.find("format");
+        if (fmt != table.properties.end() && fmt->second == "json") {
+            return true;
+        }
+        return table.columns.size() > 1;
+    }
+    auto inputs = node.inputs();
+    if (inputs.empty()) {
+        return true;  // no scan below: let the planner report it, not us
+    }
+    return plan_is_row_channel(*inputs[0]);
+}
+
 }  // namespace
 
 SubmitFn make_http_submit(std::string coordinator_host,
@@ -512,6 +534,9 @@ int run_script(const std::string& sql,
                         def.columns.push_back(ColumnSpec{field->name(), field->type()});
                     }
                     def.properties["connector"] = "collect";
+                    if (plan_is_row_channel(*plan)) {
+                        def.properties["format"] = "json";
+                    }
                     if (is_changelog_plan(*plan)) {
                         def.properties["changelog"] = "true";
                     }
@@ -537,6 +562,9 @@ int run_script(const std::string& sql,
                         def.columns.push_back(ColumnSpec{field->name(), field->type()});
                     }
                     def.properties["connector"] = "print";
+                    if (plan_is_row_channel(*plan)) {
+                        def.properties["format"] = "json";
+                    }
                     catalog.register_table(def);
                     ast::InsertStmt ins;
                     ins.target.name = def.name;
