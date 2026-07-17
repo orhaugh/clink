@@ -173,7 +173,7 @@ public:
     void on_watermark(Watermark wm) override { inner_.on_watermark(wm); }
     void on_barrier(CheckpointBarrier b) override {
         // Pre-commit: flush in-flight records into the transaction.
-        // The actual broker-side commit happens when the JM marks
+        // The actual broker-side commit happens when the coordinator marks
         // the checkpoint globally durable via on_commit().
         inner_.flush();
         pending_checkpoint_ = b.id().value();
@@ -440,7 +440,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 opts.transactional_id += "-" + std::to_string(ctx.subtask_idx);
             }
             auto sink = std::make_shared<TwoPhaseCommitStringKafkaSink>(std::move(opts));
-            // Declare commit-group membership so the JM can
+            // Declare commit-group membership so the coordinator can
             // gate this sink's CommitCheckpoint on its group peers.
             if (auto cg = ctx.param_or("commit_group", ""); !cg.empty()) {
                 sink->set_commit_group(cg);

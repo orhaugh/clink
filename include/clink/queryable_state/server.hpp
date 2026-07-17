@@ -301,7 +301,7 @@ inline void register_routes(http::HttpServer& server,
 
     // Subtask-scoped route. Same payload shape as /api/v1/queryable_state/:slot
     // but composes the registry lookup key from (role, subtask_idx, slot)
-    // so multiple subtasks of the same op on the same TM don't collide
+    // so multiple subtasks of the same op on the same worker don't collide
     // on the same bare slot name.
     server.get(
         "/api/v1/queryable_state/op/:role/subtask/:subtask/slot/:slot",

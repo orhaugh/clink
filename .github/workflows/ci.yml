@@ -119,7 +119,7 @@ jobs:
         # parallel. This is the hard gate: the unit + SQL surface is clean on
         # Linux (verified - the normal build_and_test.sh leg is 2181/2181, and
         # the SQL-on suite is 100% in the pinned toolchain). Integration tests
-        # spawn real JM/TM processes and race on ephemeral ports + heartbeat
+        # spawn real coordinator/worker processes and race on ephemeral ports + heartbeat
         # timers under -j >1, so they run serially and advisory-only below.
         run: ctest --test-dir build --output-on-failure -j 8 --timeout 180 -LE integration
       - name: Test (integration, serial) [advisory]
@@ -165,10 +165,10 @@ jobs:
           target_link_libraries(smoke PRIVATE clink::core)
           EOF
           cat > smoke.cpp <<'EOF'
-          #include <clink/api/stream_execution_environment.hpp>
+          #include <clink/api/pipeline.hpp>
           int main() {
-              clink::api::StreamExecutionEnvironment env;
-              return env.graph().ops.size() == 0 ? 0 : 1;
+              clink::api::Pipeline p;
+              return p.graph().ops.size() == 0 ? 0 : 1;
           }
           EOF
           cmake -S . -B build
@@ -181,7 +181,7 @@ jobs:
   # all tests that spawn the clink CLI subprocess (CheckSavepointCli /
   # StateExportCli - the child's ASan diagnostics pollute the stdout they
   # assert on), stand up an embedded HTTP server (HttpModelProvider / PubSub),
-  # or run an in-process cluster (InlineOpsE2E / MiniCluster / JobManager*).
+  # or run an in-process cluster (InlineOpsE2E / TestCluster / Coordinator*).
   # Until those are made sanitizer-clean (suppress child ASan output / exclude
   # under sanitizers), continue-on-error keeps the legs running - so they still
   # catch a NEW regression - without red-lighting the pipeline. Flip to blocking

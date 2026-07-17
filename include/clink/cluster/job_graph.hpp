@@ -23,7 +23,7 @@ namespace clink::cluster {
 //   * parallelism - number of subtasks this operator runs as. v1: must
 //                   be 1; the JobPlanner enforces this.
 //   * out_channel - element type emitted by this operator. Used by the
-//                   generic subtask role on the TM to pick the right
+//                   generic subtask role on the worker to pick the right
 //                   network bridge codec and to type-cast the operator
 //                   factory's boxed result back to a concrete operator.
 //   * params      - free-form key=value strings consumed by the registered
@@ -42,7 +42,7 @@ struct OperatorSpec {
     std::string type;
     std::string id;
     // Optional human-readable label. Used for logs, metrics, dashboard
-    // UI. Defaults to empty; the planner / TM use `type` or `id` as
+    // UI. Defaults to empty; the planner / worker use `type` or `id` as
     // the display fallback. Set via DataStream<T>::name("...").
     std::string display_name;
     // Optional stable identifier - `.uid("...")`. When set,
@@ -57,7 +57,7 @@ struct OperatorSpec {
     // Bounds for adaptive rescaling. When both are zero
     // (the default), this operator does NOT participate in
     // autoscaling - its parallelism stays at the static value above.
-    // When `max_parallelism > parallelism`, the JM's autoscaler
+    // When `max_parallelism > parallelism`, the coordinator's autoscaler
     // may scale this operator up to max_parallelism in
     // response to backpressure / load signals. When
     // `min_parallelism < parallelism`, it may scale down to
@@ -89,10 +89,10 @@ struct OperatorSpec {
 };
 
 // A SQL-declared scalar function the job's expressions call, shipped with
-// the spec so every TaskManager can register it at deploy time (the module
+// the spec so every Worker can register it at deploy time (the module
 // path in `definitions` is only readable where the CREATE FUNCTION ran).
 // Types are Arrow ToString() names ("int64", "double", ...); the module
-// payload is base64 so the spec stays valid JSON. Registration on the TM is
+// payload is base64 so the spec stays valid JSON. Registration on the worker is
 // process-wide and idempotent (a re-deploy replaces the same name), matching
 // how C++-registered UDFs from a job plugin behave.
 struct UdfSpec {
@@ -114,7 +114,7 @@ std::string pack_udf_specs(const std::vector<UdfSpec>& udfs);
 std::vector<UdfSpec> unpack_udf_specs(std::string_view packed);
 
 // JobGraphSpec is the wire-shaped logical description of a job (
-// JobGraph). The clink JM translates it into a JobPlan (
+// JobGraph). The clink coordinator translates it into a JobPlan (
 // ExecutionGraph) by applying placement and parallelism expansion.
 struct JobGraphSpec {
     std::vector<OperatorSpec> ops;
@@ -130,21 +130,21 @@ struct JobGraphSpec {
     // object keyed by sink op id:
     //   {"<sink_id>":[{"output":"c","transformation":"IDENTITY",
     //                  "inputs":[{"namespace":"..","name":"..","field":".."}]}]}
-    // Empty for non-SQL jobs. Carried so the JM's extract_lineage can attach
+    // Empty for non-SQL jobs. Carried so the coordinator's extract_lineage can attach
     // it to the sink datasets; survives HA restart with the rest of the spec.
     std::string column_lineage;
 
     // State schema evolution: the versions the job expects per
     // (op, state_type), declared via env.expect_state_version(...).
-    // Carried in the submitted spec so the JM/TM can migrate restored
+    // Carried in the submitted spec so the coordinator/worker can migrate restored
     // state (and a future submit-gate can reject an unbridgeable
     // restore). Empty for jobs that declare nothing. Serialized as a
     // single packed string in to_json/from_json.
     StateVersionMap expected_state_versions;
 
     // SQL-declared scalar functions (CREATE FUNCTION ... LANGUAGE ...)
-    // this job's expressions call, module payloads included. The JM
-    // threads them to every TaskManager in the DeployMsg; a TM registers
+    // this job's expressions call, module payloads included. The coordinator
+    // threads them to every Worker in the DeployMsg; a worker registers
     // each before running the job's subtasks. Empty for jobs that use
     // none. Survives HA restart with the rest of the spec.
     std::vector<UdfSpec> udfs;

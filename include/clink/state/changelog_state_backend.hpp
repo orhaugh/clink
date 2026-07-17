@@ -157,7 +157,7 @@ public:
     // <dir>/changelog-<id>.snap - off-thread on the snapshot worker). The
     // in-RAM `changelog://` scheme has no durable write to defer, so it
     // stays synchronous (supports_async_persist() returns false). A persist
-    // failure is non-lossy: the checkpoint is never ack'd, so the JM rolls
+    // failure is non-lossy: the checkpoint is never ack'd, so the coordinator rolls
     // the WHOLE job back to the last completed checkpoint and the sources
     // replay their input since then - a per-subtask backend never needs to
     // retain state newer than the last globally-completed checkpoint, so

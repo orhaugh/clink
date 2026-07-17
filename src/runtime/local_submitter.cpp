@@ -6,7 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/cluster/dag_builder_registry.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/type_registry.hpp"
@@ -17,7 +17,7 @@
 
 namespace clink::cluster {
 
-void LocalSubmitter::submit(api::StreamExecutionEnvironment& env) {
+void LocalSubmitter::submit(api::Pipeline& env) {
     // Convenience default: a bare submit(env) with no chosen backend rides the
     // disagg-local:// deferring backend, so keyed pipelines work out of the box
     // AND the async/disaggregated execution path is exercised without S3. It is
@@ -32,7 +32,7 @@ void LocalSubmitter::submit(api::StreamExecutionEnvironment& env) {
     submit(env, std::move(config));
 }
 
-void LocalSubmitter::submit(api::StreamExecutionEnvironment& env, JobConfig config) {
+void LocalSubmitter::submit(api::Pipeline& env, JobConfig config) {
     const auto& graph = env.graph();
 
     // Run the planner's structural invariants. `validate` throws on

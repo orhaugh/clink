@@ -191,7 +191,7 @@ Registering the factories with a runtime registry (callers invoke this after `en
 ```cpp
 #include "clink/postgres/install.hpp"
 
-clink::api::StreamExecutionEnvironment env;
+clink::api::Pipeline env;
 clink::postgres::install(env.registry());
 // "postgres_source", "postgres_cdc_source", "postgres_sink", etc. are now resolvable,
 // and the PostgresRow / CdcEvent typed channels are registered.

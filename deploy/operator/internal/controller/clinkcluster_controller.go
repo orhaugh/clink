@@ -47,7 +47,7 @@ func (r *ClinkClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// Normalize zero-value fields to their documented defaults. CRD/OpenAPI
 	// defaulting does not materialize a wholly-omitted nested object (e.g. an
-	// absent spec.jobManager) to fill its field defaults, so the operator applies
+	// absent spec.coordinator) to fill its field defaults, so the operator applies
 	// them itself - correctness must not depend on API-server defaulting.
 	applyDefaults(&cc)
 
@@ -70,29 +70,29 @@ func (r *ClinkClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, err
 		}
 	}
-	if err := r.reconcileJMService(ctx, &cc); err != nil {
+	if err := r.reconcileCoordinatorService(ctx, &cc); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcileTMHeadlessService(ctx, &cc); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileJMDeployment(ctx, &cc, jmReplicas); err != nil {
+	if err := r.reconcileCoordinatorDeployment(ctx, &cc, jmReplicas); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcileTMStatefulSet(ctx, &cc); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	tmReady := r.registeredTaskManagers(ctx, &cc)
+	tmReady := r.registeredWorkers(ctx, &cc)
 
 	// Status.
 	phase := "Pending"
-	if tmReady >= cc.Spec.TaskManager.Replicas && cc.Spec.TaskManager.Replicas > 0 {
+	if tmReady >= cc.Spec.Worker.Replicas && cc.Spec.Worker.Replicas > 0 {
 		phase = "Running"
 	}
 	cc.Status.Phase = phase
-	cc.Status.JobManagerReplicas = jmReplicas
-	cc.Status.TaskManagersReady = tmReady
+	cc.Status.CoordinatorReplicas = jmReplicas
+	cc.Status.WorkersReady = tmReady
 	cc.Status.ObservedGeneration = cc.Generation
 	if err := r.Status().Update(ctx, &cc); err != nil {
 		lg.Info("status update deferred", "reason", err.Error())
@@ -106,7 +106,7 @@ func (r *ClinkClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 }
 
 // applyDefaults fills zero-value spec fields with the documented defaults so the
-// operator behaves correctly for a minimal CR (only image + taskManager.replicas,
+// operator behaves correctly for a minimal CR (only image + worker.replicas,
 // say) regardless of whether CRD-level defaulting materialized nested objects.
 func applyDefaults(cc *clinkv1alpha1.ClinkCluster) {
 	s := &cc.Spec
@@ -119,23 +119,23 @@ func applyDefaults(cc *clinkv1alpha1.ClinkCluster) {
 	if s.Image.PullPolicy == "" {
 		s.Image.PullPolicy = corev1.PullIfNotPresent
 	}
-	if s.JobManager.ControlPort == 0 {
-		s.JobManager.ControlPort = 6123
+	if s.Coordinator.ControlPort == 0 {
+		s.Coordinator.ControlPort = 6123
 	}
-	if s.JobManager.HTTPPort == 0 {
-		s.JobManager.HTTPPort = 8081
+	if s.Coordinator.HTTPPort == 0 {
+		s.Coordinator.HTTPPort = 8081
 	}
-	if s.TaskManager.Replicas == 0 {
-		s.TaskManager.Replicas = 2
+	if s.Worker.Replicas == 0 {
+		s.Worker.Replicas = 2
 	}
-	if s.TaskManager.Slots == 0 {
-		s.TaskManager.Slots = 4
+	if s.Worker.Slots == 0 {
+		s.Worker.Slots = 4
 	}
-	if s.TaskManager.HTTPPort == 0 {
-		s.TaskManager.HTTPPort = 8082
+	if s.Worker.HTTPPort == 0 {
+		s.Worker.HTTPPort = 8082
 	}
-	if s.TaskManager.TerminationGracePeriodSeconds == 0 {
-		s.TaskManager.TerminationGracePeriodSeconds = 30
+	if s.Worker.TerminationGracePeriodSeconds == 0 {
+		s.Worker.TerminationGracePeriodSeconds = 30
 	}
 	if s.HA.Enabled {
 		if s.HA.Replicas < 2 {
@@ -167,13 +167,13 @@ func applyDefaults(cc *clinkv1alpha1.ClinkCluster) {
 // ---- naming + labels -------------------------------------------------------
 
 func (r *ClinkClusterReconciler) jmName(cc *clinkv1alpha1.ClinkCluster) string {
-	return cc.Name + "-jobmanager"
+	return cc.Name + "-coordinator"
 }
 func (r *ClinkClusterReconciler) tmName(cc *clinkv1alpha1.ClinkCluster) string {
-	return cc.Name + "-taskmanager"
+	return cc.Name + "-worker"
 }
 func (r *ClinkClusterReconciler) tmHeadlessName(cc *clinkv1alpha1.ClinkCluster) string {
-	return cc.Name + "-taskmanager-headless"
+	return cc.Name + "-worker-headless"
 }
 func (r *ClinkClusterReconciler) haPVCName(cc *clinkv1alpha1.ClinkCluster) string {
 	return cc.Name + "-ha"
@@ -182,7 +182,7 @@ func (r *ClinkClusterReconciler) checkpointPVCName(cc *clinkv1alpha1.ClinkCluste
 	return cc.Name + "-checkpoints"
 }
 
-// checkpointVolume returns the shared checkpoint volume + mount for a JM/TM pod,
+// checkpointVolume returns the shared checkpoint volume + mount for a coordinator/worker pod,
 // or ok=false when checkpoint storage is disabled.
 func (r *ClinkClusterReconciler) checkpointVolume(cc *clinkv1alpha1.ClinkCluster) (corev1.Volume, corev1.VolumeMount, bool) {
 	cs := cc.Spec.CheckpointStorage
@@ -286,15 +286,15 @@ func (r *ClinkClusterReconciler) reconcileCheckpointPVC(ctx context.Context, cc 
 	return r.Create(ctx, pvc)
 }
 
-func (r *ClinkClusterReconciler) reconcileJMService(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) error {
+func (r *ClinkClusterReconciler) reconcileCoordinatorService(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) error {
 	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: r.jmName(cc), Namespace: cc.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
-		svc.Labels = componentLabels(cc, "jobmanager")
-		svc.Spec.Selector = selectorLabels(cc, "jobmanager")
+		svc.Labels = componentLabels(cc, "coordinator")
+		svc.Spec.Selector = selectorLabels(cc, "coordinator")
 		svc.Spec.Type = corev1.ServiceTypeClusterIP
 		svc.Spec.Ports = []corev1.ServicePort{
-			{Name: "control", Port: cc.Spec.JobManager.ControlPort, TargetPort: intstr.FromInt32(cc.Spec.JobManager.ControlPort)},
-			{Name: "http", Port: cc.Spec.JobManager.HTTPPort, TargetPort: intstr.FromInt32(cc.Spec.JobManager.HTTPPort)},
+			{Name: "control", Port: cc.Spec.Coordinator.ControlPort, TargetPort: intstr.FromInt32(cc.Spec.Coordinator.ControlPort)},
+			{Name: "http", Port: cc.Spec.Coordinator.HTTPPort, TargetPort: intstr.FromInt32(cc.Spec.Coordinator.HTTPPort)},
 		}
 		return controllerutil.SetControllerReference(cc, svc, r.Scheme)
 	})
@@ -304,33 +304,33 @@ func (r *ClinkClusterReconciler) reconcileJMService(ctx context.Context, cc *cli
 func (r *ClinkClusterReconciler) reconcileTMHeadlessService(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) error {
 	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: r.tmHeadlessName(cc), Namespace: cc.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
-		svc.Labels = componentLabels(cc, "taskmanager")
-		svc.Spec.Selector = selectorLabels(cc, "taskmanager")
+		svc.Labels = componentLabels(cc, "worker")
+		svc.Spec.Selector = selectorLabels(cc, "worker")
 		svc.Spec.ClusterIP = corev1.ClusterIPNone
 		svc.Spec.PublishNotReadyAddresses = true
 		svc.Spec.Ports = []corev1.ServicePort{
-			{Name: "http", Port: cc.Spec.TaskManager.HTTPPort, TargetPort: intstr.FromInt32(cc.Spec.TaskManager.HTTPPort)},
+			{Name: "http", Port: cc.Spec.Worker.HTTPPort, TargetPort: intstr.FromInt32(cc.Spec.Worker.HTTPPort)},
 		}
 		return controllerutil.SetControllerReference(cc, svc, r.Scheme)
 	})
 	return err
 }
 
-func (r *ClinkClusterReconciler) reconcileJMDeployment(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, replicas int32) error {
+func (r *ClinkClusterReconciler) reconcileCoordinatorDeployment(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, replicas int32) error {
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: r.jmName(cc), Namespace: cc.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
-		dep.Labels = componentLabels(cc, "jobmanager")
+		dep.Labels = componentLabels(cc, "coordinator")
 		dep.Spec.Replicas = &replicas
 		strat := appsv1.RecreateDeploymentStrategyType
 		if cc.Spec.HA.Enabled {
 			strat = appsv1.RollingUpdateDeploymentStrategyType
 		}
 		dep.Spec.Strategy = appsv1.DeploymentStrategy{Type: strat}
-		dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: selectorLabels(cc, "jobmanager")}
+		dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: selectorLabels(cc, "coordinator")}
 
 		args := []string{
-			"--role=jm",
-			fmt.Sprintf("--port=%d", cc.Spec.JobManager.ControlPort),
+			"--role=coordinator",
+			fmt.Sprintf("--port=%d", cc.Spec.Coordinator.ControlPort),
 			"--bind-host=0.0.0.0",
 		}
 		var env []corev1.EnvVar
@@ -340,26 +340,26 @@ func (r *ClinkClusterReconciler) reconcileJMDeployment(ctx context.Context, cc *
 		} else {
 			args = append(args, "--advertise-host="+r.jmName(cc))
 		}
-		args = append(args, fmt.Sprintf("--http-port=%d", cc.Spec.JobManager.HTTPPort), "--http-bind=0.0.0.0")
-		if cc.Spec.JobManager.StateBackend != "" {
-			args = append(args, "--state-backend="+cc.Spec.JobManager.StateBackend)
+		args = append(args, fmt.Sprintf("--http-port=%d", cc.Spec.Coordinator.HTTPPort), "--http-bind=0.0.0.0")
+		if cc.Spec.Coordinator.StateBackend != "" {
+			args = append(args, "--state-backend="+cc.Spec.Coordinator.StateBackend)
 		}
-		args = append(args, cc.Spec.JobManager.ExtraArgs...)
-		env = append(env, parseEnvKVs(cc.Spec.JobManager.Env)...)
+		args = append(args, cc.Spec.Coordinator.ExtraArgs...)
+		env = append(env, parseEnvKVs(cc.Spec.Coordinator.Env)...)
 
 		c := corev1.Container{
-			Name:            "jobmanager",
+			Name:            "coordinator",
 			Image:           r.image(cc),
 			ImagePullPolicy: cc.Spec.Image.PullPolicy,
 			Args:            args,
 			Env:             env,
 			Ports: []corev1.ContainerPort{
-				{Name: "control", ContainerPort: cc.Spec.JobManager.ControlPort},
-				{Name: "http", ContainerPort: cc.Spec.JobManager.HTTPPort},
+				{Name: "control", ContainerPort: cc.Spec.Coordinator.ControlPort},
+				{Name: "http", ContainerPort: cc.Spec.Coordinator.HTTPPort},
 			},
 			ReadinessProbe: httpProbe("/api/v1/health", "http", 2, 5, 6),
 			LivenessProbe:  httpProbe("/api/v1/health", "http", 10, 10, 6),
-			Resources:      cc.Spec.JobManager.Resources,
+			Resources:      cc.Spec.Coordinator.Resources,
 		}
 		var volumes []corev1.Volume
 		var mounts []corev1.VolumeMount
@@ -375,7 +375,7 @@ func (r *ClinkClusterReconciler) reconcileJMDeployment(ctx context.Context, cc *
 		}
 		c.VolumeMounts = mounts
 		dep.Spec.Template = corev1.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{Labels: componentLabels(cc, "jobmanager")},
+			ObjectMeta: metav1.ObjectMeta{Labels: componentLabels(cc, "coordinator")},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: r.serviceAccountName(cc),
 				ImagePullSecrets:   cc.Spec.ImagePullSecrets,
@@ -391,45 +391,45 @@ func (r *ClinkClusterReconciler) reconcileJMDeployment(ctx context.Context, cc *
 func (r *ClinkClusterReconciler) reconcileTMStatefulSet(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) error {
 	ss := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: r.tmName(cc), Namespace: cc.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, ss, func() error {
-		ss.Labels = componentLabels(cc, "taskmanager")
-		replicas := cc.Spec.TaskManager.Replicas
+		ss.Labels = componentLabels(cc, "worker")
+		replicas := cc.Spec.Worker.Replicas
 		ss.Spec.Replicas = &replicas
 		ss.Spec.ServiceName = r.tmHeadlessName(cc)
 		ss.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
-		ss.Spec.Selector = &metav1.LabelSelector{MatchLabels: selectorLabels(cc, "taskmanager")}
+		ss.Spec.Selector = &metav1.LabelSelector{MatchLabels: selectorLabels(cc, "worker")}
 
 		waitCmd := fmt.Sprintf(
-			"until curl -fsS \"http://%s:%d/api/v1/health\" >/dev/null 2>&1; do echo waiting for jobmanager...; sleep 2; done; echo jobmanager is ready",
-			r.jmName(cc), cc.Spec.JobManager.HTTPPort)
+			"until curl -fsS \"http://%s:%d/api/v1/health\" >/dev/null 2>&1; do echo waiting for coordinator...; sleep 2; done; echo coordinator is ready",
+			r.jmName(cc), cc.Spec.Coordinator.HTTPPort)
 
 		args := []string{
-			"--role=tm",
+			"--role=worker",
 			"--id=$(POD_NAME)",
-			"--jm-host=" + r.jmName(cc),
-			fmt.Sprintf("--jm-port=%d", cc.Spec.JobManager.ControlPort),
+			"--coordinator-host=" + r.jmName(cc),
+			fmt.Sprintf("--coordinator-port=%d", cc.Spec.Coordinator.ControlPort),
 			"--data-host=$(POD_IP)",
-			fmt.Sprintf("--slots=%d", cc.Spec.TaskManager.Slots),
-			fmt.Sprintf("--http-port=%d", cc.Spec.TaskManager.HTTPPort),
+			fmt.Sprintf("--slots=%d", cc.Spec.Worker.Slots),
+			fmt.Sprintf("--http-port=%d", cc.Spec.Worker.HTTPPort),
 			"--http-bind=0.0.0.0",
 		}
 		if cc.Spec.HA.Enabled {
 			args = append(args, "--ha-dir="+cc.Spec.HA.MountPath)
 		}
-		args = append(args, cc.Spec.TaskManager.ExtraArgs...)
+		args = append(args, cc.Spec.Worker.ExtraArgs...)
 
-		grace := cc.Spec.TaskManager.TerminationGracePeriodSeconds
-		tm := corev1.Container{
-			Name:            "taskmanager",
+		grace := cc.Spec.Worker.TerminationGracePeriodSeconds
+		worker := corev1.Container{
+			Name:            "worker",
 			Image:           r.image(cc),
 			ImagePullPolicy: cc.Spec.Image.PullPolicy,
 			Env: append([]corev1.EnvVar{
 				{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
 				{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
 				{Name: "CLINK_DATA_BIND_HOST", Value: "0.0.0.0"},
-			}, parseEnvKVs(cc.Spec.TaskManager.Env)...),
+			}, parseEnvKVs(cc.Spec.Worker.Env)...),
 			Args:      args,
-			Ports:     []corev1.ContainerPort{{Name: "http", ContainerPort: cc.Spec.TaskManager.HTTPPort}},
-			Resources: cc.Spec.TaskManager.Resources,
+			Ports:     []corev1.ContainerPort{{Name: "http", ContainerPort: cc.Spec.Worker.HTTPPort}},
+			Resources: cc.Spec.Worker.Resources,
 		}
 		var volumes []corev1.Volume
 		var mounts []corev1.VolumeMount
@@ -443,20 +443,20 @@ func (r *ClinkClusterReconciler) reconcileTMStatefulSet(ctx context.Context, cc 
 			mounts = append(mounts, m)
 			volumes = append(volumes, v)
 		}
-		tm.VolumeMounts = mounts
+		worker.VolumeMounts = mounts
 		ss.Spec.Template = corev1.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{Labels: componentLabels(cc, "taskmanager")},
+			ObjectMeta: metav1.ObjectMeta{Labels: componentLabels(cc, "worker")},
 			Spec: corev1.PodSpec{
 				ServiceAccountName:            r.serviceAccountName(cc),
 				ImagePullSecrets:              cc.Spec.ImagePullSecrets,
 				TerminationGracePeriodSeconds: &grace,
 				InitContainers: []corev1.Container{{
-					Name:            "wait-for-jobmanager",
+					Name:            "wait-for-coordinator",
 					Image:           r.image(cc),
 					ImagePullPolicy: cc.Spec.Image.PullPolicy,
 					Command:         []string{"sh", "-c", waitCmd},
 				}},
-				Containers: []corev1.Container{tm},
+				Containers: []corev1.Container{worker},
 				Volumes:    volumes,
 			},
 		}
@@ -487,19 +487,19 @@ func parseEnvKVs(kvs []string) []corev1.EnvVar {
 	return out
 }
 
-// ---- JobManager HTTP (status + job submission) -----------------------------
+// ---- Coordinator HTTP (status + job submission) -----------------------------
 
 func (r *ClinkClusterReconciler) jmBaseURL(cc *clinkv1alpha1.ClinkCluster) string {
-	return fmt.Sprintf("http://%s.%s.svc:%d", r.jmName(cc), cc.Namespace, cc.Spec.JobManager.HTTPPort)
+	return fmt.Sprintf("http://%s.%s.svc:%d", r.jmName(cc), cc.Namespace, cc.Spec.Coordinator.HTTPPort)
 }
 
-// registeredTaskManagers reads the JM's /api/v1/tms and counts entries. Returns
-// 0 if the JM is not yet reachable (cluster still coming up).
-func (r *ClinkClusterReconciler) registeredTaskManagers(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) int32 {
+// registeredWorkers reads the coordinator's /api/v1/workers and counts entries. Returns
+// 0 if the coordinator is not yet reachable (cluster still coming up).
+func (r *ClinkClusterReconciler) registeredWorkers(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) int32 {
 	cli := &http.Client{Timeout: 3 * time.Second}
 	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, r.jmBaseURL(cc)+"/api/v1/tms", nil)
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, r.jmBaseURL(cc)+"/api/v1/workers", nil)
 	if err != nil {
 		return 0
 	}
@@ -515,7 +515,7 @@ func (r *ClinkClusterReconciler) registeredTaskManagers(ctx context.Context, cc 
 	if err != nil {
 		return 0
 	}
-	return int32(strings.Count(string(body), "\"tm_id\""))
+	return int32(strings.Count(string(body), "\"worker_id\""))
 }
 
 // SetupWithManager wires the reconciler to watch ClinkCluster + its owned kinds.

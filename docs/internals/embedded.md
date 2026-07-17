@@ -6,20 +6,20 @@
 
 ## Overview
 
-Embedded execution packages the full runtime - JobManager, TaskManager, the SQL
+Embedded execution packages the full runtime - Coordinator, Worker, the SQL
 frontend, and every linked connector - inside a single process. The connector
 catalogue is installed through `clink::plugin::install_defaults` at the front
 doors (`clink run`'s tool TU and libclink's `clink_engine_open`), whose
 `CLINK_HAS_*` guards resolve in a TU that links the impls - so embedded SQL
 reaches the same connectors a cluster node does (Kafka, Iceberg, Postgres, ...),
 not just the built-ins. `clink run
-pipeline.sql` starts an in-process JobManager and TaskManager pair connected
+pipeline.sql` starts an in-process Coordinator and Worker pair connected
 over an ephemeral loopback port, folds the script's DDL into a session catalog,
 compiles each `INSERT INTO ... SELECT` (or materialized-view statement) to a
-`JobGraphSpec`, submits it straight to the in-process JobManager, and blocks
+`JobGraphSpec`, submits it straight to the in-process Coordinator, and blocks
 until the jobs finish. Nothing about the job differs from cluster execution:
-the same planner, the same chain materialisation on the TaskManager, the same
-checkpointing machinery. Adding `--jm-host`/`--jm-port` to the same command
+the same planner, the same chain materialisation on the Worker, the same
+checkpointing machinery. Adding `--coordinator-host`/`--coordinator-port` to the same command
 compiles the same file and submits it to a running cluster instead - one verb
 from laptop to cluster.
 
@@ -37,7 +37,7 @@ silently regress.
 ## Where it lives
 
 - `include/clink/embed/embedded_engine.hpp`, `src/embed/embedded_engine.cpp` -
-  `EmbeddedEngine`: the in-process JM + TM pair plus the script-execution and
+  `EmbeddedEngine`: the in-process coordinator + worker pair plus the script-execution and
   await/cancel surface. The `clink::embed` CMake target.
 - `include/clink/embed/clink.h`, `src/embed/clink_c.cpp` - libclink: the
   pure-C ABI over EmbeddedEngine (`clink_shared` CMake target, artifact
@@ -51,7 +51,7 @@ silently regress.
   `run_script`: the statement-processing loop shared by `clink_submit_sql`,
   the embedded runner, and any future front door. DDL folds into the caller's
   catalog; every compiled job goes to a caller-supplied `SubmitFn` (HTTP POST
-  for the tool, `JobManager::submit_job` for the embedded engine).
+  for the tool, `Coordinator::submit_job` for the embedded engine).
 - `tools/clink_run_sql.cpp` - the `clink run <file>.sql` front end: flag
   parsing, the embedded/remote fork, and Ctrl-C handling.
   `tools/clink_run_sql_stub.cpp` links in its place when the build has no SQL
@@ -66,8 +66,8 @@ silently regress.
 
 `EmbeddedEngine`'s constructor installs the built-in and SQL operator
 factories once per process, then builds the same topology the SqlRuntime
-end-to-end suite proves: `JobManager::start(0)` binds an ephemeral loopback
-port, `expect_tms` + `TaskManager::connect_to_jm` + `await_registrations`
+end-to-end suite proves: `Coordinator::start(0)` binds an ephemeral loopback
+port, `expect_workers` + `Worker::connect_to_coordinator` + `await_registrations`
 make registration deterministic (no settle sleeps). Slots default to 64 -
 slots are placement bookkeeping, not threads, so a generous default keeps
 deep plans deployable at no cost.
@@ -101,7 +101,7 @@ and compiles the statement as `INSERT INTO` it. The print sink
 rows print with their kind prefixed (`-U` / `+U` / `-D`) and the
 `__row_kind` marker stripped, so a retracting TOP-N reads naturally. Remote
 submission rejects a bare SELECT: its print sink would write to a
-TaskManager's stdout, not the user's terminal.
+Worker's stdout, not the user's terminal.
 
 ### libclink and the collect sink
 
@@ -129,7 +129,7 @@ process-wide, queues are per-engine, so each engine registers its
 CollectHub under a fresh scope token and stamps that token onto every
 `collect_sink_row` op at submit time; the sink resolves its hub through the
 registry at open(). This is also what makes collect embedded-only: a
-cluster submit carries no scope (and cluster TaskManagers have no factory),
+cluster submit carries no scope (and cluster Workers have no factory),
 so it fails loudly rather than silently writing nowhere.
 
 Stream semantics: one consumer per table; `get_next` blocks until a batch
@@ -211,7 +211,7 @@ The session catalog behaves exactly like `clink_submit_sql`'s
 their initial population, but scheduler re-arming across engine restarts
 needs a catalog dir, same as a cluster. Parallelism above 1 fans plans out
 identically to a cluster submit; everything runs on the one in-process
-TaskManager's slots.
+Worker's slots.
 
 ## Verification
 

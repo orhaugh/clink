@@ -4,7 +4,7 @@
 
 ## Overview
 
-A clink job is a DAG of operators. The simplest way to run that DAG is the in-process `LocalExecutor`: it spawns one operating-system thread per DAG node (source, operator, sink, fork, split, union and so on) and lets them communicate through the bounded MPMC channels the DAG owns. There is no central scheduler loop; each thread runs its own operator's lifecycle to completion, and backpressure emerges naturally from the channels filling up. This is the runtime that single-process jobs use directly, and it is also the per-subtask engine that the distributed runtime instantiates inside each TaskManager.
+A clink job is a DAG of operators. The simplest way to run that DAG is the in-process `LocalExecutor`: it spawns one operating-system thread per DAG node (source, operator, sink, fork, split, union and so on) and lets them communicate through the bounded MPMC channels the DAG owns. There is no central scheduler loop; each thread runs its own operator's lifecycle to completion, and backpressure emerges naturally from the channels filling up. This is the runtime that single-process jobs use directly, and it is also the per-subtask engine that the distributed runtime instantiates inside each Worker.
 
 This page covers how one operator runs as a task: the lifecycle hooks the runner calls, the per-thread loop that pops input and emits output, how a checkpoint barrier triggers a state snapshot, how operator-thread exceptions are captured rather than crashing the process, and how cancellation and backpressure interact with that loop.
 
@@ -79,7 +79,7 @@ The runner's pop is timed: `in_channel->pop_for(timeout)` where the timeout is s
 
 ### Sources and sinks
 
-Sources have no input channel. The `add_source` runner restores the source's offset (if the source overrides `restore_offset`), calls `open()`, then loops `produce(emitter)` until it returns false or `should_stop()` becomes true. Between `produce()` calls it drains any checkpoint barriers that were injected into the source's pending queue (`inject_pending_barrier` / `take_pending_barrier`), calling `snapshot_offset` before emitting each barrier so the offset and the barrier reach durability together with respect to the record stream. On clean exhaustion of a bounded source it emits `Watermark::max()` to fire every downstream event-time window and timer, then handles the end-of-stream tail commit (a JM-coordinated final checkpoint on the cluster path, or a local terminal barrier in-process), before `flush`, `close` and closing the output channel.
+Sources have no input channel. The `add_source` runner restores the source's offset (if the source overrides `restore_offset`), calls `open()`, then loops `produce(emitter)` until it returns false or `should_stop()` becomes true. Between `produce()` calls it drains any checkpoint barriers that were injected into the source's pending queue (`inject_pending_barrier` / `take_pending_barrier`), calling `snapshot_offset` before emitting each barrier so the offset and the barrier reach durability together with respect to the record stream. On clean exhaustion of a bounded source it emits `Watermark::max()` to fire every downstream event-time window and timer, then handles the end-of-stream tail commit (a coordinator-coordinated final checkpoint on the cluster path, or a local terminal barrier in-process), before `flush`, `close` and closing the output channel.
 
 Sinks have no output channel. They consume `on_data` / `on_watermark` / `on_barrier`, with `flush()` before `close()`, and the two-phase-commit hooks `on_commit` / `on_abort` for sinks that participate in exactly-once. Connector-specific behaviour is documented separately; see [../connectors/README.md](../connectors/README.md).
 
@@ -105,7 +105,7 @@ A push or pop that stays blocked for longer than three seconds logs a greppable 
 Cancellation is one-way and idempotent. There are two ways to trigger it:
 
 1. `LocalExecutor::cancel()` sets the `cancel_` atomic and calls every runner's `cancel()` closure, which closes that runner's input and output channels.
-2. `JobConfig::external_cancel_token` (a `shared_ptr<atomic<bool>>` the TaskManager flips on a CancelJob): the executor spawns `external_cancel_watch_thread_`, which polls the token every 100ms and calls `cancel()` when it flips.
+2. `JobConfig::external_cancel_token` (a `shared_ptr<atomic<bool>>` the Worker flips on a CancelJob): the executor spawns `external_cancel_watch_thread_`, which polls the token every 100ms and calls `cancel()` when it flips.
 
 Each runner's `should_stop` predicate ORs the internal `cancel_` flag with the external token. The crucial mechanism is channel close: when `cancel()` closes a runner's channels, any `pop_for` / `pop` blocked on those channels wakes immediately (close notifies all waiters), so a runner sitting on an idle pop does not need a short timeout just to notice cancellation. The 30s pop timeout exists only as a slow heartbeat for paths that could change `should_stop()` without closing a channel. An operator-thread exception triggers the same path: the catch block sets `cancel_` and calls the failed runner's `cancel()`, so downstream threads drain and exit cleanly rather than hanging.
 
@@ -156,14 +156,14 @@ Both exit when `await_termination()` flips `running_` to false.
 | `JobConfig::unaligned_checkpoints` | `job_config.hpp` | `false` | Barrier alignment policy at multi-input operators (see [./checkpointing.md](./checkpointing.md)). |
 | `JobConfig::dead_letter_queue` | `job_config.hpp` | `nullptr` | When null, the executor installs a `LoggingDeadLetterQueue` so poison records are logged with zero config. |
 | `Dag` channel capacity | `dag.hpp` | `1024` elements | Per-edge `BoundedChannel` capacity; set via the `Dag` constructor or `set_default_channel_capacity`. |
-| `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS` | `dag.hpp` | `30000` | Source EOS wait for its JM-coordinated final checkpoint to commit. |
+| `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS` | `dag.hpp` | `30000` | Source EOS wait for its coordinator-coordinated final checkpoint to commit. |
 | `CLINK_DISABLE_COLUMNAR` | `dag.hpp` | unset | Diagnostic: force the row `process()` path even when a columnar fast path exists. No correctness effect. |
 
 ## Guarantees and caveats
 
 - One operator per OS thread. This is, by design, the simplest possible runtime (one `std::jthread` per DAG node); there is no cooperative scheduler, work-stealing pool or shard-per-core placement here. Thread pinning is opt-in and best-effort.
 - An operator-thread exception is captured into `operator_errors()` and winds the job down via cancellation rather than crashing the process. Only `std::exception` is caught at this site; the stack trace is best-effort and only present when built with `<stacktrace>` support (`CLINK_HAS_STACKTRACE`). The recorded trace is from the capture (runner) site, not the throw site.
-- Backpressure is automatic but in-process only: it propagates through blocking channel pushes. There is no credit-based flow control inside the executor; cross-TaskManager backpressure is handled by the network stack ([./network-stack.md](./network-stack.md)).
+- Backpressure is automatic but in-process only: it propagates through blocking channel pushes. There is no credit-based flow control inside the executor; cross-Worker backpressure is handled by the network stack ([./network-stack.md](./network-stack.md)).
 - The `flush()` end-of-input hook runs only on a clean shutdown, never on cancel, so buffered windows/joins emit residual output exactly when the stream ends naturally.
 - Async-state operators force-align at a barrier: they drain in-flight async work to quiescence before capture regardless of the barrier's mode, because drain-to-quiescence is incompatible with unaligned in-flight capture. For a single input this is lossless. See [./async-state-execution.md](./async-state-execution.md).
 - Timer restore on the operator path is same-parallelism only: timers ride operator-state and `restore_timers` narrows by key-group range on a rescale; the rescale timer-routing story is detailed in [./fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md).
@@ -174,7 +174,7 @@ Both exit when `await_termination()` flips `running_` to false.
 - [./architecture.md](./architecture.md) - where the local runtime sits in the component stack.
 - [./operator-model.md](./operator-model.md) - the operator interfaces and DAG construction the runner drives.
 - [./jobs-and-scheduling.md](./jobs-and-scheduling.md) - parallelism, batch planning and how runners are assembled.
-- [./distributed-runtime.md](./distributed-runtime.md) - how each TaskManager hosts a `LocalExecutor` per subtask.
+- [./distributed-runtime.md](./distributed-runtime.md) - how each Worker hosts a `LocalExecutor` per subtask.
 - [./network-stack.md](./network-stack.md) - cross-process channels and backpressure between subtasks.
 - [./checkpointing.md](./checkpointing.md) - barriers, alignment and the snapshot-on-barrier path.
 - [./state-and-backends.md](./state-and-backends.md) - the keyed state and backends the snapshot path persists.

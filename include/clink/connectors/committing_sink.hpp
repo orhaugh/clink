@@ -5,7 +5,7 @@
 // It owns the two-phase-commit choreography and the durable bookkeeping that
 // every exactly-once sink otherwise hand-rolls: persisting a per-checkpoint
 // "committable" into operator state at the barrier, finalising it when the
-// JobManager confirms the checkpoint is globally durable, rolling it back on
+// Coordinator confirms the checkpoint is globally durable, rolling it back on
 // abort, and re-committing anything left prepared-but-uncommitted after a
 // crash. A connector supplies only the verbs; the base supplies the protocol.
 //
@@ -38,8 +38,8 @@
 // captures the put made inside on_barrier, so a persisted handle survives a
 // crash and is replayed by recover_all_() at the next open().
 //
-// Commit-group and the JM round-trip are unchanged: a CommittingSink still
-// participates in set_commit_group() and its on_commit fires from the TM's
+// Commit-group and the coordinator round-trip are unchanged: a CommittingSink still
+// participates in set_commit_group() and its on_commit fires from the worker's
 // CommitCheckpoint handling exactly like any other sink.
 
 #include <cstdint>

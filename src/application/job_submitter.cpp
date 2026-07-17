@@ -46,8 +46,8 @@ std::optional<std::vector<std::byte>> read_frame_with_timeout(int fd, int timeou
 
 }  // namespace
 
-JobSubmitter::JobSubmitter(std::string jm_host, std::uint16_t jm_port)
-    : jm_host_(std::move(jm_host)), jm_port_(jm_port) {}
+JobSubmitter::JobSubmitter(std::string coordinator_host, std::uint16_t coordinator_port)
+    : coordinator_host_(std::move(coordinator_host)), coordinator_port_(coordinator_port) {}
 
 SubmitResult JobSubmitter::submit(const std::string& graph_json,
                                   const std::vector<std::string>& plugin_paths,
@@ -65,10 +65,10 @@ SubmitResult JobSubmitter::submit(const std::string& graph_json,
         }
     }
 
-    const int fd = NetworkSocket::connect_to(jm_host_, jm_port_);
+    const int fd = NetworkSocket::connect_to(coordinator_host_, coordinator_port_);
     if (fd < 0) {
-        result.reject_message =
-            "connect_to(" + jm_host_ + ":" + std::to_string(jm_port_) + ") failed";
+        result.reject_message = "connect_to(" + coordinator_host_ + ":" +
+                                std::to_string(coordinator_port_) + ") failed";
         return result;
     }
     // RAII for the socket; close on every exit path.
@@ -146,9 +146,10 @@ SubmitResult JobSubmitter::submit(const std::string& graph_json,
 JobSubmitter::ListResult JobSubmitter::list_jobs(std::chrono::milliseconds timeout) const {
     ListResult result;
 
-    const int fd = NetworkSocket::connect_to(jm_host_, jm_port_);
+    const int fd = NetworkSocket::connect_to(coordinator_host_, coordinator_port_);
     if (fd < 0) {
-        result.error = "connect_to(" + jm_host_ + ":" + std::to_string(jm_port_) + ") failed";
+        result.error = "connect_to(" + coordinator_host_ + ":" + std::to_string(coordinator_port_) +
+                       ") failed";
         return result;
     }
     struct FdCloser {

@@ -28,7 +28,7 @@
 
 #include "clink/api/clickhouse_builders.hpp"
 #include "clink/api/descriptors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 
 namespace clink::clickhouse {
 

@@ -1,14 +1,14 @@
 // TLS-1 cluster integration test.
 //
-// Verifies the JM accept_factory + TM connect_factory TLS path:
+// Verifies the coordinator accept_factory + worker connect_factory TLS path:
 //
 //   * Generate a self-signed cert via the openssl CLI as a fixture
 //     (the openssl CLI is on virtually every dev box; if not, skip).
-//   * Spawn a JM with --tls-cert/--tls-key.
-//   * Spawn a TM with --tls-ca pointing to the same cert.
-//   * Expect: TM appears in /api/v1/tms on the JM (proves the Register
+//   * Spawn a coordinator with --tls-cert/--tls-key.
+//   * Spawn a worker with --tls-ca pointing to the same cert.
+//   * Expect: worker appears in /api/v1/workers on the coordinator (proves the Register
 //     frame travelled over the TLS handshake successfully).
-//   * Plain-TCP TM trying to connect should fail.
+//   * Plain-TCP worker trying to connect should fail.
 
 #include <chrono>
 #include <cstdint>
@@ -144,7 +144,7 @@ std::filesystem::path generate_self_signed_cert() {
 
 }  // namespace
 
-TEST(ClusterTls, TmRegistersOverTlsControlPlane) {
+TEST(ClusterTls, WorkerRegistersOverTlsControlPlane) {
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node)) {
         GTEST_SKIP() << "clink_node not built";
@@ -158,45 +158,45 @@ TEST(ClusterTls, TmRegistersOverTlsControlPlane) {
 
     const auto control_port = probe_free_port();
     const auto http_port = probe_free_port();
-    const pid_t jm = spawn_proc({"clink_node",
-                                 "--role=jm",
-                                 "--port=" + std::to_string(control_port),
-                                 "--http-port=" + std::to_string(http_port),
-                                 "--http-bind=127.0.0.1",
-                                 "--tls-cert=" + cert,
-                                 "--tls-key=" + key},
-                                node);
-    ASSERT_GT(jm, 0);
-    // JM's HTTP listener is plain TCP (HTTPS is a separate slice), so
+    const pid_t coordinator = spawn_proc({"clink_node",
+                                          "--role=coordinator",
+                                          "--port=" + std::to_string(control_port),
+                                          "--http-port=" + std::to_string(http_port),
+                                          "--http-bind=127.0.0.1",
+                                          "--tls-cert=" + cert,
+                                          "--tls-key=" + key},
+                                         node);
+    ASSERT_GT(coordinator, 0);
+    // coordinator's HTTP listener is plain TCP (HTTPS is a separate slice), so
     // health-check goes through fine even with TLS on the control plane.
-    ASSERT_TRUE(await_http_ready(http_port, 3s)) << "JM didn't come up";
+    ASSERT_TRUE(await_http_ready(http_port, 3s)) << "coordinator didn't come up";
 
-    const auto tm_http = probe_free_port();
-    const std::string tm_id = "tm-tls";
-    const pid_t tm = spawn_proc({"clink_node",
-                                 "--role=tm",
-                                 "--id=" + tm_id,
-                                 "--jm-host=127.0.0.1",
-                                 "--jm-port=" + std::to_string(control_port),
-                                 "--http-port=" + std::to_string(tm_http),
-                                 "--http-bind=127.0.0.1",
-                                 "--tls-ca=" + cert},
-                                node);
-    ASSERT_GT(tm, 0);
-    ASSERT_TRUE(await_http_ready(tm_http, 3s)) << "TM didn't come up";
+    const auto worker_http = probe_free_port();
+    const std::string worker_id = "worker-tls";
+    const pid_t worker = spawn_proc({"clink_node",
+                                     "--role=worker",
+                                     "--id=" + worker_id,
+                                     "--coordinator-host=127.0.0.1",
+                                     "--coordinator-port=" + std::to_string(control_port),
+                                     "--http-port=" + std::to_string(worker_http),
+                                     "--http-bind=127.0.0.1",
+                                     "--tls-ca=" + cert},
+                                    node);
+    ASSERT_GT(worker, 0);
+    ASSERT_TRUE(await_http_ready(worker_http, 3s)) << "worker didn't come up";
 
-    // Give the TM ~500ms to complete its TLS handshake + Register frame.
+    // Give the worker ~500ms to complete its TLS handshake + Register frame.
     std::this_thread::sleep_for(500ms);
-    const auto r = http_get("127.0.0.1", http_port, "/api/v1/tms");
+    const auto r = http_get("127.0.0.1", http_port, "/api/v1/workers");
     EXPECT_EQ(r.status, 200);
-    EXPECT_NE(r.body.find("\"tm_id\":\"" + tm_id + "\""), std::string::npos)
-        << "TM didn't show up in /api/v1/tms; body: " << r.body;
+    EXPECT_NE(r.body.find("\"worker_id\":\"" + worker_id + "\""), std::string::npos)
+        << "worker didn't show up in /api/v1/workers; body: " << r.body;
 
-    kill_quietly(tm);
-    kill_quietly(jm);
+    kill_quietly(worker);
+    kill_quietly(coordinator);
 }
 
-TEST(ClusterTls, PlainTmCannotJoinTlsJm) {
+TEST(ClusterTls, PlainWorkerCannotJoinTlsCoordinator) {
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node)) {
         GTEST_SKIP() << "clink_node not built";
@@ -210,38 +210,38 @@ TEST(ClusterTls, PlainTmCannotJoinTlsJm) {
 
     const auto control_port = probe_free_port();
     const auto http_port = probe_free_port();
-    const pid_t jm = spawn_proc({"clink_node",
-                                 "--role=jm",
-                                 "--port=" + std::to_string(control_port),
-                                 "--http-port=" + std::to_string(http_port),
-                                 "--http-bind=127.0.0.1",
-                                 "--tls-cert=" + cert,
-                                 "--tls-key=" + key},
-                                node);
-    ASSERT_GT(jm, 0);
+    const pid_t coordinator = spawn_proc({"clink_node",
+                                          "--role=coordinator",
+                                          "--port=" + std::to_string(control_port),
+                                          "--http-port=" + std::to_string(http_port),
+                                          "--http-bind=127.0.0.1",
+                                          "--tls-cert=" + cert,
+                                          "--tls-key=" + key},
+                                         node);
+    ASSERT_GT(coordinator, 0);
     ASSERT_TRUE(await_http_ready(http_port, 3s));
 
-    // Spawn a TM WITHOUT --tls-ca: it should try plain TCP, fail the
+    // Spawn a worker WITHOUT --tls-ca: it should try plain TCP, fail the
     // handshake, and exit non-zero. We give it 2s to die.
-    const auto tm_http = probe_free_port();
-    const pid_t tm = spawn_proc({"clink_node",
-                                 "--role=tm",
-                                 "--id=tm-plain-fail",
-                                 "--jm-host=127.0.0.1",
-                                 "--jm-port=" + std::to_string(control_port),
-                                 "--http-port=" + std::to_string(tm_http),
-                                 "--http-bind=127.0.0.1"},
-                                node);
-    ASSERT_GT(tm, 0);
-    EXPECT_TRUE(wait_for_exit(tm, 3s))
-        << "plain-TCP TM should have exited fast when JM only speaks TLS";
+    const auto worker_http = probe_free_port();
+    const pid_t worker = spawn_proc({"clink_node",
+                                     "--role=worker",
+                                     "--id=worker-plain-fail",
+                                     "--coordinator-host=127.0.0.1",
+                                     "--coordinator-port=" + std::to_string(control_port),
+                                     "--http-port=" + std::to_string(worker_http),
+                                     "--http-bind=127.0.0.1"},
+                                    node);
+    ASSERT_GT(worker, 0);
+    EXPECT_TRUE(wait_for_exit(worker, 3s))
+        << "plain-TCP worker should have exited fast when coordinator only speaks TLS";
 
-    // JM /api/v1/tms should remain empty.
-    const auto r = http_get("127.0.0.1", http_port, "/api/v1/tms");
+    // coordinator /api/v1/workers should remain empty.
+    const auto r = http_get("127.0.0.1", http_port, "/api/v1/workers");
     EXPECT_EQ(r.status, 200);
-    EXPECT_EQ(r.body.find("tm-plain-fail"), std::string::npos)
-        << "plain TM should not have registered; body: " << r.body;
+    EXPECT_EQ(r.body.find("worker-plain-fail"), std::string::npos)
+        << "plain worker should not have registered; body: " << r.body;
 
-    kill_quietly(tm);
-    kill_quietly(jm);
+    kill_quietly(worker);
+    kill_quietly(coordinator);
 }

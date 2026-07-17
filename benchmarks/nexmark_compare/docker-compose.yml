@@ -1,7 +1,7 @@
 # Kafka + Flink stack for the cross-engine Nexmark comparison. Cloned from
 # benchmarks/flink_compare/docker-compose.yml. The Flink stanza (profile "flink")
-# is pinned to the image actually cached on this host; INC 4 must verify the
-# Flink SQL path on it. Kafka auto-creates topics (KAFKA_NUM_PARTITIONS sets the
+# runs the upstream Apache Flink image; the harness verifies the Flink SQL path
+# on that exact image. Kafka auto-creates topics (KAFKA_NUM_PARTITIONS sets the
 # default partition count == the matched parallelism).
 services:
   zookeeper:
@@ -75,24 +75,24 @@ services:
         state.backend.type: hashmap
 
   # Containerized clink cluster (profile "clink") for distributed functional
-  # verification: 1 JM + 4 TM, each its own container/hostname on this project
+  # verification: 1 coordinator + 4 workers, each its own container/hostname on this project
   # network, so subtasks shuffle over real container-to-container TCP (separate
   # network namespaces) and reach Kafka via the in-network listener kafka:29092.
-  # Image built by verify_distributed.sh from docker/Dockerfile.runtime. JM HTTP
-  # maps to host 8095 (8081 is taken by flink-jobmanager). 4 TM x 16 slots = 64,
+  # Image built by verify_distributed.sh from docker/Dockerfile.runtime. coordinator HTTP
+  # maps to host 8095 (8081 is taken by flink-jobmanager). 4 worker x 16 slots = 64,
   # enough for q8 at par=4 (~36 subtasks).
-  clink-jm:
+  clink-coordinator:
     image: clink-runtime:latest
     profiles: ["clink"]
-    hostname: clink-jm
+    hostname: clink-coordinator
     depends_on:
       kafka:
         condition: service_healthy
     command:
-      - --role=jm
+      - --role=coordinator
       - --port=6123
       - --bind-host=0.0.0.0
-      - --advertise-host=clink-jm
+      - --advertise-host=clink-coordinator
       - --http-port=8081
       - --http-bind=0.0.0.0
     ports:
@@ -104,19 +104,19 @@ services:
       retries: 40
       start_period: 2s
 
-  clink-tm1: &clink-tm
+  clink-worker1: &clink-worker
     image: clink-runtime:latest
     profiles: ["clink"]
-    hostname: clink-tm1
+    hostname: clink-worker1
     depends_on:
-      clink-jm:
+      clink-coordinator:
         condition: service_healthy
     command:
-      - --role=tm
-      - --id=tm-1
-      - --jm-host=clink-jm
-      - --jm-port=6123
-      - --data-host=clink-tm1
+      - --role=worker
+      - --id=worker-1
+      - --coordinator-host=clink-coordinator
+      - --coordinator-port=6123
+      - --data-host=clink-worker1
       - --slots=16
       - --http-port=8082
       - --http-bind=0.0.0.0
@@ -124,41 +124,41 @@ services:
       CLINK_DATA_BIND_HOST: 0.0.0.0
     restart: on-failure
 
-  clink-tm2:
-    <<: *clink-tm
-    hostname: clink-tm2
+  clink-worker2:
+    <<: *clink-worker
+    hostname: clink-worker2
     command:
-      - --role=tm
-      - --id=tm-2
-      - --jm-host=clink-jm
-      - --jm-port=6123
-      - --data-host=clink-tm2
+      - --role=worker
+      - --id=worker-2
+      - --coordinator-host=clink-coordinator
+      - --coordinator-port=6123
+      - --data-host=clink-worker2
       - --slots=16
       - --http-port=8082
       - --http-bind=0.0.0.0
 
-  clink-tm3:
-    <<: *clink-tm
-    hostname: clink-tm3
+  clink-worker3:
+    <<: *clink-worker
+    hostname: clink-worker3
     command:
-      - --role=tm
-      - --id=tm-3
-      - --jm-host=clink-jm
-      - --jm-port=6123
-      - --data-host=clink-tm3
+      - --role=worker
+      - --id=worker-3
+      - --coordinator-host=clink-coordinator
+      - --coordinator-port=6123
+      - --data-host=clink-worker3
       - --slots=16
       - --http-port=8082
       - --http-bind=0.0.0.0
 
-  clink-tm4:
-    <<: *clink-tm
-    hostname: clink-tm4
+  clink-worker4:
+    <<: *clink-worker
+    hostname: clink-worker4
     command:
-      - --role=tm
-      - --id=tm-4
-      - --jm-host=clink-jm
-      - --jm-port=6123
-      - --data-host=clink-tm4
+      - --role=worker
+      - --id=worker-4
+      - --coordinator-host=clink-coordinator
+      - --coordinator-port=6123
+      - --data-host=clink-worker4
       - --slots=16
       - --http-port=8082
       - --http-bind=0.0.0.0

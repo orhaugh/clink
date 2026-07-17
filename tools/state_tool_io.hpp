@@ -110,13 +110,13 @@ struct ResolvedInput {
     std::string label;
 };
 
-// Fetch a RUNNING job's whole keyed state from the JM's live-export
-// route (one canonical stream, fanned across the job's TMs and merged
-// JM-side). `jm` is "host:port" (default port 8081 when omitted).
+// Fetch a RUNNING job's whole keyed state from the coordinator's live-export
+// route (one canonical stream, fanned across the job's workers and merged
+// coordinator-side). `coordinator` is "host:port" (default port 8081 when omitted).
 // Live-view caveat: per-subtask atomic, not a checkpoint-consistent cut.
-inline std::vector<std::byte> fetch_live_job_state(const std::string& jm,
+inline std::vector<std::byte> fetch_live_job_state(const std::string& coordinator,
                                                    const std::string& job_id) {
-    std::string host = jm.empty() ? "127.0.0.1" : jm;
+    std::string host = coordinator.empty() ? "127.0.0.1" : coordinator;
     std::uint16_t port = 8081;
     if (const auto colon = host.rfind(':'); colon != std::string::npos) {
         port = static_cast<std::uint16_t>(std::stoul(host.substr(colon + 1)));
@@ -141,12 +141,13 @@ inline ResolvedInput resolve_state_input(
     const std::string& dir,
     const std::string& id_str,
     const std::string& job = {},
-    const std::string& jm = {},
+    const std::string& coordinator = {},
     const std::shared_ptr<clink::ExternalMaterializationStore>& store = nullptr) {
     ResolvedInput out;
     if (!job.empty()) {
-        out.bytes = fetch_live_job_state(jm, job);
-        out.label = "live job " + job + " @ " + (jm.empty() ? "127.0.0.1:8081" : jm);
+        out.bytes = fetch_live_job_state(coordinator, job);
+        out.label =
+            "live job " + job + " @ " + (coordinator.empty() ? "127.0.0.1:8081" : coordinator);
         return out;
     }
     if (!from.empty()) {

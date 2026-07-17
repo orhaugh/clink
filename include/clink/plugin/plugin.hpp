@@ -3,8 +3,8 @@
 // A clink plugin is a shared library compiled against these headers.
 // The library defines its own record types, sources, sinks, operators,
 // and selectors, and registers them by string name. A cluster client
-// uploads the .so as part of SubmitJob; the JM distributes it to TMs;
-// TMs dlopen and call into it.
+// uploads the .so as part of SubmitJob; the coordinator distributes it to workers;
+// workers dlopen and call into it.
 //
 // ABI compatibility:
 //   * The plugin and the cluster MUST be built from the same clink
@@ -18,7 +18,7 @@
 // Crash safety:
 //   * Plugin loaded with RTLD_LOCAL so its symbols don't pollute the
 //     global namespace.
-//   * A crash in plugin code terminates the TM process; JM watchdog
+//   * A crash in plugin code terminates the worker process; coordinator watchdog
 //     restarts per the job's max_restarts policy. v1 contract is
 //     "trust your own plugins"; sandboxing is on the v2 roadmap.
 
@@ -172,8 +172,8 @@ public:
 
     // 7-arg constructor: per-job bundle form. The DagBuilderRegistry
     // gets the inline-lambda DagBuilders so the chain dispatcher
-    // (task_manager.cpp) can find them via the per-job bundle. Without
-    // it, the dispatch falls through to the TM process's DagBuilderRegistry
+    // (worker.cpp) can find them via the per-job bundle. Without
+    // it, the dispatch falls through to the worker process's DagBuilderRegistry
     // singleton which (due to RTLD_LOCAL) doesn't see the .so's writes.
     PluginRegistry(clink::cluster::TypeRegistry& tr,
                    clink::cluster::RunnerRegistry& rr,

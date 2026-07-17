@@ -107,7 +107,7 @@ public:
 
     // Shutdown the group: wake every waiter. Members that re-join
     // after shutdown are accepted; this is purely a wake-up signal
-    // for tests and JM-driven cancellation.
+    // for tests and coordinator-driven cancellation.
     void shutdown() {
         {
             std::lock_guard lock(mu_);

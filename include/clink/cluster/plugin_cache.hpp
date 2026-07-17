@@ -26,7 +26,7 @@ std::string fnv1a_64_hex(std::span<const std::byte> bytes);
 //
 // `base_dir` defaults to a process-wide temp directory under
 // $TMPDIR/clink-plugins/<pid>/. Pass an explicit path to share a
-// cache across processes (e.g. integration tests with JM+TMs in
+// cache across processes (e.g. integration tests with coordinator+workers in
 // separate processes).
 std::string write_plugin_to_cache(const PluginBinary& blob, const std::string& base_dir = {});
 

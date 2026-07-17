@@ -7,7 +7,7 @@
 // depend on a built-in "tick" connector. The source's produce()
 // honours Source::cancelled() (inherited from Operator base) which
 // is what gives LocalExecutor's cancel-token plumbing something to
-// flip when the TaskManager handles CancelJob.
+// flip when the Worker handles CancelJob.
 
 #include <chrono>
 #include <cstdint>
@@ -16,7 +16,7 @@
 #include <thread>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/job/register_job.hpp"
 #include "clink/operators/source_operator.hpp"
@@ -58,10 +58,10 @@ std::chrono::milliseconds tick_from_env() {
     return std::chrono::milliseconds{20};
 }
 
-void define_job(clink::api::StreamExecutionEnvironment& env) {
+void define_job(clink::api::Pipeline& pipeline) {
     const auto tick = tick_from_env();
 
-    // Manually-registered sources via env.registry().register_source<T>
+    // Manually-registered sources via pipeline.registry().register_source<T>
     // need the built-in channel types in TypeRegistry first - the
     // template body looks up channel_for_typeid(typeid(T).name()),
     // which is empty until ensure_built_ins_registered has populated
@@ -70,19 +70,19 @@ void define_job(clink::api::StreamExecutionEnvironment& env) {
     clink::cluster::ensure_built_ins_registered();
 
     // Register the slow source factory in this job's bundle. The .so
-    // dlopened on the JM and each TM re-runs this build_fn and
+    // dlopened on the coordinator and each worker re-runs this build_fn and
     // re-registers - the per-job-bundle scoping keeps the
     // registrations isolated from other concurrent jobs.
-    env.registry().register_source<std::int64_t>("cancel_test.slow_source",
-                                                 [tick](const clink::plugin::BuildContext&) {
-                                                     return std::make_shared<SlowInt64Source>(tick);
-                                                 });
+    pipeline.registry().register_source<std::int64_t>(
+        "cancel_test.slow_source", [tick](const clink::plugin::BuildContext&) {
+            return std::make_shared<SlowInt64Source>(tick);
+        });
 
     clink::api::SourceDescriptor src;
     src.op_type = "cancel_test.slow_source";
     src.channel_type = "int64";
 
-    env.source<std::int64_t>(src)
+    pipeline.source<std::int64_t>(src)
         .map<std::int64_t>([](const std::int64_t& v) { return v + 1; })
         .sink(clink::api::FileInt64Sink::builder().path("/tmp/clink_cancel_test_sink").build());
 }

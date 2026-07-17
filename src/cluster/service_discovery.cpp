@@ -14,7 +14,7 @@ namespace clink::cluster {
 StaticConfigDiscovery::StaticConfigDiscovery(std::string host, std::uint16_t port)
     : ep_{.host = std::move(host), .port = port} {}
 
-std::optional<JobManagerEndpoint> StaticConfigDiscovery::discover_job_manager(
+std::optional<CoordinatorEndpoint> StaticConfigDiscovery::discover_coordinator(
     std::chrono::milliseconds /*timeout*/) {
     return ep_;
 }
@@ -24,7 +24,7 @@ std::optional<JobManagerEndpoint> StaticConfigDiscovery::discover_job_manager(
 EnvVarDiscovery::EnvVarDiscovery(std::string host_var, std::string port_var)
     : host_var_(std::move(host_var)), port_var_(std::move(port_var)) {}
 
-std::optional<JobManagerEndpoint> EnvVarDiscovery::discover_job_manager(
+std::optional<CoordinatorEndpoint> EnvVarDiscovery::discover_coordinator(
     std::chrono::milliseconds timeout) {
     // Poll: orchestrators sometimes inject env after the process starts
     // (K8s sidecars, init containers writing to /etc/env, etc.). Most of
@@ -35,8 +35,8 @@ std::optional<JobManagerEndpoint> EnvVarDiscovery::discover_job_manager(
         const char* port = std::getenv(port_var_.c_str());
         if (host != nullptr && port != nullptr && *host != '\0' && *port != '\0') {
             try {
-                return JobManagerEndpoint{.host = std::string{host},
-                                          .port = static_cast<std::uint16_t>(std::stoi(port))};
+                return CoordinatorEndpoint{.host = std::string{host},
+                                           .port = static_cast<std::uint16_t>(std::stoi(port))};
             } catch (const std::exception&) {
                 // Malformed port - give up, don't keep polling on bad input.
                 return std::nullopt;
@@ -49,7 +49,7 @@ std::optional<JobManagerEndpoint> EnvVarDiscovery::discover_job_manager(
     }
 }
 
-void EnvVarDiscovery::register_job_manager(const JobManagerEndpoint& ep) {
+void EnvVarDiscovery::register_coordinator(const CoordinatorEndpoint& ep) {
     ::setenv(host_var_.c_str(), ep.host.c_str(), 1);
     ::setenv(port_var_.c_str(), std::to_string(ep.port).c_str(), 1);
 }
@@ -58,7 +58,7 @@ void EnvVarDiscovery::register_job_manager(const JobManagerEndpoint& ep) {
 
 FileDiscovery::FileDiscovery(std::filesystem::path path) : path_(std::move(path)) {}
 
-std::optional<JobManagerEndpoint> FileDiscovery::discover_job_manager(
+std::optional<CoordinatorEndpoint> FileDiscovery::discover_coordinator(
     std::chrono::milliseconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (true) {
@@ -74,13 +74,13 @@ std::optional<JobManagerEndpoint> FileDiscovery::discover_job_manager(
                     try {
                         std::string host = line.substr(0, sep);
                         std::string port = line.substr(sep + 1);
-                        return JobManagerEndpoint{
+                        return CoordinatorEndpoint{
                             .host = std::move(host),
                             .port = static_cast<std::uint16_t>(std::stoi(port))};
                     } catch (const std::exception& e) {
                         // Partial / malformed line - keep polling: writer
                         // may still be flushing. Atomic rename in our own
-                        // register_job_manager prevents this, but external
+                        // register_coordinator prevents this, but external
                         // writers may not be atomic.
                         (void)e;
                     }
@@ -94,7 +94,7 @@ std::optional<JobManagerEndpoint> FileDiscovery::discover_job_manager(
     }
 }
 
-void FileDiscovery::register_job_manager(const JobManagerEndpoint& ep) {
+void FileDiscovery::register_coordinator(const CoordinatorEndpoint& ep) {
     // Atomic-rename pattern: write to ".tmp" then rename so a concurrent
     // reader never sees a half-written line.
     auto tmp = path_;

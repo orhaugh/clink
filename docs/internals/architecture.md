@@ -12,11 +12,11 @@ clink is an Arrow-native, stateful stream processing engine written in modern C+
 |-------|----------|------------|
 | Engine core | `include/clink/core/`, `include/clink/operators/`, `include/clink/runtime/`, `src/runtime/` | Types, operators, the `Dag`, the in-process `LocalExecutor`, channels, state plumbing. Compiled (with `src/`) into `libclink_core`. |
 | Connectors and backends | `impls/` | Optional source/sink connectors and state backends, each a separate static library (`clink::kafka`, `clink::s3`, `clink::rocksdb`, and so on). |
-| Cluster control plane | `include/clink/cluster/`, `src/cluster/` | `JobManager`, `TaskManager`, the binary TCP protocol, planning, placement, rescale, HA. |
+| Cluster control plane | `include/clink/cluster/`, `src/cluster/` | `Coordinator`, `Worker`, the binary TCP protocol, planning, placement, rescale, HA. |
 | SQL frontend | `include/clink/sql/`, `src/sql/` | Parser, AST, binder, optimizer, physical planner. Built behind `CLINK_BUILD_SQL` (off by default). |
-| Public API | `include/clink/api/`, `include/clink/application/`, `include/clink/job/` | `StreamExecutionEnvironment`, `DataStream<T>`, descriptors, `JobSubmitter`, the `CLINK_REGISTER_JOB` plugin contract. |
+| Public API | `include/clink/api/`, `include/clink/application/`, `include/clink/job/` | `Pipeline`, `DataStream<T>`, descriptors, `JobSubmitter`, the `CLINK_REGISTER_JOB` plugin contract. |
 | HTTP and observability | `include/clink/http/`, `include/clink/metrics/` | The JSON API, dashboard, Prometheus exposition. Built behind `CLINK_BUILD_HTTP` (on by default). |
-| Binaries | `tools/` | `clink` (client CLI), `clink_node` (the JM/TM daemon), `clink_submit_sql`, and the standalone client binaries. |
+| Binaries | `tools/` | `clink` (client CLI), `clink_node` (the coordinator/worker daemon), `clink_submit_sql`, and the standalone client binaries. |
 
 Key types to start from:
 
@@ -41,20 +41,20 @@ flowchart LR
     SQLF["SQL frontend (CLINK_BUILD_SQL)"]
   end
   subgraph cp["Control plane"]
-    JM["JobManager: plan + place,<br/>track, checkpoint, coordinate"]
+    coordinator["Coordinator: plan + place,<br/>track, checkpoint, coordinate"]
   end
   subgraph exec["Execution"]
-    TM["TaskManager (one per process)"]
+    worker["Worker (one per process)"]
     DAG["builds a Dag per subtask,<br/>runs it via LocalExecutor,<br/>one std::jthread per operator"]
     CORE["clink::core + impls<br/>(connectors, state backends)"]
   end
-  CLI --> JM
-  SUB --> JM
-  ENV --> JM
-  JS -->|"JobGraphSpec (JSON)"| JM
-  SQLF -->|"compiles to JobGraphSpec"| JM
-  JM -->|"Deploy"| TM
-  TM --> DAG --> CORE
+  CLI --> coordinator
+  SUB --> coordinator
+  ENV --> coordinator
+  JS -->|"JobGraphSpec (JSON)"| coordinator
+  SQLF -->|"compiles to JobGraphSpec"| coordinator
+  coordinator -->|"Deploy"| worker
+  worker --> DAG --> CORE
 ```
 
 Everything below the control plane is the engine core. `clink::core` has no dependency on the cluster, the connectors, or SQL. The connectors and state backends in `impls/` depend on the core and register themselves with an operator registry. The cluster control plane sits above the core: it accepts a `JobGraphSpec`, decides how to lay it out across task managers, and hands each task manager a chain of operator descriptors that the task manager rebuilds into a `Dag` and runs with the very same `LocalExecutor` used for in-process jobs.
@@ -84,26 +84,26 @@ All four flow in-band on the same channel because correct semantics require time
 
 A job is described by a `JobGraphSpec` (`include/clink/cluster/job_graph.hpp`): a list of `OperatorSpec` entries, each carrying an `op_type` string, an `out_channel` type, a `parallelism`, and a free-form `params` map of `key=value` strings consumed by the operator's registered factory. The spec is parser-agnostic and serialises to and from JSON (`to_json` / `from_json`, which auto-validates). It is the single interchange format: the fluent API, the programmatic Table API, and the SQL frontend all produce the same `JobGraphSpec`.
 
-The control plane is two roles, both served by one binary, `clink_node` (`tools/clink_node.cpp`), selected with `--role=jm` or `--role=tm`:
+The control plane is two roles, both served by one binary, `clink_node` (`tools/clink_node.cpp`), selected with `--role=coordinator` or `--role=worker`:
 
-- `JobManager` (`include/clink/cluster/job_manager.hpp`) is the cluster's source of truth. Task managers register with it; it accepts a submitted `JobGraphSpec`, plans it (`JobPlanner`, `include/clink/cluster/job_planner.hpp`) into a `JobPlan` of deployment tasks, places each task on a task manager with a free slot (greedy first-fit), assigns key-group ranges per subtask, sends `Deploy` messages, tracks completion and acks, coordinates checkpoints, and runs a watchdog that declares lost task managers on heartbeat timeout.
-- `TaskManager` (`include/clink/cluster/task_manager.hpp`) hosts execution slots. On `Deploy` it rebuilds the operator chain for its subtask, wiring inbound and outbound `NetworkBridgeSource`/`NetworkBridgeSink` stages for cross-process edges, then runs the chain through a `LocalExecutor`, exactly as in-process. It heartbeats the job manager and registers per-subtask callbacks for checkpoint commit, abort, and source-barrier injection.
+- `Coordinator` (`include/clink/cluster/coordinator.hpp`) is the cluster's source of truth. Task managers register with it; it accepts a submitted `JobGraphSpec`, plans it (`JobPlanner`, `include/clink/cluster/job_planner.hpp`) into a `JobPlan` of deployment tasks, places each task on a task manager with a free slot (greedy first-fit), assigns key-group ranges per subtask, sends `Deploy` messages, tracks completion and acks, coordinates checkpoints, and runs a watchdog that declares lost task managers on heartbeat timeout.
+- `Worker` (`include/clink/cluster/worker.hpp`) hosts execution slots. On `Deploy` it rebuilds the operator chain for its subtask, wiring inbound and outbound `NetworkBridgeSource`/`NetworkBridgeSink` stages for cross-process edges, then runs the chain through a `LocalExecutor`, exactly as in-process. It heartbeats the job manager and registers per-subtask callbacks for checkpoint commit, abort, and source-barrier injection.
 
 The two communicate over a binary, length-prefixed TCP protocol (`include/clink/cluster/protocol.hpp`, `messages.hpp`) carrying `Register`, `Deploy`, `Heartbeat`, `SubtaskFinished`, `TriggerCheckpoint`, `CommitCheckpoint`, `AbortCheckpoint`, `CancelJob`, `RescaleJob`, and `PeerUpdate` among others.
 
 ### How a job flows from submission to running operators
 
 ```
-  1. build       StreamExecutionEnvironment / Table API / SQL  ->  JobGraphSpec (JSON)
-  2. submit      JobSubmitter (TCP) or POST /api/v1/jobs[/spec]  ->  JobManager
+  1. build       Pipeline / Table API / SQL  ->  JobGraphSpec (JSON)
+  2. submit      JobSubmitter (TCP) or POST /api/v1/jobs[/spec]  ->  Coordinator
   3. plan        JobPlanner expands parallelism, cuts chains, assigns key groups
-  4. place       JobManager picks a TM slot per subtask (first-fit), resolves peers
-  5. deploy      JobManager sends Deploy(OperatorChainSpec) to each chosen TM
-  6. build       TaskManager rebuilds a Dag for the subtask, wiring network bridges
-  7. run         TaskManager runs the Dag via LocalExecutor (one jthread per operator)
+  4. place       Coordinator picks a worker slot per subtask (first-fit), resolves peers
+  5. deploy      Coordinator sends Deploy(OperatorChainSpec) to each chosen worker
+  6. build       Worker rebuilds a Dag for the subtask, wiring network bridges
+  7. run         Worker runs the Dag via LocalExecutor (one jthread per operator)
   8. operate     sources produce; barriers, watermarks, data flow in-band; sinks emit
-  9. checkpoint  JM triggers barriers into sources; subtasks snapshot + ack; JM commits
- 10. finish      sources reach EOS, SubtaskFinished propagates, JM marks the job done
+  9. checkpoint  coordinator triggers barriers into sources; subtasks snapshot + ack; coordinator commits
+ 10. finish      sources reach EOS, SubtaskFinished propagates, coordinator marks the job done
 ```
 
 A compiled job plugin (`CLINK_REGISTER_JOB`) is a `.so` that exports `clink_job_build`, which returns the `JobGraphSpec` JSON. The job manager dlopens the same `.so` on every task manager so user operator types resolve consistently. A spec-only job, such as one compiled by the SQL frontend, references only built-in operator factories already registered on every task manager and is submitted as JSON with no plugin (`POST /api/v1/jobs/spec`, or the `JobSubmitter` path).
@@ -128,8 +128,8 @@ The `impls/` modules are optional libraries layered on the core. Each is gated b
 | `RuntimeContext` | `runtime/runtime_context.hpp` | Per-operator handle to state, timers, metrics, side outputs, checkpoint acks. |
 | `JobConfig` | `runtime/job_config.hpp` | Per-run config: state backend, restore source, execution mode, checkpoint mode. |
 | `JobGraphSpec`, `OperatorSpec` | `cluster/job_graph.hpp` | The serialised, parser-agnostic job description. |
-| `JobManager` | `cluster/job_manager.hpp` | Plan, place, deploy, track, coordinate checkpoints, watchdog. |
-| `TaskManager` | `cluster/task_manager.hpp` | Host slots, rebuild a subtask `Dag`, run it via `LocalExecutor`. |
+| `Coordinator` | `cluster/coordinator.hpp` | Plan, place, deploy, track, coordinate checkpoints, watchdog. |
+| `Worker` | `cluster/worker.hpp` | Host slots, rebuild a subtask `Dag`, run it via `LocalExecutor`. |
 | `JobSubmitter` | `application/job_submitter.hpp` | Client-side submit of a `JobGraphSpec` over the control protocol. |
 | `operator_id_from_uid` | `core/types.hpp` | Derives the stable `OperatorId` from a `.uid(...)` for state restore. |
 
@@ -144,21 +144,21 @@ These set the shape of the stack. Subsystem-specific knobs are documented on the
 | `CLINK_BUILD_TESTS` / `CLINK_BUILD_EXAMPLES` | CMake | on | Build the test suites and in-tree examples. |
 | `CLINK_BUILD_BENCH` | CMake | off | Build the benchmarks. |
 | `CLINK_WITH_<NAME>` | CMake | `AUTO` | Per-impl gate: `AUTO` builds when the dep is found, `ON` makes a missing dep a hard error, `OFF` always skips. RocksDB is always built and cannot be turned off. |
-| `--role=jm|tm` | `clink_node` | (required) | Select job manager or task manager mode. |
-| `--port` | `clink_node` (JM) | `6123` (`kDefaultJobManagerPort`) | Control-plane listener port. |
+| `--role=coordinator|worker` | `clink_node` | (required) | Select job manager or task manager mode. |
+| `--port` | `clink_node` (coordinator) | `6123` (`kDefaultCoordinatorPort`) | Control-plane listener port. |
 | `--http-port` | `clink_node` | `0` (disabled) | Enable the HTTP API and dashboard on this port. |
-| `--heartbeat-timeout-ms` | `clink_node` (JM) | `5000` | How long without a heartbeat before a TM is declared lost. |
-| `--watchdog-interval-ms` | `clink_node` (JM) | `200` | Watchdog liveness re-evaluation cadence. |
+| `--heartbeat-timeout-ms` | `clink_node` (coordinator) | `5000` | How long without a heartbeat before a worker is declared lost. |
+| `--watchdog-interval-ms` | `clink_node` (coordinator) | `200` | Watchdog liveness re-evaluation cadence. |
 | Default channel capacity | `Dag` | `1024` | Per-channel queue depth; the backpressure threshold. |
 
-The job manager defaults shown are the `clink_node` command-line defaults; `JobManager::Config` and `TaskManager::Config` carry their own in-code defaults used by the in-process and test paths.
+The job manager defaults shown are the `clink_node` command-line defaults; `Coordinator::Config` and `Worker::Config` carry their own in-code defaults used by the in-process and test paths.
 
 ## Guarantees and caveats
 
 - The engine core is independent of the cluster, connectors, and SQL. In-process jobs run with no job manager or task manager.
 - The same `Dag`, operator runners, and `LocalExecutor` drive both in-process and per-subtask cluster execution, so behaviour does not fork between the two.
 - Exactly-once is provided by snapshot-on-barrier plus two-phase-commit sinks, and applies only to sinks that implement the 2PC contract (directly or via `CommittingSink`): the file, Parquet (local and object-store), raw-S3 multipart, Postgres `PREPARE TRANSACTION`, and transactional Kafka sinks. Other sinks are at-least-once, or effectively-once in `mode='upsert'`. See [./checkpointing.md](./checkpointing.md) and [./sink-committer-framework.md](./sink-committer-framework.md).
-- The failure posture is self-heal-by-default once checkpointing is configured: with a checkpoint directory set, `max_restarts_on_tm_loss` resolves to a bounded default (10) and the job restarts from its last completed checkpoint; without one the posture is fail-fast. An explicit value overrides either way. See [./fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md).
+- The failure posture is self-heal-by-default once checkpointing is configured: with a checkpoint directory set, `max_restarts_on_worker_loss` resolves to a bounded default (10) and the job restarts from its last completed checkpoint; without one the posture is fail-fast. An explicit value overrides either way. See [./fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md).
 - The columnar fast path is taken only when an operator opts in and the input batch carries an Arrow sidecar; row-form inputs fall back to `process()`. See [./columnar-execution.md](./columnar-execution.md).
 - The async, disaggregated-state path activates only when both the operator opts in and the state backend can genuinely defer reads; otherwise execution stays on the synchronous path. See [./async-state-execution.md](./async-state-execution.md).
 - The SQL frontend and the HTTP API are build-gated (`CLINK_BUILD_SQL` off by default, `CLINK_BUILD_HTTP` on by default but disabled unless `--http-port` is set).

@@ -2,11 +2,11 @@
 
 // LocalDataPlane: process-wide registry of in-process StreamElement
 // channels keyed by (host, port). When two subtasks are colocated on
-// the same TM, the receiver registers a typed BoundedChannel under the
+// the same worker, the receiver registers a typed BoundedChannel under the
 // port it would normally listen on; the sender's connect() checks the
 // registry first and, on hit, switches to direct typed push - skipping
 // codec serialization + TCP loopback + Arrow IPC parsing for every
-// record. The socket path remains the fallback for cross-TM hops.
+// record. The socket path remains the fallback for cross-worker hops.
 //
 // Type erasure: channels are stored as shared_ptr<void> alongside a
 // std::type_index so lookups can verify the consumer side requested

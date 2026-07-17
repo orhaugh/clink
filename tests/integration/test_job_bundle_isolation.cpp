@@ -2,7 +2,7 @@
 //
 // Two CLINK_REGISTER_JOB .so's mint overlapping inline-op names
 // (_inline_from_elements_0, _inline_map_1) against different
-// pipelines. Submitting both concurrently to the same JM+TM cluster
+// pipelines. Submitting both concurrently to the same coordinator+worker cluster
 // exercises per-job-bundle isolation: each job's bundle holds its
 // own copy of the closures, so the two jobs don't trample each
 // other's registrations.
@@ -154,45 +154,45 @@ TEST(JobBundleIsolation, ConcurrentJobsWithCollidingInlineNamesDontTrample) {
     std::filesystem::remove(out_b);
 
     // Each job's .so reads its sink path from getenv at build_fn time.
-    // Set both BEFORE spawning the cluster so JM + TMs inherit them.
+    // Set both BEFORE spawning the cluster so coordinator + workers inherit them.
     ::setenv("CLINK_COLLISION_OUT_A", out_a.c_str(), 1);
     ::setenv("CLINK_COLLISION_OUT_B", out_b.c_str(), 1);
 
-    const auto jm_port = probe_free_port();
-    const pid_t jm_pid =
-        spawn_proc({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, node);
-    ASSERT_GT(jm_pid, 0);
+    const auto coordinator_port = probe_free_port();
+    const pid_t coordinator_pid = spawn_proc(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
     // 2 subtasks per job (source + sink) * 2 jobs = 4 slots needed.
-    // Spawn enough TMs (each TM has 1 slot by default).
-    std::vector<pid_t> tms;
+    // Spawn enough workers (each worker has 1 slot by default).
+    std::vector<pid_t> workers;
     for (int i = 1; i <= 4; ++i) {
-        tms.push_back(spawn_proc({"clink_node",
-                                  "--role=tm",
-                                  "--id=tm-iso-" + std::to_string(i),
-                                  "--jm-host=127.0.0.1",
-                                  "--jm-port=" + std::to_string(jm_port)},
-                                 node));
-        ASSERT_GT(tms.back(), 0);
+        workers.push_back(spawn_proc({"clink_node",
+                                      "--role=worker",
+                                      "--id=worker-iso-" + std::to_string(i),
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(coordinator_port)},
+                                     node));
+        ASSERT_GT(workers.back(), 0);
     }
     std::this_thread::sleep_for(400ms);
 
     // Submit both jobs concurrently. The submit CLI is one-shot per
-    // invocation; we spawn two processes in parallel so the JM sees
+    // invocation; we spawn two processes in parallel so the coordinator sees
     // them overlap (modulo OS scheduling).
     const pid_t submit_a = spawn_proc({"clink_submit_job",
                                        "--job=" + job_a.string(),
-                                       "--jm-host=127.0.0.1",
-                                       "--jm-port=" + std::to_string(jm_port),
+                                       "--coordinator-host=127.0.0.1",
+                                       "--coordinator-port=" + std::to_string(coordinator_port),
                                        "--wait-timeout-s=30",
                                        "--name=collision-a"},
                                       submit);
     ASSERT_GT(submit_a, 0);
     const pid_t submit_b = spawn_proc({"clink_submit_job",
                                        "--job=" + job_b.string(),
-                                       "--jm-host=127.0.0.1",
-                                       "--jm-port=" + std::to_string(jm_port),
+                                       "--coordinator-host=127.0.0.1",
+                                       "--coordinator-port=" + std::to_string(coordinator_port),
                                        "--wait-timeout-s=30",
                                        "--name=collision-b"},
                                       submit);
@@ -203,8 +203,8 @@ TEST(JobBundleIsolation, ConcurrentJobsWithCollidingInlineNamesDontTrample) {
     const bool done_a = wait_for(submit_a, 45s, exit_a);
     const bool done_b = wait_for(submit_b, 45s, exit_b);
 
-    kill_quietly(jm_pid);
-    for (auto pid : tms) {
+    kill_quietly(coordinator_pid);
+    for (auto pid : workers) {
         kill_quietly(pid);
     }
 

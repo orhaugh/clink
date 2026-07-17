@@ -1,4 +1,4 @@
-# clink local cluster - 1 JobManager + 3 TaskManagers.
+# clink local cluster - 1 Coordinator + 3 Workers.
 #
 # Usage:
 #   # one-time: build the toolchain image (~15 min cold)
@@ -11,22 +11,22 @@
 #   open http://localhost:8081
 #
 # Tear down with `docker compose down`. To run a job against this
-# cluster, target jm:6123 from another container on the `clink`
-# network, or expose the JM control port to the host by adding
-# "6123:6123" to the jm service's `ports:` list.
+# cluster, target coordinator:6123 from another container on the `clink`
+# network, or expose the coordinator control port to the host by adding
+# "6123:6123" to the coordinator service's `ports:` list.
 
 services:
-  jm:
+  coordinator:
     build:
       context: .
       dockerfile: docker/Dockerfile.runtime
     image: clink-runtime:latest
-    hostname: jm
+    hostname: coordinator
     command:
-      - --role=jm
+      - --role=coordinator
       - --port=6123
       - --bind-host=0.0.0.0
-      - --advertise-host=jm
+      - --advertise-host=coordinator
       - --http-port=8081
       - --http-bind=0.0.0.0
       # Allow the standalone console (Vite dev server on another origin) to call
@@ -37,8 +37,8 @@ services:
       - "8081:8081"  # dashboard / HTTP API
     networks: [clink]
     healthcheck:
-      # TMs wait on this - without it, they race the JM's bind() and
-      # exit. /api/v1/health is served as soon as the JM has bound its
+      # workers wait on this - without it, they race the coordinator's bind() and
+      # exit. /api/v1/health is served as soon as the coordinator has bound its
       # control port, so passing this is a reliable readiness signal.
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/api/v1/health"]
       interval: 2s
@@ -46,98 +46,98 @@ services:
       retries: 30
       start_period: 2s
 
-  tm1:
+  worker1:
     image: clink-runtime:latest
-    hostname: tm1
+    hostname: worker1
     depends_on:
-      jm:
+      coordinator:
         condition: service_healthy
     command:
-      - --role=tm
-      - --id=tm-1
-      - --jm-host=jm
-      - --jm-port=6123
-      - --data-host=tm1
+      - --role=worker
+      - --id=worker-1
+      - --coordinator-host=coordinator
+      - --coordinator-port=6123
+      - --data-host=worker1
       - --slots=4
       - --http-port=8082
       - --http-bind=0.0.0.0
     environment:
       # Subtask data-plane bridges bind 127.0.0.1 by default (safe for
       # single-host tests). In compose, peer subtasks live in other
-      # containers and need to reach this TM via the bridge network -
+      # containers and need to reach this worker via the bridge network -
       # bind 0.0.0.0 so cross-container connect() succeeds.
       CLINK_DATA_BIND_HOST: 0.0.0.0
     networks: [clink]
     restart: on-failure
 
-  tm2:
+  worker2:
     image: clink-runtime:latest
-    hostname: tm2
+    hostname: worker2
     depends_on:
-      jm:
+      coordinator:
         condition: service_healthy
     command:
-      - --role=tm
-      - --id=tm-2
-      - --jm-host=jm
-      - --jm-port=6123
-      - --data-host=tm2
+      - --role=worker
+      - --id=worker-2
+      - --coordinator-host=coordinator
+      - --coordinator-port=6123
+      - --data-host=worker2
       - --slots=4
       - --http-port=8082
       - --http-bind=0.0.0.0
     environment:
       # Subtask data-plane bridges bind 127.0.0.1 by default (safe for
       # single-host tests). In compose, peer subtasks live in other
-      # containers and need to reach this TM via the bridge network -
+      # containers and need to reach this worker via the bridge network -
       # bind 0.0.0.0 so cross-container connect() succeeds.
       CLINK_DATA_BIND_HOST: 0.0.0.0
     networks: [clink]
     restart: on-failure
 
-  tm3:
+  worker3:
     image: clink-runtime:latest
-    hostname: tm3
+    hostname: worker3
     depends_on:
-      jm:
+      coordinator:
         condition: service_healthy
     command:
-      - --role=tm
-      - --id=tm-3
-      - --jm-host=jm
-      - --jm-port=6123
-      - --data-host=tm3
+      - --role=worker
+      - --id=worker-3
+      - --coordinator-host=coordinator
+      - --coordinator-port=6123
+      - --data-host=worker3
       - --slots=4
       - --http-port=8082
       - --http-bind=0.0.0.0
     environment:
       # Subtask data-plane bridges bind 127.0.0.1 by default (safe for
       # single-host tests). In compose, peer subtasks live in other
-      # containers and need to reach this TM via the bridge network -
+      # containers and need to reach this worker via the bridge network -
       # bind 0.0.0.0 so cross-container connect() succeeds.
       CLINK_DATA_BIND_HOST: 0.0.0.0
     networks: [clink]
     restart: on-failure
 
-  # One-shot: once the JM is healthy and TaskManager slots are registered,
+  # One-shot: once the coordinator is healthy and Worker slots are registered,
   # submit the bundled rescale-test streaming job so the cluster shows a
   # long-lived running job (busy slots, ticking checkpoints) for the console.
   # Re-runs on every `up`; `docker compose down` clears submitted jobs.
   job-submitter:
     image: clink-runtime:latest
     depends_on:
-      jm:
+      coordinator:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        echo "waiting for TaskManager slots...";
+        echo "waiting for Worker slots...";
         for i in $$(seq 1 60); do
-          cap=$$(curl -sf http://jm:8081/api/v1/cluster | sed -n 's/.*"total_slot_capacity":\([0-9]*\).*/\1/p');
+          cap=$$(curl -sf http://coordinator:8081/api/v1/cluster | sed -n 's/.*"total_slot_capacity":\([0-9]*\).*/\1/p');
           if [ "$${cap:-0}" -ge 6 ]; then break; fi;
           sleep 1;
         done;
         echo "submitting rescale-stream job (slots=$${cap:-0})...";
-        curl -s -F job_so=@/opt/clink/jobs/rescale_test_job.so -F job_name=rescale-stream http://jm:8081/api/v1/jobs;
+        curl -s -F job_so=@/opt/clink/jobs/rescale_test_job.so -F job_name=rescale-stream http://coordinator:8081/api/v1/jobs;
         echo
     networks: [clink]
     restart: "no"

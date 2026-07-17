@@ -177,7 +177,7 @@ TEST(RescaleCoordinator, AbortFromDrainingResetsToAborted) {
     c.mark_checkpoint_ready("join", 1);
     c.mark_old_drained("join", 0);
 
-    EXPECT_TRUE(c.abort("join", "TM failure"));
+    EXPECT_TRUE(c.abort("join", "worker failure"));
     auto st = c.status("join");
     ASSERT_TRUE(st.has_value());
     EXPECT_EQ(st->state, RescaleState::Aborted);
@@ -211,7 +211,7 @@ TEST(RescaleCoordinator, NewRequestAfterAbortAccepted) {
     setup_coord(c, "join", 2, 1, 8);
     c.request_rescale("join", 4);
     c.mark_checkpoint_ready("join", 1);
-    c.abort("join", "TM failure");
+    c.abort("join", "worker failure");
     EXPECT_EQ(c.status("join")->state, RescaleState::Aborted);
 
     // Aborted operator must accept a fresh request.

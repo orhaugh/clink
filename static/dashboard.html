@@ -110,12 +110,12 @@ input[type=text] { width: 12rem; }
 
 <div class="card">
   <h2>task managers</h2>
-  <div id="tms" class="muted">loading...</div>
+  <div id="workers" class="muted">loading...</div>
 </div>
 
 <div class="card">
   <h2>backpressure <span class="muted">(max input depth across operators)</span></h2>
-  <div id="backpressure" class="muted">scraping TMs...</div>
+  <div id="backpressure" class="muted">scraping workers...</div>
 </div>
 
 <div class="card">
@@ -138,7 +138,7 @@ input[type=text] { width: 12rem; }
   'use strict';
   // clink dashboard SPA. No build step, no external dependencies -
   // ships embedded as a C++ string constant alongside clink_node.
-  // Talks only to the JM's own HTTP API.
+  // Talks only to the coordinator's own HTTP API.
 
   const $ = (id) => document.getElementById(id);
   const fmtTs = (ms) => new Date(ms).toISOString().substring(11, 19);
@@ -165,14 +165,14 @@ input[type=text] { width: 12rem; }
       '<div class="row"><span>jobs</span><span>' + c.jobs_running + ' running, ' + c.jobs_completed + ' completed (' + c.jobs_total + ' total)</span></div>';
   }
 
-  function renderTms(tms) {
-    const el = $('tms');
-    if (!tms || !tms.length) { el.innerHTML = '<span class="muted">no TMs registered</span>'; return; }
+  function renderWorkers(workers) {
+    const el = $('workers');
+    if (!workers || !workers.length) { el.innerHTML = '<span class="muted">no workers registered</span>'; return; }
     el.classList.remove('muted');
-    let h = '<table><tr><th>tm_id</th><th>host</th><th>slots</th><th>http</th><th>status</th></tr>';
-    for (const t of tms) {
+    let h = '<table><tr><th>worker_id</th><th>host</th><th>slots</th><th>http</th><th>status</th></tr>';
+    for (const t of workers) {
       const status = t.lost ? '<span class="err">lost</span>' : '<span class="ok">ok</span>';
-      h += '<tr><td>' + esc(t.tm_id) + '</td>'
+      h += '<tr><td>' + esc(t.worker_id) + '</td>'
         + '<td>' + esc(t.data_host) + '</td>'
         + '<td>' + t.slots_in_use + ' / ' + t.slot_capacity + '</td>'
         + '<td>' + (t.http_port || '-') + '</td>'
@@ -248,7 +248,7 @@ input[type=text] { width: 12rem; }
         if (d.tasks && d.tasks.length) {
           dh += '<h3>tasks</h3>';
           for (const t of d.tasks) {
-            dh += '<div>' + esc(t.role) + '[' + t.subtask_idx + '] @ ' + esc(t.tm_id) + '</div>';
+            dh += '<div>' + esc(t.role) + '[' + t.subtask_idx + '] @ ' + esc(t.worker_id) + '</div>';
           }
         }
         dEl.innerHTML = dh;
@@ -276,18 +276,18 @@ input[type=text] { width: 12rem; }
     return { max, name: max_for };
   }
 
-  async function refreshBackpressure(tms) {
+  async function refreshBackpressure(workers) {
     const el = $('backpressure');
-    if (!tms || !tms.length) { el.innerHTML = '<span class="muted">no TMs</span>'; return; }
-    // Scrape each TM's /metrics via the JM proxy. Pick the worst
-    // (depth/capacity) ratio across all operators on all TMs.
+    if (!workers || !workers.length) { el.innerHTML = '<span class="muted">no workers</span>'; return; }
+    // Scrape each worker's /metrics via the coordinator proxy. Pick the worst
+    // (depth/capacity) ratio across all operators on all workers.
     let worstRatio = 0;
     let worstLabel = null;
-    let worstTm = null;
-    for (const t of tms) {
+    let worstWorker = null;
+    for (const t of workers) {
       if (!t.http_port || t.lost) continue;
       try {
-        const r = await fetch('/api/v1/tms/' + encodeURIComponent(t.tm_id) + '/metrics');
+        const r = await fetch('/api/v1/workers/' + encodeURIComponent(t.worker_id) + '/metrics');
         if (!r.ok) continue;
         const body = await r.text();
         // Find max input_depth across operators, and the matching capacity.
@@ -311,10 +311,10 @@ input[type=text] { width: 12rem; }
           if (ratio > worstRatio) {
             worstRatio = ratio;
             worstLabel = depths[id] + ' / ' + c;
-            worstTm = t.tm_id + ' op #' + id;
+            worstWorker = t.worker_id + ' op #' + id;
           }
         }
-      } catch (e) { /* TM offline / no operators */ }
+      } catch (e) { /* worker offline / no operators */ }
     }
     el.classList.remove('muted');
     if (worstLabel) {
@@ -324,7 +324,7 @@ input[type=text] { width: 12rem; }
         '<div class="row"><span>worst queue</span>'
         + '<span><span class="bar"><div class="' + cls + '" style="width:' + Math.min(pct, 100) + '%"></div></span> '
         + pct + '% (' + esc(worstLabel) + ')</span></div>'
-        + '<div class="row"><span>operator</span><span>' + esc(worstTm) + '</span></div>';
+        + '<div class="row"><span>operator</span><span>' + esc(worstWorker) + '</span></div>';
     } else {
       el.innerHTML = '<span class="muted">no operators reporting depth / all idle</span>';
     }
@@ -365,12 +365,12 @@ input[type=text] { width: 12rem; }
     try {
       const [c, t, j, l] = await Promise.all([
         fetchJson('/api/v1/cluster'),
-        fetchJson('/api/v1/tms').then(x => x.task_managers || []),
+        fetchJson('/api/v1/workers').then(x => x.workers || []),
         fetchJson('/api/v1/jobs').then(x => x.jobs || []),
         fetchJson('/api/v1/logs?level=info&limit=100').then(x => x.logs || []),
       ]);
       renderCluster(c);
-      renderTms(t);
+      renderWorkers(t);
       renderJobs(j);
       renderLogs(l);
       refreshBackpressure(t);  // fire-and-forget; updates async
@@ -421,7 +421,7 @@ input[type=text] { width: 12rem; }
     // Subscribe to known event types explicitly. An unrecognised type
     // arriving on the stream is a programming error, not silently
     // dropped UI state.
-    for (const t of ['jm.tm_registered', 'jm.tm_lost', 'jm.job_submitted', 'jm.job_completed']) {
+    for (const t of ['coordinator.worker_registered', 'coordinator.worker_lost', 'coordinator.job_submitted', 'coordinator.job_completed']) {
       es.addEventListener(t, onEvent);
     }
   }

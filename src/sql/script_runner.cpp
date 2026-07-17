@@ -31,7 +31,7 @@ namespace {
 
 // Percent-encode a query-param value (RFC 3986 unreserved chars pass through).
 // A state-backend URI can carry its own "://" and even a "?a=1&b=2" query, so
-// it must be encoded to survive the JM's query parsing; the server decodes it.
+// it must be encoded to survive the coordinator's query parsing; the server decodes it.
 std::string url_encode(const std::string& s) {
     static const char* kHex = "0123456789ABCDEF";
     std::string out;
@@ -51,18 +51,18 @@ std::string url_encode(const std::string& s) {
 
 }  // namespace
 
-SubmitFn make_http_submit(std::string jm_host,
-                          std::uint16_t jm_port,
+SubmitFn make_http_submit(std::string coordinator_host,
+                          std::uint16_t coordinator_port,
                           std::string state_backend_uri,
                           std::ostream& out,
                           std::ostream& err) {
-    return [jm_host = std::move(jm_host),
-            jm_port,
+    return [coordinator_host = std::move(coordinator_host),
+            coordinator_port,
             state_backend_uri = std::move(state_backend_uri),
             &out,
             &err](const cluster::JobGraphSpec& spec, const std::string& name) -> int {
-        clink::http::HttpClient client(jm_host, jm_port);
-        // Authenticated submission: present CLINK_AUTH_TOKEN if set, so a JM
+        clink::http::HttpClient client(coordinator_host, coordinator_port);
+        // Authenticated submission: present CLINK_AUTH_TOKEN if set, so a coordinator
         // started with the same token accepts the job (401 otherwise).
         if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr && *tok != '\0') {
             client.set_bearer_token(tok);
@@ -86,7 +86,7 @@ SubmitFn make_http_submit(std::string jm_host,
         }
         out << resp.body << "\n";
         if (resp.status != 200) {
-            err << "error: JM returned status " << resp.status << "\n";
+            err << "error: coordinator returned status " << resp.status << "\n";
             return 1;
         }
         return 0;
@@ -144,7 +144,7 @@ int run_script(const std::string& sql,
         // them there, persisted when the catalog has a dir). A registration
         // is process-local, so a job submitted to a remote cluster carries
         // the declarations it references (module payload included) and
-        // every TaskManager registers them at deploy. Referenced = the
+        // every Worker registers them at deploy. Referenced = the
         // function name appears in an op param (lowered expressions embed
         // the call as {"op":"<name>",...}); a substring match
         // over-approximates, which only ships an unused declaration, never
@@ -182,7 +182,7 @@ int run_script(const std::string& sql,
             }
         };
         // Persisted CREATE FUNCTION declarations: re-register any this
-        // process does not know yet (a fresh process, a JM after failover)
+        // process does not know yet (a fresh process, a coordinator after failover)
         // so binding and evaluation resolve them without a re-CREATE. A
         // failure warns rather than fails the script: a function the script
         // never calls must not block it (e.g. its language impl is not
@@ -359,7 +359,7 @@ int run_script(const std::string& sql,
                     // Drops the declaration (and its persisted file) plus
                     // THIS process's registration - scalar or aggregate
                     // (DROP FUNCTION and DROP AGGREGATE share semantics).
-                    // TaskManagers that registered it from an earlier deploy
+                    // Workers that registered it from an earlier deploy
                     // keep theirs for the process lifetime, like
                     // C++-registered UDFs.
                     ScalarFunctionRegistry::global().remove(fname);
@@ -473,7 +473,7 @@ int run_script(const std::string& sql,
             if (std::holds_alternative<ast::AnalyzeStmt>(stmt)) {
                 // ANALYZE runs a local in-process bounded scan, so the SQL source
                 // factories must be registered here (a spec-compiling front door
-                // otherwise only builds specs for the JM). Install once, lazily.
+                // otherwise only builds specs for the coordinator). Install once, lazily.
                 ensure_local_ops_installed();
                 const auto& an = std::get<ast::AnalyzeStmt>(stmt);
                 try {

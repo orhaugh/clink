@@ -82,7 +82,7 @@ void query_usage() {
         << "  --from=<path>   a .snap/.arrows snapshot file, or a RocksDB checkpoint\n"
         << "                  directory (RocksDB-linked builds)\n"
         << "  --dir/--id      merge a multi-subtask checkpoint instead of --from\n"
-        << "  --job/--jm      query a RUNNING job's live state via the JM route\n"
+        << "  --job/--coordinator      query a RUNNING job's live state via the coordinator route\n"
         << "  --sql=<query>   the SELECT to run against `state`\n";
 }
 
@@ -97,7 +97,7 @@ int clink_cmd_state_query(int argc, char** argv) {
     const auto dir = get_arg(argc, argv, "dir");
     const auto id_str = get_arg(argc, argv, "id");
     const auto job = get_arg(argc, argv, "job");
-    const auto jm = get_arg(argc, argv, "jm");
+    const auto coordinator = get_arg(argc, argv, "coordinator");
     const auto mat_store_path = get_arg(argc, argv, "materialisation-store");
     const auto sql = get_arg(argc, argv, "sql");
     const bool dir_form = !dir.empty() || !id_str.empty();
@@ -113,7 +113,12 @@ int clink_cmd_state_query(int argc, char** argv) {
     try {
         // 1. Snapshot -> decoded entries -> the query-projection Parquet.
         auto resolved = clink_tools::resolve_state_input(
-            from, dir, id_str, job, jm, clink_tools::materialisation_store_for(mat_store_path));
+            from,
+            dir,
+            id_str,
+            job,
+            coordinator,
+            clink_tools::materialisation_store_for(mat_store_path));
         clink::Snapshot snap;
         snap.bytes = std::move(resolved.bytes);
         auto sp = clink::state_processor::Savepoint::load_from_snapshot(std::move(snap));

@@ -6,21 +6,21 @@
 #include <utility>
 #include <vector>
 
+#include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/job_graph.hpp"
-#include "clink/cluster/job_manager.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/runner_registry.hpp"  // RoutingMode (re-imported here)
 
 namespace clink::cluster {
 
-// Sentinel role used by every subtask in a submitted job. The TM auto-
+// Sentinel role used by every subtask in a submitted job. The worker auto-
 // registers a single handler under this role (the generic subtask role)
 // that dispatches through the OperatorRegistry from the per-task
 // OperatorChainSpec embedded in extra_config.
 inline constexpr const char* kGenericSubtaskRole = "__clink_subtask";
 
 // Description of how one op behaves in a chain, used by the generic
-// subtask role on the TM. The planner groups fusable adjacent ops into
+// subtask role on the worker. The planner groups fusable adjacent ops into
 // one chain per subtask (see the chain-grouping pass in job_planner.cpp),
 // so a chain may hold one op or several fused ones.
 enum class OperatorKind : std::uint8_t {
@@ -41,7 +41,7 @@ enum class OperatorKind : std::uint8_t {
     CoOperator,
 };
 
-// Per-tag side output declaration carried over the wire to the TM. The
+// Per-tag side output declaration carried over the wire to the worker. The
 // plugin runner uses TypeRegistry to find TypeOps for `channel_type`
 // and wire a typed network sink for the side channel.
 struct ChainSideOutput {
@@ -53,7 +53,7 @@ struct ChainOp {
     std::string id;    // graph-local operator id (informational)
     std::string type;  // OperatorRegistry lookup key
     // User-supplied stable identifier (`.uid("...")`). Carried
-    // across the wire so the TM-side runner can call set_uid on the
+    // across the wire so the worker-side runner can call set_uid on the
     // built operator before it lands in the Dag - making OperatorId =
     // hash("uid/" + uid), stable across topology edits. Empty for
     // legacy / stateless ops.
@@ -109,13 +109,13 @@ struct SubtaskOutputGroup {
     std::string side_output_tag;
 };
 
-// What gets serialised into DeploymentTask.extra_config. The TM's generic
+// What gets serialised into DeploymentTask.extra_config. The worker's generic
 // role parses it back, instantiates ops via the registry, sets up
 // network bridges per input/output edge, and runs the resulting Dag via
 // LocalExecutor.
 struct OperatorChainSpec {
     // Global subtask index across the whole job (matches the
-    // DeploymentTask.subtask_idx the JM dispatches with).
+    // DeploymentTask.subtask_idx the coordinator dispatches with).
     std::uint32_t subtask_idx{};
     // Per-op subtask index (0..parallelism-1) within each op's
     // parallelism. Built-in factories read this to partition their work
@@ -164,7 +164,7 @@ struct OperatorChainSpec {
 };
 
 // Plan a JobGraphSpec into a JobPlan against the supplied snapshot of
-// registered TMs. Validates the graph, expands each op into its
+// registered workers. Validates the graph, expands each op into its
 // `parallelism` subtasks (routing edges as forward / rebalance / hash by
 // adjacency), assigns each resulting subtask a unique subtask_idx under
 // kGenericSubtaskRole, and packs an OperatorChainSpec into each task's
@@ -173,10 +173,10 @@ struct OperatorChainSpec {
 // Throws std::runtime_error if:
 //   - the graph fails JobGraphSpec::validate (missing ids, cycle, ...)
 //   - an op's type is not registered in `registry`
-//   - the union of TM slot capacities is too small to host the job
+//   - the union of worker slot capacities is too small to host the job
 //
-// The returned JobPlan still has tasks with `tm_id` left empty - the
-// caller (JobManager::deploy) does the actual placement using its
+// The returned JobPlan still has tasks with `worker_id` left empty - the
+// caller (Coordinator::deploy) does the actual placement using its
 // existing greedy first-fit logic so we don't duplicate scheduling.
 JobPlan plan_job(const JobGraphSpec& graph, const OperatorRegistry& registry);
 

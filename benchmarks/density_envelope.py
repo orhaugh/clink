@@ -58,14 +58,14 @@ def _run(clink: str, par: int, query: str) -> tuple[float, int | None, bool, boo
     wall = time.perf_counter() - t0
     m = re.search(r"tasks=(\d+)", p.stderr)
     tasks = int(m.group(1)) if m else None
-    ok = "jm.complete" in p.stderr and "ok" in p.stderr
+    ok = "coordinator.complete" in p.stderr and "ok" in p.stderr
     rejected = "insufficient free slots" in p.stderr or "slots" in p.stderr and "need" in p.stderr
     return wall, tasks, ok, rejected
 
 
 def _median_wall(clink: str, par: int, query: str, reps: int) -> tuple[float, bool, int | None]:
     """Median wall over `reps` runs, plus whether the job was rejected and the
-    actual thread/task count the JobManager reported (source + shuffle + agg +
+    actual thread/task count the Coordinator reported (source + shuffle + agg +
     sink roles times parallelism, which grows faster than a par-1 probe implies)."""
     walls = []
     rejected = False

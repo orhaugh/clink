@@ -72,7 +72,7 @@ struct ResolvedOutputGroup {
     std::string channel_type;
 };
 
-// What a SubtaskRunner receives from the generic role on the TM. The
+// What a SubtaskRunner receives from the generic role on the worker. The
 // runner knows the concrete C++ type T (captured at registration
 // time); it casts in_bridges back to NetworkBridgeSource<T> via
 // static_pointer_cast and looks up T's TypeOps via TypeRegistry to
@@ -97,7 +97,7 @@ struct RunnerContext {
     std::string checkpoint_dir;
     std::string restore_from_dir;
     std::uint64_t restore_from_checkpoint_id{0};
-    // Record-capture flight recorder (echoed from DeployMsg via the TM's
+    // Record-capture flight recorder (echoed from DeployMsg via the worker's
     // per-job checkpoint state); empty = capture off. Copied onto
     // JobConfig by make_subtask_job_config.
     std::string capture_dir;
@@ -155,36 +155,36 @@ struct RunnerContext {
     std::uint32_t restore_from_parent_count{1};
     KeyGroupRange restore_key_group_filter{};
     // Callback the runner invokes after each successful state snapshot
-    // (per checkpoint id). The TM uses this to send SubtaskCheckpointed
-    // back to the JM.
+    // (per checkpoint id). The worker uses this to send SubtaskCheckpointed
+    // back to the coordinator.
     std::function<void(std::uint64_t /*checkpoint_id*/, bool /*ok*/, std::string /*error*/)>
         on_checkpoint_ack;
     // Bounded-source EOS final-checkpoint hooks (see RuntimeContext /
-    // JobConfig). request_final_checkpoint asks the JM for a final coordinated
-    // checkpoint id (0 = declined); wait_final_committed blocks until this TM
+    // JobConfig). request_final_checkpoint asks the coordinator for a final coordinated
+    // checkpoint id (0 = declined); wait_final_committed blocks until this worker
     // observes CommitCheckpoint for that id. Empty for non-cluster runs.
     std::function<std::uint64_t()> request_final_checkpoint;
     std::function<bool(std::uint64_t, std::chrono::milliseconds)> wait_final_committed;
-    // Source-side barrier injectors the runner hands to the TM before
+    // Source-side barrier injectors the runner hands to the worker before
     // it starts running. For source subtasks the vector has one entry
     // (the injector for the source's outbound channel). For non-source
     // subtasks the vector is empty - they receive barriers from
-    // upstream over the wire. The TM stashes these in per_job_injectors_
+    // upstream over the wire. The worker stashes these in per_job_injectors_
     // so it can answer TriggerCheckpoint by pushing barriers into
     // every hosted source for the targeted job.
     using SourceInjectorFn = std::function<void(clink::CheckpointBarrier)>;
     std::function<void(std::vector<SourceInjectorFn>)> register_source_injectors;
 
     // 2PC sink commit callbacks. Sink subtasks register one callback
-    // here at startup; the TM stashes them in per_job_committers_ and
-    // invokes them when CommitCheckpoint arrives from the JM. Non-sink
+    // here at startup; the worker stashes them in per_job_committers_ and
+    // invokes them when CommitCheckpoint arrives from the coordinator. Non-sink
     // subtasks leave the vector empty. nullptr/empty register call in
     // legacy/in-process paths is a no-op.
     using CommitCheckpointFn = std::function<void(std::uint64_t /*checkpoint_id*/)>;
     std::function<void(std::vector<CommitCheckpointFn>)> register_commit_callbacks;
 
     // Abort callbacks. Sink subtasks that pre-commit on a
-    // CheckpointBarrier register a paired abort callback here; the TM
+    // CheckpointBarrier register a paired abort callback here; the worker
     // dispatches it on AbortCheckpoint so the sink can roll back its
     // prepared state (file_2pc removes staging file, kafka_2pc calls
     // abort_transaction). Same signature shape as the commit hook.
@@ -192,7 +192,7 @@ struct RunnerContext {
     std::function<void(std::vector<AbortCheckpointFn>)> register_abort_callbacks;
 
     // Drain callbacks. Subtask runners that participate in
-    // adaptive rescaling register one or more callbacks here. The TM
+    // adaptive rescaling register one or more callbacks here. The worker
     // dispatches them on BeginRescale arriving for the operator this
     // subtask belongs to: the callback runs the drain choreography
     // (finish current barrier alignment, emit DrainMarker downstream,
@@ -204,22 +204,22 @@ struct RunnerContext {
     std::function<void(std::vector<DrainFn>)> register_drain_callbacks;
 
     // Checkpoint-retention hook. make_subtask_job_config calls this once
-    // with the subtask's freshly-built state backend so the TM can purge
+    // with the subtask's freshly-built state backend so the worker can purge
     // that backend's superseded checkpoint artefacts when a newer
     // checkpoint completes (see CheckpointRetention). nullptr in
     // legacy/in-process paths is a no-op.
     std::function<void(std::shared_ptr<StateBackend>)> register_checkpoint_backend;
 
-    // Shared cancellation flag the TaskManager owns; flipped to true by
+    // Shared cancellation flag the Worker owns; flipped to true by
     // the CancelJob handler. The runner closure threads this into the
     // JobConfig it hands LocalExecutor, so the executor's stop
     // predicate sees the flip without holding a reference to anything
     // on the runner's stack. nullptr in legacy/in-process paths that
-    // don't go through the TaskManager.
+    // don't go through the Worker.
     std::shared_ptr<std::atomic<bool>> cancel_token;
 
     // The DeploymentTask role this runner executes as - the same string
-    // the JM tracks in task_records and targets when routing
+    // the coordinator tracks in task_records and targets when routing
     // queryable-state lookups. Threaded (with chain.subtask_idx) through
     // JobConfig into each RuntimeContext so operators can bind state
     // under the exact (role, subtask) slot external clients address.
@@ -231,7 +231,7 @@ struct RunnerContext {
 // type(s) it operates on, constructs the typed Source/Operator/Sink
 // via the user's factory, builds typed bridges via TypeRegistry, and
 // runs the resulting Dag via LocalExecutor. Throws on errors; the
-// TM's run_task_ converts to SubtaskFinished{had_error=true}.
+// worker's run_task_ converts to SubtaskFinished{had_error=true}.
 using SubtaskRunner = std::function<void(const RunnerContext&)>;
 
 // RunnerRegistry stores SubtaskRunner closures keyed by op-type name
@@ -240,7 +240,7 @@ using SubtaskRunner = std::function<void(const RunnerContext&)>;
 //
 // Lookups optionally fall through to a `parent` registry on miss. The
 // process-wide built-ins live in `default_instance()`; per-job registries
-// (created by the JM/TM JobBundle) set parent=&default_instance() so
+// (created by the coordinator/worker JobBundle) set parent=&default_instance() so
 // they layer plugin/inline-lambda registrations on top of built-ins
 // without duplicating them. `register_*` ALWAYS writes into the
 // receiver, never the parent - this is one-way overlay.

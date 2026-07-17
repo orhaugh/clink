@@ -1,11 +1,11 @@
 // Job-as-plugin contract.
 //
 // A *job* is a shared library a user compiles from a single .cpp that
-// uses clink's fluent StreamExecutionEnvironment API to describe a
+// uses clink's fluent Pipeline API to describe a
 // pipeline. The library is shipped from the submitter to the cluster
-// alongside the JobGraphSpec it produces: when a TaskManager dlopens
+// alongside the JobGraphSpec it produces: when a Worker dlopens
 // it, the same inline-lambda registrations that ran in the submitter
-// fire in the TM process, so operator types like _inline_map_<n> are
+// fire in the worker process, so operator types like _inline_map_<n> are
 // resolvable on both sides.
 //
 // Contract - a job .so MUST export:
@@ -42,7 +42,7 @@
 //                                         the host's global() is a different,
 //                                         empty instance), so only the .so can
 //                                         see the migrations build_fn
-//                                         registered. The host (CLI / JM) just
+//                                         registered. The host (CLI / coordinator) just
 //                                         dlopens, calls, and reports.
 //
 // Use CLINK_REGISTER_JOB(name, version, description, build_fn) at file
@@ -53,15 +53,15 @@
 // Lifecycle:
 //   * Submitter process: dlopen(.so) -> clink_plugin_register fires
 //     build_fn once (call_once gate); clink_job_build returns the
-//     captured JSON; submitter uploads .so + JSON to the JM.
-//   * TM process:        dlopen(.so) -> clink_plugin_register fires
+//     captured JSON; submitter uploads .so + JSON to the coordinator.
+//   * worker process:        dlopen(.so) -> clink_plugin_register fires
 //     build_fn once (in this process; call_once is per-process); the
 //     side-effect registrations populate THIS process's
-//     RunnerRegistry. TM ignores clink_job_build.
+//     RunnerRegistry. worker ignores clink_job_build.
 //
 // Determinism caveat: build_fn must register operators in a stable
 // order across processes. The inline-op counter
-// (StreamExecutionEnvironment::mint_inline_op_type) is per-env, so two
+// (Pipeline::mint_inline_op_type) is per-env, so two
 // jobs in the same process get independent _inline_<kind>_0, _<kind>_1,
 // ... sequences. Cross-process matching still relies on registration
 // ORDER being deterministic in build_fn.
@@ -75,7 +75,7 @@
 #include <mutex>
 #include <string>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/state/schema_version.hpp"
@@ -103,7 +103,7 @@ struct JobBuilderState {
     // export can hand back a stable pointer. Recomputed (overwritten) on
     // every clink_job_check_restore_compatibility call, so the returned
     // pointer is valid only until the next call - single-shot per load,
-    // which is all the CLI / JM gate need.
+    // which is all the CLI / coordinator gate need.
     std::string check_result;
 };
 
@@ -115,9 +115,8 @@ inline void ensure_built(JobBuilderState& state, BuildFn&& build_fn) {
     std::call_once(state.flag, [&state, build_fn = std::forward<BuildFn>(build_fn)]() mutable {
         try {
             auto env = state.host_registry != nullptr
-                           ? ::clink::api::StreamExecutionEnvironment::create_with_registry(
-                                 state.host_registry)
-                           : ::clink::api::StreamExecutionEnvironment::create();
+                           ? ::clink::api::Pipeline::create_with_registry(state.host_registry)
+                           : ::clink::api::Pipeline::create();
             build_fn(env);
             state.graph_json = env.graph().to_json();
         } catch (const std::exception& e) {
@@ -135,11 +134,11 @@ inline void ensure_built(JobBuilderState& state, BuildFn&& build_fn) {
 // Emit the full job-as-plugin C-ABI surface. `build_fn` is the user's
 // pipeline-building function with signature
 //
-//     void(clink::api::StreamExecutionEnvironment&)
+//     void(clink::api::Pipeline&)
 //
 // Example:
 //
-//     void define_job(clink::api::StreamExecutionEnvironment& env) {
+//     void define_job(clink::api::Pipeline& env) {
 //         env.from_elements<int64_t>({1, 2, 3, 4, 5})
 //            .map<int64_t>([](int64_t v) { return v * 2; })
 //            .sink(FileInt64Sink::builder().path("/tmp/out").build());
@@ -223,8 +222,6 @@ inline void ensure_built(JobBuilderState& state, BuildFn&& build_fn) {
         }                                                                                        \
         return 0;                                                                                \
     }                                                                                            \
-    static_assert(::std::is_invocable_r_v<void,                                                  \
-                                          decltype(build_fn)&,                                   \
-                                          ::clink::api::StreamExecutionEnvironment&>,            \
+    static_assert(::std::is_invocable_r_v<void, decltype(build_fn)&, ::clink::api::Pipeline&>,   \
                   "CLINK_REGISTER_JOB build_fn must have signature "                             \
-                  "void(clink::api::StreamExecutionEnvironment&)")
+                  "void(clink::api::Pipeline&)")

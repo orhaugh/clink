@@ -15,10 +15,10 @@
 #include <gtest/gtest.h>
 
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/job_graph.hpp"
-#include "clink/cluster/job_manager.hpp"
 #include "clink/cluster/operator_registry.hpp"
-#include "clink/cluster/task_manager.hpp"
+#include "clink/cluster/worker.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/operators/map_operator.hpp"
 #include "clink/operators/sink_operator.hpp"
@@ -34,7 +34,7 @@ using namespace clink::network;
 using namespace std::chrono_literals;
 
 // The submit-time default state-backend policy: a cluster-level default
-// (clink_node --default-state-backend / JobManager::Config.default_state_backend_uri)
+// (clink_node --default-state-backend / Coordinator::Config.default_state_backend_uri)
 // fills in a job's backend only when the submitter chose none, so an operator
 // can make the async/disaggregated path the default without each job opting in.
 TEST(DefaultStateBackendPolicy, AppliesDefaultWhenJobChoseNone) {
@@ -90,7 +90,7 @@ TEST(DefaultStateBackendPolicy, RecoveryLeavesExplicitUriUntouched) {
 }
 
 // The defect this closes: a job submitted under an EMPTY cluster default (so it
-// relied on checkpoint_dir -> file durability) must NOT be rebound when the JM
+// relied on checkpoint_dir -> file durability) must NOT be rebound when the coordinator
 // is later restarted with a default configured. Recovery runs pin first, then
 // submit_job's apply_default - the pin makes the default a no-op, so the
 // recovered job keeps its file backend instead of silently switching to the
@@ -104,13 +104,13 @@ TEST(DefaultStateBackendPolicy, RecoveryDoesNotRebindAcrossDefaultChange) {
         << "a recovered job must keep its original backend across a default config change";
 }
 
-// 1 JobManager + 2 TaskManagers running in 3 threads. JM coordinates the
-// deployment of a producer/consumer pipeline split across the TMs:
-//   TM-A: producer role - emits int64s into a NetworkBridgeSink.
-//   TM-B: consumer role - listens via NetworkBridgeSource, collects.
+// 1 Coordinator + 2 Workers running in 3 threads. coordinator coordinates the
+// deployment of a producer/consumer pipeline split across the workers:
+//   worker-A: producer role - emits int64s into a NetworkBridgeSink.
+//   worker-B: consumer role - listens via NetworkBridgeSource, collects.
 // Verifies the full handshake, deployment, data-plane connection, and
 // completion reporting.
-TEST(Cluster, JmTmDistributedProducerConsumer) {
+TEST(Cluster, CoordinatorWorkerDistributedProducerConsumer) {
     // Pick a free port for the consumer's data plane. The bind-then-close
     // pattern leaves a tiny race window (microseconds) where another
     // process could steal the port; fine for in-process tests.
@@ -120,18 +120,18 @@ TEST(Cluster, JmTmDistributedProducerConsumer) {
         consumer_port = probe.listen();
     }
 
-    // ----- JobManager -----
-    JobManager jm;
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"tm-a", "tm-b"});
+    // ----- Coordinator -----
+    Coordinator coordinator;
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-a", "worker-b"});
 
     // ----- Shared sink for the consumer to deposit into; the test reads
     // it after the job completes. -----
     auto consumer_sink = std::make_shared<CollectingSink<std::int64_t>>();
 
-    // ----- TM-B: consumer (start first so the producer can connect) -----
-    TaskManager tm_b("tm-b", "127.0.0.1");
-    tm_b.register_role("consumer", [consumer_sink](const DeploymentTask& task) {
+    // ----- worker-B: consumer (start first so the producer can connect) -----
+    Worker worker_b("worker-b", "127.0.0.1");
+    worker_b.register_role("consumer", [consumer_sink](const DeploymentTask& task) {
         auto src =
             std::make_shared<NetworkBridgeSource<std::int64_t>>(task.data_port, int64_codec());
         src->prepare_listen();
@@ -143,11 +143,11 @@ TEST(Cluster, JmTmDistributedProducerConsumer) {
         LocalExecutor exec(std::move(dag));
         exec.run();  // blocks until source closes
     });
-    tm_b.connect_to_jm("127.0.0.1", jm_port);
+    worker_b.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    // ----- TM-A: producer -----
-    TaskManager tm_a("tm-a", "127.0.0.1");
-    tm_a.register_role("producer", [](const DeploymentTask& task) {
+    // ----- worker-A: producer -----
+    Worker worker_a("worker-a", "127.0.0.1");
+    worker_a.register_role("producer", [](const DeploymentTask& task) {
         ASSERT_EQ(task.peers.size(), std::size_t{1});
         const auto& peer = task.peers[0];
 
@@ -173,14 +173,14 @@ TEST(Cluster, JmTmDistributedProducerConsumer) {
         LocalExecutor exec(std::move(dag));
         exec.run();
     });
-    tm_a.connect_to_jm("127.0.0.1", jm_port);
+    worker_a.connect_to_coordinator("127.0.0.1", coordinator_port);
 
     // ----- Plan and deploy -----
-    ASSERT_TRUE(jm.await_registrations(2s));
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
     JobPlan plan;
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "tm-b",
+        .worker_id = "worker-b",
         .role = "consumer",
         .subtask_idx = 0,
         .data_port = consumer_port,
@@ -188,108 +188,109 @@ TEST(Cluster, JmTmDistributedProducerConsumer) {
         .extra_config = "",
     });
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "tm-a",
+        .worker_id = "worker-a",
         .role = "producer",
         .subtask_idx = 0,
         .data_port = 0,  // outbound only
         .peer_refs = {{"consumer", 0}},
         .extra_config = "",
     });
-    jm.deploy(plan);
+    coordinator.deploy(plan);
 
-    ASSERT_TRUE(jm.await_completion(5s));
-    EXPECT_TRUE(jm.errors().empty());
+    ASSERT_TRUE(coordinator.await_completion(5s));
+    EXPECT_TRUE(coordinator.errors().empty());
 
     // Verify the consumer received the producer's records intact.
     EXPECT_EQ(consumer_sink->collected(), (std::vector<std::int64_t>{100, 200, 300, 400, 500}));
 
-    tm_a.stop();
-    tm_b.stop();
-    jm.stop();
+    worker_a.stop();
+    worker_b.stop();
+    coordinator.stop();
 }
 
-// Heartbeat watchdog detects a TM that registers but stops sending
-// heartbeats. The JM marks it lost, synthesises errors for any pending
+// Heartbeat watchdog detects a worker that registers but stops sending
+// heartbeats. The coordinator marks it lost, synthesises errors for any pending
 // tasks, and unblocks await_completion.
-TEST(Cluster, WatchdogDetectsLostTaskManager) {
-    JobManager::Config jm_cfg;
-    jm_cfg.watchdog_interval = 50ms;
-    jm_cfg.heartbeat_timeout = 250ms;
-    JobManager jm(jm_cfg);
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"silent-tm"});
+TEST(Cluster, WatchdogDetectsLostWorker) {
+    Coordinator::Config coordinator_cfg;
+    coordinator_cfg.watchdog_interval = 50ms;
+    coordinator_cfg.heartbeat_timeout = 250ms;
+    Coordinator coordinator(coordinator_cfg);
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"silent-worker"});
 
-    // TM with heartbeats disabled - registers, then goes silent.
-    TaskManager::Config tm_cfg;
-    tm_cfg.heartbeat_interval = std::chrono::milliseconds{0};
-    TaskManager tm("silent-tm", "127.0.0.1", tm_cfg);
+    // worker with heartbeats disabled - registers, then goes silent.
+    Worker::Config worker_cfg;
+    worker_cfg.heartbeat_interval = std::chrono::milliseconds{0};
+    Worker worker("silent-worker", "127.0.0.1", worker_cfg);
     // Handler blocks longer than heartbeat_timeout. With heartbeats off
     // and no SubtaskFinished arriving during the sleep, the watchdog
-    // declares the TM lost.
-    tm.register_role("blocker", [](const DeploymentTask&) { std::this_thread::sleep_for(800ms); });
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    // declares the worker lost.
+    worker.register_role("blocker",
+                         [](const DeploymentTask&) { std::this_thread::sleep_for(800ms); });
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    ASSERT_TRUE(jm.await_registrations(2s));
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
     JobPlan plan;
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "silent-tm",
+        .worker_id = "silent-worker",
         .role = "blocker",
         .subtask_idx = 0,
         .data_port = 0,
         .peer_refs = {},
         .extra_config = "",
     });
-    jm.deploy(plan);
+    coordinator.deploy(plan);
 
-    ASSERT_TRUE(jm.await_completion(2s));
+    ASSERT_TRUE(coordinator.await_completion(2s));
 
-    auto lost = jm.lost_tms();
+    auto lost = coordinator.lost_workers();
     ASSERT_EQ(lost.size(), 1u);
-    EXPECT_EQ(lost[0], "silent-tm");
+    EXPECT_EQ(lost[0], "silent-worker");
 
-    auto errs = jm.errors();
+    auto errs = coordinator.errors();
     ASSERT_EQ(errs.size(), 1u);
     EXPECT_NE(errs[0].find("heartbeat timeout"), std::string::npos);
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 }
 
-// A TM that re-registers under the SAME id (a restarted process with a stable
-// name - the Kubernetes StatefulSet pattern) replaces its old TmConnection in
-// the JM. The old connection's reader thread must be joined during that
+// A worker that re-registers under the SAME id (a restarted process with a stable
+// name - the Kubernetes StatefulSet pattern) replaces its old WorkerConnection in
+// the coordinator. The old connection's reader thread must be joined during that
 // replacement: destroying a joinable std::thread is std::terminate, and the
-// reader lambda holds a shared_ptr to its own TmConnection, so dropping the
+// reader lambda holds a shared_ptr to its own WorkerConnection, so dropping the
 // map's reference without joining hands destruction to the exiting reader
 // itself. Before the fix this test crashed the process.
-TEST(Cluster, TaskManagerReRegistrationUnderSameIdRetiresOldSession) {
-    JobManager::Config jm_cfg;
-    jm_cfg.watchdog_interval = 50ms;
-    jm_cfg.heartbeat_timeout = 60s;  // watchdog quiet; the test drives the churn
-    JobManager jm(jm_cfg);
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"stable-tm"});
+TEST(Cluster, WorkerReRegistrationUnderSameIdRetiresOldSession) {
+    Coordinator::Config coordinator_cfg;
+    coordinator_cfg.watchdog_interval = 50ms;
+    coordinator_cfg.heartbeat_timeout = 60s;  // watchdog quiet; the test drives the churn
+    Coordinator coordinator(coordinator_cfg);
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"stable-worker"});
 
     // Session 1: register, then die ungracefully (stop() closes the conn;
-    // the JM-side reader returns but its thread stays joinable).
-    auto tm1 = std::make_unique<TaskManager>("stable-tm", "127.0.0.1");
-    tm1->connect_to_jm("127.0.0.1", jm_port);
-    ASSERT_TRUE(jm.await_registrations(2s));
-    tm1->stop();
-    tm1.reset();
+    // the coordinator-side reader returns but its thread stays joinable).
+    auto worker1 = std::make_unique<Worker>("stable-worker", "127.0.0.1");
+    worker1->connect_to_coordinator("127.0.0.1", coordinator_port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+    worker1->stop();
+    worker1.reset();
 
-    // Session 2: the restarted TM re-registers under the same id. Pre-fix:
-    // std::terminate in handle_register_ replacing the old TmConnection.
-    auto tm2 = std::make_unique<TaskManager>("stable-tm", "127.0.0.1");
-    tm2->connect_to_jm("127.0.0.1", jm_port);
+    // Session 2: the restarted worker re-registers under the same id. Pre-fix:
+    // std::terminate in handle_register_ replacing the old WorkerConnection.
+    auto worker2 = std::make_unique<Worker>("stable-worker", "127.0.0.1");
+    worker2->connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    // The JM must still be alive and serving: the re-registered TM is
+    // The coordinator must still be alive and serving: the re-registered worker is
     // schedulable (registration visible), proven by a successful deploy.
     bool ran = false;
     std::mutex m;
     std::condition_variable cv;
-    tm2->register_role("noop", [&](const DeploymentTask&) {
+    worker2->register_role("noop", [&](const DeploymentTask&) {
         {
             std::lock_guard lk(m);
             ran = true;
@@ -298,57 +299,57 @@ TEST(Cluster, TaskManagerReRegistrationUnderSameIdRetiresOldSession) {
     });
     JobPlan plan;
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "stable-tm",
+        .worker_id = "stable-worker",
         .role = "noop",
         .subtask_idx = 0,
         .data_port = 0,
         .peer_refs = {},
         .extra_config = "",
     });
-    jm.deploy(plan);
+    coordinator.deploy(plan);
     {
         std::unique_lock lk(m);
         ASSERT_TRUE(cv.wait_for(lk, 5s, [&] { return ran; }));
     }
 
-    tm2->stop();
-    jm.stop();
+    worker2->stop();
+    coordinator.stop();
 }
 
-// Dynamic placement: tasks with empty tm_id are auto-assigned to TMs with
-// free slots. Two TMs each with capacity=1 → two unassigned tasks land
-// one per TM (no overload).
+// Dynamic placement: tasks with empty worker_id are auto-assigned to workers with
+// free slots. Two workers each with capacity=1 → two unassigned tasks land
+// one per worker (no overload).
 TEST(Cluster, DynamicPlacementAssignsTasksToFreeSlots) {
-    JobManager jm;
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"tm-x", "tm-y"});
+    Coordinator coordinator;
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-x", "worker-y"});
 
     std::mutex seen_mu;
-    std::vector<std::string> tm_ids_observed;
+    std::vector<std::string> worker_ids_observed;
 
-    auto record_role = [&](const std::string& tm_id) {
-        return [&seen_mu, &tm_ids_observed, tm_id](const DeploymentTask&) {
+    auto record_role = [&](const std::string& worker_id) {
+        return [&seen_mu, &worker_ids_observed, worker_id](const DeploymentTask&) {
             std::lock_guard lock(seen_mu);
-            tm_ids_observed.push_back(tm_id);
+            worker_ids_observed.push_back(worker_id);
         };
     };
 
-    TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 1;
+    Worker::Config worker_cfg;
+    worker_cfg.slot_count = 1;
 
-    TaskManager tm_x("tm-x", "127.0.0.1", tm_cfg);
-    tm_x.register_role("worker", record_role("tm-x"));
-    tm_x.connect_to_jm("127.0.0.1", jm_port);
+    Worker worker_x("worker-x", "127.0.0.1", worker_cfg);
+    worker_x.register_role("worker", record_role("worker-x"));
+    worker_x.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    TaskManager tm_y("tm-y", "127.0.0.1", tm_cfg);
-    tm_y.register_role("worker", record_role("tm-y"));
-    tm_y.connect_to_jm("127.0.0.1", jm_port);
+    Worker worker_y("worker-y", "127.0.0.1", worker_cfg);
+    worker_y.register_role("worker", record_role("worker-y"));
+    worker_y.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    ASSERT_TRUE(jm.await_registrations(2s));
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
     JobPlan plan;
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "",
+        .worker_id = "",
         .role = "worker",
         .subtask_idx = 0,
         .data_port = 0,
@@ -356,45 +357,45 @@ TEST(Cluster, DynamicPlacementAssignsTasksToFreeSlots) {
         .extra_config = "",
     });
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "",
+        .worker_id = "",
         .role = "worker",
         .subtask_idx = 1,
         .data_port = 0,
         .peer_refs = {},
         .extra_config = "",
     });
-    jm.deploy(plan);
+    coordinator.deploy(plan);
 
-    ASSERT_TRUE(jm.await_completion(2s));
-    EXPECT_TRUE(jm.errors().empty());
+    ASSERT_TRUE(coordinator.await_completion(2s));
+    EXPECT_TRUE(coordinator.errors().empty());
 
     {
         std::lock_guard lock(seen_mu);
-        ASSERT_EQ(tm_ids_observed.size(), 2u);
-        std::sort(tm_ids_observed.begin(), tm_ids_observed.end());
-        EXPECT_EQ(tm_ids_observed[0], "tm-x");
-        EXPECT_EQ(tm_ids_observed[1], "tm-y");
+        ASSERT_EQ(worker_ids_observed.size(), 2u);
+        std::sort(worker_ids_observed.begin(), worker_ids_observed.end());
+        EXPECT_EQ(worker_ids_observed[0], "worker-x");
+        EXPECT_EQ(worker_ids_observed[1], "worker-y");
     }
 
-    tm_x.stop();
-    tm_y.stop();
-    jm.stop();
+    worker_x.stop();
+    worker_y.stop();
+    coordinator.stop();
 }
 
-// JM redeploys a failing task up to max_restarts times, appending an
+// coordinator redeploys a failing task up to max_restarts times, appending an
 // attempt counter to extra_config. The role handler reads it to decide
 // whether to "fail" (first attempt) or succeed (retry). After a retry
-// succeeds the JM reports success even though the first attempt errored.
+// succeeds the coordinator reports success even though the first attempt errored.
 TEST(Cluster, RestartsFailingTaskUpToMaxRestarts) {
-    JobManager::Config jm_cfg;
-    jm_cfg.max_restarts = 3;
-    JobManager jm(jm_cfg);
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"flaky-tm"});
+    Coordinator::Config coordinator_cfg;
+    coordinator_cfg.max_restarts = 3;
+    Coordinator coordinator(coordinator_cfg);
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"flaky-worker"});
 
     std::atomic<int> attempts_observed{0};
-    TaskManager tm("flaky-tm", "127.0.0.1");
-    tm.register_role("flaky", [&attempts_observed](const DeploymentTask& task) {
+    Worker worker("flaky-worker", "127.0.0.1");
+    worker.register_role("flaky", [&attempts_observed](const DeploymentTask& task) {
         const auto& cfg = task.extra_config;
         int attempt = 0;
         if (auto pos = cfg.find("clink_attempt="); pos != std::string::npos) {
@@ -406,46 +407,46 @@ TEST(Cluster, RestartsFailingTaskUpToMaxRestarts) {
         }
         // Retries succeed.
     });
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    ASSERT_TRUE(jm.await_registrations(2s));
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
     JobPlan plan;
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "flaky-tm",
+        .worker_id = "flaky-worker",
         .role = "flaky",
         .subtask_idx = 0,
         .data_port = 0,
         .peer_refs = {},
         .extra_config = "",
     });
-    jm.deploy(plan);
+    coordinator.deploy(plan);
 
-    ASSERT_TRUE(jm.await_completion(5s));
-    EXPECT_TRUE(jm.errors().empty()) << "retry should have succeeded";
+    ASSERT_TRUE(coordinator.await_completion(5s));
+    EXPECT_TRUE(coordinator.errors().empty()) << "retry should have succeeded";
     EXPECT_GE(attempts_observed.load(), 1) << "second attempt should have run with clink_attempt=1";
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 }
 
-// JM abort path: when one TM is declared lost, the JM broadcasts CancelJob
-// to surviving TMs. Their reader loops flip `cancelled_` so role handlers
-// can poll and abort. The JM's errors() lists the lost TM's tasks; the
-// surviving TM observes was_cancelled() == true.
+// coordinator abort path: when one worker is declared lost, the coordinator broadcasts CancelJob
+// to surviving workers. Their reader loops flip `cancelled_` so role handlers
+// can poll and abort. The coordinator's errors() lists the lost worker's tasks; the
+// surviving worker observes was_cancelled() == true.
 TEST(Cluster, FailureBroadcastsCancelToSurvivors) {
-    JobManager::Config jm_cfg;
-    jm_cfg.watchdog_interval = 50ms;
-    jm_cfg.heartbeat_timeout = 600ms;  // > healthy.interval below, < silent's blocker
-    JobManager jm(jm_cfg);
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"healthy-tm", "silent-tm"});
+    Coordinator::Config coordinator_cfg;
+    coordinator_cfg.watchdog_interval = 50ms;
+    coordinator_cfg.heartbeat_timeout = 600ms;  // > healthy.interval below, < silent's blocker
+    Coordinator coordinator(coordinator_cfg);
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"healthy-worker", "silent-worker"});
 
-    // Healthy TM with frequent heartbeats so its last_seen stays current
+    // Healthy worker with frequent heartbeats so its last_seen stays current
     // throughout the run.
-    TaskManager::Config healthy_cfg;
+    Worker::Config healthy_cfg;
     healthy_cfg.heartbeat_interval = 100ms;
-    TaskManager healthy("healthy-tm", "127.0.0.1", healthy_cfg);
+    Worker healthy("healthy-worker", "127.0.0.1", healthy_cfg);
     std::atomic<bool> healthy_observed_cancel{false};
     healthy.register_role("worker", [&healthy, &healthy_observed_cancel](const DeploymentTask&) {
         const auto deadline = std::chrono::steady_clock::now() + 5s;
@@ -457,21 +458,21 @@ TEST(Cluster, FailureBroadcastsCancelToSurvivors) {
             std::this_thread::sleep_for(20ms);
         }
     });
-    healthy.connect_to_jm("127.0.0.1", jm_port);
+    healthy.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    // Silent TM with heartbeats disabled. Its handler blocks long enough
+    // Silent worker with heartbeats disabled. Its handler blocks long enough
     // for the watchdog to fire.
-    TaskManager::Config silent_cfg;
+    Worker::Config silent_cfg;
     silent_cfg.heartbeat_interval = std::chrono::milliseconds{0};
-    TaskManager silent("silent-tm", "127.0.0.1", silent_cfg);
+    Worker silent("silent-worker", "127.0.0.1", silent_cfg);
     silent.register_role("worker", [](const DeploymentTask&) { std::this_thread::sleep_for(2s); });
-    silent.connect_to_jm("127.0.0.1", jm_port);
+    silent.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    ASSERT_TRUE(jm.await_registrations(2s));
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
     JobPlan plan;
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "healthy-tm",
+        .worker_id = "healthy-worker",
         .role = "worker",
         .subtask_idx = 0,
         .data_port = 0,
@@ -479,41 +480,41 @@ TEST(Cluster, FailureBroadcastsCancelToSurvivors) {
         .extra_config = "",
     });
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "silent-tm",
+        .worker_id = "silent-worker",
         .role = "worker",
         .subtask_idx = 1,
         .data_port = 0,
         .peer_refs = {},
         .extra_config = "",
     });
-    jm.deploy(plan);
+    coordinator.deploy(plan);
 
-    ASSERT_TRUE(jm.await_completion(3s));
+    ASSERT_TRUE(coordinator.await_completion(3s));
 
-    // The watchdog should have declared silent-tm lost.
-    auto lost = jm.lost_tms();
+    // The watchdog should have declared silent-worker lost.
+    auto lost = coordinator.lost_workers();
     ASSERT_EQ(lost.size(), 1u);
-    EXPECT_EQ(lost[0], "silent-tm");
+    EXPECT_EQ(lost[0], "silent-worker");
 
-    // Surviving TM saw the CancelJob broadcast.
+    // Surviving worker saw the CancelJob broadcast.
     EXPECT_TRUE(healthy.was_cancelled());
     EXPECT_TRUE(healthy_observed_cancel.load());
 
-    // JM's errors include the lost TM's task.
-    auto errs = jm.errors();
+    // coordinator's errors include the lost worker's task.
+    auto errs = coordinator.errors();
     ASSERT_FALSE(errs.empty());
-    EXPECT_NE(errs[0].find("silent-tm"), std::string::npos);
+    EXPECT_NE(errs[0].find("silent-worker"), std::string::npos);
 
     healthy.stop();
     silent.stop();
-    jm.stop();
+    coordinator.stop();
 }
 
 // Spec-driven dispatch: the role handlers no longer hard-code the DAG
-// structure. The JM ships a `JobGraphSpec` (text) in `extra_config`; each
+// structure. The coordinator ships a `JobGraphSpec` (text) in `extra_config`; each
 // handler parses it, looks each op type up in a small registry, and
 // builds the DAG dynamically. This is the foundation for "submit a job
-// to a running JM" - users describe their job as a graph of named
+// to a running coordinator" - users describe their job as a graph of named
 // factories rather than recompiling the binary with new role lambdas.
 TEST(Cluster, GraphSpecDrivenProducerConsumer) {
     // Pre-bind ports as before.
@@ -523,9 +524,9 @@ TEST(Cluster, GraphSpecDrivenProducerConsumer) {
         consumer_port = probe.listen();
     }
 
-    JobManager jm;
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"tm-a", "tm-b"});
+    Coordinator coordinator;
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-a", "worker-b"});
 
     auto consumer_sink = std::make_shared<CollectingSink<std::int64_t>>();
 
@@ -602,15 +603,15 @@ TEST(Cluster, GraphSpecDrivenProducerConsumer) {
         exec.run();
     };
 
-    TaskManager tm_b("tm-b", "127.0.0.1");
-    tm_b.register_role("graph", run_graph);
-    tm_b.connect_to_jm("127.0.0.1", jm_port);
+    Worker worker_b("worker-b", "127.0.0.1");
+    worker_b.register_role("graph", run_graph);
+    worker_b.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    TaskManager tm_a("tm-a", "127.0.0.1");
-    tm_a.register_role("graph", run_graph);
-    tm_a.connect_to_jm("127.0.0.1", jm_port);
+    Worker worker_a("worker-a", "127.0.0.1");
+    worker_a.register_role("graph", run_graph);
+    worker_a.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    ASSERT_TRUE(jm.await_registrations(2s));
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
     // Producer's spec: vector source (1, 2, 3) → multiplier(factor=10) →
     // network sink. Output: 10, 20, 30 over the wire.
@@ -628,7 +629,7 @@ TEST(Cluster, GraphSpecDrivenProducerConsumer) {
     // the two tasks (both share role="graph"). Producer references the
     // consumer's (role, subtask) pair to find its host:port.
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "tm-b",
+        .worker_id = "worker-b",
         .role = "graph",
         .subtask_idx = 0,
         .data_port = consumer_port,
@@ -636,52 +637,52 @@ TEST(Cluster, GraphSpecDrivenProducerConsumer) {
         .extra_config = consumer_spec.serialize(),
     });
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "tm-a",
+        .worker_id = "worker-a",
         .role = "graph",
         .subtask_idx = 1,
         .data_port = 0,
         .peer_refs = {{"graph", 0}},
         .extra_config = producer_spec.serialize(),
     });
-    jm.deploy(plan);
+    coordinator.deploy(plan);
 
-    ASSERT_TRUE(jm.await_completion(5s));
-    EXPECT_TRUE(jm.errors().empty());
+    ASSERT_TRUE(coordinator.await_completion(5s));
+    EXPECT_TRUE(coordinator.errors().empty());
 
     EXPECT_EQ(consumer_sink->collected(), (std::vector<std::int64_t>{10, 20, 30}));
 
-    tm_a.stop();
-    tm_b.stop();
-    jm.stop();
+    worker_a.stop();
+    worker_b.stop();
+    coordinator.stop();
 }
 
-// A TM that registers but is dispatched a role it doesn't know about
-// must report had_error=true on SubtaskFinished. The JM surfaces it via
-// errors(); the TM stays registered and able to receive other work.
-TEST(Cluster, DeployToTmWithoutRoleHandlerReportsError) {
-    JobManager jm;
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"empty-tm"});
+// A worker that registers but is dispatched a role it doesn't know about
+// must report had_error=true on SubtaskFinished. The coordinator surfaces it via
+// errors(); the worker stays registered and able to receive other work.
+TEST(Cluster, DeployToWorkerWithoutRoleHandlerReportsError) {
+    Coordinator coordinator;
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"empty-worker"});
 
-    TaskManager tm("empty-tm", "127.0.0.1");
-    // Note: NO register_role call. TM has zero handlers.
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    Worker worker("empty-worker", "127.0.0.1");
+    // Note: NO register_role call. worker has zero handlers.
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    ASSERT_TRUE(jm.await_registrations(2s));
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
     JobPlan plan;
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "empty-tm",
+        .worker_id = "empty-worker",
         .role = "ghost",
         .subtask_idx = 0,
         .data_port = 0,
         .peer_refs = {},
         .extra_config = "",
     });
-    jm.deploy(plan);
+    coordinator.deploy(plan);
 
-    ASSERT_TRUE(jm.await_completion(2s));
-    auto errs = jm.errors();
+    ASSERT_TRUE(coordinator.await_completion(2s));
+    auto errs = coordinator.errors();
     ASSERT_FALSE(errs.empty());
     bool found = false;
     for (const auto& e : errs) {
@@ -691,32 +692,32 @@ TEST(Cluster, DeployToTmWithoutRoleHandlerReportsError) {
     }
     EXPECT_TRUE(found);
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 }
 
-// Two TMs both fail their tasks (throw). JM collects both errors and
+// Two workers both fail their tasks (throw). coordinator collects both errors and
 // reports completion - failure of one doesn't mask the other.
 TEST(Cluster, MultipleSimultaneousTaskFailuresAreAllReported) {
-    JobManager jm;  // max_restarts = 0 by default
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"tm-1", "tm-2"});
+    Coordinator coordinator;  // max_restarts = 0 by default
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-1", "worker-2"});
 
-    TaskManager tm1("tm-1", "127.0.0.1");
-    tm1.register_role("crashy",
-                      [](const DeploymentTask&) { throw std::runtime_error("crash from tm-1"); });
-    tm1.connect_to_jm("127.0.0.1", jm_port);
+    Worker worker1("worker-1", "127.0.0.1");
+    worker1.register_role(
+        "crashy", [](const DeploymentTask&) { throw std::runtime_error("crash from worker-1"); });
+    worker1.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    TaskManager tm2("tm-2", "127.0.0.1");
-    tm2.register_role("crashy",
-                      [](const DeploymentTask&) { throw std::runtime_error("crash from tm-2"); });
-    tm2.connect_to_jm("127.0.0.1", jm_port);
+    Worker worker2("worker-2", "127.0.0.1");
+    worker2.register_role(
+        "crashy", [](const DeploymentTask&) { throw std::runtime_error("crash from worker-2"); });
+    worker2.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    ASSERT_TRUE(jm.await_registrations(2s));
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
     JobPlan plan;
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "tm-1",
+        .worker_id = "worker-1",
         .role = "crashy",
         .subtask_idx = 0,
         .data_port = 0,
@@ -724,61 +725,61 @@ TEST(Cluster, MultipleSimultaneousTaskFailuresAreAllReported) {
         .extra_config = "",
     });
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "tm-2",
+        .worker_id = "worker-2",
         .role = "crashy",
         .subtask_idx = 1,
         .data_port = 0,
         .peer_refs = {},
         .extra_config = "",
     });
-    jm.deploy(plan);
+    coordinator.deploy(plan);
 
-    ASSERT_TRUE(jm.await_completion(3s));
-    auto errs = jm.errors();
+    ASSERT_TRUE(coordinator.await_completion(3s));
+    auto errs = coordinator.errors();
     ASSERT_GE(errs.size(), 2u);
 
     bool saw_tm1 = false;
     bool saw_tm2 = false;
     for (const auto& e : errs) {
-        if (e.find("tm-1") != std::string::npos) {
+        if (e.find("worker-1") != std::string::npos) {
             saw_tm1 = true;
         }
-        if (e.find("tm-2") != std::string::npos) {
+        if (e.find("worker-2") != std::string::npos) {
             saw_tm2 = true;
         }
     }
     EXPECT_TRUE(saw_tm1);
     EXPECT_TRUE(saw_tm2);
 
-    tm1.stop();
-    tm2.stop();
-    jm.stop();
+    worker1.stop();
+    worker2.stop();
+    coordinator.stop();
 }
 
-// Dynamic placement with not enough free slots: 1 TM with slot_count=1,
+// Dynamic placement with not enough free slots: 1 worker with slot_count=1,
 // 2 unassigned tasks. The behaviour is documented elsewhere - what we
 // pin here is "doesn't silently hang". Either deploy() rejects, or
 // errors() exposes the failure after await_completion.
 TEST(Cluster, DynamicPlacementWithInsufficientSlotsDoesNotHang) {
-    JobManager::Config jm_cfg;
-    jm_cfg.heartbeat_timeout = 500ms;
-    jm_cfg.watchdog_interval = 50ms;
-    JobManager jm(jm_cfg);
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"single-tm"});
+    Coordinator::Config coordinator_cfg;
+    coordinator_cfg.heartbeat_timeout = 500ms;
+    coordinator_cfg.watchdog_interval = 50ms;
+    Coordinator coordinator(coordinator_cfg);
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"single-worker"});
 
-    TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 1;
-    TaskManager tm("single-tm", "127.0.0.1", tm_cfg);
+    Worker::Config worker_cfg;
+    worker_cfg.slot_count = 1;
+    Worker worker("single-worker", "127.0.0.1", worker_cfg);
     std::atomic<int> ran{0};
-    tm.register_role("worker", [&ran](const DeploymentTask&) { ran.fetch_add(1); });
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    worker.register_role("worker", [&ran](const DeploymentTask&) { ran.fetch_add(1); });
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    ASSERT_TRUE(jm.await_registrations(2s));
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
     JobPlan plan;
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "",
+        .worker_id = "",
         .role = "worker",
         .subtask_idx = 0,
         .data_port = 0,
@@ -786,7 +787,7 @@ TEST(Cluster, DynamicPlacementWithInsufficientSlotsDoesNotHang) {
         .extra_config = "",
     });
     plan.tasks.push_back(PlannedTask{
-        .tm_id = "",
+        .worker_id = "",
         .role = "worker",
         .subtask_idx = 1,
         .data_port = 0,
@@ -796,18 +797,18 @@ TEST(Cluster, DynamicPlacementWithInsufficientSlotsDoesNotHang) {
 
     bool deploy_threw = false;
     try {
-        jm.deploy(plan);
+        coordinator.deploy(plan);
     } catch (const std::exception&) {
         deploy_threw = true;
     }
 
     if (!deploy_threw) {
-        // Bounded wait - must not hang forever even if the JM can't
+        // Bounded wait - must not hang forever even if the coordinator can't
         // place the second task.
-        const bool completed = jm.await_completion(3s);
+        const bool completed = coordinator.await_completion(3s);
         if (completed) {
             // If completion was reported, the over-subscribed task must
-            // surface as either an error or the JM must have packed both
+            // surface as either an error or the coordinator must have packed both
             // onto the single slot serially.
             EXPECT_GE(ran.load(), 1);
         } else {
@@ -817,53 +818,53 @@ TEST(Cluster, DynamicPlacementWithInsufficientSlotsDoesNotHang) {
         }
     }
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 }
 
 // History server: every job that reaches a terminal state lands in the
-// JM's bounded history ring. We verify both an OK job and a FAILED job
+// coordinator's bounded history ring. We verify both an OK job and a FAILED job
 // surface there with the right status, errors, and duration tracking.
 TEST(Cluster, HistoryServerRetainsTerminalJobs) {
-    JobManager::Config jm_cfg;
-    jm_cfg.max_restarts = 0;  // failing task surfaces immediately
-    JobManager jm(jm_cfg);
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"tm-h"});
+    Coordinator::Config coordinator_cfg;
+    coordinator_cfg.max_restarts = 0;  // failing task surfaces immediately
+    Coordinator coordinator(coordinator_cfg);
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-h"});
 
-    TaskManager tm("tm-h", "127.0.0.1");
-    tm.register_role("noop", [](const DeploymentTask&) {});
-    tm.register_role("boom",
-                     [](const DeploymentTask&) { throw std::runtime_error("intentional"); });
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    Worker worker("worker-h", "127.0.0.1");
+    worker.register_role("noop", [](const DeploymentTask&) {});
+    worker.register_role("boom",
+                         [](const DeploymentTask&) { throw std::runtime_error("intentional"); });
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
 
-    ASSERT_TRUE(jm.await_registrations(2s));
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
     JobPlan ok_plan;
     ok_plan.tasks.push_back(PlannedTask{
-        .tm_id = "tm-h",
+        .worker_id = "worker-h",
         .role = "noop",
         .subtask_idx = 0,
         .data_port = 0,
         .peer_refs = {},
         .extra_config = "",
     });
-    jm.deploy(ok_plan);
-    ASSERT_TRUE(jm.await_completion(3s));
+    coordinator.deploy(ok_plan);
+    ASSERT_TRUE(coordinator.await_completion(3s));
 
     JobPlan fail_plan;
     fail_plan.tasks.push_back(PlannedTask{
-        .tm_id = "tm-h",
+        .worker_id = "worker-h",
         .role = "boom",
         .subtask_idx = 0,
         .data_port = 0,
         .peer_refs = {},
         .extra_config = "",
     });
-    jm.deploy(fail_plan);
-    ASSERT_TRUE(jm.await_completion(3s));
+    coordinator.deploy(fail_plan);
+    ASSERT_TRUE(coordinator.await_completion(3s));
 
-    auto history = jm.job_history();
+    auto history = coordinator.job_history();
     ASSERT_GE(history.size(), 2u);
 
     const auto& ok_rec = history[history.size() - 2];
@@ -878,18 +879,18 @@ TEST(Cluster, HistoryServerRetainsTerminalJobs) {
     EXPECT_GT(ok_rec.completed_at_unix_seconds, 0);
     EXPECT_GT(fail_rec.completed_at_unix_seconds, 0);
 
-    auto looked_up = jm.job_history(fail_rec.job_id);
+    auto looked_up = coordinator.job_history(fail_rec.job_id);
     ASSERT_TRUE(looked_up.has_value());
     EXPECT_EQ(looked_up->status, "failed");
 
-    EXPECT_FALSE(jm.job_history(JobId{999999}).has_value());
+    EXPECT_FALSE(coordinator.job_history(JobId{999999}).has_value());
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 }
 
 // History persists to <ha_dir>/history/<job_id>.json and is reloaded
-// on a fresh JM that points at the same ha_dir. Mirrors
+// on a fresh coordinator that points at the same ha_dir. Mirrors
 // HistoryServer archive layout.
 TEST(Cluster, HistoryServerPersistsAcrossRestart) {
     auto ha_dir = std::filesystem::temp_directory_path() /
@@ -898,56 +899,56 @@ TEST(Cluster, HistoryServerPersistsAcrossRestart) {
 
     JobId failed_job_id = 0;
     {
-        JobManager::Config cfg;
+        Coordinator::Config cfg;
         cfg.max_restarts = 0;
-        JobManager jm(cfg);
-        jm.set_ha_dir(ha_dir.string());
-        const auto port = jm.start();
-        jm.expect_tms({"tm-p"});
-        TaskManager tm("tm-p", "127.0.0.1");
-        tm.register_role("noop", [](const DeploymentTask&) {});
-        tm.register_role("boom",
-                         [](const DeploymentTask&) { throw std::runtime_error("disk-test"); });
-        tm.connect_to_jm("127.0.0.1", port);
-        ASSERT_TRUE(jm.await_registrations(2s));
+        Coordinator coordinator(cfg);
+        coordinator.set_ha_dir(ha_dir.string());
+        const auto port = coordinator.start();
+        coordinator.expect_workers({"worker-p"});
+        Worker worker("worker-p", "127.0.0.1");
+        worker.register_role("noop", [](const DeploymentTask&) {});
+        worker.register_role("boom",
+                             [](const DeploymentTask&) { throw std::runtime_error("disk-test"); });
+        worker.connect_to_coordinator("127.0.0.1", port);
+        ASSERT_TRUE(coordinator.await_registrations(2s));
 
         JobPlan ok_plan;
         ok_plan.tasks.push_back(PlannedTask{
-            .tm_id = "tm-p",
+            .worker_id = "worker-p",
             .role = "noop",
             .subtask_idx = 0,
             .data_port = 0,
             .peer_refs = {},
             .extra_config = "",
         });
-        jm.deploy(ok_plan);
-        ASSERT_TRUE(jm.await_completion(3s));
+        coordinator.deploy(ok_plan);
+        ASSERT_TRUE(coordinator.await_completion(3s));
 
         JobPlan fail_plan;
         fail_plan.tasks.push_back(PlannedTask{
-            .tm_id = "tm-p",
+            .worker_id = "worker-p",
             .role = "boom",
             .subtask_idx = 0,
             .data_port = 0,
             .peer_refs = {},
             .extra_config = "",
         });
-        jm.deploy(fail_plan);
-        ASSERT_TRUE(jm.await_completion(3s));
+        coordinator.deploy(fail_plan);
+        ASSERT_TRUE(coordinator.await_completion(3s));
 
-        auto h = jm.job_history();
+        auto h = coordinator.job_history();
         ASSERT_GE(h.size(), 2u);
         failed_job_id = h.back().job_id;
 
-        tm.stop();
-        jm.stop();
+        worker.stop();
+        coordinator.stop();
     }
 
-    // Fresh JM points at the same ha_dir - should reload both records.
+    // Fresh coordinator points at the same ha_dir - should reload both records.
     {
-        JobManager jm2;
-        jm2.set_ha_dir(ha_dir.string());
-        auto h = jm2.job_history();
+        Coordinator coordinator2;
+        coordinator2.set_ha_dir(ha_dir.string());
+        auto h = coordinator2.job_history();
         ASSERT_EQ(h.size(), 2u);
         const auto* found = static_cast<const CompletedJobRecord*>(nullptr);
         for (const auto& rec : h) {
@@ -960,7 +961,7 @@ TEST(Cluster, HistoryServerPersistsAcrossRestart) {
         EXPECT_EQ(found->status, "failed");
         ASSERT_FALSE(found->errors.empty());
         EXPECT_NE(found->errors[0].find("disk-test"), std::string::npos);
-        jm2.stop();
+        coordinator2.stop();
     }
 
     std::filesystem::remove_all(ha_dir);
@@ -968,14 +969,14 @@ TEST(Cluster, HistoryServerPersistsAcrossRestart) {
 
 // --- Per-operator rescale request surface ---------------
 
-TEST(JobManagerRescale, RequestOperatorRescaleUnknownJobReturnsError) {
-    // The JM-level delegate validates job existence; the underlying
+TEST(CoordinatorRescale, RequestOperatorRescaleUnknownJobReturnsError) {
+    // The coordinator-level delegate validates job existence; the underlying
     // RescaleCoordinator state machine + bounds checks are already
     // unit-tested via test_rescale_coordinator.cpp. This test pins
-    // the JM-only paths (unknown job, no coordinator) so a future
+    // the coordinator-only paths (unknown job, no coordinator) so a future
     // refactor can't silently drop them.
-    JobManager jm;
-    auto result = jm.request_operator_rescale(JobId{999}, "join", 4);
+    Coordinator coordinator;
+    auto result = coordinator.request_operator_rescale(JobId{999}, "join", 4);
     EXPECT_FALSE(result.ok);
     EXPECT_NE(result.reason.find("unknown job_id"), std::string::npos);
 }
@@ -984,19 +985,19 @@ TEST(JobManagerRescale, RequestOperatorRescaleUnknownJobReturnsError) {
 // checkpoint lands. A job with no periodic checkpointing would sit in
 // Preparing forever, so request_operator_rescale must reject up front
 // with a clear reason instead of hanging silently.
-TEST(JobManagerRescale, RejectsRescaleWhenNoCheckpointingConfigured) {
+TEST(CoordinatorRescale, RejectsRescaleWhenNoCheckpointingConfigured) {
     using namespace std::chrono_literals;
     ensure_built_ins_registered();
 
-    JobManager jm;  // no autoscaler, and the submitted job has no checkpoint config
-    const auto jm_port = jm.start();
-    jm.expect_tms({"tm-rs-nockpt"});
+    Coordinator coordinator;  // no autoscaler, and the submitted job has no checkpoint config
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-rs-nockpt"});
 
-    TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 4;
-    TaskManager tm("tm-rs-nockpt", "127.0.0.1", tm_cfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
-    ASSERT_TRUE(jm.await_registrations(2s));
+    Worker::Config worker_cfg;
+    worker_cfg.slot_count = 4;
+    Worker worker("worker-rs-nockpt", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
     const auto out_path = std::filesystem::temp_directory_path() / "clink_rescale_no_ckpt.txt";
     std::filesystem::remove(out_path);
@@ -1020,7 +1021,7 @@ TEST(JobManagerRescale, RejectsRescaleWhenNoCheckpointingConfigured) {
     snk.params = {{"path", out_path.string()}};
     g.ops.push_back(snk);
 
-    const auto job_id = jm.submit_job(g, OperatorRegistry::default_instance());
+    const auto job_id = coordinator.submit_job(g, OperatorRegistry::default_instance());
 
     // Wait until the operator is deployed and its rescale coordinator is
     // registered (status becomes non-nullopt). Completed jobs linger in
@@ -1028,7 +1029,7 @@ TEST(JobManagerRescale, RejectsRescaleWhenNoCheckpointingConfigured) {
     const auto deadline = std::chrono::steady_clock::now() + 2s;
     bool coordinator_ready = false;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (jm.operator_rescale_status(job_id, "src").has_value()) {
+        if (coordinator.operator_rescale_status(job_id, "src").has_value()) {
             coordinator_ready = true;
             break;
         }
@@ -1036,51 +1037,51 @@ TEST(JobManagerRescale, RejectsRescaleWhenNoCheckpointingConfigured) {
     }
     ASSERT_TRUE(coordinator_ready) << "operator rescale coordinator was not registered";
 
-    auto result = jm.request_operator_rescale(job_id, "src", 2);
+    auto result = coordinator.request_operator_rescale(job_id, "src", 2);
     EXPECT_FALSE(result.ok);
     EXPECT_NE(result.reason.find("periodic checkpointing"), std::string::npos) << result.reason;
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
     std::filesystem::remove(out_path);
 }
 
-TEST(JobManagerRescale, OperatorRescaleStatusUnknownJobReturnsNullopt) {
-    JobManager jm;
-    auto st = jm.operator_rescale_status(JobId{999}, "join");
+TEST(CoordinatorRescale, OperatorRescaleStatusUnknownJobReturnsNullopt) {
+    Coordinator coordinator;
+    auto st = coordinator.operator_rescale_status(JobId{999}, "join");
     EXPECT_FALSE(st.has_value());
 }
 
-// --- Autoscaler wiring through JobManager -----------------
+// --- Autoscaler wiring through Coordinator -----------------
 
-TEST(JobManagerAutoscaler, NoConfigMeansNoAutoscaler) {
-    // Default JobManager::Config leaves the autoscaler unset.
+TEST(CoordinatorAutoscaler, NoConfigMeansNoAutoscaler) {
+    // Default Coordinator::Config leaves the autoscaler unset.
     // autoscaler_ticks must return nullopt for any job; the wiring
     // is opt-in.
-    JobManager jm;
-    auto t = jm.autoscaler_ticks(JobId{1});
+    Coordinator coordinator;
+    auto t = coordinator.autoscaler_ticks(JobId{1});
     EXPECT_FALSE(t.has_value());
 }
 
-TEST(JobManagerAutoscaler, UnknownJobReturnsNullopt) {
-    JobManager::Config cfg;
+TEST(CoordinatorAutoscaler, UnknownJobReturnsNullopt) {
+    Coordinator::Config cfg;
     AutoscalerConfig as_cfg;
     as_cfg.sample_period = std::chrono::milliseconds{50};
     cfg.autoscaler = as_cfg;
-    JobManager jm(cfg);
-    EXPECT_FALSE(jm.autoscaler_ticks(JobId{99}).has_value());
+    Coordinator coordinator(cfg);
+    EXPECT_FALSE(coordinator.autoscaler_ticks(JobId{99}).has_value());
 }
 
 // End-to-end: submit a graph with a bounded op, the per-job autoscaler
 // thread starts, ticks, and (because sample_fn returns a saturated
-// signal) eventually drives request_operator_rescale through the JM's
-// public surface. Runs entirely in-process: one JM, one TM, one
+// signal) eventually drives request_operator_rescale through the coordinator's
+// public surface. Runs entirely in-process: one coordinator, one worker, one
 // short-lived built-in pipeline.
-TEST(JobManagerAutoscaler, TicksAndFiresRescaleRequest) {
+TEST(CoordinatorAutoscaler, TicksAndFiresRescaleRequest) {
     using namespace std::chrono_literals;
     ensure_built_ins_registered();
 
-    JobManager::Config jm_cfg;
+    Coordinator::Config coordinator_cfg;
     AutoscalerConfig as_cfg;
     as_cfg.sample_period = 30ms;
     as_cfg.setpoint = 0.7;
@@ -1091,29 +1092,30 @@ TEST(JobManagerAutoscaler, TicksAndFiresRescaleRequest) {
     as_cfg.pid.kd = 0.0;
     as_cfg.pid.output_min = -1.0;
     as_cfg.pid.output_max = 1.0;
-    jm_cfg.autoscaler = as_cfg;
+    coordinator_cfg.autoscaler = as_cfg;
 
-    JobManager jm(jm_cfg);
+    Coordinator coordinator(coordinator_cfg);
 
     std::atomic<int> sample_calls{0};
     std::atomic<int> requests_seen{0};
-    jm.set_autoscaler_sample_fn([&sample_calls](JobId, const std::string&) -> double {
+    coordinator.set_autoscaler_sample_fn([&sample_calls](JobId, const std::string&) -> double {
         sample_calls.fetch_add(1, std::memory_order_relaxed);
         return 0.95;  // over-saturated -> scale up
     });
 
-    const auto jm_port = jm.start();
-    jm.expect_tms({"tm-as"});
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-as"});
 
-    TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 4;  // enough headroom for the 2 subtasks plus
-                            // any rescale fan-out the autoscaler asks
-                            // for during the test window.
-    TaskManager tm("tm-as", "127.0.0.1", tm_cfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
-    ASSERT_TRUE(jm.await_registrations(2s));
+    Worker::Config worker_cfg;
+    worker_cfg.slot_count = 4;  // enough headroom for the 2 subtasks plus
+                                // any rescale fan-out the autoscaler asks
+                                // for during the test window.
+    Worker worker("worker-as", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
-    const auto out_path = std::filesystem::temp_directory_path() / "clink_autoscaler_jm_test.txt";
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_autoscaler_coordinator_test.txt";
     std::filesystem::remove(out_path);
 
     JobGraphSpec g;
@@ -1135,14 +1137,14 @@ TEST(JobManagerAutoscaler, TicksAndFiresRescaleRequest) {
     snk.params = {{"path", out_path.string()}};
     g.ops.push_back(snk);
 
-    const auto job_id = jm.submit_job(g, OperatorRegistry::default_instance());
+    const auto job_id = coordinator.submit_job(g, OperatorRegistry::default_instance());
 
     // Wait for the per-job autoscaler thread to clock at least a few
     // ticks AND for a rescale request to land (or saturate the budget).
     const auto deadline = std::chrono::steady_clock::now() + 1500ms;
     while (std::chrono::steady_clock::now() < deadline) {
-        auto ticks = jm.autoscaler_ticks(job_id);
-        auto status = jm.operator_rescale_status(job_id, "src");
+        auto ticks = coordinator.autoscaler_ticks(job_id);
+        auto status = coordinator.operator_rescale_status(job_id, "src");
         if (status.has_value() && status->state != RescaleState::Idle) {
             requests_seen.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1152,33 +1154,33 @@ TEST(JobManagerAutoscaler, TicksAndFiresRescaleRequest) {
         std::this_thread::sleep_for(20ms);
     }
 
-    const auto ticks = jm.autoscaler_ticks(job_id);
+    const auto ticks = coordinator.autoscaler_ticks(job_id);
     ASSERT_TRUE(ticks.has_value()) << "autoscaler was not created for the job";
     EXPECT_GE(*ticks, 3u);
     EXPECT_GE(sample_calls.load(), 1);
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
     std::filesystem::remove(out_path);
 }
 
-TEST(JobManagerAutoscaler, NoAutoscalerWhenOpsLackBounds) {
+TEST(CoordinatorAutoscaler, NoAutoscalerWhenOpsLackBounds) {
     using namespace std::chrono_literals;
     ensure_built_ins_registered();
 
-    JobManager::Config jm_cfg;
+    Coordinator::Config coordinator_cfg;
     AutoscalerConfig as_cfg;
     as_cfg.sample_period = 30ms;
-    jm_cfg.autoscaler = as_cfg;
-    JobManager jm(jm_cfg);
+    coordinator_cfg.autoscaler = as_cfg;
+    Coordinator coordinator(coordinator_cfg);
 
-    const auto jm_port = jm.start();
-    jm.expect_tms({"tm-no-bounds"});
-    TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 2;
-    TaskManager tm("tm-no-bounds", "127.0.0.1", tm_cfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
-    ASSERT_TRUE(jm.await_registrations(2s));
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-no-bounds"});
+    Worker::Config worker_cfg;
+    worker_cfg.slot_count = 2;
+    Worker worker("worker-no-bounds", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
 
     const auto out_path = std::filesystem::temp_directory_path() / "clink_autoscaler_no_bounds.txt";
     std::filesystem::remove(out_path);
@@ -1200,12 +1202,12 @@ TEST(JobManagerAutoscaler, NoAutoscalerWhenOpsLackBounds) {
     snk.params = {{"path", out_path.string()}};
     g.ops.push_back(snk);
 
-    const auto job_id = jm.submit_job(g, OperatorRegistry::default_instance());
-    // No op declares bounds -> the JM must NOT spawn a per-job
+    const auto job_id = coordinator.submit_job(g, OperatorRegistry::default_instance());
+    // No op declares bounds -> the coordinator must NOT spawn a per-job
     // autoscaler. autoscaler_ticks returns nullopt.
-    EXPECT_FALSE(jm.autoscaler_ticks(job_id).has_value());
+    EXPECT_FALSE(coordinator.autoscaler_ticks(job_id).has_value());
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
     std::filesystem::remove(out_path);
 }

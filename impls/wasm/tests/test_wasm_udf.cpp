@@ -350,7 +350,7 @@ TEST(WasmUdfString, DeallocIsCalledForArgAndResultBuffers) {
 }
 
 TEST(WasmUdfString, TextWireTypeNameRoundTrips) {
-    // The ship path carries UDF types as Arrow ToString() names; the TM
+    // The ship path carries UDF types as Arrow ToString() names; the worker
     // maps them back without the SQL frontend. Pin the TEXT agreement.
     EXPECT_TRUE(clink::udf_type_from_wire_name(arrow::utf8()->ToString())->Equals(arrow::utf8()));
 }

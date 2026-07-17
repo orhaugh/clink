@@ -34,7 +34,7 @@ docs current when a subsystem changes.
 | Operators + DAG + fluent API | `include/clink/operators/`, `include/clink/runtime/dag.hpp`, `include/clink/api/` | `docs/internals/operator-model.md` |
 | Local runtime / task lifecycle | `src/runtime/local_executor.cpp`, `include/clink/runtime/` | `docs/internals/task-lifecycle.md` |
 | Jobs, parallelism, scheduling, key groups | `include/clink/cluster/job_graph.hpp`, `include/clink/job/` | `docs/internals/jobs-and-scheduling.md` |
-| Cluster control plane (JM/TM, protocol, HA, plugin model) | `src/cluster/`, `include/clink/cluster/`, `include/clink/plugin/`, `tools/clink_node.cpp` | `docs/internals/distributed-runtime.md` |
+| Cluster control plane (coordinator/worker, protocol, HA, plugin model) | `src/cluster/`, `include/clink/cluster/`, `include/clink/plugin/`, `tools/clink_node.cpp` | `docs/internals/distributed-runtime.md` |
 | Network / channels / Arrow wire / backpressure | `include/clink/runtime/network/`, `include/clink/runtime/multi_input_alignment.hpp` | `docs/internals/network-stack.md` |
 | Time, watermarks, windows, CEP | `include/clink/time/`, `include/clink/operators/`, `include/clink/cep/` | `docs/internals/time-and-windowing.md` |
 | Keyed/broadcast state + backends + queryable state | `include/clink/state/`, `src/state/`, `include/clink/queryable_state/` | `docs/internals/state-and-backends.md`, format contract: `docs/internals/state-snapshot-format.md` |

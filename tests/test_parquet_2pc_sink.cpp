@@ -185,7 +185,7 @@ TEST(ParquetSink2PC, BarrierWithoutCommitLeavesStagingAndState) {
     sink->open();
     sink->on_data(sample_batch());
     sink->on_barrier(CheckpointBarrier{CheckpointId{7}});
-    // No on_commit - simulate a crash before the JM declares ckpt 7 done.
+    // No on_commit - simulate a crash before the coordinator declares ckpt 7 done.
 
     EXPECT_EQ(count_parquet(dir / "staging"), 1u);
     EXPECT_EQ(count_parquet(dir / "committed"), 0u);

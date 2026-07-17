@@ -27,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/job/register_job.hpp"
 #include "clink/operators/process_function.hpp"
@@ -77,26 +77,25 @@ inline std::int64_t read_i64_le(std::span<const std::byte> b, std::size_t& pos) 
 }
 
 inline clink::Codec<Order> order_codec() {
-    return clink::Codec<Order>{
-        .encode =
-            [](const Order& o) {
-                std::vector<std::byte> out(32);
-                std::byte* p = out.data();
-                put_i64_le(p, o.ts_ms);
-                put_i64_le(p, o.user_id);
-                put_i64_le(p, o.order_id);
-                put_i64_le(p, o.amount_cents);
-                return out;
-            },
-        .decode = [](std::span<const std::byte> b) -> std::optional<Order> {
-            std::size_t pos = 0;
-            Order o;
-            o.ts_ms = read_i64_le(b, pos);
-            o.user_id = read_i64_le(b, pos);
-            o.order_id = read_i64_le(b, pos);
-            o.amount_cents = read_i64_le(b, pos);
-            return o;
-        }};
+    return clink::Codec<Order>{.encode =
+                                   [](const Order& o) {
+                                       std::vector<std::byte> out(32);
+                                       std::byte* p = out.data();
+                                       put_i64_le(p, o.ts_ms);
+                                       put_i64_le(p, o.user_id);
+                                       put_i64_le(p, o.order_id);
+                                       put_i64_le(p, o.amount_cents);
+                                       return out;
+                                   },
+                               .decode = [](std::span<const std::byte> b) -> std::optional<Order> {
+                                   std::size_t pos = 0;
+                                   Order o;
+                                   o.ts_ms = read_i64_le(b, pos);
+                                   o.user_id = read_i64_le(b, pos);
+                                   o.order_id = read_i64_le(b, pos);
+                                   o.amount_cents = read_i64_le(b, pos);
+                                   return o;
+                               }};
 }
 
 inline clink::Codec<Payment> payment_codec() {
@@ -165,8 +164,8 @@ public:
             }
             return false;
         }
-        const std::int64_t end = std::min<std::int64_t>(
-            cursor_ + static_cast<std::int64_t>(kBatchSize), total_);
+        const std::int64_t end =
+            std::min<std::int64_t>(cursor_ + static_cast<std::int64_t>(kBatchSize), total_);
         clink::Batch<Order> batch;
         batch.reserve(static_cast<std::size_t>(end - cursor_));
         const double step_ms = static_cast<double>(windows_ * 1000) / static_cast<double>(total_);
@@ -207,8 +206,8 @@ public:
             }
             return false;
         }
-        const std::int64_t end = std::min<std::int64_t>(
-            cursor_ + static_cast<std::int64_t>(kBatchSize), total_);
+        const std::int64_t end =
+            std::min<std::int64_t>(cursor_ + static_cast<std::int64_t>(kBatchSize), total_);
         clink::Batch<Payment> batch;
         batch.reserve(static_cast<std::size_t>(end - cursor_));
         // Payments lag orders by 50ms so the latest-order-state has been
@@ -240,8 +239,7 @@ private:
 
 // KeyedCoProcessFunction: latest-order-state per key; on Payment,
 // look up latest Order and emit Joined.
-class JoinFn final
-    : public clink::KeyedCoProcessFunction<std::int64_t, Order, Payment, Joined> {
+class JoinFn final : public clink::KeyedCoProcessFunction<std::int64_t, Order, Payment, Joined> {
 public:
     void open(clink::RuntimeContext& ctx) override {
         latest_order_ = std::make_unique<clink::KeyedState<std::int64_t, Order>>(
@@ -286,8 +284,10 @@ public:
     }
 
     void close() override {
-        std::fprintf(
-            stderr, "[%s] sink final count: %lld\n", label_.c_str(), static_cast<long long>(count_));
+        std::fprintf(stderr,
+                     "[%s] sink final count: %lld\n",
+                     label_.c_str(),
+                     static_cast<long long>(count_));
     }
 
     std::string name() const override { return "join_sink"; }
@@ -297,7 +297,7 @@ private:
     std::int64_t count_{0};
 };
 
-void define_job(clink::api::StreamExecutionEnvironment& env) {
+void define_job(clink::api::Pipeline& env) {
     clink::rocksdb::install();
     const auto envv_int64 = [](const char* k, std::int64_t def) -> std::int64_t {
         const char* v = std::getenv(k);
@@ -318,19 +318,17 @@ void define_job(clink::api::StreamExecutionEnvironment& env) {
     // upstreams use the same key-extractor name (so subtask routing
     // is consistent across the join's two inputs); inline lambdas via
     // .key_by(fn) mint distinct names and break connect_process.
-    env.registry().register_key_extractor<Order>(
-        "user_id", [](const Order& o) { return o.user_id; });
-    env.registry().register_key_extractor<Payment>(
-        "user_id", [](const Payment& p) { return p.user_id; });
+    env.registry().register_key_extractor<Order>("user_id",
+                                                 [](const Order& o) { return o.user_id; });
+    env.registry().register_key_extractor<Payment>("user_id",
+                                                   [](const Payment& p) { return p.user_id; });
 
     env.registry().register_source<Order>(
-        "bench.join.order_source",
-        [orders, keys, windows](const clink::plugin::BuildContext&) {
+        "bench.join.order_source", [orders, keys, windows](const clink::plugin::BuildContext&) {
             return std::make_shared<OrderSource>(orders, keys, windows);
         });
     env.registry().register_source<Payment>(
-        "bench.join.payment_source",
-        [payments, keys, windows](const clink::plugin::BuildContext&) {
+        "bench.join.payment_source", [payments, keys, windows](const clink::plugin::BuildContext&) {
             return std::make_shared<PaymentSource>(payments, keys, windows);
         });
     env.registry().register_sink<Joined>(

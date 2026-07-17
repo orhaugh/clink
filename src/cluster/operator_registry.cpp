@@ -239,7 +239,7 @@ void register_built_ins(OperatorRegistry& reg) {
 
     // identity_<T>: passes records through unchanged. Useful for graphs
     // that want a sink with no transform, or as a routing waypoint when
-    // the user wants to force two ops onto different TMs.
+    // the user wants to force two ops onto different workers.
     reg.register_operator(
         "identity_int64",
         OperatorFactory{

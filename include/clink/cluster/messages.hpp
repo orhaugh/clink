@@ -8,11 +8,11 @@ namespace clink::cluster {
 // caller is responsible for putting the leading kind byte.
 
 inline void encode_body(MessageBuilder& b, const RegisterMsg& m) {
-    b.put_string(m.tm_id);
+    b.put_string(m.worker_id);
     b.put_string(m.data_host);
     b.put_u32_be(m.slot_count);
-    // Trailing u16 - old JMs that don't read this far just see end-of-
-    // frame, get http_port=0 on the decoded struct, treat the TM as
+    // Trailing u16 - old coordinators that don't read this far just see end-of-
+    // frame, get http_port=0 on the decoded struct, treat the worker as
     // HTTP-disabled. Same wire-compat pattern as slot_count.
     b.put_u16_be(m.http_port);
 }
@@ -70,7 +70,7 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
     b.put_string(m.restore_from_dir);
     b.put_u64_be(m.restore_from_checkpoint_id);
     // Per-task rescale directives - appended as a parallel array after
-    // the legacy task / plugin / checkpoint fields so old TM decoders
+    // the legacy task / plugin / checkpoint fields so old worker decoders
     // (which stop reading at EOF here) silently see the defaults
     // (kRestoreFromSelf + {0, 0} = no override).
     for (const auto& t : m.tasks) {
@@ -84,19 +84,19 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
     for (const auto& t : m.tasks) {
         b.put_u32_be(t.restore_from_parent_count);
     }
-    // Trailing per-job alignment flag. Older TMs see EOF before this
+    // Trailing per-job alignment flag. Older workers see EOF before this
     // byte and default to aligned, matching their historical behaviour.
     b.put_u8(m.unaligned_checkpoints ? 1 : 0);
-    // Trailing packed expected state-version map. Older TMs see EOF
+    // Trailing packed expected state-version map. Older workers see EOF
     // before this string and leave it empty (no schema migration).
     b.put_string(m.expected_state_versions_packed);
-    // Trailing state-backend URI. Older TMs see EOF before this string and
+    // Trailing state-backend URI. Older workers see EOF before this string and
     // leave it empty, so checkpoint_dir doubles as the backend URI.
     b.put_string(m.state_backend_uri);
-    // Trailing record-capture config. Older TMs see EOF and leave it off.
+    // Trailing record-capture config. Older workers see EOF and leave it off.
     b.put_string(m.capture_dir);
     b.put_u64_be(m.capture_records);
-    // Trailing packed UDF declarations. Older TMs see EOF and leave it
+    // Trailing packed UDF declarations. Older workers see EOF and leave it
     // empty (no deploy-time registration).
     b.put_string(m.udfs_packed);
 }
@@ -156,7 +156,7 @@ inline void encode_body(MessageBuilder& b, const SavepointAckMsg& m) {
 
 inline void encode_body(MessageBuilder& b, const SubtaskFinishedMsg& m) {
     b.put_u64_be(m.job_id);
-    b.put_string(m.tm_id);
+    b.put_string(m.worker_id);
     b.put_string(m.role);
     b.put_u32_be(m.subtask_idx);
     b.put_u8(m.had_error ? 1 : 0);
@@ -164,7 +164,7 @@ inline void encode_body(MessageBuilder& b, const SubtaskFinishedMsg& m) {
 }
 
 inline void encode_body(MessageBuilder& b, const HeartbeatMsg& m) {
-    b.put_string(m.tm_id);
+    b.put_string(m.worker_id);
 }
 
 inline void encode_body(MessageBuilder& /*b*/, const HelloClientMsg&) {}
@@ -179,16 +179,16 @@ inline void encode_body(MessageBuilder& b, const SubmitJobMsg& m) {
     b.put_u64_be(static_cast<std::uint64_t>(m.checkpoint.interval_ms));
     b.put_string(m.checkpoint.restore_from_dir);
     b.put_u64_be(m.checkpoint.restore_from_checkpoint_id);
-    b.put_u32_be(m.checkpoint.max_restarts_on_tm_loss);
+    b.put_u32_be(m.checkpoint.max_restarts_on_worker_loss);
     // Trailing wire-compat: alignment mode added later than the rest.
-    // Older JMs ignore the trailing byte and see alignment=Aligned via
+    // Older coordinators ignore the trailing byte and see alignment=Aligned via
     // the default-init, which matches their historical behaviour.
     b.put_u8(static_cast<std::uint8_t>(m.checkpoint.alignment));
     // Trailing state-backend URI (decoupled from checkpoint_dir). Older
-    // JMs see EOF before this string and leave it empty, so checkpoint_dir
+    // coordinators see EOF before this string and leave it empty, so checkpoint_dir
     // doubles as the backend URI (legacy behaviour).
     b.put_string(m.checkpoint.state_backend_uri);
-    // Trailing record-capture config. Older JMs see EOF and leave it off.
+    // Trailing record-capture config. Older coordinators see EOF and leave it off.
     b.put_string(m.checkpoint.capture_dir);
     b.put_u64_be(m.checkpoint.capture_records);
 }
@@ -253,7 +253,7 @@ inline void encode_body(MessageBuilder& b, const ListJobsAckMsg& m) {
 
 inline void encode_body(MessageBuilder& b, const SubtaskListeningMsg& m) {
     b.put_u64_be(m.job_id);
-    b.put_string(m.tm_id);
+    b.put_string(m.worker_id);
     b.put_string(m.role);
     b.put_u32_be(m.subtask_idx);
     b.put_string(m.host);
@@ -308,7 +308,7 @@ inline std::vector<std::byte> encode_frame(MessageKind kind, const Msg& m) {
 
 inline RegisterMsg decode_register(MessageReader& r) {
     RegisterMsg m;
-    m.tm_id = r.read_string();
+    m.worker_id = r.read_string();
     m.data_host = r.read_string();
     m.slot_count = r.eof() ? std::uint32_t{1} : r.read_u32_be();
     m.http_port = r.eof() ? std::uint16_t{0} : r.read_u16_be();
@@ -358,7 +358,7 @@ inline DeployMsg decode_deploy(MessageReader& r) {
         m.restore_from_checkpoint_id = r.read_u64_be();
     }
     // Rescale directives: per-task triple, in the same task order as the
-    // body above. Missing for legacy JM peers - leave defaults in place
+    // body above. Missing for legacy coordinator peers - leave defaults in place
     // (kRestoreFromSelf + {0, 0} means "restore from own subtask_idx,
     // no kg filter") so behaviour is unchanged.
     if (!r.eof()) {
@@ -368,8 +368,8 @@ inline DeployMsg decode_deploy(MessageReader& r) {
             t.key_group_last = r.read_u16_be();
         }
     }
-    // Parent-count array - present only for JMs that emit scale-down
-    // rescale directives. Older JMs / non-rescale Deploys leave each
+    // Parent-count array - present only for coordinators that emit scale-down
+    // rescale directives. Older coordinators / non-rescale Deploys leave each
     // task at parent_count=1 (single parent, the historic shape).
     if (!r.eof()) {
         for (auto& t : m.tasks) {
@@ -380,23 +380,23 @@ inline DeployMsg decode_deploy(MessageReader& r) {
         m.unaligned_checkpoints = r.read_u8() != 0;
     }
     // Trailing packed expected state-version map (schema evolution).
-    // Absent from older JM peers -> stays empty (no migration).
+    // Absent from older coordinator peers -> stays empty (no migration).
     if (!r.eof()) {
         m.expected_state_versions_packed = r.read_string();
     }
-    // Trailing state-backend URI. Absent from older JM peers -> stays
+    // Trailing state-backend URI. Absent from older coordinator peers -> stays
     // empty (checkpoint_dir is the backend URI).
     if (!r.eof()) {
         m.state_backend_uri = r.read_string();
     }
-    // Trailing record-capture config. Absent from older JM peers -> off.
+    // Trailing record-capture config. Absent from older coordinator peers -> off.
     if (!r.eof()) {
         m.capture_dir = r.read_string();
     }
     if (!r.eof()) {
         m.capture_records = r.read_u64_be();
     }
-    // Trailing packed UDF declarations. Absent from older JM peers ->
+    // Trailing packed UDF declarations. Absent from older coordinator peers ->
     // empty (no deploy-time registration).
     if (!r.eof()) {
         m.udfs_packed = r.read_string();
@@ -486,7 +486,7 @@ inline SavepointAckMsg decode_savepoint_ack(MessageReader& r) {
 inline SubtaskFinishedMsg decode_subtask_finished(MessageReader& r) {
     SubtaskFinishedMsg m;
     m.job_id = r.read_u64_be();
-    m.tm_id = r.read_string();
+    m.worker_id = r.read_string();
     m.role = r.read_string();
     m.subtask_idx = r.read_u32_be();
     m.had_error = r.read_u8() != 0;
@@ -538,7 +538,7 @@ inline SubmitJobMsg decode_submit_job(MessageReader& r) {
     if (!r.eof()) {
         // Trailing wire-compat field (added later than the other
         // checkpoint fields). Older clients leave it implicitly 0 = off.
-        m.checkpoint.max_restarts_on_tm_loss = r.read_u32_be();
+        m.checkpoint.max_restarts_on_worker_loss = r.read_u32_be();
     }
     if (!r.eof()) {
         const auto raw = r.read_u8();
@@ -640,7 +640,7 @@ inline JobCompletedMsg decode_job_completed(MessageReader& r) {
 inline SubtaskListeningMsg decode_subtask_listening(MessageReader& r) {
     SubtaskListeningMsg m;
     m.job_id = r.read_u64_be();
-    m.tm_id = r.read_string();
+    m.worker_id = r.read_string();
     m.role = r.read_string();
     m.subtask_idx = r.read_u32_be();
     m.host = r.read_string();

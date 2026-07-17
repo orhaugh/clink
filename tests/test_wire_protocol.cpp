@@ -1,4 +1,4 @@
-// Wire-format invariants for the JM/TM cluster protocol.
+// Wire-format invariants for the coordinator/worker cluster protocol.
 //
 // The wire format is the contract between every clink_node process in a
 // cluster. Once two nodes are running different versions of the binary,
@@ -130,9 +130,9 @@ Msg round_trip(MessageKind kind, const Msg& original, Decoder decode) {
 }  // namespace
 
 TEST(WireProtocol, RegisterRoundTrips) {
-    RegisterMsg in{.tm_id = "tm-a", .data_host = "10.0.0.7", .slot_count = 4};
+    RegisterMsg in{.worker_id = "worker-a", .data_host = "10.0.0.7", .slot_count = 4};
     auto out = round_trip(MessageKind::Register, in, decode_register);
-    EXPECT_EQ(out.tm_id, in.tm_id);
+    EXPECT_EQ(out.worker_id, in.worker_id);
     EXPECT_EQ(out.data_host, in.data_host);
     EXPECT_EQ(out.slot_count, in.slot_count);
 }
@@ -143,10 +143,10 @@ TEST(WireProtocol, RegisterAckRoundTrips) {
     EXPECT_EQ(ok_out.ok, true);
     EXPECT_EQ(ok_out.message, "welcome");
 
-    RegisterAckMsg bad_msg{.ok = false, .message = "duplicate tm_id"};
+    RegisterAckMsg bad_msg{.ok = false, .message = "duplicate worker_id"};
     auto bad_out = round_trip(MessageKind::RegisterAck, bad_msg, decode_register_ack);
     EXPECT_EQ(bad_out.ok, false);
-    EXPECT_EQ(bad_out.message, "duplicate tm_id");
+    EXPECT_EQ(bad_out.message, "duplicate worker_id");
 }
 
 TEST(WireProtocol, DeployRoundTripsSimpleTask) {
@@ -221,19 +221,19 @@ TEST(WireProtocol, StartJobAndCancelJobRoundTripWithEmptyBody) {
 
 TEST(WireProtocol, SubtaskFinishedRoundTrips) {
     SubtaskFinishedMsg in_ok{.job_id = 1,
-                             .tm_id = "tm-a",
+                             .worker_id = "worker-a",
                              .role = "producer",
                              .subtask_idx = 0,
                              .had_error = false,
                              .error_message = ""};
     auto out_ok = round_trip(MessageKind::SubtaskFinished, in_ok, decode_subtask_finished);
     EXPECT_EQ(out_ok.job_id, 1u);
-    EXPECT_EQ(out_ok.tm_id, "tm-a");
+    EXPECT_EQ(out_ok.worker_id, "worker-a");
     EXPECT_FALSE(out_ok.had_error);
     EXPECT_EQ(out_ok.error_message, "");
 
     SubtaskFinishedMsg in_err{.job_id = 99,
-                              .tm_id = "tm-b",
+                              .worker_id = "worker-b",
                               .role = "consumer",
                               .subtask_idx = 3,
                               .had_error = true,
@@ -246,9 +246,9 @@ TEST(WireProtocol, SubtaskFinishedRoundTrips) {
 }
 
 TEST(WireProtocol, HeartbeatRoundTrips) {
-    HeartbeatMsg in{.tm_id = "tm-z"};
+    HeartbeatMsg in{.worker_id = "worker-z"};
     auto out = round_trip(MessageKind::Heartbeat, in, decode_heartbeat);
-    EXPECT_EQ(out.tm_id, "tm-z");
+    EXPECT_EQ(out.worker_id, "worker-z");
 }
 
 // ----- Backwards-compat: Register without slot_count must still parse -----
@@ -258,12 +258,12 @@ TEST(WireProtocol, RegisterWithoutSlotCountDefaultsToOne) {
     // ends after data_host. The decoder must accept and default to 1.
     MessageBuilder b;
     b.put_u8(static_cast<std::uint8_t>(MessageKind::Register));
-    b.put_string("legacy-tm");
+    b.put_string("legacy-worker");
     b.put_string("10.0.0.99");
     MessageReader r(body_of(b.finalize()));
     EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::Register);
     auto out = decode_register(r);
-    EXPECT_EQ(out.tm_id, "legacy-tm");
+    EXPECT_EQ(out.worker_id, "legacy-worker");
     EXPECT_EQ(out.data_host, "10.0.0.99");
     EXPECT_EQ(out.slot_count, 1u);
 }
@@ -456,19 +456,20 @@ TEST(WireProtocol, JobCompletedRoundTrips) {
     EXPECT_TRUE(ok_out.ok);
     EXPECT_TRUE(ok_out.errors.empty());
 
-    JobCompletedMsg bad{
-        .job_id = 12, .ok = false, .errors = {"tm-a/producer[0]: send failed", "tm-b: lost"}};
+    JobCompletedMsg bad{.job_id = 12,
+                        .ok = false,
+                        .errors = {"worker-a/producer[0]: send failed", "worker-b: lost"}};
     auto bad_out = round_trip(MessageKind::JobCompleted, bad, decode_job_completed);
     EXPECT_EQ(bad_out.job_id, 12u);
     EXPECT_FALSE(bad_out.ok);
     ASSERT_EQ(bad_out.errors.size(), 2u);
-    EXPECT_EQ(bad_out.errors[0], "tm-a/producer[0]: send failed");
+    EXPECT_EQ(bad_out.errors[0], "worker-a/producer[0]: send failed");
 }
 
 TEST(WireProtocol, SubtaskListeningRoundTrips) {
     SubtaskListeningMsg in;
     in.job_id = 5;
-    in.tm_id = "tm-b";
+    in.worker_id = "worker-b";
     in.role = "consumer";
     in.subtask_idx = 0;
     in.host = "10.0.0.7";
@@ -478,7 +479,7 @@ TEST(WireProtocol, SubtaskListeningRoundTrips) {
         {.upstream_role = "producer", .upstream_subtask_idx = 1, .port = 39445});
     auto out = round_trip(MessageKind::SubtaskListening, in, decode_subtask_listening);
     EXPECT_EQ(out.job_id, 5u);
-    EXPECT_EQ(out.tm_id, "tm-b");
+    EXPECT_EQ(out.worker_id, "worker-b");
     EXPECT_EQ(out.host, "10.0.0.7");
     ASSERT_EQ(out.edge_ports.size(), 2u);
     EXPECT_EQ(out.edge_ports[0].upstream_role, "producer");
@@ -529,7 +530,7 @@ TEST(WireProtocol, CommitCheckpointRoundTrips) {
     EXPECT_EQ(out.checkpoint_id, 99u);
 }
 
-// BeginRescale message frame. JM -> TM signal that starts
+// BeginRescale message frame. coordinator -> worker signal that starts
 // the dual-run rescale: target_parallelism + cutover_checkpoint
 // pinpoint exactly which checkpoint the new subtasks load their
 // state slice from.
@@ -544,8 +545,8 @@ TEST(WireProtocol, BeginRescaleRoundTrips) {
 }
 
 TEST(WireProtocol, BeginRescaleHandlesEmptyOpId) {
-    // Defensive: an empty op_id is invalid at the JM level but the
-    // wire codec shouldn't choke on it. The JM dispatch is the
+    // Defensive: an empty op_id is invalid at the coordinator level but the
+    // wire codec shouldn't choke on it. The coordinator dispatch is the
     // layer that validates / rejects.
     BeginRescaleMsg in{.job_id = 1, .op_id = "", .target_parallelism = 2, .cutover_checkpoint = 0};
     auto out = round_trip(MessageKind::BeginRescale, in, decode_begin_rescale);
@@ -586,7 +587,7 @@ TEST(WireProtocol, RescaleOperatorAckRejectionCarriesReason) {
 // through unchanged so a user can force fail-fast or a specific cap.
 TEST(RecoveryDefaults, EffectiveMaxRestartsResolution) {
     CheckpointConfig def;  // default-constructed -> kRestartAuto
-    EXPECT_EQ(def.max_restarts_on_tm_loss, kRestartAuto);
+    EXPECT_EQ(def.max_restarts_on_worker_loss, kRestartAuto);
 
     // auto + checkpointing -> self-heal default.
     CheckpointConfig ckpt = def;
@@ -598,21 +599,21 @@ TEST(RecoveryDefaults, EffectiveMaxRestartsResolution) {
 
     // explicit 0 -> fail-fast even with checkpointing.
     CheckpointConfig off = ckpt;
-    off.max_restarts_on_tm_loss = 0;
+    off.max_restarts_on_worker_loss = 0;
     EXPECT_EQ(effective_max_restarts(off), 0u);
 
     // explicit N -> used verbatim.
     CheckpointConfig fixed = ckpt;
-    fixed.max_restarts_on_tm_loss = 3;
+    fixed.max_restarts_on_worker_loss = 3;
     EXPECT_EQ(effective_max_restarts(fixed), 3u);
 }
 
-// The JM's client-loop dispatch matches on the MessageKind byte, so every
-// client->JM request kind MUST have a distinct value. A collision routes a
+// The coordinator's client-loop dispatch matches on the MessageKind byte, so every
+// client->coordinator request kind MUST have a distinct value. A collision routes a
 // frame to the wrong handler: Savepoint (13) once shared value 12 with
 // RescaleOperator, so a savepoint frame decoded as a RescaleOperatorMsg and
 // then, with no `continue`, fell through to the savepoint handler on an
-// already-consumed reader - throwing "truncated payload" and aborting the JM.
+// already-consumed reader - throwing "truncated payload" and aborting the coordinator.
 TEST(WireProtocol, ClientRequestKindsAreDistinct) {
     const std::vector<std::pair<const char*, MessageKind>> kinds{
         {"HelloClient", MessageKind::HelloClient},

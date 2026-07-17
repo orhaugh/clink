@@ -185,7 +185,7 @@ TEST(PluginRegistry, BuildContextCarriesParamsAndSubtaskInfo) {
 
 // Schema evolution (cluster-C part 2): make_subtask_job_config unpacks the
 // RunnerContext's packed expected state-version map onto the JobConfig so
-// the LocalExecutor auto-migrates restored state. This is the TM-side
+// the LocalExecutor auto-migrates restored state. This is the worker-side
 // terminus of the deploy wire DeployMsg.expected_state_versions_packed ->
 // RunnerContext -> JobConfig.expected_state_versions.
 TEST(PluginRegistry, MakeSubtaskJobConfigUnpacksExpectedStateVersions) {

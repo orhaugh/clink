@@ -27,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/connectors/kafka_message.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/job/register_job.hpp"
@@ -128,7 +128,7 @@ inline std::int64_t env_i64(const char* name, std::int64_t fallback) {
     return fallback;
 }
 
-inline void define_job(clink::api::StreamExecutionEnvironment& env) {
+inline void define_job(clink::api::Pipeline& env) {
     using namespace std::chrono_literals;
 
     // Register built-in channel types into THIS env's bundle. The
@@ -205,7 +205,6 @@ inline void define_job(clink::api::StreamExecutionEnvironment& env) {
         auto bytes = out_codec().encode(r);
         return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     });
-
 }
 
 }  // namespace bench

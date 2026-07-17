@@ -3,9 +3,9 @@
 // Column-level lineage capture for a compiled SQL INSERT.
 //
 // Runs at SQL compile time, where the bound LogicalSink and its upstream
-// LogicalScan leaves are in scope (the JobManager only sees the lowered
+// LogicalScan leaves are in scope (the Coordinator only sees the lowered
 // operator graph and has no column context). Produces the JSON object the
-// JobManager later attaches to sink datasets via extract_lineage:
+// Coordinator later attaches to sink datasets via extract_lineage:
 //
 //   {"<sink_op_id>":[
 //      {"output":"<col>","transformation":"IDENTITY|TRANSFORMATION|AGGREGATION",

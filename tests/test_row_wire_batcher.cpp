@@ -1,6 +1,6 @@
 // Columnar-into-SQL, increment 3: the sidecar-preserving Row wire batcher.
 //
-// make_row_wire_batcher keeps columnar Row data columnar across a TM boundary
+// make_row_wire_batcher keeps columnar Row data columnar across a worker boundary
 // while staying lossless for row-form data. Claims under test (each goes
 // through the REAL wire path: build -> Arrow IPC bytes -> parse):
 //   - a columnar Batch<Row> survives the wire AS columnar (sidecar set), with no

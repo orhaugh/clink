@@ -75,7 +75,7 @@ TEST(RealConnectorFactories, FileSourceToFileSinkEndToEnd) {
 
 // Drive the file_text_source factory's underlying constructor directly
 // to confirm the BuildContext -> FileSource<string> wiring is correct.
-// Same code path the generic role on the TM uses when a job graph
+// Same code path the generic role on the worker uses when a job graph
 // references "file_text_source".
 TEST(RealConnectorFactories, FileTextSourceFactoryBuildsAndRuns) {
     ensure_built_ins_registered();

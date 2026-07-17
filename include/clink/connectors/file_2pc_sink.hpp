@@ -30,7 +30,7 @@
 //                      handle - recovery will not commit it).
 //
 // Crash semantics: any pre-committed file in staging/ whose persisted handle
-// matches a COMPLETED-N marker on the JM gets committed at next restart. Files
+// matches a COMPLETED-N marker on the coordinator gets committed at next restart. Files
 // for checkpoints that did not complete are left in staging/ until the user
 // cleans them up; recovery does not auto-abort because a half-written file is
 // ambiguous (commit-failed vs. crashed mid-write).

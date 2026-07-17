@@ -7,18 +7,18 @@
 // Pre-deploy restore-compatibility gate (schema evolution D, part 2).
 //
 // When a job is submitted (or HA-recovered) with a restore configured,
-// the JM can fail fast if the savepoint's stored state versions cannot be
+// the coordinator can fail fast if the savepoint's stored state versions cannot be
 // migrated to the versions the job binary expects - instead of letting
-// the job deploy and then throw at TM start (which C, the restore-time
-// migrator, would do anyway). This is the JM-side automation of
+// the job deploy and then throw at worker start (which C, the restore-time
+// migrator, would do anyway). This is the coordinator-side automation of
 // `clink check-savepoint --expected=<job.so>`.
 //
 // BEST-EFFORT by design: it only ever BLOCKS on a definitive
 // incompatibility verdict. If it cannot read the savepoint (remote/shared
-// storage the JM doesn't mount, missing file), cannot load a .so, or no
+// storage the coordinator doesn't mount, missing file), cannot load a .so, or no
 // .so exports the check, it returns "" and lets the deploy proceed - C
 // still guarantees correctness at restore time. The gate buys an earlier,
-// clearer error when the JM happens to have what it needs.
+// clearer error when the coordinator happens to have what it needs.
 
 namespace clink::cluster {
 

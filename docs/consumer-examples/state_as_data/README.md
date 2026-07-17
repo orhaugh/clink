@@ -77,6 +77,6 @@ and the state backends and export surfaces are in
 ## Live jobs
 
 The same export works against a *running* job without a checkpoint:
-`clink state-export --job=<id> [--jm=host:port]` (and `state-query --job=<id>`)
-fetch the live keyed state over the JobManager's export route - a per-subtask
+`clink state-export --job=<id> [--coordinator=host:port]` (and `state-query --job=<id>`)
+fetch the live keyed state over the Coordinator's export route - a per-subtask
 atomic view rather than a checkpoint-consistent cut.

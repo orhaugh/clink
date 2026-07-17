@@ -1,4 +1,4 @@
-// Heavy-duty integration test: 1 JM + 3 TMs (separate processes,
+// Heavy-duty integration test: 1 coordinator + 3 workers (separate processes,
 // real networking) running a CLINK_REGISTER_JOB pipeline with
 // custom typed channels.
 //
@@ -8,7 +8,7 @@
 //
 // The sink runs at parallelism=3, so the final mapped strings are
 // scattered across <out>.0, <out>.1, <out>.2 via Rebalance routing
-// (cross-TM wire). Reduce emits the running accumulator on every
+// (cross-worker wire). Reduce emits the running accumulator on every
 // input, so each region has a sequence of partial sums in the
 // outputs; the row with the highest count per region carries the
 // final per-region total.
@@ -140,7 +140,7 @@ std::optional<std::pair<std::string, RegionTotal>> parse_line(const std::string&
 
 }  // namespace
 
-TEST(HeavyPipelineE2E, KeyByReduceSinkAcrossThreeTaskManagers) {
+TEST(HeavyPipelineE2E, KeyByReduceSinkAcrossThreeWorkers) {
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node)) {
         GTEST_SKIP() << "clink_node not built";
@@ -161,36 +161,36 @@ TEST(HeavyPipelineE2E, KeyByReduceSinkAcrossThreeTaskManagers) {
     }
     // The job .so reads CLINK_HEAVY_OUT_BASE at build_fn time
     // (under std::call_once). Set BEFORE spawning the cluster so the
-    // JM + TMs all inherit it through their environments.
+    // coordinator + workers all inherit it through their environments.
     ::setenv("CLINK_HEAVY_OUT_BASE", out_base.c_str(), 1);
 
-    const auto jm_port = probe_free_port();
-    const pid_t jm_pid =
-        spawn_proc({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, node);
-    ASSERT_GT(jm_pid, 0);
+    const auto coordinator_port = probe_free_port();
+    const pid_t coordinator_pid = spawn_proc(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
-    // 3 TMs, each with --slots=3. Pipeline needs 1+1+1+1+3 = 7 slots;
+    // 3 workers, each with --slots=3. Pipeline needs 1+1+1+1+3 = 7 slots;
     // 9 across the cluster means the deploy spreads work across all
-    // three TMs (placement is greedy first-fit, slot_capacity=3 forces
-    // the planner to pick a new TM after the third subtask).
-    std::vector<pid_t> tms;
+    // three workers (placement is greedy first-fit, slot_capacity=3 forces
+    // the planner to pick a new worker after the third subtask).
+    std::vector<pid_t> workers;
     for (int i = 1; i <= 3; ++i) {
-        tms.push_back(spawn_proc({"clink_node",
-                                  "--role=tm",
-                                  "--id=tm-heavy-" + std::to_string(i),
-                                  "--slots=3",
-                                  "--jm-host=127.0.0.1",
-                                  "--jm-port=" + std::to_string(jm_port)},
-                                 node));
-        ASSERT_GT(tms.back(), 0);
+        workers.push_back(spawn_proc({"clink_node",
+                                      "--role=worker",
+                                      "--id=worker-heavy-" + std::to_string(i),
+                                      "--slots=3",
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(coordinator_port)},
+                                     node));
+        ASSERT_GT(workers.back(), 0);
     }
     std::this_thread::sleep_for(400ms);
 
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),
-                                         "--jm-host=127.0.0.1",
-                                         "--jm-port=" + std::to_string(jm_port),
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port),
                                          "--wait-timeout-s=45",
                                          "--name=heavy-pipeline"},
                                         submit);
@@ -199,8 +199,8 @@ TEST(HeavyPipelineE2E, KeyByReduceSinkAcrossThreeTaskManagers) {
     int submit_exit = -1;
     const bool exited = wait_for(submit_pid, 60s, submit_exit);
 
-    kill_quietly(jm_pid);
-    for (auto pid : tms) {
+    kill_quietly(coordinator_pid);
+    for (auto pid : workers) {
         kill_quietly(pid);
     }
 

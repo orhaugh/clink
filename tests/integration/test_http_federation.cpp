@@ -1,10 +1,10 @@
 // Federation + actions integration tests for the HTTP subsystem.
 //
-// HTTP-3a: TMs report their --http-port via Register, the JM stores
-//          it, /api/v1/tms exposes it.
-// HTTP-3b: GET /api/v1/tms/:id/{tm,subtasks,config} on the JM proxies
-//          through to the TM and returns its response unchanged.
-// HTTP-3d: POST /api/v1/jobs/:id/cancel calls JobManager::cancel_job
+// HTTP-3a: workers report their --http-port via Register, the coordinator stores
+//          it, /api/v1/workers exposes it.
+// HTTP-3b: GET /api/v1/workers/:id/{worker,subtasks,config} on the coordinator proxies
+//          through to the worker and returns its response unchanged.
+// HTTP-3d: POST /api/v1/jobs/:id/cancel calls Coordinator::cancel_job
 //          and returns an ack JSON. Cancels mid-flight job_id=1 from
 //          clink_submit_job, expects submitter to see "cancelled by
 //          client".
@@ -158,24 +158,24 @@ bool await_http_ready(std::uint16_t port, std::chrono::milliseconds timeout) {
 }
 
 struct Cluster {
-    pid_t jm_pid{-1};
-    std::uint16_t jm_http_port{0};
-    std::uint16_t jm_control_port{0};
-    std::vector<pid_t> tm_pids;
-    std::vector<std::string> tm_ids;
-    std::vector<std::uint16_t> tm_http_ports;
+    pid_t coordinator_pid{-1};
+    std::uint16_t coordinator_http_port{0};
+    std::uint16_t coordinator_control_port{0};
+    std::vector<pid_t> worker_pids;
+    std::vector<std::string> worker_ids;
+    std::vector<std::uint16_t> worker_http_ports;
 
     Cluster() = default;
     Cluster(const Cluster&) = delete;
     Cluster& operator=(const Cluster&) = delete;
     Cluster(Cluster&& o) noexcept
-        : jm_pid(o.jm_pid),
-          jm_http_port(o.jm_http_port),
-          jm_control_port(o.jm_control_port),
-          tm_pids(std::move(o.tm_pids)),
-          tm_ids(std::move(o.tm_ids)),
-          tm_http_ports(std::move(o.tm_http_ports)) {
-        o.jm_pid = -1;
+        : coordinator_pid(o.coordinator_pid),
+          coordinator_http_port(o.coordinator_http_port),
+          coordinator_control_port(o.coordinator_control_port),
+          worker_pids(std::move(o.worker_pids)),
+          worker_ids(std::move(o.worker_ids)),
+          worker_http_ports(std::move(o.worker_http_ports)) {
+        o.coordinator_pid = -1;
     }
     Cluster& operator=(Cluster&& o) noexcept {
         if (this != &o) {
@@ -185,79 +185,80 @@ struct Cluster {
         return *this;
     }
     ~Cluster() {
-        for (auto pid : tm_pids) {
+        for (auto pid : worker_pids) {
             kill_quietly(pid);
         }
-        kill_quietly(jm_pid);
+        kill_quietly(coordinator_pid);
     }
 };
 
-std::optional<Cluster> start_cluster(int n_tms) {
+std::optional<Cluster> start_cluster(int n_workers) {
     Cluster c;
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node)) {
         return std::nullopt;
     }
-    c.jm_control_port = probe_free_port();
-    c.jm_http_port = probe_free_port();
-    c.jm_pid = spawn_proc({"clink_node",
-                           "--role=jm",
-                           "--port=" + std::to_string(c.jm_control_port),
-                           "--http-port=" + std::to_string(c.jm_http_port),
-                           "--http-bind=127.0.0.1"},
-                          node);
-    if (c.jm_pid <= 0 || !await_http_ready(c.jm_http_port, 2s)) {
+    c.coordinator_control_port = probe_free_port();
+    c.coordinator_http_port = probe_free_port();
+    c.coordinator_pid = spawn_proc({"clink_node",
+                                    "--role=coordinator",
+                                    "--port=" + std::to_string(c.coordinator_control_port),
+                                    "--http-port=" + std::to_string(c.coordinator_http_port),
+                                    "--http-bind=127.0.0.1"},
+                                   node);
+    if (c.coordinator_pid <= 0 || !await_http_ready(c.coordinator_http_port, 2s)) {
         return std::nullopt;
     }
-    for (int i = 1; i <= n_tms; ++i) {
+    for (int i = 1; i <= n_workers; ++i) {
         const auto http_port = probe_free_port();
-        const std::string tm_id = "tm-fed-" + std::to_string(i);
-        const pid_t pid = spawn_proc({"clink_node",
-                                      "--role=tm",
-                                      "--id=" + tm_id,
-                                      "--jm-host=127.0.0.1",
-                                      "--jm-port=" + std::to_string(c.jm_control_port),
-                                      "--http-port=" + std::to_string(http_port),
-                                      "--http-bind=127.0.0.1"},
-                                     node);
+        const std::string worker_id = "worker-fed-" + std::to_string(i);
+        const pid_t pid =
+            spawn_proc({"clink_node",
+                        "--role=worker",
+                        "--id=" + worker_id,
+                        "--coordinator-host=127.0.0.1",
+                        "--coordinator-port=" + std::to_string(c.coordinator_control_port),
+                        "--http-port=" + std::to_string(http_port),
+                        "--http-bind=127.0.0.1"},
+                       node);
         if (pid <= 0 || !await_http_ready(http_port, 2s)) {
             return std::nullopt;
         }
-        c.tm_pids.push_back(pid);
-        c.tm_ids.push_back(tm_id);
-        c.tm_http_ports.push_back(http_port);
+        c.worker_pids.push_back(pid);
+        c.worker_ids.push_back(worker_id);
+        c.worker_http_ports.push_back(http_port);
     }
-    // Let TMs register with the JM before tests assert.
+    // Let workers register with the coordinator before tests assert.
     std::this_thread::sleep_for(400ms);
     return c;
 }
 
 }  // namespace
 
-TEST(HttpFederation, TmsEndpointReportsHttpPortAfterRegister) {
-    auto c = start_cluster(/*n_tms=*/2);
+TEST(HttpFederation, WorkersEndpointReportsHttpPortAfterRegister) {
+    auto c = start_cluster(/*n_workers=*/2);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    const auto r = http_get("127.0.0.1", c->jm_http_port, "/api/v1/tms");
+    const auto r = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/workers");
     ASSERT_EQ(r.status, 200);
-    // Each TM advertised its http_port via Register; both should appear.
-    const auto p0 = std::string{"\"http_port\":"} + std::to_string(c->tm_http_ports[0]);
-    const auto p1 = std::string{"\"http_port\":"} + std::to_string(c->tm_http_ports[1]);
+    // Each worker advertised its http_port via Register; both should appear.
+    const auto p0 = std::string{"\"http_port\":"} + std::to_string(c->worker_http_ports[0]);
+    const auto p1 = std::string{"\"http_port\":"} + std::to_string(c->worker_http_ports[1]);
     EXPECT_NE(r.body.find(p0), std::string::npos)
-        << "expected " << p0 << " in /api/v1/tms body: " << r.body;
+        << "expected " << p0 << " in /api/v1/workers body: " << r.body;
     EXPECT_NE(r.body.find(p1), std::string::npos)
-        << "expected " << p1 << " in /api/v1/tms body: " << r.body;
+        << "expected " << p1 << " in /api/v1/workers body: " << r.body;
 }
 
-TEST(HttpFederation, JmProxiesTmTmEndpoint) {
-    auto c = start_cluster(/*n_tms=*/1);
+TEST(HttpFederation, CoordinatorProxiesWorkerWorkerEndpoint) {
+    auto c = start_cluster(/*n_workers=*/1);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    const auto direct = http_get("127.0.0.1", c->tm_http_ports[0], "/api/v1/tm");
-    const auto proxied =
-        http_get("127.0.0.1", c->jm_http_port, "/api/v1/tms/" + c->tm_ids[0] + "/tm");
+    const auto direct = http_get("127.0.0.1", c->worker_http_ports[0], "/api/v1/worker");
+    const auto proxied = http_get(
+        "127.0.0.1", c->coordinator_http_port, "/api/v1/workers/" + c->worker_ids[0] + "/worker");
     ASSERT_EQ(direct.status, 200);
     EXPECT_EQ(proxied.status, 200);
     EXPECT_EQ(proxied.body, direct.body)
@@ -265,38 +266,39 @@ TEST(HttpFederation, JmProxiesTmTmEndpoint) {
         << "\n proxied=" << proxied.body;
 }
 
-TEST(HttpFederation, JmProxiesTmSubtasksAndConfig) {
-    auto c = start_cluster(/*n_tms=*/1);
+TEST(HttpFederation, CoordinatorProxiesWorkerSubtasksAndConfig) {
+    auto c = start_cluster(/*n_workers=*/1);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    const auto proxied_subtasks =
-        http_get("127.0.0.1", c->jm_http_port, "/api/v1/tms/" + c->tm_ids[0] + "/subtasks");
+    const auto proxied_subtasks = http_get(
+        "127.0.0.1", c->coordinator_http_port, "/api/v1/workers/" + c->worker_ids[0] + "/subtasks");
     EXPECT_EQ(proxied_subtasks.status, 200);
     EXPECT_NE(proxied_subtasks.body.find("\"subtasks\""), std::string::npos);
 
-    const auto proxied_config =
-        http_get("127.0.0.1", c->jm_http_port, "/api/v1/tms/" + c->tm_ids[0] + "/config");
+    const auto proxied_config = http_get(
+        "127.0.0.1", c->coordinator_http_port, "/api/v1/workers/" + c->worker_ids[0] + "/config");
     EXPECT_EQ(proxied_config.status, 200);
     EXPECT_NE(proxied_config.body.find("\"slot_count\""), std::string::npos);
 }
 
-TEST(HttpFederation, ProxyReturns404ForUnknownTm) {
-    auto c = start_cluster(/*n_tms=*/1);
+TEST(HttpFederation, ProxyReturns404ForUnknownWorker) {
+    auto c = start_cluster(/*n_workers=*/1);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    const auto r = http_get("127.0.0.1", c->jm_http_port, "/api/v1/tms/no-such-tm/tm");
+    const auto r =
+        http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/workers/no-such-worker/worker");
     EXPECT_EQ(r.status, 404);
     EXPECT_NE(r.body.find("\"error\""), std::string::npos);
 }
 
 TEST(HttpFederation, JobsCancelEndpointReturns404ForUnknownJob) {
-    auto c = start_cluster(/*n_tms=*/1);
+    auto c = start_cluster(/*n_workers=*/1);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    const auto r = http_post("127.0.0.1", c->jm_http_port, "/api/v1/jobs/9999/cancel");
+    const auto r = http_post("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/9999/cancel");
     EXPECT_EQ(r.status, 404);
     EXPECT_NE(r.body.find("no such job"), std::string::npos);
 }
@@ -307,24 +309,26 @@ TEST(HttpFederation, JobsCancelEndpointCancelsRunningJob) {
     if (!std::filesystem::exists(submit) || !std::filesystem::exists(job_so)) {
         GTEST_SKIP() << "submitter or cancel_test_job.so not built";
     }
-    auto c = start_cluster(/*n_tms=*/2);
+    auto c = start_cluster(/*n_workers=*/2);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
 
     ::setenv("CLINK_CANCEL_TICK_MS", "20", 1);
-    const pid_t submit_pid = spawn_proc({"clink_submit_job",
-                                         "--job=" + job_so.string(),
-                                         "--jm-host=127.0.0.1",
-                                         "--jm-port=" + std::to_string(c->jm_control_port),
-                                         "--wait-timeout-s=30"},
-                                        submit);
+    const pid_t submit_pid =
+        spawn_proc({"clink_submit_job",
+                    "--job=" + job_so.string(),
+                    "--coordinator-host=127.0.0.1",
+                    "--coordinator-port=" + std::to_string(c->coordinator_control_port),
+                    "--wait-timeout-s=30"},
+                   submit);
     ASSERT_GT(submit_pid, 0);
     // Let the submitter complete its SubmitJob -> SubmitJobAck round
     // so the job is registered as id=1 before we POST cancel.
     std::this_thread::sleep_for(2s);
 
-    const auto cancel_resp = http_post("127.0.0.1", c->jm_http_port, "/api/v1/jobs/1/cancel");
+    const auto cancel_resp =
+        http_post("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1/cancel");
     EXPECT_EQ(cancel_resp.status, 200);
     EXPECT_NE(cancel_resp.body.find("\"ok\":true"), std::string::npos)
         << "cancel ack: " << cancel_resp.body;

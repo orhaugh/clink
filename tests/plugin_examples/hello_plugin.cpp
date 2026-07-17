@@ -21,7 +21,7 @@
 
 namespace hello {
 
-// User record type. Crosses the network bridge between TMs as
+// User record type. Crosses the network bridge between workers as
 // "hello.Greeting"; serialised by greeting_codec() below.
 struct Greeting {
     std::int64_t id{0};
@@ -70,7 +70,7 @@ clink::Codec<Greeting> greeting_codec() {
 // Source: emits a fixed sequence configurable via params. When
 // `delay_ms` is non-zero, emits one record per produce() call with a
 // per-record sleep so distributed-checkpointing barriers triggered by
-// the JM have time to interleave between records.
+// the coordinator have time to interleave between records.
 class GreetingSource final : public clink::Source<Greeting> {
 public:
     GreetingSource(std::int64_t count, std::int64_t start, std::int64_t delay_ms)

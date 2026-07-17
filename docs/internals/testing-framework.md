@@ -19,7 +19,7 @@ Link the `clink::test_support` CMake target from test executables only; producti
 | `include/clink/test/failure_injection.hpp` | `FailurePlan`, `FailurePoint`, `InjectedFailure`: deterministic failure injection at the harness's mediation points |
 | `include/clink/test/sources_and_sinks.hpp` | `TestSource<T>` (scripted, checkpointable), `CollectSink<T>`, `FailingSink<T>`, `TransactionalTestSink<T>` (2PC lifecycle recorder) |
 | `include/clink/test/local_environment.hpp` | `LocalTestEnvironment`: complete pipelines on the real local runtime, run to completion, failures surfaced |
-| `include/clink/test/mini_cluster.hpp` | `MiniCluster`: a real JobManager + N real TaskManagers over loopback RPC, in one process |
+| `include/clink/test/test_cluster.hpp` | `TestCluster`: a real Coordinator + N real Workers over loopback RPC, in one process |
 | `include/clink/test/assertions.hpp` | Framework-neutral checks (`values_are`, `values_are_unordered`, `contains_value`, `watermarks_are_monotonic`) returning `CheckResult` |
 | `include/clink/test/sequence.hpp` | `TestSequence<In>` (replayable input scripts) and `deterministic_shuffle` (platform-stable property-test shuffling) |
 | `include/clink/test/side_output_capture.hpp` | Typed side-output registration + drains for harnesses |
@@ -146,16 +146,16 @@ EXPECT_EQ(sink->values(), (std::vector<std::int64_t>{1, 2, 3}));
 
 `env.dag()` is the production `Dag` - everything it offers (operators, splits, unions, joins) is available. `execute()` throws a `PipelineFailure` listing every `(operator, error)` pair if any operator thread failed; `execute_collecting_errors()` returns them instead, for tests where the crash is the point. `Options` sets the state backend (a fresh in-memory one by default, inspectable via `state_backend()`), the execution mode, and `restore_from` (a `Snapshot`) for pipeline-level recovery tests. One-shot: each environment executes once.
 
-## Testing on a real cluster: MiniCluster
+## Testing on a real cluster: TestCluster
 
-The smallest true distributed deployment, in one process: a real `JobManager` and N real `TaskManagers` wired over loopback RPC, registration awaited before the constructor returns. Everything - planning, deployment, slots, checkpoint coordination, failover - is the production cluster code.
+The smallest true distributed deployment, in one process: a real `Coordinator` and N real `Workers` wired over loopback RPC, registration awaited before the constructor returns. Everything - planning, deployment, slots, checkpoint coordination, failover - is the production cluster code.
 
 ```cpp
-clink::test::MiniCluster mini({.task_managers = 2, .slots_per_task_manager = 4});
+clink::test::TestCluster mini({.workers = 2, .slots_per_worker = 4});
 mini.execute(spec);  // submit a JobGraphSpec + await completion; throws on job errors
 ```
 
-`submit()`/`await_completion()`/`errors()` decompose `execute()` for finer control; `job_manager()`/`task_manager(i)` are escape hatches to the real pieces; `Options::checkpoint` carries a `cluster::CheckpointConfig` for distributed-checkpointing jobs. Specs come from the fluent environment, a SQL capture, or by hand. Use this tier only for behaviour a single process cannot exhibit - operator logic belongs on the harnesses, pipeline wiring on `LocalTestEnvironment`.
+`submit()`/`await_completion()`/`errors()` decompose `execute()` for finer control; `coordinator()`/`worker(i)` are escape hatches to the real pieces; `Options::checkpoint` carries a `cluster::CheckpointConfig` for distributed-checkpointing jobs. Specs come from the fluent environment, a SQL capture, or by hand. Use this tier only for behaviour a single process cannot exhibit - operator logic belongs on the harnesses, pipeline wiring on `LocalTestEnvironment`.
 
 ## Side outputs
 
@@ -216,7 +216,7 @@ The framework's acceptance proof is that it tests clink's own production operato
 3. Two-input harnesses (co-process, joins, connected streams) with the engine's real two-input watermark combination - DONE.
 4. Snapshot/restore (the real backend + `snapshot_timers` cycle), failure injection, lifecycle log - DONE.
 5. Test sources and sinks (scripted, replayable, transactional) - DONE.
-6. `LocalTestEnvironment` (full pipelines over the local runtime) and `MiniCluster` (the in-process JM+TM fixture) - DONE.
+6. `LocalTestEnvironment` (full pipelines over the local runtime) and `TestCluster` (the in-process coordinator+worker fixture) - DONE.
 7. Assertions, sequence/property-testing support, side-output capture, compiling documentation examples, and dogfood tests over production operators - DONE.
 
 All seven increments are complete; the framework is the supported public testing API.

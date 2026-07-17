@@ -50,7 +50,7 @@ across subtasks is not defined, same as any parallel sink.
 ## `queryable_state` (source)
 
 State-as-table: a bounded source that snapshots another job's LIVE
-queryable state through the JobManager's JSON scan route and emits one
+queryable state through the Coordinator's JSON scan route and emits one
 row per key - the served value document's fields become the row's
 columns. One job's running aggregates are another job's table, with no
 sink round-trip. SQL `aggregate_row` (unbounded GROUP BY, in-memory
@@ -60,13 +60,13 @@ this way while it runs.
 ```sql
 CREATE TABLE live_totals (usr TEXT, total BIGINT)
 WITH (connector='queryable_state', format='json',
-      jm_port='8081', job_id='1');
+      coordinator_port='8081', job_id='1');
 
 SELECT usr, total FROM live_totals;   -- the CURRENT aggregate values
 ```
 
-Options: `jm_port` (required - the JobManager's HTTP port), `job_id`
-(required), `jm_host` (default `127.0.0.1`), `role` (default the generic
+Options: `coordinator_port` (required - the Coordinator's HTTP port), `job_id`
+(required), `coordinator_host` (default `127.0.0.1`), `role` (default the generic
 subtask role), `slot` (default `agg`), `limit` (default 100000, the
 route's cap), `batch_size` (default 256). The snapshot is taken once, at
 the first produce; `truncated` results are cut at `limit`. Delivery is a

@@ -21,7 +21,7 @@ execution and JVM-free deployment.
 This is a working engine, not a toy. The operator model, in-process and
 distributed runtimes, event-time windowing, exactly-once checkpointing (with
 rescale and restart-from-checkpoint), in-memory / RocksDB / changelog /
-file-backed state, the Arrow columnar wire format, a JobManager/TaskManager
+file-backed state, the Arrow columnar wire format, a Coordinator/Worker
 cluster control plane, the connector suite, and a SQL frontend are all
 implemented and covered by tests. It is a young project rather than a
 battle-tested production deployment: a number of features are config-gated or
@@ -45,7 +45,7 @@ section below.
   - [Event-time tumbling window](#event-time-tumbling-window)
   - [Keyed state in a process function](#keyed-state-in-a-process-function)
   - [Interval join across two streams](#interval-join-across-two-streams)
-  - [Cluster job plugin (StreamExecutionEnvironment)](#cluster-job-plugin-streamexecutionenvironment)
+  - [Cluster job plugin (Pipeline)](#cluster-job-plugin-pipeline)
 - [SQL frontend](#sql-frontend)
 - [Time-travel debugging](#time-travel-debugging)
 - [State as data](#state-as-data)
@@ -75,7 +75,7 @@ correctness caveat, the caveat is stated in the row.
 | Operator parallelism       | `Dag::add_parallel_{source,operator,operator_shuffled,sink}`; hash-partitioned shuffle on `add_parallel_operator_shuffled`; per-subtask `OperatorId` + `RuntimeContext` so keyed state stays isolated across subtasks |
 | Branching DAG              | broadcast `Dag::fork<T>` (tee to N branches)        |
 | Multi-input alignment      | `MultiInputAlignment` + `Dag::union_streams<T>(...)` (watermark = min, Chandy-Lamport barrier alignment) |
-| Fluent API                 | `StreamExecutionEnvironment` / `DataStream<T>` builder chain |
+| Fluent API                 | `Pipeline` / `DataStream<T>` builder chain |
 | Operator-thread errors     | `LocalExecutor::operator_errors()` captures worker-thread exceptions instead of terminating the process |
 | Stable `OperatorId`        | hash of `(stage_index, operator_name)`; same DAG → same ids across restarts |
 | Columnar execution         | `ArrowBatcher<T>`; operators opt in via `supports_columnar()` + `process_columnar()` and read columns through `Batch<T>::is_columnar()` / `arrow()`; built-in int/string batchers, binary-column fallback for user types |
@@ -110,7 +110,7 @@ correctness caveat, the caveat is stated in the row.
 | Fsync durability           | `write_fsync_rename` fsyncs file + directory before checkpoint ack; toggle off with `CLINK_STATE_FSYNC=0` for fsync-hostile CI or throughput benchmarks |
 | State schema evolution     | migrate-at-restore via a migration registry; version map carried in `JobGraphSpec`; pre-deploy compatibility gate (best-effort, real enforcement at restore time) |
 | Savepoint / state-processor| offline savepoint read + transform API (`state_processor/savepoint.hpp`); tested |
-| Queryable state            | Live keyed state as a serving surface: a SQL GROUP BY exposes its running aggregates automatically, and `GET /api/v1/queryable_state/job/:id/op/:role/json/agg?key=alice` on the JobManager returns the key's current finalised row as JSON - no sink round-trip, no user code, readable mid-run. Whole-slot scans back state-as-table: `connector='queryable_state'` lets one job SELECT from (or join against) another job's live state, and `.../scan.arrow` returns the same scan as one Arrow IPC stream over plain HTTP - live state as a pyarrow/polars/duckdb DataFrame, no client library, no gRPC. Byte-level slots + JM key routing remain for custom operators; `RemoteReadBackend` offers two-tier reads (hot in-memory tier + remote tier) |
+| Queryable state            | Live keyed state as a serving surface: a SQL GROUP BY exposes its running aggregates automatically, and `GET /api/v1/queryable_state/job/:id/op/:role/json/agg?key=alice` on the Coordinator returns the key's current finalised row as JSON - no sink round-trip, no user code, readable mid-run. Whole-slot scans back state-as-table: `connector='queryable_state'` lets one job SELECT from (or join against) another job's live state, and `.../scan.arrow` returns the same scan as one Arrow IPC stream over plain HTTP - live state as a pyarrow/polars/duckdb DataFrame, no client library, no gRPC. Byte-level slots + coordinator key routing remain for custom operators; `RemoteReadBackend` offers two-tier reads (hot in-memory tier + remote tier) |
 
 ### Distributed and cluster
 
@@ -118,11 +118,11 @@ correctness caveat, the caveat is stated in the row.
 |----------------------------|-----------------------------------------------------|
 | TCP transport              | `NetworkChannelSink<T>` / `NetworkChannelSource<T>` round-trip `StreamElement<T>`s over TCP with length-prefixed framing; same push/pop semantics as `BoundedChannel` |
 | Distributed bridges        | `NetworkBridgeSink<T>` / `NetworkBridgeSource<T>` adapt the TCP transport into the operator interface so two `LocalExecutor`s link via a `NetworkChannel` |
-| JobManager / TaskManager   | cluster control plane: binary length-prefixed protocol over TCP, register/deploy/finish/cancel/heartbeat; JM watchdog declares lost TMs at `heartbeat_timeout` and broadcasts `CancelJob`; `JobGraphSpec` carries serialized `(op_type, params)` chains; `clink_node --role=jm|tm` for multi-process deployment (verified end-to-end via a `posix_spawn` integration test) |
-| Failover / restart-from-checkpoint | JM watchdog detects a lost TM, surviving subtasks drain (bounded by `restart_drain_timeout`), then the job redeploys from the latest completed checkpoint with state restored per subtask. Default is fail-fast: `max_restarts_on_tm_loss = 0` and a checkpoint dir must be configured |
+| Coordinator / Worker   | cluster control plane: binary length-prefixed protocol over TCP, register/deploy/finish/cancel/heartbeat; coordinator watchdog declares lost workers at `heartbeat_timeout` and broadcasts `CancelJob`; `JobGraphSpec` carries serialized `(op_type, params)` chains; `clink_node --role=coordinator|worker` for multi-process deployment (verified end-to-end via a `posix_spawn` integration test) |
+| Failover / restart-from-checkpoint | coordinator watchdog detects a lost worker, surviving subtasks drain (bounded by `restart_drain_timeout`), then the job redeploys from the latest completed checkpoint with state restored per subtask. Default is fail-fast: `max_restarts_on_worker_loss = 0` and a checkpoint dir must be configured |
 | Autoscaler                 | load-driven rescale trigger (`autoscaler.hpp`)      |
-| TLS / mTLS transport       | `clink_node --tls-cert` / `--tls-ca` (and `--tls-client-*` for mTLS) install custom accept/connect factories on JM and TM |
-| etcd HA coordinator        | leader election via etcd v3 (optional, `CLINK_WITH_ETCD`). Job persistence is filesystem-backed (`--ha-dir`) regardless of coordinator choice |
+| TLS / mTLS transport       | `clink_node --tls-cert` / `--tls-ca` (and `--tls-client-*` for mTLS) install custom accept/connect factories on coordinator and worker |
+| etcd HA coordinator        | leader election via etcd v3 (optional, `CLINK_WITH_ETCD`). Job persistence is filesystem-backed (`--ha-dir`) regardless of the election backend |
 | HTTP / JSON API + dashboard| `CLINK_BUILD_HTTP` (on by default): `clink_node` serves `/api/v1/jobs`, `/api/v1/jobs/:id`, `/api/v1/cluster`, `/metrics` (Prometheus), an SSE event stream, and an embedded SPA at `/`. Off unless `--http-port` is set (default 0 = disabled) |
 
 ### Connectors
@@ -248,7 +248,7 @@ This writes:
 | `<prefix>/lib/libclink_<impl>.a`   | One static lib per built impl (`kafka`, `postgres`, `s3`, `rocksdb`, …)  |
 | `<prefix>/lib/librocksdb.a`        | Bundled RocksDB (transitive dep of `clink::rocksdb`)                     |
 | `<prefix>/bin/clink`               | client CLI (`run`, `run-application`, `cancel`, `savepoint`, `check-savepoint`, `rescale`, `rescale-op`, `list`) |
-| `<prefix>/bin/clink_node`          | Server daemon (run as `--role=jm` or `--role=tm` for cluster mode)       |
+| `<prefix>/bin/clink_node`          | Server daemon (run as `--role=coordinator` or `--role=worker` for cluster mode)       |
 | `<prefix>/bin/clink_{submit_job,app,cancel_job,rescale_job,savepoint}` | Standalone client binaries (the `clink` subcommands dispatch to these) |
 | `<prefix>/lib/cmake/clink/`        | `clinkConfig.cmake`, `clinkTargets.cmake`, version file                  |
 
@@ -400,11 +400,11 @@ single `install_defaults(env.registry())`:
 
 ```cpp
 #include <clink/plugin/install_defaults.hpp>
-#include <clink/api/stream_execution_environment.hpp>
+#include <clink/api/pipeline.hpp>
 
-clink::api::StreamExecutionEnvironment env;
-clink::plugin::install_defaults(env.registry());     // built-ins + every
-                                                     // linked impl, in order
+clink::api::Pipeline pipeline;
+clink::plugin::install_defaults(pipeline.registry());  // built-ins + every
+                                                        // linked impl, in order
 ```
 
 `install_defaults` is idempotent and conditional on the `CLINK_HAS_<NAME>`
@@ -447,7 +447,7 @@ auto codec = clink::avro::binary_codec<MyAvroRecord>();
 Same shape as the typed source/sink builder API: each helper mints an
 inline op type via `mint_inline_op_type`, registers a per-T factory via
 `PluginRegistry::register_source<T>` / `register_sink<T>`, and appends the
-matching descriptor on the env. No JSON wiring; no manual op_type strings.
+matching descriptor on the pipeline. No JSON wiring; no manual op_type strings.
 
 ## Code examples
 
@@ -459,7 +459,7 @@ copy-pasteable, fully-compileable versions.
 
 The smallest possible clink job: a bounded source, a `MapOperator`, a
 `FilterOperator`, and a sink that prints to stdout. Runs in-process via
-`LocalExecutor` - no JobManager, no TaskManager.
+`LocalExecutor` - no Coordinator, no Worker.
 
 ```
 VectorSource<int64_t> -> Map(v * 2) -> Filter(v > 10) -> FunctionSink(print)
@@ -605,26 +605,26 @@ dag.add_sink<Joined>(h_joined, sink);
 
 → Full source: [`05_interval_join.cpp`](docs/consumer-examples/05_interval_join.cpp)
 
-### Cluster job plugin (`StreamExecutionEnvironment`)
+### Cluster job plugin (`Pipeline`)
 
 The fluent API. The build function is packaged into a `.so`
 via `CLINK_REGISTER_JOB(...)` and submitted to a running cluster:
 
 ```bash
-clink_node --role=jm --rpc-port=6123 &
-clink_node --role=tm --jm-host=127.0.0.1 --jm-port=6123 &
-clink run --jobmanager 127.0.0.1:6123 ./my_job.so
+clink_node --role=coordinator --rpc-port=6123 &
+clink_node --role=worker --coordinator-host=127.0.0.1 --coordinator-port=6123 &
+clink run --coordinator 127.0.0.1:6123 ./my_job.so
 ```
 
 ```cpp
 #include <clink/api/builtin_connectors.hpp>
-#include <clink/api/stream_execution_environment.hpp>
+#include <clink/api/pipeline.hpp>
 #include <clink/job/register_job.hpp>
 
-void define_job(clink::api::StreamExecutionEnvironment& env) {
+void define_job(clink::api::Pipeline& pipeline) {
     using namespace std::chrono_literals;
 
-    env.from_elements<std::int64_t>({1, 2, 3, 4, 5})
+    pipeline.from_elements<std::int64_t>({1, 2, 3, 4, 5})
         .map<std::int64_t>([](const std::int64_t& v) { return v * 10; })
         .filter([](const std::int64_t& v) { return v > 20; })
         .assign_timestamps_monotonic(
@@ -662,7 +662,7 @@ clink run -e "CREATE TABLE orders (usr VARCHAR, amount BIGINT) \
 
 # The same script file, unchanged, on a real cluster: add one flag.
 clink run pipeline.sql
-clink run pipeline.sql --jm-host=jm.prod --jm-port=8081
+clink run pipeline.sql --coordinator-host=coordinator.prod --coordinator-port=8081
 ```
 
 First result row lands on stdout in ~155 ms from process start (median of 20
@@ -778,7 +778,7 @@ Advanced and extensibility (each a documented v1 subset)
 - `CREATE MATERIALIZED VIEW ... AS <SELECT>`: continuous maintenance (keyed GROUP
   BY auto-derives upsert mode and primary key), or a scheduled full-refresh arm via
   `WITH ('freshness'='1h')` that recomputes over bounded sources and atomically
-  overwrites the backing, driven by a JobManager-side scheduler and `REFRESH
+  overwrites the backing, driven by a Coordinator-side scheduler and `REFRESH
   MATERIALIZED VIEW`; `partition_by` writes a per-partition set swapped atomically
 - SQL-native AI: `CREATE MODEL name INPUT (...) OUTPUT (...) WITH (provider=...)`
   registers a model, and `ML_PREDICT(TABLE t, MODEL m, DESCRIPTOR(cols))` applies
@@ -813,7 +813,7 @@ Advanced and extensibility (each a documented v1 subset)
   pair, result = packed i64; the module exports `memory` and `alloc`, with an
   optional `dealloc` the host calls after copy-out; all guest pointers are
   bounds-checked). Works embedded (`clink run`, libclink) and on a cluster: a
-  submitted job ships the module bytes in its spec and every TaskManager
+  submitted job ships the module bytes in its spec and every Worker
   registers the function at deploy, no shared filesystem needed. Declarations
   persist in the catalog (payload included, so a restart never needs the
   original module path) and `DROP FUNCTION [IF EXISTS]` removes them; calls
@@ -832,10 +832,10 @@ Advanced and extensibility (each a documented v1 subset)
 Submit via the CLI:
 
 ```bash
-clink_node --role=jm --rpc-port=6123 &
-clink_node --role=tm --jm-host=127.0.0.1 --jm-port=6123 &
+clink_node --role=coordinator --rpc-port=6123 &
+clink_node --role=worker --coordinator-host=127.0.0.1 --coordinator-port=6123 &
 
-clink_submit_sql --jobmanager 127.0.0.1:6123 <<'SQL'
+clink_submit_sql --coordinator 127.0.0.1:6123 <<'SQL'
 CREATE TABLE clicks (user_id BIGINT, ts BIGINT, url TEXT)
     WITH (connector='file', format='json', path='/tmp/clicks.ndjson',
           event_time_column='ts');
@@ -867,12 +867,12 @@ auto plan = b.bind_insert(std::get<clink::sql::ast::InsertStmt>(
 auto spec = clink::sql::PhysicalPlanner{}.compile(
     static_cast<const clink::sql::LogicalSink&>(*plan));
 
-clink::application::JobSubmitter submitter("127.0.0.1", jm_port);
+clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
 submitter.submit(spec.to_json(), /*plugins=*/{}, opts);
 ```
 
 End-to-end coverage lives in `tests/test_sql_runtime.cpp`: compiles
-SQL, submits to an in-process JM + TM pair, and asserts the sink file
+SQL, submits to an in-process coordinator + worker pair, and asserts the sink file
 content across the supported feature surface.
 
 ## Time-travel debugging
@@ -1037,7 +1037,7 @@ seeding; side-output capture; snapshot/restore round trips through the
 production checkpoint cycle; deterministic failure injection; scripted
 `TestSource`/`CollectSink`/`TransactionalTestSink` endpoints;
 `LocalTestEnvironment` for whole pipelines on the real local runtime;
-an in-process `MiniCluster` (real JobManager + TaskManagers); assertion
+an in-process `TestCluster` (real Coordinator + Workers); assertion
 helpers and platform-stable property-testing shuffles. The framework's
 own suite dogfoods it against clink's production window operator. Full
 guide: [`docs/internals/testing-framework.md`](docs/internals/testing-framework.md).
@@ -1085,12 +1085,12 @@ the repo root.
 
 ```
 include/clink/
-    api/             # public API facade (StreamExecutionEnvironment, descriptors)
+    api/             # public API facade (Pipeline, descriptors)
     application/     # application-mode lifecycle and configuration
     async/           # async utilities and continuations (Task<T>)
     cep/             # complex event processing (pattern DSL + operator)
     checkpoint/      # barriers + coordinator + 2PC sinks
-    cluster/         # JobManager, TaskManager, HA, autoscaler, rescale
+    cluster/         # Coordinator, Worker, HA, autoscaler, rescale
     config/          # configuration types (incl. exact decimal)
     connectors/      # built-in sources/sinks (file, parquet, text, 2PC)
     core/            # types, records, batches, stream elements, Arrow batcher

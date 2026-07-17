@@ -131,7 +131,7 @@ TEST(PluginLoader, LoadIsIdempotent) {
 
 // load_into must give each call a FRESH module instance so a .so's
 // per-instance, call_once-gated registration (CLINK_REGISTER_JOB build_fn)
-// re-runs into THIS caller's bundle. A long-lived JobManager loads the same
+// re-runs into THIS caller's bundle. A long-lived Coordinator loads the same
 // .so once per submitted job into a different per-job bundle; if the second
 // load reused the first's dlopen handle, the once-gate would have already
 // fired and the second bundle would resolve no factories (plan_job then

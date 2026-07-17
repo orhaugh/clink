@@ -1,22 +1,22 @@
-// clink_cancel_job - client CLI that asks a running JobManager to
+// clink_cancel_job - client CLI that asks a running Coordinator to
 // cancel a job by id. Mirrors ` cancel <jobid>` from .
 //
 // Wire flow:
-//   1. Open a TCP connection to --jm-host:--jm-port.
-//   2. Send HelloClient so the JM kicks us through to its
+//   1. Open a TCP connection to --coordinator-host:--coordinator-port.
+//   2. Send HelloClient so the coordinator kicks us through to its
 //      handle_client_loop_.
 //   3. Send a CancelJob frame with the requested job_id.
 //   4. Block on CancelJobAck. Print the ack and exit.
 //
-// The CLI does NOT wait for the job to actually finish - the JM
-// broadcasts CancelJob to every TM hosting subtasks of the job,
-// and the LocalExecutor on each TM honours the cancel token its
+// The CLI does NOT wait for the job to actually finish - the coordinator
+// broadcasts CancelJob to every worker hosting subtasks of the job,
+// and the LocalExecutor on each worker honours the cancel token its
 // next loop iteration. The submitter (`clink_submit_job` or
 // `clink_app`) sees JobCompleted with ok=false + errors[0] =
 // "cancelled by client" once every subtask finishes.
 //
 // Usage:
-//   clink_cancel_job --job-id=N --jm-host=127.0.0.1 --jm-port=N
+//   clink_cancel_job --job-id=N --coordinator-host=127.0.0.1 --coordinator-port=N
 
 #include <array>
 #include <cstddef>
@@ -59,7 +59,8 @@ bool has_flag(int argc, char** argv, std::string_view flag) {
 }
 
 void usage() {
-    std::cerr << "Usage: clink cancel --job-id=N --jm-host=<host> --jm-port=<port>\n";
+    std::cerr
+        << "Usage: clink cancel --job-id=N --coordinator-host=<host> --coordinator-port=<port>\n";
 }
 
 }  // namespace
@@ -71,23 +72,24 @@ int clink_cmd_cancel(int argc, char** argv) {
     }
 
     const auto job_id_str = get_arg(argc, argv, "job-id");
-    const auto jm_host = get_arg(argc, argv, "jm-host", "127.0.0.1");
-    const auto jm_port_str = get_arg(argc, argv, "jm-port", "6123");
+    const auto coordinator_host = get_arg(argc, argv, "coordinator-host", "127.0.0.1");
+    const auto coordinator_port_str = get_arg(argc, argv, "coordinator-port", "6123");
 
     if (job_id_str.empty()) {
         std::cerr << "clink_cancel_job: --job-id=N is required\n";
         return 2;
     }
     const auto job_id = static_cast<clink::cluster::JobId>(std::stoull(job_id_str));
-    const auto jm_port = static_cast<std::uint16_t>(std::stoi(jm_port_str));
+    const auto coordinator_port = static_cast<std::uint16_t>(std::stoi(coordinator_port_str));
 
-    const int fd = clink::network::NetworkSocket::connect_to(jm_host, jm_port);
+    const int fd = clink::network::NetworkSocket::connect_to(coordinator_host, coordinator_port);
     if (fd < 0) {
-        std::cerr << "clink_cancel_job: connect_to(" << jm_host << ":" << jm_port << ") failed\n";
+        std::cerr << "clink_cancel_job: connect_to(" << coordinator_host << ":" << coordinator_port
+                  << ") failed\n";
         return 3;
     }
 
-    // Identify as a client so the JM routes us through handle_client_loop_.
+    // Identify as a client so the coordinator routes us through handle_client_loop_.
     {
         clink::cluster::HelloClientMsg hello;
         const auto frame =
@@ -111,7 +113,7 @@ int clink_cmd_cancel(int argc, char** argv) {
         }
     }
 
-    // Wait for the JM to ack. Frame format: 4-byte big-endian length +
+    // Wait for the coordinator to ack. Frame format: 4-byte big-endian length +
     // 1-byte MessageKind + body. We use the same helpers the wire
     // protocol uses elsewhere so framing matches exactly.
     std::array<std::byte, 4> len_hdr{};

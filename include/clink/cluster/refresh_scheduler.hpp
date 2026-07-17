@@ -1,13 +1,13 @@
 #pragma once
 
-// JM-side refresh scheduler for full-refresh materialized views.
+// coordinator-side refresh scheduler for full-refresh materialized views.
 //
 // A full-refresh materialized view (CREATE MATERIALIZED VIEW ... FRESHNESS='<interval>')
 // recomputes its whole result on a cadence. This scheduler owns that cadence: for each
 // registered view it fires a refresh callback every `interval`. The callback (wired by
-// the JM host) recompiles the defining query and submits + awaits a bounded job whose
+// the coordinator host) recompiles the defining query and submits + awaits a bounded job whose
 // overwrite sink atomically republishes the backing - so the scheduler itself is
-// decoupled from SQL / the JobManager (it only knows names, intervals, and an opaque
+// decoupled from SQL / the Coordinator (it only knows names, intervals, and an opaque
 // RefreshFn), which keeps it unit-testable without a cluster.
 //
 // v1 runs refreshes sequentially on the scheduler's own thread: a tick fires every due

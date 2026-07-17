@@ -1,6 +1,6 @@
 // SIGTERM graceful-shutdown test for clink_node.
 //
-// Spawns a JM (then a TM in a second sub-test) and sends SIGTERM via
+// Spawns a coordinator (then a worker in a second sub-test) and sends SIGTERM via
 // kill(2). Verifies the process exits 0 within a generous window
 // (~2 s), not with a signal-terminated status. Without the handler
 // installed in main(), the default action for SIGTERM is terminate,
@@ -94,16 +94,16 @@ void hard_kill(pid_t pid) {
 
 }  // namespace
 
-TEST(SigtermShutdown, JobManagerExitsCleanlyOnSIGTERM) {
+TEST(SigtermShutdown, CoordinatorExitsCleanlyOnSIGTERM) {
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node)) {
         GTEST_SKIP() << "clink_node not built";
     }
     const auto port = probe_free_port();
     const pid_t pid =
-        spawn_proc({"clink_node", "--role=jm", "--port=" + std::to_string(port)}, node);
+        spawn_proc({"clink_node", "--role=coordinator", "--port=" + std::to_string(port)}, node);
     ASSERT_GT(pid, 0);
-    // Let the JM bind + start its accept loop before signalling.
+    // Let the coordinator bind + start its accept loop before signalling.
     std::this_thread::sleep_for(300ms);
 
     ::kill(pid, SIGTERM);
@@ -112,45 +112,45 @@ TEST(SigtermShutdown, JobManagerExitsCleanlyOnSIGTERM) {
     if (!info.exited) {
         hard_kill(pid);
     }
-    ASSERT_TRUE(info.exited) << "clink_node JM did not exit within 5s after SIGTERM";
-    EXPECT_FALSE(info.signal_terminated)
-        << "JM was killed by signal " << info.code << " instead of handling SIGTERM cleanly";
-    EXPECT_EQ(info.code, 0) << "JM exited non-zero (" << info.code << ")";
+    ASSERT_TRUE(info.exited) << "clink_node coordinator did not exit within 5s after SIGTERM";
+    EXPECT_FALSE(info.signal_terminated) << "coordinator was killed by signal " << info.code
+                                         << " instead of handling SIGTERM cleanly";
+    EXPECT_EQ(info.code, 0) << "coordinator exited non-zero (" << info.code << ")";
 }
 
-TEST(SigtermShutdown, TaskManagerExitsCleanlyOnSIGTERM) {
+TEST(SigtermShutdown, WorkerExitsCleanlyOnSIGTERM) {
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node)) {
         GTEST_SKIP() << "clink_node not built";
     }
 
-    // We need a JM up for the TM to register against - without it, the
-    // TM exits with an error immediately and the test asserts nothing
+    // We need a coordinator up for the worker to register against - without it, the
+    // worker exits with an error immediately and the test asserts nothing
     // useful about shutdown handling.
     const auto port = probe_free_port();
-    const pid_t jm_pid =
-        spawn_proc({"clink_node", "--role=jm", "--port=" + std::to_string(port)}, node);
-    ASSERT_GT(jm_pid, 0);
+    const pid_t coordinator_pid =
+        spawn_proc({"clink_node", "--role=coordinator", "--port=" + std::to_string(port)}, node);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
-    const pid_t tm_pid = spawn_proc({"clink_node",
-                                     "--role=tm",
-                                     "--id=tm-sigterm",
-                                     "--jm-host=127.0.0.1",
-                                     "--jm-port=" + std::to_string(port)},
-                                    node);
-    ASSERT_GT(tm_pid, 0);
+    const pid_t worker_pid = spawn_proc({"clink_node",
+                                         "--role=worker",
+                                         "--id=worker-sigterm",
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(port)},
+                                        node);
+    ASSERT_GT(worker_pid, 0);
     std::this_thread::sleep_for(400ms);
 
-    ::kill(tm_pid, SIGTERM);
-    const auto info = wait_for_exit(tm_pid, 5s);
+    ::kill(worker_pid, SIGTERM);
+    const auto info = wait_for_exit(worker_pid, 5s);
 
-    hard_kill(jm_pid);
+    hard_kill(coordinator_pid);
     if (!info.exited) {
-        hard_kill(tm_pid);
+        hard_kill(worker_pid);
     }
-    ASSERT_TRUE(info.exited) << "clink_node TM did not exit within 5s after SIGTERM";
+    ASSERT_TRUE(info.exited) << "clink_node worker did not exit within 5s after SIGTERM";
     EXPECT_FALSE(info.signal_terminated)
-        << "TM was killed by signal " << info.code << " instead of handling SIGTERM cleanly";
-    EXPECT_EQ(info.code, 0) << "TM exited non-zero (" << info.code << ")";
+        << "worker was killed by signal " << info.code << " instead of handling SIGTERM cleanly";
+    EXPECT_EQ(info.code, 0) << "worker exited non-zero (" << info.code << ")";
 }

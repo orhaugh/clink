@@ -79,10 +79,10 @@ inline std::string op_shard_metric_name(const char* metric,
 // Named user accumulator: clink_op_acc{op_id="N",name="<name>"}. A gauge (not a
 // counter) so it supports +/- deltas, and because a gauge is a single atomic
 // per (op_id,name) it merges every subtask of the operator that runs in the
-// SAME process automatically; the JM aggregator sums it across TMs for the
+// SAME process automatically; the coordinator aggregator sums it across workers for the
 // operator-wide value. This is how clink surfaces job-wide user accumulators -
 // the host metrics registry is already threaded into every RuntimeContext and
-// scraped by the JM, so it is the natural cross-subtask transport (a separate
+// scraped by the coordinator, so it is the natural cross-subtask transport (a separate
 // per-subtask wire message would just duplicate it).
 inline std::string op_acc_metric_name(std::uint64_t op_id, const std::string& acc_name) {
     std::string out = kOpMetricPrefix;
@@ -188,7 +188,7 @@ inline void watermark_set(MetricsRegistry* reg, std::uint64_t op_id, std::int64_
 }
 
 // Per-operator bytes crossing the network bridge. Counted only at a serialising
-// boundary (cross-TM edges); intra-process / chained edges move shared_ptr<Batch>
+// boundary (cross-worker edges); intra-process / chained edges move shared_ptr<Batch>
 // with no serialisation, so they are deliberately not counted here.
 inline void bytes_sent_inc(MetricsRegistry* reg, std::uint64_t op_id, std::uint64_t n) {
     if (reg == nullptr)

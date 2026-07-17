@@ -128,7 +128,7 @@ void clink_engine_close(clink_engine* engine) {
         engine->engine->cancel_all();
     } catch (...) {
     }
-    delete engine;  // ~EmbeddedEngine aborts collect streams, stops TM + JM
+    delete engine;  // ~EmbeddedEngine aborts collect streams, stops worker + coordinator
 }
 
 int clink_exec(clink_engine* engine, const char* sql) {

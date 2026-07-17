@@ -31,7 +31,7 @@ struct LoggingConfig {
     // Level as a lowercase string ("trace".."error" / "off"); parsed by init().
     // String-typed so this header stays spdlog-free for non-core consumers.
     std::string level = "info";
-    std::string node_name;  // root logger %n, e.g. "jm" or "tm@<id>"; empty -> "clink"
+    std::string node_name;  // root logger %n, e.g. "coordinator" or "worker@<id>"; empty -> "clink"
 
     // File sink. Empty file_path -> no file sink (console + ring only).
     std::string file_path;

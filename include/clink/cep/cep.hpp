@@ -18,7 +18,7 @@
 #include <string>
 #include <utility>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/cep/cep_operator.hpp"
 #include "clink/cep/pattern.hpp"
 #include "clink/cep/pattern_stream.hpp"

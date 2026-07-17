@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Distributed FUNCTIONAL verification: run clink in CONTAINERS (1 JM + 4 TM, each
+# Distributed FUNCTIONAL verification: run clink in CONTAINERS (1 coordinator + 4 worker, each
 # its own container/hostname on the project network) and confirm the Nexmark
 # queries are gate-correct when subtasks shuffle over real container-to-container
 # TCP (separate network namespaces) at parallelism>1 - a faithful single-host
@@ -21,7 +21,7 @@ CLINK_ROOT="$(cd "$ROOT/../.." && pwd)"
 PROJECT=nxcompare
 PY="$ROOT/../flink_compare/.venv/bin/python"
 KEX="docker exec ${PROJECT}-kafka-1 kafka-topics --bootstrap-server localhost:9092"
-JM_HTTP=8095  # host port mapped to clink-jm:8081
+JM_HTTP=8095  # host port mapped to clink-coordinator:8081
 
 EVENTS="${EVENTS:-500000}"
 TPS="${TPS:-1000}"
@@ -66,19 +66,19 @@ if ! docker image inspect clink-runtime:latest >/dev/null 2>&1; then
         echo "clink-runtime build failed"; exit 1; }
 fi
 
-step "2. Bring up Kafka + clink cluster (1 JM + 4 TM containers, par up to 4)"
+step "2. Bring up Kafka + clink cluster (1 coordinator + 4 worker containers, par up to 4)"
 docker compose -p "$PROJECT" up -d zookeeper kafka >/dev/null 2>&1
 for i in $(seq 1 45); do
     docker exec ${PROJECT}-kafka-1 kafka-broker-api-versions --bootstrap-server localhost:9092 \
         >/dev/null 2>&1 && break
     sleep 2
 done
-docker compose -p "$PROJECT" --profile clink up -d clink-jm clink-tm1 clink-tm2 clink-tm3 clink-tm4 >/dev/null 2>&1
+docker compose -p "$PROJECT" --profile clink up -d clink-coordinator clink-worker1 clink-worker2 clink-worker3 clink-worker4 >/dev/null 2>&1
 for i in $(seq 1 60); do
     curl -fsS "http://127.0.0.1:${JM_HTTP}/api/v1/health" >/dev/null 2>&1 && break
     sleep 2
 done
-curl -fsS "http://127.0.0.1:${JM_HTTP}/api/v1/health" >/dev/null 2>&1 || { echo "clink JM not healthy"; exit 1; }
+curl -fsS "http://127.0.0.1:${JM_HTTP}/api/v1/health" >/dev/null 2>&1 || { echo "clink coordinator not healthy"; exit 1; }
 
 step "3. Generate dataset ($EVENTS events tps=$TPS) + load nx-{person,auction,bid} ($PAR partitions, keyed)"
 "$CLINK_ROOT/build/benchmarks/nexmark_dump" --events "$EVENTS" --tps "$TPS" --out-dir "$DATA_DIR" | tail -1
@@ -95,7 +95,7 @@ for q in $QUERIES; do
     sed -e "s#__OUT__#$out#" -e "s#__BROKERS__#kafka:29092#" \
         "$ROOT/queries/clink/$q.tmpl.sql" > "$DATA_DIR/$q-cverify.sql"
     "$CLINK_ROOT/build/clink_submit_sql" --file "$DATA_DIR/$q-cverify.sql" \
-        --jm-host 127.0.0.1 --jm-port "$JM_HTTP" --name "cv_$q" --parallelism "$PAR" 2>&1 | tail -1
+        --coordinator-host 127.0.0.1 --coordinator-port "$JM_HTTP" --name "cv_$q" --parallelism "$PAR" 2>&1 | tail -1
     exp=$(expected_for "$q")
     cnt=$("$PY" "$ROOT/driver/measure_steady.py" --brokers localhost:9092 --topic "$out" \
         --expected "$exp" --quiet-timeout 20 2>/dev/null | \

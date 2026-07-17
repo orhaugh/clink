@@ -5,18 +5,18 @@
 // Stream operators can opt a keyed-state slot in to external lookup
 // by registering it with a QueryableStateRegistry. The registry is a
 // process-wide map from slot-name -> byte-level lookup closure.
-// Clients hit the TM's HTTP endpoint which consults the registry,
+// Clients hit the worker's HTTP endpoint which consults the registry,
 // retrieves the raw value bytes, and returns them. Codec decoding
 // happens on the client.
 //
 // V1 scope (deliberately tight; see project memory for the resolved
 // entry and limits):
 //
-//   * Single TM per slot. Multi-subtask routing (the JM directing a
-//     client to the TM that holds a particular key-group) is a v2
-//     enhancement. Today's clients query whichever TM happens to host
+//   * Single worker per slot. Multi-subtask routing (the coordinator directing a
+//     client to the worker that holds a particular key-group) is a v2
+//     enhancement. Today's clients query whichever worker happens to host
 //     the slot. For a single-subtask deployment that's the only
-//     option; for multi-subtask, query each TM.
+//     option; for multi-subtask, query each worker.
 //   * Reads only. No write-through, no delete.
 //   * The registered closure captures references to the operator's
 //     KeyedState / StateBackend. The user is responsible for
@@ -195,7 +195,7 @@ public:
         return json_scan_by_slot_.find(slot) != json_scan_by_slot_.end();
     }
 
-    // The process-wide instance the TaskManager's HTTP routes serve and
+    // The process-wide instance the Worker's HTTP routes serve and
     // operators bind into (test harnesses construct their own).
     static Registry& global() {
         static Registry instance;

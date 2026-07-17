@@ -5,7 +5,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// ImageSpec pins the clink runtime image the JobManager + TaskManagers run.
+// ImageSpec pins the clink runtime image the Coordinator + Workers run.
 type ImageSpec struct {
 	// +kubebuilder:default="clink-runtime"
 	Repository string `json:"repository,omitempty"`
@@ -16,26 +16,26 @@ type ImageSpec struct {
 	PullPolicy corev1.PullPolicy `json:"pullPolicy,omitempty"`
 }
 
-// JobManagerSpec configures the JobManager role.
-type JobManagerSpec struct {
+// CoordinatorSpec configures the Coordinator role.
+type CoordinatorSpec struct {
 	// +kubebuilder:default=6123
 	ControlPort int32 `json:"controlPort,omitempty"`
 	// +kubebuilder:default=8081
 	HTTPPort int32 `json:"httpPort,omitempty"`
 	// StateBackend passes --state-backend when set (e.g. "rocksdb").
 	StateBackend string `json:"stateBackend,omitempty"`
-	// ExtraArgs are appended verbatim to the JobManager command line.
+	// ExtraArgs are appended verbatim to the Coordinator command line.
 	ExtraArgs []string                    `json:"extraArgs,omitempty"`
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
-	// Env sets extra environment variables (KEY=VALUE) on the JobManager
+	// Env sets extra environment variables (KEY=VALUE) on the Coordinator
 	// container. Job plugins dlopen'd in this process read their build-time
 	// configuration from process env, so this is how per-cluster job env is
 	// supplied (ClinkJob.env only reaches the submit-side build).
 	Env []string `json:"env,omitempty"`
 }
 
-// TaskManagerSpec configures the TaskManager role.
-type TaskManagerSpec struct {
+// WorkerSpec configures the Worker role.
+type WorkerSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=2
 	Replicas int32 `json:"replicas,omitempty"`
@@ -48,14 +48,14 @@ type TaskManagerSpec struct {
 	TerminationGracePeriodSeconds int64                       `json:"terminationGracePeriodSeconds,omitempty"`
 	ExtraArgs                     []string                    `json:"extraArgs,omitempty"`
 	Resources                     corev1.ResourceRequirements `json:"resources,omitempty"`
-	// Env sets extra environment variables (KEY=VALUE) on every TaskManager
-	// container. Job plugins dlopen'd on the TaskManagers read their
+	// Env sets extra environment variables (KEY=VALUE) on every Worker
+	// container. Job plugins dlopen'd on the Workers read their
 	// build-time configuration from process env (registered factory closures
 	// capture it), so runtime-side job env belongs here, not on ClinkJob.
 	Env []string `json:"env,omitempty"`
 }
 
-// HASpec turns on multi-JobManager high availability with file-coordinator
+// HASpec turns on multi-Coordinator high availability with file-coordinator
 // leader election over a shared RWX volume.
 type HASpec struct {
 	Enabled bool `json:"enabled,omitempty"`
@@ -70,10 +70,10 @@ type HASpec struct {
 	Size string `json:"size,omitempty"`
 }
 
-// CheckpointStorageSpec mounts a shared volume into every JobManager and
-// TaskManager pod at MountPath, so checkpoints and savepoints written by one pod
+// CheckpointStorageSpec mounts a shared volume into every Coordinator and
+// Worker pod at MountPath, so checkpoints and savepoints written by one pod
 // are readable by another (required for savepoint-on-upgrade restore, where the
-// resubmitted job's TaskManagers must read the savepoint the old job wrote). A
+// resubmitted job's Workers must read the savepoint the old job wrote). A
 // ClinkJob points its --checkpoint-dir under this path.
 type CheckpointStorageSpec struct {
 	Enabled bool `json:"enabled,omitempty"`
@@ -97,8 +97,8 @@ type ClinkClusterSpec struct {
 	Image              ImageSpec                     `json:"image,omitempty"`
 	ServiceAccountName string                        `json:"serviceAccountName,omitempty"`
 	ImagePullSecrets   []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
-	JobManager         JobManagerSpec                `json:"jobManager,omitempty"`
-	TaskManager        TaskManagerSpec               `json:"taskManager,omitempty"`
+	Coordinator         CoordinatorSpec                `json:"coordinator,omitempty"`
+	Worker        WorkerSpec               `json:"worker,omitempty"`
 	HA                 HASpec                        `json:"ha,omitempty"`
 	CheckpointStorage  CheckpointStorageSpec         `json:"checkpointStorage,omitempty"`
 }
@@ -107,11 +107,11 @@ type ClinkClusterSpec struct {
 type ClinkClusterStatus struct {
 	// Phase is a coarse lifecycle summary: Pending, Running or Failed.
 	Phase string `json:"phase,omitempty"`
-	// JobManagerReplicas is the desired JobManager replica count (1, or ha.replicas).
-	JobManagerReplicas int32 `json:"jobManagerReplicas,omitempty"`
-	// TaskManagersReady is the number of TaskManagers currently registered with
-	// the JobManager (read from its /api/v1/tms endpoint).
-	TaskManagersReady int32 `json:"taskManagersReady,omitempty"`
+	// CoordinatorReplicas is the desired Coordinator replica count (1, or ha.replicas).
+	CoordinatorReplicas int32 `json:"coordinatorReplicas,omitempty"`
+	// WorkersReady is the number of Workers currently registered with
+	// the Coordinator (read from its /api/v1/workers endpoint).
+	WorkersReady int32 `json:"workersReady,omitempty"`
 	// ObservedGeneration is the .metadata.generation last reconciled.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 	// Conditions follow the standard k8s condition convention.
@@ -122,12 +122,12 @@ type ClinkClusterStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=clink;cc
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
-// +kubebuilder:printcolumn:name="TMs-Ready",type=integer,JSONPath=`.status.taskManagersReady`
-// +kubebuilder:printcolumn:name="Desired-TMs",type=integer,JSONPath=`.spec.taskManager.replicas`
+// +kubebuilder:printcolumn:name="workers-Ready",type=integer,JSONPath=`.status.workersReady`
+// +kubebuilder:printcolumn:name="Desired-workers",type=integer,JSONPath=`.spec.worker.replicas`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// ClinkCluster is a clink stream-processing cluster (a JobManager plus a set of
-// TaskManagers) managed declaratively by the clink operator.
+// ClinkCluster is a clink stream-processing cluster (a Coordinator plus a set of
+// Workers) managed declaratively by the clink operator.
 type ClinkCluster struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

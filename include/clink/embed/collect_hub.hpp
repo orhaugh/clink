@@ -16,7 +16,7 @@
 // token in the process-wide CollectScopeRegistry and stamps that token
 // onto every collect_sink_row op at submit time; the sink instance
 // resolves its hub through the registry at open(). connector='collect' is
-// therefore embedded-only by design: a cluster TaskManager has no scope
+// therefore embedded-only by design: a cluster Worker has no scope
 // (and no factory) for it.
 //
 // End-of-stream: the queue counts open producers. Once at least one

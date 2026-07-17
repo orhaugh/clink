@@ -6,18 +6,18 @@ Exercises two-input streams via `connect_process` + `KeyedCoProcessFunction`.
 
 **Scaffolded but not yet functional end-to-end.** Both the clink-side
 .so and the Flink-side jar build cleanly; the Flink side runs to
-completion. The clink-side hits a planner gap when JM tries to
+completion. The clink-side hits a planner gap when coordinator tries to
 validate a plan with two source operators feeding into a `connect_process`
-operator: the JM-side plan_job lookup returns "no source factory
+operator: the coordinator-side plan_job lookup returns "no source factory
 registered" for the first source even though `define_job` registered
 both sources successfully.
 
 Two suspected fix paths, both deferred:
 
-1. JM-side dlopen of the .so populates JM's RunnerRegistry; for
+1. coordinator-side dlopen of the .so populates coordinator's RunnerRegistry; for
    single-source pipelines this works, but a two-source connect_process
-   chain may not be re-running define_job on the JM side, or the
-   second source registration is overwriting the first in JM's view.
+   chain may not be re-running define_job on the coordinator side, or the
+   second source registration is overwriting the first in coordinator's view.
 
 2. The planner's chain-fusion logic at par=1 (`CLINK_PLAN_FUSE_PAR1=1`)
    refuses chains where a sink follows a multi-input op, throwing

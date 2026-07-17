@@ -1,9 +1,9 @@
 // DagBuilderRegistry - type-erased Dag construction callbacks indexed by
 // op_type. Companion to RunnerRegistry: where RunnerRegistry stores
 // `SubtaskRunner`s (per-subtask mini-Dags wired with network bridges, run
-// by the TaskManager), DagBuilderRegistry stores callbacks that add the
+// by the Worker), DagBuilderRegistry stores callbacks that add the
 // op directly to a single shared `clink::Dag` for in-process execution
-// (no JM/TM, no network bridges, no per-op LocalExecutor).
+// (no coordinator/worker, no network bridges, no per-op LocalExecutor).
 //
 // Each callback captures the user's typed factory and the channel types
 // (In / Out for operators, T for source/sink) so it can call

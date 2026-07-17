@@ -1,7 +1,7 @@
-// JobGraphSpec is the JM-side description of a job that gets serialized
-// into the DeployMsg.extra_config string and parsed by the TM-side
-// OperatorRegistry. It's the boundary between "what to run" (JM) and
-// "how to run it" (TM), so silent serialization regressions break the
+// JobGraphSpec is the coordinator-side description of a job that gets serialized
+// into the DeployMsg.extra_config string and parsed by the worker-side
+// OperatorRegistry. It's the boundary between "what to run" (coordinator) and
+// "how to run it" (worker), so silent serialization regressions break the
 // dispatch path. These tests pin:
 //   - serialize/parse round-trip for empty, single-op, multi-op,
 //     parameter-bearing specs.
@@ -251,7 +251,7 @@ TEST(JobGraphSpec, BoundsRoundTripThroughJson) {
 }
 
 // State schema evolution: the expected-version map declared via
-// env.expect_state_version(...) rides the spec to the JM/TM. It is keyed
+// env.expect_state_version(...) rides the spec to the coordinator/worker. It is keyed
 // by operator_id_from_uid (the same derivation the runtime stamps state
 // under) and survives the JSON round-trip; absent when nothing declared.
 TEST(JobGraphSpec, ExpectedStateVersionsRoundTripThroughJson) {
@@ -382,7 +382,7 @@ TEST(JobGraphSpec, FromJsonAcceptsWellFormedDag) {
 }
 
 TEST(JobGraphSpec, ComplexFanOutGraphRoundTrips) {
-    // Models a producer → join → sink graph the JM might assemble.
+    // Models a producer → join → sink graph the coordinator might assemble.
     JobGraphSpec s;
     s.ops.push_back(OperatorSpec{
         .type = "int64_vector_source",

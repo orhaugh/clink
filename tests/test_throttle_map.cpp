@@ -69,7 +69,7 @@ public:
 TEST(ThrottleMap, ZeroRateIsPassThrough) {
     Dag dag;
     auto src = std::make_shared<IntSource>(std::vector<std::int64_t>{1, 2, 3, 4, 5});
-    auto throttle = std::make_shared<ThrottleMap<std::int64_t>>(0ms, "tm");
+    auto throttle = std::make_shared<ThrottleMap<std::int64_t>>(0ms, "worker");
     auto sink = std::make_shared<IntCollectingSink>();
     auto h_src = dag.add_source<std::int64_t>(src);
     auto h_op = dag.add_operator<std::int64_t, std::int64_t>(h_src, throttle);
@@ -87,7 +87,7 @@ TEST(ThrottleMap, ZeroRateIsPassThrough) {
 TEST(ThrottleMap, NonZeroRateActuallySleeps) {
     Dag dag;
     auto src = std::make_shared<IntSource>(std::vector<std::int64_t>{1, 2, 3});  // 3 records
-    auto throttle = std::make_shared<ThrottleMap<std::int64_t>>(40ms, "tm");
+    auto throttle = std::make_shared<ThrottleMap<std::int64_t>>(40ms, "worker");
     auto sink = std::make_shared<IntCollectingSink>();
     auto h_src = dag.add_source<std::int64_t>(src);
     auto h_op = dag.add_operator<std::int64_t, std::int64_t>(h_src, throttle);

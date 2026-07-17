@@ -1,6 +1,6 @@
 // OperatorRegistry resolves op-type strings to typed factories,
 // keyed by (type, in_channel, out_channel). The generic subtask role on
-// the TM uses it to translate a JSON OperatorChainSpec back into typed
+// the worker uses it to translate a JSON OperatorChainSpec back into typed
 // operators. These tests pin:
 //   - The default registry has the v1 built-ins for both supported
 //     channel types.

@@ -95,7 +95,7 @@ std::string http_get(const std::string& host, std::uint16_t port, const std::str
 }
 
 // Wait up to `timeout` for the HTTP server to accept connections - the
-// JM/TM prints "HTTP on host:port" after binding, but we may try before
+// coordinator/worker prints "HTTP on host:port" after binding, but we may try before
 // the listener thread loops in. Returns true on first 200 OK.
 bool await_http_ready(std::uint16_t port, std::chrono::milliseconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -111,7 +111,7 @@ bool await_http_ready(std::uint16_t port, std::chrono::milliseconds timeout) {
 
 }  // namespace
 
-TEST(HttpHealthEndpoint, JobManagerExposesHealth) {
+TEST(HttpHealthEndpoint, CoordinatorExposesHealth) {
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node)) {
         GTEST_SKIP() << "clink_node not built";
@@ -119,7 +119,7 @@ TEST(HttpHealthEndpoint, JobManagerExposesHealth) {
     const auto control_port = probe_free_port();
     const auto http_port = probe_free_port();
     const pid_t pid = spawn_proc({"clink_node",
-                                  "--role=jm",
+                                  "--role=coordinator",
                                   "--port=" + std::to_string(control_port),
                                   "--http-port=" + std::to_string(http_port),
                                   "--http-bind=127.0.0.1"},
@@ -130,43 +130,43 @@ TEST(HttpHealthEndpoint, JobManagerExposesHealth) {
     const auto body = http_get("127.0.0.1", http_port, "/api/v1/health");
     kill_quietly(pid);
 
-    EXPECT_NE(body.find("\"role\":\"jm\""), std::string::npos)
-        << "expected role=jm in body, got: " << body;
+    EXPECT_NE(body.find("\"role\":\"coordinator\""), std::string::npos)
+        << "expected role=coordinator in body, got: " << body;
     EXPECT_NE(body.find("\"ok\":true"), std::string::npos);
     EXPECT_NE(body.find("\"uptime_s\""), std::string::npos);
 }
 
-TEST(HttpHealthEndpoint, TaskManagerExposesHealth) {
+TEST(HttpHealthEndpoint, WorkerExposesHealth) {
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node)) {
         GTEST_SKIP() << "clink_node not built";
     }
-    // TM needs a JM to register against.
-    const auto jm_port = probe_free_port();
-    const pid_t jm_pid =
-        spawn_proc({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, node);
-    ASSERT_GT(jm_pid, 0);
+    // worker needs a coordinator to register against.
+    const auto coordinator_port = probe_free_port();
+    const pid_t coordinator_pid = spawn_proc(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
-    const auto tm_http = probe_free_port();
-    const pid_t tm_pid = spawn_proc({"clink_node",
-                                     "--role=tm",
-                                     "--id=tm-http-test",
-                                     "--jm-host=127.0.0.1",
-                                     "--jm-port=" + std::to_string(jm_port),
-                                     "--http-port=" + std::to_string(tm_http),
-                                     "--http-bind=127.0.0.1"},
-                                    node);
-    ASSERT_GT(tm_pid, 0);
-    ASSERT_TRUE(await_http_ready(tm_http, 2s)) << "TM HTTP didn't accept within 2s";
+    const auto worker_http = probe_free_port();
+    const pid_t worker_pid = spawn_proc({"clink_node",
+                                         "--role=worker",
+                                         "--id=worker-http-test",
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port),
+                                         "--http-port=" + std::to_string(worker_http),
+                                         "--http-bind=127.0.0.1"},
+                                        node);
+    ASSERT_GT(worker_pid, 0);
+    ASSERT_TRUE(await_http_ready(worker_http, 2s)) << "worker HTTP didn't accept within 2s";
 
-    const auto body = http_get("127.0.0.1", tm_http, "/api/v1/health");
+    const auto body = http_get("127.0.0.1", worker_http, "/api/v1/health");
 
-    kill_quietly(tm_pid);
-    kill_quietly(jm_pid);
+    kill_quietly(worker_pid);
+    kill_quietly(coordinator_pid);
 
-    EXPECT_NE(body.find("\"role\":\"tm\""), std::string::npos)
-        << "expected role=tm in body, got: " << body;
+    EXPECT_NE(body.find("\"role\":\"worker\""), std::string::npos)
+        << "expected role=worker in body, got: " << body;
     EXPECT_NE(body.find("\"ok\":true"), std::string::npos);
 }
 
@@ -178,7 +178,7 @@ TEST(HttpHealthEndpoint, UnknownPathReturnsError) {
     const auto control_port = probe_free_port();
     const auto http_port = probe_free_port();
     const pid_t pid = spawn_proc({"clink_node",
-                                  "--role=jm",
+                                  "--role=coordinator",
                                   "--port=" + std::to_string(control_port),
                                   "--http-port=" + std::to_string(http_port),
                                   "--http-bind=127.0.0.1"},

@@ -30,7 +30,7 @@
 #include <utility>
 
 #include "clink/api/descriptors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/connectors/parquet_s3_sink.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/core/codec.hpp"

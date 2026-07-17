@@ -114,35 +114,35 @@ run_clink() {  # query
     recreate_topic "$out" "$PAR" append
     sed -e "s#__OUT__#$out#" -e "s#__BROKERS__#localhost:9092#" \
         "$ROOT/queries/clink/$q.tmpl.sql" > "$DATA_DIR/$q-clink.sql"
-    "$BUILD_DIR/clink_node" --role=jm --port=7100 --http-port=8081 >"$RESULTS/clink-jm.log" 2>&1 &
-    local jm=$!; sleep 2
+    "$BUILD_DIR/clink_node" --role=coordinator --port=7100 --http-port=8081 >"$RESULTS/clink-coordinator.log" 2>&1 &
+    local coordinator=$!; sleep 2
     # clink needs ONE slot per subtask (no slot-sharing like Flink), so total
-    # slots must cover (#ops * PAR). Scale slots-per-TM with PAR (>=8) so deeper
-    # plans (q8's 9 ops -> 36 subtasks at PAR=4) still deploy across 4 TMs.
+    # slots must cover (#ops * PAR). Scale slots-per-worker with PAR (>=8) so deeper
+    # plans (q8's 9 ops -> 36 subtasks at PAR=4) still deploy across 4 workers.
     local slots=$(( PAR * 12 )); [ "$slots" -lt 8 ] && slots=8
-    local tms=(); for i in 1 2 3 4; do
-        "$BUILD_DIR/clink_node" --role=tm --jm-host=127.0.0.1 --jm-port=7100 --id=tm-$i --slots="$slots" \
-            >"$RESULTS/clink-tm-$i.log" 2>&1 & tms+=($!)
+    local workers=(); for i in 1 2 3 4; do
+        "$BUILD_DIR/clink_node" --role=worker --coordinator-host=127.0.0.1 --coordinator-port=7100 --id=worker-$i --slots="$slots" \
+            >"$RESULTS/clink-worker-$i.log" 2>&1 & workers+=($!)
     done
     sleep 3
-    # CPU + wall sampled tight around the active window: just before submit (JM/TM
+    # CPU + wall sampled tight around the active window: just before submit (coordinator/worker
     # idle-settled) and right after the drain (measure_steady returns at the last
     # output record for a gate-passing query, so no quiet-wait pollutes the delta).
     local cpu_pre wall_pre
-    cpu_pre=$("$PY" "$ROOT/driver/cpu.py" read-clink "$jm" "${tms[@]}")
+    cpu_pre=$("$PY" "$ROOT/driver/cpu.py" read-clink "$coordinator" "${workers[@]}")
     wall_pre=$(now_s)
     "$BUILD_DIR/clink_submit_sql" --file "$DATA_DIR/$q-clink.sql" \
-        --jm-host 127.0.0.1 --jm-port 8081 --name "nx_$q" --parallelism "$PAR" >/dev/null 2>&1
+        --coordinator-host 127.0.0.1 --coordinator-port 8081 --name "nx_$q" --parallelism "$PAR" >/dev/null 2>&1
     "$PY" "$ROOT/driver/measure_steady.py" --brokers "$BROKERS_HOST" --topic "$out" \
         --expected "$(expected_for "$q")" --query "$q" --engine clink --out "$RESULTS/$q-clink.json" \
         --quiet-timeout 12 2>/dev/null | tail -1
     local cpu_post wall_post
-    cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-clink "$jm" "${tms[@]}")
+    cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-clink "$coordinator" "${workers[@]}")
     wall_post=$(now_s)
     "$PY" "$ROOT/driver/cpu.py" merge "$RESULTS/$q-clink.json" --cpu-pre "$cpu_pre" \
         --cpu-post "$cpu_post" --wall-pre "$wall_pre" --wall-post "$wall_post" \
         --input-events "$(input_events_for "$q")" >/dev/null
-    kill "${tms[@]}" "$jm" 2>/dev/null; sleep 1; kill -9 "${tms[@]}" "$jm" 2>/dev/null; sleep 1
+    kill "${workers[@]}" "$coordinator" 2>/dev/null; sleep 1; kill -9 "${workers[@]}" "$coordinator" 2>/dev/null; sleep 1
 }
 
 run_flink() {  # query

@@ -1,6 +1,6 @@
 // Command clink-operator is the controller manager for the clink Kubernetes
 // operator. It watches ClinkCluster custom resources and reconciles each into a
-// JobManager Deployment + Service, a TaskManager StatefulSet + headless Service,
+// Coordinator Deployment + Service, a Worker StatefulSet + headless Service,
 // a ServiceAccount and (for HA) a shared PVC, then reports cluster status.
 package main
 

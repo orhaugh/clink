@@ -2,9 +2,9 @@
 
 // Adaptive autoscaler loop.
 //
-// Drives `JobManager::request_operator_rescale`
+// Drives `Coordinator::request_operator_rescale`
 // from a periodic metric poll, one PidController per operator. The
-// autoscaler is intentionally decoupled from JobManager via three
+// autoscaler is intentionally decoupled from Coordinator via three
 // function objects (sample / request / status) so it's testable
 // without a cluster and so callers can plug their own metric source.
 //

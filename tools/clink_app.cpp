@@ -1,23 +1,23 @@
 // clink_app -  Application Mode equivalent.
 //
-// Application Mode runs the user's main() inside the JobManager
-// process (instead of in a separate client). The JM dlopens the user
+// Application Mode runs the user's main() inside the Coordinator
+// process (instead of in a separate client). The coordinator dlopens the user
 // JAR, builds the JobGraph in-process, schedules it, awaits completion,
 // and exits. clink_app mirrors that shape:
 //
-//   1. Start a JobManager in THIS process bound to --port.
+//   1. Start a Coordinator in THIS process bound to --port.
 //   2. dlopen the supplied .so (built with CLINK_REGISTER_JOB) and
 //      retrieve its JobGraphSpec via clink_job_build. No wire round-
 //      trip: the bundle is constructed in-process and threaded straight
-//      into JobManager::submit_job.
-//   3. The JM ships the .so bytes to every TM that registers, the same
+//      into Coordinator::submit_job.
+//   3. The coordinator ships the .so bytes to every worker that registers, the same
 //      way it does for clink_submit_job submissions.
-//   4. Block on JobManager::await_job_completion(...).
+//   4. Block on Coordinator::await_job_completion(...).
 //   5. Surface job_errors and exit (non-zero on any error).
 //
-// External TMs are required: spawn them with `clink_node --role=tm
-// --jm-host=127.0.0.1 --jm-port=<port>` before or during clink_app's
-// `--wait-slots-s` window. The JM will block in submit_job until enough
+// External workers are required: spawn them with `clink_node --role=worker
+// --coordinator-host=127.0.0.1 --coordinator-port=<port>` before or during clink_app's
+// `--wait-slots-s` window. The coordinator will block in submit_job until enough
 // slots are available (or the wait window expires).
 //
 // Usage:
@@ -27,9 +27,9 @@
 //               [--no-tcp]  (don't accept external clients; in-proc only)
 //
 // Compared to clink_submit_job:
-//   * submit_job: connects to an EXISTING JM as a client; JM is long-lived.
+//   * submit_job: connects to an EXISTING coordinator as a client; coordinator is long-lived.
 //     Like  "session mode" submissions.
-//   * clink_app: STARTS A NEW JM bound to the job; exits when the job
+//   * clink_app: STARTS A NEW coordinator bound to the job; exits when the job
 //     ends. Like  "application mode".
 
 #include <chrono>
@@ -45,9 +45,9 @@
 #include <string_view>
 
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/job_bundle.hpp"
 #include "clink/cluster/job_graph.hpp"
-#include "clink/cluster/job_manager.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/plugin_cache.hpp"
 #include "clink/cluster/plugin_loader.hpp"
@@ -84,9 +84,9 @@ void usage() {
               << "                   [--wait-slots-s=N] [--wait-job-s=N] [--name=<label>]\n"
               << "                   [--state-backend=<uri>]\n"
               << "\n"
-              << "Start a JM in this process, dlopen the job .so locally, submit\n"
-              << "via the in-process API, wait for completion. External TMs must\n"
-              << "register with this JM during the --wait-slots-s window.\n"
+              << "Start a coordinator in this process, dlopen the job .so locally, submit\n"
+              << "via the in-process API, wait for completion. External workers must\n"
+              << "register with this coordinator during the --wait-slots-s window.\n"
               << "\n"
               << "--state-backend defaults to disagg-local:// (process-local, async\n"
               << "path on, not durable). Use file:///dir or remote-read://bucket for\n"
@@ -114,7 +114,7 @@ int clink_cmd_run_application(int argc, char** argv) {
     // process-local + non-durable, which is correct for a single-process local
     // run. Override for a durable run, e.g. --state-backend=remote-read://bkt
     // or --state-backend=file:///var/clink. An empty value falls back to the
-    // legacy memory backend. Applied via the JM's default lever below.
+    // legacy memory backend. Applied via the coordinator's default lever below.
     const auto state_backend = get_arg(argc, argv, "state-backend", "disagg-local://");
 
     if (job_path.empty()) {
@@ -131,27 +131,27 @@ int clink_cmd_run_application(int argc, char** argv) {
     const auto wait_slots = std::chrono::seconds{std::stoi(wait_slots_str)};
     const auto wait_job = std::chrono::seconds{std::stoi(wait_job_str)};
 
-    // Built-ins must be registered before the JM accepts anything that
-    // references int64 / string channels. JobManager::submit_job calls
+    // Built-ins must be registered before the coordinator accepts anything that
+    // references int64 / string channels. Coordinator::submit_job calls
     // this internally too, but registering up front keeps the order
     // explicit and matches clink_node's behaviour.
     clink::cluster::ensure_built_ins_registered();
 
-    // Start the JM. submit_wait_for_slots is the per-submission slot-
+    // Start the coordinator. submit_wait_for_slots is the per-submission slot-
     // availability timeout: submit_job() blocks until either the cluster
     // has the slots the job needs, or this elapses.
-    clink::cluster::JobManager::Config cfg;
+    clink::cluster::Coordinator::Config cfg;
     cfg.bind_host = bind_host;
     cfg.advertise_host = advertise;
     cfg.submit_wait_for_slots = wait_slots;
     cfg.default_state_backend_uri = state_backend;
-    clink::cluster::JobManager jm(cfg);
-    const auto bound = jm.start(bind_port);
-    std::cerr << "clink_app: JM listening on " << advertise << ":" << bound << "\n";
+    clink::cluster::Coordinator coordinator(cfg);
+    const auto bound = coordinator.start(bind_port);
+    std::cerr << "clink_app: coordinator listening on " << advertise << ":" << bound << "\n";
 
     // Allocate the per-job bundle and load the .so INTO it. Locally, in
     // this process - no wire submit. The same .so will be shipped to
-    // remote TMs as PluginBinary bytes via the Deploy message.
+    // remote workers as PluginBinary bytes via the Deploy message.
     auto bundle = std::make_unique<clink::cluster::JobBundle>();
     auto bundle_preg = bundle->as_plugin_registry();
     auto load_result =
@@ -185,7 +185,7 @@ int clink_cmd_run_application(int argc, char** argv) {
     auto graph =
         clink::cluster::JobGraphSpec::from_json(std::string{graph_json_data, graph_json_size});
 
-    // Read the .so bytes so the JM can ship them to every TM in Deploy.
+    // Read the .so bytes so the coordinator can ship them to every worker in Deploy.
     std::vector<clink::cluster::PluginBinary> plugins;
     plugins.push_back(clink::cluster::make_plugin_binary_from_file(job_abs.string()));
 
@@ -194,25 +194,25 @@ int clink_cmd_run_application(int argc, char** argv) {
     // await_job_completion below.
     std::uint64_t job_id = 0;
     try {
-        job_id = jm.submit_job(graph,
-                               clink::cluster::OperatorRegistry::default_instance(),
-                               std::move(plugins),
-                               clink::cluster::CheckpointConfig{},
-                               std::move(bundle),
-                               /*notify_client_conn=*/nullptr);
+        job_id = coordinator.submit_job(graph,
+                                        clink::cluster::OperatorRegistry::default_instance(),
+                                        std::move(plugins),
+                                        clink::cluster::CheckpointConfig{},
+                                        std::move(bundle),
+                                        /*notify_client_conn=*/nullptr);
     } catch (const std::exception& e) {
         std::cerr << "clink_app: submit_job threw: " << e.what() << "\n";
         return 6;
     }
     std::cerr << "clink_app: submitted job " << job_id << " (name=" << job_name << ")\n";
 
-    if (!jm.await_job_completion(job_id, wait_job)) {
+    if (!coordinator.await_job_completion(job_id, wait_job)) {
         std::cerr << "clink_app: job " << job_id << " did not complete within " << wait_job.count()
                   << "s\n";
         return 7;
     }
 
-    const auto errors = jm.job_errors(job_id);
+    const auto errors = coordinator.job_errors(job_id);
     if (!errors.empty()) {
         for (const auto& e : errors) {
             std::cerr << "clink_app: job error: " << e << "\n";

@@ -350,7 +350,7 @@ void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
 
     // 2PC version: same wire-up surface but the runtime writes into
     // <dir>/staging/ and only an atomic rename into <dir>/committed/
-    // makes records visible. Survives JM crashes mid-checkpoint: on
+    // makes records visible. Survives coordinator crashes mid-checkpoint: on
     // restart-with-restore, any pre-committed staging file whose
     // checkpoint id is in restored state gets committed; uncommitted
     // staging files stay in place for operator inspection.

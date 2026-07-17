@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/connectors/cdc_event.hpp"
 #include "clink/postgres/cdc_event_codec.hpp"
@@ -14,7 +14,7 @@
 
 TEST(PostgresTypedCdcSource, ProducesExpectedDescriptor) {
     clink::cluster::ensure_built_ins_registered();
-    clink::api::StreamExecutionEnvironment env;
+    clink::api::Pipeline env;
     clink::postgres::install(env.registry());
 
     auto stream = clink::postgres::cdc_event_source(env,

@@ -27,13 +27,13 @@
 #include <vector>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/job/register_job.hpp"
 #include "clink/state/schema_version.hpp"
 
 namespace {
 
-void define_job(clink::api::StreamExecutionEnvironment& env) {
+void define_job(clink::api::Pipeline& pipeline) {
     // Identity migrations - the check only consults path existence, not
     // the transform itself.
     const auto identity = [](std::span<const std::byte> in) {
@@ -42,11 +42,11 @@ void define_job(clink::api::StreamExecutionEnvironment& env) {
     clink::StateMigrationRegistry::global().register_migration("counter", 1, 2, identity);
     clink::StateMigrationRegistry::global().register_migration("counter", 2, 3, identity);
 
-    env.from_elements<std::int64_t>({1, 2, 3})
+    pipeline.from_elements<std::int64_t>({1, 2, 3})
         .map<std::int64_t>([](const std::int64_t& v) { return v; })
         .sink(clink::api::FileInt64Sink::builder().path("/tmp/schema_evo_test_out.txt").build());
 
-    env.expect_state_version("counter-op", "counter", 3);
+    pipeline.expect_state_version("counter-op", "counter", 3);
 }
 
 }  // namespace

@@ -1,7 +1,7 @@
 // Nexmark-on-clink benchmark harness.
 //
 // Generates a Nexmark event stream (connector='nexmark') and runs a Nexmark
-// query as a clink SQL job on an in-process JobManager+TaskManager cluster,
+// query as a clink SQL job on an in-process Coordinator+Worker cluster,
 // discarding output through a blackhole sink, and reports input-event
 // throughput. Mirrors the SQL runtime tests' InProcessCluster + the
 // failover/cold-start bench shape.
@@ -26,8 +26,8 @@
 
 #include "clink/application/job_submitter.hpp"
 #include "clink/cluster/built_in_factories.hpp"
-#include "clink/cluster/job_manager.hpp"
-#include "clink/cluster/task_manager.hpp"
+#include "clink/cluster/coordinator.hpp"
+#include "clink/cluster/worker.hpp"
 #include "clink/nexmark/register.hpp"
 #include "clink/operators/scalar_function_registry.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -346,7 +346,7 @@ int main(int argc, char** argv) {
     }
 
     // Install SQL ops + the Nexmark source/blackhole-sink factories into the host
-    // registry (default_instance), so the in-process TM can build them.
+    // registry (default_instance), so the in-process worker can build them.
     cluster::ensure_built_ins_registered();
     plugin::PluginRegistry reg;
     sql::install(reg);
@@ -382,13 +382,13 @@ int main(int argc, char** argv) {
             return config::JsonValue{!a.empty() && !a[0].is_null() && a[0].as_number() >= 50.0};
         });
 
-    cluster::JobManager jm;
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"tm-nexmark"});
-    cluster::TaskManager::Config tcfg;
+    cluster::Coordinator coordinator;
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-nexmark"});
+    cluster::Worker::Config tcfg;
     tcfg.slot_count = slots;
-    cluster::TaskManager tm("tm-nexmark", "127.0.0.1", tcfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    cluster::Worker worker("worker-nexmark", "127.0.0.1", tcfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
     std::this_thread::sleep_for(150ms);
 
     cluster::JobGraphSpec spec;
@@ -396,19 +396,19 @@ int main(int argc, char** argv) {
         spec = build_spec(events, tps, it->second);
     } catch (const std::exception& e) {
         std::cerr << "compile failed for " << query_id << ": " << e.what() << "\n";
-        tm.stop();
-        jm.stop();
+        worker.stop();
+        coordinator.stop();
         return 1;
     }
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     application::SubmitOptions opts;
     const auto t0 = std::chrono::steady_clock::now();
     auto result = submitter.submit(spec.to_json(), {}, opts);
     const auto wall = std::chrono::steady_clock::now() - t0;
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 
     if (!result.completed || !result.ok) {
         std::cerr << "job did not complete cleanly: "

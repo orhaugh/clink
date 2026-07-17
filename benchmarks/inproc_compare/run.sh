@@ -12,10 +12,10 @@
 
 set -euo pipefail
 
-# Robust cleanup: every bench launches JM + TM in background. If
+# Robust cleanup: every bench launches coordinator + worker in background. If
 # submit_job fails (reject, timeout, signal) the script would exit
 # under `set -e` before the inline kills run, leaving zombies on
-# the JM port that silently corrupt the next iteration. Trap EXIT
+# the coordinator port that silently corrupt the next iteration. Trap EXIT
 # instead so the kills fire on every exit path.
 _CLINK_BENCH_PIDS=()
 _clink_bench_cleanup() {
@@ -78,26 +78,26 @@ FLINK_END=$(date +%s.%N)
 FLINK_WALL=$(awk "BEGIN { printf \"%.3f\", $FLINK_END - $FLINK_START }")
 echo "flink wall: ${FLINK_WALL}s"
 
-step "4. clink run (JM + 1 TM in process, foreground)"
+step "4. clink run (coordinator + 1 worker in process, foreground)"
 CLINK_PLAN_FUSE_PAR1=1 \
-    "$CLINK_ROOT/build/clink_node" --role=jm --port=7150 \
-        >"$RESULTS/clink_jm.log" 2>&1 &
+    "$CLINK_ROOT/build/clink_node" --role=coordinator --port=7150 \
+        >"$RESULTS/clink_coordinator.log" 2>&1 &
 JM_PID=$!
 _CLINK_BENCH_PIDS+=("$JM_PID")
 sleep 1
 
 # The .so reads BENCH_* from getenv() inside define_job, which runs
-# in the TM process — not the submit client — so the TM must see them.
+# in the worker process — not the submit client — so the worker must see them.
 BENCH_RECORDS="$RECORDS" \
 BENCH_KEYS="$KEYS" \
 BENCH_WINDOWS="$WINDOWS" \
 BENCH_PAYLOAD_BYTES="$PAYLOAD_BYTES" \
 CLINK_PLAN_FUSE_PAR1=1 \
 CLINK_WB_STATE_CACHE="${CLINK_WB_STATE_CACHE:-0}" \
-    "$CLINK_ROOT/build/clink_node" --role=tm \
-        --jm-host=127.0.0.1 --jm-port=7150 \
-        --id=tm-inproc --slots=16 \
-        >"$RESULTS/clink_tm.log" 2>&1 &
+    "$CLINK_ROOT/build/clink_node" --role=worker \
+        --coordinator-host=127.0.0.1 --coordinator-port=7150 \
+        --id=worker-inproc --slots=16 \
+        >"$RESULTS/clink_worker.log" 2>&1 &
 TM_PID=$!
 _CLINK_BENCH_PIDS+=("$TM_PID")
 sleep 1
@@ -109,7 +109,7 @@ BENCH_WINDOWS="$WINDOWS" \
 BENCH_PAYLOAD_BYTES="$PAYLOAD_BYTES" \
     "$CLINK_ROOT/build/clink_submit_job" \
         --job="$SO" \
-        --jm-host=127.0.0.1 --jm-port=7150 \
+        --coordinator-host=127.0.0.1 --coordinator-port=7150 \
         --state-backend="$CLINK_STATE_BACKEND" \
         --checkpoint-interval-ms=5000 \
         --wait-timeout-s=300 \
@@ -150,7 +150,7 @@ echo "clink durability mode: $MODE_LABEL"
 # 3.5s "Flink wall" we'd been quoting was JVM startup time.
 EXPECTED_PANES=$(awk "BEGIN { print $KEYS * $WINDOWS }")
 FLINK_PANES=$(grep -oE 'FLINK_SINK_FINISH panes=[0-9]+' "$RESULTS/flink.log" 2>/dev/null | head -1 | awk -F= '{print $2}')
-CLINK_PANES=$(grep -oE 'sink final count: [0-9]+' "$RESULTS/clink_tm.log" 2>/dev/null | head -1 | awk -F': ' '{print $2}')
+CLINK_PANES=$(grep -oE 'sink final count: [0-9]+' "$RESULTS/clink_worker.log" 2>/dev/null | head -1 | awk -F': ' '{print $2}')
 FLINK_PANES=${FLINK_PANES:-0}
 CLINK_PANES=${CLINK_PANES:-0}
 

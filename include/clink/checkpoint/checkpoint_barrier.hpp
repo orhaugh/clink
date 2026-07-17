@@ -47,7 +47,7 @@ public:
     constexpr CheckpointId id() const noexcept { return id_; }
     // Terminal barriers are emitted by a source after it returns false
     // from produce(). They flow downstream like any other barrier, but
-    // sinks treat them as both pre-commit AND commit (no JM round-trip
+    // sinks treat them as both pre-commit AND commit (no coordinator round-trip
     // - there's no recovery scenario after end-of-stream). This is how
     // 2PC sinks commit the tail of bounded streams without periodic
     // checkpointing reaching every record.

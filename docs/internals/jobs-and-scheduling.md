@@ -1,17 +1,17 @@
 # Jobs, parallelism and scheduling
 
-> How a logical job graph is described, planned into parallel subtasks routed by key group, and placed onto TaskManager slots by the JobManager.
+> How a logical job graph is described, planned into parallel subtasks routed by key group, and placed onto Worker slots by the Coordinator.
 
 ## Overview
 
-A clink job starts life as a logical DAG of operators and ends as a set of independent subtasks, each running on a slot somewhere in the cluster. Three layers do the translation. The submitter builds a `JobGraphSpec`, a serialisable list of `(op_type, params)` operator chains with per-op parallelism. The planner (`plan_job`) expands that spec into a `JobPlan` of one `OperatorChainSpec` per subtask, fixing the routing of every inter-operator edge (forward, rebalance, or hash-partitioned shuffle). The JobManager then resolves placement: it assigns each subtask to a TaskManager slot, resolves the peer addresses of every data edge, and ships the deployment. Per-subtask isolation is the invariant that makes parallelism correct: every subtask gets its own `OperatorId` and its own `RuntimeContext`, so keyed state never bleeds across subtasks, and records that belong to a key always reach the one subtask that owns that key's state.
+A clink job starts life as a logical DAG of operators and ends as a set of independent subtasks, each running on a slot somewhere in the cluster. Three layers do the translation. The submitter builds a `JobGraphSpec`, a serialisable list of `(op_type, params)` operator chains with per-op parallelism. The planner (`plan_job`) expands that spec into a `JobPlan` of one `OperatorChainSpec` per subtask, fixing the routing of every inter-operator edge (forward, rebalance, or hash-partitioned shuffle). The Coordinator then resolves placement: it assigns each subtask to a Worker slot, resolves the peer addresses of every data edge, and ships the deployment. Per-subtask isolation is the invariant that makes parallelism correct: every subtask gets its own `OperatorId` and its own `RuntimeContext`, so keyed state never bleeds across subtasks, and records that belong to a key always reach the one subtask that owns that key's state.
 
 ## Where it lives
 
 - `include/clink/cluster/job_graph.hpp`, `src/cluster/job_graph.cpp` - `JobGraphSpec` / `OperatorSpec`: the wire-shaped logical job, its JSON and line formats, and `validate()` (unique ids, resolvable inputs, no cycles).
 - `include/clink/job/register_job.hpp` - the job-as-plugin C-ABI (`CLINK_REGISTER_JOB`): how a compiled `.so` produces a `JobGraphSpec` JSON via a build function.
 - `include/clink/cluster/job_planner.hpp`, `src/cluster/job_planner.cpp` - `plan_job`, `OperatorChainSpec`, `ChainOp`, `SubtaskEdge`, `SubtaskOutputGroup`: spec to `JobPlan` translation, chaining, fusion, edge routing.
-- `include/clink/cluster/job_manager.hpp`, `src/cluster/job_manager.cpp` - `JobManager`, `JobPlan`, `PlannedTask`: slot model, greedy first-fit placement, peer-address resolution, deployment.
+- `include/clink/cluster/coordinator.hpp`, `src/cluster/coordinator.cpp` - `Coordinator`, `JobPlan`, `PlannedTask`: slot model, greedy first-fit placement, peer-address resolution, deployment.
 - `include/clink/runtime/key_groups.hpp` - `kNumKeyGroups`, `key_group_for_key`, `subtask_for_key_group`, `key_group_range_for_subtask`: the partitioning primitive.
 - `include/clink/runtime/key_group_partitioner.hpp` - `make_key_group_partitioner`: routes records to the subtask that owns their key group, consistent with state placement.
 - `include/clink/runtime/dag.hpp` - `Dag::add_parallel_{source,operator,operator_shuffled,sink}` and `wire_stage_`: the in-process side that builds per-subtask runners, channels, and emitters.
@@ -23,7 +23,7 @@ A clink job starts life as a logical DAG of operators and ends as a set of indep
 
 A `JobGraphSpec` is a flat vector of `OperatorSpec`. Each op carries:
 
-- `type`: the factory key looked up in the operator registry on the TaskManager.
+- `type`: the factory key looked up in the operator registry on the Worker.
 - `id`: a graph-local stable id, referenced by downstream ops in `inputs`.
 - `inputs`: the upstream op ids this op reads from. Empty marks a source. The input grammar allows a `.N` suffix for a split branch (`splitter.0`) and a `::tag` suffix for a named side output (`emitter::errors`).
 - `parallelism`: how many subtasks this op expands into (default 1).
@@ -34,7 +34,7 @@ A `JobGraphSpec` is a flat vector of `OperatorSpec`. Each op carries:
 
 `JobGraphSpec::to_json` / `from_json` are the submission format; `serialize` / `parse` are a terser line format kept for hand-written specs and round-trip tests. `from_json` auto-runs `validate()`, so a parsed spec is always known well-formed: ids are unique, every `inputs` ref (after stripping the `.N` / `::tag` suffix) resolves to a real op, and a Kahn topological sort proves the graph is acyclic. The cross-field autoscale invariants are enforced here too (both bounds set or neither; `min <= parallelism <= max`).
 
-A job is authored as a shared library. `CLINK_REGISTER_JOB(name, version, description, build_fn)` emits the plugin C-ABI: the submitter dlopens the `.so`, `clink_plugin_register` runs the user's `build_fn` once under `std::call_once` against a `StreamExecutionEnvironment`, and `clink_job_build` hands back the resulting `JobGraphSpec` JSON. The same `.so` is shipped to each TaskManager, which dlopens it so the inline operator registrations (for example `_inline_map_<n>`) that ran in the submitter fire again in the TM process and resolve. See `include/clink/job/register_job.hpp` for the determinism caveat: `build_fn` must register operators in a stable order across processes.
+A job is authored as a shared library. `CLINK_REGISTER_JOB(name, version, description, build_fn)` emits the plugin C-ABI: the submitter dlopens the `.so`, `clink_plugin_register` runs the user's `build_fn` once under `std::call_once` against a `Pipeline`, and `clink_job_build` hands back the resulting `JobGraphSpec` JSON. The same `.so` is shipped to each Worker, which dlopens it so the inline operator registrations (for example `_inline_map_<n>`) that ran in the submitter fire again in the worker process and resolve. See `include/clink/job/register_job.hpp` for the determinism caveat: `build_fn` must register operators in a stable order across processes.
 
 ### Planning: spec to subtasks
 
@@ -56,7 +56,7 @@ A job is authored as a shared library. `CLINK_REGISTER_JOB(name, version, descri
 
    A keyed chain head likewise listens on an edge from every upstream subtask, since each upstream is hash-routing per record and this subtask receives whatever slice fell into its hash bucket. Split tails set the chain's `output_routing` to `Split` and order the groups by branch index; broadcast (the default) tees every record to every group.
 
-Each `PlannedTask` is created with an empty `tm_id` (placement is the JobManager's job), the sentinel role `kGenericSubtaskRole` (`"__clink_subtask"`), its global `subtask_idx`, a list of `peer_refs` derived from the output edges, and the serialised `OperatorChainSpec` JSON in `extra_config`. On the TaskManager a single generic-role handler parses that JSON, instantiates the ops via the registry, wires a network bridge per input and output edge, and runs the resulting `Dag` through the local executor (see `./task-lifecycle.md`).
+Each `PlannedTask` is created with an empty `worker_id` (placement is the Coordinator's job), the sentinel role `kGenericSubtaskRole` (`"__clink_subtask"`), its global `subtask_idx`, a list of `peer_refs` derived from the output edges, and the serialised `OperatorChainSpec` JSON in `extra_config`. On the Worker a single generic-role handler parses that JSON, instantiates the ops via the registry, wires a network bridge per input and output edge, and runs the resulting `Dag` through the local executor (see `./task-lifecycle.md`).
 
 ```
 JobGraphSpec (logical)            JobPlan (physical, one task per subtask)
@@ -86,7 +86,7 @@ Operator state that has no key (source offsets, broadcast slots) is marked with 
 
 `make_key_group_partitioner` (`include/clink/runtime/key_group_partitioner.hpp`) closes the gap between record routing and state placement: it routes a record to the same subtask that owns its key group's state. Its contract is strict: build it with `parallelism == output_count` of the emitter it feeds, since `subtask_for_key_group` already returns an index in `[0, parallelism)`. A mismatch silently mis-routes records to a subtask that does not own their key's state.
 
-When a job is deployed, the JobManager stamps each subtask's `[key_group_first, key_group_last)` range from the role's initial parallelism using the same `key_group_range_for_subtask` formula (`src/cluster/job_manager.cpp`), so queryable-state routing works on the first deploy without waiting for a rescale. For non-keyed operators the range fields are simply unread.
+When a job is deployed, the Coordinator stamps each subtask's `[key_group_first, key_group_last)` range from the role's initial parallelism using the same `key_group_range_for_subtask` formula (`src/cluster/coordinator.cpp`), so queryable-state routing works on the first deploy without waiting for a rescale. For non-keyed operators the range fields are simply unread.
 
 ### Per-subtask isolation
 
@@ -103,20 +103,20 @@ Parallelism is correct only because each subtask is independent. In `include/cli
 
 ### The slot model and deployment
 
-A TaskManager advertises a `slot_count` (its `Config::slot_count` defaults to 1; the `clink_node --slots` flag defaults to 4; the JobManager treats a reported `slot_count` of 0 as 1). One subtask consumes one slot. The cluster's free-slot count is the sum of `slot_capacity - slots_in_use` over all non-lost TMs (`JobManager::free_slots`).
+A Worker advertises a `slot_count` (its `Config::slot_count` defaults to 1; the `clink_node --slots` flag defaults to 4; the Coordinator treats a reported `slot_count` of 0 as 1). One subtask consumes one slot. The cluster's free-slot count is the sum of `slot_capacity - slots_in_use` over all non-lost workers (`Coordinator::free_slots`).
 
 Submission checks slots before planning: `total_subtask_count(graph)` (the sum of parallelism across ops) must be satisfiable. `Config::submit_wait_for_slots` controls how long `SubmitJob` waits for spare slots before rejecting; 0 means reject immediately.
 
-Placement happens in `JobManager::deploy_internal_` (`src/cluster/job_manager.cpp`) and is greedy first-fit: for each task whose `tm_id` is still empty, the JM scans registered TMs in map order and picks the first non-lost TM with `slots_in_use < slot_capacity`, incrementing its `slots_in_use`. If no TM has a free slot, deployment throws. The legacy in-process API can pre-set `tm_id` and a non-zero `data_port`, in which case those tasks are taken as-is.
+Placement happens in `Coordinator::deploy_internal_` (`src/cluster/coordinator.cpp`) and is greedy first-fit: for each task whose `worker_id` is still empty, the coordinator scans registered workers in map order and picks the first non-lost worker with `slots_in_use < slot_capacity`, incrementing its `slots_in_use`. If no worker has a free slot, deployment throws. The legacy in-process API can pre-set `worker_id` and a non-zero `data_port`, in which case those tasks are taken as-is.
 
-After placement, the JM builds a `(role, subtask_idx) -> (tm_id, data_port)` index and resolves each task's `peer_refs` into concrete `host:port` `PeerAddress` entries, the host coming from the peer TM's `data_host`. Generic-role subtasks bind their data ports ephemerally and report back via `SubtaskListening`, so their peer ports start at 0 and are filled in later via `PeerUpdate` once the listening handshake completes. The JM groups the tasks by `tm_id` into `DeploymentTask` lists, records them in `JobState`, stamps each with its key-group range, and sends a `Deploy` to each affected TM carrying the tasks and any plugin binaries. The distributed control-plane mechanics (registration, heartbeats, listening handshake, the watchdog) are covered in `./distributed-runtime.md`.
+After placement, the coordinator builds a `(role, subtask_idx) -> (worker_id, data_port)` index and resolves each task's `peer_refs` into concrete `host:port` `PeerAddress` entries, the host coming from the peer worker's `data_host`. Generic-role subtasks bind their data ports ephemerally and report back via `SubtaskListening`, so their peer ports start at 0 and are filled in later via `PeerUpdate` once the listening handshake completes. The coordinator groups the tasks by `worker_id` into `DeploymentTask` lists, records them in `JobState`, stamps each with its key-group range, and sends a `Deploy` to each affected worker carrying the tasks and any plugin binaries. The distributed control-plane mechanics (registration, heartbeats, listening handshake, the watchdog) are covered in `./distributed-runtime.md`.
 
 ```mermaid
 flowchart TD
-  SJ["submit_job"] --> PJ["plan_job"] --> JP["JobPlan (tm_id empty)"] --> DI["deploy_internal_"]
-  DI --> FF["greedy first-fit: pick first non-lost TM<br/>with a free slot, ++slots_in_use"]
+  SJ["submit_job"] --> PJ["plan_job"] --> JP["JobPlan (worker_id empty)"] --> DI["deploy_internal_"]
+  DI --> FF["greedy first-fit: pick first non-lost worker<br/>with a free slot, ++slots_in_use"]
   FF --> RP["resolve peer_refs to PeerAddress(host:port)<br/>(generic-role ports filled later via PeerUpdate)"]
-  RP --> GR["group by tm_id, send Deploy(tasks, plugins) to TMs"]
+  RP --> GR["group by worker_id, send Deploy(tasks, plugins) to workers"]
 ```
 
 ### Rescale
@@ -141,7 +141,7 @@ Measured with `benchmarks/density_envelope.py` on a Release build (2026-07-12, 1
 
 Throughput peaks around `threads ~= cores` (here at parallelism 2, before the shuffle and thread overhead outweigh the gain on this light workload) and then falls off roughly in step with the oversubscription ratio - each doubling of parallelism past the cores roughly halves throughput. The embedded engine also has a fixed slot count (64), so a job whose `W * P` exceeds it is rejected up front rather than thrashing.
 
-The supported envelope, therefore: size total threads (`operators x parallelism`, summed across the chains placed on one machine) at or below that machine's physical cores. Scale beyond one machine's cores by adding TaskManagers - each subtask lands on a slot on some machine and runs its own thread there - not by raising parallelism on a single box. For an embedded or single-machine bounded workload the parallelism sweet spot is low (often 1-2); parallelism earns its keep when the per-key work is heavy enough that sharding it across cores repays the shuffle, and when the subtasks are spread across machines rather than stacked on one.
+The supported envelope, therefore: size total threads (`operators x parallelism`, summed across the chains placed on one machine) at or below that machine's physical cores. Scale beyond one machine's cores by adding Workers - each subtask lands on a slot on some machine and runs its own thread there - not by raising parallelism on a single box. For an embedded or single-machine bounded workload the parallelism sweet spot is low (often 1-2); parallelism earns its keep when the per-key work is heavy enough that sharding it across cores repays the shuffle, and when the subtasks are spread across machines rather than stacked on one.
 
 Decision (roadmap C5): a cooperative / shared-thread scheduler is **not** built now. The current thread-per-operator model is optimal inside its envelope, and the target embedded-first and moderate-cluster workloads sit inside it (run parallelism up to roughly `cores / operators-per-chain` per machine and scale out with machines). A scheduler rewrite would only pay off for a workload that must stack many oversubscribed operators on a single box - which the data above says to avoid regardless - so it is deferred until such a workload is a real target, and would be measured against this benchmark before any code.
 
@@ -150,14 +150,14 @@ Decision (roadmap C5): a cooperative / shared-thread scheduler is **not** built 
 | Type / function | Responsibility |
 |---|---|
 | `JobGraphSpec`, `OperatorSpec` (`job_graph.hpp`) | The logical job: serialisable `(type, params)` op chains with parallelism, inputs, `key_by`, side outputs. `validate()` proves unique ids, resolvable inputs, acyclicity. |
-| `CLINK_REGISTER_JOB` (`register_job.hpp`) | Emits the job-as-plugin C-ABI; `build_fn` produces the `JobGraphSpec` JSON via `StreamExecutionEnvironment`. |
+| `CLINK_REGISTER_JOB` (`register_job.hpp`) | Emits the job-as-plugin C-ABI; `build_fn` produces the `JobGraphSpec` JSON via `Pipeline`. |
 | `plan_job` (`job_planner.hpp`) | Expands a spec into a `JobPlan`: validates factories, chains/fuses ops, allocates subtask indices, fixes edge routing. |
 | `OperatorChainSpec`, `ChainOp`, `SubtaskEdge`, `SubtaskOutputGroup` | The per-subtask deployment record packed into `PlannedTask.extra_config`: the ops in the chain, inbound edges, outbound groups with `RoutingMode` (Forward / Rebalance / Hash), optional `fused_source` / `fused_sink`. |
-| `JobPlan`, `PlannedTask` (`job_manager.hpp`) | A plan is a flat list of tasks; each has `tm_id` (empty until placed), role, `subtask_idx`, `data_port`, `peer_refs`, and the chain-spec JSON. |
+| `JobPlan`, `PlannedTask` (`coordinator.hpp`) | A plan is a flat list of tasks; each has `worker_id` (empty until placed), role, `subtask_idx`, `data_port`, `peer_refs`, and the chain-spec JSON. |
 | `kNumKeyGroups`, `key_group_for_key`, `subtask_for_key_group`, `key_group_range_for_subtask` (`key_groups.hpp`) | The 128-group partitioning primitive and its rescale-friendly contiguous-range assignment. |
 | `make_key_group_partitioner` (`key_group_partitioner.hpp`) | A `SubtaskEmitter` partitioner that routes records to the subtask owning their key group's state. |
 | `Dag::add_parallel_{source,operator,operator_shuffled,sink}` (`dag.hpp`) | In-process construction of per-subtask runners, channels, and emitters; per-subtask `OperatorId` and `RuntimeContext`. |
-| `JobManager::submit_job`, `free_slots`, `deploy_internal_` | Slot accounting, greedy first-fit placement, peer resolution, deployment. |
+| `Coordinator::submit_job`, `free_slots`, `deploy_internal_` | Slot accounting, greedy first-fit placement, peer resolution, deployment. |
 | `RescaleCoordinator` (`rescale_coordinator.hpp`) | Per-operator rescale lifecycle state machine. |
 
 ## Configuration and knobs
@@ -165,17 +165,17 @@ Decision (roadmap C5): a cooperative / shared-thread scheduler is **not** built 
 - `OperatorSpec.parallelism` (default 1): subtasks per op. Set via the fluent API's `set_parallelism(n)` / per-descriptor `parallelism`.
 - `OperatorSpec.min_parallelism` / `max_parallelism` (default 0/0, no autoscaling): the bounds the autoscaler may move the op within.
 - `CLINK_PLAN_FUSE_PAR1=1` (default off): enables source/sink fusion into a parallelism-1 chain task during planning.
-- `TaskManager Config::slot_count` (default 1 in the struct; `clink_node --slots` default 4): how many subtasks a TM can host. A reported value of 0 is treated as 1 by the JM.
-- `JobManager Config::submit_wait_for_slots` (default 0, reject immediately): how long `SubmitJob` waits for spare slots.
-- `JobManager Config::autoscaler` (default `nullopt`, disabled): when set, jobs with `[min, max]`-bounded ops get a per-job autoscaler.
-- `JobManager Config::max_restarts`, `restart_drain_timeout`, `heartbeat_timeout`: failover policy that interacts with redeployment (detailed in `./distributed-runtime.md` and `./fault-tolerance-and-rescale.md`).
+- `Worker Config::slot_count` (default 1 in the struct; `clink_node --slots` default 4): how many subtasks a worker can host. A reported value of 0 is treated as 1 by the coordinator.
+- `Coordinator Config::submit_wait_for_slots` (default 0, reject immediately): how long `SubmitJob` waits for spare slots.
+- `Coordinator Config::autoscaler` (default `nullopt`, disabled): when set, jobs with `[min, max]`-bounded ops get a per-job autoscaler.
+- `Coordinator Config::max_restarts`, `restart_drain_timeout`, `heartbeat_timeout`: failover policy that interacts with redeployment (detailed in `./distributed-runtime.md` and `./fault-tolerance-and-rescale.md`).
 
 ## Guarantees and caveats
 
 - Same key, same subtask. With a hash-partitioned edge (a keyed downstream op), every record for a given key reaches the one subtask that owns that key's group, and keyed state is isolated per subtask. This is the correctness basis for parallelism greater than 1.
 - The partitioner contract is unchecked at the call site: `make_key_group_partitioner` must be built with parallelism equal to the emitter's output count, or records silently mis-route. The planner wires this correctly for graph-driven jobs; hand-built `Dag`s must honour it.
 - Parallel sources are largely parallelism 1 in this iteration. Partition-aware parallel sources need connector-specific partition assignment, which is not yet wired; see `../connectors/README.md`.
-- Placement is greedy first-fit in TM map iteration order, not load-aware or locality-aware. It only checks slot availability.
+- Placement is greedy first-fit in worker map iteration order, not load-aware or locality-aware. It only checks slot availability.
 - Chaining requires equal parallelism and a single-consumer/single-input edge, and never chains across a keyed boundary at parallelism greater than 1. Only ops resolvable in the operator registry are chained; registry-only ops (inline-lambda or plugin ops) run in their own subtasks rather than being folded in.
 - Source/sink fusion is off by default and only applies to parallelism-1 chains.
 - Rescale restores keyed state by key group without a full replay, but per the root README it carries a caveat: sources must store offsets as operator-state to survive a rescale. The `RescaleCoordinator` itself is only the state machine; dispatch correctness depends on the surrounding layer.
@@ -186,7 +186,7 @@ Decision (roadmap C5): a cooperative / shared-thread scheduler is **not** built 
 - `./operator-model.md` - the operator and DAG model the spec describes.
 - `./task-lifecycle.md` - how a deployed subtask is built from its `OperatorChainSpec` and run.
 - `./distributed-runtime.md` - registration, heartbeats, the listening/peer-update handshake, and the control plane that carries `Deploy`.
-- `./network-stack.md` - the network bridges that realise forward / rebalance / hash edges across TMs.
+- `./network-stack.md` - the network bridges that realise forward / rebalance / hash edges across workers.
 - `./state-and-backends.md` - keyed state and how key groups map onto backend storage.
 - `./checkpointing.md` - barriers, alignment, and the checkpoint that gates a rescale cutover.
 - `./fault-tolerance-and-rescale.md` - the rescale state machine in full, key-group restore, and failover redeployment.

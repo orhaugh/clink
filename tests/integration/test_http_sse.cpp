@@ -1,7 +1,7 @@
 // HTTP-5 SSE integration test.
 //
-// Opens GET /api/v1/events on the JM, then drives cluster lifecycle:
-// register a TM (already happens during start_cluster), then submit + cancel
+// Opens GET /api/v1/events on the coordinator, then drives cluster lifecycle:
+// register a worker (already happens during start_cluster), then submit + cancel
 // a job. Reads the chunked response for a bounded window and asserts the
 // expected event-name lines appear in order.
 //
@@ -220,24 +220,24 @@ bool await_http_ready(std::uint16_t port, std::chrono::milliseconds timeout) {
 }
 
 struct Cluster {
-    pid_t jm_pid{-1};
-    std::uint16_t jm_http_port{0};
-    std::uint16_t jm_control_port{0};
-    std::vector<pid_t> tm_pids;
-    std::vector<std::string> tm_ids;
-    std::vector<std::uint16_t> tm_http_ports;
+    pid_t coordinator_pid{-1};
+    std::uint16_t coordinator_http_port{0};
+    std::uint16_t coordinator_control_port{0};
+    std::vector<pid_t> worker_pids;
+    std::vector<std::string> worker_ids;
+    std::vector<std::uint16_t> worker_http_ports;
 
     Cluster() = default;
     Cluster(const Cluster&) = delete;
     Cluster& operator=(const Cluster&) = delete;
     Cluster(Cluster&& o) noexcept
-        : jm_pid(o.jm_pid),
-          jm_http_port(o.jm_http_port),
-          jm_control_port(o.jm_control_port),
-          tm_pids(std::move(o.tm_pids)),
-          tm_ids(std::move(o.tm_ids)),
-          tm_http_ports(std::move(o.tm_http_ports)) {
-        o.jm_pid = -1;
+        : coordinator_pid(o.coordinator_pid),
+          coordinator_http_port(o.coordinator_http_port),
+          coordinator_control_port(o.coordinator_control_port),
+          worker_pids(std::move(o.worker_pids)),
+          worker_ids(std::move(o.worker_ids)),
+          worker_http_ports(std::move(o.worker_http_ports)) {
+        o.coordinator_pid = -1;
     }
     Cluster& operator=(Cluster&& o) noexcept {
         if (this != &o) {
@@ -247,93 +247,96 @@ struct Cluster {
         return *this;
     }
     ~Cluster() {
-        for (auto pid : tm_pids)
+        for (auto pid : worker_pids)
             kill_quietly(pid);
-        kill_quietly(jm_pid);
+        kill_quietly(coordinator_pid);
     }
 };
 
-std::optional<Cluster> start_cluster(int n_tms) {
+std::optional<Cluster> start_cluster(int n_workers) {
     Cluster c;
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node))
         return std::nullopt;
-    c.jm_control_port = probe_free_port();
-    c.jm_http_port = probe_free_port();
-    c.jm_pid = spawn_proc({"clink_node",
-                           "--role=jm",
-                           "--port=" + std::to_string(c.jm_control_port),
-                           "--http-port=" + std::to_string(c.jm_http_port),
-                           "--http-bind=127.0.0.1"},
-                          node);
-    if (c.jm_pid <= 0 || !await_http_ready(c.jm_http_port, 2s))
+    c.coordinator_control_port = probe_free_port();
+    c.coordinator_http_port = probe_free_port();
+    c.coordinator_pid = spawn_proc({"clink_node",
+                                    "--role=coordinator",
+                                    "--port=" + std::to_string(c.coordinator_control_port),
+                                    "--http-port=" + std::to_string(c.coordinator_http_port),
+                                    "--http-bind=127.0.0.1"},
+                                   node);
+    if (c.coordinator_pid <= 0 || !await_http_ready(c.coordinator_http_port, 2s))
         return std::nullopt;
-    for (int i = 1; i <= n_tms; ++i) {
+    for (int i = 1; i <= n_workers; ++i) {
         const auto http_port = probe_free_port();
-        const std::string tm_id = "tm-sse-" + std::to_string(i);
-        const pid_t pid = spawn_proc({"clink_node",
-                                      "--role=tm",
-                                      "--id=" + tm_id,
-                                      "--jm-host=127.0.0.1",
-                                      "--jm-port=" + std::to_string(c.jm_control_port),
-                                      "--http-port=" + std::to_string(http_port),
-                                      "--http-bind=127.0.0.1"},
-                                     node);
+        const std::string worker_id = "worker-sse-" + std::to_string(i);
+        const pid_t pid =
+            spawn_proc({"clink_node",
+                        "--role=worker",
+                        "--id=" + worker_id,
+                        "--coordinator-host=127.0.0.1",
+                        "--coordinator-port=" + std::to_string(c.coordinator_control_port),
+                        "--http-port=" + std::to_string(http_port),
+                        "--http-bind=127.0.0.1"},
+                       node);
         if (pid <= 0 || !await_http_ready(http_port, 2s))
             return std::nullopt;
-        c.tm_pids.push_back(pid);
-        c.tm_ids.push_back(tm_id);
-        c.tm_http_ports.push_back(http_port);
+        c.worker_pids.push_back(pid);
+        c.worker_ids.push_back(worker_id);
+        c.worker_http_ports.push_back(http_port);
     }
     return c;
 }
 
 }  // namespace
 
-TEST(HttpSse, SseSurfacesTmRegistered) {
-    // Start the JM first, hook up SSE, THEN spawn the TM, so the TM
+TEST(HttpSse, SseSurfacesWorkerRegistered) {
+    // Start the coordinator first, hook up SSE, THEN spawn the worker, so the worker
     // register lands while we're already listening.
     Cluster c;
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node)) {
         GTEST_SKIP() << "clink_node not built";
     }
-    c.jm_control_port = probe_free_port();
-    c.jm_http_port = probe_free_port();
-    c.jm_pid = spawn_proc({"clink_node",
-                           "--role=jm",
-                           "--port=" + std::to_string(c.jm_control_port),
-                           "--http-port=" + std::to_string(c.jm_http_port),
-                           "--http-bind=127.0.0.1"},
-                          node);
-    ASSERT_GT(c.jm_pid, 0);
-    ASSERT_TRUE(await_http_ready(c.jm_http_port, 2s));
+    c.coordinator_control_port = probe_free_port();
+    c.coordinator_http_port = probe_free_port();
+    c.coordinator_pid = spawn_proc({"clink_node",
+                                    "--role=coordinator",
+                                    "--port=" + std::to_string(c.coordinator_control_port),
+                                    "--http-port=" + std::to_string(c.coordinator_http_port),
+                                    "--http-bind=127.0.0.1"},
+                                   node);
+    ASSERT_GT(c.coordinator_pid, 0);
+    ASSERT_TRUE(await_http_ready(c.coordinator_http_port, 2s));
 
-    auto reader = open_sse("127.0.0.1", c.jm_http_port, "/api/v1/events");
+    auto reader = open_sse("127.0.0.1", c.coordinator_http_port, "/api/v1/events");
     ASSERT_TRUE(reader.has_value());
     // Give the SSE handler a moment to set up the chunked provider.
     std::this_thread::sleep_for(150ms);
 
-    // Now register a TM. The SSE stream should surface jm.tm_registered.
+    // Now register a worker. The SSE stream should surface coordinator.worker_registered.
     const auto http_port = probe_free_port();
-    const std::string tm_id = "tm-sse-late";
-    const pid_t pid = spawn_proc({"clink_node",
-                                  "--role=tm",
-                                  "--id=" + tm_id,
-                                  "--jm-host=127.0.0.1",
-                                  "--jm-port=" + std::to_string(c.jm_control_port),
-                                  "--http-port=" + std::to_string(http_port),
-                                  "--http-bind=127.0.0.1"},
-                                 node);
+    const std::string worker_id = "worker-sse-late";
+    const pid_t pid =
+        spawn_proc({"clink_node",
+                    "--role=worker",
+                    "--id=" + worker_id,
+                    "--coordinator-host=127.0.0.1",
+                    "--coordinator-port=" + std::to_string(c.coordinator_control_port),
+                    "--http-port=" + std::to_string(http_port),
+                    "--http-bind=127.0.0.1"},
+                   node);
     ASSERT_GT(pid, 0);
-    c.tm_pids.push_back(pid);
-    c.tm_http_ports.push_back(http_port);
+    c.worker_pids.push_back(pid);
+    c.worker_http_ports.push_back(http_port);
 
     const bool saw = drain_until(*reader, 4s, [&](const std::string& s) {
-        return s.find("event: jm.tm_registered") != std::string::npos &&
-               s.find("\"tm_id\":\"" + tm_id + "\"") != std::string::npos;
+        return s.find("event: coordinator.worker_registered") != std::string::npos &&
+               s.find("\"worker_id\":\"" + worker_id + "\"") != std::string::npos;
     });
-    EXPECT_TRUE(saw) << "did not see jm.tm_registered for " << tm_id << " in stream:\n"
+    EXPECT_TRUE(saw) << "did not see coordinator.worker_registered for " << worker_id
+                     << " in stream:\n"
                      << reader->buf;
 }
 
@@ -343,46 +346,49 @@ TEST(HttpSse, SseSurfacesJobLifecycleEvents) {
     if (!std::filesystem::exists(submit) || !std::filesystem::exists(job_so)) {
         GTEST_SKIP() << "submitter or cancel_test_job.so not built";
     }
-    auto c = start_cluster(/*n_tms=*/2);
+    auto c = start_cluster(/*n_workers=*/2);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    // TM registrations have already happened by now (start_cluster waits
+    // worker registrations have already happened by now (start_cluster waits
     // for /api/v1/health, plus a 400ms settle). Open SSE AFTER, so the
     // first events we see are the upcoming job lifecycle ones.
-    auto reader = open_sse("127.0.0.1", c->jm_http_port, "/api/v1/events");
+    auto reader = open_sse("127.0.0.1", c->coordinator_http_port, "/api/v1/events");
     ASSERT_TRUE(reader.has_value());
     std::this_thread::sleep_for(150ms);
 
     ::setenv("CLINK_CANCEL_TICK_MS", "20", 1);
-    const pid_t submit_pid = spawn_proc({"clink_submit_job",
-                                         "--job=" + job_so.string(),
-                                         "--jm-host=127.0.0.1",
-                                         "--jm-port=" + std::to_string(c->jm_control_port),
-                                         "--wait-timeout-s=30"},
-                                        submit);
+    const pid_t submit_pid =
+        spawn_proc({"clink_submit_job",
+                    "--job=" + job_so.string(),
+                    "--coordinator-host=127.0.0.1",
+                    "--coordinator-port=" + std::to_string(c->coordinator_control_port),
+                    "--wait-timeout-s=30"},
+                   submit);
     ASSERT_GT(submit_pid, 0);
 
     // First: job_submitted should appear within a few hundred ms.
     EXPECT_TRUE(drain_until(*reader,
                             3s,
                             [](const std::string& s) {
-                                return s.find("event: jm.job_submitted") != std::string::npos;
+                                return s.find("event: coordinator.job_submitted") !=
+                                       std::string::npos;
                             }))
-        << "no jm.job_submitted seen in stream:\n"
+        << "no coordinator.job_submitted seen in stream:\n"
         << reader->buf;
 
     // Cancel it via the HTTP action endpoint we wired in HTTP-3.
     std::this_thread::sleep_for(500ms);
-    const auto cancel = http_post("127.0.0.1", c->jm_http_port, "/api/v1/jobs/1/cancel");
+    const auto cancel = http_post("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1/cancel");
     EXPECT_EQ(cancel.status, 200) << "cancel ack: " << cancel.body;
 
     // Then: job_completed should appear with status=cancelled.
     const bool saw_complete = drain_until(*reader, 15s, [](const std::string& s) {
-        return s.find("event: jm.job_completed") != std::string::npos &&
+        return s.find("event: coordinator.job_completed") != std::string::npos &&
                s.find("\"status\":\"cancelled\"") != std::string::npos;
     });
-    EXPECT_TRUE(saw_complete) << "no jm.job_completed (cancelled) seen in stream:\n" << reader->buf;
+    EXPECT_TRUE(saw_complete) << "no coordinator.job_completed (cancelled) seen in stream:\n"
+                              << reader->buf;
 
     int submit_exit = -1;
     if (::waitpid(submit_pid, &submit_exit, WNOHANG) == 0) {
@@ -391,12 +397,12 @@ TEST(HttpSse, SseSurfacesJobLifecycleEvents) {
 }
 
 TEST(HttpSse, SseStreamSendsHeartbeatsWhenIdle) {
-    auto c = start_cluster(/*n_tms=*/1);
+    auto c = start_cluster(/*n_workers=*/1);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
     // Wait past start-up event flurry so the stream sits idle.
-    auto reader = open_sse("127.0.0.1", c->jm_http_port, "/api/v1/events");
+    auto reader = open_sse("127.0.0.1", c->coordinator_http_port, "/api/v1/events");
     ASSERT_TRUE(reader.has_value());
     // Drain whatever's already buffered, then look ONLY for the
     // heartbeat that should arrive after ~15s of silence.

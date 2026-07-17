@@ -27,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/job/register_job.hpp"
 #include "clink/operators/process_function.hpp"
@@ -127,29 +127,29 @@ inline std::string read_string(std::span<const std::byte> b, std::size_t& pos) {
 }
 
 inline clink::Codec<Event> event_codec() {
-    return clink::Codec<Event>{
-        .encode =
-            [](const Event& e) {
-                const std::string& payload = e.body ? e.body->payload : std::string{};
-                std::vector<std::byte> out(8 + 8 + 8 + 4 + payload.size());
-                std::byte* p = out.data();
-                put_i64_le(p, e.ts_ms);
-                put_i64_le(p, e.key);
-                put_i64_le(p, e.value);
-                put_bytes(p, payload);
-                return out;
-            },
-        .decode = [](std::span<const std::byte> b) -> std::optional<Event> {
-            std::size_t pos = 0;
-            Event e;
-            e.ts_ms = read_i64_le(b, pos);
-            e.key = read_i64_le(b, pos);
-            e.value = read_i64_le(b, pos);
-            auto body = std::make_shared<EventBody>();
-            body->payload = read_string(b, pos);
-            e.body = std::move(body);
-            return e;
-        }};
+    return clink::Codec<Event>{.encode =
+                                   [](const Event& e) {
+                                       const std::string& payload =
+                                           e.body ? e.body->payload : std::string{};
+                                       std::vector<std::byte> out(8 + 8 + 8 + 4 + payload.size());
+                                       std::byte* p = out.data();
+                                       put_i64_le(p, e.ts_ms);
+                                       put_i64_le(p, e.key);
+                                       put_i64_le(p, e.value);
+                                       put_bytes(p, payload);
+                                       return out;
+                                   },
+                               .decode = [](std::span<const std::byte> b) -> std::optional<Event> {
+                                   std::size_t pos = 0;
+                                   Event e;
+                                   e.ts_ms = read_i64_le(b, pos);
+                                   e.key = read_i64_le(b, pos);
+                                   e.value = read_i64_le(b, pos);
+                                   auto body = std::make_shared<EventBody>();
+                                   body->payload = read_string(b, pos);
+                                   e.body = std::move(body);
+                                   return e;
+                               }};
 }
 
 inline clink::Codec<ProcessStats> process_stats_codec() {
@@ -201,8 +201,8 @@ public:
             }
             return false;
         }
-        const std::int64_t end = std::min<std::int64_t>(
-            cursor_ + static_cast<std::int64_t>(kBatchSize), total_);
+        const std::int64_t end =
+            std::min<std::int64_t>(cursor_ + static_cast<std::int64_t>(kBatchSize), total_);
         clink::Batch<Event> batch;
         batch.reserve(static_cast<std::size_t>(end - cursor_));
         const double step_ms = static_cast<double>(windows_ * 1000) / static_cast<double>(total_);
@@ -235,19 +235,17 @@ private:
 // KeyedProcessFunction with ValueState + ListState
 // ---------------------------------------------------------------------------
 
-class StatefulFn final
-    : public clink::KeyedProcessFunction<std::int64_t, Event, ProcessStats> {
+class StatefulFn final : public clink::KeyedProcessFunction<std::int64_t, Event, ProcessStats> {
 public:
     void open(clink::RuntimeContext& ctx) override {
         count_state_ = std::make_unique<clink::KeyedState<std::int64_t, std::int64_t>>(
             ctx.keyed_state<std::int64_t, std::int64_t>(
                 "count", clink::int64_codec(), clink::int64_codec()));
-        last8_state_ =
-            std::make_unique<clink::KeyedState<std::int64_t, std::vector<std::int64_t>>>(
-                ctx.keyed_state<std::int64_t, std::vector<std::int64_t>>(
-                    "last8",
-                    clink::int64_codec(),
-                    clink::vector_codec<std::int64_t>(clink::int64_codec())));
+        last8_state_ = std::make_unique<clink::KeyedState<std::int64_t, std::vector<std::int64_t>>>(
+            ctx.keyed_state<std::int64_t, std::vector<std::int64_t>>(
+                "last8",
+                clink::int64_codec(),
+                clink::vector_codec<std::int64_t>(clink::int64_codec())));
     }
 
     void process_element(const Event& e,
@@ -278,8 +276,7 @@ public:
         if (e.body) {
             // Aliasing shared_ptr piggybacks on the body's control block
             // - no string copy on the emit path.
-            stats.latest_payload =
-                std::shared_ptr<const std::string>(e.body, &e.body->payload);
+            stats.latest_payload = std::shared_ptr<const std::string>(e.body, &e.body->payload);
         }
         out.collect(stats);
     }
@@ -304,8 +301,10 @@ public:
     }
 
     void close() override {
-        std::fprintf(
-            stderr, "[%s] sink final count: %lld\n", label_.c_str(), static_cast<long long>(count_));
+        std::fprintf(stderr,
+                     "[%s] sink final count: %lld\n",
+                     label_.c_str(),
+                     static_cast<long long>(count_));
     }
 
     std::string name() const override { return "counting_sink"; }
@@ -319,7 +318,7 @@ private:
 // Job entry point
 // ---------------------------------------------------------------------------
 
-void define_job(clink::api::StreamExecutionEnvironment& env) {
+void define_job(clink::api::Pipeline& env) {
     clink::rocksdb::install();
     const auto envv_int64 = [](const char* k, std::int64_t def) -> std::int64_t {
         const char* v = std::getenv(k);

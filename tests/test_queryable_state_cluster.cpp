@@ -1,6 +1,6 @@
-// Multi-TM Queryable State tests. Validates that ClusterClient
-// brute-iterates the given TM list and surfaces the first hit.
-// Full JM-discovery integration (real JM + 2 registered TMs +
+// Multi-worker Queryable State tests. Validates that ClusterClient
+// brute-iterates the given worker list and surfaces the first hit.
+// Full coordinator-discovery integration (real coordinator + 2 registered workers +
 // deployed job) is out of scope here; the direct-construction path
 // covers the routing logic, and a unit test for the parser closes
 // the discovery seam.
@@ -28,18 +28,18 @@ using namespace clink::queryable_state;
 
 namespace {
 
-// Owns a backend + slot + Registry + HttpServer for one simulated TM.
-// Multiple instances stand in for a multi-TM deployment.
-struct TmHarness {
+// Owns a backend + slot + Registry + HttpServer for one simulated worker.
+// Multiple instances stand in for a multi-worker deployment.
+struct WorkerHarness {
     std::shared_ptr<InMemoryStateBackend> backend;
     std::shared_ptr<KeyedState<std::string, std::int64_t>> state;
     Registry registry;
     http::HttpServer server;
     std::uint16_t port{0};
 
-    TmHarness(OperatorId op,
-              const std::string& slot,
-              const std::vector<std::pair<std::string, std::int64_t>>& seeds)
+    WorkerHarness(OperatorId op,
+                  const std::string& slot,
+                  const std::vector<std::pair<std::string, std::int64_t>>& seeds)
         : backend(std::make_shared<InMemoryStateBackend>()) {
         state = std::make_shared<KeyedState<std::string, std::int64_t>>(
             *backend, op, slot, string_codec(), int64_codec());
@@ -50,19 +50,19 @@ struct TmHarness {
         register_routes(server, registry);
         port = server.start("127.0.0.1", 0);
     }
-    ~TmHarness() { server.stop(); }
+    ~WorkerHarness() { server.stop(); }
 };
 
 }  // namespace
 
-TEST(QueryableStateCluster, ClusterClientFindsKeyOnFirstTm) {
-    // Both TMs host the slot "counts" but only TM-A has the key.
-    TmHarness tm_a(OperatorId{1}, "counts", {{"alpha", 100}});
-    TmHarness tm_b(OperatorId{1}, "counts", {{"beta", 200}});
+TEST(QueryableStateCluster, ClusterClientFindsKeyOnFirstWorker) {
+    // Both workers host the slot "counts" but only worker-A has the key.
+    WorkerHarness worker_a(OperatorId{1}, "counts", {{"alpha", 100}});
+    WorkerHarness worker_b(OperatorId{1}, "counts", {{"beta", 200}});
 
     ClusterClient cc({
-        {"127.0.0.1", tm_a.port},
-        {"127.0.0.1", tm_b.port},
+        {"127.0.0.1", worker_a.port},
+        {"127.0.0.1", worker_b.port},
     });
 
     auto v = cc.get<std::string, std::int64_t>("counts", "alpha", string_codec(), int64_codec());
@@ -70,15 +70,15 @@ TEST(QueryableStateCluster, ClusterClientFindsKeyOnFirstTm) {
     EXPECT_EQ(*v, 100);
 }
 
-TEST(QueryableStateCluster, ClusterClientFindsKeyOnSecondTm) {
-    // Same shape but the key lives on TM-B. ClusterClient should
-    // iterate past TM-A (miss) and return TM-B's value.
-    TmHarness tm_a(OperatorId{1}, "counts", {{"alpha", 100}});
-    TmHarness tm_b(OperatorId{1}, "counts", {{"beta", 200}});
+TEST(QueryableStateCluster, ClusterClientFindsKeyOnSecondWorker) {
+    // Same shape but the key lives on worker-B. ClusterClient should
+    // iterate past worker-A (miss) and return worker-B's value.
+    WorkerHarness worker_a(OperatorId{1}, "counts", {{"alpha", 100}});
+    WorkerHarness worker_b(OperatorId{1}, "counts", {{"beta", 200}});
 
     ClusterClient cc({
-        {"127.0.0.1", tm_a.port},
-        {"127.0.0.1", tm_b.port},
+        {"127.0.0.1", worker_a.port},
+        {"127.0.0.1", worker_b.port},
     });
 
     auto v = cc.get<std::string, std::int64_t>("counts", "beta", string_codec(), int64_codec());
@@ -86,20 +86,20 @@ TEST(QueryableStateCluster, ClusterClientFindsKeyOnSecondTm) {
     EXPECT_EQ(*v, 200);
 }
 
-TEST(QueryableStateCluster, ClusterClientReturnsNulloptWhenNoTmHasKey) {
-    TmHarness tm_a(OperatorId{1}, "counts", {{"alpha", 100}});
-    TmHarness tm_b(OperatorId{1}, "counts", {{"beta", 200}});
+TEST(QueryableStateCluster, ClusterClientReturnsNulloptWhenNoWorkerHasKey) {
+    WorkerHarness worker_a(OperatorId{1}, "counts", {{"alpha", 100}});
+    WorkerHarness worker_b(OperatorId{1}, "counts", {{"beta", 200}});
 
     ClusterClient cc({
-        {"127.0.0.1", tm_a.port},
-        {"127.0.0.1", tm_b.port},
+        {"127.0.0.1", worker_a.port},
+        {"127.0.0.1", worker_b.port},
     });
 
     auto v = cc.get<std::string, std::int64_t>("counts", "missing", string_codec(), int64_codec());
     EXPECT_FALSE(v.has_value());
 }
 
-TEST(QueryableStateCluster, ClusterClientWithEmptyTmListReturnsNullopt) {
+TEST(QueryableStateCluster, ClusterClientWithEmptyWorkerListReturnsNullopt) {
     ClusterClient cc({});
     auto v = cc.get<std::string, std::int64_t>("counts", "alpha", string_codec(), int64_codec());
     EXPECT_FALSE(v.has_value());

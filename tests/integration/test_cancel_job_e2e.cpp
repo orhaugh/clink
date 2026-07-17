@@ -1,16 +1,16 @@
 // End-to-end test for client-initiated cancel_job.
 //
-// Spawns JM + 2 TMs, submits cancel_test_job.so via clink_submit_job
+// Spawns coordinator + 2 workers, submits cancel_test_job.so via clink_submit_job
 // (the .so emits one int64 every 20 ms forever - only CancelJob stops
-// it). After a brief delay we run clink_cancel_job against the JM
+// it). After a brief delay we run clink_cancel_job against the coordinator
 // for job_id=1. Expectations:
 //   * clink_cancel_job exits 0 with ok=true ack
 //   * clink_submit_job exits non-zero (job ended cancelled, not ok)
 //   * clink_submit_job's wall time is well under the source's
 //     natural lifetime - i.e. the cancel actually shortened the run
 //
-// This exercises the full pipe: client TCP -> JM handle_cancel_job_ ->
-// CancelJob broadcast to each TM -> TM flips per-(job, subtask)
+// This exercises the full pipe: client TCP -> coordinator handle_cancel_job_ ->
+// CancelJob broadcast to each worker -> worker flips per-(job, subtask)
 // cancel_token -> LocalExecutor stop_predicate observes it -> source
 // produce() returns false -> SubtaskFinished -> signal_job_completion_
 // stamps "cancelled by client" -> client sees JobCompleted ok=false.
@@ -142,45 +142,45 @@ TEST(CancelJobE2E, ClientInitiatedCancelStopsRunningPipeline) {
     // before the source has done anything significant.
     ::setenv("CLINK_CANCEL_TICK_MS", "20", 1);
 
-    const auto jm_port = probe_free_port();
-    const pid_t jm_pid =
-        spawn_proc({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, node);
-    ASSERT_GT(jm_pid, 0);
+    const auto coordinator_port = probe_free_port();
+    const pid_t coordinator_pid = spawn_proc(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
-    std::vector<pid_t> tms;
+    std::vector<pid_t> workers;
     for (int i = 1; i <= 2; ++i) {
-        tms.push_back(spawn_proc({"clink_node",
-                                  "--role=tm",
-                                  "--id=tm-cancel-" + std::to_string(i),
-                                  "--jm-host=127.0.0.1",
-                                  "--jm-port=" + std::to_string(jm_port)},
-                                 node));
-        ASSERT_GT(tms.back(), 0);
+        workers.push_back(spawn_proc({"clink_node",
+                                      "--role=worker",
+                                      "--id=worker-cancel-" + std::to_string(i),
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(coordinator_port)},
+                                     node));
+        ASSERT_GT(workers.back(), 0);
     }
     std::this_thread::sleep_for(300ms);
 
     const auto t_submit_start = std::chrono::steady_clock::now();
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),
-                                         "--jm-host=127.0.0.1",
-                                         "--jm-port=" + std::to_string(jm_port),
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port),
                                          "--wait-timeout-s=30",
                                          "--name=cancel-test"},
                                         submit);
     ASSERT_GT(submit_pid, 0);
 
-    // Give the JM time to receive SubmitJob, allocate the JobId,
-    // plan + deploy + the TMs time to start their subtask runners.
-    // Empirically this needs ~1.5s on dev hardware (the JM blocks in
+    // Give the coordinator time to receive SubmitJob, allocate the JobId,
+    // plan + deploy + the workers time to start their subtask runners.
+    // Empirically this needs ~1.5s on dev hardware (the coordinator blocks in
     // deploy_internal_ until each subtask sends SubtaskListening
     // before issuing PeerUpdate).
     std::this_thread::sleep_for(2s);
 
     const pid_t cancel_pid = spawn_proc({"clink_cancel_job",
                                          "--job-id=1",
-                                         "--jm-host=127.0.0.1",
-                                         "--jm-port=" + std::to_string(jm_port)},
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port)},
                                         cancel);
     ASSERT_GT(cancel_pid, 0);
     int cancel_exit = -1;
@@ -190,8 +190,8 @@ TEST(CancelJobE2E, ClientInitiatedCancelStopsRunningPipeline) {
     const bool submit_done = wait_for(submit_pid, 30s, submit_exit);
     const auto t_submit_end = std::chrono::steady_clock::now();
 
-    kill_quietly(jm_pid);
-    for (auto pid : tms) {
+    kill_quietly(coordinator_pid);
+    for (auto pid : workers) {
         kill_quietly(pid);
     }
 

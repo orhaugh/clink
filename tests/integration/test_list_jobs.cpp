@@ -1,7 +1,7 @@
-// End-to-end test for JobSubmitter::list_jobs() against a live JM.
+// End-to-end test for JobSubmitter::list_jobs() against a live coordinator.
 //
-// Spawns JM + TM, submits a small job, and after it completes calls
-// list_jobs() to confirm the JM is tracking the job and the snapshot
+// Spawns coordinator + worker, submits a small job, and after it completes calls
+// list_jobs() to confirm the coordinator is tracking the job and the snapshot
 // reflects the completion state.
 
 #include <chrono>
@@ -74,25 +74,25 @@ TEST(ListJobs, SubmitterCanEnumerateRunningAndCompletedJobs) {
         GTEST_SKIP() << "clink_node not built";
     }
 
-    const auto jm_port = probe_free_port();
+    const auto coordinator_port = probe_free_port();
     const auto out_path = std::filesystem::temp_directory_path() / "clink_list_jobs_test.txt";
     std::filesystem::remove(out_path);
 
-    const pid_t jm_pid =
-        spawn_node({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, binary);
-    ASSERT_GT(jm_pid, 0);
+    const pid_t coordinator_pid = spawn_node(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
-    const pid_t tm_pid = spawn_node({"clink_node",
-                                     "--role=tm",
-                                     "--id=tm-list-jobs",
-                                     "--jm-host=127.0.0.1",
-                                     "--jm-port=" + std::to_string(jm_port)},
-                                    binary);
-    ASSERT_GT(tm_pid, 0);
+    const pid_t worker_pid = spawn_node({"clink_node",
+                                         "--role=worker",
+                                         "--id=worker-list-jobs",
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port)},
+                                        binary);
+    ASSERT_GT(worker_pid, 0);
     std::this_thread::sleep_for(300ms);
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
 
     // Initially: no jobs.
     {
@@ -125,7 +125,7 @@ TEST(ListJobs, SubmitterCanEnumerateRunningAndCompletedJobs) {
     EXPECT_TRUE(submit_res.ok);
 
     // After completion, list_jobs should show the job with
-    // completion_signalled = true. The JM doesn't prune the record
+    // completion_signalled = true. The coordinator doesn't prune the record
     // immediately.
     {
         const auto listing = submitter.list_jobs();
@@ -137,12 +137,12 @@ TEST(ListJobs, SubmitterCanEnumerateRunningAndCompletedJobs) {
         EXPECT_GT(listing.jobs[0].total_subtasks, 0u);
     }
 
-    kill_quietly(jm_pid);
-    kill_quietly(tm_pid);
+    kill_quietly(coordinator_pid);
+    kill_quietly(worker_pid);
     std::filesystem::remove(out_path);
 }
 
-TEST(ListJobs, FailsCleanlyWhenJmUnreachable) {
+TEST(ListJobs, FailsCleanlyWhenCoordinatorUnreachable) {
     application::JobSubmitter submitter("127.0.0.1", 1);  // unreachable
     const auto listing = submitter.list_jobs();
     EXPECT_FALSE(listing.ok);

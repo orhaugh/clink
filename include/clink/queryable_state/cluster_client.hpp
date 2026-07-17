@@ -1,17 +1,18 @@
 #pragma once
 
-// Multi-TM Queryable State client. Wraps the single-TM Client to
-// iterate every TM hosting a given job until one returns a hit.
+// Multi-worker Queryable State client. Wraps the single-worker Client to
+// iterate every worker hosting a given job until one returns a hit.
 //
 // Two ways to construct:
 //
-//   1. With an explicit list of TM HTTP targets:
+//   1. With an explicit list of worker HTTP targets:
 //        ClusterClient cc({{"host1", 8081}, {"host2", 8081}, ...});
 //
-//   2. By discovery against the JM:
-//        ClusterClient cc = ClusterClient::from_jm(jm_host, jm_port, job_id);
-//      The constructor hits GET /api/v1/queryable_state/job/<id>/tms
-//      on the JM and uses the returned list. Discovery happens once;
+//   2. By discovery against the coordinator:
+//        ClusterClient cc = ClusterClient::from_coordinator(coordinator_host, coordinator_port,
+//        job_id);
+//      The constructor hits GET /api/v1/queryable_state/job/<id>/workers
+//      on the coordinator and uses the returned list. Discovery happens once;
 //      callers re-create the client to pick up rescale-driven changes.
 //
 // Usage:
@@ -19,21 +20,21 @@
 //   auto v = cc.get<std::string, std::int64_t>("counter", "alpha",
 //                                              string_codec(), int64_codec());
 //
-// Iteration order is the JM's returned order; first non-nullopt wins.
-// All-nullopt returns nullopt. Transport / 5xx errors on any TM are
-// surfaced as exceptions (we don't silently skip a broken TM -
+// Iteration order is the coordinator's returned order; first non-nullopt wins.
+// All-nullopt returns nullopt. Transport / 5xx errors on any worker are
+// surfaced as exceptions (we don't silently skip a broken worker -
 // otherwise a transient blip could hide a real hit).
 //
 // V1 limits (see project memory):
-//   * Brute-force per-TM iteration: O(parallelism) requests per get.
-//   * No caching of the TM list across calls. Callers that issue
+//   * Brute-force per-worker iteration: O(parallelism) requests per get.
+//   * No caching of the worker list across calls. Callers that issue
 //     many queries against the same job should hold a single
 //     ClusterClient instance and re-construct on cluster topology
 //     changes (e.g., post-rescale).
 //
 // For key-group-aware single-hop routing, use `RoutedClient` (below):
-// it asks the JM which TM hosts the key's key-group, then queries
-// that one TM. Two HTTP round-trips per get steady-state (route +
+// it asks the coordinator which worker hosts the key's key-group, then queries
+// that one worker. Two HTTP round-trips per get steady-state (route +
 // value); the route can be cached client-side per key for repeated
 // lookups against the same key.
 
@@ -57,10 +58,10 @@
 
 namespace clink::queryable_state {
 
-struct TmTarget {
+struct WorkerTarget {
     std::string host;
     std::uint16_t port{0};
-    // Populated by RoutedClient's parse_route_ from the JM /route
+    // Populated by RoutedClient's parse_route_ from the coordinator /route
     // response. Default 0 for ClusterClient's brute-force usage,
     // which doesn't know the subtask layout.
     std::uint32_t subtask_idx{0};
@@ -68,36 +69,39 @@ struct TmTarget {
 
 class ClusterClient {
 public:
-    explicit ClusterClient(std::vector<TmTarget> tms) : tms_(std::move(tms)) {}
+    explicit ClusterClient(std::vector<WorkerTarget> workers) : workers_(std::move(workers)) {}
 
-    // Construct by JM discovery. Issues one HTTP call to fetch the
-    // current TM list for `job_id`; if the JM returns an empty list
+    // Construct by coordinator discovery. Issues one HTTP call to fetch the
+    // current worker list for `job_id`; if the coordinator returns an empty list
     // the resulting client will also return nullopt for every query.
-    [[nodiscard]] static ClusterClient from_jm(const std::string& jm_host,
-                                               std::uint16_t jm_port,
-                                               cluster::JobId job_id) {
-        http::HttpClient http(jm_host, jm_port);
-        const std::string path = "/api/v1/queryable_state/job/" + std::to_string(job_id) + "/tms";
+    [[nodiscard]] static ClusterClient from_coordinator(const std::string& coordinator_host,
+                                                        std::uint16_t coordinator_port,
+                                                        cluster::JobId job_id) {
+        http::HttpClient http(coordinator_host, coordinator_port);
+        const std::string path =
+            "/api/v1/queryable_state/job/" + std::to_string(job_id) + "/workers";
         auto resp = http.get(path);
         if (resp.status == 0) {
-            throw std::runtime_error("ClusterClient::from_jm: transport error: " + resp.error);
+            throw std::runtime_error("ClusterClient::from_coordinator: transport error: " +
+                                     resp.error);
         }
         if (resp.status != 200) {
-            throw std::runtime_error("ClusterClient::from_jm: JM returned status " +
-                                     std::to_string(resp.status) + ": " + resp.body);
+            throw std::runtime_error(
+                "ClusterClient::from_coordinator: coordinator returned status " +
+                std::to_string(resp.status) + ": " + resp.body);
         }
-        return ClusterClient(parse_tm_list_(resp.body));
+        return ClusterClient(parse_worker_list_(resp.body));
     }
 
-    // Typed lookup. Iterates the captured TM list and returns the
+    // Typed lookup. Iterates the captured worker list and returns the
     // first non-nullopt result. nullopt on all-miss.
     template <typename K, typename V>
     [[nodiscard]] std::optional<V> get(const std::string& slot,
                                        const K& key,
                                        Codec<K> kc,
                                        Codec<V> vc) {
-        for (const auto& tm : tms_) {
-            Client client(tm.host, tm.port);
+        for (const auto& worker : workers_) {
+            Client client(worker.host, worker.port);
             auto v = client.template get<K, V>(slot, key, kc, vc);
             if (v.has_value()) {
                 return v;
@@ -106,15 +110,15 @@ public:
         return std::nullopt;
     }
 
-    [[nodiscard]] const std::vector<TmTarget>& tms() const noexcept { return tms_; }
+    [[nodiscard]] const std::vector<WorkerTarget>& workers() const noexcept { return workers_; }
 
 private:
-    // Cheap parse of `{"tms":[{"host":"...","port":NNN}, ...]}`. The
-    // JM side controls the format, so we don't need a full JSON
+    // Cheap parse of `{"workers":[{"host":"...","port":NNN}, ...]}`. The
+    // coordinator side controls the format, so we don't need a full JSON
     // parser - find every `"host":"..."` / `"port":NNN` pair and
     // accumulate them.
-    [[nodiscard]] static std::vector<TmTarget> parse_tm_list_(const std::string& body) {
-        std::vector<TmTarget> out;
+    [[nodiscard]] static std::vector<WorkerTarget> parse_worker_list_(const std::string& body) {
+        std::vector<WorkerTarget> out;
         std::size_t i = 0;
         while (true) {
             const auto host_pos = body.find("\"host\":\"", i);
@@ -138,7 +142,7 @@ private:
             if (port_end == port_start) {
                 break;
             }
-            TmTarget t;
+            WorkerTarget t;
             t.host = body.substr(host_start, host_end - host_start);
             t.port = static_cast<std::uint16_t>(
                 std::stoul(body.substr(port_start, port_end - port_start)));
@@ -148,33 +152,35 @@ private:
         return out;
     }
 
-    std::vector<TmTarget> tms_;
+    std::vector<WorkerTarget> workers_;
 };
 
-// Key-group-aware single-hop client. Holds a JM target + job_id +
-// op-role. Each get() first asks the JM which TM hosts the key's
+// Key-group-aware single-hop client. Holds a coordinator target + job_id +
+// op-role. Each get() first asks the coordinator which worker hosts the key's
 // key-group via GET /api/v1/queryable_state/job/<id>/op/<role>/route,
-// then queries that one TM. Returns nullopt if the JM routes to no
-// subtask (job/role unknown, kg uncovered) OR if the routed TM
+// then queries that one worker. Returns nullopt if the coordinator routes to no
+// subtask (job/role unknown, kg uncovered) OR if the routed worker
 // returns 404 for the slot/key.
 //
-// Versus ClusterClient: trades one extra JM round-trip per get for
-// O(1) TM queries instead of O(parallelism). At parallelism >= 3 or
+// Versus ClusterClient: trades one extra coordinator round-trip per get for
+// O(1) worker queries instead of O(parallelism). At parallelism >= 3 or
 // so the routed path wins; at parallelism = 1 ClusterClient is
-// slightly faster (no JM hop). Use RoutedClient when you know the
+// slightly faster (no coordinator hop). Use RoutedClient when you know the
 // job has multiple subtasks for the queryable op.
 class RoutedClient {
 public:
-    RoutedClient(std::string jm_host,
-                 std::uint16_t jm_port,
+    RoutedClient(std::string coordinator_host,
+                 std::uint16_t coordinator_port,
                  cluster::JobId job_id,
                  std::string role)
-        : jm_(std::move(jm_host), jm_port), job_id_(job_id), role_(std::move(role)) {}
+        : coordinator_(std::move(coordinator_host), coordinator_port),
+          job_id_(job_id),
+          role_(std::move(role)) {}
 
     // Configure the route-cache TTL. The cache is keyed by
-    // (key_group, role) and stores the JM's route response for that
+    // (key_group, role) and stores the coordinator's route response for that
     // span; subsequent gets for keys in the SAME key-group skip the
-    // JM round-trip until the entry ages out OR the TM returns 404
+    // coordinator round-trip until the entry ages out OR the worker returns 404
     // (which suggests the route is stale post-rescale and the entry
     // is evicted). Default 30s. Set to 0 to disable caching.
     RoutedClient& set_route_cache_ttl(std::chrono::milliseconds ttl) noexcept {
@@ -183,9 +189,9 @@ public:
         return *this;
     }
 
-    // How often the client checks the JM's topology_version while
+    // How often the client checks the coordinator's topology_version while
     // serving cached lookups. Smaller = quicker rescale detection,
-    // more JM traffic. Default 1s. Set to 0 to disable the version
+    // more coordinator traffic. Default 1s. Set to 0 to disable the version
     // check entirely (fall back to TTL + 404-eviction only).
     RoutedClient& set_topology_version_check_interval(std::chrono::milliseconds iv) noexcept {
         std::lock_guard lock(cache_mu_);
@@ -193,17 +199,17 @@ public:
         return *this;
     }
 
-    // Counter for tests / metrics: how many times the JM /route
+    // Counter for tests / metrics: how many times the coordinator /route
     // endpoint has been hit by this client. With caching working,
     // this should grow much slower than the number of get() calls.
-    [[nodiscard]] std::uint64_t jm_route_requests() const noexcept {
-        return jm_route_requests_.load(std::memory_order_relaxed);
+    [[nodiscard]] std::uint64_t coordinator_route_requests() const noexcept {
+        return coordinator_route_requests_.load(std::memory_order_relaxed);
     }
 
     // How many times the topology_version endpoint was hit. Useful
     // for tests that want to verify the version-check polling rate.
-    [[nodiscard]] std::uint64_t jm_topology_version_requests() const noexcept {
-        return jm_topology_version_requests_.load(std::memory_order_relaxed);
+    [[nodiscard]] std::uint64_t coordinator_topology_version_requests() const noexcept {
+        return coordinator_topology_version_requests_.load(std::memory_order_relaxed);
     }
 
     template <typename K, typename V>
@@ -219,35 +225,37 @@ public:
         // every cached entry is suspect).
         maybe_refresh_topology_version_();
         // Cache fast-path: if a fresh entry exists for this kg, skip
-        // the JM round-trip and query the cached TM target directly.
+        // the coordinator round-trip and query the cached worker target directly.
         auto cached = cached_target_for_(kg);
         if (cached.has_value()) {
-            Client tm_client(cached->host, cached->port);
-            auto v = tm_client.template get<K, V>(role_, cached->subtask_idx, slot, key, kc, vc);
+            Client worker_client(cached->host, cached->port);
+            auto v =
+                worker_client.template get<K, V>(role_, cached->subtask_idx, slot, key, kc, vc);
             if (!v.has_value()) {
                 // 404 on a cached route could be a normal miss OR a
                 // stale route post-rescale. Evict and let the next
-                // get() refresh from the JM. Simple, slightly more
-                // JM traffic than strictly needed but always correct.
+                // get() refresh from the coordinator. Simple, slightly more
+                // coordinator traffic than strictly needed but always correct.
                 evict_cache_for_(kg);
             }
             return v;
         }
-        // Cache miss: hit the JM /route endpoint.
+        // Cache miss: hit the coordinator /route endpoint.
         const auto key_hex =
             detail::hex_encode(std::span<const std::byte>{key_bytes.data(), key_bytes.size()});
         const std::string route_path = "/api/v1/queryable_state/job/" + std::to_string(job_id_) +
                                        "/op/" + role_ + "/route?key=" + key_hex;
-        auto route_resp = jm_.get(route_path);
-        jm_route_requests_.fetch_add(1, std::memory_order_relaxed);
+        auto route_resp = coordinator_.get(route_path);
+        coordinator_route_requests_.fetch_add(1, std::memory_order_relaxed);
         if (route_resp.status == 0) {
-            throw std::runtime_error("RoutedClient: transport error to JM: " + route_resp.error);
+            throw std::runtime_error("RoutedClient: transport error to coordinator: " +
+                                     route_resp.error);
         }
         if (route_resp.status == 404) {
             return std::nullopt;
         }
         if (route_resp.status != 200) {
-            throw std::runtime_error("RoutedClient: JM returned status " +
+            throw std::runtime_error("RoutedClient: coordinator returned status " +
                                      std::to_string(route_resp.status) + ": " + route_resp.body);
         }
         const auto target = parse_route_(route_resp.body);
@@ -260,10 +268,10 @@ public:
             update_topology_version_(*v);
         }
         cache_target_for_(kg, *target);
-        Client tm_client(target->host, target->port);
-        auto v = tm_client.template get<K, V>(role_, target->subtask_idx, slot, key, kc, vc);
+        Client worker_client(target->host, target->port);
+        auto v = worker_client.template get<K, V>(role_, target->subtask_idx, slot, key, kc, vc);
         if (!v.has_value()) {
-            // 404 from the routed TM: evict eagerly. The cache entry
+            // 404 from the routed worker: evict eagerly. The cache entry
             // we just populated is suspect; the next get() should
             // refetch.
             evict_cache_for_(kg);
@@ -272,7 +280,7 @@ public:
     }
 
 private:
-    [[nodiscard]] static std::optional<TmTarget> parse_route_(const std::string& body) {
+    [[nodiscard]] static std::optional<WorkerTarget> parse_route_(const std::string& body) {
         const auto host_pos = body.find("\"host\":\"");
         if (host_pos == std::string::npos) {
             return std::nullopt;
@@ -294,11 +302,11 @@ private:
         if (port_end == port_start) {
             return std::nullopt;
         }
-        TmTarget t;
+        WorkerTarget t;
         t.host = body.substr(host_start, host_end - host_start);
         t.port =
             static_cast<std::uint16_t>(std::stoul(body.substr(port_start, port_end - port_start)));
-        // Optional subtask_idx field; the JM /route endpoint emits it
+        // Optional subtask_idx field; the coordinator /route endpoint emits it
         // alongside host/port, but older snapshots may have omitted
         // it. Default 0 if absent.
         const auto sub_pos = body.find("\"subtask_idx\":", port_end);
@@ -317,7 +325,7 @@ private:
     }
 
     struct CachedRoute {
-        TmTarget target;
+        WorkerTarget target;
         std::chrono::steady_clock::time_point fetched_at;
     };
 
@@ -353,7 +361,7 @@ private:
     void update_topology_version_(std::uint64_t v) {
         std::lock_guard lock(cache_mu_);
         if (v != known_topology_version_) {
-            // Version changed: clear all cached routes. The JM moved
+            // Version changed: clear all cached routes. The coordinator moved
             // key-groups; every entry could be pointing at the wrong
             // subtask now.
             if (known_topology_version_ != 0) {
@@ -383,8 +391,8 @@ private:
         // Hit the cheap topology_version endpoint.
         const std::string path =
             "/api/v1/queryable_state/job/" + std::to_string(job_id_) + "/topology_version";
-        auto resp = jm_.get(path);
-        jm_topology_version_requests_.fetch_add(1, std::memory_order_relaxed);
+        auto resp = coordinator_.get(path);
+        coordinator_topology_version_requests_.fetch_add(1, std::memory_order_relaxed);
         if (resp.status != 200) {
             // Transient failure: don't tamper with the cache. Next
             // get() will retry on the next interval boundary.
@@ -395,7 +403,7 @@ private:
         }
     }
 
-    [[nodiscard]] std::optional<TmTarget> cached_target_for_(KeyGroup kg) {
+    [[nodiscard]] std::optional<WorkerTarget> cached_target_for_(KeyGroup kg) {
         std::lock_guard lock(cache_mu_);
         if (route_cache_ttl_.count() <= 0) {
             return std::nullopt;
@@ -412,7 +420,7 @@ private:
         }
         return it->second.target;
     }
-    void cache_target_for_(KeyGroup kg, const TmTarget& target) {
+    void cache_target_for_(KeyGroup kg, const WorkerTarget& target) {
         std::lock_guard lock(cache_mu_);
         if (route_cache_ttl_.count() <= 0) {
             return;
@@ -424,11 +432,11 @@ private:
         cache_.erase(kg);
     }
 
-    http::HttpClient jm_;
+    http::HttpClient coordinator_;
     cluster::JobId job_id_;
     std::string role_;
-    std::atomic<std::uint64_t> jm_route_requests_{0};
-    std::atomic<std::uint64_t> jm_topology_version_requests_{0};
+    std::atomic<std::uint64_t> coordinator_route_requests_{0};
+    std::atomic<std::uint64_t> coordinator_topology_version_requests_{0};
 
     mutable std::mutex cache_mu_;
     std::chrono::milliseconds route_cache_ttl_{30'000};

@@ -677,11 +677,11 @@ void export_usage() {
               << "                    <root>/<subtask>/checkpoint-N.snap (and the flat\n"
               << "                    <root>/checkpoint-N.snap) into ONE export - key groups\n"
               << "                    are disjoint across subtasks, so the union is exact\n"
-              << "  --job=<id> [--jm=host:port]\n"
+              << "  --job=<id> [--coordinator=host:port]\n"
               << "                    instead of --from: fetch a RUNNING job's whole keyed\n"
-              << "                    state from the JM's live-export route (per-subtask\n"
+              << "                    state from the coordinator's live-export route (per-subtask\n"
               << "                    atomic view, not a checkpoint-consistent cut;\n"
-              << "                    default JM 127.0.0.1:8081)\n"
+              << "                    default coordinator 127.0.0.1:8081)\n"
               << "  --out=<file>      output file (arrow / parquet formats)\n"
               << "  --format=arrow    the canonical Arrow IPC stream (op_id, key_bytes,\n"
               << "                    value_bytes) - exact fidelity, restorable, readable by\n"
@@ -710,7 +710,7 @@ int clink_cmd_state_export(int argc, char** argv) {
     const auto dir = get_arg(argc, argv, "dir");
     const auto id_str = get_arg(argc, argv, "id");
     const auto job = get_arg(argc, argv, "job");
-    const auto jm = get_arg(argc, argv, "jm");
+    const auto coordinator = get_arg(argc, argv, "coordinator");
     const auto mat_store_path = get_arg(argc, argv, "materialisation-store");
     const auto out = get_arg(argc, argv, "out");
     std::string format = get_arg(argc, argv, "format");
@@ -734,7 +734,12 @@ int clink_cmd_state_export(int argc, char** argv) {
     }
     try {
         auto resolved = clink_tools::resolve_state_input(
-            from, dir, id_str, job, jm, clink_tools::materialisation_store_for(mat_store_path));
+            from,
+            dir,
+            id_str,
+            job,
+            coordinator,
+            clink_tools::materialisation_store_for(mat_store_path));
         auto& bytes = resolved.bytes;
         const auto& source = resolved.label;
 

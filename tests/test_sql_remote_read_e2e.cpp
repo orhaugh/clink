@@ -1,13 +1,13 @@
 // SQL GROUP BY end-to-end on the disaggregated remote-read:// state backend.
 //
 // This is the whole-stack proof: a SQL aggregation job, with the async-state
-// execution path enabled, runs in a real in-process cluster (JM + TM) whose
+// execution path enabled, runs in a real in-process cluster (coordinator + worker) whose
 // per-subtask state backend is built by the StateBackendFactory from a
 // remote-read://<bucket>/<prefix> URI - so keyed aggregate state lives in S3
 // (content-addressed objects + per-checkpoint manifests via S3RemotePool),
 // cold reads defer to S3 through the AsyncExecutionController, and a fresh job
 // restores that state lazily. It ties together every layer that was built in
-// isolation: the state_backend_uri wire plumbing (decoupled from the JM's
+// isolation: the state_backend_uri wire plumbing (decoupled from the coordinator's
 // local coordination checkpoint_dir), the factory-built RemoteReadBackend on
 // the deploy path, the async aggregate operator on the runner, and lazy
 // restore from S3.
@@ -45,8 +45,8 @@
 
 #include "clink/application/job_submitter.hpp"
 #include "clink/cluster/built_in_factories.hpp"
-#include "clink/cluster/job_manager.hpp"
-#include "clink/cluster/task_manager.hpp"
+#include "clink/cluster/coordinator.hpp"
+#include "clink/cluster/worker.hpp"
 #include "clink/config/json.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/s3/install.hpp"
@@ -130,23 +130,23 @@ cluster::JobGraphSpec compile_groupby(const std::filesystem::path& in_path,
 }
 
 struct InProcessCluster {
-    cluster::JobManager jm;
-    std::uint16_t jm_port{};
-    std::unique_ptr<cluster::TaskManager> tm;
+    cluster::Coordinator coordinator;
+    std::uint16_t coordinator_port{};
+    std::unique_ptr<cluster::Worker> worker;
 
-    InProcessCluster(const std::string& tm_id, std::size_t slots) {
-        jm_port = jm.start();
-        jm.expect_tms({tm_id});
-        cluster::TaskManager::Config cfg;
+    InProcessCluster(const std::string& worker_id, std::size_t slots) {
+        coordinator_port = coordinator.start();
+        coordinator.expect_workers({worker_id});
+        cluster::Worker::Config cfg;
         cfg.slot_count = slots;
-        tm = std::make_unique<cluster::TaskManager>(tm_id, "127.0.0.1", cfg);
-        tm->connect_to_jm("127.0.0.1", jm_port);
+        worker = std::make_unique<cluster::Worker>(worker_id, "127.0.0.1", cfg);
+        worker->connect_to_coordinator("127.0.0.1", coordinator_port);
         std::this_thread::sleep_for(150ms);
     }
     ~InProcessCluster() {
-        if (tm)
-            tm->stop();
-        jm.stop();
+        if (worker)
+            worker->stop();
+        coordinator.stop();
     }
 };
 
@@ -192,14 +192,14 @@ cluster::JobGraphSpec with_parallelism(cluster::JobGraphSpec spec, std::uint32_t
 // Run one GROUP BY job to completion against the cluster, optionally restoring
 // from a prior checkpoint on the given S3 prefix. Returns the final total for
 // user_id=1 from the sink output.
-std::int64_t run_groupby_job(const std::string& tm_id,
+std::int64_t run_groupby_job(const std::string& worker_id,
                              const std::filesystem::path& in_path,
                              const std::filesystem::path& out_path,
                              const std::string& state_prefix,
                              bool restore,
                              std::uint64_t restore_ckpt) {
-    InProcessCluster cluster(tm_id, 4);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster(worker_id, 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 60s;
     // checkpoint_dir stays empty: state lives entirely in S3 via the
@@ -231,7 +231,7 @@ std::map<std::int64_t, std::int64_t> all_totals(const std::filesystem::path& out
 // Run a GROUP BY job with an explicit (tiny) hot-tier budget + a sharded
 // aggregate parallelism, optionally restoring from a prior checkpoint. Returns
 // the per-key final totals.
-std::map<std::int64_t, std::int64_t> run_groupby_evict(const std::string& tm_id,
+std::map<std::int64_t, std::int64_t> run_groupby_evict(const std::string& worker_id,
                                                        const std::filesystem::path& in_path,
                                                        const std::filesystem::path& out_path,
                                                        const std::string& state_prefix,
@@ -239,8 +239,8 @@ std::map<std::int64_t, std::int64_t> run_groupby_evict(const std::string& tm_id,
                                                        std::uint32_t parallelism,
                                                        bool restore,
                                                        std::uint64_t restore_ckpt) {
-    InProcessCluster cluster(tm_id, 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster(worker_id, 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 90s;
     opts.checkpoint.state_backend_uri = remote_read_uri_evict(state_prefix, hot_max_bytes);
@@ -300,7 +300,7 @@ TEST(SqlRemoteReadE2E, MultiKeyEvictionAndRestoreShardedOverS3) {
     constexpr std::uint32_t kPar = 4;  // sharded GROUP BY across 4 keyed subtasks
 
     // Build 20-key aggregate state, sharded, evicting under the budget.
-    auto built = run_groupby_evict("tm-rr-mk-build",
+    auto built = run_groupby_evict("worker-rr-mk-build",
                                    in1,
                                    out1,
                                    prefix,
@@ -315,7 +315,7 @@ TEST(SqlRemoteReadE2E, MultiKeyEvictionAndRestoreShardedOverS3) {
     // Fresh cluster restores all 20 keys lazily from S3 (hot tier empty)
     // and folds batch 2 touching every key. Under the tiny budget each key is
     // cold-read from S3, filled, then evicted as others arrive (heavy churn).
-    auto restored = run_groupby_evict("tm-rr-mk-restore",
+    auto restored = run_groupby_evict("worker-rr-mk-restore",
                                       in2,
                                       out2,
                                       prefix,
@@ -365,11 +365,11 @@ TEST(SqlRemoteReadE2E, GroupByAsyncCheckpointsToS3AndRestores) {
 
     // ---- Build aggregate state and commit it to S3. ----
     const std::int64_t built =
-        run_groupby_job("tm-rr-e2e-build", in1, out1, prefix_main, /*restore=*/false, 0);
+        run_groupby_job("worker-rr-e2e-build", in1, out1, prefix_main, /*restore=*/false, 0);
     EXPECT_EQ(built, kBatch1Rows);  // GROUP BY SUM over batch 1
 
     // ---- Fresh cluster restores that state from S3, folds batch 2. ----
-    const std::int64_t restored = run_groupby_job("tm-rr-e2e-restore",
+    const std::int64_t restored = run_groupby_job("worker-rr-e2e-restore",
                                                   in2,
                                                   out2,
                                                   prefix_main,
@@ -378,7 +378,7 @@ TEST(SqlRemoteReadE2E, GroupByAsyncCheckpointsToS3AndRestores) {
 
     // ---- Control: fresh empty prefix, no restore. ----
     const std::int64_t control =
-        run_groupby_job("tm-rr-e2e-control", in2, outc, prefix_ctrl, /*restore=*/false, 0);
+        run_groupby_job("worker-rr-e2e-control", in2, outc, prefix_ctrl, /*restore=*/false, 0);
 
     // Control had no prior state, so it reflects only batch 2.
     EXPECT_EQ(control, kBatch2Rows);

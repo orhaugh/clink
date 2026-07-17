@@ -1,13 +1,13 @@
 // Integration test for the inline-lambda DataStream<T>::map() /
 // .flat_map() sugar. The pipeline is submitted through a real
-// JobSubmitter against an in-process JM + TM pair so the round-trip
-// touches: fluent-API graph construction, JSON serialisation, JM
-// planning, deployment to the TM, and the TM's lookup of the minted
+// JobSubmitter against an in-process coordinator + worker pair so the round-trip
+// touches: fluent-API graph construction, JSON serialisation, coordinator
+// planning, deployment to the worker, and the worker's lookup of the minted
 // op-type in the process-wide RunnerRegistry singleton.
 //
 // In-process is the only configuration where inline lambdas work -
 // the lambda lives in this test's RunnerRegistry singleton and a
-// remote TM (different process) wouldn't see it. The contract is
+// remote worker (different process) wouldn't see it. The contract is
 // documented on DataStream<T>::map().
 
 #include <algorithm>
@@ -22,10 +22,10 @@
 #include <gtest/gtest.h>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/application/job_submitter.hpp"
-#include "clink/cluster/job_manager.hpp"
-#include "clink/cluster/task_manager.hpp"
+#include "clink/cluster/coordinator.hpp"
+#include "clink/cluster/worker.hpp"
 
 using namespace clink;
 using namespace clink::api;
@@ -46,31 +46,31 @@ std::vector<std::string> read_lines(const std::filesystem::path& path) {
 }  // namespace
 
 TEST(InlineOpsE2E, InlineMapRunsEndToEndAgainstInProcessCluster) {
-    cluster::JobManager jm;
-    const auto jm_port = jm.start();
-    jm.expect_tms({"tm-inline"});
+    cluster::Coordinator coordinator;
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-inline"});
 
-    cluster::TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 4;  // source + op + sink need 3 slots
-    cluster::TaskManager tm("tm-inline", "127.0.0.1", tm_cfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    cluster::Worker::Config worker_cfg;
+    worker_cfg.slot_count = 4;  // source + op + sink need 3 slots
+    cluster::Worker worker("worker-inline", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
     std::this_thread::sleep_for(100ms);
 
     const auto out_path = std::filesystem::temp_directory_path() / "clink_inline_map_e2e.txt";
     std::filesystem::remove(out_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(5).start(10).build());
     src.map<std::int64_t>([](const std::int64_t& v) { return v * 3; })
         .sink(FileInt64Sink::builder().path(out_path.string()).build());
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 10s;
     const auto result = env.execute("inline-map", submitter, opts);
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
     EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
@@ -81,31 +81,31 @@ TEST(InlineOpsE2E, InlineMapRunsEndToEndAgainstInProcessCluster) {
 }
 
 TEST(InlineOpsE2E, InlineFilterDropsRecordsAgainstInProcessCluster) {
-    cluster::JobManager jm;
-    const auto jm_port = jm.start();
-    jm.expect_tms({"tm-inline-filter"});
+    cluster::Coordinator coordinator;
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-inline-filter"});
 
-    cluster::TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 4;
-    cluster::TaskManager tm("tm-inline-filter", "127.0.0.1", tm_cfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    cluster::Worker::Config worker_cfg;
+    worker_cfg.slot_count = 4;
+    cluster::Worker worker("worker-inline-filter", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
     std::this_thread::sleep_for(100ms);
 
     const auto out_path = std::filesystem::temp_directory_path() / "clink_inline_filter_e2e.txt";
     std::filesystem::remove(out_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(10).start(1).build());
     src.filter([](const std::int64_t& v) { return v % 2 == 0; })
         .sink(FileInt64Sink::builder().path(out_path.string()).build());
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 10s;
     const auto result = env.execute("inline-filter", submitter, opts);
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
     EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
@@ -116,21 +116,21 @@ TEST(InlineOpsE2E, InlineFilterDropsRecordsAgainstInProcessCluster) {
 }
 
 TEST(InlineOpsE2E, InlineKeyByThenReduceAccumulatesPerKey) {
-    cluster::JobManager jm;
-    const auto jm_port = jm.start();
-    jm.expect_tms({"tm-inline-reduce"});
+    cluster::Coordinator coordinator;
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-inline-reduce"});
 
-    cluster::TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 8;  // 1 src + 2 reduce + 2 sink = 5
-    cluster::TaskManager tm("tm-inline-reduce", "127.0.0.1", tm_cfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    cluster::Worker::Config worker_cfg;
+    worker_cfg.slot_count = 8;  // 1 src + 2 reduce + 2 sink = 5
+    cluster::Worker worker("worker-inline-reduce", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
     std::this_thread::sleep_for(100ms);
 
     const auto base_path = std::filesystem::temp_directory_path() / "clink_inline_reduce_e2e.txt";
     std::filesystem::remove(std::filesystem::path{base_path.string() + ".0"});
     std::filesystem::remove(std::filesystem::path{base_path.string() + ".1"});
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     // Source (par=1) -> keyed reduce (par=2 via key_by hash routing) ->
     // sink (par=2 produces path.0 and path.1). Key = v % 2 routes evens
     // to one subtask, odds to the other; each subtask accumulates
@@ -144,13 +144,13 @@ TEST(InlineOpsE2E, InlineKeyByThenReduceAccumulatesPerKey) {
         .reduce([](const std::int64_t& a, const std::int64_t& b) { return a + b; })
         .sink(FileInt64Sink::builder().path(base_path.string()).parallelism(2).build());
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 10s;
     const auto result = env.execute("inline-reduce", submitter, opts);
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
     EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
@@ -185,16 +185,16 @@ TEST(InlineOpsE2E, InlineKeyByThenReduceAccumulatesPerKey) {
 // Canonical pipeline: source -> map -> filter ->
 // assign_timestamps -> key_by -> sliding_window -> aggregate -> sink.
 // Verifies the full fluent API stack runs end-to-end through an
-// in-process JobManager + TaskManager.
+// in-process Coordinator + Worker.
 TEST(InlineOpsE2E, CanonicalPatternRunsEndToEnd) {
-    cluster::JobManager jm;
-    const auto jm_port = jm.start();
-    jm.expect_tms({"tm-canonical"});
+    cluster::Coordinator coordinator;
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-canonical"});
 
-    cluster::TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 16;
-    cluster::TaskManager tm("tm-canonical", "127.0.0.1", tm_cfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    cluster::Worker::Config worker_cfg;
+    worker_cfg.slot_count = 16;
+    cluster::Worker worker("worker-canonical", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
     std::this_thread::sleep_for(100ms);
 
     const auto base_path = std::filesystem::temp_directory_path() / "clink_canonical_pipeline.txt";
@@ -203,7 +203,7 @@ TEST(InlineOpsE2E, CanonicalPatternRunsEndToEnd) {
             std::filesystem::path{base_path.string() + "." + std::to_string(i)});
     }
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(10).start(1).build());
     src.map<std::int64_t>([](const std::int64_t& v) { return v * 10; })  // 10..100
         .filter([](const std::int64_t& v) { return v > 30; })            // 40..100
@@ -215,13 +215,13 @@ TEST(InlineOpsE2E, CanonicalPatternRunsEndToEnd) {
                                  [](const std::int64_t& a, const std::int64_t& b) { return a + b; })
         .sink(FileInt64Sink::builder().path(base_path.string()).parallelism(2).build());
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     const auto result = env.execute("-canonical", submitter, opts);
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
     EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
@@ -258,14 +258,14 @@ TEST(InlineOpsE2E, CanonicalPatternRunsEndToEnd) {
 // timestamps off IntRangeSource indices, and the data → window
 // mapping reads directly off the values list.
 TEST(InlineOpsE2E, FromElementsEventTimeSlidingWindowAggregate) {
-    cluster::JobManager jm;
-    const auto jm_port = jm.start();
-    jm.expect_tms({"tm-from-elements-window"});
+    cluster::Coordinator coordinator;
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-from-elements-window"});
 
-    cluster::TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 12;
-    cluster::TaskManager tm("tm-from-elements-window", "127.0.0.1", tm_cfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    cluster::Worker::Config worker_cfg;
+    worker_cfg.slot_count = 12;
+    cluster::Worker worker("worker-from-elements-window", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
     std::this_thread::sleep_for(100ms);
 
     const auto base_path =
@@ -275,7 +275,7 @@ TEST(InlineOpsE2E, FromElementsEventTimeSlidingWindowAggregate) {
             std::filesystem::path{base_path.string() + "." + std::to_string(i)});
     }
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     // Events at event-time = value * 100 ms: 100ms, 200ms, ..., 500ms.
     env.from_elements<std::int64_t>({1, 2, 3, 4, 5})
         .assign_timestamps_monotonic([](const std::int64_t& v) { return EventTime{v * 100}; })
@@ -286,13 +286,13 @@ TEST(InlineOpsE2E, FromElementsEventTimeSlidingWindowAggregate) {
                                  [](const std::int64_t& a, const std::int64_t& b) { return a + b; })
         .sink(FileInt64Sink::builder().path(base_path.string()).parallelism(2).build());
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     const auto result = env.execute("from-elements-window", submitter, opts);
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
     EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
@@ -325,31 +325,31 @@ TEST(InlineOpsE2E, FromElementsEventTimeSlidingWindowAggregate) {
 }
 
 TEST(InlineOpsE2E, FromElementsEmitsLiteralValuesThroughCluster) {
-    cluster::JobManager jm;
-    const auto jm_port = jm.start();
-    jm.expect_tms({"tm-from-elements"});
+    cluster::Coordinator coordinator;
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-from-elements"});
 
-    cluster::TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 4;
-    cluster::TaskManager tm("tm-from-elements", "127.0.0.1", tm_cfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    cluster::Worker::Config worker_cfg;
+    worker_cfg.slot_count = 4;
+    cluster::Worker worker("worker-from-elements", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
     std::this_thread::sleep_for(100ms);
 
     const auto out_path = std::filesystem::temp_directory_path() / "clink_from_elements_e2e.txt";
     std::filesystem::remove(out_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.from_elements<std::string>({"alpha", "beta", "gamma", "delta"})
         .map<std::string>([](const std::string& s) { return s + "!"; })
         .sink(FileTextSink::builder().path(out_path.string()).build());
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 10s;
     const auto result = env.execute("from-elements", submitter, opts);
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
     EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
@@ -360,31 +360,31 @@ TEST(InlineOpsE2E, FromElementsEmitsLiteralValuesThroughCluster) {
 }
 
 TEST(InlineOpsE2E, InlineAssignTimestampsRunsThroughCluster) {
-    cluster::JobManager jm;
-    const auto jm_port = jm.start();
-    jm.expect_tms({"tm-inline-ts"});
+    cluster::Coordinator coordinator;
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-inline-ts"});
 
-    cluster::TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 4;
-    cluster::TaskManager tm("tm-inline-ts", "127.0.0.1", tm_cfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    cluster::Worker::Config worker_cfg;
+    worker_cfg.slot_count = 4;
+    cluster::Worker worker("worker-inline-ts", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
     std::this_thread::sleep_for(100ms);
 
     const auto out_path = std::filesystem::temp_directory_path() / "clink_inline_ts_e2e.txt";
     std::filesystem::remove(out_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.source<std::int64_t>(IntRangeSource::builder().count(5).start(1).build())
         .assign_timestamps_monotonic([](const std::int64_t& v) { return EventTime{v * 100}; })
         .sink(FileInt64Sink::builder().path(out_path.string()).build());
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 10s;
     const auto result = env.execute("inline-ts", submitter, opts);
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
     EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
@@ -396,20 +396,20 @@ TEST(InlineOpsE2E, InlineAssignTimestampsRunsThroughCluster) {
 }
 
 TEST(InlineOpsE2E, InlineFlatMapExpandsAndDropsRecords) {
-    cluster::JobManager jm;
-    const auto jm_port = jm.start();
-    jm.expect_tms({"tm-inline-flat"});
+    cluster::Coordinator coordinator;
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-inline-flat"});
 
-    cluster::TaskManager::Config tm_cfg;
-    tm_cfg.slot_count = 4;
-    cluster::TaskManager tm("tm-inline-flat", "127.0.0.1", tm_cfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    cluster::Worker::Config worker_cfg;
+    worker_cfg.slot_count = 4;
+    cluster::Worker worker("worker-inline-flat", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
     std::this_thread::sleep_for(100ms);
 
     const auto out_path = std::filesystem::temp_directory_path() / "clink_inline_flatmap_e2e.txt";
     std::filesystem::remove(out_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(4).start(1).build());
 
     // For each input n: emit "n" once if n is odd, twice if even.
@@ -423,13 +423,13 @@ TEST(InlineOpsE2E, InlineFlatMapExpandsAndDropsRecords) {
        })
         .sink(FileTextSink::builder().path(out_path.string()).build());
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 10s;
     const auto result = env.execute("inline-flat-map", submitter, opts);
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
     EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);

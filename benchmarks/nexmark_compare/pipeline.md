@@ -42,9 +42,9 @@ the pinned Flink image.
 
 ## The matched premise (non-negotiable)
 
-1. **Topology**: both clustered. clink runs `clink_node` JM + N TMs as host
-   processes over a real network; Flink runs a real JM/TM cluster. The in-process
-   single-TaskManager clink number (`clink_nexmark_bench` steady-state mode) is
+1. **Topology**: both clustered. clink runs `clink_node` coordinator + N workers as host
+   processes over a real network; Flink runs a real coordinator/worker cluster. The in-process
+   single-Worker clink number (`clink_nexmark_bench` steady-state mode) is
    clink-vs-clink regression tracking ONLY and must never be cross-quoted against a
    clustered Flink number.
 
@@ -109,7 +109,7 @@ the pinned Flink image.
   compiled before the measured window opens. This anchors the clock to the first
   STEADY output record, so it excludes deploy, cluster bring-up and JVM warm-up.
 - **CPU normalisation**: report Time(s), measured Cores (`/proc/<pid>/stat` summed
-  over the clink JM+TM processes; cgroup `cpuacct` for the Flink JM+TM containers),
+  over the clink coordinator+worker processes; cgroup `cpuacct` for the Flink coordinator+worker containers),
   and Cores*Time, as canonical Nexmark and Feldera do, NOT events/wall/nominal-slots.
   The sampling boundary (which processes/containers) is pinned in the banner.
 - **Cold whole-job wall** (engine-start to last output record, the `flink_compare`

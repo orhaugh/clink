@@ -17,7 +17,7 @@ namespace clink {
 // downstream announcing that THIS subtask is winding down and routing
 // for its key-groups is moving to peer subtasks (at
 // target_parallelism). Every operator runner (single-input, co-op,
-// union, interval-join, and the cross-TM bridge) consumes the marker as
+// union, interval-join, and the cross-worker bridge) consumes the marker as
 // a signal to expect a fresh stream from the new subtask set; the old
 // upstream's subsequent records (if any, before its shutdown) still
 // flow as the last of its tail.
@@ -34,7 +34,7 @@ struct DrainMarker {
     std::uint32_t subtask_idx{0};
     // Target parallelism the rescale is moving towards. Informational
     // for downstream metrics / logs; the actual routing change is
-    // owned by the JobManager's RescaleCoordinator.
+    // owned by the Coordinator's RescaleCoordinator.
     std::uint32_t target_parallelism{0};
 
     constexpr bool operator==(const DrainMarker&) const noexcept = default;

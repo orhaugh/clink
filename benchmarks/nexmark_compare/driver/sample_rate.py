@@ -83,7 +83,7 @@ def main():
     # not trip the quiet-timeout. Baseline-subtraction makes this robust to
     # engines whose per-operator counters accumulate across job submissions.
     # clink's per-op counters are cumulative across job submissions on a persistent
-    # TM, so we anchor the baseline at the first strictly-positive reading (= the
+    # worker, so we anchor the baseline at the first strictly-positive reading (= the
     # op's prior total) and measure only the delta. Flink job_ids are unique per
     # submission with fresh vertices starting at 0, so its counts are absolute (no
     # baseline subtraction - subtracting would lose the metric-lagged ramp).

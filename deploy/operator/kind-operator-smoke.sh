@@ -4,9 +4,9 @@
 #
 # Spins up (or reuses) a kind cluster, builds + loads the operator image, installs
 # the CRD + RBAC + manager, applies a ClinkCluster custom resource, and asserts the
-# operator reconciles it into a running cluster: JobManager + TaskManagers Ready,
-# every TM registered with the JM, and the ClinkCluster status reports Running with
-# the expected TaskManagersReady count.
+# operator reconciles it into a running cluster: Coordinator + Workers Ready,
+# every worker registered with the coordinator, and the ClinkCluster status reports Running with
+# the expected WorkersReady count.
 #
 # Prereqs: docker, kind, kubectl. The clink-runtime image must exist locally
 # (build once: docker build -t clink-runtime:latest -f docker/Dockerfile.runtime .).
@@ -66,41 +66,41 @@ spec:
     repository: ${RUNTIME_IMAGE%:*}
     tag: ${RUNTIME_IMAGE##*:}
     pullPolicy: IfNotPresent
-  taskManager:
+  worker:
     replicas: ${TM_REPLICAS}
     slots: 4
 YAML
 
-step "wait: operator created the JM Deployment + TM StatefulSet"
+step "wait: operator created the coordinator Deployment + worker StatefulSet"
 for i in $(seq 1 30); do
-  if kubectl --context "${CTX}" get deploy "${CR_NAME}-jobmanager" >/dev/null 2>&1 && \
-     kubectl --context "${CTX}" get statefulset "${CR_NAME}-taskmanager" >/dev/null 2>&1; then
+  if kubectl --context "${CTX}" get deploy "${CR_NAME}-coordinator" >/dev/null 2>&1 && \
+     kubectl --context "${CTX}" get statefulset "${CR_NAME}-worker" >/dev/null 2>&1; then
     echo "  owned workloads created (after ${i} attempt(s))"; break
   fi
   sleep 2
 done
-kubectl --context "${CTX}" get deploy "${CR_NAME}-jobmanager" >/dev/null 2>&1 || fail "JM Deployment not created"
-kubectl --context "${CTX}" get statefulset "${CR_NAME}-taskmanager" >/dev/null 2>&1 || fail "TM StatefulSet not created"
+kubectl --context "${CTX}" get deploy "${CR_NAME}-coordinator" >/dev/null 2>&1 || fail "coordinator Deployment not created"
+kubectl --context "${CTX}" get statefulset "${CR_NAME}-worker" >/dev/null 2>&1 || fail "worker StatefulSet not created"
 
 step "wait: all cluster pods Ready"
-kubectl --context "${CTX}" rollout status deploy/"${CR_NAME}-jobmanager" --timeout=150s
-kubectl --context "${CTX}" rollout status statefulset/"${CR_NAME}-taskmanager" --timeout=150s
+kubectl --context "${CTX}" rollout status deploy/"${CR_NAME}-coordinator" --timeout=150s
+kubectl --context "${CTX}" rollout status statefulset/"${CR_NAME}-worker" --timeout=150s
 kubectl --context "${CTX}" get pods -l app.kubernetes.io/instance="${CR_NAME}"
 
-step "verify: ClinkCluster status converges to Running + ${TM_REPLICAS} TMs"
+step "verify: ClinkCluster status converges to Running + ${TM_REPLICAS} workers"
 ok=""
 for i in $(seq 1 40); do
   phase=$(kubectl --context "${CTX}" get clinkcluster "${CR_NAME}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
-  ready=$(kubectl --context "${CTX}" get clinkcluster "${CR_NAME}" -o jsonpath='{.status.taskManagersReady}' 2>/dev/null || true)
-  echo "  status: phase=${phase:-<none>} taskManagersReady=${ready:-0} (attempt ${i})"
+  ready=$(kubectl --context "${CTX}" get clinkcluster "${CR_NAME}" -o jsonpath='{.status.workersReady}' 2>/dev/null || true)
+  echo "  status: phase=${phase:-<none>} workersReady=${ready:-0} (attempt ${i})"
   if [[ "${phase}" == "Running" && "${ready}" == "${TM_REPLICAS}" ]]; then ok=1; break; fi
   sleep 3
 done
-[[ -n "${ok}" ]] || fail "ClinkCluster never reached Running with ${TM_REPLICAS} TMs"
+[[ -n "${ok}" ]] || fail "ClinkCluster never reached Running with ${TM_REPLICAS} workers"
 
 step "verify: owner refs (deleting the CR would GC the workloads)"
-owner=$(kubectl --context "${CTX}" get deploy "${CR_NAME}-jobmanager" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null || true)
-[[ "${owner}" == "ClinkCluster" ]] || fail "JM Deployment not owned by ClinkCluster (got '${owner}')"
+owner=$(kubectl --context "${CTX}" get deploy "${CR_NAME}-coordinator" -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null || true)
+[[ "${owner}" == "ClinkCluster" ]] || fail "coordinator Deployment not owned by ClinkCluster (got '${owner}')"
 
 kubectl --context "${CTX}" get clinkcluster "${CR_NAME}"
-printf '\nOPERATOR SMOKE PASSED: CR reconciled to Running, %s TMs registered, workloads owner-refed.\n' "${TM_REPLICAS}"
+printf '\nOPERATOR SMOKE PASSED: CR reconciled to Running, %s workers registered, workloads owner-refed.\n' "${TM_REPLICAS}"

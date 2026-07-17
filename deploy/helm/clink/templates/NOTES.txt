@@ -1,30 +1,30 @@
 clink cluster "{{ .Release.Name }}" deployed.
 
-  JobManager : {{ include "clink.jobmanager.fullname" . }} (1 replica)
-  TaskManagers: {{ include "clink.taskmanager.fullname" . }} ({{ .Values.taskmanager.replicas }} replicas x {{ .Values.taskmanager.slots }} slots)
+  Coordinator : {{ include "clink.coordinator.fullname" . }} (1 replica)
+  Workers: {{ include "clink.worker.fullname" . }} ({{ .Values.worker.replicas }} replicas x {{ .Values.worker.slots }} slots)
 
 Watch them come up:
 
   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -w
 
-Open the dashboard / HTTP API (port-forward the JobManager):
+Open the dashboard / HTTP API (port-forward the Coordinator):
 
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "clink.jobmanager.fullname" . }} {{ .Values.jobmanager.httpPort }}:{{ .Values.jobmanager.httpPort }}
-  # then: open http://localhost:{{ .Values.jobmanager.httpPort }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "clink.coordinator.fullname" . }} {{ .Values.coordinator.httpPort }}:{{ .Values.coordinator.httpPort }}
+  # then: open http://localhost:{{ .Values.coordinator.httpPort }}
 
 Submit a job against the control port from inside the cluster (target):
 
-  {{ include "clink.jobmanager.fullname" . }}:{{ .Values.jobmanager.controlPort }}
+  {{ include "clink.coordinator.fullname" . }}:{{ .Values.coordinator.controlPort }}
 
 {{- if .Values.ha.enabled }}
 
-HA: {{ .Values.ha.replicas }} JobManagers race for leadership on the shared
+HA: {{ .Values.ha.replicas }} Coordinators race for leadership on the shared
 --ha-dir ({{ .Values.ha.storage.type }}); the leader binds the control port,
 standbys take over on its death. Inspect the current leader:
 
-  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "clink.jobmanager.fullname" . }} -- cat {{ .Values.ha.storage.mountPath }}/active-leader.json
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "clink.coordinator.fullname" . }} -- cat {{ .Values.ha.storage.mountPath }}/active-leader.json
 {{- else }}
 
-Note: this release runs a SINGLE JobManager (no HA). For multi-JM leader
+Note: this release runs a SINGLE Coordinator (no HA). For multi-coordinator leader
 election set ha.enabled=true (shared-storage file coordinator; see values.yaml).
 {{- end }}

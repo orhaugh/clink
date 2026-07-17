@@ -129,7 +129,7 @@ run_flink() {
     step "5a. Flink run"
     docker compose -f "$ROOT/docker-compose.yml" --profile flink up -d \
         flink-jobmanager flink-taskmanager
-    # Wait for JM REST.
+    # Wait for coordinator REST.
     for _ in {1..60}; do
         if curl -sf http://localhost:8081/overview >/dev/null; then break; fi
         sleep 1
@@ -171,24 +171,24 @@ run_flink() {
 
 run_clink() {
     step "5b. clink run"
-    # Start JM + TMs on host, pointing at host Kafka.
+    # Start coordinator + workers on host, pointing at host Kafka.
     "$CLINK_ROOT/build/clink_node" \
-        --role=jm --port=7100 \
-        >"$RESULTS/clink_jm.log" 2>&1 &
+        --role=coordinator --port=7100 \
+        >"$RESULTS/clink_coordinator.log" 2>&1 &
     JM_PID=$!
     sleep 2
 
-    # 4 TMs * 8 slots = 32 slots. Apples-to-apples with Flink:
+    # 4 workers * 8 slots = 32 slots. Apples-to-apples with Flink:
     # parallelism=4 across ~6 operators = ~24 subtasks total, all fit
-    # across this slot pool. Each Flink TM here has 4 slots too.
+    # across this slot pool. Each Flink worker here has 4 slots too.
     declare -a TM_PIDS=()
     for i in 1 2 3 4; do
         "$CLINK_ROOT/build/clink_node" \
-            --role=tm \
-            --jm-host=127.0.0.1 --jm-port=7100 \
-            --id="tm-$i" \
+            --role=worker \
+            --coordinator-host=127.0.0.1 --coordinator-port=7100 \
+            --id="worker-$i" \
             --slots=8 \
-            >"$RESULTS/clink_tm_$i.log" 2>&1 &
+            >"$RESULTS/clink_worker_$i.log" 2>&1 &
         TM_PIDS+=($!)
     done
     sleep 2
@@ -203,7 +203,7 @@ run_clink() {
     BENCH_PARALLELISM="$PARALLELISM" \
         "$CLINK_ROOT/build/clink_submit_job" \
             --job="$SO" \
-            --jm-host=127.0.0.1 --jm-port=7100 \
+            --coordinator-host=127.0.0.1 --coordinator-port=7100 \
             --state-backend=memory \
             >"$RESULTS/clink_submit.log" 2>&1 &
     SUBMIT_PID=$!

@@ -3,7 +3,7 @@
 // Demonstrates the PUBLIC testing framework (docs/internals/testing-framework.md)
 // that ships as the installed `clink::test_support` target. A consumer links it
 // alongside `clink::core` and drives its own operators through a harness - no
-// cluster, no JM, no gtest dependency (this file is a plain main() that returns
+// cluster, no coordinator, no gtest dependency (this file is a plain main() that returns
 // non-zero if any check fails, so CTest or CI can gate on it).
 //
 // What it shows:

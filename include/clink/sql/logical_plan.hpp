@@ -413,7 +413,7 @@ public:
         return output_columns_;
     }
     // The model's provider WITH-options (provider / endpoint / task / ...), threaded
-    // to the runtime operator's params so a TaskManager (which has no catalog) can
+    // to the runtime operator's params so a Worker (which has no catalog) can
     // build the model provider from the JobGraphSpec alone.
     [[nodiscard]] const std::map<std::string, std::string>& model_properties() const noexcept {
         return model_properties_;

@@ -55,7 +55,7 @@ struct OperatorBuildContext {
 // Factories return shared_ptr<void> bound to the concrete typed object
 // (e.g., shared_ptr<Source<std::int64_t>>). Callers use the in/out
 // ChannelType to static_pointer_cast back to the right typed shared_ptr.
-// Not pretty but contained: only the generic subtask role on the TM
+// Not pretty but contained: only the generic subtask role on the worker
 // performs the cast, and it has the channel types in hand.
 using BoxedFactory = std::function<std::shared_ptr<void>(const OperatorBuildContext&)>;
 

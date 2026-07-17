@@ -181,7 +181,7 @@ TEST(FileSink2PC, UncommittedBarrierLeavesStagingFile) {
     sink->open();
     sink->on_data(batch_of({"x", "y"}));
     sink->on_barrier(CheckpointBarrier{CheckpointId{7}});
-    // NO on_commit - simulates JM crash before declaring ckpt 7 complete.
+    // NO on_commit - simulates coordinator crash before declaring ckpt 7 complete.
 
     EXPECT_TRUE(std::filesystem::exists(out / "staging" / "sub0-7.dat"));
     EXPECT_FALSE(std::filesystem::exists(out / "committed" / "sub0-7.dat"));

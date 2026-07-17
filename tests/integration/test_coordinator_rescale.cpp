@@ -1,10 +1,10 @@
-// Rescale integration: spawn a real JM + 2 TMs, submit the slow
+// Rescale integration: spawn a real coordinator + 2 workers, submit the slow
 // rescale_test_job at parallelism=2, wait for at least one
 // checkpoint to land, then invoke clink_rescale_job to expand
 // the sink role from 2 to 4. The test asserts:
 //
 //   1. clink_rescale_job exits 0 with ok=true.
-//   2. After the rescale completes the JM's ListJobs reports the
+//   2. After the rescale completes the coordinator's ListJobs reports the
 //      job at the larger total_subtasks (so the new placement
 //      actually landed on the cluster - not just acknowledged).
 //   3. Sink files for the post-rescale subtasks exist; in
@@ -14,7 +14,7 @@
 //
 // The reducer's keyed state preservation rides on the underlying
 // kg-filtered restore that the previous slices wired up; this test
-// exercises the e2e path end to end (JM API + TM dispatch + state
+// exercises the e2e path end to end (coordinator API + worker dispatch + state
 // backend + sink) at coarse granularity. Per-key value verification
 // is deferred because the v1 source has no replay tracking - on
 // restart it re-emits from offset 0, so post-rescale sums would
@@ -129,10 +129,10 @@ std::uint16_t probe_free_port() {
     return probe.listen();
 }
 
-// Open a client connection to the JM, send HelloClient + ListJobs,
+// Open a client connection to the coordinator, send HelloClient + ListJobs,
 // return the parsed ListJobsAck. nullopt on connect / frame errors.
-std::optional<ListJobsAckMsg> list_jobs_over_wire(std::uint16_t jm_port) {
-    const int fd = NetworkSocket::connect_to("127.0.0.1", jm_port);
+std::optional<ListJobsAckMsg> list_jobs_over_wire(std::uint16_t coordinator_port) {
+    const int fd = NetworkSocket::connect_to("127.0.0.1", coordinator_port);
     if (fd < 0) {
         return std::nullopt;
     }
@@ -174,7 +174,7 @@ std::optional<ListJobsAckMsg> list_jobs_over_wire(std::uint16_t jm_port) {
 
 }  // namespace
 
-TEST(JmRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
+TEST(CoordinatorRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
     const auto node = node_binary_path();
     const auto submit = submit_binary_path();
     const auto rescale = rescale_binary_path();
@@ -196,23 +196,23 @@ TEST(JmRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
     ::setenv("CLINK_RESCALE_TICK_MS", "25", 1);
     ::setenv("CLINK_RESCALE_INITIAL_P", "2", 1);
 
-    const auto jm_port = probe_free_port();
-    const pid_t jm_pid =
-        spawn_proc({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, node);
-    ASSERT_GT(jm_pid, 0);
+    const auto coordinator_port = probe_free_port();
+    const pid_t coordinator_pid = spawn_proc(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
-    // Two TMs with --slots=4 so the post-rescale p=4 sink fits.
-    std::vector<pid_t> tms;
+    // Two workers with --slots=4 so the post-rescale p=4 sink fits.
+    std::vector<pid_t> workers;
     for (int i = 1; i <= 2; ++i) {
-        tms.push_back(spawn_proc({"clink_node",
-                                  "--role=tm",
-                                  "--id=tm-rescale-" + std::to_string(i),
-                                  "--slots=4",
-                                  "--jm-host=127.0.0.1",
-                                  "--jm-port=" + std::to_string(jm_port)},
-                                 node));
-        ASSERT_GT(tms.back(), 0);
+        workers.push_back(spawn_proc({"clink_node",
+                                      "--role=worker",
+                                      "--id=worker-rescale-" + std::to_string(i),
+                                      "--slots=4",
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(coordinator_port)},
+                                     node));
+        ASSERT_GT(workers.back(), 0);
     }
     std::this_thread::sleep_for(400ms);
 
@@ -221,8 +221,8 @@ TEST(JmRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
     // block forever - we'll cancel ourselves at end of test.
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),
-                                         "--jm-host=127.0.0.1",
-                                         "--jm-port=" + std::to_string(jm_port),
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port),
                                          "--wait-timeout-s=30",
                                          "--checkpoint-dir=" + ckpt_dir.string(),
                                          "--checkpoint-interval-ms=200",
@@ -231,12 +231,12 @@ TEST(JmRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
     ASSERT_GT(submit_pid, 0);
 
     // Wait until the job is running and at least one checkpoint has
-    // landed (visible via the COMPLETED-N marker the JM writes after
+    // landed (visible via the COMPLETED-N marker the coordinator writes after
     // every subtask acks a checkpoint).
     const auto job_visible_deadline = std::chrono::steady_clock::now() + 10s;
     JobId job_id = 0;
     while (std::chrono::steady_clock::now() < job_visible_deadline) {
-        auto resp = list_jobs_over_wire(jm_port);
+        auto resp = list_jobs_over_wire(coordinator_port);
         if (resp.has_value() && !resp->jobs.empty()) {
             job_id = resp->jobs.front().job_id;
             break;
@@ -245,8 +245,8 @@ TEST(JmRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
     }
     if (job_id == 0) {
         kill_quietly(submit_pid);
-        kill_quietly(jm_pid);
-        for (auto pid : tms)
+        kill_quietly(coordinator_pid);
+        for (auto pid : workers)
             kill_quietly(pid);
         FAIL() << "job never became visible in ListJobs";
     }
@@ -272,8 +272,8 @@ TEST(JmRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
     }
     if (!saw_checkpoint) {
         kill_quietly(submit_pid);
-        kill_quietly(jm_pid);
-        for (auto pid : tms)
+        kill_quietly(coordinator_pid);
+        for (auto pid : workers)
             kill_quietly(pid);
         FAIL() << "no COMPLETED-N checkpoint marker landed within 8s";
     }
@@ -282,8 +282,8 @@ TEST(JmRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
     const pid_t rescale_pid = spawn_proc(
         {"clink_rescale_job",
          "--job-id=" + std::to_string(job_id),
-         "--jm-host=127.0.0.1",
-         "--jm-port=" + std::to_string(jm_port),
+         "--coordinator-host=127.0.0.1",
+         "--coordinator-port=" + std::to_string(coordinator_port),
          "--role=" + std::string{"_inline_sink_"} +  // FileTextSink uses inline_sink_N op type
              "0",
          "--parallelism=4"},
@@ -296,17 +296,17 @@ TEST(JmRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
     // The op-type for the inline sink is minted at submit; we don't
     // actually know its exact role name from outside the .so. So
     // instead of relying on the role name in the CLI invocation, the
-    // CHECK is that the CLI returned cleanly (the JM may have
+    // CHECK is that the CLI returned cleanly (the coordinator may have
     // rejected on unknown role, which is fine for this v1 smoke test).
     // What we really want to verify is the wire round-trip.
     EXPECT_TRUE(rescale_exit == 0 || rescale_exit == 8)
         << "rescale CLI exited with unexpected code " << rescale_exit;
 
     // Tear down. The submitter will fail with timeout / cancel which
-    // is fine - we already proved the JM accepts the wire protocol.
+    // is fine - we already proved the coordinator accepts the wire protocol.
     kill_quietly(submit_pid);
-    kill_quietly(jm_pid);
-    for (auto pid : tms) {
+    kill_quietly(coordinator_pid);
+    for (auto pid : workers) {
         kill_quietly(pid);
     }
     std::filesystem::remove_all(ckpt_dir);
@@ -315,13 +315,13 @@ TEST(JmRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
     }
 }
 
-// Drive a REAL, accepted whole-role rescale end to end and assert the JM
+// Drive a REAL, accepted whole-role rescale end to end and assert the coordinator
 // resizes + redeploys the running job. This hardens the smoke test above (which
 // sends a deliberately-unknown role and accepts the rejection): here we send the
 // actual shared role kGenericSubtaskRole = "__clink_subtask" (every clink v1
 // subtask carries this single role, job_planner.cpp) with a valid divisor
 // parallelism (scale-down to 1: always a divisor, fits one slot). We assert the
-// CLI is ACCEPTED (exit 0), the JM reports the new smaller total_subtasks (the
+// CLI is ACCEPTED (exit 0), the coordinator reports the new smaller total_subtasks (the
 // redeploy actually landed, not just an ack), and the redeployed job reaches
 // completion.
 //
@@ -334,7 +334,7 @@ TEST(JmRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
 // per-key sums double-count. A per-key exactly-once assertion needs both an
 // op-level rescale path (RescaleCoordinator, gated on per-op bounds today) and a
 // replay-correct source. Those are separate engine items, tracked as such.
-TEST(JmRescale, WholeRoleRescaleAcceptedAndRedeploys) {
+TEST(CoordinatorRescale, WholeRoleRescaleAcceptedAndRedeploys) {
     const auto node = node_binary_path();
     const auto submit = submit_binary_path();
     const auto rescale = rescale_binary_path();
@@ -356,28 +356,28 @@ TEST(JmRescale, WholeRoleRescaleAcceptedAndRedeploys) {
     ::setenv("CLINK_RESCALE_TICK_MS", "25", 1);
     ::setenv("CLINK_RESCALE_INITIAL_P", "2", 1);
 
-    const auto jm_port = probe_free_port();
-    const pid_t jm_pid =
-        spawn_proc({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, node);
-    ASSERT_GT(jm_pid, 0);
+    const auto coordinator_port = probe_free_port();
+    const pid_t coordinator_pid = spawn_proc(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
-    std::vector<pid_t> tms;
+    std::vector<pid_t> workers;
     for (int i = 1; i <= 2; ++i) {
-        tms.push_back(spawn_proc({"clink_node",
-                                  "--role=tm",
-                                  "--id=tm-rescale-obs-" + std::to_string(i),
-                                  "--slots=4",
-                                  "--jm-host=127.0.0.1",
-                                  "--jm-port=" + std::to_string(jm_port)},
-                                 node));
-        ASSERT_GT(tms.back(), 0);
+        workers.push_back(spawn_proc({"clink_node",
+                                      "--role=worker",
+                                      "--id=worker-rescale-obs-" + std::to_string(i),
+                                      "--slots=4",
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(coordinator_port)},
+                                     node));
+        ASSERT_GT(workers.back(), 0);
     }
     std::this_thread::sleep_for(400ms);
 
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),
-                                         "--jm-host=127.0.0.1",
-                                         "--jm-port=" + std::to_string(jm_port),
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port),
                                          "--wait-timeout-s=30",
                                          "--checkpoint-dir=" + ckpt_dir.string(),
                                          "--checkpoint-interval-ms=200",
@@ -387,8 +387,8 @@ TEST(JmRescale, WholeRoleRescaleAcceptedAndRedeploys) {
 
     auto cleanup = [&]() {
         kill_quietly(submit_pid);
-        kill_quietly(jm_pid);
-        for (auto pid : tms) {
+        kill_quietly(coordinator_pid);
+        for (auto pid : workers) {
             kill_quietly(pid);
         }
         std::filesystem::remove_all(ckpt_dir);
@@ -402,7 +402,7 @@ TEST(JmRescale, WholeRoleRescaleAcceptedAndRedeploys) {
     std::uint32_t p_before = 0;
     const auto vis_deadline = std::chrono::steady_clock::now() + 10s;
     while (std::chrono::steady_clock::now() < vis_deadline) {
-        auto resp = list_jobs_over_wire(jm_port);
+        auto resp = list_jobs_over_wire(coordinator_port);
         if (resp.has_value() && !resp->jobs.empty()) {
             job_id = resp->jobs.front().job_id;
             p_before = resp->jobs.front().total_subtasks;
@@ -436,8 +436,8 @@ TEST(JmRescale, WholeRoleRescaleAcceptedAndRedeploys) {
     // Drive the rescale with the CORRECT role and a valid divisor (scale to 1).
     const pid_t rescale_pid = spawn_proc({"clink_rescale_job",
                                           "--job-id=" + std::to_string(job_id),
-                                          "--jm-host=127.0.0.1",
-                                          "--jm-port=" + std::to_string(jm_port),
+                                          "--coordinator-host=127.0.0.1",
+                                          "--coordinator-port=" + std::to_string(coordinator_port),
                                           "--role=__clink_subtask",
                                           "--parallelism=1"},
                                          rescale);
@@ -451,7 +451,7 @@ TEST(JmRescale, WholeRoleRescaleAcceptedAndRedeploys) {
     bool completion = false;
     const auto after_deadline = std::chrono::steady_clock::now() + 6s;
     while (std::chrono::steady_clock::now() < after_deadline) {
-        auto resp = list_jobs_over_wire(jm_port);
+        auto resp = list_jobs_over_wire(coordinator_port);
         if (resp.has_value() && !resp->jobs.empty()) {
             p_after = resp->jobs.front().total_subtasks;
             completion = resp->jobs.front().completion_signalled;
@@ -464,15 +464,15 @@ TEST(JmRescale, WholeRoleRescaleAcceptedAndRedeploys) {
     cleanup();
 
     // The rescale request used the correct shared role + a valid divisor, so the
-    // JM must ACCEPT it (exit 0), not reject it.
+    // coordinator must ACCEPT it (exit 0), not reject it.
     EXPECT_TRUE(rescale_exited);
     EXPECT_EQ(rescale_exit, 0) << "whole-role rescale with the correct role + a "
                                   "valid divisor must be accepted";
     // The job started multi-subtask and the accepted rescale must have actually
-    // resized + redeployed it (the JM reports the new, smaller total_subtasks -
+    // resized + redeployed it (the coordinator reports the new, smaller total_subtasks -
     // proving the redeploy landed, not just that the request was acked).
     EXPECT_GE(p_before, 2u) << "chained job should start with >1 subtask";
-    EXPECT_EQ(p_after, 1u) << "JM should report the post-rescale parallelism";
+    EXPECT_EQ(p_after, 1u) << "coordinator should report the post-rescale parallelism";
     EXPECT_LT(p_after, p_before) << "scale-down must shrink the deployed subtasks";
     // The redeployed job must run to completion (the source drains on the new
     // topology), proving the redeploy is live, not wedged.
@@ -482,16 +482,16 @@ TEST(JmRescale, WholeRoleRescaleAcceptedAndRedeploys) {
 // Regression guard: a CHAINED job must complete a periodic checkpoint in
 // multi-process mode. The rescale_test_job fuses source->map->keyBy and
 // reduce->map->sink into chained subtasks. Chained subtasks run via the
-// TM's DagBuilder path; that path previously failed to wire the
+// worker's DagBuilder path; that path previously failed to wire the
 // checkpoint-ack callback, so chained subtasks never sent
-// SubtaskCheckpointed - the JM's ack set never emptied, no COMPLETED-N
+// SubtaskCheckpointed - the coordinator's ack set never emptied, no COMPLETED-N
 // marker was ever written, and latest_completed_checkpoint_id stayed 0.
 // That silently broke periodic-checkpoint completion (and therefore
 // rescale + distributed recovery) for any job with a chained operator;
 // only end-of-stream terminal-barrier commits worked, which is why the
 // 2PC happy-path masked it. This test fails (times out waiting for a
 // marker) without the ack wiring and passes with it.
-TEST(JmCheckpoint, ChainedJobCompletesPeriodicCheckpointInMultiProcess) {
+TEST(CoordinatorCheckpoint, ChainedJobCompletesPeriodicCheckpointInMultiProcess) {
     const auto node = node_binary_path();
     const auto submit = submit_binary_path();
     const auto job_so = rescale_test_job_path();
@@ -514,26 +514,26 @@ TEST(JmCheckpoint, ChainedJobCompletesPeriodicCheckpointInMultiProcess) {
     ::setenv("CLINK_RESCALE_TICK_MS", "50", 1);
     ::setenv("CLINK_RESCALE_INITIAL_P", "2", 1);
 
-    const auto jm_port = probe_free_port();
-    const pid_t jm_pid =
-        spawn_proc({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, node);
-    ASSERT_GT(jm_pid, 0);
+    const auto coordinator_port = probe_free_port();
+    const pid_t coordinator_pid = spawn_proc(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
-    const pid_t tm_pid = spawn_proc({"clink_node",
-                                     "--role=tm",
-                                     "--id=tm-ckpt-chain",
-                                     "--slots=8",
-                                     "--jm-host=127.0.0.1",
-                                     "--jm-port=" + std::to_string(jm_port)},
-                                    node);
-    ASSERT_GT(tm_pid, 0);
+    const pid_t worker_pid = spawn_proc({"clink_node",
+                                         "--role=worker",
+                                         "--id=worker-ckpt-chain",
+                                         "--slots=8",
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port)},
+                                        node);
+    ASSERT_GT(worker_pid, 0);
     std::this_thread::sleep_for(400ms);
 
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),
-                                         "--jm-host=127.0.0.1",
-                                         "--jm-port=" + std::to_string(jm_port),
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port),
                                          "--wait-timeout-s=30",
                                          "--checkpoint-dir=" + ckpt_dir.string(),
                                          "--checkpoint-interval-ms=150",
@@ -563,12 +563,12 @@ TEST(JmCheckpoint, ChainedJobCompletesPeriodicCheckpointInMultiProcess) {
     int submit_exit = -1;
     (void)wait_for(submit_pid, 5s, submit_exit);
     kill_quietly(submit_pid);
-    kill_quietly(jm_pid);
-    kill_quietly(tm_pid);
+    kill_quietly(coordinator_pid);
+    kill_quietly(worker_pid);
 
     EXPECT_TRUE(saw_marker)
         << "no COMPLETED-N marker: a chained job never completed a periodic checkpoint "
-           "(regression in the TM chain-path checkpoint-ack wiring)";
+           "(regression in the worker chain-path checkpoint-ack wiring)";
 
     std::filesystem::remove_all(ckpt_dir);
     for (int i = 0; i < 8; ++i) {

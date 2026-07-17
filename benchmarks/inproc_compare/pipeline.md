@@ -7,8 +7,8 @@ serde, scheduling) instead of Kafka throughput.
 ## Record type
 
 A ~2 KB rich nested struct. Both engines define the same shape and
-serialise it via their own type system. Serde happens on the wire (TM
-↔ TM, where applicable) and on every state-backend write / checkpoint.
+serialise it via their own type system. Serde happens on the wire (worker
+↔ worker, where applicable) and on every state-backend write / checkpoint.
 
 ```
 struct Event {
@@ -61,4 +61,4 @@ counts to N, job ends).
 - Kafka producer/consumer throughput — that's infrastructure, not engine.
 - Network bridge throughput at par > 1 — separate concern, addressed
   once par=1 numbers are clean.
-- Cluster scheduling / multi-TM placement — par=1, single TM.
+- Cluster scheduling / multi-worker placement — par=1, single worker.

@@ -14,7 +14,7 @@ struct HttpClient::Impl {
 
     Impl(const std::string& host, std::uint16_t port) : client(host, port) {
         // Keep the proxy snappy on slow / unreachable peers. The
-        // dashboard polls; we'd rather surface "TM not responding" in
+        // dashboard polls; we'd rather surface "worker not responding" in
         // 2s than hang the request thread for the OS default
         // (~75s on most platforms).
         client.set_connection_timeout(std::chrono::seconds{2});

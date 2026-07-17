@@ -46,9 +46,9 @@ Key points:
 - The barrier snapshot captures the `put` made inside `on_barrier`, so a
   persisted handle survives a crash and is replayed by `recover_all_()` at the
   next `open()`.
-- `on_commit` / `on_abort` fire from the same JobManager-driven path as any
-  sink: the JM's commit-group gate collects every group member's pre-commit ack,
-  then broadcasts `CommitCheckpoint` (or `AbortCheckpoint`); the TaskManager
+- `on_commit` / `on_abort` fire from the same Coordinator-driven path as any
+  sink: the coordinator's commit-group gate collects every group member's pre-commit ack,
+  then broadcasts `CommitCheckpoint` (or `AbortCheckpoint`); the Worker
   invokes the registered callbacks. See [checkpointing](checkpointing.md).
 - `pending_committables()` exposes the persisted-but-unfinalised handles so a
   connector can reconcile an external registry at `on_open()` (e.g. an XA sink

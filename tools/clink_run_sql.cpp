@@ -2,18 +2,18 @@
 // front door of the unified CLI.
 //
 // EMBEDDED by default: starts the whole runtime in this process (an
-// in-process JobManager + TaskManager over an ephemeral loopback port,
+// in-process Coordinator + Worker over an ephemeral loopback port,
 // via clink::embed::EmbeddedEngine), runs the script, awaits the
 // submitted jobs, and exits with their status. No daemons, no cluster.
 // A bare SELECT prints its result rows to stdout through the synthesised
 // connector='print' sink. The first Ctrl-C cancels the running jobs and
 // drains them; a second Ctrl-C force-quits.
 //
-// With --jm-host=<h> --jm-port=<p> the same script is instead compiled
-// and each job POSTed to that running JobManager (the clink_submit_sql
+// With --coordinator-host=<h> --coordinator-port=<p> the same script is instead compiled
+// and each job POSTed to that running Coordinator (the clink_submit_sql
 // path) - the same file moves from laptop to cluster by adding one flag.
 // Bare SELECT is rejected remotely: its print sink would write to a
-// TaskManager's stdout, not this terminal.
+// Worker's stdout, not this terminal.
 
 #include <csignal>
 #include <cstdint>
@@ -49,8 +49,8 @@ struct SqlRunArgs {
     std::string file;
     std::string inline_sql;
     std::string catalog_dir;
-    std::string jm_host;
-    std::uint16_t jm_port = 0;
+    std::string coordinator_host;
+    std::uint16_t coordinator_port = 0;
     std::string job_name;
     std::string state_backend;
     std::string checkpoint_dir;
@@ -84,12 +84,12 @@ void usage() {
               << "                              debugging; inspect with clink capture-cat).\n"
               << "  --capture-records=<n>       Per-epoch record cap (default 10000).\n"
               << "  --catalog-dir=<dir>         Persistent catalog (CREATE TABLE auto-saves).\n"
-              << "  --slots=<n>                 In-process TaskManager slots (default 64).\n"
+              << "  --slots=<n>                 In-process Worker slots (default 64).\n"
               << "  --name=<job>                Job-name override for submitted jobs.\n"
               << "  --explain                   Print LogicalPlans; nothing runs.\n"
-              << "  --jm-host=<host> --jm-port=<port>\n"
+              << "  --coordinator-host=<host> --coordinator-port=<port>\n"
               << "                              Submit the SAME script to a running\n"
-              << "                              JobManager instead of running embedded.\n";
+              << "                              Coordinator instead of running embedded.\n";
 }
 
 // Accepts --flag=value and --flag value; returns false on a malformed
@@ -130,10 +130,10 @@ bool parse_args(int argc, char** argv, SqlRunArgs& a) {
             a.file = v;
         } else if (value_of(i, arg, "--catalog-dir", &v)) {
             a.catalog_dir = v;
-        } else if (value_of(i, arg, "--jm-host", &v)) {
-            a.jm_host = v;
-        } else if (value_of(i, arg, "--jm-port", &v)) {
-            a.jm_port = static_cast<std::uint16_t>(std::stoi(v));
+        } else if (value_of(i, arg, "--coordinator-host", &v)) {
+            a.coordinator_host = v;
+        } else if (value_of(i, arg, "--coordinator-port", &v)) {
+            a.coordinator_port = static_cast<std::uint16_t>(std::stoi(v));
         } else if (value_of(i, arg, "--name", &v)) {
             a.job_name = v;
         } else if (value_of(i, arg, "--state-backend", &v)) {
@@ -198,9 +198,9 @@ int clink_cmd_run_sql(int argc, char** argv) {
 
     // Remote or explain-only: no in-process cluster needed - the shared
     // script runner compiles (and POSTs) exactly as clink_submit_sql does.
-    if (!args.jm_host.empty() || args.explain) {
-        if (!args.jm_host.empty() && args.jm_port == 0) {
-            std::cerr << "error: --jm-host requires --jm-port\n";
+    if (!args.coordinator_host.empty() || args.explain) {
+        if (!args.coordinator_host.empty() && args.coordinator_port == 0) {
+            std::cerr << "error: --coordinator-host requires --coordinator-port\n";
             return 2;
         }
 #ifdef CLINK_LINKED_WASM
@@ -228,11 +228,13 @@ int clink_cmd_run_sql(int argc, char** argv) {
         opts.parallelism = args.parallelism;
         opts.job_name = args.job_name;
         clink::sql::ScriptIO io{&std::cout, &std::cerr};
-        auto submit =
-            !args.jm_host.empty()
-                ? clink::sql::make_http_submit(
-                      args.jm_host, args.jm_port, args.state_backend, std::cout, std::cerr)
-                : clink::sql::make_print_submit(std::cout);
+        auto submit = !args.coordinator_host.empty()
+                          ? clink::sql::make_http_submit(args.coordinator_host,
+                                                         args.coordinator_port,
+                                                         args.state_backend,
+                                                         std::cout,
+                                                         std::cerr)
+                          : clink::sql::make_print_submit(std::cout);
         return clink::sql::run_script(sql, catalog, opts, io, submit);
     }
 

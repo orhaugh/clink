@@ -1,9 +1,9 @@
-// TM-crash automatic restart test.
+// worker-crash automatic restart test.
 //
-// 2-TM cluster. Submit the bounded slow-source -> file_2pc_sink job
-// with --max-restarts-on-tm-loss=1 and periodic checkpointing on.
-// Wait for COMPLETED-1, SIGKILL TM-1, expect the JM to redeploy the
-// affected subtask(s) onto TM-2 with restore_from set, and the
+// 2-worker cluster. Submit the bounded slow-source -> file_2pc_sink job
+// with --max-restarts-on-worker-loss=1 and periodic checkpointing on.
+// Wait for COMPLETED-1, SIGKILL worker-1, expect the coordinator to redeploy the
+// affected subtask(s) onto worker-2 with restore_from set, and the
 // submitter eventually exits 0 with the job marked complete.
 
 #include <chrono>
@@ -140,7 +140,7 @@ std::uint64_t latest_completed_checkpoint(const std::filesystem::path& ckpt_dir)
 
 }  // namespace
 
-TEST(TmCrashRecovery, JobSurvivesTmKillViaRestart) {
+TEST(WorkerCrashRecovery, JobSurvivesWorkerKillViaRestart) {
     const auto node = node_binary_path();
     const auto submit = submit_binary_path();
     const auto job_so = two_phase_commit_job_path();
@@ -159,43 +159,43 @@ TEST(TmCrashRecovery, JobSurvivesTmKillViaRestart) {
     ::setenv("CLINK_2PC_TICK_MS", "60", 1);
 
     const auto control_port = probe_free_port();
-    const pid_t jm = spawn_proc({"clink_node",
-                                 "--role=jm",
-                                 "--port=" + std::to_string(control_port),
-                                 "--bind-host=127.0.0.1"},
-                                node);
-    ASSERT_GT(jm, 0);
+    const pid_t coordinator = spawn_proc({"clink_node",
+                                          "--role=coordinator",
+                                          "--port=" + std::to_string(control_port),
+                                          "--bind-host=127.0.0.1"},
+                                         node);
+    ASSERT_GT(coordinator, 0);
     ASSERT_TRUE(await_port_open(control_port, 2s));
 
-    // Two TMs with 4 slots each. The job uses 2 subtasks; either TM
-    // alone can host both. Killing TM-1 forces the JM to redeploy.
-    const pid_t tm1 = spawn_proc({"clink_node",
-                                  "--role=tm",
-                                  "--id=tm-A",
-                                  "--jm-host=127.0.0.1",
-                                  "--jm-port=" + std::to_string(control_port),
-                                  "--slots=4"},
-                                 node);
-    const pid_t tm2 = spawn_proc({"clink_node",
-                                  "--role=tm",
-                                  "--id=tm-B",
-                                  "--jm-host=127.0.0.1",
-                                  "--jm-port=" + std::to_string(control_port),
-                                  "--slots=4"},
-                                 node);
-    ASSERT_GT(tm1, 0);
-    ASSERT_GT(tm2, 0);
-    std::this_thread::sleep_for(500ms);  // both TMs register
+    // Two workers with 4 slots each. The job uses 2 subtasks; either worker
+    // alone can host both. Killing worker-1 forces the coordinator to redeploy.
+    const pid_t worker1 = spawn_proc({"clink_node",
+                                      "--role=worker",
+                                      "--id=worker-A",
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(control_port),
+                                      "--slots=4"},
+                                     node);
+    const pid_t worker2 = spawn_proc({"clink_node",
+                                      "--role=worker",
+                                      "--id=worker-B",
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(control_port),
+                                      "--slots=4"},
+                                     node);
+    ASSERT_GT(worker1, 0);
+    ASSERT_GT(worker2, 0);
+    std::this_thread::sleep_for(500ms);  // both workers register
 
     // Kick off the job with restart-on-loss enabled.
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),
-                                         "--jm-host=127.0.0.1",
-                                         "--jm-port=" + std::to_string(control_port),
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(control_port),
                                          "--wait-timeout-s=30",
                                          "--checkpoint-dir=" + ckpt_dir.string(),
                                          "--checkpoint-interval-ms=150",
-                                         "--max-restarts-on-tm-loss=2"},
+                                         "--max-restarts-on-worker-loss=2"},
                                         submit);
     ASSERT_GT(submit_pid, 0);
 
@@ -208,20 +208,20 @@ TEST(TmCrashRecovery, JobSurvivesTmKillViaRestart) {
     const auto ckpt_before_crash = latest_completed_checkpoint(ckpt_dir);
     ASSERT_GT(ckpt_before_crash, 0u) << "no checkpoint completed before SIGKILL";
 
-    // SIGKILL one TM mid-job. The watchdog should detect it within
+    // SIGKILL one worker mid-job. The watchdog should detect it within
     // ~heartbeat_timeout (5s default), set awaiting_restart, cancel
-    // the survivor's subtasks, and redeploy onto TM-B.
-    kill_quietly(tm1);
+    // the survivor's subtasks, and redeploy onto worker-B.
+    kill_quietly(worker1);
 
     // The submitter should still exit 0 - the job completes after the
     // automatic restart.
     int submit_exit = -1;
     const bool exited = wait_for_exit(submit_pid, 25s, &submit_exit);
 
-    kill_quietly(tm2);
-    kill_quietly(jm);
+    kill_quietly(worker2);
+    kill_quietly(coordinator);
 
-    ASSERT_TRUE(exited) << "submitter did not exit within 25s after TM crash";
+    ASSERT_TRUE(exited) << "submitter did not exit within 25s after worker crash";
     EXPECT_EQ(submit_exit, 0) << "submitter exited non-zero after restart; the job did not recover";
     EXPECT_GT(latest_completed_checkpoint(ckpt_dir), ckpt_before_crash)
         << "no new checkpoint completed after restart";

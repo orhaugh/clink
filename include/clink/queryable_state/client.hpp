@@ -38,7 +38,7 @@ public:
 
     // Subtask-scoped lookup. Same wire shape as the bare-slot overload
     // but hits the path that namespaces the slot by (role, subtask_idx).
-    // Used by RoutedClient after the JM /route endpoint returns the
+    // Used by RoutedClient after the coordinator /route endpoint returns the
     // owning subtask for a given key.
     template <typename K, typename V>
     [[nodiscard]] std::optional<V> get(const std::string& role,

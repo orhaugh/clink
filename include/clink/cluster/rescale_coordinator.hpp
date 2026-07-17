@@ -1,6 +1,6 @@
 #pragma once
 
-// Per-operator RescaleCoordinator on the JM.
+// Per-operator RescaleCoordinator on the coordinator.
 //
 // Tracks per-operator rescale state across the lifecycle:
 //
@@ -22,10 +22,10 @@
 //     -> abort -> Aborted
 //
 // Each transition is mutex-protected; the coordinator is safe to
-// drive from JM RPC handlers running on multiple threads.
+// drive from coordinator RPC handlers running on multiple threads.
 //
 // Scope here: the state machine + bounds validation. The actual
-// JM-side dispatch (BeginRescale message to old TMs, deploying new
+// coordinator-side dispatch (BeginRescale message to old workers, deploying new
 // subtasks, the DrainMarker emit) is the dispatch layer's job; this object
 // is the state record those handlers update. Tests drive the state
 // machine end-to-end without spinning up a cluster.
@@ -75,7 +75,7 @@ class RescaleCoordinator {
 public:
     // Register an operator with its current parallelism + bounds.
     // Idempotent: re-registering the same op_id overwrites the
-    // entry (typical case: the JM rebuilds coordinator state on
+    // entry (typical case: the coordinator rebuilds coordinator state on
     // recovery from the JobGraphSpec).
     //
     // min == 0 && max == 0 signals "no autoscaling for this operator"
@@ -98,12 +98,12 @@ public:
 
     // Request a rescale. Validates against the operator's bounds and
     // refuses if a rescale is already in-flight for this op. On
-    // accept, transitions the operator's state to Preparing - the JM
+    // accept, transitions the operator's state to Preparing - the coordinator
     // dispatch (29d) will fire the next-checkpoint gate and drive
     // the state machine forward via the mark_* methods.
     RequestResult request_rescale(const std::string& op_id, std::uint32_t new_parallelism);
 
-    // Transition Preparing -> Draining. Called by the JM when the
+    // Transition Preparing -> Draining. Called by the coordinator when the
     // next checkpoint has been triggered; the coordinator records
     // the checkpoint id so subsequent mark_old_drained / mark_new_ready
     // calls associate to the same cutover.
@@ -124,7 +124,7 @@ public:
     bool mark_new_ready(const std::string& op_id, std::uint32_t subtask_idx);
 
     // Force-abort an in-progress rescale (any state except Idle /
-    // Complete). Typical trigger: a hard TM failure during cutover
+    // Complete). Typical trigger: a hard worker failure during cutover
     // that makes the rescale unrecoverable. The operator returns to
     // its pre-rescale parallelism; current_parallelism is unchanged.
     bool abort(const std::string& op_id, std::string reason);

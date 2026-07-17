@@ -1,9 +1,9 @@
 // clink_submit_job - submit a compiled clink job (a .so built with
-// CLINK_REGISTER_JOB) to a running JobManager. Mirrors ` run`.
+// CLINK_REGISTER_JOB) to a running Coordinator. Mirrors ` run`.
 //
 // Usage:
 //   clink_submit_job --job=/path/to/my_job.so
-//                      --jm-host=127.0.0.1 --jm-port=6123
+//                      --coordinator-host=127.0.0.1 --coordinator-port=6123
 //                      [--wait-timeout-s=N] [--name=<label>]
 //
 // Flow:
@@ -14,10 +14,10 @@
 //   2. Look up clink_job_build, call it to fetch the JobGraphSpec
 //      JSON pointer + length.
 //   3. JobSubmitter::submit(graph_json, plugin_paths = [<abs .so path>],
-//                           opts). The JM ships the .so to every TM
-//      assigned a task from this job; each TM dlopens it, which fires
+//                           opts). The coordinator ships the .so to every worker
+//      assigned a task from this job; each worker dlopens it, which fires
 //      the same clink_plugin_register call_once gate and makes the
-//      inline op-types resolvable in that TM's RunnerRegistry.
+//      inline op-types resolvable in that worker's RunnerRegistry.
 //   4. Print the SubmitResult to stdout.
 
 #include <chrono>
@@ -61,17 +61,18 @@ bool has_flag(int argc, char** argv, std::string_view flag) {
 
 void usage() {
     std::cerr
-        << "Usage: clink run --job=<path.so> --jm-host=<host> --jm-port=<port>\n"
+        << "Usage: clink run --job=<path.so> --coordinator-host=<host> --coordinator-port=<port>\n"
         << "                          [--wait-timeout-s=N] [--name=<label>]\n"
         << "                          [--state-backend=<scheme>[:<path>]]\n"
-        << "                          [--checkpoint-interval-ms=N] [--max-restarts-on-tm-loss=N]\n"
+        << "                          [--checkpoint-interval-ms=N] "
+           "[--max-restarts-on-worker-loss=N]\n"
         << "       clink run <file>.sql | -e \"<sql>\"   (embedded SQL: run with --help for "
            "flags)\n"
         << "\n"
         << "Submit a clink job (a shared library built with CLINK_REGISTER_JOB)\n"
-        << "to a running JobManager. A .sql argument instead runs the script\n"
-        << "EMBEDDED in this process (no cluster), or submits it to a JM when\n"
-        << "--jm-host/--jm-port are given.\n"
+        << "to a running Coordinator. A .sql argument instead runs the script\n"
+        << "EMBEDDED in this process (no cluster), or submits it to a coordinator when\n"
+        << "--coordinator-host/--coordinator-port are given.\n"
         << "\n"
         << "State backend selection:\n"
         << "  --state-backend=memory           in-memory keyed state (default; no persistence)\n"
@@ -92,7 +93,7 @@ std::optional<std::string> compose_state_backend_uri(const std::string& spec) {
         (colon == std::string::npos) ? std::string{kDefaultPath} : spec.substr(colon + 1);
     if (scheme == "memory") {
         // Memory backend ignores the path; an empty checkpoint_dir
-        // disables persistence entirely (the JM skips checkpoint
+        // disables persistence entirely (the coordinator skips checkpoint
         // triggers; the runner uses in-memory state).
         return std::string{};
     }
@@ -135,8 +136,8 @@ int clink_cmd_run(int argc, char** argv) {
     }
 
     const auto job_path = get_arg(argc, argv, "job");
-    const auto jm_host = get_arg(argc, argv, "jm-host", "127.0.0.1");
-    const auto jm_port_str = get_arg(argc, argv, "jm-port", "6123");
+    const auto coordinator_host = get_arg(argc, argv, "coordinator-host", "127.0.0.1");
+    const auto coordinator_port_str = get_arg(argc, argv, "coordinator-port", "6123");
     const auto wait_s_str = get_arg(argc, argv, "wait-timeout-s", "30");
     const auto job_name = get_arg(argc, argv, "name", "job");
     // Checkpointing: --checkpoint-dir enables periodic barriers at
@@ -159,7 +160,7 @@ int clink_cmd_run(int argc, char** argv) {
     const auto ckpt_interval_str = get_arg(argc, argv, "checkpoint-interval-ms", "0");
     const auto restore_dir = get_arg(argc, argv, "restore-from-dir", "");
     const auto restore_id_str = get_arg(argc, argv, "restore-from-checkpoint-id", "0");
-    const auto max_restarts_str = get_arg(argc, argv, "max-restarts-on-tm-loss", "0");
+    const auto max_restarts_str = get_arg(argc, argv, "max-restarts-on-worker-loss", "0");
 
     if (job_path.empty()) {
         std::cerr << "clink_submit_job: --job=<path.so> is required\n";
@@ -174,7 +175,7 @@ int clink_cmd_run(int argc, char** argv) {
     // Load the job .so locally: this fires clink_plugin_register
     // (call_once-gated) which runs the user's build_fn and populates
     // this process's RunnerRegistry. Catches build-fn errors before
-    // we even reach out to the JM.
+    // we even reach out to the coordinator.
     void* handle = ::dlopen(job_abs.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle == nullptr) {
         std::cerr << "clink_submit_job: dlopen failed: " << ::dlerror() << "\n";
@@ -221,8 +222,8 @@ int clink_cmd_run(int argc, char** argv) {
     }
     const std::string graph_json{graph_json_data, graph_json_size};
 
-    const auto jm_port = static_cast<std::uint16_t>(std::stoi(jm_port_str));
-    clink::application::JobSubmitter submitter(jm_host, jm_port);
+    const auto coordinator_port = static_cast<std::uint16_t>(std::stoi(coordinator_port_str));
+    clink::application::JobSubmitter submitter(coordinator_host, coordinator_port);
     clink::application::SubmitOptions opts;
     opts.wait_timeout = std::chrono::seconds{std::stoi(wait_s_str)};
     if (!ckpt_dir.empty()) {
@@ -231,7 +232,7 @@ int clink_cmd_run(int argc, char** argv) {
         opts.checkpoint.restore_from_dir = restore_dir;
         opts.checkpoint.restore_from_checkpoint_id =
             static_cast<std::uint64_t>(std::stoull(restore_id_str));
-        opts.checkpoint.max_restarts_on_tm_loss =
+        opts.checkpoint.max_restarts_on_worker_loss =
             static_cast<std::uint32_t>(std::stoul(max_restarts_str));
     }
 

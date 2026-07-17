@@ -346,7 +346,7 @@ TEST(LineageDispatcher, TranslatesBusEventsToListenerCalls) {
                              R"({"job_id":42,"job_name":"orders-etl","status":"ok","errors":0})"});
 
     // An unrelated event -> ignored.
-    bus.publish(clink::Event{789, "jm.tm_registered", R"({"tm_id":"tm-1"})"});
+    bus.publish(clink::Event{789, "coordinator.worker_registered", R"({"worker_id":"worker-1"})"});
 
     ASSERT_EQ(raw->events.size(), 2u);
 

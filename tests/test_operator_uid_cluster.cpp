@@ -1,17 +1,17 @@
 // Cluster-path uid tests. Validates that:
 //
 //   * JobGraphSpec.to_json / from_json round-trips OperatorSpec.uid +
-//     .display_name (so the JM sees them after the wire crossing).
+//     .display_name (so the coordinator sees them after the wire crossing).
 //   * OperatorChainSpec.to_json / from_json round-trips ChainOp.uid +
-//     .display_name (so the TM-side runner sees them).
+//     .display_name (so the worker-side runner sees them).
 //   * Planner copies OperatorSpec.uid / .display_name into ChainOp.
 //
 // The in-process Operator-uid behaviour (stable OperatorId across
 // topology edits) is exercised in test_operator_uid.cpp. This file
-// only covers the cluster-IR plumbing - the TM-side application of
+// only covers the cluster-IR plumbing - the worker-side application of
 // uid happens via plugin_impl.hpp's apply_chain_identity, which is
 // header-only and exercised the moment any plugin runner builds an
-// operator. A full end-to-end "submit through in-process JM+TM"
+// operator. A full end-to-end "submit through in-process coordinator+worker"
 // test is heavyweight and adds little above the unit-level coverage
 // here; if a regression slips through, the in-process and cluster
 // suites should catch it via state-restore failure.

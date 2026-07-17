@@ -7,10 +7,10 @@ spec:
     repository: clink-runtime
     tag: latest
     pullPolicy: IfNotPresent
-  jobManager:
+  coordinator:
     controlPort: 6123
     httpPort: 8081
-  taskManager:
+  worker:
     replicas: 2
     slots: 4
     httpPort: 8082

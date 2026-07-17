@@ -13,7 +13,7 @@
 // As long as parallelism doesn't change, this is identical to the
 // classic `subtask_idx = hash(key) mod parallelism` partitioning - the
 // SAME key lands on the SAME subtask. The advantage shows up when the
-// JM rescales a running operator: each new subtask just inherits a
+// coordinator rescales a running operator: each new subtask just inherits a
 // new range of key_groups, and on restore reads exactly the state
 // files (or filters within them) that hold those groups.
 //

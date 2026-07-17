@@ -17,7 +17,7 @@ public:
     PlainTcpConnection& operator=(const PlainTcpConnection&) = delete;
 
     // Serialize sends: a single connection is written from multiple threads (the
-    // JM sends TriggerCheckpoint from both the periodic checkpoint loop and the
+    // coordinator sends TriggerCheckpoint from both the periodic checkpoint loop and the
     // client-triggered savepoint path, plus deploy/cancel/heartbeat). Without this
     // lock two frames interleave byte-wise on the socket, the peer reads a
     // misframed stream, and a decode throws "MessageReader: truncated payload"

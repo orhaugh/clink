@@ -44,7 +44,7 @@ RECORDS=100000000 KEYS=10000 WINDOWS=1000 ./run.sh
 
 Output lands in `./results/`:
 - `flink.json`, `clink.json` — per-engine raw metrics.
-- `clink_jm.log`, `clink_tm_*.log`, `clink_submit.log` — clink-side logs.
+- `clink_coordinator.log`, `clink_worker_*.log`, `clink_submit.log` — clink-side logs.
 
 The final scoreboard is printed at the end of `run.sh`.
 

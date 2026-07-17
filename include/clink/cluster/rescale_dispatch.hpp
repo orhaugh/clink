@@ -2,13 +2,13 @@
 
 // Cutover-deployment planner for adaptive rescale.
 //
-// When the JM's RescaleCoordinator transitions an operator from
-// Draining to CuttingOver, the JM has to bring up the new-parallelism
+// When the coordinator's RescaleCoordinator transitions an operator from
+// Draining to CuttingOver, the coordinator has to bring up the new-parallelism
 // subtasks. This header centralises the planning math so it can be
-// tested in isolation (no JobManager, no TMs, no sockets):
+// tested in isolation (no Coordinator, no workers, no sockets):
 //
 //   - Pick the (subtask_idx -> key_group_range) assignment for the
-//     new parallelism using the same key-group math the JM uses on
+//     new parallelism using the same key-group math the coordinator uses on
 //     restart.
 //   - Compute restore_from_subtask_idx + restore_from_parent_count
 //     per new subtask so the state backend's snapshot loader can
@@ -23,7 +23,7 @@
 //         slices into one merged state.
 //     Only integer scale factors are supported (mirroring the existing
 //     rescale_job constraint).
-//   - Greedy round-robin placement onto TMs with free slot capacity.
+//   - Greedy round-robin placement onto workers with free slot capacity.
 //     Returns ok=false + a descriptive reason if total free capacity
 //     is below target_parallelism.
 
@@ -38,15 +38,15 @@
 namespace clink::cluster {
 
 struct CutoverDeployment {
-    // (tm_id, DeploymentTask). Each entry is one new-parallelism
-    // subtask placed on the given TM. role / extra_config / peers are
-    // cloned from the template; data_port stays 0 (TM picks an
+    // (worker_id, DeploymentTask). Each entry is one new-parallelism
+    // subtask placed on the given worker. role / extra_config / peers are
+    // cloned from the template; data_port stays 0 (worker picks an
     // ephemeral); restore_* + key_group_* fields are populated.
     std::vector<std::pair<std::string, DeploymentTask>> new_tasks;
 
     // "role:subtask_idx" keys of OLD subtasks to tear down. Caller
-    // uses these to remove entries from task_records / tasks_by_tm
-    // and to free the TM's slots_in_use counter. Old subtasks have
+    // uses these to remove entries from task_records / tasks_by_worker
+    // and to free the worker's slots_in_use counter. Old subtasks have
     // already drained (the coordinator is in CuttingOver by the time
     // this planner runs); their SubtaskFinished arrivals already
     // counted as drained acks, so the caller must NOT also count
@@ -71,15 +71,15 @@ struct CutoverDeployment {
 //   template_task          - DeploymentTask cloned for every new
 //                            subtask (role, extra_config, peers).
 //                            Typically one of the old subtasks of
-//                            this operator from the JM's task_records.
+//                            this operator from the coordinator's task_records.
 //   old_subtask_keys       - "role:idx" keys for every CURRENT
 //                            subtask of this operator. Returned
 //                            verbatim in teardown_keys for the caller.
-//   tm_free_slots          - (tm_id, free_slot_count) snapshot. The
+//   worker_free_slots          - (worker_id, free_slot_count) snapshot. The
 //                            planner picks placement greedily in
 //                            list order, decrementing the local copy.
 //                            Caller is responsible for committing the
-//                            slot accounting back to the JM after
+//                            slot accounting back to the coordinator after
 //                            calling this.
 //
 // Returns CutoverDeployment with ok=true on success. On failure
@@ -93,6 +93,6 @@ CutoverDeployment plan_operator_cutover(
     const std::string& restore_from_dir,
     const DeploymentTask& template_task,
     const std::vector<std::string>& old_subtask_keys,
-    std::vector<std::pair<std::string, std::uint32_t>> tm_free_slots);
+    std::vector<std::pair<std::string, std::uint32_t>> worker_free_slots);
 
 }  // namespace clink::cluster

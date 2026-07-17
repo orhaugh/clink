@@ -44,7 +44,7 @@ struct SubmitOptions {
     std::chrono::seconds wait_timeout{60};
     bool wait_for_completion{true};
     // Distributed-checkpointing config. Empty checkpoint_dir disables
-    // checkpointing entirely; otherwise the JM triggers a periodic
+    // checkpointing entirely; otherwise the coordinator triggers a periodic
     // barrier (interval_ms cadence) and every subtask snapshots its
     // keyed state to <checkpoint_dir>/<subtask>/checkpoint-<id>.snap.
     // To resume from a prior run, set restore_from_dir +
@@ -54,10 +54,10 @@ struct SubmitOptions {
 
 // JobSubmitter: programmatic equivalent of `clink_node --role=client`.
 //
-// Construct one with the JM endpoint and call submit() with a graph
+// Construct one with the coordinator endpoint and call submit() with a graph
 // JSON and zero-or-more local plugin .so paths. The submitter:
 //   1. Reads each plugin file into memory + content-hashes it
-//   2. Opens a TCP connection to the JM
+//   2. Opens a TCP connection to the coordinator
 //   3. Sends HelloClient + SubmitJob
 //   4. Waits for SubmitJobAck (with ack_timeout)
 //   5. If wait_for_completion, waits for JobCompleted (with wait_timeout)
@@ -73,15 +73,15 @@ struct SubmitOptions {
 // and exit" binaries replace JSON-on-disk + clink_node client.
 class JobSubmitter {
 public:
-    JobSubmitter(std::string jm_host, std::uint16_t jm_port);
+    JobSubmitter(std::string coordinator_host, std::uint16_t coordinator_port);
 
     SubmitResult submit(const std::string& graph_json,
                         const std::vector<std::string>& plugin_paths = {},
                         const SubmitOptions& opts = {}) const;
 
-    // Query the JM for every job it currently tracks (running and
+    // Query the coordinator for every job it currently tracks (running and
     // recently-completed; completion_signalled distinguishes them).
-    // `ok` is false when the JM is unreachable; in that case `error`
+    // `ok` is false when the coordinator is unreachable; in that case `error`
     // holds the reason. Submission and list use the same TCP path.
     struct ListResult {
         bool ok{false};
@@ -92,8 +92,8 @@ public:
         std::chrono::milliseconds timeout = std::chrono::milliseconds{10000}) const;
 
 private:
-    std::string jm_host_;
-    std::uint16_t jm_port_;
+    std::string coordinator_host_;
+    std::uint16_t coordinator_port_;
 };
 
 }  // namespace clink::application

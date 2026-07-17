@@ -28,7 +28,7 @@ namespace clink {
 struct LogRecord {
     std::int64_t ts_ms{};  // milliseconds since unix epoch
     std::string level;     // "debug", "info", "warn", "error"
-    std::string source;    // free-form, e.g. "jm.register", "tm.run_task"
+    std::string source;    // free-form, e.g. "coordinator.register", "worker.run_task"
     std::string message;
 };
 

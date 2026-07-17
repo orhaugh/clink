@@ -18,7 +18,7 @@ public:
     TlsConnectionImpl(const TlsConnectionImpl&) = delete;
     TlsConnectionImpl& operator=(const TlsConnectionImpl&) = delete;
 
-    // Serialize sends: the JM writes a single connection from multiple threads
+    // Serialize sends: the coordinator writes a single connection from multiple threads
     // (periodic checkpoint loop + client-triggered savepoint, deploy, cancel).
     // Concurrent SSL_write on one SSL* is undefined and interleaves records;
     // this lock makes each frame's send atomic. See PlainTcpConnection::send_all.

@@ -42,7 +42,7 @@ inline BuildContext build_ctx_from(const clink::cluster::RunnerContext& rctx) {
 }
 
 // Apply the leading op's uid + display_name (carried across the wire
-// via ChainOp) onto the freshly-built operator instance. The TM-side
+// via ChainOp) onto the freshly-built operator instance. The worker-side
 // Dag will see uid() / display_name() on this op and derive a stable
 // OperatorId via hash("uid/" + uid) if uid is set. Operators built
 // from the legacy/in-process path that don't go through ChainOp can
@@ -90,7 +90,7 @@ inline const clink::cluster::TypeOps& require_type_ops(const clink::cluster::Typ
 //
 // When state_backend_uri is set it overrides checkpoint_dir as the
 // backend URI, so a remote/disaggregated backend (e.g. remote-read://)
-// can be used while checkpoint_dir stays the JM's LOCAL coordination
+// can be used while checkpoint_dir stays the coordinator's LOCAL coordination
 // directory for COMPLETED-N markers and HA recovery. Empty preserves the
 // legacy behaviour where checkpoint_dir doubles as the backend URI.
 inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerContext& rctx) {
@@ -123,9 +123,9 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
                                               : clink::StateBackendFactory::default_instance();
     auto built = factory.build(spec);
     cfg.state_backend = built.backend;
-    // Hand the freshly-built backend to the TM (if it registered a hook)
+    // Hand the freshly-built backend to the worker (if it registered a hook)
     // so it can purge this subtask's superseded checkpoints under the
-    // retention policy. Shared ownership: the executor and the TM both
+    // retention policy. Shared ownership: the executor and the worker both
     // hold the backend; purge only touches old on-disk artefacts.
     if (rctx.register_checkpoint_backend && cfg.state_backend) {
         rctx.register_checkpoint_backend(cfg.state_backend);
@@ -135,7 +135,7 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
         cfg.restore_key_group_filter = rctx.restore_key_group_filter;
     }
     // Bridge the cluster's per-subtask checkpoint-ack callback (which
-    // sends SubtaskCheckpointed back to the JM) onto JobConfig so the
+    // sends SubtaskCheckpointed back to the coordinator) onto JobConfig so the
     // local operator runner can invoke it after snapshotting.
     if (rctx.on_checkpoint_ack) {
         auto ack = rctx.on_checkpoint_ack;
@@ -145,7 +145,7 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     }
     // Bounded-source EOS final-checkpoint hooks (cluster path). Bridge the
     // cluster RunnerContext callbacks onto JobConfig so the source runner can
-    // request a JM-coordinated final checkpoint at EOS and block until it
+    // request a coordinator-coordinated final checkpoint at EOS and block until it
     // commits. Empty in in-process paths (source falls back to local terminal).
     if (rctx.request_final_checkpoint) {
         cfg.request_final_checkpoint = rctx.request_final_checkpoint;
@@ -153,7 +153,7 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     if (rctx.wait_final_committed) {
         cfg.wait_final_committed = rctx.wait_final_committed;
     }
-    // Thread the TaskManager-owned cancel token through so a
+    // Thread the Worker-owned cancel token through so a
     // CancelJob message can wind the LocalExecutor down without a
     // reference to it. nullptr in legacy/in-process paths.
     cfg.external_cancel_token = rctx.cancel_token;
@@ -173,7 +173,7 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     // the .so's OWN private singletons (RTLD_LOCAL + static clink_core), so the
     // operator's gauges and logs would never reach the node's /metrics and
     // /api/v1/logs. rctx.metrics / rctx.logger were captured in the clink_node
-    // TU (task_manager.cpp). Fall back to the in-process global only when the
+    // TU (worker.cpp). Fall back to the in-process global only when the
     // host did not set them (LocalExecutor / legacy same-address-space paths).
     cfg.metrics = rctx.metrics != nullptr ? rctx.metrics : &clink::MetricsRegistry::global();
     cfg.logger = rctx.logger;
@@ -184,7 +184,7 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
 // operator-thread failure. The executor catches operator exceptions into
 // operator_errors_ and returns normally (so an in-process caller can inspect
 // them); on the cluster path the subtask runner must instead let them escape
-// so run_task_ reports had_error=true and the JM restarts. Without this, a
+// so run_task_ reports had_error=true and the coordinator restarts. Without this, a
 // bounded source's end-of-stream final-checkpoint throw (the watchdog-restart
 // signal when the final checkpoint times out) would be silently swallowed and
 // the job could complete with an uncommitted tail. Skipped when the subtask was
@@ -319,7 +319,7 @@ void PluginRegistry::register_source(
             // every network-bridge runner's bytes to it (its output bridges ->
             // bytes_sent). The source itself ignores the attribution.
             dag.set_all_runners_attributed_op_id(dag.runner_id_at(h0.runner_index));
-            // Hand the source's barrier injectors to the TM before we
+            // Hand the source's barrier injectors to the worker before we
             // hand the Dag off to LocalExecutor (which moves it).
             if (rctx.register_source_injectors) {
                 std::vector<clink::cluster::RunnerContext::SourceInjectorFn> injectors(
@@ -347,7 +347,7 @@ void PluginRegistry::register_source(
     runner_registry_.register_source(op_type, channel, std::move(runner));
 
     // Mirror into OperatorRegistry as a BoxedFactory so the chain-
-    // dispatch fused-source path (task_manager.cpp) can resolve the
+    // dispatch fused-source path (worker.cpp) can resolve the
     // source by (type, out_channel) and build a typed Source<T>
     // without going through the full SubtaskRunner. Required for the
     // par=1 fusion plan where the source is hosted inline on the
@@ -367,7 +367,7 @@ void PluginRegistry::register_source(
 
     // In-process Dag-builder hook. Stores a typed callback under op_type
     // in DagBuilderRegistry so `clink::cluster::LocalSubmitter::submit(env)`
-    // can drive the topology end-to-end without JM+TM. The closure
+    // can drive the topology end-to-end without coordinator+worker. The closure
     // captures the user's factory and resolves at run time via the same
     // BuildContext shape the cluster runner uses.
     clink::cluster::DagBuilderRegistry::default_instance().register_builder(
@@ -411,7 +411,7 @@ void PluginRegistry::register_sink(
         // 2PC support: route CommitCheckpoint -> sink->on_commit.
         // Non-2PC sinks have the default no-op so this is harmless.
         // Weak-capture the sink: the runner returns when the
-        // executor exits, but the TM may still receive a late
+        // executor exits, but the worker may still receive a late
         // CommitCheckpoint while the sink is shutting down - the
         // weak_ptr lock returns nullptr after destruction.
         if (rctx.register_commit_callbacks) {
@@ -425,7 +425,7 @@ void PluginRegistry::register_sink(
             });
         }
         // Register abort callback alongside commit. The
-        // TM dispatches it on AbortCheckpoint; non-2PC sinks ignore
+        // worker dispatches it on AbortCheckpoint; non-2PC sinks ignore
         // the call (Sink::on_abort default no-op).
         if (rctx.register_abort_callbacks) {
             std::weak_ptr<clink::Sink<T>> weak_sink = sink;
@@ -565,7 +565,7 @@ void PluginRegistry::register_operator(
     runner_registry_.register_operator(op_type, in_channel, out_channel, std::move(runner));
 
     // Mirror into OperatorRegistry so the chain dispatcher
-    // (task_manager.cpp) can build typed Operator<In,Out> for ops in
+    // (worker.cpp) can build typed Operator<In,Out> for ops in
     // chains of length >= 2. Without this, inline-lambda ops can't be
     // chained and run as separate per-op subtask threads, paying the
     // BoundedChannel cost between every pair (parallelism scaling
@@ -619,11 +619,11 @@ void PluginRegistry::register_operator(
         auto h = dag.template add_operator<In, Out>(in_handle, op, capture_codec);
         return clink::cluster::DagOpHandle{std::any{h}, h.runner_index, /*parallelism=*/1};
     };
-    // Bundle-scoped write so the TM chain dispatcher's per-job
+    // Bundle-scoped write so the worker chain dispatcher's per-job
     // DagBuilderRegistry (with parent fallback to the default
     // singleton) finds this DagBuilder. The .so writes to the .so's
     // default_instance below; with RTLD_LOCAL that singleton isn't
-    // visible to the TM process, which is why the per-bundle path is
+    // visible to the worker process, which is why the per-bundle path is
     // needed.
     dag_builder_registry_.register_builder(op_type, db);
     auto& so_dbr = clink::cluster::DagBuilderRegistry::default_instance();

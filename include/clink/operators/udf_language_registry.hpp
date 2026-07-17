@@ -61,7 +61,7 @@ public:
     // Produces the shippable payload for a locally-declared function (for
     // LANGUAGE wasm: read the module file). Called by the SQL layer after a
     // successful load so the declaration can travel with a submitted job to
-    // TaskManagers that cannot read the local path. Optional per language:
+    // Workers that cannot read the local path. Optional per language:
     // a language without one ships nothing (cluster execution then requires
     // out-of-band registration in every process).
     using Packager = std::function<std::vector<std::uint8_t>(const FunctionDecl& decl)>;
@@ -130,7 +130,7 @@ private:
 };
 
 // The wire type-name bridge for shipped declarations. A JobGraphSpec carries
-// each UDF argument/return type as Arrow's ToString() name so a TaskManager
+// each UDF argument/return type as Arrow's ToString() name so a Worker
 // can rebuild the FunctionDecl without linking the SQL frontend's type
 // bridge. Deliberately minimal: only the value models UDF loaders accept
 // (plus utf8 for future string support); anything else is a clear error at

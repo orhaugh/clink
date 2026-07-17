@@ -2,13 +2,13 @@
 
 // EmbeddedEngine: the whole clink runtime in one process, no daemons.
 //
-// Construction starts an in-process JobManager + TaskManager pair
+// Construction starts an in-process Coordinator + Worker pair
 // (control plane on an ephemeral loopback port, exactly the topology the
 // SqlRuntime end-to-end suite proves). execute_script() runs a SQL
 // script through the shared script runner (clink/sql/script_runner.hpp):
 // DDL folds into the engine's session catalog and every compiled INSERT /
 // materialized-view job is submitted straight to the in-process
-// JobManager - no HTTP, no cluster. await_all() blocks until the
+// Coordinator - no HTTP, no cluster. await_all() blocks until the
 // submitted jobs finish, with a caller-polled cancellation hook so a
 // front end (Ctrl-C in `clink run`) can stop an unbounded pipeline and
 // drain it cleanly.
@@ -26,11 +26,11 @@
 
 #include <arrow/api.h>
 
-#include "clink/cluster/job_manager.hpp"
+#include "clink/cluster/coordinator.hpp"
 #include "clink/sql/catalog.hpp"
 
 namespace clink::cluster {
-class TaskManager;
+class Worker;
 }
 
 namespace clink::embed {
@@ -40,7 +40,7 @@ class CollectHub;
 struct EngineOptions {
     // Uniform op parallelism applied to every compiled job (>1 fans out).
     std::uint32_t parallelism = 1;
-    // TaskManager slot count. Slots are placement bookkeeping, not threads,
+    // Worker slot count. Slots are placement bookkeeping, not threads,
     // so a generous default costs nothing and keeps deep plans deployable.
     std::size_t slots = 64;
     // Per-job state backend URI (e.g. "rocksdb:///tmp/state",
@@ -76,7 +76,7 @@ struct EngineOptions {
 class EmbeddedEngine {
 public:
     // Starts the in-process cluster; throws std::runtime_error if the
-    // TaskManager fails to register (or the catalog dir fails to load).
+    // Worker fails to register (or the catalog dir fails to load).
     explicit EmbeddedEngine(EngineOptions opts);
     ~EmbeddedEngine();
 
@@ -150,9 +150,9 @@ private:
 
     EngineOptions opts_;
     sql::Catalog catalog_;
-    cluster::JobManager jm_;
-    std::uint16_t jm_port_{};
-    std::unique_ptr<cluster::TaskManager> tm_;
+    cluster::Coordinator coordinator_;
+    std::uint16_t coordinator_port_{};
+    std::unique_ptr<cluster::Worker> worker_;
     std::vector<JobEntry> jobs_;
     std::vector<std::string> errors_;
     bool user_cancelled_ = false;

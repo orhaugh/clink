@@ -35,7 +35,7 @@ class JobBundle;
 // the rest of the plan at deployment time to compute the actual host:port
 // that the task should connect to for each cross-stage data channel.
 struct PlannedTask {
-    std::string tm_id;
+    std::string worker_id;
     std::string role;
     std::uint32_t subtask_idx{};
     std::uint16_t data_port{};  // 0 if no inbound listener
@@ -48,9 +48,9 @@ struct JobPlan {
 };
 
 // CompletedJobRecord - HistoryServer entry. Captured at job
-// termination and kept in a bounded ring buffer on the JM so operators
+// termination and kept in a bounded ring buffer on the coordinator so operators
 // can answer "what happened to job N?" even after the live JobState
-// is gone. The history ring holds the last `kJobManagerHistoryCap`
+// is gone. The history ring holds the last `kCoordinatorHistoryCap`
 // terminal events; older entries are evicted from the front.
 //
 // `status` is one of "ok", "failed", "cancelled" (matching the metric
@@ -68,25 +68,25 @@ struct CompletedJobRecord {
     std::int64_t completed_at_unix_seconds{};
 };
 
-// Maximum number of completed-job records the JM retains. Bounded so
+// Maximum number of completed-job records the coordinator retains. Bounded so
 // long-running clusters don't grow memory without bound; pick a number
 // big enough for "what failed last week?" but small enough to stay
 // cheap.
-inline constexpr std::size_t kJobManagerHistoryCap = 128;
+inline constexpr std::size_t kCoordinatorHistoryCap = 128;
 
-// Default control-plane port. The JM defaults to 6123; clink uses
+// Default control-plane port. The coordinator defaults to 6123; clink uses
 // the same port so operators familiar with  can reach for the same
 // muscle memory.
-inline constexpr std::uint16_t kDefaultJobManagerPort = 6123;
+inline constexpr std::uint16_t kDefaultCoordinatorPort = 6123;
 
-// JobManager is the cluster's single source of truth for deployment.
+// Coordinator is the cluster's single source of truth for deployment.
 //
 // It supports two ways to drive it:
-//   * In-process: call `expect_tms(...)`, `await_registrations(...)`,
+//   * In-process: call `expect_workers(...)`, `await_registrations(...)`,
 //     `deploy(plan)`, `await_completion(...)`. This is the original test
 //     harness path; it implicitly runs one job at a time.
 //   * Over the wire: clients connect, send HelloClient + SubmitJob with a
-//     JobGraphSpec, and the JM plans/deploys/tracks/reports completion
+//     JobGraphSpec, and the coordinator plans/deploys/tracks/reports completion
 //     entirely via the protocol. Multiple jobs can be in flight at once
 //     so long as the cluster has spare slots.
 
@@ -111,13 +111,13 @@ void apply_default_state_backend(CheckpointConfig& checkpoint, const std::string
 // no-op. Exposed for direct testing of the recovery policy.
 void pin_recovered_state_backend(CheckpointConfig& checkpoint);
 
-class JobManager {
+class Coordinator {
 public:
     struct Config {
-        // How often the watchdog thread re-evaluates TM liveness.
+        // How often the watchdog thread re-evaluates worker liveness.
         std::chrono::milliseconds watchdog_interval{100};
-        // A TM is declared lost if no message has arrived from it for
-        // longer than this. Heartbeats from a healthy TM should have a
+        // A worker is declared lost if no message has arrived from it for
+        // longer than this. Heartbeats from a healthy worker should have a
         // shorter interval - typically heartbeat_timeout / 3 - so a
         // single missed message doesn't trigger a false positive.
         std::chrono::milliseconds heartbeat_timeout{2000};
@@ -131,7 +131,7 @@ public:
         // routable hostname/IP when bind_host = "0.0.0.0".
         std::string advertise_host{};
         // Maximum number of restart attempts per failing task before the
-        // JM gives up and surfaces the failure. 0 = no retries.
+        // coordinator gives up and surfaces the failure. 0 = no retries.
         int max_restarts{0};
         // Upper bound on how long a job may sit in awaiting_restart while
         // surviving subtasks drain before the redeploy fires. A drain that
@@ -167,14 +167,14 @@ public:
         std::optional<AutoscalerConfig> autoscaler;
     };
 
-    JobManager();
-    explicit JobManager(Config cfg);
-    ~JobManager();
+    Coordinator();
+    explicit Coordinator(Config cfg);
+    ~Coordinator();
 
-    JobManager(const JobManager&) = delete;
-    JobManager& operator=(const JobManager&) = delete;
-    JobManager(JobManager&&) = delete;
-    JobManager& operator=(JobManager&&) = delete;
+    Coordinator(const Coordinator&) = delete;
+    Coordinator& operator=(const Coordinator&) = delete;
+    Coordinator(Coordinator&&) = delete;
+    Coordinator& operator=(Coordinator&&) = delete;
 
     // Bind the control-plane listener and start the accept/watchdog
     // threads. `port = 0` lets the OS pick (good for tests). Returns the
@@ -183,11 +183,11 @@ public:
 
     // ----- Legacy single-job API (test harness path) -----
 
-    // Declare the set of TM ids that must register before deploy() can
+    // Declare the set of worker ids that must register before deploy() can
     // proceed. Optional; new submission flow doesn't need it.
-    void expect_tms(std::vector<std::string> tm_ids);
+    void expect_workers(std::vector<std::string> worker_ids);
 
-    // Block until every expected TM has registered, or `timeout` elapses.
+    // Block until every expected worker has registered, or `timeout` elapses.
     bool await_registrations(std::chrono::milliseconds timeout);
 
     // Resolve peer addresses and dispatch Deploy messages directly.
@@ -208,7 +208,7 @@ public:
     // cluster has insufficient spare slots (the wait policy is
     // controlled by Config::submit_wait_for_slots).
     //
-    // If `notify_client_conn != nullptr`, the JM will send a
+    // If `notify_client_conn != nullptr`, the coordinator will send a
     // JobCompletedMsg back on that connection when the job finishes.
     // Pass nullptr for in-process submitters that poll via
     // await_job_completion.
@@ -217,7 +217,7 @@ public:
                      network::Connection* notify_client_conn = nullptr);
 
     // Overload that accepts plugin binaries to ship with every Deploy
-    // for this job. The JM also writes them to its local cache and
+    // for this job. The coordinator also writes them to its local cache and
     // dlopens them before planning so the registry-based validation
     // can see plugin-defined op types.
     JobId submit_job(const JobGraphSpec& graph,
@@ -228,7 +228,7 @@ public:
     // Overload that also carries distributed-checkpointing config (root
     // directory, periodic-trigger interval, optional restore directive).
     // Each subtask gets a private FileBackedStateBackend rooted under
-    // checkpoint_dir on its TM; the JM's coordinator triggers periodic
+    // checkpoint_dir on its worker; the coordinator's coordinator triggers periodic
     // barriers across the source subtasks at interval_ms.
     JobId submit_job(const JobGraphSpec& graph,
                      const OperatorRegistry& registry,
@@ -240,7 +240,7 @@ public:
     // JobBundle and loaded the job's plugin .so's into its
     // PluginRegistry view; this overload threads that bundle through
     // plan_job (for per-job validation) and stashes it in JobState
-    // (so the JM-side dispatcher / coordinator can reach it later).
+    // (so the coordinator-side dispatcher / coordinator can reach it later).
     // Used by handle_submit_; in-process tests still call the simpler
     // overloads above.
     JobId submit_job(const JobGraphSpec& graph,
@@ -257,9 +257,9 @@ public:
     std::vector<std::string> job_errors(JobId job_id) const;
 
     // History-server snapshot. Returns the terminal-state record for
-    // every job the JM has seen complete, capped at
-    // kJobManagerHistoryCap entries (oldest evicted first). Stable
-    // copy - safe to inspect/serialize outside the JM mutex. Mirrors
+    // every job the coordinator has seen complete, capped at
+    // kCoordinatorHistoryCap entries (oldest evicted first). Stable
+    // copy - safe to inspect/serialize outside the coordinator mutex. Mirrors
     // the read surface HistoryServer exposes via /jobs/overview
     // for completed jobs.
     std::vector<CompletedJobRecord> job_history() const;
@@ -269,15 +269,15 @@ public:
     // never existed, or evicted from the ring).
     std::optional<CompletedJobRecord> job_history(JobId job_id) const;
 
-    // Cluster-wide free slot count (sum across all registered TMs minus
+    // Cluster-wide free slot count (sum across all registered workers minus
     // tasks currently in flight). Useful for tests that want to assert
     // on slot accounting.
     std::size_t free_slots() const;
 
     // ----- Cluster state queries -----
 
-    // TMs that the watchdog has declared lost (in registration order).
-    std::vector<std::string> lost_tms() const;
+    // workers that the watchdog has declared lost (in registration order).
+    std::vector<std::string> lost_workers() const;
 
     // Close the listener and all connections.
     void stop();
@@ -295,7 +295,7 @@ public:
     // JSON outside the critical section so HTTP threads don't contend
     // with control-plane writes.
     ClusterSnapshot snapshot_cluster() const;
-    std::vector<TmSummary> snapshot_tms() const;
+    std::vector<WorkerSummary> snapshot_workers() const;
     std::vector<JobSummary> snapshot_jobs() const;
     // nullopt if job_id isn't a known job.
     std::optional<JobDetail> snapshot_job(JobId job_id) const;
@@ -311,24 +311,24 @@ public:
     // job exists but no graph was retained.
     std::optional<lineage::LineageGraph> snapshot_job_lineage(JobId job_id) const;
 
-    // (data_host, http_port) for the TM with the given id, or nullopt
-    // if the TM isn't registered, is lost, or didn't enable HTTP.
-    // Used by the JM dashboard's proxy routes (/api/v1/tms/:id/*).
-    std::optional<std::pair<std::string, std::uint16_t>> tm_http_target(
-        const std::string& tm_id) const;
+    // (data_host, http_port) for the worker with the given id, or nullopt
+    // if the worker isn't registered, is lost, or didn't enable HTTP.
+    // Used by the coordinator dashboard's proxy routes (/api/v1/workers/:id/*).
+    std::optional<std::pair<std::string, std::uint16_t>> worker_http_target(
+        const std::string& worker_id) const;
 
-    // Unique TM HTTP targets (data_host, http_port) hosting any
+    // Unique worker HTTP targets (data_host, http_port) hosting any
     // subtask of `job_id`. Returns empty if the job is unknown, has
-    // no placed subtasks, or every hosting TM has dropped HTTP.
-    // Used by the Queryable State multi-TM locate endpoint so a
-    // client can iterate the TMs holding a job's keyed state slots.
-    std::vector<std::pair<std::string, std::uint16_t>> tms_hosting_job(JobId job_id) const;
+    // no placed subtasks, or every hosting worker has dropped HTTP.
+    // Used by the Queryable State multi-worker locate endpoint so a
+    // client can iterate the workers holding a job's keyed state slots.
+    std::vector<std::pair<std::string, std::uint16_t>> workers_hosting_job(JobId job_id) const;
 
     // Key-group-aware routing for Queryable State. Given a job, role,
-    // and serialized key, returns the TM HTTP target hosting the
+    // and serialized key, returns the worker HTTP target hosting the
     // subtask responsible for that key's key-group plus the subtask
     // index. nullopt if the job/role is unknown, no subtask covers
-    // the key's group, or the hosting TM has dropped HTTP. The {0,0}
+    // the key's group, or the hosting worker has dropped HTTP. The {0,0}
     // sentinel on key_group_first/last (non-rescaled deploys) is
     // expanded to the full [0, kNumKeyGroups) range, matching the
     // back-compat behaviour used by the restore-side filter.
@@ -342,11 +342,11 @@ public:
                                                  std::span<const std::byte> key_bytes) const;
 
     // Every (host, http_port, subtask_idx) currently hosting a subtask of
-    // `role` for `job_id`, in subtask order. TMs that are lost or expose
+    // `role` for `job_id`, in subtask order. workers that are lost or expose
     // no HTTP port are skipped. Used by the queryable-state JSON serving
     // route to fan a key lookup out across the role's subtasks - correct
     // at any parallelism without reproducing the shuffle's key hashing on
-    // the JM (the key-group fast path is route_key_for_job).
+    // the coordinator (the key-group fast path is route_key_for_job).
     [[nodiscard]] std::vector<RouteTarget> subtask_targets_for_role(JobId job_id,
                                                                     const std::string& role) const;
 
@@ -354,7 +354,7 @@ public:
     // Incremented at initial deploy (-> 1) and on every successful
     // rescale. Used by Queryable State clients to invalidate cached
     // routes when the topology shifts (rescale moves key-groups to
-    // different subtasks, so a cached (kg -> TmTarget) entry from
+    // different subtasks, so a cached (kg -> WorkerTarget) entry from
     // before the rescale is stale).
     [[nodiscard]] std::uint64_t topology_version(JobId job_id) const;
 
@@ -424,7 +424,7 @@ public:
     // location; physical relocation to a portable dir is the
     // operator's responsibility (rsync, S3 copy, etc.).
     //
-    // `timeout` bounds how long the JM waits for every subtask to
+    // `timeout` bounds how long the coordinator waits for every subtask to
     // ack the savepoint. 0 picks a 30s default.
     SavepointAckMsg take_savepoint(JobId job_id, std::chrono::milliseconds timeout = {});
 
@@ -437,19 +437,19 @@ public:
     // Enable HA mode: every submitted job is persisted under <dir>/jobs/
     // (manifest.json + plugin-<hash>.so bytes). On standby->leader
     // takeover, recover_from_ha_dir replays every persisted job into
-    // the JM's in-memory state, attaching restore_from at the latest
+    // the coordinator's in-memory state, attaching restore_from at the latest
     // COMPLETED-N marker for that job. Must be called before start().
     void set_ha_dir(std::string dir);
 
     // Replay every persisted job manifest under the configured ha_dir
-    // back into this JM, with restore_from set per job. Called by
+    // back into this coordinator, with restore_from set per job. Called by
     // clink_node when its HaCoordinator fires the become-leader
     // callback. Idempotent - already-running job_ids are skipped.
     void recover_persisted_jobs();
 
 private:
-    struct TmConnection {
-        std::string tm_id;
+    struct WorkerConnection {
+        std::string worker_id;
         std::string data_host;
         // Transport. Owns the underlying fd (or TLS session). Reader
         // thread borrows; close() runs on watchdog teardown.
@@ -459,8 +459,8 @@ private:
         bool lost{false};
         std::uint32_t slot_capacity{1};
         std::uint32_t slots_in_use{0};
-        // HTTP port the TM is serving its dashboard endpoints on.
-        // 0 = TM didn't opt into HTTP; JM proxy paths skip it.
+        // HTTP port the worker is serving its dashboard endpoints on.
+        // 0 = worker didn't opt into HTTP; coordinator proxy paths skip it.
         std::uint16_t http_port{0};
     };
 
@@ -481,7 +481,7 @@ private:
         std::uint64_t topology_version{0};
         std::vector<std::string> errors;
         // Structured counterpart to `errors`, built from each SubtaskFinished
-        // failure report (role/subtask/tm + message, with the executor's
+        // failure report (role/subtask/worker + message, with the executor's
         // capture-site stack trace inside the message). Surfaced via
         // JobDetail.subtask_errors. Kept alongside the flat list, not instead.
         std::vector<SubtaskErrorRecord> subtask_errors;
@@ -493,12 +493,12 @@ private:
         std::string expected_state_versions_packed;
         // Packed UDF declarations (pack_udf_specs) for this job, captured
         // at deploy from the JobGraphSpec. Re-sent verbatim on every
-        // Deploy (initial + rescale/recovery re-deploy) so each TM
+        // Deploy (initial + rescale/recovery re-deploy) so each worker
         // registers the functions before running subtasks. Empty when the
         // job uses none.
         std::string udfs_packed;
         // Per-task records keyed by "role:subtask_idx" so a retry can
-        // re-send the original Deploy entry to the original TM.
+        // re-send the original Deploy entry to the original worker.
         std::unordered_map<std::string, std::pair<std::string, DeploymentTask>> task_records;
         std::unordered_map<std::string, int> attempt_counts;
         // Per-subtask lifecycle timestamps (unix ms), keyed like task_records
@@ -510,12 +510,12 @@ private:
             std::int64_t finished_ms{0};
         };
         std::unordered_map<std::string, SubtaskTiming> subtask_timing;
-        // Tasks per TM (for grouping PeerUpdate by tm_id).
-        std::unordered_map<std::string, std::vector<DeploymentTask>> tasks_by_tm;
-        // Tasks pending completion per TM (for synthesised errors when
-        // a TM is declared lost mid-job).
+        // Tasks per worker (for grouping PeerUpdate by worker_id).
+        std::unordered_map<std::string, std::vector<DeploymentTask>> tasks_by_worker;
+        // Tasks pending completion per worker (for synthesised errors when
+        // a worker is declared lost mid-job).
         std::unordered_map<std::string, std::vector<std::pair<std::string, std::uint32_t>>>
-            pending_per_tm;
+            pending_per_worker;
 
         // Port discovery state.
         std::size_t expected_listenings{0};
@@ -553,30 +553,30 @@ private:
         network::Connection* notify_client_conn{nullptr};
         bool completion_signalled{false};
         // Set by handle_cancel_job_ (a client-initiated cancel) BEFORE
-        // CancelJob is broadcast to the TMs. signal_job_completion uses
+        // CancelJob is broadcast to the workers. signal_job_completion uses
         // it to surface "cancelled by client" instead of the bare
         // SubtaskFinished error messages.
         bool cancel_requested{false};
 
-        // TM-crash recovery state.
+        // worker-crash recovery state.
         //
-        // When the watchdog declares a TM lost and the job's
-        // checkpoint.max_restarts_on_tm_loss permits another attempt,
-        // mark_tm_lost_locked_ sets `awaiting_restart=true` and adds
-        // every (role, subtask) hosted on the lost TM to
+        // When the watchdog declares a worker lost and the job's
+        // checkpoint.max_restarts_on_worker_loss permits another attempt,
+        // mark_worker_lost_locked_ sets `awaiting_restart=true` and adds
+        // every (role, subtask) hosted on the lost worker to
         // restart_pending. error synthesis is skipped. The existing
         // CancelJob broadcast winds down surviving subtasks; their
         // SubtaskFinished arrivals do NOT add to errors / completed_count
         // when awaiting_restart is set - instead they're recorded in
-        // restart_drained_keys until every surviving-TM subtask has
+        // restart_drained_keys until every surviving-worker subtask has
         // reported. At that point handle_subtask_finished_ triggers
         // restart_job_locked_, which redeploys the entire task set onto
-        // surviving TMs with restore_from pointing at the JM's checkpoint
+        // surviving workers with restore_from pointing at the coordinator's checkpoint
         // dir + latest_completed_checkpoint_id, clears the restart
         // bookkeeping, and increments restart_attempts.
         bool awaiting_restart{false};
         std::uint32_t restart_attempts{0};
-        // (role, subtask_idx) entries from the lost TM that need to be
+        // (role, subtask_idx) entries from the lost worker that need to be
         // re-deployed onto a survivor.
         std::vector<std::pair<std::string, std::uint32_t>> restart_pending;
         // Set by rescale_job: maps role -> new parallelism. The next
@@ -584,7 +584,7 @@ private:
         // the new task set, computes per-new-subtask key-group ranges,
         // and tags each new DeploymentTask with the parent old subtask
         // whose state file it should restore from. Cleared after the
-        // redeploy fires. Empty for TM-loss-driven restarts (where the
+        // redeploy fires. Empty for worker-loss-driven restarts (where the
         // parallelism doesn't change).
         std::unordered_map<std::string, std::uint32_t> rescale_overrides;
         // Captured per-role parallelism at the moment a rescale was
@@ -593,12 +593,12 @@ private:
         // index for each new subtask. Populated alongside
         // rescale_overrides; cleared together.
         std::unordered_map<std::string, std::uint32_t> pre_rescale_parallelism;
-        // Surviving-TM subtasks we've already received SubtaskFinished
+        // Surviving-worker subtasks we've already received SubtaskFinished
         // for during the awaiting_restart drain.
         std::unordered_set<std::string> restart_drained_keys;
         // The set of "role:subtask_idx" keys we expect to drain before
-        // firing the restart. Equals tasks_by_tm minus lost-TM tasks
-        // at the moment mark_tm_lost_locked_ fires.
+        // firing the restart. Equals tasks_by_worker minus lost-worker tasks
+        // at the moment mark_worker_lost_locked_ fires.
         std::unordered_set<std::string> restart_drain_expected;
         // Deadline by which the awaiting_restart drain must complete.
         // Set when the job enters awaiting_restart (now +
@@ -608,7 +608,7 @@ private:
         std::chrono::steady_clock::time_point restart_deadline{};
 
         // Plugin binaries this job depends on. Held so deploy_internal_
-        // can attach them to every DeployMsg. The JM caches the bytes
+        // can attach them to every DeployMsg. The coordinator caches the bytes
         // on disk separately via PluginLoader.
         std::vector<PluginBinary> plugins;
 
@@ -624,7 +624,7 @@ private:
         // deploy_internal_ when cfg_.autoscaler is set and at least
         // one of the job's operators carries [min, max] bounds.
         // Owns its own polling thread; destroyed (and joins) when
-        // JobState is removed or when JM::stop_autoscalers_() runs.
+        // JobState is removed or when coordinator::stop_autoscalers_() runs.
         std::unique_ptr<Autoscaler> autoscaler;
 
         // Original JobGraphSpec JSON. Captured at submit so HA recovery
@@ -638,12 +638,12 @@ private:
         std::string name;
 
         // Distributed-checkpointing config carried from SubmitJob. The
-        // JM uses checkpoint_dir to address per-job snapshot storage,
+        // coordinator uses checkpoint_dir to address per-job snapshot storage,
         // and interval_ms to drive its periodic trigger thread.
         CheckpointConfig checkpoint;
 
         // Per-checkpoint ack tracking: id -> set of "role:subtask_idx"
-        // strings still pending. When the set empties the JM writes a
+        // strings still pending. When the set empties the coordinator writes a
         // <checkpoint_dir>/<job_id>/COMPLETED-<id> marker and updates
         // `latest_completed_checkpoint_id`.
         std::unordered_map<std::uint64_t, std::unordered_set<std::string>> pending_checkpoint_acks;
@@ -658,7 +658,7 @@ private:
 
         // Bounded-source end-of-stream FINAL checkpoint coordination. When the
         // first bounded source reaches clean EOS and sends RequestFinalCheckpoint,
-        // the JM assigns ONE final checkpoint id for the whole job (so every
+        // the coordinator assigns ONE final checkpoint id for the whole job (so every
         // parallel source subtask injects + acks the SAME id), seeds its pending
         // ack set from the live task set, and broadcasts TriggerCheckpoint for it.
         // Every requester is replied the same id. Cleared on restart so a replayed
@@ -666,7 +666,7 @@ private:
         std::optional<std::uint64_t> final_checkpoint_id;
         std::unordered_set<std::string> sources_requested_final;
         // Test-only (CLINK_TEST_STALL_FIRST_FINAL_CKPT): force the no-crash
-        // EOS-timeout path. On the FIRST final checkpoint, the JM picks the
+        // EOS-timeout path. On the FIRST final checkpoint, the coordinator picks the
         // first subtask that acks it (test_stall_key) and drops EVERY ack for
         // that (key, id) pair, so its pending entry never clears and the final
         // checkpoint never completes -> the source's wait_final_committed times
@@ -696,7 +696,7 @@ private:
         // Per-checkpoint group state. For each in-flight
         // checkpoint that touches at least one commit-group,
         // group_state[ckpt_id][group_name] tracks the set of subtasks
-        // that have NOT yet acked. When the set empties the JM
+        // that have NOT yet acked. When the set empties the coordinator
         // broadcasts CommitCheckpoint to the group's members; if any
         // ack reports ok=false the group is aborted and every member
         // gets AbortCheckpoint.
@@ -716,8 +716,8 @@ private:
         //
         // Held by unique_ptr to a forward-declared type so this header
         // doesn't have to include job_bundle.hpp (which would create a
-        // job_planner.hpp <-> job_manager.hpp cycle). The destructor is
-        // declared here and defined out-of-line in job_manager.cpp where
+        // job_planner.hpp <-> coordinator.hpp cycle). The destructor is
+        // declared here and defined out-of-line in coordinator.cpp where
         // JobBundle is a complete type.
         std::unique_ptr<JobBundle> bundle;
 
@@ -725,7 +725,7 @@ private:
         ~JobState();
         // Move ctors/operators declared but NOT defaulted here: a
         // defaulted move would be implicit-inline, which needs the full
-        // JobBundle type. Defined in job_manager.cpp.
+        // JobBundle type. Defined in coordinator.cpp.
         JobState(JobState&&) noexcept;
         JobState& operator=(JobState&&) noexcept;
         JobState(const JobState&) = delete;
@@ -748,16 +748,16 @@ private:
     // Per-operator rescale request dispatch.
     void handle_rescale_operator_(network::Connection& conn, MessageReader& r);
     void handle_savepoint_(network::Connection& conn, MessageReader& r);
-    void start_reader_for_(std::shared_ptr<TmConnection> tm);
+    void start_reader_for_(std::shared_ptr<WorkerConnection> worker);
     void watchdog_loop_();
-    void mark_tm_lost_locked_(TmConnection& tm);
+    void mark_worker_lost_locked_(WorkerConnection& worker);
     void send_peer_updates_locked_(JobState& job);
     void signal_job_completion_locked_(JobState& job);
-    // After every surviving-TM subtask of `job` has drained on
-    // awaiting_restart=true, rebuild tasks_by_tm by round-robin
-    // assigning the original task set onto survivor TMs, reset
+    // After every surviving-worker subtask of `job` has drained on
+    // awaiting_restart=true, rebuild tasks_by_worker by round-robin
+    // assigning the original task set onto survivor workers, reset
     // transient JobState fields, and broadcast fresh Deploys with
-    // restore_from set to the JM's latest_completed_checkpoint_id.
+    // restore_from set to the coordinator's latest_completed_checkpoint_id.
     // Returns the new Deploy frames to send outside the lock.
     struct PendingDeploy {
         network::Connection* conn;
@@ -768,7 +768,7 @@ private:
     // Coordinator-driven adaptive rescale dispatch.
     //
     // dispatch_begin_rescale_locked_: builds one BeginRescaleMsg per
-    // TM hosting at least one old subtask of `op_id`. Appended to
+    // worker hosting at least one old subtask of `op_id`. Appended to
     // `out`. Caller sends outside the lock.
     void dispatch_begin_rescale_locked_(JobState& job,
                                         const std::string& op_id,
@@ -778,10 +778,10 @@ private:
 
     // dispatch_cutover_deploy_locked_: fires on the coordinator's
     // Draining -> CuttingOver transition. Plans the new subtasks via
-    // plan_operator_cutover, mutates job.task_records / tasks_by_tm
+    // plan_operator_cutover, mutates job.task_records / tasks_by_worker
     // to remove the drained old subtasks and add the new ones,
     // bumps expected_completion / expected_listenings, decrements
-    // the old subtasks' TM slots and claims slots for the new ones.
+    // the old subtasks' worker slots and claims slots for the new ones.
     // On insufficient capacity or non-integer scale factor the
     // coordinator's rescale is aborted and `out` is left empty.
     void dispatch_cutover_deploy_locked_(JobState& job,
@@ -802,14 +802,14 @@ private:
     // TriggerCheckpoint, and replies FinalCheckpointAssigned on `reply_conn`.
     void handle_request_final_checkpoint_(MessageReader& r, network::Connection& reply_conn);
     void checkpoint_trigger_loop_();
-    // Read every <ha_dir>/history/*.json on startup so the JM's
+    // Read every <ha_dir>/history/*.json on startup so the coordinator's
     // in-memory ring picks up where the previous leader left off.
-    // Bounded to kJobManagerHistoryCap entries (oldest dropped). Called
+    // Bounded to kCoordinatorHistoryCap entries (oldest dropped). Called
     // from set_ha_dir; no-op if ha_dir_ is empty.
     void reload_history_from_disk_();
 
     // Extract every per-job Autoscaler under the lock and
-    // join its thread outside the lock. Called from JM::stop() before
+    // join its thread outside the lock. Called from coordinator::stop() before
     // tearing down jobs_, and from job-completion paths so a finished
     // job's autoscaler thread doesn't linger.
     void stop_autoscalers_();
@@ -830,13 +830,13 @@ private:
 
     mutable std::mutex mu_;
     std::condition_variable cv_;
-    std::vector<std::string> expected_tms_;
-    std::unordered_map<std::string, std::shared_ptr<TmConnection>> registered_;
-    std::vector<std::string> lost_tm_ids_;
+    std::vector<std::string> expected_workers_;
+    std::unordered_map<std::string, std::shared_ptr<WorkerConnection>> registered_;
+    std::vector<std::string> lost_worker_ids_;
     std::unordered_map<JobId, std::shared_ptr<JobState>> jobs_;
     // Ring buffer of terminated jobs. signal_job_completion_locked_
     // pushes back; the front is evicted once size exceeds
-    // kJobManagerHistoryCap. Guarded by mu_ so job_history() can take
+    // kCoordinatorHistoryCap. Guarded by mu_ so job_history() can take
     // a consistent snapshot.
     std::deque<CompletedJobRecord> history_;
     JobId next_job_id_{1};

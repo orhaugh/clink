@@ -1,5 +1,5 @@
 // EmbeddedEngine end-to-end: the whole runtime in one process (in-process
-// JM + TM over loopback) driving the shared SQL script runner - the
+// coordinator + worker over loopback) driving the shared SQL script runner - the
 // execution core behind `clink run <file>.sql`. Also covers the
 // script-runner's bare-SELECT-to-print synthesis and the print sink's
 // stdout output (captured at the fd level, since sink subtasks write from

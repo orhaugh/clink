@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# kind-ha-smoke.sh - multi-JobManager HA failover smoke on a kind cluster.
+# kind-ha-smoke.sh - multi-Coordinator HA failover smoke on a kind cluster.
 #
-# Deploys the chart with ha.enabled (N JobManagers sharing an --ha-dir via a
+# Deploys the chart with ha.enabled (N Coordinators sharing an --ha-dir via a
 # hostPath volume - correct on single-node kind), confirms a leader is elected
-# and the TaskManagers register with it, then KILLS the leader and asserts a
-# standby takes over (epoch bump + a different leader pod) and the TMs
+# and the Workers register with it, then KILLS the leader and asserts a
+# standby takes over (epoch bump + a different leader pod) and the workers
 # re-register with the new leader. This exercises clink's file HA coordinator
 # (fcntl lock on the shared dir) across pods.
 #
@@ -14,14 +14,14 @@
 # but needs an etcd-enabled clink_node image (a documented follow-on).
 #
 # Usage: kind-ha-smoke.sh [--cleanup]   Env: CLUSTER NAMESPACE RELEASE IMAGE
-#                                              JM_REPLICAS TM_REPLICAS
+#                                              COORDINATOR_REPLICAS TM_REPLICAS
 set -euo pipefail
 
 CLUSTER="${CLUSTER:-clink-ha-smoke}"
 NAMESPACE="${NAMESPACE:-clink-ha}"
 RELEASE="${RELEASE:-clink}"
 IMAGE="${IMAGE:-clink-runtime:latest}"
-JM_REPLICAS="${JM_REPLICAS:-2}"
+COORDINATOR_REPLICAS="${COORDINATOR_REPLICAS:-2}"
 TM_REPLICAS="${TM_REPLICAS:-2}"
 MOUNT="/var/lib/clink/ha"
 CHART_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +32,7 @@ if [[ "${1:-}" == "--cleanup" ]]; then kind delete cluster --name "${CLUSTER}"; 
 step() { printf '\n=== %s ===\n' "$*"; }
 fail() { printf 'HA SMOKE FAILED: %s\n' "$*" >&2; exit 1; }
 kx() { kubectl --context "${CTX}" -n "${NAMESPACE}" "$@"; }
-leader_json() { kx exec "deploy/${RELEASE}-jobmanager" -- cat "${MOUNT}/active-leader.json" 2>/dev/null || true; }
+leader_json() { kx exec "deploy/${RELEASE}-coordinator" -- cat "${MOUNT}/active-leader.json" 2>/dev/null || true; }
 # Extract a top-level JSON scalar (string or number) by key; portable across
 # BSD (macOS) and GNU sed - no \? extension.
 jget() {
@@ -41,10 +41,10 @@ jget() {
   [[ -n "${v}" ]] || v="$(grep -oE "\"$1\":[0-9]+" <<<"${in}" | head -1 | sed -E 's/^"[^"]*"://')"
   printf '%s' "${v}"
 }
-pod_for_ip() { kx get pods -l app.kubernetes.io/component=jobmanager \
+pod_for_ip() { kx get pods -l app.kubernetes.io/component=coordinator \
   -o jsonpath='{range .items[*]}{.metadata.name} {.status.podIP}{"\n"}{end}' | awk -v ip="$1" '$2==ip{print $1}'; }
-# registered TM count as seen by a specific JM pod (the leader)
-registered_on() { kx exec "$1" -- curl -fsS "http://127.0.0.1:8081/api/v1/tms" 2>/dev/null | grep -o '"tm_id"' | wc -l | tr -d ' '; }
+# registered worker count as seen by a specific coordinator pod (the leader)
+registered_on() { kx exec "$1" -- curl -fsS "http://127.0.0.1:8081/api/v1/workers" 2>/dev/null | grep -o '"worker_id"' | wc -l | tr -d ' '; }
 
 step "preflight"
 for t in docker kind kubectl helm; do command -v "$t" >/dev/null || fail "$t not found"; done
@@ -55,19 +55,19 @@ kind get clusters 2>/dev/null | grep -qx "${CLUSTER}" || kind create cluster --n
 kubectl --context "${CTX}" wait --for=condition=Ready node --all --timeout=120s
 kind load docker-image "${IMAGE}" --name "${CLUSTER}"
 
-step "helm install (HA: ${JM_REPLICAS} JobManagers, shared hostPath --ha-dir)"
+step "helm install (HA: ${COORDINATOR_REPLICAS} Coordinators, shared hostPath --ha-dir)"
 helm --kube-context "${CTX}" upgrade --install "${RELEASE}" "${CHART_DIR}" \
   --namespace "${NAMESPACE}" --create-namespace \
   --set image.repository="${IMAGE%%:*}" --set image.tag="${IMAGE##*:}" \
-  --set ha.enabled=true --set ha.storage.type=hostPath --set ha.replicas="${JM_REPLICAS}" \
-  --set taskmanager.replicas="${TM_REPLICAS}" --set taskmanager.slots=2 \
+  --set ha.enabled=true --set ha.storage.type=hostPath --set ha.replicas="${COORDINATOR_REPLICAS}" \
+  --set worker.replicas="${TM_REPLICAS}" --set worker.slots=2 \
   --wait --timeout 4m
 kx wait --for=condition=Ready pod -l "app.kubernetes.io/instance=${RELEASE}" --timeout=180s
 kx get pods -o wide
 
-step "verify: a leader is elected (${JM_REPLICAS} JM pods, one holds the lock)"
-[[ "$(kx get pods -l app.kubernetes.io/component=jobmanager --no-headers | wc -l | tr -d ' ')" == "${JM_REPLICAS}" ]] \
-  || fail "expected ${JM_REPLICAS} JobManager pods"
+step "verify: a leader is elected (${COORDINATOR_REPLICAS} coordinator pods, one holds the lock)"
+[[ "$(kx get pods -l app.kubernetes.io/component=coordinator --no-headers | wc -l | tr -d ' ')" == "${COORDINATOR_REPLICAS}" ]] \
+  || fail "expected ${COORDINATOR_REPLICAS} Coordinator pods"
 lj=""; for _ in $(seq 1 30); do lj="$(leader_json)"; grep -q '"host"' <<<"${lj}" && break; sleep 2; done
 grep -q '"host"' <<<"${lj}" || fail "no leader elected (active-leader.json never appeared)"
 host1="$(jget host <<<"${lj}")"; epoch1="$(jget epoch <<<"${lj}")"
@@ -75,13 +75,13 @@ leader1="$(pod_for_ip "${host1}")"
 echo "leader: ${leader1} (host=${host1}, epoch=${epoch1})"
 [[ -n "${leader1}" ]] || fail "could not map leader host ${host1} to a pod"
 
-step "verify: TaskManagers registered with the leader"
+step "verify: Workers registered with the leader"
 got=0; for _ in $(seq 1 30); do [[ "$(registered_on "${leader1}")" == "${TM_REPLICAS}" ]] && { got=1; break; }; sleep 2; done
-[[ "${got}" == "1" ]] || fail "TMs did not register with the leader (${leader1})"
-echo "leader ${leader1} sees ${TM_REPLICAS} TMs"
+[[ "${got}" == "1" ]] || fail "workers did not register with the leader (${leader1})"
+echo "leader ${leader1} sees ${TM_REPLICAS} workers"
 
 step "FAILOVER: kill the leader; a standby must take over"
-# The file coordinator's epoch is PER-PROCESS (each JM's first acquisition is
+# The file coordinator's epoch is PER-PROCESS (each coordinator's first acquisition is
 # epoch 1), so the unambiguous takeover signal is the leader HOST moving to a
 # different pod, not a global epoch bump.
 kx delete pod "${leader1}" --wait=false
@@ -95,10 +95,10 @@ done
 leader2="$(pod_for_ip "${h}")"
 echo "new leader: ${leader2:-<recreating>} (host=${h}, epoch=${e}) - took over from ${leader1} (${host1})"
 
-step "verify: TaskManagers re-register with the new leader"
+step "verify: Workers re-register with the new leader"
 got=0; for _ in $(seq 1 45); do [[ "$(registered_on "${leader2}")" == "${TM_REPLICAS}" ]] && { got=1; break; }; sleep 2; done
-[[ "${got}" == "1" ]] || fail "TMs did not re-register with the new leader (${leader2})"
+[[ "${got}" == "1" ]] || fail "workers did not re-register with the new leader (${leader2})"
 
-printf '\nHA SMOKE PASSED: leader %s killed, standby %s took over (leader host %s -> %s), %s TMs re-registered.\n' \
+printf '\nHA SMOKE PASSED: leader %s killed, standby %s took over (leader host %s -> %s), %s workers re-registered.\n' \
   "${host1}" "${h}" "${host1}" "${h}" "${TM_REPLICAS}"
 printf 'Tear down with: %s --cleanup\n' "${BASH_SOURCE[0]}"

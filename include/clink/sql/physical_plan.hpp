@@ -42,7 +42,7 @@ public:
     PhysicalPlanner() = default;
 
     // Compile a bound LogicalPlan (always rooted in a LogicalSink for
-    // INSERT INTO ... SELECT) to a JobGraphSpec the JM can submit.
+    // INSERT INTO ... SELECT) to a JobGraphSpec the coordinator can submit.
     // Throws TranslationError when the plan uses unsupported constructs
     // (multi-column tables, unknown connectors, etc.).
     [[nodiscard]] cluster::JobGraphSpec compile(const LogicalSink& root) const;

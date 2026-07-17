@@ -27,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/job/register_job.hpp"
 #include "clink/operators/source_operator.hpp"
@@ -122,70 +122,70 @@ inline std::string read_string(std::span<const std::byte> b, std::size_t& pos) {
 }
 
 inline clink::Codec<Event> event_codec() {
-    return clink::Codec<Event>{
-        .encode =
-            [](const Event& e) {
-                static const EventBody kEmptyBody;
-                const EventBody& body = e.body ? *e.body : kEmptyBody;
-                const std::string& payload = body.payload;
-                const auto& tags = body.tags;
-                const auto& attrs = body.attributes;
-                std::size_t total = 8 * 3                  // ts, key, value
-                                    + 4 + payload.size()    // payload
-                                    + 4 + 8 * tags.size()   // tags
-                                    + 4;                   // attr count
-                for (const auto& [k, v] : attrs) {
-                    total += 4 + k.size() + 4 + v.size();
-                }
-                std::vector<std::byte> out(total);
-                std::byte* p = out.data();
-                put_i64_le(p, e.ts_ms);
-                put_i64_le(p, e.key);
-                put_i64_le(p, e.value);
-                put_bytes(p, payload);
-                const auto n_tags = static_cast<std::uint32_t>(tags.size());
-                std::memcpy(p, &n_tags, 4);
-                p += 4;
-                std::memcpy(p, tags.data(), n_tags * sizeof(std::int64_t));
-                p += n_tags * sizeof(std::int64_t);
-                const auto n_attrs = static_cast<std::uint32_t>(attrs.size());
-                std::memcpy(p, &n_attrs, 4);
-                p += 4;
-                for (const auto& [k, v] : attrs) {
-                    put_bytes(p, k);
-                    put_bytes(p, v);
-                }
-                return out;
-            },
-        .decode = [](std::span<const std::byte> b) -> std::optional<Event> {
-            if (b.size() < 24) {
-                return std::nullopt;
-            }
-            std::size_t pos = 0;
-            Event e;
-            e.ts_ms = read_i64_le(b, pos);
-            e.key = read_i64_le(b, pos);
-            e.value = read_i64_le(b, pos);
-            // Decode into a fresh EventBody, then hand it to a single
-            // shared_ptr<const EventBody>. One heap object instead of
-            // three, one atomic refcount instead of three on every
-            // copy/destroy.
-            auto body = std::make_shared<EventBody>();
-            body->payload = read_string(b, pos);
-            const auto n_tags = read_u32_le(b, pos);
-            body->tags.reserve(n_tags);
-            for (std::uint32_t i = 0; i < n_tags; ++i) {
-                body->tags.push_back(read_i64_le(b, pos));
-            }
-            const auto n_attrs = read_u32_le(b, pos);
-            for (std::uint32_t i = 0; i < n_attrs; ++i) {
-                auto k = read_string(b, pos);
-                auto v = read_string(b, pos);
-                body->attributes.emplace(std::move(k), std::move(v));
-            }
-            e.body = std::move(body);
-            return e;
-        }};
+    return clink::Codec<Event>{.encode =
+                                   [](const Event& e) {
+                                       static const EventBody kEmptyBody;
+                                       const EventBody& body = e.body ? *e.body : kEmptyBody;
+                                       const std::string& payload = body.payload;
+                                       const auto& tags = body.tags;
+                                       const auto& attrs = body.attributes;
+                                       std::size_t total = 8 * 3                  // ts, key, value
+                                                           + 4 + payload.size()   // payload
+                                                           + 4 + 8 * tags.size()  // tags
+                                                           + 4;                   // attr count
+                                       for (const auto& [k, v] : attrs) {
+                                           total += 4 + k.size() + 4 + v.size();
+                                       }
+                                       std::vector<std::byte> out(total);
+                                       std::byte* p = out.data();
+                                       put_i64_le(p, e.ts_ms);
+                                       put_i64_le(p, e.key);
+                                       put_i64_le(p, e.value);
+                                       put_bytes(p, payload);
+                                       const auto n_tags = static_cast<std::uint32_t>(tags.size());
+                                       std::memcpy(p, &n_tags, 4);
+                                       p += 4;
+                                       std::memcpy(p, tags.data(), n_tags * sizeof(std::int64_t));
+                                       p += n_tags * sizeof(std::int64_t);
+                                       const auto n_attrs =
+                                           static_cast<std::uint32_t>(attrs.size());
+                                       std::memcpy(p, &n_attrs, 4);
+                                       p += 4;
+                                       for (const auto& [k, v] : attrs) {
+                                           put_bytes(p, k);
+                                           put_bytes(p, v);
+                                       }
+                                       return out;
+                                   },
+                               .decode = [](std::span<const std::byte> b) -> std::optional<Event> {
+                                   if (b.size() < 24) {
+                                       return std::nullopt;
+                                   }
+                                   std::size_t pos = 0;
+                                   Event e;
+                                   e.ts_ms = read_i64_le(b, pos);
+                                   e.key = read_i64_le(b, pos);
+                                   e.value = read_i64_le(b, pos);
+                                   // Decode into a fresh EventBody, then hand it to a single
+                                   // shared_ptr<const EventBody>. One heap object instead of
+                                   // three, one atomic refcount instead of three on every
+                                   // copy/destroy.
+                                   auto body = std::make_shared<EventBody>();
+                                   body->payload = read_string(b, pos);
+                                   const auto n_tags = read_u32_le(b, pos);
+                                   body->tags.reserve(n_tags);
+                                   for (std::uint32_t i = 0; i < n_tags; ++i) {
+                                       body->tags.push_back(read_i64_le(b, pos));
+                                   }
+                                   const auto n_attrs = read_u32_le(b, pos);
+                                   for (std::uint32_t i = 0; i < n_attrs; ++i) {
+                                       auto k = read_string(b, pos);
+                                       auto v = read_string(b, pos);
+                                       body->attributes.emplace(std::move(k), std::move(v));
+                                   }
+                                   e.body = std::move(body);
+                                   return e;
+                               }};
 }
 
 inline clink::Codec<EventStats> event_stats_codec() {
@@ -198,8 +198,7 @@ inline clink::Codec<EventStats> event_stats_codec() {
     return clink::Codec<EventStats>{
         .encode =
             [write_payload](const EventStats& s) {
-                const std::string& payload =
-                    s.latest_payload ? *s.latest_payload : std::string{};
+                const std::string& payload = s.latest_payload ? *s.latest_payload : std::string{};
                 const std::size_t total = 8 + 8 + 4 + payload.size();
                 std::vector<std::byte> out(total);
                 write_payload(s, out.data());
@@ -216,16 +215,17 @@ inline clink::Codec<EventStats> event_stats_codec() {
             s.latest_payload = std::make_shared<std::string>(read_string(b, pos));
             return s;
         },
-        .encode_into = [write_payload](const EventStats& s, std::vector<std::byte>& out) {
-            // APPEND contract (Codec::encode_into): append to the caller-cleared
-            // buffer so window_entry_codec can compose this after its header.
-            // Zero-alloc after warm-up; the 1.5KB payload memcpy is unavoidable.
-            const std::string& payload = s.latest_payload ? *s.latest_payload : std::string{};
-            const std::size_t total = 8 + 8 + 4 + payload.size();
-            const std::size_t off = out.size();
-            out.resize(off + total);
-            write_payload(s, out.data() + off);
-        }};
+        .encode_into =
+            [write_payload](const EventStats& s, std::vector<std::byte>& out) {
+                // APPEND contract (Codec::encode_into): append to the caller-cleared
+                // buffer so window_entry_codec can compose this after its header.
+                // Zero-alloc after warm-up; the 1.5KB payload memcpy is unavoidable.
+                const std::string& payload = s.latest_payload ? *s.latest_payload : std::string{};
+                const std::size_t total = 8 + 8 + 4 + payload.size();
+                const std::size_t off = out.size();
+                out.resize(off + total);
+                write_payload(s, out.data() + off);
+            }};
 }
 
 // ---------------------------------------------------------------------------
@@ -274,8 +274,7 @@ public:
         // ~8 reallocations × ~128 mean copies = ~1k Record copies
         // per batch we can avoid with one reserve call.
         batch.reserve(static_cast<std::size_t>(end - cursor_));
-        const double step_ms =
-            static_cast<double>(windows_ * 1000) / static_cast<double>(total_);
+        const double step_ms = static_cast<double>(windows_ * 1000) / static_cast<double>(total_);
         for (std::int64_t i = cursor_; i < end; ++i) {
             Event e;
             e.ts_ms = static_cast<std::int64_t>(static_cast<double>(i) * step_ms);
@@ -343,11 +342,11 @@ inline std::int64_t env_i64(const char* name, std::int64_t fallback) {
     return fallback;
 }
 
-inline void define_job(clink::api::StreamExecutionEnvironment& env) {
+inline void define_job(clink::api::Pipeline& env) {
     using namespace std::chrono_literals;
 
     // The .so dlopens with RTLD_LOCAL so its StateBackendFactory
-    // singleton is private; the TM-side install() never reaches it.
+    // singleton is private; the worker-side install() never reaches it.
     // Calling install() here registers "rocksdb" scheme on the .so's
     // own factory so make_subtask_job_config() can build the backend.
     clink::rocksdb::install();
@@ -374,12 +373,9 @@ inline void define_job(clink::api::StreamExecutionEnvironment& env) {
 
     // Register the counting sink as a custom op_type, similarly.
     const std::string sink_op = "bench.counting_sink";
-    env.registry().register_sink<EventStats>(
-        sink_op,
-        [](const clink::plugin::BuildContext& ctx) {
-            return std::make_shared<CountingSink>("clink-subtask-" +
-                                                  std::to_string(ctx.subtask_idx));
-        });
+    env.registry().register_sink<EventStats>(sink_op, [](const clink::plugin::BuildContext& ctx) {
+        return std::make_shared<CountingSink>("clink-subtask-" + std::to_string(ctx.subtask_idx));
+    });
 
     clink::api::SourceDescriptor src_desc;
     src_desc.op_type = source_op;
@@ -409,15 +405,16 @@ inline void define_job(clink::api::StreamExecutionEnvironment& env) {
                 }
                 return next;
             },
-            [](std::int64_t /*key*/,
-               const clink::TimeWindow& /*window*/,
-               const EventStats& s) { return s; })
+            [](std::int64_t /*key*/, const clink::TimeWindow& /*window*/, const EventStats& s) {
+                return s;
+            })
         .sink(sink_desc);
 }
 
 }  // namespace bench
 
-CLINK_REGISTER_JOB("sliding-window-bench-pipeline",
-                   "1.0",
-                   "in-proc synthetic source -> key_by -> sliding 1s/250ms -> aggregate -> counting sink",
-                   bench::define_job);
+CLINK_REGISTER_JOB(
+    "sliding-window-bench-pipeline",
+    "1.0",
+    "in-proc synthetic source -> key_by -> sliding 1s/250ms -> aggregate -> counting sink",
+    bench::define_job);

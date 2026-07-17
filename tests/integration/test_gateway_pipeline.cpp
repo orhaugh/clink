@@ -6,10 +6,10 @@
 // no substitutions.
 //
 // Spawns:
-//   * 1 JM
-//   * 6 TMs (1 fragment source + 1 enrichment source + 2 reassemblers
+//   * 1 coordinator
+//   * 6 workers (1 fragment source + 1 enrichment source + 2 reassemblers
 //     + 2 joins + 2 main sinks + 1 liveness sink = 9 subtasks. Slot
-//     count is 2 per TM by default so 6 TMs cover 12 slots cleanly.)
+//     count is 2 per worker by default so 6 workers cover 12 slots cleanly.)
 //
 // Asserts:
 //   * The main sink files together contain one enriched record per
@@ -125,7 +125,7 @@ TEST(GatewayPipeline, ReassemblyJoinAndLivenessSideOutputCrossWire) {
         GTEST_SKIP() << "gateway_plugin not built";
     }
 
-    const auto jm_port = probe_free_port();
+    const auto coordinator_port = probe_free_port();
     const auto main_sink_path =
         std::filesystem::temp_directory_path() / "clink_gateway_pipeline_main.txt";
     const auto liveness_path =
@@ -211,33 +211,33 @@ TEST(GatewayPipeline, ReassemblyJoinAndLivenessSideOutputCrossWire) {
         graph.ops.push_back(std::move(op));
     }
 
-    const pid_t jm_pid =
-        spawn_node({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, binary);
-    ASSERT_GT(jm_pid, 0);
+    const pid_t coordinator_pid = spawn_node(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
-    // 1 + 1 + 2 + 2 + 2 + 1 = 9 subtasks. The TM default slot count is
-    // 1, so spawn 9 TMs for clean placement.
-    std::vector<pid_t> tms;
+    // 1 + 1 + 2 + 2 + 2 + 1 = 9 subtasks. The worker default slot count is
+    // 1, so spawn 9 workers for clean placement.
+    std::vector<pid_t> workers;
     for (int i = 1; i <= 9; ++i) {
-        tms.push_back(spawn_node({"clink_node",
-                                  "--role=tm",
-                                  "--id=tm-gw-" + std::to_string(i),
-                                  "--jm-host=127.0.0.1",
-                                  "--jm-port=" + std::to_string(jm_port)},
-                                 binary));
-        ASSERT_GT(tms.back(), 0);
+        workers.push_back(spawn_node({"clink_node",
+                                      "--role=worker",
+                                      "--id=worker-gw-" + std::to_string(i),
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(coordinator_port)},
+                                     binary));
+        ASSERT_GT(workers.back(), 0);
     }
     std::this_thread::sleep_for(400ms);
 
-    clink::application::JobSubmitter submitter("127.0.0.1", jm_port);
+    clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
     opts.wait_timeout = std::chrono::seconds(30);
     const auto result = submitter.submit(graph.to_json(), {plugin.string()}, opts);
 
-    kill_quietly(jm_pid);
-    for (auto tm : tms) {
-        kill_quietly(tm);
+    kill_quietly(coordinator_pid);
+    for (auto worker : workers) {
+        kill_quietly(worker);
     }
 
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;

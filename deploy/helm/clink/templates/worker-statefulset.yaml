@@ -1,67 +1,67 @@
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "clink.taskmanager.fullname" . }}
+  name: {{ include "clink.worker.fullname" . }}
   labels:
     {{- include "clink.labels" . | nindent 4 }}
-    app.kubernetes.io/component: taskmanager
+    app.kubernetes.io/component: worker
   {{- with .Values.commonAnnotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  serviceName: {{ include "clink.taskmanager.headless" . }}
-  replicas: {{ .Values.taskmanager.replicas }}
-  # TMs are independent; start/stop them in parallel rather than one ordinal
+  serviceName: {{ include "clink.worker.headless" . }}
+  replicas: {{ .Values.worker.replicas }}
+  # workers are independent; start/stop them in parallel rather than one ordinal
   # at a time.
   podManagementPolicy: Parallel
   selector:
     matchLabels:
-      {{- include "clink.componentSelectorLabels" (dict "root" . "component" "taskmanager") | nindent 6 }}
+      {{- include "clink.componentSelectorLabels" (dict "root" . "component" "worker") | nindent 6 }}
   template:
     metadata:
       labels:
         {{- include "clink.labels" . | nindent 8 }}
-        app.kubernetes.io/component: taskmanager
-      {{- with .Values.taskmanager.podAnnotations }}
+        app.kubernetes.io/component: worker
+      {{- with .Values.worker.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
       serviceAccountName: {{ include "clink.serviceAccountName" . }}
-      terminationGracePeriodSeconds: {{ .Values.taskmanager.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       initContainers:
-        # k8s has no compose-style depends_on; without this gate the TM races
-        # the JobManager's bind, fails connect_to_jm, exits, and crash-loops
-        # until the JM is up. Wait for the JM's health endpoint (the same
+        # k8s has no compose-style depends_on; without this gate the worker races
+        # the Coordinator's bind, fails connect_to_coordinator, exits, and crash-loops
+        # until the coordinator is up. Wait for the coordinator's health endpoint (the same
         # readiness signal compose used) before starting clink_node.
-        - name: wait-for-jobmanager
+        - name: wait-for-coordinator
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             - sh
             - -c
             - |
-              until curl -fsS "http://{{ include "clink.jobmanager.fullname" . }}:{{ .Values.jobmanager.httpPort }}/api/v1/health" >/dev/null 2>&1; do
-                echo "waiting for jobmanager..."
+              until curl -fsS "http://{{ include "clink.coordinator.fullname" . }}:{{ .Values.coordinator.httpPort }}/api/v1/health" >/dev/null 2>&1; do
+                echo "waiting for coordinator..."
                 sleep 2
               done
-              echo "jobmanager is ready"
+              echo "coordinator is ready"
       containers:
-        - name: taskmanager
+        - name: worker
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
-            # Stable ordinal pod name -> stable TM id across restarts.
+            # Stable ordinal pod name -> stable worker id across restarts.
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # The TM advertises its own pod IP for the data plane; reachable
+            # The worker advertises its own pod IP for the data plane; reachable
             # cluster-wide on the flat pod network.
             - name: POD_IP
               valueFrom:
@@ -72,26 +72,26 @@ spec:
             - name: CLINK_DATA_BIND_HOST
               value: "0.0.0.0"
           args:
-            - --role=tm
+            - --role=worker
             - --id=$(POD_NAME)
-            - --jm-host={{ include "clink.jobmanager.fullname" . }}
-            - --jm-port={{ .Values.jobmanager.controlPort }}
+            - --coordinator-host={{ include "clink.coordinator.fullname" . }}
+            - --coordinator-port={{ .Values.coordinator.controlPort }}
             - --data-host=$(POD_IP)
-            - --slots={{ .Values.taskmanager.slots }}
-            - --http-port={{ .Values.taskmanager.httpPort }}
+            - --slots={{ .Values.worker.slots }}
+            - --http-port={{ .Values.worker.httpPort }}
             - --http-bind=0.0.0.0
             {{- if .Values.ha.enabled }}
-            # In HA the TM discovers the current leader from the shared
-            # active-leader.json (overriding --jm-host) and re-discovers after a
-            # leader change when k8s restarts it on JM disconnect.
+            # In HA the worker discovers the current leader from the shared
+            # active-leader.json (overriding --coordinator-host) and re-discovers after a
+            # leader change when k8s restarts it on coordinator disconnect.
             - --ha-dir={{ .Values.ha.storage.mountPath }}
             {{- end }}
-            {{- with .Values.taskmanager.extraArgs }}
+            {{- with .Values.worker.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           ports:
             - name: http
-              containerPort: {{ .Values.taskmanager.httpPort }}
+              containerPort: {{ .Values.worker.httpPort }}
           readinessProbe:
             httpGet:
               path: /api/v1/health
@@ -108,7 +108,7 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 6
-          {{- with .Values.taskmanager.resources }}
+          {{- with .Values.worker.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -120,15 +120,15 @@ spec:
       volumes:
         {{- include "clink.haVolume" . | nindent 8 }}
       {{- end }}
-      {{- with .Values.taskmanager.nodeSelector }}
+      {{- with .Values.worker.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.taskmanager.affinity }}
+      {{- with .Values.worker.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.taskmanager.tolerations }}
+      {{- with .Values.worker.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}

@@ -116,7 +116,7 @@ typedef struct clink_engine_options {
  * CLINK_EMBED_ABI_VERSION before using anything else. */
 CLINK_EMBED_API int32_t clink_abi_version(void);
 
-/* Start an engine (in-process JobManager + TaskManager). NULL `options`
+/* Start an engine (in-process Coordinator + Worker). NULL `options`
  * uses defaults. Returns NULL on failure; see clink_open_error(). */
 CLINK_EMBED_API clink_engine* clink_engine_open(const clink_engine_options* options);
 

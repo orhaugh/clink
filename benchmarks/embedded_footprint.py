@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Measure embedded clink first-row latency and memory footprint.
 
-`clink run -e "<sql>"` starts the whole engine in-process (JobManager +
-TaskManager, no daemons), compiles and submits the job, and a bare SELECT
+`clink run -e "<sql>"` starts the whole engine in-process (Coordinator +
+Worker, no daemons), compiles and submits the job, and a bare SELECT
 prints its result rows to stdout. This harness times the path from process
 start to the FIRST result row, and measures peak resident memory at a tiny and
 a large input so the per-in-flight-record cost can be estimated.

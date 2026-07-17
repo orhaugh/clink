@@ -1,7 +1,7 @@
 // Fluent builders for clink's built-in (core, no external deps)
 // connector factories. Each builder is a thin typed wrapper around the
 // registered factory name + param map; .build() returns a Source/Sink
-// descriptor the StreamExecutionEnvironment knows how to insert into
+// descriptor the Pipeline knows how to insert into
 // the graph.
 //
 // Vendor-specific builders (Kafka, Postgres, ClickHouse, S3) moved into

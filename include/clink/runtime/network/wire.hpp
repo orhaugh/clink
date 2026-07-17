@@ -100,7 +100,7 @@ enum class Kind : std::uint8_t {
     // operators consume it to know a fresh stream is incoming from
     // the new subtask set. The actual rescale choreography (when to
     // emit drain, when to shut the upstream down) is owned by the
-    // JM's RescaleCoordinator; this kind is the wire bit.
+    // coordinator's RescaleCoordinator; this kind is the wire bit.
     Drain = 8,
 };
 

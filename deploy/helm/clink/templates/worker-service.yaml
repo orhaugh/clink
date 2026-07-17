@@ -1,10 +1,10 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "clink.taskmanager.headless" . }}
+  name: {{ include "clink.worker.headless" . }}
   labels:
     {{- include "clink.labels" . | nindent 4 }}
-    app.kubernetes.io/component: taskmanager
+    app.kubernetes.io/component: worker
   {{- with .Values.commonAnnotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -12,15 +12,15 @@ metadata:
 spec:
   # Headless: backs the StatefulSet (stable per-pod DNS) and carries no
   # cluster IP. Data-plane traffic flows pod-to-pod on the flat pod network
-  # (TMs advertise their own pod IP via --data-host), so no data port is
+  # (workers advertise their own pod IP via --data-host), so no data port is
   # published here. publishNotReadyAddresses so a pod's DNS resolves while it
   # is still registering.
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
-    {{- include "clink.componentSelectorLabels" (dict "root" . "component" "taskmanager") | nindent 4 }}
+    {{- include "clink.componentSelectorLabels" (dict "root" . "component" "worker") | nindent 4 }}
   ports:
     - name: http
-      port: {{ .Values.taskmanager.httpPort }}
+      port: {{ .Values.worker.httpPort }}
       targetPort: http
       protocol: TCP

@@ -53,7 +53,7 @@ struct TableDef {
     // 'exactly_once' enables a 2PC-aware sink op: the planner routes
     // to a transactional variant (file_2pc_sink_row,
     // kafka_2pc_sink_string, ...) and the runtime stages records per
-    // checkpoint barrier + commits when the JM marks the checkpoint
+    // checkpoint barrier + commits when the coordinator marks the checkpoint
     // globally durable.
     [[nodiscard]] std::string delivery_guarantee() const {
         auto it = properties.find("delivery_guarantee");
@@ -264,7 +264,7 @@ public:
     // register_model overloads reject a collision with an existing table, and
     // register_table is unaffected). Models persist to a `models/` subdir of the
     // catalog dir (kept separate from the flat table files), so a CREATE MODEL
-    // survives a JobManager restart / HA takeover the same way a table does, and a
+    // survives a Coordinator restart / HA takeover the same way a table does, and a
     // job that re-plans against the catalog (a scheduled REFRESH, a client re-submit)
     // still resolves the model.
     void register_model(ModelDef def);

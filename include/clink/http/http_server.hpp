@@ -7,7 +7,7 @@
 // include site.
 //
 // Lifetime: owned by whoever spawned it (typically clink_node's
-// run_jm / run_tm). Construct, register routes, call start(host, port).
+// run_coordinator / run_worker). Construct, register routes, call start(host, port).
 // The server spawns its own thread pool; start() returns immediately.
 // stop() is idempotent and joins the listener thread before returning.
 //

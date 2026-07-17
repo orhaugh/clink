@@ -3551,7 +3551,7 @@ public:
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (element.is_data()) {
             // Batch-granularity serving lock: external queryable-state
-            // lookups read the live buckets from the TM's HTTP thread.
+            // lookups read the live buckets from the worker's HTTP thread.
             // Uncontended in the steady state, so the fold path pays one
             // lock per batch, not per record.
             std::lock_guard serving_lock(serving_mu_);
@@ -3837,7 +3837,7 @@ public:
         // (the serving surface - see queryable_state/). In-memory path only;
         // the closure reads state_ under serving_mu_, which the processing
         // paths hold at batch granularity. The slot address is the exact
-        // (deployment role, global subtask, "agg") triple the JM routes
+        // (deployment role, global subtask, "agg") triple the coordinator routes
         // clients to, and the served value is the FINALISED output row for
         // the key - what a downstream consumer would see - not the raw
         // accumulators. Keys are the operator's composite group-key string
@@ -7331,7 +7331,7 @@ private:
 };
 
 // connector='queryable_state': state-as-table. A bounded source that
-// snapshots another job's live queryable state through the JM's JSON scan
+// snapshots another job's live queryable state through the coordinator's JSON scan
 // route and emits one Row per entry (the served value document's fields
 // become the row's columns). A SELECT or join over it reads the CURRENT
 // aggregate values with no sink round-trip: one job's state is another
@@ -7339,15 +7339,15 @@ private:
 // bounded read of a moving target, consistent per subtask scan.
 class QueryableStateSource final : public Source<Row> {
 public:
-    QueryableStateSource(std::string jm_host,
-                         std::uint16_t jm_port,
+    QueryableStateSource(std::string coordinator_host,
+                         std::uint16_t coordinator_port,
                          std::string job_id,
                          std::string role,
                          std::string slot,
                          std::size_t limit,
                          std::size_t batch_size)
-        : jm_host_(std::move(jm_host)),
-          jm_port_(jm_port),
+        : coordinator_host_(std::move(coordinator_host)),
+          coordinator_port_(coordinator_port),
           job_id_(std::move(job_id)),
           role_(std::move(role)),
           slot_(std::move(slot)),
@@ -7361,15 +7361,16 @@ public:
             return false;
         }
         done_ = true;
-        clink::http::HttpClient client(jm_host_, jm_port_);
+        clink::http::HttpClient client(coordinator_host_, coordinator_port_);
         if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr && *tok != '\0') {
             client.set_bearer_token(tok);
         }
         auto resp = client.get("/api/v1/queryable_state/job/" + job_id_ + "/op/" + role_ +
                                "/json/" + slot_ + "/scan?limit=" + std::to_string(limit_));
         if (resp.status != 200) {
-            throw std::runtime_error("queryable_state source: JM scan for job " + job_id_ + " op " +
-                                     role_ + " returned status " + std::to_string(resp.status) +
+            throw std::runtime_error("queryable_state source: coordinator scan for job " + job_id_ +
+                                     " op " + role_ + " returned status " +
+                                     std::to_string(resp.status) +
                                      (resp.body.empty() ? std::string{} : (": " + resp.body)));
         }
         auto js = clink::config::parse(resp.body);
@@ -7398,8 +7399,8 @@ public:
     }
 
 private:
-    std::string jm_host_;
-    std::uint16_t jm_port_;
+    std::string coordinator_host_;
+    std::uint16_t coordinator_port_;
     std::string job_id_;
     std::string role_;
     std::string slot_;
@@ -7420,7 +7421,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     // synthetic table whose columns are the named parameters, compiles once
     // to the json_value_expr program, and registers as an ordinary scalar
     // function. The definition text IS the implementation, so it ships to
-    // TaskManagers verbatim (no packager) and reloads from the catalog.
+    // Workers verbatim (no packager) and reloads from the catalog.
     UdfLanguageRegistry::global().register_language(
         "sql", [](const UdfLanguageRegistry::FunctionDecl& decl) {
             if (decl.is_aggregate) {
@@ -7478,7 +7479,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         });
 
     // ---- Channel type ----
-    // The Row wire batcher preserves columnar data across TM boundaries: a
+    // The Row wire batcher preserves columnar data across worker boundaries: a
     // columnar Batch<Row> ships its typed Arrow RecordBatch verbatim and is
     // received as a columnar batch, so the post-shuffle operator chain keeps
     // riding the columnar fast path; row-form batches fall back to the
@@ -7504,21 +7505,22 @@ void install(clink::plugin::PluginRegistry& reg) {
     // ---- Sources ----
 
     // queryable_state_row_source: state-as-table (see QueryableStateSource).
-    //   jm_port (required): the JobManager's HTTP port
+    //   coordinator_port (required): the Coordinator's HTTP port
     //   job_id (required): the job whose state to read
-    //   jm_host (default 127.0.0.1), role (default the generic subtask
+    //   coordinator_host (default 127.0.0.1), role (default the generic subtask
     //   role), slot (default 'agg'), limit (default 100000, the route cap),
     //   batch_size (default 256)
     reg.register_source<Row>(
         "queryable_state_row_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<Row>> {
-            auto jm_host = ctx.param_or("jm_host");
-            if (jm_host.empty()) {
-                jm_host = "127.0.0.1";
+            auto coordinator_host = ctx.param_or("coordinator_host");
+            if (coordinator_host.empty()) {
+                coordinator_host = "127.0.0.1";
             }
-            const auto jm_port = ctx.param_int64_or("jm_port", 0);
-            if (jm_port <= 0 || jm_port > 65535) {
+            const auto coordinator_port = ctx.param_int64_or("coordinator_port", 0);
+            if (coordinator_port <= 0 || coordinator_port > 65535) {
                 throw std::runtime_error(
-                    "queryable_state source: 'jm_port' param is required (the JobManager's "
+                    "queryable_state source: 'coordinator_port' param is required (the "
+                    "Coordinator's "
                     "HTTP port)");
             }
             auto job_id = ctx.param_or("job_id");
@@ -7535,13 +7537,14 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             const auto limit = ctx.param_int64_or("limit", 100'000);
             const auto batch_size = ctx.param_int64_or("batch_size", 256);
-            return std::make_shared<QueryableStateSource>(std::move(jm_host),
-                                                          static_cast<std::uint16_t>(jm_port),
-                                                          std::move(job_id),
-                                                          std::move(role),
-                                                          std::move(slot),
-                                                          static_cast<std::size_t>(limit),
-                                                          static_cast<std::size_t>(batch_size));
+            return std::make_shared<QueryableStateSource>(
+                std::move(coordinator_host),
+                static_cast<std::uint16_t>(coordinator_port),
+                std::move(job_id),
+                std::move(role),
+                std::move(slot),
+                static_cast<std::size_t>(limit),
+                static_cast<std::size_t>(batch_size));
         });
 
     // file_json_source: read NDJSON, emit one Row per line. When `path` names a
@@ -7630,7 +7633,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     // channel. Wraps the general-purpose FileSink2PC<T> with the
     // row_json text format. Activated by mode='exactly_once' (Phase
     // 23). Records are staged per-checkpoint and atomically renamed
-    // into a committed/ subdirectory once the JM confirms the
+    // into a committed/ subdirectory once the coordinator confirms the
     // checkpoint is globally durable. Params:
     //   dir (required) - output directory; both staging/ and
     //                    committed/ subdirectories are created here.
@@ -7646,7 +7649,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                     parse_decimal_columns(ctx.param_or("decimal_columns"))),
                 ctx.subtask_idx,
                 "file_2pc_sink_row");
-            // Declare commit-group membership so the JM can
+            // Declare commit-group membership so the coordinator can
             // gate this sink's CommitCheckpoint on its group peers.
             if (auto cg = ctx.param_or("commit_group", ""); !cg.empty()) {
                 sink->set_commit_group(cg);

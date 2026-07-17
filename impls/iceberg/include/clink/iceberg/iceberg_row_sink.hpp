@@ -14,7 +14,7 @@
 // globally durable - on_commit; the commit is idempotent, tagged with a clink.checkpoint-id
 // snapshot summary property, so a redelivered commit or recovery replay never
 // double-commits). Append-only, SINGLE-WRITER (only subtask 0 active). Falls back to
-// AT-LEAST-ONCE in standalone use (no state backend / no JM): the barrier commits
+// AT-LEAST-ONCE in standalone use (no state backend / no coordinator): the barrier commits
 // immediately. IDENTITY partitioning is supported (partition_by, on INT/LONG/BOOL/STRING
 // columns); one data file per (partition, interval) - a HIGH-CARDINALITY partition column
 // means many open writers + small files per interval, so prefer bounded-cardinality keys

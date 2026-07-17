@@ -1,7 +1,7 @@
-// LocalSubmitter - drives a fluent `StreamExecutionEnvironment` topology
-// to completion in-process, without JobManager + TaskManager + network
+// LocalSubmitter - drives a fluent `Pipeline` topology
+// to completion in-process, without Coordinator + Worker + network
 // bridges. The cluster path
-// (`StreamExecutionEnvironment::execute(job_name, JobSubmitter)`) is the
+// (`Pipeline::execute(job_name, JobSubmitter)`) is the
 // production interface; this is its peer for tests, examples, and tight
 // dev loops.
 //
@@ -43,7 +43,7 @@
 #include "clink/runtime/job_config.hpp"
 
 namespace clink::api {
-class StreamExecutionEnvironment;
+class Pipeline;
 }
 
 namespace clink::cluster {
@@ -64,8 +64,8 @@ public:
     //     underlying LocalExecutor. Required when the topology uses
     //     keyed state (`RuntimeContext::keyed_state`), which throws
     //     without a configured `state_backend`.
-    static void submit(api::StreamExecutionEnvironment& env);
-    static void submit(api::StreamExecutionEnvironment& env, JobConfig config);
+    static void submit(api::Pipeline& env);
+    static void submit(api::Pipeline& env, JobConfig config);
 };
 
 }  // namespace clink::cluster

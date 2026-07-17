@@ -2,10 +2,18 @@
 
 ## v0.1.0 (July 2026)
 
-Initial public release: the engine as described in the README. In brief:
+Initial public release: the engine as described in the README.
+
+Naming, settled for 1.0: the cluster roles are the **coordinator** (control
+plane) and **workers** (subtask hosts), `clink_node --role=coordinator|worker`;
+the fluent API entry point is `clink::api::Pipeline`; the in-process test
+cluster is `clink::test::TestCluster`. Domain vocabulary (watermarks, windows,
+checkpoints, savepoints, keyed state, key groups, slots) is unchanged.
+
+In brief:
 
 - Typed operator DAG and fluent API on a local runtime and a distributed
-  JobManager/TaskManager runtime (TLS/mTLS, HA, HTTP API + dashboard).
+  Coordinator/Worker runtime (TLS/mTLS, HA, HTTP API + dashboard).
 - Event time end to end: watermarks, tumbling/sliding/session windows,
   interval joins, CEP.
 - Keyed and broadcast state over in-memory, file-backed, RocksDB, and

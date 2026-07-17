@@ -26,7 +26,7 @@
 #include <arrow/ipc/api.h>
 
 #include "clink/config/json.hpp"
-#include "clink/queryable_state/jm_routes.hpp"
+#include "clink/queryable_state/coordinator_routes.hpp"
 #include "clink/queryable_state/registry.hpp"
 #include "clink/queryable_state/server.hpp"
 
@@ -180,7 +180,7 @@ inline std::optional<std::string> arrow_ipc_from_scan(
     return (*buf_r)->ToString();
 }
 
-// TM-side Arrow scan route (subtask-scoped):
+// worker-side Arrow scan route (subtask-scoped):
 //   GET .../op/:role/subtask/:n/json/:slot/scan.arrow?limit=N
 // Body = one Arrow IPC stream of the scan (schema above); truncation is
 // signalled via the X-Clink-Truncated header since the body is binary.
@@ -240,14 +240,15 @@ inline void register_arrow_scan_route(http::HttpServer& server, Registry& regist
                });
 }
 
-// JM-side Arrow scan route - the bulk state-as-DataFrame read:
+// coordinator-side Arrow scan route - the bulk state-as-DataFrame read:
 //   GET .../job/:job_id/op/:role/json/:slot/scan.arrow?limit=N
 // Fans out across the role's subtasks (the same merge the JSON scan
 // uses) and returns ONE Arrow IPC stream, directly readable by pyarrow /
 // polars / duckdb from the HTTP response body.
-inline void register_jm_arrow_scan_route(http::HttpServer& server, cluster::JobManager& jm) {
+inline void register_coordinator_arrow_scan_route(http::HttpServer& server,
+                                                  cluster::Coordinator& coordinator) {
     server.get("/api/v1/queryable_state/job/:job_id/op/:role/json/:slot/scan.arrow",
-               [&jm](const http::HttpRequest& req) -> http::HttpResponse {
+               [&coordinator](const http::HttpRequest& req) -> http::HttpResponse {
                    http::HttpResponse resp;
                    auto job_it = req.path_params.find("job_id");
                    auto role_it = req.path_params.find("role");
@@ -277,12 +278,12 @@ inline void register_jm_arrow_scan_route(http::HttpServer& server, cluster::JobM
                        }
                    }
                    limit = std::min<std::size_t>(limit, 100'000);
-                   const auto scan =
-                       detail::fan_out_scan(jm, job, role_it->second, slot_it->second, limit);
+                   const auto scan = detail::fan_out_scan(
+                       coordinator, job, role_it->second, slot_it->second, limit);
                    if (!scan.any_target) {
                        resp.status = 404;
                        resp.body =
-                           "{\"error\":\"job or role not found (or no hosting TM "
+                           "{\"error\":\"job or role not found (or no hosting worker "
                            "exposes HTTP)\"}";
                        return resp;
                    }

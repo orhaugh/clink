@@ -8,8 +8,8 @@
 // every compiled job (INSERT INTO ... SELECT, materialized-view
 // maintenance / refresh) to the caller's SubmitFn - the ONLY thing that
 // differs between front doors. The tool's SubmitFn POSTs the spec JSON
-// to a JobManager (or prints it); the embedded engine's SubmitFn calls
-// JobManager::submit_job in-process.
+// to a Coordinator (or prints it); the embedded engine's SubmitFn calls
+// Coordinator::submit_job in-process.
 //
 // Bare top-level SELECT: rejected by default (the historical submit-tool
 // behaviour). With ScriptRunOptions::bare_select_to_print the runner
@@ -67,16 +67,16 @@ int run_script(const std::string& sql,
                const ScriptIO& io,
                const SubmitFn& submit);
 
-// SubmitFn that POSTs the spec JSON to a JobManager's HTTP submit
-// endpoint (/api/v1/jobs/spec), forwarding the JM's response body to
+// SubmitFn that POSTs the spec JSON to a Coordinator's HTTP submit
+// endpoint (/api/v1/jobs/spec), forwarding the coordinator's response body to
 // `out`. `state_backend_uri` (optional) rides as a query param.
-SubmitFn make_http_submit(std::string jm_host,
-                          std::uint16_t jm_port,
+SubmitFn make_http_submit(std::string coordinator_host,
+                          std::uint16_t coordinator_port,
                           std::string state_backend_uri,
                           std::ostream& out,
                           std::ostream& err);
 
-// SubmitFn that prints the spec JSON to `out` (the no-JM inspection mode).
+// SubmitFn that prints the spec JSON to `out` (the no-coordinator inspection mode).
 SubmitFn make_print_submit(std::ostream& out);
 
 }  // namespace clink::sql

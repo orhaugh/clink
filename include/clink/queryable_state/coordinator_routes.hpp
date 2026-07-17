@@ -1,14 +1,14 @@
 #pragma once
 
-// JM-side HTTP route registration for Queryable State multi-TM
-// discovery. Layered on top of the TM-side Registry+server triple
-// (registry.hpp / server.hpp / client.hpp) and the JM's existing
+// coordinator-side HTTP route registration for Queryable State multi-worker
+// discovery. Layered on top of the worker-side Registry+server triple
+// (registry.hpp / server.hpp / client.hpp) and the coordinator's existing
 // per-job placement tracking.
 //
 // Adds two routes to the HttpServer:
 //
-//   GET /api/v1/queryable_state/job/:job_id/tms
-//     -> { "tms": [{ "host": "...", "port": NNN }, ...] }
+//   GET /api/v1/queryable_state/job/:job_id/workers
+//     -> { "workers": [{ "host": "...", "port": NNN }, ...] }
 //
 //   GET /api/v1/queryable_state/job/:job_id/op/:role/route?key=<hex>
 //     -> { "host": "...", "port": NNN, "subtask_idx": N,
@@ -19,25 +19,25 @@
 //   GET /api/v1/queryable_state/job/:job_id/topology_version
 //     -> { "version": V }   (V == 0 means job unknown)
 //
-// The `topology_version` is a per-job counter the JM bumps on every
+// The `topology_version` is a per-job counter the coordinator bumps on every
 // successful (re)deploy. Clients piggyback on it for cache
-// invalidation: a cached `(kg → TmTarget)` entry captured at version
-// V is stale once the JM reports a different V. The topology_version
+// invalidation: a cached `(kg → WorkerTarget)` entry captured at version
+// V is stale once the coordinator reports a different V. The topology_version
 // endpoint is a cheap call clients periodically poll to detect
 // rescales without re-fetching individual routes.
 //
-// The `/tms` list is the set of unique TM HTTP targets hosting any
+// The `/workers` list is the set of unique worker HTTP targets hosting any
 // subtask of the given job at the moment the request was served. Used
 // by ClusterClient for brute-force iteration when key-group-aware
-// routing isn't worth a JM round-trip (small parallelism).
+// routing isn't worth a coordinator round-trip (small parallelism).
 //
-// The `/route` endpoint is the kg-aware fast path. The JM computes
+// The `/route` endpoint is the kg-aware fast path. The coordinator computes
 // key_group_for_key(key_bytes) and returns the single subtask
-// responsible for that group, plus its TM's HTTP target. Used by
+// responsible for that group, plus its worker's HTTP target. Used by
 // `RoutedClient` in cluster_client.hpp.
 //
 // Empty list response (still 200) for: job not found, job has no
-// running subtasks yet, or every hosting TM has dropped HTTP.
+// running subtasks yet, or every hosting worker has dropped HTTP.
 
 #include <algorithm>
 #include <cstdint>
@@ -46,7 +46,7 @@
 #include <utility>
 #include <vector>
 
-#include "clink/cluster/job_manager.hpp"
+#include "clink/cluster/coordinator.hpp"
 #include "clink/config/json.hpp"
 #include "clink/http/http_client.hpp"
 #include "clink/http/http_server.hpp"
@@ -81,17 +81,17 @@ inline std::string json_string(const std::string& s) {
 struct FannedScan {
     std::vector<std::pair<std::string, std::string>> entries;  // key -> value JSON
     bool truncated{false};
-    bool any_target{false};  // the role resolved to at least one HTTP TM
+    bool any_target{false};  // the role resolved to at least one HTTP worker
     bool any_slot{false};    // at least one subtask served the slot
 };
 
-inline FannedScan fan_out_scan(cluster::JobManager& jm,
+inline FannedScan fan_out_scan(cluster::Coordinator& coordinator,
                                cluster::JobId job,
                                const std::string& role,
                                const std::string& slot,
                                std::size_t limit) {
     FannedScan out;
-    const auto targets = jm.subtask_targets_for_role(job, role);
+    const auto targets = coordinator.subtask_targets_for_role(job, role);
     out.any_target = !targets.empty();
     for (const auto& t : targets) {
         if (out.entries.size() >= limit) {
@@ -99,14 +99,14 @@ inline FannedScan fan_out_scan(cluster::JobManager& jm,
             break;
         }
         http::HttpClient client(t.host, t.port);
-        auto tm_resp = client.get("/api/v1/queryable_state/op/" + role + "/subtask/" +
-                                  std::to_string(t.subtask_idx) + "/json/" + slot +
-                                  "/scan?limit=" + std::to_string(limit - out.entries.size()));
-        if (tm_resp.status != 200) {
+        auto worker_resp = client.get("/api/v1/queryable_state/op/" + role + "/subtask/" +
+                                      std::to_string(t.subtask_idx) + "/json/" + slot +
+                                      "/scan?limit=" + std::to_string(limit - out.entries.size()));
+        if (worker_resp.status != 200) {
             continue;  // subtask without the slot (or gone): skip
         }
         try {
-            auto js = clink::config::parse(tm_resp.body);
+            auto js = clink::config::parse(worker_resp.body);
             out.any_slot = true;
             for (const auto& entry : js.at("entries").as_array()) {
                 if (out.entries.size() >= limit) {
@@ -121,7 +121,7 @@ inline FannedScan fan_out_scan(cluster::JobManager& jm,
                 out.truncated = true;
             }
         } catch (...) {
-            continue;  // malformed TM body: skip that subtask
+            continue;  // malformed worker body: skip that subtask
         }
     }
     return out;
@@ -129,9 +129,10 @@ inline FannedScan fan_out_scan(cluster::JobManager& jm,
 
 }  // namespace detail
 
-inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm) {
-    server.get("/api/v1/queryable_state/job/:job_id/tms",
-               [&jm](const http::HttpRequest& req) -> http::HttpResponse {
+inline void register_coordinator_routes(http::HttpServer& server,
+                                        cluster::Coordinator& coordinator) {
+    server.get("/api/v1/queryable_state/job/:job_id/workers",
+               [&coordinator](const http::HttpRequest& req) -> http::HttpResponse {
                    http::HttpResponse resp;
                    auto it = req.path_params.find("job_id");
                    if (it == req.path_params.end()) {
@@ -147,16 +148,16 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
                        resp.body = "{\"error\":\"malformed job_id\"}";
                        return resp;
                    }
-                   const auto tms = jm.tms_hosting_job(job);
-                   std::string body = "{\"tms\":[";
-                   for (std::size_t i = 0; i < tms.size(); ++i) {
+                   const auto workers = coordinator.workers_hosting_job(job);
+                   std::string body = "{\"workers\":[";
+                   for (std::size_t i = 0; i < workers.size(); ++i) {
                        if (i > 0) {
                            body.push_back(',');
                        }
                        body += "{\"host\":";
-                       body += detail::json_string(tms[i].first);
+                       body += detail::json_string(workers[i].first);
                        body += ",\"port\":";
-                       body += std::to_string(tms[i].second);
+                       body += std::to_string(workers[i].second);
                        body += "}";
                    }
                    body += "]}";
@@ -166,7 +167,7 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
 
     server.get(
         "/api/v1/queryable_state/job/:job_id/op/:role/route",
-        [&jm](const http::HttpRequest& req) -> http::HttpResponse {
+        [&coordinator](const http::HttpRequest& req) -> http::HttpResponse {
             http::HttpResponse resp;
             auto job_it = req.path_params.find("job_id");
             auto role_it = req.path_params.find("role");
@@ -195,14 +196,14 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
                 resp.body = "{\"error\":\"malformed key hex\"}";
                 return resp;
             }
-            auto target = jm.route_key_for_job(
+            auto target = coordinator.route_key_for_job(
                 job, role_it->second, std::span<const std::byte>{decoded->data(), decoded->size()});
             if (!target.has_value()) {
                 resp.status = 404;
                 resp.body = "{\"error\":\"no subtask covers key\"}";
                 return resp;
             }
-            const auto version = jm.topology_version(job);
+            const auto version = coordinator.topology_version(job);
             std::string body = "{\"host\":";
             body += detail::json_string(target->host);
             body += ",\"port\":";
@@ -218,17 +219,17 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
 
     // JSON serving route - the one-call lookup a consumer actually uses:
     //   GET /api/v1/queryable_state/job/:job_id/op/:role/json/:slot?key=<string>
-    // The JM fans the lookup out across the role's subtasks (in subtask
+    // The coordinator fans the lookup out across the role's subtasks (in subtask
     // order) and relays the first hit verbatim, so the client needs no
-    // codec, no hex, and no TM discovery. Fan-out is correct at any
+    // codec, no hex, and no worker discovery. Fan-out is correct at any
     // parallelism without reproducing the shuffle's key hashing here; the
-    // key-group fast path (/route + a direct TM call) remains available
+    // key-group fast path (/route + a direct worker call) remains available
     // to latency-sensitive clients. Keys must be URL-safe (percent-encode
     // anything else); the raw query value is forwarded verbatim.
-    //   200 -> the owning TM's body: {"key":"...","value":{...}}
-    //   404 -> job/role unknown, no TM exposes HTTP, or key not found
+    //   200 -> the owning worker's body: {"key":"...","value":{...}}
+    //   404 -> job/role unknown, no worker exposes HTTP, or key not found
     server.get("/api/v1/queryable_state/job/:job_id/op/:role/json/:slot",
-               [&jm](const http::HttpRequest& req) -> http::HttpResponse {
+               [&coordinator](const http::HttpRequest& req) -> http::HttpResponse {
                    http::HttpResponse resp;
                    auto job_it = req.path_params.find("job_id");
                    auto role_it = req.path_params.find("role");
@@ -253,22 +254,22 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
                        resp.body = "{\"error\":\"missing key=<string> query param\"}";
                        return resp;
                    }
-                   const auto targets = jm.subtask_targets_for_role(job, role_it->second);
+                   const auto targets = coordinator.subtask_targets_for_role(job, role_it->second);
                    if (targets.empty()) {
                        resp.status = 404;
                        resp.body =
-                           "{\"error\":\"job or role not found (or no hosting TM "
+                           "{\"error\":\"job or role not found (or no hosting worker "
                            "exposes HTTP)\"}";
                        return resp;
                    }
                    for (const auto& t : targets) {
                        http::HttpClient client(t.host, t.port);
-                       auto tm_resp =
+                       auto worker_resp =
                            client.get("/api/v1/queryable_state/op/" + role_it->second +
                                       "/subtask/" + std::to_string(t.subtask_idx) + "/json/" +
                                       slot_it->second + "?key=" + key_it->second);
-                       if (tm_resp.status == 200) {
-                           resp.body = tm_resp.body;
+                       if (worker_resp.status == 200) {
+                           resp.body = worker_resp.body;
                            return resp;
                        }
                    }
@@ -288,7 +289,7 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
     // when any subtask truncated or the limit cut the fan-out short.
     // The SQL connector='queryable_state' source reads this route.
     server.get("/api/v1/queryable_state/job/:job_id/op/:role/json/:slot/scan",
-               [&jm](const http::HttpRequest& req) -> http::HttpResponse {
+               [&coordinator](const http::HttpRequest& req) -> http::HttpResponse {
                    http::HttpResponse resp;
                    auto job_it = req.path_params.find("job_id");
                    auto role_it = req.path_params.find("role");
@@ -318,12 +319,12 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
                        }
                    }
                    limit = std::min<std::size_t>(limit, 100'000);
-                   const auto scan =
-                       detail::fan_out_scan(jm, job, role_it->second, slot_it->second, limit);
+                   const auto scan = detail::fan_out_scan(
+                       coordinator, job, role_it->second, slot_it->second, limit);
                    if (!scan.any_target) {
                        resp.status = 404;
                        resp.body =
-                           "{\"error\":\"job or role not found (or no hosting TM "
+                           "{\"error\":\"job or role not found (or no hosting worker "
                            "exposes HTTP)\"}";
                        return resp;
                    }
@@ -348,7 +349,7 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
                });
 
     server.get("/api/v1/queryable_state/job/:job_id/topology_version",
-               [&jm](const http::HttpRequest& req) -> http::HttpResponse {
+               [&coordinator](const http::HttpRequest& req) -> http::HttpResponse {
                    http::HttpResponse resp;
                    auto it = req.path_params.find("job_id");
                    if (it == req.path_params.end()) {
@@ -364,7 +365,7 @@ inline void register_jm_routes(http::HttpServer& server, cluster::JobManager& jm
                        resp.body = "{\"error\":\"malformed job_id\"}";
                        return resp;
                    }
-                   const auto version = jm.topology_version(job);
+                   const auto version = coordinator.topology_version(job);
                    resp.body = "{\"version\":" + std::to_string(version) + "}";
                    return resp;
                });

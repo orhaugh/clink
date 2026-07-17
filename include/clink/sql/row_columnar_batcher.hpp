@@ -521,7 +521,7 @@ inline Batch<Row>::MaterializeFn row_materialize_fn() {
 //
 // The Row channel's default wire batcher (make_default_arrow_batcher<Row>) wraps
 // each row's JSON in a single value_bytes:binary column - it MATERIALIZES a
-// columnar batch to rows and re-encodes them as JSON to cross a TM boundary, so
+// columnar batch to rows and re-encodes them as JSON to cross a worker boundary, so
 // columnar never survives a shuffle. This batcher instead keeps columnar data
 // columnar end-to-end:
 //

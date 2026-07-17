@@ -39,23 +39,23 @@ app.kubernetes.io/name: {{ include "clink.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
-{{/* Per-component selector labels (jobmanager / taskmanager). */}}
+{{/* Per-component selector labels (coordinator / worker). */}}
 {{- define "clink.componentSelectorLabels" -}}
 {{ include "clink.selectorLabels" .root }}
 app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
 {{/* Object names. */}}
-{{- define "clink.jobmanager.fullname" -}}
-{{- printf "%s-jobmanager" (include "clink.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- define "clink.coordinator.fullname" -}}
+{{- printf "%s-coordinator" (include "clink.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "clink.taskmanager.fullname" -}}
-{{- printf "%s-taskmanager" (include "clink.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- define "clink.worker.fullname" -}}
+{{- printf "%s-worker" (include "clink.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "clink.taskmanager.headless" -}}
-{{- printf "%s-taskmanager-headless" (include "clink.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- define "clink.worker.headless" -}}
+{{- printf "%s-worker-headless" (include "clink.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{/* Shared HA volume (file-coordinator --ha-dir): name, PVC name, volume + mount. */}}

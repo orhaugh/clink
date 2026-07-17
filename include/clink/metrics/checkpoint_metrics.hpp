@@ -3,10 +3,10 @@
 // Checkpointing observability.
 //
 // Coverage:
-//   - checkpoints_triggered_total      : JM-side trigger fires
+//   - checkpoints_triggered_total      : coordinator-side trigger fires
 //   - checkpoints_completed_total      : all-acked completions
 //   - checkpoints_failed_total         : aborted / hit max retries
-//   - checkpoint_duration_ms_sum/count : end-to-end JM trigger -> all
+//   - checkpoint_duration_ms_sum/count : end-to-end coordinator trigger -> all
 //                                        acked, aggregated
 //   - barrier_alignments_total         : per-operator successful
 //                                        alignments (every alive
@@ -29,7 +29,7 @@
 //                                              restore performed at
 //                                              task open().
 //
-// The JM-side counters use the `clink_ckpt_` prefix; the per-operator
+// The coordinator-side counters use the `clink_ckpt_` prefix; the per-operator
 // alignment counters use `clink_op_barrier_*` and are keyed by
 // op_id like the operator data-plane metrics.
 

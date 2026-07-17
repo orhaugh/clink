@@ -1,4 +1,4 @@
-// `clink list` - ` list`. Queries a running JM
+// `clink list` - ` list`. Queries a running coordinator
 // over the control plane and prints one line per job (id, total /
 // completed subtasks, signalled, errors).
 //
@@ -42,7 +42,7 @@ std::string get_arg(int argc, char** argv, std::string_view flag, std::string fa
 }
 
 void usage() {
-    std::cerr << "Usage: clink list --jm-host=<host> --jm-port=<port>\n";
+    std::cerr << "Usage: clink list --coordinator-host=<host> --coordinator-port=<port>\n";
 }
 
 }  // namespace
@@ -53,17 +53,18 @@ int clink_cmd_list(int argc, char** argv) {
         return 0;
     }
 
-    const auto jm_host = get_arg(argc, argv, "jm-host", "127.0.0.1");
-    const auto jm_port_str = get_arg(argc, argv, "jm-port", "6123");
-    const auto jm_port = static_cast<std::uint16_t>(std::stoi(jm_port_str));
+    const auto coordinator_host = get_arg(argc, argv, "coordinator-host", "127.0.0.1");
+    const auto coordinator_port_str = get_arg(argc, argv, "coordinator-port", "6123");
+    const auto coordinator_port = static_cast<std::uint16_t>(std::stoi(coordinator_port_str));
 
-    const int fd = clink::network::NetworkSocket::connect_to(jm_host, jm_port);
+    const int fd = clink::network::NetworkSocket::connect_to(coordinator_host, coordinator_port);
     if (fd < 0) {
-        std::cerr << "clink list: connect_to(" << jm_host << ":" << jm_port << ") failed\n";
+        std::cerr << "clink list: connect_to(" << coordinator_host << ":" << coordinator_port
+                  << ") failed\n";
         return 3;
     }
 
-    // HelloClient first so the JM routes us to the client handler.
+    // HelloClient first so the coordinator routes us to the client handler.
     {
         clink::cluster::HelloClientMsg hello;
         const auto frame =

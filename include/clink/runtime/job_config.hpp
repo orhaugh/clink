@@ -121,15 +121,15 @@ struct JobConfig {
     DeadLetterQueue* dead_letter_queue{nullptr};
 
     // Called by each operator runner after it successfully snapshots its
-    // state in response to a CheckpointBarrier. The cluster's TaskManager
+    // state in response to a CheckpointBarrier. The cluster's Worker
     // populates this with a callback that sends a SubtaskCheckpointed
-    // message back to the JM. Empty for in-process LocalExecutor runs.
+    // message back to the coordinator. Empty for in-process LocalExecutor runs.
     using CheckpointAckFn =
         std::function<void(CheckpointId /*id*/, bool /*ok*/, std::string /*error*/)>;
     CheckpointAckFn on_checkpoint_ack;
 
     // Bounded-source end-of-stream FINAL checkpoint hooks (cluster path). The
-    // TaskManager wires these to request a JM-coordinated final checkpoint at
+    // Worker wires these to request a coordinator-coordinated final checkpoint at
     // EOS and block until it commits, so a bounded job is not marked complete
     // until its post-last-checkpoint tail is durable + recoverable. Empty for
     // in-process runs (the source falls back to its local terminal commit).
@@ -141,7 +141,7 @@ struct JobConfig {
 
     // External cancellation flag. If set, the LocalExecutor's stop
     // predicate ORs with `external_cancel_token->load()` so an outside
-    // signaller (the TaskManager handling a CancelJob message) can ask
+    // signaller (the Worker handling a CancelJob message) can ask
     // the executor to wind down without holding a reference to the
     // executor itself. shared_ptr so the executor's thread captures
     // can outlive the caller's stack frame.
@@ -159,7 +159,7 @@ struct JobConfig {
     // buffer via the state backend).
     bool unaligned_checkpoints{false};
 
-    // Shared drain-target signal. The cluster's TM wires
+    // Shared drain-target signal. The cluster's worker wires
     // BeginRescale dispatch to set this atomic to the rescale's
     // target_parallelism; the source runner in dag.hpp polls it
     // between produce() calls and, when non-zero, emits a

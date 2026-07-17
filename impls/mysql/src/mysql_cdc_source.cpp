@@ -604,17 +604,19 @@ private:
     // Copies the binlog column metadata out of the TABLE_MAP and FREES the event
     // (we decode row images ourselves, so the rpl event need not be retained).
     void cache_table_map_(MARIADB_RPL_EVENT* ev) {
-        const auto& tm = ev->event.table_map;
-        const std::uint64_t id = tm.table_id;
-        std::string db(tm.database.str != nullptr ? tm.database.str : "", tm.database.length);
-        std::string table(tm.table.str != nullptr ? tm.table.str : "", tm.table.length);
-        const std::uint32_t ncols = tm.column_count;
+        const auto& worker = ev->event.table_map;
+        const std::uint64_t id = worker.table_id;
+        std::string db(worker.database.str != nullptr ? worker.database.str : "",
+                       worker.database.length);
+        std::string table(worker.table.str != nullptr ? worker.table.str : "", worker.table.length);
+        const std::uint32_t ncols = worker.column_count;
         std::vector<std::uint8_t> types(
-            reinterpret_cast<const std::uint8_t*>(tm.column_types.str),
-            reinterpret_cast<const std::uint8_t*>(tm.column_types.str) + tm.column_types.length);
+            reinterpret_cast<const std::uint8_t*>(worker.column_types.str),
+            reinterpret_cast<const std::uint8_t*>(worker.column_types.str) +
+                worker.column_types.length);
         std::vector<std::uint8_t> metabytes(
-            reinterpret_cast<const std::uint8_t*>(tm.metadata.str),
-            reinterpret_cast<const std::uint8_t*>(tm.metadata.str) + tm.metadata.length);
+            reinterpret_cast<const std::uint8_t*>(worker.metadata.str),
+            reinterpret_cast<const std::uint8_t*>(worker.metadata.str) + worker.metadata.length);
         mariadb_free_rpl_event(ev);  // done with the event; nothing retained
 
         const std::string key = db + "." + table;

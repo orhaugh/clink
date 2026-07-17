@@ -1,8 +1,8 @@
 // Queryable state as a serving surface, end to end: a plain SQL GROUP BY
-// job on a real JM + TM (loopback, HTTP enabled, mirroring clink_node's
+// job on a real coordinator + worker (loopback, HTTP enabled, mirroring clink_node's
 // wiring) exposes its live aggregate state with ZERO user code. The test
-// discovers the slot via the TM's slot list, then reads a key mid-run
-// through the JM's one-call JSON route (fan-out proxy), and finally
+// discovers the slot via the worker's slot list, then reads a key mid-run
+// through the coordinator's one-call JSON route (fan-out proxy), and finally
 // checks the slot unbinds when the operator closes.
 
 #include <chrono>
@@ -20,15 +20,15 @@
 #include <gtest/gtest.h>
 
 #include "clink/cluster/built_in_factories.hpp"
-#include "clink/cluster/job_manager.hpp"
+#include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/operator_registry.hpp"
-#include "clink/cluster/task_manager.hpp"
+#include "clink/cluster/worker.hpp"
 #include "clink/config/json.hpp"
 #include "clink/http/http_client.hpp"
 #include "clink/http/http_server.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/queryable_state/arrow_scan.hpp"
-#include "clink/queryable_state/jm_routes.hpp"
+#include "clink/queryable_state/coordinator_routes.hpp"
 #include "clink/queryable_state/registry.hpp"
 #include "clink/queryable_state/server.hpp"
 #include "clink/sql/catalog.hpp"
@@ -81,42 +81,43 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
     ASSERT_EQ(clink::sql::run_script(script, catalog, {}, io, capture), 0) << err_s.str();
     ASSERT_EQ(captured.size(), 1u);
 
-    // JM + TM with HTTP, wired exactly as clink_node wires them.
-    clink::cluster::JobManager jm;
-    const auto rpc_port = jm.start();
-    clink::http::HttpServer jm_http;
-    clink::queryable_state::register_jm_routes(jm_http, jm);
-    clink::queryable_state::register_jm_arrow_scan_route(jm_http, jm);
-    const auto jm_http_port = jm_http.start("127.0.0.1", 0);
-    jm.expect_tms({"qs-tm"});
-    clink::http::HttpServer tm_http;
-    clink::queryable_state::register_routes(tm_http, clink::queryable_state::Registry::global());
-    clink::queryable_state::register_arrow_scan_route(tm_http,
+    // coordinator + worker with HTTP, wired exactly as clink_node wires them.
+    clink::cluster::Coordinator coordinator;
+    const auto rpc_port = coordinator.start();
+    clink::http::HttpServer coordinator_http;
+    clink::queryable_state::register_coordinator_routes(coordinator_http, coordinator);
+    clink::queryable_state::register_coordinator_arrow_scan_route(coordinator_http, coordinator);
+    const auto coordinator_http_port = coordinator_http.start("127.0.0.1", 0);
+    coordinator.expect_workers({"qs-worker"});
+    clink::http::HttpServer worker_http;
+    clink::queryable_state::register_routes(worker_http,
+                                            clink::queryable_state::Registry::global());
+    clink::queryable_state::register_arrow_scan_route(worker_http,
                                                       clink::queryable_state::Registry::global());
-    const auto tm_http_port = tm_http.start("127.0.0.1", 0);
-    clink::cluster::TaskManager::Config cfg;
+    const auto worker_http_port = worker_http.start("127.0.0.1", 0);
+    clink::cluster::Worker::Config cfg;
     cfg.slot_count = 8;
-    clink::cluster::TaskManager tm("qs-tm", "127.0.0.1", cfg);
-    tm.set_advertised_http_port(tm_http_port);
-    tm.connect_to_jm("127.0.0.1", rpc_port);
-    ASSERT_TRUE(jm.await_registrations(std::chrono::milliseconds{10'000}));
+    clink::cluster::Worker worker("qs-worker", "127.0.0.1", cfg);
+    worker.set_advertised_http_port(worker_http_port);
+    worker.connect_to_coordinator("127.0.0.1", rpc_port);
+    ASSERT_TRUE(coordinator.await_registrations(std::chrono::milliseconds{10'000}));
 
-    const auto id = jm.submit_job(captured[0],
-                                  clink::cluster::OperatorRegistry::default_instance(),
-                                  {},
-                                  clink::cluster::CheckpointConfig{},
-                                  nullptr);
+    const auto id = coordinator.submit_job(captured[0],
+                                           clink::cluster::OperatorRegistry::default_instance(),
+                                           {},
+                                           clink::cluster::CheckpointConfig{},
+                                           nullptr);
 
-    // Discover the aggregate's slot from the TM's list (role:subtask:agg),
-    // then hit the JM's one-call JSON route with the bare key string.
-    clink::http::HttpClient tm_client("127.0.0.1", tm_http_port);
-    clink::http::HttpClient jm_client("127.0.0.1", jm_http_port);
+    // Discover the aggregate's slot from the worker's list (role:subtask:agg),
+    // then hit the coordinator's one-call JSON route with the bare key string.
+    clink::http::HttpClient worker_client("127.0.0.1", worker_http_port);
+    clink::http::HttpClient coordinator_client("127.0.0.1", coordinator_http_port);
     std::string role;
     std::string served_body;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{20};
     while (std::chrono::steady_clock::now() < deadline) {
         if (role.empty()) {
-            auto list = tm_client.get("/api/v1/queryable_state");
+            auto list = worker_client.get("/api/v1/queryable_state");
             if (list.status == 200) {
                 auto js = clink::config::parse(list.body);
                 for (const auto& s : js.at("json_slots").as_array()) {
@@ -130,8 +131,8 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
             }
         }
         if (!role.empty()) {
-            auto resp = jm_client.get("/api/v1/queryable_state/job/" + std::to_string(id) + "/op/" +
-                                      role + "/json/agg?key=alice");
+            auto resp = coordinator_client.get("/api/v1/queryable_state/job/" + std::to_string(id) +
+                                               "/op/" + role + "/json/agg?key=alice");
             if (resp.status == 200) {
                 served_body = resp.body;
                 break;
@@ -151,14 +152,14 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
     EXPECT_LE(live_total, kAliceRows);
 
     // A key that never existed: 404 through the same route.
-    auto missing = jm_client.get("/api/v1/queryable_state/job/" + std::to_string(id) + "/op/" +
-                                 role + "/json/agg?key=nobody");
+    auto missing = coordinator_client.get("/api/v1/queryable_state/job/" + std::to_string(id) +
+                                          "/op/" + role + "/json/agg?key=nobody");
     EXPECT_EQ(missing.status, 404);
 
     // Scan route: the state-as-table transport. Entries for the live keys
     // come back with the truncation contract honoured.
-    auto scan = jm_client.get("/api/v1/queryable_state/job/" + std::to_string(id) + "/op/" + role +
-                              "/json/agg/scan?limit=10");
+    auto scan = coordinator_client.get("/api/v1/queryable_state/job/" + std::to_string(id) +
+                                       "/op/" + role + "/json/agg/scan?limit=10");
     ASSERT_EQ(scan.status, 200) << scan.body;
     std::size_t live_keys = 0;
     {
@@ -172,8 +173,8 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
     }
     if (live_keys >= 2) {
         // With more keys than the limit, the scan says so.
-        auto lim = jm_client.get("/api/v1/queryable_state/job/" + std::to_string(id) + "/op/" +
-                                 role + "/json/agg/scan?limit=1");
+        auto lim = coordinator_client.get("/api/v1/queryable_state/job/" + std::to_string(id) +
+                                          "/op/" + role + "/json/agg/scan?limit=1");
         ASSERT_EQ(lim.status, 200) << lim.body;
         auto lj = clink::config::parse(lim.body);
         EXPECT_EQ(lj.at("entries").as_array().size(), 1u);
@@ -184,8 +185,9 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
     // plain HTTP - state-as-DataFrame, readable by pyarrow/polars/duckdb
     // straight from the response body, no clink client code, no gRPC.
     {
-        auto arrow_scan = jm_client.get("/api/v1/queryable_state/job/" + std::to_string(id) +
-                                        "/op/" + role + "/json/agg/scan.arrow?limit=10");
+        auto arrow_scan =
+            coordinator_client.get("/api/v1/queryable_state/job/" + std::to_string(id) + "/op/" +
+                                   role + "/json/agg/scan.arrow?limit=10");
         ASSERT_EQ(arrow_scan.status, 200) << arrow_scan.body;
         auto buf = arrow::Buffer::FromString(arrow_scan.body);
         auto reader_r = arrow::ipc::RecordBatchStreamReader::Open(
@@ -219,8 +221,9 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
         };
         const std::string script_b =
             "CREATE TABLE live_totals (usr TEXT, total BIGINT) "
-            "WITH (connector='queryable_state', format='json', jm_host='127.0.0.1', jm_port='" +
-            std::to_string(jm_http_port) + "', job_id='" + std::to_string(id) +
+            "WITH (connector='queryable_state', format='json', coordinator_host='127.0.0.1', "
+            "coordinator_port='" +
+            std::to_string(coordinator_http_port) + "', job_id='" + std::to_string(id) +
             "');"
             "CREATE TABLE snap (usr TEXT, total BIGINT) "
             "WITH (connector='file', format='json', path='" +
@@ -230,13 +233,14 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
         ASSERT_EQ(clink::sql::run_script(script_b, catalog_b, {}, io_b, capture_b), 0)
             << err_b.str();
         ASSERT_EQ(captured_b.size(), 1u);
-        const auto id_b = jm.submit_job(captured_b[0],
-                                        clink::cluster::OperatorRegistry::default_instance(),
-                                        {},
-                                        clink::cluster::CheckpointConfig{},
-                                        nullptr);
-        ASSERT_TRUE(jm.await_job_completion(id_b, std::chrono::milliseconds{20'000}));
-        const auto errors_b = jm.job_errors(id_b);
+        const auto id_b =
+            coordinator.submit_job(captured_b[0],
+                                   clink::cluster::OperatorRegistry::default_instance(),
+                                   {},
+                                   clink::cluster::CheckpointConfig{},
+                                   nullptr);
+        ASSERT_TRUE(coordinator.await_job_completion(id_b, std::chrono::milliseconds{20'000}));
+        const auto errors_b = coordinator.job_errors(id_b);
         EXPECT_TRUE(errors_b.empty()) << errors_b[0];
     }
     {
@@ -257,18 +261,18 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
     }
     fs::remove(b_out);
 
-    ASSERT_TRUE(jm.await_job_completion(id, std::chrono::milliseconds{60'000}));
-    EXPECT_TRUE(jm.job_errors(id).empty());
+    ASSERT_TRUE(coordinator.await_job_completion(id, std::chrono::milliseconds{60'000}));
+    EXPECT_TRUE(coordinator.job_errors(id).empty());
 
     // The operator unbound its slot at close: the registry no longer
-    // serves it (fresh lookups 404 at the TM).
+    // serves it (fresh lookups 404 at the worker).
     const auto composed = role + ":0:agg";
     EXPECT_FALSE(clink::queryable_state::Registry::global().has_json_slot(composed));
 
-    tm.stop();
-    jm.stop();
-    tm_http.stop();
-    jm_http.stop();
+    worker.stop();
+    coordinator.stop();
+    worker_http.stop();
+    coordinator_http.stop();
     fs::remove(in_path);
     fs::remove(out_path);
 }
@@ -276,10 +280,10 @@ TEST(SqlQueryableState, LiveGroupByStateServedOverHttp) {
 #include "clink/queryable_state/live_export.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 
-// Live whole-job state export: while a checkpointing job runs, the JM
+// Live whole-job state export: while a checkpointing job runs, the coordinator
 // route returns ONE canonical Arrow snapshot stream of the job's state
-// backends (fanned across TMs, merged), restorable by the format's
-// reference reader. The TM route serves this TM's share directly.
+// backends (fanned across workers, merged), restorable by the format's
+// reference reader. The worker route serves this worker's share directly.
 TEST(SqlQueryableState, LiveWholeJobStateExportOverHttp) {
     clink::cluster::ensure_built_ins_registered();
     clink::plugin::PluginRegistry reg;
@@ -322,37 +326,37 @@ TEST(SqlQueryableState, LiveWholeJobStateExportOverHttp) {
     ASSERT_EQ(clink::sql::run_script(script, catalog, {}, io, capture), 0) << err_s.str();
     ASSERT_EQ(captured.size(), 1u);
 
-    clink::cluster::JobManager jm;
-    const auto rpc_port = jm.start();
-    clink::http::HttpServer jm_http;
-    clink::queryable_state::register_jm_state_export_route(jm_http, jm);
-    const auto jm_http_port = jm_http.start("127.0.0.1", 0);
-    jm.expect_tms({"qs-export-tm"});
-    clink::cluster::TaskManager::Config cfg;
+    clink::cluster::Coordinator coordinator;
+    const auto rpc_port = coordinator.start();
+    clink::http::HttpServer coordinator_http;
+    clink::queryable_state::register_coordinator_state_export_route(coordinator_http, coordinator);
+    const auto coordinator_http_port = coordinator_http.start("127.0.0.1", 0);
+    coordinator.expect_workers({"qs-export-worker"});
+    clink::cluster::Worker::Config cfg;
     cfg.slot_count = 8;
-    clink::cluster::TaskManager tm("qs-export-tm", "127.0.0.1", cfg);
-    clink::http::HttpServer tm_http;
-    clink::queryable_state::register_tm_state_export_route(tm_http, tm);
-    const auto tm_http_port = tm_http.start("127.0.0.1", 0);
-    tm.set_advertised_http_port(tm_http_port);
-    tm.connect_to_jm("127.0.0.1", rpc_port);
-    ASSERT_TRUE(jm.await_registrations(std::chrono::milliseconds{10'000}));
+    clink::cluster::Worker worker("qs-export-worker", "127.0.0.1", cfg);
+    clink::http::HttpServer worker_http;
+    clink::queryable_state::register_worker_state_export_route(worker_http, worker);
+    const auto worker_http_port = worker_http.start("127.0.0.1", 0);
+    worker.set_advertised_http_port(worker_http_port);
+    worker.connect_to_coordinator("127.0.0.1", rpc_port);
+    ASSERT_TRUE(coordinator.await_registrations(std::chrono::milliseconds{10'000}));
 
     // Checkpointing ON so the job gets a state backend (file://) and the
     // source persists offsets as operator-state at every barrier.
     clink::cluster::CheckpointConfig ckpt;
     ckpt.checkpoint_dir = ckpt_dir.string();
     ckpt.interval_ms = 100;
-    const auto id = jm.submit_job(
+    const auto id = coordinator.submit_job(
         captured[0], clink::cluster::OperatorRegistry::default_instance(), {}, ckpt, nullptr);
 
-    clink::http::HttpClient jm_client("127.0.0.1", jm_http_port);
-    clink::http::HttpClient tm_client("127.0.0.1", tm_http_port);
+    clink::http::HttpClient coordinator_client("127.0.0.1", coordinator_http_port);
+    clink::http::HttpClient worker_client("127.0.0.1", worker_http_port);
     std::size_t live_entries = 0;
     std::string live_body;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
     while (std::chrono::steady_clock::now() < deadline) {
-        auto resp = jm_client.get("/api/v1/state/export/job/" + std::to_string(id));
+        auto resp = coordinator_client.get("/api/v1/state/export/job/" + std::to_string(id));
         if (resp.status == 200 && !resp.body.empty()) {
             clink::Snapshot snap;
             snap.bytes.resize(resp.body.size());
@@ -374,19 +378,19 @@ TEST(SqlQueryableState, LiveWholeJobStateExportOverHttp) {
     ASSERT_GE(live_entries, 1u) << "live export never returned restorable state "
                                 << "(job may have finished before the first checkpoint)";
 
-    // The TM route serves the same share directly.
-    auto tm_resp = tm_client.get("/api/v1/state/export/job/" + std::to_string(id));
-    if (tm_resp.status == 200) {
-        EXPECT_FALSE(tm_resp.body.empty());
+    // The worker route serves the same share directly.
+    auto worker_resp = worker_client.get("/api/v1/state/export/job/" + std::to_string(id));
+    if (worker_resp.status == 200) {
+        EXPECT_FALSE(worker_resp.body.empty());
     }
 
-    ASSERT_TRUE(jm.await_job_completion(id, std::chrono::milliseconds{120'000}));
-    EXPECT_TRUE(jm.job_errors(id).empty());
+    ASSERT_TRUE(coordinator.await_job_completion(id, std::chrono::milliseconds{120'000}));
+    EXPECT_TRUE(coordinator.job_errors(id).empty());
 
-    tm.stop();
-    jm.stop();
-    tm_http.stop();
-    jm_http.stop();
+    worker.stop();
+    coordinator.stop();
+    worker_http.stop();
+    coordinator_http.stop();
     fs::remove(in_path);
     fs::remove(out_path);
     fs::remove_all(ckpt_dir);

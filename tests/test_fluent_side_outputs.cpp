@@ -24,7 +24,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/runtime/output_tag.hpp"
 
 using namespace clink;
@@ -45,7 +45,7 @@ const cluster::OperatorSpec& find_op(const cluster::JobGraphSpec& g, const std::
 }  // namespace
 
 TEST(FluentSideOutput, DataStreamSideOutputDeclaresTagAndReturnsTypedHandle) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     OutputTag<std::string> errors{"errors"};
 
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(3).build());
@@ -65,7 +65,7 @@ TEST(FluentSideOutput, DataStreamSideOutputDeclaresTagAndReturnsTypedHandle) {
 }
 
 TEST(FluentSideOutput, DownstreamChainOffSideHandleReferencesIdColonTagInput) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     OutputTag<std::string> bad{"bad"};
 
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(3).build());
@@ -83,7 +83,7 @@ TEST(FluentSideOutput, DownstreamChainOffSideHandleReferencesIdColonTagInput) {
 }
 
 TEST(FluentSideOutput, RepeatedSameTagSameChannelIsIdempotent) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     OutputTag<std::string> tag{"audit"};
 
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(3).build());
@@ -98,7 +98,7 @@ TEST(FluentSideOutput, RepeatedSameTagSameChannelIsIdempotent) {
 }
 
 TEST(FluentSideOutput, SameTagDifferentChannelThrows) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     OutputTag<std::string> tag_str{"x"};
     OutputTag<std::int64_t> tag_int{"x"};  // same id, different element type
 
@@ -110,7 +110,7 @@ TEST(FluentSideOutput, SameTagDifferentChannelThrows) {
 }
 
 TEST(FluentSideOutput, KeyedDataStreamSideOutputDeclares) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     OutputTag<std::string> reject{"reject"};
 
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(3).build());
@@ -127,7 +127,7 @@ TEST(FluentSideOutput, KeyedDataStreamSideOutputDeclares) {
 }
 
 TEST(FluentSideOutput, TumblingWindowLateTagAppearsInSideOutputs) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     OutputTag<std::int64_t> late{"late"};
 
     auto src = env.from_elements<std::int64_t>({1, 2, 3});
@@ -156,7 +156,7 @@ TEST(FluentSideOutput, TumblingWindowLateTagAppearsInSideOutputs) {
 }
 
 TEST(FluentSideOutput, SlidingWindowLateTagAppearsInSideOutputs) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     OutputTag<std::int64_t> late{"sliding_late"};
 
     auto src = env.from_elements<std::int64_t>({1, 2, 3});

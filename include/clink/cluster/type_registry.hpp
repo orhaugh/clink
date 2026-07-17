@@ -29,7 +29,7 @@ namespace clink::cluster {
 // TypeOps is the per-channel-type record stored in TypeRegistry. Each
 // registered channel ("int64", "string", "hello.Greeting", ...) gets
 // one TypeOps whose closures bake in the concrete C++ type T and its
-// Codec<T> at registration time. The generic role on the TM can then
+// Codec<T> at registration time. The generic role on the worker can then
 // build NetworkBridgeSource<T> / NetworkBridgeSink<T> from the channel
 // name alone, without dispatching on a closed enum.
 //
@@ -81,7 +81,7 @@ struct TypeOps {
                                         std::uint32_t /*parallelism*/)>
         make_fork_handles;
 
-    // Chain dispatch (task_manager.cpp length>=2 path): build the
+    // Chain dispatch (worker.cpp length>=2 path): build the
     // chain's input stage from pre-bound NetworkBridgeSource<T>
     // handles. Wraps the resulting StageHandle<T> in std::any so the
     // chain dispatcher can thread it through DagBuilders without
@@ -107,7 +107,7 @@ struct TypeOps {
         attach_chain_main_outputs;
 
     // Source/sink fusion entry points: when the planner has fused a
-    // source/sink into the chain, the TM-side dispatch builds the
+    // source/sink into the chain, the worker-side dispatch builds the
     // typed source/sink via OperatorRegistry and hands the boxed
     // shared_ptr<void> off to these closures. They unbox to the
     // concrete typed Source<T>/Sink<T> and attach to the dag - no
@@ -128,7 +128,7 @@ struct TypeOps {
     // shared_ptr<void> and return {commit, abort} callbacks bound to its
     // notify_checkpoint_complete / notify_checkpoint_aborted (weak-captured, so a
     // late notification after teardown is a safe no-op). The fused-chain
-    // dispatch registers these into the TM's per-subtask committer/aborter
+    // dispatch registers these into the worker's per-subtask committer/aborter
     // buckets, so a source fused into a par-1 chain still gets its broker ack
     // deferred to checkpoint commit - the same wiring the non-fused SubtaskRunner
     // does via register_commit_callbacks.
@@ -139,7 +139,7 @@ struct TypeOps {
     // fused_sink_commit_hooks: the sink counterpart. Recover the typed Sink<T>
     // from the boxed shared_ptr<void> and return {commit, abort} callbacks bound
     // to its on_commit / on_abort (weak-captured). The fused-chain dispatch
-    // registers these into the TM's per-subtask committer/aborter buckets so a
+    // registers these into the worker's per-subtask committer/aborter buckets so a
     // 2PC sink fused into a par-1 chain commits per checkpoint - the same wiring
     // the non-fused SubtaskRunner does via register_commit_callbacks. on_commit /
     // on_abort are idempotent (the dag's terminal path may also fire them), so a
@@ -251,7 +251,7 @@ inline void TypeRegistry::register_typed(const std::string& name,
         return out;
     };
 
-    // Chain dispatch closures (used by task_manager.cpp's length>=2
+    // Chain dispatch closures (used by worker.cpp's length>=2
     // chain path to build a typed Dag without knowing T at compile
     // time). Captures T, codec, batcher, channel-name.
     ops.build_chain_input_stage =
@@ -384,7 +384,7 @@ inline void TypeRegistry::register_typed(const std::string& name,
 
     // Source/sink fusion closures - unbox shared_ptr<void> → typed
     // pointer and attach to the dag. The chain dispatcher in
-    // task_manager.cpp calls these when chain.fused_source /
+    // worker.cpp calls these when chain.fused_source /
     // chain.fused_sink is set.
     ops.add_fused_source_to_dag = [](clink::Dag& dag, std::shared_ptr<void> source) -> std::any {
         auto typed = std::static_pointer_cast<clink::Source<T>>(std::move(source));

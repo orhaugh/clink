@@ -1,12 +1,12 @@
 # Network stack and data exchange
 
-> The transport that carries `StreamElement<T>`s, watermarks, drain markers and checkpoint barriers between operators, in-process over bounded channels and across TaskManagers over a length-prefixed Arrow-IPC TCP wire.
+> The transport that carries `StreamElement<T>`s, watermarks, drain markers and checkpoint barriers between operators, in-process over bounded channels and across Workers over a length-prefixed Arrow-IPC TCP wire.
 
 ## Overview
 
-Every edge in a clink DAG is a channel. Within one process, an operator hands elements to the next operator through a `BoundedChannel<StreamElement<T>>`; across TaskManagers, the same elements are serialised onto a TCP socket and reconstructed on the far side. Both ends present the same interface (push an element, pop an element) so operator code never needs to know whether its peer is local or remote. Backpressure, framing, the Arrow-IPC data format, control frames and multi-input alignment are all handled by this layer, leaving operators to do data work only.
+Every edge in a clink DAG is a channel. Within one process, an operator hands elements to the next operator through a `BoundedChannel<StreamElement<T>>`; across Workers, the same elements are serialised onto a TCP socket and reconstructed on the far side. Both ends present the same interface (push an element, pop an element) so operator code never needs to know whether its peer is local or remote. Backpressure, framing, the Arrow-IPC data format, control frames and multi-input alignment are all handled by this layer, leaving operators to do data work only.
 
-The same logical channel can also short-circuit: when sender and receiver are colocated on one TaskManager, the cross-TM path is bypassed entirely and elements are pushed straight into the receiver's queue with no serialisation, no TCP loopback and no Arrow IPC. The socket path remains the fallback for genuinely remote hops.
+The same logical channel can also short-circuit: when sender and receiver are colocated on one Worker, the cross-worker path is bypassed entirely and elements are pushed straight into the receiver's queue with no serialisation, no TCP loopback and no Arrow IPC. The socket path remains the fallback for genuinely remote hops.
 
 ## Where it lives
 
@@ -30,11 +30,11 @@ The same logical channel can also short-circuit: when sender and receiver are co
 
 Closing is one-way. After `close()`, `pop()` drains any remaining queued elements and then returns `std::nullopt`; that terminal `nullopt` is how a downstream operator learns its input has ended. There are non-blocking (`try_push` / `try_pop`) and timed (`pop_for`) variants, and a `high_water_mark()` for diagnostics. If a `push` or `pop` stays blocked past `kStuckWarnInterval` (3 seconds) the channel prints a greppable `BOUNDED_CHANNEL_STUCK` line to stderr with its name, depth, capacity and waiter counts, which is the first thing to look for when diagnosing a backpressure deadlock.
 
-Intra-process operator edges in the DAG are `BoundedChannel<StreamElement<T>>` created by `Dag` (`dag.hpp`) with `default_channel_capacity_`, which defaults to 1024 elements. The cross-TM receive side uses a smaller queue (see below).
+Intra-process operator edges in the DAG are `BoundedChannel<StreamElement<T>>` created by `Dag` (`dag.hpp`) with `default_channel_capacity_`, which defaults to 1024 elements. The cross-worker receive side uses a smaller queue (see below).
 
 ### NetworkBridge over NetworkChannel
 
-For cross-TaskManager edges there are two layers. The outer layer, `NetworkBridgeSink<T>` and `NetworkBridgeSource<T>` (`network_bridge.hpp`), implements the operator `Sink<T>` / `Source<T>` interface so a bridge slots into a DAG like any other operator. The inner layer, `NetworkChannelSink<T>` and `NetworkChannelSource<T>` (`network_channel.hpp`), owns the socket and the wire protocol.
+For cross-Worker edges there are two layers. The outer layer, `NetworkBridgeSink<T>` and `NetworkBridgeSource<T>` (`network_bridge.hpp`), implements the operator `Sink<T>` / `Source<T>` interface so a bridge slots into a DAG like any other operator. The inner layer, `NetworkChannelSink<T>` and `NetworkChannelSource<T>` (`network_channel.hpp`), owns the socket and the wire protocol.
 
 The pairing is single-connection: one sink talks to one source. An `N`-to-`M` shuffle in the distributed runtime is realised as each upstream subtask owning one sink per downstream subtask, with the symmetric story on the receive side.
 
@@ -46,7 +46,7 @@ source side                              sink side
 prepare_listen()  -> bind, listen,
                      register in LocalDataPlane,
                      return bound port
-        (bound port communicated out-of-band, e.g. by the JM)
+        (bound port communicated out-of-band, e.g. by the coordinator)
                                          open() -> connect() to (host, port)
 open() -> accept() (spawns recv thread)
                                          on_data/on_watermark/on_barrier -> push frames
@@ -124,7 +124,7 @@ The receiver bootstraps a fresh connection with one `CreditUpdate(kInitialNetwor
 
 ### The local fast path (LocalDataPlane)
 
-When two subtasks are colocated on one TaskManager, the socket path is pure overhead. `LocalDataPlane` (`local_data_plane.hpp`) is a process-wide registry keyed by `(host, port)`. When a `NetworkChannelSource` calls `listen()`, it also registers its receive queue (`local_channel_`, a `LocalEndpointChannel<T>` which is just a `BoundedChannel<StreamElement<T>>` of capacity `kLocalChannelCapacity = 256`) under the port it bound. When a `NetworkChannelSink` calls `connect()`, it first does a typed `lookup_endpoint<T>` against the registry. On a hit it keeps the queue and routes every `push` directly into it, skipping codec encode, Arrow IPC, the TCP loopback and the decode on the other side; the `BoundedChannel`'s own blocking push provides backpressure in place of credit grants. On a miss it opens the socket.
+When two subtasks are colocated on one Worker, the socket path is pure overhead. `LocalDataPlane` (`local_data_plane.hpp`) is a process-wide registry keyed by `(host, port)`. When a `NetworkChannelSource` calls `listen()`, it also registers its receive queue (`local_channel_`, a `LocalEndpointChannel<T>` which is just a `BoundedChannel<StreamElement<T>>` of capacity `kLocalChannelCapacity = 256`) under the port it bound. When a `NetworkChannelSink` calls `connect()`, it first does a typed `lookup_endpoint<T>` against the registry. On a hit it keeps the queue and routes every `push` directly into it, skipping codec encode, Arrow IPC, the TCP loopback and the decode on the other side; the `BoundedChannel`'s own blocking push provides backpressure in place of credit grants. On a miss it opens the socket.
 
 Both pathways feed the same queue, so `pop()` is uniform regardless of how an element arrived. Lookups are type-checked via a stored `std::type_index`; a type mismatch returns null. The registry can be disabled at runtime via `set_enabled(false)` (or the RAII `ScopedDisableLocalDataPlane`), which tests use to force the cross-process socket path; production leaves it enabled.
 
@@ -161,7 +161,7 @@ In `Unaligned` mode the first delivery forwards the barrier immediately and neve
 
 ### Cluster control plane transport
 
-Operator data and watermarks use the channel/bridge stack above. The cluster control plane (JobManager to TaskManager: deploy, cancel, heartbeat, frame readers) instead uses the `Connection` abstraction (`connection.hpp`), a transport interface with `send_all` / `recv_all` / `shutdown_write` / `shutdown_read` / `close`, implemented over plain TCP (`make_plain_connection`, `connect_plain`) or TLS. This keeps the dozens of control-plane call sites ignorant of whether a given peer is TLS. See [./distributed-runtime.md](./distributed-runtime.md).
+Operator data and watermarks use the channel/bridge stack above. The cluster control plane (Coordinator to Worker: deploy, cancel, heartbeat, frame readers) instead uses the `Connection` abstraction (`connection.hpp`), a transport interface with `send_all` / `recv_all` / `shutdown_write` / `shutdown_read` / `close`, implemented over plain TCP (`make_plain_connection`, `connect_plain`) or TLS. This keeps the dozens of control-plane call sites ignorant of whether a given peer is TLS. See [./distributed-runtime.md](./distributed-runtime.md).
 
 ## Key types and APIs
 

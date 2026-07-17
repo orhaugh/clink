@@ -8,7 +8,7 @@
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/operator_registry.hpp"
-#include "clink/cluster/task_manager.hpp"
+#include "clink/cluster/worker.hpp"
 #include "clink/embed/arrow_pool_pin.hpp"
 #include "clink/embed/collect_hub.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -23,7 +23,7 @@ namespace clink::embed {
 
 namespace {
 
-// The in-process TaskManager materialises compiled chains through the
+// The in-process Worker materialises compiled chains through the
 // process-wide registries, so the built-ins plus the SQL operator set
 // (and the embedded-only collect sink) must be installed before the
 // first submit. Once per process.
@@ -42,7 +42,7 @@ void ensure_factories_installed_once() {
     });
 }
 
-// Distinct TM ids across engine instances (tests run several per process).
+// Distinct worker ids across engine instances (tests run several per process).
 std::atomic<int> g_engine_seq{0};
 
 // A RecordBatchReader over one collect table's queue: ReadNext blocks
@@ -84,16 +84,16 @@ EmbeddedEngine::EmbeddedEngine(EngineOptions opts) : opts_(std::move(opts)) {
     }
     collect_hub_ = std::make_shared<CollectHub>();
     collect_scope_ = CollectScopeRegistry::instance().register_hub(collect_hub_);
-    const std::string tm_id = "embedded-tm-" + std::to_string(g_engine_seq.fetch_add(1));
-    jm_port_ = jm_.start();  // ephemeral loopback port
-    jm_.expect_tms({tm_id});
-    cluster::TaskManager::Config cfg;
+    const std::string worker_id = "embedded-worker-" + std::to_string(g_engine_seq.fetch_add(1));
+    coordinator_port_ = coordinator_.start();  // ephemeral loopback port
+    coordinator_.expect_workers({worker_id});
+    cluster::Worker::Config cfg;
     cfg.slot_count = opts_.slots;
-    tm_ = std::make_unique<cluster::TaskManager>(tm_id, "127.0.0.1", cfg);
-    tm_->connect_to_jm("127.0.0.1", jm_port_);
-    if (!jm_.await_registrations(std::chrono::milliseconds{10'000})) {
+    worker_ = std::make_unique<cluster::Worker>(worker_id, "127.0.0.1", cfg);
+    worker_->connect_to_coordinator("127.0.0.1", coordinator_port_);
+    if (!coordinator_.await_registrations(std::chrono::milliseconds{10'000})) {
         CollectScopeRegistry::instance().unregister(collect_scope_);
-        throw std::runtime_error("EmbeddedEngine: in-process TaskManager failed to register");
+        throw std::runtime_error("EmbeddedEngine: in-process Worker failed to register");
     }
 }
 
@@ -104,10 +104,10 @@ EmbeddedEngine::~EmbeddedEngine() {
     if (collect_hub_) {
         collect_hub_->abort_all();
     }
-    if (tm_) {
-        tm_->stop();
+    if (worker_) {
+        worker_->stop();
     }
-    jm_.stop();
+    coordinator_.stop();
 }
 
 int EmbeddedEngine::submit_spec_(const cluster::JobGraphSpec& spec,
@@ -131,7 +131,7 @@ int EmbeddedEngine::submit_spec_(const cluster::JobGraphSpec& spec,
         }
     }
     try {
-        const auto id = jm_.submit_job(
+        const auto id = coordinator_.submit_job(
             stamped, cluster::OperatorRegistry::default_instance(), {}, std::move(ckpt), nullptr);
         jobs_.push_back(JobEntry{id, name.empty() ? ("job_" + std::to_string(id)) : name});
     } catch (const std::exception& e) {
@@ -213,19 +213,19 @@ std::vector<cluster::JobId> EmbeddedEngine::job_ids() const {
 }
 
 bool EmbeddedEngine::await_job(cluster::JobId id, std::chrono::milliseconds timeout) {
-    return jm_.await_job_completion(id, timeout);
+    return coordinator_.await_job_completion(id, timeout);
 }
 
 void EmbeddedEngine::cancel_job(cluster::JobId id) {
     try {
-        jm_.cancel_job(id);
+        coordinator_.cancel_job(id);
     } catch (const std::exception& e) {
         *opts_.err << "warning: cancel of job " << id << " failed: " << e.what() << "\n";
     }
 }
 
 std::vector<std::string> EmbeddedEngine::job_errors(cluster::JobId id) const {
-    return jm_.job_errors(id);
+    return coordinator_.job_errors(id);
 }
 
 arrow::Result<std::shared_ptr<arrow::RecordBatchReader>> EmbeddedEngine::collect_reader(
@@ -275,7 +275,7 @@ void EmbeddedEngine::cancel_all() {
     user_cancelled_ = true;
     for (const auto& j : jobs_) {
         try {
-            jm_.cancel_job(j.id);
+            coordinator_.cancel_job(j.id);
         } catch (const std::exception& e) {
             *opts_.err << "warning: cancel of job " << j.id << " failed: " << e.what() << "\n";
         }
@@ -298,7 +298,7 @@ bool EmbeddedEngine::await_all(const std::function<bool()>& cancel_requested) {
             cancel_deadline = std::chrono::steady_clock::now() + kDrainCap;
         }
         for (auto it = pending.begin(); it != pending.end();) {
-            if (jm_.await_job_completion(it->id, kSlice)) {
+            if (coordinator_.await_job_completion(it->id, kSlice)) {
                 it = pending.erase(it);
             } else {
                 ++it;
@@ -312,7 +312,7 @@ bool EmbeddedEngine::await_all(const std::function<bool()>& cancel_requested) {
     }
     const bool all_done = pending.empty();
     for (const auto& j : jobs_) {
-        for (const auto& e : jm_.job_errors(j.id)) {
+        for (const auto& e : coordinator_.job_errors(j.id)) {
             errors_.push_back(j.name + ": " + e);
         }
     }

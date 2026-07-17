@@ -83,10 +83,10 @@ The capture side rides the existing in-process `EventBus`
 (`include/clink/runtime/event_bus.hpp`), the same bus that backs the
 `/api/v1/events` SSE stream:
 
-- At submit, `JobManager::submit_job` publishes `jm.job_lineage` with the lineage
+- At submit, `Coordinator::submit_job` publishes `coordinator.job_lineage` with the lineage
   graph (payload `{"job_id":N,"job_name":"...","lineage":{...}}`). Best-effort: a
   job is never failed because of lineage.
-- At termination, the existing `jm.job_completed` event carries the outcome
+- At termination, the existing `coordinator.job_completed` event carries the outcome
   (payload `{"job_id":N,"job_name":"...","status":"...","errors":<count>}`, plus
   an `"error"` string on failure). The `job_name` and `error` keys are additive;
   `errors` stays a count for existing consumers.
@@ -99,7 +99,7 @@ GET /api/v1/jobs/:id/lineage
   -> {"job_id":N,"available":true,"lineage":{"sources":[...],"sinks":[...],"edges":[...]}}
 ```
 
-served by `JobManager::snapshot_job_lineage`, a mirror of `snapshot_job_graph`
+served by `Coordinator::snapshot_job_lineage`, a mirror of `snapshot_job_graph`
 that reads the retained `JobGraphSpec` and runs the extractor. `available` is
 false when the job exists but no graph was retained.
 
@@ -107,8 +107,8 @@ false when the job exists but no graph was retained.
 
 For SQL jobs, lineage also records which source column(s) feed each sink column.
 This is only knowable at SQL compile time (the column mapping lives in the bound
-plan; the JobManager sees only the lowered operator graph), so it is captured in
-the planner and carried on the spec to the JobManager:
+plan; the Coordinator sees only the lowered operator graph), so it is captured in
+the planner and carried on the spec to the Coordinator:
 
 - **Capture** (`src/sql/column_lineage.cpp`, run from `PhysicalPlanner::compile`).
   A recursive tracer walks the bound `LogicalSink` tree. For each sink output
@@ -140,13 +140,13 @@ process, never on the job-plugin `.so` path: a `.so` links its own private
 
 ```mermaid
 flowchart LR
-  submit["submit_job"] -->|"jm.job_lineage"| bus["EventBus (host)"]
-  done["job termination"] -->|"jm.job_completed"| bus
+  submit["submit_job"] -->|"coordinator.job_lineage"| bus["EventBus (host)"]
+  done["job termination"] -->|"coordinator.job_completed"| bus
   bus --> disp["LineageDispatcher"]
   disp -->|"LineageEvent"| ol["OpenLineageExporter"]
   disp -->|"LineageEvent"| custom["your LineageListener"]
   ol -->|"START / COMPLETE run events"| ext["OpenLineage receiver<br/>(Marquez, DataHub, Atlas)"]
-  jm["snapshot_job_lineage"] -->|"GET /api/v1/jobs/:id/lineage"| poll["polling tools"]
+  coordinator["snapshot_job_lineage"] -->|"GET /api/v1/jobs/:id/lineage"| poll["polling tools"]
 ```
 
 - `LineageDispatcher` subscribes to the bus, reconstructs a structured
@@ -178,10 +178,10 @@ submitted unnamed. The name is set per submission path: the `?name=` query (or a
 per-statement name for SQL. The name also rides the retained graph and the HA
 manifest, so it survives a leader takeover.
 
-Enable it on the JobManager:
+Enable it on the Coordinator:
 
 ```
-clink_node --role=jm --http-port=8081 \
+clink_node --role=coordinator --http-port=8081 \
   --lineage-listener=openlineage \
   --lineage-endpoint=http://marquez:5000 \
   --lineage-namespace=prod
@@ -217,6 +217,6 @@ limits:
 | `include/clink/lineage/lineage_listener.hpp`, `src/lineage/lineage_listener.cpp` | `LineageEvent`, `LineageListener`, the registry, and the `LineageDispatcher` EventBus bridge. |
 | `include/clink/lineage/openlineage_exporter.hpp`, `src/lineage/openlineage_exporter.cpp` | The built-in OpenLineage HTTP exporter (run events + `columnLineage` facet). |
 | `include/clink/sql/column_lineage.hpp`, `src/sql/column_lineage.cpp` | The SQL column-lineage tracer (`capture_column_lineage`), run from `PhysicalPlanner::compile`. |
-| `src/cluster/job_manager.cpp` | `snapshot_job_lineage` and the `jm.job_lineage` emit in `submit_job`. |
+| `src/cluster/coordinator.cpp` | `snapshot_job_lineage` and the `coordinator.job_lineage` emit in `submit_job`. |
 | `tools/clink_node.cpp` | The `GET /api/v1/jobs/:id/lineage` route and the dispatcher wiring (`--lineage-*` flags). |
 | `tests/test_lineage.cpp`, `tests/test_column_lineage.cpp` | Unit tests for the model + dispatcher, and the SQL column-lineage tracer. |

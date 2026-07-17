@@ -6,7 +6,7 @@
 //     /api/v1/jobs and can be cancelled via /api/v1/jobs/:id/cancel.
 //
 // Backpressure:
-//   * Once a job is running, the TM's /metrics exposes
+//   * Once a job is running, the worker's /metrics exposes
 //     clink_op_input_depth{op_id} and clink_op_input_capacity{op_id} gauges
 //     (populated by LocalExecutor's metrics-poll thread). We don't
 //     assert specific depths - just that the gauges exist with sane
@@ -185,22 +185,22 @@ bool await_http_ready(std::uint16_t port, std::chrono::milliseconds timeout) {
 }
 
 struct Cluster {
-    pid_t jm_pid{-1};
-    std::uint16_t jm_http_port{0};
-    std::uint16_t jm_control_port{0};
-    std::vector<pid_t> tm_pids;
-    std::vector<std::string> tm_ids;
+    pid_t coordinator_pid{-1};
+    std::uint16_t coordinator_http_port{0};
+    std::uint16_t coordinator_control_port{0};
+    std::vector<pid_t> worker_pids;
+    std::vector<std::string> worker_ids;
 
     Cluster() = default;
     Cluster(const Cluster&) = delete;
     Cluster& operator=(const Cluster&) = delete;
     Cluster(Cluster&& o) noexcept
-        : jm_pid(o.jm_pid),
-          jm_http_port(o.jm_http_port),
-          jm_control_port(o.jm_control_port),
-          tm_pids(std::move(o.tm_pids)),
-          tm_ids(std::move(o.tm_ids)) {
-        o.jm_pid = -1;
+        : coordinator_pid(o.coordinator_pid),
+          coordinator_http_port(o.coordinator_http_port),
+          coordinator_control_port(o.coordinator_control_port),
+          worker_pids(std::move(o.worker_pids)),
+          worker_ids(std::move(o.worker_ids)) {
+        o.coordinator_pid = -1;
     }
     Cluster& operator=(Cluster&& o) noexcept {
         if (this != &o) {
@@ -210,44 +210,45 @@ struct Cluster {
         return *this;
     }
     ~Cluster() {
-        for (auto pid : tm_pids)
+        for (auto pid : worker_pids)
             kill_quietly(pid);
-        kill_quietly(jm_pid);
+        kill_quietly(coordinator_pid);
     }
 };
 
-std::optional<Cluster> start_cluster(int n_tms) {
+std::optional<Cluster> start_cluster(int n_workers) {
     Cluster c;
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node))
         return std::nullopt;
-    c.jm_control_port = probe_free_port();
-    c.jm_http_port = probe_free_port();
-    c.jm_pid = spawn_proc({"clink_node",
-                           "--role=jm",
-                           "--port=" + std::to_string(c.jm_control_port),
-                           "--http-port=" + std::to_string(c.jm_http_port),
-                           "--http-bind=127.0.0.1"},
-                          node);
-    if (c.jm_pid <= 0 || !await_http_ready(c.jm_http_port, 2s))
+    c.coordinator_control_port = probe_free_port();
+    c.coordinator_http_port = probe_free_port();
+    c.coordinator_pid = spawn_proc({"clink_node",
+                                    "--role=coordinator",
+                                    "--port=" + std::to_string(c.coordinator_control_port),
+                                    "--http-port=" + std::to_string(c.coordinator_http_port),
+                                    "--http-bind=127.0.0.1"},
+                                   node);
+    if (c.coordinator_pid <= 0 || !await_http_ready(c.coordinator_http_port, 2s))
         return std::nullopt;
-    for (int i = 1; i <= n_tms; ++i) {
+    for (int i = 1; i <= n_workers; ++i) {
         const auto http_port = probe_free_port();
-        const std::string tm_id = "tm-sub-" + std::to_string(i);
-        const pid_t pid = spawn_proc({"clink_node",
-                                      "--role=tm",
-                                      "--id=" + tm_id,
-                                      "--jm-host=127.0.0.1",
-                                      "--jm-port=" + std::to_string(c.jm_control_port),
-                                      "--http-port=" + std::to_string(http_port),
-                                      "--http-bind=127.0.0.1"},
-                                     node);
+        const std::string worker_id = "worker-sub-" + std::to_string(i);
+        const pid_t pid =
+            spawn_proc({"clink_node",
+                        "--role=worker",
+                        "--id=" + worker_id,
+                        "--coordinator-host=127.0.0.1",
+                        "--coordinator-port=" + std::to_string(c.coordinator_control_port),
+                        "--http-port=" + std::to_string(http_port),
+                        "--http-bind=127.0.0.1"},
+                       node);
         if (pid <= 0 || !await_http_ready(http_port, 2s))
             return std::nullopt;
-        c.tm_pids.push_back(pid);
-        c.tm_ids.push_back(tm_id);
+        c.worker_pids.push_back(pid);
+        c.worker_ids.push_back(worker_id);
     }
-    std::this_thread::sleep_for(400ms);  // TM registration settle
+    std::this_thread::sleep_for(400ms);  // worker registration settle
     return c;
 }
 
@@ -263,7 +264,7 @@ TEST(HttpSubmit, PostJobsAcceptsSoAndReturnsJobId) {
     if (!std::filesystem::exists(job_so)) {
         GTEST_SKIP() << "cancel_test_job.so not built";
     }
-    auto c = start_cluster(/*n_tms=*/2);
+    auto c = start_cluster(/*n_workers=*/2);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
@@ -273,7 +274,7 @@ TEST(HttpSubmit, PostJobsAcceptsSoAndReturnsJobId) {
     ASSERT_GT(bytes.size(), 1024u) << "plugin .so unexpectedly small";
 
     const auto resp = http_post_multipart_file("127.0.0.1",
-                                               c->jm_http_port,
+                                               c->coordinator_http_port,
                                                "/api/v1/jobs",
                                                "job_so",
                                                "cancel_test_job.so",
@@ -286,38 +287,38 @@ TEST(HttpSubmit, PostJobsAcceptsSoAndReturnsJobId) {
 
     // /api/v1/jobs should now list the submitted job.
     std::this_thread::sleep_for(500ms);
-    const auto list = http_get("127.0.0.1", c->jm_http_port, "/api/v1/jobs");
+    const auto list = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs");
     EXPECT_EQ(list.status, 200);
     EXPECT_NE(list.body.find("\"id\":1"), std::string::npos) << "jobs list: " << list.body;
 
-    // Tidy up so the JM doesn't hang waiting for the never-ending job.
-    http_post_empty("127.0.0.1", c->jm_http_port, "/api/v1/jobs/1/cancel");
+    // Tidy up so the coordinator doesn't hang waiting for the never-ending job.
+    http_post_empty("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1/cancel");
 }
 
 TEST(HttpSubmit, PostJobsRejectsRequestWithoutFile) {
-    auto c = start_cluster(/*n_tms=*/1);
+    auto c = start_cluster(/*n_workers=*/1);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    const auto resp = http_post_empty("127.0.0.1", c->jm_http_port, "/api/v1/jobs");
+    const auto resp = http_post_empty("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs");
     EXPECT_EQ(resp.status, 400);
     EXPECT_NE(resp.body.find("job_so"), std::string::npos)
         << "expected job_so mention in error body: " << resp.body;
 }
 
-// The SQL endpoints (compiled into the JM when libclink_sql is linked) are not
+// The SQL endpoints (compiled into the coordinator when libclink_sql is linked) are not
 // present in a SQL-less build; skip the whole group then.
 bool sql_endpoints_present(std::uint16_t http_port) {
     return http_get("127.0.0.1", http_port, "/api/v1/connectors").status == 200;
 }
 
 TEST(HttpSql, ExplainAppliesDdlAndReturnsPlan) {
-    auto c = start_cluster(/*n_tms=*/0);
+    auto c = start_cluster(/*n_workers=*/0);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    if (!sql_endpoints_present(c->jm_http_port)) {
-        GTEST_SKIP() << "JM built without SQL";
+    if (!sql_endpoints_present(c->coordinator_http_port)) {
+        GTEST_SKIP() << "coordinator built without SQL";
     }
     // Two DDL statements register tables in the session catalog; the INSERT
     // explains against them.
@@ -327,14 +328,14 @@ TEST(HttpSql, ExplainAppliesDdlAndReturnsPlan) {
         "CREATE TABLE dst (a BIGINT) WITH (connector='file', format='json', path='/tmp/o.ndjson'); "
         "INSERT INTO dst SELECT a FROM src WHERE b > 10;";
     const auto resp =
-        http_post_body("127.0.0.1", c->jm_http_port, "/api/v1/jobs/sql?mode=explain", sql);
+        http_post_body("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/sql?mode=explain", sql);
     EXPECT_EQ(resp.status, 200) << resp.body;
     EXPECT_NE(resp.body.find("\"ok\":true"), std::string::npos) << resp.body;
     EXPECT_NE(resp.body.find("\"applied\":2"), std::string::npos) << resp.body;
     EXPECT_NE(resp.body.find("Sink"), std::string::npos) << resp.body;
 
     // The DDL persisted into the session catalog, visible via /api/v1/catalog.
-    const auto cat = http_get("127.0.0.1", c->jm_http_port, "/api/v1/catalog");
+    const auto cat = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/catalog");
     EXPECT_EQ(cat.status, 200);
     EXPECT_NE(cat.body.find("\"name\":\"src\""), std::string::npos) << cat.body;
     EXPECT_NE(cat.body.find("\"name\":\"dst\""), std::string::npos) << cat.body;
@@ -342,23 +343,23 @@ TEST(HttpSql, ExplainAppliesDdlAndReturnsPlan) {
 }
 
 TEST(HttpSql, CompileReturnsParallelisedSpec) {
-    auto c = start_cluster(/*n_tms=*/0);
+    auto c = start_cluster(/*n_workers=*/0);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    if (!sql_endpoints_present(c->jm_http_port)) {
-        GTEST_SKIP() << "JM built without SQL";
+    if (!sql_endpoints_present(c->coordinator_http_port)) {
+        GTEST_SKIP() << "coordinator built without SQL";
     }
     // A compatible JSON file source + sink so the physical planner accepts it.
     http_post_body("127.0.0.1",
-                   c->jm_http_port,
+                   c->coordinator_http_port,
                    "/api/v1/jobs/sql?mode=explain",
                    "CREATE TABLE s (a BIGINT, b BIGINT) WITH (connector='file', format='json', "
                    "path='/tmp/i.ndjson'); "
                    "CREATE TABLE d (a BIGINT) WITH (connector='file', format='json', "
                    "path='/tmp/o.ndjson');");
     const auto resp = http_post_body("127.0.0.1",
-                                     c->jm_http_port,
+                                     c->coordinator_http_port,
                                      "/api/v1/jobs/sql?mode=compile&parallelism=3",
                                      "INSERT INTO d SELECT a FROM s WHERE b > 5;");
     EXPECT_EQ(resp.status, 200) << resp.body;
@@ -367,15 +368,15 @@ TEST(HttpSql, CompileReturnsParallelisedSpec) {
 }
 
 TEST(HttpSql, RejectsBadSqlWithPosition) {
-    auto c = start_cluster(/*n_tms=*/0);
+    auto c = start_cluster(/*n_workers=*/0);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    if (!sql_endpoints_present(c->jm_http_port)) {
-        GTEST_SKIP() << "JM built without SQL";
+    if (!sql_endpoints_present(c->coordinator_http_port)) {
+        GTEST_SKIP() << "coordinator built without SQL";
     }
     const auto resp = http_post_body("127.0.0.1",
-                                     c->jm_http_port,
+                                     c->coordinator_http_port,
                                      "/api/v1/jobs/sql?mode=explain",
                                      "INSERT INTO nope SELECT 1;");
     EXPECT_EQ(resp.status, 400) << resp.body;
@@ -384,44 +385,49 @@ TEST(HttpSql, RejectsBadSqlWithPosition) {
 }
 
 TEST(HttpSql, ConnectorsListIncludesKnownNames) {
-    auto c = start_cluster(/*n_tms=*/0);
+    auto c = start_cluster(/*n_workers=*/0);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    const auto resp = http_get("127.0.0.1", c->jm_http_port, "/api/v1/connectors");
+    const auto resp = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/connectors");
     if (resp.status != 200) {
-        GTEST_SKIP() << "JM built without SQL";
+        GTEST_SKIP() << "coordinator built without SQL";
     }
     EXPECT_NE(resp.body.find("\"name\":\"kafka\""), std::string::npos) << resp.body;
     EXPECT_NE(resp.body.find("\"name\":\"parquet\""), std::string::npos) << resp.body;
     EXPECT_NE(resp.body.find("\"category\":\"messaging\""), std::string::npos) << resp.body;
 }
 
-TEST(HttpBackpressure, TmMetricsExposeOperatorInputGauges) {
+TEST(HttpBackpressure, WorkerMetricsExposeOperatorInputGauges) {
     const auto job_so = cancel_test_job_path();
     if (!std::filesystem::exists(job_so)) {
         GTEST_SKIP() << "cancel_test_job.so not built";
     }
-    auto c = start_cluster(/*n_tms=*/2);
+    auto c = start_cluster(/*n_workers=*/2);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
     ::setenv("CLINK_CANCEL_TICK_MS", "20", 1);
 
     const auto bytes = read_file_bytes(job_so);
-    const auto submit = http_post_multipart_file(
-        "127.0.0.1", c->jm_http_port, "/api/v1/jobs", "job_so", "cancel_test_job.so", bytes);
+    const auto submit = http_post_multipart_file("127.0.0.1",
+                                                 c->coordinator_http_port,
+                                                 "/api/v1/jobs",
+                                                 "job_so",
+                                                 "cancel_test_job.so",
+                                                 bytes);
     ASSERT_EQ(submit.status, 200) << "submit body: " << submit.body;
 
-    // Give the TMs ~1s to start the executor + metrics-poll thread.
+    // Give the workers ~1s to start the executor + metrics-poll thread.
     std::this_thread::sleep_for(1500ms);
 
-    // Scrape both TMs via the JM proxy; at least one must report
+    // Scrape both workers via the coordinator proxy; at least one must report
     // operator input gauges.
     bool saw_depth = false;
     bool saw_capacity = false;
-    for (const auto& tm_id : c->tm_ids) {
-        const auto m = http_get("127.0.0.1", c->jm_http_port, "/api/v1/tms/" + tm_id + "/metrics");
+    for (const auto& worker_id : c->worker_ids) {
+        const auto m = http_get(
+            "127.0.0.1", c->coordinator_http_port, "/api/v1/workers/" + worker_id + "/metrics");
         if (m.status != 200)
             continue;
         if (m.body.find("clink_op_input_depth{op_id=") != std::string::npos) {
@@ -431,8 +437,8 @@ TEST(HttpBackpressure, TmMetricsExposeOperatorInputGauges) {
             saw_capacity = true;
         }
     }
-    EXPECT_TRUE(saw_depth) << "no clink_op_input_depth{op_id} gauge on any TM";
-    EXPECT_TRUE(saw_capacity) << "no clink_op_input_capacity{op_id} gauge on any TM";
+    EXPECT_TRUE(saw_depth) << "no clink_op_input_depth{op_id} gauge on any worker";
+    EXPECT_TRUE(saw_capacity) << "no clink_op_input_capacity{op_id} gauge on any worker";
 
-    http_post_empty("127.0.0.1", c->jm_http_port, "/api/v1/jobs/1/cancel");
+    http_post_empty("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1/cancel");
 }

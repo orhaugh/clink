@@ -10,7 +10,7 @@
 
 #include <gtest/gtest.h>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -43,7 +43,7 @@ clink::Codec<DummyRecord> dummy_codec() {
 
 TEST(S3TypedSink, ParquetSinkAppendsTypedDescriptorAndRegistersFactory) {
     clink::cluster::ensure_built_ins_registered();
-    clink::api::StreamExecutionEnvironment env;
+    clink::api::Pipeline env;
     clink::s3::install(env.registry());
     // DummyRecord is the user's channel type; register it with a codec
     // before the helper can route through register_sink<T>.

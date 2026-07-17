@@ -82,7 +82,7 @@ public:
     // Connect to the configured (host, port). For same-process peers
     // (LocalDataPlane registered (host, port)) this short-circuits to
     // direct typed push - no socket, no codec, no Arrow IPC. The
-    // socket path is the cross-TM fallback.
+    // socket path is the cross-worker fallback.
     //
     // Throws on socket failure. Blocks only when we go through the
     // socket path - the local fast path returns once the registry
@@ -397,7 +397,7 @@ private:
 // The same channel is exposed via LocalDataPlane so a same-process
 // NetworkChannelSink can push StreamElements directly into it without
 // going through the socket+codec path. This is the "local fast path"
-// for colocated subtasks; the socket recv path remains the cross-TM
+// for colocated subtasks; the socket recv path remains the cross-worker
 // fallback. Both pathways feed the same queue, so pop() is uniform.
 template <typename T>
 class NetworkChannelSource {

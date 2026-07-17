@@ -653,7 +653,7 @@ TEST(TestFramework, TransactionalTestSinkModelsTheTwoPhaseCommitLifecycle) {
     EXPECT_TRUE(sink.pending_checkpoints().empty());
 
     // A TERMINAL barrier commits its epoch immediately (bounded-stream
-    // contract: no JM round-trip after end-of-stream).
+    // contract: no coordinator round-trip after end-of-stream).
     Batch<std::int64_t> e3;
     e3.emplace(4);
     sink.on_data(e3);
@@ -664,14 +664,14 @@ TEST(TestFramework, TransactionalTestSinkModelsTheTwoPhaseCommitLifecycle) {
     EXPECT_EQ(sink.aborts(), (std::vector<std::uint64_t>{2}));
 }
 
-// ---- Increment 6: LocalTestEnvironment and MiniCluster ----
+// ---- Increment 6: LocalTestEnvironment and TestCluster ----
 
 #include <filesystem>
 #include <fstream>
 
 #include "clink/operators/map_operator.hpp"
 #include "clink/test/local_environment.hpp"
-#include "clink/test/mini_cluster.hpp"
+#include "clink/test/test_cluster.hpp"
 
 TEST(TestFramework, LocalTestEnvironmentRunsAPipelineOnTheRealRuntime) {
     test::LocalTestEnvironment env;
@@ -715,11 +715,11 @@ TEST(TestFramework, LocalTestEnvironmentSurfacesOperatorFailures) {
     EXPECT_THROW(env2.execute(), test::PipelineFailure);
 }
 
-TEST(TestFramework, MiniClusterRunsAJobGraphSpecToCompletion) {
-    test::MiniCluster mini({.task_managers = 1, .slots_per_task_manager = 4});
+TEST(TestFramework, TestClusterRunsAJobGraphSpecToCompletion) {
+    test::TestCluster mini({.workers = 1, .slots_per_worker = 4});
 
     const auto out_path =
-        std::filesystem::temp_directory_path() / "clink_test_framework_mini_cluster.txt";
+        std::filesystem::temp_directory_path() / "clink_test_framework_test_cluster.txt";
     std::filesystem::remove(out_path);
 
     cluster::JobGraphSpec g;

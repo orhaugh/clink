@@ -1,6 +1,6 @@
 // clink_bench - single-process wall-clock throughput harness.
 //
-// Runs a parameterised in-process pipeline (no JM / TM / wire) and
+// Runs a parameterised in-process pipeline (no coordinator / worker / wire) and
 // emits a JSON line summarising throughput + per-record latency.
 // Establishes a baseline so later changes (backpressure rework,
 // rescaling work, etc.) can measure regressions.

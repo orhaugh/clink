@@ -2,7 +2,7 @@
 //
 // Demonstrates the smallest possible clink pipeline: a bounded source, a
 // map step, a filter step, and a sink that prints to stdout. Run it as
-// a standalone executable - no clink_node, no cluster, no JM.
+// a standalone executable - no clink_node, no cluster, no coordinator.
 //
 // Pipeline:
 //   VectorSource<int64_t> -> Map(*2) -> Filter(>10) -> FunctionSink(print)
@@ -32,12 +32,12 @@ int main() {
 
     Dag dag;
 
-    auto src      = std::make_shared<VectorSource<std::int64_t>>(std::move(input));
-    auto doubler  = std::make_shared<MapOperator<std::int64_t, std::int64_t>>(
+    auto src = std::make_shared<VectorSource<std::int64_t>>(std::move(input));
+    auto doubler = std::make_shared<MapOperator<std::int64_t, std::int64_t>>(
         [](const std::int64_t& v) { return v * 2; });
     auto big_only = std::make_shared<FilterOperator<std::int64_t>>(
         [](const std::int64_t& v) { return v > 10; });
-    auto printer  = std::make_shared<FunctionSink<std::int64_t>>(
+    auto printer = std::make_shared<FunctionSink<std::int64_t>>(
         [](const std::int64_t& v) { std::cout << v << '\n'; });
 
     auto s0 = dag.add_source<std::int64_t>(src);

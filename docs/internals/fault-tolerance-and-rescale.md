@@ -1,51 +1,51 @@
 # Fault tolerance, rescale and schema evolution
 
-> How clink recovers a job after a TaskManager is lost, changes a running operator's parallelism, and migrates keyed state across a schema change, all anchored on completed checkpoints.
+> How clink recovers a job after a Worker is lost, changes a running operator's parallelism, and migrates keyed state across a schema change, all anchored on completed checkpoints.
 
 ## Overview
 
-A clink job survives infrastructure failure and reconfiguration by redeploying its operators from a previously completed checkpoint rather than from scratch. Three related mechanisms share that foundation. Restart-from-checkpoint failover detects a lost TaskManager (TM), drains the survivors, and redeploys the affected subtasks. Rescale repartitions keyed state across a new subtask count using key groups, scaling up or down by integer factors. State schema evolution lets a job whose state layout has changed restore from an older savepoint by running each stored value through a registered migration before any operator reads it. All three depend on the checkpoint machinery (see [./checkpointing.md](./checkpointing.md)) and the keyed-state backends (see [./state-and-backends.md](./state-and-backends.md)).
+A clink job survives infrastructure failure and reconfiguration by redeploying its operators from a previously completed checkpoint rather than from scratch. Three related mechanisms share that foundation. Restart-from-checkpoint failover detects a lost Worker (worker), drains the survivors, and redeploys the affected subtasks. Rescale repartitions keyed state across a new subtask count using key groups, scaling up or down by integer factors. State schema evolution lets a job whose state layout has changed restore from an older savepoint by running each stored value through a registered migration before any operator reads it. All three depend on the checkpoint machinery (see [./checkpointing.md](./checkpointing.md)) and the keyed-state backends (see [./state-and-backends.md](./state-and-backends.md)).
 
 ## Where it lives
 
 | Area | Files |
 | --- | --- |
-| Failover and the watchdog | `src/cluster/job_manager.cpp` (`watchdog_loop_`, `mark_tm_lost_locked_`, `restart_job_locked_`), `include/clink/cluster/job_manager.hpp` (`JobManager::Config`) |
+| Failover and the watchdog | `src/cluster/coordinator.cpp` (`watchdog_loop_`, `mark_worker_lost_locked_`, `restart_job_locked_`), `include/clink/cluster/coordinator.hpp` (`Coordinator::Config`) |
 | Restart policy resolution | `include/clink/cluster/protocol.hpp` (`CheckpointConfig`, `effective_max_restarts`, `kRestartAuto`, `kDefaultSelfHealRestarts`) |
 | Key groups (rescale partitioning) | `include/clink/runtime/key_groups.hpp` |
 | Operator-level rescale state machine | `include/clink/cluster/rescale_coordinator.hpp`, `src/cluster/rescale_coordinator.cpp` |
 | Cutover deployment planning | `include/clink/cluster/rescale_dispatch.hpp`, `src/cluster/rescale_dispatch.cpp` |
-| Whole-job rescale | `src/cluster/job_manager.cpp` (`rescale_job`, `restart_job_locked_` rescale branch) |
+| Whole-job rescale | `src/cluster/coordinator.cpp` (`rescale_job`, `restart_job_locked_` rescale branch) |
 | Schema version trait + maps + migration registry | `include/clink/state/schema_version.hpp`, `src/state/schema_version.cpp` |
 | Restore-time migration + compatibility check | `include/clink/state/state_migration_on_restore.hpp`, `src/state/state_migration_on_restore.cpp`, `src/runtime/local_executor.cpp` |
 | Pre-deploy compatibility gate | `include/clink/cluster/restore_compat_gate.hpp`, `src/cluster/restore_compat_gate.cpp`, `tools/clink_check_savepoint.cpp` |
-| Savepoints (online + offline) | `src/cluster/job_manager.cpp` (`take_savepoint`), `include/clink/state_processor/savepoint.hpp` |
+| Savepoints (online + offline) | `src/cluster/coordinator.cpp` (`take_savepoint`), `include/clink/state_processor/savepoint.hpp` |
 
 ## How it works
 
 ### Restart-from-checkpoint failover
 
-Every registered TM heartbeats the JobManager. A watchdog thread (`JobManager::watchdog_loop_`) wakes every `watchdog_interval` (default 100ms) and marks any TM whose last message is older than `heartbeat_timeout` (default 2000ms) as lost via `mark_tm_lost_locked_`. Healthy TMs are expected to heartbeat at roughly `heartbeat_timeout / 3` so a single dropped message does not trigger a false positive.
+Every registered worker heartbeats the Coordinator. A watchdog thread (`Coordinator::watchdog_loop_`) wakes every `watchdog_interval` (default 100ms) and marks any worker whose last message is older than `heartbeat_timeout` (default 2000ms) as lost via `mark_worker_lost_locked_`. Healthy workers are expected to heartbeat at roughly `heartbeat_timeout / 3` so a single dropped message does not trigger a false positive.
 
-When a TM is declared lost, `mark_tm_lost_locked_` walks every job that had a subtask on that TM and decides, per job, whether to restart. The decision is gated on `effective_max_restarts(job.checkpoint)`:
+When a worker is declared lost, `mark_worker_lost_locked_` walks every job that had a subtask on that worker and decides, per job, whether to restart. The decision is gated on `effective_max_restarts(job.checkpoint)`:
 
 - A non-empty `checkpoint_dir` and `job.restart_attempts < effective_max_restarts(...)` means the job can recover. It is moved into the `awaiting_restart` state.
-- Otherwise the JM fails fast: it synthesises a `TM lost (heartbeat timeout)` error per pending subtask, counts them toward completion, and surfaces the failure to the client.
+- Otherwise the coordinator fails fast: it synthesises a `worker lost (heartbeat timeout)` error per pending subtask, counts them toward completion, and surfaces the failure to the client.
 
-On the recovery path the JM must first drain the surviving subtasks before it can safely redeploy. The lost-TM subtasks go into `restart_pending`; the still-in-flight subtasks on surviving TMs go into `restart_drain_expected`. The watchdog then broadcasts `CancelJob` to every surviving TM hosting that job. Each survivor's role handler is expected to observe `was_cancelled()`, exit, and report a normal `SubtaskFinished`, which decrements the expected-drain set. Once the drain set empties (or it was already empty because the survivors had finished), `restart_job_locked_` runs and rebuilds the deployment.
+On the recovery path the coordinator must first drain the surviving subtasks before it can safely redeploy. The lost-worker subtasks go into `restart_pending`; the still-in-flight subtasks on surviving workers go into `restart_drain_expected`. The watchdog then broadcasts `CancelJob` to every surviving worker hosting that job. Each survivor's role handler is expected to observe `was_cancelled()`, exit, and report a normal `SubtaskFinished`, which decrements the expected-drain set. Once the drain set empties (or it was already empty because the survivors had finished), `restart_job_locked_` runs and rebuilds the deployment.
 
 ```mermaid
 flowchart TD
-  HB["TM heartbeat stops"] --> WD["watchdog_loop_:<br/>now - last_seen &gt; heartbeat_timeout"]
-  WD --> ML{"mark_tm_lost_locked_:<br/>restart budget left?"}
+  HB["worker heartbeat stops"] --> WD["watchdog_loop_:<br/>now - last_seen &gt; heartbeat_timeout"]
+  WD --> ML{"mark_worker_lost_locked_:<br/>restart budget left?"}
   ML -->|no| FF["fail fast (synthesise errors)"]
-  ML -->|yes| AR["awaiting_restart:<br/>restart_pending = lost-TM subtasks,<br/>drain_expected = surviving in-flight subtasks,<br/>restart_deadline = now + restart_drain_timeout"]
+  ML -->|yes| AR["awaiting_restart:<br/>restart_pending = lost-worker subtasks,<br/>drain_expected = surviving in-flight subtasks,<br/>restart_deadline = now + restart_drain_timeout"]
   AR --> CJ["CancelJob: survivors drain (SubtaskFinished)"]
   CJ --> DE{"drain set empty?"}
   DE -->|yes| RJ["restart_job_locked_:<br/>place tasks on survivor slots,<br/>Deploy with restore_from_dir +<br/>latest_completed_checkpoint_id"]
 ```
 
-`restart_job_locked_` rebuilds a `DeploymentTask` template per subtask (preserving `role`, `subtask_idx`, `extra_config`, and peer topology while clearing resolved host/port), places the tasks round-robin across survivor TMs with free slots, resets the job's transient coordination state, and emits one `DeployMsg` per TM. The restore handle on every Deploy is the JM's own coordination directory and last acknowledged id:
+`restart_job_locked_` rebuilds a `DeploymentTask` template per subtask (preserving `role`, `subtask_idx`, `extra_config`, and peer topology while clearing resolved host/port), places the tasks round-robin across survivor workers with free slots, resets the job's transient coordination state, and emits one `DeployMsg` per worker. The restore handle on every Deploy is the coordinator's own coordination directory and last acknowledged id:
 
 ```cpp
 deploy_msg.restore_from_dir = job.checkpoint.checkpoint_dir;
@@ -54,13 +54,13 @@ deploy_msg.restore_from_checkpoint_id = job.latest_completed_checkpoint_id;
 
 If no survivor has a free slot, the restart is aborted with a `no slot available` error per subtask and the job is failed.
 
-The drain is bounded. When a job enters `awaiting_restart` the JM sets `restart_deadline = now + restart_drain_timeout` (default 30000ms). A watchdog scan that runs every tick, independent of any new TM loss, fails any job whose drain has outrun its deadline. This catches a survivor that is hung but still heartbeating, so it neither acks the cancel nor dies. Failing is the safe escalation here, because force-restarting could double-run a slow-but-alive subtask against shared state.
+The drain is bounded. When a job enters `awaiting_restart` the coordinator sets `restart_deadline = now + restart_drain_timeout` (default 30000ms). A watchdog scan that runs every tick, independent of any new worker loss, fails any job whose drain has outrun its deadline. This catches a survivor that is hung but still heartbeating, so it neither acks the cancel nor dies. Failing is the safe escalation here, because force-restarting could double-run a slow-but-alive subtask against shared state.
 
-Two edge cases are handled explicitly. A second TM lost while the job is already draining folds its subtasks into the in-progress restart (they move from `restart_drain_expected` to `restart_pending`) without consuming an extra restart attempt, since it is the same restart now covering both losses. A subtask error or a bounded-source end-of-stream final-checkpoint timeout follows the same `awaiting_restart` machinery but redeploys the full topology from `tasks_by_tm` rather than just the in-flight set, because the failing subtask may have peers that already finished.
+Two edge cases are handled explicitly. A second worker lost while the job is already draining folds its subtasks into the in-progress restart (they move from `restart_drain_expected` to `restart_pending`) without consuming an extra restart attempt, since it is the same restart now covering both losses. A subtask error or a bounded-source end-of-stream final-checkpoint timeout follows the same `awaiting_restart` machinery but redeploys the full topology from `tasks_by_worker` rather than just the in-flight set, because the failing subtask may have peers that already finished.
 
 #### The restart-policy default
 
-`CheckpointConfig::max_restarts_on_tm_loss` defaults to the sentinel `kRestartAuto`. `effective_max_restarts` resolves it at every restart decision:
+`CheckpointConfig::max_restarts_on_worker_loss` defaults to the sentinel `kRestartAuto`. `effective_max_restarts` resolves it at every restart decision:
 
 - `kRestartAuto` with a `checkpoint_dir` set resolves to `kDefaultSelfHealRestarts` (10): the job self-heals up to ten times before failing loudly rather than looping forever.
 - `kRestartAuto` with no `checkpoint_dir` resolves to 0: fail fast, because there is no checkpoint to restore from.
@@ -82,7 +82,7 @@ subtask   = key_group * parallelism / 128
 
 clink has two rescale paths that share this math.
 
-**Whole-job rescale** (`JobManager::rescale_job`) changes the parallelism of one or more roles at once. It requires a `checkpoint_dir` and at least one completed checkpoint, validates that each new parallelism is an integer multiple (scale-up) or divisor (scale-down) of the current value, and checks free slot capacity if the change net-grows usage. It then stages `rescale_overrides`, marks the job `awaiting_restart`, sets the drain deadline, and broadcasts `CancelJob`. The same drain-then-`restart_job_locked_` machinery used by failover fires, but now the rescale branch resizes the per-role template set, rewrites peer fan-out for the new subtask count, and tags each new subtask with its restore mapping and key-group range. The per-subtask restore mapping is:
+**Whole-job rescale** (`Coordinator::rescale_job`) changes the parallelism of one or more roles at once. It requires a `checkpoint_dir` and at least one completed checkpoint, validates that each new parallelism is an integer multiple (scale-up) or divisor (scale-down) of the current value, and checks free slot capacity if the change net-grows usage. It then stages `rescale_overrides`, marks the job `awaiting_restart`, sets the drain deadline, and broadcasts `CancelJob`. The same drain-then-`restart_job_locked_` machinery used by failover fires, but now the rescale branch resizes the per-role template set, rewrites peer fan-out for the new subtask count, and tags each new subtask with its restore mapping and key-group range. The per-subtask restore mapping is:
 
 - **Scale-up** (`new_p > old_p`): `k = new_p / old_p` new subtasks per parent. `restore_from_subtask_idx = new_idx / k`, `restore_from_parent_count = 1`. Each new subtask reads its parent's snapshot and filters it down to its own key-group slice on read.
 - **Scale-down** (`new_p < old_p`): `k_down = old_p / new_p` parents per new subtask. `restore_from_subtask_idx = new_idx * k_down`, `restore_from_parent_count = k_down`. The snapshot loader concatenates the `k_down` contiguous parent slices into one merged state.
@@ -101,7 +101,7 @@ stateDiagram-v2
   CuttingOver --> Aborted: abort
 ```
 
-`JobManager::request_operator_rescale` validates the request and refuses if the job has no coordinator, or if periodic checkpointing is not configured (`checkpoint_dir` empty or `interval_ms <= 0`), because the `Preparing -> Draining` transition is driven by a checkpoint landing and would otherwise wait forever. The actual cutover deployment math lives in `plan_operator_cutover` (`rescale_dispatch.cpp`), which computes the same key-group ranges and `restore_from_*` mapping as the whole-job path and places the new subtasks greedily onto TMs with free slots. `JobManager::dispatch_begin_rescale_locked_` sends `BeginRescale` to every TM hosting the operator; each TM fires its drain callbacks so the running subtask emits a `DrainMarker` and shuts down. The coordinator itself is purely the state record: each transition is mutex-protected and the JM RPC handlers update it via `mark_checkpoint_ready`, `mark_old_drained`, and `mark_new_ready`.
+`Coordinator::request_operator_rescale` validates the request and refuses if the job has no coordinator, or if periodic checkpointing is not configured (`checkpoint_dir` empty or `interval_ms <= 0`), because the `Preparing -> Draining` transition is driven by a checkpoint landing and would otherwise wait forever. The actual cutover deployment math lives in `plan_operator_cutover` (`rescale_dispatch.cpp`), which computes the same key-group ranges and `restore_from_*` mapping as the whole-job path and places the new subtasks greedily onto workers with free slots. `Coordinator::dispatch_begin_rescale_locked_` sends `BeginRescale` to every worker hosting the operator; each worker fires its drain callbacks so the running subtask emits a `DrainMarker` and shuts down. The coordinator itself is purely the state record: each transition is mutex-protected and the coordinator RPC handlers update it via `mark_checkpoint_ready`, `mark_old_drained`, and `mark_new_ready`.
 
 #### Sources as operator state
 
@@ -128,14 +128,14 @@ When the byte layout of a state value changes, an old savepoint's bytes are no l
             (pre-deploy gate, fail fast)     (restore-time migrator)
                         |                          |
    check_restore_compatibility_via_plugins   migrate_restored_state
-   at SubmitJob / HA-recovery in JM          in LocalExecutor::start
+   at SubmitJob / HA-recovery in coordinator          in LocalExecutor::start
 ```
 
-`check_restore_compatibility` returns a list of `(op, state_type, from, to)` pairs the registry cannot bridge; an empty list means the restore is compatible. The JM calls `check_restore_compatibility_via_plugins` at job submission: it reads subtask 0's stored version map and asks each job `.so` (where the job's `StateMigrationRegistry` lives) whether it can migrate to its expected versions, rejecting the deploy on a definite incompatibility. This gate is best-effort by design: if it cannot read the savepoint, load a `.so`, or find the exported check, it returns empty and lets the deploy proceed, since `migrate_restored_state` still guarantees correctness (or throws) at restore. The offline `clink check-savepoint` CLI exposes the same inspection for operators without a running JM.
+`check_restore_compatibility` returns a list of `(op, state_type, from, to)` pairs the registry cannot bridge; an empty list means the restore is compatible. The coordinator calls `check_restore_compatibility_via_plugins` at job submission: it reads subtask 0's stored version map and asks each job `.so` (where the job's `StateMigrationRegistry` lives) whether it can migrate to its expected versions, rejecting the deploy on a definite incompatibility. This gate is best-effort by design: if it cannot read the savepoint, load a `.so`, or find the exported check, it returns empty and lets the deploy proceed, since `migrate_restored_state` still guarantees correctness (or throws) at restore. The offline `clink check-savepoint` CLI exposes the same inspection for operators without a running coordinator.
 
 ### Savepoints
 
-A savepoint is a checkpoint taken on demand and intended to be restored from later. `JobManager::take_savepoint` assigns a fresh checkpoint id, registers a pending ack for every subtask, broadcasts `TriggerCheckpoint`, and blocks until `latest_completed_checkpoint_id` advances past it (default timeout 30000ms). It requires a `checkpoint_dir`. The resulting `.snap` blob is the same Arrow-IPC snapshot format the runtime produces during periodic checkpointing.
+A savepoint is a checkpoint taken on demand and intended to be restored from later. `Coordinator::take_savepoint` assigns a fresh checkpoint id, registers a pending ack for every subtask, broadcasts `TriggerCheckpoint`, and blocks until `latest_completed_checkpoint_id` advances past it (default timeout 30000ms). It requires a `checkpoint_dir`. The resulting `.snap` blob is the same Arrow-IPC snapshot format the runtime produces during periodic checkpointing.
 
 Because the format is shared, clink also exposes an offline State Processor API (`include/clink/state_processor/savepoint.hpp`). `Savepoint::load_from_file` reads a `.snap` blob into an in-memory backend; typed `keyed_state<K, V>(op, slot, kc, vc)` views read and mutate the stored entries; `write_to_file` persists a new savepoint a later job can restore from. This is the path for bulk state migration across a schema change, offline inspection or audit, and seeding a fresh job with pre-populated state. The v1 scope is deliberately tight: keyed state only (broadcast and operator-list state are not surfaced, and timers live in the timer service, not the backend), the whole savepoint is materialised in RAM while open, and there is no schema check on the codec pair, so the codecs must match the originating job's.
 
@@ -143,7 +143,7 @@ Because the format is shared, clink also exposes an offline State Processor API 
 
 `include/clink/state_processor/state_diff.hpp` layers a comparison primitive over the Savepoint: `collect_entries` scans a savepoint into a structured `op -> slot -> (key -> entry)` model (parsing the stored-key layout `[key-group byte][slot]['|'][user-key bytes]`), `merge_entries` unions the per-subtask files of one checkpoint (key groups are disjoint across subtasks), and `diff_entries` reports per-slot added/removed/changed keys with bounded concrete samples, alongside `diff_versions` for state-schema stamp changes.
 
-Two CLI verbs ride it. `clink state-diff --a=<f.snap> --b=<f.snap>` (or `--dir=<checkpoint-root> --from=N --to=M`, merging every subtask file per id) prints exactly which keys appeared, vanished or changed between two checkpoints or savepoints of a job - keys and values rendered readably (an 8-byte key doubles as its little-endian int64 reading, printable bytes as text, the rest as hex), `--json` for machines, exit code 0 identical / 1 differs / 2 error, diff(1)-style. `clink state-cat` dumps one snapshot's contents the same way. Both read the canonical Arrow-IPC snapshot blobs (checkpoints and savepoints from the file-backed default), accept a RocksDB checkpoint DIRECTORY wherever a snapshot file is accepted (rendered through the RocksDB Arrow export, RocksDB-linked builds), and accept CHANGELOG snapshots, replayed to the canonical form on load - a changelog+rocksdb external-materialisation snapshot resolves its handles through `--materialisation-store=<rocksdb path>`. `clink state-export --from=<snapshot-or-rocksdb-dir> --out=<file> [--format=arrow|parquet]` writes the state as an open dataset, validated by loading it before writing. `arrow` (the default) is the canonical IPC stream - exact fidelity, restorable, openable by any Arrow consumer or clink state tool. `parquet` (inferred when `--out` ends in `.parquet`) is the analytics projection: the DECODED entry table (`op_id`, `key_group`, `slot`, `user_key`, `value_bytes`, one row per entry, versions in the file metadata) via `state_processor::write_state_parquet` (`include/clink/state_processor/parquet_export.hpp`), directly queryable in DuckDB / Spark / pyarrow with slot names and user keys as first-class columns. `--format=iceberg` (Iceberg-linked builds) commits the same decoded table as ONE snapshot of an Apache Iceberg table via `clink::iceberg::export_state_iceberg` - `--warehouse` and `--table` replace `--out`, the table is created when missing, and repeated exports accumulate as snapshots, so the lake table's own history time-travels across exports. All formats also take `--job=<id> [--jm=host:port]` to fetch a RUNNING job's whole keyed state through the JM's live-export route (per-subtask atomic view, not a checkpoint-consistent cut), and `--dir=<root> --id=N` instead of `--from`, merging every subtask's `checkpoint-N.snap` into one export via `merge_snapshot_bytes` (key groups are disjoint across subtasks, so the keyed union is exact; a duplicated operator-state offset row resolves to the greater value, the scale-down restore policy). `clink state-query --from=<snapshot-or-rocksdb-dir> --sql="SELECT ..."` (SQL-frontend builds; also `--dir/--id`) runs SQL over the state IN-PROCESS through the embedded engine: the decoded entries are rendered to a temp Parquet (`write_state_query_parquet`: `op_id`, `key_group`, `slot`, `user_key` as text with an `0x`-hex fallback, `key_int`/`value_int` as the 8-byte int64 readings, `value` as text) and exposed as a table named `state`; results print as NDJSON with retracting plans (GROUP BY, DISTINCT) netted client-side to their final rows, multiplicity preserved.
+Two CLI verbs ride it. `clink state-diff --a=<f.snap> --b=<f.snap>` (or `--dir=<checkpoint-root> --from=N --to=M`, merging every subtask file per id) prints exactly which keys appeared, vanished or changed between two checkpoints or savepoints of a job - keys and values rendered readably (an 8-byte key doubles as its little-endian int64 reading, printable bytes as text, the rest as hex), `--json` for machines, exit code 0 identical / 1 differs / 2 error, diff(1)-style. `clink state-cat` dumps one snapshot's contents the same way. Both read the canonical Arrow-IPC snapshot blobs (checkpoints and savepoints from the file-backed default), accept a RocksDB checkpoint DIRECTORY wherever a snapshot file is accepted (rendered through the RocksDB Arrow export, RocksDB-linked builds), and accept CHANGELOG snapshots, replayed to the canonical form on load - a changelog+rocksdb external-materialisation snapshot resolves its handles through `--materialisation-store=<rocksdb path>`. `clink state-export --from=<snapshot-or-rocksdb-dir> --out=<file> [--format=arrow|parquet]` writes the state as an open dataset, validated by loading it before writing. `arrow` (the default) is the canonical IPC stream - exact fidelity, restorable, openable by any Arrow consumer or clink state tool. `parquet` (inferred when `--out` ends in `.parquet`) is the analytics projection: the DECODED entry table (`op_id`, `key_group`, `slot`, `user_key`, `value_bytes`, one row per entry, versions in the file metadata) via `state_processor::write_state_parquet` (`include/clink/state_processor/parquet_export.hpp`), directly queryable in DuckDB / Spark / pyarrow with slot names and user keys as first-class columns. `--format=iceberg` (Iceberg-linked builds) commits the same decoded table as ONE snapshot of an Apache Iceberg table via `clink::iceberg::export_state_iceberg` - `--warehouse` and `--table` replace `--out`, the table is created when missing, and repeated exports accumulate as snapshots, so the lake table's own history time-travels across exports. All formats also take `--job=<id> [--coordinator=host:port]` to fetch a RUNNING job's whole keyed state through the coordinator's live-export route (per-subtask atomic view, not a checkpoint-consistent cut), and `--dir=<root> --id=N` instead of `--from`, merging every subtask's `checkpoint-N.snap` into one export via `merge_snapshot_bytes` (key groups are disjoint across subtasks, so the keyed union is exact; a duplicated operator-state offset row resolves to the greater value, the scale-down restore policy). `clink state-query --from=<snapshot-or-rocksdb-dir> --sql="SELECT ..."` (SQL-frontend builds; also `--dir/--id`) runs SQL over the state IN-PROCESS through the embedded engine: the decoded entries are rendered to a temp Parquet (`write_state_query_parquet`: `op_id`, `key_group`, `slot`, `user_key` as text with an `0x`-hex fallback, `key_int`/`value_int` as the 8-byte int64 readings, `value` as text) and exposed as a table named `state`; results print as NDJSON with retracting plans (GROUP BY, DISTINCT) netted client-side to their final rows, multiplicity preserved.
 
 Its first demonstration exposed a real restore-correctness gap - the default (non-async) SQL `GROUP BY` held its accumulators only in operator memory, so checkpoints carried no aggregate state and any restore silently zeroed the running totals - fixed by the write-behind flush described in the SQL frontend's aggregate operator (dirty buckets persist to the `agg` KeyedState slot in the runner's pre-snapshot hook, and reload at `open()`).
 
@@ -171,40 +171,40 @@ Scope and honesty: Row-channel operators (the SQL frontend's set - GROUP BY, win
 
 | Type / function | Responsibility |
 | --- | --- |
-| `JobManager::watchdog_loop_` | Periodic liveness scan; declares TMs lost, drives restart drains and the drain-timeout escalation |
-| `JobManager::mark_tm_lost_locked_` | Per-job restart-or-fail decision on TM loss; builds the drain and redeploy sets |
-| `JobManager::restart_job_locked_` | Rebuilds the deployment from templates, places tasks on survivor slots, emits Deploy frames pointing at the last completed checkpoint |
+| `Coordinator::watchdog_loop_` | Periodic liveness scan; declares workers lost, drives restart drains and the drain-timeout escalation |
+| `Coordinator::mark_worker_lost_locked_` | Per-job restart-or-fail decision on worker loss; builds the drain and redeploy sets |
+| `Coordinator::restart_job_locked_` | Rebuilds the deployment from templates, places tasks on survivor slots, emits Deploy frames pointing at the last completed checkpoint |
 | `effective_max_restarts(CheckpointConfig)` | Resolves `kRestartAuto` to self-heal (10) with checkpointing or fail-fast (0) without |
 | `key_group_for_key` / `subtask_for_key_group` / `key_group_range_for_subtask` | The 128-group partitioning primitive and its inverse used by rescale restore |
-| `JobManager::rescale_job` | Whole-job parallelism change via the drain-then-restart machinery |
+| `Coordinator::rescale_job` | Whole-job parallelism change via the drain-then-restart machinery |
 | `RescaleCoordinator` | Per-operator rescale state machine (`Idle`/`Preparing`/`Draining`/`CuttingOver`/`Complete`/`Aborted`) |
-| `plan_operator_cutover` | Computes new-subtask key-group ranges, restore mapping, and TM placement for an operator cutover |
+| `plan_operator_cutover` | Computes new-subtask key-group ranges, restore mapping, and worker placement for an operator cutover |
 | `SchemaVersionTrait<T>` / `StateVersionMap` | Compile-time version trait and the `(op, state_type, slot) -> version` map stamped into snapshots |
 | `StateMigrationRegistry` | Registers single-step migrations, plans multi-step chains, and synthesises additive Arrow migrations |
 | `check_restore_compatibility` / `migrate_restored_state` | The shared compatibility decision and the in-place restore-time transform |
-| `check_restore_compatibility_via_plugins` | JM-side best-effort pre-deploy gate |
-| `JobManager::take_savepoint` | On-demand checkpoint a later run can restore from |
+| `check_restore_compatibility_via_plugins` | coordinator-side best-effort pre-deploy gate |
+| `Coordinator::take_savepoint` | On-demand checkpoint a later run can restore from |
 | `clink::state_processor::Savepoint` | Offline read/transform/write API over a savepoint's keyed state |
 
 ## Configuration and knobs
 
 | Knob | Where | Default | Effect |
 | --- | --- | --- | --- |
-| `watchdog_interval` | `JobManager::Config` | 100ms | How often the watchdog re-evaluates TM liveness |
-| `heartbeat_timeout` | `JobManager::Config` | 2000ms | A TM is declared lost after this much silence |
-| `restart_drain_timeout` | `JobManager::Config` | 30000ms | Upper bound on the `awaiting_restart` drain; on expiry the watchdog fails the job |
-| `max_restarts` | `JobManager::Config` | 0 | Per-failing-task retry budget (distinct from TM-level restarts) |
-| `max_restarts_on_tm_loss` | `CheckpointConfig` | `kRestartAuto` | Resolves to 10 (self-heal) with a checkpoint dir, 0 (fail-fast) without; explicit `N` caps attempts |
+| `watchdog_interval` | `Coordinator::Config` | 100ms | How often the watchdog re-evaluates worker liveness |
+| `heartbeat_timeout` | `Coordinator::Config` | 2000ms | A worker is declared lost after this much silence |
+| `restart_drain_timeout` | `Coordinator::Config` | 30000ms | Upper bound on the `awaiting_restart` drain; on expiry the watchdog fails the job |
+| `max_restarts` | `Coordinator::Config` | 0 | Per-failing-task retry budget (distinct from worker-level restarts) |
+| `max_restarts_on_worker_loss` | `CheckpointConfig` | `kRestartAuto` | Resolves to 10 (self-heal) with a checkpoint dir, 0 (fail-fast) without; explicit `N` caps attempts |
 | `checkpoint_dir` | `CheckpointConfig` | empty | Required for any restart-from-checkpoint, rescale, or savepoint |
 | `interval_ms` | `CheckpointConfig` | 0 | Periodic-checkpoint cadence; operator rescale requires it `> 0` |
 | `restore_from_dir` / `restore_from_checkpoint_id` | `CheckpointConfig` | empty / 0 | Resume a fresh job from a prior completed checkpoint or savepoint |
 | `min_parallelism` / `max_parallelism` | `OperatorSpec` | 0 / 0 | `0/0` means not scalable; otherwise bound a rescale request |
 | `kNumKeyGroups` | `key_groups.hpp` | 128 | Partition count; tunable in the range 16 to 1024 without protocol changes |
-| `kDefaultSelfHealRestarts` | `protocol.hpp` | 10 | Self-heal attempt cap when `max_restarts_on_tm_loss` is auto |
+| `kDefaultSelfHealRestarts` | `protocol.hpp` | 10 | Self-heal attempt cap when `max_restarts_on_worker_loss` is auto |
 
 ## Guarantees and caveats
 
-- **Recovery is checkpoint-anchored.** Restart, rescale, and savepoint-restore all require a `checkpoint_dir`. Without one a TM loss fails the job. Keyed state is preserved across a restart; source replay correctness depends on the source implementation (see [../connectors/README.md](../connectors/README.md)).
+- **Recovery is checkpoint-anchored.** Restart, rescale, and savepoint-restore all require a `checkpoint_dir`. Without one a worker loss fails the job. Keyed state is preserved across a restart; source replay correctness depends on the source implementation (see [../connectors/README.md](../connectors/README.md)).
 - **Self-heal is bounded and the default.** With checkpointing, a job self-heals up to `kDefaultSelfHealRestarts` (10) times by default, then fails loudly. An explicit `0` keeps the strict fail-fast behaviour. The restart drain is itself bounded by `restart_drain_timeout`; a hung-but-heartbeating survivor causes the job to fail rather than risk a double-run.
 - **Rescale is integer-factor only.** Both the whole-job and operator paths require the new parallelism to be an integer multiple (scale-up) or divisor (scale-down) of the current value. Non-integer factors would leave key groups straddling parents and are not supported.
 - **Operator rescale needs periodic checkpointing.** `request_operator_rescale` rejects the request unless `checkpoint_dir` is set and `interval_ms > 0`, because the cutover is gated on a checkpoint landing.
@@ -218,7 +218,7 @@ Scope and honesty: Row-channel operators (the SQL frontend's set - GROUP BY, win
 
 - [./checkpointing.md](./checkpointing.md) - barriers, alignment, and the completed-checkpoint markers every recovery path restores from
 - [./state-and-backends.md](./state-and-backends.md) - keyed state, slots, TTL, and the backend snapshot/restore contract
-- [./distributed-runtime.md](./distributed-runtime.md) - the JM/TM control plane, heartbeats, and deploy messaging
+- [./distributed-runtime.md](./distributed-runtime.md) - the coordinator/worker control plane, heartbeats, and deploy messaging
 - [./jobs-and-scheduling.md](./jobs-and-scheduling.md) - slots, placement, and the job graph the restart path rebuilds from
 - [./task-lifecycle.md](./task-lifecycle.md) - `LocalExecutor::start`, where restore-time migration runs before operators open
 - [../connectors/README.md](../connectors/README.md) - per-connector source replay and exactly-once caveats across a restart or rescale

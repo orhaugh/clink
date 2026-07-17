@@ -2,12 +2,12 @@
 //
 // The dashboard is embedded as a string constant at build time; this test
 // just checks that:
-//   * GET / on the JM returns 200 with text/html and the page markers we
+//   * GET / on the coordinator returns 200 with text/html and the page markers we
 //     expect (the <title> and a chunk of the EventSource bootstrap JS),
-//   * GET /dashboard on the JM serves the same page (-muscle-memory
+//   * GET /dashboard on the coordinator serves the same page (-muscle-memory
 //     URL parity),
-//   * GET / on a TM does NOT serve the dashboard (TM HTTP is JSON-API
-//     only; the JM is the single human entry point).
+//   * GET / on a worker does NOT serve the dashboard (worker HTTP is JSON-API
+//     only; the coordinator is the single human entry point).
 
 #include <chrono>
 #include <cstdint>
@@ -123,22 +123,22 @@ bool await_http_ready(std::uint16_t port, std::chrono::milliseconds timeout) {
 }
 
 struct Cluster {
-    pid_t jm_pid{-1};
-    std::uint16_t jm_http_port{0};
-    std::uint16_t jm_control_port{0};
-    std::vector<pid_t> tm_pids;
-    std::vector<std::uint16_t> tm_http_ports;
+    pid_t coordinator_pid{-1};
+    std::uint16_t coordinator_http_port{0};
+    std::uint16_t coordinator_control_port{0};
+    std::vector<pid_t> worker_pids;
+    std::vector<std::uint16_t> worker_http_ports;
 
     Cluster() = default;
     Cluster(const Cluster&) = delete;
     Cluster& operator=(const Cluster&) = delete;
     Cluster(Cluster&& o) noexcept
-        : jm_pid(o.jm_pid),
-          jm_http_port(o.jm_http_port),
-          jm_control_port(o.jm_control_port),
-          tm_pids(std::move(o.tm_pids)),
-          tm_http_ports(std::move(o.tm_http_ports)) {
-        o.jm_pid = -1;
+        : coordinator_pid(o.coordinator_pid),
+          coordinator_http_port(o.coordinator_http_port),
+          coordinator_control_port(o.coordinator_control_port),
+          worker_pids(std::move(o.worker_pids)),
+          worker_http_ports(std::move(o.worker_http_ports)) {
+        o.coordinator_pid = -1;
     }
     Cluster& operator=(Cluster&& o) noexcept {
         if (this != &o) {
@@ -148,54 +148,55 @@ struct Cluster {
         return *this;
     }
     ~Cluster() {
-        for (auto pid : tm_pids)
+        for (auto pid : worker_pids)
             kill_quietly(pid);
-        kill_quietly(jm_pid);
+        kill_quietly(coordinator_pid);
     }
 };
 
-std::optional<Cluster> start_cluster(int n_tms) {
+std::optional<Cluster> start_cluster(int n_workers) {
     Cluster c;
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node))
         return std::nullopt;
-    c.jm_control_port = probe_free_port();
-    c.jm_http_port = probe_free_port();
-    c.jm_pid = spawn_proc({"clink_node",
-                           "--role=jm",
-                           "--port=" + std::to_string(c.jm_control_port),
-                           "--http-port=" + std::to_string(c.jm_http_port),
-                           "--http-bind=127.0.0.1"},
-                          node);
-    if (c.jm_pid <= 0 || !await_http_ready(c.jm_http_port, 2s))
+    c.coordinator_control_port = probe_free_port();
+    c.coordinator_http_port = probe_free_port();
+    c.coordinator_pid = spawn_proc({"clink_node",
+                                    "--role=coordinator",
+                                    "--port=" + std::to_string(c.coordinator_control_port),
+                                    "--http-port=" + std::to_string(c.coordinator_http_port),
+                                    "--http-bind=127.0.0.1"},
+                                   node);
+    if (c.coordinator_pid <= 0 || !await_http_ready(c.coordinator_http_port, 2s))
         return std::nullopt;
-    for (int i = 1; i <= n_tms; ++i) {
+    for (int i = 1; i <= n_workers; ++i) {
         const auto http_port = probe_free_port();
-        const std::string tm_id = "tm-dash-" + std::to_string(i);
-        const pid_t pid = spawn_proc({"clink_node",
-                                      "--role=tm",
-                                      "--id=" + tm_id,
-                                      "--jm-host=127.0.0.1",
-                                      "--jm-port=" + std::to_string(c.jm_control_port),
-                                      "--http-port=" + std::to_string(http_port),
-                                      "--http-bind=127.0.0.1"},
-                                     node);
+        const std::string worker_id = "worker-dash-" + std::to_string(i);
+        const pid_t pid =
+            spawn_proc({"clink_node",
+                        "--role=worker",
+                        "--id=" + worker_id,
+                        "--coordinator-host=127.0.0.1",
+                        "--coordinator-port=" + std::to_string(c.coordinator_control_port),
+                        "--http-port=" + std::to_string(http_port),
+                        "--http-bind=127.0.0.1"},
+                       node);
         if (pid <= 0 || !await_http_ready(http_port, 2s))
             return std::nullopt;
-        c.tm_pids.push_back(pid);
-        c.tm_http_ports.push_back(http_port);
+        c.worker_pids.push_back(pid);
+        c.worker_http_ports.push_back(http_port);
     }
     return c;
 }
 
 }  // namespace
 
-TEST(HttpDashboard, JmRootServesDashboardHtml) {
-    auto c = start_cluster(/*n_tms=*/0);
+TEST(HttpDashboard, CoordinatorRootServesDashboardHtml) {
+    auto c = start_cluster(/*n_workers=*/0);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    const auto r = http_get("127.0.0.1", c->jm_http_port, "/");
+    const auto r = http_get("127.0.0.1", c->coordinator_http_port, "/");
     ASSERT_EQ(r.status, 200);
     EXPECT_NE(r.content_type.find("text/html"), std::string::npos)
         << "content_type=" << r.content_type;
@@ -207,28 +208,28 @@ TEST(HttpDashboard, JmRootServesDashboardHtml) {
         << "missing EventSource bootstrap";
 }
 
-TEST(HttpDashboard, JmDashboardPathServesSameHtml) {
-    auto c = start_cluster(/*n_tms=*/0);
+TEST(HttpDashboard, CoordinatorDashboardPathServesSameHtml) {
+    auto c = start_cluster(/*n_workers=*/0);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    const auto root = http_get("127.0.0.1", c->jm_http_port, "/");
-    const auto dash = http_get("127.0.0.1", c->jm_http_port, "/dashboard");
+    const auto root = http_get("127.0.0.1", c->coordinator_http_port, "/");
+    const auto dash = http_get("127.0.0.1", c->coordinator_http_port, "/dashboard");
     ASSERT_EQ(root.status, 200);
     ASSERT_EQ(dash.status, 200);
     EXPECT_EQ(root.body, dash.body) << "/ and /dashboard should serve the same HTML";
 }
 
-TEST(HttpDashboard, TmRootDoesNotServeDashboard) {
-    auto c = start_cluster(/*n_tms=*/1);
+TEST(HttpDashboard, WorkerRootDoesNotServeDashboard) {
+    auto c = start_cluster(/*n_workers=*/1);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
-    const auto r = http_get("127.0.0.1", c->tm_http_ports[0], "/");
-    // TM has no `/` route, so cpp-httplib's default 404 fires. We don't
+    const auto r = http_get("127.0.0.1", c->worker_http_ports[0], "/");
+    // worker has no `/` route, so cpp-httplib's default 404 fires. We don't
     // strictly assert 404 (different cpp-httplib versions might serve
     // a directory listing), but we DO assert the body doesn't carry
     // the dashboard title.
     EXPECT_EQ(r.body.find("clink dashboard"), std::string::npos)
-        << "TM should not serve the dashboard; body head: " << r.body.substr(0, 200);
+        << "worker should not serve the dashboard; body head: " << r.body.substr(0, 200);
 }

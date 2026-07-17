@@ -41,7 +41,7 @@ struct EtcdHaConfig {
 
     // Logical cluster name. Lets one etcd cluster host multiple
     // clink deployments - the leader key is prefixed with this so
-    // /clink/jm/<cluster_name>/leader doesn't collide. Required.
+    // /clink/coordinator/<cluster_name>/leader doesn't collide. Required.
     std::string cluster_name;
 
     // Lease TTL. A leader that fails to refresh within this window
@@ -53,7 +53,7 @@ struct EtcdHaConfig {
 };
 
 // Construct an etcd-backed HaCoordinator. advertise is the (host,
-// port) this JM publishes when it becomes leader (zero-init for TMs
+// port) this coordinator publishes when it becomes leader (zero-init for workers
 // that only read). The factory throws std::runtime_error on a
 // fundamentally broken config (empty endpoints / cluster_name); the
 // initial etcd connection happens lazily on start() so a temporarily

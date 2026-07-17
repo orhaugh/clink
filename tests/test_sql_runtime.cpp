@@ -2,7 +2,7 @@
 //
 // Compiles a SQL job through the full frontend (parser -> binder ->
 // optimizer -> physical planner), then runs the resulting
-// JobGraphSpec in-process against a JobManager + TaskManager pair.
+// JobGraphSpec in-process against a Coordinator + Worker pair.
 // The SQL ops are registered on the process-wide registry by
 // clink::sql::install at test start.
 
@@ -28,11 +28,11 @@
 #include "clink/application/job_submitter.hpp"
 #include "clink/async/task.hpp"
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/dag_builder_registry.hpp"
-#include "clink/cluster/job_manager.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/refresh_scheduler.hpp"
-#include "clink/cluster/task_manager.hpp"
+#include "clink/cluster/worker.hpp"
 #include "clink/config/json.hpp"
 #include "clink/operators/agg_function_registry.hpp"
 #include "clink/operators/process_function.hpp"
@@ -278,23 +278,23 @@ cluster::JobGraphSpec compile(const Catalog& cat, const char* sql, bool async_ag
 }
 
 struct InProcessCluster {
-    cluster::JobManager jm;
-    std::uint16_t jm_port{};
-    std::unique_ptr<cluster::TaskManager> tm;
+    cluster::Coordinator coordinator;
+    std::uint16_t coordinator_port{};
+    std::unique_ptr<cluster::Worker> worker;
 
-    InProcessCluster(const std::string& tm_id, std::size_t slots) {
-        jm_port = jm.start();
-        jm.expect_tms({tm_id});
-        cluster::TaskManager::Config cfg;
+    InProcessCluster(const std::string& worker_id, std::size_t slots) {
+        coordinator_port = coordinator.start();
+        coordinator.expect_workers({worker_id});
+        cluster::Worker::Config cfg;
         cfg.slot_count = slots;
-        tm = std::make_unique<cluster::TaskManager>(tm_id, "127.0.0.1", cfg);
-        tm->connect_to_jm("127.0.0.1", jm_port);
+        worker = std::make_unique<cluster::Worker>(worker_id, "127.0.0.1", cfg);
+        worker->connect_to_coordinator("127.0.0.1", coordinator_port);
         std::this_thread::sleep_for(150ms);
     }
     ~InProcessCluster() {
-        if (tm)
-            tm->stop();
-        jm.stop();
+        if (worker)
+            worker->stop();
+        coordinator.stop();
     }
 };
 
@@ -330,8 +330,8 @@ TEST(SqlRuntime, GroupByKeyAliasHonouredInOutput) {
         "INSERT INTO out_t SELECT user_id AS uid, SUM(amount) AS total FROM orders GROUP BY "
         "user_id");
 
-    InProcessCluster cluster("tm-sql-gka", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-gka", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -380,8 +380,8 @@ TEST(SqlRuntime, BlackholeSinkRunsToCompletion) {
             has_bh = true;
     EXPECT_TRUE(has_bh) << "connector='blackhole' did not map to blackhole_sink_row";
 
-    InProcessCluster cluster("tm-sql-bh", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-bh", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -422,8 +422,8 @@ TEST(SqlRuntime, UnboundedGroupBySumRunsEndToEnd) {
                         "INSERT INTO out_t SELECT user_id, SUM(amount) AS total "
                         "FROM orders GROUP BY user_id");
 
-    InProcessCluster cluster("tm-sql-e2e-groupby", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-groupby", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -491,8 +491,8 @@ TEST(SqlRuntime, SumBigintIsExactPastDoubleMantissa) {
 
     auto spec = compile(cat, "INSERT INTO out_t SELECT g, SUM(amount) AS total FROM t GROUP BY g");
 
-    InProcessCluster cluster("tm-sql-e2e-sumexact", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-sumexact", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -952,8 +952,8 @@ TEST(SqlRuntime, AsyncStateInnerJoinOverDisaggProducesCorrectOutput) {
     auto spec = compile(
         cat, "INSERT INTO jout SELECT l_lv AS lv, r_rv AS rv FROM lt l JOIN rt r ON l.id = r.id");
 
-    InProcessCluster cluster("tm-sql-join-disagg", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-join-disagg", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     // A deferring backend: EquiJoinRowOp::open() auto-enables the async KeyedState
@@ -2345,8 +2345,8 @@ TEST(SqlRuntime, TableApiGroupBySumRunsEndToEnd) {
                     .agg({key("user_id"), sum("amount") >> "total"})
                     .insert_into("out_t");
 
-    InProcessCluster cluster("tm-tapi-e2e-groupby", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-tapi-e2e-groupby", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -2411,8 +2411,8 @@ TEST(SqlRuntime, CreateViewExpandsAndFiltersEndToEnd) {
 
     auto spec = compile(cat, "INSERT INTO out_t SELECT a FROM big");
 
-    InProcessCluster cluster("tm-sql-view-e2e", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-view-e2e", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -2461,8 +2461,8 @@ TEST(SqlRuntime, CreateViewColumnAliasFlowsUnderAliasedNamesEndToEnd) {
 
     auto spec = compile(cat, "INSERT INTO out_t SELECT id FROM v WHERE score > 10");
 
-    InProcessCluster cluster("tm-sql-valias-e2e", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-valias-e2e", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -2513,8 +2513,8 @@ TEST(SqlRuntime, AlterTableAddColumnMakesItQueryableEndToEnd) {
         std::get<ast::AlterTableStmt>(parse("ALTER TABLE t ADD COLUMN b BIGINT").statements[0]));
     auto spec = compile(cat, "INSERT INTO out_t SELECT a, b FROM t");
 
-    InProcessCluster cluster("tm-sql-alter-e2e", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-alter-e2e", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -2565,8 +2565,8 @@ TEST(SqlRuntime, AlterTableSetOptionRedirectsSourceEndToEnd) {
         parse(std::string{"ALTER TABLE t SET (path='"} + in_b.string() + "')").statements[0]));
     auto spec = compile(cat, "INSERT INTO out_t SELECT a FROM t");
 
-    InProcessCluster cluster("tm-sql-set-e2e", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-set-e2e", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -2618,8 +2618,8 @@ TEST(SqlRuntime, AlterTableRenameColumnTakesEffectEndToEnd) {
         parse("ALTER TABLE t RENAME COLUMN amt TO amount").statements[0]));
     auto spec = compile(cat, "INSERT INTO out_t SELECT amount FROM t");
 
-    InProcessCluster cluster("tm-sql-rename-e2e", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-rename-e2e", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -2641,7 +2641,7 @@ TEST(SqlRuntime, AlterTableRenameColumnTakesEffectEndToEnd) {
 // actual match_recognize_row params, builds the op via the registry factory,
 // and drives it through a cluster-free Dag + LocalExecutor (VectorSource ->
 // op -> CollectingSink) so the runtime matching is exercised without the
-// InProcessCluster (whose TaskManager heartbeat is flaky under Docker).
+// InProcessCluster (whose Worker heartbeat is flaky under Docker).
 TEST(SqlRuntime, MatchRecognizeMatchesEndToEnd) {
     ensure_sql_installed_once();
 
@@ -2880,8 +2880,8 @@ TEST(SqlRuntime, AggregateRetractsOnDeleteTaggedInput) {
                         "INSERT INTO per_user SELECT user_id, SUM(amount) AS total FROM orders "
                         "GROUP BY user_id");
 
-    InProcessCluster cluster("tm-sql-e2e-retract", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-retract", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -2943,8 +2943,8 @@ TEST(SqlRuntime, MinMaxRecomputeWhenTheExtremeIsRetracted) {
                         "INSERT INTO per_user SELECT user_id, MIN(amount) AS lo, MAX(amount) AS hi "
                         "FROM orders GROUP BY user_id");
 
-    InProcessCluster cluster("tm-sql-e2e-minmax-retract", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-minmax-retract", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -2987,8 +2987,8 @@ TEST(SqlRuntime, CastToBooleanRunsEndToEnd) {
     auto spec =
         compile(cat, "INSERT INTO flags SELECT id, CAST(amount AS BOOLEAN) AS flag FROM orders");
 
-    InProcessCluster cluster("tm-sql-cast-bool", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-cast-bool", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3032,8 +3032,8 @@ TEST(SqlRuntime, NestedCteBodyRunsEndToEnd) {
                         "           SELECT id FROM b) "
                         "SELECT id FROM a");
 
-    InProcessCluster cluster("tm-sql-nested-cte", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-nested-cte", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3069,8 +3069,8 @@ TEST(SqlRuntime, FloatLiteralInArithmeticRunsEndToEnd) {
     // 1.5 is a fractional literal - previously rejected at parse time.
     auto spec = compile(cat, "INSERT INTO scaled SELECT id, amount * 1.5 AS s FROM orders");
 
-    InProcessCluster cluster("tm-sql-flit", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-flit", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3110,8 +3110,8 @@ TEST(SqlRuntime, PercentileMedianRunsEndToEnd) {
                         "PERCENTILE(amount, 0.5) AS p50, PERCENTILE(amount, 1.0) AS p100 "
                         "FROM orders GROUP BY g");
 
-    InProcessCluster cluster("tm-sql-pct", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-pct", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3156,8 +3156,8 @@ TEST(SqlRuntime, ArrayLiteralAndSubscriptRunEndToEnd) {
                         "INSERT INTO picks SELECT id, (ARRAY[10,20,30])[2] AS second, "
                         "(ARRAY[amount,99,7])[3] AS third, (ARRAY[1,2])[9] AS oob FROM orders");
 
-    InProcessCluster cluster("tm-sql-arr1", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-arr1", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3195,8 +3195,8 @@ TEST(SqlRuntime, ArrayLiteralRoundTripsToArrayColumn) {
     auto spec =
         compile(cat, "INSERT INTO bagged SELECT id, ARRAY[id, amount, 99] AS vals FROM orders");
 
-    InProcessCluster cluster("tm-sql-arr2", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-arr2", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3238,8 +3238,8 @@ TEST(SqlRuntime, ArrayColumnIndexRunsEndToEnd) {
     auto spec = compile(
         cat, "INSERT INTO firsts SELECT id, tags[1] AS first_tag, tags[5] AS missing FROM t");
 
-    InProcessCluster cluster("tm-sql-arr3", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-arr3", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3293,8 +3293,8 @@ TEST(SqlRuntime, ArrayElementAccessEdgeCasesYieldNull) {
                         "(ARRAY[10,20,30])[maybe] AS null_idx, "
                         "(ARRAY[10,20,30])[0-1] AS neg_idx FROM t");
 
-    InProcessCluster cluster("tm-sql-arr4", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-arr4", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3361,8 +3361,8 @@ TEST(SqlRuntime, RowConstructAndFieldAccessRunEndToEnd) {
                         "INSERT INTO picked SELECT id, (ROW(amount, id)).amount AS amt, "
                         "(ROW(amount)).nope AS miss FROM orders");
 
-    InProcessCluster cluster("tm-sql-row1", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-row1", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3404,8 +3404,8 @@ TEST(SqlRuntime, FieldAccessOnNestedSourceColumnRunsEndToEnd) {
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec = compile(cat, "INSERT INTO cities SELECT id, (profile).city AS city FROM events");
 
-    InProcessCluster cluster("tm-sql-row2", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-row2", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3465,8 +3465,8 @@ TEST(SqlRuntime, MapConstructAndAccessRunEndToEnd) {
                         "(MAP('US', 'United States', 'GB', 'United Kingdom'))[code] AS country "
                         "FROM codes");
 
-    InProcessCluster cluster("tm-sql-map1", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-map1", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3508,8 +3508,8 @@ TEST(SqlRuntime, MapEdgeCasesRunEndToEnd) {
                         "INSERT INTO r SELECT id, (MAP('k', 'a', 'k', 'b'))['k'] AS dup, "
                         "(MAP(nullc, 'v'))['k'] AS nk FROM t");
 
-    InProcessCluster cluster("tm-sql-map2", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-map2", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3549,8 +3549,8 @@ TEST(SqlRuntime, MapValueToTypedSinkRunsEndToEnd) {
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec = compile(cat, "INSERT INTO out SELECT id, MAP(k, v) AS m FROM src");
 
-    InProcessCluster cluster("tm-sql-mapsink", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mapsink", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3595,8 +3595,8 @@ TEST(SqlRuntime, RowValueToTypedSinkRunsEndToEnd) {
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec = compile(cat, "INSERT INTO out SELECT id AS rid, ROW(id, amount) AS r FROM src");
 
-    InProcessCluster cluster("tm-sql-rowsink", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-rowsink", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3634,8 +3634,8 @@ TEST(SqlRuntime, ArrayAggCollectsPerGroup) {
     auto spec = compile(
         cat, "INSERT INTO grouped SELECT g, array_agg(amount) AS xs FROM orders GROUP BY g");
 
-    InProcessCluster cluster("tm-sql-aagg1", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-aagg1", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3674,8 +3674,8 @@ TEST(SqlRuntime, ArrayAggRetractsDeletedValue) {
     auto spec = compile(
         cat, "INSERT INTO grouped SELECT g, array_agg(amount) AS xs FROM orders GROUP BY g");
 
-    InProcessCluster cluster("tm-sql-aagg2", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-aagg2", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3711,8 +3711,8 @@ TEST(SqlRuntime, ArrayAggDistinctDedups) {
         cat,
         "INSERT INTO grouped SELECT g, array_agg(DISTINCT amount) AS xs FROM orders GROUP BY g");
 
-    InProcessCluster cluster("tm-sql-aagg3", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-aagg3", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3748,8 +3748,8 @@ TEST(SqlRuntime, ArrayAggAllNullReturnsNull) {
     auto spec = compile(
         cat, "INSERT INTO grouped SELECT g, array_agg(amount) AS xs FROM orders GROUP BY g");
 
-    InProcessCluster cluster("tm-sql-aanull", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-aanull", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3793,8 +3793,8 @@ TEST(SqlRuntime, ArrayAggSessionMergeKeepsAllValues) {
                         "INSERT INTO out_t SELECT u, array_agg(amount) AS amounts FROM evt "
                         "GROUP BY SESSION(ts, 500), u");
 
-    InProcessCluster cluster("tm-sql-aasess", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-aasess", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3843,8 +3843,8 @@ TEST(SqlRuntime, FileExactlyOnceSinkProducesCommittedRecords) {
 
     auto spec = compile(cat, "INSERT INTO eo SELECT k, v FROM src_t");
 
-    InProcessCluster cluster("tm-sql-e2e-eo", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-eo", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3914,8 +3914,8 @@ TEST(SqlRuntime, TopNPerKeyEmitsChangelog) {
                         "(SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY amount DESC)"
                         " AS rn FROM orders) sub WHERE rn <= 2");
 
-    InProcessCluster cluster("tm-sql-e2e-tnpk", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-tnpk", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -3981,8 +3981,8 @@ TEST(SqlRuntime, RankAndDenseRankTopNSemantics) {
             std::to_string(n);
         auto spec = compile(cat, sql.c_str());
 
-        InProcessCluster cluster("tm-sql-e2e-rank-" + tag, 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-sql-e2e-rank-" + tag, 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4061,8 +4061,8 @@ TEST(SqlRuntime, DerivedTableFeedsOuterAggregate) {
                         "(SELECT user_id, amount FROM orders WHERE amount > 10) AS big "
                         "GROUP BY user_id");
 
-    InProcessCluster cluster("tm-sql-e2e-dt", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-dt", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4114,8 +4114,8 @@ TEST(SqlRuntime, InsertColumnListReordersToSinkSchema) {
     // matches the sink's declared order.
     auto spec = compile(cat, "INSERT INTO out_t (b, a) SELECT user_id, url FROM clicks");
 
-    InProcessCluster cluster("tm-sql-e2e-ic", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-ic", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4170,8 +4170,8 @@ TEST(SqlRuntime, HavingDirectAggregateFiltersGroups) {
                         "INSERT INTO per_user SELECT user_id, SUM(amount) AS total FROM orders "
                         "GROUP BY user_id HAVING SUM(amount) > 20");
 
-    InProcessCluster cluster("tm-sql-e2e-having", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-having", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4227,8 +4227,8 @@ TEST(SqlRuntime, LimitOffsetSkipsThenForwards) {
     // OFFSET 2 LIMIT 2: skip ids 1,2; emit ids 3,4.
     auto spec = compile(cat, "INSERT INTO out_t SELECT id FROM t LIMIT 2 OFFSET 2");
 
-    InProcessCluster cluster("tm-sql-e2e-offset", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-offset", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4278,8 +4278,8 @@ TEST(SqlRuntime, InListFiltersUsers) {
                         "INSERT INTO out_t SELECT user_id, url FROM clicks "
                         "WHERE user_id IN (2, 4)");
 
-    InProcessCluster cluster("tm-sql-e2e-in", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-in", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4349,8 +4349,8 @@ TEST(SqlRuntime, EquiJoinMatchesAllPairsByKey) {
                         "INSERT INTO joined SELECT * FROM clicks c JOIN orders o "
                         "ON c.user_id = o.user_id");
 
-    InProcessCluster cluster("tm-sql-e2e-eqj", 12);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-eqj", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4412,8 +4412,8 @@ TEST(SqlRuntime, EquiJoinNarrowsWideSources) {
                         "INSERT INTO out_t SELECT c_page, o_sku FROM clicks c JOIN orders o "
                         "ON c.user_id = o.user_id");
 
-    InProcessCluster cluster("tm-sql-ejnw", 12);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-ejnw", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4467,8 +4467,8 @@ TEST(SqlRuntime, JoinWithWhereAndProjection) {
                         "INSERT INTO out_t SELECT c_page, o_amount FROM clicks c JOIN orders o "
                         "ON c.user_id = o.user_id WHERE o_amount > 50");
 
-    InProcessCluster cluster("tm-sql-jwp", 12);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-jwp", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4525,8 +4525,8 @@ TEST(SqlRuntime, QualifiedColumnsOverJoin) {
                         "INSERT INTO out_t SELECT c.page, o.amount FROM clicks c JOIN orders o "
                         "ON c.user_id = o.user_id WHERE o.amount > 50");
 
-    InProcessCluster cluster("tm-sql-qcj", 12);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-qcj", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4579,8 +4579,8 @@ TEST(SqlRuntime, QualifiedColumnsOverJoinGroupBy) {
                         "INSERT INTO out_t SELECT c.page AS page, SUM(o.amount) AS total "
                         "FROM clicks c JOIN orders o ON c.user_id = o.user_id GROUP BY c.page");
 
-    InProcessCluster cluster("tm-sql-qcg", 12);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-qcg", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4636,8 +4636,8 @@ TEST(SqlRuntime, JoinFeedsGroupByAggregate) {
                         "INSERT INTO out_t SELECT c_region, SUM(o_amount) AS total "
                         "FROM clicks c JOIN orders o ON c.user_id = o.user_id GROUP BY c_region");
 
-    InProcessCluster cluster("tm-sql-jga", 12);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-jga", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4705,8 +4705,8 @@ TEST(SqlRuntime, OuterEquiJoins) {
                              " JOIN orders o ON c.id = o.cust")
                                 .c_str());
 
-        InProcessCluster cluster("tm-sql-e2e-oj-" + tag, 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-sql-e2e-oj-" + tag, 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4799,8 +4799,8 @@ TEST(SqlRuntime, TumbleWindowAggregatesByUserPerSecond) {
                         "SELECT user_id, SUM(amount) AS total FROM events "
                         "GROUP BY TUMBLE(ts, 1000), user_id");
 
-    InProcessCluster cluster("tm-sql-e2e-tumble", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-tumble", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4875,8 +4875,8 @@ TEST(SqlRuntime, TumbleWindowSelectsWindowBounds) {
                         "SELECT user_id, SUM(amount) AS total, window_start AS wstart, "
                         "window_end AS wend FROM events GROUP BY TUMBLE(ts, 1000), user_id");
 
-    InProcessCluster cluster("tm-sql-e2e-winbounds", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-winbounds", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -4946,8 +4946,8 @@ TEST(SqlRuntime, WhereComparesTwoColumns) {
 
     auto spec = compile(cat, "INSERT INTO kept SELECT a, b FROM pairs WHERE a >= b");
 
-    InProcessCluster cluster("tm-sql-e2e-colcmp", 4);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-colcmp", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5010,8 +5010,8 @@ TEST(SqlRuntime, HighestBidPerWindowJoinWithRangeResidual) {
         "GROUP BY TUMBLE(ts, 1000)) AS M ON B.price = M.maxprice "
         "WHERE b_ts >= m_ws AND b_ts < m_we");
 
-    InProcessCluster cluster("tm-sql-e2e-q7", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q7", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 20s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5063,8 +5063,8 @@ TEST(SqlRuntime, NonWindowedAggregateEmitsChangelogToNettingSink) {
 
     auto spec = compile(cat, "INSERT INTO agg SELECT k, SUM(v) AS total FROM events GROUP BY k");
 
-    InProcessCluster cluster("tm-sql-e2e-clog", 4);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-clog", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5123,8 +5123,8 @@ TEST(SqlRuntime, TopNBidsPerAuctionToNettingSink) {
                         "(SELECT *, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) "
                         "AS rn FROM bids) AS t WHERE rn <= 2");
 
-    InProcessCluster cluster("tm-sql-e2e-q19", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q19", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5187,8 +5187,8 @@ TEST(SqlRuntime, PerDayBiddingStatsWithDistinctCounts) {
                         "FROM (SELECT DATE_TRUNC('day', datetime) AS day, bidder, auction "
                         "FROM bids) AS t GROUP BY day");
 
-    InProcessCluster cluster("tm-sql-e2e-q15", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q15", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5265,8 +5265,8 @@ TEST(SqlRuntime, ChannelStatsPerDayWithBuckets) {
         "CASE WHEN price >= 10000 AND price <= 1000000 THEN 1 ELSE 0 END AS r2, "
         "CASE WHEN price > 1000000 THEN 1 ELSE 0 END AS r3 FROM bid) AS t GROUP BY channel, day");
 
-    InProcessCluster cluster("tm-sql-e2e-q16", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q16", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5339,8 +5339,8 @@ TEST(SqlRuntime, RegexpExtractAndSplitIndexInProjection) {
                         "split_index(url, '/', 0) AS seg0, split_index(url, '/', 2) AS seg2 "
                         "FROM src");
 
-    InProcessCluster cluster("tm-sql-e2e-strfn", 4);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-strfn", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5398,8 +5398,8 @@ TEST(SqlRuntime, PartitionedFileSinkByColumn) {
 
     auto spec = compile(cat, "INSERT INTO part SELECT id, day, v FROM src");
 
-    InProcessCluster cluster("tm-sql-e2e-q10", 4);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q10", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5461,8 +5461,8 @@ TEST(SqlRuntime, PartitionedFileSinkPercentEncodesUnsafeKeys) {
 
     auto spec = compile(cat, "INSERT INTO part SELECT id, k, v FROM src");
 
-    InProcessCluster cluster("tm-sql-q10enc", 4);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-q10enc", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5563,8 +5563,8 @@ TEST(SqlRuntime, ScalarUdfInProjectionAndPredicate) {
                         "(SELECT id, bid_fee(price) AS fee, bid_keep(price) AS k FROM bid) AS t "
                         "WHERE k = true");
 
-    InProcessCluster cluster("tm-sql-e2e-q14", 4);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q14", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5633,8 +5633,8 @@ TEST(SqlRuntime, BoundedSideInputLookupJoin) {
                         "INSERT INTO out_t SELECT B_auction AS auction, B_bidder AS bidder, "
                         "S_label AS label FROM bid AS B JOIN side AS S ON B.auction = S.key");
 
-    InProcessCluster cluster("tm-sql-e2e-q13", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q13", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5707,8 +5707,8 @@ TEST(SqlRuntime, WinningBidPerAuctionIntervalJoinTopN) {
         "(SELECT b_auction, b_bidder, b_price FROM bid AS B JOIN auction AS A ON B.auction = A.id "
         "WHERE b_datetime >= a_datetime AND b_datetime <= a_expires) AS j) AS r WHERE rn <= 1");
 
-    InProcessCluster cluster("tm-sql-e2e-q9", 16);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q9", 16);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 25s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5788,8 +5788,8 @@ TEST(SqlRuntime, AvgWinningPriceByCategoryStackedAggregate) {
                         "WHERE b_datetime >= a_datetime AND b_datetime <= a_expires) AS j "
                         "GROUP BY b_auction, a_category) AS wins GROUP BY category");
 
-    InProcessCluster cluster("tm-sql-e2e-q4", 16);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q4", 16);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 25s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5848,8 +5848,8 @@ TEST(SqlRuntime, LastNAggRollingAverageSlidesPerKey) {
                         "INSERT INTO rollavg SELECT k, AVG(v) OVER (PARTITION BY k ORDER BY t "
                         "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS avgv FROM src");
 
-    InProcessCluster cluster("tm-sql-lastn", 4);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-lastn", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 20s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5933,8 +5933,8 @@ TEST(SqlRuntime, WinningPriceAvgOverSellerLastNClosedAuctions) {
         "B.auction = A.id WHERE b_datetime >= a_datetime AND b_datetime <= a_expires) AS j) AS r "
         "WHERE rn <= 1) AS wins");
 
-    InProcessCluster cluster("tm-sql-q6", 16);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-q6", 16);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 25s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -5994,8 +5994,8 @@ TEST(SqlRuntime, LastNAggEmptyWindowRetractsKey) {
                         "INSERT INTO rollavg SELECT k, AVG(v) OVER (PARTITION BY k ORDER BY t "
                         "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS avgv FROM src");
 
-    InProcessCluster cluster("tm-sql-lastn-empty", 4);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-lastn-empty", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 20s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6075,8 +6075,8 @@ TEST(SqlRuntime, LastNAggSchemaFollowsSelectOrder) {
                         "INSERT INTO out_t SELECT AVG(v) OVER (PARTITION BY k ORDER BY t "
                         "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS avgv, k FROM src");
 
-    InProcessCluster cluster("tm-sql-lastn-ord", 4);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-lastn-ord", 4);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 20s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6132,8 +6132,8 @@ TEST(SqlRuntime, LatestBidPerAuctionBidderMultiColPartition) {
                         "(SELECT *, ROW_NUMBER() OVER (PARTITION BY auction, bidder ORDER BY ts "
                         "DESC) AS rn FROM bids) AS t WHERE rn <= 1");
 
-    InProcessCluster cluster("tm-sql-e2e-q18", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q18", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6199,8 +6199,8 @@ TEST(SqlRuntime, PerAuctionDayStatsMultiKeyMixedAggregates) {
                 "DATE_TRUNC('day', datetime) AS day, bidder, price FROM bids) AS t "
                 "GROUP BY auction, day");
 
-    InProcessCluster cluster("tm-sql-e2e-q17", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q17", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6295,8 +6295,9 @@ TEST(SqlRuntime, HotItemsPerWindowMaxOverWindowedAggregate) {
         "M "
         "ON D.ws = M.ws WHERE D_we = M_we AND D_num = M_maxnum");
 
-    InProcessCluster cluster("tm-sql-e2e-q5", 16);  // nested windowed-agg + join: many operators
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q5",
+                             16);  // nested windowed-agg + join: many operators
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 25s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6364,8 +6365,8 @@ TEST(SqlRuntime, NewUsersTwoWindowedAggregateJoinSides) {
         "GROUP BY TUMBLE(ts, 1000), seller) AS A ON P.id = A.seller "
         "WHERE P_ps = A_as_ AND P_pe = A_ae");
 
-    InProcessCluster cluster("tm-sql-e2e-q8", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-q8", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 20s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6431,8 +6432,8 @@ TEST(SqlRuntime, WindowedAggregateAsJoinSide) {
                         "FROM probe AS P JOIN (SELECT k AS mk, SUM(v) AS total FROM events "
                         "GROUP BY TUMBLE(ts, 1000), k) AS M ON P.k = M.mk");
 
-    InProcessCluster cluster("tm-sql-e2e-wjoin", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-wjoin", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 20s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6499,8 +6500,8 @@ TEST(SqlRuntime, SessionWindowSelectsMergedBounds) {
                         "SELECT user_id, COUNT(*) AS cnt, window_start AS wstart, "
                         "window_end AS wend FROM events GROUP BY SESSION(ts, 500), user_id");
 
-    InProcessCluster cluster("tm-sql-e2e-sessbounds", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-sessbounds", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6573,8 +6574,8 @@ TEST(SqlRuntime, ProjectionPushdownNarrowsWideEventTimeWindow) {
                         "INSERT INTO per_window SELECT user_id, SUM(amount) AS total FROM events "
                         "GROUP BY TUMBLE(ts, 1000), user_id");
 
-    InProcessCluster cluster("tm-sql-ppw", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-ppw", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6645,8 +6646,8 @@ TEST(SqlRuntime, CumulateWindowEmitsGrowingSlices) {
             "FROM events GROUP BY " +
             group_by + ", user_id";
         auto spec = compile(cat, sql.c_str());
-        InProcessCluster cluster("tm-sql-e2e-cumul-" + tag, 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-sql-e2e-cumul-" + tag, 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6714,8 +6715,8 @@ TEST(SqlRuntime, OverRunningAggregatesAppendOnly) {
                         "FIRST_VALUE(amount) OVER (PARTITION BY user_id ORDER BY ts) AS fv "
                         "FROM evt");
 
-    InProcessCluster cluster("tm-sql-e2e-over", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-over", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6802,8 +6803,8 @@ TEST(SqlRuntime, OverBoundedFrameRowsVsRange) {
         "SUM(amount) OVER (PARTITION BY u ORDER BY ts RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) "
         "AS sum_range FROM evt");
 
-    InProcessCluster cluster("tm-sql-obf", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-obf", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6857,8 +6858,8 @@ TEST(SqlRuntime, ArrayAggOverRunningEmitsGrowingArrays) {
                         "INSERT INTO out_t SELECT *, "
                         "ARRAY_AGG(amount) OVER (PARTITION BY u ORDER BY ts) AS hist FROM evt");
 
-    InProcessCluster cluster("tm-sql-aaov", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-aaov", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6912,8 +6913,8 @@ TEST(SqlRuntime, InSubquerySemiJoin) {
     auto spec = compile(cat,
                         "INSERT INTO out_t SELECT * FROM clicks "
                         "WHERE user_id IN (SELECT user_id FROM vips)");
-    InProcessCluster cluster("tm-sql-e2e-in", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-in", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -6961,8 +6962,8 @@ TEST(SqlRuntime, MultiColumnInSemiJoin) {
         cat.register_table(std::get<ast::CreateTableStmt>(st));
     auto spec =
         compile(cat, "INSERT INTO out_t SELECT * FROM t WHERE (a, b) IN (SELECT x, y FROM s)");
-    InProcessCluster cluster("tm-sql-mcin", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mcin", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7007,8 +7008,8 @@ TEST(SqlRuntime, MultiEqualityExistsSemiJoin) {
     auto spec = compile(cat,
                         "INSERT INTO out_t SELECT * FROM t c WHERE EXISTS "
                         "(SELECT 1 FROM s WHERE s.x = c.a AND s.y = c.b)");
-    InProcessCluster cluster("tm-sql-mcex", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mcex", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7055,8 +7056,8 @@ TEST(SqlRuntime, MultiEqualityNotExistsAntiJoin) {
     auto spec = compile(cat,
                         "INSERT INTO out_t SELECT * FROM t WHERE NOT EXISTS "
                         "(SELECT 1 FROM s WHERE s.x = t.a AND s.y = t.b)");
-    InProcessCluster cluster("tm-sql-mcne", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mcne", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7108,8 +7109,8 @@ TEST(SqlRuntime, NotInAntiJoinWithNull) {
     auto spec = compile(cat,
                         "INSERT INTO out_t SELECT * FROM clicks "
                         "WHERE user_id NOT IN (SELECT user_id FROM vips)");
-    InProcessCluster cluster("tm-sql-e2e-ni", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-ni", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7155,8 +7156,8 @@ std::set<std::int64_t> run_multicol_not_in(const std::string& cluster_tag,
     auto spec = compile(cat,
                         "INSERT INTO out_t SELECT * FROM t WHERE (a, b) NOT IN "
                         "(SELECT x, y FROM s)");
-    InProcessCluster cluster("tm-" + cluster_tag, 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-" + cluster_tag, 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7256,8 +7257,8 @@ TEST(SqlRuntime, SingleColumnNotInEmptyRightNullProbe) {
     auto spec = compile(cat,
                         "INSERT INTO out_t SELECT * FROM clicks "
                         "WHERE user_id NOT IN (SELECT user_id FROM vips)");
-    InProcessCluster cluster("tm-sql-scni", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-scni", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7314,8 +7315,8 @@ TEST(SqlRuntime, MultiColumnNotInFloatComponentMatch) {
     auto spec = compile(cat,
                         "INSERT INTO out_t SELECT * FROM t WHERE (a, b) NOT IN "
                         "(SELECT x, y FROM s)");
-    InProcessCluster cluster("tm-sql-mcnif", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mcnif", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7359,8 +7360,8 @@ TEST(SqlRuntime, DecimalGroupBySumExactAndClean) {
         cat.register_table(std::get<ast::CreateTableStmt>(st));
     auto spec =
         compile(cat, "INSERT INTO out_t SELECT k, SUM(price) AS total FROM orders GROUP BY k");
-    InProcessCluster cluster("tm-sql-decsum", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-decsum", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7406,8 +7407,8 @@ TEST(SqlRuntime, DecimalArithmeticExactInProjection) {
         cat.register_table(std::get<ast::CreateTableStmt>(st));
     // 0.1 + 0.2 -> exactly 0.3; qty(3) * 1.50 -> exactly 4.50.
     auto spec = compile(cat, "INSERT INTO out_t SELECT 0.1 + 0.2 AS a, qty * 1.50 AS b FROM t");
-    InProcessCluster cluster("tm-sql-decar", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-decar", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7447,8 +7448,8 @@ TEST(SqlRuntime, DecimalIngestExactPastDoublePrecision) {
     for (const auto& st : ddl.statements)
         cat.register_table(std::get<ast::CreateTableStmt>(st));
     auto spec = compile(cat, "INSERT INTO out_t SELECT amount FROM t");
-    InProcessCluster cluster("tm-sql-decing", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-decing", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7489,8 +7490,8 @@ TEST(SqlRuntime, DecimalDivisionAndOverflow) {
     auto spec = compile(cat,
                         "INSERT INTO out_t SELECT CAST(amount AS DECIMAL(10,2)) / 3 AS q, "
                         "CAST(12345.67 AS DECIMAL(5,2)) AS o FROM t");
-    InProcessCluster cluster("tm-sql-decdiv", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-decdiv", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7534,8 +7535,8 @@ TEST(SqlRuntime, DecimalSessionMinMaxMergeIsNumeric) {
     auto spec = compile(cat,
                         "INSERT INTO out_t SELECT k, MIN(amount) AS lo, MAX(amount) AS hi "
                         "FROM events GROUP BY SESSION(ts, 500), k");
-    InProcessCluster cluster("tm-sql-decsess", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-decsess", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7579,8 +7580,8 @@ TEST(SqlRuntime, ExistsCorrelatedSemiJoin) {
     auto spec = compile(cat,
                         "INSERT INTO out_t SELECT * FROM clicks c "
                         "WHERE EXISTS (SELECT 1 FROM vips v WHERE v.user_id = c.user_id)");
-    InProcessCluster cluster("tm-sql-e2e-ex", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-ex", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7633,8 +7634,8 @@ TEST(SqlRuntime, ScalarSubqueryGreaterThanAvg) {
     auto spec = compile(cat,
                         "INSERT INTO out_t SELECT * FROM orders "
                         "WHERE amount > (SELECT avg(amount) FROM refs)");
-    InProcessCluster cluster("tm-sql-e2e-sc", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-sc", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7686,8 +7687,8 @@ TEST(SqlRuntime, ScalarSubqueryInSelectAppendsToEveryRow) {
         cat.register_table(std::get<ast::CreateTableStmt>(st));
     auto spec = compile(
         cat, "INSERT INTO out_t SELECT id, (SELECT max(amount) FROM refs) AS m FROM orders");
-    InProcessCluster cluster("tm-sql-e2e-scp", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-scp", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7733,8 +7734,8 @@ TEST(SqlRuntime, ScalarSubqueryInSelectEmptyYieldsNull) {
         cat.register_table(std::get<ast::CreateTableStmt>(st));
     auto spec = compile(
         cat, "INSERT INTO out_t SELECT id, (SELECT max(amount) FROM refs) AS m FROM orders");
-    InProcessCluster cluster("tm-sql-e2e-scpn", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-scpn", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7788,8 +7789,8 @@ TEST(SqlRuntime, SessionWindowCollapsesBurstsPerUser) {
                         "SELECT user_id, COUNT(*) AS hits FROM events "
                         "GROUP BY SESSION(ts, 500), user_id");
 
-    InProcessCluster cluster("tm-sql-e2e-session", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-session", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -7867,8 +7868,8 @@ TEST(SqlRuntime, IntervalJoinMatchesWithinWindow) {
                         "ON c.user_id = o.user_id AND "
                         "   c.click_ts BETWEEN o.order_ts - 50 AND o.order_ts + 200");
 
-    InProcessCluster cluster("tm-sql-e2e-ij", 12);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-ij", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8141,8 +8142,8 @@ TEST(SqlRuntime, LeftOuterIntervalJoinNullPadsUnmatchedLeft) {
                         "ON c.user_id = o.user_id AND "
                         "   c.click_ts BETWEEN o.order_ts - 50 AND o.order_ts + 200");
 
-    InProcessCluster cluster("tm-sql-e2e-lij", 12);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-lij", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8223,8 +8224,8 @@ TEST(SqlRuntime, FullOuterIntervalJoinNullPadsBothSides) {
                         "ON c.user_id = o.user_id AND "
                         "   c.click_ts BETWEEN o.order_ts - 50 AND o.order_ts + 200");
 
-    InProcessCluster cluster("tm-sql-e2e-fij", 12);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-fij", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8300,8 +8301,8 @@ TEST(SqlRuntime, ScalarUdfCallableFromSql) {
 
     auto spec = compile(cat, "INSERT INTO out_t SELECT user_id, bump(amount) AS bumped FROM evt");
 
-    InProcessCluster cluster("tm-sql-e2e-udf", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-udf", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8398,8 +8399,8 @@ TEST(SqlRuntime, UdafGroupBySum) {
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec = compile(cat, "INSERT INTO out_t SELECT k, t_sum(v) AS total FROM evt GROUP BY k");
 
-    InProcessCluster cluster("tm-sql-udaf-gb", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-udaf-gb", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8444,8 +8445,8 @@ TEST(SqlRuntime, UdafTumbleProduct) {
     auto spec = compile(
         cat, "INSERT INTO out_t SELECT k, t_prod(v) AS p FROM evt GROUP BY TUMBLE(ts, 1000), k");
 
-    InProcessCluster cluster("tm-sql-udaf-tw", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-udaf-tw", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8483,8 +8484,8 @@ TEST(SqlRuntime, UdafAllNullGroupReturnsInit) {
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec = compile(cat, "INSERT INTO out_t SELECT k, t_sum(v) AS total FROM evt GROUP BY k");
-    InProcessCluster cluster("tm-sql-udaf-nil", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-udaf-nil", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8523,8 +8524,8 @@ TEST(SqlRuntime, UdafSessionMerge) {
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec = compile(
         cat, "INSERT INTO out_t SELECT k, t_sum(v) AS total FROM evt GROUP BY SESSION(ts, 500), k");
-    InProcessCluster cluster("tm-sql-udaf-se", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-udaf-se", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8608,8 +8609,8 @@ TEST(SqlRuntime, UdafRetractionApplied) {
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec = compile(cat, "INSERT INTO out_t SELECT k, t_sum(v) AS total FROM evt GROUP BY k");
-    InProcessCluster cluster("tm-sql-udaf-rt", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-udaf-rt", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8665,8 +8666,8 @@ TEST(SqlRuntime, MultisetCollectCardinalityAndElement) {
         cat.register_table(std::get<ast::CreateTableStmt>(st));
     }
 
-    InProcessCluster cluster("tm-sql-ms", 12);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-ms", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
 
@@ -8731,8 +8732,8 @@ TEST(SqlRuntime, UdafMultiArgWeightedSum) {
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec =
         compile(cat, "INSERT INTO out_t SELECT k, t_wsum(v, w) AS total FROM evt GROUP BY k");
-    InProcessCluster cluster("tm-sql-udaf-ma", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-udaf-ma", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8766,8 +8767,8 @@ TEST(SqlRuntime, UdafNoArgCountsRows) {
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec = compile(cat, "INSERT INTO out_t SELECT k, t_rows() AS n FROM evt GROUP BY k");
-    InProcessCluster cluster("tm-sql-udaf-na", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-udaf-na", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8807,8 +8808,8 @@ TEST(SqlRuntime, UdafDistinctFoldsEachTupleOnce) {
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec =
         compile(cat, "INSERT INTO out_t SELECT k, t_sum(DISTINCT v) AS total FROM evt GROUP BY k");
-    InProcessCluster cluster("tm-sql-udaf-di", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-udaf-di", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8851,8 +8852,8 @@ TEST(SqlRuntime, UdafDistinctRetractsOnLastOccurrence) {
     cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
     auto spec =
         compile(cat, "INSERT INTO out_t SELECT k, t_sum(DISTINCT v) AS total FROM evt GROUP BY k");
-    InProcessCluster cluster("tm-sql-udaf-dr", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-udaf-dr", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -8948,8 +8949,8 @@ TEST(SqlRuntime, ProcessTableFunctionPartitionedRunningTotal) {
                         "SELECT user_id, running FROM running_total(TABLE events PARTITION BY "
                         "user_id)");
 
-    InProcessCluster cluster("tm-sql-ptf", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-ptf", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9014,8 +9015,8 @@ TEST(SqlRuntime, ProcessTableFunctionFeedsOuterFilter) {
                         "SELECT running FROM running_total(TABLE events PARTITION BY user_id) "
                         "WHERE running > 20");
 
-    InProcessCluster cluster("tm-sql-ptf2", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-ptf2", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9121,8 +9122,8 @@ TEST(SqlRuntime, MaterializedViewKeyedAggregationRunsEndToEnd) {
     // The referencing query scans the backing table like any source.
     auto read_spec = compile(cat, "INSERT INTO out_t SELECT user_id, total FROM mv");
 
-    InProcessCluster cluster("tm-sql-mv", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mv", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
 
@@ -9194,8 +9195,8 @@ TEST(SqlRuntime, UnionAllMergesTwoFileSources) {
                         "INSERT INTO out_t "
                         "SELECT id, url FROM a UNION ALL SELECT id, url FROM b");
 
-    InProcessCluster cluster("tm-sql-e2e-union", 12);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-union", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9259,8 +9260,8 @@ TEST(SqlRuntime, SetOperations) {
         auto spec =
             compile(cat, ("INSERT INTO out_t SELECT v FROM a " + op + " SELECT v FROM b").c_str());
 
-        InProcessCluster cluster("tm-sql-e2e-setop-" + tag, 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-sql-e2e-setop-" + tag, 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9328,8 +9329,8 @@ TEST(SqlRuntime, SetOperationsAll) {
         auto spec =
             compile(cat, ("INSERT INTO out_t SELECT v FROM a " + op + " SELECT v FROM b").c_str());
 
-        InProcessCluster cluster("tm-sql-setall-" + tag, 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-sql-setall-" + tag, 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9389,8 +9390,8 @@ TEST(SqlRuntime, SetOpExceptRetractsDeletedLeftRow) {
         cat.register_table(std::get<ast::CreateTableStmt>(st));
     auto spec = compile(cat, "INSERT INTO out_t SELECT v FROM a EXCEPT SELECT v FROM b");
 
-    InProcessCluster cluster("tm-sql-setdel", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-setdel", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9445,8 +9446,8 @@ TEST(SqlRuntime, TopNReturnsHighestThreeByAmount) {
                         "INSERT INTO top_orders "
                         "SELECT id, amount FROM orders ORDER BY amount DESC LIMIT 3");
 
-    InProcessCluster cluster("tm-sql-e2e-topn", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-topn", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9503,8 +9504,8 @@ TEST(SqlRuntime, CteFiltersFeedingUnboundedAggregate) {
                         "WITH big_orders AS (SELECT user_id, amount FROM orders WHERE amount > 10) "
                         "SELECT user_id, SUM(amount) AS total FROM big_orders GROUP BY user_id");
 
-    InProcessCluster cluster("tm-sql-e2e-cte", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-cte", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9570,8 +9571,8 @@ TEST(SqlRuntime, ScalarBuiltinsAppliedPerRow) {
                         "  NULLIF(user_id, 1) AS zeroed "
                         "FROM in_t");
 
-    InProcessCluster cluster("tm-sql-e2e-builtins", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-builtins", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9638,8 +9639,8 @@ TEST(SqlRuntime, ExtendedScalarBuiltinsAppliedPerRow) {
                         "  STARTS_WITH(url, 'a') AS sw "
                         "FROM in_t");
 
-    InProcessCluster cluster("tm-sql-e2e-ext", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-ext", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9691,8 +9692,8 @@ TEST(SqlRuntime, StddevVarianceAggregates) {
                 "INSERT INTO out_t SELECT user_id, STDDEV_POP(amount) AS sd, "
                 "VAR_POP(amount) AS vp, VAR_SAMP(amount) AS vs FROM orders GROUP BY user_id");
 
-    InProcessCluster cluster("tm-sql-e2e-stddev", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-stddev", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9749,8 +9750,8 @@ TEST(SqlRuntime, CaseWhenAssignsTierPerRow) {
                         "     ELSE 'low' END AS tier "
                         "FROM scores");
 
-    InProcessCluster cluster("tm-sql-e2e-case", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-case", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9802,8 +9803,8 @@ TEST(SqlRuntime, LimitCapsOutputRowCount) {
 
     auto spec = compile(cat, "INSERT INTO out_t SELECT user_id, url FROM clicks LIMIT 2");
 
-    InProcessCluster cluster("tm-sql-e2e-limit", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-limit", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9846,8 +9847,8 @@ TEST(SqlRuntime, FilterAndProjectRunsEndToEnd) {
 
     auto spec = compile(cat, "INSERT INTO out_t SELECT url FROM clicks WHERE url = 'home'");
 
-    InProcessCluster cluster("tm-sql-e2e-filter", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-filter", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9910,8 +9911,8 @@ TEST(SqlRuntime, AggregateNetsUpdateBeforeAfterPairs) {
                         "INSERT INTO per_user SELECT user_id, SUM(amount) AS total FROM orders "
                         "GROUP BY user_id");
 
-    InProcessCluster cluster("tm-sql-e2e-updpair", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-updpair", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -9983,8 +9984,8 @@ TEST(SqlRuntime, ExactlyOnceSinkViaSqlCommitsRecordsExactlyOnce) {
 
     auto spec = compile(cat, "INSERT INTO eo SELECT k, v FROM src_t");
 
-    InProcessCluster cluster("tm-sql-e2e-eocommit", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-eocommit", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 20s;
     // Enable checkpointing: gives the job a state backend so the
@@ -10082,8 +10083,8 @@ TEST(SqlRuntime, AsyncLookupViaSqlEnrichesRows) {
     // recognizes and lowers to async_lookup_row.
     auto spec = compile(cat, "INSERT INTO enriched SELECT enrich_double(*) FROM events");
 
-    InProcessCluster cluster("tm-sql-e2e-async", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-async", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -10160,8 +10161,8 @@ TEST(SqlRuntime, LookupJoinEnrichesProbeStream) {
                              " JOIN customers c ON o.cust = c.id")
                                 .c_str());
 
-        InProcessCluster cluster("tm-sql-e2e-lj-" + tag, 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-sql-e2e-lj-" + tag, 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -10220,8 +10221,8 @@ TEST(SqlRuntime, DateTimeFunctionsPerRow) {
                         "DATE_FORMAT(ts, 'yyyy-MM-dd HH:mm:ss') AS fmt, "
                         "TO_TIMESTAMP(DATE_FORMAT(ts, 'yyyy-MM-dd HH:mm:ss')) AS rt FROM events");
 
-    InProcessCluster cluster("tm-sql-e2e-dt", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-dt", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -10293,8 +10294,8 @@ TEST(SqlRuntime, JsonFunctionsExtractAndConstruct) {
                         "JSON_OBJECT('who', JSON_VALUE(payload, '$.user.name')) AS obj "
                         "FROM events");
 
-    InProcessCluster cluster("tm-sql-e2e-json", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-json", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -10365,8 +10366,8 @@ TEST(SqlRuntime, CountDistinctAndStringAggGroupBy) {
                         "INSERT INTO per_k SELECT k, COUNT(DISTINCT v) AS cd, "
                         "STRING_AGG(s, '|') AS sa FROM t GROUP BY k");
 
-    InProcessCluster cluster("tm-sql-e2e-aggd", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-e2e-aggd", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -10425,8 +10426,8 @@ TEST(SqlRuntime, ParquetTypedColumnarRoundTripEndToEnd) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT id, name, px, active FROM ev");
 
-        InProcessCluster cluster("tm-sql-pq-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-sql-pq-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -10464,8 +10465,8 @@ TEST(SqlRuntime, ParquetTypedColumnarRoundTripEndToEnd) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO final_t SELECT id, name, px, active FROM pq_in");
 
-        InProcessCluster cluster("tm-sql-pq-read", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-sql-pq-read", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -10541,8 +10542,8 @@ TEST(SqlRuntime, ColumnarParquetGroupByEndToEnd) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT region, amount FROM ev");
-        InProcessCluster cluster("tm-cgb-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-cgb-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -10564,8 +10565,8 @@ TEST(SqlRuntime, ColumnarParquetGroupByEndToEnd) {
         auto spec = compile(cat,
                             "INSERT INTO agg_out SELECT region, SUM(amount) AS total, "
                             "COUNT(*) AS n FROM pq_in GROUP BY region");
-        InProcessCluster cluster("tm-cgb-agg", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-cgb-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -10635,8 +10636,8 @@ TEST(SqlRuntime, ColumnarParquetGroupByMultiAggregateBatchFold) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT region, amount FROM ev");
-        InProcessCluster cluster("tm-ws3-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-ws3-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -10659,8 +10660,8 @@ TEST(SqlRuntime, ColumnarParquetGroupByMultiAggregateBatchFold) {
         auto spec = compile(cat,
                             "INSERT INTO agg_out SELECT region, SUM(amount) AS total, "
                             "COUNT(*) AS n, AVG(amount) AS av FROM pq_in GROUP BY region");
-        InProcessCluster cluster("tm-ws3-agg", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-ws3-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -10736,8 +10737,8 @@ TEST(SqlRuntime, ColumnarParquetBigintSumExactPastDoubleMantissa) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT region, amount FROM ev");
-        InProcessCluster cluster("tm-ws3big-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-ws3big-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -10762,8 +10763,8 @@ TEST(SqlRuntime, ColumnarParquetBigintSumExactPastDoubleMantissa) {
         auto spec = compile(cat,
                             "INSERT INTO agg_out SELECT region, SUM(amount) AS total "
                             "FROM pq_in GROUP BY region");
-        InProcessCluster cluster("tm-ws3big-agg", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-ws3big-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -10828,8 +10829,8 @@ TEST(SqlRuntime, ColumnarParquetDoubleVarianceBatchFold) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT region, amount FROM ev");
-        InProcessCluster cluster("tm-ws6v-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-ws6v-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -10856,8 +10857,8 @@ TEST(SqlRuntime, ColumnarParquetDoubleVarianceBatchFold) {
                             "INSERT INTO agg_out SELECT region, SUM(amount) AS total, "
                             "AVG(amount) AS av, VAR_POP(amount) AS vp, STDDEV_POP(amount) AS sd, "
                             "COUNT(*) AS n FROM pq_in GROUP BY region");
-        InProcessCluster cluster("tm-ws6v-agg", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-ws6v-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -10936,8 +10937,8 @@ TEST(SqlRuntime, ColumnarParquetDecimalSumExact) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT region, amount FROM ev");
-        InProcessCluster cluster("tm-ws6d-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-ws6d-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -10961,8 +10962,8 @@ TEST(SqlRuntime, ColumnarParquetDecimalSumExact) {
         auto spec = compile(cat,
                             "INSERT INTO agg_out SELECT region, SUM(amount) AS total "
                             "FROM pq_in GROUP BY region");
-        InProcessCluster cluster("tm-ws6d-agg", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-ws6d-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11027,8 +11028,8 @@ TEST(SqlRuntime, ColumnarParquetTumbleWindowEndToEnd) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts, amount FROM ev");
-        InProcessCluster cluster("tm-ctw-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-ctw-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11050,8 +11051,8 @@ TEST(SqlRuntime, ColumnarParquetTumbleWindowEndToEnd) {
         auto spec = compile(cat,
                             "INSERT INTO per_window SELECT user_id, SUM(amount) AS total "
                             "FROM pq_in GROUP BY TUMBLE(ts, 1000), user_id");
-        InProcessCluster cluster("tm-ctw-agg", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-ctw-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11123,8 +11124,8 @@ TEST(SqlRuntime, ColumnarParquetHopWindowVectorised) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts, amount FROM ev");
-        InProcessCluster cluster("tm-chw-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-chw-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11148,8 +11149,8 @@ TEST(SqlRuntime, ColumnarParquetHopWindowVectorised) {
         auto spec = compile(cat,
                             "INSERT INTO per_window SELECT user_id, SUM(amount) AS total, "
                             "COUNT(*) AS cnt FROM pq_in GROUP BY HOP(ts, 2000, 1000), user_id");
-        InProcessCluster cluster("tm-chw-agg", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-chw-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11247,8 +11248,8 @@ TEST(SqlRuntime, ColumnarKafkaDecodeFiresOnProductionPath) {
     const std::uint64_t mat_before =
         clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
     {
-        InProcessCluster cluster("tm-ckd", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-ckd", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11313,8 +11314,8 @@ TEST(SqlRuntime, ColumnarParquetWindowMinMaxVectorised) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts, price FROM ev");
-        InProcessCluster cluster("tm-wmm-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-wmm-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11336,8 +11337,8 @@ TEST(SqlRuntime, ColumnarParquetWindowMinMaxVectorised) {
         auto spec = compile(cat,
                             "INSERT INTO per_window SELECT user_id, MAX(price) AS mx, "
                             "MIN(price) AS mn FROM pq_in GROUP BY TUMBLE(ts, 1000), user_id");
-        InProcessCluster cluster("tm-wmm-agg", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-wmm-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11397,8 +11398,8 @@ TEST(SqlRuntime, ColumnarParquetWindowedCountDistinctRowFallback) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts, bidder FROM ev");
-        InProcessCluster cluster("tm-wcd-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-wcd-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11418,8 +11419,8 @@ TEST(SqlRuntime, ColumnarParquetWindowedCountDistinctRowFallback) {
         auto spec = compile(cat,
                             "INSERT INTO per_window SELECT user_id, COUNT(DISTINCT bidder) AS d "
                             "FROM pq_in GROUP BY TUMBLE(ts, 1000), user_id");
-        InProcessCluster cluster("tm-wcd-agg", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-wcd-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11477,8 +11478,8 @@ TEST(SqlRuntime, ColumnarParquetSessionWindowEndToEnd) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts FROM ev");
-        InProcessCluster cluster("tm-csw-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-csw-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11500,8 +11501,8 @@ TEST(SqlRuntime, ColumnarParquetSessionWindowEndToEnd) {
         auto spec = compile(cat,
                             "INSERT INTO per_session SELECT user_id, COUNT(*) AS hits "
                             "FROM pq_in GROUP BY SESSION(ts, 500), user_id");
-        InProcessCluster cluster("tm-csw-agg", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-csw-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11569,8 +11570,8 @@ TEST(SqlRuntime, ColumnarParquetSessionSumVectorised) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts, amount FROM ev");
-        InProcessCluster cluster("tm-css-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-css-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11592,8 +11593,8 @@ TEST(SqlRuntime, ColumnarParquetSessionSumVectorised) {
         auto spec = compile(cat,
                             "INSERT INTO per_session SELECT user_id, COUNT(*) AS hits, "
                             "SUM(amount) AS total FROM pq_in GROUP BY SESSION(ts, 500), user_id");
-        InProcessCluster cluster("tm-css-agg", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-css-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11653,8 +11654,8 @@ TEST(SqlRuntime, ColumnarParquetSessionMinMaxMergeVectorised) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, "INSERT INTO pq SELECT user_id, ts, price FROM ev");
-        InProcessCluster cluster("tm-smm-write", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-smm-write", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11676,8 +11677,8 @@ TEST(SqlRuntime, ColumnarParquetSessionMinMaxMergeVectorised) {
         auto spec = compile(cat,
                             "INSERT INTO per_session SELECT user_id, MAX(price) AS mx, "
                             "MIN(price) AS mn FROM pq_in GROUP BY SESSION(ts, 500), user_id");
-        InProcessCluster cluster("tm-smm-agg", 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster("worker-smm-agg", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11754,8 +11755,8 @@ TEST(SqlRuntime, ThreeWayInnerJoinEndToEnd) {
                         "INSERT INTO out_t SELECT a_av AS av, b_bv AS bv, c_cv AS cv FROM a "
                         "JOIN b ON a.id = b.id JOIN c ON b.id = c.id");
 
-    InProcessCluster cluster("tm-3wj", 12);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-3wj", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto r = submitter.submit(spec.to_json(), {}, opts);
@@ -11810,7 +11811,7 @@ TEST(SqlRuntime, AsyncStateGroupByMatchesInMemory) {
         "MAX(amount) AS mx, AVG(amount) AS av, COUNT(DISTINCT amount) AS cd "
         "FROM orders GROUP BY user_id";
 
-    auto run = [&](const std::filesystem::path& out_path, bool async_agg, const char* tm_id) {
+    auto run = [&](const std::filesystem::path& out_path, bool async_agg, const char* worker_id) {
         Catalog cat;
         auto ddl = parse(std::string{"CREATE TABLE orders (user_id BIGINT, amount BIGINT) "
                                      "WITH (connector='file', format='json', path='"} +
@@ -11823,8 +11824,8 @@ TEST(SqlRuntime, AsyncStateGroupByMatchesInMemory) {
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
         cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
         auto spec = compile(cat, ("INSERT INTO dst " + select).c_str(), async_agg);
-        InProcessCluster cluster(tm_id, 8);
-        application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+        InProcessCluster cluster(worker_id, 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
         application::SubmitOptions opts;
         opts.wait_timeout = 15s;
         auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -11833,8 +11834,8 @@ TEST(SqlRuntime, AsyncStateGroupByMatchesInMemory) {
                                << (result.errors.empty() ? "(none)" : result.errors[0]);
     };
 
-    run(sync_out, /*async_agg=*/false, "tm-agg-sync");
-    run(async_out, /*async_agg=*/true, "tm-agg-async");
+    run(sync_out, /*async_agg=*/false, "worker-agg-sync");
+    run(async_out, /*async_agg=*/true, "worker-agg-async");
 
     // Last emission per group is its final aggregate (upsert stream). Order
     // across keys is not guaranteed, so compare per-key finals, not raw lines.
@@ -11989,8 +11990,8 @@ TEST(SqlRuntime, VectorSearchTopKEndToEnd) {
                         "INSERT INTO vout SELECT * FROM VECTOR_SEARCH("
                         "TABLE q, emb, docs, DESCRIPTOR(vec), 1, metric='cosine')");
 
-    InProcessCluster cluster("tm-sql-vs", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-vs", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -12042,8 +12043,8 @@ TEST(SqlRuntime, MlPredictAppendsModelOutputEndToEnd) {
         cat,
         "INSERT INTO mlout SELECT * FROM ML_PREDICT(TABLE nums, MODEL doubler, DESCRIPTOR(n))");
 
-    InProcessCluster cluster("tm-sql-mlp", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mlp", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -12107,8 +12108,8 @@ TEST(SqlRuntime, MlPredictAsyncProviderAppendsModelOutputEndToEnd) {
         cat,
         "INSERT INTO amlout SELECT * FROM ML_PREDICT(TABLE anums, MODEL adoubler, DESCRIPTOR(n))");
 
-    InProcessCluster cluster("tm-sql-mlpa", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mlpa", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -12174,8 +12175,8 @@ TEST(SqlRuntime, MlPredictBatchedProviderEndToEnd) {
         cat,
         "INSERT INTO bmlout SELECT * FROM ML_PREDICT(TABLE bnums, MODEL bdoubler, DESCRIPTOR(n))");
 
-    InProcessCluster cluster("tm-sql-mlpb", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mlpb", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -12233,8 +12234,8 @@ TEST(SqlRuntime, MlPredictOnErrorNullEmitsNullOutputs) {
         cat,
         "INSERT INTO emlout SELECT * FROM ML_PREDICT(TABLE enums, MODEL flaky, DESCRIPTOR(n))");
 
-    InProcessCluster cluster("tm-sql-mlperr", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mlperr", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -12283,8 +12284,8 @@ TEST(SqlRuntime, MlPredictOnErrorFailPropagates) {
         cat,
         "INSERT INTO fmlout SELECT * FROM ML_PREDICT(TABLE fnums, MODEL flaky2, DESCRIPTOR(n))");
 
-    InProcessCluster cluster("tm-sql-mlpfail", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mlpfail", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     (void)submitter.submit(spec.to_json(), {}, opts);
@@ -12329,8 +12330,8 @@ TEST(SqlRuntime, MaterializedViewFullRefreshOverwritesAtomically) {
     EXPECT_EQ(mvplan.arm, RefreshArm::Full);
     EXPECT_EQ(cat.get_table("mv")->properties.at("write_mode"), "overwrite");
 
-    InProcessCluster cluster("tm-sql-mv", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mv", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
 
@@ -12391,8 +12392,8 @@ TEST(SqlRuntime, MaterializedViewSchedulerAutoRefreshes) {
         std::get<ast::CreateMaterializedViewStmt>(std::move(mv_script.statements[0])), cat, mv_sql);
     ASSERT_EQ(mvplan.arm, RefreshArm::Full);
 
-    InProcessCluster cluster("tm-sql-mvsched", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mvsched", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto ids_in_out = [&]() {
@@ -12473,8 +12474,8 @@ TEST(SqlRuntime, MaterializedViewPartitionedFullRefresh) {
     EXPECT_EQ(cat.get_table("pmv")->properties.at("write_mode"), "overwrite");
     EXPECT_EQ(cat.get_table("pmv")->properties.at("partition_by"), "region");
 
-    InProcessCluster cluster("tm-sql-mvpart", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mvpart", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
 
@@ -12540,8 +12541,8 @@ TEST(SqlRuntime, MaterializedViewFullRefreshAggregateNetsByKey) {
     EXPECT_EQ(cat.get_table("amv")->properties.at("mode"), "upsert");
     EXPECT_EQ(cat.get_table("amv")->properties.at("primary_key"), "region");
 
-    InProcessCluster cluster("tm-sql-mvagg", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-mvagg", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto submit_plan = [&](std::unique_ptr<LogicalPlan> plan) {
@@ -12604,8 +12605,8 @@ TEST(SqlRuntime, FileSourceReadsBackPartitionedDirectory) {
                          out.string() + "')");
     cat.register_table(std::get<ast::CreateTableStmt>(out_ddl.statements[0]));
 
-    InProcessCluster cluster("tm-sql-readback", 8);
-    application::JobSubmitter submitter("127.0.0.1", cluster.jm_port);
+    InProcessCluster cluster("worker-sql-readback", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
     auto spec = compile(cat, "INSERT INTO out_t SELECT region, amt FROM rb");

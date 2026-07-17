@@ -24,7 +24,7 @@ one summary number.
 | `parallel_recovery/` | par=4 hash partitioning over the tumbling-window workload  | runs       |
 
 Status: 3 of 4 benches run end to end on 2026-06-01. `interval_join`
-builds but the two-source connect_process path hits a JM-side planner
+builds but the two-source connect_process path hits a coordinator-side planner
 gap; see `interval_join/README.md` for the residual issue and fix
 candidates. `parallel_recovery/` runs at par=N for any N>=1 but does
 not yet exercise the induced-crash / restore axis - v2 work.

@@ -28,8 +28,8 @@ clink_set_warnings(clink_k8s_smoke_job)
 # canonical_pipeline_job: a CLINK_REGISTER_JOB-wrapped pipeline built as a
 # shared library. The clink_submit_job CLI dlopens this and ships it
 # to the cluster. The .so links against clink::core so the inline
-# StreamExecutionEnvironment templates / RunnerRegistry singletons it
-# touches resolve symbols in this process; on the TM side dlopen
+# Pipeline templates / RunnerRegistry singletons it
+# touches resolve symbols in this process; on the worker side dlopen
 # resolves the same symbols against the host clink_node binary.
 add_library(clink_canonical_pipeline_job MODULE canonical_pipeline_job.cpp)
 target_link_libraries(clink_canonical_pipeline_job PRIVATE clink::core)
@@ -55,7 +55,7 @@ endforeach()
 
 # heavy_pipeline_job: 99-customer pipeline (Customer -> Order key_by/reduce,
 # sink at parallelism=3). Exercises typed channels, custom codecs, and
-# cross-TM wire traffic. Drives test_heavy_pipeline_e2e.cpp.
+# cross-worker wire traffic. Drives test_heavy_pipeline_e2e.cpp.
 add_library(clink_heavy_pipeline_job MODULE heavy_pipeline_job.cpp)
 target_link_libraries(clink_heavy_pipeline_job PRIVATE clink::core)
 set_target_properties(clink_heavy_pipeline_job PROPERTIES
@@ -95,7 +95,7 @@ set_target_properties(clink_two_phase_commit_job PROPERTIES
 clink_set_warnings(clink_two_phase_commit_job)
 
 # rescale_test_job: slow generator source -> keyBy -> reduce(sum) ->
-# file sink. Drives test_jm_rescale.cpp; the source's per-record
+# file sink. Drives test_coordinator_rescale.cpp; the source's per-record
 # sleep keeps the pipeline alive long enough to checkpoint and then
 # rescale via clink_rescale_job.
 add_library(clink_rescale_test_job MODULE rescale_test_job.cpp)

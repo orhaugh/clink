@@ -19,7 +19,7 @@ This page covers the data model and the topology builder. How those runner closu
 | `include/clink/runtime/dag.hpp` | `Dag`, `StageHandle<T>`, `ParallelStageHandle<T>`, the `detail::OperatorRunner` struct, and all the `add_*` / `fork` / `union_streams` builders |
 | `include/clink/runtime/runtime_context.hpp` | `RuntimeContext`, `Accumulator` |
 | `include/clink/runtime/key_groups.hpp` | `kNumKeyGroups`, `KeyGroup`, key-group hashing |
-| `include/clink/api/stream_execution_environment.hpp` | the fluent `StreamExecutionEnvironment` / `DataStream<T>` front end |
+| `include/clink/api/pipeline.hpp` | the fluent `Pipeline` / `DataStream<T>` front end |
 
 ## How it works
 
@@ -149,7 +149,7 @@ A value of `0` is reserved (the default-constructed sentinel), so derivation map
 
 ### The fluent front end
 
-`StreamExecutionEnvironment` and `DataStream<T>` (`include/clink/api/stream_execution_environment.hpp`) are the user-facing builder. `env.source<T>(...)` returns a `DataStream<T>`; `.map`, `.flat_map`, `.filter`, `.process`, `.assign_timestamps_*`, `.key_by`, `.side_output` chain it; `.name(...)` and `.uid(...)` attach a display name and the stable identity. `key_by` returns a `KeyedDataStream<T>` whose subsequent operators carry a `key_by` field that signals the planner to hash-route the incoming edge. The fluent layer produces an `OperatorSpec` graph that the planner compiles into a `Dag` per subtask; it does not build the `Dag` directly. Connectors are anchored through descriptors, documented in [../connectors/README.md](../connectors/README.md).
+`Pipeline` and `DataStream<T>` (`include/clink/api/pipeline.hpp`) are the user-facing builder. `env.source<T>(...)` returns a `DataStream<T>`; `.map`, `.flat_map`, `.filter`, `.process`, `.assign_timestamps_*`, `.key_by`, `.side_output` chain it; `.name(...)` and `.uid(...)` attach a display name and the stable identity. `key_by` returns a `KeyedDataStream<T>` whose subsequent operators carry a `key_by` field that signals the planner to hash-route the incoming edge. The fluent layer produces an `OperatorSpec` graph that the planner compiles into a `Dag` per subtask; it does not build the `Dag` directly. Connectors are anchored through descriptors, documented in [../connectors/README.md](../connectors/README.md).
 
 ## Key types and APIs
 
@@ -176,10 +176,10 @@ A value of `0` is reserved (the default-constructed sentinel), so derivation map
 | `Dag(default_channel_capacity)` constructor arg | `1024` | capacity of every inter-operator `BoundedChannel` |
 | `kNumKeyGroups` (`key_groups.hpp`) | `128` | number of key groups; the rescale partitioning unit |
 | `CLINK_DISABLE_COLUMNAR=1` | unset | forces the row path even where a columnar fast path exists; diagnostic / benchmark only, never a correctness change |
-| `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS` | `30000` | how long a bounded source waits at clean end-of-stream for its final JM-coordinated checkpoint to commit before throwing (drives watchdog restart) |
+| `CLINK_EOS_FINAL_CKPT_TIMEOUT_MS` | `30000` | how long a bounded source waits at clean end-of-stream for its final coordinator-coordinated checkpoint to commit before throwing (drives watchdog restart) |
 | `IterationConfig::max_records` | `0` (no cap) | safety cap on records through an iteration head |
 | `IterationConfig::idle_threshold` | `100` (~100 ms) | consecutive idle polls before an iteration loop decides it is quiescent |
-| `StreamExecutionEnvironment::set_parallelism(n)` | `1` | default per-operator parallelism floor in the fluent API |
+| `Pipeline::set_parallelism(n)` | `1` | default per-operator parallelism floor in the fluent API |
 
 ## Guarantees and caveats
 

@@ -14,7 +14,7 @@ premise holding is not apples-to-apples.
 ## Why this exists
 
 clink's own Nexmark bench (`benchmarks/clink_nexmark_bench`) is clink-only:
-in-process, single TaskManager, logical-stream rate, with a steady-state mode for
+in-process, single Worker, logical-stream rate, with a steady-state mode for
 clink-vs-clink tracking. It is NOT comparable to another engine. The only existing
 cross-engine number in this repo (`flink_compare`) is a different, single-pipeline
 workload. This harness produces the first defensible clink-vs-Flink Nexmark number.
@@ -339,11 +339,11 @@ and led to fixing - a genuine clink bug in the distributed two-input join:
 
 1. **Slots** (fixed): clink needs one slot per subtask (no Flink-style slot
    sharing), so q8's ~9 ops at par=4 = 36 subtasks exceeded the old 32-slot pool
-   and the job did not deploy. `run.sh` now scales slots-per-TM with `PAR`.
+   and the job did not deploy. `run.sh` now scales slots-per-worker with `PAR`.
 
 2. **Distributed co-operator input mis-partitioning** (fixed): the stream-stream
    equi/interval join is a two-input co-operator whose In1 and In2 share a channel
-   type (Row, Row). The TM runner split its input bridges into the two sides by
+   type (Row, Row). The worker runner split its input bridges into the two sides by
    ordinal, hard-assuming exactly 2 (the par=1 case: one left + one right bridge).
    At par>1 each side contributes one bridge per upstream subtask (par=4 -> 4 left
    + 4 right = 8 bridges), so the split threw / mis-assigned and the join saw no
@@ -367,7 +367,7 @@ SQL suite 546/546 green (the equi-join at par=1 is unchanged).
 
 ## Distributed (containerized) verification + the throughput-measurement caveat
 
-`verify_distributed.sh` runs clink as a real multi-container cluster (1 JM + 4 TM,
+`verify_distributed.sh` runs clink as a real multi-container cluster (1 coordinator + 4 worker,
 separate network namespaces, shuffle over container-to-container TCP, in-network
 Kafka) and gate-checks q0/q12/q8 at par=4 - all gate-exact (460000 / 184767 /
 1056), confirming correctness when distributed across containers, not just over
@@ -408,7 +408,7 @@ engine's own records-processed counter** over time and reports the **drain rate*
 - clink: `GET /api/v1/jobs/<id>/operators`, max `records_in` across operators.
   The counter is fine-grained (~80ms), so the drain is measured first-record to
   last-record (excludes the deploy gap). clink's per-op counters are cumulative
-  across job submissions on a persistent TM, so the sampler anchors a baseline at
+  across job submissions on a persistent worker, so the sampler anchors a baseline at
   the first positive reading and measures the delta.
 - Flink: `GET /jobs/<jid>`, max `read/write-records` across vertices. Flink's
   aggregated metrics lag the metric-fetcher interval (~10s) and arrive as a step,

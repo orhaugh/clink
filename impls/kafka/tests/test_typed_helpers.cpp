@@ -7,7 +7,7 @@
 
 #include <gtest/gtest.h>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/connectors/kafka_message.hpp"
 #include "clink/kafka/install.hpp"
@@ -17,7 +17,7 @@
 
 TEST(KafkaTypedHelpers, MessageSourceProducesTypedDescriptor) {
     clink::cluster::ensure_built_ins_registered();
-    clink::api::StreamExecutionEnvironment env;
+    clink::api::Pipeline env;
     clink::kafka::install(env.registry());
 
     auto stream = clink::kafka::message_source(env,
@@ -46,7 +46,7 @@ TEST(KafkaTypedHelpers, TextSourceComposesTextSourceWithDecoderMap) {
     // that decodes each string into an optional<T>. Two ops in the
     // graph; both reference text-channel-or-target.
     clink::cluster::ensure_built_ins_registered();
-    clink::api::StreamExecutionEnvironment env;
+    clink::api::Pipeline env;
     clink::kafka::install(env.registry());
 
     auto stream = clink::kafka::text_source<std::int64_t>(
@@ -78,7 +78,7 @@ TEST(KafkaTypedHelpers, TextSourceComposesTextSourceWithDecoderMap) {
 
 TEST(KafkaTypedHelpers, MessageSinkConsumesMessageStream) {
     clink::cluster::ensure_built_ins_registered();
-    clink::api::StreamExecutionEnvironment env;
+    clink::api::Pipeline env;
     clink::kafka::install(env.registry());
 
     auto stream = clink::kafka::message_source(

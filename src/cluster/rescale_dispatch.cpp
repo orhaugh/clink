@@ -14,7 +14,7 @@ CutoverDeployment plan_operator_cutover(
     const std::string& restore_from_dir,
     const DeploymentTask& template_task,
     const std::vector<std::string>& old_subtask_keys,
-    std::vector<std::pair<std::string, std::uint32_t>> tm_free_slots) {
+    std::vector<std::pair<std::string, std::uint32_t>> worker_free_slots) {
     CutoverDeployment out;
     out.teardown_keys = old_subtask_keys;
 
@@ -48,11 +48,11 @@ CutoverDeployment plan_operator_cutover(
     }
 
     std::uint32_t total_free = 0;
-    for (const auto& [_, slots] : tm_free_slots) {
+    for (const auto& [_, slots] : worker_free_slots) {
         total_free += slots;
     }
     if (total_free < new_p) {
-        out.error = "rescale: insufficient free TM slots (" + std::to_string(total_free) +
+        out.error = "rescale: insufficient free worker slots (" + std::to_string(total_free) +
                     ") for target parallelism " + std::to_string(new_p);
         return out;
     }
@@ -63,7 +63,7 @@ CutoverDeployment plan_operator_cutover(
         DeploymentTask d = template_task;
         d.role = op_id;
         d.subtask_idx = i;
-        d.data_port = 0;  // TM binds ephemerally; SubtaskListening reports the port.
+        d.data_port = 0;  // worker binds ephemerally; SubtaskListening reports the port.
 
         const auto range = key_group_range_for_subtask(i, new_p);
         d.key_group_first = range.first;
@@ -79,26 +79,27 @@ CutoverDeployment plan_operator_cutover(
             d.restore_from_parent_count = k_down;
         }
 
-        // Greedy placement: scan starting at rr looking for a TM with
+        // Greedy placement: scan starting at rr looking for a worker with
         // free capacity. We've already validated total_free >= new_p
         // above so the scan is guaranteed to find a slot.
-        std::string picked_tm;
-        for (std::size_t step = 0; step < tm_free_slots.size(); ++step) {
-            auto& slot = tm_free_slots[(rr + step) % tm_free_slots.size()];
+        std::string picked_worker;
+        for (std::size_t step = 0; step < worker_free_slots.size(); ++step) {
+            auto& slot = worker_free_slots[(rr + step) % worker_free_slots.size()];
             if (slot.second > 0) {
-                picked_tm = slot.first;
+                picked_worker = slot.first;
                 --slot.second;
-                rr = (rr + step + 1) % tm_free_slots.size();
+                rr = (rr + step + 1) % worker_free_slots.size();
                 break;
             }
         }
-        if (picked_tm.empty()) {
-            out.error = "rescale: ran out of TM slots while placing subtask " + std::to_string(i);
+        if (picked_worker.empty()) {
+            out.error =
+                "rescale: ran out of worker slots while placing subtask " + std::to_string(i);
             out.new_tasks.clear();
             return out;
         }
 
-        out.new_tasks.emplace_back(std::move(picked_tm), std::move(d));
+        out.new_tasks.emplace_back(std::move(picked_worker), std::move(d));
     }
 
     // Carry forward the checkpoint restore handle on every new task.
@@ -109,7 +110,7 @@ CutoverDeployment plan_operator_cutover(
     (void)restore_from_dir;
     // Deploy-level fields (restore_from_dir + restore_from_checkpoint_id)
     // sit on DeployMsg, not DeploymentTask; the caller copies them into
-    // the outgoing DeployMsg envelope when packaging the per-TM frames.
+    // the outgoing DeployMsg envelope when packaging the per-worker frames.
 
     out.ok = true;
     return out;

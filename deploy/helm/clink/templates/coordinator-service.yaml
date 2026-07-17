@@ -1,28 +1,28 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "clink.jobmanager.fullname" . }}
+  name: {{ include "clink.coordinator.fullname" . }}
   labels:
     {{- include "clink.labels" . | nindent 4 }}
-    app.kubernetes.io/component: jobmanager
+    app.kubernetes.io/component: coordinator
   {{- with .Values.commonAnnotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  {{- with .Values.jobmanager.service.annotations }}
+  {{- with .Values.coordinator.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  type: {{ .Values.jobmanager.service.type }}
+  type: {{ .Values.coordinator.service.type }}
   selector:
-    {{- include "clink.componentSelectorLabels" (dict "root" . "component" "jobmanager") | nindent 4 }}
+    {{- include "clink.componentSelectorLabels" (dict "root" . "component" "coordinator") | nindent 4 }}
   ports:
     - name: control
-      port: {{ .Values.jobmanager.controlPort }}
+      port: {{ .Values.coordinator.controlPort }}
       targetPort: control
       protocol: TCP
     - name: http
-      port: {{ .Values.jobmanager.httpPort }}
+      port: {{ .Values.coordinator.httpPort }}
       targetPort: http
       protocol: TCP

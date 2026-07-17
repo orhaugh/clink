@@ -145,7 +145,7 @@ def _enc(s: str | None) -> bytes | None:
 
 
 class Engine:
-    """One embedded clink engine (in-process JobManager + TaskManager)."""
+    """One embedded clink engine (in-process Coordinator + Worker)."""
 
     def __init__(
         self,

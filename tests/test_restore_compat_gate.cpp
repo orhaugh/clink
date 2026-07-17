@@ -1,4 +1,4 @@
-// Unit tests for the JM-side pre-deploy restore-compatibility gate
+// Unit tests for the coordinator-side pre-deploy restore-compatibility gate
 // (schema evolution D, part 2). The gate reads a savepoint's stored
 // version map from <restore_from_dir>/0/checkpoint-<id>.snap and asks the
 // job .so, .so-side, whether it can migrate to its expected versions.
@@ -104,7 +104,7 @@ TEST(RestoreCompatGate, UnreadableSavepointIsBestEffortSkip) {
     }
     // Restore dir points somewhere with no savepoint file -> the gate
     // can't read it -> "" (don't block; C will catch any real problem at
-    // TM start).
+    // worker start).
     const auto reject = clink::cluster::check_restore_compatibility_via_plugins(
         {schema_evo_job_path()}, "/nonexistent/restore/dir", 1);
     EXPECT_TRUE(reject.empty());

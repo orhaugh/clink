@@ -11,7 +11,7 @@
 
 #include <gtest/gtest.h>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/core/types.hpp"
 #include "clink/metrics/metrics_registry.hpp"
@@ -170,8 +170,8 @@ TEST(OperatorMetrics, HelpersAreReentrantForArbitraryOperatorIds) {
 TEST(OperatorMetrics, AccumulatorMergesAcrossSubtasksForSameOpId) {
     // A user accumulator is a per-(op_id, name) gauge, so two RuntimeContexts
     // for the SAME operator (two subtasks in one process) merge their adds -
-    // the in-process half of the cross-subtask merge the JM completes across
-    // TaskManagers. Negative deltas are supported.
+    // the in-process half of the cross-subtask merge the coordinator completes across
+    // Workers. Negative deltas are supported.
     using namespace clink::metrics;
     auto& reg = MetricsRegistry::global();
     const clink::OperatorId op{777'001u};

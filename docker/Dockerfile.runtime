@@ -1,11 +1,11 @@
 ## clink runtime image - builds clink_node from source against the
-## pinned build toolchain and ships it ready to run as JM or TM.
+## pinned build toolchain and ships it ready to run as coordinator or worker.
 ##
 ## Prereq: clink-build:latest must exist locally. Build it once with:
 ##   docker build -t clink-build:latest -f docker/Dockerfile .
 ##
 ## After that, docker-compose.yml (at the repo root) builds this image
-## and spins up a 1 JM + 3 TM cluster.
+## and spins up a 1 coordinator + 3 worker cluster.
 FROM clink-build:latest
 
 USER root
@@ -26,7 +26,7 @@ ENV CMAKE_BUILD_PARALLEL_LEVEL=4
 # CLINK_BUILD_SQL=ON so clink_node registers the SQL operator factories
 # (json_string_to_row, window_row, equi_join_row, ...) - required to run SQL
 # jobs (e.g. the Nexmark queries) against a containerized cluster; without it the
-# JM planner rejects the spec with "no operator factory registered".
+# coordinator planner rejects the spec with "no operator factory registered".
 # Release + LTO (interprocedural optimisation) for a maximally-optimised runtime,
 # then strip the binaries (perf-neutral, smaller image). Throughput-grade build.
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCLINK_BUILD_SQL=ON \
@@ -49,14 +49,14 @@ WORKDIR /var/lib/clink
 # count + a 100ms tick make it run effectively forever (a long-lived, gently
 # active streaming job), so a cluster shows a running job with busy slots and
 # ticking checkpoints. Read by the job's define_job on whichever node loads the
-# .so (JM at submit + TMs at deploy), hence set image-wide. Override per-service
+# .so (coordinator at submit + workers at deploy), hence set image-wide. Override per-service
 # in compose to change the rate. (CLINK_RESCALE_OUT_BASE defaults to /tmp.)
 ENV CLINK_RESCALE_COUNT=1000000000 \
     CLINK_RESCALE_TICK_MS=100 \
     CLINK_RESCALE_INITIAL_P=6
 
-# 6123: JM control plane (TMs connect here)
-# 8081: JM dashboard + HTTP API (also TM HTTP API when set)
+# 6123: coordinator control plane (workers connect here)
+# 8081: coordinator dashboard + HTTP API (also worker HTTP API when set)
 # 6124+: data plane ports - left implicit (auto-bound), reachable via
 # the compose-internal network so no explicit EXPOSE needed.
 EXPOSE 6123 8081

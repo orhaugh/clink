@@ -160,7 +160,7 @@ public:
             // hot path (which reads/writes mem_ only) starts with the
             // post-restore view of state. On a fresh job this scan
             // finds nothing; on a restored job it pulls every entry
-            // the JM's restore_from snapshot wrote into the backend.
+            // the coordinator's restore_from snapshot wrote into the backend.
             keyed_->scan([this](const StateKey& sk, const Entry& e) {
                 mem_.emplace(sk, e);
                 const std::int64_t end = sk.first + window_size_.count();

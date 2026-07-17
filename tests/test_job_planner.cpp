@@ -4,7 +4,7 @@
 //     constraints for v1)
 //   - parallelism expansion (v1: must be 1 per op)
 //   - per-subtask OperatorChainSpec encoding into extra_config
-// These tests pin the contracts the JM relies on for slot accounting,
+// These tests pin the contracts the coordinator relies on for slot accounting,
 // peer-ref bookkeeping, and dispatch.
 
 #include <cstdint>
@@ -79,7 +79,7 @@ TEST(JobPlanner, LinearGraphProducesOneTaskPerOpUnderGenericRole) {
 TEST(JobPlanner, SourceTaskCarriesPeerRefToSink) {
     auto g = linear_int64_graph();
     auto plan = plan_job(g, OperatorRegistry::default_instance());
-    // Producer (source) holds peer_refs to its downstream so JM can
+    // Producer (source) holds peer_refs to its downstream so coordinator can
     // hand it the sink's address once the sink reports listening.
     EXPECT_EQ(plan.tasks[0].peer_refs.size(), 1u);
     EXPECT_EQ(plan.tasks[1].peer_refs.size(), 0u);

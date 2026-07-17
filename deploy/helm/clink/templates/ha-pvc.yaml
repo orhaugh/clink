@@ -6,7 +6,7 @@ metadata:
   labels:
     {{- include "clink.labels" . | nindent 4 }}
 spec:
-  # Shared by every JobManager and TaskManager pod for leader election +
+  # Shared by every Coordinator and Worker pod for leader election +
   # job-manifest persistence, so it MUST be ReadWriteMany on a multi-node
   # cluster (needs an RWX-capable StorageClass).
   accessModes:

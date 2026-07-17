@@ -7,7 +7,7 @@
 //           map<string>(serialize Order as "<region>|<sum>|<count>") ->
 //           sink(file_text_sink, parallelism=3).
 //
-// The test wraps this .so via clink_submit_job against a JM + 3 TMs
+// The test wraps this .so via clink_submit_job against a coordinator + 3 workers
 // running as separate processes. Records cross the wire from the
 // reduce subtask (par=1) to three sink subtasks (par=3, Rebalance).
 // Each sink writes its records to <out>.<subtask_idx>.
@@ -30,7 +30,7 @@
 #include <vector>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/job/register_job.hpp"
 
@@ -185,16 +185,16 @@ inline std::string output_base_path() {
     return "/tmp/clink_heavy_pipeline_out";
 }
 
-inline void define_job(clink::api::StreamExecutionEnvironment& env) {
-    // Register the custom typed channels. Goes through env.registry()
-    // so the registrations land in the per-job bundle on the JM/TM
+inline void define_job(clink::api::Pipeline& pipeline) {
+    // Register the custom typed channels. Goes through pipeline.registry()
+    // so the registrations land in the per-job bundle on the coordinator/worker
     // AND the .so's local default-instance (via the mirror
     // in plugin_impl.hpp::register_type) so the .so's runtime
     // template instantiations resolve them too.
-    env.registry().register_type<Customer>("heavy.customer", customer_codec());
-    env.registry().register_type<Order>("heavy.order", order_codec());
+    pipeline.registry().register_type<Customer>("heavy.customer", customer_codec());
+    pipeline.registry().register_type<Order>("heavy.order", order_codec());
 
-    env.from_elements<Customer>(make_customers())
+    pipeline.from_elements<Customer>(make_customers())
         .map<Order>([](const Customer& c) { return Order{c.region, c.amount, 1}; })
         .key_by([](const Order& o) -> std::int64_t {
             return static_cast<std::int64_t>(std::hash<std::string>{}(o.region));
@@ -212,5 +212,5 @@ inline void define_job(clink::api::StreamExecutionEnvironment& env) {
 
 CLINK_REGISTER_JOB("heavy-pipeline",
                    "1.0",
-                   "99 customers -> map -> keyBy region -> reduce -> sink across 3 TMs",
+                   "99 customers -> map -> keyBy region -> reduce -> sink across 3 workers",
                    heavy::define_job);

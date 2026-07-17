@@ -1,15 +1,15 @@
-// Plain-value-type snapshots of JM and TM internal state.
+// Plain-value-type snapshots of coordinator and worker internal state.
 //
 // Designed for the HTTP read API: handlers grab the mutex briefly,
 // copy out into one of these structs, release, then serialize to
 // JSON outside the critical section. No shared_ptrs, no references
-// back into JM/TM internals - these are safe to keep around across
+// back into coordinator/worker internals - these are safe to keep around across
 // async work.
 //
 // Snapshot fields are deliberately a subset of the full state: only
 // the bits a dashboard / ops user needs. New endpoints that need
 // additional fields should extend the corresponding struct here
-// rather than reaching back into JM/TM internals.
+// rather than reaching back into coordinator/worker internals.
 
 #pragma once
 
@@ -21,17 +21,17 @@
 
 namespace clink::cluster {
 
-// One registered TaskManager. lost=true means the JM watchdog
-// declared the TM unreachable; its slots are excluded from
-// slots_in_use but still counted in registered_tms (so the dashboard
-// can show "5 TMs registered, 2 lost").
-struct TmSummary {
-    std::string tm_id;
+// One registered Worker. lost=true means the coordinator watchdog
+// declared the worker unreachable; its slots are excluded from
+// slots_in_use but still counted in registered_workers (so the dashboard
+// can show "5 workers registered, 2 lost").
+struct WorkerSummary {
+    std::string worker_id;
     std::string data_host;
     std::uint32_t slot_capacity{0};
     std::uint32_t slots_in_use{0};
     bool lost{false};
-    std::uint16_t http_port{0};  // 0 = TM not exposing HTTP; non-zero for federation
+    std::uint16_t http_port{0};  // 0 = worker not exposing HTTP; non-zero for federation
 };
 
 // One submitted job. Keeps just the surface fields; full per-subtask
@@ -48,19 +48,19 @@ struct JobSummary {
 struct JobTaskRecord {
     std::string role;
     std::uint32_t subtask_idx{0};
-    std::string tm_id;
+    std::string worker_id;
 };
 
 // A structured per-subtask failure, surfaced by GET /api/v1/jobs/:id alongside
 // the flat `errors` list. The message carries the operator exception text and,
 // where the toolchain supports std::stacktrace, a capture-site trace appended
 // by the executor. `attempt` is the job restart generation at the time of the
-// failure (0 = first run). This is built JM-side from the SubtaskFinished
+// failure (0 = first run). This is built coordinator-side from the SubtaskFinished
 // report, so it adds no new wire fields.
 struct SubtaskErrorRecord {
     std::string role;
     std::uint32_t subtask_idx{0};
-    std::string tm_id;
+    std::string worker_id;
     std::uint32_t attempt{0};
     std::int64_t ts_ms{0};
     std::string message;
@@ -83,13 +83,13 @@ struct JobDetail {
 // --- Job DAG (GET /api/v1/jobs/:id/graph) ----------------------------------
 // The logical operator graph plus physical subtask placement. Built from the
 // retained JobGraphSpec (nodes + input edges) and the per-subtask
-// OperatorChainSpec in tasks_by_tm (placement). Static topology; live metrics
+// OperatorChainSpec in tasks_by_worker (placement). Static topology; live metrics
 // are layered in by the console from the separate /metrics scrape.
 
 // One operator subtask's placement.
 struct GraphSubtaskPlacement {
     std::uint32_t subtask_idx{0};
-    std::string tm_id;
+    std::string worker_id;
     // Lifecycle timestamps (unix ms), 0 when unknown. started at deploy,
     // finished at SubtaskFinished (0 = still running). The console derives
     // duration / uptime from these.
@@ -126,7 +126,7 @@ struct JobGraphDetail {
     std::vector<GraphEdge> edges;
 };
 
-// Cluster-wide rollup served by GET /api/v1/cluster. Per-TM detail
+// Cluster-wide rollup served by GET /api/v1/cluster. Per-worker detail
 // is also embedded so a single fetch fills the dashboard overview.
 struct ClusterSnapshot {
     std::string bind_host;
@@ -137,11 +137,11 @@ struct ClusterSnapshot {
     std::size_t jobs_total{0};
     std::size_t jobs_running{0};
     std::size_t jobs_completed{0};
-    std::vector<TmSummary> task_managers;
+    std::vector<WorkerSummary> workers;
 };
 
-// One running subtask on a TaskManager. Surfaced by GET /api/v1/tm/subtasks
-// so the dashboard can show what each TM is currently executing.
+// One running subtask on a Worker. Surfaced by GET /api/v1/worker/subtasks
+// so the dashboard can show what each worker is currently executing.
 struct SubtaskRecord {
     JobId job_id{0};
     std::string role;
@@ -153,14 +153,14 @@ struct SubtaskRecord {
     std::string status;
 };
 
-// One TaskManager's local view of itself, returned by GET /api/v1/tm.
-struct TmSnapshot {
-    std::string tm_id;
+// One Worker's local view of itself, returned by GET /api/v1/worker.
+struct WorkerSnapshot {
+    std::string worker_id;
     std::string data_host;
     std::uint32_t slot_capacity{0};
     std::uint32_t slots_in_use{0};
-    std::string jm_host;
-    std::uint16_t jm_port{0};
+    std::string coordinator_host;
+    std::uint16_t coordinator_port{0};
     std::size_t active_subtasks{0};
 };
 

@@ -18,7 +18,7 @@
 #include <utility>
 
 #include "clink/api/descriptors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/connectors/cdc_event.hpp"
 #include "clink/postgres/cdc_event_codec.hpp"
 
@@ -33,10 +33,9 @@ struct CdcEventSourceOptions {
     bool drop_slot_on_close{false};
 };
 
-inline clink::api::DataStream<clink::CdcEvent> cdc_event_source(
-    clink::api::StreamExecutionEnvironment& env,
-    const CdcEventSourceOptions& opts,
-    std::string id = {}) {
+inline clink::api::DataStream<clink::CdcEvent> cdc_event_source(clink::api::Pipeline& env,
+                                                                const CdcEventSourceOptions& opts,
+                                                                std::string id = {}) {
     clink::api::SourceDescriptor d;
     d.op_type = "postgres_cdc_event_source";
     d.channel_type = std::string{kChannelPostgresCdcEvent};

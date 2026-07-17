@@ -2,7 +2,7 @@
 //
 // Used by the 2PC integration test. Emits exactly N strings ("record-0"
 // through "record-(N-1)"), one every ~50ms, then returns false (natural
-// completion). Output dir from CLINK_2PC_OUT_DIR env var (defaulted
+// completion). Output dir from CLINK_2PC_OUT_DIR pipeline var (defaulted
 // for safety); checkpoint dir set by the submitter's CheckpointConfig.
 
 #include <array>
@@ -15,7 +15,7 @@
 #include <thread>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/job/register_job.hpp"
 #include "clink/operators/source_operator.hpp"
@@ -42,7 +42,7 @@ public:
         return counter_ < total_;
     }
 
-    // Checkpoint the next-record index as operator state so a restart (TM
+    // Checkpoint the next-record index as operator state so a restart (worker
     // crash / rescale redeploy) resumes from where the source left off
     // instead of replaying from 0. Combined with the 2PC sink's commit-on-
     // checkpoint, that gives exactly-once across a recovery: no record is
@@ -113,13 +113,13 @@ std::string out_dir_from_env() {
     return "/tmp/clink_2pc_default";
 }
 
-void define_job(clink::api::StreamExecutionEnvironment& env) {
+void define_job(clink::api::Pipeline& pipeline) {
     clink::cluster::ensure_built_ins_registered();
     const auto total = total_from_env();
     const auto tick = tick_from_env();
     const auto out_dir = out_dir_from_env();
 
-    env.registry().register_source<std::string>(
+    pipeline.registry().register_source<std::string>(
         "twopc_test.bounded_slow_source", [total, tick](const clink::plugin::BuildContext&) {
             return std::make_shared<BoundedSlowStringSource>(total, tick);
         });
@@ -133,7 +133,7 @@ void define_job(clink::api::StreamExecutionEnvironment& env) {
     sink.channel_type = "string";
     sink.params["dir"] = out_dir;
 
-    env.source<std::string>(src).sink(sink);
+    pipeline.source<std::string>(src).sink(sink);
 }
 
 }  // namespace twopc_test

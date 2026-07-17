@@ -5,7 +5,7 @@ do not, and that the native, no-JVM, no-warmup design is meant to win on:
 
 1. **Cold start** - wall-clock from a cold process launch to a running,
    producing cluster job.
-2. **Failover recovery** - wall-clock from a TaskManager `SIGKILL` to the
+2. **Failover recovery** - wall-clock from a Worker `SIGKILL` to the
    job processing again, restored from its last checkpoint.
 
 This is a clink-only measurement. There is no cross-engine ratio here; the
@@ -14,7 +14,7 @@ point is that these numbers were previously unmeasured.
 ## What it does
 
 The driver is a standalone C++ binary, `clink_failover_coldstart_bench`. It
-spawns real `clink_node` JobManager/TaskManager processes and drives them
+spawns real `clink_node` Coordinator/Worker processes and drives them
 exactly as a deployment would, reusing the two-phase-commit example job: a
 bounded slow source that checkpoints its offset, piped to a 2PC file sink
 that commits on checkpoint. The committed output is the work-done proof for
@@ -26,13 +26,13 @@ duplicates, no loss - even across the crash.
 
 | phase         | what it times                                              |
 |---------------|------------------------------------------------------------|
-| `jm_up`       | spawn JM process -> control port accepts TCP               |
-| `tm_register` | spawn TM process -> "registered" on its stdout             |
+| `coordinator_up`       | spawn coordinator process -> control port accepts TCP               |
+| `worker_register` | spawn worker process -> "registered" on its stdout             |
 | `deploy_run`  | `clink_submit_job` start -> a small bounded job commits     |
-| `total`       | JM spawn -> bounded job committed                          |
+| `total`       | coordinator spawn -> bounded job committed                          |
 
-`jm_up` + `tm_register` are the native-binary cold-start edge: a JobManager
-listening and a TaskManager registered in well under 100 ms each, because
+`coordinator_up` + `worker_register` are the native-binary cold-start edge: a Coordinator
+listening and a Worker registered in well under 100 ms each, because
 there is no JVM to start or warm up. `deploy_run` is a separate number - the
 cluster job-submission round-trip (deploy, per-job plugin `dlopen`,
 peer-update handshake, run, 2PC commit, completion) for a trivial job - and
@@ -40,22 +40,22 @@ is dominated by deploy/coordination, not record processing.
 
 ### Failover recovery
 
-A single TaskManager (TM-A) hosts the whole job; once it is checkpointing, a
-second TaskManager (TM-B) is brought up as the recovery target, then TM-A is
+A single Worker (worker-A) hosts the whole job; once it is checkpointing, a
+second Worker (worker-B) is brought up as the recovery target, then worker-A is
 `SIGKILL`ed. `recovery_ms` is the wall-clock from the kill to the first
 **new** durable checkpoint (a `COMPLETED-N` marker with a higher id than any
 before the crash), which proves the redeployed job is processing again.
 
-The benchmark self-validates: it confirms the JobManager watchdog actually
-logged the TM loss (`real failover: yes`), so a kill that happened to hit an
-idle TM cannot be reported as a recovery, and it asserts the completed job
+The benchmark self-validates: it confirms the Coordinator watchdog actually
+logged the worker loss (`real failover: yes`), so a kill that happened to hit an
+idle worker cannot be reported as a recovery, and it asserts the completed job
 committed every record exactly once.
 
-`recovery_ms` includes the TM-loss detection window. Detection is via the
-JobManager watchdog (there is no connection-close fast path), so roughly
+`recovery_ms` includes the worker-loss detection window. Detection is via the
+Coordinator watchdog (there is no connection-close fast path), so roughly
 `--heartbeat-timeout-ms` of the number is the (tunable) detection delay; the
 remainder is redeploy + state restore + resume. The benchmark sets the
-heartbeat timeout low (1000 ms, safely above the TM's 500 ms heartbeat
+heartbeat timeout low (1000 ms, safely above the worker's 500 ms heartbeat
 interval) so the measured figure reflects the actual recovery work rather
 than the conservative 5 s default.
 
@@ -85,8 +85,8 @@ result):
 
 ```
 COLD START (median over 5 ok runs):
-  jm_up        ~50  ms
-  tm_register  ~40  ms
+  coordinator_up        ~50  ms
+  worker_register  ~40  ms
   deploy_run   ~3.5 s   (cluster submit -> trivial job committed)
   total        ~3.6 s
 
@@ -107,6 +107,6 @@ FAILOVER RECOVERY:
   terminal commit and completion handshake, not just "time to first record";
   it is the cluster round-trip cost, and a candidate for future optimisation.
 - The recovery path exercised is same-parallelism redeploy onto a surviving
-  TaskManager (the `--max-restarts-on-tm-loss` auto-restart). JobManager HA
+  Worker (the `--max-restarts-on-worker-loss` auto-restart). Coordinator HA
   takeover and rescale-on-restart are covered by the integration tests, not
   this benchmark.

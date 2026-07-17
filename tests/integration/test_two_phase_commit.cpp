@@ -6,7 +6,7 @@
 //   once; <out>/staging/ must be empty.
 //
 // Test 2 (CrashMidstreamThenRestore): submit the same job, but cut the
-//   cluster (SIGKILL JM+TM) ~600ms in, before the bounded source
+//   cluster (SIGKILL coordinator+worker) ~600ms in, before the bounded source
 //   finishes. Inspect <out>/staging/ for leftover pre-committed files
 //   whose checkpoint ids are present in the latest COMPLETED-N marker.
 //   Restart the cluster from scratch, re-submit with restore_from
@@ -85,7 +85,7 @@ pid_t spawn_proc(const std::vector<std::string>& argv, const std::filesystem::pa
 }
 
 // Like spawn_proc, but redirects the child's stdout AND stderr to `log_path`.
-// A spawned JM/TM/submitter otherwise INHERITS the harness's stdout. Under a
+// A spawned coordinator/worker/submitter otherwise INHERITS the harness's stdout. Under a
 // captured-pipe harness (ctest) that is a real hazard: a long-lived child holds
 // the pipe's write end open, so the reader never sees EOF and the test's own
 // process is reported as a hang/timeout even after it finishes - and a child
@@ -199,18 +199,21 @@ std::uint64_t latest_completed_checkpoint(const std::filesystem::path& ckpt_dir)
 }
 
 struct Cluster {
-    pid_t jm_pid{-1};
-    std::uint16_t jm_port{0};
-    pid_t tm_pid{-1};
-    std::string tm_id;
+    pid_t coordinator_pid{-1};
+    std::uint16_t coordinator_port{0};
+    pid_t worker_pid{-1};
+    std::string worker_id;
 
     Cluster() = default;
     Cluster(const Cluster&) = delete;
     Cluster& operator=(const Cluster&) = delete;
     Cluster(Cluster&& o) noexcept
-        : jm_pid(o.jm_pid), jm_port(o.jm_port), tm_pid(o.tm_pid), tm_id(std::move(o.tm_id)) {
-        o.jm_pid = -1;
-        o.tm_pid = -1;
+        : coordinator_pid(o.coordinator_pid),
+          coordinator_port(o.coordinator_port),
+          worker_pid(o.worker_pid),
+          worker_id(std::move(o.worker_id)) {
+        o.coordinator_pid = -1;
+        o.worker_pid = -1;
     }
     Cluster& operator=(Cluster&& o) noexcept {
         if (this != &o) {
@@ -220,8 +223,8 @@ struct Cluster {
         return *this;
     }
     ~Cluster() {
-        kill_quietly(tm_pid);
-        kill_quietly(jm_pid);
+        kill_quietly(worker_pid);
+        kill_quietly(coordinator_pid);
     }
 };
 
@@ -243,24 +246,26 @@ std::optional<Cluster> start_cluster() {
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node))
         return std::nullopt;
-    c.jm_port = probe_free_port();
-    c.jm_pid = spawn_proc(
-        {"clink_node", "--role=jm", "--port=" + std::to_string(c.jm_port), "--bind-host=127.0.0.1"},
-        node);
-    if (c.jm_pid <= 0 || !await_port_open(c.jm_port, 2s))
+    c.coordinator_port = probe_free_port();
+    c.coordinator_pid = spawn_proc({"clink_node",
+                                    "--role=coordinator",
+                                    "--port=" + std::to_string(c.coordinator_port),
+                                    "--bind-host=127.0.0.1"},
+                                   node);
+    if (c.coordinator_pid <= 0 || !await_port_open(c.coordinator_port, 2s))
         return std::nullopt;
 
-    c.tm_id = "tm-2pc-1";
-    c.tm_pid = spawn_proc({"clink_node",
-                           "--role=tm",
-                           "--id=" + c.tm_id,
-                           "--jm-host=127.0.0.1",
-                           "--jm-port=" + std::to_string(c.jm_port),
-                           "--slots=4"},
-                          node);
-    if (c.tm_pid <= 0)
+    c.worker_id = "worker-2pc-1";
+    c.worker_pid = spawn_proc({"clink_node",
+                               "--role=worker",
+                               "--id=" + c.worker_id,
+                               "--coordinator-host=127.0.0.1",
+                               "--coordinator-port=" + std::to_string(c.coordinator_port),
+                               "--slots=4"},
+                              node);
+    if (c.worker_pid <= 0)
         return std::nullopt;
-    std::this_thread::sleep_for(400ms);  // TM register settle
+    std::this_thread::sleep_for(400ms);  // worker register settle
     return c;
 }
 
@@ -287,14 +292,15 @@ TEST(TwoPhaseCommit, HappyPathExactlyOnceCommittedFiles) {
     // file; each completed checkpoint commits it. End-of-stream flushes
     // any remaining pending data to staging without committing
     // (no terminal barrier yet).
-    const pid_t submit_pid = spawn_proc({"clink_submit_job",
-                                         "--job=" + job_so.string(),
-                                         "--jm-host=127.0.0.1",
-                                         "--jm-port=" + std::to_string(c->jm_port),
-                                         "--wait-timeout-s=15",
-                                         "--checkpoint-dir=" + ckpt_dir.string(),
-                                         "--checkpoint-interval-ms=150"},
-                                        submit);
+    const pid_t submit_pid =
+        spawn_proc({"clink_submit_job",
+                    "--job=" + job_so.string(),
+                    "--coordinator-host=127.0.0.1",
+                    "--coordinator-port=" + std::to_string(c->coordinator_port),
+                    "--wait-timeout-s=15",
+                    "--checkpoint-dir=" + ckpt_dir.string(),
+                    "--checkpoint-interval-ms=150"},
+                   submit);
     ASSERT_GT(submit_pid, 0);
     int submit_exit = -1;
     ASSERT_TRUE(wait_for_exit(submit_pid, 12s, &submit_exit))
@@ -322,7 +328,7 @@ TEST(TwoPhaseCommit, HappyPathExactlyOnceCommittedFiles) {
 
 TEST(TwoPhaseCommit, RecoveryCommitsPreCommittedFilesOnRestart) {
     // Crash + restart proof. Run 1: submit the bounded job with
-    // periodic checkpointing on. SIGKILL the JM mid-stream (before the
+    // periodic checkpointing on. SIGKILL the coordinator mid-stream (before the
     // source finishes). Run 2: spawn a fresh cluster, re-submit the
     // same job with restore_from pointing at run 1's checkpoint dir.
     // The sink's recover_pending_() should commit any leftover staging
@@ -333,7 +339,7 @@ TEST(TwoPhaseCommit, RecoveryCommitsPreCommittedFilesOnRestart) {
     // get true pipeline-wide exactly-once. We DO get exactly-once
     // semantics from the SINK: every checkpoint that completed in run
     // 1 has its records in committed/, and run 2's commits land in
-    // separate committed/ files (different filenames if the JM
+    // separate committed/ files (different filenames if the coordinator
     // allocates new checkpoint ids; same filenames otherwise - content
     // is identical due to source determinism so a rename-overwrite is
     // semantically a no-op).
@@ -354,14 +360,15 @@ TEST(TwoPhaseCommit, RecoveryCommitsPreCommittedFilesOnRestart) {
         auto c = start_cluster();
         ASSERT_TRUE(c.has_value()) << "run-1 cluster startup failed";
 
-        const pid_t submit_pid = spawn_proc({"clink_submit_job",
-                                             "--job=" + job_so.string(),
-                                             "--jm-host=127.0.0.1",
-                                             "--jm-port=" + std::to_string(c->jm_port),
-                                             "--wait-timeout-s=5",
-                                             "--checkpoint-dir=" + ckpt_dir.string(),
-                                             "--checkpoint-interval-ms=100"},
-                                            submit);
+        const pid_t submit_pid =
+            spawn_proc({"clink_submit_job",
+                        "--job=" + job_so.string(),
+                        "--coordinator-host=127.0.0.1",
+                        "--coordinator-port=" + std::to_string(c->coordinator_port),
+                        "--wait-timeout-s=5",
+                        "--checkpoint-dir=" + ckpt_dir.string(),
+                        "--checkpoint-interval-ms=100"},
+                       submit);
         ASSERT_GT(submit_pid, 0);
 
         // Wait until at least one checkpoint has completed, then crash
@@ -375,11 +382,11 @@ TEST(TwoPhaseCommit, RecoveryCommitsPreCommittedFilesOnRestart) {
         }
         ASSERT_GT(latest_completed_checkpoint(ckpt_dir), 0u) << "no checkpoint completed in run 1";
 
-        // Hard kill JM + TM. Submitter will fail; that's expected.
-        kill_quietly(c->jm_pid);
-        kill_quietly(c->tm_pid);
-        c->jm_pid = -1;
-        c->tm_pid = -1;
+        // Hard kill coordinator + worker. Submitter will fail; that's expected.
+        kill_quietly(c->coordinator_pid);
+        kill_quietly(c->worker_pid);
+        c->coordinator_pid = -1;
+        c->worker_pid = -1;
         kill_quietly(submit_pid);
     }
 
@@ -398,8 +405,8 @@ TEST(TwoPhaseCommit, RecoveryCommitsPreCommittedFilesOnRestart) {
     const pid_t submit2_pid =
         spawn_proc({"clink_submit_job",
                     "--job=" + job_so.string(),
-                    "--jm-host=127.0.0.1",
-                    "--jm-port=" + std::to_string(c2->jm_port),
+                    "--coordinator-host=127.0.0.1",
+                    "--coordinator-port=" + std::to_string(c2->coordinator_port),
                     "--wait-timeout-s=15",
                     "--checkpoint-dir=" + ckpt_dir.string(),
                     "--checkpoint-interval-ms=150",
@@ -441,17 +448,17 @@ TEST(TwoPhaseCommit, RecoveryCommitsPreCommittedFilesOnRestart) {
         << distinct.size() << " distinct): the source re-emitted instead of resuming";
 }
 
-// F1 - end-to-end exactly-once INVARIANCE across an AUTOMATIC (JM-driven)
-// TaskManager-loss failover. This is the gap the two tests above each leave
+// F1 - end-to-end exactly-once INVARIANCE across an AUTOMATIC (coordinator-driven)
+// Worker-loss failover. This is the gap the two tests above each leave
 // half-covered:
 //   * RecoveryCommitsPreCommittedFilesOnRestart uses a MANUAL restore into a
-//     FRESH cluster and explicitly WAIVES no-loss (a fresh JM resets its
+//     FRESH cluster and explicitly WAIVES no-loss (a fresh coordinator resets its
 //     checkpoint counter, so run-2's committed filenames can collide with
 //     run-1's - it can only assert no-duplicates + progress, not full count).
-//   * test_tm_crash_recovery drives the automatic failover but asserts nothing
+//   * test_worker_crash_recovery drives the automatic failover but asserts nothing
 //     about the sink output.
-// Here the JM SURVIVES (only the TM hosting the job is SIGKILLed), so the JM's
-// per-job checkpoint counter stays monotonic across the redeploy (verified:
+// Here the coordinator SURVIVES (only the worker hosting the job is SIGKILLed), so the
+// coordinator's per-job checkpoint counter stays monotonic across the redeploy (verified:
 // next_checkpoint_id is only ever ++'d, never reset, and rides the surviving
 // job state). Monotonic ids mean the 2PC sink's committed/sub<N>-<ckpt>.dat
 // filenames never collide, so the committed set is the union of pre- and
@@ -475,7 +482,7 @@ TEST(TwoPhaseCommit, RecoveryCommitsPreCommittedFilesOnRestart) {
 // HappyPathExactlyOnceCommittedFiles above (an uncrashed run commits exactly
 // {record-0..record-(N-1)}); the source is deterministic, so that set is the
 // golden this test compares against.
-TEST(TwoPhaseCommit, TmKillMidStreamIsExactlyOnce) {
+TEST(TwoPhaseCommit, WorkerKillMidStreamIsExactlyOnce) {
     const auto submit = submit_binary_path();
     const auto job_so = two_phase_commit_job_path();
     const auto node = node_binary_path();
@@ -492,48 +499,48 @@ TEST(TwoPhaseCommit, TmKillMidStreamIsExactlyOnce) {
     ::setenv("CLINK_2PC_TOTAL", std::to_string(kTotal).c_str(), 1);
     ::setenv("CLINK_2PC_TICK_MS", "30", 1);  // ~2.4s of clean runtime
 
-    // JM with a short-but-safe loss window (well above the TM's 500ms
-    // heartbeat interval so a healthy TM is never wrongly declared lost). All
+    // coordinator with a short-but-safe loss window (well above the worker's 500ms
+    // heartbeat interval so a healthy worker is never wrongly declared lost). All
     // spawns redirect their output to per-process log files under log_dir (see
-    // spawn_proc_logged): a JM/TM inheriting a captured stdout pipe would hang
+    // spawn_proc_logged): a coordinator/worker inheriting a captured stdout pipe would hang
     // the harness.
     const auto port = probe_free_port();
-    const pid_t jm = spawn_proc_logged({"clink_node",
-                                        "--role=jm",
-                                        "--port=" + std::to_string(port),
-                                        "--bind-host=127.0.0.1",
-                                        "--heartbeat-timeout-ms=1500",
-                                        "--watchdog-interval-ms=100"},
-                                       node,
-                                       log_dir / "jm.log");
-    ASSERT_GT(jm, 0);
+    const pid_t coordinator = spawn_proc_logged({"clink_node",
+                                                 "--role=coordinator",
+                                                 "--port=" + std::to_string(port),
+                                                 "--bind-host=127.0.0.1",
+                                                 "--heartbeat-timeout-ms=1500",
+                                                 "--watchdog-interval-ms=100"},
+                                                node,
+                                                log_dir / "coordinator.log");
+    ASSERT_GT(coordinator, 0);
     ASSERT_TRUE(await_port_open(port, 2s));
 
-    auto spawn_tm = [&](const std::string& id) {
+    auto spawn_worker = [&](const std::string& id) {
         return spawn_proc_logged({"clink_node",
-                                  "--role=tm",
+                                  "--role=worker",
                                   "--id=" + id,
-                                  "--jm-host=127.0.0.1",
-                                  "--jm-port=" + std::to_string(port),
+                                  "--coordinator-host=127.0.0.1",
+                                  "--coordinator-port=" + std::to_string(port),
                                   "--slots=4"},
                                  node,
                                  log_dir / (id + ".log"));
     };
 
-    // ONE TM at submit time, so both subtasks deterministically land on it
-    // and the later kill is guaranteed to hit the TM hosting the job.
-    const pid_t tm_a = spawn_tm("tm-eo-A");
-    ASSERT_GT(tm_a, 0);
-    std::this_thread::sleep_for(500ms);  // tm-A registers
+    // ONE worker at submit time, so both subtasks deterministically land on it
+    // and the later kill is guaranteed to hit the worker hosting the job.
+    const pid_t worker_a = spawn_worker("worker-eo-A");
+    ASSERT_GT(worker_a, 0);
+    std::this_thread::sleep_for(500ms);  // worker-A registers
 
     const pid_t submit_pid = spawn_proc_logged({"clink_submit_job",
                                                 "--job=" + job_so.string(),
-                                                "--jm-host=127.0.0.1",
-                                                "--jm-port=" + std::to_string(port),
+                                                "--coordinator-host=127.0.0.1",
+                                                "--coordinator-port=" + std::to_string(port),
                                                 "--wait-timeout-s=60",
                                                 "--checkpoint-dir=" + ckpt_dir.string(),
                                                 "--checkpoint-interval-ms=100",
-                                                "--max-restarts-on-tm-loss=3"},
+                                                "--max-restarts-on-worker-loss=3"},
                                                submit,
                                                log_dir / "submit.log");
     ASSERT_GT(submit_pid, 0);
@@ -550,12 +557,12 @@ TEST(TwoPhaseCommit, TmKillMidStreamIsExactlyOnce) {
     ASSERT_GT(ckpt_before, 0u) << "no checkpoint completed before the kill";
 
     // Bring up the survivor (so a free slot exists for the redeploy), then
-    // SIGKILL the TM hosting the job. Watchdog -> tm lost -> redeploy onto
-    // tm-B, restoring from the last completed checkpoint.
-    const pid_t tm_b = spawn_tm("tm-eo-B");
-    ASSERT_GT(tm_b, 0);
-    std::this_thread::sleep_for(500ms);  // tm-B registers
-    kill_quietly(tm_a);
+    // SIGKILL the worker hosting the job. Watchdog -> worker lost -> redeploy onto
+    // worker-B, restoring from the last completed checkpoint.
+    const pid_t worker_b = spawn_worker("worker-eo-B");
+    ASSERT_GT(worker_b, 0);
+    std::this_thread::sleep_for(500ms);  // worker-B registers
+    kill_quietly(worker_a);
 
     // Wait past the submitter's own --wait-timeout-s=60 so its exit code is
     // the authoritative signal: on recovery it exits 0; if the job never
@@ -576,10 +583,10 @@ TEST(TwoPhaseCommit, TmKillMidStreamIsExactlyOnce) {
     } while (std::chrono::steady_clock::now() < poll);
 
     const auto ckpt_after = latest_completed_checkpoint(ckpt_dir);
-    kill_quietly(tm_b);
-    kill_quietly(jm);
+    kill_quietly(worker_b);
+    kill_quietly(coordinator);
 
-    ASSERT_TRUE(exited) << "submitter never exited after the TM kill";
+    ASSERT_TRUE(exited) << "submitter never exited after the worker kill";
     EXPECT_EQ(submit_exit, 0) << "job did not recover from the SIGKILL";
     EXPECT_GT(ckpt_after, ckpt_before) << "no NEW checkpoint after restart - job did not resume";
 

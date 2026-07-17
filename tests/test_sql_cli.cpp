@@ -28,7 +28,7 @@ extern char** environ;
 // JobGraphSpec JSON matches the expected shape.
 //
 // This SCOPES OUT actual cluster execution of the produced spec -
-// that needs an HTTP / wire submission path the JM doesn't expose yet
+// that needs an HTTP / wire submission path the coordinator doesn't expose yet
 // for JSON specs. The clink::sql tests verify the compile path; this
 // test verifies the BINARY assembles the same artifact when invoked
 // as users will invoke it.
@@ -444,37 +444,38 @@ void kill_quietly(pid_t pid) {
 }
 
 struct Cluster {
-    pid_t jm_pid{-1};
-    pid_t tm_pid{-1};
-    std::uint16_t jm_http_port{0};
-    std::uint16_t jm_control_port{0};
+    pid_t coordinator_pid{-1};
+    pid_t worker_pid{-1};
+    std::uint16_t coordinator_http_port{0};
+    std::uint16_t coordinator_control_port{0};
     ~Cluster() {
-        kill_quietly(tm_pid);
-        kill_quietly(jm_pid);
+        kill_quietly(worker_pid);
+        kill_quietly(coordinator_pid);
     }
 };
 
 bool start_cluster(Cluster& c) {
-    c.jm_control_port = probe_free_port();
-    c.jm_http_port = probe_free_port();
-    auto tm_http_port = probe_free_port();
-    c.jm_pid = spawn({node_binary_path(),
-                      "--role=jm",
-                      "--port=" + std::to_string(c.jm_control_port),
-                      "--http-port=" + std::to_string(c.jm_http_port),
-                      "--http-bind=127.0.0.1"});
-    if (c.jm_pid <= 0 || !await_http_ready(c.jm_http_port, std::chrono::seconds(3)))
+    c.coordinator_control_port = probe_free_port();
+    c.coordinator_http_port = probe_free_port();
+    auto worker_http_port = probe_free_port();
+    c.coordinator_pid = spawn({node_binary_path(),
+                               "--role=coordinator",
+                               "--port=" + std::to_string(c.coordinator_control_port),
+                               "--http-port=" + std::to_string(c.coordinator_http_port),
+                               "--http-bind=127.0.0.1"});
+    if (c.coordinator_pid <= 0 ||
+        !await_http_ready(c.coordinator_http_port, std::chrono::seconds(3)))
         return false;
-    c.tm_pid = spawn({node_binary_path(),
-                      "--role=tm",
-                      "--id=tm-sql-1",
-                      "--jm-host=127.0.0.1",
-                      "--jm-port=" + std::to_string(c.jm_control_port),
-                      "--http-port=" + std::to_string(tm_http_port),
-                      "--http-bind=127.0.0.1"});
-    if (c.tm_pid <= 0 || !await_http_ready(tm_http_port, std::chrono::seconds(3)))
+    c.worker_pid = spawn({node_binary_path(),
+                          "--role=worker",
+                          "--id=worker-sql-1",
+                          "--coordinator-host=127.0.0.1",
+                          "--coordinator-port=" + std::to_string(c.coordinator_control_port),
+                          "--http-port=" + std::to_string(worker_http_port),
+                          "--http-bind=127.0.0.1"});
+    if (c.worker_pid <= 0 || !await_http_ready(worker_http_port, std::chrono::seconds(3)))
         return false;
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));  // TM register settle
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));  // worker register settle
     return true;
 }
 
@@ -482,7 +483,7 @@ bool start_cluster(Cluster& c) {
 
 }  // namespace
 
-TEST(SqlCli, HttpSubmitDeliversSpecToJobManager) {
+TEST(SqlCli, HttpSubmitDeliversSpecToCoordinator) {
     integration::Cluster c;
     if (!integration::start_cluster(c)) {
         GTEST_SKIP() << "cluster startup failed";
@@ -510,7 +511,8 @@ TEST(SqlCli, HttpSubmitDeliversSpecToJobManager) {
                "'); "
                "INSERT INTO dst_t SELECT line FROM src_t";
 
-    auto result = run_compiler("--jm-host 127.0.0.1 --jm-port " + std::to_string(c.jm_http_port) +
+    auto result = run_compiler("--coordinator-host 127.0.0.1 --coordinator-port " +
+                               std::to_string(c.coordinator_http_port) +
                                " --name sql-http-test -e \"" + sql + "\"");
 
     EXPECT_EQ(result.exit_code, 0)

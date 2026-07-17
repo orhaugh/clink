@@ -104,7 +104,7 @@ public:
     // since the last checkpoint) and returns Unaligned when the
     // signal crosses a threshold, Aligned otherwise. The plumbing
     // from NetworkChannelSink up to the coordinator is left to the
-    // hosting runtime (LocalExecutor / TaskManager); the coordinator
+    // hosting runtime (LocalExecutor / Worker); the coordinator
     // only exposes the resolver seam.
     //
     // When not set, the coordinator falls back to the configured

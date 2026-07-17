@@ -770,7 +770,7 @@ TEST(SqlPreparse, FullRefreshBackingSurvivesCatalogReload) {
             "AS SELECT a FROM t";
         (void)plan_materialized_view(parse_mv(mv_sql.c_str()), cat, mv_sql);
     }
-    // A fresh catalog loaded from the dir (as a new JM leader would) sees the view.
+    // A fresh catalog loaded from the dir (as a new coordinator leader would) sees the view.
     Catalog reloaded;
     reloaded.load_from_dir(dir.string());
     const auto* mv = reloaded.get_table("mv");

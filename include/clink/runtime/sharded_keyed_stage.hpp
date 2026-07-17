@@ -29,7 +29,7 @@
 //   * checkpoint: each worker captures its own (single-stream-consistent)
 //     backend at the barrier; the coordinator merges the S blobs into ONE
 //     Snapshot and forwards the barrier downstream once. The merged Snapshot is
-//     RETURNED; persisting it and acking the JM is the caller's job (the 2c-2
+//     RETURNED; persisting it and acking the coordinator is the caller's job (the 2c-2
 //     DAG runner).
 //   * watermark: each worker fires its event-time timers (timer output flows
 //     downstream) but does NOT forward the watermark; the coordinator forwards a
@@ -116,7 +116,7 @@ public:
     // (byte-compatible with the mono/sharded backends) plus the fan-in status.
     // `ok` is false if any shard failed to capture (e.g. a worker threw); the
     // barrier is still forwarded downstream regardless (the global commit
-    // decision is the coordinator/JM's, from the per-subtask acks).
+    // decision is the coordinator/coordinator's, from the per-subtask acks).
     struct CheckpointResult {
         CheckpointId id{};
         bool ok{false};

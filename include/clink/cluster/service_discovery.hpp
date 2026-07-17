@@ -8,21 +8,21 @@
 
 namespace clink::cluster {
 
-// Endpoint of a JobManager that TaskManagers should connect to.
-struct JobManagerEndpoint {
+// Endpoint of a Coordinator that Workers should connect to.
+struct CoordinatorEndpoint {
     std::string host;
     std::uint16_t port{};
 };
 
-// Abstraction so TMs don't need a hardcoded JM address. Useful for K8s,
-// Consul, etcd, etc., where the JM's endpoint is not known until launch
+// Abstraction so workers don't need a hardcoded coordinator address. Useful for K8s,
+// Consul, etcd, etc., where the coordinator's endpoint is not known until launch
 // time. Concrete implementations only have to satisfy two operations:
 //
-//   - discover_job_manager(timeout): block (or poll) until the endpoint
+//   - discover_coordinator(timeout): block (or poll) until the endpoint
 //     is known. Return nullopt on timeout.
 //
-//   - register_job_manager(endpoint): publish the endpoint so other
-//     processes can discover it. JM side calls this after it knows
+//   - register_coordinator(endpoint): publish the endpoint so other
+//     processes can discover it. coordinator side calls this after it knows
 //     its bound port. Default is no-op for read-only backends.
 class ServiceDiscovery {
 public:
@@ -33,10 +33,10 @@ public:
     ServiceDiscovery(ServiceDiscovery&&) = delete;
     ServiceDiscovery& operator=(ServiceDiscovery&&) = delete;
 
-    virtual std::optional<JobManagerEndpoint> discover_job_manager(
+    virtual std::optional<CoordinatorEndpoint> discover_coordinator(
         std::chrono::milliseconds timeout) = 0;
 
-    virtual void register_job_manager(const JobManagerEndpoint& /*ep*/) {}
+    virtual void register_coordinator(const CoordinatorEndpoint& /*ep*/) {}
 };
 
 // Hardcoded endpoint - useful for tests and simple two-host deployments
@@ -44,52 +44,52 @@ public:
 class StaticConfigDiscovery final : public ServiceDiscovery {
 public:
     StaticConfigDiscovery(std::string host, std::uint16_t port);
-    std::optional<JobManagerEndpoint> discover_job_manager(
+    std::optional<CoordinatorEndpoint> discover_coordinator(
         std::chrono::milliseconds timeout) override;
 
 private:
-    JobManagerEndpoint ep_;
+    CoordinatorEndpoint ep_;
 };
 
-// Reads endpoint from environment variables. Defaults to CLINK_JM_HOST
-// and CLINK_JM_PORT, but the variable names can be overridden - handy
+// Reads endpoint from environment variables. Defaults to CLINK_COORDINATOR_HOST
+// and CLINK_COORDINATOR_PORT, but the variable names can be overridden - handy
 // for K8s where service env vars follow the {NAME}_HOST / {NAME}_PORT
 // convention.
 //
-// register_job_manager sets the variables in the calling process's env
-// (so an in-process JM can publish for an in-process TM to discover).
-// In real K8s deployments, the orchestrator sets the env vars; the JM
+// register_coordinator sets the variables in the calling process's env
+// (so an in-process coordinator can publish for an in-process worker to discover).
+// In real K8s deployments, the orchestrator sets the env vars; the coordinator
 // process never publishes anywhere.
 class EnvVarDiscovery final : public ServiceDiscovery {
 public:
     EnvVarDiscovery() = default;
     EnvVarDiscovery(std::string host_var, std::string port_var);
 
-    std::optional<JobManagerEndpoint> discover_job_manager(
+    std::optional<CoordinatorEndpoint> discover_coordinator(
         std::chrono::milliseconds timeout) override;
 
-    void register_job_manager(const JobManagerEndpoint& ep) override;
+    void register_coordinator(const CoordinatorEndpoint& ep) override;
 
 private:
-    std::string host_var_{"CLINK_JM_HOST"};
-    std::string port_var_{"CLINK_JM_PORT"};
+    std::string host_var_{"CLINK_COORDINATOR_HOST"};
+    std::string port_var_{"CLINK_COORDINATOR_PORT"};
 };
 
 // Reads endpoint from a file containing a single line "host:port". Polls
 // (every 50ms) until the file appears, then parses. Models the workflow
 // where a coordinator (Consul, etcd, K8s ConfigMap volume mount) writes
-// the JM's endpoint to a known path on disk.
+// the coordinator's endpoint to a known path on disk.
 //
-// register_job_manager writes the file atomically (write to ".tmp" then
+// register_coordinator writes the file atomically (write to ".tmp" then
 // rename) so a partial read can never produce a malformed endpoint.
 class FileDiscovery final : public ServiceDiscovery {
 public:
     explicit FileDiscovery(std::filesystem::path path);
 
-    std::optional<JobManagerEndpoint> discover_job_manager(
+    std::optional<CoordinatorEndpoint> discover_coordinator(
         std::chrono::milliseconds timeout) override;
 
-    void register_job_manager(const JobManagerEndpoint& ep) override;
+    void register_coordinator(const CoordinatorEndpoint& ep) override;
 
 private:
     std::filesystem::path path_;

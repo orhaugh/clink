@@ -17,7 +17,7 @@
 #include <string>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/job/register_job.hpp"
 
 namespace {
@@ -29,8 +29,8 @@ std::string output_path() {
     return "/tmp/clink_collision_a.txt";
 }
 
-void define_job(clink::api::StreamExecutionEnvironment& env) {
-    env.from_elements<std::int64_t>({1, 2, 3, 4, 5})
+void define_job(clink::api::Pipeline& pipeline) {
+    pipeline.from_elements<std::int64_t>({1, 2, 3, 4, 5})
         .map<std::int64_t>([](const std::int64_t& v) { return v * 10; })
         .sink(clink::api::FileInt64Sink::builder().path(output_path()).build());
 }

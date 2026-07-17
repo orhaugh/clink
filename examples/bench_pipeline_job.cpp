@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/job/register_job.hpp"
 
 namespace {
@@ -42,7 +42,7 @@ std::string output_path() {
     return "/tmp/clink_bench_pipeline_out";
 }
 
-void define_job(clink::api::StreamExecutionEnvironment& env) {
+void define_job(clink::api::Pipeline& pipeline) {
     const auto n = record_count();
     std::vector<std::int64_t> input;
     input.reserve(static_cast<std::size_t>(n));
@@ -50,7 +50,7 @@ void define_job(clink::api::StreamExecutionEnvironment& env) {
         input.push_back(i);
     }
 
-    env.from_elements<std::int64_t>(std::move(input))
+    pipeline.from_elements<std::int64_t>(std::move(input))
         .map<std::int64_t>([](const std::int64_t& v) { return v * 2; })
         .map<std::int64_t>([](const std::int64_t& v) { return v + 1; })
         .sink(clink::api::FileInt64Sink::builder().path(output_path()).build());

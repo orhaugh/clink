@@ -38,7 +38,7 @@
 
 namespace clink {
 
-// Bounded timeout a source waits at clean EOS for its JM-coordinated final
+// Bounded timeout a source waits at clean EOS for its coordinator-coordinated final
 // checkpoint to commit before giving up (and throwing -> watchdog restart).
 // Configurable via CLINK_EOS_FINAL_CKPT_TIMEOUT_MS (default 30s); read once.
 // A shorter value lets failure/recovery integration tests run quickly.
@@ -228,7 +228,7 @@ public:
     // Stamp the spec graph node id + uid onto a runner after construction.
     // The fluent / plugin add_* paths copy these from the operator (set by
     // apply_chain_identity), but the cluster chain-dispatch build path
-    // (task_manager.cpp) builds operators via DagBuilders that don't carry the
+    // (worker.cpp) builds operators via DagBuilders that don't carry the
     // chain identity, so it stamps each runner here from the chain spec. This
     // lets LocalExecutor emit clink_op_info{op_id,node,uid} for every operator.
     // No-op if runner_index is out of range.
@@ -282,7 +282,7 @@ public:
         // the record stream. Acks fire from the runner loop too, after
         // both the snapshot AND the downstream-bound barrier push have
         // happened - that's the "the source has finished its slice of
-        // checkpoint K" signal the JM expects.
+        // checkpoint K" signal the coordinator expects.
         auto ack_ref = std::make_shared<std::function<void(CheckpointId, bool, std::string)>>();
         source_injectors_.push_back(
             [source, ack_ref](CheckpointBarrier b) { source->inject_pending_barrier(b); });
@@ -366,7 +366,7 @@ public:
                 // (NetworkBridgeSource): they only forward whatever arrived from
                 // upstream, whose terminal is already in the relayed stream.
                 if (ctx.has_state_backend() && source->emit_terminal_barrier_on_exit()) {
-                    // Cluster path: ask the JM for one FINAL JM-coordinated
+                    // Cluster path: ask the coordinator for one FINAL coordinator-coordinated
                     // checkpoint that durably + recoverably commits the tail
                     // (records since the last completed periodic checkpoint),
                     // then BLOCK until it commits before closing. Because the
@@ -380,7 +380,7 @@ public:
                     // the standard ack -> CommitCheckpoint path.
                     std::uint64_t final_id = 0;
                     if (const auto& req = ctx.request_final_checkpoint(); req) {
-                        final_id = req();  // 0 = JM declined / timed out / unwired
+                        final_id = req();  // 0 = coordinator declined / timed out / unwired
                     }
                     if (final_id != 0) {
                         source->inject_pending_barrier(CheckpointBarrier{CheckpointId{final_id},
@@ -391,7 +391,7 @@ public:
                         // The runner's clean return is what emits SubtaskFinished
                         // and drives job completion, so we must NOT return until
                         // the final checkpoint is durably committed. If it does
-                        // not commit within the bound (JM unreachable / a sibling
+                        // not commit within the bound (coordinator unreachable / a sibling
                         // subtask stuck) AND we are not being cancelled, THROW:
                         // that surfaces as had_error and drives the watchdog
                         // restart + replay, instead of silently completing the job
@@ -403,12 +403,11 @@ public:
                                 "source EOS final checkpoint did not commit within timeout");
                         }
                     } else if (!should_stop()) {
-                        // In-process / no JM / JM declined: fall back to the local
-                        // terminal commit (UINT64_MAX sentinel), unchanged. 2PC
-                        // sinks pre-commit + commit the tail locally. No recovery
-                        // after end-of-stream on this path (in-process only).
-                        // Skipped on cancel (request returns 0 on a cancel-wake):
-                        // a torn-down job should not commit a terminal.
+                        // In-process / no coordinator / coordinator declined: fall back to the
+                        // local terminal commit (UINT64_MAX sentinel), unchanged. 2PC sinks
+                        // pre-commit + commit the tail locally. No recovery after end-of-stream on
+                        // this path (in-process only). Skipped on cancel (request returns 0 on a
+                        // cancel-wake): a torn-down job should not commit a terminal.
                         channel->push(StreamElement<T>::barrier(CheckpointBarrier{
                             CheckpointId{std::numeric_limits<std::uint64_t>::max()},
                             /*terminal=*/true,
@@ -1098,7 +1097,7 @@ public:
                     } else if (maybe->is_barrier()) {
                         auto result = stage.checkpoint(maybe->as_barrier());
                         // Persist ONLY a successful checkpoint, THEN ack with the
-                        // combined status (ack-after-durable: the JM counts a
+                        // combined status (ack-after-durable: the coordinator counts a
                         // subtask checkpointed once its bytes are on stable
                         // storage). A FAILED checkpoint (a worker threw or the
                         // merge failed) carries empty bytes; persisting it would
@@ -3373,7 +3372,7 @@ public:
                 bool drained = false;
                 while (!should_stop() && source->produce(typed_emitter)) {
                     drain_pending_barriers();
-                    // Rescale-driven drain. The TM's
+                    // Rescale-driven drain. The worker's
                     // BeginRescale dispatch sets ctx.drain_target() to
                     // the rescale's target_parallelism via the
                     // JobConfig-threaded shared atomic; here the
@@ -3382,8 +3381,8 @@ public:
                     // consumers know this upstream subtask is leaving
                     // and the rescaled set is taking over for its
                     // key-groups, then bail. The runner thread
-                    // unwinds; the TM sees SubtaskFinished + signals
-                    // the JM, which calls mark_old_drained on its
+                    // unwinds; the worker sees SubtaskFinished + signals
+                    // the coordinator, which calls mark_old_drained on its
                     // RescaleCoordinator.
                     if (auto t = ctx.drain_target(); t > 0) {
                         typed_emitter.emit_drain(DrainMarker{.subtask_idx = subtask_idx_for_drain,
@@ -3404,13 +3403,13 @@ public:
                         typed_emitter.emit_watermark(Watermark::max());
                     }
                     // Cluster-path EOS final checkpoint, identical to the
-                    // single-source runner: request one JM-coordinated final
+                    // single-source runner: request one coordinator-coordinated final
                     // checkpoint that durably + recoverably commits the tail,
                     // inject it through this subtask's own drain (snapshot_offset
                     // captures the EOS offset), and block until it commits before
                     // closing - so job completion (driven by SubtaskFinished on
                     // return) cannot precede the tail being durable. Every
-                    // parallel source subtask injects the SAME JM-assigned id and
+                    // parallel source subtask injects the SAME coordinator-assigned id and
                     // they align downstream. In-process / declined (final_id == 0)
                     // falls through unchanged (this path emits no local terminal).
                     if (ctx.has_state_backend() && source->emit_terminal_barrier_on_exit()) {
@@ -3436,7 +3435,7 @@ public:
                                     "source EOS final checkpoint did not commit within timeout");
                             }
                         } else if (!should_stop()) {
-                            // In-process / no JM / JM declined: fall back to the
+                            // In-process / no coordinator / coordinator declined: fall back to the
                             // local terminal commit (UINT64_MAX), mirroring the
                             // single-source runner so a parallel bounded 2PC job
                             // never silently drops its tail on the decline path.
@@ -3795,7 +3794,7 @@ public:
             // Per-subtask async snapshot worker (FileBacked + disk-backed
             // changelog). Only the non-terminal snapshot+ack path uses it;
             // terminal barriers stay fully synchronous (they finalize locally
-            // with no JM round-trip).
+            // with no coordinator round-trip).
             std::unique_ptr<SnapshotWorker> snap_worker;
             if (ctx.has_state_backend() && ctx.state_backend()->supports_async_persist()) {
                 snap_worker = std::make_unique<SnapshotWorker>();
@@ -3826,7 +3825,7 @@ public:
                 } else if (maybe->is_barrier()) {
                     // Snapshot any state slice the sink has registered,
                     // hand the barrier to the sink for user hooks, then
-                    // ack so the JM coordinator can complete the
+                    // ack so the coordinator coordinator can complete the
                     // checkpoint once every subtask has reported.
                     const auto& barrier = maybe->as_barrier();
                     const auto ckpt_id = barrier.id();
@@ -3864,7 +3863,7 @@ public:
                         }
                     } else {
                         // Synchronous path: terminal barriers (always - they
-                        // commit locally with no JM round-trip) and
+                        // commit locally with no coordinator round-trip) and
                         // non-async backends.
                         std::string err;
                         bool ok = true;
@@ -3878,7 +3877,7 @@ public:
                         }
                         sink->on_barrier(barrier);
                         if (barrier.is_terminal()) {
-                            // Terminal barriers don't go through the JM
+                            // Terminal barriers don't go through the coordinator
                             // commit broadcast - there's no recovery
                             // scenario after end-of-stream. Commit locally
                             // so the sink finalizes its pre-committed

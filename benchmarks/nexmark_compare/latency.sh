@@ -90,16 +90,16 @@ run_clink() {
     recreate_topic "$out" 1
     sed -e "s#__IN__#$in#" -e "s#__OUT__#$out#" -e "s#__BROKERS__#localhost:9092#" \
         "$ROOT/queries/clink/q0_lat.tmpl.sql" > "$DATA_DIR/q0_lat-clink.sql"
-    "$BUILD_DIR/clink_node" --role=jm --port=7100 --http-port=8081 >"$RESULTS/clink-jm.log" 2>&1 &
-    local jm=$!; sleep 2
-    "$BUILD_DIR/clink_node" --role=tm --jm-host=127.0.0.1 --jm-port=7100 --id=tm-1 --slots=12 \
-        >"$RESULTS/clink-tm-1.log" 2>&1 &
-    local tm=$!; sleep 3
+    "$BUILD_DIR/clink_node" --role=coordinator --port=7100 --http-port=8081 >"$RESULTS/clink-coordinator.log" 2>&1 &
+    local coordinator=$!; sleep 2
+    "$BUILD_DIR/clink_node" --role=worker --coordinator-host=127.0.0.1 --coordinator-port=7100 --id=worker-1 --slots=12 \
+        >"$RESULTS/clink-worker-1.log" 2>&1 &
+    local worker=$!; sleep 3
     "$BUILD_DIR/clink_submit_sql" --file "$DATA_DIR/q0_lat-clink.sql" \
-        --jm-host 127.0.0.1 --jm-port 8081 --name nx_q0_lat --parallelism 1 >/dev/null 2>&1
+        --coordinator-host 127.0.0.1 --coordinator-port 8081 --name nx_q0_lat --parallelism 1 >/dev/null 2>&1
     sleep 3   # job deployed + consumer subscribed on the (empty) topic
     pace_and_measure clink "$in" "$out"
-    kill "$tm" "$jm" 2>/dev/null; sleep 1; kill -9 "$tm" "$jm" 2>/dev/null; sleep 1
+    kill "$worker" "$coordinator" 2>/dev/null; sleep 1; kill -9 "$worker" "$coordinator" 2>/dev/null; sleep 1
 }
 
 run_flink() {

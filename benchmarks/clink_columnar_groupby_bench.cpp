@@ -38,8 +38,8 @@
 
 #include "clink/application/job_submitter.hpp"
 #include "clink/cluster/built_in_factories.hpp"
-#include "clink/cluster/job_manager.hpp"
-#include "clink/cluster/task_manager.hpp"
+#include "clink/cluster/coordinator.hpp"
+#include "clink/cluster/worker.hpp"
 #include "clink/core/record.hpp"
 #include "clink/nexmark/register.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -137,23 +137,23 @@ int main(int argc, char** argv) {
 #endif
 
     // Register SQL ops + Nexmark source + blackhole sink into the host registry
-    // (default_instance) so the in-process TM can build them.
+    // (default_instance) so the in-process worker can build them.
     cluster::ensure_built_ins_registered();
     plugin::PluginRegistry reg;
     sql::install(reg);
     auto marks = std::make_shared<nexmark::SteadyMarks>();
     nexmark::register_nexmark_factories(reg, marks);
 
-    cluster::JobManager jm;
-    const std::uint16_t jm_port = jm.start();
-    jm.expect_tms({"tm-cgb"});
-    cluster::TaskManager::Config tcfg;
+    cluster::Coordinator coordinator;
+    const std::uint16_t coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-cgb"});
+    cluster::Worker::Config tcfg;
     tcfg.slot_count = slots;
-    cluster::TaskManager tm("tm-cgb", "127.0.0.1", tcfg);
-    tm.connect_to_jm("127.0.0.1", jm_port);
+    cluster::Worker worker("worker-cgb", "127.0.0.1", tcfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
     std::this_thread::sleep_for(150ms);
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
 
     // Parquet schema + the projection into it. --wide keeps all 6 bid columns
     // (two of them VARCHAR), --narrow keeps only the 2 the query reads.
@@ -181,16 +181,16 @@ int main(int argc, char** argv) {
             auto spec = compile_job(ddl, "INSERT INTO pq " + pq_select);
             const double w = submit_wall_ms(submitter, spec);
             if (w < 0) {
-                tm.stop();
-                jm.stop();
+                worker.stop();
+                coordinator.stop();
                 return 1;
             }
             std::cerr << "wrote parquet " << pq_path << " (" << events << " bids, " << (int)w
                       << " ms)\n";
         } catch (const std::exception& e) {
             std::cerr << "parquet-write compile/run failed: " << e.what() << "\n";
-            tm.stop();
-            jm.stop();
+            worker.stop();
+            coordinator.stop();
             return 1;
         }
     } else {
@@ -224,8 +224,8 @@ int main(int argc, char** argv) {
         agg_spec = compile_job(agg_ddl, agg_sql);
     } catch (const std::exception& e) {
         std::cerr << "groupby compile failed: " << e.what() << "\n";
-        tm.stop();
-        jm.stop();
+        worker.stop();
+        coordinator.stop();
         return 1;
     }
 
@@ -238,16 +238,16 @@ int main(int argc, char** argv) {
         const std::uint64_t mat_after =
             detail::batch_materialize_counter().load(std::memory_order_relaxed);
         if (w < 0) {
-            tm.stop();
-            jm.stop();
+            worker.stop();
+            coordinator.stop();
             return 1;
         }
         walls.push_back(w);
         mat_delta_total += (mat_after - mat_before);
     }
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
 
     std::sort(walls.begin(), walls.end());
     const double best = walls.front();

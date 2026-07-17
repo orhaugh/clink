@@ -204,7 +204,7 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
     if (!spec.restore_uri.empty() && spec.restore_checkpoint_id != 0) {
         auto [restore_scheme, restore_path] = split_uri(spec.restore_uri);
         (void)restore_scheme;
-        // Rescale: the JM assigns this new subtask one or more parent old
+        // Rescale: the coordinator assigns this new subtask one or more parent old
         // subtasks whose KEYED state to inherit (restore_from_subtask_idx set;
         // restore_from_parent_count contiguous parents for scale-down). The
         // sentinel UINT32_MAX is the non-rescale same-subtask-idx path.

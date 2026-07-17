@@ -9,11 +9,11 @@
 //     -> file_text_sink(parallelism configurable, one file per subtask)
 //
 // The source is intentionally slow so the test has time to:
-//   1. let the JM trigger at least one checkpoint,
+//   1. let the coordinator trigger at least one checkpoint,
 //   2. call clink_rescale_job to expand reduce + sink parallelism,
 //   3. observe that the redeploy lands on the new parallelism.
 //
-// Configurable via env (read once on .so load, propagated to all
+// Configurable via pipeline (read once on .so load, propagated to all
 // processes by the caller):
 //   CLINK_RESCALE_COUNT       - total records to emit (default 200)
 //   CLINK_RESCALE_TICK_MS     - ms to sleep between records (default 25)
@@ -38,7 +38,7 @@
 #include <vector>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/job/register_job.hpp"
 #include "clink/operators/source_operator.hpp"
@@ -170,7 +170,7 @@ inline std::shared_ptr<clink::Source<std::int64_t>> make_slow_source(std::int64_
     return std::make_shared<SlowCountingSource>(count, tick_ms, parallelism, subtask_idx);
 }
 
-inline void define_job(clink::api::StreamExecutionEnvironment& env) {
+inline void define_job(clink::api::Pipeline& pipeline) {
     const auto count = env_i64("CLINK_RESCALE_COUNT", 200);
     const auto tick_ms = env_i64("CLINK_RESCALE_TICK_MS", 25);
     const auto initial_p = env_i64("CLINK_RESCALE_INITIAL_P", 2);
@@ -178,17 +178,17 @@ inline void define_job(clink::api::StreamExecutionEnvironment& env) {
 
     // Register int64_t into the per-job bundle so register_source<int64_t>
     // below can find the typed bridge factories. The built-ins
-    // singleton has it, but env.registry() is a bundle-scoped overlay
+    // singleton has it, but pipeline.registry() is a bundle-scoped overlay
     // and won't see the singleton's typed entry for source-side
     // construction.
-    env.registry().register_type<std::int64_t>("int64", clink::int64_codec());
-    env.registry().register_type<KV>("rescale.kv", kv_codec());
+    pipeline.registry().register_type<std::int64_t>("int64", clink::int64_codec());
+    pipeline.registry().register_type<KV>("rescale.kv", kv_codec());
 
     // Register the slow source as a plugin op so the per-subtask
     // factory can read parallelism + subtask_idx from BuildContext
     // and partition the count range across subtasks.
     const std::string source_op_type = "rescale_slow_source";
-    env.registry().register_source<std::int64_t>(
+    pipeline.registry().register_source<std::int64_t>(
         source_op_type, [count, tick_ms](const clink::plugin::BuildContext& ctx) {
             const auto par = static_cast<std::int64_t>(ctx.parallelism == 0 ? 1 : ctx.parallelism);
             return make_slow_source(
@@ -200,7 +200,7 @@ inline void define_job(clink::api::StreamExecutionEnvironment& env) {
     src_desc.channel_type = clink::api::ChannelName<std::int64_t>::get();
     src_desc.parallelism = 1;
 
-    env.source<std::int64_t>(src_desc)
+    pipeline.source<std::int64_t>(src_desc)
         .map<KV>([](const std::int64_t& v) { return KV{v % 8, 1}; })
         .key_by([](const KV& kv) -> std::int64_t { return kv.key; })
         .reduce([](const KV& a, const KV& b) { return KV{a.key, a.count + b.count}; })

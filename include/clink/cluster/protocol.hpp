@@ -9,7 +9,7 @@
 
 namespace clink::cluster {
 
-// JobManager ↔ TaskManager ↔ Client wire protocol.
+// Coordinator ↔ Worker ↔ Client wire protocol.
 //
 // All messages are length-prefixed: [u32 length BE][payload].
 // Payload starts with [u8 kind].
@@ -17,37 +17,37 @@ namespace clink::cluster {
 // String fields: [u32 length BE][bytes].
 // All multi-byte integers are big-endian on the wire.
 
-// JobId is the JM-assigned monotonic identifier for one submitted job.
+// JobId is the coordinator-assigned monotonic identifier for one submitted job.
 // 0 is reserved as "no job" / unset.
 using JobId = std::uint64_t;
 
 enum class MessageKind : std::uint8_t {
-    // TM → JM
+    // worker → coordinator
     Register = 1,
     SubtaskFinished = 2,
     Heartbeat = 3,
     SubtaskListening = 6,
     SubtaskCheckpointed = 9,
-    // TM → JM. A bounded source at clean end-of-stream asks the JM to
-    // trigger one FINAL JM-coordinated checkpoint that durably commits the
+    // worker → coordinator. A bounded source at clean end-of-stream asks the coordinator to
+    // trigger one FINAL coordinator-coordinated checkpoint that durably commits the
     // post-last-checkpoint tail before the job is allowed to complete. The
-    // JM replies with FinalCheckpointAssigned carrying the assigned id (or 0
+    // coordinator replies with FinalCheckpointAssigned carrying the assigned id (or 0
     // to decline if the job is already completing/cancelling).
     RequestFinalCheckpoint = 10,
-    // Client → JM
+    // Client → coordinator
     HelloClient = 4,
     SubmitJob = 5,
     ListJobs = 7,
     // RescaleJob (kind 11) is a client-initiated request: the client
-    // asks the JM to redeploy a running job at a new parallelism per
-    // role. The JM responds with RescaleJobAck. Implementation triggers
+    // asks the coordinator to redeploy a running job at a new parallelism per
+    // role. The coordinator responds with RescaleJobAck. Implementation triggers
     // a final checkpoint, cancels the existing task set, and redeploys
     // each new subtask with a key-group range filter and a pointer at
     // its parent old subtask's state file (see DeploymentTask).
     RescaleJob = 11,
     // Client-initiated per-operator rescale request.
-    // Wraps JobManager::request_operator_rescale (which delegates to
-    // RescaleCoordinator). The JM responds with RescaleOperatorAck
+    // Wraps Coordinator::request_operator_rescale (which delegates to
+    // RescaleCoordinator). The coordinator responds with RescaleOperatorAck
     // carrying ok + reason; on accept the RescaleCoordinator state
     // moves Idle -> Preparing and the rest of the dual-run
     // choreography (BeginRescale dispatch, drain, cutover) runs.
@@ -58,15 +58,15 @@ enum class MessageKind : std::uint8_t {
     // restore_from_checkpoint_id. The handle is the same (dir, id)
     // pair the periodic checkpoint machinery already produces - no
     // file relocation is performed; the user can copy elsewhere.
-    // Must NOT share a value with any other client->JM kind: the JM
+    // Must NOT share a value with any other client->coordinator kind: the coordinator
     // dispatch matches on kind, so a duplicate silently routes the
     // frame to the wrong handler (this previously collided with
-    // RescaleOperator=12 and aborted the JM on every savepoint).
+    // RescaleOperator=12 and aborted the coordinator on every savepoint).
     Savepoint = 13,
-    // CancelJob (kind 103) is overloaded for the client→JM direction:
-    // the client sends it to ask the JM to cancel a running job. The
-    // JM responds with CancelJobAck.
-    // JM → TM
+    // CancelJob (kind 103) is overloaded for the client→coordinator direction:
+    // the client sends it to ask the coordinator to cancel a running job. The
+    // coordinator responds with CancelJobAck.
+    // coordinator → worker
     RegisterAck = 100,
     Deploy = 101,
     StartJob = 102,
@@ -74,26 +74,26 @@ enum class MessageKind : std::uint8_t {
     PeerUpdate = 104,
     TriggerCheckpoint = 108,
     // Broadcast after every SubtaskCheckpointed ack for checkpoint N has
-    // arrived and the JM has written the COMPLETED-N marker. Sinks that
+    // arrived and the coordinator has written the COMPLETED-N marker. Sinks that
     // implement 2PC use this as the phase-2 "commit" signal: their
     // pre-committed transaction (file stage, Kafka tx, SQL PREPARED)
     // finalizes only after this message.
     CommitCheckpoint = 110,
-    // Broadcast to TMs hosting sinks in a commit_group when
-    // the JM has decided the group cannot commit atomically (any
+    // Broadcast to workers hosting sinks in a commit_group when
+    // the coordinator has decided the group cannot commit atomically (any
     // member's pre-commit failed). Sinks implementing 2PC roll back
     // their prepared state: file_2pc deletes staging file, kafka_2pc
     // calls abort_transaction. Mirrors CommitCheckpointMsg's payload
     // shape; the kind byte distinguishes commit-vs-abort intent.
     AbortCheckpoint = 113,
-    // JM -> TM. Asks the TM hosting old subtasks for an
+    // coordinator -> worker. Asks the worker hosting old subtasks for an
     // operator to begin the dual-run rescale: finish current barrier
     // alignment, emit DrainMarker downstream, close output channels,
     // signal shutdown via SubtaskFinished.
     // New subtasks are deployed separately via Deploy with key-group
     // ranges sliced from the cutover checkpoint.
     BeginRescale = 114,
-    // JM → Client
+    // coordinator → Client
     SubmitJobAck = 105,
     JobCompleted = 106,
     ListJobsAck = 107,
@@ -101,7 +101,7 @@ enum class MessageKind : std::uint8_t {
     RescaleJobAck = 111,
     RescaleOperatorAck = 115,
     SavepointAck = 112,
-    // JM → TM. Reply to RequestFinalCheckpoint: the JM-assigned final
+    // coordinator → worker. Reply to RequestFinalCheckpoint: the coordinator-assigned final
     // checkpoint id (0 = declined). The requesting source subtask injects
     // this id as a normal barrier through its own drain path, then blocks
     // until it observes CommitCheckpoint for it.
@@ -109,11 +109,11 @@ enum class MessageKind : std::uint8_t {
 };
 
 // Sentinel marking "no rescale-specific restore override" on a
-// DeploymentTask. When the TM sees this value it restores from
+// DeploymentTask. When the worker sees this value it restores from
 // <restore_from_dir>/<own_subtask_idx>/, the historic behaviour.
 inline constexpr std::uint32_t kRestoreFromSelf = std::numeric_limits<std::uint32_t>::max();
 
-// Address of a peer subtask in the deployment plan. The TM uses these to
+// Address of a peer subtask in the deployment plan. The worker uses these to
 // open NetworkBridge channels to its peers.
 struct PeerAddress {
     std::string role;             // peer's role name (e.g., "consumer")
@@ -122,18 +122,18 @@ struct PeerAddress {
     std::uint16_t data_port{};    // peer's data-plane port
 };
 
-// One subtask the JM is asking this TM to run.
+// One subtask the coordinator is asking this worker to run.
 struct DeploymentTask {
-    std::string role;                // dispatched against TM's role registry
+    std::string role;                // dispatched against worker's role registry
     std::uint32_t subtask_idx{};     // this subtask's index within the role
     std::uint16_t data_port{};       // port this subtask should listen on (0 = ephemeral)
     std::vector<PeerAddress> peers;  // addresses for cross-stage data channels
     std::string extra_config;        // role-specific config blob (JSON, etc.)
 
-    // Rescale-aware restore directives. Set by the JM when a rescale
+    // Rescale-aware restore directives. Set by the coordinator when a rescale
     // emits a fresh placement; left at defaults for ordinary deploys.
     //
-    // restore_from_subtask_idx == kRestoreFromSelf (default) → the TM
+    // restore_from_subtask_idx == kRestoreFromSelf (default) → the worker
     // restores from <restore_from_dir>/<subtask_idx>/ as before. When
     // a different value is set, the new subtask reads its parent old
     // subtask's state file at <restore_from_dir>/<that idx>/ instead.
@@ -152,7 +152,7 @@ struct DeploymentTask {
     // groups this new subtask is responsible for. Backends apply it
     // as a filter at restore time so each new subtask only loads the
     // slice of the parent file(s) that maps to its assigned groups.
-    // {0, 0} is the back-compat sentinel: the TM widens it to the
+    // {0, 0} is the back-compat sentinel: the worker widens it to the
     // full [0, kNumKeyGroups) range so non-rescale deploys behave
     // identically to before this field existed.
     std::uint32_t restore_from_subtask_idx{kRestoreFromSelf};
@@ -164,7 +164,7 @@ struct DeploymentTask {
 // ----- Message bodies -----
 
 // One plugin shared library shipped with a SubmitJob (and re-shipped
-// by the JM in each Deploy so TMs can dlopen it). v1 inlines the
+// by the coordinator in each Deploy so workers can dlopen it). v1 inlines the
 // bytes; a future content-addressed-upload variant can avoid
 // re-shipping if the same plugin is submitted multiple times.
 struct PluginBinary {
@@ -174,13 +174,13 @@ struct PluginBinary {
 };
 
 struct RegisterMsg {
-    std::string tm_id;
-    std::string data_host;        // host the TM advertises for inbound data connections
-    std::uint32_t slot_count{1};  // how many concurrent tasks this TM can host
-    // HTTP port the TM is serving its /api/v1/* read API on. 0 means
-    // the TM didn't start an HTTP listener; the JM dashboard then can't
-    // proxy to it. Backward-compatible: old TMs that don't send this
-    // field just look like "HTTP disabled" to the JM.
+    std::string worker_id;
+    std::string data_host;        // host the worker advertises for inbound data connections
+    std::uint32_t slot_count{1};  // how many concurrent tasks this worker can host
+    // HTTP port the worker is serving its /api/v1/* read API on. 0 means
+    // the worker didn't start an HTTP listener; the coordinator dashboard then can't
+    // proxy to it. Backward-compatible: old workers that don't send this
+    // field just look like "HTTP disabled" to the coordinator.
     std::uint16_t http_port{0};
 };
 
@@ -192,12 +192,12 @@ struct RegisterAckMsg {
 struct DeployMsg {
     JobId job_id{};
     std::vector<DeploymentTask> tasks;
-    // Plugins needed to instantiate the tasks. The TM writes each
+    // Plugins needed to instantiate the tasks. The worker writes each
     // blob to its local cache (keyed by content_hash) and dlopens
-    // before running the tasks. Same bytes the JM received via
+    // before running the tasks. Same bytes the coordinator received via
     // SubmitJob.
     std::vector<PluginBinary> plugins;
-    // Per-job checkpoint config (echoed from SubmitJob). The TM uses
+    // Per-job checkpoint config (echoed from SubmitJob). The worker uses
     // this to wire each subtask's FileBackedStateBackend and, when
     // restore_from_dir is set, to instruct the subtask to load its
     // saved state slice before opening operators.
@@ -205,33 +205,33 @@ struct DeployMsg {
     std::string restore_from_dir;
     std::uint64_t restore_from_checkpoint_id{0};
     // Unaligned-checkpoint mode for this job, echoed from
-    // CheckpointConfig.alignment. The TM passes it through to each
+    // CheckpointConfig.alignment. The worker passes it through to each
     // RunnerContext so multi-input operator runners can switch
-    // their alignment state machine. v1 trailing field - old TMs
+    // their alignment state machine. v1 trailing field - old workers
     // see EOF and default to aligned.
     bool unaligned_checkpoints{false};
     // State schema evolution: the versions the job expects per
     // (op, state_type), packed as "op|type|ver" lines (StateVersionMap::pack).
-    // The TM unpacks it into JobConfig.expected_state_versions so each
+    // The worker unpacks it into JobConfig.expected_state_versions so each
     // subtask migrates restored state up to these versions before its
     // operators run. Empty for jobs that declare none. v1 trailing field -
-    // old TMs see EOF and leave it empty (no migration).
+    // old workers see EOF and leave it empty (no migration).
     std::string expected_state_versions_packed;
     // Per-subtask state-backend URI, echoed from CheckpointConfig. When
     // non-empty it overrides checkpoint_dir as the StateBackendSpec.uri so
     // the subtask builds a remote/disaggregated backend; checkpoint_dir
     // stays the local coordination dir. Empty -> checkpoint_dir is the
-    // backend URI (legacy). v1 trailing field - old TMs see EOF and leave
+    // backend URI (legacy). v1 trailing field - old workers see EOF and leave
     // it empty.
     std::string state_backend_uri;
     // Record-capture flight recorder, echoed from CheckpointConfig (see
-    // there). Trailing wire fields - old TMs see EOF and leave capture off.
+    // there). Trailing wire fields - old workers see EOF and leave capture off.
     std::string capture_dir;
     std::uint64_t capture_records{0};
     // SQL-declared UDFs the job's expressions call, packed as a JSON array
-    // (pack_udf_specs, module payloads base64 inside). The TM registers
+    // (pack_udf_specs, module payloads base64 inside). The worker registers
     // each before running the job's subtasks. Trailing wire field - old
-    // TMs see EOF and leave it empty (no deploy-time registration).
+    // workers see EOF and leave it empty (no deploy-time registration).
     std::string udfs_packed;
 };
 
@@ -243,8 +243,8 @@ struct CancelJobMsg {
     JobId job_id{};
 };
 
-// JM -> Client reply to a client-initiated CancelJob. `ok` is false
-// when the JM rejected the request (no such job, already finished,
+// coordinator -> Client reply to a client-initiated CancelJob. `ok` is false
+// when the coordinator rejected the request (no such job, already finished,
 // already cancelling) - `message` carries the human-readable reason.
 struct CancelJobAckMsg {
     JobId job_id{};
@@ -252,18 +252,18 @@ struct CancelJobAckMsg {
     std::string message;
 };
 
-// Client -> JM. Request to change the parallelism of one or more
+// Client -> coordinator. Request to change the parallelism of one or more
 // roles in a running job. `role_parallelism` lists each role's new
 // parallelism; roles not listed keep their current parallelism. v1
 // requires every listed parallelism to be an integer multiple of
-// the role's current parallelism (scale-up only) - the JM rejects
+// the role's current parallelism (scale-up only) - the coordinator rejects
 // other shapes with ok=false.
 struct RescaleJobMsg {
     JobId job_id{};
     std::vector<std::pair<std::string, std::uint32_t>> role_parallelism;
 };
 
-// JM -> Client. Reply to RescaleJob. `ok=false` carries the reason in
+// coordinator -> Client. Reply to RescaleJob. `ok=false` carries the reason in
 // `message` (no such job, parallelism not a multiple, no spare slots,
 // final checkpoint failed, etc.).
 struct RescaleJobAckMsg {
@@ -272,8 +272,8 @@ struct RescaleJobAckMsg {
     std::string message;
 };
 
-// Client -> JM. Per-operator rescale request. The JM
-// delegates to JobManager::request_operator_rescale, which validates
+// Client -> coordinator. Per-operator rescale request. The coordinator
+// delegates to Coordinator::request_operator_rescale, which validates
 // new_parallelism against the operator's [min, max] bounds and
 // transitions the operator's RescaleCoordinator state to Preparing
 // on accept. The reply (RescaleOperatorAckMsg) carries the
@@ -284,7 +284,7 @@ struct RescaleOperatorMsg {
     std::uint32_t new_parallelism{};
 };
 
-// JM -> client. Reply to RescaleOperator. `ok=false` means the
+// coordinator -> client. Reply to RescaleOperator. `ok=false` means the
 // request was rejected (out-of-bounds, equals-current,
 // already-in-progress, unknown job/operator); `message` carries
 // the descriptive reason from RescaleCoordinator. `ok=true` +
@@ -298,17 +298,17 @@ struct RescaleOperatorAckMsg {
     std::string message;
 };
 
-// Client -> JM. Trigger a synchronous savepoint for a running job.
+// Client -> coordinator. Trigger a synchronous savepoint for a running job.
 // Returns SavepointAckMsg carrying the (dir, id) handle.
 struct SavepointMsg {
     JobId job_id{};
-    // Optional timeout in ms (0 = use JM default ~30s). The JM waits
+    // Optional timeout in ms (0 = use coordinator default ~30s). The coordinator waits
     // up to this long for every subtask to ack the savepoint before
     // returning an error.
     std::int64_t timeout_ms{0};
 };
 
-// JM -> Client. Reply to Savepoint.
+// coordinator -> Client. Reply to Savepoint.
 //   ok=true  : checkpoint_dir + checkpoint_id name a complete
 //              snapshot. Feed them into clink_submit_job's
 //              --restore-from-dir / --restore-from-checkpoint-id to
@@ -324,7 +324,7 @@ struct SavepointAckMsg {
 
 struct SubtaskFinishedMsg {
     JobId job_id{};
-    std::string tm_id;
+    std::string worker_id;
     std::string role;
     std::uint32_t subtask_idx{};
     bool had_error{};
@@ -332,11 +332,11 @@ struct SubtaskFinishedMsg {
 };
 
 struct HeartbeatMsg {
-    std::string tm_id;
+    std::string worker_id;
 };
 
-// TM → JM. A bounded source subtask reached clean end-of-stream and asks the
-// JM to coordinate one final checkpoint so its tail is durably committed
+// worker → coordinator. A bounded source subtask reached clean end-of-stream and asks the
+// coordinator to coordinate one final checkpoint so its tail is durably committed
 // before the job completes. See MessageKind::RequestFinalCheckpoint.
 struct RequestFinalCheckpointMsg {
     JobId job_id{};
@@ -344,8 +344,8 @@ struct RequestFinalCheckpointMsg {
     std::uint32_t subtask_idx{};
 };
 
-// JM → TM. Reply to RequestFinalCheckpoint. final_checkpoint_id == 0 means the
-// JM declined (job already completing/cancelling, or no checkpoint dir); the
+// coordinator → worker. Reply to RequestFinalCheckpoint. final_checkpoint_id == 0 means the
+// coordinator declined (job already completing/cancelling, or no checkpoint dir); the
 // source then falls back / returns and the normal restart path takes over.
 struct FinalCheckpointAssignedMsg {
     JobId job_id{};
@@ -354,8 +354,8 @@ struct FinalCheckpointAssignedMsg {
     std::uint64_t final_checkpoint_id{};
 };
 
-// Sent by the client as the first frame on a control connection so the JM
-// can route the connection to its client handler instead of the TM
+// Sent by the client as the first frame on a control connection so the coordinator
+// can route the connection to its client handler instead of the worker
 // register-and-reader path. Empty body.
 struct HelloClientMsg {};
 
@@ -374,8 +374,8 @@ enum class CheckpointAlignment : std::uint8_t {
     Unaligned = 1,
 };
 
-// Sentinel for max_restarts_on_tm_loss meaning "not set - use the recovery
-// default." Resolved at the JobManager: when checkpointing is enabled
+// Sentinel for max_restarts_on_worker_loss meaning "not set - use the recovery
+// default." Resolved at the Coordinator: when checkpointing is enabled
 // (checkpoint_dir set) it becomes kDefaultSelfHealRestarts (self-heal by
 // default); without checkpointing it
 // becomes 0 (fail-fast, since there is no checkpoint to restore from). An
@@ -393,7 +393,7 @@ struct CheckpointConfig {
     // Directory the cluster uses as the snapshot root. Each job writes
     // under <dir>/<job_id>/<subtask_idx>/. Empty disables checkpointing.
     std::string checkpoint_dir;
-    // Interval between JM-initiated periodic checkpoints. Zero disables
+    // Interval between coordinator-initiated periodic checkpoints. Zero disables
     // periodic triggers (the client / operator can still trigger via
     // future API surface).
     std::int64_t interval_ms{0};
@@ -403,15 +403,15 @@ struct CheckpointConfig {
     // completed checkpoint.
     std::string restore_from_dir;
     std::uint64_t restore_from_checkpoint_id{0};
-    // Max times the JM will automatically re-deploy this job's subtasks after a
-    // TM goes lost or a subtask errors. Each restart starts from
+    // Max times the coordinator will automatically re-deploy this job's subtasks after a
+    // worker goes lost or a subtask errors. Each restart starts from
     // latest_completed_checkpoint_id (so keyed state is preserved; source replay
     // correctness depends on the source impl). The default kRestartAuto resolves
     // to self-heal (kDefaultSelfHealRestarts) when checkpoint_dir is set and
     // fail-fast (0) otherwise; an explicit 0 forces fail-fast even with
     // checkpointing; an explicit N caps the attempts. Resolved by
-    // effective_max_restarts() at the JM. Has no effect without checkpoint_dir.
-    std::uint32_t max_restarts_on_tm_loss{kRestartAuto};
+    // effective_max_restarts() at the coordinator. Has no effect without checkpoint_dir.
+    std::uint32_t max_restarts_on_worker_loss{kRestartAuto};
 
     // Aligned vs unaligned barrier handling at multi-input operators.
     // Default Aligned - back-compat with every existing job.
@@ -420,12 +420,12 @@ struct CheckpointConfig {
     // Per-subtask state-backend URI, decoupled from checkpoint_dir. When
     // set, each subtask builds its state backend from this URI via the
     // StateBackendFactory (e.g. "remote-read://bucket/job?endpoint=...");
-    // checkpoint_dir then stays the JM's LOCAL coordination directory for
+    // checkpoint_dir then stays the coordinator's LOCAL coordination directory for
     // COMPLETED-N markers and HA recovery. Empty keeps the legacy
     // behaviour: checkpoint_dir doubles as the backend URI (bare path =
     // file scheme). This is what makes the remote/disaggregated backends
     // (remote-read, s3+rocksdb, changelog+s3) usable in a cluster job
-    // without the JM writing markers to a non-filesystem path.
+    // without the coordinator writing markers to a non-filesystem path.
     std::string state_backend_uri;
 
     // Record-capture flight recorder (time-travel debugging). When
@@ -438,19 +438,19 @@ struct CheckpointConfig {
     std::uint64_t capture_records{0};
 };
 
-// Resolve max_restarts_on_tm_loss to its effective value (see the field +
+// Resolve max_restarts_on_worker_loss to its effective value (see the field +
 // kRestartAuto). kRestartAuto -> self-heal default when checkpointing is enabled,
-// fail-fast otherwise; an explicit value is used verbatim. The JobManager calls
+// fail-fast otherwise; an explicit value is used verbatim. The Coordinator calls
 // this at every restart decision, so the stored/persisted value keeps the user's
 // original intent (auto vs explicit) and HA recovery round-trips it.
 [[nodiscard]] inline std::uint32_t effective_max_restarts(const CheckpointConfig& c) noexcept {
-    if (c.max_restarts_on_tm_loss == kRestartAuto) {
+    if (c.max_restarts_on_worker_loss == kRestartAuto) {
         return c.checkpoint_dir.empty() ? 0u : kDefaultSelfHealRestarts;
     }
-    return c.max_restarts_on_tm_loss;
+    return c.max_restarts_on_worker_loss;
 }
 
-// Client → JM. Carries a JobGraphSpec serialized as JSON, plus any
+// Client → coordinator. Carries a JobGraphSpec serialized as JSON, plus any
 // plugin .so/.dylib files referenced by the graph, plus optional
 // checkpointing config.
 struct SubmitJobMsg {
@@ -459,14 +459,14 @@ struct SubmitJobMsg {
     CheckpointConfig checkpoint;
 };
 
-// JM → Client. Returned in response to SubmitJob. job_id is 0 on rejection.
+// coordinator → Client. Returned in response to SubmitJob. job_id is 0 on rejection.
 struct SubmitJobAckMsg {
     JobId job_id{};
     bool ok{};
     std::string message;
 };
 
-// JM → Client. One per submitted job, sent when every subtask has finished
+// coordinator → Client. One per submitted job, sent when every subtask has finished
 // (cleanly or with errors) or the job was cancelled.
 struct JobCompletedMsg {
     JobId job_id{};
@@ -475,7 +475,7 @@ struct JobCompletedMsg {
 };
 
 // JobInfo: a snapshot of one running or recently-completed job, returned
-// inside ListJobsAck. The JM does NOT prune completed jobs immediately,
+// inside ListJobsAck. The coordinator does NOT prune completed jobs immediately,
 // so list_jobs() shows both live and recently-finished jobs - the
 // completion_signalled flag distinguishes them.
 struct JobInfo {
@@ -485,17 +485,17 @@ struct JobInfo {
     bool completion_signalled{};
 };
 
-// Client → JM. Empty body; the JM replies with a snapshot of every job
+// Client → coordinator. Empty body; the coordinator replies with a snapshot of every job
 // it currently tracks.
 struct ListJobsMsg {};
 
-// JM → Client.
+// coordinator → Client.
 struct ListJobsAckMsg {
     std::vector<JobInfo> jobs;
 };
 
-// JM → TM. Asks the TM to start a distributed checkpoint for the given
-// job at the given id. The TM injects a CheckpointBarrier(checkpoint_id)
+// coordinator → worker. Asks the worker to start a distributed checkpoint for the given
+// job at the given id. The worker injects a CheckpointBarrier(checkpoint_id)
 // into every source subtask it hosts for this job; the barrier flows
 // downstream and each subtask snapshots its keyed state, then sends
 // SubtaskCheckpointed back.
@@ -504,7 +504,7 @@ struct TriggerCheckpointMsg {
     std::uint64_t checkpoint_id{};
 };
 
-// JM → TM. The commit phase of the 2PC sink protocol. Broadcast to every TM
+// coordinator → worker. The commit phase of the 2PC sink protocol. Broadcast to every worker
 // hosting tasks for the job once SubtaskCheckpointed acks for
 // `checkpoint_id` are all in and the COMPLETED-N marker is on disk.
 // Sinks implementing TwoPhaseCommitSink<T> finalize their pre-
@@ -515,9 +515,9 @@ struct CommitCheckpointMsg {
     std::uint64_t checkpoint_id{};
 };
 
-// JM → TM. Broadcast when the JM decides a checkpoint
+// coordinator → worker. Broadcast when the coordinator decides a checkpoint
 // must abort - one member of a commit_group failed its pre-commit,
-// so every member of the group rolls back. The TM dispatches this
+// so every member of the group rolls back. The worker dispatches this
 // to per_job_aborters_, mirroring the CommitCheckpoint path; sinks
 // call their on_abort hook to release prepared state.
 struct AbortCheckpointMsg {
@@ -525,25 +525,25 @@ struct AbortCheckpointMsg {
     std::uint64_t checkpoint_id{};
 };
 
-// JM -> TM. Signal the TM hosting one or more old
-// subtasks of `op_id` to begin the dual-run rescale. The TM
+// coordinator -> worker. Signal the worker hosting one or more old
+// subtasks of `op_id` to begin the dual-run rescale. The worker
 // dispatches to per-subtask drain callbacks: each old subtask
 // runner finishes its current barrier alignment, emits a
 // DrainMarker downstream announcing
 // `target_parallelism` to consumers, closes its output channels,
 // and signals shutdown via SubtaskFinished. The new-parallelism
 // subtasks are deployed separately via Deploy with key-group
-// ranges sliced from the cutover checkpoint. The JM's
+// ranges sliced from the cutover checkpoint. The coordinator's
 // RescaleCoordinator tracks drained / ready acks and
 // completes the rescale when both populations settle.
 struct BeginRescaleMsg {
     JobId job_id{};
-    std::string op_id;  // matches OperatorSpec.id / role on the TM
+    std::string op_id;  // matches OperatorSpec.id / role on the worker
     std::uint32_t target_parallelism{};
     std::uint64_t cutover_checkpoint{};
 };
 
-// TM → JM. One ack per subtask that completed its slice of checkpoint
+// worker → coordinator. One ack per subtask that completed its slice of checkpoint
 // `checkpoint_id`. `ok=false` + `error` for snapshot failures.
 struct SubtaskCheckpointedMsg {
     JobId job_id{};
@@ -554,14 +554,14 @@ struct SubtaskCheckpointedMsg {
     std::string error;
 };
 
-// TM → JM. Sent after the TM has bound its inbound data-plane listeners
+// worker → coordinator. Sent after the worker has bound its inbound data-plane listeners
 // for a deployed subtask. Reports one bound port per input edge so the
-// JM can resolve the upstream's outbound bridge target.
+// coordinator can resolve the upstream's outbound bridge target.
 //
 // `edge_ports` is empty for subtasks with no inbound listener (sources).
-// In that case the subtask still sends SubtaskListening so the JM knows
+// In that case the subtask still sends SubtaskListening so the coordinator knows
 // when every task is ready. Each entry pairs the listening port with the
-// (upstream_role, upstream_subtask_idx) it serves; the JM uses that
+// (upstream_role, upstream_subtask_idx) it serves; the coordinator uses that
 // tuple as the lookup key when populating PeerUpdate.
 struct SubtaskListeningMsg {
     struct EdgePort {
@@ -570,17 +570,17 @@ struct SubtaskListeningMsg {
         std::uint16_t port{};
     };
     JobId job_id{};
-    std::string tm_id;
+    std::string worker_id;
     std::string role;
     std::uint32_t subtask_idx{};
     std::string host;
     std::vector<EdgePort> edge_ports;
 };
 
-// JM → TM. Sent after every subtask of a job has reported listening, so
+// coordinator → worker. Sent after every subtask of a job has reported listening, so
 // each task with outbound peer references can open its NetworkBridgeSinks
 // to the right addresses. tasks[] carries one entry per (role, subtask)
-// owned by this TM that has at least one peer.
+// owned by this worker that has at least one peer.
 struct PeerUpdateMsg {
     struct TaskPeers {
         std::string role;

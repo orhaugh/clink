@@ -12,7 +12,7 @@ class RunnerRegistry;
 //
 // Built-ins go through the same registration path as user plugins to
 // keep one code path for dispatch. Callers should invoke this from
-// any entry point that needs the built-ins resolvable - the TM's
+// any entry point that needs the built-ins resolvable - the worker's
 // generic role, the planner's validation step, integration tests.
 void ensure_built_ins_registered();
 

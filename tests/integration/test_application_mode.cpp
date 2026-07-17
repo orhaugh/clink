@@ -1,6 +1,6 @@
 // End-to-end test for the Application-Mode JobSubmitter API.
 //
-// Spawns a JM + TM and uses clink::application::JobSubmitter to push
+// Spawns a coordinator + worker and uses clink::application::JobSubmitter to push
 // a job graph (built from a JobGraphSpec via the C++ API, no JSON file
 // on disk) at the cluster, waits for completion, and asserts the sink
 // wrote what we expected. This replaces the `clink_node --role=client
@@ -77,23 +77,23 @@ TEST(ApplicationMode, JobSubmitterPushesAndWaitsForCompletion) {
         GTEST_SKIP() << "clink_node not built";
     }
 
-    const auto jm_port = probe_free_port();
+    const auto coordinator_port = probe_free_port();
     const auto out_path =
         std::filesystem::temp_directory_path() / "clink_application_mode_test.txt";
     std::filesystem::remove(out_path);
 
-    const pid_t jm_pid =
-        spawn_node({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, binary);
-    ASSERT_GT(jm_pid, 0);
+    const pid_t coordinator_pid = spawn_node(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
-    const pid_t tm_pid = spawn_node({"clink_node",
-                                     "--role=tm",
-                                     "--id=tm-1",
-                                     "--jm-host=127.0.0.1",
-                                     "--jm-port=" + std::to_string(jm_port)},
-                                    binary);
-    ASSERT_GT(tm_pid, 0);
+    const pid_t worker_pid = spawn_node({"clink_node",
+                                         "--role=worker",
+                                         "--id=worker-1",
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port)},
+                                        binary);
+    ASSERT_GT(worker_pid, 0);
     std::this_thread::sleep_for(300ms);
 
     // Build the job graph programmatically rather than reading JSON
@@ -115,13 +115,13 @@ TEST(ApplicationMode, JobSubmitterPushesAndWaitsForCompletion) {
     snk.params["path"] = out_path.string();
     graph.ops.push_back(std::move(snk));
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = std::chrono::seconds(15);
     const auto result = submitter.submit(graph.to_json(), {}, opts);
 
-    kill_quietly(jm_pid);
-    kill_quietly(tm_pid);
+    kill_quietly(coordinator_pid);
+    kill_quietly(worker_pid);
 
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
     EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
@@ -137,7 +137,7 @@ TEST(ApplicationMode, JobSubmitterPushesAndWaitsForCompletion) {
     std::filesystem::remove(out_path);
 }
 
-// Reject path: submit with no JM listening. Verifies that the API
+// Reject path: submit with no coordinator listening. Verifies that the API
 // returns a SubmitResult with reject_message instead of throwing,
 // which is what applications need for clean error reporting.
 TEST(ApplicationMode, JobSubmitterReportsConnectFailureCleanly) {

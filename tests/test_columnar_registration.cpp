@@ -532,7 +532,7 @@ public:
 }  // namespace
 
 // The TypeOps::fused_source_commit_hooks seam (used by the fused-chain dispatch in
-// task_manager.cpp) must recover the typed Source from the boxed shared_ptr<void>
+// worker.cpp) must recover the typed Source from the boxed shared_ptr<void>
 // and return callbacks that drive its notify_checkpoint_complete / _aborted, and
 // those callbacks must weak-capture so a notification after teardown is a safe
 // no-op. This is the mechanism that closes the messaging-source ack window under

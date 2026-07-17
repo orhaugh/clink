@@ -1,6 +1,6 @@
 // Cross-process throughput benchmark.
 //
-// Spawns 1 JM + 3 TMs as separate processes, submits the
+// Spawns 1 coordinator + 3 workers as separate processes, submits the
 // bench_pipeline_job.so (VectorSource -> 2x map -> sink) via
 // clink_submit_job, and measures wall-clock from submit-start to
 // submit-exit. Establishes a baseline for the WIRE-INCLUDED path
@@ -118,7 +118,7 @@ std::uint16_t probe_free_port() {
 
 }  // namespace
 
-TEST(CrossProcessBench, PipelineWallTimeAcrossThreeTaskManagers) {
+TEST(CrossProcessBench, PipelineWallTimeAcrossThreeWorkers) {
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node)) {
         GTEST_SKIP() << "clink_node not built";
@@ -137,33 +137,33 @@ TEST(CrossProcessBench, PipelineWallTimeAcrossThreeTaskManagers) {
     std::filesystem::remove(out_path);
 
     // bench_pipeline_job reads these at build_fn time (under call_once)
-    // when the .so is dlopened in the submitter, JM, and each TM.
+    // when the .so is dlopened in the submitter, coordinator, and each worker.
     ::setenv("CLINK_BENCH_RECORDS", std::to_string(kRecords).c_str(), 1);
     ::setenv("CLINK_BENCH_OUT", out_path.c_str(), 1);
 
-    const auto jm_port = probe_free_port();
-    const pid_t jm_pid =
-        spawn_proc({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, node);
-    ASSERT_GT(jm_pid, 0);
+    const auto coordinator_port = probe_free_port();
+    const pid_t coordinator_pid = spawn_proc(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
-    std::vector<pid_t> tms;
+    std::vector<pid_t> workers;
     for (int i = 1; i <= 3; ++i) {
-        tms.push_back(spawn_proc({"clink_node",
-                                  "--role=tm",
-                                  "--id=tm-bench-" + std::to_string(i),
-                                  "--jm-host=127.0.0.1",
-                                  "--jm-port=" + std::to_string(jm_port)},
-                                 node));
-        ASSERT_GT(tms.back(), 0);
+        workers.push_back(spawn_proc({"clink_node",
+                                      "--role=worker",
+                                      "--id=worker-bench-" + std::to_string(i),
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(coordinator_port)},
+                                     node));
+        ASSERT_GT(workers.back(), 0);
     }
     std::this_thread::sleep_for(400ms);
 
     const auto t_submit_start = std::chrono::steady_clock::now();
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),
-                                         "--jm-host=127.0.0.1",
-                                         "--jm-port=" + std::to_string(jm_port),
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port),
                                          "--wait-timeout-s=30",
                                          "--name=cross-process-bench"},
                                         submit);
@@ -173,8 +173,8 @@ TEST(CrossProcessBench, PipelineWallTimeAcrossThreeTaskManagers) {
     const bool exited = wait_for(submit_pid, 45s, submit_exit);
     const auto t_submit_done = std::chrono::steady_clock::now();
 
-    kill_quietly(jm_pid);
-    for (auto pid : tms) {
+    kill_quietly(coordinator_pid);
+    for (auto pid : workers) {
         kill_quietly(pid);
     }
 

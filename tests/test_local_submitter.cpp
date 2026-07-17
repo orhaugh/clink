@@ -1,7 +1,7 @@
 // LocalSubmitter end-to-end test.
 //
-// Drives the fluent `StreamExecutionEnvironment` topology in-process -
-// no JobManager, no TaskManager, no network bridges. Same fluent API
+// Drives the fluent `Pipeline` topology in-process -
+// no Coordinator, no Worker, no network bridges. Same fluent API
 // surface the cluster path uses; the only difference is the terminal
 // step: `LocalSubmitter::submit(env)` instead of
 // `env.execute(name, JobSubmitter)`.
@@ -18,7 +18,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/operators/process_function.hpp"
@@ -52,7 +52,7 @@ TEST(LocalSubmitter, SourceMapSinkRunsInProcess) {
         std::filesystem::temp_directory_path() / "clink_local_submitter_source_map_sink.txt";
     std::filesystem::remove(out_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(5).start(1).build());
     src.map<std::int64_t>([](const std::int64_t& v) { return v * 2; })
         .sink(FileInt64Sink::builder().path(out_path.string()).build());
@@ -80,7 +80,7 @@ TEST(LocalSubmitter, FilterChainCompiles) {
         std::filesystem::temp_directory_path() / "clink_local_submitter_chain.txt";
     std::filesystem::remove(out_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.source<std::int64_t>(IntRangeSource::builder().count(10).start(1).build())
         .filter([](const std::int64_t& v) { return v % 2 == 0; })
         .map<std::int64_t>([](const std::int64_t& v) { return v + 100; })
@@ -101,7 +101,7 @@ TEST(LocalSubmitter, FilterChainCompiles) {
 }
 
 TEST(LocalSubmitter, EmptyGraphRejected) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     EXPECT_THROW(cluster::LocalSubmitter::submit(env), std::runtime_error);
 }
 
@@ -141,7 +141,7 @@ TEST(LocalSubmitter, SideOutputFlowsToSeparateSink) {
     std::filesystem::remove(evens_path);
     std::filesystem::remove(odds_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(6).start(1).build());
     auto split = src.process<std::int64_t>(std::make_shared<SplitEvensOddsProcess>());
 
@@ -188,7 +188,7 @@ TEST(LocalSubmitter, ParallelUniformChainSubmitsWithoutThrowing) {
         std::filesystem::temp_directory_path() / "clink_local_submitter_parallel_smoke.txt";
     std::filesystem::remove(out_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.source<std::int64_t>(IntRangeSource::builder().count(2).start(1).build())
         .map<std::int64_t>([](const std::int64_t& v) { return v * 10; })
         .sink(FileInt64Sink::builder().path(out_path.string()).build());
@@ -205,7 +205,7 @@ TEST(LocalSubmitter, MixedParallelismRejected) {
     // Uniform parallelism is supported; mixing values across an edge
     // requires hash-shuffle or rebalance which are follow-ups.
     cluster::ensure_built_ins_registered();
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.source<std::int64_t>(IntRangeSource::builder().count(1).start(0).build())
         .map<std::int64_t>([](const std::int64_t& v) { return v; })
         .sink(FileInt64Sink::builder().path("/tmp/_unused.txt").build());
@@ -221,7 +221,7 @@ TEST(LocalSubmitter, UnregisteredOpTypeRejected) {
     // LocalSubmitter must surface that as a precise runtime_error
     // rather than silently dropping the op.
     cluster::ensure_built_ins_registered();
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     // Use the existing source builder so the env has one valid op,
     // then mutate the graph's op_type to something fake via a fresh
     // env -- simulating a plugin .so that didn't load.
@@ -295,7 +295,7 @@ TEST(LocalSubmitter, KeyedConnectProcessExposesTypedKey) {
         std::filesystem::temp_directory_path() / "clink_keyed_connect_process.txt";
     std::filesystem::remove(out_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     // Pre-register a shared int64 key extractor so both sides of the
     // connect agree on the partitioning name. connect_process checks
     // the names match (so subtask routing is consistent across the
@@ -349,7 +349,7 @@ TEST(LocalSubmitter, JobConfigOverloadProvidesStateBackendForKeyedState) {
         std::filesystem::temp_directory_path() / "clink_local_submitter_keyed_state.txt";
     std::filesystem::remove(out_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.source<std::int64_t>(IntRangeSource::builder().count(5).start(1).build())
         .key_by([](const std::int64_t& v) { return v % 2; })
         .process<std::int64_t>(std::make_shared<RunningSumFn>())
@@ -382,7 +382,7 @@ TEST(LocalSubmitter, BareSubmitDefaultsToDisaggLocalForKeyedState) {
         std::filesystem::temp_directory_path() / "clink_local_submitter_keyed_default.txt";
     std::filesystem::remove(out_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.source<std::int64_t>(IntRangeSource::builder().count(5).start(1).build())
         .key_by([](const std::int64_t& v) { return v % 2; })
         .process<std::int64_t>(std::make_shared<RunningSumFn>())
@@ -413,7 +413,7 @@ TEST(LocalSubmitter, ExplicitEmptyJobConfigStillRejectsKeyedState) {
         std::filesystem::temp_directory_path() / "clink_local_submitter_keyed_state_no_backend.txt";
     std::filesystem::remove(out_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.source<std::int64_t>(IntRangeSource::builder().count(5).start(1).build())
         .key_by([](const std::int64_t& v) { return v % 2; })
         .process<std::int64_t>(std::make_shared<RunningSumFn>())
@@ -447,7 +447,7 @@ TEST(LocalSubmitter, MultiConsumerFanOutBothConsumersReceiveAllRecords) {
     std::filesystem::remove(direct_path);
     std::filesystem::remove(mapped_path);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(5).start(1).build());
     src.sink(FileInt64Sink::builder().path(direct_path.string()).build());
     src.map<std::int64_t>([](const std::int64_t& v) { return v + 100; })
@@ -494,7 +494,7 @@ TEST(LocalSubmitter, MultiConsumerFanOutAtParallelismGreaterThanOneSubmitsWithou
     std::filesystem::remove(path_a);
     std::filesystem::remove(path_b);
 
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(1).start(0).build());
     src.sink(FileInt64Sink::builder().path(path_a.string()).build());
     src.sink(FileInt64Sink::builder().path(path_b.string()).build());

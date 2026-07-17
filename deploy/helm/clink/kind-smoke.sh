@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # kind-smoke.sh - end-to-end smoke for the clink Helm chart on a local kind
 # cluster. Brings up a real (single-node) Kubernetes cluster, deploys the chart,
-# and asserts the cluster converges: JobManager + TaskManagers Ready, every TM
-# registered with the JM, and a clean cold start (0 TM restarts, proving the
-# wait-for-jobmanager initContainer gates the JM race).
+# and asserts the cluster converges: Coordinator + Workers Ready, every worker
+# registered with the coordinator, and a clean cold start (0 worker restarts, proving the
+# wait-for-coordinator initContainer gates the coordinator race).
 #
 # It validates the CHART (deployment surface), not the engine - a job-submission
 # end-to-end on k8s (build a CLINK_REGISTER_JOB .so matching the image's
@@ -53,7 +53,7 @@ step "helm upgrade --install"
 helm --kube-context "${CTX}" upgrade --install "${RELEASE}" "${CHART_DIR}" \
   --namespace "${NAMESPACE}" --create-namespace \
   --set image.repository="${IMAGE%%:*}" --set image.tag="${IMAGE##*:}" \
-  --set taskmanager.replicas="${TM_REPLICAS}" --set taskmanager.slots="${TM_SLOTS}" \
+  --set worker.replicas="${TM_REPLICAS}" --set worker.slots="${TM_SLOTS}" \
   --wait --timeout 4m
 
 step "verify: all pods Ready"
@@ -61,37 +61,37 @@ kubectl --context "${CTX}" -n "${NAMESPACE}" wait --for=condition=Ready \
   pod -l "app.kubernetes.io/instance=${RELEASE}" --timeout=180s
 kubectl --context "${CTX}" -n "${NAMESPACE}" get pods
 
-step "verify: every TaskManager registered with the JobManager"
-registered=$(kubectl --context "${CTX}" -n "${NAMESPACE}" exec "deploy/${RELEASE}-jobmanager" -- \
-  curl -fsS "http://127.0.0.1:8081/api/v1/tms" | grep -o '"tm_id"' | wc -l | tr -d ' ')
-echo "registered TMs: ${registered} (expected ${TM_REPLICAS})"
-[[ "${registered}" == "${TM_REPLICAS}" ]] || fail "expected ${TM_REPLICAS} registered TMs, got ${registered}"
+step "verify: every Worker registered with the Coordinator"
+registered=$(kubectl --context "${CTX}" -n "${NAMESPACE}" exec "deploy/${RELEASE}-coordinator" -- \
+  curl -fsS "http://127.0.0.1:8081/api/v1/workers" | grep -o '"worker_id"' | wc -l | tr -d ' ')
+echo "registered workers: ${registered} (expected ${TM_REPLICAS})"
+[[ "${registered}" == "${TM_REPLICAS}" ]] || fail "expected ${TM_REPLICAS} registered workers, got ${registered}"
 
-step "verify: clean cold start (0 TM restarts -> initContainer gated the JM race)"
+step "verify: clean cold start (0 worker restarts -> initContainer gated the coordinator race)"
 restarts=$(kubectl --context "${CTX}" -n "${NAMESPACE}" get pods \
-  -l "app.kubernetes.io/component=taskmanager" \
+  -l "app.kubernetes.io/component=worker" \
   -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' | paste -sd+ - | bc)
-echo "total TM restarts: ${restarts}"
-[[ "${restarts}" == "0" ]] || fail "expected 0 TM restarts on a clean cold start, got ${restarts}"
+echo "total worker restarts: ${restarts}"
+[[ "${restarts}" == "0" ]] || fail "expected 0 worker restarts on a clean cold start, got ${restarts}"
 
 step "verify: submit a job and confirm it runs end-to-end"
 # The k8s-smoke sample job (from_elements[1..5] -> *10 -> filter >20 -> FileSink)
-# is baked into the runtime image. Submit it to the JM over HTTP, then poll the
-# TM pods for the sink output (30,40,50 = the work-done proof that the submitted
+# is baked into the runtime image. Submit it to the coordinator over HTTP, then poll the
+# worker pods for the sink output (30,40,50 = the work-done proof that the submitted
 # job actually executed across the cluster).
 JOB_SO="/opt/clink/jobs/k8s_smoke_job.so"
 kx() { kubectl --context "${CTX}" -n "${NAMESPACE}" "$@"; }
-if ! kx exec "deploy/${RELEASE}-jobmanager" -- test -f "${JOB_SO}" 2>/dev/null; then
+if ! kx exec "deploy/${RELEASE}-coordinator" -- test -f "${JOB_SO}" 2>/dev/null; then
   echo "SKIP: ${JOB_SO} not in image (rebuild clink-runtime at this commit to enable job submission)"
 else
-  resp=$(kx exec "deploy/${RELEASE}-jobmanager" -- \
+  resp=$(kx exec "deploy/${RELEASE}-coordinator" -- \
     curl -fsS -F "job_so=@${JOB_SO}" -F "job_name=k8s-smoke" \
     "http://127.0.0.1:8081/api/v1/jobs")
   echo "submit response: ${resp}"
   echo "${resp}" | grep -q '"ok":true' || fail "job submit did not return ok: ${resp}"
   got=0
   for _ in $(seq 1 30); do
-    for pod in $(kx get pods -l app.kubernetes.io/component=taskmanager -o name); do
+    for pod in $(kx get pods -l app.kubernetes.io/component=worker -o name); do
       out=$(kx exec "${pod}" -- cat /tmp/clink_k8s_smoke_out.txt 2>/dev/null || true)
       if grep -q 30 <<<"${out}" && grep -q 40 <<<"${out}" && grep -q 50 <<<"${out}"; then
         echo "job output on ${pod}: $(tr '\n' ' ' <<<"${out}")"
@@ -100,8 +100,8 @@ else
     done
     sleep 2
   done
-  [[ "${got}" == "1" ]] || fail "job sink output (30,40,50) not found on any TaskManager"
+  [[ "${got}" == "1" ]] || fail "job sink output (30,40,50) not found on any Worker"
 fi
 
-printf '\nSMOKE PASSED: %s TMs Ready + registered, 0 restarts, job ran end-to-end.\n' "${TM_REPLICAS}"
+printf '\nSMOKE PASSED: %s workers Ready + registered, 0 restarts, job ran end-to-end.\n' "${TM_REPLICAS}"
 printf 'Tear down with: %s --cleanup\n' "${BASH_SOURCE[0]}"

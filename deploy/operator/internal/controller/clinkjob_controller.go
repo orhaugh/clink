@@ -33,9 +33,9 @@ const clinkJobFinalizer = "clink.dev/clinkjob-finalizer"
 
 // ClinkJobReconciler runs a compiled-.so job on a ClinkCluster and drains it to a
 // savepoint + restores on upgrade. It orchestrates the clink control plane by
-// exec'ing the in-image `clink` CLI inside a JobManager pod (submit / savepoint /
+// exec'ing the in-image `clink` CLI inside a Coordinator pod (submit / savepoint /
 // cancel all speak the control-plane binary protocol on 127.0.0.1) and reads job
-// status over the JobManager's HTTP API.
+// status over the Coordinator's HTTP API.
 type ClinkJobReconciler struct {
 	client.Client
 	Scheme     *runtime.Scheme
@@ -59,7 +59,7 @@ func (r *ClinkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	var cc clinkv1alpha1.ClinkCluster
 	clusterErr := r.Get(ctx, types.NamespacedName{Name: cj.Spec.ClusterName, Namespace: cj.Namespace}, &cc)
 	if clusterErr == nil {
-		// The stored ClinkCluster spec may omit nested objects (e.g. jobManager),
+		// The stored ClinkCluster spec may omit nested objects (e.g. coordinator),
 		// whose field defaults CRD defaulting does not materialize; the cluster
 		// controller only defaults in-memory during its own reconcile. Apply the
 		// same defaults here so ports (control 6123 / http 8081) are correct.
@@ -70,7 +70,7 @@ func (r *ClinkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if !cj.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&cj, clinkJobFinalizer) {
 			if clusterErr == nil && cj.Status.JobID != 0 {
-				if pod, err := r.readyJMPod(ctx, &cc); err == nil && pod != "" {
+				if pod, err := r.readyCoordinatorPod(ctx, &cc); err == nil && pod != "" {
 					_, _, _ = r.execClink(ctx, cc.Namespace, pod, r.cancelArgs(&cc, cj.Status.JobID))
 				}
 			}
@@ -89,13 +89,13 @@ func (r *ClinkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	// Gate on a Running cluster with a ready JM pod.
+	// Gate on a Running cluster with a ready coordinator pod.
 	if clusterErr != nil || cc.Status.Phase != "Running" {
 		return r.setPhase(ctx, &cj, "Pending", "waiting for ClinkCluster to be Running", 5*time.Second)
 	}
-	pod, err := r.readyJMPod(ctx, &cc)
+	pod, err := r.readyCoordinatorPod(ctx, &cc)
 	if err != nil || pod == "" {
-		return r.setPhase(ctx, &cj, "Pending", "waiting for a ready JobManager pod", 5*time.Second)
+		return r.setPhase(ctx, &cj, "Pending", "waiting for a ready Coordinator pod", 5*time.Second)
 	}
 
 	wantHash := specHash(&cj)
@@ -437,7 +437,7 @@ func (r *ClinkJobReconciler) refreshStatus(ctx context.Context, cj *clinkv1alpha
 	return r.setPhase(ctx, cj, phase, msg, 20*time.Second)
 }
 
-// jobActivity sums per-operator records_in for a job from the JobManager's
+// jobActivity sums per-operator records_in for a job from the Coordinator's
 // per-operator stats endpoint. false when the endpoint is unreachable or the
 // body does not parse (the idle clock then simply does not advance).
 func (r *ClinkJobReconciler) jobActivity(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, id int64) (int64, bool) {
@@ -489,9 +489,9 @@ func (r *ClinkJobReconciler) submitArgs(cj *clinkv1alpha1.ClinkJob, cc *clinkv1a
 		"clink", "run",
 		"--job=" + cj.Spec.JobSo,
 		"--name=" + cj.Spec.JobName,
-		"--jm-host=127.0.0.1",
-		fmt.Sprintf("--jm-port=%d", cc.Spec.JobManager.ControlPort),
-		"--wait-timeout-s=0", // fire-and-forget: return after the JM accepts
+		"--coordinator-host=127.0.0.1",
+		fmt.Sprintf("--coordinator-port=%d", cc.Spec.Coordinator.ControlPort),
+		"--wait-timeout-s=0", // fire-and-forget: return after the coordinator accepts
 	}
 	if cc.Spec.CheckpointStorage.Enabled && cj.Spec.CheckpointIntervalMs > 0 {
 		run = append(run,
@@ -518,15 +518,15 @@ func (r *ClinkJobReconciler) submitArgs(cj *clinkv1alpha1.ClinkJob, cc *clinkv1a
 func (r *ClinkJobReconciler) savepointArgs(cc *clinkv1alpha1.ClinkCluster, jobID int64) []string {
 	return []string{"clink", "savepoint",
 		fmt.Sprintf("--job-id=%d", jobID),
-		"--jm-host=127.0.0.1",
-		fmt.Sprintf("--jm-port=%d", cc.Spec.JobManager.ControlPort)}
+		"--coordinator-host=127.0.0.1",
+		fmt.Sprintf("--coordinator-port=%d", cc.Spec.Coordinator.ControlPort)}
 }
 
 func (r *ClinkJobReconciler) cancelArgs(cc *clinkv1alpha1.ClinkCluster, jobID int64) []string {
 	return []string{"clink", "cancel",
 		fmt.Sprintf("--job-id=%d", jobID),
-		"--jm-host=127.0.0.1",
-		fmt.Sprintf("--jm-port=%d", cc.Spec.JobManager.ControlPort)}
+		"--coordinator-host=127.0.0.1",
+		fmt.Sprintf("--coordinator-port=%d", cc.Spec.Coordinator.ControlPort)}
 }
 
 var savepointRe = regexp.MustCompile(`dir="([^"]*)"\s+id=(\d+)`)
@@ -549,7 +549,7 @@ func (r *ClinkJobReconciler) triggerSavepoint(ctx context.Context, cc *clinkv1al
 	return &clinkv1alpha1.SavepointRef{Dir: m[1], CheckpointID: id}, nil
 }
 
-// ---- JobManager HTTP (job status) ------------------------------------------
+// ---- Coordinator HTTP (job status) ------------------------------------------
 
 type jobSummaryJSON struct {
 	ID                  int64 `json:"id"`
@@ -560,7 +560,7 @@ type jobSummaryJSON struct {
 }
 
 func (r *ClinkJobReconciler) jmBaseURL(cc *clinkv1alpha1.ClinkCluster) string {
-	return fmt.Sprintf("http://%s-jobmanager.%s.svc:%d", cc.Name, cc.Namespace, cc.Spec.JobManager.HTTPPort)
+	return fmt.Sprintf("http://%s-coordinator.%s.svc:%d", cc.Name, cc.Namespace, cc.Spec.Coordinator.HTTPPort)
 }
 
 func (r *ClinkJobReconciler) listJobs(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) []jobSummaryJSON {
@@ -658,14 +658,14 @@ func (r *ClinkJobReconciler) doSubmit(ctx context.Context, cc *clinkv1alpha1.Cli
 
 // ---- pod discovery + exec --------------------------------------------------
 
-// readyJMPod returns the name of a Ready JobManager pod for the cluster. In HA,
-// only the leader binds the control port; v1 targets a single-JM cluster (any
-// ready JM pod is the leader). HA leader-targeting is a follow-on.
-func (r *ClinkJobReconciler) readyJMPod(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) (string, error) {
+// readyCoordinatorPod returns the name of a Ready Coordinator pod for the cluster. In HA,
+// only the leader binds the control port; v1 targets a single-coordinator cluster (any
+// ready coordinator pod is the leader). HA leader-targeting is a follow-on.
+func (r *ClinkJobReconciler) readyCoordinatorPod(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) (string, error) {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(cc.Namespace), client.MatchingLabels{
 		"app.kubernetes.io/instance":  cc.Name,
-		"app.kubernetes.io/component": "jobmanager",
+		"app.kubernetes.io/component": "coordinator",
 	}); err != nil {
 		return "", err
 	}
@@ -683,13 +683,13 @@ func (r *ClinkJobReconciler) readyJMPod(ctx context.Context, cc *clinkv1alpha1.C
 	return "", nil
 }
 
-// execClink runs a command in the jobmanager container of pod and returns
+// execClink runs a command in the coordinator container of pod and returns
 // stdout/stderr.
 func (r *ClinkJobReconciler) execClink(ctx context.Context, namespace, pod string, cmd []string) (string, string, error) {
 	req := r.Clientset.CoreV1().RESTClient().Post().
 		Resource("pods").Name(pod).Namespace(namespace).SubResource("exec").
 		VersionedParams(&corev1.PodExecOptions{
-			Container: "jobmanager",
+			Container: "coordinator",
 			Command:   cmd,
 			Stdout:    true,
 			Stderr:    true,

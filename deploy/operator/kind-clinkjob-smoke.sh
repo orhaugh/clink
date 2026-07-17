@@ -55,7 +55,7 @@ spec:
   image:
     repository: ${RUNTIME_IMAGE%:*}
     tag: ${RUNTIME_IMAGE##*:}
-  taskManager:
+  worker:
     replicas: 2
     slots: 4
   checkpointStorage:

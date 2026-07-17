@@ -1,4 +1,4 @@
-#include "clink/cluster/task_manager.hpp"
+#include "clink/cluster/worker.hpp"
 
 #include <array>
 #include <chrono>
@@ -395,31 +395,31 @@ void register_builtin_joins(RunnerRegistry& rr) {
                      make_int64_int64_match_join_runner());
 }
 
-TaskManager::TaskManager(std::string tm_id, std::string data_host)
-    : TaskManager(std::move(tm_id), std::move(data_host), Config{}) {}
+Worker::Worker(std::string worker_id, std::string data_host)
+    : Worker(std::move(worker_id), std::move(data_host), Config{}) {}
 
-TaskManager::TaskManager(std::string tm_id, std::string data_host, Config cfg)
-    : cfg_(cfg), tm_id_(std::move(tm_id)), data_host_(std::move(data_host)) {
+Worker::Worker(std::string worker_id, std::string data_host, Config cfg)
+    : cfg_(cfg), worker_id_(std::move(worker_id)), data_host_(std::move(data_host)) {
     // Auto-register the generic subtask role so any submission can run
-    // on this TM without job-specific C++ glue.
+    // on this worker without job-specific C++ glue.
     roles_[kGenericSubtaskRole] = [](const DeploymentTask& /*task*/) {
         // Sentinel - run_task_ takes the kGenericSubtaskRole branch
         // before reaching this function. Defensive: if somehow invoked,
         // report a clear error.
         throw std::runtime_error("generic subtask handler reached via legacy dispatch");
     };
-    // Default to plain-TCP for the JM connection. TLS callers override
-    // via set_connect_factory() before connect_to_jm.
+    // Default to plain-TCP for the coordinator connection. TLS callers override
+    // via set_connect_factory() before connect_to_coordinator.
     connect_factory_ = [](const std::string& host, std::uint16_t port) {
         return network::connect_plain(host, port);
     };
 }
 
-TaskManager::~TaskManager() {
+Worker::~Worker() {
     stop();
 }
 
-void TaskManager::register_role(std::string role, RoleHandler handler) {
+void Worker::register_role(std::string role, RoleHandler handler) {
     if (role == kGenericSubtaskRole) {
         // Refuse to overwrite the built-in generic role.
         return;
@@ -427,34 +427,37 @@ void TaskManager::register_role(std::string role, RoleHandler handler) {
     roles_[std::move(role)] = std::move(handler);
 }
 
-void TaskManager::connect_to_jm(const std::string& jm_host, std::uint16_t jm_port) {
-    jm_host_ = jm_host;
-    jm_port_ = jm_port;
-    metrics::tm::slot_capacity_set(cfg_.slot_count);
-    conn_ = connect_factory_(jm_host, jm_port);
+void Worker::connect_to_coordinator(const std::string& coordinator_host,
+                                    std::uint16_t coordinator_port) {
+    coordinator_host_ = coordinator_host;
+    coordinator_port_ = coordinator_port;
+    metrics::worker::slot_capacity_set(cfg_.slot_count);
+    conn_ = connect_factory_(coordinator_host, coordinator_port);
     if (!conn_) {
-        throw std::runtime_error("TaskManager::connect_to_jm: connect failed for " + jm_host + ":" +
-                                 std::to_string(jm_port));
+        throw std::runtime_error("Worker::connect_to_coordinator: connect failed for " +
+                                 coordinator_host + ":" + std::to_string(coordinator_port));
     }
 
-    const auto reg_frame = encode_frame(
-        MessageKind::Register, RegisterMsg{tm_id_, data_host_, cfg_.slot_count, cfg_.http_port});
+    const auto reg_frame =
+        encode_frame(MessageKind::Register,
+                     RegisterMsg{worker_id_, data_host_, cfg_.slot_count, cfg_.http_port});
     if (!send_frame_(reg_frame)) {
-        throw std::runtime_error("TaskManager::connect_to_jm: Register send failed");
+        throw std::runtime_error("Worker::connect_to_coordinator: Register send failed");
     }
 
     auto frame = read_frame(*conn_);
     if (!frame.has_value()) {
-        throw std::runtime_error("TaskManager::connect_to_jm: connection closed before ack");
+        throw std::runtime_error("Worker::connect_to_coordinator: connection closed before ack");
     }
     MessageReader r(std::move(*frame));
     const auto kind = static_cast<MessageKind>(r.read_u8());
     if (kind != MessageKind::RegisterAck) {
-        throw std::runtime_error("TaskManager::connect_to_jm: unexpected first message");
+        throw std::runtime_error("Worker::connect_to_coordinator: unexpected first message");
     }
     const auto ack = decode_register_ack(r);
     if (!ack.ok) {
-        throw std::runtime_error("TaskManager::connect_to_jm: register rejected: " + ack.message);
+        throw std::runtime_error("Worker::connect_to_coordinator: register rejected: " +
+                                 ack.message);
     }
 
     reader_ = std::thread([this] { reader_loop_(); });
@@ -463,28 +466,29 @@ void TaskManager::connect_to_jm(const std::string& jm_host, std::uint16_t jm_por
     }
 }
 
-void TaskManager::connect_to_jm(ServiceDiscovery& sd, std::chrono::milliseconds discover_timeout) {
-    auto ep = sd.discover_job_manager(discover_timeout);
+void Worker::connect_to_coordinator(ServiceDiscovery& sd,
+                                    std::chrono::milliseconds discover_timeout) {
+    auto ep = sd.discover_coordinator(discover_timeout);
     if (!ep.has_value()) {
-        throw std::runtime_error("TaskManager::connect_to_jm: service discovery timed out");
+        throw std::runtime_error("Worker::connect_to_coordinator: service discovery timed out");
     }
-    connect_to_jm(ep->host, ep->port);
+    connect_to_coordinator(ep->host, ep->port);
 }
 
-void TaskManager::heartbeat_loop_() {
+void Worker::heartbeat_loop_() {
     while (!stop_.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(cfg_.heartbeat_interval);
         if (stop_.load(std::memory_order_acquire)) {
             return;
         }
-        const auto frame = encode_frame(MessageKind::Heartbeat, HeartbeatMsg{tm_id_});
+        const auto frame = encode_frame(MessageKind::Heartbeat, HeartbeatMsg{worker_id_});
         if (!send_frame_(frame)) {
             return;
         }
     }
 }
 
-void TaskManager::reader_loop_() {
+void Worker::reader_loop_() {
     while (!stop_.load(std::memory_order_acquire)) {
         if (!conn_) {
             disconnected_.store(true, std::memory_order_release);
@@ -494,7 +498,7 @@ void TaskManager::reader_loop_() {
         if (!frame.has_value()) {
             // Connection closed; wake any pending awaiters so they can
             // exit instead of hanging forever. Flip disconnected_ so
-            // an --ha-dir TM in clink_node can detect the JM
+            // an --ha-dir worker in clink_node can detect the coordinator
             // disconnect and exit (supervisor restarts it; the new
             // process re-reads active-leader.json).
             disconnected_.store(true, std::memory_order_release);
@@ -576,7 +580,7 @@ void TaskManager::reader_loop_() {
     }
 }
 
-void TaskManager::handle_commit_checkpoint_(MessageReader& r) {
+void Worker::handle_commit_checkpoint_(MessageReader& r) {
     auto msg = decode_commit_checkpoint(r);
     // Record the committed high-water mark + wake any source blocked in
     // wait_final_committed() for its final checkpoint id (see EOS handling).
@@ -649,7 +653,7 @@ void TaskManager::handle_commit_checkpoint_(MessageReader& r) {
     }
 }
 
-void TaskManager::handle_final_checkpoint_assigned_(MessageReader& r) {
+void Worker::handle_final_checkpoint_assigned_(MessageReader& r) {
     auto msg = decode_final_checkpoint_assigned(r);
     const std::string key =
         std::to_string(msg.job_id) + ":" + msg.role + ":" + std::to_string(msg.subtask_idx);
@@ -659,13 +663,13 @@ void TaskManager::handle_final_checkpoint_assigned_(MessageReader& r) {
         // the source already timed out + erased its entry is dropped (no leak).
         auto it = final_assigned_.find(key);
         if (it != final_assigned_.end()) {
-            it->second = msg.final_checkpoint_id;  // 0 = JM declined
+            it->second = msg.final_checkpoint_id;  // 0 = coordinator declined
         }
     }
     final_ckpt_cv_.notify_all();
 }
 
-void TaskManager::handle_begin_rescale_(MessageReader& r) {
+void Worker::handle_begin_rescale_(MessageReader& r) {
     auto msg = decode_begin_rescale(r);
     // Snapshot the drain callbacks for the addressed (job, op) under
     // the lock, invoke outside it. Same lock-discipline as
@@ -688,13 +692,13 @@ void TaskManager::handle_begin_rescale_(MessageReader& r) {
             fn(msg.target_parallelism);
         } catch (...) {
             // Best-effort: a single subtask failing to drain isn't
-            // fatal to the dispatcher. The JM will time out the
+            // fatal to the dispatcher. The coordinator will time out the
             // rescale if the SubtaskFinished ack never arrives.
         }
     }
 }
 
-void TaskManager::handle_abort_checkpoint_(MessageReader& r) {
+void Worker::handle_abort_checkpoint_(MessageReader& r) {
     auto msg = decode_abort_checkpoint(r);
     // Same dispatch shape as handle_commit_checkpoint_: snapshot the
     // aborter callbacks under the lock, invoke outside it. on_abort
@@ -723,14 +727,14 @@ void TaskManager::handle_abort_checkpoint_(MessageReader& r) {
     }
 }
 
-void TaskManager::handle_trigger_checkpoint_(MessageReader& r) {
+void Worker::handle_trigger_checkpoint_(MessageReader& r) {
     auto msg = decode_trigger_checkpoint(r);
     // Snapshot per-job injectors under the lock; release before
     // invoking so injection (which pushes into BoundedChannels and may
     // block) doesn't contend with deploy / peer-update bookkeeping.
     // If no sources have registered yet for the job, queue the trigger
     // so the first registration can replay it. This eliminates the race
-    // where the JM fires a periodic trigger while the chain is still
+    // where the coordinator fires a periodic trigger while the chain is still
     // coming up locally.
     std::vector<RunnerContext::SourceInjectorFn> to_invoke;
     {
@@ -751,18 +755,18 @@ void TaskManager::handle_trigger_checkpoint_(MessageReader& r) {
         try {
             fn(barrier);
         } catch (...) {
-            // Best-effort: if a barrier injection fails the JM's ack
+            // Best-effort: if a barrier injection fails the coordinator's ack
             // timeout will surface the missed subtask.
         }
     }
 }
 
-void TaskManager::handle_deploy_(MessageReader& r) {
+void Worker::handle_deploy_(MessageReader& r) {
     auto msg = decode_deploy(r);
 
     // Allocate (or reuse) the per-job bundle. Plugin .so bytes that
     // come with this Deploy will register their op factories INTO this
-    // bundle's PluginRegistry view, NOT the TM's default singletons.
+    // bundle's PluginRegistry view, NOT the worker's default singletons.
     // Subtask dispatch below looks runners up via the bundle (with
     // fallback to default singletons for built-ins).
     JobBundle* job_bundle = nullptr;
@@ -778,7 +782,7 @@ void TaskManager::handle_deploy_(MessageReader& r) {
 
     // Load plugins bundled with this job before spawning task threads.
     // Any failure here is reported back via a synthetic
-    // SubtaskFinished for every task in this deploy, so the JM doesn't
+    // SubtaskFinished for every task in this deploy, so the coordinator doesn't
     // wedge waiting for a subtask that never started.
     std::string plugin_err;
     for (const auto& plug : msg.plugins) {
@@ -799,7 +803,7 @@ void TaskManager::handle_deploy_(MessageReader& r) {
         for (const auto& task : msg.tasks) {
             SubtaskFinishedMsg done;
             done.job_id = msg.job_id;
-            done.tm_id = tm_id_;
+            done.worker_id = worker_id_;
             done.role = task.role;
             done.subtask_idx = task.subtask_idx;
             done.had_error = true;
@@ -851,7 +855,7 @@ void TaskManager::handle_deploy_(MessageReader& r) {
     }
 }
 
-void TaskManager::handle_peer_update_(MessageReader& r) {
+void Worker::handle_peer_update_(MessageReader& r) {
     auto msg = decode_peer_update(r);
     std::lock_guard lock(mu_);
     if (msg.tasks.empty()) {
@@ -886,8 +890,9 @@ void TaskManager::handle_peer_update_(MessageReader& r) {
     }
 }
 
-std::optional<TaskManager::ResolvedPeers> TaskManager::await_peer_update_(
-    JobId job_id, const std::string& role, std::uint32_t subtask_idx) {
+std::optional<Worker::ResolvedPeers> Worker::await_peer_update_(JobId job_id,
+                                                                const std::string& role,
+                                                                std::uint32_t subtask_idx) {
     std::shared_ptr<PendingTask> pt;
     {
         std::lock_guard lock(mu_);
@@ -910,15 +915,15 @@ std::optional<TaskManager::ResolvedPeers> TaskManager::await_peer_update_(
     return ResolvedPeers{pt->resolved_peers};
 }
 
-void TaskManager::run_task_(JobId job_id,
-                            const DeploymentTask& task,
-                            const std::string& checkpoint_dir,
-                            const std::string& restore_from_dir,
-                            std::uint64_t restore_from_checkpoint_id,
-                            bool unaligned_checkpoints,
-                            const std::string& expected_state_versions_packed,
-                            const std::string& udfs_packed) {
-    metrics::tm::subtask_started();
+void Worker::run_task_(JobId job_id,
+                       const DeploymentTask& task,
+                       const std::string& checkpoint_dir,
+                       const std::string& restore_from_dir,
+                       std::uint64_t restore_from_checkpoint_id,
+                       bool unaligned_checkpoints,
+                       const std::string& expected_state_versions_packed,
+                       const std::string& udfs_packed) {
+    metrics::worker::subtask_started();
     bool had_error = false;
     std::string err_msg;
     try {
@@ -955,11 +960,11 @@ void TaskManager::run_task_(JobId job_id,
         err_msg = "unknown exception";
     }
     if (had_error) {
-        metrics::tm::subtask_failed();
+        metrics::worker::subtask_failed();
         // Test-only (env-gated, default off): delay a FAILED subtask's
         // SubtaskFinished so a peer that finishes cleanly in the same window
         // reports first. Lets the failover bench deterministically exercise the
-        // JM's finished-peer redeploy path (a subtask errors AFTER its peer
+        // coordinator's finished-peer redeploy path (a subtask errors AFTER its peer
         // already finished -> restart_drain_expected empty -> restart_pending
         // must re-add the finished peer) instead of racing it. No-op in
         // production.
@@ -970,12 +975,12 @@ void TaskManager::run_task_(JobId job_id,
             }
         }
     } else {
-        metrics::tm::subtask_completed_ok();
+        metrics::worker::subtask_completed_ok();
     }
 
     SubtaskFinishedMsg done;
     done.job_id = job_id;
-    done.tm_id = tm_id_;
+    done.worker_id = worker_id_;
     done.role = task.role;
     done.subtask_idx = task.subtask_idx;
     done.had_error = had_error;
@@ -990,13 +995,13 @@ void TaskManager::run_task_(JobId job_id,
     cv_.notify_all();
 }
 
-void TaskManager::run_generic_subtask_(JobId job_id,
-                                       const DeploymentTask& task,
-                                       const std::string& checkpoint_dir,
-                                       const std::string& restore_from_dir,
-                                       std::uint64_t restore_from_checkpoint_id,
-                                       bool unaligned_ckpt,
-                                       const std::string& expected_state_versions_packed) {
+void Worker::run_generic_subtask_(JobId job_id,
+                                  const DeploymentTask& task,
+                                  const std::string& checkpoint_dir,
+                                  const std::string& restore_from_dir,
+                                  std::uint64_t restore_from_checkpoint_id,
+                                  bool unaligned_ckpt,
+                                  const std::string& expected_state_versions_packed) {
     // Built-in channels and op-runners must be present before we look
     // up TypeRegistry entries for bridge construction. Idempotent.
     ensure_built_ins_registered();
@@ -1050,7 +1055,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
     in_bridges.reserve(chain.input_edges.size());
     SubtaskListeningMsg sl;
     sl.job_id = job_id;
-    sl.tm_id = tm_id_;
+    sl.worker_id = worker_id_;
     sl.role = task.role;
     sl.subtask_idx = task.subtask_idx;
     sl.host = data_host_;
@@ -1068,7 +1073,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
     }
 
     // 3. Report SubtaskListening - one entry per input edge. Sources
-    // send an empty edge_ports list; the JM uses this only as a "ready"
+    // send an empty edge_ports list; the coordinator uses this only as a "ready"
     // tick.
     if (!send_frame_(encode_frame(MessageKind::SubtaskListening, sl))) {
         throw std::runtime_error("generic subtask: SubtaskListening send failed");
@@ -1208,7 +1213,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
         }
         if (runner != nullptr) {
             // Build a checkpoint-ack callback that sends
-            // SubtaskCheckpointed back to the JM whenever the runner
+            // SubtaskCheckpointed back to the coordinator whenever the runner
             // (via the operator runner's snapshot-on-barrier path)
             // completes a checkpoint id.
             auto ack_cb = [this, job_id, role = task.role, sub = task.subtask_idx](
@@ -1225,13 +1230,13 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             // Cancel token for this subtask: ORed into the runner's stop
             // predicate via JobConfig.external_cancel_token (so should_stop()
             // observes it) AND captured by the EOS final-checkpoint waits below
-            // so a CancelJob/TM-stop wakes a source blocked at EOS promptly
+            // so a CancelJob/worker-stop wakes a source blocked at EOS promptly
             // instead of stalling its bounded 30s wait. Registered under mu_ (and
             // threaded onto rctx) just before the runner starts, lower down.
             auto cancel_token = std::make_shared<std::atomic<bool>>(false);
-            // Bounded-source EOS hooks. request_final_checkpoint asks the JM for
+            // Bounded-source EOS hooks. request_final_checkpoint asks the coordinator for
             // a final coordinated checkpoint id and blocks (bounded) for the
-            // reply; wait_final_committed blocks (bounded) until this TM observes
+            // reply; wait_final_committed blocks (bounded) until this worker observes
             // CommitCheckpoint for that id. Only a real bounded source at clean
             // EOS invokes these (relays/unbounded sources never do). Both waits
             // also wake on cancel_token / stop_ for prompt teardown.
@@ -1282,9 +1287,9 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 return it != final_committed_high_water_.end() && it->second >= id;
             };
             // Callback the source runner uses to register its barrier
-            // injectors with the TM. Multiple subtasks per (job, sub_idx)
+            // injectors with the worker. Multiple subtasks per (job, sub_idx)
             // would overwrite; in v1 each subtask has at most one set.
-            // On first registration we replay any triggers the JM fired
+            // On first registration we replay any triggers the coordinator fired
             // before the chain was ready, so periodic checkpoints never
             // drop the leading interval.
             auto register_injectors = [this, job_id, sub = task.subtask_idx](
@@ -1317,7 +1322,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             };
             // 2PC commit-callback registration. Sink runners that
             // implement the 2PC protocol register one or more callbacks
-            // here; the TM dispatches them on CommitCheckpoint.
+            // here; the worker dispatches them on CommitCheckpoint.
             auto register_commits = [this, job_id, sub = task.subtask_idx](
                                         std::vector<RunnerContext::CommitCheckpointFn> cbs) {
                 std::lock_guard lock(mu_);
@@ -1327,7 +1332,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             };
             // Abort-callback registration. Mirrors the
             // commit-callback path; sink runners register one or more
-            // abort callbacks alongside their commits, and the TM
+            // abort callbacks alongside their commits, and the worker
             // dispatches them on AbortCheckpoint.
             auto register_aborts = [this, job_id, sub = task.subtask_idx](
                                        std::vector<RunnerContext::AbortCheckpointFn> cbs) {
@@ -1338,7 +1343,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             };
             // Drain-callback registration. Subtasks
             // participating in adaptive rescaling register their
-            // drain closure here; the TM keys the registration by
+            // drain closure here; the worker keys the registration by
             // (job_id, role) so BeginRescale dispatch can target the
             // right operator's subtasks. Multiple subtasks of the
             // same operator accumulate in the same vector.
@@ -1541,7 +1546,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
             // (messaging sources defer their broker ack to commit). The non-fused
             // SubtaskRunner does this via register_commit_callbacks; the inline
             // fused-chain path has no such wiring, so register directly into the
-            // TM's per-subtask committer/aborter buckets - dispatched by
+            // worker's per-subtask committer/aborter buckets - dispatched by
             // handle_commit_checkpoint_ / handle_abort_checkpoint_ the same way. A
             // shared copy of the boxed source is passed (weak-captured inside), so
             // ownership still moves to the dag below.
@@ -1565,7 +1570,7 @@ void TaskManager::run_generic_subtask_(JobId job_id,
         //    for side-output attachment below. Use the per-job bundle's
         //    DagBuilderRegistry so inline-lambda DagBuilders that the
         //    .so registered via PluginRegistry::register_operator are
-        //    visible (the TM's default-instance singleton isn't, due
+        //    visible (the worker's default-instance singleton isn't, due
         //    to RTLD_LOCAL).
         const auto& dbr = job_dbr != nullptr ? *job_dbr : DagBuilderRegistry::default_instance();
         std::vector<std::size_t> runner_indexes;
@@ -1739,8 +1744,8 @@ void TaskManager::run_generic_subtask_(JobId job_id,
                 task.restore_from_parent_count == 0 ? 1 : task.restore_from_parent_count,
             .restore_key_group_filter = {},
             // Wire the checkpoint-ack callback so chained subtasks report
-            // SubtaskCheckpointed to the JM, keyed by the GLOBAL
-            // task.subtask_idx (what the JM tracks in task_records). The
+            // SubtaskCheckpointed to the coordinator, keyed by the GLOBAL
+            // task.subtask_idx (what the coordinator tracks in task_records). The
             // single-op path below does this; without it here, any job
             // with a chained operator never completes a periodic
             // checkpoint - every chained subtask's ack slot stays
@@ -1905,21 +1910,21 @@ void TaskManager::run_generic_subtask_(JobId job_id,
     }
 }
 
-bool TaskManager::send_frame_(const std::vector<std::byte>& frame) {
+bool Worker::send_frame_(const std::vector<std::byte>& frame) {
     std::lock_guard lock(send_mu_);
     if (!conn_)
         return false;
     return conn_->send_all(frame.data(), frame.size());
 }
 
-bool TaskManager::await_all_tasks(std::chrono::milliseconds timeout) {
+bool Worker::await_all_tasks(std::chrono::milliseconds timeout) {
     std::unique_lock lock(mu_);
     return cv_.wait_for(lock, timeout, [this] {
         return cancelled_.load(std::memory_order_acquire) || (deployed_ && in_flight_tasks_ == 0);
     });
 }
 
-void TaskManager::stop() {
+void Worker::stop() {
     stop_.store(true, std::memory_order_release);
     {
         std::lock_guard lock(mu_);
@@ -1954,7 +1959,7 @@ void TaskManager::stop() {
     conn_.reset();
 }
 
-std::optional<TaskManager::JobStateExport> TaskManager::export_job_state_arrow(JobId job_id) const {
+std::optional<Worker::JobStateExport> Worker::export_job_state_arrow(JobId job_id) const {
     // Copy the backend handles out under the lock, export outside it: a
     // backend export takes the backend's own locks and can be slow (a
     // RocksDB iteration), and must not block deploys or heartbeats.
@@ -1991,20 +1996,20 @@ std::optional<TaskManager::JobStateExport> TaskManager::export_job_state_arrow(J
     return out;
 }
 
-TmSnapshot TaskManager::snapshot_tm() const {
-    TmSnapshot s;
-    s.tm_id = tm_id_;
+WorkerSnapshot Worker::snapshot_worker() const {
+    WorkerSnapshot s;
+    s.worker_id = worker_id_;
     s.data_host = data_host_;
     s.slot_capacity = cfg_.slot_count;
-    s.jm_host = jm_host_;
-    s.jm_port = jm_port_;
+    s.coordinator_host = coordinator_host_;
+    s.coordinator_port = coordinator_port_;
     std::lock_guard lock(mu_);
     s.slots_in_use = static_cast<std::uint32_t>(in_flight_tasks_);
     s.active_subtasks = in_flight_tasks_;
     return s;
 }
 
-std::vector<SubtaskRecord> TaskManager::snapshot_subtasks() const {
+std::vector<SubtaskRecord> Worker::snapshot_subtasks() const {
     std::vector<SubtaskRecord> out;
     std::lock_guard lock(mu_);
     out.reserve(pending_.size());

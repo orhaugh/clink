@@ -28,7 +28,7 @@ type ClinkJobSpec struct {
 	// +kubebuilder:default=savepoint
 	UpgradeMode string `json:"upgradeMode,omitempty"`
 	// Suspend parks the job when true: the operator drains it to a savepoint
-	// (upgradeMode=savepoint), cancels it, and frees its TaskManager slots;
+	// (upgradeMode=savepoint), cancels it, and frees its Worker slots;
 	// state waits in the savepoint. Setting it back to false resubmits the
 	// job restored from that savepoint. Manual suspension is absolute: a
 	// wakePolicy never overrides it.
@@ -44,7 +44,7 @@ type ClinkJobSpec struct {
 // SuspendPolicySpec configures automatic parking.
 type SuspendPolicySpec struct {
 	// IdleAfterSeconds parks the job once NO operator has processed a record
-	// for this long (observed via the JobManager's per-operator records_in
+	// for this long (observed via the Coordinator's per-operator records_in
 	// counters). 0 disables auto-park. Pair with a wakePolicy, or the job
 	// stays parked until this policy is removed or suspend is toggled.
 	// +kubebuilder:validation:Minimum=0
@@ -92,7 +92,7 @@ type ClinkJobStatus struct {
 	// Phase: Pending (cluster not ready), Submitting, Running, Upgrading,
 	// Suspending, Suspended, Completed, Failed, Cancelled.
 	Phase string `json:"phase,omitempty"`
-	// JobID is the JobManager-assigned id of the currently-running job.
+	// JobID is the Coordinator-assigned id of the currently-running job.
 	JobID int64 `json:"jobID,omitempty"`
 	// SpecHash is a hash of the running job's inputs (JobSo+Env+Args); a change
 	// versus the current spec is what triggers an upgrade.

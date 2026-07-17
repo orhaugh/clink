@@ -33,7 +33,7 @@
 
 #include "clink/api/descriptors.hpp"
 #include "clink/api/kafka_builders.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/connectors/kafka_message.hpp"
 #include "clink/kafka/kafka_message_codec.hpp"
 
@@ -63,7 +63,7 @@ inline clink::api::SourceDescriptor make_text_source_descriptor(const KafkaSourc
 
 template <typename T>
 inline clink::api::DataStream<T> text_source(
-    clink::api::StreamExecutionEnvironment& env,
+    clink::api::Pipeline& env,
     const KafkaSourceOptions& opts,
     std::function<std::optional<T>(const std::string&)> decode_fn,
     std::string id = {}) {
@@ -80,10 +80,9 @@ inline clink::api::DataStream<T> text_source(
     });
 }
 
-inline clink::api::DataStream<clink::KafkaMessage> message_source(
-    clink::api::StreamExecutionEnvironment& env,
-    const KafkaSourceOptions& opts,
-    std::string id = {}) {
+inline clink::api::DataStream<clink::KafkaMessage> message_source(clink::api::Pipeline& env,
+                                                                  const KafkaSourceOptions& opts,
+                                                                  std::string id = {}) {
     clink::api::SourceDescriptor d;
     d.op_type = "kafka_message_source";
     d.channel_type = std::string{clink::kChannelKafkaMessage};

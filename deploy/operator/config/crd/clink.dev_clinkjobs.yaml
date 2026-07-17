@@ -92,7 +92,7 @@ spec:
                 default: false
                 description: |-
                   Suspend parks the job when true: the operator drains it to a savepoint
-                  (upgradeMode=savepoint), cancels it, and frees its TaskManager slots;
+                  (upgradeMode=savepoint), cancels it, and frees its Worker slots;
                   state waits in the savepoint. Setting it back to false resubmits the
                   job restored from that savepoint. Manual suspension is absolute: a
                   wakePolicy never overrides it.
@@ -104,7 +104,7 @@ spec:
                   idleAfterSeconds:
                     description: |-
                       IdleAfterSeconds parks the job once NO operator has processed a record
-                      for this long (observed via the JobManager's per-operator records_in
+                      for this long (observed via the Coordinator's per-operator records_in
                       counters). 0 disables auto-park. Pair with a wakePolicy, or the job
                       stays parked until this policy is removed or suspend is toggled.
                     format: int64
@@ -181,7 +181,7 @@ spec:
                 format: int64
                 type: integer
               jobID:
-                description: JobID is the JobManager-assigned id of the currently-running
+                description: JobID is the Coordinator-assigned id of the currently-running
                   job.
                 format: int64
                 type: integer

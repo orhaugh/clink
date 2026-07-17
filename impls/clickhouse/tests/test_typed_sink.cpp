@@ -7,7 +7,7 @@
 
 #include <gtest/gtest.h>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/clickhouse/install.hpp"
 #include "clink/clickhouse/typed_sink.hpp"
 #include "clink/cluster/built_in_factories.hpp"
@@ -29,7 +29,7 @@ std::string to_jsoneachrow(const DummyRecord& r) {
 
 TEST(ClickHouseTypedSink, ComposesEncodeMapAndSink) {
     clink::cluster::ensure_built_ins_registered();
-    clink::api::StreamExecutionEnvironment env;
+    clink::api::Pipeline env;
     clink::clickhouse::install(env.registry());
     // DummyRecord is a project-internal channel type; the consumer
     // registers it with a codec before using it in the fluent map call.

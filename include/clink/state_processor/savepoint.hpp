@@ -59,7 +59,7 @@ public:
     // Load a savepoint from a .snap blob on disk. The path must point
     // at a Snapshot byte blob (the FileBackedStateBackend produces
     // these at <ha-dir>/checkpoint-<id>.snap or under savepoint dirs
-    // via JobManager::take_savepoint). Throws if the file is missing
+    // via Coordinator::take_savepoint). Throws if the file is missing
     // or unreadable.
     [[nodiscard]] static Savepoint load_from_file(const std::filesystem::path& path) {
         std::ifstream in(path, std::ios::binary);

@@ -214,7 +214,7 @@ public:
     }
 
     // Drain marker. Source runners and stateful
-    // intermediate operators emit this when the JM has signalled a
+    // intermediate operators emit this when the coordinator has signalled a
     // rescale at their operator; downstream consumers see it
     // immediately before this subtask closes its outputs.
     bool emit_drain(DrainMarker d) {
@@ -756,7 +756,7 @@ public:
             b_rc_ = std::make_unique<RuntimeContext>(
                 parent->operator_id(), b_->name(), parent->state_backend(), parent->metrics());
             // Carry the checkpoint-ack so an inner op snapshotting via
-            // its own RC still notifies the JM. Both inner ops share the
+            // its own RC still notifies the coordinator. Both inner ops share the
             // same job-level ack callback.
             if (parent->checkpoint_ack()) {
                 a_rc_->set_checkpoint_ack(parent->checkpoint_ack());
@@ -1130,15 +1130,15 @@ public:
     virtual void on_data(Batch<In>&& batch) { on_data(static_cast<const Batch<In>&>(batch)); }
     virtual void on_watermark(Watermark /*wm*/) {}
     virtual void on_barrier(CheckpointBarrier /*b*/) {}
-    // 2PC phase-2 hook. Called when the JM has confirmed checkpoint
+    // 2PC phase-2 hook. Called when the coordinator has confirmed checkpoint
     // `checkpoint_id` is globally durable (every subtask acked, the
-    // COMPLETED-N marker is on disk, the JM broadcast CommitCheckpoint).
+    // COMPLETED-N marker is on disk, the coordinator broadcast CommitCheckpoint).
     // Non-2PC sinks ignore this; 2PC sinks finalise their pre-committed
     // transaction (atomic rename, Kafka commitTransaction, SQL COMMIT
     // PREPARED). Must be idempotent - a recovery-time on_commit for an
     // already-committed checkpoint may legitimately fire.
     virtual void on_commit(std::uint64_t /*checkpoint_id*/) {}
-    // Abort hook (declared here, wired later). Called when the JM
+    // Abort hook (declared here, wired later). Called when the coordinator
     // determines this sink's commit group cannot commit atomically
     // (one or more members of the group failed their pre-commit). The
     // sink rolls back any prepared state: file_2pc unlinks staging
@@ -1171,11 +1171,11 @@ public:
 
     // Commit-group declaration. Sinks that share a non-empty
     // commit_group must commit together or all abort together; the
-    // JobManager will only broadcast CommitCheckpoint to group
+    // Coordinator will only broadcast CommitCheckpoint to group
     // members once every member of the group has acked its pre-commit
     // (on_barrier). Empty string (the default) means "this sink is
     // not in any commit group; it commits independently as soon as
-    // the JM marks the checkpoint COMPLETED".
+    // the coordinator marks the checkpoint COMPLETED".
     void set_commit_group(std::string group) noexcept { commit_group_ = std::move(group); }
     [[nodiscard]] const std::string& commit_group() const noexcept { return commit_group_; }
     [[nodiscard]] bool has_commit_group() const noexcept { return !commit_group_.empty(); }

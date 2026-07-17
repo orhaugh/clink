@@ -1,20 +1,20 @@
 // End-to-end test for the "job as plugin .so" contract.
 //
-// Spawns a JM + 6 TMs as separate processes via posix_spawn, then
+// Spawns a coordinator + 6 workers as separate processes via posix_spawn, then
 // drives the clink_submit_job CLI to submit a canonical pipeline
 // .so (built from examples/canonical_pipeline_job.cpp by
 // CLINK_REGISTER_JOB). The .so contains the user's inline lambdas
 // (map / filter / key_by / sliding_window / aggregate); the submit
-// CLI dlopens it locally to retrieve the JobGraphSpec, the JM ships
-// the .so to each TM, and each TM dlopens it under std::call_once so
+// CLI dlopens it locally to retrieve the JobGraphSpec, the coordinator ships
+// the .so to each worker, and each worker dlopens it under std::call_once so
 // the inline-op registrations resolve there too.
 //
 // Asserts the sink wrote the per-window aggregates the pipeline
-// computes, which only happens if the build_fn ran on every TM and
+// computes, which only happens if the build_fn ran on every worker and
 // the same _inline_<kind>_<n> op-types resolved in every process.
 //
 // The job's output path is configured via CLINK_CANONICAL_OUT_PATH;
-// we setenv() before spawning JM + TMs so the child processes inherit it.
+// we setenv() before spawning coordinator + workers so the child processes inherit it.
 
 #include <algorithm>
 #include <chrono>
@@ -134,35 +134,35 @@ TEST(JobPluginE2E, CanonicalPipelineRunsAcrossSeparateProcesses) {
     std::filesystem::remove(out_path);
 
     // The job .so reads its sink path from CLINK_CANONICAL_OUT_PATH at
-    // build_fn time. Set it BEFORE spawning the cluster so JM + TMs
-    // inherit it (TMs dlopen the .so in their own process and re-run
+    // build_fn time. Set it BEFORE spawning the cluster so coordinator + workers
+    // inherit it (workers dlopen the .so in their own process and re-run
     // build_fn under std::call_once).
     ::setenv("CLINK_CANONICAL_OUT_PATH", out_path.c_str(), 1);
 
-    const auto jm_port = probe_free_port();
-    const pid_t jm_pid =
-        spawn_proc({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, node);
-    ASSERT_GT(jm_pid, 0);
+    const auto coordinator_port = probe_free_port();
+    const pid_t coordinator_pid = spawn_proc(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, node);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
     // Pipeline subtask slots: from_elements + map + filter +
     // ts_monotonic + sliding_aggregate + sink = 6 (each at par=1).
-    std::vector<pid_t> tms;
+    std::vector<pid_t> workers;
     for (int i = 1; i <= 6; ++i) {
-        tms.push_back(spawn_proc({"clink_node",
-                                  "--role=tm",
-                                  "--id=tm-jpe2e-" + std::to_string(i),
-                                  "--jm-host=127.0.0.1",
-                                  "--jm-port=" + std::to_string(jm_port)},
-                                 node));
-        ASSERT_GT(tms.back(), 0);
+        workers.push_back(spawn_proc({"clink_node",
+                                      "--role=worker",
+                                      "--id=worker-jpe2e-" + std::to_string(i),
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(coordinator_port)},
+                                     node));
+        ASSERT_GT(workers.back(), 0);
     }
     std::this_thread::sleep_for(400ms);
 
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),
-                                         "--jm-host=127.0.0.1",
-                                         "--jm-port=" + std::to_string(jm_port),
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port),
                                          "--wait-timeout-s=30",
                                          "--name=canonical-pipeline-e2e"},
                                         submit);
@@ -171,8 +171,8 @@ TEST(JobPluginE2E, CanonicalPipelineRunsAcrossSeparateProcesses) {
     int submit_exit = -1;
     const bool exited = wait_for(submit_pid, 45s, submit_exit);
 
-    kill_quietly(jm_pid);
-    for (auto pid : tms) {
+    kill_quietly(coordinator_pid);
+    for (auto pid : workers) {
         kill_quietly(pid);
     }
 

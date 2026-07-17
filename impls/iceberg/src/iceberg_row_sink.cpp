@@ -390,7 +390,7 @@ public:
             return;
         }
         // Hold mu_ across the whole of open() (incl. recovery) so an early CommitCheckpoint
-        // on the TM thread cannot race the catalog/table build or the recovery commit.
+        // on the worker thread cannot race the catalog/table build or the recovery commit.
         std::lock_guard<std::mutex> lk(mu_);
         ensure_registered();
         schema_ = opts_.batcher.schema();
@@ -442,7 +442,7 @@ public:
         if (dormant_ || batch.empty()) {
             return;
         }
-        // mu_ serialises the runner thread (on_data/on_barrier) against the TM reader thread
+        // mu_ serialises the runner thread (on_data/on_barrier) against the worker reader thread
         // that delivers on_commit/on_abort - both touch table_/catalog_/file_io_/open_.
         std::lock_guard<std::mutex> lk(mu_);
         if (table_ == nullptr) {
@@ -515,7 +515,7 @@ public:
     // Barrier = 2PC phase 1 (PRE-COMMIT). With a state backend the interval's data files are
     // closed + recorded in state but NOT yet snapshotted - they become visible only when the
     // engine confirms the checkpoint is globally durable (on_commit). Without a state
-    // backend (standalone use, no JM) there is no second phase to wait for, so commit
+    // backend (standalone use, no coordinator) there is no second phase to wait for, so commit
     // immediately = at-least-once, preserving the simple-sink behaviour.
     void on_barrier(CheckpointBarrier b) override {
         if (dormant_) {
@@ -540,7 +540,7 @@ public:
         if (dormant_) {
             return;
         }
-        // Runs on the TM reader thread; serialise against close()/on_barrier and bail if the
+        // Runs on the worker reader thread; serialise against close()/on_barrier and bail if the
         // sink was torn down concurrently (a late CommitCheckpoint racing shutdown).
         std::lock_guard<std::mutex> lk(mu_);
         auto* state = state_backend_();
@@ -578,7 +578,7 @@ public:
     }
 
     void close() override {
-        // Hold mu_ across teardown so a late on_commit/on_abort on the TM thread either runs
+        // Hold mu_ across teardown so a late on_commit/on_abort on the worker thread either runs
         // fully before close (mutex) or sees the reset table_/catalog_/file_io_ and bails.
         std::lock_guard<std::mutex> lk(mu_);
         if (!dormant_ && table_ != nullptr) {
@@ -1200,7 +1200,7 @@ private:
 
     IcebergRowSinkOptions opts_;
     bool dormant_{false};
-    // Serialises the runner thread (open/on_data/on_barrier/close) against the TM reader
+    // Serialises the runner thread (open/on_data/on_barrier/close) against the worker reader
     // thread that delivers on_commit/on_abort. Single-writer table, so contention is rare.
     mutable std::mutex mu_;
     std::shared_ptr<arrow::Schema> schema_;

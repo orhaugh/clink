@@ -289,9 +289,9 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_http_submit.cpp
         integration/test_cluster_tls.cpp
         integration/test_two_phase_commit.cpp
-        integration/test_tm_crash_recovery.cpp
-        integration/test_jm_ha_failover.cpp
-        integration/test_jm_rescale.cpp
+        integration/test_worker_crash_recovery.cpp
+        integration/test_coordinator_ha_failover.cpp
+        integration/test_coordinator_rescale.cpp
         integration/test_schema_evo_check.cpp
         test_helpers/register_linked_impls.cpp
     )
@@ -366,8 +366,8 @@ if(CLINK_INTEGRATION_TESTS)
         PROPERTIES TIMEOUT 120 LABELS integration)
 
     # Failover + cold-start benchmark. A standalone (non-gtest) driver that
-    # spawns real clink_node JM/TM processes, times the cold-start path and
-    # a TM-crash recovery, and prints a clink-only scoreboard. It reuses the
+    # spawns real clink_node coordinator/worker processes, times the cold-start path and
+    # a worker-crash recovery, and prints a clink-only scoreboard. It reuses the
     # same cluster binaries + 2PC job .so as the crash-recovery test, so it
     # lives under the integration gate. Labelled 'benchmark' so it is opt-in
     # (ctest -L benchmark) and not part of the normal integration run.
@@ -451,7 +451,7 @@ if(CLINK_BUILD_SQL)
         )
         clink_set_warnings(clink_flight_tests)
         # 120s like the integration tier: the test spawns an embedded
-        # JM+TM plus a gRPC server, and under a parallel full-suite run
+        # coordinator+worker plus a gRPC server, and under a parallel full-suite run
         # (heavy multi-process SQL ITs saturating every core) the 60s
         # guard produced a false Timeout; solo the test runs in ~1s.
         gtest_discover_tests(clink_flight_tests

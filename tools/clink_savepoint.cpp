@@ -7,11 +7,11 @@
 // v1 returns the in-place checkpoint location - physical relocation
 // to a portable path is the operator's responsibility (rsync, S3
 // copy). The handle is a stable filesystem path + integer id that
-// both the JM and any future clink_submit_job can address.
+// both the coordinator and any future clink_submit_job can address.
 //
 // Wire flow:
 //   1. HelloClient frames us as a client.
-//   2. Savepoint(job_id, timeout) → JM triggers a checkpoint and
+//   2. Savepoint(job_id, timeout) → coordinator triggers a checkpoint and
 //      blocks until every subtask acks.
 //   3. SavepointAck carries (ok, checkpoint_id, checkpoint_dir,
 //      message). On ok=true we print one line:
@@ -20,7 +20,7 @@
 //
 // Usage:
 //   clink_savepoint --job-id=N [--timeout-s=30] \
-//                     [--jm-host=127.0.0.1] [--jm-port=6123]
+//                     [--coordinator-host=127.0.0.1] [--coordinator-port=6123]
 
 #include <array>
 #include <cstddef>
@@ -63,7 +63,7 @@ bool has_flag(int argc, char** argv, std::string_view flag) {
 
 void usage() {
     std::cerr << "Usage: clink savepoint --job-id=N [--timeout-s=30] "
-                 "[--jm-host=127.0.0.1] [--jm-port=6123]\n";
+                 "[--coordinator-host=127.0.0.1] [--coordinator-port=6123]\n";
 }
 
 }  // namespace
@@ -75,8 +75,8 @@ int clink_cmd_savepoint(int argc, char** argv) {
     }
 
     const auto job_id_str = get_arg(argc, argv, "job-id");
-    const auto jm_host = get_arg(argc, argv, "jm-host", "127.0.0.1");
-    const auto jm_port_str = get_arg(argc, argv, "jm-port", "6123");
+    const auto coordinator_host = get_arg(argc, argv, "coordinator-host", "127.0.0.1");
+    const auto coordinator_port_str = get_arg(argc, argv, "coordinator-port", "6123");
     const auto timeout_s_str = get_arg(argc, argv, "timeout-s", "30");
 
     if (job_id_str.empty()) {
@@ -84,12 +84,13 @@ int clink_cmd_savepoint(int argc, char** argv) {
         return 2;
     }
     const auto job_id = static_cast<clink::cluster::JobId>(std::stoull(job_id_str));
-    const auto jm_port = static_cast<std::uint16_t>(std::stoi(jm_port_str));
+    const auto coordinator_port = static_cast<std::uint16_t>(std::stoi(coordinator_port_str));
     const auto timeout_s = static_cast<std::int64_t>(std::stoll(timeout_s_str));
 
-    const int fd = clink::network::NetworkSocket::connect_to(jm_host, jm_port);
+    const int fd = clink::network::NetworkSocket::connect_to(coordinator_host, coordinator_port);
     if (fd < 0) {
-        std::cerr << "clink_savepoint: connect_to(" << jm_host << ":" << jm_port << ") failed\n";
+        std::cerr << "clink_savepoint: connect_to(" << coordinator_host << ":" << coordinator_port
+                  << ") failed\n";
         return 3;
     }
 

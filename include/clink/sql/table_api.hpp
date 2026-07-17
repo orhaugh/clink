@@ -165,7 +165,7 @@ public:
     [[nodiscard]] GroupedTable group_by(std::vector<std::string> keys) &&;
 
     // Compile: build the LogicalSink for `sink_table`, validate, optimise, and
-    // produce a JobGraphSpec the JM can submit (spec.to_json()).
+    // produce a JobGraphSpec the coordinator can submit (spec.to_json()).
     [[nodiscard]] cluster::JobGraphSpec insert_into(const std::string& sink_table) &&;
 
     // Test/EXPLAIN accessor for the current logical plan root.

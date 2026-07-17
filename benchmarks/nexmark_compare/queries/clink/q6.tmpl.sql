@@ -15,7 +15,7 @@
 -- Verified over Kafka: 30,845 changelog records netting to 5,223 distinct sellers.
 --
 -- Run it (clink only):
---   clink_submit_sql --file q6-clink.sql --jm-host 127.0.0.1 --jm-port 8081
+--   clink_submit_sql --file q6-clink.sql --coordinator-host 127.0.0.1 --coordinator-port 8081
 CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-bid',
         group_id='clink-q6-b', auto_offset_reset='earliest',

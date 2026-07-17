@@ -2,7 +2,7 @@
 
 // In-process pub-sub for cluster lifecycle events.
 //
-// Backs the HTTP-5 /api/v1/events SSE endpoint: JM/TM lifecycle code calls
+// Backs the HTTP-5 /api/v1/events SSE endpoint: coordinator/worker lifecycle code calls
 // `clink::events::publish(...)` at the same hooks where it already emits
 // log lines and metrics, and any number of subscribers (currently: SSE
 // streams) fan-out from a single mutex-guarded vector.
@@ -28,7 +28,7 @@ namespace clink {
 
 struct Event {
     std::int64_t ts_ms{};  // milliseconds since unix epoch
-    std::string type;      // e.g. "jm.tm_registered", "jm.job_submitted"
+    std::string type;      // e.g. "coordinator.worker_registered", "coordinator.job_submitted"
     std::string payload;   // JSON; consumer-defined per type
 };
 

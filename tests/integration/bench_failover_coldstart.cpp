@@ -4,16 +4,16 @@
 // native-binary (no-JVM, no-warmup) design is meant to win on:
 //
 //   1. COLD START - wall-clock from a cold process launch to a running,
-//      producing job. Reported as phases over K fresh JM+TM launches:
-//        jm_up      : spawn clink_node JM -> control port accepts TCP
-//        tm_register: spawn clink_node TM -> "registered" on its stdout
+//      producing job. Reported as phases over K fresh coordinator+worker launches:
+//        coordinator_up      : spawn clink_node coordinator -> control port accepts TCP
+//        worker_register: spawn clink_node worker -> "registered" on its stdout
 //        deploy_run : clink_submit_job start -> a small bounded job commits
-//        total      : JM spawn -> bounded job committed
+//        total      : coordinator spawn -> bounded job committed
 //
-//   2. FAILOVER RECOVERY - wall-clock from a TaskManager SIGKILL to the
+//   2. FAILOVER RECOVERY - wall-clock from a Worker SIGKILL to the
 //      job processing again, observed as a NEW durable checkpoint
 //      (COMPLETED-N marker with id > the last one before the crash). The
-//      JM's TM-loss detection window (--heartbeat-timeout-ms) is set low so
+//      coordinator's worker-loss detection window (--heartbeat-timeout-ms) is set low so
 //      the measured number is dominated by the actual recovery work
 //      (detect -> redeploy onto the survivor -> restore state -> resume),
 //      not by the conservative default detection delay.
@@ -87,7 +87,7 @@ double ms_since(clock_t_::time_point t0) {
 }
 
 // posix_spawn with stdout+stderr redirected to log_path, so we can poll
-// the child's startup banner ("JM listening", "TM ... registered") for a
+// the child's startup banner ("coordinator listening", "worker ... registered") for a
 // precise readiness timestamp instead of a conservative fixed sleep.
 pid_t spawn_logged(const std::vector<std::string>& argv,
                    const fs::path& binary,
@@ -242,8 +242,8 @@ bool file_contains(const fs::path& path, const std::string& needle) {
 }
 
 // Count non-overlapping occurrences of `needle` in `path` (whole-file). Used to
-// self-certify, from the JM log, that each sequential crash produced a NEW
-// "tm lost" and a NEW single-survivor "jm.restart ... survivors=1" line - i.e.
+// self-certify, from the coordinator log, that each sequential crash produced a NEW
+// "worker lost" and a NEW single-survivor "coordinator.restart ... survivors=1" line - i.e.
 // every kill was a genuine failover that forced a redeploy, not a no-op.
 std::size_t count_occurrences(const fs::path& path, const std::string& needle) {
     std::ifstream in(path);
@@ -315,7 +315,7 @@ Stats summarise(std::vector<double> xs) {
 // ---- cold start ---------------------------------------------------------
 
 struct ColdSample {
-    double jm_up{-1}, tm_register{-1}, deploy_run{-1}, total{-1};
+    double coordinator_up{-1}, worker_register{-1}, deploy_run{-1}, total{-1};
     bool ok{false};
     std::size_t committed{0};
 };
@@ -330,8 +330,8 @@ ColdSample cold_start_once(const fs::path& node,
     const auto out_dir = mktmpdir("cs_out_" + std::to_string(iter));
     scratch.add(ckpt_dir);
     scratch.add(out_dir);
-    const auto jm_log = ckpt_dir / "jm.log";
-    const auto tm_log = ckpt_dir / "tm.log";
+    const auto coordinator_log = ckpt_dir / "coordinator.log";
+    const auto worker_log = ckpt_dir / "worker.log";
 
     // Tiny bounded job: the dominant cost is process launch + plugin
     // dlopen + deploy, not the ~handful of ms of record processing.
@@ -340,34 +340,36 @@ ColdSample cold_start_once(const fs::path& node,
     ::setenv("CLINK_2PC_TICK_MS", "1", 1);
 
     const auto port = probe_free_port();
-    const auto t_jm = clock_t_::now();
-    const pid_t jm = spawn_logged(
-        {"clink_node", "--role=jm", "--port=" + std::to_string(port), "--bind-host=127.0.0.1"},
-        node,
-        jm_log);
-    if (jm <= 0) {
+    const auto t_coordinator = clock_t_::now();
+    const pid_t coordinator = spawn_logged({"clink_node",
+                                            "--role=coordinator",
+                                            "--port=" + std::to_string(port),
+                                            "--bind-host=127.0.0.1"},
+                                           node,
+                                           coordinator_log);
+    if (coordinator <= 0) {
         return s;
     }
-    s.jm_up = await_port_open(port, 5s);
+    s.coordinator_up = await_port_open(port, 5s);
 
-    const auto t_tm = clock_t_::now();
-    const pid_t tm = spawn_logged({"clink_node",
-                                   "--role=tm",
-                                   "--id=tm-cs",
-                                   "--jm-host=127.0.0.1",
-                                   "--jm-port=" + std::to_string(port),
-                                   "--slots=4"},
-                                  node,
-                                  tm_log);
-    if (tm > 0) {
-        s.tm_register = await_log_contains(tm_log, "registered", t_tm, 5s);
+    const auto t_worker = clock_t_::now();
+    const pid_t worker = spawn_logged({"clink_node",
+                                       "--role=worker",
+                                       "--id=worker-cs",
+                                       "--coordinator-host=127.0.0.1",
+                                       "--coordinator-port=" + std::to_string(port),
+                                       "--slots=4"},
+                                      node,
+                                      worker_log);
+    if (worker > 0) {
+        s.worker_register = await_log_contains(worker_log, "registered", t_worker, 5s);
     }
 
     const auto t_submit = clock_t_::now();
     const pid_t sub = spawn_logged({"clink_submit_job",
                                     "--job=" + job_so.string(),
-                                    "--jm-host=127.0.0.1",
-                                    "--jm-port=" + std::to_string(port),
+                                    "--coordinator-host=127.0.0.1",
+                                    "--coordinator-port=" + std::to_string(port),
                                     "--wait-timeout-s=30",
                                     "--checkpoint-dir=" + ckpt_dir.string(),
                                     "--checkpoint-interval-ms=5000"},
@@ -376,15 +378,15 @@ ColdSample cold_start_once(const fs::path& node,
     int sub_exit = -1;
     const bool exited = sub > 0 && wait_for_exit(sub, 30s, &sub_exit);
     s.deploy_run = ms_since(t_submit);
-    s.total = ms_since(t_jm);
+    s.total = ms_since(t_coordinator);
 
     const auto lines = read_committed_lines(out_dir);
     std::set<std::string> uniq(lines.begin(), lines.end());
     s.committed = uniq.size();
     s.ok = exited && sub_exit == 0 && s.committed == 10 && lines.size() == uniq.size();
 
-    kill_quietly(tm);
-    kill_quietly(jm);
+    kill_quietly(worker);
+    kill_quietly(coordinator);
     return s;  // scratch dirs cleaned by ScopedDirs
 }
 
@@ -400,22 +402,22 @@ struct FailoverResult {
     std::size_t committed{0};
     std::size_t expected{0};
     bool exactly_once{false};
-    bool real_failover{false};  // JM watchdog actually detected the TM loss
+    bool real_failover{false};  // coordinator watchdog actually detected the worker loss
 };
 
-// default_state_backend_uri (when non-empty) is passed to the JM as
+// default_state_backend_uri (when non-empty) is passed to the coordinator as
 // --default-state-backend, so the 2PC job's keyed + operator state (the source
 // offset) lives there instead of the local checkpoint dir. With a
 // remote-read:// URI the state is in S3 and is LAZILY restored from the last
 // committed checkpoint after the crash - the same exactly-once invariant must
 // still hold, which proves disaggregated state recovers correctly through a
-// failover. checkpoint_dir stays the JM's local coordination dir either way.
+// failover. checkpoint_dir stays the coordinator's local coordination dir either way.
 FailoverResult failover_once(const fs::path& node,
                              const fs::path& submit,
                              const fs::path& job_so,
                              const std::string& default_state_backend_uri = "") {
     FailoverResult r;
-    r.heartbeat_ms = 1000;  // > the TM's 500ms heartbeat interval, << the 5s default
+    r.heartbeat_ms = 1000;  // > the worker's 500ms heartbeat interval, << the 5s default
     const int total = 400;
     r.expected = static_cast<std::size_t>(total);
 
@@ -429,53 +431,54 @@ FailoverResult failover_once(const fs::path& node,
     ::setenv("CLINK_2PC_TICK_MS", "20", 1);  // ~8s of runtime: room to crash mid-flight
 
     const auto port = probe_free_port();
-    std::vector<std::string> jm_args{"clink_node",
-                                     "--role=jm",
-                                     "--port=" + std::to_string(port),
-                                     "--bind-host=127.0.0.1",
-                                     "--heartbeat-timeout-ms=" + std::to_string(r.heartbeat_ms),
-                                     "--watchdog-interval-ms=50"};
+    std::vector<std::string> coordinator_args{
+        "clink_node",
+        "--role=coordinator",
+        "--port=" + std::to_string(port),
+        "--bind-host=127.0.0.1",
+        "--heartbeat-timeout-ms=" + std::to_string(r.heartbeat_ms),
+        "--watchdog-interval-ms=50"};
     if (!default_state_backend_uri.empty()) {
-        jm_args.push_back("--default-state-backend=" + default_state_backend_uri);
+        coordinator_args.push_back("--default-state-backend=" + default_state_backend_uri);
     }
-    const pid_t jm = spawn_logged(jm_args, node, ckpt_dir / "jm.log");
-    if (jm <= 0 || await_port_open(port, 5s) < 0) {
-        kill_quietly(jm);
+    const pid_t coordinator = spawn_logged(coordinator_args, node, ckpt_dir / "coordinator.log");
+    if (coordinator <= 0 || await_port_open(port, 5s) < 0) {
+        kill_quietly(coordinator);
         return r;
     }
 
-    // Bring up TM-A alone and submit: with a single TM the whole 2-subtask
+    // Bring up worker-A alone and submit: with a single worker the whole 2-subtask
     // job deploys onto it deterministically (no placement ambiguity), so
-    // killing TM-A is guaranteed to take down every subtask and force a
-    // real restore-and-redeploy - not a no-op kill of an idle TM.
+    // killing worker-A is guaranteed to take down every subtask and force a
+    // real restore-and-redeploy - not a no-op kill of an idle worker.
     const pid_t tmA = spawn_logged({"clink_node",
-                                    "--role=tm",
-                                    "--id=tm-A",
-                                    "--jm-host=127.0.0.1",
-                                    "--jm-port=" + std::to_string(port),
+                                    "--role=worker",
+                                    "--id=worker-A",
+                                    "--coordinator-host=127.0.0.1",
+                                    "--coordinator-port=" + std::to_string(port),
                                     "--slots=4"},
                                    node,
                                    ckpt_dir / "tmA.log");
     if (tmA <= 0 ||
         await_log_contains(ckpt_dir / "tmA.log", "registered", clock_t_::now(), 5s) < 0) {
         kill_quietly(tmA);
-        kill_quietly(jm);
+        kill_quietly(coordinator);
         return r;
     }
 
     const pid_t sub = spawn_logged({"clink_submit_job",
                                     "--job=" + job_so.string(),
-                                    "--jm-host=127.0.0.1",
-                                    "--jm-port=" + std::to_string(port),
+                                    "--coordinator-host=127.0.0.1",
+                                    "--coordinator-port=" + std::to_string(port),
                                     "--wait-timeout-s=60",
                                     "--checkpoint-dir=" + ckpt_dir.string(),
                                     "--checkpoint-interval-ms=150",
-                                    "--max-restarts-on-tm-loss=2"},
+                                    "--max-restarts-on-worker-loss=2"},
                                    submit,
                                    ckpt_dir / "submit.log");
     if (sub <= 0) {
         kill_quietly(tmA);
-        kill_quietly(jm);
+        kill_quietly(coordinator);
         return r;
     }
 
@@ -485,32 +488,32 @@ FailoverResult failover_once(const fs::path& node,
         std::this_thread::sleep_for(10ms);
     }
 
-    // Bring up TM-B as the recovery target only now, AFTER the job is
-    // checkpointing on TM-A. It sits idle until TM-A dies, then the JM
+    // Bring up worker-B as the recovery target only now, AFTER the job is
+    // checkpointing on worker-A. It sits idle until worker-A dies, then the coordinator
     // redeploys the restored job onto it (the proven survivor path).
     const pid_t tmB = spawn_logged({"clink_node",
-                                    "--role=tm",
-                                    "--id=tm-B",
-                                    "--jm-host=127.0.0.1",
-                                    "--jm-port=" + std::to_string(port),
+                                    "--role=worker",
+                                    "--id=worker-B",
+                                    "--coordinator-host=127.0.0.1",
+                                    "--coordinator-port=" + std::to_string(port),
                                     "--slots=4"},
                                    node,
                                    ckpt_dir / "tmB.log");
-    // TM-B is the mandatory recovery target: if it never registers there is
+    // worker-B is the mandatory recovery target: if it never registers there is
     // nowhere to redeploy after the crash, so bail rather than report a
     // meaningless number.
     if (tmB <= 0 ||
         await_log_contains(ckpt_dir / "tmB.log", "registered", clock_t_::now(), 5s) < 0) {
         kill_quietly(tmA);
         kill_quietly(tmB);
-        kill_quietly(jm);
+        kill_quietly(coordinator);
         return r;
     }
     r.ckpt_before = latest_completed_checkpoint(ckpt_dir);
 
-    // Crash TM-A and time the recovery: from SIGKILL to a NEW durable
+    // Crash worker-A and time the recovery: from SIGKILL to a NEW durable
     // checkpoint id, which proves the redeployed job is processing again.
-    // Detection is via the JM watchdog (no connection-close fast path), so
+    // Detection is via the coordinator watchdog (no connection-close fast path), so
     // ~heartbeat_timeout of the measured number is the detection window.
     const auto t_crash = clock_t_::now();
     kill_quietly(tmA);
@@ -523,9 +526,9 @@ FailoverResult failover_once(const fs::path& node,
     if (r.ckpt_after > r.ckpt_before) {
         r.recovery_ms = ms_since(t_crash);
     }
-    // Confirm the JM actually detected TM-A's death and ran the restart
+    // Confirm the coordinator actually detected worker-A's death and ran the restart
     // path - otherwise the kill was a no-op and recovery_ms is meaningless.
-    r.real_failover = file_contains(ckpt_dir / "jm.log", "tm lost");
+    r.real_failover = file_contains(ckpt_dir / "coordinator.log", "worker lost");
 
     const bool exited = wait_for_exit(sub, 40s, &r.submit_exit);
 
@@ -555,17 +558,17 @@ FailoverResult failover_once(const fs::path& node,
            r.real_failover && r.exactly_once;
 
     kill_quietly(tmB);
-    kill_quietly(jm);
+    kill_quietly(coordinator);
     return r;  // scratch dirs cleaned by ScopedDirs
 }
 
 struct SeqFailoverResult {
     std::size_t requested{0};  // N crashes asked for
     std::size_t real_crashes{
-        0};  // crashes confirmed genuine (new tm-lost + survivors=1 + ckpt advance)
-    std::size_t tm_lost_events{0};  // distinct "tm lost" lines the JM logged
+        0};  // crashes confirmed genuine (new worker-lost + survivors=1 + ckpt advance)
+    std::size_t worker_lost_events{0};  // distinct "worker lost" lines the coordinator logged
     std::size_t survivor_restarts{
-        0};  // distinct single-survivor "jm.restart ... survivors=1" lines
+        0};  // distinct single-survivor "coordinator.restart ... survivors=1" lines
     std::size_t expected{0};
     std::size_t committed{0};
     std::size_t dups{0};         // total_lines - unique (>0 = a record committed twice)
@@ -578,13 +581,13 @@ struct SeqFailoverResult {
 };
 
 // N SEQUENTIAL mid-flight failovers on the given backend. Rolling standby:
-// tm[i] is launched and registered BEFORE tm[i-1] is killed, so at the moment
-// of each crash exactly one slot-holder remains and the JM's redeploy target is
+// worker[i] is launched and registered BEFORE worker[i-1] is killed, so at the moment
+// of each crash exactly one slot-holder remains and the coordinator's redeploy target is
 // deterministic - the whole 2-subtask job (parallelism 1) lands on the single
 // survivor, just as failover_once relies on. Each crash is forced mid-flight
 // (we wait for fresh checkpoints after the standby is up) and SELF-CERTIFIED
-// genuine from the JM log: a NEW "tm lost" line AND a NEW single-survivor
-// "jm.restart ... survivors=1" line must appear, and the completed-checkpoint
+// genuine from the coordinator log: a NEW "worker lost" line AND a NEW single-survivor
+// "coordinator.restart ... survivors=1" line must appear, and the completed-checkpoint
 // id must advance past the kill point (the redeployed job is processing again).
 //
 // SCOPE of the exactly-once claim this proves: every one of the TOTAL records
@@ -592,7 +595,7 @@ struct SeqFailoverResult {
 // duplicate AND no loss, including the post-last-checkpoint tail. Records that
 // cross a periodic checkpoint recover from S3 exactly-once; the tail is made
 // recoverable too because at clean EOS the bounded source drives one
-// JM-coordinated FINAL checkpoint (real id, committed via the normal ack ->
+// coordinator-coordinated FINAL checkpoint (real id, committed via the normal ack ->
 // CommitCheckpoint path) and BLOCKS until it commits before finishing, so a
 // crash at end-of-stream replays and re-commits it rather than losing it. The
 // check (no dup AND no loss AND submit_exit==0) also certifies S3 was the live
@@ -621,29 +624,30 @@ SeqFailoverResult failover_sequential(const fs::path& node,
 
     const int heartbeat_ms = 1000;
     const auto port = probe_free_port();
-    std::vector<std::string> jm_args{"clink_node",
-                                     "--role=jm",
-                                     "--port=" + std::to_string(port),
-                                     "--bind-host=127.0.0.1",
-                                     "--heartbeat-timeout-ms=" + std::to_string(heartbeat_ms),
-                                     "--watchdog-interval-ms=50"};
+    std::vector<std::string> coordinator_args{
+        "clink_node",
+        "--role=coordinator",
+        "--port=" + std::to_string(port),
+        "--bind-host=127.0.0.1",
+        "--heartbeat-timeout-ms=" + std::to_string(heartbeat_ms),
+        "--watchdog-interval-ms=50"};
     if (!default_state_backend_uri.empty()) {
-        jm_args.push_back("--default-state-backend=" + default_state_backend_uri);
+        coordinator_args.push_back("--default-state-backend=" + default_state_backend_uri);
     }
-    const pid_t jm = spawn_logged(jm_args, node, ckpt_dir / "jm.log");
-    if (jm <= 0 || await_port_open(port, 5s) < 0) {
-        kill_quietly(jm);
+    const pid_t coordinator = spawn_logged(coordinator_args, node, ckpt_dir / "coordinator.log");
+    if (coordinator <= 0 || await_port_open(port, 5s) < 0) {
+        kill_quietly(coordinator);
         return r;
     }
-    const auto jm_log = ckpt_dir / "jm.log";
+    const auto coordinator_log = ckpt_dir / "coordinator.log";
 
-    auto start_tm = [&](int idx) -> pid_t {
-        const std::string log = "tm" + std::to_string(idx) + ".log";
+    auto start_worker = [&](int idx) -> pid_t {
+        const std::string log = "worker" + std::to_string(idx) + ".log";
         const pid_t p = spawn_logged({"clink_node",
-                                      "--role=tm",
-                                      "--id=tm-" + std::to_string(idx),
-                                      "--jm-host=127.0.0.1",
-                                      "--jm-port=" + std::to_string(port),
+                                      "--role=worker",
+                                      "--id=worker-" + std::to_string(idx),
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(port),
                                       "--slots=4"},
                                      node,
                                      ckpt_dir / log);
@@ -653,25 +657,26 @@ SeqFailoverResult failover_sequential(const fs::path& node,
         return p;
     };
 
-    pid_t active = start_tm(0);
+    pid_t active = start_worker(0);
     if (active <= 0) {
-        kill_quietly(jm);
+        kill_quietly(coordinator);
         return r;
     }
 
-    const pid_t sub = spawn_logged({"clink_submit_job",
-                                    "--job=" + job_so.string(),
-                                    "--jm-host=127.0.0.1",
-                                    "--jm-port=" + std::to_string(port),
-                                    "--wait-timeout-s=180",
-                                    "--checkpoint-dir=" + ckpt_dir.string(),
-                                    "--checkpoint-interval-ms=150",
-                                    "--max-restarts-on-tm-loss=" + std::to_string(n_failovers + 2)},
-                                   submit,
-                                   ckpt_dir / "submit.log");
+    const pid_t sub =
+        spawn_logged({"clink_submit_job",
+                      "--job=" + job_so.string(),
+                      "--coordinator-host=127.0.0.1",
+                      "--coordinator-port=" + std::to_string(port),
+                      "--wait-timeout-s=180",
+                      "--checkpoint-dir=" + ckpt_dir.string(),
+                      "--checkpoint-interval-ms=150",
+                      "--max-restarts-on-worker-loss=" + std::to_string(n_failovers + 2)},
+                     submit,
+                     ckpt_dir / "submit.log");
     if (sub <= 0) {
         kill_quietly(active);
-        kill_quietly(jm);
+        kill_quietly(coordinator);
         return r;
     }
 
@@ -702,7 +707,7 @@ SeqFailoverResult failover_sequential(const fs::path& node,
             job_done = true;
             break;  // job finished before we could crash again
         }
-        const pid_t standby = start_tm(i);
+        const pid_t standby = start_worker(i);
         if (standby <= 0) {
             break;  // no recovery target -> stop (ok stays false)
         }
@@ -710,18 +715,18 @@ SeqFailoverResult failover_sequential(const fs::path& node,
         wait_ckpt_ge(base + 2);  // genuine mid-flight: fresh state landed since the standby came up
         const std::uint64_t before = latest_completed_checkpoint(ckpt_dir);
         const auto t_crash = clock_t_::now();
-        kill_quietly(active);      // SIGKILL the active TM (the sole slot-holder)
+        kill_quietly(active);      // SIGKILL the active worker (the sole slot-holder)
         active = standby;          // the standby is the only remaining slot-holder
         wait_ckpt_ge(before + 2);  // the redeployed job is checkpointing again
         const std::uint64_t after = latest_completed_checkpoint(ckpt_dir);
-        // Genuine failover: with single-TM placement the killed TM was running
+        // Genuine failover: with single-worker placement the killed worker was running
         // the whole job, so the job CAN only advance past the kill point by
         // failing over to the standby and resuming. A checkpoint id strictly
         // beyond the pre-kill id is that proof. We deliberately do NOT read the
-        // JM "tm lost" / "survivors=1" counts here per crash: those are logged
+        // coordinator "worker lost" / "survivors=1" counts here per crash: those are logged
         // asynchronously ~heartbeat_timeout after the kill (and restarts are
         // coalesced under rapid succession), so a per-crash count read races the
-        // logger. The total tm-lost count is checked once at the end instead,
+        // logger. The total worker-lost count is checked once at the end instead,
         // when all logging has settled.
         if (after > before) {
             ++r.real_crashes;
@@ -734,8 +739,9 @@ SeqFailoverResult failover_sequential(const fs::path& node,
     // ~36s; wait generously (the submitter's own --wait-timeout-s=180 bounds it)
     // so a slow-but-completing job is not misread mid-flight as a shortfall.
     const bool exited = wait_for_exit(sub, 150s, &r.submit_exit);
-    r.tm_lost_events = count_occurrences(jm_log, "tm lost");
-    r.survivor_restarts = count_occurrences(jm_log, "survivors=1");  // informational (coalesced)
+    r.worker_lost_events = count_occurrences(coordinator_log, "worker lost");
+    r.survivor_restarts =
+        count_occurrences(coordinator_log, "survivors=1");  // informational (coalesced)
 
     // Absorb terminal-commit flush lag: the submitter can observe JobCompleted a
     // hair before the 2PC sink's final staging->committed rename is visible (the
@@ -778,15 +784,15 @@ SeqFailoverResult failover_sequential(const fs::path& node,
     r.exactly_once =
         exited && r.submit_exit == 0 && lines.size() == uniq.size() && r.committed == r.expected;
     // The proof holds iff every requested crash was a genuine, self-certified
-    // sequential failover - the JM detected N distinct TM losses and the job
+    // sequential failover - the coordinator detected N distinct worker losses and the job
     // advanced past each kill point (r.real_crashes) - checkpoints never
     // regressed, and the full bounded output is exactly-once. survivor_restarts
-    // is NOT gated on (the JM coalesces restarts under rapid succession).
+    // is NOT gated on (the coordinator coalesces restarts under rapid succession).
     r.ok = r.exactly_once && r.real_crashes == static_cast<std::size_t>(n_failovers) &&
-           r.tm_lost_events >= static_cast<std::size_t>(n_failovers) && r.monotonic_ckpts;
+           r.worker_lost_events >= static_cast<std::size_t>(n_failovers) && r.monotonic_ckpts;
 
     kill_quietly(active);
-    kill_quietly(jm);
+    kill_quietly(coordinator);
     return r;
 }
 
@@ -801,7 +807,7 @@ struct EosRecoveryResult {
 };
 
 // NO-CRASH end-of-stream final-checkpoint TIMEOUT, exercised deterministically.
-// The JM is told (CLINK_TEST_STALL_FIRST_FINAL_CKPT) to drop every ack for the
+// The coordinator is told (CLINK_TEST_STALL_FIRST_FINAL_CKPT) to drop every ack for the
 // FIRST final checkpoint's first-acking subtask, so that checkpoint never
 // completes; with a short EOS-wait timeout (CLINK_EOS_FINAL_CKPT_TIMEOUT_MS) the
 // bounded source's wait_final_committed times out WITHOUT any crash, throws, and
@@ -809,7 +815,7 @@ struct EosRecoveryResult {
 // last completed checkpoint -> replay -> the replay's fresh final checkpoint
 // completes -> exactly-once. Pre-fix the throw was swallowed and the job
 // completed with the tail uncommitted; the assertions below (exactly-once AND a
-// whole-job restart) fail pre-fix and pass post-fix. No TM is ever killed.
+// whole-job restart) fail pre-fix and pass post-fix. No worker is ever killed.
 EosRecoveryResult eos_timeout_recovery(const fs::path& node,
                                        const fs::path& submit,
                                        const fs::path& job_so) {
@@ -830,44 +836,44 @@ EosRecoveryResult eos_timeout_recovery(const fs::path& node,
     ::setenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT", "1", 1);
 
     const auto port = probe_free_port();
-    const pid_t jm = spawn_logged({"clink_node",
-                                   "--role=jm",
-                                   "--port=" + std::to_string(port),
-                                   "--bind-host=127.0.0.1",
-                                   "--heartbeat-timeout-ms=1000",
-                                   "--watchdog-interval-ms=50"},
-                                  node,
-                                  ckpt_dir / "jm.log");
-    if (jm <= 0 || await_port_open(port, 5s) < 0) {
-        kill_quietly(jm);
+    const pid_t coordinator = spawn_logged({"clink_node",
+                                            "--role=coordinator",
+                                            "--port=" + std::to_string(port),
+                                            "--bind-host=127.0.0.1",
+                                            "--heartbeat-timeout-ms=1000",
+                                            "--watchdog-interval-ms=50"},
+                                           node,
+                                           ckpt_dir / "coordinator.log");
+    if (coordinator <= 0 || await_port_open(port, 5s) < 0) {
+        kill_quietly(coordinator);
         ::unsetenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT");
         ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
         return r;
     }
-    const pid_t tm = spawn_logged({"clink_node",
-                                   "--role=tm",
-                                   "--id=tm-0",
-                                   "--jm-host=127.0.0.1",
-                                   "--jm-port=" + std::to_string(port),
-                                   "--slots=4"},
-                                  node,
-                                  ckpt_dir / "tm0.log");
-    if (tm <= 0 ||
-        await_log_contains(ckpt_dir / "tm0.log", "registered", clock_t_::now(), 5s) < 0) {
-        kill_quietly(tm);
-        kill_quietly(jm);
+    const pid_t worker = spawn_logged({"clink_node",
+                                       "--role=worker",
+                                       "--id=worker-0",
+                                       "--coordinator-host=127.0.0.1",
+                                       "--coordinator-port=" + std::to_string(port),
+                                       "--slots=4"},
+                                      node,
+                                      ckpt_dir / "worker0.log");
+    if (worker <= 0 ||
+        await_log_contains(ckpt_dir / "worker0.log", "registered", clock_t_::now(), 5s) < 0) {
+        kill_quietly(worker);
+        kill_quietly(coordinator);
         ::unsetenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT");
         ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
         return r;
     }
     const pid_t sub = spawn_logged({"clink_submit_job",
                                     "--job=" + job_so.string(),
-                                    "--jm-host=127.0.0.1",
-                                    "--jm-port=" + std::to_string(port),
+                                    "--coordinator-host=127.0.0.1",
+                                    "--coordinator-port=" + std::to_string(port),
                                     "--wait-timeout-s=90",
                                     "--checkpoint-dir=" + ckpt_dir.string(),
                                     "--checkpoint-interval-ms=150",
-                                    "--max-restarts-on-tm-loss=3"},
+                                    "--max-restarts-on-worker-loss=3"},
                                    submit,
                                    ckpt_dir / "submit.log");
     // The hooks are now in the spawned children's environment; unset in this
@@ -890,13 +896,14 @@ EosRecoveryResult eos_timeout_recovery(const fs::path& node,
     r.committed = uniq.size();
     r.dups = lines.size() - uniq.size();
     // The EOS-timeout surfaced as a whole-job restart (vs the pre-fix swallow).
-    r.restart_observed = file_contains(ckpt_dir / "jm.log", "subtask error -> whole-job restart");
+    r.restart_observed =
+        file_contains(ckpt_dir / "coordinator.log", "subtask error -> whole-job restart");
     r.exactly_once =
         exited && r.submit_exit == 0 && lines.size() == uniq.size() && r.committed == r.expected;
     r.ok = r.exactly_once && r.restart_observed;
 
-    kill_quietly(tm);
-    kill_quietly(jm);
+    kill_quietly(worker);
+    kill_quietly(coordinator);
     return r;
 }
 
@@ -913,13 +920,13 @@ struct EosBudgetResult {
 // recovery is BOUNDED (no infinite loop). CLINK_TEST_STALL_EVERY_FINAL_CKPT
 // re-arms the stall on EVERY attempt's final checkpoint, so the bounded
 // source's wait_final_committed times out and it throws on every replay. With a
-// small budget (--max-restarts-on-tm-loss=2) the job must restart EXACTLY that
+// small budget (--max-restarts-on-worker-loss=2) the job must restart EXACTLY that
 // many times then FAIL LOUDLY - not retry forever, not silently complete. Only
 // the source ever throws on an EOS timeout (sinks don't wait), so exactly one
 // restart fires per cycle; the assertions below check the restart count equals
 // the budget and the submitter exits non-zero (failed or timed out, never
 // 0/success). Companion to eos_timeout_recovery (which proves the RECOVERING
-// case); this proves the GIVE-UP case is bounded. No TM is ever killed.
+// case); this proves the GIVE-UP case is bounded. No worker is ever killed.
 EosBudgetResult eos_budget_exhaustion(const fs::path& node,
                                       const fs::path& submit,
                                       const fs::path& job_so) {
@@ -940,46 +947,47 @@ EosBudgetResult eos_budget_exhaustion(const fs::path& node,
     ::setenv("CLINK_TEST_STALL_EVERY_FINAL_CKPT", "1", 1);
 
     const auto port = probe_free_port();
-    const pid_t jm = spawn_logged({"clink_node",
-                                   "--role=jm",
-                                   "--port=" + std::to_string(port),
-                                   "--bind-host=127.0.0.1",
-                                   "--heartbeat-timeout-ms=1000",
-                                   "--watchdog-interval-ms=50"},
-                                  node,
-                                  ckpt_dir / "jm.log");
-    if (jm <= 0 || await_port_open(port, 5s) < 0) {
-        kill_quietly(jm);
+    const pid_t coordinator = spawn_logged({"clink_node",
+                                            "--role=coordinator",
+                                            "--port=" + std::to_string(port),
+                                            "--bind-host=127.0.0.1",
+                                            "--heartbeat-timeout-ms=1000",
+                                            "--watchdog-interval-ms=50"},
+                                           node,
+                                           ckpt_dir / "coordinator.log");
+    if (coordinator <= 0 || await_port_open(port, 5s) < 0) {
+        kill_quietly(coordinator);
         ::unsetenv("CLINK_TEST_STALL_EVERY_FINAL_CKPT");
         ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
         return r;
     }
-    const pid_t tm = spawn_logged({"clink_node",
-                                   "--role=tm",
-                                   "--id=tm-0",
-                                   "--jm-host=127.0.0.1",
-                                   "--jm-port=" + std::to_string(port),
-                                   "--slots=4"},
-                                  node,
-                                  ckpt_dir / "tm0.log");
-    if (tm <= 0 ||
-        await_log_contains(ckpt_dir / "tm0.log", "registered", clock_t_::now(), 5s) < 0) {
-        kill_quietly(tm);
-        kill_quietly(jm);
+    const pid_t worker = spawn_logged({"clink_node",
+                                       "--role=worker",
+                                       "--id=worker-0",
+                                       "--coordinator-host=127.0.0.1",
+                                       "--coordinator-port=" + std::to_string(port),
+                                       "--slots=4"},
+                                      node,
+                                      ckpt_dir / "worker0.log");
+    if (worker <= 0 ||
+        await_log_contains(ckpt_dir / "worker0.log", "registered", clock_t_::now(), 5s) < 0) {
+        kill_quietly(worker);
+        kill_quietly(coordinator);
         ::unsetenv("CLINK_TEST_STALL_EVERY_FINAL_CKPT");
         ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
         return r;
     }
-    const pid_t sub = spawn_logged({"clink_submit_job",
-                                    "--job=" + job_so.string(),
-                                    "--jm-host=127.0.0.1",
-                                    "--jm-port=" + std::to_string(port),
-                                    "--wait-timeout-s=60",
-                                    "--checkpoint-dir=" + ckpt_dir.string(),
-                                    "--checkpoint-interval-ms=150",
-                                    "--max-restarts-on-tm-loss=" + std::to_string(r.max_restarts)},
-                                   submit,
-                                   ckpt_dir / "submit.log");
+    const pid_t sub =
+        spawn_logged({"clink_submit_job",
+                      "--job=" + job_so.string(),
+                      "--coordinator-host=127.0.0.1",
+                      "--coordinator-port=" + std::to_string(port),
+                      "--wait-timeout-s=60",
+                      "--checkpoint-dir=" + ckpt_dir.string(),
+                      "--checkpoint-interval-ms=150",
+                      "--max-restarts-on-worker-loss=" + std::to_string(r.max_restarts)},
+                     submit,
+                     ckpt_dir / "submit.log");
     ::unsetenv("CLINK_TEST_STALL_EVERY_FINAL_CKPT");
     ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
     const bool exited = (sub > 0) && wait_for_exit(sub, 75s, &r.submit_exit);
@@ -988,14 +996,14 @@ EosBudgetResult eos_budget_exhaustion(const fs::path& node,
     const std::set<std::string> uniq(lines.begin(), lines.end());
     r.committed = uniq.size();
     r.whole_job_restarts =
-        count_occurrences(ckpt_dir / "jm.log", "subtask error -> whole-job restart");
+        count_occurrences(ckpt_dir / "coordinator.log", "subtask error -> whole-job restart");
     // Bounded recovery: EXACTLY max_restarts whole-job restarts (no infinite
     // loop), and the job ends in failure (submit_exit != 0), never success.
     r.ok = exited && r.whole_job_restarts == static_cast<std::size_t>(r.max_restarts) &&
            r.submit_exit != 0;
 
-    kill_quietly(tm);
-    kill_quietly(jm);
+    kill_quietly(worker);
+    kill_quietly(coordinator);
     return r;
 }
 
@@ -1012,7 +1020,7 @@ struct EosFinishedPeerResult {
 // FINISHED-PEER redeploy, exercised DETERMINISTICALLY. The whole-job restart on
 // a subtask error has two sub-cases: drain_expected>0 (a peer is still in
 // flight, so it is cancelled + drained before redeploy) and drain_expected=0 (a
-// peer already FINISHED, so restart_pending - built from tasks_by_tm minus
+// peer already FINISHED, so restart_pending - built from tasks_by_worker minus
 // in_flight - must re-add it, else it is orphaned). The eos_timeout_recovery leg
 // hits whichever the source-error-vs-sink-finish race lands on (~1/3 the
 // finished-peer one), so the finished-peer redeploy can silently rot. Here
@@ -1020,7 +1028,7 @@ struct EosFinishedPeerResult {
 // the cleanly-finishing 2PC sink always reports FIRST -> drain_expected=0 every
 // run. Asserts the restart line carries drain_expected=0 (the finished-peer
 // path was taken) AND recovery is exactly-once (the finished peer was redeployed
-// and re-committed the tail - no orphan, no loss). No TM is killed.
+// and re-committed the tail - no orphan, no loss). No worker is killed.
 EosFinishedPeerResult eos_finished_peer_recovery(const fs::path& node,
                                                  const fs::path& submit,
                                                  const fs::path& job_so) {
@@ -1044,47 +1052,47 @@ EosFinishedPeerResult eos_finished_peer_recovery(const fs::path& node,
     ::setenv("CLINK_TEST_DELAY_ERROR_FINISH_MS", "1500", 1);
 
     const auto port = probe_free_port();
-    const pid_t jm = spawn_logged({"clink_node",
-                                   "--role=jm",
-                                   "--port=" + std::to_string(port),
-                                   "--bind-host=127.0.0.1",
-                                   "--heartbeat-timeout-ms=1000",
-                                   "--watchdog-interval-ms=50"},
-                                  node,
-                                  ckpt_dir / "jm.log");
+    const pid_t coordinator = spawn_logged({"clink_node",
+                                            "--role=coordinator",
+                                            "--port=" + std::to_string(port),
+                                            "--bind-host=127.0.0.1",
+                                            "--heartbeat-timeout-ms=1000",
+                                            "--watchdog-interval-ms=50"},
+                                           node,
+                                           ckpt_dir / "coordinator.log");
     auto cleanup_env = [] {
         ::unsetenv("CLINK_TEST_STALL_FIRST_FINAL_CKPT");
         ::unsetenv("CLINK_EOS_FINAL_CKPT_TIMEOUT_MS");
         ::unsetenv("CLINK_TEST_DELAY_ERROR_FINISH_MS");
     };
-    if (jm <= 0 || await_port_open(port, 5s) < 0) {
-        kill_quietly(jm);
+    if (coordinator <= 0 || await_port_open(port, 5s) < 0) {
+        kill_quietly(coordinator);
         cleanup_env();
         return r;
     }
-    const pid_t tm = spawn_logged({"clink_node",
-                                   "--role=tm",
-                                   "--id=tm-0",
-                                   "--jm-host=127.0.0.1",
-                                   "--jm-port=" + std::to_string(port),
-                                   "--slots=4"},
-                                  node,
-                                  ckpt_dir / "tm0.log");
-    if (tm <= 0 ||
-        await_log_contains(ckpt_dir / "tm0.log", "registered", clock_t_::now(), 5s) < 0) {
-        kill_quietly(tm);
-        kill_quietly(jm);
+    const pid_t worker = spawn_logged({"clink_node",
+                                       "--role=worker",
+                                       "--id=worker-0",
+                                       "--coordinator-host=127.0.0.1",
+                                       "--coordinator-port=" + std::to_string(port),
+                                       "--slots=4"},
+                                      node,
+                                      ckpt_dir / "worker0.log");
+    if (worker <= 0 ||
+        await_log_contains(ckpt_dir / "worker0.log", "registered", clock_t_::now(), 5s) < 0) {
+        kill_quietly(worker);
+        kill_quietly(coordinator);
         cleanup_env();
         return r;
     }
     const pid_t sub = spawn_logged({"clink_submit_job",
                                     "--job=" + job_so.string(),
-                                    "--jm-host=127.0.0.1",
-                                    "--jm-port=" + std::to_string(port),
+                                    "--coordinator-host=127.0.0.1",
+                                    "--coordinator-port=" + std::to_string(port),
                                     "--wait-timeout-s=90",
                                     "--checkpoint-dir=" + ckpt_dir.string(),
                                     "--checkpoint-interval-ms=150",
-                                    "--max-restarts-on-tm-loss=3"},
+                                    "--max-restarts-on-worker-loss=3"},
                                    submit,
                                    ckpt_dir / "submit.log");
     cleanup_env();  // hooks are now in the children's env; clear ours
@@ -1106,13 +1114,13 @@ EosFinishedPeerResult eos_finished_peer_recovery(const fs::path& node,
     // The restart fired specifically as the finished-peer (drain_expected=0)
     // sub-case: the peer had already finished, so restart_pending re-added it.
     r.finished_peer_path =
-        line_contains_both(ckpt_dir / "jm.log", "whole-job restart", "drain_expected=0");
+        line_contains_both(ckpt_dir / "coordinator.log", "whole-job restart", "drain_expected=0");
     r.exactly_once =
         exited && r.submit_exit == 0 && lines.size() == uniq.size() && r.committed == r.expected;
     r.ok = r.exactly_once && r.finished_peer_path;
 
-    kill_quietly(tm);
-    kill_quietly(jm);
+    kill_quietly(worker);
+    kill_quietly(coordinator);
     return r;
 }
 
@@ -1133,34 +1141,35 @@ int main() {
 
     // ---- cold start ----
     constexpr int kIters = 5;
-    std::vector<double> jm_up, tm_reg, deploy, total;
+    std::vector<double> coordinator_up, worker_reg, deploy, total;
     int cold_ok = 0;
     for (int i = 0; i < kIters; ++i) {
         const auto s = cold_start_once(node, submit, job_so, i);
         std::printf(
-            "cold[%d]: jm_up=%.1fms tm_register=%.1fms deploy_run=%.1fms total=%.1fms "
+            "cold[%d]: coordinator_up=%.1fms worker_register=%.1fms deploy_run=%.1fms total=%.1fms "
             "committed=%zu "
             "%s\n",
             i,
-            s.jm_up,
-            s.tm_register,
+            s.coordinator_up,
+            s.worker_register,
             s.deploy_run,
             s.total,
             s.committed,
             s.ok ? "OK" : "FAIL");
         if (s.ok) {
             ++cold_ok;
-            jm_up.push_back(s.jm_up);
-            tm_reg.push_back(s.tm_register);
+            coordinator_up.push_back(s.coordinator_up);
+            worker_reg.push_back(s.worker_register);
             deploy.push_back(s.deploy_run);
             total.push_back(s.total);
         }
     }
-    const auto sj = summarise(jm_up), st = summarise(tm_reg), sd = summarise(deploy),
+    const auto sj = summarise(coordinator_up), st = summarise(worker_reg), sd = summarise(deploy),
                so = summarise(total);
     std::printf("\nCOLD START (%d/%d ok, median over ok runs):\n", cold_ok, kIters);
-    std::printf("  jm_up        min=%.1f median=%.1f max=%.1f ms\n", sj.min, sj.median, sj.max);
-    std::printf("  tm_register  min=%.1f median=%.1f max=%.1f ms\n", st.min, st.median, st.max);
+    std::printf(
+        "  coordinator_up        min=%.1f median=%.1f max=%.1f ms\n", sj.min, sj.median, sj.max);
+    std::printf("  worker_register  min=%.1f median=%.1f max=%.1f ms\n", st.min, st.median, st.max);
     std::printf("  deploy_run   min=%.1f median=%.1f max=%.1f ms\n", sd.min, sd.median, sd.max);
     std::printf("  total        min=%.1f median=%.1f max=%.1f ms\n", so.min, so.median, so.max);
 
@@ -1168,9 +1177,9 @@ int main() {
     std::printf("\n---- failover ----\n");
     const auto f = failover_once(node, submit, job_so);
     std::printf("FAILOVER RECOVERY:\n");
-    std::printf("  real failover          %s (JM watchdog detected the TM loss)\n",
+    std::printf("  real failover          %s (coordinator watchdog detected the worker loss)\n",
                 f.real_failover ? "yes" : "NO - kill was a no-op, number invalid");
-    std::printf("  heartbeat_timeout      %d ms (TM-loss detection window, tunable)\n",
+    std::printf("  heartbeat_timeout      %d ms (worker-loss detection window, tunable)\n",
                 f.heartbeat_ms);
     std::printf("  checkpoint before crash COMPLETED-%llu\n",
                 static_cast<unsigned long long>(f.ckpt_before));
@@ -1178,7 +1187,8 @@ int main() {
                 static_cast<unsigned long long>(f.ckpt_after));
     std::printf("  recovery_ms            %.1f ms (SIGKILL -> first new durable checkpoint)\n",
                 f.recovery_ms);
-    std::printf("    of which ~%d ms is the tunable TM-loss detection window;\n", f.heartbeat_ms);
+    std::printf("    of which ~%d ms is the tunable worker-loss detection window;\n",
+                f.heartbeat_ms);
     std::printf("    the remainder is redeploy + state restore + resume.\n");
     std::printf("  job completed          submit_exit=%d\n", f.submit_exit);
     std::printf("  committed records      %zu / %zu (exactly-once across failover: %s)\n",
@@ -1217,9 +1227,9 @@ int main() {
         std::printf("  SKIPPED (set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET to run)\n");
     }
 
-    // ---- SEQUENTIAL multi-failover: crash the active TM N times in a row ----
-    // Proves exactly-once is preserved not just across one TM loss but across a
-    // chain of them, each crash mid-flight on a fresh active TM (rolling
+    // ---- SEQUENTIAL multi-failover: crash the active worker N times in a row ----
+    // Proves exactly-once is preserved not just across one worker loss but across a
+    // chain of them, each crash mid-flight on a fresh active worker (rolling
     // standby). Run on the local-dir backend as a control and, when MinIO is
     // configured, on the disaggregated remote-read:// (S3) backend - the latter
     // re-restores the source offset from the last committed S3 checkpoint on
@@ -1229,11 +1239,11 @@ int main() {
     std::printf("\n---- sequential multi-failover (%d crashes in a row) ----\n", kSeqFailovers);
     const auto seq_file = failover_sequential(node, submit, job_so, kSeqFailovers);
     std::printf(
-        "  [file] real_crashes=%zu/%zu tm_lost=%zu survivor_restarts=%zu "
+        "  [file] real_crashes=%zu/%zu worker_lost=%zu survivor_restarts=%zu "
         "committed=%zu/%zu dups=%zu submit_exit=%d monotonic_ckpts=%s exactly_once=%s%s%s\n",
         seq_file.real_crashes,
         seq_file.requested,
-        seq_file.tm_lost_events,
+        seq_file.worker_lost_events,
         seq_file.survivor_restarts,
         seq_file.committed,
         seq_file.expected,
@@ -1252,12 +1262,12 @@ int main() {
                                 "?endpoint=" + s3_endpoint + "&region=us-east-1";
         const auto seq_rr = failover_sequential(node, submit, job_so, kSeqFailovers, uri);
         std::printf(
-            "  [remote-read] real_crashes=%zu/%zu tm_lost=%zu survivor_restarts=%zu "
+            "  [remote-read] real_crashes=%zu/%zu worker_lost=%zu survivor_restarts=%zu "
             "committed=%zu/%zu dups=%zu submit_exit=%d avg_recovery_ms=%.0f "
             "monotonic_ckpts=%s exactly_once=%s%s%s\n",
             seq_rr.real_crashes,
             seq_rr.requested,
-            seq_rr.tm_lost_events,
+            seq_rr.worker_lost_events,
             seq_rr.survivor_restarts,
             seq_rr.committed,
             seq_rr.expected,
@@ -1270,7 +1280,7 @@ int main() {
             seq_rr.missing_sample.c_str());
         std::printf(
             "  (every record - including the post-last-checkpoint tail - is durably\n"
-            "   committed: at clean EOS the source drives one JM-coordinated FINAL\n"
+            "   committed: at clean EOS the source drives one coordinator-coordinated FINAL\n"
             "   checkpoint and blocks until it commits, so a crash anywhere replays it)\n");
         seq_remote_ok = seq_rr.ok;
     } else {
@@ -1278,8 +1288,8 @@ int main() {
     }
 
     // ---- no-crash end-of-stream final-checkpoint TIMEOUT -> recovery ----
-    // The one path the failover legs cannot reach (they all crash a TM): a
-    // source's EOS final checkpoint stalls while the JM stays alive. It must
+    // The one path the failover legs cannot reach (they all crash a worker): a
+    // source's EOS final checkpoint stalls while the coordinator stays alive. It must
     // surface as a whole-job restart + replay, recovering exactly-once, NOT
     // silently complete with an uncommitted tail. Runs last so its test hooks
     // never leak to the other legs. Local-only (no S3 needed).
@@ -1294,7 +1304,7 @@ int main() {
         eos.restart_observed ? "yes" : "NO",
         eos.exactly_once ? "yes" : "NO");
     std::printf(
-        "  (the stalled final checkpoint timed out -> the source threw -> the JM rolled\n"
+        "  (the stalled final checkpoint timed out -> the source threw -> the coordinator rolled\n"
         "   the whole job back to the last checkpoint and replayed, recovering the tail)\n");
 
     // ---- PERMANENT EOS final-checkpoint failure -> bounded restart + loud fail ----

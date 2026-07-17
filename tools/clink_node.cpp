@@ -1,9 +1,9 @@
-// clink_node - one binary that runs as either JobManager or
-// TaskManager based on `--role`. The binary itself ships no job-
-// specific code: TMs auto-register the generic subtask role from the
-// OperatorRegistry; the JM accepts pipelines submitted via the
-// programmatic StreamExecutionEnvironment API (see
-// include/clink/api/stream_execution_environment.hpp).
+// clink_node - one binary that runs as either Coordinator or
+// Worker based on `--role`. The binary itself ships no job-
+// specific code: workers auto-register the generic subtask role from the
+// OperatorRegistry; the coordinator accepts pipelines submitted via the
+// programmatic Pipeline API (see
+// include/clink/api/pipeline.hpp).
 //
 // Job submission is intentionally NOT exposed here.  doesn't
 // configure jobs via JSON files and clink follows suit: applications
@@ -12,13 +12,13 @@
 // tests/integration/test_stream_env_end_to_end.cpp for the shape.
 //
 // Examples
-//   # Run the JobManager on the default port (6123).
-//   clink_node --role=jm
+//   # Run the Coordinator on the default port (6123).
+//   clink_node --role=coordinator
 //
-//   # Run a TaskManager that finds the JM at 127.0.0.1:6123.
-//   clink_node --role=tm --id=tm-a
+//   # Run a Worker that finds the coordinator at 127.0.0.1:6123.
+//   clink_node --role=worker --id=worker-a
 //
-// All --port / --jm-port / --jm-host flags accept overrides.
+// All --port / --coordinator-port / --coordinator-host flags accept overrides.
 
 #include <atomic>
 #include <chrono>
@@ -51,15 +51,15 @@
 #ifdef CLINK_LINKED_ETCD
 #include "clink/etcd/etcd_ha_coordinator.hpp"
 #endif
+#include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/job_bundle.hpp"
 #include "clink/cluster/job_graph.hpp"
-#include "clink/cluster/job_manager.hpp"
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/plugin_cache.hpp"
 #include "clink/cluster/plugin_loader.hpp"
 #include "clink/cluster/protocol.hpp"
-#include "clink/cluster/task_manager.hpp"
+#include "clink/cluster/worker.hpp"
 #include "clink/lineage/lineage_listener.hpp"
 #ifdef CLINK_HAS_HTTP
 #include "clink/cluster/snapshots.hpp"
@@ -73,7 +73,7 @@
 #include "clink/metrics/prometheus.hpp"
 #include "clink/metrics/system_metrics.hpp"
 #include "clink/queryable_state/arrow_scan.hpp"
-#include "clink/queryable_state/jm_routes.hpp"
+#include "clink/queryable_state/coordinator_routes.hpp"
 #include "clink/queryable_state/live_export.hpp"
 #include "clink/queryable_state/registry.hpp"
 #include "clink/queryable_state/server.hpp"
@@ -185,7 +185,7 @@ using namespace std::chrono_literals;
 
 // Process-wide "shutdown requested" flag the role mainloops poll. A
 // SIGTERM / SIGINT handler sets it; the loop wakes within at most one
-// poll interval (200ms) and calls JM::stop() / TM::stop() so the
+// poll interval (200ms) and calls coordinator::stop() / worker::stop() so the
 // listener fd closes, the accept thread joins, in-flight subtasks
 // drain via their existing cancellation paths, and the binary exits 0.
 // Without this, the existing `while (true) sleep_for(1h)` made
@@ -255,7 +255,7 @@ std::string json_escape(std::string_view s) {
     return out;
 }
 
-// Compose a /api/v1/health JSON body for a role. The role-tag (jm/tm)
+// Compose a /api/v1/health JSON body for a role. The role-tag (coordinator/worker)
 // is the discriminator the dashboard uses to decide which view to
 // render. uptime is computed from a steady-clock anchor taken when
 // the role starts. ok is always true today; future readiness checks
@@ -285,9 +285,9 @@ std::string make_health_body(std::string_view role,
 // of the JSON shape - adding fields means touching both the snapshot
 // struct (snapshots.hpp) and one of these serializers.
 
-void write_tm_summary(clink::http::JsonWriter& w, const clink::cluster::TmSummary& t) {
+void write_worker_summary(clink::http::JsonWriter& w, const clink::cluster::WorkerSummary& t) {
     w.begin_object();
-    w.kv("tm_id", t.tm_id);
+    w.kv("worker_id", t.worker_id);
     w.kv("data_host", t.data_host);
     w.kv("slot_capacity", t.slot_capacity);
     w.kv("slots_in_use", t.slots_in_use);
@@ -306,9 +306,9 @@ void write_cluster(clink::http::JsonWriter& w, const clink::cluster::ClusterSnap
     w.kv("jobs_total", s.jobs_total);
     w.kv("jobs_running", s.jobs_running);
     w.kv("jobs_completed", s.jobs_completed);
-    w.key("task_managers").begin_array();
-    for (const auto& tm : s.task_managers) {
-        write_tm_summary(w, tm);
+    w.key("workers").begin_array();
+    for (const auto& worker : s.workers) {
+        write_worker_summary(w, worker);
     }
     w.end_array();
     w.end_object();
@@ -342,7 +342,7 @@ void write_job_detail(clink::http::JsonWriter& w, const clink::cluster::JobDetai
         w.begin_object();
         w.kv("role", se.role);
         w.kv("subtask_idx", se.subtask_idx);
-        w.kv("tm_id", se.tm_id);
+        w.kv("worker_id", se.worker_id);
         w.kv("attempt", se.attempt);
         w.kv("ts_ms", static_cast<std::int64_t>(se.ts_ms));
         w.kv("message", se.message);
@@ -354,7 +354,7 @@ void write_job_detail(clink::http::JsonWriter& w, const clink::cluster::JobDetai
         w.begin_object();
         w.kv("role", t.role);
         w.kv("subtask_idx", t.subtask_idx);
-        w.kv("tm_id", t.tm_id);
+        w.kv("worker_id", t.worker_id);
         w.end_object();
     }
     w.end_array();
@@ -387,7 +387,7 @@ void write_job_graph(clink::http::JsonWriter& w, const clink::cluster::JobGraphD
         for (const auto& s : n.subtasks) {
             w.begin_object();
             w.kv("subtask_idx", static_cast<std::int64_t>(s.subtask_idx));
-            w.kv("tm_id", s.tm_id);
+            w.kv("worker_id", s.worker_id);
             w.kv("started_at_unix_ms", s.started_at_unix_ms);
             w.kv("finished_at_unix_ms", s.finished_at_unix_ms);
             w.end_object();
@@ -409,14 +409,14 @@ void write_job_graph(clink::http::JsonWriter& w, const clink::cluster::JobGraphD
     w.end_object();
 }
 
-void write_tm_snapshot(clink::http::JsonWriter& w, const clink::cluster::TmSnapshot& t) {
+void write_worker_snapshot(clink::http::JsonWriter& w, const clink::cluster::WorkerSnapshot& t) {
     w.begin_object();
-    w.kv("tm_id", t.tm_id);
+    w.kv("worker_id", t.worker_id);
     w.kv("data_host", t.data_host);
     w.kv("slot_capacity", t.slot_capacity);
     w.kv("slots_in_use", t.slots_in_use);
-    w.kv("jm_host", t.jm_host);
-    w.kv("jm_port", t.jm_port);
+    w.kv("coordinator_host", t.coordinator_host);
+    w.kv("coordinator_port", t.coordinator_port);
     w.kv("active_subtasks", t.active_subtasks);
     w.end_object();
 }
@@ -430,7 +430,8 @@ void write_subtask_record(clink::http::JsonWriter& w, const clink::cluster::Subt
     w.end_object();
 }
 
-void write_jm_config(clink::http::JsonWriter& w, const clink::cluster::JobManager::Config& c) {
+void write_coordinator_config(clink::http::JsonWriter& w,
+                              const clink::cluster::Coordinator::Config& c) {
     w.begin_object();
     w.kv("bind_host", c.bind_host);
     w.kv("advertise_host", c.advertise_host);
@@ -445,7 +446,7 @@ void write_jm_config(clink::http::JsonWriter& w, const clink::cluster::JobManage
     w.end_object();
 }
 
-void write_tm_config(clink::http::JsonWriter& w, const clink::cluster::TaskManager::Config& c) {
+void write_worker_config(clink::http::JsonWriter& w, const clink::cluster::Worker::Config& c) {
     w.begin_object();
     w.kv("slot_count", c.slot_count);
     w.kv("heartbeat_interval_ms",
@@ -453,19 +454,19 @@ void write_tm_config(clink::http::JsonWriter& w, const clink::cluster::TaskManag
     w.end_object();
 }
 
-// Build a proxy response for JM-side /api/v1/tms/:id/<remote_path>.
-// Pulls the (host, port) for `tm_id` from the JM's registry; 404 if
-// the TM is unknown / lost / didn't enable HTTP. Forwards the GET
+// Build a proxy response for coordinator-side /api/v1/workers/:id/<remote_path>.
+// Pulls the (host, port) for `worker_id` from the coordinator's registry; 404 if
+// the worker is unknown / lost / didn't enable HTTP. Forwards the GET
 // POST /api/v1/jobs upload handler. Multipart form with one `job_so`
 // file part and an optional `job_name` text part. Writes the bytes to
 // a temp file, loads them via PluginLoader (which runs the user's
 // build_fn under call_once and surfaces errors), extracts the
-// JobGraphSpec via clink_job_build, and calls JobManager::submit_job
-// with the bytes as a PluginBinary so every TM dlopens the same .so.
+// JobGraphSpec via clink_job_build, and calls Coordinator::submit_job
+// with the bytes as a PluginBinary so every worker dlopens the same .so.
 //
 // Returns 200 with {"job_id":N,"name":"...","ok":true} on success,
 // 400 on bad request (missing file), 500 on build/submit failure.
-clink::http::HttpResponse handle_submit_job(clink::cluster::JobManager& jm,
+clink::http::HttpResponse handle_submit_job(clink::cluster::Coordinator& coordinator,
                                             const clink::http::HttpRequest& req) {
     clink::http::HttpResponse resp;
     auto fail = [&](int status, std::string msg) {
@@ -556,12 +557,12 @@ clink::http::HttpResponse handle_submit_job(clink::cluster::JobManager& jm,
 
     std::uint64_t job_id = 0;
     try {
-        job_id = jm.submit_job(graph,
-                               clink::cluster::OperatorRegistry::default_instance(),
-                               std::move(plugins),
-                               clink::cluster::CheckpointConfig{},
-                               std::move(bundle),
-                               /*notify_client_conn=*/nullptr);
+        job_id = coordinator.submit_job(graph,
+                                        clink::cluster::OperatorRegistry::default_instance(),
+                                        std::move(plugins),
+                                        clink::cluster::CheckpointConfig{},
+                                        std::move(bundle),
+                                        /*notify_client_conn=*/nullptr);
     } catch (const std::exception& e) {
         return fail(500, std::string{"submit_job threw: "} + e.what());
     }
@@ -579,13 +580,13 @@ clink::http::HttpResponse handle_submit_job(clink::cluster::JobManager& jm,
 // POST /api/v1/jobs/spec - JSON-body job submission. The body is a
 // JobGraphSpec JSON document; no plugin .so. Use this for SQL-
 // compiled jobs and any other workflow that only references the
-// built-in operator factories already registered on every TM.
+// built-in operator factories already registered on every worker.
 //
 // Optional ?name=<job_name> picks the display name (defaults to
 // "sql_job"). Optional ?state_backend=<uri> picks the per-job state
 // backend (else the cluster default). Returns 200 with
 // {ok:true,job_id,name} on success, 400 on bad JSON, 500 on submit failure.
-clink::http::HttpResponse handle_submit_spec(clink::cluster::JobManager& jm,
+clink::http::HttpResponse handle_submit_spec(clink::cluster::Coordinator& coordinator,
                                              const clink::http::HttpRequest& req) {
     clink::http::HttpResponse resp;
     auto fail = [&](int status, std::string msg) {
@@ -625,12 +626,12 @@ clink::http::HttpResponse handle_submit_spec(clink::cluster::JobManager& jm,
 
     std::uint64_t job_id = 0;
     try {
-        job_id = jm.submit_job(graph,
-                               clink::cluster::OperatorRegistry::default_instance(),
-                               /*plugins=*/{},
-                               ckpt,
-                               /*bundle=*/nullptr,
-                               /*notify_client_conn=*/nullptr);
+        job_id = coordinator.submit_job(graph,
+                                        clink::cluster::OperatorRegistry::default_instance(),
+                                        /*plugins=*/{},
+                                        ckpt,
+                                        /*bundle=*/nullptr,
+                                        /*notify_client_conn=*/nullptr);
     } catch (const std::exception& e) {
         return fail(500, std::string{"submit_job threw: "} + e.what());
     }
@@ -649,7 +650,7 @@ clink::http::HttpResponse handle_submit_spec(clink::cluster::JobManager& jm,
 // Server-side SQL session: one catalog shared across requests so DDL registered
 // by one /api/v1/jobs/sql call (CREATE TABLE / VIEW, ALTER, RENAME, DROP) is
 // visible to later statements and later requests, and to the /api/v1/catalog
-// browser. Optionally persisted to a dir (--sql-catalog-dir) so it survives a JM
+// browser. Optionally persisted to a dir (--sql-catalog-dir) so it survives a coordinator
 // restart. The mutex serialises the (rare, interactive) SQL requests against the
 // concurrent catalog reads.
 struct SqlSession {
@@ -662,7 +663,7 @@ SqlSession& sql_session() {
     return session;
 }
 
-// Process-global scheduler for full-refresh materialized views. Started once the JM
+// Process-global scheduler for full-refresh materialized views. Started once the coordinator
 // is up (see main); each full-refresh CREATE registers its view + recompute callback.
 clink::cluster::RefreshScheduler& refresh_scheduler() {
     static clink::cluster::RefreshScheduler scheduler;
@@ -673,7 +674,8 @@ clink::cluster::RefreshScheduler& refresh_scheduler() {
 // on-CREATE initial population is separate (handle_compiled); this is the cadence /
 // manual REFRESH path. Locks the SQL session only to compile the spec (fast), then
 // submits + awaits without the lock so a long recompute never blocks interactive SQL.
-void run_materialized_view_refresh(clink::cluster::JobManager& jm, const std::string& view_name) {
+void run_materialized_view_refresh(clink::cluster::Coordinator& coordinator,
+                                   const std::string& view_name) {
     clink::cluster::JobGraphSpec spec;
     {
         auto& session = sql_session();
@@ -684,15 +686,15 @@ void run_materialized_view_refresh(clink::cluster::JobManager& jm, const std::st
         spec = planner.compile(static_cast<const clink::sql::LogicalSink&>(*plan));
         spec.name = "refresh_" + view_name;
     }
-    const auto job_id = jm.submit_job(spec,
-                                      clink::cluster::OperatorRegistry::default_instance(),
-                                      /*plugins=*/{},
-                                      clink::cluster::CheckpointConfig{},
-                                      /*bundle=*/nullptr,
-                                      /*notify_client_conn=*/nullptr);
+    const auto job_id = coordinator.submit_job(spec,
+                                               clink::cluster::OperatorRegistry::default_instance(),
+                                               /*plugins=*/{},
+                                               clink::cluster::CheckpointConfig{},
+                                               /*bundle=*/nullptr,
+                                               /*notify_client_conn=*/nullptr);
     // A bounded recompute; wait for it to finish (the overwrite sink republishes on
     // completion). A generous cap bounds a wedged job without hanging the scheduler.
-    jm.await_job_completion(job_id, std::chrono::minutes{10});
+    coordinator.await_job_completion(job_id, std::chrono::minutes{10});
 }
 
 // Re-register every full-refresh materialized view in the session catalog with the
@@ -701,7 +703,7 @@ void run_materialized_view_refresh(clink::cluster::JobManager& jm, const std::st
 // the catalog resumes their cadence without the original CREATE request). Idempotent:
 // a view already scheduled is skipped. The published backing data is served as-is
 // until the next scheduled refresh (no forced repopulate on takeover).
-void reregister_full_refresh_views(clink::cluster::JobManager& jm) {
+void reregister_full_refresh_views(clink::cluster::Coordinator& coordinator) {
     auto& session = sql_session();
     std::vector<std::pair<std::string, std::int64_t>> full_views;
     {
@@ -733,8 +735,8 @@ void reregister_full_refresh_views(clink::cluster::JobManager& jm) {
             continue;
         }
         refresh_scheduler().register_view(
-            name, std::chrono::milliseconds{interval_ms}, [&jm, name]() {
-                run_materialized_view_refresh(jm, name);
+            name, std::chrono::milliseconds{interval_ms}, [&coordinator, name]() {
+                run_materialized_view_refresh(coordinator, name);
             });
     }
 }
@@ -745,11 +747,11 @@ void reregister_full_refresh_views(clink::cluster::JobManager& jm) {
 // MATERIALIZED VIEW (and an explicit EXPLAIN) the mode decides the action:
 //   explain -> return the LogicalPlan tree text (no job is created)
 //   compile -> return the compiled JobGraphSpec JSON as a string (no job)
-//   submit  -> submit to the JM and return the job id
+//   submit  -> submit to the coordinator and return the job id
 // Returns 200 with {ok:true,mode,applied,plans|specs|jobs}, or 400 with
 // {ok:false,error,position} on a parse/bind/compile error (position is the
 // 1-based byte offset, 0 if unknown).
-clink::http::HttpResponse handle_sql(clink::cluster::JobManager& jm,
+clink::http::HttpResponse handle_sql(clink::cluster::Coordinator& coordinator,
                                      const clink::http::HttpRequest& req) {
     clink::http::HttpResponse resp;
     auto fail = [&](int status, std::string msg, int position = -1) {
@@ -836,12 +838,13 @@ clink::http::HttpResponse handle_sql(clink::cluster::JobManager& jm,
         if (mode == "compile") {
             specs.push_back({nm, spec.to_json()});
         } else {  // submit
-            auto job_id = jm.submit_job(spec,
-                                        clink::cluster::OperatorRegistry::default_instance(),
-                                        /*plugins=*/{},
-                                        clink::cluster::CheckpointConfig{},
-                                        /*bundle=*/nullptr,
-                                        /*notify_client_conn=*/nullptr);
+            auto job_id =
+                coordinator.submit_job(spec,
+                                       clink::cluster::OperatorRegistry::default_instance(),
+                                       /*plugins=*/{},
+                                       clink::cluster::CheckpointConfig{},
+                                       /*bundle=*/nullptr,
+                                       /*notify_client_conn=*/nullptr);
             jobs.push_back({nm, job_id});
         }
     };
@@ -866,7 +869,7 @@ clink::http::HttpResponse handle_sql(clink::cluster::JobManager& jm,
                 catalog.register_table(std::get<ast::CreateTableStmt>(stmt));
                 ++applied;
             } else if (std::holds_alternative<ast::CreateModelStmt>(stmt)) {
-                // SQL-native AI: register the model in the JM's catalog so it persists
+                // SQL-native AI: register the model in the coordinator's catalog so it persists
                 // (survives restart / HA takeover) and a later ML_PREDICT re-plan - a
                 // scheduled full-refresh REFRESH, a client re-submit - can resolve it.
                 catalog.register_model(std::get<ast::CreateModelStmt>(stmt));
@@ -937,8 +940,8 @@ clink::http::HttpResponse handle_sql(clink::cluster::JobManager& jm,
                             refresh_scheduler().register_view(
                                 view_name,
                                 std::chrono::milliseconds{interval_ms},
-                                [&jm, view_name]() {
-                                    run_materialized_view_refresh(jm, view_name);
+                                [&coordinator, view_name]() {
+                                    run_materialized_view_refresh(coordinator, view_name);
                                 });
                         }
                     }
@@ -1206,7 +1209,7 @@ clink::http::SseFactory make_event_bus_sse_factory() {
 }
 
 // Build a /metrics body from the process-wide MetricsRegistry. Same
-// renderer on JM and TM; the metric names differ by which helpers each
+// renderer on coordinator and worker; the metric names differ by which helpers each
 // side has wired (process_metrics.hpp).
 clink::http::HttpResponse make_metrics_response() {
     clink::metrics::http::request_seen();
@@ -1292,13 +1295,13 @@ clink::http::HttpResponse make_log_components_response() {
 // --- per-operator runtime stats (GET /api/v1/jobs/:id/operators) -----------
 //
 // Aggregates the per-operator clink_op_* series the runtime emits into each
-// TM's host registry. The JM scrapes every TM hosting the job, parses the
+// worker's host registry. The coordinator scrapes every worker hosting the job, parses the
 // Prometheus text, maps the numeric op_id back to a graph node (via the
 // clink_op_info series the runtime emits, plus operator_id_from_uid for uid'd
-// nodes), and folds the per-(op_id, TM) values into per-operator totals. The
-// host registry is one-per-TM-process shared across that TM's subtasks, so the
-// finest separable granularity is per-TM (the /graph placement lists which
-// exact subtasks run on each TM); per-TM rows are included alongside the
+// nodes), and folds the per-(op_id, worker) values into per-operator totals. The
+// host registry is one-per-worker-process shared across that worker's subtasks, so the
+// finest separable granularity is per-worker (the /graph placement lists which
+// exact subtasks run on each worker); per-worker rows are included alongside the
 // node-level totals.
 namespace opstats {
 
@@ -1384,26 +1387,26 @@ struct OpRuntime {
     bool has_watermark{false};
     std::int64_t input_depth{0};
     std::int64_t input_capacity{0};
-    bool stale{false};  // at least one hosting TM was unreachable
+    bool stale{false};  // at least one hosting worker was unreachable
 
-    struct TmRow {
-        std::string tm_id;
+    struct WorkerRow {
+        std::string worker_id;
         std::uint64_t records_in{0};
         std::uint64_t records_out{0};
         std::int64_t input_depth{0};
         std::int64_t input_capacity{0};
     };
-    std::vector<TmRow> per_tm;
-    // Named user accumulators, summed across TMs (within a TM the gauge already
+    std::vector<WorkerRow> per_worker;
+    // Named user accumulators, summed across workers (within a worker the gauge already
     // merged the operator's subtasks). Sorted for stable JSON output.
     std::map<std::string, std::int64_t> accumulators;
 };
 
-// Build the per-operator stats by scraping every TM hosting the job.
-inline std::vector<OpRuntime> build(const clink::cluster::JobManager& jm,
+// Build the per-operator stats by scraping every worker hosting the job.
+inline std::vector<OpRuntime> build(const clink::cluster::Coordinator& coordinator,
                                     clink::cluster::JobId job_id,
                                     bool& available) {
-    auto g = jm.snapshot_job_graph(job_id);
+    auto g = coordinator.snapshot_job_graph(job_id);
     if (!g.has_value()) {
         available = false;
         return {};
@@ -1435,18 +1438,18 @@ inline std::vector<OpRuntime> build(const clink::cluster::JobManager& jm,
     if (!available)
         return ops;
 
-    // Distinct TMs hosting any subtask of this job.
-    std::vector<std::string> tms;
-    std::unordered_set<std::string> seen_tm;
+    // Distinct workers hosting any subtask of this job.
+    std::vector<std::string> workers;
+    std::unordered_set<std::string> seen_worker;
     for (const auto& o : ops) {
         for (const auto& s : o.subtasks) {
-            if (seen_tm.insert(s.tm_id).second)
-                tms.push_back(s.tm_id);
+            if (seen_worker.insert(s.worker_id).second)
+                workers.push_back(s.worker_id);
         }
     }
 
-    for (const auto& tm_id : tms) {
-        auto tgt = jm.tm_http_target(tm_id);
+    for (const auto& worker_id : workers) {
+        auto tgt = coordinator.worker_http_target(worker_id);
         std::string body;
         bool reachable = tgt.has_value();
         if (reachable) {
@@ -1461,7 +1464,7 @@ inline std::vector<OpRuntime> build(const clink::cluster::JobManager& jm,
         if (!reachable) {
             for (auto& o : ops) {
                 for (const auto& s : o.subtasks) {
-                    if (s.tm_id == tm_id) {
+                    if (s.worker_id == worker_id) {
                         o.stale = true;
                         break;
                     }
@@ -1475,8 +1478,8 @@ inline std::vector<OpRuntime> build(const clink::cluster::JobManager& jm,
             std::int64_t depth{0}, cap{0}, wm{0};
             bool has_wm{false};
         };
-        std::unordered_map<std::uint64_t, M> by_op;  // op_id -> metrics on this TM
-        // op_id -> {accumulator name -> value} on this TM (gauge already merged
+        std::unordered_map<std::uint64_t, M> by_op;  // op_id -> metrics on this worker
+        // op_id -> {accumulator name -> value} on this worker (gauge already merged
         // the operator's subtasks within the process).
         std::unordered_map<std::uint64_t, std::map<std::string, std::int64_t>> by_op_acc;
 
@@ -1497,7 +1500,7 @@ inline std::vector<OpRuntime> build(const clink::cluster::JobManager& jm,
             }
             if (p.base == "clink_op_info") {
                 // Map op_id -> node via the runtime-emitted identity series
-                // (covers non-uid operators the JM cannot recompute).
+                // (covers non-uid operators the coordinator cannot recompute).
                 const auto nit = p.labels.find("node");
                 if (nit != p.labels.end()) {
                     const auto idx = by_node.find(nit->second);
@@ -1557,7 +1560,7 @@ inline std::vector<OpRuntime> build(const clink::cluster::JobManager& jm,
                 o.watermark_ms = m.wm;  // operator watermark = min over its subtasks
                 o.has_watermark = true;
             }
-            o.per_tm.push_back({tm_id, m.ri, m.ro, m.depth, m.cap});
+            o.per_worker.push_back({worker_id, m.ri, m.ro, m.depth, m.cap});
         }
 
         for (const auto& [oid, accs] : by_op_acc) {
@@ -1567,7 +1570,7 @@ inline std::vector<OpRuntime> build(const clink::cluster::JobManager& jm,
             auto& o = ops[iit->second];
             o.has_metrics = true;
             for (const auto& [name, val] : accs) {
-                o.accumulators[name] += val;  // sum across TMs
+                o.accumulators[name] += val;  // sum across workers
             }
         }
     }
@@ -1609,16 +1612,16 @@ inline void write_json(clink::http::JsonWriter& w,
         for (const auto& s : o.subtasks) {
             w.begin_object();
             w.kv("subtask_idx", static_cast<std::int64_t>(s.subtask_idx));
-            w.kv("tm_id", s.tm_id);
+            w.kv("worker_id", s.worker_id);
             w.kv("started_at_unix_ms", s.started_at_unix_ms);
             w.kv("finished_at_unix_ms", s.finished_at_unix_ms);
             w.end_object();
         }
         w.end_array();
-        w.key("per_tm").begin_array();
-        for (const auto& t : o.per_tm) {
+        w.key("per_worker").begin_array();
+        for (const auto& t : o.per_worker) {
             w.begin_object();
-            w.kv("tm_id", t.tm_id);
+            w.kv("worker_id", t.worker_id);
             w.kv("records_in", t.records_in);
             w.kv("records_out", t.records_out);
             w.kv("input_depth", t.input_depth);
@@ -1639,27 +1642,27 @@ inline void write_json(clink::http::JsonWriter& w,
 
 }  // namespace opstats
 
-clink::http::HttpResponse proxy_to_tm(const clink::cluster::JobManager& jm,
-                                      const std::string& tm_id,
-                                      const std::string& remote_path) {
+clink::http::HttpResponse proxy_to_worker(const clink::cluster::Coordinator& coordinator,
+                                          const std::string& worker_id,
+                                          const std::string& remote_path) {
     clink::http::HttpResponse out;
-    auto target = jm.tm_http_target(tm_id);
+    auto target = coordinator.worker_http_target(worker_id);
     if (!target.has_value()) {
         out.status = 404;
-        out.body =
-            std::string{R"({"error":"no such TM, or TM has no HTTP listener: )"} + tm_id + "\"}";
+        out.body = std::string{R"({"error":"no such worker, or worker has no HTTP listener: )"} +
+                   worker_id + "\"}";
         return out;
     }
     clink::http::HttpClient client(target->first, target->second);
     auto r = client.get(remote_path);
     if (r.status == 0) {
         out.status = 502;
-        out.body = std::string{R"({"error":"proxy to TM failed: )"} + r.error + "\"}";
+        out.body = std::string{R"({"error":"proxy to worker failed: )"} + r.error + "\"}";
         return out;
     }
     out.status = r.status;
     out.body = std::move(r.body);
-    // Forwarded TM responses are always JSON for our /api/v1/* routes;
+    // Forwarded worker responses are always JSON for our /api/v1/* routes;
     // preserve the content-type so a curl piped into jq Just Works.
     out.content_type = "application/json";
     return out;
@@ -1728,59 +1731,59 @@ clink::logging::LoggingConfig make_logging_config(int argc, char** argv, std::st
     return cfg;
 }
 
-// JM mode. Bind, idle, await jobs. Stops cleanly on SIGINT/SIGTERM. The
+// coordinator mode. Bind, idle, await jobs. Stops cleanly on SIGINT/SIGTERM. The
 // binary stays up until killed; jobs come and go entirely over the
 // submission protocol.
-int run_jm(int argc, char** argv) {
+int run_coordinator(int argc, char** argv) {
     // Initialise logging before anything emits. Configures console + optional
     // rolling (zstd-compressed) file sink + the /api/v1/logs ring; all
     // clink::log calls and the daemon diagnostics below route through it.
-    clink::logging::init(make_logging_config(argc, argv, "jm"));
+    clink::logging::init(make_logging_config(argc, argv, "coordinator"));
 #ifdef CLINK_HAS_HTTP
-    clink::metrics::init_jm_metrics();
+    clink::metrics::init_coordinator_metrics();
     clink::metrics::init_checkpoint_metrics();
 #endif
-    const auto port_str = get_arg(argc, argv, "port", std::to_string(kDefaultJobManagerPort));
+    const auto port_str = get_arg(argc, argv, "port", std::to_string(kDefaultCoordinatorPort));
     const auto bind_host = get_arg(argc, argv, "bind-host", "127.0.0.1");
     const auto advertise_host = get_arg(argc, argv, "advertise-host", bind_host);
     const auto duration_str = get_arg(argc, argv, "stop-after", "");
     const auto http_port_str = get_arg(argc, argv, "http-port", "0");
     const auto http_bind = get_arg(argc, argv, "http-bind", "127.0.0.1");
     // TLS for the control-plane listener. If --tls-cert is given, the
-    // JM presents this cert to connecting TMs and clients, and accepts
+    // coordinator presents this cert to connecting workers and clients, and accepts
     // only TLS handshakes. --tls-client-ca turns on mTLS (server
-    // requires + verifies a TM/client cert).
+    // requires + verifies a worker/client cert).
     const auto tls_cert = get_arg(argc, argv, "tls-cert", "");
     const auto tls_key = get_arg(argc, argv, "tls-key", "");
     const auto tls_client_ca = get_arg(argc, argv, "tls-client-ca", "");
     // HA: shared directory used by the FileHaCoordinator for leader
     // election (leader.lock + active-leader.json) and job-manifest
     // persistence (jobs/<id>/manifest.json + plugin-*.so). When set
-    // along with a non-zero --port, this JM races for leadership; if
-    // it wins, it advertises the bound port and accepts TM connections.
+    // along with a non-zero --port, this coordinator races for leadership; if
+    // it wins, it advertises the bound port and accepts worker connections.
     // If a previous leader had submitted jobs, on takeover it scans
     // <ha-dir>/jobs and replays each one with restore_from at the
     // latest checkpoint.
     const auto ha_dir = get_arg(argc, argv, "ha-dir", "");
-    // Etcd-backed HA: when --etcd-endpoints is provided, the JM uses
+    // Etcd-backed HA: when --etcd-endpoints is provided, the coordinator uses
     // the etcd coordinator for leader election instead of the file
     // lock. --ha-dir is STILL required for job manifest persistence -
     // etcd handles the election primitive, but plugin .so bytes are
     // too large to stash in etcd values and stay on shared/local
     // disk. --etcd-cluster names the logical cluster; the leader key
-    // is /clink/jm/<cluster>/leader so multiple clink deployments
+    // is /clink/coordinator/<cluster>/leader so multiple clink deployments
     // can share one etcd.
     const auto etcd_endpoints = get_arg(argc, argv, "etcd-endpoints", "");
     const auto etcd_cluster = get_arg(argc, argv, "etcd-cluster", "default");
     const auto etcd_ttl_str = get_arg(argc, argv, "etcd-lease-ttl-s", "10");
     // Upper bound on how long a job may sit draining survivors before a
-    // TM-loss restart fires; on expiry the JM fails the job rather than
+    // worker-loss restart fires; on expiry the coordinator fails the job rather than
     // wedge on a hung survivor. Tunable per deployment.
     const auto restart_drain_timeout_str = get_arg(argc, argv, "restart-drain-timeout-ms", "30000");
-    // How long the JM waits without hearing from a TM before declaring it
+    // How long the coordinator waits without hearing from a worker before declaring it
     // lost (and, if checkpointing + restart are configured, restarting the
     // job from the latest checkpoint). The default is conservative; lower
-    // it to detect a crashed TM faster (it must stay above the TM's
+    // it to detect a crashed worker faster (it must stay above the worker's
     // heartbeat_interval, 500ms, to avoid false positives). The watchdog
     // poll cadence is tunable too.
     const auto heartbeat_timeout_str = get_arg(argc, argv, "heartbeat-timeout-ms", "5000");
@@ -1803,7 +1806,7 @@ int run_jm(int argc, char** argv) {
     const auto lineage_endpoint = get_arg(argc, argv, "lineage-endpoint", "");
     const auto lineage_namespace = get_arg(argc, argv, "lineage-namespace", "");
 
-    JobManager::Config cfg;
+    Coordinator::Config cfg;
     cfg.bind_host = bind_host;
     cfg.advertise_host = advertise_host;
     cfg.heartbeat_timeout = std::chrono::milliseconds{std::stoll(heartbeat_timeout_str)};
@@ -1811,23 +1814,23 @@ int run_jm(int argc, char** argv) {
     cfg.restart_drain_timeout = std::chrono::milliseconds{std::stoll(restart_drain_timeout_str)};
     cfg.default_state_backend_uri = default_state_backend;
     if (!ha_dir.empty()) {
-        // Takeover recovery races a TM restart: the standby tries to
+        // Takeover recovery races a worker restart: the standby tries to
         // resubmit persisted jobs as soon as it wins leadership, but
-        // the supervisor needs a beat to restart the TM whose
+        // the supervisor needs a beat to restart the worker whose
         // connection died with the old leader. Wait up to 15s for
         // slots before failing the recovery.
         cfg.submit_wait_for_slots = 15s;
     }
 
-    JobManager jm(cfg);
+    Coordinator coordinator(cfg);
     if (!ha_dir.empty()) {
-        jm.set_ha_dir(ha_dir);
+        coordinator.set_ha_dir(ha_dir);
     }
 
     // Data-lineage exporter. Subscribe to the EventBus before any job is
     // submitted or replayed (HA takeover replays on becoming leader), so no
-    // jm.job_lineage event is missed. The dispatcher owns the listener and
-    // the subscription for the lifetime of run_jm. Off unless a listener is
+    // coordinator.job_lineage event is missed. The dispatcher owns the listener and
+    // the subscription for the lifetime of run_coordinator. Off unless a listener is
     // named; only the leader produces job events, so no HA-double-emit guard
     // is needed (a standby never submits).
     std::unique_ptr<clink::lineage::LineageDispatcher> lineage_dispatcher;
@@ -1847,9 +1850,9 @@ int run_jm(int argc, char** argv) {
             listeners.push_back(std::move(listener));
             lineage_dispatcher =
                 std::make_unique<clink::lineage::LineageDispatcher>(std::move(listeners));
-            std::cout << "JM lineage export via '" << lineage_listener << "'\n";
+            std::cout << "coordinator lineage export via '" << lineage_listener << "'\n";
         } else {
-            clink::log::warn("jm.lineage",
+            clink::log::warn("coordinator.lineage",
                              "unknown or unconfigured lineage listener '" + lineage_listener +
                                  "'; export disabled");
         }
@@ -1860,15 +1863,15 @@ int run_jm(int argc, char** argv) {
         if (!tls_client_ca.empty()) {
             server_ctx->set_client_ca_path(tls_client_ca);
         }
-        jm.set_accept_factory([server_ctx](int listener_fd) {
+        coordinator.set_accept_factory([server_ctx](int listener_fd) {
             return clink::network::accept_tls_connection(listener_fd, server_ctx);
         });
-        std::cout << "JM TLS enabled (cert=" << tls_cert
+        std::cout << "coordinator TLS enabled (cert=" << tls_cert
                   << (tls_client_ca.empty() ? "" : ", mTLS=on") << ")\n";
     }
 #else
     if (!tls_cert.empty() || !tls_key.empty() || !tls_client_ca.empty()) {
-        clink::log::warn("jm.tls", "--tls-* flags ignored (clink_tls not linked)");
+        clink::log::warn("coordinator.tls", "--tls-* flags ignored (clink_tls not linked)");
     }
 #endif
     const auto want_port = static_cast<std::uint16_t>(std::stoi(port_str));
@@ -1878,15 +1881,15 @@ int run_jm(int argc, char** argv) {
     const std::string sql_catalog_dir = get_arg(argc, argv, "sql-catalog-dir", "");
     std::unique_ptr<clink::cluster::HaCoordinator> ha_coord;
     if (ha_dir.empty()) {
-        const auto bound = jm.start(want_port);
+        const auto bound = coordinator.start(want_port);
         // Load-bearing readiness banner on STDOUT: test harnesses and operators
-        // grep stdout for "JM listening". Keep it on std::cout (NOT the logger)
+        // grep stdout for "coordinator listening". Keep it on std::cout (NOT the logger)
         // so it survives --log-no-console and is not reordered by async logging.
-        std::cout << "JM listening on " << advertise_host << ":" << bound << "\n";
+        std::cout << "coordinator listening on " << advertise_host << ":" << bound << "\n";
         std::cout.flush();
     } else {
-        // HA mode: defer jm.start until this JM wins the leadership
-        // election. Standby JMs just sit on the coordinator's poll
+        // HA mode: defer coordinator.start until this coordinator wins the leadership
+        // election. Standby coordinators just sit on the coordinator's poll
         // thread; on takeover the callback binds the control port and
         // replays any persisted jobs.
         clink::cluster::LeaderEndpoint advertise;
@@ -1899,10 +1902,10 @@ int run_jm(int argc, char** argv) {
             ecfg.cluster_name = etcd_cluster;
             ecfg.lease_ttl = std::chrono::seconds{std::stoi(etcd_ttl_str)};
             ha_coord = clink::cluster::make_etcd_ha_coordinator(ecfg, advertise);
-            std::cout << "JM HA via etcd endpoints=" << etcd_endpoints
+            std::cout << "coordinator HA via etcd endpoints=" << etcd_endpoints
                       << " cluster=" << etcd_cluster << "\n";
 #else
-            std::cerr << "JM: --etcd-endpoints given but clink_etcd not linked; "
+            std::cerr << "coordinator: --etcd-endpoints given but clink_etcd not linked; "
                          "rebuild with -DCLINK_WITH_ETCD=ON (and etcd-cpp-apiv3 installed)\n";
             return 1;
 #endif
@@ -1910,13 +1913,13 @@ int run_jm(int argc, char** argv) {
             ha_coord = clink::cluster::make_file_ha_coordinator(ha_dir, advertise);
         }
         ha_coord->set_on_become_leader(
-            [&jm, want_port, advertise_host, sql_catalog_dir](std::uint64_t epoch) {
+            [&coordinator, want_port, advertise_host, sql_catalog_dir](std::uint64_t epoch) {
                 try {
-                    const auto bound = jm.start(want_port);
-                    std::cout << "JM became leader (epoch=" << epoch << "), listening on "
+                    const auto bound = coordinator.start(want_port);
+                    std::cout << "coordinator became leader (epoch=" << epoch << "), listening on "
                               << advertise_host << ":" << bound << "\n";
                     std::cout.flush();
-                    jm.recover_persisted_jobs();
+                    coordinator.recover_persisted_jobs();
 #ifdef CLINK_LINKED_SQL
                     // Reload the persisted catalog (the previous leader may have
                     // created materialized views after this node's startup load) and
@@ -1926,16 +1929,16 @@ int run_jm(int argc, char** argv) {
                         std::lock_guard<std::mutex> lock(session.mu);
                         session.catalog.load_from_dir(sql_catalog_dir);
                     }
-                    reregister_full_refresh_views(jm);
+                    reregister_full_refresh_views(coordinator);
 #else
                     (void)sql_catalog_dir;
 #endif
                 } catch (const std::exception& e) {
-                    std::cerr << "JM HA takeover failed: " << e.what() << "\n";
+                    std::cerr << "coordinator HA takeover failed: " << e.what() << "\n";
                 }
             });
         ha_coord->start();
-        std::cout << "JM standby (ha-dir=" << ha_dir << ")\n";
+        std::cout << "coordinator standby (ha-dir=" << ha_dir << ")\n";
         std::cout.flush();
     }
 
@@ -1973,52 +1976,54 @@ int run_jm(int argc, char** argv) {
 #ifdef CLINK_LINKED_SQL
         // Optional persistent SQL catalog for the /api/v1/jobs/sql workbench:
         // load any tables/views from the dir and auto-save subsequent DDL, so
-        // table definitions survive a JM restart. Without it the catalog is
+        // table definitions survive a coordinator restart. Without it the catalog is
         // in-memory (session-scoped).
         if (const auto sql_dir = get_arg(argc, argv, "sql-catalog-dir", ""); !sql_dir.empty()) {
             try {
                 sql_session().catalog.load_from_dir(sql_dir);
                 sql_session().catalog.set_persistence_dir(sql_dir);
-                std::cout << "JM SQL catalog dir: " << sql_dir << "\n";
+                std::cout << "coordinator SQL catalog dir: " << sql_dir << "\n";
             } catch (const std::exception& e) {
-                std::cerr << "JM: failed to load --sql-catalog-dir " << sql_dir << ": " << e.what()
-                          << "\n";
+                std::cerr << "coordinator: failed to load --sql-catalog-dir " << sql_dir << ": "
+                          << e.what() << "\n";
             }
         }
 #endif
-        auto* jm_ptr = &jm;
-        // Queryable state: TM discovery, key routing, the one-call JSON
+        auto* coordinator_ptr = &coordinator;
+        // Queryable state: worker discovery, key routing, the one-call JSON
         // serving route (fan-out proxy), and the Arrow bulk scan.
-        clink::queryable_state::register_jm_routes(*http_srv, jm);
-        clink::queryable_state::register_jm_arrow_scan_route(*http_srv, jm);
-        // Live whole-job state export: fan out across the job's TMs and
+        clink::queryable_state::register_coordinator_routes(*http_srv, coordinator);
+        clink::queryable_state::register_coordinator_arrow_scan_route(*http_srv, coordinator);
+        // Live whole-job state export: fan out across the job's workers and
         // merge into one canonical Arrow snapshot stream.
-        clink::queryable_state::register_jm_state_export_route(*http_srv, jm);
-        http_srv->get("/api/v1/health", [start_time, jm_ptr](const clink::http::HttpRequest&) {
-            clink::http::HttpResponse resp;
-            resp.body = make_health_body("jm", start_time, jm_ptr->bound_port());
-            return resp;
-        });
-        http_srv->get("/api/v1/cluster", [jm_ptr](const clink::http::HttpRequest&) {
+        clink::queryable_state::register_coordinator_state_export_route(*http_srv, coordinator);
+        http_srv->get(
+            "/api/v1/health", [start_time, coordinator_ptr](const clink::http::HttpRequest&) {
+                clink::http::HttpResponse resp;
+                resp.body =
+                    make_health_body("coordinator", start_time, coordinator_ptr->bound_port());
+                return resp;
+            });
+        http_srv->get("/api/v1/cluster", [coordinator_ptr](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
             clink::http::JsonWriter w;
-            write_cluster(w, jm_ptr->snapshot_cluster());
+            write_cluster(w, coordinator_ptr->snapshot_cluster());
             resp.body = w.str();
             return resp;
         });
-        http_srv->get("/api/v1/config", [jm_ptr](const clink::http::HttpRequest&) {
+        http_srv->get("/api/v1/config", [coordinator_ptr](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
             clink::http::JsonWriter w;
-            write_jm_config(w, jm_ptr->config_snapshot());
+            write_coordinator_config(w, coordinator_ptr->config_snapshot());
             resp.body = w.str();
             return resp;
         });
-        http_srv->get("/api/v1/jobs", [jm_ptr](const clink::http::HttpRequest&) {
+        http_srv->get("/api/v1/jobs", [coordinator_ptr](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
             clink::http::JsonWriter w;
             w.begin_object();
             w.key("jobs").begin_array();
-            for (const auto& j : jm_ptr->snapshot_jobs()) {
+            for (const auto& j : coordinator_ptr->snapshot_jobs()) {
                 write_job_summary(w, j);
             }
             w.end_array();
@@ -2026,7 +2031,7 @@ int run_jm(int argc, char** argv) {
             resp.body = w.str();
             return resp;
         });
-        http_srv->get("/api/v1/jobs/:id", [jm_ptr](const clink::http::HttpRequest& req) {
+        http_srv->get("/api/v1/jobs/:id", [coordinator_ptr](const clink::http::HttpRequest& req) {
             clink::http::HttpResponse resp;
             clink::cluster::JobId job_id = 0;
             if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
@@ -2038,7 +2043,7 @@ int run_jm(int argc, char** argv) {
                     return resp;
                 }
             }
-            auto detail = jm_ptr->snapshot_job(job_id);
+            auto detail = coordinator_ptr->snapshot_job(job_id);
             if (!detail.has_value()) {
                 resp.status = 404;
                 resp.body = R"({"error":"no such job"})";
@@ -2051,96 +2056,99 @@ int run_jm(int argc, char** argv) {
         });
         // GET /api/v1/jobs/:id/graph - the logical operator DAG + subtask
         // placement, for the console's graph view.
-        http_srv->get("/api/v1/jobs/:id/graph", [jm_ptr](const clink::http::HttpRequest& req) {
-            clink::http::HttpResponse resp;
-            clink::cluster::JobId job_id = 0;
-            if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
-                try {
-                    job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
-                } catch (...) {
-                    resp.status = 400;
-                    resp.body = R"({"error":"invalid job id"})";
-                    return resp;
+        http_srv->get(
+            "/api/v1/jobs/:id/graph", [coordinator_ptr](const clink::http::HttpRequest& req) {
+                clink::http::HttpResponse resp;
+                clink::cluster::JobId job_id = 0;
+                if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
+                    try {
+                        job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
+                    } catch (...) {
+                        resp.status = 400;
+                        resp.body = R"({"error":"invalid job id"})";
+                        return resp;
+                    }
                 }
-            }
-            auto g = jm_ptr->snapshot_job_graph(job_id);
-            if (!g.has_value()) {
-                resp.status = 404;
-                resp.body = R"({"error":"no such job"})";
-                return resp;
-            }
-            clink::http::JsonWriter w;
-            write_job_graph(w, *g);
-            resp.body = w.str();
-            return resp;
-        });
-        // GET /api/v1/jobs/:id/lineage - the external datasets the job reads
-        // from and writes to, plus coarse source -> sink edges. Derived from
-        // the retained JobGraphSpec; for integrating clink into an external
-        // lineage system by polling (the same data is pushed on
-        // /api/v1/events as jm.job_lineage).
-        http_srv->get("/api/v1/jobs/:id/lineage", [jm_ptr](const clink::http::HttpRequest& req) {
-            clink::http::HttpResponse resp;
-            clink::cluster::JobId job_id = 0;
-            if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
-                try {
-                    job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
-                } catch (...) {
-                    resp.status = 400;
-                    resp.body = R"({"error":"invalid job id"})";
-                    return resp;
-                }
-            }
-            auto lg = jm_ptr->snapshot_job_lineage(job_id);
-            if (!lg.has_value()) {
-                resp.status = 404;
-                resp.body = R"({"error":"no such job"})";
-                return resp;
-            }
-            resp.body = "{\"job_id\":" + std::to_string(job_id) +
-                        ",\"available\":" + (lg->empty() ? "false" : "true") +
-                        ",\"lineage\":" + lg->to_json() + "}";
-            return resp;
-        });
-        // GET /api/v1/jobs/:id/operators - per-operator runtime stats (records
-        // in/out/dropped, backpressure, bytes, watermark) aggregated across the
-        // TMs hosting the job, for the console's per-node DAG overlays. Polled
-        // fast (the topology /graph is polled slowly); a slow/lost TM yields a
-        // partial response with the affected operators marked stale.
-        http_srv->get("/api/v1/jobs/:id/operators", [jm_ptr](const clink::http::HttpRequest& req) {
-            clink::http::HttpResponse resp;
-            clink::cluster::JobId job_id = 0;
-            if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
-                try {
-                    job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
-                } catch (...) {
-                    resp.status = 400;
-                    resp.body = R"({"error":"invalid job id"})";
-                    return resp;
-                }
-            }
-            bool available = false;
-            auto ops = opstats::build(*jm_ptr, job_id, available);
-            if (ops.empty() && !available) {
-                // snapshot_job_graph returned nullopt only for an unknown job.
-                if (!jm_ptr->snapshot_job(job_id).has_value()) {
+                auto g = coordinator_ptr->snapshot_job_graph(job_id);
+                if (!g.has_value()) {
                     resp.status = 404;
                     resp.body = R"({"error":"no such job"})";
                     return resp;
                 }
-            }
-            clink::http::JsonWriter w;
-            opstats::write_json(w, job_id, available, ops);
-            resp.body = w.str();
-            return resp;
-        });
-        http_srv->get("/api/v1/tms", [jm_ptr](const clink::http::HttpRequest&) {
+                clink::http::JsonWriter w;
+                write_job_graph(w, *g);
+                resp.body = w.str();
+                return resp;
+            });
+        // GET /api/v1/jobs/:id/lineage - the external datasets the job reads
+        // from and writes to, plus coarse source -> sink edges. Derived from
+        // the retained JobGraphSpec; for integrating clink into an external
+        // lineage system by polling (the same data is pushed on
+        // /api/v1/events as coordinator.job_lineage).
+        http_srv->get(
+            "/api/v1/jobs/:id/lineage", [coordinator_ptr](const clink::http::HttpRequest& req) {
+                clink::http::HttpResponse resp;
+                clink::cluster::JobId job_id = 0;
+                if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
+                    try {
+                        job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
+                    } catch (...) {
+                        resp.status = 400;
+                        resp.body = R"({"error":"invalid job id"})";
+                        return resp;
+                    }
+                }
+                auto lg = coordinator_ptr->snapshot_job_lineage(job_id);
+                if (!lg.has_value()) {
+                    resp.status = 404;
+                    resp.body = R"({"error":"no such job"})";
+                    return resp;
+                }
+                resp.body = "{\"job_id\":" + std::to_string(job_id) +
+                            ",\"available\":" + (lg->empty() ? "false" : "true") +
+                            ",\"lineage\":" + lg->to_json() + "}";
+                return resp;
+            });
+        // GET /api/v1/jobs/:id/operators - per-operator runtime stats (records
+        // in/out/dropped, backpressure, bytes, watermark) aggregated across the
+        // workers hosting the job, for the console's per-node DAG overlays. Polled
+        // fast (the topology /graph is polled slowly); a slow/lost worker yields a
+        // partial response with the affected operators marked stale.
+        http_srv->get(
+            "/api/v1/jobs/:id/operators", [coordinator_ptr](const clink::http::HttpRequest& req) {
+                clink::http::HttpResponse resp;
+                clink::cluster::JobId job_id = 0;
+                if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
+                    try {
+                        job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
+                    } catch (...) {
+                        resp.status = 400;
+                        resp.body = R"({"error":"invalid job id"})";
+                        return resp;
+                    }
+                }
+                bool available = false;
+                auto ops = opstats::build(*coordinator_ptr, job_id, available);
+                if (ops.empty() && !available) {
+                    // snapshot_job_graph returned nullopt only for an unknown job.
+                    if (!coordinator_ptr->snapshot_job(job_id).has_value()) {
+                        resp.status = 404;
+                        resp.body = R"({"error":"no such job"})";
+                        return resp;
+                    }
+                }
+                clink::http::JsonWriter w;
+                opstats::write_json(w, job_id, available, ops);
+                resp.body = w.str();
+                return resp;
+            });
+        http_srv->get("/api/v1/workers", [coordinator_ptr](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
             clink::http::JsonWriter w;
             w.begin_object();
-            w.key("task_managers").begin_array();
-            for (const auto& tm : jm_ptr->snapshot_tms()) {
-                write_tm_summary(w, tm);
+            w.key("workers").begin_array();
+            for (const auto& worker : coordinator_ptr->snapshot_workers()) {
+                write_worker_summary(w, worker);
             }
             w.end_array();
             w.end_object();
@@ -2151,26 +2159,26 @@ int run_jm(int argc, char** argv) {
         // POST /api/v1/jobs - multipart upload + submit. Closes the
         // dashboard's loop: the SPA can submit a job .so directly
         // without dropping to the clink_submit_job CLI.
-        http_srv->post("/api/v1/jobs", [jm_ptr](const clink::http::HttpRequest& req) {
+        http_srv->post("/api/v1/jobs", [coordinator_ptr](const clink::http::HttpRequest& req) {
             clink::metrics::http::request_seen();
-            return handle_submit_job(*jm_ptr, req);
+            return handle_submit_job(*coordinator_ptr, req);
         });
 
         // POST /api/v1/jobs/spec - JSON-body submission (no plugin .so).
         // Used by clink_submit_sql and any other tool that compiles to
         // a JobGraphSpec referencing built-in operator factories only.
-        http_srv->post("/api/v1/jobs/spec", [jm_ptr](const clink::http::HttpRequest& req) {
+        http_srv->post("/api/v1/jobs/spec", [coordinator_ptr](const clink::http::HttpRequest& req) {
             clink::metrics::http::request_seen();
-            return handle_submit_spec(*jm_ptr, req);
+            return handle_submit_spec(*coordinator_ptr, req);
         });
 
 #ifdef CLINK_LINKED_SQL
         // POST /api/v1/jobs/sql - compile / explain / submit SQL text directly.
         // Body is raw SQL; ?mode=explain|compile|submit. DDL accumulates in the
-        // JM's session catalog (optionally persisted via --sql-catalog-dir).
-        http_srv->post("/api/v1/jobs/sql", [jm_ptr](const clink::http::HttpRequest& req) {
+        // coordinator's session catalog (optionally persisted via --sql-catalog-dir).
+        http_srv->post("/api/v1/jobs/sql", [coordinator_ptr](const clink::http::HttpRequest& req) {
             clink::metrics::http::request_seen();
-            return handle_sql(*jm_ptr, req);
+            return handle_sql(*coordinator_ptr, req);
         });
         // GET /api/v1/catalog - the session catalog (tables / views + columns).
         http_srv->get("/api/v1/catalog", [](const clink::http::HttpRequest& req) {
@@ -2189,189 +2197,198 @@ int run_jm(int argc, char** argv) {
         // "no such job" / "already completed" / "already in progress"
         // to 404 / 409 / 409 so dashboards can display the right
         // outcome without sniffing the message string.
-        http_srv->post("/api/v1/jobs/:id/cancel", [jm_ptr](const clink::http::HttpRequest& req) {
-            clink::http::HttpResponse resp;
-            clink::cluster::JobId job_id = 0;
-            if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
-                try {
-                    job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
-                } catch (...) {
-                    resp.status = 400;
-                    resp.body = R"({"error":"invalid job id"})";
-                    return resp;
+        http_srv->post(
+            "/api/v1/jobs/:id/cancel", [coordinator_ptr](const clink::http::HttpRequest& req) {
+                clink::http::HttpResponse resp;
+                clink::cluster::JobId job_id = 0;
+                if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
+                    try {
+                        job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
+                    } catch (...) {
+                        resp.status = 400;
+                        resp.body = R"({"error":"invalid job id"})";
+                        return resp;
+                    }
                 }
-            }
-            const auto ack = jm_ptr->cancel_job(job_id);
-            clink::http::JsonWriter w;
-            w.begin_object();
-            w.kv("job_id", static_cast<std::int64_t>(ack.job_id));
-            w.kv("ok", ack.ok);
-            w.kv("message", ack.message);
-            w.end_object();
-            resp.body = w.str();
-            if (!ack.ok) {
-                if (ack.message == "no such job") {
-                    resp.status = 404;
-                } else {
-                    // "job already completed" / "cancel
-                    // already in progress" - semantic
-                    // conflict with current state.
-                    resp.status = 409;
+                const auto ack = coordinator_ptr->cancel_job(job_id);
+                clink::http::JsonWriter w;
+                w.begin_object();
+                w.kv("job_id", static_cast<std::int64_t>(ack.job_id));
+                w.kv("ok", ack.ok);
+                w.kv("message", ack.message);
+                w.end_object();
+                resp.body = w.str();
+                if (!ack.ok) {
+                    if (ack.message == "no such job") {
+                        resp.status = 404;
+                    } else {
+                        // "job already completed" / "cancel
+                        // already in progress" - semantic
+                        // conflict with current state.
+                        resp.status = 409;
+                    }
                 }
-            }
-            return resp;
-        });
+                return resp;
+            });
 
         // POST /api/v1/jobs/:id/savepoint - HTTP equivalent of clink_savepoint.
         // Triggers a one-off synchronous checkpoint and returns the (dir, id)
         // handle. ?timeout_ms bounds the wait (0/unset = 30s default).
-        http_srv->post("/api/v1/jobs/:id/savepoint", [jm_ptr](const clink::http::HttpRequest& req) {
-            clink::http::HttpResponse resp;
-            clink::cluster::JobId job_id = 0;
-            if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
-                try {
-                    job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
-                } catch (...) {
-                    resp.status = 400;
-                    resp.body = R"({"error":"invalid job id"})";
-                    return resp;
+        http_srv->post(
+            "/api/v1/jobs/:id/savepoint", [coordinator_ptr](const clink::http::HttpRequest& req) {
+                clink::http::HttpResponse resp;
+                clink::cluster::JobId job_id = 0;
+                if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
+                    try {
+                        job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
+                    } catch (...) {
+                        resp.status = 400;
+                        resp.body = R"({"error":"invalid job id"})";
+                        return resp;
+                    }
                 }
-            }
-            std::chrono::milliseconds timeout{};
-            if (auto it = req.query.find("timeout_ms"); it != req.query.end()) {
-                try {
-                    timeout = std::chrono::milliseconds{std::stoll(it->second)};
-                } catch (...) {
-                    // fall through to the JM default
+                std::chrono::milliseconds timeout{};
+                if (auto it = req.query.find("timeout_ms"); it != req.query.end()) {
+                    try {
+                        timeout = std::chrono::milliseconds{std::stoll(it->second)};
+                    } catch (...) {
+                        // fall through to the coordinator default
+                    }
                 }
-            }
-            const auto ack = jm_ptr->take_savepoint(job_id, timeout);
-            clink::http::JsonWriter w;
-            w.begin_object();
-            w.kv("job_id", static_cast<std::int64_t>(ack.job_id));
-            w.kv("ok", ack.ok);
-            w.kv("checkpoint_id", static_cast<std::int64_t>(ack.checkpoint_id));
-            w.kv("checkpoint_dir", ack.checkpoint_dir);
-            w.kv("message", ack.message);
-            w.end_object();
-            resp.body = w.str();
-            if (!ack.ok) {
-                resp.status = ack.message == "no such job" ? 404 : 409;
-            }
-            return resp;
-        });
+                const auto ack = coordinator_ptr->take_savepoint(job_id, timeout);
+                clink::http::JsonWriter w;
+                w.begin_object();
+                w.kv("job_id", static_cast<std::int64_t>(ack.job_id));
+                w.kv("ok", ack.ok);
+                w.kv("checkpoint_id", static_cast<std::int64_t>(ack.checkpoint_id));
+                w.kv("checkpoint_dir", ack.checkpoint_dir);
+                w.kv("message", ack.message);
+                w.end_object();
+                resp.body = w.str();
+                if (!ack.ok) {
+                    resp.status = ack.message == "no such job" ? 404 : 409;
+                }
+                return resp;
+            });
 
         // POST /api/v1/jobs/:id/rescale - HTTP equivalent of clink_rescale_job.
         // Body is a JSON object mapping role -> new parallelism, e.g.
         // {"map": 4, "sink": 2}. Roles omitted keep their current parallelism.
-        // Synchronous; the JM blocks until the checkpoint+drain+redeploy chain
+        // Synchronous; the coordinator blocks until the checkpoint+drain+redeploy chain
         // finishes or it rejects the request (bad parallelism, no slots, ...).
-        http_srv->post("/api/v1/jobs/:id/rescale", [jm_ptr](const clink::http::HttpRequest& req) {
-            clink::http::HttpResponse resp;
-            clink::cluster::JobId job_id = 0;
-            if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
-                try {
-                    job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
-                } catch (...) {
-                    resp.status = 400;
-                    resp.body = R"({"error":"invalid job id"})";
-                    return resp;
-                }
-            }
-            std::unordered_map<std::string, std::uint32_t> role_p;
-            try {
-                const auto v = clink::config::parse(req.body);
-                if (!v.is_object()) {
-                    resp.status = 400;
-                    resp.body = R"({"error":"body must be a JSON object of role -> parallelism"})";
-                    return resp;
-                }
-                for (const auto& [role, pv] : v.as_object()) {
-                    if (!pv.is_number() || pv.as_number() < 1) {
+        http_srv->post(
+            "/api/v1/jobs/:id/rescale", [coordinator_ptr](const clink::http::HttpRequest& req) {
+                clink::http::HttpResponse resp;
+                clink::cluster::JobId job_id = 0;
+                if (auto it = req.path_params.find("id"); it != req.path_params.end()) {
+                    try {
+                        job_id = static_cast<clink::cluster::JobId>(std::stoull(it->second));
+                    } catch (...) {
                         resp.status = 400;
-                        resp.body = R"({"error":"each parallelism must be a positive number"})";
+                        resp.body = R"({"error":"invalid job id"})";
                         return resp;
                     }
-                    role_p[role] = static_cast<std::uint32_t>(pv.as_number());
                 }
-            } catch (const std::exception& e) {
-                resp.status = 400;
-                resp.body =
-                    std::string{R"({"error":"invalid JSON body: )"} + json_escape(e.what()) + "\"}";
+                std::unordered_map<std::string, std::uint32_t> role_p;
+                try {
+                    const auto v = clink::config::parse(req.body);
+                    if (!v.is_object()) {
+                        resp.status = 400;
+                        resp.body =
+                            R"({"error":"body must be a JSON object of role -> parallelism"})";
+                        return resp;
+                    }
+                    for (const auto& [role, pv] : v.as_object()) {
+                        if (!pv.is_number() || pv.as_number() < 1) {
+                            resp.status = 400;
+                            resp.body = R"({"error":"each parallelism must be a positive number"})";
+                            return resp;
+                        }
+                        role_p[role] = static_cast<std::uint32_t>(pv.as_number());
+                    }
+                } catch (const std::exception& e) {
+                    resp.status = 400;
+                    resp.body = std::string{R"({"error":"invalid JSON body: )"} +
+                                json_escape(e.what()) + "\"}";
+                    return resp;
+                }
+                if (role_p.empty()) {
+                    resp.status = 400;
+                    resp.body = R"({"error":"no roles specified"})";
+                    return resp;
+                }
+                const auto ack = coordinator_ptr->rescale_job(job_id, role_p);
+                clink::http::JsonWriter w;
+                w.begin_object();
+                w.kv("job_id", static_cast<std::int64_t>(ack.job_id));
+                w.kv("ok", ack.ok);
+                w.kv("message", ack.message);
+                w.end_object();
+                resp.body = w.str();
+                if (!ack.ok) {
+                    resp.status = ack.message.find("no such job") != std::string::npos ? 404 : 409;
+                }
                 return resp;
-            }
-            if (role_p.empty()) {
-                resp.status = 400;
-                resp.body = R"({"error":"no roles specified"})";
-                return resp;
-            }
-            const auto ack = jm_ptr->rescale_job(job_id, role_p);
-            clink::http::JsonWriter w;
-            w.begin_object();
-            w.kv("job_id", static_cast<std::int64_t>(ack.job_id));
-            w.kv("ok", ack.ok);
-            w.kv("message", ack.message);
-            w.end_object();
-            resp.body = w.str();
-            if (!ack.ok) {
-                resp.status = ack.message.find("no such job") != std::string::npos ? 404 : 409;
-            }
-            return resp;
-        });
+            });
 
-        // Federation proxies: /api/v1/tms/:id/{tm,subtasks,config}
-        // forward GETs to that TM's HTTP listener. Without these the
-        // dashboard would have to know each TM's port and contact it
+        // Federation proxies: /api/v1/workers/:id/{worker,subtasks,config}
+        // forward GETs to that worker's HTTP listener. Without these the
+        // dashboard would have to know each worker's port and contact it
         // directly - fine on a flat network, broken behind any NAT
-        // or DMZ where only the JM is reachable. The JM becomes the
+        // or DMZ where only the coordinator is reachable. The coordinator becomes the
         // single entry-point.
-        http_srv->get("/api/v1/tms/:id/tm", [jm_ptr](const clink::http::HttpRequest& req) {
-            const auto it = req.path_params.find("id");
-            const auto& id = it != req.path_params.end() ? it->second : std::string{};
-            return proxy_to_tm(*jm_ptr, id, "/api/v1/tm");
-        });
-        http_srv->get("/api/v1/tms/:id/subtasks", [jm_ptr](const clink::http::HttpRequest& req) {
-            const auto it = req.path_params.find("id");
-            const auto& id = it != req.path_params.end() ? it->second : std::string{};
-            return proxy_to_tm(*jm_ptr, id, "/api/v1/tm/subtasks");
-        });
-        http_srv->get("/api/v1/tms/:id/config", [jm_ptr](const clink::http::HttpRequest& req) {
-            const auto it = req.path_params.find("id");
-            const auto& id = it != req.path_params.end() ? it->second : std::string{};
-            return proxy_to_tm(*jm_ptr, id, "/api/v1/config");
-        });
-        http_srv->get("/api/v1/tms/:id/metrics", [jm_ptr](const clink::http::HttpRequest& req) {
-            const auto it = req.path_params.find("id");
-            const auto& id = it != req.path_params.end() ? it->second : std::string{};
-            auto resp = proxy_to_tm(*jm_ptr, id, "/metrics");
-            if (resp.status >= 200 && resp.status < 300) {
-                resp.content_type = clink::metrics::kPrometheusContentType;
-            }
-            return resp;
-        });
-        http_srv->get("/api/v1/tms/:id/logs", [jm_ptr](const clink::http::HttpRequest& req) {
-            const auto it = req.path_params.find("id");
-            const auto& id = it != req.path_params.end() ? it->second : std::string{};
-            // Forward query string so ?level=warn&limit=50 reach the TM.
-            std::string remote = "/api/v1/logs";
-            if (!req.query.empty()) {
-                remote += '?';
-                bool first = true;
-                for (const auto& [k, v] : req.query) {
-                    if (!first)
-                        remote += '&';
-                    first = false;
-                    remote += k;
-                    remote += '=';
-                    remote += v;
-                }
-            }
-            return proxy_to_tm(*jm_ptr, id, remote);
-        });
+        http_srv->get("/api/v1/workers/:id/worker",
+                      [coordinator_ptr](const clink::http::HttpRequest& req) {
+                          const auto it = req.path_params.find("id");
+                          const auto& id = it != req.path_params.end() ? it->second : std::string{};
+                          return proxy_to_worker(*coordinator_ptr, id, "/api/v1/worker");
+                      });
+        http_srv->get("/api/v1/workers/:id/subtasks",
+                      [coordinator_ptr](const clink::http::HttpRequest& req) {
+                          const auto it = req.path_params.find("id");
+                          const auto& id = it != req.path_params.end() ? it->second : std::string{};
+                          return proxy_to_worker(*coordinator_ptr, id, "/api/v1/worker/subtasks");
+                      });
+        http_srv->get("/api/v1/workers/:id/config",
+                      [coordinator_ptr](const clink::http::HttpRequest& req) {
+                          const auto it = req.path_params.find("id");
+                          const auto& id = it != req.path_params.end() ? it->second : std::string{};
+                          return proxy_to_worker(*coordinator_ptr, id, "/api/v1/config");
+                      });
+        http_srv->get("/api/v1/workers/:id/metrics",
+                      [coordinator_ptr](const clink::http::HttpRequest& req) {
+                          const auto it = req.path_params.find("id");
+                          const auto& id = it != req.path_params.end() ? it->second : std::string{};
+                          auto resp = proxy_to_worker(*coordinator_ptr, id, "/metrics");
+                          if (resp.status >= 200 && resp.status < 300) {
+                              resp.content_type = clink::metrics::kPrometheusContentType;
+                          }
+                          return resp;
+                      });
+        http_srv->get("/api/v1/workers/:id/logs",
+                      [coordinator_ptr](const clink::http::HttpRequest& req) {
+                          const auto it = req.path_params.find("id");
+                          const auto& id = it != req.path_params.end() ? it->second : std::string{};
+                          // Forward query string so ?level=warn&limit=50 reach the worker.
+                          std::string remote = "/api/v1/logs";
+                          if (!req.query.empty()) {
+                              remote += '?';
+                              bool first = true;
+                              for (const auto& [k, v] : req.query) {
+                                  if (!first)
+                                      remote += '&';
+                                  first = false;
+                                  remote += k;
+                                  remote += '=';
+                                  remote += v;
+                              }
+                          }
+                          return proxy_to_worker(*coordinator_ptr, id, remote);
+                      });
 
         // Process-level observability: /metrics scrapes the in-process
         // registry; /api/v1/logs serves the bounded log ring buffer.
-        // Both also live on TMs (see run_tm). Prometheus exposition is
+        // Both also live on workers (see run_worker). Prometheus exposition is
         // served at the un-prefixed path to match scraper conventions.
         http_srv->get("/metrics",
                       [](const clink::http::HttpRequest&) { return make_metrics_response(); });
@@ -2386,9 +2403,9 @@ int run_jm(int argc, char** argv) {
 
         // Embedded SPA. Both `/` and `/dashboard` serve the same page
         // so curl-friendly paths (`curl host/`) and -muscle-memory
-        // paths (`/dashboard`) both work. TM HTTP servers don't mount
-        // this - the JM is the single human-facing entry point;
-        // individual TM data is reachable through /api/v1/tms/:id/*
+        // paths (`/dashboard`) both work. worker HTTP servers don't mount
+        // this - the coordinator is the single human-facing entry point;
+        // individual worker data is reachable through /api/v1/workers/:id/*
         // proxies.
         auto dashboard_handler = [](const clink::http::HttpRequest&) {
             clink::metrics::http::request_seen();
@@ -2401,15 +2418,15 @@ int run_jm(int argc, char** argv) {
         http_srv->get("/dashboard", dashboard_handler);
 
         // Server-Sent Events stream - the dashboard's live wake-up signal.
-        // Federated /api/v1/tms/:id/events is deliberately NOT wired:
+        // Federated /api/v1/workers/:id/events is deliberately NOT wired:
         // proxying a chunked stream through HttpClient::Get is non-
         // trivial (httplib's blocking response API doesn't surface the
-        // body in pieces). For HTTP-5 the JM stream is the canonical
-        // feed; per-TM SSE comes in HTTP-6 if the dashboard needs it.
+        // body in pieces). For HTTP-5 the coordinator stream is the canonical
+        // feed; per-worker SSE comes in HTTP-6 if the dashboard needs it.
         http_srv->sse("/api/v1/events", make_event_bus_sse_factory());
 
         const auto http_bound = http_srv->start(http_bind, http_port);
-        std::cout << "JM HTTP on " << http_bind << ":" << http_bound << "\n";
+        std::cout << "coordinator HTTP on " << http_bind << ":" << http_bound << "\n";
         std::cout.flush();
     }
 #else
@@ -2426,18 +2443,18 @@ int run_jm(int argc, char** argv) {
     // Non-HA restart survival: resume any full-refresh views loaded from a persisted
     // catalog. (The HA path re-registers in the leadership callback after reloading.)
     if (ha_dir.empty()) {
-        reregister_full_refresh_views(jm);
+        reregister_full_refresh_views(coordinator);
     }
 #endif
 
     // Run until either the user-requested duration elapses or the
-    // process catches SIGTERM/SIGINT (handler set in main()). The JM
+    // process catches SIGTERM/SIGINT (handler set in main()). The coordinator
     // threads do all the real work; we just gate the lifetime here.
     const auto max_duration = duration_str.empty() ? std::chrono::seconds{0}
                                                    : std::chrono::seconds{std::stoi(duration_str)};
     wait_for_shutdown(max_duration);
 #ifdef CLINK_LINKED_SQL
-    refresh_scheduler().stop();  // join the scheduler thread before tearing down the JM
+    refresh_scheduler().stop();  // join the scheduler thread before tearing down the coordinator
 #endif
 #ifdef CLINK_HAS_HTTP
     if (http_srv) {
@@ -2446,48 +2463,50 @@ int run_jm(int argc, char** argv) {
 #endif
     if (ha_coord)
         ha_coord->stop();
-    jm.stop();
+    coordinator.stop();
     return 0;
 }
 
-// TM mode. Connect to JM, idle, run whatever subtasks the JM deploys
+// worker mode. Connect to coordinator, idle, run whatever subtasks the coordinator deploys
 // via the generic role. No job-specific roles registered here.
-int run_tm(int argc, char** argv) {
+int run_worker(int argc, char** argv) {
 #ifdef CLINK_HAS_HTTP
-    clink::metrics::init_tm_metrics();
+    clink::metrics::init_worker_metrics();
     clink::metrics::init_checkpoint_metrics();
 #endif
-    const auto tm_id = get_arg(argc, argv, "id");
-    const auto jm_host = get_arg(argc, argv, "jm-host", "127.0.0.1");
-    const auto jm_port = get_arg(argc, argv, "jm-port", std::to_string(kDefaultJobManagerPort));
+    const auto worker_id = get_arg(argc, argv, "id");
+    const auto coordinator_host = get_arg(argc, argv, "coordinator-host", "127.0.0.1");
+    const auto coordinator_port =
+        get_arg(argc, argv, "coordinator-port", std::to_string(kDefaultCoordinatorPort));
     const auto data_host = get_arg(argc, argv, "data-host", "127.0.0.1");
     const auto slot_str = get_arg(argc, argv, "slots", "4");
     const auto http_port_str = get_arg(argc, argv, "http-port", "0");
     const auto http_bind = get_arg(argc, argv, "http-bind", "127.0.0.1");
     // TLS for the control-plane connection. --tls-ca turns on TLS and
-    // verifies the JM cert against this CA. --tls-client-cert/--key are
-    // optional mTLS material (required if the JM was started with
+    // verifies the coordinator cert against this CA. --tls-client-cert/--key are
+    // optional mTLS material (required if the coordinator was started with
     // --tls-client-ca).
     const auto tls_ca = get_arg(argc, argv, "tls-ca", "");
     const auto tls_client_cert = get_arg(argc, argv, "tls-client-cert", "");
     const auto tls_client_key = get_arg(argc, argv, "tls-client-key", "");
     // HA: when set, look up the current leader endpoint from
-    // <ha-dir>/active-leader.json instead of using --jm-host/--jm-port
-    // directly. On JM disconnect (reader_loop_ exits), this TM exits
+    // <ha-dir>/active-leader.json instead of using --coordinator-host/--coordinator-port
+    // directly. On coordinator disconnect (reader_loop_ exits), this worker exits
     // non-zero so an external supervisor (systemd/k8s/test harness)
     // can restart it; the restart re-reads active-leader.json to find
     // the new (possibly-just-elected) leader.
     const auto ha_dir = get_arg(argc, argv, "ha-dir", "");
     const auto etcd_endpoints = get_arg(argc, argv, "etcd-endpoints", "");
     const auto etcd_cluster = get_arg(argc, argv, "etcd-cluster", "default");
-    if (tm_id.empty()) {
-        std::cerr << "tm requires --id\n";
+    if (worker_id.empty()) {
+        std::cerr << "worker requires --id\n";
         return 1;
     }
-    // Initialise logging now that the id is known (root logger %n = tm@<id>).
-    clink::logging::init(make_logging_config(argc, argv, "tm@" + tm_id));
-    std::string discovered_jm_host = jm_host;
-    std::uint16_t discovered_jm_port = static_cast<std::uint16_t>(std::stoi(jm_port));
+    // Initialise logging now that the id is known (root logger %n = worker@<id>).
+    clink::logging::init(make_logging_config(argc, argv, "worker@" + worker_id));
+    std::string discovered_coordinator_host = coordinator_host;
+    std::uint16_t discovered_coordinator_port =
+        static_cast<std::uint16_t>(std::stoi(coordinator_port));
     if (!etcd_endpoints.empty() || !ha_dir.empty()) {
         std::unique_ptr<clink::cluster::HaCoordinator> coord;
         if (!etcd_endpoints.empty()) {
@@ -2497,14 +2516,14 @@ int run_tm(int argc, char** argv) {
             ecfg.cluster_name = etcd_cluster;
             coord = clink::cluster::make_etcd_ha_coordinator(ecfg, {});
 #else
-            std::cerr << "TM: --etcd-endpoints given but clink_etcd not linked\n";
+            std::cerr << "worker: --etcd-endpoints given but clink_etcd not linked\n";
             return 1;
 #endif
         } else {
             coord = clink::cluster::make_file_ha_coordinator(ha_dir, {});
         }
         // Poll the active-leader file for up to 10s - covers the gap
-        // between TM startup and the first JM acquiring leadership.
+        // between worker startup and the first coordinator acquiring leadership.
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
         std::optional<clink::cluster::LeaderEndpoint> ep;
         while (std::chrono::steady_clock::now() < deadline) {
@@ -2514,52 +2533,52 @@ int run_tm(int argc, char** argv) {
             std::this_thread::sleep_for(100ms);
         }
         if (!ep.has_value()) {
-            std::cerr << "TM: no leader visible (etcd=\"" << etcd_endpoints << "\" file=\""
+            std::cerr << "worker: no leader visible (etcd=\"" << etcd_endpoints << "\" file=\""
                       << ha_dir << "\") after 10s\n";
             return 2;
         }
-        discovered_jm_host = ep->host;
-        discovered_jm_port = ep->port;
-        std::cout << "TM HA: discovered leader " << discovered_jm_host << ":" << discovered_jm_port
-                  << " (epoch=" << ep->epoch << ")\n";
+        discovered_coordinator_host = ep->host;
+        discovered_coordinator_port = ep->port;
+        std::cout << "worker HA: discovered leader " << discovered_coordinator_host << ":"
+                  << discovered_coordinator_port << " (epoch=" << ep->epoch << ")\n";
     }
 
-    TaskManager::Config cfg;
+    Worker::Config cfg;
     cfg.heartbeat_interval = 500ms;
     cfg.slot_count = static_cast<std::uint32_t>(std::stoi(slot_str));
     // cfg.http_port is set later via set_advertised_http_port AFTER
     // the HttpServer binds - so when --http-port=0 lets the OS pick,
     // the Register frame carries the actually-bound port.
-    TaskManager tm(tm_id, data_host, cfg);
+    Worker worker(worker_id, data_host, cfg);
 #ifdef CLINK_LINKED_TLS
     if (!tls_ca.empty()) {
         auto client_ctx = std::make_shared<clink::network::TlsClientContext>(tls_ca);
         if (!tls_client_cert.empty() && !tls_client_key.empty()) {
             client_ctx->set_client_cert(tls_client_cert, tls_client_key);
         }
-        tm.set_connect_factory([client_ctx](const std::string& host, std::uint16_t port) {
+        worker.set_connect_factory([client_ctx](const std::string& host, std::uint16_t port) {
             return clink::network::connect_tls_connection(host, port, client_ctx);
         });
-        std::cout << "TM TLS enabled (ca=" << tls_ca << (tls_client_cert.empty() ? "" : ", mTLS=on")
-                  << ")\n";
+        std::cout << "worker TLS enabled (ca=" << tls_ca
+                  << (tls_client_cert.empty() ? "" : ", mTLS=on") << ")\n";
     }
 #else
     if (!tls_ca.empty() || !tls_client_cert.empty() || !tls_client_key.empty()) {
-        clink::log::warn("tm.tls", "--tls-* flags ignored (clink_tls not linked)");
+        clink::log::warn("worker.tls", "--tls-* flags ignored (clink_tls not linked)");
     }
 #endif
 
-    // No register_role() calls: the TaskManager constructor wired up the
-    // generic subtask role, which is everything a TM needs to execute
+    // No register_role() calls: the Worker constructor wired up the
+    // generic subtask role, which is everything a worker needs to execute
     // any submitted graph that uses operators in the OperatorRegistry.
 
     const auto start_time = std::chrono::steady_clock::now();
 
 #ifdef CLINK_HAS_HTTP
-    // Start the HTTP listener BEFORE connect_to_jm so the actual bound
+    // Start the HTTP listener BEFORE connect_to_coordinator so the actual bound
     // port (which may differ from the request if --http-port=0 lets
-    // the OS pick) can be included in the Register frame. The JM
-    // stores it for /api/v1/tms/:id/* proxy routes.
+    // the OS pick) can be included in the Register frame. The coordinator
+    // stores it for /api/v1/workers/:id/* proxy routes.
     std::unique_ptr<clink::http::HttpServer> http_srv;
     const auto http_port_req = static_cast<std::uint16_t>(std::stoi(http_port_str));
     std::uint16_t http_bound{0};
@@ -2574,7 +2593,7 @@ int run_tm(int argc, char** argv) {
         if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr && *tok != '\0') {
             http_srv->set_auth_token(tok);
         }
-        // Disk volumes for /metrics: working dir + the TM's checkpoint/state
+        // Disk volumes for /metrics: working dir + the worker's checkpoint/state
         // mount when the operator names one (--metrics-disk-path).
         {
             std::vector<clink::metrics::DiskVolume> vols{{"workdir", "."}};
@@ -2583,7 +2602,7 @@ int run_tm(int argc, char** argv) {
             }
             clink::metrics::configure_disk_volumes(std::move(vols));
         }
-        auto* tm_ptr = &tm;
+        auto* worker_ptr = &worker;
         // Queryable state: serve the process-wide registry. Operators that
         // expose state (SQL aggregates do so automatically) bind their
         // slots into Registry::global(); these routes make them readable.
@@ -2591,27 +2610,27 @@ int run_tm(int argc, char** argv) {
                                                 clink::queryable_state::Registry::global());
         clink::queryable_state::register_arrow_scan_route(
             *http_srv, clink::queryable_state::Registry::global());
-        // Live whole-job state export: this TM's share of a job's keyed
+        // Live whole-job state export: this worker's share of a job's keyed
         // state as one canonical Arrow snapshot stream.
-        clink::queryable_state::register_tm_state_export_route(*http_srv, tm);
+        clink::queryable_state::register_worker_state_export_route(*http_srv, worker);
         http_srv->get("/api/v1/health", [start_time, &http_bound](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
-            resp.body = make_health_body("tm", start_time, http_bound);
+            resp.body = make_health_body("worker", start_time, http_bound);
             return resp;
         });
-        http_srv->get("/api/v1/tm", [tm_ptr](const clink::http::HttpRequest&) {
+        http_srv->get("/api/v1/worker", [worker_ptr](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
             clink::http::JsonWriter w;
-            write_tm_snapshot(w, tm_ptr->snapshot_tm());
+            write_worker_snapshot(w, worker_ptr->snapshot_worker());
             resp.body = w.str();
             return resp;
         });
-        http_srv->get("/api/v1/tm/subtasks", [tm_ptr](const clink::http::HttpRequest&) {
+        http_srv->get("/api/v1/worker/subtasks", [worker_ptr](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
             clink::http::JsonWriter w;
             w.begin_object();
             w.key("subtasks").begin_array();
-            for (const auto& s : tm_ptr->snapshot_subtasks()) {
+            for (const auto& s : worker_ptr->snapshot_subtasks()) {
                 write_subtask_record(w, s);
             }
             w.end_array();
@@ -2619,15 +2638,15 @@ int run_tm(int argc, char** argv) {
             resp.body = w.str();
             return resp;
         });
-        http_srv->get("/api/v1/config", [tm_ptr](const clink::http::HttpRequest&) {
+        http_srv->get("/api/v1/config", [worker_ptr](const clink::http::HttpRequest&) {
             clink::http::HttpResponse resp;
             clink::http::JsonWriter w;
-            write_tm_config(w, tm_ptr->config_snapshot());
+            write_worker_config(w, worker_ptr->config_snapshot());
             resp.body = w.str();
             return resp;
         });
-        // Same /metrics + /api/v1/logs surface as JM; TM-side metrics
-        // are populated by run_task_ (subtasks_*) and connect_to_jm
+        // Same /metrics + /api/v1/logs surface as coordinator; worker-side metrics
+        // are populated by run_task_ (subtasks_*) and connect_to_coordinator
         // (slot_capacity).
         http_srv->get("/metrics",
                       [](const clink::http::HttpRequest&) { return make_metrics_response(); });
@@ -2641,37 +2660,38 @@ int run_tm(int argc, char** argv) {
         });
         http_srv->sse("/api/v1/events", make_event_bus_sse_factory());
         http_bound = http_srv->start(http_bind, http_port_req);
-        std::cout << "TM HTTP on " << http_bind << ":" << http_bound << "\n";
+        std::cout << "worker HTTP on " << http_bind << ":" << http_bound << "\n";
         std::cout.flush();
-        // Tell the TaskManager which port to advertise to the JM at
-        // register time. Must happen BEFORE connect_to_jm.
-        tm.set_advertised_http_port(http_bound);
+        // Tell the Worker which port to advertise to the coordinator at
+        // register time. Must happen BEFORE connect_to_coordinator.
+        worker.set_advertised_http_port(http_bound);
     }
 #else
     (void)http_port_str;
     (void)http_bind;
 #endif
 
-    tm.connect_to_jm(discovered_jm_host, discovered_jm_port);
+    worker.connect_to_coordinator(discovered_coordinator_host, discovered_coordinator_port);
     // Load-bearing readiness banner on STDOUT: bench_failover_coldstart greps the
     // child's captured stdout for "registered" at several sites. Keep it on
     // std::cout (NOT the logger) so it survives --log-no-console and is not
     // reordered by async logging.
-    std::cout << "TM " << tm_id << " registered with " << discovered_jm_host << ":"
-              << discovered_jm_port << "\n";
+    std::cout << "worker " << worker_id << " registered with " << discovered_coordinator_host << ":"
+              << discovered_coordinator_port << "\n";
     std::cout.flush();
 
-    // Idle until SIGTERM/SIGINT - or until the JM disconnects, in EVERY
-    // mode, not just HA. A disconnected TM is useless (there is no TM-side
+    // Idle until SIGTERM/SIGINT - or until the coordinator disconnects, in EVERY
+    // mode, not just HA. A disconnected worker is useless (there is no worker-side
     // re-register path), so staying up just zombies the process; under a
     // supervisor (k8s restartPolicy, compose restart, the HA wrapper)
     // exiting is what triggers the restart + re-registration that heals the
     // cluster. In HA the next process reads active-leader.json and follows
-    // whatever JM holds leadership; in non-HA it reconnects to the same
+    // whatever coordinator holds leadership; in non-HA it reconnects to the same
     // address. Exit code 2 marks a restart-me exit, not a clean shutdown.
     while (!g_shutdown_requested.load(std::memory_order_acquire)) {
-        if (tm.disconnected()) {
-            std::cerr << "TM " << tm_id << ": JM disconnected; exiting for restart\n";
+        if (worker.disconnected()) {
+            std::cerr << "worker " << worker_id
+                      << ": coordinator disconnected; exiting for restart\n";
             break;
         }
         std::this_thread::sleep_for(200ms);
@@ -2681,8 +2701,8 @@ int run_tm(int argc, char** argv) {
         http_srv->stop();
     }
 #endif
-    tm.stop();
-    return (tm.disconnected() && !g_shutdown_requested.load()) ? 2 : 0;
+    worker.stop();
+    return (worker.disconnected() && !g_shutdown_requested.load()) ? 2 : 0;
 }
 
 }  // namespace
@@ -2800,19 +2820,20 @@ int main(int argc, char** argv) {
         }
         if (has_flag(argc, argv, "help")) {
             std::cout
-                << "Usage: clink_node --role={jm|tm} [options]\n"
+                << "Usage: clink_node --role={coordinator|worker} [options]\n"
                 << "\n"
                 << "Roles:\n"
-                << "  jm       Run a JobManager.   --port=<n>\n"
-                << "  tm       Run a TaskManager.  --id=<name> --jm-host=<h> --jm-port=<n>\n"
+                << "  coordinator       Run a Coordinator.   --port=<n>\n"
+                << "  worker       Run a Worker.  --id=<name> --coordinator-host=<h> "
+                   "--coordinator-port=<n>\n"
                 << "\n"
                 << "Jobs are submitted programmatically via the C++ API\n"
-                << "(StreamExecutionEnvironment + JobSubmitter); clink does\n"
+                << "(Pipeline + JobSubmitter); clink does\n"
                 << "not accept JSON job configurations.\n"
                 << "\n"
-                << "JobManager flags:\n"
-                << "  --heartbeat-timeout-ms=<n>   TM-loss detection window (default 5000).\n"
-                << "  --watchdog-interval-ms=<n>   TM-liveness poll cadence (default 200).\n"
+                << "Coordinator flags:\n"
+                << "  --heartbeat-timeout-ms=<n>   worker-loss detection window (default 5000).\n"
+                << "  --watchdog-interval-ms=<n>   worker-liveness poll cadence (default 200).\n"
                 << "\n"
                 << "Logging flags:\n"
                 << "  --log-level=<lvl>            trace|debug|info|warn|error|off "
@@ -2835,7 +2856,7 @@ int main(int argc, char** argv) {
                    "(e.g. '*' or http://host:5181) so a standalone console can call the\n"
                    "                               API cross-origin. Unset = same-origin only.\n"
                 << "  --metrics-disk-path=<path>   Report disk usage for this filesystem as the "
-                   "'checkpoint' volume in /metrics (JM defaults to --ha-dir).\n"
+                   "'checkpoint' volume in /metrics (coordinator defaults to --ha-dir).\n"
                 << "\n"
                 << "Global flags:\n"
                 << "  --version    Print version + commit and exit.\n"
@@ -2847,8 +2868,9 @@ int main(int argc, char** argv) {
         // arrived at any point catches an idempotent flag flip.
         install_shutdown_signal_handler();
         const auto role = get_arg(argc, argv, "role");
-        if (role == "jm" || role == "tm") {
-            const int rc = role == "jm" ? run_jm(argc, argv) : run_tm(argc, argv);
+        if (role == "coordinator" || role == "worker") {
+            const int rc =
+                role == "coordinator" ? run_coordinator(argc, argv) : run_worker(argc, argv);
             // Flush + join the async worker/flush threads on the clean exit
             // path. Not called from the signal handler (atomic-only); the role
             // mainloops observe the flag and return here.
@@ -2860,7 +2882,7 @@ int main(int argc, char** argv) {
             clink::connectors::finalize_arrow_s3();
             return rc;
         }
-        std::cerr << "Usage: clink_node --role={jm|tm} ... (--help for details)\n";
+        std::cerr << "Usage: clink_node --role={coordinator|worker} ... (--help for details)\n";
         return 1;
     } catch (const std::exception& e) {
         // Fatal path stays on std::cerr (synchronous) so the message is not

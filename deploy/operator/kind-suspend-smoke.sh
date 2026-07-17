@@ -4,7 +4,7 @@
 #
 # Proves the full park/wake surface on a kind cluster:
 #   1. MANUAL PARK   spec.suspend=true  -> savepoint -> cancel -> Suspended
-#                    (reason Manual), job gone from the JM, slots freed.
+#                    (reason Manual), job gone from the coordinator, slots freed.
 #   2. MANUAL WAKE   spec.suspend=false -> resubmitted restored from the
 #                    savepoint (new job id), wake latency measured.
 #   3. IDLE PARK     suspendPolicy.idleAfterSeconds parks a job whose source
@@ -94,9 +94,9 @@ spec:
   ports: [{ port: 9092, targetPort: 9092 }]
 YAML
 
-step "apply ClinkCluster/${CLUSTER_CR} (slow-tick TM env; shared checkpoint storage)"
-# The job plugin's source reads CLINK_RESCALE_TICK_MS in the TaskManager
-# process (factory closures capture env at dlopen), so the cluster-level TM
+step "apply ClinkCluster/${CLUSTER_CR} (slow-tick worker env; shared checkpoint storage)"
+# The job plugin's source reads CLINK_RESCALE_TICK_MS in the Worker
+# process (factory closures capture env at dlopen), so the cluster-level worker
 # env is what actually paces it. 600000ms = the job emits its first record(s)
 # then goes quiet - exactly what park/idle/wake want to observe.
 kx apply -f - <<YAML
@@ -108,7 +108,7 @@ spec:
   image:
     repository: ${RUNTIME_IMAGE%:*}
     tag: ${RUNTIME_IMAGE##*:}
-  taskManager:
+  worker:
     replicas: 2
     slots: 4
     env:
@@ -119,21 +119,21 @@ spec:
     mountPath: /var/lib/clink/checkpoints
     hostPath: /var/lib/clink-checkpoints
 YAML
-step "wait: TM pods carry the slow-tick env, all pods Ready, cluster Running"
-# The env change rolls the TaskManager StatefulSet; the plugin closures are
-# baked per TM process, so the phases below need the ROLLED pods.
+step "wait: worker pods carry the slow-tick env, all pods Ready, cluster Running"
+# The env change rolls the Worker StatefulSet; the plugin closures are
+# baked per worker process, so the phases below need the ROLLED pods.
 for i in $(seq 1 60); do
-  ENV_OK=$(kx get pod szdemo-taskmanager-0 -o jsonpath='{.spec.containers[0].env[?(@.name=="CLINK_RESCALE_TICK_MS")].value}' 2>/dev/null || true)
-  READY=$(kx get statefulset ${CLUSTER_CR}-taskmanager -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
-  UPDATED=$(kx get statefulset ${CLUSTER_CR}-taskmanager -o jsonpath='{.status.updatedReplicas}' 2>/dev/null || true)
+  ENV_OK=$(kx get pod szdemo-worker-0 -o jsonpath='{.spec.containers[0].env[?(@.name=="CLINK_RESCALE_TICK_MS")].value}' 2>/dev/null || true)
+  READY=$(kx get statefulset ${CLUSTER_CR}-worker -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
+  UPDATED=$(kx get statefulset ${CLUSTER_CR}-worker -o jsonpath='{.status.updatedReplicas}' 2>/dev/null || true)
   ph=$(kx get clinkcluster ${CLUSTER_CR} -o jsonpath='{.status.phase}' 2>/dev/null || true)
   echo "  tick_env='${ENV_OK:-}' ready=${READY:-0}/2 updated=${UPDATED:-0}/2 phase=${ph:-} (attempt $i)"
   [[ "$ENV_OK" == "600000" && "$READY" == "2" && "$UPDATED" == "2" && "$ph" == "Running" ]] && break
   sleep 3
 done
-[[ "$(kx get pod szdemo-taskmanager-0 -o jsonpath='{.spec.containers[0].env[?(@.name=="CLINK_RESCALE_TICK_MS")].value}')" == "600000" ]] \
-  || fail "TM pods never picked up the slow-tick env (operator too old?)"
-JM_POD=$(kx get pods -l app.kubernetes.io/component=jobmanager,app.kubernetes.io/instance=${CLUSTER_CR} -o jsonpath='{.items[0].metadata.name}')
+[[ "$(kx get pod szdemo-worker-0 -o jsonpath='{.spec.containers[0].env[?(@.name=="CLINK_RESCALE_TICK_MS")].value}')" == "600000" ]] \
+  || fail "worker pods never picked up the slow-tick env (operator too old?)"
+COORDINATOR_POD=$(kx get pods -l app.kubernetes.io/component=coordinator,app.kubernetes.io/instance=${CLUSTER_CR} -o jsonpath='{.items[0].metadata.name}')
 
 apply_job() {
 kx apply -f - <<YAML
@@ -178,10 +178,10 @@ await_phase Suspended 20 .status.suspendReason || fail "did not park"
 [[ "$(job_field .status.suspendReason)" == "Manual" ]] || fail "suspendReason != Manual"
 SP=$(job_field .status.suspendSavepoint.dir)
 [[ -n "$SP" ]] || fail "no suspend savepoint recorded"
-# The job must actually be gone from the JM (slots freed): its id shows
+# The job must actually be gone from the coordinator (slots freed): its id shows
 # signalled (cancelled) in clink list.
-LIST=$(kx exec "$JM_POD" -c jobmanager -- clink list --jm-host=127.0.0.1 --jm-port=6123 2>/dev/null || true)
-echo "$LIST" | sed 's/^/  jm: /'
+LIST=$(kx exec "$COORDINATOR_POD" -c coordinator -- clink list --coordinator-host=127.0.0.1 --coordinator-port=6123 2>/dev/null || true)
+echo "$LIST" | sed 's/^/  coordinator: /'
 echo "$LIST" | awk -v id="$J1" '$1 == id && $NF == "yes" { found=1 } END { exit found?0:1 }' \
   || echo "  (list format note: proceeding on CR status)"
 echo "  PARKED: savepoint '$SP', reason Manual"

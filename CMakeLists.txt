@@ -276,8 +276,8 @@ add_library(clink_core STATIC
     src/state/state_migration_on_restore.cpp
     src/cluster/ha_coordinator.cpp
     src/cluster/restore_compat_gate.cpp
-    src/cluster/job_manager.cpp
-    src/cluster/task_manager.cpp
+    src/cluster/coordinator.cpp
+    src/cluster/worker.cpp
     src/cluster/service_discovery.cpp
     src/cluster/job_graph.cpp
     src/cluster/job_planner.cpp
@@ -678,7 +678,7 @@ if(CLINK_BUILD_SQL)
     install(TARGETS clink_submit_sql
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-    # clink::embed - the whole runtime in one process (in-process JM + TM
+    # clink::embed - the whole runtime in one process (in-process coordinator + worker
     # driving the shared SQL script runner). The execution core behind
     # `clink run <file>.sql`; the embeddable C ABI wraps the same class.
     add_library(clink_embed STATIC
@@ -889,7 +889,7 @@ if(TARGET clink::embed)
     target_sources(clink_cli_cmds PRIVATE tools/clink_run_sql.cpp tools/clink_replay.cpp
                                           tools/clink_state_query.cpp)
     target_link_libraries(clink_cli_cmds PUBLIC clink::embed)
-    # `clink run --jm-host` bypasses EmbeddedEngine (which installs the wasm
+    # `clink run --coordinator-host` bypasses EmbeddedEngine (which installs the wasm
     # loader itself), so the CLI installs it for the remote-submit path.
     if(TARGET clink::wasm)
         target_link_libraries(clink_cli_cmds PUBLIC clink::wasm)
@@ -938,7 +938,7 @@ clink_set_warnings(clink_cli_cmds)
 # subcommands: run, run-application, cancel, savepoint, rescale, list.
 # Mirrors ` run / cancel / savepoint / list` so muscle memory
 # carries over from . The server daemon stays in its own binary
-# (clink_node) - analogous to jobmanager.sh / taskmanager.sh
+# (clink_node) - analogous to coordinator.sh / worker.sh
 # split.
 add_executable(clink tools/clink_cli.cpp)
 target_link_libraries(clink PRIVATE clink_cli_cmds clink::core ${CMAKE_DL_LIBS})

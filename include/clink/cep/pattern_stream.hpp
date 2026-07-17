@@ -4,7 +4,7 @@
 // It captures everything needed to materialise the CEP operator on
 // the subsequent .select<U>() call:
 //
-//   * env_         - the StreamExecutionEnvironment to append to
+//   * env_         - the Pipeline to append to
 //   * upstream_id_ - the producing op's id
 //   * channel_type - the upstream channel type name
 //   * key_by_      - empty for non-keyed CEP; otherwise the key
@@ -25,7 +25,7 @@
 #include <string>
 #include <utility>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/cep/cep_operator.hpp"
 #include "clink/cep/pattern.hpp"
 #include "clink/cluster/built_in_factories.hpp"
@@ -38,7 +38,7 @@ namespace clink::cep {
 template <typename T>
 class PatternStream {
 public:
-    PatternStream(api::StreamExecutionEnvironment* env,
+    PatternStream(api::Pipeline* env,
                   std::string upstream_id,
                   std::string channel_type,
                   std::string key_by,
@@ -60,7 +60,7 @@ public:
     // Same in-process-only contract as the other inline-lambda fluent
     // shortcuts: the operator factory captures `fn` by value into the
     // process-wide RunnerRegistry, so submitting this job to a remote
-    // TM that has no equivalent registration will fail there. For
+    // worker that has no equivalent registration will fail there. For
     // cross-process CEP jobs, package the operator as a real plugin.
     template <typename U>
     api::DataStream<U> select(std::function<U(const PatternMatch<T>&)> fn, std::string id = {}) {
@@ -120,7 +120,7 @@ public:
     }
 
 private:
-    api::StreamExecutionEnvironment* env_;
+    api::Pipeline* env_;
     std::string upstream_id_;
     std::string channel_type_;
     std::string key_by_;

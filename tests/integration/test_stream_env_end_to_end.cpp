@@ -1,6 +1,6 @@
-// End-to-end test for the fluent StreamExecutionEnvironment API.
+// End-to-end test for the fluent Pipeline API.
 //
-// Spawns a JM + TM, then drives a pipeline entirely via the typed
+// Spawns a coordinator + worker, then drives a pipeline entirely via the typed
 // builder API (no JSON file on disk, no hand-written JobGraphSpec).
 // Asserts the sink received the expected records.
 
@@ -19,7 +19,7 @@
 #include <sys/wait.h>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/application/job_submitter.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
@@ -75,37 +75,37 @@ TEST(StreamEnvEndToEnd, FluentApiSubmitsAndRunsAgainstCluster) {
         GTEST_SKIP() << "clink_node not built";
     }
 
-    const auto jm_port = probe_free_port();
+    const auto coordinator_port = probe_free_port();
     const auto out_path = std::filesystem::temp_directory_path() / "clink_stream_env_e2e.txt";
     std::filesystem::remove(out_path);
 
-    const pid_t jm_pid =
-        spawn_node({"clink_node", "--role=jm", "--port=" + std::to_string(jm_port)}, binary);
-    ASSERT_GT(jm_pid, 0);
+    const pid_t coordinator_pid = spawn_node(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
+    ASSERT_GT(coordinator_pid, 0);
     std::this_thread::sleep_for(200ms);
 
-    const pid_t tm_pid = spawn_node({"clink_node",
-                                     "--role=tm",
-                                     "--id=tm-e2e",
-                                     "--jm-host=127.0.0.1",
-                                     "--jm-port=" + std::to_string(jm_port)},
-                                    binary);
-    ASSERT_GT(tm_pid, 0);
+    const pid_t worker_pid = spawn_node({"clink_node",
+                                         "--role=worker",
+                                         "--id=worker-e2e",
+                                         "--coordinator-host=127.0.0.1",
+                                         "--coordinator-port=" + std::to_string(coordinator_port)},
+                                        binary);
+    ASSERT_GT(worker_pid, 0);
     std::this_thread::sleep_for(300ms);
 
     // Build the pipeline using only the fluent API. No JSON anywhere.
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(4).start(50).build());
     src.transform<std::int64_t>("multiply_int64", {{"factor", "2"}})
         .sink(FileInt64Sink::builder().path(out_path.string()).build());
 
-    application::JobSubmitter submitter("127.0.0.1", jm_port);
+    application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = std::chrono::seconds(15);
     const auto result = env.execute("e2e", submitter, opts);
 
-    kill_quietly(jm_pid);
-    kill_quietly(tm_pid);
+    kill_quietly(coordinator_pid);
+    kill_quietly(worker_pid);
 
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
     EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);

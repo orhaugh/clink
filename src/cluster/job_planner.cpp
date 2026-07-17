@@ -235,9 +235,9 @@ std::string OperatorChainSpec::to_json() const {
     out += ']';
     // Optional fused source / sink. Encoded as nested ChainOp JSON
     // objects so the wire shape mirrors the in-process struct - the
-    // TM's decoder reads the same fields. Absent keys mean "no
+    // worker's decoder reads the same fields. Absent keys mean "no
     // fusion at this end", which is the default and the multi-task
-    // path the TM has always used.
+    // path the worker has always used.
     if (fused_source.has_value()) {
         out += ",\"fused_source\":";
         append_chain_op_json(out, *fused_source);
@@ -572,7 +572,7 @@ JobPlan plan_job(const JobGraphSpec& graph,
                                      "' has no inputs and no consumers; nothing to do");
         }
         if (is_join_op_type(op.type, &runner_reg_param)) {
-            // Join ops are dispatched specially on the TM; their
+            // Join ops are dispatched specially on the worker; their
             // factory isn't in the standard (type, in, out) registry.
             if (op.inputs.size() != 2) {
                 throw std::runtime_error("plan_job: join op '" + op.id +
@@ -642,7 +642,7 @@ JobPlan plan_job(const JobGraphSpec& graph,
     //   * Same parallelism
     //
     // Greedy left-to-right pairing. Chain length is unbounded - the
-    // generic role on the TM folds N ops via repeated composition,
+    // generic role on the worker folds N ops via repeated composition,
     // which keeps the template-instantiation matrix at 8 (one
     // ChainedOperator<A,B,C> per channel-type triple) regardless of N.
     constexpr std::size_t kMaxChainLength = 64;
@@ -690,7 +690,7 @@ JobPlan plan_job(const JobGraphSpec& graph,
         //
         // (Was previously gated; lifted when chain dispatch was
         // generalized to support user-registered channel types via
-        // the DagBuilder path in task_manager.cpp.)
+        // the DagBuilder path in worker.cpp.)
         // Side-output-emitting ops CAN be chained as of 2026-05-22.
         // The chain runtime already propagates side_output_channels
         // from the chain RC to each inner op's RC (see
@@ -751,7 +751,7 @@ JobPlan plan_job(const JobGraphSpec& graph,
             continue;
         }
         // Only chain ops that are findable in OperatorRegistry. The
-        // chain dispatch path on the TM (legacy run_generic_subtask_
+        // chain dispatch path on the worker (legacy run_generic_subtask_
         // fallback for chain.ops.size() >= 2) looks each op up there;
         // RunnerRegistry-only ops (inline-lambda fluent API ops, plugin
         // ops registered via PluginRegistry) would fail with
@@ -807,7 +807,7 @@ JobPlan plan_job(const JobGraphSpec& graph,
     // Gate: fusion is opt-in via CLINK_PLAN_FUSE_PAR1=1. Default off
     // so the existing per-op subtask layout - which a lot of tests
     // and operational tooling assume - is preserved. Set to 1 in the
-    // bench's run.sh (or any par=1 single-TM job) to take the win.
+    // bench's run.sh (or any par=1 single-worker job) to take the win.
     const char* fuse_env = std::getenv("CLINK_PLAN_FUSE_PAR1");
     const bool fuse_enabled = (fuse_env != nullptr) && (std::string_view{fuse_env} == "1");
     std::unordered_map<std::string, const OperatorSpec*> chain_fused_source;
@@ -831,7 +831,7 @@ JobPlan plan_job(const JobGraphSpec& graph,
         // dispatches it correctly. (After fusion the chain's ops list
         // must be Operator-kind; folding a sink into a source-only
         // chain would violate that and trigger the "chained ops must
-        // all be Operator kind" guard in task_manager.cpp.)
+        // all be Operator kind" guard in worker.cpp.)
         if (!is_operator_kind(head) || !is_operator_kind(tail)) {
             continue;
         }
@@ -1027,7 +1027,7 @@ JobPlan plan_job(const JobGraphSpec& graph,
             chain.subtask_idx_in_op = sub_i;
 
             // Fold the absorbed source / sink into the chain spec. The
-            // TM-side dispatch will build them via OperatorRegistry and
+            // worker-side dispatch will build them via OperatorRegistry and
             // attach them directly to the dag (Dag::add_source for the
             // head, Dag::add_sink for the tail) - no in/out bridges
             // for the fused ends, no separate subtasks for them.
@@ -1117,7 +1117,7 @@ JobPlan plan_job(const JobGraphSpec& graph,
             const bool head_is_keyed = !head.key_by.empty();
             // When the chain absorbed its upstream source, the head no
             // longer reads from a NetworkBridgeSource - skip the
-            // input_edges loop entirely so the TM-side dispatch goes
+            // input_edges loop entirely so the worker-side dispatch goes
             // through the fused_source path.
             if (!head_is_source && fused_source_spec == nullptr) {
                 std::uint32_t in_ord = 0;  // logical input position (In1=0, In2=1, ...)
@@ -1267,7 +1267,7 @@ JobPlan plan_job(const JobGraphSpec& graph,
             }
 
             PlannedTask t;
-            t.tm_id = "";
+            t.worker_id = "";
             t.role = kGenericSubtaskRole;
             t.subtask_idx = chain.subtask_idx;
             t.data_port = 0;

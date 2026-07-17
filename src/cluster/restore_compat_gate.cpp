@@ -83,7 +83,7 @@ std::string check_restore_compatibility_via_plugins(const std::vector<std::strin
     }
     const auto stored_packed = read_stored_versions_packed(restore_from_dir, restore_checkpoint_id);
     if (!stored_packed.has_value()) {
-        return "";  // best-effort: savepoint not JM-readable -> rely on C at TM start
+        return "";  // best-effort: savepoint not coordinator-readable -> rely on C at worker start
     }
 
     for (const auto& so_path : plugin_so_paths) {

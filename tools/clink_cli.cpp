@@ -3,8 +3,8 @@
 // tools/clink_<verb>.cpp files. Mirrors ` run / cancel /
 // savepoint / list` shape so muscle memory carries over.
 //
-// The server-side daemon (`clink_node --role=jm|tm`) is a separate
-// binary, matching `jobmanager.sh` / `taskmanager.sh` split.
+// The server-side daemon (`clink_node --role=coordinator|worker`) is a separate
+// binary, matching `coordinator.sh` / `worker.sh` split.
 
 #include <cstring>
 #include <iostream>
@@ -40,9 +40,9 @@ void usage() {
         << "Usage: clink <command> [--flags...]\n"
         << "\n"
         << "Commands:\n"
-        << "  run               Submit a compiled job .so to a running JM, or run a .sql\n"
+        << "  run               Submit a compiled job .so to a running coordinator, or run a .sql\n"
         << "                    script embedded in this process (`clink run job.sql`).\n"
-        << "  run-application   Start an in-process JM and run a job (alias of  "
+        << "  run-application   Start an in-process coordinator and run a job (alias of  "
            "run-application).\n"
         << "  cancel            Cancel an active job by id (alias of  cancel).\n"
         << "  savepoint         Trigger a synchronous savepoint (alias of  savepoint).\n"

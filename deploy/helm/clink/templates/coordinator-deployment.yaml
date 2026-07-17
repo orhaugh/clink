@@ -1,16 +1,16 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "clink.jobmanager.fullname" . }}
+  name: {{ include "clink.coordinator.fullname" . }}
   labels:
     {{- include "clink.labels" . | nindent 4 }}
-    app.kubernetes.io/component: jobmanager
+    app.kubernetes.io/component: coordinator
   {{- with .Values.commonAnnotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  # Non-HA: a single JobManager. HA (ha.enabled): replicas race an fcntl lock on
+  # Non-HA: a single Coordinator. HA (ha.enabled): replicas race an fcntl lock on
   # the shared --ha-dir; the winner binds the control port and is leader,
   # standbys wait, and a standby takes over on leader death. See values.ha.
   replicas: {{ if .Values.ha.enabled }}{{ .Values.ha.replicas }}{{ else }}1{{ end }}
@@ -22,13 +22,13 @@ spec:
     {{- end }}
   selector:
     matchLabels:
-      {{- include "clink.componentSelectorLabels" (dict "root" . "component" "jobmanager") | nindent 6 }}
+      {{- include "clink.componentSelectorLabels" (dict "root" . "component" "coordinator") | nindent 6 }}
   template:
     metadata:
       labels:
         {{- include "clink.labels" . | nindent 8 }}
-        app.kubernetes.io/component: jobmanager
-      {{- with .Values.jobmanager.podAnnotations }}
+        app.kubernetes.io/component: coordinator
+      {{- with .Values.coordinator.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -39,42 +39,42 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
-        - name: jobmanager
+        - name: coordinator
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- if .Values.ha.enabled }}
           env:
             # In HA the leader advertises its OWN reachable address (peers +
-            # TMs read it from active-leader.json), not the round-robin Service.
+            # workers read it from active-leader.json), not the round-robin Service.
             - name: POD_IP
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
           {{- end }}
           args:
-            - --role=jm
-            - --port={{ .Values.jobmanager.controlPort }}
+            - --role=coordinator
+            - --port={{ .Values.coordinator.controlPort }}
             - --bind-host=0.0.0.0
             {{- if .Values.ha.enabled }}
             - --advertise-host=$(POD_IP)
             - --ha-dir={{ .Values.ha.storage.mountPath }}
             {{- else }}
-            # TMs reach the JM via this Service DNS name; the JM advertises it.
-            - --advertise-host={{ include "clink.jobmanager.fullname" . }}
+            # workers reach the coordinator via this Service DNS name; the coordinator advertises it.
+            - --advertise-host={{ include "clink.coordinator.fullname" . }}
             {{- end }}
-            - --http-port={{ .Values.jobmanager.httpPort }}
+            - --http-port={{ .Values.coordinator.httpPort }}
             - --http-bind=0.0.0.0
-            {{- if .Values.jobmanager.stateBackend }}
-            - --state-backend={{ .Values.jobmanager.stateBackend }}
+            {{- if .Values.coordinator.stateBackend }}
+            - --state-backend={{ .Values.coordinator.stateBackend }}
             {{- end }}
-            {{- with .Values.jobmanager.extraArgs }}
+            {{- with .Values.coordinator.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           ports:
             - name: control
-              containerPort: {{ .Values.jobmanager.controlPort }}
+              containerPort: {{ .Values.coordinator.controlPort }}
             - name: http
-              containerPort: {{ .Values.jobmanager.httpPort }}
+              containerPort: {{ .Values.coordinator.httpPort }}
           readinessProbe:
             httpGet:
               path: /api/v1/health
@@ -91,7 +91,7 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 6
-          {{- with .Values.jobmanager.resources }}
+          {{- with .Values.coordinator.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -103,15 +103,15 @@ spec:
       volumes:
         {{- include "clink.haVolume" . | nindent 8 }}
       {{- end }}
-      {{- with .Values.jobmanager.nodeSelector }}
+      {{- with .Values.coordinator.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.jobmanager.affinity }}
+      {{- with .Values.coordinator.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.jobmanager.tolerations }}
+      {{- with .Values.coordinator.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}

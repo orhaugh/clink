@@ -22,8 +22,8 @@ serviceAccount:
   name: ""
   annotations: {}
 
-jobmanager:
-  # The control plane is a single leader. v1 runs ONE JobManager (HA multi-JM
+coordinator:
+  # The control plane is a single leader. v1 runs ONE Coordinator (HA multi-coordinator
   # leader election is a documented follow-on - see ha below). Pinned to 1.
   controlPort: 6123
   httpPort: 8081
@@ -43,9 +43,9 @@ jobmanager:
   affinity: {}
   podAnnotations: {}
 
-taskmanager:
+worker:
   replicas: 3
-  # Task slots per TaskManager (parallelism capacity).
+  # Task slots per Worker (parallelism capacity).
   slots: 4
   httpPort: 8082
   extraArgs: []
@@ -57,15 +57,15 @@ taskmanager:
   # How long to let an in-flight subtask drain on pod termination before SIGKILL.
   terminationGracePeriodSeconds: 30
 
-# High availability: run multiple JobManager replicas with leader election.
+# High availability: run multiple Coordinator replicas with leader election.
 #
-# Uses clink's FILE coordinator (always compiled into clink_node, no extra
-# dependency): every JM races an fcntl lock on a SHARED --ha-dir; the winner
+# Uses clink's file-based HA backend (always compiled into clink_node, no extra
+# dependency): every coordinator races an fcntl lock on a SHARED --ha-dir; the winner
 # binds the control port and writes its endpoint to active-leader.json, standbys
-# wait, and TaskManagers discover the leader from that same shared dir. On
+# wait, and Workers discover the leader from that same shared dir. On
 # leader death a standby acquires the lock and takes over.
 #
-# REQUIRES shared storage mounted by every JM and TM pod:
+# REQUIRES shared storage mounted by every coordinator and worker pod:
 #   storage.type=pvc  : a ReadWriteMany PVC (production; needs an RWX-capable
 #                       StorageClass - NFS/CephFS/etc). fcntl over a network FS
 #                       carries a stale-lock risk under pathological hangs.
@@ -77,7 +77,7 @@ taskmanager:
 # default runtime image is not - so it is a documented follow-on, not wired here.)
 ha:
   enabled: false
-  # JobManager replica count (the leader + standbys).
+  # Coordinator replica count (the leader + standbys).
   replicas: 2
   storage:
     type: pvc            # pvc | hostPath

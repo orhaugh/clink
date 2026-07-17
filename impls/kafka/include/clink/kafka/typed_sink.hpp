@@ -21,7 +21,7 @@
 
 #include "clink/api/descriptors.hpp"
 #include "clink/api/kafka_builders.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/connectors/kafka_message.hpp"
 #include "clink/kafka/kafka_message_codec.hpp"
 

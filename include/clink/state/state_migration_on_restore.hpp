@@ -48,7 +48,7 @@ struct StateIncompatibility {
 // (no incompatibilities). state_type must not contain '|' or '\n' (same
 // constraint StateVersionMap enforces). unpack throws std::runtime_error
 // on a malformed line. These mirror StateVersionMap::pack/unpack so the
-// .so-side packer and the host-side (CLI / JM) unpacker share one format.
+// .so-side packer and the host-side (CLI / coordinator) unpacker share one format.
 [[nodiscard]] std::string pack_incompatibilities(const std::vector<StateIncompatibility>& incompat);
 [[nodiscard]] std::vector<StateIncompatibility> unpack_incompatibilities(std::string_view packed);
 

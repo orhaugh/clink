@@ -126,7 +126,7 @@ void LocalExecutor::start() {
         auto cancel_fn = runner.cancel;
         auto op_name = runner.name;
         // Stop predicate ORs the internal cancel flag with the external
-        // token from JobConfig (if set). The TaskManager wires that
+        // token from JobConfig (if set). The Worker wires that
         // token into CancelJob handling so a client-initiated cancel
         // can wind the executor down without a reference to it.
         auto ext_token = config_.external_cancel_token;
@@ -287,7 +287,7 @@ void LocalExecutor::register_metrics() {
         // Identity mapping so a metrics scraper can map this numeric op_id back
         // to a graph node. Only runners that carry a spec node id (user
         // operators built via apply_chain_identity) emit it; internal runners
-        // (bridges, fork/split) and uid-only keyed stages do not (the JM maps
+        // (bridges, fork/split) and uid-only keyed stages do not (the coordinator maps
         // uid'd nodes by computing operator_id_from_uid directly).
         metrics::op::op_info_set(config_.metrics, id, runner.spec_node_id, runner.spec_uid);
     }

@@ -47,7 +47,7 @@ using SideOutputChannelMap = std::unordered_map<std::string, SideOutputChannelEn
 // A named user accumulator handle, scoped to one operator. Obtained from
 // RuntimeContext::accumulator(name). add() folds a delta into a per-operator
 // value that merges across every subtask of the operator (within a process via
-// one atomic gauge, across TaskManagers via the JM's per-operator
+// one atomic gauge, across Workers via the coordinator's per-operator
 // aggregation). Cheap to copy; holds no state of
 // its own beyond the (registry, op id, name) it writes through.
 class Accumulator {
@@ -148,7 +148,7 @@ public:
     // Queryable-state identity: the DeploymentTask role and global subtask
     // index this operator runs as. An operator that exposes a state slot
     // for external lookup binds it under exactly this (role, subtask) pair
-    // - the address the JM routes clients to. Empty role in in-process /
+    // - the address the coordinator routes clients to. Empty role in in-process /
     // legacy paths: operators skip queryable binding there.
     void set_runner_identity(std::string role, std::size_t subtask_idx) noexcept {
         runner_role_ = std::move(role);
@@ -193,8 +193,8 @@ public:
     const CheckpointAckFn& checkpoint_ack() const noexcept { return ack_fn_; }
 
     // Bounded-source end-of-stream FINAL checkpoint (cluster path only).
-    // At clean bounded EOS the source runner asks the JM to trigger ONE
-    // JM-coordinated checkpoint that durably captures the EOS offset and drives
+    // At clean bounded EOS the source runner asks the coordinator to trigger ONE
+    // coordinator-coordinated checkpoint that durably captures the EOS offset and drives
     // the sink's tail commit through the normal ack -> CommitCheckpoint path,
     // then BLOCKS until that checkpoint is committed before the runner returns.
     // Because the runner's return is what emits SubtaskFinished (which drives
@@ -202,8 +202,8 @@ public:
     // durable, and a crash in the window leaves the source unfinished -> restart
     // -> replay -> re-commit. Both hooks are empty on in-process / non-cluster
     // runs, where the source falls back to the local terminal commit (unchanged).
-    // request_final_checkpoint() returns the JM-assigned final checkpoint id, or
-    // 0 if the JM declined (job cancelling/completing) or the hook is unwired.
+    // request_final_checkpoint() returns the coordinator-assigned final checkpoint id, or
+    // 0 if the coordinator declined (job cancelling/completing) or the hook is unwired.
     using RequestFinalCheckpointFn = std::function<std::uint64_t()>;
     using WaitFinalCommittedFn = std::function<bool(std::uint64_t, std::chrono::milliseconds)>;
     void set_request_final_checkpoint(RequestFinalCheckpointFn fn) noexcept {
@@ -246,7 +246,7 @@ public:
     // Drain-target signal. The shared atomic (if set
     // by the executor at startup) is the rendezvous between the
     // cluster's BeginRescale dispatch and the source runner: the
-    // TM's drain callback sets the atomic to target_parallelism;
+    // worker's drain callback sets the atomic to target_parallelism;
     // the source runner's produce loop polls drain_target() and
     // emits a DrainMarker downstream when it sees a non-zero value.
     // Null pointer (LocalExecutor / non-cluster path) means

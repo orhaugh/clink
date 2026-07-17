@@ -4,7 +4,7 @@
 // shared SQL script runner (clink/sql/script_runner.hpp):
 //   * DDL statements fold into an in-memory (optionally persistent) catalog
 //   * INSERT INTO ... SELECT compiles to a JobGraphSpec, printed to stdout
-//     or POSTed to a running JM with --jm-host/--jm-port
+//     or POSTed to a running coordinator with --coordinator-host/--coordinator-port
 //
 // Usage:
 //   clink_submit_sql --file path/to/job.sql
@@ -30,8 +30,8 @@ struct Args {
     std::string file;
     std::string inline_sql;
     std::string catalog_dir;
-    std::string jm_host;
-    std::uint16_t jm_port = 0;
+    std::string coordinator_host;
+    std::uint16_t coordinator_port = 0;
     std::string job_name;
     std::string state_backend;  // per-job state backend URI (empty = cluster default)
     bool explain = false;
@@ -42,21 +42,25 @@ void print_usage() {
     std::cerr
         << "Usage: clink_submit_sql --file <path> | -e <sql>\n"
         << "                        [--catalog-dir <dir>]\n"
-        << "                        [--jm-host <host> --jm-port <port> [--name <job>]]\n"
+        << "                        [--coordinator-host <host> --coordinator-port <port> [--name "
+           "<job>]]\n"
         << "                        [--explain]\n"
         << "\n"
         << "  --file <path>       Read SQL from a file.\n"
         << "  -e <sql>            Read SQL from the command line.\n"
         << "  --catalog-dir <dir> Persistent catalog dir. Loaded at startup; tables\n"
         << "                      registered via CREATE TABLE auto-save as JSON-per-table.\n"
-        << "  --jm-host <host>    JM HTTP host. When set with --jm-port, INSERT statements\n"
-        << "  --jm-port <port>    POST the compiled JobGraphSpec to the JM instead of\n"
-        << "                      printing JSON. The JM runs the job and replies with a\n"
+        << "  --coordinator-host <host>    coordinator HTTP host. When set with "
+           "--coordinator-port, INSERT statements\n"
+        << "  --coordinator-port <port>    POST the compiled JobGraphSpec to the coordinator "
+           "instead of\n"
+        << "                      printing JSON. The coordinator runs the job and replies with a\n"
         << "                      job id.\n"
-        << "  --name <job>        Job name (default 'sql_job'). Only used with --jm-host.\n"
+        << "  --name <job>        Job name (default 'sql_job'). Only used with "
+           "--coordinator-host.\n"
         << "  --state-backend <uri>  Per-job state backend URI, overriding the cluster default.\n"
         << "                      A disaggregated tier (e.g. remote-read://...) activates the\n"
-        << "                      async KeyedState path. Only used with --jm-host.\n"
+        << "                      async KeyedState path. Only used with --coordinator-host.\n"
         << "  --parallelism <n>   Uniform op parallelism (default 1). >1 fans every op out to\n"
         << "  -p <n>              n subtasks; keyed ops hash-partition by key, sources split\n"
         << "                      partitions across subtasks (Kafka needs >= n partitions).\n"
@@ -86,18 +90,18 @@ Args parse_args(int argc, char** argv) {
                 std::exit(2);
             }
             a.catalog_dir = argv[i];
-        } else if (arg == "--jm-host") {
+        } else if (arg == "--coordinator-host") {
             if (++i >= argc) {
-                std::cerr << "error: --jm-host requires a host\n";
+                std::cerr << "error: --coordinator-host requires a host\n";
                 std::exit(2);
             }
-            a.jm_host = argv[i];
-        } else if (arg == "--jm-port") {
+            a.coordinator_host = argv[i];
+        } else if (arg == "--coordinator-port") {
             if (++i >= argc) {
-                std::cerr << "error: --jm-port requires a port\n";
+                std::cerr << "error: --coordinator-port requires a port\n";
                 std::exit(2);
             }
-            a.jm_port = static_cast<std::uint16_t>(std::stoi(argv[i]));
+            a.coordinator_port = static_cast<std::uint16_t>(std::stoi(argv[i]));
         } else if (arg == "--name") {
             if (++i >= argc) {
                 std::cerr << "error: --name requires a string\n";
@@ -159,7 +163,7 @@ int main(int argc, char** argv) {
 #ifdef CLINK_LINKED_WASM
     // CREATE FUNCTION ... LANGUAGE wasm executes here, client-side: the
     // loader validates the module and packages its bytes into the spec the
-    // JM receives, so the cluster needs no access to the local path.
+    // coordinator receives, so the cluster needs no access to the local path.
     {
         clink::plugin::PluginRegistry reg;
         clink::wasm::install(reg);
@@ -184,9 +188,12 @@ int main(int argc, char** argv) {
     opts.job_name = args.job_name;
 
     clink::sql::ScriptIO io{&std::cout, &std::cerr};
-    auto submit = (!args.jm_host.empty() && args.jm_port != 0)
-                      ? clink::sql::make_http_submit(
-                            args.jm_host, args.jm_port, args.state_backend, std::cout, std::cerr)
+    auto submit = (!args.coordinator_host.empty() && args.coordinator_port != 0)
+                      ? clink::sql::make_http_submit(args.coordinator_host,
+                                                     args.coordinator_port,
+                                                     args.state_backend,
+                                                     std::cout,
+                                                     std::cerr)
                       : clink::sql::make_print_submit(std::cout);
     return clink::sql::run_script(sql, catalog, opts, io, submit);
 }

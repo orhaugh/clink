@@ -1,10 +1,10 @@
 apiVersion: v2
 name: clink
 description: |
-  A clink streaming cluster: one JobManager (control plane + dashboard) and a
-  pool of TaskManagers. Maps the docker-compose topology onto Kubernetes - the
-  JobManager is a Deployment fronted by a Service (its advertised host is the
-  Service DNS name), and the TaskManagers are a StatefulSet so each has a stable
+  A clink streaming cluster: one Coordinator (control plane + dashboard) and a
+  pool of Workers. Maps the docker-compose topology onto Kubernetes - the
+  Coordinator is a Deployment fronted by a Service (its advertised host is the
+  Service DNS name), and the Workers are a StatefulSet so each has a stable
   id across restarts and advertises its own pod IP for the data plane.
 type: application
 # Chart version; bump on chart changes.

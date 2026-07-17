@@ -6,7 +6,7 @@ out/
 
 # Tooling caches that would otherwise balloon the build context
 # (.git is intentionally NOT ignored - CMake hashes HEAD into the
-# plugin ABI version so JM and plugin .so's must agree on it. ~10MB.)
+# plugin ABI version so coordinator and plugin .so's must agree on it. ~10MB.)
 .cache/
 .clangd/
 .ccls-cache/

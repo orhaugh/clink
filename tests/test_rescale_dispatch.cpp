@@ -1,5 +1,5 @@
 // Unit tests for plan_operator_cutover. Drives the pure
-// planning helper that the JM uses when the RescaleCoordinator
+// planning helper that the coordinator uses when the RescaleCoordinator
 // transitions an operator from Draining to CuttingOver.
 
 #include <string>
@@ -32,7 +32,7 @@ TEST(PlanOperatorCutover, ScaleUpDoublesParallelismAndSplitsKeyGroups) {
                                       /*restore_from_dir=*/"/tmp/ckpt",
                                       make_template("agg"),
                                       /*old_subtask_keys=*/{"agg:0", "agg:1"},
-                                      /*tm_free_slots=*/{{"tm-a", 4}, {"tm-b", 4}});
+                                      /*worker_free_slots=*/{{"worker-a", 4}, {"worker-b", 4}});
 
     ASSERT_TRUE(plan.ok) << plan.error;
     ASSERT_EQ(plan.new_tasks.size(), 4u);
@@ -68,7 +68,7 @@ TEST(PlanOperatorCutover, ScaleDownMergesParentSlices) {
                                       "/tmp/ckpt",
                                       make_template("agg"),
                                       {"agg:0", "agg:1", "agg:2", "agg:3"},
-                                      {{"tm-a", 4}});
+                                      {{"worker-a", 4}});
 
     ASSERT_TRUE(plan.ok) << plan.error;
     ASSERT_EQ(plan.new_tasks.size(), 2u);
@@ -95,14 +95,14 @@ TEST(PlanOperatorCutover, RoundRobinPlacementAcrossTMs) {
                                       "/tmp/ckpt",
                                       make_template("agg"),
                                       {"agg:0"},
-                                      {{"tm-a", 2}, {"tm-b", 2}});
+                                      {{"worker-a", 2}, {"worker-b", 2}});
 
     ASSERT_TRUE(plan.ok) << plan.error;
     ASSERT_EQ(plan.new_tasks.size(), 4u);
-    EXPECT_EQ(plan.new_tasks[0].first, "tm-a");
-    EXPECT_EQ(plan.new_tasks[1].first, "tm-b");
-    EXPECT_EQ(plan.new_tasks[2].first, "tm-a");
-    EXPECT_EQ(plan.new_tasks[3].first, "tm-b");
+    EXPECT_EQ(plan.new_tasks[0].first, "worker-a");
+    EXPECT_EQ(plan.new_tasks[1].first, "worker-b");
+    EXPECT_EQ(plan.new_tasks[2].first, "worker-a");
+    EXPECT_EQ(plan.new_tasks[3].first, "worker-b");
 }
 
 TEST(PlanOperatorCutover, RejectsInsufficientCapacity) {
@@ -113,11 +113,11 @@ TEST(PlanOperatorCutover, RejectsInsufficientCapacity) {
                                       "/tmp/ckpt",
                                       make_template("agg"),
                                       {"agg:0", "agg:1"},
-                                      {{"tm-a", 1}, {"tm-b", 2}});
+                                      {{"worker-a", 1}, {"worker-b", 2}});
 
     EXPECT_FALSE(plan.ok);
     EXPECT_TRUE(plan.new_tasks.empty());
-    EXPECT_NE(plan.error.find("insufficient free TM slots"), std::string::npos);
+    EXPECT_NE(plan.error.find("insufficient free worker slots"), std::string::npos);
 }
 
 TEST(PlanOperatorCutover, RejectsNonIntegerScaleFactor) {
@@ -128,7 +128,7 @@ TEST(PlanOperatorCutover, RejectsNonIntegerScaleFactor) {
                                          "/tmp",
                                          make_template("agg"),
                                          {"agg:0", "agg:1"},
-                                         {{"tm-a", 4}});
+                                         {{"worker-a", 4}});
     EXPECT_FALSE(plan_up.ok);
     EXPECT_NE(plan_up.error.find("integer multiple"), std::string::npos);
 
@@ -139,14 +139,14 @@ TEST(PlanOperatorCutover, RejectsNonIntegerScaleFactor) {
                                            "/tmp",
                                            make_template("agg"),
                                            {"agg:0", "agg:1", "agg:2", "agg:3", "agg:4", "agg:5"},
-                                           {{"tm-a", 4}});
+                                           {{"worker-a", 4}});
     EXPECT_FALSE(plan_down.ok);
     EXPECT_NE(plan_down.error.find("integer multiple"), std::string::npos);
 }
 
 TEST(PlanOperatorCutover, RejectsZeroParallelism) {
     auto plan =
-        plan_operator_cutover("agg", 0, 4, 1, "/tmp", make_template("agg"), {}, {{"tm-a", 4}});
+        plan_operator_cutover("agg", 0, 4, 1, "/tmp", make_template("agg"), {}, {{"worker-a", 4}});
     EXPECT_FALSE(plan.ok);
     EXPECT_NE(plan.error.find("non-zero"), std::string::npos);
 }
@@ -159,7 +159,7 @@ TEST(PlanOperatorCutover, RejectsNoOpRescale) {
                                       "/tmp",
                                       make_template("agg"),
                                       {"agg:0", "agg:1", "agg:2", "agg:3"},
-                                      {{"tm-a", 8}});
+                                      {{"worker-a", 8}});
     EXPECT_FALSE(plan.ok);
     EXPECT_NE(plan.error.find("no-op"), std::string::npos);
 }
@@ -171,7 +171,7 @@ TEST(PlanOperatorCutover, ClonesTemplatePeersIntoEveryNewSubtask) {
     templ.peers.push_back(
         PeerAddress{.role = "snk", .subtask_idx = 1, .host = "h", .data_port = 0});
 
-    auto plan = plan_operator_cutover("agg", 1, 2, 1, "/tmp", templ, {"agg:0"}, {{"tm-a", 4}});
+    auto plan = plan_operator_cutover("agg", 1, 2, 1, "/tmp", templ, {"agg:0"}, {{"worker-a", 4}});
     ASSERT_TRUE(plan.ok) << plan.error;
     ASSERT_EQ(plan.new_tasks.size(), 2u);
     for (const auto& [_, t] : plan.new_tasks) {

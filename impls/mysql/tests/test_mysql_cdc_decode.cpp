@@ -51,7 +51,7 @@ CdcColumn col(std::string name, bool uns = false, std::vector<std::string> label
 
 // Ground truth captured from a live MySQL 8.0 master for:
 //   (id INT, u INT UNSIGNED, c CHAR(4), v VARCHAR(300), t TEXT, dt DATETIME(3),
-//    ts TIMESTAMP(0), d DATE, tm TIME(2), dc DECIMAL(10,2), dbl DOUBLE, fl FLOAT,
+//    ts TIMESTAMP(0), d DATE, worker TIME(2), dc DECIMAL(10,2), dbl DOUBLE, fl FLOAT,
 //    en ENUM('a','b','c'), st SET('x','y','z'), js JSON, bl BLOB, bt BIT(8), yr YEAR)
 //   INSERT (-5, 4000000000, 'abcd', 'hi there', 'hello world',
 //           '2026-06-27 14:05:09.123', '2026-06-27 14:05:09', '2026-06-27',
@@ -81,7 +81,7 @@ TEST(MysqlRowDecode, DecodesEveryCommonTypeFromLiveBytes) {
                       col("dt"),
                       col("ts"),
                       col("d"),
-                      col("tm"),
+                      col("worker"),
                       col("dc"),
                       col("dbl"),
                       col("fl"),

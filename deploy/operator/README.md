@@ -2,7 +2,7 @@
 
 A Kubernetes operator that manages clink clusters declaratively through a
 `ClinkCluster` custom resource. Instead of running `helm upgrade` and hand-wiring
-JobManager and TaskManager workloads, you apply one custom resource and the
+Coordinator and Worker workloads, you apply one custom resource and the
 operator reconciles the cluster to match, continuously.
 
 It is built with controller-runtime (Go) and ships as a small static image; it
@@ -12,17 +12,17 @@ needs no host Go toolchain to build (the image is a multi-stage Docker build).
 
 Given a `ClinkCluster`, the controller creates and owns:
 
-- a **JobManager** Deployment (1 replica, or `ha.replicas` when HA is enabled) plus
+- a **Coordinator** Deployment (1 replica, or `ha.replicas` when HA is enabled) plus
   a ClusterIP Service (control + http ports),
-- a **TaskManager** StatefulSet (`taskManager.replicas`, parallel pod management,
-  a `wait-for-jobmanager` initContainer) plus a headless Service,
+- a **Worker** StatefulSet (`worker.replicas`, parallel pod management,
+  a `wait-for-coordinator` initContainer) plus a headless Service,
 - a **ServiceAccount** (unless you supply one),
 - for HA, a shared **ReadWriteMany PVC** mounted at `ha.mountPath`, used by the
   file-coordinator leader election.
 
 All owned objects carry an owner reference, so deleting the `ClinkCluster`
 garbage-collects the whole cluster. The controller then reports status by reading
-the JobManager's `/api/v1/tms` endpoint:
+the Coordinator's `/api/v1/workers` endpoint:
 
 ```
 $ kubectl get clinkcluster
@@ -30,8 +30,8 @@ NAME   PHASE     TMS-READY   DESIRED-TMS   AGE
 demo   Running   2           2             40s
 ```
 
-`.status.phase` is `Pending` until every TaskManager has registered, then
-`Running`; `.status.taskManagersReady` is the live registered count.
+`.status.phase` is `Pending` until every Worker has registered, then
+`Running`; `.status.workersReady` is the live registered count.
 
 ## Install
 
@@ -55,7 +55,7 @@ spec:
   image:
     repository: clink-runtime
     tag: latest
-  taskManager:
+  worker:
     replicas: 2
     slots: 4
   # ha:
@@ -63,18 +63,18 @@ spec:
   #   replicas: 2        # needs a ReadWriteMany StorageClass
 ```
 
-Scaling is declarative: edit `spec.taskManager.replicas` and re-apply; the
+Scaling is declarative: edit `spec.worker.replicas` and re-apply; the
 StatefulSet is reconciled in place. See `config/samples/clinkcluster.yaml`.
 
-`spec.taskManager.env` / `spec.jobManager.env` set extra `KEY=VALUE`
-environment variables on the pods. Job plugins dlopen'd on the TaskManagers
+`spec.worker.env` / `spec.coordinator.env` set extra `KEY=VALUE`
+environment variables on the pods. Job plugins dlopen'd on the Workers
 read their build-time configuration from process env (registered factory
 closures capture it at dlopen), so runtime-side job env belongs on the
 CLUSTER; `ClinkJob.env` only reaches the submit-side spec build.
 
 ## HA
 
-`spec.ha.enabled: true` runs `spec.ha.replicas` JobManagers that elect a leader via
+`spec.ha.enabled: true` runs `spec.ha.replicas` Coordinators that elect a leader via
 the file coordinator over the shared HA PVC (which must be `ReadWriteMany`). This is
 the same coordinator the Helm chart uses; see `deploy/helm/clink`.
 
@@ -82,7 +82,7 @@ the same coordinator the Helm chart uses; see `deploy/helm/clink`.
 
 `kind-operator-smoke.sh` builds the operator image, stands up a kind cluster, installs
 the operator, applies a `ClinkCluster`, and asserts it reconciles to `Running` with
-the expected TaskManager count and correct owner references. It requires a local
+the expected Worker count and correct owner references. It requires a local
 `clink-runtime:latest` image (`docker build -t clink-runtime:latest -f
 docker/Dockerfile.runtime .`).
 
@@ -98,8 +98,8 @@ cancel-on-delete) on top of the same kind setup.
 
 A `ClinkJob` runs a compiled job plugin (`.so`, baked into the runtime image) on a
 `ClinkCluster` and manages its lifecycle declaratively. The controller submits the
-job by exec'ing the in-image `clink` CLI inside a JobManager pod and tracks it over
-the JobManager HTTP API.
+job by exec'ing the in-image `clink` CLI inside a Coordinator pod and tracks it over
+the Coordinator HTTP API.
 
 ```yaml
 apiVersion: clink.dev/v1alpha1
@@ -157,7 +157,7 @@ delete -> assert the finalizer cancelled it.
 ## Scale-to-zero (suspend / resume)
 
 A parked job costs nothing: the operator drains it to a savepoint, cancels it
-(freeing its TaskManager slots for other jobs), and the state waits on shared
+(freeing its Worker slots for other jobs), and the state waits on shared
 storage. Waking is a resubmit restored from that savepoint - seconds-class,
 exactly-once. Three triggers:
 
@@ -167,7 +167,7 @@ spec:
                                #    Absolute: no wake policy overrides it.
   suspendPolicy:               # 2. auto-park when the job goes idle:
     idleAfterSeconds: 600      #    no operator processed a record for 10min
-                               #    (watched via the JM's per-op records_in).
+                               #    (watched via the coordinator's per-op records_in).
   wakePolicy:                  # 3. auto-wake an Idle-parked job:
     kafkaLag:                  #    poll consumer-group lag while parked,
       brokers: kafka:9092      #    resume when pending records reach the
@@ -194,7 +194,7 @@ re-wakes it, cycling at the idle window - the same feedback rule as any
 lag-driven autoscaler.
 
 `kind-suspend-smoke.sh` proves all four paths end to end: manual park (savepoint
-recorded, job cancelled on the JM) -> manual wake (restored, latency printed) ->
+recorded, job cancelled on the coordinator) -> manual wake (restored, latency printed) ->
 idle auto-park (slow-tick job) -> lag wake against an in-cluster single-node
 KRaft Kafka, including the negative check (empty topic keeps it parked, status
 reporting `lag 0 < threshold`).
@@ -205,7 +205,7 @@ v1 covers the cluster lifecycle (create, scale, HA, status, garbage collection) 
 jobs (`ClinkJob` submit, status, savepoint-on-upgrade, cancel-on-delete).
 
 Not yet implemented (roadmap): HA leader-targeting for job exec (v1 targets any ready
-JobManager pod, correct for single-JM clusters), and image-driven upgrades (rolling
+Coordinator pod, correct for single-coordinator clusters), and image-driven upgrades (rolling
 the runtime image as an upgrade trigger).
 
 ## Develop

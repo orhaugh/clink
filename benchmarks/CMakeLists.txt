@@ -49,7 +49,7 @@ clink_set_warnings(clink_serde_bench)
 
 # Nexmark benchmark - the Nexmark streaming benchmark
 # (github.com/nexmark/nexmark) as clink SQL jobs over a generated event stream
-# (connector='nexmark') on an in-process JM/TM cluster, output discarded through
+# (connector='nexmark') on an in-process coordinator/worker cluster, output discarded through
 # a blackhole sink. Reports input-event throughput. Needs the SQL frontend.
 if(TARGET clink::sql)
     add_executable(clink_nexmark_bench clink_nexmark_bench.cpp)
@@ -149,7 +149,7 @@ clink_set_warnings(clink_join_bench_pipeline)
 # prod_compare/parallel_recovery: same workload as inproc_compare but
 # at parallelism=N. Source shards the cursor across subtasks; key_by
 # routes by extractor name so hash-partitioning is consistent. v1 has
-# no induced-crash test; v2 will kill the TM mid-run.
+# no induced-crash test; v2 will kill the worker mid-run.
 add_library(clink_parallel_bench_pipeline MODULE
     prod_compare/parallel_recovery/clink-job/parallel_pipeline.cpp)
 target_link_libraries(clink_parallel_bench_pipeline PRIVATE

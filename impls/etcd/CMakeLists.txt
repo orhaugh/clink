@@ -3,12 +3,12 @@
 # Replaces the FileHaCoordinator's shared-filesystem assumption with
 # an etcd v3 cluster, so multi-machine HA works without an NFS mount.
 # The leader-election protocol uses a TTL'd lease + atomic Put (the
-# etcdv3 equivalent of "create-if-absent"): whichever JM creates the
+# etcdv3 equivalent of "create-if-absent"): whichever coordinator creates the
 # leader key first wins, holds it via lease KeepAlive, and the lease
 # expires automatically if the process dies.
 #
 # Standbys Watch the leader key and try to acquire on every
-# DELETE event. TMs use the same Get() against the leader key to
+# DELETE event. workers use the same Get() against the leader key to
 # discover the active endpoint.
 #
 # Optional dep: etcd-cpp-apiv3 (https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3).

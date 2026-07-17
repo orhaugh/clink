@@ -1,4 +1,4 @@
-// Unit tests for the StreamExecutionEnvironment / DataStream<T> fluent
+// Unit tests for the Pipeline / DataStream<T> fluent
 // API. These verify the IR the env builds matches what hand-written
 // JobGraphSpecs used to look like and that the planner is happy with
 // the result, without any user-facing JSON in sight.
@@ -12,7 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/job_planner.hpp"
@@ -25,7 +25,7 @@ using namespace clink;
 using namespace clink::api;
 
 TEST(StreamEnvBuilder, SourceAndSinkAppendIntoJobGraphSpec) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(5).start(100).build());
     src.sink(FileInt64Sink::builder().path("/tmp/clink_env_test.out").build());
 
@@ -45,7 +45,7 @@ TEST(StreamEnvBuilder, ExpectStateVersionRecordsSlotInGraph) {
     // The 4-arg expect_state_version overload must land the slot on the
     // graph's expected map (keyed by operator_id_from_uid). get() is
     // slot-blind, so assert via entries().
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.expect_state_version("join", "JoinLeft", 2, "left_buf");
 
     const auto entries = env.graph().expected_state_versions.entries();
@@ -57,7 +57,7 @@ TEST(StreamEnvBuilder, ExpectStateVersionRecordsSlotInGraph) {
 }
 
 TEST(StreamEnvBuilder, TransformChainsTypedStages) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(3).build());
     auto evens = src.transform<std::int64_t>("even_filter_int64");
     auto strs = evens.transform<std::string>("int64_to_string");
@@ -74,7 +74,7 @@ TEST(StreamEnvBuilder, TransformChainsTypedStages) {
 }
 
 TEST(StreamEnvBuilder, BuiltGraphPlansCleanly) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(4).build());
     src.transform<std::int64_t>("multiply_int64", {{"factor", "10"}})
         .sink(FileInt64Sink::builder().path("/tmp/clink_plan_test.out").build());
@@ -87,7 +87,7 @@ TEST(StreamEnvBuilder, BuiltGraphPlansCleanly) {
 }
 
 TEST(StreamEnvBuilder, ParallelismOnSourceFlowsThroughGraph) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.source<std::int64_t>(IntRangeSource::builder().count(10).parallelism(3).build())
         .sink(FileInt64Sink::builder().path("/tmp/clink_par_test.out").parallelism(3).build());
     const auto& graph = env.graph();
@@ -96,13 +96,13 @@ TEST(StreamEnvBuilder, ParallelismOnSourceFlowsThroughGraph) {
 }
 
 TEST(StreamEnvBuilder, EmptyGraphExecutionThrows) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     application::JobSubmitter submitter("127.0.0.1", 1);
     EXPECT_THROW(env.execute("noop", submitter, {}), std::runtime_error);
 }
 
 TEST(StreamEnvBuilder, DuplicateExplicitIdThrows) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(1).build(), "src");
     // Re-using "src" as the next op's id collides with the source.
     EXPECT_THROW(src.sink(FileInt64Sink::builder().path("/tmp/x").build(), "src"),
@@ -113,7 +113,7 @@ TEST(StreamEnvBuilder, DuplicateExplicitIdThrows) {
 // impls/clickhouse/tests/ and impls/s3/tests/ respectively.
 
 TEST(StreamEnvBuilder, InlineMapMintsOpTypeAndChainsTransform) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(3).build());
     auto mapped = src.map<std::int64_t>([](const std::int64_t& v) { return v + 1; });
     mapped.sink(FileInt64Sink::builder().path("/tmp/clink_inline_map.out").build());
@@ -126,13 +126,13 @@ TEST(StreamEnvBuilder, InlineMapMintsOpTypeAndChainsTransform) {
     EXPECT_EQ(graph.ops[2].type, "file_int64_sink");
 
     // The minted op-type must be reachable through the runner registry -
-    // that's what the planner / TM will consult when the job runs.
+    // that's what the planner / worker will consult when the job runs.
     const auto& rr = cluster::RunnerRegistry::default_instance();
     EXPECT_NE(rr.find_operator(graph.ops[1].type, "int64", "int64"), nullptr);
 }
 
 TEST(StreamEnvBuilder, InlineFlatMapRegistersWithRunnerRegistry) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(3).build());
     auto flat = src.flat_map<std::string>([](const std::int64_t& v) {
         return std::vector<std::string>{std::to_string(v), "x" + std::to_string(v)};
@@ -150,7 +150,7 @@ TEST(StreamEnvBuilder, InlineFlatMapRegistersWithRunnerRegistry) {
 }
 
 TEST(StreamEnvBuilder, InlineFilterRegistersWithRunnerRegistry) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(10).build());
     auto filtered = src.filter([](const std::int64_t& v) { return v % 2 == 0; });
     filtered.sink(FileInt64Sink::builder().path("/tmp/clink_inline_filter.out").build());
@@ -165,7 +165,7 @@ TEST(StreamEnvBuilder, InlineFilterRegistersWithRunnerRegistry) {
 }
 
 TEST(StreamEnvBuilder, InlineMapNamesAreUniqueAcrossCalls) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(1).build());
     auto a = src.map<std::int64_t>([](const std::int64_t& v) { return v; });
     auto b = a.map<std::int64_t>([](const std::int64_t& v) { return v; });
@@ -179,7 +179,7 @@ TEST(StreamEnvBuilder, InlineMapNamesAreUniqueAcrossCalls) {
 }
 
 TEST(StreamEnvBuilder, InlineKeyByRegistersExtractorAndChains) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(4).build());
     auto keyed = src.key_by([](const std::int64_t& v) { return v % 2; });
     keyed.template process<std::int64_t>("identity_int64")
@@ -209,7 +209,7 @@ public:
 }  // namespace
 
 TEST(StreamEnvBuilder, InlineProcessAsyncMintsOpTypeAndCarriesKeyBy) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(4).build());
     src.key_by([](const std::int64_t& v) { return v % 2; })
         .process_async<std::int64_t, std::int64_t>(
@@ -247,7 +247,7 @@ public:
 }  // namespace
 
 TEST(StreamEnvBuilder, InlineConnectProcessAsyncMintsOpTypeAndCarriesKeyBy) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     // Both streams must share the same key_by NAME for connect (the guard); a
     // named (vs inline) key_by keeps the two names identical for this
     // graph-shape test.
@@ -277,7 +277,7 @@ TEST(StreamEnvBuilder, InlineConnectProcessAsyncMintsOpTypeAndCarriesKeyBy) {
 }
 
 TEST(StreamEnvBuilder, InlineReduceMintsOpTypeAndCarriesKeyBy) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(4).build());
     auto reduced = src.key_by([](const std::int64_t& v) { return v % 2; })
                        .reduce([](const std::int64_t& a, const std::int64_t& b) { return a + b; });
@@ -294,7 +294,7 @@ TEST(StreamEnvBuilder, InlineReduceMintsOpTypeAndCarriesKeyBy) {
 }
 
 TEST(StreamEnvBuilder, InlineAssignTimestampsRegistersWatermarkAssigner) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(3).build());
     src.assign_timestamps_monotonic([](const std::int64_t& v) { return EventTime{v * 1000}; })
         .sink(FileInt64Sink::builder().path("/tmp/clink_inline_ts.out").build());
@@ -310,7 +310,7 @@ TEST(StreamEnvBuilder, InlineAssignTimestampsRegistersWatermarkAssigner) {
 
 TEST(StreamEnvBuilder, InlineSlidingWindowAggregateMintsOpTypeAndCarriesKeyBy) {
     using namespace std::chrono_literals;
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.source<std::int64_t>(IntRangeSource::builder().count(4).build());
     auto agg = src.key_by([](const std::int64_t& v) { return v % 2; })
                    .sliding_window(1000ms, 500ms)
@@ -428,7 +428,7 @@ TEST(SlidingWindowAggregateOperator, EmitsOverlappingWindowsForTrueSlide) {
 }
 
 TEST(StreamEnvBuilder, FromElementsBuildsSourceWithRegisteredFactory) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.from_elements<std::int64_t>({10, 20, 30})
         .sink(FileInt64Sink::builder().path("/tmp/clink_from_elements.out").build());
 
@@ -443,7 +443,7 @@ TEST(StreamEnvBuilder, FromElementsBuildsSourceWithRegisteredFactory) {
 }
 
 TEST(StreamEnvBuilder, FromElementsAcceptsStrings) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.from_elements<std::string>({"alpha", "beta", "gamma"})
         .sink(FileTextSink::builder().path("/tmp/clink_from_elements_str.out").build());
 

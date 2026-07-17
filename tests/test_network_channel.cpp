@@ -376,8 +376,8 @@ TEST(NetworkChannel, DrainMarkerRoundTripsAcrossWire) {
 
 // The bridge adapter (NetworkBridgeSource::produce) must FORWARD a wire-delivered
 // drain marker, not route it into as_barrier() - the old else-branch did the
-// latter and threw bad_variant_access, killing the cross-TM recv consumer the
-// moment a rescale drained an upstream subtask on the sending TM. The channel-
+// latter and threw bad_variant_access, killing the cross-worker recv consumer the
+// moment a rescale drained an upstream subtask on the sending worker. The channel-
 // level round-trip above never goes through produce(); this exercises it.
 TEST(NetworkBridge, ProduceForwardsDrainMarker) {
     NetworkBridgeSource<std::int64_t> source(/*port*/ 0, int64_codec());
@@ -514,7 +514,7 @@ TEST(NetworkChannel, PerOperatorBytesAttributed) {
 
 // Security: a frame header is attacker-controllable, so an unbounded
 // vector<byte>(frame_len) is a memory-amplification DoS - a peer that claims
-// 4 GiB makes the reader allocate 4 GiB and OOM the JobManager/TaskManager.
+// 4 GiB makes the reader allocate 4 GiB and OOM the Coordinator/Worker.
 // wire.hpp caps the frame length; the source must reject an oversized header
 // and drop the connection (so pop() drains to nullopt) rather than allocating
 // it or blocking forever on a body that never comes. Before the cap this test

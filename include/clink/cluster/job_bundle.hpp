@@ -13,15 +13,15 @@
 namespace clink::cluster {
 
 // JobBundle owns one of each registry type, all parented to the
-// corresponding default-instance. It's how the JM and TM scope a
+// corresponding default-instance. It's how the coordinator and worker scope a
 // submitted job's plugin/inline-lambda registrations: registrations
 // (PluginLoader writes, build_fn writes) land in the bundle's
 // instances, while lookups (planner, runner dispatch) fall through to
 // the default singletons on miss for built-ins (int64/string types,
 // file_text_sink etc).
 //
-// Lifetime: one bundle per submitted job. JM creates it in
-// handle_submit_; TM creates a mirror on first Deploy of that job.
+// Lifetime: one bundle per submitted job. coordinator creates it in
+// handle_submit_; worker creates a mirror on first Deploy of that job.
 // Bundles do NOT cross processes - each side maintains its own,
 // driven by the same .so dlopened in both places.
 //

@@ -1,10 +1,10 @@
 // Canonical map/filter/window/aggregate pipeline packaged as a job .so.
 //
-// A single build function that uses the fluent StreamExecutionEnvironment
+// A single build function that uses the fluent Pipeline
 // API to describe a pipeline. The CLINK_REGISTER_JOB macro wraps it as
-// a plugin .so the submitter and TM processes both dlopen.
+// a plugin .so the submitter and worker processes both dlopen.
 // Cross-process, the inline lambdas inside .map() / .filter() /
-// .key_by() / .aggregate() fire under std::call_once on each TM, so
+// .key_by() / .aggregate() fire under std::call_once on each worker, so
 // the operator-types resolve the same way on every node.
 //
 // Pipeline:
@@ -22,7 +22,7 @@
 //   key 0 (even bucket: 40):        40
 //   key 1 (odd bucket: 30, 50):     30 + 50 = 80
 //
-// Output path is set via the env var CLINK_CANONICAL_OUT_PATH so the
+// Output path is set via the pipeline var CLINK_CANONICAL_OUT_PATH so the
 // integration test can control where the sink writes.
 
 #include <chrono>
@@ -31,7 +31,7 @@
 #include <string>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/job/register_job.hpp"
 #include "clink/time/event_time.hpp"
 
@@ -44,10 +44,10 @@ std::string output_path() {
     return "/tmp/canonical_pipeline_out.txt";
 }
 
-void define_job(clink::api::StreamExecutionEnvironment& env) {
+void define_job(clink::api::Pipeline& pipeline) {
     using namespace std::chrono_literals;
 
-    env.from_elements<std::int64_t>({1, 2, 3, 4, 5})
+    pipeline.from_elements<std::int64_t>({1, 2, 3, 4, 5})
         .map<std::int64_t>([](const std::int64_t& v) { return v * 10; })
         .filter([](const std::int64_t& v) { return v > 20; })
         .assign_timestamps_monotonic([](const std::int64_t& v) { return clink::EventTime{v}; })

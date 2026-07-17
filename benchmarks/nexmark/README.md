@@ -2,7 +2,7 @@
 
 Runs queries from the [Nexmark streaming benchmark](https://github.com/nexmark/nexmark)
 as clink SQL jobs over a generated event stream, on an in-process
-JobManager + TaskManager cluster, and reports input-event throughput.
+Coordinator + Worker cluster, and reports input-event throughput.
 
 ## Build & run
 
@@ -17,7 +17,7 @@ cmake --build build --target clink_nexmark_bench -j
 ```
 
 Flags: `--query qN`, `--events N` (total events), `--tps N` (dateTime spacing =
-1000/tps ms/event), `--slots N` (TaskManager slots = parallelism; joins need >= 7),
+1000/tps ms/event), `--slots N` (Worker slots = parallelism; joins need >= 7),
 `--warmup-events N` / `--warmup-frac F` (steady-state warm-up boundary, default
 10% of events).
 
@@ -35,7 +35,7 @@ dominates the steady rate is visibly higher than the cold rate; on a large run
 they converge.
 
 This is a clink-only number for tracking clink against itself. It is NOT a
-cross-engine figure, and the in-process single-TaskManager shape here must never
+cross-engine figure, and the in-process single-Worker shape here must never
 be compared against a clustered engine. A separate, premise-pinned cross-engine
 harness is the follow-on.
 
@@ -138,7 +138,7 @@ window and fires at end-of-stream.
 - `events_per_sec` is the logical-stream rate (`events / wall`). Multi-table
   queries instantiate the generator per table, re-deriving the shared stream, so
   the denominator is logical events, not physically-generated events.
-- In-process single TaskManager; not a distributed-cluster number, and not
+- In-process single Worker; not a distributed-cluster number, and not
   comparable to any other engine.
 - All 23 queries run; q10 is IT-only (it writes partition files, not a
   throughput query).

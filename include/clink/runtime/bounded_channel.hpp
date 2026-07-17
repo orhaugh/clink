@@ -45,7 +45,7 @@ public:
             ++push_waiters_;
             // Periodic stuck-warning: every kStuckWarnInterval seconds
             // a still-blocked push prints (name, size/capacity, waiters)
-            // to stderr. Logs land in clink_tm.log naturally; greppable
+            // to stderr. Logs land in clink_worker.log naturally; greppable
             // signature is "BOUNDED_CHANNEL_STUCK". Used for backpressure-
             // deadlock diagnosis - works across the RTLD_LOCAL plugin
             // boundary because each .so logs its own channels through

@@ -1,13 +1,13 @@
-// clink_rescale_op - client CLI: ask a running JobManager to rescale
+// clink_rescale_op - client CLI: ask a running Coordinator to rescale
 // ONE operator within a job to a new parallelism.
 // Mirrors clink_rescale_job's wire flow but targets a single operator
 // (via its OperatorSpec.id) rather than a whole role list.
 //
 // Usage:
 //   clink rescale-op --job-id=N --op=<op_id> --parallelism=<p> \
-//                    [--jm-host=127.0.0.1] [--jm-port=6123]
+//                    [--coordinator-host=127.0.0.1] [--coordinator-port=6123]
 //
-// The JM validates against the operator's min/max bounds
+// The coordinator validates against the operator's min/max bounds
 // (set in the OperatorSpec at submit time) and rejects out-of-range
 // requests, requests equal to the current parallelism, and requests
 // against operators that already have a rescale in progress.
@@ -52,7 +52,7 @@ bool has_flag(int argc, char** argv, std::string_view flag) {
 
 void usage() {
     std::cerr << "Usage: clink rescale-op --job-id=N --op=<op_id> --parallelism=<p> "
-                 "[--jm-host=127.0.0.1] [--jm-port=6123]\n";
+                 "[--coordinator-host=127.0.0.1] [--coordinator-port=6123]\n";
 }
 
 }  // namespace
@@ -66,8 +66,8 @@ int clink_cmd_rescale_op(int argc, char** argv) {
     const auto job_id_str = get_arg(argc, argv, "job-id");
     const auto op_id = get_arg(argc, argv, "op");
     const auto parallelism_str = get_arg(argc, argv, "parallelism");
-    const auto jm_host = get_arg(argc, argv, "jm-host", "127.0.0.1");
-    const auto jm_port_str = get_arg(argc, argv, "jm-port", "6123");
+    const auto coordinator_host = get_arg(argc, argv, "coordinator-host", "127.0.0.1");
+    const auto coordinator_port_str = get_arg(argc, argv, "coordinator-port", "6123");
 
     if (job_id_str.empty() || op_id.empty() || parallelism_str.empty()) {
         std::cerr << "clink_rescale_op: --job-id, --op, and --parallelism are all required\n";
@@ -76,11 +76,12 @@ int clink_cmd_rescale_op(int argc, char** argv) {
 
     const auto job_id = static_cast<clink::cluster::JobId>(std::stoull(job_id_str));
     const auto new_parallelism = static_cast<std::uint32_t>(std::stoul(parallelism_str));
-    const auto jm_port = static_cast<std::uint16_t>(std::stoi(jm_port_str));
+    const auto coordinator_port = static_cast<std::uint16_t>(std::stoi(coordinator_port_str));
 
-    const int fd = clink::network::NetworkSocket::connect_to(jm_host, jm_port);
+    const int fd = clink::network::NetworkSocket::connect_to(coordinator_host, coordinator_port);
     if (fd < 0) {
-        std::cerr << "clink_rescale_op: connect_to(" << jm_host << ":" << jm_port << ") failed\n";
+        std::cerr << "clink_rescale_op: connect_to(" << coordinator_host << ":" << coordinator_port
+                  << ") failed\n";
         return 3;
     }
 
@@ -109,7 +110,7 @@ int clink_cmd_rescale_op(int argc, char** argv) {
         }
     }
 
-    // Wait for the JM to ack. Frame: 4-byte big-endian length + 1-byte
+    // Wait for the coordinator to ack. Frame: 4-byte big-endian length + 1-byte
     // MessageKind + body. Same framing as the other CLI tools.
     std::array<std::byte, 4> len_hdr{};
     if (!clink::network::NetworkSocket::recv_all(fd, len_hdr.data(), len_hdr.size())) {

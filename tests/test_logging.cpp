@@ -80,13 +80,13 @@ TEST(LogBufferTest, TailSinceMsCursor) {
 
 TEST(LogBufferTest, TailSourcePrefixFilter) {
     clink::LogBuffer buf(16);
-    buf.push(rec(1, "info", "jm.register", "x"));
-    buf.push(rec(2, "info", "jm.watchdog", "y"));
-    buf.push(rec(3, "info", "tm.run", "z"));
+    buf.push(rec(1, "info", "coordinator.register", "x"));
+    buf.push(rec(2, "info", "coordinator.watchdog", "y"));
+    buf.push(rec(3, "info", "worker.run", "z"));
 
-    EXPECT_EQ(buf.tail(100, "", 0, "jm.").size(), 2U);
-    EXPECT_EQ(buf.tail(100, "", 0, "tm.").size(), 1U);
-    EXPECT_EQ(buf.tail(100, "", 0, "jm.register").size(), 1U);
+    EXPECT_EQ(buf.tail(100, "", 0, "coordinator.").size(), 2U);
+    EXPECT_EQ(buf.tail(100, "", 0, "worker.").size(), 1U);
+    EXPECT_EQ(buf.tail(100, "", 0, "coordinator.register").size(), 1U);
     EXPECT_TRUE(buf.tail(100, "", 0, "nope").empty());
 }
 
@@ -104,13 +104,13 @@ TEST(LogBufferTest, TailAppliesFiltersBeforeLimit) {
 
 TEST(LogBufferTest, DistinctSourcesSortedUnique) {
     clink::LogBuffer buf(16);
-    buf.push(rec(1, "info", "tm.run", "x"));
-    buf.push(rec(2, "info", "jm.register", "y"));
-    buf.push(rec(3, "info", "tm.run", "z"));  // dup
+    buf.push(rec(1, "info", "worker.run", "x"));
+    buf.push(rec(2, "info", "coordinator.register", "y"));
+    buf.push(rec(3, "info", "worker.run", "z"));  // dup
     auto sources = buf.distinct_sources();
     ASSERT_EQ(sources.size(), 2U);
-    EXPECT_EQ(sources[0], "jm.register");  // sorted
-    EXPECT_EQ(sources[1], "tm.run");
+    EXPECT_EQ(sources[0], "coordinator.register");  // sorted
+    EXPECT_EQ(sources[1], "worker.run");
 }
 
 // --------------------------------------------------------------------------
@@ -262,7 +262,7 @@ TEST(LoggingInit, FacadeFeedsRingAndFileWithSourceAsName) {
     const auto file = (dir / "node.log").string();
     clink::logging::LoggingConfig cfg;
     cfg.level = "debug";
-    cfg.node_name = "jm";
+    cfg.node_name = "coordinator";
     cfg.file_path = file;
     cfg.console = false;  // keep test output clean
     cfg.async = false;    // synchronous: assert immediately after logging
@@ -271,7 +271,7 @@ TEST(LoggingInit, FacadeFeedsRingAndFileWithSourceAsName) {
 
     const std::string marker = "init.facade.unique";
     clink::log::debug(marker, "dbg-line");
-    clink::log::info(marker, "tm=foo slots=4");
+    clink::log::info(marker, "worker=foo slots=4");
     clink::log::error(marker, "err-line");
 
     // Ring: source == the call-site source (the %n routing), level mapped.
@@ -279,7 +279,7 @@ TEST(LoggingInit, FacadeFeedsRingAndFileWithSourceAsName) {
     ASSERT_EQ(ring.size(), 3U);
     EXPECT_EQ(ring[0].source, marker);
     EXPECT_EQ(ring[0].level, "debug");
-    EXPECT_EQ(ring[1].message, "tm=foo slots=4");
+    EXPECT_EQ(ring[1].message, "worker=foo slots=4");
     EXPECT_EQ(ring[2].level, "error");
 
     // ?level=error drops the lower levels (the /api/v1/logs filter contract).
@@ -288,7 +288,7 @@ TEST(LoggingInit, FacadeFeedsRingAndFileWithSourceAsName) {
     // File got the rendered lines (pattern carries [source] and the message).
     const auto contents = read_file(file);
     EXPECT_NE(contents.find(marker), std::string::npos);
-    EXPECT_NE(contents.find("tm=foo slots=4"), std::string::npos);
+    EXPECT_NE(contents.find("worker=foo slots=4"), std::string::npos);
 
     clink::logging::shutdown();
 }
@@ -300,7 +300,7 @@ TEST(LoggingInit, AsyncConcurrentProducersAllRecordsLandNoRace) {
     auto dir = temp_dir("async");
     clink::logging::LoggingConfig cfg;
     cfg.level = "info";
-    cfg.node_name = "jm";
+    cfg.node_name = "coordinator";
     cfg.file_path = (dir / "node.log").string();
     cfg.console = false;
     cfg.async = true;  // the path clink_node uses by default
@@ -335,7 +335,7 @@ TEST(LoggingInit, ConfiguredLevelGatesLowerSeverities) {
     const auto file = (dir / "node.log").string();
     clink::logging::LoggingConfig cfg;
     cfg.level = "warn";
-    cfg.node_name = "tm@x";
+    cfg.node_name = "worker@x";
     cfg.file_path = file;
     cfg.console = false;
     cfg.async = false;

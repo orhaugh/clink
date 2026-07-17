@@ -21,7 +21,7 @@
 
 #include <gtest/gtest.h>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/runtime/bounded_channel.hpp"
 #include "clink/runtime/runtime_context.hpp"
 
@@ -34,7 +34,7 @@ using namespace std::chrono_literals;
 // ---------------------------------------------------------------------------
 
 TEST(FluentTumblingWindow, AppearsInGraphWithLatenessAndLateTagAccepted) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.from_elements<std::int64_t>({1, 2, 3});
     OutputTag<std::int64_t> late_tag("late");
     src.assign_timestamps_monotonic([](const std::int64_t& v) { return EventTime{v}; })
@@ -56,7 +56,7 @@ TEST(FluentTumblingWindow, AppearsInGraphWithLatenessAndLateTagAccepted) {
 }
 
 TEST(FluentSlidingWindow, AppearsInGraphWithLatenessAndLateTagAccepted) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.from_elements<std::int64_t>({1, 2, 3});
     OutputTag<std::int64_t> late_tag("late");
     src.assign_timestamps_monotonic([](const std::int64_t& v) { return EventTime{v}; })
@@ -78,7 +78,7 @@ TEST(FluentSlidingWindow, AppearsInGraphWithLatenessAndLateTagAccepted) {
 }
 
 TEST(FluentSessionWindow, AppearsInGraphWithMergerAndLatenessAccepted) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.from_elements<std::int64_t>({1, 2, 3});
     src.assign_timestamps_monotonic([](const std::int64_t& v) { return EventTime{v}; })
         .key_by([](const std::int64_t&) { return std::int64_t{0}; })
@@ -283,7 +283,7 @@ TEST(KeyedSessionWindowAggregateOperator, FiresOnTimeAndRefiresOnMergedLateRecor
 // ---------------------------------------------------------------------------
 
 TEST(FluentTumblingWindow, WithTriggerCompilesAndAppearsInGraph) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.from_elements<std::int64_t>({1, 2, 3});
     src.assign_timestamps_monotonic([](const std::int64_t& v) { return EventTime{v}; })
         .key_by([](const std::int64_t&) { return std::int64_t{0}; })
@@ -303,7 +303,7 @@ TEST(FluentTumblingWindow, WithTriggerCompilesAndAppearsInGraph) {
 }
 
 TEST(FluentSlidingWindow, WithTriggerCompilesAndAppearsInGraph) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.from_elements<std::int64_t>({1, 2, 3});
     src.assign_timestamps_monotonic([](const std::int64_t& v) { return EventTime{v}; })
         .key_by([](const std::int64_t&) { return std::int64_t{0}; })
@@ -383,7 +383,7 @@ TEST(KeyedTumblingWindowFullOperator, CountTriggerFiresOnNthRecord) {
 // ---------------------------------------------------------------------------
 
 TEST(FluentEvictingTumbling, CompilesAndAppearsInGraph) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.from_elements<std::int64_t>({1, 2, 3, 4, 5});
     src.assign_timestamps_monotonic([](const std::int64_t& v) { return EventTime{v}; })
         .key_by([](const std::int64_t&) { return std::int64_t{0}; })
@@ -477,7 +477,7 @@ struct EmitTriple {
 }  // namespace
 
 TEST(FluentTumblingWindowEmit, AppearsInGraphAndExposesKeyAndWindowEnd) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.registry().register_type<EmitTriple>(
         "test.EmitTriple",
         Codec<EmitTriple>{.encode = [](const EmitTriple&) { return std::vector<std::byte>{}; },
@@ -505,7 +505,7 @@ TEST(FluentTumblingWindowEmit, AppearsInGraphAndExposesKeyAndWindowEnd) {
 }
 
 TEST(FluentSlidingWindowEmit, AppearsInGraph) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.registry().register_type<EmitTriple>(
         "test.EmitTriple",
         Codec<EmitTriple>{.encode = [](const EmitTriple&) { return std::vector<std::byte>{}; },
@@ -533,7 +533,7 @@ TEST(FluentSlidingWindowEmit, AppearsInGraph) {
 }
 
 TEST(FluentSessionWindowEmit, AppearsInGraph) {
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     env.registry().register_type<EmitTriple>(
         "test.EmitTriple",
         Codec<EmitTriple>{.encode = [](const EmitTriple&) { return std::vector<std::byte>{}; },

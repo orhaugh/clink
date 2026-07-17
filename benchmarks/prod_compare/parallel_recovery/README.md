@@ -22,8 +22,8 @@ parallelism.
     Late records (arriving after watermark > window.end + 2s) are
     routed to a `late_data_side_output<Event>` and counted
     separately by a side sink.
-  - **Induced crash**: at the 6 s mark the runner kills the TM
-    process. The runner then restarts the TM, the JM restores from
+  - **Induced crash**: at the 6 s mark the runner kills the worker
+    process. The runner then restarts the worker, the coordinator restores from
     the most recent successful checkpoint, the source replays from
     the restored offset, the job runs to completion.
 

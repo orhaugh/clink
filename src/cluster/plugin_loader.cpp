@@ -143,7 +143,7 @@ PluginLoadResult PluginLoader::load_into(const std::string& so_path,
     // build_fn) re-runs into THIS caller's registry. dlopen() refcounts by
     // inode: opening the same path twice returns the same instance whose
     // call_once has already fired, so a second caller's registry (e.g. a
-    // long-lived JobManager planning a second job, or resubmitting the same
+    // long-lived Coordinator planning a second job, or resubmitting the same
     // .so on a savepoint-driven upgrade) would get NO factories and plan_job
     // rejects with "no source factory registered". We sidestep that by
     // dlopening a unique per-load copy: a distinct inode is a distinct

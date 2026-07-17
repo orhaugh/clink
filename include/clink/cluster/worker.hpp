@@ -30,12 +30,12 @@ class JobBundle;
 // (which contains peer addresses, the bind port, and any role-specific
 // extra_config) and runs synchronously until the task is done or fails.
 //
-// Throwing from the handler is reported back to the JobManager as a task
+// Throwing from the handler is reported back to the Coordinator as a task
 // error; otherwise the task is reported as a clean finish.
 using RoleHandler = std::function<void(const DeploymentTask& task)>;
 
-// TaskManager is the cluster's worker side. Each TM:
-//   1. Connects to the JobManager on (host, port) and sends Register.
+// Worker is the cluster's worker side. Each worker:
+//   1. Connects to the Coordinator on (host, port) and sends Register.
 //   2. Reads Deploy messages and dispatches each task either to the
 //      built-in generic subtask role (when role == kGenericSubtaskRole)
 //      or to a user-registered RoleHandler.
@@ -44,20 +44,20 @@ using RoleHandler = std::function<void(const DeploymentTask& task)>;
 //      reports SubtaskListening, awaits PeerUpdate, then builds and
 //      runs the operator chain via LocalExecutor.
 //   4. Sends SubtaskFinished back when each handler completes.
-//   5. Cleanly shuts down on stop() or when the JM closes the connection.
-class TaskManager {
+//   5. Cleanly shuts down on stop() or when the coordinator closes the connection.
+class Worker {
 public:
     struct Config {
         std::chrono::milliseconds heartbeat_interval{500};
         std::uint32_t slot_count{1};
         // Maximum time to wait for a PeerUpdate after sending
         // SubtaskListening. Beyond this the generic role aborts the
-        // task with an error so the JM can retry/cancel cleanly.
+        // task with an error so the coordinator can retry/cancel cleanly.
         std::chrono::milliseconds peer_update_timeout{30000};
-        // HTTP port the TM reports to the JM on Register. The JM uses
-        // it to proxy /api/v1/tms/:id/* through to this TM's
-        // dashboard endpoints. 0 means "no HTTP" - the JM won't
-        // surface this TM in proxy paths.
+        // HTTP port the worker reports to the coordinator on Register. The coordinator uses
+        // it to proxy /api/v1/workers/:id/* through to this worker's
+        // dashboard endpoints. 0 means "no HTTP" - the coordinator won't
+        // surface this worker in proxy paths.
         std::uint16_t http_port{0};
         // Number of most-recent COMPLETED checkpoints to retain per job.
         // When a newer checkpoint completes, older ones beyond this count
@@ -68,67 +68,69 @@ public:
         std::size_t checkpoint_num_retained{1};
     };
 
-    TaskManager(std::string tm_id, std::string data_host);
-    TaskManager(std::string tm_id, std::string data_host, Config cfg);
-    ~TaskManager();
+    Worker(std::string worker_id, std::string data_host);
+    Worker(std::string worker_id, std::string data_host, Config cfg);
+    ~Worker();
 
-    TaskManager(const TaskManager&) = delete;
-    TaskManager& operator=(const TaskManager&) = delete;
-    TaskManager(TaskManager&&) = delete;
-    TaskManager& operator=(TaskManager&&) = delete;
+    Worker(const Worker&) = delete;
+    Worker& operator=(const Worker&) = delete;
+    Worker(Worker&&) = delete;
+    Worker& operator=(Worker&&) = delete;
 
     // Install a handler for a role name. The handler is dispatched when
-    // the JM sends a Deploy task with this role. The kGenericSubtaskRole
+    // the coordinator sends a Deploy task with this role. The kGenericSubtaskRole
     // is auto-registered in the constructor and uses the
     // OperatorRegistry::default_instance() registry; user code should
     // not override it.
     void register_role(std::string role, RoleHandler handler);
 
-    // Connect to the JM, send Register, await RegisterAck, then start
+    // Connect to the coordinator, send Register, await RegisterAck, then start
     // the message-reader thread.
-    void connect_to_jm(const std::string& jm_host, std::uint16_t jm_port);
-    void connect_to_jm(class ServiceDiscovery& sd, std::chrono::milliseconds discover_timeout);
+    void connect_to_coordinator(const std::string& coordinator_host,
+                                std::uint16_t coordinator_port);
+    void connect_to_coordinator(class ServiceDiscovery& sd,
+                                std::chrono::milliseconds discover_timeout);
 
-    // Block until all tasks deployed to this TM have completed.
+    // Block until all tasks deployed to this worker have completed.
     bool await_all_tasks(std::chrono::milliseconds timeout);
 
-    // Close the JM connection and join all task threads.
+    // Close the coordinator connection and join all task threads.
     void stop();
 
-    const std::string& tm_id() const noexcept { return tm_id_; }
+    const std::string& worker_id() const noexcept { return worker_id_; }
 
-    // True after the JM has sent CancelJob (e.g., because the watchdog
-    // declared a peer TM lost). Role handlers can poll this to abort
+    // True after the coordinator has sent CancelJob (e.g., because the watchdog
+    // declared a peer worker lost). Role handlers can poll this to abort
     // long-running work cooperatively.
     bool was_cancelled() const noexcept { return cancelled_.load(std::memory_order_acquire); }
 
-    // True once the reader_loop_ has observed the JM connection
+    // True once the reader_loop_ has observed the coordinator connection
     // dropping (peer closed, transport error). Stays true until
-    // stop(). clink_node's --ha-dir TM mode polls this so it can
+    // stop(). clink_node's --ha-dir worker mode polls this so it can
     // exit on disconnect; an external supervisor (or the integration
-    // test) restarts the TM, which then reads active-leader.json to
+    // test) restarts the worker, which then reads active-leader.json to
     // find the new leader.
     bool disconnected() const noexcept { return disconnected_.load(std::memory_order_acquire); }
 
-    // Set the HTTP port this TM will advertise to the JM at register
+    // Set the HTTP port this worker will advertise to the coordinator at register
     // time. Call AFTER starting the HttpServer (so the actually-bound
     // port is known, esp. when --http-port=0 lets the OS pick) but
-    // BEFORE connect_to_jm. Has no effect after Register has been
-    // sent. 0 = HTTP disabled; the JM won't proxy to this TM.
+    // BEFORE connect_to_coordinator. Has no effect after Register has been
+    // sent. 0 = HTTP disabled; the coordinator won't proxy to this worker.
     void set_advertised_http_port(std::uint16_t port) noexcept { cfg_.http_port = port; }
 
-    // Override the factory used to open the JM control-plane connection.
+    // Override the factory used to open the coordinator control-plane connection.
     // Default = plain-TCP via connect_plain. clink_node installs a TLS
-    // factory when --tls-ca is given. Must be called before connect_to_jm.
+    // factory when --tls-ca is given. Must be called before connect_to_coordinator.
     using ConnectFactory = std::function<std::unique_ptr<network::Connection>(
         const std::string& host, std::uint16_t port)>;
     void set_connect_factory(ConnectFactory f) { connect_factory_ = std::move(f); }
 
     // ----- Snapshot API for the HTTP read endpoints -----
     //
-    // Same shape as the JM side: take mu_ briefly, copy state into a
+    // Same shape as the coordinator side: take mu_ briefly, copy state into a
     // plain value-type, release. Handlers serialize outside the lock.
-    TmSnapshot snapshot_tm() const;
+    WorkerSnapshot snapshot_worker() const;
 
     // State-as-data: merge every hosted subtask backend's LIVE Arrow
     // export for `job_id` into one canonical state-snapshot stream (see
@@ -136,7 +138,7 @@ public:
     // a checkpoint-consistent global cut. Backends that refuse a live
     // export (e.g. the disaggregated backend's partial hot tier) are
     // counted in skipped_subtasks rather than silently omitted. nullopt
-    // when this TM hosts no state backends for the job.
+    // when this worker hosts no state backends for the job.
     struct JobStateExport {
         std::vector<std::byte> bytes;
         std::size_t skipped_subtasks{0};
@@ -166,7 +168,7 @@ private:
                               const std::string& expected_state_versions_packed);
     void handle_trigger_checkpoint_(MessageReader& r);
     void handle_commit_checkpoint_(MessageReader& r);
-    // Reply to a source's RequestFinalCheckpoint: records the JM-assigned id and
+    // Reply to a source's RequestFinalCheckpoint: records the coordinator-assigned id and
     // wakes the blocked source runner (see request_final_checkpoint hook wiring).
     void handle_final_checkpoint_assigned_(MessageReader& r);
     // Dispatch AbortCheckpoint to per-subtask abort
@@ -175,7 +177,7 @@ private:
     // startup.
     void handle_abort_checkpoint_(MessageReader& r);
     // Dispatch BeginRescale to per-(job, op) drain
-    // callbacks. The TM looks up callbacks registered against the
+    // callbacks. The worker looks up callbacks registered against the
     // op_id in the BeginRescaleMsg payload and invokes them outside
     // the lock with the target_parallelism. Subtask runners
     // belonging to other operators are unaffected.
@@ -183,8 +185,8 @@ private:
     bool send_frame_(const std::vector<std::byte>& frame);
     void heartbeat_loop_();
 
-    // Waits for the JM-supplied PeerUpdate for one in-flight subtask.
-    // Returns nullopt if the wait was interrupted (TM stop / job cancel
+    // Waits for the coordinator-supplied PeerUpdate for one in-flight subtask.
+    // Returns nullopt if the wait was interrupted (worker stop / job cancel
     // / timeout). Any caller that gets nullopt must treat the task as
     // cancelled and report SubtaskFinished with had_error=true.
     struct ResolvedPeers {
@@ -195,12 +197,12 @@ private:
                                                     std::uint32_t subtask_idx);
 
     Config cfg_;
-    std::string tm_id_;
+    std::string worker_id_;
     std::string data_host_;
-    // JM connection target - populated by connect_to_jm so the
-    // snapshot_tm() / /api/v1/tm endpoint can report it.
-    std::string jm_host_;
-    std::uint16_t jm_port_{0};
+    // coordinator connection target - populated by connect_to_coordinator so the
+    // snapshot_worker() / /api/v1/worker endpoint can report it.
+    std::string coordinator_host_;
+    std::uint16_t coordinator_port_{0};
     std::unique_ptr<network::Connection> conn_;
     ConnectFactory connect_factory_;
     std::thread reader_;
@@ -218,9 +220,9 @@ private:
     std::size_t in_flight_tasks_{0};
 
     // Bounded-source EOS final-checkpoint coordination (cluster path). A source
-    // runner blocks in request_final_checkpoint() until the JM replies with the
+    // runner blocks in request_final_checkpoint() until the coordinator replies with the
     // assigned id (final_assigned_, keyed "job:role:subtask"), then blocks in
-    // wait_final_committed() until this TM observes CommitCheckpoint for that id
+    // wait_final_committed() until this worker observes CommitCheckpoint for that id
     // (final_committed_high_water_, per job). Both waits are bounded; the reader
     // thread fills these and notifies final_ckpt_cv_.
     std::mutex final_ckpt_mu_;
@@ -265,7 +267,7 @@ private:
 
     // Source-barrier injectors registered per running subtask. The
     // runner closure pushes its Dag::source_injectors() in here at
-    // startup; the TM iterates them on TriggerCheckpoint to push a
+    // startup; the worker iterates them on TriggerCheckpoint to push a
     // CheckpointBarrier into each hosted source. Keyed by
     // (job_id, subtask_idx) under a coarse mutex (mu_).
     using BarrierInjector = std::function<void(CheckpointBarrier)>;
@@ -277,8 +279,8 @@ private:
 
     // Triggers that arrived before any source registered injectors for
     // the job. Drained on the first register_source_injectors() call for
-    // that job. Avoids the deploy/trigger race where the JM fires a
-    // periodic checkpoint while the TM is still bringing up the chain.
+    // that job. Avoids the deploy/trigger race where the coordinator fires a
+    // periodic checkpoint while the worker is still bringing up the chain.
     std::unordered_map<JobId, std::vector<std::uint64_t>> pending_triggers_;
 
     // Per-(job_id, subtask_idx) commit callbacks. Sinks implementing the
@@ -292,7 +294,7 @@ private:
     // Checkpoint retention. per_job_backends_ holds each hosted subtask's
     // state backend (registered via RunnerContext::register_checkpoint_backend
     // at deploy); per_job_retention_ tracks the completed-checkpoint window
-    // per job. On CommitCheckpoint the TM records the completed id and purges
+    // per job. On CommitCheckpoint the worker records the completed id and purges
     // any now-subsumed checkpoint from every hosted subtask backend so
     // checkpoint storage stays bounded. See CheckpointRetention.
     std::unordered_map<JobId, std::unordered_map<std::uint32_t, std::shared_ptr<StateBackend>>>
@@ -301,7 +303,7 @@ private:
 
     // Per-(job_id, subtask_idx) abort callbacks. Sinks
     // register an abort closure alongside their commit closure at
-    // startup; the TM dispatches it on AbortCheckpoint. Same
+    // startup; the worker dispatches it on AbortCheckpoint. Same
     // signature shape as CommitCallback so callers can use the same
     // type alias and registration plumbing.
     using AbortCallback = std::function<void(std::uint64_t checkpoint_id)>;
@@ -321,16 +323,16 @@ private:
     std::unordered_map<JobId, std::unordered_map<std::string, std::vector<DrainCallback>>>
         per_job_drain_callbacks_;
 
-    // Per-job registry bundle on the TM. Plugin .so bytes shipped with
+    // Per-job registry bundle on the worker. Plugin .so bytes shipped with
     // each Deploy are dlopened into THIS job's bundle (instead of the
-    // TM-process-wide default singletons), so two concurrent jobs that
+    // worker-process-wide default singletons), so two concurrent jobs that
     // mint overlapping _inline_<kind>_<n> names don't trample each
     // other. Subtask runner lookups go through this bundle's
     // RunnerRegistry; built-in lookups fall through to the default
     // singletons via the bundle's parent pointer.
     std::unordered_map<JobId, std::unique_ptr<JobBundle>> per_job_bundle_;
 
-    // Per-(job, subtask_idx) cancel token. The TM allocates the
+    // Per-(job, subtask_idx) cancel token. The worker allocates the
     // shared_ptr<atomic<bool>> in run_task_ before invoking the
     // runner and threads it through RunnerContext::cancel_token so
     // the LocalExecutor's stop predicate sees it. On CancelJob the

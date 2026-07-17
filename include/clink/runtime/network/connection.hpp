@@ -1,11 +1,11 @@
 #pragma once
 
 // Connection is the cluster-side abstraction over a transport (plain TCP
-// or TLS). JM and TM hold one of these per peer instead of bare int fds
+// or TLS). coordinator and worker hold one of these per peer instead of bare int fds
 // so the TLS variant can be slotted in without forking the cluster
 // machinery.
 //
-// Why an abstraction rather than two parallel code paths: a JM accepting
+// Why an abstraction rather than two parallel code paths: a coordinator accepting
 // connections has dozens of call sites (frame readers, watchdog, cancel
 // broadcast, deploy dispatch). Each one would need a switch on "is this
 // peer TLS?". The PIMPL interface here keeps all that ignorance of the

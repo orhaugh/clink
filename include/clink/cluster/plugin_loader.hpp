@@ -19,7 +19,7 @@ namespace clink::cluster {
 // process-wide TypeRegistry / RunnerRegistry / SelectorRegistry.
 //
 // v1: handles are tracked but never explicitly released - we keep
-// plugins loaded for the TM's lifetime. dlclose() with registered
+// plugins loaded for the worker's lifetime. dlclose() with registered
 // std::function closures pointing back into plugin code is risky
 // without quiescing all in-flight subtasks first; that
 // machinery is deferred.
@@ -47,7 +47,7 @@ struct PluginLoadResult {
 // file path and bridges it into the process-wide registries.
 //
 // Lifecycle:
-//   1. The JM (or test harness) writes plugin bytes to a path on disk.
+//   1. The coordinator (or test harness) writes plugin bytes to a path on disk.
 //   2. PluginLoader::load(path) dlopen()'s the file with RTLD_LOCAL,
 //      reads the four extern "C" handshake symbols, verifies the ABI
 //      hash and target triple against the cluster's own values, then
@@ -72,7 +72,7 @@ public:
     PluginLoadResult load(const std::string& so_path);
 
     // Load a plugin from disk, directing its register-hook output at
-    // `registry` rather than the default singletons. Used by the JM/TM
+    // `registry` rather than the default singletons. Used by the coordinator/worker
     // to scope a job's registrations to its JobBundle. Idempotency
     // applies per (path, registry-identity) pair - see notes on the
     // implementation.

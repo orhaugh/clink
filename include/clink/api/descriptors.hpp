@@ -7,7 +7,7 @@
 namespace clink::api {
 
 // SourceDescriptor / SinkDescriptor / OperatorDescriptor are the
-// type-erased rectangles the fluent API hands to StreamExecutionEnvironment
+// type-erased rectangles the fluent API hands to Pipeline
 // when wiring up a pipeline. Each carries the registered operator type
 // name (lookup key in OperatorRegistry / RunnerRegistry) and a flat
 // string map of params. The connector-specific Builder classes produce

@@ -1,6 +1,6 @@
 // Multi-process cluster integration test, end-to-end submission flow.
 //
-// Spawns 1x JM + 2x TMs as real OS processes, then submits a job in-
+// Spawns 1x coordinator + 2x workers as real OS processes, then submits a job in-
 // process via clink::application::JobSubmitter (no client subprocess,
 // no JSON file on disk). Verifies the sink output.
 
@@ -100,7 +100,7 @@ TEST(MultiprocessCluster, SubmitJobOverWireProducesExpectedOutput) {
                      << "; build with `cmake --build ... --target clink_node`";
     }
 
-    const auto jm_port = probe_free_port();
+    const auto coordinator_port = probe_free_port();
     const auto out_path = std::filesystem::temp_directory_path() / "clink_submit_test_output.txt";
     std::filesystem::remove(out_path);
 
@@ -126,47 +126,47 @@ TEST(MultiprocessCluster, SubmitJobOverWireProducesExpectedOutput) {
         graph.ops.push_back(std::move(op));
     }
 
-    // 1. JM: empty, idles forever waiting for clients.
-    const std::vector<std::string> jm_argv{
+    // 1. coordinator: empty, idles forever waiting for clients.
+    const std::vector<std::string> coordinator_argv{
         "clink_node",
-        "--role=jm",
-        "--port=" + std::to_string(jm_port),
+        "--role=coordinator",
+        "--port=" + std::to_string(coordinator_port),
     };
-    const pid_t jm_pid = spawn_node(jm_argv, binary);
-    ASSERT_GT(jm_pid, 0);
-    std::this_thread::sleep_for(200ms);  // give JM time to bind.
+    const pid_t coordinator_pid = spawn_node(coordinator_argv, binary);
+    ASSERT_GT(coordinator_pid, 0);
+    std::this_thread::sleep_for(200ms);  // give coordinator time to bind.
 
-    // 2. TMs: empty, register and idle.
-    const std::vector<std::string> tm_a_argv{
+    // 2. workers: empty, register and idle.
+    const std::vector<std::string> worker_a_argv{
         "clink_node",
-        "--role=tm",
-        "--id=tm-a",
-        "--jm-host=127.0.0.1",
-        "--jm-port=" + std::to_string(jm_port),
+        "--role=worker",
+        "--id=worker-a",
+        "--coordinator-host=127.0.0.1",
+        "--coordinator-port=" + std::to_string(coordinator_port),
     };
-    const std::vector<std::string> tm_b_argv{
+    const std::vector<std::string> worker_b_argv{
         "clink_node",
-        "--role=tm",
-        "--id=tm-b",
-        "--jm-host=127.0.0.1",
-        "--jm-port=" + std::to_string(jm_port),
+        "--role=worker",
+        "--id=worker-b",
+        "--coordinator-host=127.0.0.1",
+        "--coordinator-port=" + std::to_string(coordinator_port),
     };
-    const pid_t tm_a_pid = spawn_node(tm_a_argv, binary);
-    const pid_t tm_b_pid = spawn_node(tm_b_argv, binary);
-    ASSERT_GT(tm_a_pid, 0);
-    ASSERT_GT(tm_b_pid, 0);
-    std::this_thread::sleep_for(300ms);  // give TMs time to register.
+    const pid_t worker_a_pid = spawn_node(worker_a_argv, binary);
+    const pid_t worker_b_pid = spawn_node(worker_b_argv, binary);
+    ASSERT_GT(worker_a_pid, 0);
+    ASSERT_GT(worker_b_pid, 0);
+    std::this_thread::sleep_for(300ms);  // give workers time to register.
 
     // 3. Submit the graph in-process via JobSubmitter and wait for completion.
-    clink::application::JobSubmitter submitter("127.0.0.1", jm_port);
+    clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
     opts.wait_timeout = std::chrono::seconds(15);
     const auto result = submitter.submit(graph.to_json(), {}, opts);
 
-    // Tear down JM and TMs (they idle forever otherwise).
-    kill_quietly(jm_pid);
-    kill_quietly(tm_a_pid);
-    kill_quietly(tm_b_pid);
+    // Tear down coordinator and workers (they idle forever otherwise).
+    kill_quietly(coordinator_pid);
+    kill_quietly(worker_a_pid);
+    kill_quietly(worker_b_pid);
 
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
     EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);

@@ -1,7 +1,7 @@
 // Cross-job-collision test job B.
 //
 // Companion of collision_job_a.cpp. Same inline-op name minting
-// pattern (env mints _inline_from_elements_0, _inline_map_1) but a
+// pattern (pipeline mints _inline_from_elements_0, _inline_map_1) but a
 // different pipeline. With per-job bundles the two jobs' registrations
 // stay isolated and both produce correct output when submitted
 // concurrently.
@@ -16,7 +16,7 @@
 #include <string>
 
 #include "clink/api/builtin_connectors.hpp"
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/job/register_job.hpp"
 
 namespace {
@@ -28,8 +28,8 @@ std::string output_path() {
     return "/tmp/clink_collision_b.txt";
 }
 
-void define_job(clink::api::StreamExecutionEnvironment& env) {
-    env.from_elements<std::int64_t>({100, 200, 300})
+void define_job(clink::api::Pipeline& pipeline) {
+    pipeline.from_elements<std::int64_t>({100, 200, 300})
         .map<std::int64_t>([](const std::int64_t& v) { return v + 1; })
         .sink(clink::api::FileInt64Sink::builder().path(output_path()).build());
 }

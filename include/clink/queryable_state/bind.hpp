@@ -59,7 +59,7 @@ inline void bind_keyed_state(Registry& registry,
 
 // Bind a typed KeyedState<K, V> under a subtask-scoped slot. Same
 // shape as bind_keyed_state but namespaces the slot by (role,
-// subtask_idx) so multiple subtasks of the same op on the same TM
+// subtask_idx) so multiple subtasks of the same op on the same worker
 // don't collide. Look up via Client::get(role, subtask_idx, slot,
 // key) or the corresponding HTTP route. The non-scoped variant
 // remains available for single-subtask jobs and back-compat.

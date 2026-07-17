@@ -42,7 +42,7 @@ The plugin example (`08_cluster_job_plugin`) builds a .so and is gated:
 ```bash
 cmake -S . -B build -DCLINK_BUILD_PLUGIN_EXAMPLE=ON
 cmake --build build --target 08_cluster_job_plugin --parallel 10
-# Then start a JM + TM with clink_node and submit with `clink run` - see
+# Then start a coordinator + worker with clink_node and submit with `clink run` - see
 # the comment block at the top of 08_cluster_job_plugin.cpp.
 ```
 
@@ -57,7 +57,7 @@ cmake --build build --target 08_cluster_job_plugin --parallel 10
 | 05 | [`05_interval_join.cpp`](05_interval_join.cpp) | Two-stream interval join on a shared key with an event-time window `[lower, upper]`. Default is inner join; pass a `Dag::JoinType::LeftOuter` (and friends) for outer joins with watermark-driven emission of unmatched rows. |
 | 06 | [`06_file_io.cpp`](06_file_io.cpp) | `FileSource<string>` + `FileSink<string>` against a `TextFormat<T>` codec. Word-count over newline-delimited input, written as TSV. |
 | 07 | [`07_parquet_io.cpp`](07_parquet_io.cpp) | `ParquetSink<T>` + `ParquetSource<T>` over the shared `ArrowBatcher<T>` seam. The resulting file is a vanilla Parquet stream - open it from pyarrow / duckdb / polars to confirm. |
-| 08 | [`08_cluster_job_plugin.cpp`](08_cluster_job_plugin.cpp) | Pipeline packaged as a job plugin `.so` using `StreamExecutionEnvironment` + `CLINK_REGISTER_JOB`. Submit to a running cluster via `clink run`. |
+| 08 | [`08_cluster_job_plugin.cpp`](08_cluster_job_plugin.cpp) | Pipeline packaged as a job plugin `.so` using `Pipeline` + `CLINK_REGISTER_JOB`. Submit to a running cluster via `clink run`. |
 | 09 | [`09_testing_framework.cpp`](09_testing_framework.cpp) | Testing a stateful operator with `clink::test_support` (the public testing framework): a `KeyedProcessFunction` driven through `make_keyed_process_function_harness`, per-key state inspected via the production read path, and a snapshot → restore round trip. Links `clink::test_support` and registers with CTest (it exits non-zero on failure). |
 
 ## Picking targets vs. linking everything
@@ -94,7 +94,7 @@ Threads (no connector SDKs), shipping `clink::core`, `clink::clink` and
 
 ## Where to go next
 
-* [`include/clink/api/stream_execution_environment.hpp`](../../include/clink/api/stream_execution_environment.hpp)
+* [`include/clink/api/pipeline.hpp`](../../include/clink/api/pipeline.hpp)
   - the higher-level fluent builder used by #08. Comparable to `DataStream` API.
 * [`include/clink/runtime/dag.hpp`](../../include/clink/runtime/dag.hpp)
   - the lower-level DAG used by #01-#07. Comparable to `StreamGraph`. The fluent env lowers to this.

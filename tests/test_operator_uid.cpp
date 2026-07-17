@@ -11,7 +11,7 @@
 //   * Duplicate uids within a Dag throw on add_operator.
 //
 //   * The fluent API DataStream<T>::uid(...) writes through to
-//     OperatorSpec.uid, and stream_execution_environment rejects
+//     OperatorSpec.uid, and pipeline rejects
 //     duplicates with a precise diagnostic.
 
 #include <cstdint>
@@ -21,7 +21,7 @@
 
 #include <gtest/gtest.h>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/operators/process_function.hpp"
 #include "clink/operators/sink_operator.hpp"
@@ -191,7 +191,7 @@ TEST(OperatorUid, DuplicateUidInSameDagThrows) {
 
 TEST(OperatorUid, FluentApiWritesOperatorSpecUid) {
     using namespace clink::api;
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.from_elements<std::int64_t>({1, 2, 3});
     auto mapped = src.map<std::int64_t>([](const std::int64_t& v) { return v * 2; })
                       .name("multiply-by-2")
@@ -211,7 +211,7 @@ TEST(OperatorUid, FluentApiWritesOperatorSpecUid) {
 
 TEST(OperatorUid, FluentApiRejectsDuplicateUid) {
     using namespace clink::api;
-    auto env = StreamExecutionEnvironment::create();
+    auto env = Pipeline::create();
     auto src = env.from_elements<std::int64_t>({1});
     auto a = src.map<std::int64_t>([](const std::int64_t& v) { return v; }).uid("shared");
     EXPECT_THROW(a.map<std::int64_t>([](const std::int64_t& v) { return v; }).uid("shared"),

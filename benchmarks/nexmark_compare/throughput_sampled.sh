@@ -33,7 +33,7 @@ GETOFF="docker exec ${PROJECT}-kafka-1 kafka-get-offsets --bootstrap-server loca
 CLINK_JM_HTTP=8095
 FLINK_REST=8081
 FLINK_JM=${PROJECT}-flink-jobmanager-1
-CLINK_CTRS="${PROJECT}-clink-jm-1 ${PROJECT}-clink-tm1-1 ${PROJECT}-clink-tm2-1 ${PROJECT}-clink-tm3-1 ${PROJECT}-clink-tm4-1"
+CLINK_CTRS="${PROJECT}-clink-coordinator-1 ${PROJECT}-clink-worker1-1 ${PROJECT}-clink-worker2-1 ${PROJECT}-clink-worker3-1 ${PROJECT}-clink-worker4-1"
 FLINK_CTRS="${PROJECT}-flink-jobmanager-1 ${PROJECT}-flink-taskmanager-1"
 
 EVENTS="${EVENTS:-5000000}"
@@ -75,10 +75,10 @@ wait_stable_offset() {  # topic -> total records once the sink stops growing
         prev=$cur; sleep 1.5
     done; echo "$cur"
 }
-# clink's per-op counters are cumulative per op_id on the persistent TM process,
+# clink's per-op counters are cumulative per op_id on the persistent worker process,
 # so a repeat run re-appears at its prior total. The sampler anchors its baseline
 # at the first strictly-positive reading (= that prior total) and measures only
-# the delta, so no TM restart is needed - each run's drain rate is clean.
+# the delta, so no worker restart is needed - each run's drain rate is clean.
 
 mkdir -p "$RESULTS" "$DATA_DIR"; rm -f "$RESULTS"/*.json
 
@@ -123,7 +123,7 @@ run_clink() {  # query
     sed -e "s#__OUT__#$out#" -e "s#__BROKERS__#kafka:29092#" "$ROOT/queries/clink/$q$QSUFFIX.tmpl.sql" > "$DATA_DIR/$q-clink.sql"
     local cpu_pre wall_pre; cpu_pre=$("$PY" "$ROOT/driver/cpu.py" read-flink $CLINK_CTRS); wall_pre=$(now_s)
     local jid; jid=$(../../build/clink_submit_sql --file "$DATA_DIR/$q-clink.sql" \
-        --jm-host 127.0.0.1 --jm-port "$CLINK_JM_HTTP" --name "ts_$q" --parallelism "$PAR" 2>/dev/null | extract_job_id)
+        --coordinator-host 127.0.0.1 --coordinator-port "$CLINK_JM_HTTP" --name "ts_$q" --parallelism "$PAR" 2>/dev/null | extract_job_id)
     [ -z "$jid" ] && { echo "  clink submit failed"; return 1; }
     # Generous quiet-timeout/max-runtime (like the Flink side) so a momentary
     # metric-refresh plateau does not trip an early "drained" before the full

@@ -6,8 +6,8 @@
 // vendor-neutral. Export is pluggable: a LineageListener translates the
 // graph plus run-state into whatever an external lineage system wants
 // (OpenLineage, a catalog, a metadata store). The two are connected by
-// the in-process EventBus: the JM emits "jm.job_lineage" at submit and
-// "jm.job_completed" at termination; a LineageDispatcher subscribes,
+// the in-process EventBus: the coordinator emits "coordinator.job_lineage" at submit and
+// "coordinator.job_completed" at termination; a LineageDispatcher subscribes,
 // reconstructs the structured event, and fans it out to the listeners.
 //
 // Listeners are HOST-side components. They must be constructed inside the
@@ -26,10 +26,10 @@
 
 namespace clink::lineage {
 
-// Canonical EventBus types the dispatcher consumes. Shared so the JM
+// Canonical EventBus types the dispatcher consumes. Shared so the coordinator
 // emit-site and the dispatcher agree on the strings.
-inline constexpr const char* kEventJobLineage = "jm.job_lineage";
-inline constexpr const char* kEventJobCompleted = "jm.job_completed";
+inline constexpr const char* kEventJobLineage = "coordinator.job_lineage";
+inline constexpr const char* kEventJobCompleted = "coordinator.job_completed";
 
 // A run-level lineage event delivered to listeners.
 struct LineageEvent {

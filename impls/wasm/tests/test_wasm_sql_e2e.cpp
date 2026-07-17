@@ -3,7 +3,7 @@
 // SELECT expression, and assert the pipeline output - the exact path
 // `clink run` drives. Also covers CREATE OR REPLACE, the duplicate-name
 // rejection, and cluster module shipping (the compiled spec carries the
-// declaration + module bytes; a TaskManager that never saw the CREATE
+// declaration + module bytes; a Worker that never saw the CREATE
 // registers it at deploy).
 
 #include <chrono>
@@ -18,9 +18,9 @@
 #include <gtest/gtest.h>
 
 #include "clink/cluster/built_in_factories.hpp"
-#include "clink/cluster/job_manager.hpp"
+#include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/operator_registry.hpp"
-#include "clink/cluster/task_manager.hpp"
+#include "clink/cluster/worker.hpp"
 #include "clink/config/json.hpp"
 #include "clink/embed/embedded_engine.hpp"
 #include "clink/operators/agg_function_registry.hpp"
@@ -148,9 +148,9 @@ TEST(WasmSqlE2E, UnknownLanguageErrorsClearly) {
 
 TEST(WasmSqlE2E, CreateFunctionShipsModuleWithTheJob) {
     // The cluster path. CREATE FUNCTION registers where the script runs,
-    // but the job's expressions evaluate on TaskManagers that never saw
+    // but the job's expressions evaluate on Workers that never saw
     // the statement (and cannot read the module path). The compiled spec
-    // must carry the declaration + module bytes, and the TM must register
+    // must carry the declaration + module bytes, and the worker must register
     // them at deploy. Proven by REMOVING the local registration between
     // compile and submit: only deploy-time registration can make the job
     // pass. A stripped-spec control shows the test would catch a broken
@@ -210,15 +210,15 @@ TEST(WasmSqlE2E, CreateFunctionShipsModuleWithTheJob) {
     clink::ScalarFunctionRegistry::global().remove("ship_dbl");
     ASSERT_FALSE(clink::ScalarFunctionRegistry::global().contains("ship_dbl"));
 
-    // In-process JM + TM over loopback: the Deploy travels the real wire.
-    clink::cluster::JobManager jm;
-    const auto port = jm.start();
-    jm.expect_tms({"wasm-ship-tm"});
-    clink::cluster::TaskManager::Config cfg;
+    // In-process coordinator + worker over loopback: the Deploy travels the real wire.
+    clink::cluster::Coordinator coordinator;
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"wasm-ship-worker"});
+    clink::cluster::Worker::Config cfg;
     cfg.slot_count = 8;
-    clink::cluster::TaskManager tm("wasm-ship-tm", "127.0.0.1", cfg);
-    tm.connect_to_jm("127.0.0.1", port);
-    ASSERT_TRUE(jm.await_registrations(std::chrono::milliseconds{10'000}));
+    clink::cluster::Worker worker("wasm-ship-worker", "127.0.0.1", cfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(std::chrono::milliseconds{10'000}));
 
     // Control: the declaration stripped -> the job must FAIL with the
     // evaluator's unknown-op error, proving the positive leg below cannot
@@ -226,29 +226,29 @@ TEST(WasmSqlE2E, CreateFunctionShipsModuleWithTheJob) {
     {
         auto stripped = spec;
         stripped.udfs.clear();
-        const auto id = jm.submit_job(stripped,
-                                      clink::cluster::OperatorRegistry::default_instance(),
-                                      {},
-                                      clink::cluster::CheckpointConfig{},
-                                      nullptr);
-        ASSERT_TRUE(jm.await_job_completion(id, std::chrono::milliseconds{20'000}));
-        const auto errors = jm.job_errors(id);
+        const auto id = coordinator.submit_job(stripped,
+                                               clink::cluster::OperatorRegistry::default_instance(),
+                                               {},
+                                               clink::cluster::CheckpointConfig{},
+                                               nullptr);
+        ASSERT_TRUE(coordinator.await_job_completion(id, std::chrono::milliseconds{20'000}));
+        const auto errors = coordinator.job_errors(id);
         ASSERT_FALSE(errors.empty());
         EXPECT_NE(errors[0].find("unknown op"), std::string::npos) << errors[0];
         ASSERT_FALSE(clink::ScalarFunctionRegistry::global().contains("ship_dbl"));
     }
     fs::remove(out_path);
 
-    // The real submit: the TM registers ship_dbl from the shipped payload
+    // The real submit: the worker registers ship_dbl from the shipped payload
     // and the pipeline produces the doubled values.
     {
-        const auto id = jm.submit_job(spec,
-                                      clink::cluster::OperatorRegistry::default_instance(),
-                                      {},
-                                      clink::cluster::CheckpointConfig{},
-                                      nullptr);
-        ASSERT_TRUE(jm.await_job_completion(id, std::chrono::milliseconds{20'000}));
-        const auto errors = jm.job_errors(id);
+        const auto id = coordinator.submit_job(spec,
+                                               clink::cluster::OperatorRegistry::default_instance(),
+                                               {},
+                                               clink::cluster::CheckpointConfig{},
+                                               nullptr);
+        ASSERT_TRUE(coordinator.await_job_completion(id, std::chrono::milliseconds{20'000}));
+        const auto errors = coordinator.job_errors(id);
         EXPECT_TRUE(errors.empty()) << errors[0];
     }
     EXPECT_TRUE(clink::ScalarFunctionRegistry::global().contains("ship_dbl"));
@@ -262,8 +262,8 @@ TEST(WasmSqlE2E, CreateFunctionShipsModuleWithTheJob) {
     EXPECT_EQ(got[1], 42);
     EXPECT_EQ(got[2], 10);
 
-    tm.stop();
-    jm.stop();
+    worker.stop();
+    coordinator.stop();
     fs::remove(in_path);
     fs::remove(out_path);
     fs::remove(mod);

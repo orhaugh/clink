@@ -57,11 +57,11 @@ class SessionWindowedDataStream;
 template <typename T>
 class EvictingTumblingWindowedDataStream;
 
-// StreamExecutionEnvironment is the entry point for building a pipeline
+// Pipeline is the entry point for building a pipeline
 // programmatically. Mirrors
-// `StreamExecutionEnvironment.getExecutionEnvironment()`.
+// `Pipeline.getExecutionEnvironment()`.
 //
-//   auto env = StreamExecutionEnvironment::create();
+//   auto env = Pipeline::create();
 //   DataStream<std::int64_t> src = env.source<std::int64_t>(
 //       IntRangeSource::builder().count(10).build());
 //   src.transform<std::int64_t>("multiply_int64", {{"factor", "3"}})
@@ -75,9 +75,9 @@ class EvictingTumblingWindowedDataStream;
 //
 // The env is single-use after execute() - calling fluent methods on
 // stale DataStream<T> handles afterwards is a programmer error.
-class StreamExecutionEnvironment {
+class Pipeline {
 public:
-    static StreamExecutionEnvironment create() { return StreamExecutionEnvironment{}; }
+    static Pipeline create() { return Pipeline{}; }
 
     // Construct an env that routes inline-lambda registrations through
     // an externally-provided PluginRegistry instead of a default-
@@ -90,14 +90,13 @@ public:
     // Without this, the registrations land in the .so's own copy of
     // those singletons (since clink_core is statically linked into
     // each plugin .so under RTLD_LOCAL), and the host can't see them.
-    static StreamExecutionEnvironment create_with_registry(
-        ::clink::plugin::PluginRegistry* host_registry) {
-        StreamExecutionEnvironment env;
+    static Pipeline create_with_registry(::clink::plugin::PluginRegistry* host_registry) {
+        Pipeline env;
         env.host_registry_ = host_registry;
         return env;
     }
 
-    StreamExecutionEnvironment() = default;
+    Pipeline() = default;
 
     // Returns the PluginRegistry the inline-lambda fluent shortcuts
     // should write into. If `create_with_registry()` set a host registry,
@@ -126,7 +125,7 @@ public:
     // PluginRegistry::register_type<T>(name, codec) call at process
     // startup. Same in-process-only contract as the other inline-lambda
     // fluent shortcuts: the elements live in this process's
-    // RunnerRegistry singleton and a remote TM won't see them.
+    // RunnerRegistry singleton and a remote worker won't see them.
     //
     // At parallelism > 1 the elements are striped across subtasks
     // round-robin (subtask i emits indices i, i+N, i+2N, ...), matching
@@ -140,9 +139,9 @@ public:
     }
 
     // Track a plugin .so that should be shipped to the cluster with this
-    // job. Repeated calls add additional plugins. The JM ships every
+    // job. Repeated calls add additional plugins. The coordinator ships every
     // listed plugin in every Deploy message.
-    StreamExecutionEnvironment& add_plugin(std::string path) {
+    Pipeline& add_plugin(std::string path) {
         plugin_paths_.push_back(std::move(path));
         return *this;
     }
@@ -158,7 +157,7 @@ public:
     // appended to the graph. Source/sink read it as a floor on
     // descriptor.parallelism. Window classes already have their own
     // .parallelism(n) setter that overrides this default.
-    StreamExecutionEnvironment& set_parallelism(std::uint32_t n) {
+    Pipeline& set_parallelism(std::uint32_t n) {
         default_parallelism_ = (n == 0 ? 1u : n);
         return *this;
     }
@@ -169,15 +168,14 @@ public:
     }
 
     // Compile the accumulated graph and submit via the supplied
-    // JobSubmitter. job_name is informational (logged by the JM and
+    // JobSubmitter. job_name is informational (logged by the coordinator and
     // surfaced in ListJobs once we attach job-name metadata to JobInfo).
     application::SubmitResult execute(const std::string& job_name,
                                       const application::JobSubmitter& submitter,
                                       application::SubmitOptions opts = {}) {
         (void)job_name;  // reserved for when JobInfo carries names
         if (graph_.ops.empty()) {
-            throw std::runtime_error(
-                "StreamExecutionEnvironment::execute: no sources / sinks have been added");
+            throw std::runtime_error("Pipeline::execute: no sources / sinks have been added");
         }
         return submitter.submit(graph_.to_json(), plugin_paths_, opts);
     }
@@ -189,8 +187,7 @@ public:
         if (op.id.empty()) {
             op.id = "op_" + std::to_string(graph_.ops.size());
         } else if (used_ids_.count(op.id) != 0) {
-            throw std::runtime_error("StreamExecutionEnvironment: duplicate operator id '" + op.id +
-                                     "'");
+            throw std::runtime_error("Pipeline: duplicate operator id '" + op.id + "'");
         }
         used_ids_.insert(op.id);
         std::string id = op.id;
@@ -210,16 +207,16 @@ public:
     // by the same operator_id_from_uid the runtime stamps state under,
     // so the tag here must match the one used at register_migration and
     // at the snapshot stamp. Carried in the submitted JobGraphSpec so it
-    // reaches the JM and TMs.
+    // reaches the coordinator and workers.
     // `slot` (optional) is the keyed-state slot name (the name passed to
     // RuntimeContext::keyed_state) this version applies to. Set it when an
     // operator has more than one keyed-state slot so restore migrates only
     // that slot; leave empty (the default) for single-slot operators, where
     // every value under the operator is migrated.
-    StreamExecutionEnvironment& expect_state_version(const std::string& uid,
-                                                     std::string state_type,
-                                                     std::uint32_t version,
-                                                     std::string slot = {}) {
+    Pipeline& expect_state_version(const std::string& uid,
+                                   std::string state_type,
+                                   std::uint32_t version,
+                                   std::string slot = {}) {
         graph_.expected_state_versions.set(
             clink::operator_id_from_uid(uid), std::move(state_type), version, std::move(slot));
         return *this;
@@ -236,7 +233,7 @@ public:
         auto* op = find_op_(op_id);
         if (op == nullptr) {
             throw std::runtime_error(
-                "StreamExecutionEnvironment::set_op_display_name: "
+                "Pipeline::set_op_display_name: "
                 "unknown op id '" +
                 op_id + "'");
         }
@@ -247,16 +244,15 @@ public:
         auto* op = find_op_(op_id);
         if (op == nullptr) {
             throw std::runtime_error(
-                "StreamExecutionEnvironment::set_op_uid: "
+                "Pipeline::set_op_uid: "
                 "unknown op id '" +
                 op_id + "'");
         }
         if (!new_uid.empty()) {
             for (const auto& other : graph_.ops) {
                 if (other.id != op_id && other.uid == new_uid) {
-                    throw std::runtime_error(
-                        "StreamExecutionEnvironment::set_op_uid: duplicate uid '" + new_uid +
-                        "' (already on op '" + other.id + "')");
+                    throw std::runtime_error("Pipeline::set_op_uid: duplicate uid '" + new_uid +
+                                             "' (already on op '" + other.id + "')");
                 }
             }
         }
@@ -282,7 +278,7 @@ public:
         auto* op = find_op_(op_id);
         if (op == nullptr) {
             throw std::runtime_error(
-                "StreamExecutionEnvironment::declare_side_output_on: "
+                "Pipeline::declare_side_output_on: "
                 "unknown op id '" +
                 op_id + "'");
         }
@@ -290,7 +286,7 @@ public:
             if (existing.tag == tag) {
                 if (existing.channel_type != channel_type) {
                     throw std::runtime_error(
-                        "StreamExecutionEnvironment::declare_side_output_on: "
+                        "Pipeline::declare_side_output_on: "
                         "tag '" +
                         tag + "' on op '" + op_id + "' is already declared as channel '" +
                         existing.channel_type + "', cannot re-declare as '" + channel_type + "'");
@@ -312,12 +308,12 @@ public:
     // The counter is per-env (not process-wide): two distinct envs in
     // the same process mint independent _inline_<kind>_0, _<kind>_1, ...
     // sequences. Cross-process determinism still holds because each
-    // process (submitter, JM, TM) re-runs the same build_fn against a
+    // process (submitter, coordinator, worker) re-runs the same build_fn against a
     // fresh env, which mints names in the same order - the contract is
     // that build_fn's registration order is deterministic.
     //
     // The previous (process-wide) counter trampled itself when two
-    // jobs were loaded into the same TM. Per-env makes per-job
+    // jobs were loaded into the same worker. Per-env makes per-job
     // hosting possible.
     std::string mint_inline_op_type(const std::string& kind) {
         return "_inline_" + kind + "_" + std::to_string(inline_op_counter_++);
@@ -1542,7 +1538,7 @@ private:
 template <typename T>
 class DataStream {
 public:
-    DataStream(StreamExecutionEnvironment* env, std::string upstream_id, std::string channel_type)
+    DataStream(Pipeline* env, std::string upstream_id, std::string channel_type)
         : env_(env), upstream_id_(std::move(upstream_id)), channel_type_(std::move(channel_type)) {}
 
     // Append a registered operator that converts T -> U. The named op
@@ -1574,7 +1570,7 @@ public:
     // The lambda is captured by value into the registered runner closure,
     // which lives for the process lifetime. Submitting a job that
     // references this op-type to a remote cluster will fail there
-    // because the remote TM has no such registration - for cross-process
+    // because the remote worker has no such registration - for cross-process
     // jobs, package your operator into a real plugin instead.
     template <typename U>
     DataStream<U> map(std::function<U(const T&)> fn, std::string id = {}) {
@@ -1762,10 +1758,10 @@ public:
 
     [[nodiscard]] const std::string& id() const noexcept { return upstream_id_; }
     [[nodiscard]] const std::string& channel_type() const noexcept { return channel_type_; }
-    [[nodiscard]] StreamExecutionEnvironment* env() const noexcept { return env_; }
+    [[nodiscard]] Pipeline* env() const noexcept { return env_; }
 
 private:
-    StreamExecutionEnvironment* env_;
+    Pipeline* env_;
     std::string upstream_id_;
     std::string channel_type_;
 };
@@ -1778,7 +1774,7 @@ private:
 template <typename T>
 class KeyedDataStream {
 public:
-    KeyedDataStream(StreamExecutionEnvironment* env,
+    KeyedDataStream(Pipeline* env,
                     std::string upstream_id,
                     std::string channel_type,
                     std::string key_by)
@@ -2130,10 +2126,10 @@ public:
     [[nodiscard]] const std::string& id() const noexcept { return upstream_id_; }
     [[nodiscard]] const std::string& channel_type() const noexcept { return channel_type_; }
     [[nodiscard]] const std::string& key_by() const noexcept { return key_by_; }
-    [[nodiscard]] StreamExecutionEnvironment* env() const noexcept { return env_; }
+    [[nodiscard]] Pipeline* env() const noexcept { return env_; }
 
 private:
-    StreamExecutionEnvironment* env_;
+    Pipeline* env_;
     std::string upstream_id_;
     std::string channel_type_;
     std::string key_by_;
@@ -2146,7 +2142,7 @@ private:
 template <typename T>
 class SlidingWindowedDataStream {
 public:
-    SlidingWindowedDataStream(StreamExecutionEnvironment* env,
+    SlidingWindowedDataStream(Pipeline* env,
                               std::string upstream_id,
                               std::string channel_type,
                               std::string key_by,
@@ -2334,7 +2330,7 @@ public:
     }
 
 private:
-    StreamExecutionEnvironment* env_;
+    Pipeline* env_;
     std::string upstream_id_;
     std::string channel_type_;
     std::string key_by_;
@@ -2351,7 +2347,7 @@ private:
 template <typename T>
 class TumblingWindowedDataStream {
 public:
-    TumblingWindowedDataStream(StreamExecutionEnvironment* env,
+    TumblingWindowedDataStream(Pipeline* env,
                                std::string upstream_id,
                                std::string channel_type,
                                std::string key_by,
@@ -2544,7 +2540,7 @@ public:
     }
 
 private:
-    StreamExecutionEnvironment* env_;
+    Pipeline* env_;
     std::string upstream_id_;
     std::string channel_type_;
     std::string key_by_;
@@ -2566,7 +2562,7 @@ public:
     using EvictorFactory = std::function<std::unique_ptr<clink::Evictor<T, clink::TimeWindow>>()>;
     using TriggerFactory = std::function<std::unique_ptr<clink::Trigger<T, clink::TimeWindow>>()>;
 
-    EvictingTumblingWindowedDataStream(StreamExecutionEnvironment* env,
+    EvictingTumblingWindowedDataStream(Pipeline* env,
                                        std::string upstream_id,
                                        std::string channel_type,
                                        std::string key_by,
@@ -2668,7 +2664,7 @@ public:
     }
 
 private:
-    StreamExecutionEnvironment* env_;
+    Pipeline* env_;
     std::string upstream_id_;
     std::string channel_type_;
     std::string key_by_;
@@ -2695,7 +2691,7 @@ EvictingTumblingWindowedDataStream<T> TumblingWindowedDataStream<T>::evicting(
 template <typename T>
 class SessionWindowedDataStream {
 public:
-    SessionWindowedDataStream(StreamExecutionEnvironment* env,
+    SessionWindowedDataStream(Pipeline* env,
                               std::string upstream_id,
                               std::string channel_type,
                               std::string key_by,
@@ -2845,7 +2841,7 @@ public:
     }
 
 private:
-    StreamExecutionEnvironment* env_;
+    Pipeline* env_;
     std::string upstream_id_;
     std::string channel_type_;
     std::string key_by_;
@@ -2870,7 +2866,7 @@ KeyedDataStream<T> DataStream<T>::key_by(std::function<std::int64_t(const T&)> f
 }
 
 template <typename T>
-DataStream<T> StreamExecutionEnvironment::from_elements(std::vector<T> elements, std::string id) {
+DataStream<T> Pipeline::from_elements(std::vector<T> elements, std::string id) {
     cluster::ensure_built_ins_registered();
     const std::string op_type = mint_inline_op_type("from_elements");
     auto& reg = registry();
@@ -2896,7 +2892,7 @@ DataStream<T> StreamExecutionEnvironment::from_elements(std::vector<T> elements,
 }
 
 template <typename T>
-DataStream<T> StreamExecutionEnvironment::source(SourceDescriptor desc, std::string id) {
+DataStream<T> Pipeline::source(SourceDescriptor desc, std::string id) {
     cluster::OperatorSpec op;
     op.id = std::move(id);
     op.type = std::move(desc.op_type);

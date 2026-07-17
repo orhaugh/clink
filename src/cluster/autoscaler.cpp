@@ -76,7 +76,7 @@ std::vector<AutoscalerDecision> Autoscaler::tick(std::chrono::milliseconds dt) {
 
     // Snapshot the op list under the lock so we can release it before
     // calling user-provided callbacks (sample_fn / status_fn may
-    // acquire other locks, e.g. JobManager::mu_).
+    // acquire other locks, e.g. Coordinator::mu_).
     std::vector<std::string> op_ids;
     {
         std::lock_guard lock(mu_);

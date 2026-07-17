@@ -21,11 +21,11 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
-    - jsonPath: .status.taskManagersReady
-      name: TMs-Ready
+    - jsonPath: .status.workersReady
+      name: workers-Ready
       type: integer
-    - jsonPath: .spec.taskManager.replicas
-      name: Desired-TMs
+    - jsonPath: .spec.worker.replicas
+      name: Desired-workers
       type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -34,8 +34,8 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          ClinkCluster is a clink stream-processing cluster (a JobManager plus a set of
-          TaskManagers) managed declaratively by the clink operator.
+          ClinkCluster is a clink stream-processing cluster (a Coordinator plus a set of
+          Workers) managed declaratively by the clink operator.
         properties:
           apiVersion:
             description: |-
@@ -59,10 +59,10 @@ spec:
             properties:
               checkpointStorage:
                 description: |-
-                  CheckpointStorageSpec mounts a shared volume into every JobManager and
-                  TaskManager pod at MountPath, so checkpoints and savepoints written by one pod
+                  CheckpointStorageSpec mounts a shared volume into every Coordinator and
+                  Worker pod at MountPath, so checkpoints and savepoints written by one pod
                   are readable by another (required for savepoint-on-upgrade restore, where the
-                  resubmitted job's TaskManagers must read the savepoint the old job wrote). A
+                  resubmitted job's Workers must read the savepoint the old job wrote). A
                   ClinkJob points its --checkpoint-dir under this path.
                 properties:
                   enabled:
@@ -92,7 +92,7 @@ spec:
                 type: object
               ha:
                 description: |-
-                  HASpec turns on multi-JobManager high availability with file-coordinator
+                  HASpec turns on multi-Coordinator high availability with file-coordinator
                   leader election over a shared RWX volume.
                 properties:
                   enabled:
@@ -114,8 +114,8 @@ spec:
                     type: string
                 type: object
               image:
-                description: ImageSpec pins the clink runtime image the JobManager
-                  + TaskManagers run.
+                description: ImageSpec pins the clink runtime image the Coordinator
+                  + Workers run.
                 properties:
                   pullPolicy:
                     default: IfNotPresent
@@ -151,8 +151,8 @@ spec:
                   type: object
                   x-kubernetes-map-type: atomic
                 type: array
-              jobManager:
-                description: JobManagerSpec configures the JobManager role.
+              coordinator:
+                description: CoordinatorSpec configures the Coordinator role.
                 properties:
                   controlPort:
                     default: 6123
@@ -160,7 +160,7 @@ spec:
                     type: integer
                   env:
                     description: |-
-                      Env sets extra environment variables (KEY=VALUE) on the JobManager
+                      Env sets extra environment variables (KEY=VALUE) on the Coordinator
                       container. Job plugins dlopen'd in this process read their build-time
                       configuration from process env, so this is how per-cluster job env is
                       supplied (ClinkJob.env only reaches the submit-side build).
@@ -168,7 +168,7 @@ spec:
                       type: string
                     type: array
                   extraArgs:
-                    description: ExtraArgs are appended verbatim to the JobManager
+                    description: ExtraArgs are appended verbatim to the Coordinator
                       command line.
                     items:
                       type: string
@@ -244,13 +244,13 @@ spec:
                 type: object
               serviceAccountName:
                 type: string
-              taskManager:
-                description: TaskManagerSpec configures the TaskManager role.
+              worker:
+                description: WorkerSpec configures the Worker role.
                 properties:
                   env:
                     description: |-
-                      Env sets extra environment variables (KEY=VALUE) on every TaskManager
-                      container. Job plugins dlopen'd on the TaskManagers read their
+                      Env sets extra environment variables (KEY=VALUE) on every Worker
+                      container. Job plugins dlopen'd on the Workers read their
                       build-time configuration from process env (registered factory closures
                       capture it), so runtime-side job env belongs here, not on ClinkJob.
                     items:
@@ -400,8 +400,8 @@ spec:
                   - type
                   type: object
                 type: array
-              jobManagerReplicas:
-                description: JobManagerReplicas is the desired JobManager replica
+              coordinatorReplicas:
+                description: CoordinatorReplicas is the desired Coordinator replica
                   count (1, or ha.replicas).
                 format: int32
                 type: integer
@@ -413,10 +413,10 @@ spec:
                 description: 'Phase is a coarse lifecycle summary: Pending, Running
                   or Failed.'
                 type: string
-              taskManagersReady:
+              workersReady:
                 description: |-
-                  TaskManagersReady is the number of TaskManagers currently registered with
-                  the JobManager (read from its /api/v1/tms endpoint).
+                  WorkersReady is the number of Workers currently registered with
+                  the Coordinator (read from its /api/v1/workers endpoint).
                 format: int32
                 type: integer
             type: object

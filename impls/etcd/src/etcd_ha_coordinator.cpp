@@ -29,7 +29,7 @@ std::int64_t unix_ms_now() {
 
 // Serialize the leader endpoint into the same JSON shape
 // FileHaCoordinator writes to active-leader.json. Lets the existing
-// TM-side discovery and dashboard rendering work against either
+// worker-side discovery and dashboard rendering work against either
 // coordinator without branching on the kind of storage.
 std::string serialize_leader_endpoint(const LeaderEndpoint& ep, std::uint64_t epoch) {
     clink::http::JsonWriter w;
@@ -80,7 +80,7 @@ public:
         if (cfg_.cluster_name.empty()) {
             throw std::runtime_error("EtcdHaCoordinator: cluster_name must be non-empty");
         }
-        leader_key_ = "/clink/jm/" + cfg_.cluster_name + "/leader";
+        leader_key_ = "/clink/coordinator/" + cfg_.cluster_name + "/leader";
     }
 
     ~EtcdHaCoordinator() override { stop(); }

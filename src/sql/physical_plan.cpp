@@ -221,7 +221,7 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
     }
     if (connector == "queryable_state") {
         // State-as-table: a bounded snapshot of another job's live
-        // queryable state, read over the JM's HTTP scan route.
+        // queryable state, read over the coordinator's HTTP scan route.
         return RowConnectorBinding{"queryable_state_row_source", kChannelRow, {}};
     }
     if (connector == "kafka") {
@@ -1431,7 +1431,7 @@ std::string compile_node(const LogicalPlan& node,
     if (node.kind() == "MlPredict") {
         // SQL-native AI: ml_predict_row applies a model per row and appends its
         // OUTPUT columns. The runtime factory resolves the provider from the
-        // threaded model.* params (a TaskManager has no catalog) and runs it on the
+        // threaded model.* params (a Worker has no catalog) and runs it on the
         // sync flatmap or the async path per the provider's kind. No keyer needed.
         const auto& mp = static_cast<const LogicalMlPredict&>(node);
         std::string input_id = compile_node(mp.input(), ch, spec, next_id, async_agg);

@@ -24,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-#include "clink/api/stream_execution_environment.hpp"
+#include "clink/api/pipeline.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/job/register_job.hpp"
 #include "clink/operators/source_operator.hpp"
@@ -343,11 +343,11 @@ inline std::int64_t env_i64(const char* name, std::int64_t fallback) {
     return fallback;
 }
 
-inline void define_job(clink::api::StreamExecutionEnvironment& env) {
+inline void define_job(clink::api::Pipeline& env) {
     using namespace std::chrono_literals;
 
     // The .so dlopens with RTLD_LOCAL so its StateBackendFactory
-    // singleton is private; the TM-side install() never reaches it.
+    // singleton is private; the worker-side install() never reaches it.
     // Calling install() here registers "rocksdb" scheme on the .so's
     // own factory so make_subtask_job_config() can build the backend.
     clink::rocksdb::install();
