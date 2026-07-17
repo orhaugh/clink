@@ -48,6 +48,13 @@ TEST(PipeThroughputFloor, InProcessPipelineStaysAboveOneMillionRecordsPerSecond)
     if (clink::test_support::under_thread_sanitizer()) {
         GTEST_SKIP() << "throughput floor unmeasurable under TSan instrumentation";
     }
+#ifndef NDEBUG
+    // A throughput floor asserts an optimized-code property. An unoptimized
+    // (Debug / -O0) build runs the operator hot path several times slower, so
+    // the floor would be measuring the lack of optimization, not a regression.
+    // The CI gate builds Debug; perf floors belong to Release runs.
+    GTEST_SKIP() << "throughput floor unmeasurable in an unoptimized (Debug) build";
+#endif
     constexpr std::int64_t kRecords = 100'000;
 
     std::vector<Record<std::int64_t>> input;

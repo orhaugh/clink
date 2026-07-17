@@ -197,9 +197,26 @@ inline std::optional<Decimal> dec_div(const Decimal& a, const Decimal& b, int re
     if (!dres.ok()) {
         return std::nullopt;
     }
-    arrow::Decimal256 rounded =
-        dres->first.ReduceScaleBy(1, /*round=*/true);  // drop guard digit, HALF_UP
-    return dec_detail::narrow(rounded, result_scale);
+    // Drop the single guard digit with HALF_UP rounding, done explicitly via
+    // divmod by 10 rather than arrow's Decimal256::ReduceScaleBy(round=true):
+    // that path produced a corrupt (out-of-range) coefficient for round-up
+    // cases on x86_64 - e.g. 2/3 at scale 0 and -1/8 at scale 2 - which then
+    // failed the narrow() precision check and returned a spurious NULL, while
+    // the same inputs rounded correctly on arm64. divmod is exact and
+    // architecture-independent. The remainder carries the dividend's sign
+    // (arrow contract), so |rem| >= 5 rounds the magnitude away from zero.
+    auto gdm = dres->first.Divide(arrow::Decimal256(10));
+    if (!gdm.ok()) {
+        return std::nullopt;
+    }
+    arrow::Decimal256 quotient = gdm->first;
+    const arrow::Decimal256& guard_rem = gdm->second;
+    if (guard_rem >= arrow::Decimal256(5)) {
+        quotient += arrow::Decimal256(1);
+    } else if (guard_rem <= arrow::Decimal256(-5)) {
+        quotient -= arrow::Decimal256(1);
+    }
+    return dec_detail::narrow(quotient, result_scale);
 }
 
 // a mod b at the common (max) scale: exact truncated remainder. nullopt on

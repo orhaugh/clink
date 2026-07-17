@@ -155,14 +155,22 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS=-s
       - name: Build
         run: cmake --build build -j "$(( $(nproc) / 2 ))"
-      - name: Test (unit + SQL, parallel) [blocking gate]
-        # Everything except the multi-process integration suite, run in
-        # parallel. This is the hard gate: the unit + SQL surface is clean on
-        # Linux (verified - a full in-container run of this exact config is
-        # 3023/3023 at -j8). Integration tests spawn real coordinator/worker
-        # processes and race on ephemeral ports + heartbeat timers under
-        # -j >1, so they run serially and advisory-only below.
-        run: ctest --test-dir build --output-on-failure -j 8 --timeout 180 -LE integration
+      - name: Test (unit, parallel) [blocking gate]
+        # The fast unit surface: everything except the sql, integration, and
+        # benchmark labels. Parallel at the runner's core count - NOT a fixed
+        # -j8, which 4x-oversubscribes a 4-core runner and starves the
+        # timing-sensitive multi-process tests into spurious timeouts.
+        # benchmark is excluded entirely: throughput/timing asserts are
+        # meaningless on a shared runner in a Debug (-O0) build and belong to
+        # the perf harness on real hardware.
+        run: ctest --test-dir build --output-on-failure -j "$(nproc)" --timeout 180 -LE 'integration|benchmark|sql'
+      - name: Test (SQL, low parallelism) [blocking gate]
+        # The SQL surface, incl. runtime ITs that stand up in-process
+        # coordinator/worker clusters and HTTP servers. These are
+        # timing-sensitive (heartbeats, queryable-state HTTP deadlines), so
+        # they run at -j2 to avoid the CPU oversubscription that timed them
+        # out under the old -j8. Still blocking - the SQL surface must pass.
+        run: ctest --test-dir build --output-on-failure -j 2 --timeout 300 -L sql -LE integration
       - name: Test (integration, serial) [advisory]
         # Multi-process integration tests (incl. the exactly-once failover
         # test). Advisory until the pre-existing multi-process flakiness is
