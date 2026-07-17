@@ -304,7 +304,7 @@ TEST(JsonValueExpr, RegexpExtract) {
 }
 
 TEST(JsonValueExpr, SplitIndex) {
-    // 0-based (Flink semantics).
+    // 0-based indexing.
     EXPECT_EQ(
         eval(R"({"op":"split_index","args":[{"lit":"a/b/c"},{"lit":"/"},{"lit":0}]})").as_string(),
         "a");

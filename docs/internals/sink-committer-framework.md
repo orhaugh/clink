@@ -1,8 +1,7 @@
 # The sink committer framework
 
 How clink gives a connector exactly-once (or honest effectively-once) delivery
-without each sink hand-rolling the two-phase-commit protocol. This is clink's
-analogue of Flink's Sink V2 committer.
+without each sink hand-rolling the two-phase-commit protocol.
 
 The base is `CommittingSink<In, Committable>`
 (`include/clink/connectors/committing_sink.hpp`). A connector supplies only the

@@ -1846,7 +1846,7 @@ ast::AlterTableStmt translate_alter_table_stmt(const JsonValue& body) {
 
 // ANALYZE [<col>...] <table> parses as a PG VacuumStmt. We support the ANALYZE
 // form on a single table; VACUUM has no clink meaning and is rejected. The
-// optional `TABLE` keyword in the Flink-style spelling is stripped by the
+// optional `TABLE` keyword in the `ANALYZE TABLE` spelling is stripped by the
 // pre-parser before this point.
 // ALTER TABLE <name> RENAME TO <new> / RENAME COLUMN <old> TO <new> parses as a
 // PG RenameStmt. renameType OBJECT_TABLE = rename the table; OBJECT_COLUMN =

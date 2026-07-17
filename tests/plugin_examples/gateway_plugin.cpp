@@ -1,4 +1,4 @@
-// Gateway-parity plugin: a realistic multi-stage shape
+// Gateway pipeline plugin: a realistic multi-stage shape
 // (FragmentReassembly → EnrichmentJoin → sinks) packaged for the
 // integration test that proves clink can run such a topology
 // end-to-end without substitutions.
@@ -513,5 +513,5 @@ void register_plugin(clink::plugin::PluginRegistry& reg) {
 
 }  // namespace gateway
 
-CLINK_DECLARE_PLUGIN("gateway-plugin", "1.0.0", "clink gateway parity test plugin");
+CLINK_DECLARE_PLUGIN("gateway-plugin", "1.0.0", "clink gateway pipeline test plugin");
 CLINK_REGISTER_PLUGIN(gateway::register_plugin);

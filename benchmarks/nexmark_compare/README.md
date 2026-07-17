@@ -24,7 +24,8 @@ workload. This harness produces the first defensible clink-vs-Flink Nexmark numb
 Implemented: q0 (stateless) and q12 (windowed-agg) as gated SQL-vs-SQL throughput
 ratios (geomean); q8 (windowed stream-stream join) as a gated correctness result
 (row count, throughput indicative); q6 as a SQL-only capability (clink runs it in
-SQL, Flink cannot - DataStream-only - so it is documented, not gated). q13/q14/q10
+SQL; the Flink reference implementation ships q6 only as a DataStream program, so
+it is documented, not gated). q13/q14/q10
 out of v1. See `pipeline.md` for the rationale.
 
 ## Run it
@@ -160,8 +161,9 @@ netting to a final upsert state of 5,223 distinct sellers. It is NOT in the gate
 `run.sh` suite - there is no Flink SQL counterpart to gate against, and its
 changelog output (vs a clean append/pane count) does not fit the row-count gate; a
 faithful gate-matched Flink DataStream job was judged disproportionate effort for
-a fragile final-state gate. q6 stands as the demonstration that clink covers a
-query class Flink SQL cannot.
+a fragile final-state gate. q6 stands as the demonstration that clink covers in
+SQL a query class the Flink reference suite expresses only as a DataStream
+program.
 
 Caveats (so these are not yet the full `pipeline.md` headline): parallelism is 1
 on BOTH (matched, the cleanest per-core comparison; **1-partition input topics**

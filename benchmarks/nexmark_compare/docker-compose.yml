@@ -41,7 +41,7 @@ services:
       timeout: 5s
       retries: 30
 
-  # Pinned to the image cached on this host. INC 4 verifies the Flink SQL +
+  # The upstream Apache Flink image. The harness verifies the Flink SQL +
   # flink-sql-connector-kafka path on this exact image (upstream nexmark-flink SQL
   # targeted Flink 1.x, so 2.2.0 compatibility is unverified - q0 is the canary).
   flink-jobmanager:

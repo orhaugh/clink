@@ -80,7 +80,7 @@ inline std::string op_shard_metric_name(const char* metric,
 // counter) so it supports +/- deltas, and because a gauge is a single atomic
 // per (op_id,name) it merges every subtask of the operator that runs in the
 // SAME process automatically; the JM aggregator sums it across TMs for the
-// operator-wide value. This is how clink surfaces Flink-style accumulators -
+// operator-wide value. This is how clink surfaces job-wide user accumulators -
 // the host metrics registry is already threaded into every RuntimeContext and
 // scraped by the JM, so it is the natural cross-subtask transport (a separate
 // per-subtask wire message would just duplicate it).

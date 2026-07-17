@@ -116,9 +116,9 @@ private:
 // global max-seen watermark races to the FASTEST partition and marks slower
 // partitions' in-window records late. This strategy instead tracks the max
 // event-time PER partition (Record::source_partition) and emits
-// watermark = (min over partitions of per-partition max) - bound, the Flink
-// per-split + min-across-splits behaviour, so the watermark advances only as
-// fast as the slowest partition and no in-window record is falsely late.
+// watermark = (min over partitions of per-partition max) - bound, so the
+// watermark advances only as fast as the slowest partition and no in-window
+// record is falsely late.
 //
 // Records WITHOUT a source_partition (file / generator / single-stream sources)
 // fold into one global bucket, so behaviour is byte-identical to

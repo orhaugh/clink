@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=70", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,8 +7,13 @@ name = "pyclink"
 version = "0.1.0"
 description = "Embed the clink stream engine in Python: run streaming SQL in-process, read results as Arrow"
 readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Ross Haugh", email = "orhaugh@gmail.com" }]
 requires-python = ">=3.9"
 dependencies = ["pyarrow>=14"]
+
+[project.urls]
+Repository = "https://github.com/orhaugh/clink"
 
 [tool.setuptools.packages.find]
 include = ["pyclink*"]

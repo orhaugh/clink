@@ -377,7 +377,7 @@ enum class CheckpointAlignment : std::uint8_t {
 // Sentinel for max_restarts_on_tm_loss meaning "not set - use the recovery
 // default." Resolved at the JobManager: when checkpointing is enabled
 // (checkpoint_dir set) it becomes kDefaultSelfHealRestarts (self-heal by
-// default, Flink's exponential-delay-by-default model); without checkpointing it
+// default); without checkpointing it
 // becomes 0 (fail-fast, since there is no checkpoint to restore from). An
 // explicit 0 stays fail-fast; an explicit N stays N.
 inline constexpr std::uint32_t kRestartAuto = std::numeric_limits<std::uint32_t>::max();

@@ -1,4 +1,4 @@
-// Gateway pipeline parity end-to-end test.
+// Gateway pipeline end-to-end test.
 //
 // Exercises a realistic multi-stage shape (FragmentReassembly →
 // EnrichmentJoin → main + liveness side outputs) on the cluster
@@ -115,7 +115,7 @@ std::vector<std::string> read_all_lines(const std::filesystem::path& p) {
 // causes some fragments to arrive at the join before their enrichment
 // (forcing the join's pending buffer) and some after (forcing the
 // processElement1 fast path).
-TEST(GatewayParity, ReassemblyJoinAndLivenessSideOutputCrossWire) {
+TEST(GatewayPipeline, ReassemblyJoinAndLivenessSideOutputCrossWire) {
     const auto binary = node_binary_path();
     if (!std::filesystem::exists(binary)) {
         GTEST_SKIP() << "clink_node not built";
@@ -127,9 +127,9 @@ TEST(GatewayParity, ReassemblyJoinAndLivenessSideOutputCrossWire) {
 
     const auto jm_port = probe_free_port();
     const auto main_sink_path =
-        std::filesystem::temp_directory_path() / "clink_gateway_parity_main.txt";
+        std::filesystem::temp_directory_path() / "clink_gateway_pipeline_main.txt";
     const auto liveness_path =
-        std::filesystem::temp_directory_path() / "clink_gateway_parity_liveness.txt";
+        std::filesystem::temp_directory_path() / "clink_gateway_pipeline_liveness.txt";
     // Sinks at par=2 use suffixes .0/.1; clean them all up beforehand.
     for (const auto& base : {main_sink_path}) {
         std::filesystem::remove(base);

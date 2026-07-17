@@ -47,8 +47,8 @@ using SideOutputChannelMap = std::unordered_map<std::string, SideOutputChannelEn
 // A named user accumulator handle, scoped to one operator. Obtained from
 // RuntimeContext::accumulator(name). add() folds a delta into a per-operator
 // value that merges across every subtask of the operator (within a process via
-// one atomic gauge, across TaskManagers via the JM's per-operator aggregation),
-// the clink equivalent of a Flink accumulator. Cheap to copy; holds no state of
+// one atomic gauge, across TaskManagers via the JM's per-operator
+// aggregation). Cheap to copy; holds no state of
 // its own beyond the (registry, op id, name) it writes through.
 class Accumulator {
 public:
@@ -96,8 +96,8 @@ public:
     MetricsRegistry* metrics() const noexcept { return metrics_; }
 
     // Named user accumulator scoped to this operator. The returned handle's
-    // add() merges across all of the operator's subtasks (Flink-style
-    // accumulator), surfaced per operator on GET /api/v1/jobs/:id/operators.
+    // add() merges across all of the operator's subtasks, surfaced per
+    // operator on GET /api/v1/jobs/:id/operators.
     // Routes through the host registry (metrics()), so it is correct on the
     // cluster path; a no-op when no registry is configured.
     [[nodiscard]] Accumulator accumulator(std::string name) {

@@ -1360,7 +1360,7 @@ std::string rewrite_composite_types(std::string_view sql,
 
 }  // namespace
 
-// The Flink/Spark spelling `ANALYZE TABLE <name>` is not PG-grammatical (PG is
+// The `ANALYZE TABLE <name>` spelling used by other dialects is not PG-grammatical (PG is
 // `ANALYZE <name>`), so drop the optional `TABLE` keyword right after a
 // statement-leading `ANALYZE`. Statement-boundary-aware (only at input start or
 // after a top-level ';') and string/comment-safe, so a literal containing

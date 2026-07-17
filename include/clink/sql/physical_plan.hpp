@@ -53,7 +53,6 @@ public:
     // take process_async() when the state backend can defer reads, so a
     // slow remote/disaggregated read suspends a record instead of blocking
     // the runner. Default off keeps the in-memory aggregate path unchanged.
-    // Flink analogue: table.exec.async-state.enabled.
     void set_async_state_for_aggregation(bool v) noexcept { async_state_for_aggregation_ = v; }
 
 private:

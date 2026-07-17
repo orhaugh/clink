@@ -13,7 +13,7 @@ authors:
 repository-code: "https://github.com/orhaugh/clink"
 url: "https://github.com/orhaugh/clink"
 license: Apache-2.0
-version: 0.0.1
+version: 0.1.0
 keywords:
   - stream-processing
   - dataflow

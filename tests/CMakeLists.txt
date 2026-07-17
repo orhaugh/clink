@@ -272,7 +272,7 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_application_mode.cpp
         integration/test_list_jobs.cpp
         integration/test_stream_env_end_to_end.cpp
-        integration/test_gateway_parity.cpp
+        integration/test_gateway_pipeline.cpp
         integration/test_job_plugin_e2e.cpp
         integration/test_job_bundle_isolation.cpp
         integration/test_application_mode_e2e.cpp

@@ -98,7 +98,7 @@ Threads (no connector SDKs), shipping `clink::core`, `clink::clink` and
   - the higher-level fluent builder used by #08. Comparable to `DataStream` API.
 * [`include/clink/runtime/dag.hpp`](../../include/clink/runtime/dag.hpp)
   - the lower-level DAG used by #01-#07. Comparable to `StreamGraph`. The fluent env lowers to this.
-* [`docs/architecture.md`](../architecture.md) - engine concepts in
+* [`docs/internals/architecture.md`](../internals/architecture.md) - engine concepts in
   more depth (watermarks, checkpoints, state, alignment, …).
 * [`examples/`](../../examples/) - additional in-tree examples that are
   built and run as part of the upstream test suite.

@@ -5590,7 +5590,7 @@ TEST(SqlRuntime, ScalarUdfInProjectionAndPredicate) {
 // Nexmark-q13 shape: bounded side-input join - enrich each bid with a label
 // from a static side table keyed by (auction mod N). Expressed via clink's
 // lookup join (connector='lookup' + a registered side function), the engine's
-// equivalent of Flink's FOR SYSTEM_TIME side-input join.
+// spelling of a FOR SYSTEM_TIME-style side-input join.
 TEST(SqlRuntime, BoundedSideInputLookupJoin) {
     ensure_sql_installed_once();
 
@@ -11879,7 +11879,7 @@ TEST(SqlRuntime, AsyncStateGroupByMatchesInMemory) {
         std::filesystem::remove(p);
 }
 
-// ANALYZE parses (both the PG `ANALYZE t` and the Flink-style `ANALYZE TABLE t`,
+// ANALYZE parses (both the PG `ANALYZE t` and the `ANALYZE TABLE t` spelling,
 // the latter via the pre-parser strip), carrying the table + optional columns.
 TEST(SqlAnalyzeStmt, ParsesTableAndColumns) {
     auto s1 = parse("ANALYZE TABLE orders");

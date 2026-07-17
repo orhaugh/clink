@@ -1205,7 +1205,7 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
         }
         return value_expr_detail::null_value();
     }
-    // split_index(s, delim, idx) - the idx-th (0-based, Flink semantics) field of
+    // split_index(s, delim, idx) - the idx-th (0-based) field of
     // `s` split by the string `delim`. Returns null on an out-of-range index, an
     // empty delimiter, or any null arg.
     if (op == ValueOp::SplitIndex) {

@@ -1113,7 +1113,7 @@ impls/               # optional connectors/backends: kafka, postgres, clickhouse
                      #   s3, rocksdb, rocksdb-s3, avro, etcd, tls
 tests/               # GoogleTest suites (unit + integration)
 examples/            # in-tree example jobs
-docs/                # design docs + consumer-examples/
+docs/                # connector + internals references, consumer-examples/
 benchmarks/          # clink_bench, clink_serde_bench, failover_coldstart,
                      #   inproc_compare, prod_compare, flink_compare
 tools/               # clink (unified CLI), clink_node, clink_submit_sql, and
@@ -1122,7 +1122,7 @@ tools/               # clink (unified CLI), clink_node, clink_submit_sql, and
 
 ## Reading order (for new contributors)
 
-1. `docs/architecture.md` - the conceptual model
+1. `docs/internals/architecture.md` - the conceptual model
 2. `include/clink/core/stream_element.hpp` - the wire format between operators
 3. `include/clink/runtime/dag.hpp` - how the DAG is built and run
 4. `tests/test_map_filter.cpp` - the smallest end-to-end integration

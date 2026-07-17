@@ -10,7 +10,8 @@
 # pays the ~20-30 min from-source rebuild); the other jobs run in it.
 #
 # Jobs and what gates the pipeline:
-#   toolchain-image - build + push the pinned image (cached).            [gate]
+#   toolchain-image - build + push the pinned image (cached). Push events
+#                     only; pull_request runs reuse the :main image.     [gate]
 #   build           - build with SQL + WASM + integration on; the unit + SQL
 #                     ctest run is the hard gate, the multi-process integration
 #                     run is advisory (see the step comments).           [gate + advisory step]
@@ -44,6 +45,14 @@ env:
 jobs:
   toolchain-image:
     name: Pinned toolchain image
+    # Push events only: on a pull_request run (fork or same-repo) the
+    # GITHUB_TOKEN is read-only for packages, so the GHCR push would 403.
+    # PR runs skip this job and consume the image from the latest main
+    # build via the `:main` moving tag pushed below. Consequence: a PR that
+    # changes the toolchain inputs (docker/Dockerfile, scripts/versions.env,
+    # the setup scripts) is tested against the pre-change image until it
+    # lands on main; CONTRIBUTING.md tells authors to flag such PRs.
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     outputs:
       ref: ${{ steps.meta.outputs.ref }}
@@ -63,7 +72,11 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.ref }}
+          # The per-SHA tag pins this run; the `:main` moving tag is what
+          # pull_request runs (which skip this job) pull instead.
+          tags: |
+            ${{ steps.meta.outputs.ref }}
+            ${{ env.IMAGE }}:main
           # Registry-backed layer cache: the expensive from-source Arrow /
           # aws-sdk / iceberg-cpp layers are reused across runs and only
           # rebuilt when their COPYed scripts change (see docker/Dockerfile).
@@ -74,8 +87,11 @@ jobs:
     name: Build + full ctest
     runs-on: ubuntu-24.04
     needs: toolchain-image
+    # Run when the image job succeeded (push) or was skipped (pull_request);
+    # in the skipped case fall back to the `:main` image.
+    if: ${{ !cancelled() && (needs.toolchain-image.result == 'success' || needs.toolchain-image.result == 'skipped') }}
     container:
-      image: ${{ needs.toolchain-image.outputs.ref }}
+      image: ${{ needs.toolchain-image.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -121,8 +137,9 @@ jobs:
     name: Install + downstream consume
     runs-on: ubuntu-24.04
     needs: toolchain-image
+    if: ${{ !cancelled() && (needs.toolchain-image.result == 'success' || needs.toolchain-image.result == 'skipped') }}
     container:
-      image: ${{ needs.toolchain-image.outputs.ref }}
+      image: ${{ needs.toolchain-image.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -173,13 +190,14 @@ jobs:
     name: Sanitizer (${{ matrix.mode }}) [advisory]
     runs-on: ubuntu-24.04
     needs: toolchain-image
+    if: ${{ !cancelled() && (needs.toolchain-image.result == 'success' || needs.toolchain-image.result == 'skipped') }}
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         mode: [asan, tsan, ubsan]
     container:
-      image: ${{ needs.toolchain-image.outputs.ref }}
+      image: ${{ needs.toolchain-image.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
