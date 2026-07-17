@@ -54,6 +54,8 @@ echo "build-iceberg-cpp: configuring (bundle + S3 + sqlite catalog) against Arro
 # (a plain set(), so -D cannot override it), and gcc 14 (Debian trixie) raises a
 # -Werror=free-nonheap-object FALSE POSITIVE in json_serde.cc. It is a dependency, so we
 # do not want its warnings to be errors; this flag overrides the property cross-platform.
+# POSITION_INDEPENDENT_CODE: the static libiceberg.a links into libclink.so; without
+# PIC the Linux link fails on TLS relocations (R_X86_64_TPOFF32 in retry_util.cc).
 cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
     --compile-no-warning-as-error \
     -DCMAKE_BUILD_TYPE=Release \
@@ -61,6 +63,7 @@ cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
     -DCMAKE_PREFIX_PATH="${PREFIX}" \
     -DICEBERG_BUILD_STATIC=ON \
     -DICEBERG_BUILD_SHARED=OFF \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DICEBERG_BUILD_BUNDLE=ON \
     -DICEBERG_S3=ON \
     -DICEBERG_BUILD_SQL_CATALOG=ON \
