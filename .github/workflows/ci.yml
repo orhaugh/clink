@@ -95,12 +95,22 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+      # root: the image's default user is non-root, but the runner mounts its
+      # file-command dirs root-owned, so checkout dies with EACCES otherwise
+      # (same reason the sanitizer job runs as root).
+      options: --user root
     env:
       # The image bakes the pinned toolchain at /usr/local; this tells the
       # build to resolve it there instead of the host ~/.clink-deps path.
       CLINK_DEPS_PREFIX: /usr/local
     steps:
       - uses: actions/checkout@v4
+      - name: Mark workspace safe for git
+        # The checkout's safe.directory entry lands in the action user's HOME,
+        # which differs from the run-step HOME in a container job; without
+        # this every git call in the build (the plugin ABI hash reads the
+        # HEAD SHA) fails with 'dubious ownership'.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Configure
         run: |
           # Full surface: SQL frontend, WASM UDFs, and the multi-process
@@ -143,10 +153,14 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+      # root: see the build job - the runner's mounted dirs are root-owned.
+      options: --user root
     env:
       CLINK_DEPS_PREFIX: /usr/local
     steps:
       - uses: actions/checkout@v4
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Build + install clink
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -209,5 +223,9 @@ jobs:
       IN_DOCKER: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Mark workspace safe for git
+        # See the build job: without this the plugin ABI-hash git calls fail
+        # with 'dubious ownership' inside the container.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Sanitizer build + tests
         run: ./build_and_test.sh --sanitizer ${{ matrix.mode }}

@@ -75,7 +75,12 @@ target_compile_definitions(clink_vector_search PUBLIC CLINK_HAS_VECTOR_SEARCH)
 if(_vs_simd)
     target_include_directories(clink_vector_search SYSTEM PRIVATE
         $<BUILD_INTERFACE:${simsimd_SOURCE_DIR}/include>)
-    target_compile_definitions(clink_vector_search PRIVATE CLINK_VECTOR_SIMSIMD=1)
+    # clink only uses the f32 dot/cos/l2sq kernels. SimSIMD's native bf16
+    # detection mis-fires on some GCC versions (`__bfloat16` does not name a
+    # type - GCC spells it `__bf16`), which broke the Linux CI build; force
+    # the emulated bf16 path, which we never call anyway.
+    target_compile_definitions(clink_vector_search PRIVATE CLINK_VECTOR_SIMSIMD=1
+                                                           SIMSIMD_NATIVE_BF16=0)
 endif()
 if(_vs_hnsw)
     target_include_directories(clink_vector_search SYSTEM PRIVATE
