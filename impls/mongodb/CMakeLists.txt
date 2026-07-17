@@ -84,6 +84,13 @@ clink_set_warnings(clink_mongodb)
 if(TARGET clink_mongocxx_external)
     install(TARGETS clink_mongocxx_external EXPORT ${CLINK_EXPORT_NAME})
     clink_install_impl(TARGET clink_mongodb NAME mongodb)
+elseif(TARGET PkgConfig::LIBMONGOCXX)
+    # pkg-config tier: recreate the exact imported target the exported
+    # clink_mongodb links (see the kafka impl for the pattern).
+    clink_install_impl(
+        TARGET   clink_mongodb
+        NAME     mongodb
+        FIND_DEP "find_dependency(PkgConfig)\npkg_check_modules(LIBMONGOCXX REQUIRED IMPORTED_TARGET GLOBAL libmongocxx1)")
 else()
     clink_install_impl(
         TARGET   clink_mongodb

@@ -96,6 +96,13 @@ endif()
 if(TARGET clink_hiredis_external)
     install(TARGETS clink_hiredis_external EXPORT ${CLINK_EXPORT_NAME})
     clink_install_impl(TARGET clink_redis NAME redis)
+elseif(TARGET PkgConfig::HIREDIS)
+    # pkg-config tier: recreate the exact imported target the exported
+    # clink_redis links (see the kafka impl for the pattern).
+    clink_install_impl(
+        TARGET   clink_redis
+        NAME     redis
+        FIND_DEP "find_dependency(PkgConfig)\npkg_check_modules(HIREDIS REQUIRED IMPORTED_TARGET GLOBAL hiredis)")
 else()
     clink_install_impl(
         TARGET   clink_redis

@@ -90,6 +90,13 @@ clink_set_warnings(clink_mqtt)
 if(TARGET clink_mosquitto_external)
     install(TARGETS clink_mosquitto_external EXPORT ${CLINK_EXPORT_NAME})
     clink_install_impl(TARGET clink_mqtt NAME mqtt)
+elseif(TARGET PkgConfig::LIBMOSQUITTO)
+    # pkg-config tier: recreate the exact imported target the exported
+    # clink_mqtt links (see the kafka impl for the pattern).
+    clink_install_impl(
+        TARGET   clink_mqtt
+        NAME     mqtt
+        FIND_DEP "find_dependency(PkgConfig)\npkg_check_modules(LIBMOSQUITTO REQUIRED IMPORTED_TARGET GLOBAL libmosquitto)")
 else()
     clink_install_impl(
         TARGET   clink_mqtt

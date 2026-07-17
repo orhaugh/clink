@@ -112,6 +112,15 @@ if(TARGET _clink_rdkafka_external)
     clink_install_impl(
         TARGET clink_kafka
         NAME   kafka)
+elseif(TARGET PkgConfig::RDKAFKA)
+    # Found via the pkg-config tier: the exported target links
+    # PkgConfig::RDKAFKA, so the installed config must recreate that exact
+    # imported target - a find_dependency(RdKafka CONFIG) would fail on any
+    # machine without a CMake config for librdkafka (Debian, Homebrew).
+    clink_install_impl(
+        TARGET   clink_kafka
+        NAME     kafka
+        FIND_DEP "find_dependency(PkgConfig)\npkg_check_modules(RDKAFKA REQUIRED IMPORTED_TARGET GLOBAL rdkafka rdkafka++)")
 else()
     clink_install_impl(
         TARGET   clink_kafka

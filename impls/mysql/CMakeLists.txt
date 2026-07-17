@@ -76,6 +76,13 @@ clink_set_warnings(clink_mysql)
 if(TARGET clink_mariadb_external)
     install(TARGETS clink_mariadb_external EXPORT ${CLINK_EXPORT_NAME})
     clink_install_impl(TARGET clink_mysql NAME mysql)
+elseif(TARGET PkgConfig::LIBMARIADB)
+    # pkg-config tier: recreate the exact imported target the exported
+    # clink_mysql links (see the kafka impl for the pattern).
+    clink_install_impl(
+        TARGET   clink_mysql
+        NAME     mysql
+        FIND_DEP "find_dependency(PkgConfig)\npkg_check_modules(LIBMARIADB REQUIRED IMPORTED_TARGET GLOBAL libmariadb)")
 else()
     clink_install_impl(
         TARGET   clink_mysql
