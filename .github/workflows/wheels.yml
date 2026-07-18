@@ -138,14 +138,23 @@ jobs:
           path: ~/.clink-deps
           key: clink-deps-${{ runner.os }}-${{ runner.arch }}-macos${{ env.MACOSX_DEPLOYMENT_TARGET }}-${{ hashFiles('scripts/versions.env') }}
 
-      - name: Bootstrap pinned Arrow + iceberg-cpp (at the macOS floor)
-        # MACOSX_DEPLOYMENT_TARGET is exported job-wide, so cmake inside these
-        # scripts pins Arrow's objects to the same minos as libclink - no minos
+      - name: Bootstrap pinned Arrow (at the macOS floor)
+        # MACOSX_DEPLOYMENT_TARGET is exported job-wide, so cmake inside this
+        # script pins Arrow's objects to the same minos as libclink - no minos
         # skew between the vendored Arrow and the wheel tag.
+        #
+        # iceberg-cpp is deliberately NOT bootstrapped for the wheel: the wheel
+        # builds libclink with CLINK_BUILD_IMPLS=OFF, which never configures or
+        # links iceberg (find_package(iceberg) lives only under impls/iceberg,
+        # gated by CLINK_BUILD_IMPLS; the state-export=iceberg CLI is gated on
+        # TARGET clink::iceberg). Building it here only added ~10 min and, at
+        # the wheel's macOS 11 floor, fails to compile: iceberg-cpp uses
+        # std::format on floats, whose std::to_chars is unavailable before
+        # macOS 13.3. Skipping it keeps the broad 11.0 floor. (A future
+        # iceberg-in-wheel build would need the floor raised to 13.3.)
         run: |
           set -euo pipefail
           scripts/build-arrow.sh
-          scripts/build-iceberg-cpp.sh
 
       - name: Wheel build tooling
         run: python -m pip install --upgrade pip build delocate pytest
