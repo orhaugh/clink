@@ -16,12 +16,15 @@
 #                     ctest run is the hard gate, the multi-process integration
 #                     run is advisory (see the step comments).           [gate + advisory step]
 #   install-smoke   - install + consume from an out-of-tree find_package. [gate]
+#   release-sql-runtime - the two live queryable-state HTTP tests, built in
+#                     Release (they need optimized throughput; the Debug gate
+#                     excludes them).                                    [gate]
 #
 # So a green pipeline requires: the pinned image builds, the full tree builds,
-# the unit + SQL suite passes, and the install-smoke consumes clink. The
-# integration step runs advisory until its pre-existing timing tail is
-# triaged. The sanitizer matrix is a separate MANUAL workflow
-# (sanitizers.yml) - over an hour per mode, too heavy for every push.
+# the unit + SQL suite passes, install-smoke consumes clink, and the Release
+# queryable-state HTTP tests pass. The integration step runs advisory until
+# its pre-existing timing tail is triaged. The sanitizer matrix is a separate
+# MANUAL workflow (sanitizers.yml) - over an hour per mode, too heavy per push.
 
 name: ci
 
@@ -263,6 +266,71 @@ jobs:
         with:
           path: /root/.ccache
           key: ccache-install-${{ github.run_id }}
+
+  release-sql-runtime:
+    # Gates the two live queryable-state HTTP tests that the Debug gate
+    # excludes: they run a 1.5M-row job and poll for live / checkpoint-exported
+    # state over HTTP within a fixed in-test deadline, which only an optimized
+    # build's throughput meets. This job builds JUST the SQL test target in
+    # Release (one binary, so it fits the disk without the full-tree strip
+    # dance) and runs exactly those two tests as a blocking gate.
+    name: Release SQL runtime ITs
+    runs-on: ubuntu-24.04
+    needs: toolchain-image
+    if: ${{ !cancelled() && (needs.toolchain-image.result == 'success' || needs.toolchain-image.result == 'skipped') }}
+    container:
+      image: ${{ needs.toolchain-image.outputs.ref || format('ghcr.io/{0}/clink-build:main', github.repository_owner) }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # root: see the build job - the runner's mounted dirs are root-owned.
+      options: --user root
+    env:
+      CLINK_DEPS_PREFIX: /usr/local
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install ccache
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends ccache
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /root/.ccache
+          key: ccache-release-sql-${{ github.run_id }}
+          restore-keys: ccache-release-sql-
+      - name: Configure (Release, SQL on)
+        # -s strips the one test binary at link: the image's static Arrow
+        # carries debug info that Release would otherwise pull in whole.
+        run: |
+          # Examples stay ON (default): some test targets reference example
+          # job plugins via generator expressions, so they must be defined at
+          # configure time. Only clink_sql_tests is actually built below, so
+          # the example binaries never link and cost no disk.
+          cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \
+            -DCLINK_BUILD_TESTS=ON \
+            -DCLINK_BUILD_SQL=ON \
+            -DCMAKE_EXE_LINKER_FLAGS=-s
+      - name: Build the SQL test target only
+        run: cmake --build build-release --target clink_sql_tests -j "$(nproc)"
+      - name: Test (live queryable-state HTTP, Release) [blocking gate]
+        # Serial: each test stands up its own coordinator+worker+HTTP cluster.
+        run: >-
+          ctest --test-dir build-release --output-on-failure -j 1 --timeout 300
+          -R 'SqlQueryableState\.Live(GroupByStateServedOverHttp|WholeJobStateExportOverHttp)'
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /root/.ccache
+          key: ccache-release-sql-${{ github.run_id }}
 
   # The sanitizer matrix lives in its own manually-triggered workflow
   # (sanitizers.yml): a full asan/tsan/ubsan pass takes over an hour per mode
