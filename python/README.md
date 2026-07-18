@@ -12,7 +12,7 @@ Arrow/Parquet) next to the package, so nothing else is needed - no separate
 build, no `CLINK_LIB`:
 
 ```bash
-pip install pyclink-<version>-py3-none-macosx_11_0_arm64.whl
+pip install pyclink-<version>-py3-none-macosx_14_0_arm64.whl
 ```
 
 pyclink is not yet published to PyPI. Wheels are produced by

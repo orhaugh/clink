@@ -69,7 +69,14 @@ env:
   # build-libclink-wheel.sh and build-arrow.sh) AND the wheel platform tag
   # (wheel's get_platform reads this env var), so binary and tag agree. Bumping
   # it busts the ~/.clink-deps cache so Arrow is rebuilt at the new floor.
-  MACOSX_DEPLOYMENT_TARGET: "11.0"
+  #
+  # 14.0, not a lower floor: clink is C++23 and uses libc++ features that are
+  # availability-gated to a recent macOS - std::jthread and std::stop_token
+  # (the C++20 sync library) and std::atomic<floating-point>::fetch_add. At an
+  # 11.0 target libc++ compiles those declarations out ("no type named
+  # 'jthread'"), so libclink cannot build. 14.0 makes the whole C++20 library
+  # surface available. The wheel therefore requires macOS 14+.
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
   # Portable manylinux target. The Linux repair step warns if the wheel's actual
   # glibc floor exceeds this (see PLATFORM SCOPE). major.minor.
   MANYLINUX_TARGET: "2.34"
@@ -147,11 +154,8 @@ jobs:
         # builds libclink with CLINK_BUILD_IMPLS=OFF, which never configures or
         # links iceberg (find_package(iceberg) lives only under impls/iceberg,
         # gated by CLINK_BUILD_IMPLS; the state-export=iceberg CLI is gated on
-        # TARGET clink::iceberg). Building it here only added ~10 min and, at
-        # the wheel's macOS 11 floor, fails to compile: iceberg-cpp uses
-        # std::format on floats, whose std::to_chars is unavailable before
-        # macOS 13.3. Skipping it keeps the broad 11.0 floor. (A future
-        # iceberg-in-wheel build would need the floor raised to 13.3.)
+        # TARGET clink::iceberg). Building it here is pure dead weight (~10 min)
+        # for a lib the wheel never links - so skip it and build only Arrow.
         run: |
           set -euo pipefail
           scripts/build-arrow.sh
