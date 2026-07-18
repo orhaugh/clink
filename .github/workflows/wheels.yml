@@ -50,14 +50,20 @@
 name: wheels
 
 on:
+  # MANUAL ONLY for now. The tag trigger (push: tags: ["v*"]) is intentionally
+  # removed: the macOS wheel cannot build until clink's std::jthread /
+  # std::stop_token usage is resolved - Apple's libc++ gates the C++20 sync
+  # library to a macOS floor far above the wheel's target (even Xcode 17 on
+  # macos-15 lacks jthread at deployment target 14). So prebuilt wheels are
+  # deferred; v0.1.0 ships with the documented build-from-source path. Re-add
+  # the tag trigger once the jthread portability is fixed (see the tracked
+  # follow-up), then a release tag produces wheels again.
   workflow_dispatch:
     inputs:
       build_linux:
         description: "Also build Linux wheels. Built on the trixie toolchain image, so the manylinux glibc floor is high and the wheels are NOT broadly installable (see workflow header)."
         type: boolean
         default: false
-  push:
-    tags: ["v*"]
 
 permissions:
   contents: read
