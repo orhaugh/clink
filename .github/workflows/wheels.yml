@@ -41,7 +41,8 @@
 # Shape when Linux is enabled ({macos-arm64, linux-x86_64, linux-aarch64}):
 #   toolchain-image  build + push the pinned image per arch on its NATIVE runner
 #                    (no QEMU), so the aarch64 wheel job can pull an arm64 image.
-#   macos-wheel      native macos-14; cached ~/.clink-deps; delocate.
+#   macos-wheel      native macos-15 (Xcode 16 - older Xcode lacks the C++20
+#                    libc++ features clink needs); cached ~/.clink-deps; delocate.
 #   linux-wheels     matrix {x86_64, aarch64}; runs INSIDE the pinned image
 #                    (toolchain at /usr/local, no Arrow rebuild); auditwheel.
 #   collect          gather whatever wheels were built into one artifact.
@@ -122,7 +123,14 @@ jobs:
   # Always built; this is the shippable path.
   macos-wheel:
     name: Wheel (macos-arm64)
-    runs-on: macos-14
+    # macos-15, not macos-14: the macos-14 image's Xcode 15.4 Apple-clang/libc++
+    # does not ship std::jthread, std::stop_token, or std::atomic<float>::fetch_add
+    # (they compile out entirely - "no type named 'jthread'"), which clink uses
+    # throughout, so libclink cannot build there. macos-15 ships Xcode 16, whose
+    # newer libc++ has them. The wheel still targets macOS 14 via
+    # MACOSX_DEPLOYMENT_TARGET, so the build host being 15 does not raise the
+    # runtime floor.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
