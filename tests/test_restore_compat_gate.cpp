@@ -40,8 +40,9 @@ std::filesystem::path write_savepoint(const clink::StateVersionMap& versions,
                                       const std::string& tag) {
     namespace fs = std::filesystem;
     static std::atomic<std::uint64_t> counter{0};
-    auto dir = fs::temp_directory_path() / ("rcg_" + tag + "_" + std::to_string(getpid()) + "_" +
-                                            std::to_string(counter.fetch_add(1)));
+    auto dir =
+        fs::temp_directory_path() / ("restore_compat_gate_" + tag + "_" + std::to_string(getpid()) +
+                                     "_" + std::to_string(counter.fetch_add(1)));
     fs::create_directories(dir / "0");
 
     clink::InMemoryStateBackend backend;
