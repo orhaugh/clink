@@ -58,7 +58,7 @@ counts to N, job ends).
 
 ## What we DON'T measure (skipped on purpose)
 
-- Kafka producer/consumer throughput — that's infrastructure, not engine.
-- Network bridge throughput at par > 1 — separate concern, addressed
+- Kafka producer/consumer throughput - that's infrastructure, not engine.
+- Network bridge throughput at par > 1 - separate concern, addressed
   once par=1 numbers are clean.
-- Cluster scheduling / multi-worker placement — par=1, single worker.
+- Cluster scheduling / multi-worker placement - par=1, single worker.

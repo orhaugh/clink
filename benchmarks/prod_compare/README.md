@@ -1,4 +1,4 @@
-# clink vs Flink — production-feature bench suite
+# clink vs Flink - production-feature bench suite
 
 A head-to-head suite that exercises the parts of the streaming engine a
 production deployment actually leans on, so a port to clink can be

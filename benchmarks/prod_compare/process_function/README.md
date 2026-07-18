@@ -1,6 +1,6 @@
 # process-function bench
 
-Exercises the Flink `KeyedProcessFunction` surface — the workhorse
+Exercises the Flink `KeyedProcessFunction` surface - the workhorse
 for stateful business logic where windows don't fit. Verifies clink's
 process-function operator, timer service, and per-state-type APIs
 under load.

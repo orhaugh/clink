@@ -1,4 +1,4 @@
-# clink vs Flink — head-to-head benchmark
+# clink vs Flink - head-to-head benchmark
 
 Apples-to-apples throughput benchmark. Both engines run the same
 pipeline (Kafka → `key_by` → 1s tumbling event-time window → sum →
@@ -43,8 +43,8 @@ RECORDS=100000000 KEYS=10000 WINDOWS=1000 ./run.sh
 ```
 
 Output lands in `./results/`:
-- `flink.json`, `clink.json` — per-engine raw metrics.
-- `clink_coordinator.log`, `clink_worker_*.log`, `clink_submit.log` — clink-side logs.
+- `flink.json`, `clink.json` - per-engine raw metrics.
+- `clink_coordinator.log`, `clink_worker_*.log`, `clink_submit.log` - clink-side logs.
 
 The final scoreboard is printed at the end of `run.sh`.
 
@@ -73,7 +73,7 @@ once throughput numbers stabilize.
 
 - Both engines are configured with checkpointing OFF and at-least-once
   Kafka sink. Turning checkpointing on costs both engines, but not
-  symmetrically — Flink's snapshot machinery is more mature, so this
+  symmetrically - Flink's snapshot machinery is more mature, so this
   benchmark intentionally compares the hot path.
 - Flink and clink use different default chaining strategies. Operator
   chaining is *disabled* on the Flink side (`env.disableOperatorChaining()`)

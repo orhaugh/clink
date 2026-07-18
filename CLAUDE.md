@@ -1,31 +1,34 @@
-# clink - agent notes
-No emdashes!!!
+# clink - working guide
+
+Conventions and orientation for working in this repository, whether by hand or
+with an AI coding assistant. It supplements the root `README.md` and the
+references under `docs/`; it does not replace them.
 
 ## Working conventions
 
-How to work in this repo. These reflect standing preferences; honour them by default.
+Standing preferences for this repository. Follow them by default.
 
-- Voice: British English. No em dashes anywhere (use a spaced hyphen or restructure). No hype or filler.
-- Framing: describe clink in its own terms in engine code, tests, and docs; do not explain features by analogy to other engines. Exceptions: the root README's "inspired by Apache Flink" note, the single sentence in `docs/internals/architecture.md`, and the cross-engine benchmark harnesses under `benchmarks/` (naming the compared engine there is unavoidable; keep those premise-pinned and correctness-gated, with no absolute claims about the other engine's capabilities).
-- Git: work directly on `main`; no feature branches. Commit when a unit of work is done and verified; push only when asked. Do NOT add a `Co-Authored-By: Claude` trailer (this is a public repo).
-- Effort: default to working INLINE. Reserve multi-agent workflows for genuine large parallel fan-out (many independent units, parallel edits that would collide, scope beyond one context), not routine tasks. Consult the Codebase map and `docs/` below before scanning the tree, so work starts informed.
-- Comments: do not add internal roadmap or milestone tags (e.g. "Phase 12", "Phase 29d") to comments or messages; they carry no meaning outside the work plan and were deliberately removed.
-- Stateful operators MUST be given a stable uid: `.uid("...")` on the fluent `DataStream`/`KeyedDataStream`, or `set_uid("...")` on a Dag-direct operator. The uid derives the `OperatorId` (`operator_id_from_uid`, `include/clink/core/types.hpp`) that state restore, rescale, and schema evolution key on. A missing uid on a stateful op is a correctness bug, not a style nit.
-- Build parallelism: use `cmake --build <dir> --parallel 10` and `ctest --test-dir <dir> --parallel 8` (or `-j8`). NEVER a bare `-j` (unbounded parallelism can freeze a workstation).
-- clang-format: the pre-commit hook uses Apple clang-format at `/Library/Developer/CommandLineTools/usr/bin/clang-format`. Format with THAT binary, not Homebrew's newer clang-format, or a version skew reformats lines differently and blocks the commit.
-- Docs are part of "done": at the end of a feature round, update the affected documentation in the SAME change, not as a later follow-up. That means the relevant `docs/connectors/<name>.md` or `docs/internals/<page>.md` (and its index `README.md`), the root `README.md` if a capability or section changed, and the Codebase map below if a subsystem or key file moved or was added. If a shipped feature has no doc page yet, create one. A feature is not complete until its docs match the code.
-- Docs location: `/docs/*` is gitignored except `consumer-examples/`, `connectors/`, and `internals/`. Never commit other `docs/*.md` (internal work notes); to publish a new docs subdir, add a matching `!/docs/<dir>/` exception.
-- Diagrams in docs: use a fenced ` ```mermaid ` block (GitHub renders it), not ASCII art. Keep node labels in double quotes, escape `<`/`>`/`&` as `&lt;`/`&gt;`/`&amp;`, use `<br/>` for line breaks, and avoid `[`/`]`/`|`/`{`/`}` inside labels. For data layouts (struct fields, byte formats) a Markdown table is fine.
+- Voice: British English. No em dashes; use a spaced hyphen or restructure the sentence. No hype or filler.
+- Framing: describe clink in its own terms in engine code, tests, and docs, and do not explain features by analogy to other engines. The exceptions are the "inspired by Apache Flink" note in the root README, one sentence in `docs/internals/architecture.md`, and the cross-engine benchmark harnesses under `benchmarks/`, where naming the compared engine is unavoidable. Keep those harnesses premise-pinned and correctness-gated, and make no absolute claims about the other engine's capabilities.
+- Git: work directly on `main`; no feature branches. Commit once a unit of work is done and verified, and push only when asked. Do not add a `Co-Authored-By` trailer; the commit history is kept single-author.
+- Effort: work inline by default. Reserve multi-agent workflows for genuine large fan-out, such as many independent units, parallel edits that would otherwise collide, or scope beyond a single context. Consult the codebase map and `docs/` below before scanning the tree, so work starts informed.
+- Comments: do not add internal roadmap or milestone tags (for example "Phase 12") to comments or commit messages. They carry no meaning outside the work plan and were removed deliberately.
+- Stateful operators need a uid: give every stateful operator a stable uid, via `.uid("...")` on the fluent `DataStream` / `KeyedDataStream` or `set_uid("...")` on a Dag-direct operator. The uid derives the `OperatorId` (`operator_id_from_uid` in `include/clink/core/types.hpp`) that state restore, rescale, and schema evolution key on. An operator without one cannot have its state restored, so a missing uid is a correctness bug rather than a style nit.
+- Build parallelism: use `cmake --build <dir> --parallel 10` and `ctest --test-dir <dir> --parallel 8` (or `-j8`). Never use a bare `-j`, as unbounded parallelism can freeze a workstation.
+- clang-format: the pre-commit hook uses Apple clang-format at `/Library/Developer/CommandLineTools/usr/bin/clang-format`. Format with that binary, not Homebrew's newer clang-format, or the version skew reformats lines differently and blocks the commit.
+- Docs are part of "done": at the end of a feature round, update the affected documentation in the same change rather than as a follow-up. That means the relevant `docs/connectors/<name>.md` or `docs/internals/<page>.md` (and its index `README.md`), the root `README.md` if a capability or section changed, and the codebase map below if a subsystem or key file moved or was added. If a shipped feature has no doc page, create one. A feature is not complete until its docs match the code.
+- Docs location: `/docs/*` is gitignored except `consumer-examples/`, `connectors/`, and `internals/`. Do not commit other `docs/*.md`, which are internal work notes; to publish a new docs subdirectory, add a matching `!/docs/<dir>/` exception.
+- Diagrams: use a fenced ` ```mermaid ` block, which GitHub renders, not ASCII art. Keep node labels in double quotes; escape `<`, `>`, and `&` as `&lt;`, `&gt;`, and `&amp;`; use `<br/>` for line breaks; and avoid `[`, `]`, `|`, `{`, and `}` inside labels. For data layouts such as struct fields or byte formats, a Markdown table is fine.
 
-## Codebase map (read this before scanning the tree)
+## Codebase map
 
-Persisted orientation so work starts informed instead of re-deriving the layout
-each time. For any "how does X work" or "where does X live" question, consult the
-relevant `docs/internals/` page first, then go to the source it cites. Keep these
-docs current when a subsystem changes.
+Orientation so work starts informed instead of re-deriving the layout each time.
+Read this before scanning the tree. For any "how does X work" or "where does X
+live" question, read the relevant `docs/internals/` page first, then follow it to
+the source it cites. Keep these pages current when a subsystem changes.
 
 - Deep per-subsystem references: `docs/internals/` (index: `docs/internals/README.md`).
-- Per-connector references (deps, factory names, options, SQL usage): `docs/connectors/`.
+- Per-connector references (dependencies, factory names, options, SQL usage): `docs/connectors/`.
 - Runnable API examples: `docs/consumer-examples/`.
 
 | Subsystem | Source | Internals page |
@@ -51,27 +54,28 @@ docs current when a subsystem changes.
 
 ## Pinned toolchain (one-time bootstrap)
 
-Arrow/Parquet + iceberg-cpp are COMPILED FROM SOURCE at exact versions
-(`scripts/versions.env`) into `CLINK_DEPS_PREFIX` (host default `~/.clink-deps`)
-so the host and the Debian image link byte-for-byte the same libraries. CMake
+Arrow, Parquet, and iceberg-cpp are compiled from source at the exact versions in
+`scripts/versions.env`, into `CLINK_DEPS_PREFIX` (host default `~/.clink-deps`),
+so the host and the Debian image link byte-for-byte identical libraries. CMake
 auto-prepends that prefix and asserts the Arrow version, so any `cmake` invocation
-finds it once it exists. Bootstrap it once on a fresh checkout (slow - builds Arrow
-from source; idempotent after):
+finds it once it exists. Bootstrap it once on a fresh checkout. This is slow,
+since it builds Arrow from source, but idempotent afterwards:
 
 ```bash
 scripts/build-arrow.sh && scripts/build-iceberg-cpp.sh   # -> ~/.clink-deps
 ```
 
 `./build_and_test.sh` does this automatically. In Docker it is baked into the
-image at `/usr/local` (`scripts/setup-build-env.sh`). Bump a version in
-`scripts/versions.env`, delete the prefix, and re-bootstrap to change it. Arrow's
-S3 uses the SYSTEM aws-sdk (Homebrew on host / built in the image), not Arrow 24's
-broken bundled CRT; the data-path deps stay bundled + pinned.
+image at `/usr/local` (`scripts/setup-build-env.sh`). To change a version, bump it
+in `scripts/versions.env`, delete the prefix, and re-bootstrap. Arrow's S3 support
+uses the system aws-sdk (Homebrew on the host, built into the image) rather than
+Arrow 24's bundled CRT, which does not build cleanly here; the data-path
+dependencies stay bundled and pinned.
 
 ## Build & test
 
-The reproducible path is `./build_and_test.sh`, optionally inside the
-project's Docker image:
+The reproducible path is `./build_and_test.sh`, optionally inside the project's
+Docker image:
 
 ```bash
 ./build_and_test.sh                                            # normal build + ctest
@@ -82,16 +86,15 @@ project's Docker image:
 ./build_and_test.sh --image clink-build:latest --sanitizer all
 ```
 
-**The local Docker image is `clink-build:latest`.** When running
-sanitizers or coverage, prefer the `--image clink-build:latest`
-form - that's where the toolchain (clang, lcov, gcovr, the right
-librdkafka/libpq versions, etc.) is pinned. The host machine can be
-missing pieces.
+The local Docker image is `clink-build:latest`. When running sanitizers or
+coverage, prefer the `--image clink-build:latest` form, since that is where the
+toolchain (clang, lcov, gcovr, the right librdkafka and libpq versions, and so
+on) is pinned; the host machine can be missing pieces.
 
-Build artifacts go into `build/`, `build-asan/`, `build-tsan/`,
-`build-ubsan/`, `build-coverage/`. All are gitignored.
+Build artifacts go into `build/`, `build-asan/`, `build-tsan/`, `build-ubsan/`,
+and `build-coverage/`, all of which are gitignored.
 
-## Quick fast-path
+## Fast path
 
 For everyday local iteration without sanitizers:
 
@@ -99,62 +102,37 @@ For everyday local iteration without sanitizers:
 cmake -S . -B build && cmake --build build --parallel 10 && ctest --test-dir build -j8
 ```
 
-`ctest --test-dir build -L core` runs just `clink_core_tests`;
-`-L kafka`, `-L postgres`, `-L clickhouse`, `-L s3`, `-L rocksdb`,
-`-L tls`, `-L integration` hit the per-impl test exes.
+`ctest --test-dir build -L core` runs just `clink_core_tests`; `-L kafka`,
+`-L postgres`, `-L clickhouse`, `-L s3`, `-L rocksdb`, `-L tls`, and
+`-L integration` hit the per-impl test executables.
 
 ## Nexmark benchmark ("run a nexmark run")
 
-Harness lives in `benchmarks/nexmark_compare/`. Two scripts, different jobs:
+The harness lives in `benchmarks/nexmark_compare/`. Two scripts do different jobs:
 
-- `throughput_sampled.sh` is the CANONICAL throughput run and what "run a
-  nexmark run" means by default. It measures sustained engine-side
-  records/sec (polls each engine's own counter, takes the max slope, so the
-  number excludes deploy/JVM-warmup and end taper). Default `q0 q12`, par 4,
-  5M events. Both engines run CONTAINERIZED.
-- `run.sh` is the correctness-gated clink-vs-Flink comparison (broker-append
-  timing, gates on identical output-row counts). Default `q0 q12`, par 1, 500k
-  events. Runs the HOST build (`BUILD_DIR`, default `build/`).
+- `throughput_sampled.sh` is the canonical throughput run, and what "run a nexmark run" means by default. It measures sustained engine-side records per second by polling each engine's own counter and taking the maximum slope, so the figure excludes deploy time, JVM warm-up, and the end taper. Defaults: `q0 q12`, parallelism 4, 5M events. Both engines run containerised.
+- `run.sh` is the correctness-gated comparison. It times broker append and gates on identical output-row counts. Defaults: `q0 q12`, parallelism 1, 500k events. It runs the host build (`BUILD_DIR`, default `build/`).
 
-Canonical command for a before/after engine-throughput check:
+Canonical command for a before/after throughput check:
 
 ```bash
 cd benchmarks/nexmark_compare
 SINK=blackhole EVENTS=10000000 QUERIES="q0 q12" PARALLELISM=4 ./throughput_sampled.sh
 ```
 
-`SINK=blackhole` discards output (uses the `q*_bh.tmpl.sql` variants) so the
-Kafka write ceiling is removed and we measure engine read+process rate only;
-`SINK=kafka` (default) writes to a topic and gates on row count. `KEEP_UP=1`
-leaves the cluster up.
+`SINK=blackhole` discards output (using the `q*_bh.tmpl.sql` variants), removing
+the Kafka write ceiling so the measurement reflects engine read and process rate
+only. `SINK=kafka` (the default) writes to a topic and gates on row count.
+`KEEP_UP=1` leaves the cluster running.
 
-CRITICAL caveats for a valid before/after (do NOT skip):
+Three things to get right for a valid before/after:
 
-1. `throughput_sampled.sh` runs the `clink-runtime:latest` DOCKER IMAGE for the
-   engine, not the host `build/`. The host build only compiles `nexmark_dump`
-   (data gen) and `clink_submit_sql` (submission). So a code change is NOT
-   measured until the image is rebuilt at the new commit. Rebuild it first
-   (`verify_distributed.sh` builds/refreshes `clink-runtime:latest`), then run.
-   Check freshness: `docker image inspect clink-runtime:latest --format '{{.Created}}'`
-   against the commit under test.
-2. The columnar wave's `process_columnar` fast paths (WS1 filter/project
-   programs, WS3 within-batch group-by) do NOT fire on a Kafka-JSON-sourced
-   nexmark. Verified by tracing: the Kafka JSON source decodes to row `Batch`es
-   with no Arrow sidecar; the inter-operator wire batcher (`make_row_wire_batcher`)
-   is columnar PASS-THROUGH (ships an existing sidecar verbatim, but a row-form
-   batch falls back to the JSON binary layout) so it never MANUFACTURES columnar
-   from rows; the receiver materialises rows and the window/agg op takes the row
-   path. Columnar is only born from a columnar-native source (e.g. `ParquetSource`
-   with `schema_columns`) - which is what the in-tree `ColumnarParquet*` tests
-   use. So to benchmark WS1/WS3 you must feed the query from Parquet, not Kafka
-   JSON. As wired today the ONLY wave lever nexmark touches is WS4 (the `FlatMap`
-   window-state map on q12), and only when the image is built with
-   `-DCLINK_USE_FLAT_HASH_MAP=ON` (OFF by default).
-3. Only `q0` (projection-ish passthrough) and `q12` (windowed GROUP BY) are
-   sampled for throughput; `q8`/`q6` have tiny join inputs that drain in under a
-   second so they live in the gate harness, not here.
+1. `throughput_sampled.sh` runs the `clink-runtime:latest` Docker image, not the host `build/`. The host build only compiles `nexmark_dump` (data generation) and `clink_submit_sql` (submission), so a code change is not measured until the image is rebuilt at the new commit. Rebuild it first (`verify_distributed.sh` builds or refreshes `clink-runtime:latest`), then run. Check freshness with `docker image inspect clink-runtime:latest --format '{{.Created}}'` against the commit under test.
+2. The columnar fast paths (`process_columnar`: WS1 filter/project programs, WS3 within-batch group-by) do not fire on a Kafka-JSON-sourced nexmark. The Kafka JSON source decodes to row batches with no Arrow sidecar, and the inter-operator wire batcher (`make_row_wire_batcher`) only passes an existing sidecar through; it never manufactures columnar data from rows, so the receiver materialises rows and the window or aggregation operator takes the row path. Columnar data is only born from a columnar-native source such as `ParquetSource` with `schema_columns`, which is what the in-tree `ColumnarParquet*` tests use. To benchmark WS1 or WS3, feed the query from Parquet, not Kafka JSON. As wired today, the only columnar lever nexmark touches is WS4 (the `FlatMap` window-state map on q12), and only when the image is built with `-DCLINK_USE_FLAT_HASH_MAP=ON` (off by default).
+3. Only `q0` (projection-style passthrough) and `q12` (windowed GROUP BY) are sampled for throughput. `q6` and `q8` have tiny join inputs that drain in under a second, so they live in the gate harness rather than here.
 
-Results (gitignored): `results-sampled/` (sampled), `results/` (run.sh),
-`results-containers/`. Each is a per-query JSON with `sustained_slope`
-(headline rec/s), `drain_rate`, `reached_target`, cpu/wall seconds. Compare
-`sustained_slope` before vs after for the same query/par/events/sink.
+Results are gitignored: `results-sampled/` (sampled runs), `results/` (`run.sh`),
+and `results-containers/`. Each is a per-query JSON with `sustained_slope` (the
+headline records per second), `drain_rate`, `reached_target`, and CPU and wall
+seconds. Compare `sustained_slope` before and after for the same query,
+parallelism, event count, and sink.

@@ -26,8 +26,8 @@ the Coordinator's `/api/v1/workers` endpoint:
 
 ```
 $ kubectl get clinkcluster
-NAME   PHASE     TMS-READY   DESIRED-TMS   AGE
-demo   Running   2           2             40s
+NAME   PHASE     WORKERS-READY   DESIRED-WORKERS   AGE
+demo   Running   2               2                 40s
 ```
 
 `.status.phase` is `Pending` until every Worker has registered, then

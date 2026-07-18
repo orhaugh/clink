@@ -1,7 +1,7 @@
 # nexmark_compare - clink vs Flink on Nexmark (apples-to-apples)
 
-A cross-engine Nexmark throughput comparison. Both engines run the SAME query over
-ONE pre-generated Nexmark dataset read from identical Kafka topics, under a written
+A cross-engine Nexmark throughput comparison. Both engines run the same query over
+one pre-generated Nexmark dataset read from identical Kafka topics, under a written
 matched premise, measured the same way. Sibling of `benchmarks/flink_compare`
 (which compares a single keyed-window pipeline); this reuses its skeleton and its
 honesty discipline for the Nexmark workload.
@@ -15,7 +15,7 @@ premise holding is not apples-to-apples.
 
 clink's own Nexmark bench (`benchmarks/clink_nexmark_bench`) is clink-only:
 in-process, single Worker, logical-stream rate, with a steady-state mode for
-clink-vs-clink tracking. It is NOT comparable to another engine. The only existing
+clink-vs-clink tracking. It is not comparable to another engine. The only existing
 cross-engine number in this repo (`flink_compare`) is a different, single-pipeline
 workload. This harness produces the first defensible clink-vs-Flink Nexmark number.
 
@@ -40,10 +40,10 @@ PARALLELISM=4 ./run.sh    # par 4: 4-partition topics, both engines at -p 4
 KEEP_UP=1 ./run.sh        # leave Kafka + Flink up afterwards
 ```
 
-It builds both engines, brings up Kafka + Flink, generates ONE canonical dataset,
+It builds both engines, brings up Kafka + Flink, generates one canonical dataset,
 loads it to PAR-partition topics both engines read, runs each query on both at
 parallelism PAR, measures steady-state by broker append-time, gates on identical
-output-row counts (a mismatch HALTS that query, no ratio), and prints the
+output-row counts (a mismatch halts that query, no ratio), and prints the
 scoreboard under the matched-premise banner. The results table below is the
 default par=1; see the Parallelism>1 section for the par=4 run.
 
@@ -138,26 +138,26 @@ output-burst-bound, its eff baseline-bound) - see below.
 
 **q8 is a correctness milestone, not a throughput data point.** It proves clink's
 two-source windowed join over Kafka (person-window aggregate JOIN auction-window
-aggregate on `id=seller` + same window) computes the SAME relation as Flink -
+aggregate on `id=seller` + same window) computes the same relation as Flink -
 both emit exactly 1,056 rows (the data-derived count of distinct persons created
 in a window who also sold an auction in that window, over the 49 watermark-closed
 windows). Its throughput rate is **indicative only and excluded from the
 geomean**: q8 emits few rows relative to input (1,056 vs ~40k person+auction
 events), so the output-row-append rate measures emission-burst dynamics, not
 processing throughput (it swings run-to-run, e.g. 3-10x, while the 1,056=1,056
-gate is rock-solid). The geomean is over the two throughput-comparable queries
+gate is exact). The geomean is over the two throughput-comparable queries
 (q0, q12) where output is input-scale.
 
 **q6 is a SQL-only capability, not a measured comparison.** q6 (average selling
 price per seller over their last 10 closed auctions) is the query Flink itself
-does NOT express in SQL - its `OVER` operator does not consume retractions, so the
+does not express in SQL - its `OVER` operator does not consume retractions, so the
 canonical Nexmark q6 ships only via Flink's DataStream API. clink runs it in SQL
 (`queries/clink/q6.tmpl.sql`): winning bid per auction (bid INNER JOIN auction +
 interval residual + ROW_NUMBER top-1) feeding a last-10-per-seller `AVG ... OVER
 (... ROWS BETWEEN 9 PRECEDING AND CURRENT ROW)`, which lowers to clink's
 `last_n_agg` operator (consumes the winning-bid changelog, re-emits the per-seller
 avg as the last-10 set slides). Verified over Kafka: 30,845 changelog records
-netting to a final upsert state of 5,223 distinct sellers. It is NOT in the gated
+netting to a final upsert state of 5,223 distinct sellers. It is not in the gated
 `run.sh` suite - there is no Flink SQL counterpart to gate against, and its
 changelog output (vs a clean append/pane count) does not fit the row-count gate; a
 faithful gate-matched Flink DataStream job was judged disproportionate effort for
@@ -166,7 +166,7 @@ SQL a query class the Flink reference suite expresses only as a DataStream
 program.
 
 Caveats (so these are not yet the full `pipeline.md` headline): parallelism is 1
-on BOTH (matched, the cleanest per-core comparison; **1-partition input topics**
+on both (matched, the cleanest per-core comparison; **1-partition input topics**
 are the correct config at parallelism 1 - see the multi-partition note below).
 CPU is now measured (the eff column), but the eff ratio is a total-CPU-footprint
 number incl. each engine's baseline overhead, not a compute-kernel ratio (see the
@@ -177,7 +177,7 @@ stateless, q12 windowed-agg); q8
 ## Latency (the second measured axis)
 
 Throughput asks how fast an engine drains a backlog; the latency axis asks how
-long ONE record takes under a load both engines handle comfortably, and what the
+long one record takes under a load both engines handle comfortably, and what the
 tail looks like. Premise: `pipeline.md`, "Latency axis". One command:
 
 ```bash
@@ -296,12 +296,12 @@ now deterministic), and single-partition is **exact** (184,767). So the
 parallelism-1 benchmark (single-partition topics) is fully correct - the q0/q12
 ratios above stand.
 
-**Residual (~1.4%) is confined to par=1 reading MANY partitions:** when ONE
+**Residual (~1.4%) is confined to par=1 reading many partitions:** when one
 subtask reads 4 interleaved partitions, at start-of-stream (before every
 partition has delivered its first record) the min is over the seen subset, so the
 earliest window can fire slightly early (par=1 over 4-partition keyed q12:
-187,432 vs 184,767). This does NOT occur at par>1 (next section): there each
-subtask reads ONE ordered partition, so there is no within-subtask interleave -
+187,432 vs 184,767). This does not occur at par>1 (next section): there each
+subtask reads one ordered partition, so there is no within-subtask interleave -
 the cross-partition min happens at the keyed shuffle, which the runtime does
 exactly. So the residual is a par=1-multi-partition edge case, not a correctness
 limit on scaled runs.
@@ -374,10 +374,10 @@ Kafka) and gate-checks q0/q12/q8 at par=4 - all gate-exact (460000 / 184767 /
 loopback. The runtime image (`docker/Dockerfile.runtime`) is Release + LTO +
 stripped.
 
-`throughput_containers.sh` runs BOTH engines containerized for a throughput
+`throughput_containers.sh` runs both engines containerized for a throughput
 comparison. It is built and gate-passes, but a throughput run at this scale
-EXPOSED A MEASUREMENT-VALIDITY PROBLEM, and the honest conclusion is that the
-rate numbers are NOT a clean sustained-throughput ratio:
+exposed a measurement-validity problem, and the honest conclusion is that the
+rate numbers are not a clean sustained-throughput ratio:
 
 - clink **burst-drains** the pre-loaded Kafka topic - the engine finishes q0 in
   ~0.1s and flushes output in a burst (460000 records, broker-append span 0.11s),
@@ -457,7 +457,7 @@ counter (only the sink differs):
 | blackhole | 881k/s | 426k/s | 2.07x |
 
 The result is the opposite of the naive expectation, and it is the honest one. The
-Kafka sink throttles BOTH engines, but Flink **catastrophically** (426k -> 68k, ~6x)
+Kafka sink throttles both engines, but Flink far more so (426k -> 68k, ~6x)
 versus clink **modestly** (881k -> 682k, ~1.3x) - because the shared single broker
 contends on the output path and hits Flink's sink far harder. So removing the sink
 SHRINKS the ratio (10x -> ~2x). Across runs, Flink's Kafka-sink rate swings wildly

@@ -11,7 +11,7 @@ honesty discipline for the Nexmark workload.
 
 ## What is being compared
 
-clink SQL vs Flink SQL, both running the SAME Nexmark query over ONE pre-generated
+clink SQL vs Flink SQL, both running the same Nexmark query over one pre-generated
 Nexmark dataset read from identical Kafka topics, under a matched premise, measured
 the same way. The headline is a small, defensible SQL-vs-SQL subset, not all 23
 queries.
@@ -45,7 +45,7 @@ the pinned Flink image.
 1. **Topology**: both clustered. clink runs `clink_node` coordinator + N workers as host
    processes over a real network; Flink runs a real coordinator/worker cluster. The in-process
    single-Worker clink number (`clink_nexmark_bench` steady-state mode) is
-   clink-vs-clink regression tracking ONLY and must never be cross-quoted against a
+   clink-vs-clink regression tracking only and must never be cross-quoted against a
    clustered Flink number.
 
 2. **Shared input, generated once**: one canonical Nexmark dataset is generated
@@ -105,12 +105,12 @@ the pinned Flink image.
   the input (the source `datetime`/event identity, carried through the projection).
   The consumer measures throughput over the steady interval `[warmup_n, N - tail_n]`
   of the output topic, discarding the warm-up prefix and the end-of-stream burst on
-  BOTH engines identically. The warm-up prefix is large enough that Flink's JIT has
+  both engines identically. The warm-up prefix is large enough that Flink's JIT has
   compiled before the measured window opens. This anchors the clock to the first
   STEADY output record, so it excludes deploy, cluster bring-up and JVM warm-up.
 - **CPU normalisation**: report Time(s), measured Cores (`/proc/<pid>/stat` summed
   over the clink coordinator+worker processes; cgroup `cpuacct` for the Flink coordinator+worker containers),
-  and Cores*Time, as canonical Nexmark and Feldera do, NOT events/wall/nominal-slots.
+  and Cores*Time, as canonical Nexmark and Feldera do, not events/wall/nominal-slots.
   The sampling boundary (which processes/containers) is pinned in the banner.
 - **Cold whole-job wall** (engine-start to last output record, the `flink_compare`
   anchor) is reported ALONGSIDE the steady number, clearly labelled, never as the
@@ -124,7 +124,7 @@ the pinned Flink image.
 ## Correctness gate (anti-cheat)
 
 - Per-query EXPECTED output-row count is computed from the pinned deterministic
-  dataset, emitted by BOTH engines, and asserted EQUAL. A mismatch HALTS as a
+  dataset, emitted by both engines, and asserted equal. A mismatch halts as a
   correctness failure and is never quoted as a perf delta. (This is the gate that
   caught a broken zero-pane no-op in prior cross-engine work.)
 - Dataset determinism is proven first: the producer writes byte-identical topic
@@ -132,7 +132,7 @@ the pinned Flink image.
 - Per-query verification on the pinned Flink image before a query enters the
   headline: any query that does not run unmodified is dropped or
   hand-reconciled-and-disclosed, never silently forced.
-- The clink SQL must compute the SAME relation as the Flink SQL. Known clink
+- The clink SQL must compute the same relation as the Flink SQL. Known clink
   idioms to reconcile per query: q12 substitutes an event-time analogue for
   proctime; q8's per-window grouping carries an unused `COUNT(*)`; some joins are a
   single equi-key plus a column-vs-column residual. If both compute the same
@@ -159,7 +159,7 @@ handle, how long does one record take to get through, and what does the tail loo
 like". This section pins the latency premise the same way the sections above pin
 throughput. A latency number printed without this premise holding is not quotable.
 
-1. **Workload**: q0 only in v1 (the stateless pass-through), the SAME relation as
+1. **Workload**: q0 only in v1 (the stateless pass-through), the same relation as
    the throughput q0. It measures the record path: source decode, engine wire,
    sink encode, Kafka produce. It deliberately has no windows, so nothing in the
    number is watermark- or trigger-timing; it is pure pipeline latency.
@@ -172,16 +172,16 @@ throughput. A latency number printed without this premise holding is not quotabl
    the same target rate, sequentially. The topic being empty at job start means
    deploy time creates no backlog; the engine meets each record at arrival.
 
-3. **Load level**: the paced rate must sit well below BOTH engines' gated q0
+3. **Load level**: the paced rate must sit well below both engines' gated q0
    Kafka-sink throughput at the same parallelism (par=1: clink ~452k/s, Flink
    ~211k/s), so the number is latency-under-load, not saturation queueing. Default
    50,000 events/s (~24% of the slower engine's ceiling). The harness computes the
-   achieved input rate from broker append times and HALTS if it missed the target
+   achieved input rate from broker append times and halts if it missed the target
    by more than 5% (a lagging pacer invalidates the run).
 
 4. **Definition**: latency of the record at position N = broker append time of
    output record N minus broker append time of input record N. Both topics are
-   LogAppendTime on the SAME single broker, so both timestamps come from one clock
+   LogAppendTime on the same single broker, so both timestamps come from one clock
    and no host/producer clock skew can enter. Resolution is Kafka's millisecond
    timestamp granularity; sub-ms differences do not resolve, which is disclosed
    and acceptable because the axis targets tail effects (10ms-class and up).
@@ -190,10 +190,10 @@ throughput. A latency number printed without this premise holding is not quotabl
    order-preserving pass-through on both engines, so output position N corresponds
    to input position N. This is not assumed; it is verified: the count gate
    (output count == input count) plus a per-position content check (auction,
-   price, datetime compared on EVERY record) must both pass, else the run HALTS
+   price, datetime compared on every record) must both pass, else the run halts
    with no number. par>1 latency needs correlation-id injection and is out of v1.
 
-6. **Sink batching pinned**: the engine's output producer linger is 0ms on BOTH
+6. **Sink batching pinned**: the engine's output producer linger is 0ms on both
    (clink `linger_ms='0'` - librdkafka's default is 5ms; Flink
    `properties.linger.ms='0'` - the Java default is already 0, set explicitly).
    Without this, clink pays up to 5ms of pure producer batching per record that

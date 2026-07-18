@@ -155,9 +155,9 @@ pyclink (`python/pyclink/`) is pure Python over this ABI: ctypes bindings,
 no compiled extension, with collect streams imported straight into
 `pyarrow.RecordBatchReader`.
 
-libclink is SELF-CONTAINED: Arrow and Parquet link statically into the
+libclink is self-contained: Arrow and Parquet link statically into the
 artifact (the then-unreferenced dylib load commands are stripped), and the
-dynamic symbol table exports ONLY the clink_* C API - macOS uses an
+dynamic symbol table exports only the clink_* C API - macOS uses an
 exported-symbols list, Linux a version script - so ~20k engine and
 third-party symbols no longer leak into the host process. Two consequences:
 the artifact needs no Arrow install on the host, and load order against a
@@ -220,7 +220,7 @@ bare-SELECT print output captured at the fd level, a retracting TOP-N
 printing kind prefixes, cancel-while-running, pure-DDL scripts, the
 collect reader (typed batches, end-of-stream, single-consumer, changelog
 rejection), and the script-runner's synthesis and rejection paths.
-`tests/test_clink_c_abi.cpp` drives the C ABI end to end while linking ONLY
+`tests/test_clink_c_abi.cpp` drives the C ABI end to end while linking only
 the shared library (the registries live inside libclink, mirroring a real
 embedding), importing the collect stream through Arrow C++ and asserting
 values; `tests/test_clink_c_smoke.c` is a pure-C consumer (compiled as C)

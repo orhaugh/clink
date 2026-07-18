@@ -7,14 +7,13 @@
 `clink` is a semantics-first, Arrow-native, stateful stream
 processing engine in modern C++ (C++23).
 
-The thesis is simple: existing native stream engines are either toy projects
-that ignore correctness (no event time, no checkpoints, no keyed state) or
-production systems that are too coupled to a particular runtime (Seastar,
-gRPC, Arrow Flight) to evolve cleanly. clink is an attempt to build a
-credible engine out of the right primitives - typed operator DAGs, in-band
-watermarks, in-band checkpoint barriers, keyed state, bounded backpressure -
-without nailing those primitives to a particular runtime, executor, or wire
-format.
+Most native stream engines fall into one of two camps: small projects that
+skip the hard correctness work (no event time, no checkpoints, no keyed
+state), or production systems tied so closely to a particular runtime
+(Seastar, gRPC, Arrow Flight) that they are hard to evolve. clink is built
+from the primitives that matter - typed operator DAGs, in-band watermarks,
+in-band checkpoint barriers, keyed state, bounded backpressure - without
+binding them to a particular runtime, executor, or wire format.
 
 clink is heavily inspired by Apache Flink. Flink's model of typed operator
 DAGs, event-time processing, in-band watermarks and checkpoint barriers, keyed
@@ -22,15 +21,14 @@ state, and exactly-once semantics is the conceptual foundation this engine
 builds on. clink reworks that model in modern C++ around Arrow-native columnar
 execution and JVM-free deployment.
 
-This is a working engine, not a toy. The operator model, in-process and
-distributed runtimes, event-time windowing, exactly-once checkpointing (with
-rescale and restart-from-checkpoint), in-memory / RocksDB / changelog /
+The core is implemented and covered by tests: the operator model, in-process
+and distributed runtimes, event-time windowing, exactly-once checkpointing
+(with rescale and restart-from-checkpoint), in-memory / RocksDB / changelog /
 file-backed state, the Arrow columnar wire format, a Coordinator/Worker
-cluster control plane, the connector suite, and a SQL frontend are all
-implemented and covered by tests. It is a young project rather than a
-battle-tested production deployment: a number of features are config-gated or
-carry correctness caveats, and those are called out explicitly in the Status
-section below.
+cluster control plane, the connector suite, and a SQL frontend. It is still a
+young project rather than a battle-tested production deployment: some features
+are config-gated or carry correctness caveats, and those are called out in the
+Status section below.
 
 ## Contents
 
@@ -703,7 +701,7 @@ branch of [`docs/consumer-examples/CMakeLists.txt`](docs/consumer-examples/CMake
 ## SQL frontend
 
 Built when `CLINK_BUILD_SQL=ON` (default off; flip it on to opt in). Compiles a
-PostgreSQL-shaped subset of SQL to a `JobGraphSpec` and either runs it EMBEDDED
+PostgreSQL-shaped subset of SQL to a `JobGraphSpec` and either runs it embedded
 (the whole engine in one process, no daemons) or submits it to a running
 cluster through the same HTTP path as a compiled job plugin.
 
@@ -751,7 +749,7 @@ DDL and basics
 - `SHOW TABLES`, `DROP TABLE [IF EXISTS]`; the catalog is session-scoped by
   default and persists as one JSON file per table when a catalog directory
   is set (`--sql-catalog-dir` on `clink_node`, `--catalog-dir` on `clink run`)
-- `EXPLAIN <stmt>` prints the OPTIMIZED `LogicalPlan` tree (the plan that
+- `EXPLAIN <stmt>` prints the optimized `LogicalPlan` tree (the plan that
   would run, join reorders and pushdowns applied), each node annotated with
   its estimated output rows; a scan with no declared statistics is flagged
 - `ANALYZE TABLE t` scans a bounded table and writes exact statistics (row
@@ -940,12 +938,13 @@ with print statements. clink records enough at runtime to answer "why is
 this value what it is" offline: checkpoints double as queryable state
 snapshots, and an opt-in flight recorder (`--capture-dir`) tees the
 records each operator consumed into per-checkpoint-epoch files. Three CLI
-verbs close the loop: `state-diff` finds WHO moved and WHEN, `capture-cat`
-shows WHAT the operator saw, and `replay` re-executes the operator over
-exactly those records - deterministically, offline, no cluster.
+verbs close the loop: `state-diff` finds which key moved and when,
+`capture-cat` shows what the operator saw, and `replay` re-executes the
+operator over exactly those records, deterministically and offline, with no
+cluster.
 
-The transcript below is real. A 1.4M-order pipeline computes per-user
-totals, and alice's comes out roughly five times everyone else's:
+In the walk-through below, a 1.4M-order pipeline computes per-user
+totals, and alice's comes out at roughly five times everyone else's:
 
 ```bash
 $ clink run orders.sql --checkpoint-dir=ckpt --checkpoint-interval-ms=400 \
@@ -990,7 +989,7 @@ $ clink capture-cat --file=capture/op-5824225372086884863/subtask-1/epoch-9.cap 
   "{"__key":-5626395697980741632,"amount":9999999,"usr":"alice"}"
 ```
 
-**4. Prove it.** Replay the epoch: rebuild the operator from its capture
+**4. Confirm it.** Replay the epoch: rebuild the operator from its capture
 sidecar, restore its keyed state from checkpoint 8, feed exactly the
 captured records, and print every emission. The jump lands at precisely
 that record - and running it twice produces 100,102 byte-identical
@@ -1040,7 +1039,7 @@ Details:
 
 ## State as data
 
-A pipeline's state is an open dataset, not a black box. Snapshots are
+A pipeline's state is an open dataset. Snapshots are
 plain Apache Arrow IPC streams (a documented, stable format - see
 `docs/internals/state-snapshot-format.md`), so a checkpoint is readable
 by pyarrow, DuckDB or Polars directly, and the CLI closes the loop for
