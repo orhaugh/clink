@@ -18,6 +18,8 @@
 #include "clink/state/forst_state_backend.hpp"
 #include "clink/state/state_backend_factory.hpp"
 
+#include "forst_remote_filesystem.hpp"
+
 namespace clink::forst_s3 {
 namespace {
 
@@ -301,12 +303,92 @@ BuiltStateBackend build_changelog_s3_forst(const StateBackendSpec& spec) {
     return out;
 }
 
+// s3sst+forst://: LIVE remote data files. The engine opens with a
+// filesystem that routes the immutable *.sst files to object storage
+// (written once via multipart upload, random-read on block-cache miss,
+// checkpoint "hard links" become server-side copies) while the small
+// mutable metadata files stay on the local working dir. The working set
+// is bounded by object storage, not local disk. Restore is same-config:
+// the restore URI must name the same bucket/prefix/local root (a restart
+// or a new subtask over the same layout), since the object mapping is
+// relative to that root.
+BuiltStateBackend build_s3sst_forst(const StateBackendSpec& spec) {
+    const auto [scheme, base] = split_uri(spec.uri);
+    (void)scheme;
+    const auto cfg = parse_cfg(base);
+    if (cfg.bucket.empty()) {
+        throw std::runtime_error("s3sst+forst scheme requires a bucket");
+    }
+    const fs::path root = local_root(cfg);
+    const fs::path subtask_local = root / std::to_string(spec.subtask_idx);
+    std::error_code ec;
+    fs::create_directories(subtask_local, ec);
+
+    RemoteSstOptions ro;
+    ro.bucket = cfg.bucket;
+    ro.key_prefix = cfg.prefix;
+    ro.local_root = root.string();
+    ro.endpoint = cfg.endpoint;
+    ro.region = cfg.region;
+    ro.anonymous = cfg.anonymous;
+    auto env = make_remote_sst_env(ro);
+
+    clink::ForStStateBackend::Options fopts;
+    fopts.path = subtask_local.string();
+    fopts.create_if_missing = true;
+    fopts.engine_env_holder = env.holder;
+    fopts.engine_env = env.env;
+    fopts.data_mirror = make_s3_data_file_mirror(ro);
+
+    BuiltStateBackend out;
+    out.backend = std::make_shared<clink::ForStStateBackend>(std::move(fopts));
+
+    if (!spec.restore_uri.empty() && spec.restore_checkpoint_id != 0) {
+        const auto [rscheme, rbase] = split_uri(spec.restore_uri);
+        (void)rscheme;
+        const auto rcfg = parse_cfg(rbase);
+        const bool is_rescale =
+            spec.restore_from_subtask_idx != std::numeric_limits<std::uint32_t>::max();
+        const std::uint32_t src_first =
+            is_rescale ? spec.restore_from_subtask_idx : spec.subtask_idx;
+        const std::uint32_t parent_count =
+            spec.restore_from_parent_count == 0 ? 1 : spec.restore_from_parent_count;
+        // Handles are the LOCAL metadata cp dirs (as for forst://); the
+        // backend's DataFileMirror replicates the matching remote data
+        // files during restore. Same-config restore (see above).
+        std::string joined;
+        for (std::uint32_t i = 0; i < parent_count; ++i) {
+            const std::string dir =
+                (local_root(rcfg) / (std::to_string(src_first + i) + ".cp-" +
+                                     std::to_string(spec.restore_checkpoint_id)))
+                    .string();
+            if (!fs::exists(dir)) {
+                throw std::runtime_error(
+                    "s3sst+forst scheme: restore requested but local checkpoint metadata dir not "
+                    "found: " +
+                    dir);
+            }
+            if (!joined.empty()) {
+                joined.push_back('\n');
+            }
+            joined += dir;
+        }
+        Snapshot snap;
+        snap.checkpoint_id = CheckpointId{spec.restore_checkpoint_id};
+        snap.bytes.assign(reinterpret_cast<const std::byte*>(joined.data()),
+                          reinterpret_cast<const std::byte*>(joined.data() + joined.size()));
+        out.restore_from = std::move(snap);
+    }
+    return out;
+}
+
 }  // namespace
 
 void install() {
     auto& f = clink::StateBackendFactory::default_instance();
     f.register_scheme("s3+forst", &build_s3_forst);
     f.register_scheme("changelog+s3+forst", &build_changelog_s3_forst);
+    f.register_scheme("s3sst+forst", &build_s3sst_forst);
 }
 
 }  // namespace clink::forst_s3

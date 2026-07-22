@@ -134,6 +134,16 @@ inline const forstdb::WriteOptions& keyed_state_write_options() {
 // Implementation
 // ---------------------------------------------------------------------------
 struct ForStStateBackend::Impl {
+    // Optional caller-supplied engine Env (live remote data files). The
+    // holder owns it; env is the typed view. Declared BEFORE db so member
+    // destruction (reverse order) tears the DB down while the Env is
+    // still alive - the engine calls into its Env during close.
+    std::shared_ptr<void> env_holder;
+    forstdb::Env* env{nullptr};
+    // Remote half of checkpoint-dir handling when data files live
+    // remotely (see DataFileMirror in the header). Null = all-local.
+    std::shared_ptr<DataFileMirror> mirror;
+
     std::unique_ptr<forstdb::DB> db;
     std::string path;
     // Where checkpoint dirs are published/fetched. Defaults to
@@ -265,21 +275,30 @@ namespace {
 // handles in `out_handles` line up positionally with the descriptors.
 void open_db_with_all_cfs(const std::string& path,
                           bool create_if_missing,
+                          forstdb::Env* env,
                           std::unique_ptr<forstdb::DB>& out_db,
                           std::vector<forstdb::ColumnFamilyHandle*>& out_handles,
                           std::vector<std::string>& out_cf_names) {
     forstdb::DBOptions db_opts;
     db_opts.create_if_missing = create_if_missing;
     db_opts.create_missing_column_families = true;
+    if (env != nullptr) {
+        db_opts.env = env;
+    }
     db_opts.IncreaseParallelism(
         static_cast<int>(std::max<unsigned>(2u, std::thread::hardware_concurrency() / 2)));
 
     // Discover existing CFs. ListColumnFamilies fails on a fresh path
-    // (no MANIFEST yet); treat that as "default only".
+    // (no MANIFEST yet); treat that as "default only". The CF list lives
+    // in the (local) MANIFEST, but the probe still carries the custom
+    // env so a remote-data-file backend never consults the wrong FS.
     std::vector<std::string> cf_names;
     {
         forstdb::Options probe_opts;
         probe_opts.create_if_missing = create_if_missing;
+        if (env != nullptr) {
+            probe_opts.env = env;
+        }
         auto st = forstdb::DB::ListColumnFamilies(probe_opts, path, &cf_names);
         if (!st.ok()) {
             cf_names = {forstdb::kDefaultColumnFamilyName};
@@ -311,12 +330,16 @@ void open_db_with_all_cfs(const std::string& path,
 // read-only and its rows copied into the live DB. Read-only avoids
 // mutating or locking the parent checkpoint dir (it may be shared).
 void open_readonly_with_all_cfs(const std::string& path,
+                                forstdb::Env* env,
                                 std::unique_ptr<forstdb::DB>& out_db,
                                 std::vector<forstdb::ColumnFamilyHandle*>& out_handles,
                                 std::vector<std::string>& out_cf_names) {
     std::vector<std::string> cf_names;
     {
         forstdb::Options probe_opts;
+        if (env != nullptr) {
+            probe_opts.env = env;
+        }
         auto st = forstdb::DB::ListColumnFamilies(probe_opts, path, &cf_names);
         if (!st.ok()) {
             cf_names = {forstdb::kDefaultColumnFamilyName};
@@ -331,6 +354,9 @@ void open_readonly_with_all_cfs(const std::string& path,
         descriptors.emplace_back(name, make_cf_options());
     }
     forstdb::DBOptions db_opts;
+    if (env != nullptr) {
+        db_opts.env = env;
+    }
     forstdb::DB* raw = nullptr;
     auto st = forstdb::DB::OpenForReadOnly(db_opts, path, descriptors, &out_handles, &raw);
     if (!st.ok()) {
@@ -348,9 +374,16 @@ ForStStateBackend::ForStStateBackend(Options opts) : impl_(std::make_unique<Impl
     // usage (same rationale as the bundled RocksDB backend).
     forstdb::SetPerfLevel(forstdb::PerfLevel::kDisable);
 
+    // Live-remote-data-files wiring (see Options): the holder keeps the
+    // caller's Env alive for the backend's whole life; every open below
+    // routes through it.
+    impl_->env_holder = std::move(opts.engine_env_holder);
+    impl_->env = static_cast<forstdb::Env*>(opts.engine_env);
+    impl_->mirror = std::move(opts.data_mirror);
+
     std::vector<forstdb::ColumnFamilyHandle*> handles;
     std::vector<std::string> names;
-    open_db_with_all_cfs(opts.path, opts.create_if_missing, impl_->db, handles, names);
+    open_db_with_all_cfs(opts.path, opts.create_if_missing, impl_->env, impl_->db, handles, names);
 
     // Wire up the CF map. The default CF is kept around as default_cf_
     // (we never write keyed state to it, but the engine requires it stay
@@ -542,6 +575,13 @@ CaptureHandle ForStStateBackend::capture(CheckpointId id) {
     SnapshotStats stats;
     stats.checkpoint_id = id.value();
     stats.sst_files = list_sst_basenames(snap_path);
+    if (impl_->mirror) {
+        // Remote data files: the local cp dir holds only metadata, so the
+        // SST list for stats comes from the mirror's side of the mapping.
+        auto remote = impl_->mirror->list_dir(snap_path);
+        stats.sst_files.insert(stats.sst_files.end(), remote.begin(), remote.end());
+        std::sort(stats.sst_files.begin(), stats.sst_files.end());
+    }
     stats.total_sst_count = stats.sst_files.size();
     {
         std::lock_guard lock(impl_->snap_mu);
@@ -601,6 +641,11 @@ void ForStStateBackend::purge_checkpoint(CheckpointId id) {
     // Drop the published checkpoint through the store. LocalSnapshotStore
     // remove_all's the dir; a remote store deletes its objects for this id.
     impl_->store->delete_checkpoint(snap_path, id);
+    if (impl_->mirror) {
+        // Remote data files: the store only removed the local metadata
+        // dir; drop the checkpoint's remote data files too.
+        impl_->mirror->delete_dir(snap_path);
+    }
 }
 
 void ForStStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg_filter) {
@@ -674,10 +719,19 @@ void ForStStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg_fi
                 entry.path(), target, std::filesystem::copy_options::overwrite_existing, link_ec);
         }
     }
+    if (impl_->mirror) {
+        // Remote data files: the local loop above re-homed only the
+        // metadata files. Replicate the checkpoint's remote data files to
+        // the working dir's side of the mapping BEFORE opening - the
+        // MANIFEST references them by name and the engine resolves them
+        // through the filesystem the moment the DB opens.
+        impl_->mirror->copy_dir(source_path, working_path);
+    }
 
     std::vector<forstdb::ColumnFamilyHandle*> handles;
     std::vector<std::string> names;
-    open_db_with_all_cfs(working_path, /*create_if_missing=*/false, impl_->db, handles, names);
+    open_db_with_all_cfs(
+        working_path, /*create_if_missing=*/false, impl_->env, impl_->db, handles, names);
     for (std::size_t i = 0; i < handles.size(); ++i) {
         if (names[i] == forstdb::kDefaultColumnFamilyName) {
             impl_->default_cf_ = handles[i];
@@ -706,7 +760,10 @@ void ForStStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg_fi
         std::vector<forstdb::ColumnFamilyHandle*> parent_handles;
         std::vector<std::string> parent_names;
         const std::string parent_path = impl_->store->fetch_checkpoint_dir(source_paths[p]);
-        open_readonly_with_all_cfs(parent_path, parent_db, parent_handles, parent_names);
+        // Read-only: the parent's remote data files are read in place
+        // through the env's mapping (no copy needed for a merge source).
+        open_readonly_with_all_cfs(
+            parent_path, impl_->env, parent_db, parent_handles, parent_names);
         for (std::size_t i = 0; i < parent_handles.size(); ++i) {
             if (parent_names[i] == forstdb::kDefaultColumnFamilyName) {
                 continue;
@@ -867,7 +924,11 @@ std::vector<std::byte> forst_checkpoint_to_arrow(const std::string& checkpoint_d
     std::unique_ptr<forstdb::DB> db;
     std::vector<forstdb::ColumnFamilyHandle*> handles;
     std::vector<std::string> names;
-    open_readonly_with_all_cfs(checkpoint_dir, db, handles, names);
+    // Default filesystem: this offline helper reads all-local checkpoint
+    // dirs. A checkpoint whose data files live remotely (a DataFileMirror
+    // backend) is out of its reach - export that state through the live
+    // backend's export_arrow_snapshot() instead.
+    open_readonly_with_all_cfs(checkpoint_dir, /*env=*/nullptr, db, handles, names);
 
     std::vector<std::pair<std::uint64_t, forstdb::ColumnFamilyHandle*>> cfs;
     cfs.reserve(handles.size());

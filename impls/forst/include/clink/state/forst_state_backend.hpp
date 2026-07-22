@@ -15,6 +15,25 @@ namespace clink {
 // pulling the full definition; the default (null) means LocalSnapshotStore.
 class SnapshotStore;
 
+// Companion hook for a backend whose engine filesystem routes the
+// immutable data files (*.sst) to remote object storage while the local
+// checkpoint dirs hold only the small metadata files. The backend's own
+// dir handling (hard-link re-home, local delete) stays as-is; this
+// covers the remote side of the same operations, keyed by the SAME
+// local dir paths the backend uses (the implementation owns the
+// path-to-object mapping). Engine-free by design so this header carries
+// no engine types.
+class DataFileMirror {
+public:
+    virtual ~DataFileMirror() = default;
+    // Replicate every remote data file under src_dir to dst_dir.
+    virtual void copy_dir(const std::string& src_dir, const std::string& dst_dir) = 0;
+    // Delete every remote data file under dir.
+    virtual void delete_dir(const std::string& dir) = 0;
+    // Basenames of the remote data files under dir (for snapshot stats).
+    [[nodiscard]] virtual std::vector<std::string> list_dir(const std::string& dir) const = 0;
+};
+
 // ForSt-backed keyed state.
 //
 // ForSt (https://github.com/ververica/ForSt) is an LSM key-value store of
@@ -56,6 +75,21 @@ public:
         // filesystem store; never set for S3 (object handles relocate via
         // bucket/prefix, not a local rebase).
         std::string restore_base;
+        // Live remote data files (optional). When set, the engine opens
+        // with this caller-supplied Env, whose filesystem routes the
+        // immutable data files (*.sst) to remote object storage while the
+        // small mutable metadata files (MANIFEST, CURRENT, WAL, LOCK, ...)
+        // stay on the local path - the working set is then bounded by
+        // object storage, not local disk, and reads are served from the
+        // remote store on block-cache miss. Opaque on purpose: engine
+        // types stay out of this header. engine_env must point at a
+        // forstdb::Env; engine_env_holder owns its lifetime and must
+        // outlive the backend. When routing data files remotely,
+        // data_mirror must be set too - restore/purge/stats use it for
+        // the remote half of their checkpoint-dir handling.
+        std::shared_ptr<void> engine_env_holder;
+        void* engine_env{nullptr};
+        std::shared_ptr<DataFileMirror> data_mirror;
     };
 
     // Per-checkpoint introspection. Returned by snapshot_stats() so tests

@@ -19,6 +19,15 @@
 //       to object storage via S3MaterializationStore. The small framing
 //       blob self-persists to the local working dir.
 //
+//   s3sst+forst://<bucket>/<prefix>[?local=<dir>&endpoint=<url>&region=<r>&anonymous=1]
+//       LIVE remote data files: the engine itself runs over a filesystem
+//       that keeps the immutable *.sst files on object storage (written
+//       once, random-read on block-cache miss, checkpoint links become
+//       server-side copies) while the small mutable metadata files stay
+//       on the local working dir - state is bounded by object storage,
+//       not local disk. Restore is same-config (same bucket/prefix/local
+//       root): the object mapping is relative to that root.
+//
 // Idempotent. Invoked once at startup (clink_node, test entry points).
 // Requires clink::forst + clink::s3.
 

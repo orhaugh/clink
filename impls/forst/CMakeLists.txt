@@ -139,6 +139,10 @@ add_library(clink_forst_engine STATIC IMPORTED GLOBAL)
 set_target_properties(clink_forst_engine PROPERTIES
     IMPORTED_LOCATION "${_forst_lib}"
     INTERFACE_LINK_LIBRARIES Threads::Threads)
+# Sibling impls that also compile against the engine (forst-s3's remote
+# filesystem) read the header location from here and apply the same
+# SYSTEM BEFORE include-order care.
+set_property(GLOBAL PROPERTY CLINK_FORST_ENGINE_INCLUDE_DIR "${_forst_src}/include")
 
 add_library(clink_forst STATIC
     src/forst_state_backend.cpp

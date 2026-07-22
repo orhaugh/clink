@@ -17,17 +17,27 @@ endif()
 
 add_library(clink_forst_s3 STATIC
     src/register_state_backend.cpp
+    src/forst_remote_filesystem.cpp
 )
 add_library(clink::forst_s3 ALIAS clink_forst_s3)
+# The remote filesystem compiles against the engine, so this target needs
+# the ExternalProject's headers/archive and the same include-order care
+# as impls/forst (both engines ship rocksdb/-layout headers; ForSt's dir
+# must come first for this target's TUs).
+add_dependencies(clink_forst_s3 forst_ep)
+get_property(_forst_engine_inc GLOBAL PROPERTY CLINK_FORST_ENGINE_INCLUDE_DIR)
 
 target_include_directories(clink_forst_s3 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+target_include_directories(clink_forst_s3 SYSTEM BEFORE PRIVATE
+    "${_forst_engine_inc}")
 target_compile_features(clink_forst_s3 PUBLIC cxx_std_23)
 target_compile_definitions(clink_forst_s3 PUBLIC CLINK_HAS_FORST_S3)
 target_link_libraries(clink_forst_s3
     PUBLIC clink::core clink::forst clink::s3
+    PRIVATE clink_forst_engine
 )
 clink_set_warnings(clink_forst_s3)
 
