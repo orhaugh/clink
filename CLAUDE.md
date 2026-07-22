@@ -123,16 +123,27 @@ SINK=blackhole EVENTS=10000000 QUERIES="q0 q12" PARALLELISM=4 ./throughput_sampl
 `SINK=blackhole` discards output (using the `q*_bh.tmpl.sql` variants), removing
 the Kafka write ceiling so the measurement reflects engine read and process rate
 only. `SINK=kafka` (the default) writes to a topic and gates on row count.
-`KEEP_UP=1` leaves the cluster running.
+`KEEP_UP=1` leaves the cluster running. `STATE_BACKEND=<uri>` (for example
+`rocksdb:///tmp/nx-state` or `forst:///tmp/nx-state`; paths are inside the
+worker containers) passes a per-job `--state-backend` to clink's submit; unset
+keeps the canonical in-memory premise, and a set value makes the run
+clink-vs-clink tracking for that backend (Flink stays on its compose-pinned
+hashmap, so the cross-engine ratio no longer holds the matched premise).
+`RUN_TAG=<tag>` suffixes the clink result filenames (`q12-clink-<tag>.json`)
+and scopes the startup wipe to that tag, so backend variants sit side by side.
+A `forst://` run needs the runtime image built with the opt-in engine:
+`docker build --build-arg CLINK_WITH_FORST=ON -t clink-runtime:latest -f
+docker/Dockerfile.runtime .`
 
-Three things to get right for a valid before/after:
+Four things to get right for a valid before/after:
 
 1. `throughput_sampled.sh` runs the `clink-runtime:latest` Docker image, not the host `build/`. The host build only compiles `nexmark_dump` (data generation) and `clink_submit_sql` (submission), so a code change is not measured until the image is rebuilt at the new commit. Rebuild it first (`verify_distributed.sh` builds or refreshes `clink-runtime:latest`), then run. Check freshness with `docker image inspect clink-runtime:latest --format '{{.Created}}'` against the commit under test.
 2. The columnar fast paths (`process_columnar`: WS1 filter/project programs, WS3 within-batch group-by) do not fire on a Kafka-JSON-sourced nexmark. The Kafka JSON source decodes to row batches with no Arrow sidecar, and the inter-operator wire batcher (`make_row_wire_batcher`) only passes an existing sidecar through; it never manufactures columnar data from rows, so the receiver materialises rows and the window or aggregation operator takes the row path. Columnar data is only born from a columnar-native source such as `ParquetSource` with `schema_columns`, which is what the in-tree `ColumnarParquet*` tests use. To benchmark WS1 or WS3, feed the query from Parquet, not Kafka JSON. As wired today, the only columnar lever nexmark touches is WS4 (the `FlatMap` window-state map on q12), and only when the image is built with `-DCLINK_USE_FLAT_HASH_MAP=ON` (off by default).
 3. Only `q0` (projection-style passthrough) and `q12` (windowed GROUP BY) are sampled for throughput. `q6` and `q8` have tiny join inputs that drain in under a second, so they live in the gate harness rather than here.
+4. A `STATE_BACKEND` run on a synchronous backend (`rocksdb://`, `forst://`) is an integration check, not a state-backend benchmark. The SQL window and aggregate operators keep hot-path state in in-memory maps unless the backend defers reads (`supports_async_get()`, i.e. `remote-read://`); a synchronous backend carries checkpoint and restore durability only, and q12's window operator does not even flush to it. Verified 2026-07-22: q0/q12 throughput deltas across memory, rocksdb and forst runs sit inside the harness's run-to-run variance (stateless q0 alone spread 1.04M-1.82M drain rec/s over three runs). For a per-record backend A/B, use `benchmarks/inproc_compare` with `CLINK_STATE_BACKEND=rocksdb://<dir>` vs `forst://<dir>` and `CLINK_WB_STATE_CACHE=0` (strict writes); measured there at parity, with a one-off ~5s cold-start on the first-ever forst run.
 
 Results are gitignored: `results-sampled/` (sampled runs), `results/` (`run.sh`),
 and `results-containers/`. Each is a per-query JSON with `sustained_slope` (the
 headline records per second), `drain_rate`, `reached_target`, and CPU and wall
 seconds. Compare `sustained_slope` before and after for the same query,
-parallelism, event count, and sink.
+parallelism, event count, sink, and state backend.
