@@ -166,6 +166,9 @@
 #ifdef CLINK_LINKED_FORST
 #include "clink/forst/install.hpp"
 #endif
+#ifdef CLINK_LINKED_FORST_S3
+#include "clink/forst_s3/install.hpp"
+#endif
 #ifdef CLINK_LINKED_SQL
 #include "clink/cluster/refresh_scheduler.hpp"
 #include "clink/nexmark/register.hpp"  // header-only synthetic 'nexmark' Row source
@@ -2784,6 +2787,11 @@ void install_linked_impls() {
     // ForSt state backend (forst://, changelog+forst://). Opt-in build
     // (CLINK_WITH_FORST=ON); registered only when the forst target is linked.
     clink::forst::install();
+#endif
+#ifdef CLINK_LINKED_FORST_S3
+    // ForSt remote-state schemes (s3+forst://, changelog+s3+forst://).
+    // Registered only when the forst_s3 target is linked (forst + s3).
+    clink::forst_s3::install();
 #endif
 #ifdef CLINK_LINKED_SQL
     clink::sql::install(reg);

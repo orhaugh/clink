@@ -845,6 +845,12 @@ if(TARGET clink::rocksdb_s3)
     target_link_libraries(clink_node PRIVATE clink::rocksdb_s3)
     target_compile_definitions(clink_node PRIVATE CLINK_LINKED_ROCKSDB_S3)
 endif()
+# clink::forst_s3: the ForSt analogues (s3+forst://, changelog+s3+forst://).
+# Needs both forst (opt-in) and s3.
+if(TARGET clink::forst_s3)
+    target_link_libraries(clink_node PRIVATE clink::forst_s3)
+    target_compile_definitions(clink_node PRIVATE CLINK_LINKED_FORST_S3)
+endif()
 # clink::sql: register the SQL Row channel + Row-typed factories at
 # clink_node startup. Mirrors the tls / etcd link-after-define pattern.
 if(TARGET clink::sql)

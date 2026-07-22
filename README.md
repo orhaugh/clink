@@ -150,7 +150,7 @@ correctness caveat, the caveat is stated in the row.
 | Broadcast state            | `RuntimeContext::broadcast_state<V>` for non-keyed values; `Dag::broadcast_connect<Main, Brod, Out, State>` |
 | In-memory state backend    | implemented (Arrow IPC snapshot/restore)            |
 | RocksDB state backend      | always built (bundled via `FetchContent`); native SST checkpoints, incremental via hard-link |
-| ForSt state backend        | opt-in (`CLINK_WITH_FORST=ON`, built from the pinned upstream tag via ExternalProject); `forst://` and `changelog+forst://`, behavioural parity with the RocksDB backend, coexists with it in one binary. v1 is the local engine; remote-storage publication is a follow-on |
+| ForSt state backend        | opt-in (`CLINK_WITH_FORST=ON`, built from the pinned upstream tag via ExternalProject); `forst://` and `changelog+forst://`, behavioural parity with the RocksDB backend, coexists with it in one binary. `s3+forst://` / `changelog+s3+forst://` publish checkpoints to object storage with the async-persist split; live remote SST reads are a follow-on |
 | Changelog state backend    | write-ahead log + periodic materialisation; in-blob or external-store modes |
 | File-backed state backend  | Arrow IPC snapshots                                 |
 | State recovery on startup  | `JobConfig::restore_from` runs `StateBackend::restore` before any operator |
