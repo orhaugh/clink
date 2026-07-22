@@ -163,6 +163,9 @@
 #ifdef CLINK_LINKED_ROCKSDB_S3
 #include "clink/rocksdb_s3/install.hpp"
 #endif
+#ifdef CLINK_LINKED_FORST
+#include "clink/forst/install.hpp"
+#endif
 #ifdef CLINK_LINKED_SQL
 #include "clink/cluster/refresh_scheduler.hpp"
 #include "clink/nexmark/register.hpp"  // header-only synthetic 'nexmark' Row source
@@ -2776,6 +2779,11 @@ void install_linked_impls() {
     // Remote-state schemes (s3+rocksdb://, changelog+s3+rocksdb://,
     // changelog+s3://). Registered only when the rocksdb_s3 target is linked.
     clink::rocksdb_s3::install();
+#endif
+#ifdef CLINK_LINKED_FORST
+    // ForSt state backend (forst://, changelog+forst://). Opt-in build
+    // (CLINK_WITH_FORST=ON); registered only when the forst target is linked.
+    clink::forst::install();
 #endif
 #ifdef CLINK_LINKED_SQL
     clink::sql::install(reg);

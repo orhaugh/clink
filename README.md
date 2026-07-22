@@ -150,6 +150,7 @@ correctness caveat, the caveat is stated in the row.
 | Broadcast state            | `RuntimeContext::broadcast_state<V>` for non-keyed values; `Dag::broadcast_connect<Main, Brod, Out, State>` |
 | In-memory state backend    | implemented (Arrow IPC snapshot/restore)            |
 | RocksDB state backend      | always built (bundled via `FetchContent`); native SST checkpoints, incremental via hard-link |
+| ForSt state backend        | opt-in (`CLINK_WITH_FORST=ON`, built from the pinned upstream tag via ExternalProject); `forst://` and `changelog+forst://`, behavioural parity with the RocksDB backend, coexists with it in one binary. v1 is the local engine; remote-storage publication is a follow-on |
 | Changelog state backend    | write-ahead log + periodic materialisation; in-blob or external-store modes |
 | File-backed state backend  | Arrow IPC snapshots                                 |
 | State recovery on startup  | `JobConfig::restore_from` runs `StateBackend::restore` before any operator |
@@ -265,6 +266,7 @@ its pinned version in full.
 |-------------------------|-------------------------------------------------|-----------------------------------------|
 | Apache Arrow + Parquet  | `find_package(Arrow)` + `find_package(Parquet)` | `libarrow-dev libparquet-dev` (required)|
 | RocksDB state backend   | bundled via `FetchContent` (always built)       | upstream tag pinned in CMake            |
+| ForSt state backend     | opt-in `CLINK_WITH_FORST=ON` (ExternalProject)  | upstream tag pinned in CMake            |
 | Kafka source / sink     | three-tier: CMake → pkg-config → manual probe   | `librdkafka-dev librdkafka++1`          |
 | S3 + Parquet S3         | `find_package(AWSSDK COMPONENTS s3)` + Arrow S3 | built from source in setup script       |
 | ClickHouse source / sink| CMake config → manual probe fallback            | built from source in setup script       |
@@ -369,6 +371,7 @@ target_link_libraries(my_pipeline PRIVATE clink::clink)   # everything
 #   clink::clickhouse   (ClickHouseSource, ClickHouseSink)
 #   clink::s3           (S3 + Parquet-S3 source/sink)
 #   clink::rocksdb      (RocksDB state backend)
+#   clink::forst        (ForSt state backend, opt-in build)
 #   clink::rocksdb_s3   (S3 remote state backend with a RocksDB tier)
 #   clink::tls          (mTLS transport)
 #   clink::etcd         (etcd HA coordinator)

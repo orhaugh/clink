@@ -19,6 +19,21 @@ find_dependency(Parquet CONFIG)
 # that actually built. Missing impls are silently absent.
 @CLINK_FIND_DEPS_BODY@
 
+# --- Bundled engine archives ------------------------------------------------
+# clink::forst links the ForSt engine as an imported static archive built by
+# an ExternalProject, so the archive cannot ride the export set the way an
+# in-build target does. It is installed under a private name; recreate the
+# imported target (the name the exported clink::forst's LINK_ONLY reference
+# resolves against) before the targets file is included. Self-gating: the
+# block is a no-op unless the forst impl was installed.
+if(NOT TARGET clink_forst_engine
+   AND EXISTS "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/libclink_forst_engine.a")
+    add_library(clink_forst_engine STATIC IMPORTED)
+    set_target_properties(clink_forst_engine PROPERTIES
+        IMPORTED_LOCATION "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/libclink_forst_engine.a"
+        INTERFACE_LINK_LIBRARIES Threads::Threads)
+endif()
+
 # --- Targets ---------------------------------------------------------------
 include("${CMAKE_CURRENT_LIST_DIR}/clinkTargets.cmake")
 

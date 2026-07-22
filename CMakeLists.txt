@@ -86,12 +86,18 @@ set(CLINK_WITH_ONNX       "OFF"  CACHE STRING "ONNX Runtime ML_PREDICT provider 
 # AUTO uses a locally-discoverable wasmtime C API but never downloads (offline-safe);
 # ON fetches the pinned prebuilt c-api when none is found locally.
 set(CLINK_WITH_WASM       "OFF"  CACHE STRING "WebAssembly (wasmtime) scalar UDFs (OFF/AUTO/ON)")
+# ForSt state backend (github.com/ververica/ForSt, an LSM store of RocksDB
+# lineage). Opt-in: ON clones and builds the pinned tag via ExternalProject
+# (needs network + a RocksDB-scale first build), so there is no AUTO tier -
+# nothing local to discover.
+set(CLINK_WITH_FORST      "OFF"  CACHE STRING "ForSt state backend, built from the pinned upstream tag (OFF/ON)")
 foreach(_opt CLINK_WITH_ROCKSDB CLINK_WITH_KAFKA CLINK_WITH_AWS_S3 CLINK_WITH_AWS
              CLINK_WITH_CLICKHOUSE CLINK_WITH_POSTGRES CLINK_WITH_TLS
              CLINK_WITH_ETCD CLINK_WITH_AVRO CLINK_WITH_HTTP CLINK_WITH_REDIS CLINK_WITH_MYSQL
              CLINK_WITH_MQTT CLINK_WITH_MONGODB CLINK_WITH_ICEBERG CLINK_WITH_RABBITMQ
              CLINK_WITH_NATS CLINK_WITH_PULSAR CLINK_WITH_CASSANDRA CLINK_WITH_GCS CLINK_WITH_AZURE
-             CLINK_WITH_WEBHDFS CLINK_WITH_VECTOR_SEARCH CLINK_WITH_ONNX CLINK_WITH_WASM)
+             CLINK_WITH_WEBHDFS CLINK_WITH_VECTOR_SEARCH CLINK_WITH_ONNX CLINK_WITH_WASM
+             CLINK_WITH_FORST)
     set_property(CACHE ${_opt} PROPERTY STRINGS AUTO ON OFF)
 endforeach()
 if(CLINK_WITH_ROCKSDB STREQUAL "OFF")
@@ -815,7 +821,7 @@ clink_set_warnings(clink_node)
 # up clink::<x>::install() calls without #ifdef on macros that
 # leaked from libclink's old build. Each impl sets a CLINK_LINKED_<X>
 # define at the consumer-link boundary.
-foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd http_connector redis mysql mqtt mongodb iceberg rabbitmq nats pulsar cassandra gcs azure webhdfs vector_search onnx wasm)
+foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd http_connector redis mysql mqtt mongodb iceberg rabbitmq nats pulsar cassandra gcs azure webhdfs vector_search onnx wasm forst)
     if(TARGET clink::${_impl})
         string(TOUPPER ${_impl} _IMPL_UC)
         target_compile_definitions(clink_node PRIVATE CLINK_LINKED_${_IMPL_UC})

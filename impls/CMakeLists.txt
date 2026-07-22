@@ -46,6 +46,9 @@ add_subdirectory(azure)
 add_subdirectory(webhdfs)
 # rocksdb-s3 needs both clink::rocksdb and clink::s3, so it is added after them.
 add_subdirectory(rocksdb-s3)
+# forst (ForSt state backend): opt-in (CLINK_WITH_FORST defaults OFF); builds
+# the pinned upstream tag via ExternalProject and returns early when disabled.
+add_subdirectory(forst)
 # vector_search (SQL-native AI KNN): header-only SimSIMD + usearch, needs only
 # clink::core (the SQL Row headers it uses are header-only, reachable via core).
 add_subdirectory(vector_search)
@@ -61,7 +64,7 @@ add_subdirectory(wasm)
 # Linking clink::impls_all is equivalent to the legacy
 # clink::clink behaviour (kitchen-sink dep on every available impl).
 add_library(clink_impls_all INTERFACE)
-foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd avro http_connector redis mysql mqtt mongodb iceberg rabbitmq nats pulsar cassandra gcs azure webhdfs rocksdb_s3 vector_search onnx wasm)
+foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd avro http_connector redis mysql mqtt mongodb iceberg rabbitmq nats pulsar cassandra gcs azure webhdfs rocksdb_s3 vector_search onnx wasm forst)
     if(TARGET clink::${_impl})
         target_link_libraries(clink_impls_all INTERFACE clink::${_impl})
     endif()
