@@ -106,6 +106,12 @@ add_library(clink_inproc_bench_pipeline MODULE
     inproc_compare/clink-job/inproc_pipeline.cpp)
 target_link_libraries(clink_inproc_bench_pipeline PRIVATE
     clink::core clink::rocksdb)
+# Optional ForSt backend for the same pipeline (CLINK_STATE_BACKEND=
+# forst://<dir>): linked only when the opt-in impl was built; the
+# CLINK_HAS_FORST define it propagates gates the install() call.
+if(TARGET clink::forst)
+    target_link_libraries(clink_inproc_bench_pipeline PRIVATE clink::forst)
+endif()
 set_target_properties(clink_inproc_bench_pipeline PROPERTIES
     PREFIX ""
     OUTPUT_NAME "inproc_bench_pipeline")

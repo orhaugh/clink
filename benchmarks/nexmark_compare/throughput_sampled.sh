@@ -47,9 +47,21 @@ QUERIES="${QUERIES:-q0 q12}"
 # completeness check is that each engine's own counter drained the full input
 # (reached_target). Uses the q*_bh.tmpl.sql variants.
 SINK="${SINK:-kafka}"
+# STATE_BACKEND: optional per-job state backend URI passed to clink's submit
+# (--state-backend), e.g. rocksdb:///tmp/nx-state or forst:///tmp/nx-state
+# (paths are inside the worker containers). Unset = cluster default
+# (in-memory), the canonical hot-path premise. clink-side only; Flink stays
+# on its compose-pinned hashmap backend, so cross-engine ratios keep the
+# matched premise ONLY when this is unset - a set value makes the run
+# clink-vs-clink tracking for that backend.
+STATE_BACKEND="${STATE_BACKEND:-}"
+# RUN_TAG: optional suffix on the per-query result filenames so backend
+# variants do not overwrite each other (q12-clink-<tag>.json).
+RUN_TAG="${RUN_TAG:-}"
 DATA_DIR="${DATA_DIR:-/tmp/nxcompare-sampled}"
 RESULTS="$ROOT/results-sampled"
 QSUFFIX=""; [ "$SINK" = "blackhole" ] && QSUFFIX="_bh"
+TAGSUF=""; [ -n "$RUN_TAG" ] && TAGSUF="-$RUN_TAG"
 
 now_s() { python3 -c 'import time;print(time.time())'; }
 step() { printf '\n=== %s ===\n' "$*"; }
@@ -80,7 +92,10 @@ wait_stable_offset() {  # topic -> total records once the sink stops growing
 # at the first strictly-positive reading (= that prior total) and measures only
 # the delta, so no worker restart is needed - each run's drain rate is clean.
 
-mkdir -p "$RESULTS" "$DATA_DIR"; rm -f "$RESULTS"/*.json
+# Tagged runs clear only their own tag's files, so backend variants can
+# accumulate side by side; an untagged run keeps the historic wipe-all.
+mkdir -p "$RESULTS" "$DATA_DIR"
+if [ -n "$RUN_TAG" ]; then rm -f "$RESULTS"/*"$TAGSUF".json; else rm -f "$RESULTS"/*.json; fi
 
 step "1. Build host deps + Flink jar, check clink-runtime image"
 cmake --build "$CLINK_ROOT/build" --target nexmark_dump clink_submit_sql --parallel 10 >/dev/null 2>&1 \
@@ -123,7 +138,8 @@ run_clink() {  # query
     sed -e "s#__OUT__#$out#" -e "s#__BROKERS__#kafka:29092#" "$ROOT/queries/clink/$q$QSUFFIX.tmpl.sql" > "$DATA_DIR/$q-clink.sql"
     local cpu_pre wall_pre; cpu_pre=$("$PY" "$ROOT/driver/cpu.py" read-flink $CLINK_CTRS); wall_pre=$(now_s)
     local jid; jid=$(../../build/clink_submit_sql --file "$DATA_DIR/$q-clink.sql" \
-        --coordinator-host 127.0.0.1 --coordinator-port "$CLINK_JM_HTTP" --name "ts_$q" --parallelism "$PAR" 2>/dev/null | extract_job_id)
+        --coordinator-host 127.0.0.1 --coordinator-port "$CLINK_JM_HTTP" --name "ts_$q" --parallelism "$PAR" \
+        ${STATE_BACKEND:+--state-backend "$STATE_BACKEND"} 2>/dev/null | extract_job_id)
     [ -z "$jid" ] && { echo "  clink submit failed"; return 1; }
     # Generous quiet-timeout/max-runtime (like the Flink side) so a momentary
     # metric-refresh plateau does not trip an early "drained" before the full
@@ -133,7 +149,7 @@ run_clink() {  # query
     local cpu_post wall_post; cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-flink $CLINK_CTRS); wall_post=$(now_s)
     local off=-1; [ "$SINK" = "kafka" ] && off=$(wait_stable_offset "$out")
     echo "$s" | python3 -c "import json,sys
-d=json.load(sys.stdin); d.update({'query':'$q','sink':'$SINK','cpu_seconds':round($cpu_post-$cpu_pre,2),'wall_seconds':round($wall_post-$wall_pre,2),'out_rows':$off}); open('$RESULTS/$q-clink.json','w').write(json.dumps(d)); print('  clink drain',d['drain_rate'],'rec/s (',d.get('drain_seconds'),'s), reached',d['reached_target'],', out_rows',($off if $off>=0 else 'n/a(blackhole)'))"
+d=json.load(sys.stdin); d.update({'query':'$q','sink':'$SINK','state_backend':'${STATE_BACKEND}','cpu_seconds':round($cpu_post-$cpu_pre,2),'wall_seconds':round($wall_post-$wall_pre,2),'out_rows':$off}); open('$RESULTS/$q-clink$TAGSUF.json','w').write(json.dumps(d)); print('  clink drain',d['drain_rate'],'rec/s (',d.get('drain_seconds'),'s), reached',d['reached_target'],', out_rows',($off if $off>=0 else 'n/a(blackhole)'))"
     curl -fsS -X POST "http://127.0.0.1:$CLINK_JM_HTTP/api/v1/jobs/$jid/cancel" >/dev/null 2>&1
     sleep 2
 }

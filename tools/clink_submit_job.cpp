@@ -105,8 +105,15 @@ std::optional<std::string> compose_state_backend_uri(const std::string& spec) {
     if (scheme == "rocksdb") {
         return std::string{"rocksdb://"} + path;
     }
+    if (scheme == "forst") {
+        // ForSt backend (opt-in build): the scheme resolves worker-side
+        // only when the node was built with CLINK_WITH_FORST=ON - an
+        // unknown scheme there fails the deploy with a clear factory
+        // error, so the client passes it through like rocksdb.
+        return std::string{"forst://"} + path;
+    }
     std::cerr << "clink run: unknown --state-backend scheme '" << scheme
-              << "' (expected one of: memory, file, rocksdb)\n";
+              << "' (expected one of: memory, file, rocksdb, forst)\n";
     return std::nullopt;
 }
 

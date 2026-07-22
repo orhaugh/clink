@@ -23,6 +23,11 @@ COPY . /src
 # container's nproc anyway, but being explicit here keeps the build
 # polite on hosts that haven't tuned Docker's resource allocation.
 ENV CMAKE_BUILD_PARALLEL_LEVEL=4
+# Opt-in: bake the ForSt state backend into the runtime (forst:// and the
+# forst_s3 schemes). Default OFF keeps the image build identical; ON adds
+# the ForSt engine's ExternalProject fetch + build (~5-8 min, needs
+# network). Usage: docker build --build-arg CLINK_WITH_FORST=ON ...
+ARG CLINK_WITH_FORST=OFF
 # CLINK_BUILD_SQL=ON so clink_node registers the SQL operator factories
 # (json_string_to_row, window_row, equi_join_row, ...) - required to run SQL
 # jobs (e.g. the Nexmark queries) against a containerized cluster; without it the
@@ -30,6 +35,7 @@ ENV CMAKE_BUILD_PARALLEL_LEVEL=4
 # Release + LTO (interprocedural optimisation) for a maximally-optimised runtime,
 # then strip the binaries (perf-neutral, smaller image). Throughput-grade build.
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCLINK_BUILD_SQL=ON \
+        -DCLINK_WITH_FORST=${CLINK_WITH_FORST} \
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
     && cmake --build build --target clink_node \
     && cmake --build build --target clink \

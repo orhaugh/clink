@@ -29,6 +29,9 @@
 #include "clink/job/register_job.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/rocksdb/install.hpp"
+#ifdef CLINK_HAS_FORST
+#include "clink/forst/install.hpp"
+#endif
 #include "clink/time/event_time.hpp"
 
 namespace bench {
@@ -351,6 +354,12 @@ inline void define_job(clink::api::Pipeline& env) {
     // Calling install() here registers "rocksdb" scheme on the .so's
     // own factory so make_subtask_job_config() can build the backend.
     clink::rocksdb::install();
+#ifdef CLINK_HAS_FORST
+    // Same private-factory rule for the ForSt backend: registering here
+    // lets CLINK_STATE_BACKEND=forst://<dir> drive the identical keyed
+    // window-aggregate through ForSt for a backend A/B.
+    clink::forst::install();
+#endif
 
     const auto records = env_i64("BENCH_RECORDS", 10'000'000);
     const auto keys = env_i64("BENCH_KEYS", 1000);
