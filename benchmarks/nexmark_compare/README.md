@@ -194,8 +194,11 @@ resolution). The positional in/out join is verified by a per-record content
 check, producer linger is pinned to 0 on both sinks (the clink Kafka sink
 gained a `linger_ms` option for this), and the run gates on exact count, zero
 content mismatches, and the pacer hitting its target within 5%. Warm-up and
-drain are trimmed (head 20% / tail 5%), with a per-5s-bucket p50/p99 series in
-the result JSON so the trim is inspectable rather than trusted.
+drain are trimmed by TIME (`--warmup-s`, default 10 s of wall clock, with the
+20% head fraction as a floor - a fixed fraction leaves warm-up records inside
+the steady window at high paced rates) plus a 5% tail fraction, with a
+per-5s-bucket p50/p99 series in the result JSON so the trim is inspectable
+rather than trusted.
 
 ### Results (par=1, 50k ev/s, 3.68M bids, hot path, Release+LTO clink vs Flink 2.2.0)
 
@@ -218,6 +221,24 @@ itself the finding: the tail is scheduled by the garbage collector, not by
 load. clink's post-fix tail reproduced flat across runs. For a latency SLO
 (the p99.9 you can promise), the gap is structural: no JVM, no warm-up phase,
 no pause-class spikes.
+
+### Revalidation caveat (2026-07-22): the tail is rig-sensitive
+
+A three-rate sweep (50k/100k/150k ev/s, 7.36M bids each, RelWithDebInfo
+clink) on a heavily-used single box could NOT reproduce the attribution
+above: sporadic 100-900 ms bucket spikes landed on BOTH engines, in
+different runs, non-reproducibly (Flink's 50k p99 was 16 ms in one sweep and
+392 ms in the next; clink caught 932/1101 ms buckets of its own). On a
+shared box the Docker-VM broker's stalls pollute the append timestamps that
+ARE the measurement, so p99+ comparisons are not attributable to engines
+there. What DID hold across every run, rate, and sweep: the quiet-bucket
+steady p99 (clink ~8-10 ms, Flink ~4-8 ms - comparable, Flink slightly
+tighter) and a load-correlated clink p90 (7 -> ~20 ms as the rate rises,
+where Flink's falls to ~3 ms) whose shape points at clink's
+throughput-biased source/wire batch sizing, a concrete latency-tuning
+lever. Quote the table above only after reproducing it on a quiet or
+dedicated rig; do not quote p99.9 ratios from shared-box runs in either
+direction.
 
 ### The bench earned its keep on day one: the batch-fill defect it caught
 

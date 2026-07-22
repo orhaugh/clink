@@ -92,6 +92,14 @@ def main():
     ap.add_argument("--rate", type=float, required=True, help="target input events/s (pace gate)")
     ap.add_argument("--head-trim", type=float, default=0.20)
     ap.add_argument("--tail-trim", type=float, default=0.05)
+    ap.add_argument(
+        "--warmup-s",
+        type=float,
+        default=10.0,
+        help="time-based head trim: drop records paced within this many seconds "
+        "of the first input append (warm-up transient); the fraction-based "
+        "--head-trim acts as a floor",
+    )
     ap.add_argument("--quiet-timeout", type=float, default=30.0)
     ap.add_argument("--query", default="q0_lat")
     ap.add_argument("--engine", default="")
@@ -134,11 +142,25 @@ def main():
         "ok": ok_count and ok_content and ok_pace,
         "head_trim": args.head_trim,
         "tail_trim": args.tail_trim,
+        "warmup_s": args.warmup_s,
     }
 
     if n > 0:
         lat = [out_ts[i] - in_ts[i] for i in range(n)]
-        lo = int(args.head_trim * n)
+        # Head trim is TIME-based (--warmup-s of wall clock from the first
+        # input append), not fraction-based: both engines show a multi-second
+        # warm-up transient (consumer group join, fetch ramp, cold code
+        # paths), and at high paced rates a run is short enough that a
+        # fixed FRACTION leaves warm-up records inside the "steady" window,
+        # inflating the tail percentiles by an amount that varies with the
+        # rate - the exact artefact that misread a 150k ev/s run. The
+        # fraction-based head trim is kept as a floor.
+        warmup_ms = int(args.warmup_s * 1000)
+        t_base = in_ts[0]
+        lo_time = 0
+        while lo_time < n and in_ts[lo_time] - t_base < warmup_ms:
+            lo_time += 1
+        lo = max(lo_time, int(args.head_trim * n))
         hi = int((1.0 - args.tail_trim) * n)
         win = sorted(lat[lo:hi])
         result.update(
