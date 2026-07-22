@@ -232,13 +232,19 @@ different runs, non-reproducibly (Flink's 50k p99 was 16 ms in one sweep and
 shared box the Docker-VM broker's stalls pollute the append timestamps that
 ARE the measurement, so p99+ comparisons are not attributable to engines
 there. What DID hold across every run, rate, and sweep: the quiet-bucket
-steady p99 (clink ~8-10 ms, Flink ~4-8 ms - comparable, Flink slightly
-tighter) and a load-correlated clink p90 (7 -> ~20 ms as the rate rises,
-where Flink's falls to ~3 ms) whose shape points at clink's
-throughput-biased source/wire batch sizing, a concrete latency-tuning
-lever. Quote the table above only after reproducing it on a quiet or
-dedicated rig; do not quote p99.9 ratios from shared-box runs in either
-direction.
+steady p99 (clink ~8-10 ms, Flink ~4-8 ms - comparable) and a stable
+clink p50/p90 floor of ~3 / 7-8 ms. An earlier reading of a
+"load-correlated clink p90" (rising to ~20 ms) pointing at source batch
+sizing was REFUTED by an interleaved A/B at 100k ev/s: shrinking the
+source batches (`max_batch_size='32', batch_max_wait_ms='1'`, both now
+SQL-reachable WITH options) made every percentile worse both times
+(p99 33/43 ms default vs 109/732 ms tuned - more batches means more
+per-batch overhead downstream and less headroom), and repeated default
+runs pinned p90 at 7-8 ms at 100k. The defaults (256 records / 5 ms
+fill bound) are latency-sound; the elevated-p90 reading was the same
+shared-box contamination. Quote the table above only after reproducing
+it on a quiet or dedicated rig; do not quote p99.9 ratios from
+shared-box runs in either direction.
 
 ### The bench earned its keep on day one: the batch-fill defect it caught
 

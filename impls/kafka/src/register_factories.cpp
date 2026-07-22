@@ -67,6 +67,27 @@ void apply_batch_max_wait(const plugin::BuildContext& ctx, KafkaSource::Options&
     apply_ms_param(ctx, "batch_max_wait_ms", opts.batch_max_wait);
 }
 
+// The rest of the source's batch-formation surface, so a latency-tuned
+// table can shrink batches end to end (WITH max_batch_size='32',
+// batch_max_wait_ms='1') without touching code. Absent keeps defaults.
+void apply_batch_shape(const plugin::BuildContext& ctx, KafkaSource::Options& opts) {
+    apply_ms_param(ctx, "poll_timeout_ms", opts.poll_timeout);
+    const auto v = ctx.param_or("max_batch_size", "");
+    if (v.empty()) {
+        return;
+    }
+    try {
+        const auto n = std::stoll(v);
+        if (n <= 0) {
+            throw std::invalid_argument("non-positive");
+        }
+        opts.max_batch_size = static_cast<std::size_t>(n);
+    } catch (const std::exception&) {
+        throw std::runtime_error("kafka: invalid 'max_batch_size' value '" + v +
+                                 "' (want a positive integer of records)");
+    }
+}
+
 // Forwarding emitter: convert KafkaMessage batches to string batches;
 // pass watermarks/barriers through.
 class StringKafkaSource final : public Source<std::string> {
@@ -326,6 +347,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             opts.client_id = ctx.param_or("client_id", "clink-source");
             opts.auto_offset_reset = ctx.param_or("auto_offset_reset", "earliest");
             apply_batch_max_wait(ctx, opts);
+            apply_batch_shape(ctx, opts);
             populate_kafka_security_conf(ctx, opts.conf);
             if (opts.brokers.empty()) {
                 throw std::runtime_error("kafka_message_source: 'brokers' is required");
@@ -375,6 +397,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         opts.client_id = ctx.param_or("client_id", "clink-source");
         opts.auto_offset_reset = ctx.param_or("auto_offset_reset", "earliest");
         apply_batch_max_wait(ctx, opts);
+        apply_batch_shape(ctx, opts);
         populate_kafka_security_conf(ctx, opts.conf);
         if (opts.brokers.empty()) {
             throw std::runtime_error("kafka source: 'brokers' is required");
