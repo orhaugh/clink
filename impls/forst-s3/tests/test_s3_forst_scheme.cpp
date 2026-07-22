@@ -358,6 +358,219 @@ TEST(S3ForstSchemes, S3SstPurgeCleansRemoteCheckpointObjects) {
     EXPECT_EQ(to_string(*built.backend->get(op, sv(std::string{"k"}))), "v");
 }
 
+// Cross-machine restore: the metadata store uploads the checkpoint's
+// metadata files at persist, so a machine with an EMPTY local disk (same
+// URI) restores from the bucket alone - fetch re-materialises the
+// metadata dir, the mirror replicates the data files, the engine reads
+// them from S3. Also pins that the metadata store flips the backend to
+// the capture/persist split.
+TEST(S3ForstSchemes, S3SstCrossMachineRestoreFromBucketAlone) {
+    const char* ep = std::getenv("CLINK_S3_TEST_ENDPOINT");
+    const char* bk = std::getenv("CLINK_S3_TEST_BUCKET");
+    if (ep == nullptr || bk == nullptr) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET";
+    }
+    auto& f = StateBackendFactory::default_instance();
+    const OperatorId op{7};
+    const std::string prefix =
+        std::string{"forst-s3sst-xm-"} + std::to_string(static_cast<long>(::getpid()));
+    const std::string local = tmp_local("xm");
+    const std::string uri = std::string{"s3sst+forst://"} + bk + "/" + prefix + "?local=" + local +
+                            "&endpoint=" + ep + "&region=us-east-1";
+
+    {
+        StateBackendSpec spec1;
+        spec1.uri = uri;
+        spec1.subtask_idx = 0;
+        auto built1 = f.build(spec1);
+        ASSERT_TRUE(built1.backend != nullptr);
+        EXPECT_TRUE(built1.backend->supports_async_persist())
+            << "the metadata store's upload must ride the capture/persist split";
+        built1.backend->put(op, sv(std::string{"a"}), sv(std::string{"1"}));
+        built1.backend->put(op, sv(std::string{"b"}), sv(std::string{"2"}));
+        for (int i = 0; i < 4096; ++i) {
+            built1.backend->put(op, sv("warm_" + std::to_string(i)), sv(std::string(64, 'x')));
+        }
+        (void)built1.backend->snapshot(CheckpointId{1});  // metadata uploads at persist
+    }
+
+    // "New machine": the same URI over an empty disk.
+    std::filesystem::remove_all(local);
+    ASSERT_FALSE(std::filesystem::exists(local));
+
+    StateBackendSpec spec2;
+    spec2.uri = uri;
+    spec2.subtask_idx = 0;
+    spec2.restore_uri = uri;
+    spec2.restore_checkpoint_id = 1;
+    auto built2 = f.build(spec2);
+    ASSERT_TRUE(built2.backend != nullptr);
+    ASSERT_TRUE(built2.restore_from.has_value());
+    built2.backend->restore(*built2.restore_from);
+    ASSERT_TRUE(built2.backend->get(op, sv(std::string{"a"})).has_value());
+    EXPECT_EQ(to_string(*built2.backend->get(op, sv(std::string{"a"}))), "1");
+    EXPECT_EQ(to_string(*built2.backend->get(op, sv(std::string{"b"}))), "2");
+    // The metadata dir was re-materialised locally; the data files were not.
+    EXPECT_TRUE(std::filesystem::exists(local + "/0.cp-1"))
+        << "fetch must re-materialise the checkpoint metadata dir";
+    EXPECT_FALSE(local_tree_has_sst(local));
+}
+
+// Local SST read cache: the write-tee lands each uploaded SST in the
+// cache dir (so flush/compaction outputs read locally), and the LRU byte
+// budget bounds the cache's size.
+TEST(S3ForstSchemes, S3SstLocalCacheTeesAndRespectsBudget) {
+    const char* ep = std::getenv("CLINK_S3_TEST_ENDPOINT");
+    const char* bk = std::getenv("CLINK_S3_TEST_BUCKET");
+    if (ep == nullptr || bk == nullptr) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET";
+    }
+    auto& f = StateBackendFactory::default_instance();
+    const OperatorId op{7};
+
+    auto cache_tree_bytes = [](const std::string& dir) {
+        std::uint64_t total = 0;
+        std::error_code ec;
+        for (auto it = std::filesystem::recursive_directory_iterator(dir, ec);
+             !ec && it != std::filesystem::recursive_directory_iterator();
+             ++it) {
+            if (it->is_regular_file()) {
+                total += it->file_size(ec);
+            }
+        }
+        return total;
+    };
+
+    // Generous budget: the flushed SST must be teed into the cache.
+    {
+        const std::string prefix =
+            std::string{"forst-s3sst-cache-"} + std::to_string(static_cast<long>(::getpid()));
+        const std::string cache_dir = tmp_local("cachedir");
+        const std::string uri = std::string{"s3sst+forst://"} + bk + "/" + prefix +
+                                "?local=" + tmp_local("cache") + "&endpoint=" + ep +
+                                "&region=us-east-1&sst_cache=" + cache_dir +
+                                "&sst_cache_bytes=104857600";
+        StateBackendSpec spec;
+        spec.uri = uri;
+        spec.subtask_idx = 0;
+        auto built = f.build(spec);
+        for (int i = 0; i < 4096; ++i) {
+            built.backend->put(op, sv("warm_" + std::to_string(i)), sv(std::string(64, 'x')));
+        }
+        (void)built.backend->snapshot(CheckpointId{1});  // flush -> SST -> tee
+        bool cached_sst = false;
+        std::error_code ec;
+        for (auto it = std::filesystem::recursive_directory_iterator(cache_dir, ec);
+             !ec && it != std::filesystem::recursive_directory_iterator();
+             ++it) {
+            const auto name = it->path().filename().string();
+            if (name.size() >= 4 && name.compare(name.size() - 4, 4, ".sst") == 0) {
+                cached_sst = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(cached_sst) << "the uploaded SST must be teed into the local cache";
+        // Reads (served from the cache on hit) stay correct.
+        EXPECT_EQ(to_string(*built.backend->get(op, sv(std::string{"warm_1"}))),
+                  std::string(64, 'x'));
+    }
+
+    // Tiny budget: whatever the tee inserts is evicted back down to the
+    // budget immediately - the cache never outgrows it.
+    {
+        const std::string prefix =
+            std::string{"forst-s3sst-evict-"} + std::to_string(static_cast<long>(::getpid()));
+        const std::string cache_dir = tmp_local("evictdir");
+        const std::string uri = std::string{"s3sst+forst://"} + bk + "/" + prefix +
+                                "?local=" + tmp_local("evict") + "&endpoint=" + ep +
+                                "&region=us-east-1&sst_cache=" + cache_dir +
+                                "&sst_cache_bytes=1024";
+        StateBackendSpec spec;
+        spec.uri = uri;
+        spec.subtask_idx = 0;
+        auto built = f.build(spec);
+        for (int i = 0; i < 4096; ++i) {
+            built.backend->put(op, sv("warm_" + std::to_string(i)), sv(std::string(64, 'x')));
+        }
+        (void)built.backend->snapshot(CheckpointId{1});
+        EXPECT_LE(cache_tree_bytes(cache_dir), 1024u)
+            << "the cache must evict down to its byte budget";
+        // A cache miss reads S3 - values stay correct either way.
+        EXPECT_EQ(to_string(*built.backend->get(op, sv(std::string{"warm_2"}))),
+                  std::string(64, 'x'));
+    }
+}
+
+// Stale-staging sweep: a checkpoint that crashed mid-stage leaves its
+// objects at "<subtask>.cp-<id>.tmp/..." (the engine's local staging-dir
+// cleanup never reaches the remote side). A fresh backend construction
+// sweeps them; real checkpoints are untouched.
+TEST(S3ForstSchemes, S3SstConstructionSweepsStaleStaging) {
+    const char* ep = std::getenv("CLINK_S3_TEST_ENDPOINT");
+    const char* bk = std::getenv("CLINK_S3_TEST_BUCKET");
+    if (ep == nullptr || bk == nullptr) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET";
+    }
+    auto& f = StateBackendFactory::default_instance();
+    const OperatorId op{7};
+    const std::string prefix =
+        std::string{"forst-s3sst-sweep-"} + std::to_string(static_cast<long>(::getpid()));
+    const std::string local = tmp_local("sweep");
+    const std::string uri = std::string{"s3sst+forst://"} + bk + "/" + prefix + "?local=" + local +
+                            "&endpoint=" + ep + "&region=us-east-1";
+
+    // Real checkpoint first.
+    {
+        StateBackendSpec spec;
+        spec.uri = uri;
+        spec.subtask_idx = 0;
+        auto built = f.build(spec);
+        for (int i = 0; i < 4096; ++i) {
+            built.backend->put(op, sv("warm_" + std::to_string(i)), sv(std::string(64, 'x')));
+        }
+        (void)built.backend->snapshot(CheckpointId{1});
+    }
+
+    // Simulate a crashed staging: plant an object at the .tmp prefix.
+    {
+        clink::detail::ensure_arrow_s3_initialised();
+        auto opts = arrow::fs::S3Options::Defaults();
+        opts.endpoint_override = ep;
+        opts.scheme = "http";
+        opts.region = "us-east-1";
+        auto s3 = arrow::fs::S3FileSystem::Make(opts);
+        ASSERT_TRUE(s3.ok());
+        auto out =
+            (*s3)->OpenOutputStream(std::string{bk} + "/" + prefix + "/0.cp-9.tmp/000099.sst");
+        ASSERT_TRUE(out.ok());
+        ASSERT_TRUE((*out)->Write("stranded", 8).ok());
+        ASSERT_TRUE((*out)->Close().ok());
+    }
+    auto count = [&](const char* needle) {
+        int n = 0;
+        for (const auto& obj : list_objects(ep, std::string{bk} + "/" + prefix)) {
+            if (obj.find(needle) != std::string::npos) {
+                ++n;
+            }
+        }
+        return n;
+    };
+    ASSERT_EQ(count("/0.cp-9.tmp/"), 1);
+    ASSERT_GE(count("/0.cp-1/"), 1);
+
+    // A fresh construction (restart) sweeps the stale staging and leaves
+    // the real checkpoint alone.
+    {
+        StateBackendSpec spec;
+        spec.uri = uri;
+        spec.subtask_idx = 0;
+        auto built = f.build(spec);
+        ASSERT_TRUE(built.backend != nullptr);
+    }
+    EXPECT_EQ(count("/0.cp-9.tmp/"), 0) << "stale staging must be swept at construction";
+    EXPECT_GE(count("/0.cp-1/"), 1) << "real checkpoints must survive the sweep";
+}
+
 // Live: changelog+s3+forst materialization payload goes to object storage
 // (framing blob stays local); restore replays it back into a fresh ForSt
 // inner.

@@ -49,7 +49,24 @@ struct S3Cfg {
     std::string cache;             // content-addressed object-cache dir (empty -> temp default)
     std::uint64_t cache_bytes{0};  // 0 -> cache disabled
     bool cas{false};               // content-addressed manifest store vs the cp-dir store
+    // s3sst only: local read cache for the remote data files (write-tee +
+    // LRU byte budget; see forst_remote_filesystem.hpp).
+    std::string sst_cache;
+    std::uint64_t sst_cache_bytes{0};
 };
+
+// Strict base-10 byte count: a non-empty all-digit token, else 0
+// (std::stoull would accept "10MB" as 10 and wrap a leading '-').
+std::uint64_t parse_bytes(const std::string& v) {
+    if (v.empty() || v.find_first_not_of("0123456789") != std::string::npos) {
+        return 0;
+    }
+    try {
+        return std::stoull(v);
+    } catch (...) {
+        return 0;  // overflow
+    }
+}
 
 S3Cfg parse_cfg(const std::string& base) {
     S3Cfg c;
@@ -88,17 +105,11 @@ S3Cfg parse_cfg(const std::string& base) {
             } else if (k == "cache") {
                 c.cache = v;
             } else if (k == "cache_bytes") {
-                // Strict base-10 byte count: a non-empty all-digit token, else
-                // disabled (mirrors rocksdb_s3's parsing rationale).
-                if (!v.empty() && v.find_first_not_of("0123456789") == std::string::npos) {
-                    try {
-                        c.cache_bytes = std::stoull(v);
-                    } catch (...) {
-                        c.cache_bytes = 0;  // overflow
-                    }
-                } else {
-                    c.cache_bytes = 0;
-                }
+                c.cache_bytes = parse_bytes(v);
+            } else if (k == "sst_cache") {
+                c.sst_cache = v;
+            } else if (k == "sst_cache_bytes") {
+                c.sst_cache_bytes = parse_bytes(v);
             }
         }
         if (amp == std::string::npos) {
@@ -331,6 +342,14 @@ BuiltStateBackend build_s3sst_forst(const StateBackendSpec& spec) {
     ro.endpoint = cfg.endpoint;
     ro.region = cfg.region;
     ro.anonymous = cfg.anonymous;
+    ro.sst_cache_dir = cfg.sst_cache;
+    ro.sst_cache_bytes = cfg.sst_cache_bytes;
+
+    // A fresh construction means no checkpoint of THIS subtask is
+    // mid-stage, so anything matching "<subtask>.cp-*.tmp" on the remote
+    // side is a crashed checkpoint's stranded staging - reclaim it.
+    (void)sweep_stale_staging(ro, subtask_local.string());
+
     auto env = make_remote_sst_env(ro);
 
     clink::ForStStateBackend::Options fopts;
@@ -339,6 +358,12 @@ BuiltStateBackend build_s3sst_forst(const StateBackendSpec& spec) {
     fopts.engine_env_holder = env.holder;
     fopts.engine_env = env.env;
     fopts.data_mirror = make_s3_data_file_mirror(ro);
+    // Metadata publication: persist() uploads the cp dir's metadata files
+    // to the cp's object prefix (and flips supports_async_persist(), so
+    // the upload rides the snapshot worker); fetch() re-materialises them
+    // on a machine whose local disk lacks the cp dir - cross-machine
+    // restore from the bucket alone.
+    fopts.snapshot_store = make_s3_metadata_store(ro);
 
     BuiltStateBackend out;
     out.backend = std::make_shared<clink::ForStStateBackend>(std::move(fopts));
@@ -355,19 +380,16 @@ BuiltStateBackend build_s3sst_forst(const StateBackendSpec& spec) {
             spec.restore_from_parent_count == 0 ? 1 : spec.restore_from_parent_count;
         // Handles are the LOCAL metadata cp dirs (as for forst://); the
         // backend's DataFileMirror replicates the matching remote data
-        // files during restore. Same-config restore (see above).
+        // files during restore. No local existence check here: the
+        // metadata store's fetch serves a missing dir from the bucket
+        // (cross-machine restore) and throws only when the checkpoint
+        // exists in neither place.
         std::string joined;
         for (std::uint32_t i = 0; i < parent_count; ++i) {
             const std::string dir =
                 (local_root(rcfg) / (std::to_string(src_first + i) + ".cp-" +
                                      std::to_string(spec.restore_checkpoint_id)))
                     .string();
-            if (!fs::exists(dir)) {
-                throw std::runtime_error(
-                    "s3sst+forst scheme: restore requested but local checkpoint metadata dir not "
-                    "found: " +
-                    dir);
-            }
             if (!joined.empty()) {
                 joined.push_back('\n');
             }
