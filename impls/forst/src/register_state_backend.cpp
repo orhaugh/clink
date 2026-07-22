@@ -43,6 +43,42 @@ std::pair<std::string, std::string> split_uri(const std::string& uri) {
 // offsets).
 BuiltStateBackend build_forst(const StateBackendSpec& spec) {
     auto [_, base_path] = split_uri(spec.uri);
+    // Optional query params: ?defer_reads=1 (report supports_async_get and
+    // run reads on an IO executor so operators ride their async KeyedState
+    // paths - per-record state then lives in the engine rather than the
+    // operators' in-memory maps) and &io_threads=<n>. Default off: local
+    // engine reads are fast, so deferring is a benchmarking / large-state
+    // opt-in here; the remote-data-file scheme (s3sst+forst) defaults on.
+    bool defer_reads = false;
+    std::size_t io_threads = 0;
+    if (const auto q = base_path.find('?'); q != std::string::npos) {
+        const std::string query = base_path.substr(q + 1);
+        base_path = base_path.substr(0, q);
+        for (std::size_t start = 0; start < query.size();) {
+            const auto amp = query.find('&', start);
+            const std::string kv =
+                query.substr(start, amp == std::string::npos ? std::string::npos : amp - start);
+            if (const auto eq = kv.find('='); eq != std::string::npos) {
+                const std::string k = kv.substr(0, eq);
+                const std::string v = kv.substr(eq + 1);
+                if (k == "defer_reads") {
+                    defer_reads = (v == "1" || v == "true");
+                } else if (k == "io_threads") {
+                    if (!v.empty() && v.find_first_not_of("0123456789") == std::string::npos) {
+                        try {
+                            io_threads = std::stoull(v);
+                        } catch (...) {
+                            io_threads = 0;
+                        }
+                    }
+                }
+            }
+            if (amp == std::string::npos) {
+                break;
+            }
+            start = amp + 1;
+        }
+    }
     if (base_path.empty()) {
         throw std::runtime_error("forst scheme requires a path");
     }
@@ -62,6 +98,8 @@ BuiltStateBackend build_forst(const StateBackendSpec& spec) {
     clink::ForStStateBackend::Options opts;
     opts.path = subtask_dir.string();
     opts.create_if_missing = true;
+    opts.defer_reads = defer_reads;
+    opts.io_threads = io_threads;
 
     BuiltStateBackend out;
     out.backend = std::make_shared<clink::ForStStateBackend>(std::move(opts));

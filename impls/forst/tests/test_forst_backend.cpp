@@ -8,15 +8,27 @@
 // version stamps.
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
+#include "clink/core/codec.hpp"
 #include "clink/forst/install.hpp"
+#include "clink/operators/keyed_aggregate_operator.hpp"
+#include "clink/operators/sink_operator.hpp"
+#include "clink/operators/source_operator.hpp"
+#include "clink/runtime/async_execution_controller.hpp"
+#include "clink/runtime/dag.hpp"
+#include "clink/runtime/job_config.hpp"
+#include "clink/runtime/local_executor.hpp"
 #include "clink/state/forst_state_backend.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/state_backend_factory.hpp"
@@ -663,4 +675,175 @@ TEST(ForStStateBackend, ChangelogForstFactoryRoundTrip) {
     EXPECT_EQ(to_string(*v), "cv");
 
     std::filesystem::remove_all(root);
+}
+
+// ----- deferred reads (Options::defer_reads) -----
+
+namespace {
+
+std::shared_ptr<ForStStateBackend> make_defer_backend(const std::string& tag) {
+    auto dir = std::filesystem::temp_directory_path() / ("clink_forst_defer_" + tag);
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    ForStStateBackend::Options opts;
+    opts.path = (dir / "db").string();
+    opts.create_if_missing = true;
+    opts.defer_reads = true;
+    opts.io_threads = 2;
+    return std::make_shared<ForStStateBackend>(std::move(opts));
+}
+
+}  // namespace
+
+// The headline contract: a deferred read runs on an IO thread and the
+// completion is handed back through the wired resume scheduler, so the
+// record resumes on the runner - the exact seam the async execution
+// controller drives in production.
+TEST(ForStStateBackend, DeferredReadDefersAndResumesThroughController) {
+    // Controller before backend: the backend's IO thread may call
+    // schedule_resume, so it must quiesce before the controller dies.
+    AsyncExecutionController aec;
+    auto backend = make_defer_backend("ctrl");
+    ASSERT_TRUE(backend->supports_async_get());
+    backend->put(OperatorId{1}, sv(std::string{"k"}), sv(std::string{"v"}));
+
+    backend->set_async_resume_scheduler(
+        [&aec](std::coroutine_handle<> h) { aec.schedule_resume(h); });
+
+    std::optional<std::string> resolved;
+    std::thread::id resume_thread;
+    const bool accepted = aec.submit("k", [&]() -> async::Task<void> {
+        auto v = co_await backend->get_async(OperatorId{1}, sv(std::string{"k"}));
+        if (v) {
+            resolved = to_string(*v);
+        }
+        resume_thread = std::this_thread::get_id();
+        co_return;
+    });
+    ASSERT_TRUE(accepted);
+    aec.drain();
+
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(*resolved, "v");
+    EXPECT_EQ(resume_thread, std::this_thread::get_id()) << "must resume on the runner";
+    EXPECT_EQ(backend->deferred_reads(), 1u);
+    backend->set_async_resume_scheduler({});
+}
+
+// Without a wired scheduler the read is a safe inline blocking load: the
+// task completes in one synchronous step and nothing is deferred.
+TEST(ForStStateBackend, DeferredReadFallsBackInlineWithoutScheduler) {
+    auto backend = make_defer_backend("inline");
+    backend->put(OperatorId{1}, sv(std::string{"k"}), sv(std::string{"v"}));
+
+    auto t = backend->get_async(OperatorId{1}, sv(std::string{"k"}));
+    t.resume();
+    ASSERT_TRUE(t.done());
+    auto got = t.get();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(to_string(*got), "v");
+    EXPECT_EQ(backend->deferred_reads(), 0u);
+}
+
+// A batched read is ONE executor job - a single deferral for N keys,
+// results positional, absent keys nullopt, buffered writes visible.
+TEST(ForStStateBackend, DeferredGetManyIsOneDeferralForTheBatch) {
+    AsyncExecutionController aec;
+    auto backend = make_defer_backend("many");
+    backend->put(OperatorId{1}, sv(std::string{"a"}), sv(std::string{"1"}));
+    backend->put(OperatorId{1}, sv(std::string{"b"}), sv(std::string{"2"}));
+
+    backend->set_async_resume_scheduler(
+        [&aec](std::coroutine_handle<> h) { aec.schedule_resume(h); });
+
+    std::vector<std::optional<StateBackend::Value>> got;
+    const bool accepted = aec.submit("batch", [&]() -> async::Task<void> {
+        got = co_await backend->get_many_async(OperatorId{1}, {"a", "missing", "b"});
+        co_return;
+    });
+    ASSERT_TRUE(accepted);
+    aec.drain();
+
+    ASSERT_EQ(got.size(), 3u);
+    ASSERT_TRUE(got[0].has_value());
+    EXPECT_EQ(to_string(*got[0]), "1");
+    EXPECT_FALSE(got[1].has_value());
+    ASSERT_TRUE(got[2].has_value());
+    EXPECT_EQ(to_string(*got[2]), "2");
+    EXPECT_EQ(backend->deferred_reads(), 1u) << "the whole batch is one deferral";
+    backend->set_async_resume_scheduler({});
+}
+
+// Scheme surface: forst://<dir>?defer_reads=1 builds a deferring backend;
+// the plain URI stays synchronous.
+TEST(ForStStateBackend, SchemeDeferReadsParam) {
+    clink::forst::install();
+    auto root = std::filesystem::temp_directory_path() / "clink_forst_defer_scheme";
+    std::filesystem::remove_all(root);
+    auto& f = StateBackendFactory::default_instance();
+
+    StateBackendSpec plain;
+    plain.uri = "forst://" + (root / "plain").string();
+    plain.subtask_idx = 0;
+    EXPECT_FALSE(f.build(plain).backend->supports_async_get());
+
+    StateBackendSpec defer;
+    defer.uri = "forst://" + (root / "defer").string() + "?defer_reads=1&io_threads=2";
+    defer.subtask_idx = 0;
+    EXPECT_TRUE(f.build(defer).backend->supports_async_get());
+
+    std::filesystem::remove_all(root);
+}
+
+// The payoff, end to end through the REAL runner: a keyed aggregate over a
+// deferring forst backend rides the async path - per-record hot state
+// lives in the engine, every read is deferred to the IO pool and resumed
+// by the controller, and the output is byte-identical to the sync run.
+TEST(ForStStateBackend, DeferredReadsCarryHotPathStateThroughRealRunner) {
+    using KV = std::pair<std::int64_t, std::int64_t>;
+    const std::vector<KV> input = {{1, 10}, {2, 20}, {1, 30}, {2, 5}, {1, 7}};
+
+    auto backend = make_defer_backend("runner");
+
+    std::vector<Record<KV>> records;
+    records.reserve(input.size());
+    for (const auto& x : input) {
+        records.emplace_back(x);
+    }
+    Dag dag;
+    auto src = std::make_shared<VectorSource<KV>>(std::move(records));
+    auto op = std::make_shared<KeyedAggregateOperator<std::int64_t, std::int64_t, std::int64_t>>(
+        [] { return std::int64_t{0}; },
+        [](const std::int64_t& acc, const std::int64_t& v) { return acc + v; },
+        int64_codec(),
+        int64_codec(),
+        "sum");
+    auto sink = std::make_shared<CollectingSink<KV>>();
+    auto h0 = dag.add_source<KV>(src);
+    auto h1 = dag.add_operator<KV, KV>(h0, op);
+    dag.add_sink<KV>(h1, sink);
+
+    JobConfig cfg;
+    cfg.state_backend = backend;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    // Cross-key emission order is completion order on a genuinely
+    // deferring backend (the per-key gate orders only same-key records),
+    // so assert the per-key running-sum subsequences, not a global order.
+    const auto got = sink->collected();
+    auto per_key = [&](std::int64_t k) {
+        std::vector<std::int64_t> vals;
+        for (const auto& [key, v] : got) {
+            if (key == k) {
+                vals.push_back(v);
+            }
+        }
+        return vals;
+    };
+    ASSERT_EQ(got.size(), input.size());
+    EXPECT_EQ(per_key(1), (std::vector<std::int64_t>{10, 40, 47}));
+    EXPECT_EQ(per_key(2), (std::vector<std::int64_t>{20, 25}));
+    EXPECT_EQ(backend->deferred_reads(), input.size())
+        << "every record's state read must ride the IO pool";
 }

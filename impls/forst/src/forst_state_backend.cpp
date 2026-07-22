@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <coroutine>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/async/completion_executor.hpp"
 #include "clink/state/snapshot_arrow_writer.hpp"
 #include "clink/state/snapshot_store.hpp"
 
@@ -144,6 +147,29 @@ struct ForStStateBackend::Impl {
     // remotely (see DataFileMirror in the header). Null = all-local.
     std::shared_ptr<DataFileMirror> mirror;
 
+    // Deferred-read machinery (Options::defer_reads). The executor runs
+    // the (potentially remote-blocking) engine reads off the runner
+    // thread; per-THREAD resume targets route each completion back to
+    // the runner that issued the read (a JobConfig-shared backend serves
+    // several operator threads). Mirrors RemoteReadBackend's contract.
+    // Declared before db: the executor is explicitly reset first in the
+    // destructor, but keep the member order safe regardless.
+    bool defer_reads{false};
+    std::shared_ptr<async::CompletionExecutor> io;
+    struct ResumeTarget {
+        StateBackend::AsyncResumeScheduler resume;
+        StateBackend::DeadlineResumeScheduler deadline;
+    };
+    mutable std::mutex sched_mu;
+    std::unordered_map<std::thread::id, ResumeTarget> schedulers;
+    mutable std::atomic<std::uint64_t> deferred_reads{0};
+
+    [[nodiscard]] ResumeTarget sched_for_thread() const {
+        std::lock_guard lk(sched_mu);
+        auto it = schedulers.find(std::this_thread::get_id());
+        return it == schedulers.end() ? ResumeTarget{} : it->second;
+    }
+
     std::unique_ptr<forstdb::DB> db;
     std::string path;
     // Where checkpoint dirs are published/fetched. Defaults to
@@ -264,6 +290,121 @@ struct ForStStateBackend::Impl {
         }
         write_batch_.Clear();
     }
+
+    // The one blocking read (the exact get() semantics: drain buffered
+    // writes, read through the engine). Callable from the runner (sync
+    // path, inline fallback) or an IO executor thread (deferred path):
+    // the buffer flush is mutex-guarded and the engine's Get is safe
+    // against concurrent runner-thread writes.
+    [[nodiscard]] std::optional<StateBackend::Value> read_one(OperatorId op, std::string_view key) {
+        auto* cf = cf_lookup(op);
+        if (cf == nullptr) {
+            return std::nullopt;
+        }
+        {
+            std::lock_guard lock(buffer_mu_);
+            flush_write_batch_locked();
+        }
+        const forstdb::Slice k_slice(key.data(), key.size());
+        std::string out;
+        auto st = db->Get(forstdb::ReadOptions{}, cf, k_slice, &out);
+        if (st.IsNotFound()) {
+            return std::nullopt;
+        }
+        if (!st.ok()) {
+            throw std::runtime_error("ForStStateBackend::get failed: " + st.ToString());
+        }
+        StateBackend::Value bytes(out.size());
+        if (!out.empty()) {
+            std::memcpy(bytes.data(), out.data(), out.size());
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] std::vector<std::optional<StateBackend::Value>> read_many(
+        OperatorId op, const std::vector<std::string>& keys) {
+        std::vector<std::optional<StateBackend::Value>> out;
+        out.reserve(keys.size());
+        for (const auto& k : keys) {
+            out.push_back(read_one(op, k));
+        }
+        return out;
+    }
+
+    // Route a completed deferred read back to the issuing runner (called
+    // on the IO thread). Prefers the deadline-aware scheduler when wired
+    // so an order_key participates in priority resume.
+    static void post_resume(const ResumeTarget& t,
+                            std::coroutine_handle<> h,
+                            std::uint64_t order_key) {
+        if (t.deadline) {
+            t.deadline(h, order_key);
+        } else if (t.resume) {
+            t.resume(h);
+        }
+    }
+
+    // Awaiter for one deferred read: the IO thread runs the engine read
+    // and posts the handle back to the issuing runner; await_resume (on
+    // the runner) surfaces the value, rethrowing any engine error there
+    // rather than letting it escape an executor worker.
+    struct Load {
+        Impl* self;
+        OperatorId op;
+        std::string key;
+        std::uint64_t order_key{0};
+        ResumeTarget target;
+        std::optional<StateBackend::Value> value{};
+        std::exception_ptr error{};
+
+        [[nodiscard]] bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> h) {
+            self->io->submit_blocking([this, h]() {
+                try {
+                    value = self->read_one(op, key);
+                } catch (...) {
+                    error = std::current_exception();
+                }
+                post_resume(target, h, order_key);
+            });
+        }
+        std::optional<StateBackend::Value> await_resume() {
+            if (error) {
+                std::rethrow_exception(error);
+            }
+            return std::move(value);
+        }
+    };
+
+    // Batched twin: the whole batch runs as ONE executor job - a single
+    // suspension for N keys. Keys are owned by the awaiter across the
+    // suspension.
+    struct LoadMany {
+        Impl* self;
+        OperatorId op;
+        std::vector<std::string> keys;
+        ResumeTarget target;
+        std::vector<std::optional<StateBackend::Value>> values{};
+        std::exception_ptr error{};
+
+        [[nodiscard]] bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> h) {
+            self->io->submit_blocking([this, h]() {
+                try {
+                    values = self->read_many(op, keys);
+                } catch (...) {
+                    error = std::current_exception();
+                }
+                post_resume(target, h, 0);
+            });
+        }
+        std::vector<std::optional<StateBackend::Value>> await_resume() {
+            if (error) {
+                std::rethrow_exception(error);
+            }
+            return std::move(values);
+        }
+    };
 };
 
 namespace {
@@ -380,6 +521,13 @@ ForStStateBackend::ForStStateBackend(Options opts) : impl_(std::make_unique<Impl
     impl_->env_holder = std::move(opts.engine_env_holder);
     impl_->env = static_cast<forstdb::Env*>(opts.engine_env);
     impl_->mirror = std::move(opts.data_mirror);
+    // Deferred reads (see Options): a sized IO pool for the engine reads.
+    impl_->defer_reads = opts.defer_reads;
+    if (impl_->defer_reads) {
+        constexpr std::size_t kDefaultIoThreads = 8;
+        impl_->io = std::make_shared<async::ThreadPoolCompletionExecutor>(
+            opts.io_threads == 0 ? kDefaultIoThreads : opts.io_threads);
+    }
 
     std::vector<forstdb::ColumnFamilyHandle*> handles;
     std::vector<std::string> names;
@@ -416,6 +564,10 @@ void ForStStateBackend::set_restore_base(const std::string& dir) {
 }
 
 ForStStateBackend::~ForStStateBackend() {
+    // Join the IO workers FIRST: any in-flight deferred read references
+    // the DB (the runner's drain has already quiesced the async paths;
+    // this is the belt-and-braces ordering).
+    impl_->io.reset();
     // Drain the WriteBatch before tearing down the DB.
     try {
         std::lock_guard lock(impl_->buffer_mu_);
@@ -460,28 +612,80 @@ void ForStStateBackend::put(OperatorId op, KeyView key, ValueView value) {
 }
 
 std::optional<ForStStateBackend::Value> ForStStateBackend::get(OperatorId op, KeyView key) const {
-    auto* cf = impl_->cf_lookup(op);
-    if (cf == nullptr) {
-        return std::nullopt;
+    return impl_->read_one(op, key);
+}
+
+bool ForStStateBackend::supports_async_get() const noexcept {
+    return impl_->defer_reads;
+}
+
+async::Task<std::optional<ForStStateBackend::Value>> ForStStateBackend::get_async(
+    OperatorId op, KeyView key) const {
+    return get_async(op, key, 0);
+}
+
+async::Task<std::optional<ForStStateBackend::Value>> ForStStateBackend::get_async(
+    OperatorId op, KeyView key, std::uint64_t order_key) const {
+    std::string owned(key);  // own the bytes across any suspension
+    if (!impl_->defer_reads) {
+        co_return impl_->read_one(op, owned);
     }
-    {
-        std::lock_guard lock(impl_->buffer_mu_);
-        impl_->flush_write_batch_locked();
+    const auto rt = impl_->sched_for_thread();
+    if (!rt.resume && !rt.deadline) {
+        // No runner to marshal resumes to: safe inline blocking read.
+        co_return impl_->read_one(op, owned);
     }
-    const forstdb::Slice k_slice(key.data(), key.size());
-    std::string out;
-    auto st = impl_->db->Get(forstdb::ReadOptions{}, cf, k_slice, &out);
-    if (st.IsNotFound()) {
-        return std::nullopt;
+    impl_->deferred_reads.fetch_add(1, std::memory_order_relaxed);
+    co_return co_await Impl::Load{impl_.get(), op, std::move(owned), order_key, rt};
+}
+
+async::Task<std::vector<std::optional<ForStStateBackend::Value>>> ForStStateBackend::get_many_async(
+    OperatorId op, const std::vector<std::string>& keys) const {
+    if (!impl_->defer_reads) {
+        co_return impl_->read_many(op, keys);
     }
-    if (!st.ok()) {
-        throw std::runtime_error("ForStStateBackend::get failed: " + st.ToString());
+    const auto rt = impl_->sched_for_thread();
+    if (!rt.resume && !rt.deadline) {
+        co_return impl_->read_many(op, keys);
     }
-    Value bytes(out.size());
-    if (!out.empty()) {
-        std::memcpy(bytes.data(), out.data(), out.size());
+    impl_->deferred_reads.fetch_add(1, std::memory_order_relaxed);  // one batch, one deferral
+    co_return co_await Impl::LoadMany{impl_.get(), op, keys, rt};
+}
+
+void ForStStateBackend::set_async_resume_scheduler(AsyncResumeScheduler schedule) {
+    std::lock_guard lk(impl_->sched_mu);
+    const auto tid = std::this_thread::get_id();
+    if (!schedule) {
+        auto it = impl_->schedulers.find(tid);
+        if (it != impl_->schedulers.end()) {
+            it->second.resume = nullptr;
+            if (!it->second.deadline) {
+                impl_->schedulers.erase(it);
+            }
+        }
+        return;
     }
-    return bytes;
+    impl_->schedulers[tid].resume = std::move(schedule);
+}
+
+void ForStStateBackend::set_deadline_resume_scheduler(DeadlineResumeScheduler schedule) {
+    std::lock_guard lk(impl_->sched_mu);
+    const auto tid = std::this_thread::get_id();
+    if (!schedule) {
+        auto it = impl_->schedulers.find(tid);
+        if (it != impl_->schedulers.end()) {
+            it->second.deadline = nullptr;
+            if (!it->second.resume) {
+                impl_->schedulers.erase(it);
+            }
+        }
+        return;
+    }
+    impl_->schedulers[tid].deadline = std::move(schedule);
+}
+
+std::uint64_t ForStStateBackend::deferred_reads() const noexcept {
+    return impl_->deferred_reads.load(std::memory_order_relaxed);
 }
 
 void ForStStateBackend::erase(OperatorId op, KeyView key) {

@@ -90,6 +90,17 @@ public:
         std::shared_ptr<void> engine_env_holder;
         void* engine_env{nullptr};
         std::shared_ptr<DataFileMirror> data_mirror;
+        // Deferred reads: report supports_async_get() so operators ride
+        // their async KeyedState paths, and serve get_async /
+        // get_many_async by running the engine read on an IO executor -
+        // the record's coroutine suspends and the async execution
+        // controller overlaps other work while the read (which can block
+        // on object storage in the remote-data-file mode) completes.
+        // With no runner wired the calls fall back to a safe inline
+        // blocking read. Writes stay on the runner thread (the engine is
+        // read-thread-safe against concurrent writes).
+        bool defer_reads{false};
+        std::size_t io_threads{0};  // 0 = default pool size
     };
 
     // Per-checkpoint introspection. Returned by snapshot_stats() so tests
@@ -115,6 +126,25 @@ public:
     std::optional<Value> get(OperatorId op, KeyView key) const override;
     void erase(OperatorId op, KeyView key) override;
     void scan(OperatorId op, const ScanVisitor& visit) const override;
+    // Deferred-read surface (active when Options::defer_reads is set; see
+    // there). Mirrors the RemoteReadBackend contract: reads run on an IO
+    // executor and the completion is handed back to the issuing runner
+    // through the wired resume scheduler (deadline-aware overload
+    // preferred when an order_key is carried); with no scheduler wired
+    // the read is a safe inline blocking load. get_many_async runs the
+    // whole batch as ONE executor job - a single suspension.
+    [[nodiscard]] bool supports_async_get() const noexcept override;
+    async::Task<std::optional<Value>> get_async(OperatorId op, KeyView key) const override;
+    async::Task<std::optional<Value>> get_async(OperatorId op,
+                                                KeyView key,
+                                                std::uint64_t order_key) const override;
+    async::Task<std::vector<std::optional<Value>>> get_many_async(
+        OperatorId op, const std::vector<std::string>& keys) const override;
+    void set_async_resume_scheduler(AsyncResumeScheduler schedule) override;
+    void set_deadline_resume_scheduler(DeadlineResumeScheduler schedule) override;
+    // Observability: reads actually deferred to the IO executor (a
+    // batched read counts once). Inline fallbacks do not count.
+    [[nodiscard]] std::uint64_t deferred_reads() const noexcept;
     Snapshot snapshot(CheckpointId id) override;
     // Async-persist split, enabled only when the SnapshotStore defers a
     // durable write (a remote store). capture() does the cheap local

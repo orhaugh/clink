@@ -53,6 +53,11 @@ struct S3Cfg {
     // LRU byte budget; see forst_remote_filesystem.hpp).
     std::string sst_cache;
     std::uint64_t sst_cache_bytes{0};
+    // s3sst only: deferred reads (raw token so "absent" and "0" are
+    // distinguishable - the scheme defaults ON because its reads can
+    // block on object storage) + IO pool size.
+    std::string defer_reads;
+    std::uint64_t io_threads{0};
 };
 
 // Strict base-10 byte count: a non-empty all-digit token, else 0
@@ -110,6 +115,10 @@ S3Cfg parse_cfg(const std::string& base) {
                 c.sst_cache = v;
             } else if (k == "sst_cache_bytes") {
                 c.sst_cache_bytes = parse_bytes(v);
+            } else if (k == "defer_reads") {
+                c.defer_reads = v;
+            } else if (k == "io_threads") {
+                c.io_threads = parse_bytes(v);
             }
         }
         if (amp == std::string::npos) {
@@ -364,6 +373,15 @@ BuiltStateBackend build_s3sst_forst(const StateBackendSpec& spec) {
     // on a machine whose local disk lacks the cp dir - cross-machine
     // restore from the bucket alone.
     fopts.snapshot_store = make_s3_metadata_store(ro);
+    // Deferred reads DEFAULT ON for this scheme: a block-cache miss is a
+    // ranged GET against object storage, exactly the blocking read the
+    // deferring contract exists for. supports_async_get() then flips the
+    // SQL window/aggregate/join operators onto their async KeyedState
+    // paths, so per-record hot state lives in the engine (memtable +
+    // remote SSTs) instead of operator-local maps. ?defer_reads=0 keeps
+    // the synchronous integration-check behaviour.
+    fopts.defer_reads = !(cfg.defer_reads == "0" || cfg.defer_reads == "false");
+    fopts.io_threads = static_cast<std::size_t>(cfg.io_threads);
 
     BuiltStateBackend out;
     out.backend = std::make_shared<clink::ForStStateBackend>(std::move(fopts));

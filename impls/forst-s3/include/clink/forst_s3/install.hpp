@@ -34,6 +34,10 @@
 //       write-tee (flush/compaction outputs read locally; the dir must
 //       not sit under `local`). Stale checkpoint staging left by a crash
 //       ("<subtask>.cp-*.tmp" objects) is swept at construction.
+//       Deferred reads DEFAULT ON here (&defer_reads=0 opts out,
+//       &io_threads=<n> sizes the pool): supports_async_get() flips
+//       operators onto their async KeyedState paths, so per-record hot
+//       state lives in the remote-SST engine rather than operator maps.
 //
 // Idempotent. Invoked once at startup (clink_node, test entry points).
 // Requires clink::forst + clink::s3.

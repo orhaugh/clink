@@ -10,8 +10,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include <arrow/filesystem/filesystem.h>
@@ -19,6 +21,14 @@
 #include <gtest/gtest.h>
 
 #include "clink/connectors/parquet_s3_sink.hpp"  // ensure_arrow_s3_initialised
+#include "clink/core/codec.hpp"
+#include "clink/operators/keyed_aggregate_operator.hpp"
+#include "clink/operators/sink_operator.hpp"
+#include "clink/operators/source_operator.hpp"
+#include "clink/runtime/dag.hpp"
+#include "clink/runtime/job_config.hpp"
+#include "clink/runtime/local_executor.hpp"
+#include "clink/state/forst_state_backend.hpp"
 #include "clink/state/state_backend.hpp"
 #include "clink/state/state_backend_factory.hpp"
 
@@ -569,6 +579,85 @@ TEST(S3ForstSchemes, S3SstConstructionSweepsStaleStaging) {
     }
     EXPECT_EQ(count("/0.cp-9.tmp/"), 0) << "stale staging must be swept at construction";
     EXPECT_GE(count("/0.cp-1/"), 1) << "real checkpoints must survive the sweep";
+}
+
+// Deferred reads default ON for s3sst (its block-cache misses are ranged
+// GETs against object storage - the blocking read the deferring contract
+// exists for), so supports_async_get() flips operators onto their async
+// KeyedState paths and per-record hot state lives in the remote-SST
+// engine. ?defer_reads=0 restores the synchronous mode. The end-to-end
+// half runs a keyed aggregate through the REAL runner over MinIO and
+// proves every record's read rode the IO pool.
+TEST(S3ForstSchemes, S3SstDefersReadsByDefaultAndCarriesHotPathState) {
+    const char* ep = std::getenv("CLINK_S3_TEST_ENDPOINT");
+    const char* bk = std::getenv("CLINK_S3_TEST_BUCKET");
+    if (ep == nullptr || bk == nullptr) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET";
+    }
+    auto& f = StateBackendFactory::default_instance();
+    const std::string prefix =
+        std::string{"forst-s3sst-defer-"} + std::to_string(static_cast<long>(::getpid()));
+    const std::string base = std::string{"s3sst+forst://"} + bk + "/" + prefix +
+                             "?local=" + tmp_local("defer") + "&endpoint=" + ep +
+                             "&region=us-east-1";
+
+    // Default: deferring. Opt-out: synchronous.
+    StateBackendSpec off;
+    off.uri = base + "&defer_reads=0";
+    off.subtask_idx = 1;
+    EXPECT_FALSE(f.build(off).backend->supports_async_get());
+
+    StateBackendSpec spec;
+    spec.uri = base;
+    spec.subtask_idx = 0;
+    auto built = f.build(spec);
+    ASSERT_TRUE(built.backend->supports_async_get());
+    auto forst = std::dynamic_pointer_cast<ForStStateBackend>(built.backend);
+    ASSERT_NE(forst, nullptr);
+
+    using KV = std::pair<std::int64_t, std::int64_t>;
+    const std::vector<KV> input = {{1, 10}, {2, 20}, {1, 30}, {2, 5}, {1, 7}};
+    std::vector<Record<KV>> records;
+    records.reserve(input.size());
+    for (const auto& x : input) {
+        records.emplace_back(x);
+    }
+    Dag dag;
+    auto src = std::make_shared<VectorSource<KV>>(std::move(records));
+    auto op = std::make_shared<KeyedAggregateOperator<std::int64_t, std::int64_t, std::int64_t>>(
+        [] { return std::int64_t{0}; },
+        [](const std::int64_t& acc, const std::int64_t& v) { return acc + v; },
+        int64_codec(),
+        int64_codec(),
+        "sum");
+    auto sink = std::make_shared<CollectingSink<KV>>();
+    auto h0 = dag.add_source<KV>(src);
+    auto h1 = dag.add_operator<KV, KV>(h0, op);
+    dag.add_sink<KV>(h1, sink);
+
+    JobConfig cfg;
+    cfg.state_backend = built.backend;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    // Per-key subsequences: cross-key emission order is completion order
+    // on a deferring backend (the per-key gate orders only same-key
+    // records).
+    const auto got = sink->collected();
+    auto per_key = [&](std::int64_t k) {
+        std::vector<std::int64_t> vals;
+        for (const auto& [key, v] : got) {
+            if (key == k) {
+                vals.push_back(v);
+            }
+        }
+        return vals;
+    };
+    ASSERT_EQ(got.size(), input.size());
+    EXPECT_EQ(per_key(1), (std::vector<std::int64_t>{10, 40, 47}));
+    EXPECT_EQ(per_key(2), (std::vector<std::int64_t>{20, 25}));
+    EXPECT_EQ(forst->deferred_reads(), input.size())
+        << "per-record state reads must ride the IO pool over the remote-SST engine";
 }
 
 // Live: changelog+s3+forst materialization payload goes to object storage
