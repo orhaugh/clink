@@ -35,7 +35,9 @@ fi
 # source build. fetch-deps.sh exits 3 for "no artifact / guard declined"
 # (fall back to source) and nonzero-else for hard failures such as a
 # checksum mismatch, which must NOT be papered over by a silent rebuild.
-if [ "${CLINK_DEPS_FROM_SOURCE:-0}" != "1" ]; then
+# The existence check matters: contexts that copy scripts selectively
+# (e.g. the Docker toolchain layer) may run this without fetch-deps.sh.
+if [ "${CLINK_DEPS_FROM_SOURCE:-0}" != "1" ] && [ -f "${HERE}/fetch-deps.sh" ]; then
     fetch_rc=0
     "${HERE}/fetch-deps.sh" || fetch_rc=$?
     if [ "${fetch_rc}" -eq 0 ]; then

@@ -17,8 +17,10 @@ ARG CLINK_BUILD_JOBS=""
 ENV CLINK_BUILD_JOBS=${CLINK_BUILD_JOBS}
 
 # Layer 1 (EXPENSIVE, rarely invalidated): base toolchain + from-source toolchain. Sources
-# versions.env and calls build-arrow.sh + build-iceberg-cpp.sh, so copy those alongside it.
-COPY scripts/versions.env scripts/build-arrow.sh scripts/build-iceberg-cpp.sh scripts/install-system-deps.sh /tmp/clink-sys/
+# versions.env and calls build-arrow.sh + build-iceberg-cpp.sh, so copy those alongside it
+# (fetch-deps.sh + deps-checksums.txt let build-arrow.sh restore the prebuilt archive
+# instead of compiling, once one is pinned for this platform).
+COPY scripts/versions.env scripts/build-arrow.sh scripts/build-iceberg-cpp.sh scripts/fetch-deps.sh scripts/deps-checksums.txt scripts/install-system-deps.sh /tmp/clink-sys/
 RUN chmod +x /tmp/clink-sys/*.sh && /tmp/clink-sys/install-system-deps.sh Debug && rm -rf /tmp/clink-sys
 
 # Layer 2 (CHEAP, volatile): optional connector client apt packages + the Pulsar .deb.

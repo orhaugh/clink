@@ -44,7 +44,8 @@ jobs:
             -DENABLE_TESTING=OFF \
             -DAUTORUN_UNIT_TESTS=OFF \
             -DCMAKE_INSTALL_PREFIX=/usr/local
-          cmake --build /tmp/aws-sdk-cpp/build --parallel "$(nproc)" --target install
+          cmake --build /tmp/aws-sdk-cpp/build --parallel "$(nproc)"
+          sudo cmake --install /tmp/aws-sdk-cpp/build
           sudo ldconfig
 
       - name: Build pinned toolchain

@@ -39,6 +39,17 @@ if [ -f "${ver_file}" ] && grep -q "\"${ARROW_VERSION}\"" "${ver_file}" 2>/dev/n
     exit 0
 fi
 
+# A pinned macOS deployment floor means the caller needs Arrow's objects
+# compiled at that minos (the portable-wheel build). Archives are compiled
+# at the packaging host's default floor and do not record it, so a fetched
+# archive could silently raise the wheel's runtime floor - refuse and let
+# the source build honour the floor.
+if [ -n "${MACOSX_DEPLOYMENT_TARGET:-}" ]; then
+    echo "fetch-deps: MACOSX_DEPLOYMENT_TARGET is set (${MACOSX_DEPLOYMENT_TARGET}); prebuilt"
+    echo "archives do not pin a minos floor - source build required."
+    exit 3
+fi
+
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 arch="$(uname -m)"
 [ "$arch" = "aarch64" ] && arch="arm64"
