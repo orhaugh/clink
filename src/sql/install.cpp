@@ -4240,7 +4240,32 @@ public:
           right_alias_(std::move(right_alias)),
           kind_(kind),
           left_columns_(std::move(left_columns)),
-          right_columns_(std::move(right_columns)) {}
+          right_columns_(std::move(right_columns)) {
+        // Precompute the joined row's output columns in FlatMap (sorted-key)
+        // order, so build_ assembles each output row in ONE sorted pass via
+        // from_entries instead of a binary-search-plus-memmove insert per
+        // column. The name set is static per operator. Semantics guard: the
+        // legacy per-column fill is last-wins on a duplicate output name
+        // (right overwrites left) while from_entries is first-wins, so a
+        // (planner-anomalous) duplicate disables the fast path.
+        for (const auto& c : left_columns_) {
+            sorted_out_cols_.push_back(
+                {left_alias_.empty() ? c : left_alias_ + "_" + c, /*from_left=*/true, &c});
+        }
+        for (const auto& c : right_columns_) {
+            sorted_out_cols_.push_back(
+                {right_alias_.empty() ? c : right_alias_ + "_" + c, /*from_left=*/false, &c});
+        }
+        std::stable_sort(sorted_out_cols_.begin(),
+                         sorted_out_cols_.end(),
+                         [](const auto& a, const auto& b) { return a.name < b.name; });
+        for (std::size_t i = 1; i < sorted_out_cols_.size(); ++i) {
+            if (sorted_out_cols_[i - 1].name == sorted_out_cols_[i].name) {
+                out_name_collision_ = true;
+                break;
+            }
+        }
+    }
 
     void process_element1(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (!element.is_data())
@@ -4339,6 +4364,25 @@ private:
     // they are not double-prefixed. A base-table side keeps its non-empty alias.
     Row build_(const Row* left, const Row* right) const {
         Row out;
+        if (!out_name_collision_) {
+            // Fast path: emit the pairs in the precomputed sorted order and
+            // bulk-adopt them - from_entries takes its one-pass sorted branch,
+            // so there is no per-column binary search or tail memmove.
+            std::vector<std::pair<std::string, clink::config::JsonValue>> entries;
+            entries.reserve(sorted_out_cols_.size());
+            for (const auto& oc : sorted_out_cols_) {
+                const Row* src = oc.from_left ? left : right;
+                clink::config::JsonValue v{nullptr};
+                if (src != nullptr) {
+                    auto it = src->values.find(*oc.src);
+                    if (it != src->values.end())
+                        v = it->second;
+                }
+                entries.emplace_back(oc.name, std::move(v));
+            }
+            out.values = clink::config::JsonObject::from_entries(std::move(entries));
+            return out;
+        }
         auto fill =
             [&](const std::vector<std::string>& cols, const std::string& alias, const Row* src) {
                 for (const auto& c : cols) {
@@ -4706,6 +4750,15 @@ private:
     clink::FlatMap<std::string, std::vector<Entry>, TransparentKeyHash, std::equal_to<>>
         right_state_;
     std::string key_scratch_;  // key_of_scratch_'s reused buffer
+
+    // build_'s precomputed output layout (see the constructor).
+    struct OutCol {
+        std::string name;        // final output column name (alias applied)
+        bool from_left;          // which side supplies the value
+        const std::string* src;  // source column name (points into *_columns_)
+    };
+    std::vector<OutCol> sorted_out_cols_;
+    bool out_name_collision_ = false;
 };
 
 // Inc 4: semi / anti join over Row - the runtime for IN / NOT IN and
