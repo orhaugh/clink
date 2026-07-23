@@ -1301,7 +1301,7 @@ TEST(SqlPhysical, LateDataOptionsThreadFromSourceTableIntoWindowOp) {
     EXPECT_EQ(src->params.count("late_records_to_dlq"), 0u);
 }
 
-TEST(SqlPhysical, MultiColumnKafkaSourceBridgesViaJsonStringToRow) {
+TEST(SqlPhysical, MultiColumnKafkaSourceBridgesViaColumnarJsonToRow) {
     Catalog cat;
     auto s = parse(
         "CREATE TABLE clicks (user_id BIGINT, ts BIGINT, url TEXT) "
@@ -1315,12 +1315,14 @@ TEST(SqlPhysical, MultiColumnKafkaSourceBridgesViaJsonStringToRow) {
     PhysicalPlanner pp;
     auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
 
-    // Source chain: kafka_source_string (string) -> json_string_to_row (row)
+    // Source chain: kafka_source_string (string) -> the columnar JSON bridge
+    // (row) - the default for a kafka json table since the columnar-decode
+    // default flip.
     const auto* src = find_op(spec, "kafka_source_string");
     ASSERT_NE(src, nullptr);
     EXPECT_EQ(src->out_channel, "string");
     EXPECT_EQ(src->params.at("topic"), "clicks");
-    const auto* bridge = find_op(spec, "json_string_to_row");
+    const auto* bridge = find_op(spec, "json_string_to_row_columnar");
     ASSERT_NE(bridge, nullptr);
     EXPECT_EQ(bridge->out_channel, "row");
     ASSERT_EQ(bridge->inputs.size(), 1u);
