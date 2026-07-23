@@ -11381,6 +11381,141 @@ TEST(SqlRuntime, ColumnarKafkaDecodeSurvivesKeyedShuffle) {
         std::filesystem::remove(p);
 }
 
+namespace {
+
+// Parity-oracle helper: compile `query` against a kafka JSON table with the
+// given WITH-tail (empty = the columnar-decode default, "columnar_decode=
+// 'false'" = the row bridge), swap the kafka source for a file_text_source
+// over `in_path`, fan the named op out to `par` subtasks when set, run it,
+// and return the output file's lines as a multiset (subtask interleaving
+// makes line order non-deterministic; content must not be).
+std::multiset<std::string> run_kafka_parity_case(const std::string& table_cols,
+                                                 const std::string& with_tail,
+                                                 const std::string& out_cols,
+                                                 const std::string& query,
+                                                 const std::filesystem::path& in_path,
+                                                 const std::filesystem::path& out_path,
+                                                 const std::string& fan_out_op = {},
+                                                 std::uint32_t par = 1) {
+    std::filesystem::remove(out_path);
+    Catalog cat;
+    auto ddl = parse("CREATE TABLE t (" + table_cols +
+                     ") "
+                     "WITH (connector='kafka', format='json', brokers='localhost:9092', "
+                     "topic='t', group_id='g', auto_offset_reset='earliest'" +
+                     (with_tail.empty() ? "" : ", " + with_tail) +
+                     ");"
+                     "CREATE TABLE out_t (" +
+                     out_cols +
+                     ") WITH (connector='file', format='json', "
+                     "path='" +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat, query.c_str());
+    for (auto& op : spec.ops) {
+        if (op.type == "kafka_source_string") {
+            op.type = "file_text_source";
+            op.params.clear();
+            op.params["path"] = in_path.string();
+        }
+        if (!fan_out_op.empty() && op.type == fan_out_op) {
+            op.parallelism = par;
+        }
+    }
+    {
+        InProcessCluster cluster("worker-parity", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        EXPECT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+    std::multiset<std::string> got;
+    for (const auto& l : read_lines(out_path)) {
+        got.insert(l);
+    }
+    std::filesystem::remove(out_path);
+    return got;
+}
+
+}  // namespace
+
+// The columnar-decode PARITY ORACLE: the same query over the same input must
+// produce identical output with the columnar bridge (the default) and the
+// row bridge (columnar_decode='false'). The input deliberately mixes
+// faithful lines, unfaithful lines (extra field -> per-batch row fallback,
+// so the columnar run itself interleaves BOTH carriers through the same
+// keyed shuffle), JSON nulls, and every columnar-capable type (BIGINT, INT,
+// DOUBLE, BOOLEAN, VARCHAR). Two shapes: a q0-style filter+projection and a
+// q12-style windowed GROUP BY at parallelism 2.
+TEST(SqlRuntime, ColumnarDecodeParityOracle) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_oracle_in.ndjson";
+    const auto out_path = tmp / "clink_sql_oracle_out.ndjson";
+    std::filesystem::remove(in_path);
+
+    // 5 columns x mixed shapes. Lines 4 and 8 are unfaithful (extra field /
+    // string in an int column) so the columnar run's batches fall back
+    // per-batch; line 5 carries an explicit null.
+    write_lines(in_path,
+                {
+                    R"({"k":1,"n":10,"d":1.5,"f":true,"s":"a","ts":1000})",
+                    R"({"k":2,"n":20,"d":2.5,"f":false,"s":"b","ts":2000})",
+                    R"({"k":1,"n":30,"d":3.5,"f":true,"s":"c","ts":3000})",
+                    R"({"k":3,"n":40,"d":4.5,"f":true,"s":"d","ts":4000,"extra":1})",
+                    R"({"k":2,"n":null,"d":5.5,"f":false,"s":"e","ts":5000})",
+                    R"({"k":1,"n":60,"d":6.5,"f":true,"s":"f","ts":11000})",
+                    R"({"k":3,"n":70,"d":7.5,"f":false,"s":"g","ts":12000})",
+                    R"({"k":2,"n":"oops","d":8.5,"f":true,"s":"h","ts":13000})",
+                    R"({"k":1,"n":90,"d":9.5,"f":true,"s":"i","ts":14000})",
+                });
+
+    const std::string cols = "k BIGINT, n INT, d DOUBLE, f BOOLEAN, s VARCHAR, ts BIGINT";
+
+    // Shape 1: q0-style filter + projection.
+    {
+        const std::string q = "INSERT INTO out_t SELECT k, d, s FROM t WHERE k <= 2";
+        auto columnar =
+            run_kafka_parity_case(cols, "", "k BIGINT, d DOUBLE, s VARCHAR", q, in_path, out_path);
+        auto row_form = run_kafka_parity_case(
+            cols, "columnar_decode='false'", "k BIGINT, d DOUBLE, s VARCHAR", q, in_path, out_path);
+        EXPECT_EQ(columnar, row_form) << "filter/projection parity broken";
+        EXPECT_FALSE(columnar.empty());
+    }
+
+    // Shape 2: q12-style windowed GROUP BY at parallelism 2 (event_time via
+    // the ts column), mixed carriers crossing the keyed shuffle.
+    {
+        const std::string q =
+            "INSERT INTO out_t SELECT k, COUNT(*) AS cnt FROM t "
+            "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k";
+        auto columnar = run_kafka_parity_case(cols,
+                                              "event_time_column='ts'",
+                                              "k BIGINT, cnt BIGINT",
+                                              q,
+                                              in_path,
+                                              out_path,
+                                              "tumbling_window_row",
+                                              2);
+        auto row_form = run_kafka_parity_case(cols,
+                                              "event_time_column='ts', columnar_decode='false'",
+                                              "k BIGINT, cnt BIGINT",
+                                              q,
+                                              in_path,
+                                              out_path,
+                                              "tumbling_window_row",
+                                              2);
+        EXPECT_EQ(columnar, row_form) << "windowed GROUP BY parity broken";
+        EXPECT_FALSE(columnar.empty());
+    }
+
+    std::filesystem::remove(in_path);
+}
+
 // WS6 increment 5: windowed MAX/MIN over a numeric columnar source vectorises.
 // Window aggregates are non-retractable (only GROUP BY marks MIN/MAX retractable),
 // so MAX(price)/MIN(price) per window now fold column-at-a-time (no per-record Row)
