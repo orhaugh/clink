@@ -20,6 +20,11 @@ jobs:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+    env:
+      # iceberg-cpp uses std::ranges::to, which needs GCC 14's libstdc++;
+      # ubuntu-24.04 runners default to GCC 13.
+      CC: gcc-14
+      CXX: g++-14
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +32,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake git curl ca-certificates \
+            build-essential gcc-14 g++-14 cmake git curl ca-certificates \
             libssl-dev libcurl4-openssl-dev zlib1g-dev libxml2-dev
 
       # Arrow's S3 support links the SYSTEM aws-sdk-cpp (Arrow 24's bundled
