@@ -1,0 +1,6 @@
+# sha256 pins for the prebuilt toolchain archives fetch-deps.sh will accept.
+# The `deps` GitHub release hosts the bytes; this file decides what is
+# trusted. Regenerate a line with scripts/package-deps.sh after a version
+# bump in scripts/versions.env (the <key> in the name changes with the pins).
+# Format: <sha256><two spaces><artifact name>
+5fddda28c9e471e71379f9160e9a32922ad641edbb8026f619299ac23003c7ed  clink-deps-7a9e41926fce-darwin-arm64.tar.gz

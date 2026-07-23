@@ -29,6 +29,24 @@ if [ -f "${ver_file}" ] && grep -q "\"${ARROW_VERSION}\"" "${ver_file}" 2>/dev/n
     exit 0
 fi
 
+# Fast path: restore a prebuilt toolchain artifact (Arrow + Parquet +
+# iceberg-cpp in one archive) instead of the source build, when one exists
+# for this platform and pin. Set CLINK_DEPS_FROM_SOURCE=1 to force the
+# source build. fetch-deps.sh exits 3 for "no artifact / guard declined"
+# (fall back to source) and nonzero-else for hard failures such as a
+# checksum mismatch, which must NOT be papered over by a silent rebuild.
+if [ "${CLINK_DEPS_FROM_SOURCE:-0}" != "1" ]; then
+    fetch_rc=0
+    "${HERE}/fetch-deps.sh" || fetch_rc=$?
+    if [ "${fetch_rc}" -eq 0 ]; then
+        exit 0
+    elif [ "${fetch_rc}" -ne 3 ]; then
+        echo "build-arrow: fetch-deps.sh failed hard (exit ${fetch_rc}); aborting." >&2
+        exit "${fetch_rc}"
+    fi
+    echo "build-arrow: no usable prebuilt; building from source."
+fi
+
 # Parallelism: cap the host (12-core MacBook) at 10 per project convention; use all
 # cores in CI/Docker. Override with CLINK_BUILD_JOBS.
 if [ -n "${CLINK_BUILD_JOBS:-}" ]; then

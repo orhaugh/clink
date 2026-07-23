@@ -54,16 +54,26 @@ the source it cites. Keep these pages current when a subsystem changes.
 
 ## Pinned toolchain (one-time bootstrap)
 
-Arrow, Parquet, and iceberg-cpp are compiled from source at the exact versions in
-`scripts/versions.env`, into `CLINK_DEPS_PREFIX` (host default `~/.clink-deps`),
-so the host and the Debian image link byte-for-byte identical libraries. CMake
-auto-prepends that prefix and asserts the Arrow version, so any `cmake` invocation
-finds it once it exists. Bootstrap it once on a fresh checkout. This is slow,
-since it builds Arrow from source, but idempotent afterwards:
+Arrow, Parquet, and iceberg-cpp are pinned at the exact versions in
+`scripts/versions.env` and installed into `CLINK_DEPS_PREFIX` (host default
+`~/.clink-deps`), so the host and the Debian image link byte-for-byte identical
+libraries. CMake auto-prepends that prefix and asserts the Arrow version, so any
+`cmake` invocation finds it once it exists. Bootstrap it once on a fresh checkout;
+idempotent afterwards:
 
 ```bash
 scripts/build-arrow.sh && scripts/build-iceberg-cpp.sh   # -> ~/.clink-deps
 ```
+
+`build-arrow.sh` first tries `scripts/fetch-deps.sh`, which restores a prebuilt
+archive from the repo's `deps` GitHub release (about a minute) when one exists
+for the platform and pin; otherwise it compiles from source (slow). Archives are
+verified against the sha256 pins in `scripts/deps-checksums.txt`, and on macOS
+refused unless the linked Homebrew `aws-sdk-cpp` keg matches the one the archive
+was compiled against (the ABI-drift SIGBUS gotcha). `CLINK_DEPS_FROM_SOURCE=1`
+forces the source build. After bumping `scripts/versions.env`: rebuild + repackage
+(`scripts/package-deps.sh` on macOS, the `deps-artifacts` workflow for Linux),
+upload to the `deps` release, and update `scripts/deps-checksums.txt`.
 
 `./build_and_test.sh` does this automatically. In Docker it is baked into the
 image at `/usr/local` (`scripts/setup-build-env.sh`). To change a version, bump it

@@ -88,17 +88,22 @@ Status section below.
 
 ## Quick start
 
-Everything builds from source today (prebuilt images and wheels are
-planned). The one-time bootstrap compiles a pinned Apache Arrow into
-`~/.clink-deps` (20-40 minutes, cached across builds); the clink build
-itself is quick.
+clink builds from source, against a pinned Apache Arrow toolchain in
+`~/.clink-deps`. The bootstrap step downloads a prebuilt, checksum-pinned
+archive of that toolchain when one exists for your platform (macOS arm64
+and Linux x86_64/arm64; about a minute), and compiles it from source
+otherwise (20-40 minutes, cached across builds either way). The clink
+build itself is quick.
 
 ```bash
 git clone https://github.com/orhaugh/clink && cd clink
-scripts/build-arrow.sh && scripts/build-iceberg-cpp.sh   # one-time (slow, cached)
+scripts/build-arrow.sh && scripts/build-iceberg-cpp.sh   # one-time (prebuilt fetch or source build; cached)
 cmake -S . -B build -DCLINK_BUILD_SQL=ON
 cmake --build build --parallel 10
 ```
+
+Set `CLINK_DEPS_FROM_SOURCE=1` to skip the prebuilt archive and always
+compile the toolchain yourself.
 
 Run a first pipeline - one process, no daemons to set up:
 
@@ -249,9 +254,10 @@ per-impl test exes.
 
 Required deps on the host: a C++23 compiler (Clang 17+ / GCC 13+), CMake
 3.24+, and Apache Arrow + Parquet at the pinned version - run
-`scripts/build-arrow.sh` once to build it into `~/.clink-deps`, where every
-configure finds it automatically. GoogleTest is pulled in via `FetchContent`
-so you don't have to install it.
+`scripts/build-arrow.sh` once to install it into `~/.clink-deps` (prebuilt
+archive when available, source build otherwise), where every configure
+finds it automatically. GoogleTest is pulled in via `FetchContent` so you
+don't have to install it.
 
 ### Reproducible build + sanitizer matrix
 

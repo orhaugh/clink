@@ -1,0 +1,72 @@
+# Builds the prebuilt pinned-toolchain archives (Arrow + Parquet + iceberg-cpp,
+# see scripts/package-deps.sh) for Linux and uploads them to the repo's `deps`
+# prerelease. Run manually after bumping scripts/versions.env, then copy the
+# printed checksum lines into scripts/deps-checksums.txt and commit. The macOS
+# arm64 artifact is packaged on a dev machine (hosted macOS runners don't match
+# the Homebrew aws-sdk-cpp keg the archive must pin).
+name: deps-artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # upload assets to the `deps` release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git curl ca-certificates \
+            libssl-dev libcurl4-openssl-dev zlib1g-dev libxml2-dev
+
+      # Arrow's S3 support links the SYSTEM aws-sdk-cpp (Arrow 24's bundled
+      # CRT does not build - see scripts/build-arrow.sh). Same recipe as
+      # scripts/install-system-deps.sh and the Docker images.
+      - name: System aws-sdk-cpp (pinned)
+        run: |
+          . scripts/versions.env
+          git clone --depth 1 --branch "${AWS_SDK_CPP_TAG}" --recursive \
+            https://github.com/aws/aws-sdk-cpp /tmp/aws-sdk-cpp
+          cmake -S /tmp/aws-sdk-cpp -B /tmp/aws-sdk-cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_ONLY="config;s3;transfer;identity-management;sts;kinesis;firehose;dynamodb" \
+            -DENABLE_TESTING=OFF \
+            -DAUTORUN_UNIT_TESTS=OFF \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build /tmp/aws-sdk-cpp/build --parallel "$(nproc)" --target install
+          sudo ldconfig
+
+      - name: Build pinned toolchain
+        run: |
+          export CLINK_DEPS_PREFIX=/opt/clink-deps
+          sudo mkdir -p "${CLINK_DEPS_PREFIX}"
+          sudo chown "$(id -u):$(id -g)" "${CLINK_DEPS_PREFIX}"
+          CLINK_DEPS_FROM_SOURCE=1 scripts/build-arrow.sh
+          scripts/build-iceberg-cpp.sh
+
+      - name: Package
+        id: package
+        run: |
+          export CLINK_DEPS_PREFIX=/opt/clink-deps
+          scripts/package-deps.sh /tmp/deps-out | tee /tmp/package.log
+          name="$(basename /tmp/deps-out/clink-deps-*.tar.gz)"
+          echo "artifact=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to the deps release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload deps "/tmp/deps-out/${{ steps.package.outputs.artifact }}" --clobber
+          echo "Checksum line for scripts/deps-checksums.txt:"
+          tail -n1 /tmp/package.log
