@@ -4,16 +4,41 @@
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 [![changelog](https://img.shields.io/badge/changelog-v0.1.0-lightgrey.svg)](CHANGELOG.md)
 
-`clink` is a semantics-first, Arrow-native, stateful stream
-processing engine in modern C++ (C++23).
+`clink` is an embedded-first, Arrow-native stream processing engine in
+modern C++ (C++23): stateful stream processing with engine-grade
+semantics - SQL, event time, keyed state, exactly-once checkpoints -
+that you run like a tool rather than operate like a platform.
 
-Most native stream engines fall into one of two camps: small projects that
-skip the hard correctness work (no event time, no checkpoints, no keyed
-state), or production systems tied so closely to a particular runtime
-(Seastar, gRPC, Arrow Flight) that they are hard to evolve. clink is built
-from the primitives that matter - typed operator DAGs, in-band watermarks,
-in-band checkpoint barriers, keyed state, bounded backpressure - without
-binding them to a particular runtime, executor, or wire format.
+The whole engine lives in one library, and the same pipeline runs two
+ways. In-process: `clink run pipeline.sql` executes it in a single
+process with no daemons and prints its first result about 155 ms after
+process start; `libclink` embeds the engine in any service behind a
+pure-C ABI with results as Arrow C streams; `pyclink` returns them as
+pyarrow tables in a notebook. At scale: the same SQL file, unchanged,
+submits to a distributed Coordinator/Worker cluster with parallelism,
+failover, and rescale. Streaming has long made you choose between a
+library that skips the hard correctness work (no event time, no
+checkpoints, no keyed state) and a cluster platform you must stand up
+and operate before the first result; clink is built so one engine -
+typed operator DAGs, in-band watermarks and checkpoint barriers, keyed
+state, bounded backpressure - serves both ends, without binding to a
+particular runtime, executor, or wire format.
+
+Three capabilities follow from that design:
+
+- **State is an open dataset.** Snapshots are documented Arrow IPC:
+  checkpoints and savepoints open directly in pyarrow, DuckDB or Polars,
+  export to Parquet and Iceberg, and a running job's live state serves
+  point lookups and Arrow scans over plain HTTP, no sink round-trip.
+  See [State as data](#state-as-data).
+- **Incidents replay deterministically.** A flight recorder captures
+  what each operator consumed per checkpoint epoch; `clink replay`
+  re-executes an operator over exactly those records, offline and
+  byte-identically, and can freeze the incident into a permanent
+  regression test. See [Time-travel debugging](#time-travel-debugging).
+- **Nothing to manage under it.** A single static binary with no managed
+  runtime: cold start in milliseconds, one artefact to ship, and the
+  same behaviour embedded, in CI, and on a cluster.
 
 clink is heavily inspired by Apache Flink. Flink's model of typed operator
 DAGs, event-time processing, in-band watermarks and checkpoint barriers, keyed
@@ -94,14 +119,16 @@ printf '{"usr":"alice","amount":12}\n{"usr":"bob","amount":7}\n{"usr":"alice","a
 Totals stream as they update; the last row per key is the current
 aggregate. From here:
 
+- the same engine embedded in Python, results as Arrow:
+  [python/README.md](python/README.md);
+- the same engine behind a pure-C ABI, embeddable from any language:
+  [libclink](#libclink-embed-from-any-language-pure-c-abi);
+- the full C++ API: [Code examples](#code-examples) below and the
+  compileable [`docs/consumer-examples/`](docs/consumer-examples/);
 - a local distributed cluster with the dashboard:
   `docker build -t clink-build:latest -f docker/Dockerfile .` then
   `docker compose up --build`, and open <http://localhost:8081>
-  (see [docker-compose.yml](docker-compose.yml));
-- the same engine embedded in Python, results as Arrow:
-  [python/README.md](python/README.md);
-- the full C++ API: [Code examples](#code-examples) below and the
-  compileable [`docs/consumer-examples/`](docs/consumer-examples/).
+  (see [docker-compose.yml](docker-compose.yml)).
 
 Supported platforms: macOS (Apple Silicon is the primary development
 platform) and Linux (Debian-family, exercised in CI). Windows is not
