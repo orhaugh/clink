@@ -4,3 +4,5 @@
 # bump in scripts/versions.env (the <key> in the name changes with the pins).
 # Format: <sha256><two spaces><artifact name>
 5fddda28c9e471e71379f9160e9a32922ad641edbb8026f619299ac23003c7ed  clink-deps-7a9e41926fce-darwin-arm64.tar.gz
+7db47e198e37587fdd273aa0f35562bb91144234d1aec1eb7c34e28a2e845e1a  clink-deps-7a9e41926fce-linux-arm64.tar.gz
+fc1e90ca16eacf81d6ec98a117e6ca3a32505c30467e5807f7cb3cd4a2896c24  clink-deps-7a9e41926fce-linux-x86_64.tar.gz
