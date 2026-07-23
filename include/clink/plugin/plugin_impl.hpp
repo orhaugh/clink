@@ -851,6 +851,23 @@ void PluginRegistry::register_key_extractor(const std::string& name,
 }
 
 template <typename T>
+void PluginRegistry::register_columnar_key_extractor(
+    const std::string& name,
+    std::function<std::optional<std::vector<std::int64_t>>(const Batch<T>&)> fn) {
+    const auto channel = type_registry_.channel_for_typeid(typeid(T).name());
+    if (channel.empty()) {
+        throw std::runtime_error(
+            "register_columnar_key_extractor<T>: T not registered (call register_type<T> first)");
+    }
+    key_extractor_registry_.register_columnar_extractor<T>(channel, name, fn);
+    // Same RTLD_LOCAL mirror as register_key_extractor above.
+    auto& so_ker = clink::cluster::KeyExtractorRegistry::default_instance();
+    if (&so_ker != &key_extractor_registry_) {
+        so_ker.register_columnar_extractor<T>(channel, name, std::move(fn));
+    }
+}
+
+template <typename T>
 void PluginRegistry::register_selector(const std::string& name, std::function<int(const T&)> fn) {
     auto& so_sr = clink::cluster::SelectorRegistry::default_instance();
     if constexpr (std::is_same_v<T, std::int64_t>) {

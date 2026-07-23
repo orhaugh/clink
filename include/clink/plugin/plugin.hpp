@@ -259,6 +259,19 @@ public:
     template <typename T>
     void register_key_extractor(const std::string& name, std::function<std::int64_t(const T&)> fn);
 
+    // Columnar companion to register_key_extractor: per-batch extraction of
+    // the SAME int64 partition keys straight from the batch's Arrow sidecar
+    // (no row materialisation), so a keyed shuffle can split a columnar
+    // batch without decoding it. Register it under the same name as the row
+    // extractor; return nullopt for a batch that cannot be keyed columnar
+    // (the shuffle then routes via the row extractor). Strict contract:
+    // fn(batch)[i] must equal the row extractor applied to record i - both
+    // carriers must agree on key -> subtask ownership.
+    template <typename T>
+    void register_columnar_key_extractor(
+        const std::string& name,
+        std::function<std::optional<std::vector<std::int64_t>>(const Batch<T>&)> fn);
+
     // Sugar around `register_operator<In, Out>` for a `KeyedProcessFunction
     // <K, In, Out>`: wraps the user's factory in a closure that builds a
     // `KeyedProcessFunctionAdapter<K, In, Out>` with the supplied per-record

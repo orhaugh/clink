@@ -16,6 +16,7 @@
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/type_registry.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/runtime/columnar_split.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/key_groups.hpp"
 #include "clink/runtime/local_executor.hpp"
@@ -216,7 +217,23 @@ void attach_typed_group_output(Dag& dag,
             const auto group_id = key_group_for_key(k_bytes);
             return static_cast<int>(subtask_for_key_group(group_id, static_cast<std::uint32_t>(n)));
         };
-        auto branches = dag.template add_split<T>(handle, std::move(selector), n, "hash");
+        // Columnar keyed split: when the channel registered a columnar key
+        // extractor (e.g. the SQL Row channel reads the __key sidecar
+        // column), the split partitions the Arrow sidecar per peer without
+        // materialising rows - the shuffle stays columnar end to end.
+        // Routing is byte-identical to `selector` (same key_group maths on
+        // the same int64 keys); absent extractor or a nullopt batch falls
+        // back to the row split.
+        std::function<std::optional<std::vector<Batch<T>>>(const Batch<T>&)> columnar_split;
+#ifdef CLINK_HAS_ARROW
+        if (auto columnar_keys = KeyExtractorRegistry::default_instance().find_columnar<T>(
+                type_ops.channel_name, group.key_extractor_fn);
+            columnar_keys) {
+            columnar_split = make_keyed_columnar_split<T>(std::move(columnar_keys), n);
+        }
+#endif
+        auto branches = dag.template add_split<T>(
+            handle, std::move(selector), n, "hash", std::move(columnar_split));
         for (std::size_t i = 0; i < n; ++i) {
             dag.template add_sink<T>(branches[i], make_sink(group.peers[i]));
         }

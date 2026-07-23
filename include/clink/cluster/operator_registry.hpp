@@ -11,6 +11,13 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
+
+namespace clink {
+template <typename T>
+class Batch;  // core/record.hpp; forward-declared so the columnar key
+              // extractor signatures below need no core include
+}
 
 namespace clink::cluster {
 
@@ -236,11 +243,52 @@ public:
         return parent_ != nullptr && parent_->has(channel_name, name);
     }
 
+    // Columnar companion to register_extractor: per-BATCH extraction of the
+    // same int64 partition keys straight from the batch's Arrow sidecar,
+    // with NO row materialisation. The contract is strict routing parity:
+    // for every row i, fn(batch)[i] must equal the row extractor applied to
+    // the materialised record i, because a stream can mix columnar and
+    // row-form batches (per-batch decode fallback) and both carriers must
+    // agree on key -> subtask ownership. Return nullopt when the batch
+    // cannot be keyed columnar (no sidecar / key column absent); the caller
+    // then routes via the row extractor.
+    template <typename T>
+    void register_columnar_extractor(
+        std::string channel_name,
+        std::string name,
+        std::function<std::optional<std::vector<std::int64_t>>(const Batch<T>&)> fn) {
+        auto typed = std::make_shared<
+            std::function<std::optional<std::vector<std::int64_t>>(const Batch<T>&)>>(
+            std::move(fn));
+        std::lock_guard lock(mu_);
+        columnar_extractors_[std::make_pair(std::move(channel_name), std::move(name))] =
+            std::static_pointer_cast<void>(typed);
+    }
+
+    template <typename T>
+    std::function<std::optional<std::vector<std::int64_t>>(const Batch<T>&)> find_columnar(
+        const std::string& channel_name, const std::string& name) const {
+        {
+            std::lock_guard lock(mu_);
+            auto it = columnar_extractors_.find(std::make_pair(channel_name, name));
+            if (it != columnar_extractors_.end()) {
+                auto typed = std::static_pointer_cast<
+                    std::function<std::optional<std::vector<std::int64_t>>(const Batch<T>&)>>(
+                    it->second);
+                return *typed;
+            }
+        }
+        return parent_ != nullptr
+                   ? parent_->template find_columnar<T>(channel_name, name)
+                   : std::function<std::optional<std::vector<std::int64_t>>(const Batch<T>&)>{};
+    }
+
     static KeyExtractorRegistry& default_instance();
 
 private:
     mutable std::mutex mu_;
     std::map<std::pair<std::string, std::string>, std::shared_ptr<void>> extractors_;
+    std::map<std::pair<std::string, std::string>, std::shared_ptr<void>> columnar_extractors_;
     const KeyExtractorRegistry* parent_{nullptr};
 };
 

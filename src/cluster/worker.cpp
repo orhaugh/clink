@@ -202,7 +202,21 @@ void attach_group_output(Dag& dag,
             const auto group_id = key_group_for_key(k_bytes);
             return static_cast<int>(subtask_for_key_group(group_id, static_cast<std::uint32_t>(n)));
         };
-        auto branches = dag.template add_split<T>(handle, std::move(selector), n, "hash");
+        // Columnar keyed split when the channel registered a columnar key
+        // extractor - mirrors attach_typed_group_output (runner_helpers.hpp):
+        // identical routing, sidecar kept, row fallback otherwise.
+        std::function<std::optional<std::vector<Batch<T>>>(const Batch<T>&)> columnar_split;
+#ifdef CLINK_HAS_ARROW
+        if (auto columnar_keys = KeyExtractorRegistry::default_instance().find_columnar<T>(
+                std::is_same_v<T, std::int64_t> ? std::string{clink::cluster::kChannelInt64}
+                                                : std::string{clink::cluster::kChannelString},
+                group.key_extractor_fn);
+            columnar_keys) {
+            columnar_split = make_keyed_columnar_split<T>(std::move(columnar_keys), n);
+        }
+#endif
+        auto branches = dag.template add_split<T>(
+            handle, std::move(selector), n, "hash", std::move(columnar_split));
         for (std::size_t i = 0; i < n; ++i) {
             auto bridge = std::make_shared<network::NetworkBridgeSink<T>>(
                 group.peers[i].host, group.peers[i].data_port, codec, batcher);

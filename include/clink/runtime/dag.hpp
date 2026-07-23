@@ -1248,11 +1248,21 @@ public:
     //
     // Models Beam's TupleTag side-output pattern: branch 0 is conventionally
     // the "main" output, branches 1+ are conventionally side outputs.
+    // The optional columnar_split hook keeps a columnar batch columnar
+    // across the split: when set and the incoming data batch carries an
+    // Arrow sidecar, it returns one per-branch sub-batch (sidecar sliced,
+    // rows never materialised) or nullopt to fall back to the per-record
+    // row split. The hook's routing MUST be byte-identical to `selector`
+    // (same record -> same branch), since a stream can interleave columnar
+    // and row-form batches; make_keyed_columnar_split (columnar_split.hpp)
+    // builds a conforming hook for keyed edges.
     template <typename T>
-    std::vector<StageHandle<T>> add_split(StageHandle<T> upstream,
-                                          std::function<int(const T&)> selector,
-                                          std::size_t branch_count,
-                                          std::string name = "split") {
+    std::vector<StageHandle<T>> add_split(
+        StageHandle<T> upstream,
+        std::function<int(const T&)> selector,
+        std::size_t branch_count,
+        std::string name = "split",
+        std::function<std::optional<std::vector<Batch<T>>>(const Batch<T>&)> columnar_split = {}) {
         if (branch_count == 0) {
             throw std::invalid_argument("add_split: branch_count must be > 0");
         }
@@ -1270,7 +1280,11 @@ public:
         detail::OperatorRunner runner;
         runner.name = std::move(name);
         runner.id = id;
-        runner.run = [in_channel, outs, selector = std::move(selector), branch_count](
+        runner.run = [in_channel,
+                      outs,
+                      selector = std::move(selector),
+                      branch_count,
+                      columnar_split = std::move(columnar_split)](
                          RuntimeContext& /*ctx*/, const std::function<bool()>& should_stop) {
             while (!should_stop()) {
                 auto maybe = in_channel->pop();
@@ -1279,6 +1293,20 @@ public:
                 }
                 auto& elem = *maybe;
                 if (elem.is_data()) {
+                    // Columnar fast path: split the Arrow sidecar per branch
+                    // without materialising rows. nullopt falls through to
+                    // the row split, decided before any push (no double
+                    // emit).
+                    if (columnar_split && elem.as_data().is_columnar()) {
+                        if (auto subs = columnar_split(elem.as_data()); subs.has_value()) {
+                            for (std::size_t b = 0; b < branch_count && b < subs->size(); ++b) {
+                                if ((*subs)[b].size() > 0) {
+                                    outs[b]->push(StreamElement<T>::data(std::move((*subs)[b])));
+                                }
+                            }
+                            continue;
+                        }
+                    }
                     // Route each record in the batch independently. Records
                     // destined for the same branch are gathered into a per-
                     // branch batch so we don't fragment downstream batches

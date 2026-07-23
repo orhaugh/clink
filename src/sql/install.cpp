@@ -7502,6 +7502,36 @@ void install(clink::plugin::PluginRegistry& reg) {
         return hash_json_value(it->second);
     });
 
+    // Columnar companion: read the same int64 partition keys straight from
+    // the sidecar's __key column (appended by row_compute_key's columnar
+    // path), so the keyed shuffle can split a columnar batch without
+    // materialising rows. Routing parity with the row extractor above is
+    // exact: __key is the int64 FNV hash itself, so the row path's
+    // is_number() branch returns the identical value; a NULL cell mirrors
+    // the row path's missing-field 0. nullopt (no sidecar / no __key /
+    // unexpected column type) falls back to the row extractor.
+    reg.register_columnar_key_extractor<Row>(
+        "row_key", [](const Batch<Row>& b) -> std::optional<std::vector<std::int64_t>> {
+            const auto& rb = b.arrow();
+            if (!rb) {
+                return std::nullopt;
+            }
+            const int ki = rb->schema()->GetFieldIndex(kRowKeyField);
+            if (ki < 0) {
+                return std::nullopt;
+            }
+            const auto* karr = dynamic_cast<const arrow::Int64Array*>(rb->column(ki).get());
+            if (karr == nullptr) {
+                return std::nullopt;
+            }
+            std::vector<std::int64_t> keys;
+            keys.reserve(static_cast<std::size_t>(rb->num_rows()));
+            for (std::int64_t i = 0; i < rb->num_rows(); ++i) {
+                keys.push_back(karr->IsNull(i) ? 0 : karr->Value(i));
+            }
+            return keys;
+        });
+
     // ---- Sources ----
 
     // queryable_state_row_source: state-as-table (see QueryableStateSource).

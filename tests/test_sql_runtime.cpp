@@ -11277,6 +11277,110 @@ TEST(SqlRuntime, ColumnarKafkaDecodeFiresOnProductionPath) {
         std::filesystem::remove(p);
 }
 
+// The columnar Kafka decode SURVIVES THE KEYED SHUFFLE. Same planner-emitted
+// q12-shaped chain as ColumnarKafkaDecodeFiresOnProductionPath, but the
+// tumbling window aggregate runs at parallelism 2, so the plan gains a real
+// hash-partitioned edge (row_compute_key par 1 -> window par 2) and a merge
+// edge (window par 2 -> sink par 1). The columnar contract must hold across
+// both: the partitioner splits the Arrow sidecar per target subtask without
+// materialising rows (batch_materialize_counter frozen), each window subtask
+// folds its slice column-at-a-time, and the merged windowed counts are exactly
+// the row path's. Guards the gated nexmark premise (q12 runs at parallelism
+// 4): a partitioner or shuffle-ingest that silently rowified would cap the
+// columnar win at the first shuffle hop.
+TEST(SqlRuntime, ColumnarKafkaDecodeSurvivesKeyedShuffle) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_cks_in.ndjson";
+    const auto out_path = tmp / "clink_sql_cks_out.ndjson";
+    for (const auto& p : {in_path, out_path})
+        std::filesystem::remove(p);
+
+    // Four bidders across two 10s windows so BOTH window subtasks receive
+    // work whichever way the key hash splits them.
+    // [0,10000): b1 x2, b2 x1, b3 x1, b4 x3 ; [10000,20000): b1 x1, b3 x2.
+    write_lines(in_path,
+                {
+                    R"({"bidder":1,"datetime":1000})",
+                    R"({"bidder":1,"datetime":2000})",
+                    R"({"bidder":2,"datetime":3000})",
+                    R"({"bidder":3,"datetime":4000})",
+                    R"({"bidder":4,"datetime":5000})",
+                    R"({"bidder":4,"datetime":6000})",
+                    R"({"bidder":4,"datetime":7000})",
+                    R"({"bidder":1,"datetime":11000})",
+                    R"({"bidder":3,"datetime":12000})",
+                    R"({"bidder":3,"datetime":13000})",
+                });
+
+    Catalog cat;
+    auto ddl = parse(
+        "CREATE TABLE bid (bidder BIGINT, datetime BIGINT) "
+        "WITH (connector='kafka', format='json', brokers='localhost:9092', topic='nx-bid', "
+        "group_id='g', auto_offset_reset='earliest', event_time_column='datetime', "
+        "columnar_decode='true');"
+        "CREATE TABLE out_q (bidder BIGINT, cnt BIGINT) WITH (connector='file', format='json', "
+        "path='" +
+        out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO out_q SELECT bidder, COUNT(*) AS cnt FROM bid "
+                        "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), bidder");
+
+    // Swap the kafka source for a file_text_source (same string channel, same
+    // columnar bridge) and fan ONLY the window aggregate out to 2 subtasks -
+    // everything upstream stays at 1 so the single file is read once and the
+    // hash shuffle into the window op is a genuine 1 -> 2 edge.
+    bool swapped = false;
+    bool fanned = false;
+    for (auto& op : spec.ops) {
+        if (op.type == "kafka_source_string") {
+            op.type = "file_text_source";
+            op.params.clear();
+            op.params["path"] = in_path.string();
+            swapped = true;
+        }
+        if (op.type == "tumbling_window_row") {
+            op.parallelism = 2;
+            fanned = true;
+        }
+    }
+    ASSERT_TRUE(swapped) << "no kafka_source_string op to swap";
+    ASSERT_TRUE(fanned) << "no tumbling_window_row op to fan out";
+
+    const std::uint64_t mat_before =
+        clink::detail::batch_materialize_counter().load(std::memory_order_relaxed);
+    {
+        InProcessCluster cluster("worker-cks", 8);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 15s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    // The shuffle did not rowify: zero lazy sidecar decodes anywhere in the
+    // fanned-out chain.
+    EXPECT_EQ(clink::detail::batch_materialize_counter().load(std::memory_order_relaxed),
+              mat_before);
+
+    std::multiset<std::pair<std::int64_t, std::int64_t>> got;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        got.emplace(static_cast<std::int64_t>(js.at("bidder").as_number()),
+                    static_cast<std::int64_t>(js.at("cnt").as_number()));
+    }
+    const std::multiset<std::pair<std::int64_t, std::int64_t>> want{
+        {1, 2}, {2, 1}, {3, 1}, {4, 3}, {1, 1}, {3, 2}};
+    EXPECT_EQ(got, want);
+
+    for (const auto& p : {in_path, out_path})
+        std::filesystem::remove(p);
+}
+
 // WS6 increment 5: windowed MAX/MIN over a numeric columnar source vectorises.
 // Window aggregates are non-retractable (only GROUP BY marks MIN/MAX retractable),
 // so MAX(price)/MIN(price) per window now fold column-at-a-time (no per-record Row)
