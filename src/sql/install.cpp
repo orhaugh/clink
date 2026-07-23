@@ -1211,26 +1211,53 @@ inline void vectorised_fold_slice(const std::vector<AggSpec>& aggs,
 // A group-key column resolved to (index, type) for columnar key building.
 using KeyCol = std::pair<int, std::shared_ptr<arrow::DataType>>;
 
+// Transparent hash for the hot group-key maps: probe with the reused scratch
+// key (a string_view) without constructing a std::string per record - only a
+// NEW group's insert copies the key. Same idiom as the state backend's
+// detail::TransparentStringHash; local so install.cpp does not grow a header
+// dependency for one struct. The stored keys are unchanged std::strings, so
+// snapshot/restore and the async KeyedState path are untouched.
+struct TransparentKeyHash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+    std::size_t operator()(const std::string& s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+};
+
 // Build the group key directly from the key columns' Arrow cells, byte-for-byte
 // identical to group_key_(a row read via read_cell): the SAME read_cell, the SAME
 // serialize(0) join on '\x1f', null keys contributing the empty string. Shared by
 // the GROUP BY and window vectorised folds (their group_key_ are character-identical).
-inline std::string columnar_group_key(const arrow::RecordBatch& rb,
-                                      const std::vector<KeyCol>& key_cols,
-                                      std::int64_t i) {
-    std::string key;
+// The _into variant appends into a reused scratch (cleared here) and returns a
+// view of it - the zero-alloc per-record form for the hot folds.
+inline std::string_view columnar_group_key_into(const arrow::RecordBatch& rb,
+                                                const std::vector<KeyCol>& key_cols,
+                                                std::int64_t i,
+                                                std::string& scratch) {
+    scratch.clear();
     for (std::size_t k = 0; k < key_cols.size(); ++k) {
         if (k > 0) {
-            key += '\x1f';
+            scratch += '\x1f';
         }
         const int idx = key_cols[k].first;
         if (idx >= 0) {
             const auto& arr = *rb.column(idx);
             if (!arr.IsNull(i)) {
-                row_columnar_detail::read_cell(key_cols[k].second, arr, i).serialize_into(key);
+                row_columnar_detail::read_cell(key_cols[k].second, arr, i).serialize_into(scratch);
             }
         }
     }
+    return scratch;
+}
+
+inline std::string columnar_group_key(const arrow::RecordBatch& rb,
+                                      const std::vector<KeyCol>& key_cols,
+                                      std::int64_t i) {
+    std::string key;
+    (void)columnar_group_key_into(rb, key_cols, i, key);
     return key;
 }
 
@@ -1502,7 +1529,7 @@ public:
             }
             rows.push_back(std::move(row));
         }
-        clink::FlatMap<std::string, std::size_t> group_of;
+        clink::FlatMap<std::string, std::size_t, TransparentKeyHash, std::equal_to<>> group_of;
         std::vector<std::vector<std::int64_t>> groups;
         std::vector<std::string> group_keys;
         for (std::int64_t i = 0; i < n; ++i) {
@@ -1516,12 +1543,12 @@ public:
             if (tit == r.values.end() || !tit->second.is_number()) {
                 continue;
             }
-            std::string key = group_key_(r);
+            const auto key = group_key_scratch_(r);
             auto git = group_of.find(key);
             if (git == group_of.end()) {
-                group_of.emplace(key, groups.size());
+                group_of.emplace(std::string(key), groups.size());
                 groups.push_back({i});
-                group_keys.push_back(std::move(key));
+                group_keys.emplace_back(key);
             } else {
                 groups[git->second].push_back(i);
             }
@@ -1709,18 +1736,23 @@ private:
     // --- shared windowing helpers (sync in-memory + async KeyedState paths) ---
 
     // The concatenated group-key string (the keyer / KeyedState / timer key).
-    std::string group_key_(const Row& row) const {
-        std::string key;
+    // The scratch variant builds the same bytes into the reused member buffer
+    // and returns a view - the zero-alloc per-record form for the hot sync
+    // folds; the owned form remains for the async KeyedState / timer
+    // contracts, which keep their own strings.
+    std::string_view group_key_scratch_(const Row& row) const {
+        key_scratch_.clear();
         for (std::size_t i = 0; i < group_keys_.size(); ++i) {
             if (i > 0)
-                key += '\x1f';
+                key_scratch_ += '\x1f';
             auto vit = row.values.find(group_keys_[i]);
             if (vit != row.values.end() && !vit->second.is_null()) {
-                vit->second.serialize_into(key);
+                vit->second.serialize_into(key_scratch_);
             }
         }
-        return key;
+        return key_scratch_;
     }
+    std::string group_key_(const Row& row) const { return std::string(group_key_scratch_(row)); }
 
     // The (window_start, window_end) slices an event at `ts` belongs to.
     std::vector<std::pair<std::int64_t, std::int64_t>> windows_for_(std::int64_t ts) const {
@@ -1826,7 +1858,9 @@ private:
             std::int64_t window_start = 0;
             std::vector<std::int64_t> idxs;
         };
-        clink::FlatMap<std::string, std::map<std::int64_t, Slice>> by_group;
+        clink::
+            FlatMap<std::string, std::map<std::int64_t, Slice>, TransparentKeyHash, std::equal_to<>>
+                by_group;
         for (std::int64_t i = 0; i < n; ++i) {
             if (time_idx < 0) {
                 continue;  // no time column -> nothing folds (matches the row guard)
@@ -1838,11 +1872,20 @@ private:
                 continue;
             }
             const auto ts = static_cast<std::int64_t>(tv.as_number());
-            const std::string key = columnar_group_key(rb, key_cols, i);
+            // Transparent probe with the reused scratch key: no per-record
+            // string alloc; a NEW group's insert copies once. The entry is
+            // created lazily on the FIRST surviving window so a record whose
+            // windows are all past the horizon leaves no group (and thus no
+            // state_) entry, exactly like the per-record path.
+            const auto key = columnar_group_key_into(rb, key_cols, i, key_scratch_);
+            auto git = by_group.find(key);
             for (auto [win_start, win_end] : windows_for_(ts)) {
                 if (win_end <= horizon)
                     continue;  // already-fired window: drop (matches fold_record_into_)
-                auto& slice = by_group[key][win_end];
+                if (git == by_group.end()) {
+                    git = by_group.emplace(std::string(key), std::map<std::int64_t, Slice>{}).first;
+                }
+                auto& slice = git->second[win_end];
                 slice.window_start = win_start;
                 slice.idxs.push_back(i);
             }
@@ -1896,7 +1939,14 @@ private:
         auto it = row.values.find(time_column_);
         if (it == row.values.end() || !it->second.is_number())
             return;
-        fold_record_into_(state_[group_key_(row)], row, nullptr, drop_horizon_());
+        // Transparent probe with the scratch key: no per-record string alloc;
+        // only a NEW group's insert copies the key.
+        const auto key = group_key_scratch_(row);
+        auto sit = state_.find(key);
+        if (sit == state_.end()) {
+            sit = state_.emplace(std::string(key), std::map<std::int64_t, WindowBucket>{}).first;
+        }
+        fold_record_into_(sit->second, row, nullptr, drop_horizon_());
     }
 
     void fire_due_(EventTime wm, Emitter<Row>& out) {
@@ -1973,7 +2023,12 @@ private:
     std::vector<std::string> group_key_outputs_;
     std::string window_start_output_;
     std::string window_end_output_;
-    clink::FlatMap<std::string, std::map<std::int64_t, WindowBucket>> state_;
+    clink::FlatMap<std::string,
+                   std::map<std::int64_t, WindowBucket>,
+                   TransparentKeyHash,
+                   std::equal_to<>>
+        state_;
+    mutable std::string key_scratch_;           // group_key_scratch_'s reused buffer
     std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
 };
 
@@ -2156,7 +2211,7 @@ public:
             }
             rows.push_back(std::move(row));
         }
-        clink::FlatMap<std::string, std::size_t> group_of;
+        clink::FlatMap<std::string, std::size_t, TransparentKeyHash, std::equal_to<>> group_of;
         std::vector<std::vector<std::int64_t>> groups;
         std::vector<std::string> group_keys;
         for (std::int64_t i = 0; i < n; ++i) {
@@ -2165,12 +2220,12 @@ public:
             if (tit == r.values.end() || !tit->second.is_number()) {
                 continue;  // bad time: handle_record_ would return early, no state_ entry
             }
-            std::string key = group_key_(r);
+            const auto key = group_key_scratch_(r);
             auto git = group_of.find(key);
             if (git == group_of.end()) {
-                group_of.emplace(key, groups.size());
+                group_of.emplace(std::string(key), groups.size());
                 groups.push_back({i});
-                group_keys.push_back(std::move(key));
+                group_keys.emplace_back(key);
             } else {
                 groups[git->second].push_back(i);
             }
@@ -2310,19 +2365,21 @@ private:
     }
 
     // Concatenated group-key values (0x1f separator; null/missing skipped). The
-    // state_ key and the within-batch grouping key.
-    std::string group_key_(const Row& row) const {
-        std::string key;
+    // state_ key and the within-batch grouping key. The scratch variant is the
+    // zero-alloc per-record form (see WindowRowOp).
+    std::string_view group_key_scratch_(const Row& row) const {
+        key_scratch_.clear();
         for (std::size_t i = 0; i < group_keys_.size(); ++i) {
             if (i > 0)
-                key += '\x1f';
+                key_scratch_ += '\x1f';
             auto vit = row.values.find(group_keys_[i]);
             if (vit != row.values.end() && !vit->second.is_null()) {
-                vit->second.serialize_into(key);
+                vit->second.serialize_into(key_scratch_);
             }
         }
-        return key;
+        return key_scratch_;
     }
+    std::string group_key_(const Row& row) const { return std::string(group_key_scratch_(row)); }
 
     // Merge one event (at `ts`) into a group's session map WITHOUT touching
     // state_ - the inner body of handle_record_. The within-batch group-by
@@ -2412,7 +2469,13 @@ private:
         if (tit == row.values.end() || !tit->second.is_number())
             return;
         const auto ts = static_cast<std::int64_t>(tit->second.as_number());
-        fold_session_(state_[group_key_(row)], row, ts, late_bound_());
+        // Transparent probe with the scratch key (see WindowRowOp).
+        const auto key = group_key_scratch_(row);
+        auto sit = state_.find(key);
+        if (sit == state_.end()) {
+            sit = state_.emplace(std::string(key), std::map<std::int64_t, Session>{}).first;
+        }
+        fold_session_(sit->second, row, ts, late_bound_());
     }
 
     // WS6 cell-based session fold: the byte-identical twin of fold_session_ that
@@ -2752,7 +2815,10 @@ private:
     // Finalised in open(): a deferring backend -> the async KeyedState path
     // (process_async + event-time timers); otherwise the sync in-memory state_.
     bool effective_async_ = false;
-    clink::FlatMap<std::string, std::map<std::int64_t, Session>> state_;
+    clink::
+        FlatMap<std::string, std::map<std::int64_t, Session>, TransparentKeyHash, std::equal_to<>>
+            state_;
+    mutable std::string key_scratch_;           // group_key_scratch_'s reused buffer
     std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
 };
 
@@ -3664,16 +3730,17 @@ public:
             if (insert_only) {
                 // Group row indices by key in FIRST-SEEN order (stable emit order
                 // close to the per-row path's input order).
-                clink::FlatMap<std::string, std::size_t> group_of;
+                clink::FlatMap<std::string, std::size_t, TransparentKeyHash, std::equal_to<>>
+                    group_of;
                 std::vector<std::vector<std::int64_t>> groups;
                 std::vector<std::string> group_keys;
                 for (std::int64_t i = 0; i < n; ++i) {
-                    std::string key = group_key_(rows[static_cast<std::size_t>(i)]);
+                    const auto key = group_key_scratch_(rows[static_cast<std::size_t>(i)]);
                     auto git = group_of.find(key);
                     if (git == group_of.end()) {
-                        group_of.emplace(key, groups.size());
+                        group_of.emplace(std::string(key), groups.size());
                         groups.push_back({i});
-                        group_keys.push_back(std::move(key));
+                        group_keys.emplace_back(key);
                     } else {
                         groups[git->second].push_back(i);
                     }
@@ -3949,19 +4016,23 @@ public:
     std::string name() const override { return "aggregate_row"; }
 
 private:
-    // Concatenated group-key values; the KeyedState key and the per-key gate key.
-    std::string group_key_(const Row& row) const {
-        std::string key;
+    // Concatenated group-key values; the KeyedState key and the per-key gate
+    // key. The scratch variant is the zero-alloc per-record form for the hot
+    // in-memory paths (see WindowRowOp); the async/KeyedState paths keep
+    // owned strings.
+    std::string_view group_key_scratch_(const Row& row) const {
+        key_scratch_.clear();
         for (std::size_t i = 0; i < group_keys_.size(); ++i) {
             if (i > 0)
-                key += '\x1f';
+                key_scratch_ += '\x1f';
             auto vit = row.values.find(group_keys_[i]);
             if (vit != row.values.end() && !vit->second.is_null()) {
-                vit->second.serialize_into(key);
+                vit->second.serialize_into(key_scratch_);
             }
         }
-        return key;
+        return key_scratch_;
     }
+    std::string group_key_(const Row& row) const { return std::string(group_key_scratch_(row)); }
 
     // A fresh bucket: group-key output columns populated, one AggState per aggregate.
     AggBucket init_bucket_(const Row& row) const {
@@ -4051,13 +4122,14 @@ private:
 
     // In-memory (default) per-record path.
     void handle_record_inmem_(const Row& row, Batch<Row>& out) {
-        const std::string key = group_key_(row);
+        // Transparent probe with the scratch key (see WindowRowOp).
+        const auto key = group_key_scratch_(row);
         auto it = state_.find(key);
         if (it == state_.end()) {
-            it = state_.emplace(key, init_bucket_(row)).first;
+            it = state_.emplace(std::string(key), init_bucket_(row)).first;
         }
         fold_into_(it->second, row, out);
-        mark_dirty_(key);
+        mark_dirty_(it->first);  // the map's owned copy of the scratch key
     }
 
     // The in-memory buckets are the WORKING SET; durability rides the
@@ -4136,7 +4208,8 @@ private:
     bool persist_inmem_ = false;
     // Group keys mutated since the last flush (write-behind working set).
     std::unordered_set<std::string> dirty_;
-    clink::FlatMap<std::string, AggBucket> state_;
+    clink::FlatMap<std::string, AggBucket, TransparentKeyHash, std::equal_to<>> state_;
+    mutable std::string key_scratch_;  // group_key_scratch_'s reused buffer
     // Columns the columnar ingest reads from each input row (group keys, agg
     // inputs, __row_kind); precomputed in the ctor.
     std::vector<std::string> columnar_needed_;
