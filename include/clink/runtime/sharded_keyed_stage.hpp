@@ -512,7 +512,10 @@ private:
                 }
                 auto elem = sh.queue->pop_for(timeout);
                 if (!elem.has_value()) {
-                    if (sh.queue->closed()) {
+                    // Closed AND drained, as the comment above promises: a
+                    // push+close can land between the failed pop_for and this
+                    // check, and a bare closed() would drop the queued tail.
+                    if (sh.queue->closed() && sh.queue->size() == 0) {
                         break;
                     }
                     continue;

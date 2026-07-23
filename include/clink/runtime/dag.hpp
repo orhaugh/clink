@@ -905,7 +905,11 @@ public:
                             op->process(*maybe, emitter);
                         }
                     }
-                } else if (in_channel->closed()) {
+                } else if (in_channel->closed() && in_channel->size() == 0) {
+                    // Closed AND drained. A bare closed() check races with a
+                    // push+close landing between the failed pop above and this
+                    // line (close() never drops queued elements), silently
+                    // dropping the queued tail at end-of-stream.
                     break;
                 }
                 // A record completing in the data branch (or the idle
@@ -1128,7 +1132,11 @@ public:
                         // EOS drives the actual wind-down.
                         stage.drain(maybe->as_drain());
                     }
-                } else if (in_channel->closed()) {
+                } else if (in_channel->closed() && in_channel->size() == 0) {
+                    // Closed AND drained. A bare closed() check races with a
+                    // push+close landing between the failed pop above and this
+                    // line (close() never drops queued elements), silently
+                    // dropping the queued tail at end-of-stream.
                     break;
                 }
             }
@@ -1403,7 +1411,10 @@ public:
                     }
                     auto maybe = in_channels[i]->try_pop();
                     if (!maybe.has_value()) {
-                        if (in_channels[i]->closed()) {
+                        // Same closed-AND-drained rule as the paused branch
+                        // above: a push+close can land between the failed
+                        // try_pop and this check.
+                        if (in_channels[i]->closed() && in_channels[i]->size() == 0) {
                             align.on_input_closed(i);
                             if (auto wm_adv = align.refresh_watermark(); wm_adv.forward) {
                                 out_channel->push(StreamElement<T>::watermark(wm_adv.watermark));
@@ -1753,7 +1764,9 @@ public:
                     }
                     continue;
                 }
-                if (body_out->closed()) {
+                // Closed AND drained: a push+close landing between the failed
+                // try_pop above and this check must not drop queued feedback.
+                if (body_out->closed() && body_out->size() == 0) {
                     break;
                 }
                 std::this_thread::sleep_for(1ms);
@@ -2358,7 +2371,10 @@ public:
                     } else if (auto m = left_ch->try_pop(); m.has_value()) {
                         any_progress = true;
                         handle_left(*m);
-                    } else if (left_ch->closed()) {
+                    } else if (left_ch->closed() && left_ch->size() == 0) {
+                        // Closed AND drained (see the co_operator runner): a
+                        // push+close between the failed try_pop and this check
+                        // must not mark the input closed over queued records.
                         align.on_input_closed(0);
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             evict(wm.watermark.timestamp());
@@ -2375,7 +2391,7 @@ public:
                     } else if (auto m = right_ch->try_pop(); m.has_value()) {
                         any_progress = true;
                         handle_right(*m);
-                    } else if (right_ch->closed()) {
+                    } else if (right_ch->closed() && right_ch->size() == 0) {
                         align.on_input_closed(1);
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             evict(wm.watermark.timestamp());
@@ -2678,7 +2694,8 @@ public:
                     } else if (auto m = main_ch->try_pop(); m.has_value()) {
                         any_progress = true;
                         handle_main(*m);
-                    } else if (main_ch->closed()) {
+                    } else if (main_ch->closed() && main_ch->size() == 0) {
+                        // Closed AND drained (see the co_operator runner note).
                         align.on_input_closed(0);
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             out_channel->push(StreamElement<Out>::watermark(wm.watermark));
@@ -2694,7 +2711,7 @@ public:
                     } else if (auto b = brod_ch->try_pop(); b.has_value()) {
                         any_progress = true;
                         handle_brod(*b);
-                    } else if (brod_ch->closed()) {
+                    } else if (brod_ch->closed() && brod_ch->size() == 0) {
                         align.on_input_closed(1);
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             out_channel->push(StreamElement<Out>::watermark(wm.watermark));
@@ -3156,7 +3173,17 @@ public:
                     } else if (auto m = left_ch->try_pop(); m.has_value()) {
                         any_progress = true;
                         handle_left(*m);
-                    } else if (left_ch->closed()) {
+                    } else if (left_ch->closed() && left_ch->size() == 0) {
+                        // Closed AND drained. close() is the producer's final
+                        // act and never drops queued elements, so once
+                        // closed() reads true no further push can land and an
+                        // empty size() read after it is permanent. A bare
+                        // closed() check races with a push+close landing
+                        // between the failed try_pop above and this line: the
+                        // input is marked closed over its still-queued batch,
+                        // align.all_closed() breaks the loop, and the batch is
+                        // dropped (observed in CI as an all-zero co-op run
+                        // when the other input was empty and closed at start).
                         align.on_input_closed(0);
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             forward_watermark(wm.watermark);
@@ -3172,7 +3199,7 @@ public:
                     } else if (auto m = right_ch->try_pop(); m.has_value()) {
                         any_progress = true;
                         handle_right(*m);
-                    } else if (right_ch->closed()) {
+                    } else if (right_ch->closed() && right_ch->size() == 0) {
                         align.on_input_closed(1);
                         if (auto wm = align.refresh_watermark(); wm.forward) {
                             forward_watermark(wm.watermark);
@@ -3579,7 +3606,10 @@ public:
                         }
                         auto m = ins[k]->try_pop();
                         if (!m.has_value()) {
-                            if (ins[k]->closed()) {
+                            // Closed AND drained (see the co_operator runner
+                            // note): a push+close can land between the failed
+                            // try_pop and this check.
+                            if (ins[k]->closed() && ins[k]->size() == 0) {
                                 align.on_input_closed(k);
                             }
                             continue;
@@ -4047,7 +4077,10 @@ private:
                         }
                         auto m = ins[k]->try_pop();
                         if (!m.has_value()) {
-                            if (ins[k]->closed()) {
+                            // Closed AND drained (see the co_operator runner
+                            // note): a push+close can land between the failed
+                            // try_pop and this check.
+                            if (ins[k]->closed() && ins[k]->size() == 0) {
                                 align.on_input_closed(k);
                             }
                             continue;
