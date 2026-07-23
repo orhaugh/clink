@@ -77,6 +77,25 @@ flowchart TD
 
 The runner's pop is timed: `in_channel->pop_for(timeout)` where the timeout is sized to the operator's `next_timer_deadline_ms()` (or a 30s heartbeat when no timer is pending). This lets processing-time timers fire close to their deadline without busy-waiting, and keeps a fully idle operator responsive to cancellation. Processing-time timers are fired at the top of each loop iteration via `fire_due_timers`; event-time timers fire from inside `on_watermark` as watermarks advance.
 
+### The closed-and-drained contract
+
+"Channel closed and empty" in the loop above is a two-part condition with a
+required evaluation order, and every consumer that polls a channel
+non-blockingly must follow it. `BoundedChannel::close()` is the producer's
+final act and never discards queued elements, so after a `try_pop`/`pop_for`
+returns empty a runner may treat the input as finished only when
+`ch->closed() && ch->size() == 0`, in that order. Reading `closed()` first
+matters: a true result means no further push can ever land (push checks the
+flag under the same mutex), so an empty `size()` read after it is permanent.
+The reverse order, or a bare `closed()` check after a failed pop, races with
+a push-then-close landing in between - the input gets marked finished over
+its still-queued tail, and in a multi-input runner whose other input is
+already closed the alignment breaks the loop and the tail is silently
+dropped. Blocking `pop()` needs no guard (it returns nullopt only when the
+channel is closed and drained, decided under one lock), and barrier-time
+in-flight drains need none either: anything pushed after such a drain
+belongs to the next epoch by the upstream barrier ordering.
+
 ### Sources and sinks
 
 Sources have no input channel. The `add_source` runner restores the source's offset (if the source overrides `restore_offset`), calls `open()`, then loops `produce(emitter)` until it returns false or `should_stop()` becomes true. Between `produce()` calls it drains any checkpoint barriers that were injected into the source's pending queue (`inject_pending_barrier` / `take_pending_barrier`), calling `snapshot_offset` before emitting each barrier so the offset and the barrier reach durability together with respect to the record stream. On clean exhaustion of a bounded source it emits `Watermark::max()` to fire every downstream event-time window and timer, then handles the end-of-stream tail commit (a coordinator-coordinated final checkpoint on the cluster path, or a local terminal barrier in-process), before `flush`, `close` and closing the output channel.
