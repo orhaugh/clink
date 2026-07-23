@@ -9,7 +9,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # non-standard prefix, configure with:
 #
 #   cmake -S . -B build -DCMAKE_PREFIX_PATH=/opt/clink
-find_package(clink REQUIRED)
+#
+# COMPONENTS names exactly what these examples link, so configuring only
+# resolves the dependencies those components need - a machine without,
+# say, the Avro or MongoDB client libraries still builds every example.
+# Request more components (kafka, postgres, ...) as you link them.
+find_package(clink REQUIRED COMPONENTS core test_support)
 
 message(STATUS "clink ${clink_VERSION}: impls = ${clink_AVAILABLE_IMPLS}")
 

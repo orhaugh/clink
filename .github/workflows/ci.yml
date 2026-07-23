@@ -260,6 +260,16 @@ jobs:
           EOF
           cmake -S . -B build
           cmake --build build
+      - name: Consumer examples from the installed package
+        # The maintained consumer surface, built downstream-style: a plain
+        # find_package(clink COMPONENTS core test_support) project. This is
+        # what keeps the exported test framework (clink::test_support) and
+        # the component-gated dependency resolution consumable - 09 runs as
+        # a self-checking test of the harnesses from the install prefix.
+        run: |
+          cmake -S docs/consumer-examples -B /tmp/consumer-examples
+          cmake --build /tmp/consumer-examples -j "$(( $(nproc) / 2 ))"
+          /tmp/consumer-examples/09_testing_framework
       - name: Save compiler cache
         if: always()
         uses: actions/cache/save@v4

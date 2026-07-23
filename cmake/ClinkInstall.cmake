@@ -76,10 +76,21 @@ function(clink_install_impl)
     set_property(GLOBAL APPEND PROPERTY CLINK_AVAILABLE_IMPLS "${CIA_NAME}")
 
     if(CIA_FIND_DEP)
+        # Component-gate the impl's dependency resolution: a consumer that
+        # requests COMPONENTS (e.g. `find_package(clink REQUIRED COMPONENTS
+        # core test_support)`) only pays the find_dependency cost - and the
+        # installed-dep requirement - of the impls it asked for. A plain
+        # find_package(clink) keeps the historic resolve-everything
+        # behaviour. Without this, a core-only consumer on a machine
+        # missing any one connector dependency cannot configure at all.
+        set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
+            "if(NOT clink_FIND_COMPONENTS OR \"${CIA_NAME}\" IN_LIST clink_FIND_COMPONENTS)\n")
         foreach(_line IN LISTS CIA_FIND_DEP)
             set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
-                "${_line}\n")
+                "    ${_line}\n")
         endforeach()
+        set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
+            "endif()\n")
     endif()
 endfunction()
 

@@ -11,7 +11,33 @@ include(CMakeFindDependencyMacro)
 
 # --- Always-required core dependencies -------------------------------------
 find_dependency(Threads)
+
+# clink links the PINNED Arrow from the toolchain prefix (CLINK_DEPS_PREFIX,
+# default ~/.clink-deps; /usr/local in the project images), and a consumer
+# machine's package manager frequently carries a different Arrow. The main
+# build auto-prepends the prefix and asserts the version; a downstream
+# find_package(clink) must do the same, or Arrow resolves to whatever the
+# host has (a Homebrew Arrow with missing transitive deps was the observed
+# failure) and the version contract silently breaks.
+if(NOT DEFINED CLINK_DEPS_PREFIX)
+    if(DEFINED ENV{CLINK_DEPS_PREFIX})
+        set(CLINK_DEPS_PREFIX "$ENV{CLINK_DEPS_PREFIX}")
+    elseif(DEFINED ENV{HOME})
+        set(CLINK_DEPS_PREFIX "$ENV{HOME}/.clink-deps")
+    endif()
+endif()
+if(CLINK_DEPS_PREFIX AND EXISTS "${CLINK_DEPS_PREFIX}")
+    list(PREPEND CMAKE_PREFIX_PATH "${CLINK_DEPS_PREFIX}")
+endif()
 find_dependency(Arrow CONFIG)
+if(NOT "@CLINK_PINNED_ARROW_VERSION@" STREQUAL ""
+   AND NOT ARROW_VERSION VERSION_EQUAL "@CLINK_PINNED_ARROW_VERSION@")
+    message(FATAL_ERROR
+        "clink was built against Arrow @CLINK_PINNED_ARROW_VERSION@ but Arrow "
+        "${ARROW_VERSION} resolved. Build the pinned toolchain "
+        "(scripts/build-arrow.sh in the clink source tree) or point "
+        "CLINK_DEPS_PREFIX at an existing pinned prefix.")
+endif()
 find_dependency(Parquet CONFIG)
 
 # --- Impl-specific dependencies --------------------------------------------
