@@ -462,24 +462,34 @@ target_compile_definitions(clink_core PRIVATE CLINK_HAS_SPDLOG=1)
 target_include_directories(clink_core PRIVATE BEFORE
     $<BUILD_INTERFACE:${spdlog_SOURCE_DIR}/include>)
 
-# zstd for the compressing rotating file sink. Arrow already links zstd
-# transitively (zstd::libzstd_* is created under its static-build branch),
-# but a shared-only Arrow skips that, so resolve the target explicitly and
-# fall back to Arrow's transitive link. PRIVATE - only the sink TU needs the
-# symbols - and wrapped in $<BUILD_INTERFACE:> so the target is NOT recorded in
-# the installed clinkTargets.cmake (a static lib otherwise propagates its PRIVATE
-# deps as usage requirements, and a downstream find_package(clink) would then
-# demand a zstd:: imported target it has no find_dependency for). Consumers get
-# zstd transitively through Arrow (a find_dependency in clinkConfig).
-find_package(zstd QUIET)
-if(TARGET zstd::libzstd_shared)
-    target_link_libraries(clink_core PRIVATE $<BUILD_INTERFACE:zstd::libzstd_shared>)
-    message(STATUS "clink::core - zstd via zstd::libzstd_shared")
-elseif(TARGET zstd::libzstd_static)
-    target_link_libraries(clink_core PRIVATE $<BUILD_INTERFACE:zstd::libzstd_static>)
-    message(STATUS "clink::core - zstd via zstd::libzstd_static")
+# zstd for the compressing rotating file sink. PRIVATE - only the sink TU
+# needs the symbols - but clink_core is STATIC, so the dep must still reach a
+# downstream link line ($<LINK_ONLY:...> in the export). Link the resolved
+# LIBRARY PATH, not an imported target: an absolute path exports verbatim and
+# needs no find_dependency downstream, whereas a zstd:: target would demand
+# one (system zstd does not reliably ship a CMake config) and relying on
+# Arrow's transitive link only works where libarrow exports its bundled zstd
+# symbols (true on macOS, not in the Linux image, where a downstream
+# find_package(clink) link then fails on ZSTD_CStreamInSize).
+find_library(CLINK_ZSTD_LIBRARY NAMES zstd
+    HINTS /opt/homebrew/lib /usr/local/lib)
+if(CLINK_ZSTD_LIBRARY)
+    target_link_libraries(clink_core PRIVATE "${CLINK_ZSTD_LIBRARY}")
+    message(STATUS "clink::core - zstd at ${CLINK_ZSTD_LIBRARY}")
 else()
-    message(STATUS "clink::core - zstd target not found directly; relying on Arrow transitive link")
+    # No system zstd library found; fall back to an imported target if Arrow's
+    # static-build branch (or a system CMake config) created one, build-scope
+    # only so the unexportable target name never reaches clinkTargets.cmake.
+    find_package(zstd QUIET)
+    if(TARGET zstd::libzstd_shared)
+        target_link_libraries(clink_core PRIVATE $<BUILD_INTERFACE:zstd::libzstd_shared>)
+        message(STATUS "clink::core - zstd via zstd::libzstd_shared (build-scope only)")
+    elseif(TARGET zstd::libzstd_static)
+        target_link_libraries(clink_core PRIVATE $<BUILD_INTERFACE:zstd::libzstd_static>)
+        message(STATUS "clink::core - zstd via zstd::libzstd_static (build-scope only)")
+    else()
+        message(STATUS "clink::core - zstd not found; relying on Arrow transitive link")
+    endif()
 endif()
 # The zstd HEADER must be reachable: compressing_rotating_file_sink.hpp is a PUBLIC
 # header that #includes <zstd.h>, so every consumer (clink_core_tests, impls, clink_node)
