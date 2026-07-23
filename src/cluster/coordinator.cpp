@@ -671,20 +671,26 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
     worker->slot_capacity = reg.slot_count == 0 ? std::uint32_t{1} : reg.slot_count;
     worker->http_port = reg.http_port;
 
-    // Send RegisterAck.
-    const auto ack =
-        encode_frame(MessageKind::RegisterAck, RegisterAckMsg{.ok = true, .message = ""});
-    if (!send_frame(*worker->conn, ack)) {
-        return;
-    }
-
+    // Install the registration and send RegisterAck under ONE mu_ hold, in
+    // that order. The ack is the worker's schedulability linearisation point:
+    // connect_to_coordinator returns once the ack arrives and the caller may
+    // deploy immediately, so the map swap must happen-before the ack is on
+    // the wire. Acking first left a window where such a deploy still resolved
+    // this worker_id to the retired session's dead connection - the Deploy
+    // frame vanished into the closed socket (the first send after a peer
+    // close succeeds into the buffer) and the job never started. Sending the
+    // ack inside the lock also keeps it the FIRST frame on the wire: a
+    // concurrent deploy cannot slip a Deploy frame ahead of it (the worker's
+    // connect handshake requires RegisterAck as the first message).
+    //
     // A re-registration under an existing id (a restarted worker with a stable
     // name, e.g. a StatefulSet pod) replaces the old WorkerConnection. Its reader
     // thread must be joined before the object can be destroyed - destroying a
-    // joinable std::thread is std::terminate - and the join must happen HERE,
-    // off the reader thread (the reader lambda holds a shared_ptr to its own
-    // WorkerConnection, so letting the map drop the last map-held reference hands
-    // destruction to the exiting reader itself: self-join, terminate).
+    // joinable std::thread is std::terminate - and the join must happen off
+    // this lock AND off the reader thread (the reader takes mu_ in its loop,
+    // and it holds a shared_ptr to its own WorkerConnection, so letting the
+    // map drop the last reference hands destruction to the exiting reader
+    // itself: self-join, terminate).
     std::shared_ptr<WorkerConnection> replaced;
     {
         std::lock_guard lock(mu_);
@@ -692,6 +698,19 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
             replaced = it->second;
         }
         registered_[reg.worker_id] = worker;
+        const auto ack =
+            encode_frame(MessageKind::RegisterAck, RegisterAckMsg{.ok = true, .message = ""});
+        if (!send_frame(*worker->conn, ack)) {
+            // Handshake failed (the client vanished mid-register). Restore
+            // the previous session: a failed re-registration must not retire
+            // a live worker.
+            if (replaced) {
+                registered_[reg.worker_id] = replaced;
+            } else {
+                registered_.erase(reg.worker_id);
+            }
+            return;
+        }
     }
     if (replaced) {
         if (replaced->conn) {
