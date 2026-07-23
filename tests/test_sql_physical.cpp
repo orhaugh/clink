@@ -772,11 +772,38 @@ TEST(SqlPhysical, HttpConnectorSinkRejectsExactlyOnce) {
 }
 
 // Without the option, the kafka json table keeps the plain row-form bridge.
-TEST(SqlPhysical, KafkaJsonDefaultUsesRowFormBridge) {
+// The columnar JSON bridge is the DEFAULT for a kafka json table: no
+// WITH-option needed. The bridge carries the declared schema and falls back
+// to the byte-identical row decode per batch, so the default is safe for any
+// schema or data.
+TEST(SqlPhysical, KafkaJsonDefaultUsesColumnarBridge) {
     Catalog cat;
     auto s = parse(
         "CREATE TABLE k_in (a BIGINT, b DOUBLE, c VARCHAR) "
         "WITH (connector='kafka', format='json', topic='t', bootstrap='localhost:9092');"
+        "CREATE TABLE f_out (a BIGINT, b DOUBLE, c VARCHAR) "
+        "WITH (connector='file', format='json', path='/tmp/o.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO f_out SELECT a, b, c FROM k_in");
+
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* bridge = find_op(spec, "json_string_to_row_columnar");
+    ASSERT_NE(bridge, nullptr);
+    EXPECT_EQ(find_op(spec, "json_string_to_row"), nullptr);
+    ASSERT_EQ(bridge->params.count("schema_columns"), 1u);
+    EXPECT_FALSE(bridge->params.at("schema_columns").empty());
+}
+
+// columnar_decode='false' opts a table out entirely: the planner emits the
+// plain row-form bridge and no columnar op.
+TEST(SqlPhysical, KafkaJsonColumnarDecodeFalseOptsOut) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE k_in (a BIGINT, b DOUBLE, c VARCHAR) "
+        "WITH (connector='kafka', format='json', topic='t', bootstrap='localhost:9092', "
+        "columnar_decode='false');"
         "CREATE TABLE f_out (a BIGINT, b DOUBLE, c VARCHAR) "
         "WITH (connector='file', format='json', path='/tmp/o.ndjson');");
     cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));

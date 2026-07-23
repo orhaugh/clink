@@ -225,15 +225,21 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         return RowConnectorBinding{"queryable_state_row_source", kChannelRow, {}};
     }
     if (connector == "kafka") {
-        // Wave 2 inc1: an opt-in WITH-option swaps the row-form JSON bridge for
-        // the columnar one, which attaches an Arrow sidecar so the downstream
-        // columnar fast paths fire on the Kafka path. Default stays row-form.
+        // The columnar JSON bridge is the DEFAULT for a declared kafka
+        // schema: it attaches a typed Arrow sidecar at decode so the
+        // downstream columnar fast paths fire on the common Kafka path.
+        // This is safe to default because the bridge refuses incapable
+        // schemas at construction and falls back to the byte-identical
+        // row decode per batch on unfaithful data, with an adaptive
+        // damper so a systematically unfaithful stream does not pay a
+        // double parse (see JsonStringToRowColumnarOperator).
+        // columnar_decode='false' opts a table out entirely.
         const auto it = table.properties.find("columnar_decode");
-        const bool columnar =
-            it != table.properties.end() && (it->second == "true" || it->second == "1");
+        const bool row_form =
+            it != table.properties.end() && (it->second == "false" || it->second == "0");
         return RowConnectorBinding{"kafka_source_string",
                                    kChannelString,
-                                   columnar ? "json_string_to_row_columnar" : "json_string_to_row"};
+                                   row_form ? "json_string_to_row" : "json_string_to_row_columnar"};
     }
     if (connector == "rabbitmq") {
         // RabbitMQ / AMQP source: each message body is a JSON object string (string

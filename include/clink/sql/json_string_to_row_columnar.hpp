@@ -102,12 +102,39 @@ public:
         if (element.is_data()) {
             const Batch<std::string>& in = element.as_data();
 
+            // Adaptive damper: a batch that fails the faithfulness gate pays
+            // a partial columnar parse AND the full row re-parse, so a
+            // systematically unfaithful stream (extra fields, wrong types)
+            // would run at up to double decode cost forever. After
+            // kFallbackThreshold consecutive fallback batches, stop
+            // attempting and only probe every kProbeInterval batches; one
+            // columnar success re-arms the always-attempt mode. Faithful
+            // streams never enter the damper; occasional bad batches reset
+            // on the next good one. process() is single-threaded per
+            // subtask, so plain members suffice.
+            bool attempt = false;
+            if (consecutive_fallbacks_ < kFallbackThreshold) {
+                attempt = true;
+            } else if (++batches_since_probe_ >= kProbeInterval) {
+                attempt = true;
+                batches_since_probe_ = 0;
+            }
+
             // Fast path: parse straight into typed columns. Returns nullopt and
             // forces the row fallback the moment any record is not faithfully
             // representable (so the result is byte-identical to the row decode).
-            if (auto columnar = build_columnar_direct_(in); columnar.has_value()) {
-                out.emit_data(std::move(*columnar));
-                return;
+            if (attempt) {
+                if (auto columnar = build_columnar_direct_(in); columnar.has_value()) {
+                    consecutive_fallbacks_ = 0;
+                    out.emit_data(std::move(*columnar));
+                    return;
+                }
+                if (schema_capable_) {
+                    // Only data-driven fallbacks feed the damper; an
+                    // incapable schema already short-circuits in
+                    // build_columnar_direct_ at zero cost.
+                    ++consecutive_fallbacks_;
+                }
             }
 
             // Row fallback - identical to json_string_to_row, preserving each
@@ -386,6 +413,16 @@ private:
     std::vector<Resolved> resolved_;
     std::vector<std::shared_ptr<arrow::Field>> data_fields_;  // [event_time, declared...]
     bool schema_capable_{true};
+
+    // Adaptive damper state (see process). Tuning: 8 consecutive bad
+    // batches (~2k records at the default batch shape) to conclude the
+    // stream is systematically unfaithful; probe every 64th batch after
+    // that, bounding the wasted partial parse at ~1.6% while re-arming
+    // within seconds when the data recovers.
+    static constexpr int kFallbackThreshold = 8;
+    static constexpr std::uint32_t kProbeInterval = 64;
+    int consecutive_fallbacks_{0};
+    std::uint32_t batches_since_probe_{0};
 };
 
 }  // namespace clink::sql

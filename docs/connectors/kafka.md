@@ -141,7 +141,7 @@ CREATE TABLE click_counts (
 );
 ```
 
-A source table may set `columnar_decode='true'` to swap the row-form JSON bridge for the columnar one (`json_string_to_row_columnar`), which attaches an Arrow sidecar. The default is row-form.
+The columnar JSON bridge (`json_string_to_row_columnar`) is the default for a `format='json'` source table: it decodes straight into typed Arrow columns and attaches the sidecar, so downstream columnar operator fast paths fire on the Kafka path. It is exactly byte-equivalent to the row decode - an incapable schema (FLOAT/DECIMAL columns, reserved `__` names, duplicates) or any batch whose records do not round-trip faithfully falls back to the plain row decode, with an adaptive damper so a systematically unfaithful stream does not pay a double parse. Set `columnar_decode='false'` to opt a table out entirely (the planner emits the row-form `json_string_to_row` bridge).
 
 ## Example
 

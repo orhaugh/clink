@@ -430,3 +430,50 @@ TEST(JsonColumnarDecode, ExplicitNullValueStaysColumnar) {
     EXPECT_TRUE(col_batch.is_columnar());
     EXPECT_EQ(encoded_rows(col_batch), encoded_rows(row_el.as_data()));
 }
+
+// The adaptive damper (columnar decode is the planner DEFAULT, so a
+// systematically unfaithful stream must not pay a double parse forever):
+// after 8 consecutive fallback batches the operator stops attempting the
+// columnar parse - a faithful batch inside the damped stretch decodes
+// row-form, still byte-equivalent - and probes again every 64th batch; a
+// faithful probe goes columnar and re-arms the always-attempt mode.
+TEST(JsonColumnarDecode, AdaptiveDamperStopsAttemptingAndReArms) {
+    JsonStringToRowColumnarOperator op(demo_schema());
+    auto oracle = make_row_oracle();
+    const std::vector<std::string> bad = {R"({"a":1,"b":1.5,"c":"x","d":true,"extra":1})"};
+    const std::vector<std::string> good = {R"({"a":1,"b":1.5,"c":"x","d":true})"};
+
+    // 8 unfaithful batches: each attempts, falls back row-form, and stays
+    // byte-equivalent to the row oracle.
+    for (int i = 0; i < 8; ++i) {
+        auto el = run_one(op, lines_batch(bad));
+        ASSERT_TRUE(el.is_data());
+        EXPECT_FALSE(el.as_data().is_columnar());
+        auto want = run_one(oracle, lines_batch(bad));
+        EXPECT_EQ(encoded_rows(el.as_data()), encoded_rows(want.as_data()));
+    }
+
+    // Damped: even a FAITHFUL batch decodes row-form (no attempt), content
+    // unchanged.
+    for (int i = 0; i < 63; ++i) {
+        auto el = run_one(op, lines_batch(good));
+        ASSERT_TRUE(el.is_data());
+        EXPECT_FALSE(el.as_data().is_columnar()) << "batch " << i << " should still be damped";
+        auto want = run_one(oracle, lines_batch(good));
+        EXPECT_EQ(encoded_rows(el.as_data()), encoded_rows(want.as_data()));
+    }
+
+    // The 64th batch since damping is the probe: faithful, so it goes
+    // columnar and re-arms.
+    {
+        auto el = run_one(op, lines_batch(good));
+        ASSERT_TRUE(el.is_data());
+        EXPECT_TRUE(el.as_data().is_columnar()) << "probe batch should attempt and succeed";
+    }
+    // Re-armed: the next faithful batch is columnar immediately.
+    {
+        auto el = run_one(op, lines_batch(good));
+        ASSERT_TRUE(el.is_data());
+        EXPECT_TRUE(el.as_data().is_columnar());
+    }
+}
