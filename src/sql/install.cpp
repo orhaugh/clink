@@ -4313,6 +4313,18 @@ private:
         return it->second.serialize(0);
     }
 
+    // Zero-alloc variant for the hot sync path: serialises the key into the
+    // reused member scratch and returns a view (same bytes as key_of_). The
+    // async path keeps the owning key_of_ - its coroutine outlives the call.
+    std::optional<std::string_view> key_of_scratch_(const Row& row, const std::string& column) {
+        auto it = row.values.find(column);
+        if (it == row.values.end() || it->second.is_null())
+            return std::nullopt;  // NULL key never matches
+        key_scratch_.clear();
+        it->second.serialize_into(key_scratch_);
+        return std::string_view{key_scratch_};
+    }
+
     bool left_keeps_unmatched_() const {
         return kind_ == EquiJoinKind::LeftOuter || kind_ == EquiJoinKind::FullOuter;
     }
@@ -4384,7 +4396,9 @@ private:
 
     void handle_(const Row& row, bool is_left, Batch<Row>& batch) {
         const auto& key_col = is_left ? left_key_column_ : right_key_column_;
-        auto key = key_of_(row, key_col);
+        // Scratch key + transparent probes: no per-record key allocation, and
+        // the insert path below does one probe instead of three.
+        auto key = key_of_scratch_(row, key_col);
         const bool this_outer = is_left ? left_keeps_unmatched_() : right_keeps_unmatched_();
         const bool other_outer = is_left ? right_keeps_unmatched_() : left_keeps_unmatched_();
         const bool retract = is_delete_like(row_kind_of(row));
@@ -4439,8 +4453,12 @@ private:
             return;
         }
 
-        self[*key].push_back(Entry{row, false});
-        Entry& me = self[*key].back();
+        auto sit = self.find(*key);
+        if (sit == self.end()) {
+            sit = self.emplace(std::string(*key), std::vector<Entry>{}).first;
+        }
+        sit->second.push_back(Entry{row, false});
+        Entry& me = sit->second.back();
 
         auto oit = other.find(*key);
         if (oit == other.end() || oit->second.empty()) {
@@ -4683,8 +4701,11 @@ private:
     // Finalised in open(): INNER + a deferring backend -> the async KeyedState
     // path (process_async{1,2}); otherwise the sync in-memory path below.
     bool effective_async_ = false;
-    clink::FlatMap<std::string, std::vector<Entry>> left_state_;
-    clink::FlatMap<std::string, std::vector<Entry>> right_state_;
+    clink::FlatMap<std::string, std::vector<Entry>, TransparentKeyHash, std::equal_to<>>
+        left_state_;
+    clink::FlatMap<std::string, std::vector<Entry>, TransparentKeyHash, std::equal_to<>>
+        right_state_;
+    std::string key_scratch_;  // key_of_scratch_'s reused buffer
 };
 
 // Inc 4: semi / anti join over Row - the runtime for IN / NOT IN and
