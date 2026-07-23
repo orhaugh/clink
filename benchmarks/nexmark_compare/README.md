@@ -530,6 +530,15 @@ decode-shuffle-fold chain rides Arrow columns instead of per-record rows. q0's
 slope gain is within rig noise but its CPU drop (-26%) is consistent - the
 single-pass typed decode is simply cheaper than JSON-to-Row.
 
+Follow-up (same day, after the D4 typed-key work landed): the row-model
+optimisations (scratch group keys, transparent state probes, bulk join-output
+build) moved the ROW bridge most - gated q12 row-path CPU fell 113s -> 62s
+(+77% slope) while the columnar path held ~54-57s - so the columnar-vs-row
+delta compressed from 2.1x to ~8% on q12, with the absolute engine cost
+roughly halved either way. q0's columnar decode keeps a ~-29% CPU edge. The
+table above is the point-in-time D1 comparison; treat deltas as
+commit-specific, re-measure per change.
+
 Two methodology caveats this A/B surfaced, both now load-bearing knowledge:
 
 - **Do not chain measured runs on one warm cluster.** `KEEP_UP=1` reuses the
