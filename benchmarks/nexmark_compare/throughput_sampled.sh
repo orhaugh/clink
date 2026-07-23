@@ -58,6 +58,11 @@ STATE_BACKEND="${STATE_BACKEND:-}"
 # RUN_TAG: optional suffix on the per-query result filenames so backend
 # variants do not overwrite each other (q12-clink-<tag>.json).
 RUN_TAG="${RUN_TAG:-}"
+# ENGINES: which engines to run (default both). ENGINES=clink is the
+# clink-vs-clink A/B mode (e.g. columnar decode on/off under RUN_TAG):
+# the Flink jar build, containers and runs are skipped entirely; the
+# summary prints whatever engines have result files.
+ENGINES="${ENGINES:-clink flink}"
 DATA_DIR="${DATA_DIR:-/tmp/nxcompare-sampled}"
 RESULTS="$ROOT/results-sampled"
 QSUFFIX=""; [ "$SINK" = "blackhole" ] && QSUFFIX="_bh"
@@ -97,19 +102,26 @@ wait_stable_offset() {  # topic -> total records once the sink stops growing
 mkdir -p "$RESULTS" "$DATA_DIR"
 if [ -n "$RUN_TAG" ]; then rm -f "$RESULTS"/*"$TAGSUF".json; else rm -f "$RESULTS"/*.json; fi
 
+want_engine() { case " $ENGINES " in *" $1 "*) return 0;; *) return 1;; esac; }
+
 step "1. Build host deps + Flink jar, check clink-runtime image"
 cmake --build "$CLINK_ROOT/build" --target nexmark_dump clink_submit_sql --parallel 10 >/dev/null 2>&1 \
     || { echo "host build failed"; exit 1; }
 docker image inspect clink-runtime:latest >/dev/null 2>&1 || { echo "clink-runtime:latest missing - run verify_distributed.sh first"; exit 1; }
-( cd "$ROOT/flink-job" && mvn -q -o -DskipTests package 2>/dev/null || mvn -q -DskipTests package ) \
-    || { echo "flink jar build failed"; exit 1; }
+if want_engine flink; then
+    ( cd "$ROOT/flink-job" && mvn -q -o -DskipTests package 2>/dev/null || mvn -q -DskipTests package ) \
+        || { echo "flink jar build failed"; exit 1; }
+fi
 
-step "2. Bring up Kafka + clink + Flink (containers)"
-docker compose -p "$PROJECT" --profile clink --profile flink up -d >/dev/null 2>&1
+step "2. Bring up Kafka + containers ($ENGINES)"
+PROFILES="--profile clink"; want_engine flink && PROFILES="$PROFILES --profile flink"
+docker compose -p "$PROJECT" $PROFILES up -d >/dev/null 2>&1
 for i in $(seq 1 45); do docker exec ${PROJECT}-kafka-1 kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1 && break; sleep 2; done
 for i in $(seq 1 60); do curl -fsS "http://127.0.0.1:${CLINK_JM_HTTP}/api/v1/health" >/dev/null 2>&1 && break; sleep 2; done
-for i in $(seq 1 30); do docker exec "$FLINK_JM" flink list >/dev/null 2>&1 && break; sleep 2; done
-docker cp "$ROOT/flink-job/target/nexmark-sql.jar" "$FLINK_JM:/tmp/nexmark-sql.jar" >/dev/null 2>&1
+if want_engine flink; then
+    for i in $(seq 1 30); do docker exec "$FLINK_JM" flink list >/dev/null 2>&1 && break; sleep 2; done
+    docker cp "$ROOT/flink-job/target/nexmark-sql.jar" "$FLINK_JM:/tmp/nexmark-sql.jar" >/dev/null 2>&1
+fi
 
 step "3. Generate dataset ($EVENTS events) + load nx-{person,auction,bid} ($PAR partitions)"
 dump=$("$CLINK_ROOT/build/benchmarks/nexmark_dump" --events "$EVENTS" --tps "$TPS" --out-dir "$DATA_DIR")
@@ -178,8 +190,8 @@ d=json.load(sys.stdin); d.update({'query':'$q','sink':'$SINK','cpu_seconds':roun
 }
 
 for q in $QUERIES; do
-    step "4. $q on clink (containers, par=$PAR)"; run_clink "$q"
-    step "5. $q on Flink (containers, par=$PAR)"; run_flink "$q"
+    if want_engine clink; then step "4. $q on clink (containers, par=$PAR)"; run_clink "$q"; fi
+    if want_engine flink; then step "5. $q on Flink (containers, par=$PAR)"; run_flink "$q"; fi
 done
 
 step "6. Sustained-throughput summary (engine-side metrics, par=$PAR, $EVENTS events, sink=$SINK)"

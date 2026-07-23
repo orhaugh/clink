@@ -506,6 +506,43 @@ at par>1 its output diverges because the multi-partition watermark refinement is
 yet on the SQL Kafka-source path - a documented gap, see the q12 template. The
 blackhole path sidesteps the output gate, so it compares at any par.)
 
+## Columnar JSON decode A/B (`ENGINES=clink`, 2026-07-23)
+
+The columnar JSON decode became clink's default for Kafka tables (the source
+decodes straight into typed Arrow columns; the keyed shuffle and windowed
+aggregate stay columnar end to end). `ENGINES=clink` runs the harness
+clink-only for this kind of clink-vs-clink A/B; the baseline is the same
+template with `columnar_decode='false'`, under separate `RUN_TAG`s.
+
+Fresh-cluster A/B (each variant on a freshly composed stack, blackhole sink,
+10M events, par=4, same box, back to back):
+
+| metric | q0 row | q0 columnar | q12 row | q12 columnar |
+|---|---|---|---|---|
+| sustained slope (rec/s) | 1.89M | 1.99M (+5%) | 1.08M | **1.83M (+69%)** |
+| CPU seconds | 48.4 | **35.9 (-26%)** | 113.1 | **54.2 (-52%)** |
+| events per CPU-second | 189k | 255k (1.35x) | 68k | **145k (2.13x)** |
+
+CPU-seconds is the robust metric on this rig (slope is noisy; the per-variant
+CPU figures reproduced within ~3% across independent rounds). The q12 win is
+the headline: the windowed GROUP BY halves its CPU when the whole
+decode-shuffle-fold chain rides Arrow columns instead of per-record rows. q0's
+slope gain is within rig noise but its CPU drop (-26%) is consistent - the
+single-pass typed decode is simply cheaper than JSON-to-Row.
+
+Two methodology caveats this A/B surfaced, both now load-bearing knowledge:
+
+- **Do not chain measured runs on one warm cluster.** `KEEP_UP=1` reuses the
+  worker containers, and CPU-seconds rose monotonically across chained runs
+  regardless of variant (a 2.6x drift by the sixth job on the same workers),
+  which erased the delta in one round. Each measured variant needs a freshly
+  composed stack; `KEEP_UP` is for debugging only.
+- **The q12 tail is sampler-limited on this rig.** Both variants end at
+  ~85% of the input before the 20s quiet-timeout trips (the taper after the
+  sustained window is slow in the Docker VM). This is variant-independent and
+  does not affect the sustained slope or CPU comparison; `reached_target` is
+  the flag to watch when comparing across engines rather than variants.
+
 ## Producer (`nexmark_dump`)
 
 ```bash
