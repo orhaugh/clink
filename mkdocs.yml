@@ -39,14 +39,20 @@ theme:
     - content.code.copy
     - content.action.edit
 
+# NOTE: these patterns are also matched against the THEME's static files
+# (MkDocs adds them to the same file collection), so a blanket /* would strip
+# Material's assets/ tree and ship an unstyled site. Exclude narrowly and
+# re-include /assets/ for the theme.
 exclude_docs: |
-  /*
+  /*.md
   !/index.md
   !/capabilities.md
+  /*/
   !/internals/
   !/connectors/
   !/design/
   !/consumer-examples/
+  !/assets/
   consumer-examples/build/
 
 validation:
