@@ -1,6 +1,7 @@
 # clink
 
 [![ci](https://github.com/orhaugh/clink/actions/workflows/ci.yml/badge.svg)](https://github.com/orhaugh/clink/actions/workflows/ci.yml)
+[![docs](https://github.com/orhaugh/clink/actions/workflows/docs.yml/badge.svg)](https://orhaugh.github.io/clink/)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 [![changelog](https://img.shields.io/badge/changelog-v0.1.0-lightgrey.svg)](CHANGELOG.md)
 
@@ -367,6 +368,12 @@ The full set lives in the [connector reference](docs/connectors/README.md). In b
 - Serialization: [Avro](docs/connectors/avro.md)
 
 ## Internals
+
+All of the documentation below is also published as a browsable site at
+[orhaugh.github.io/clink](https://orhaugh.github.io/clink/), together with a
+[capability catalogue](https://orhaugh.github.io/clink/capabilities/) and the
+[design decisions](https://orhaugh.github.io/clink/design/) behind the
+engine's architecture.
 
 For a deeper look at how the engine works inside, the [internals
 reference](docs/internals/README.md) documents each subsystem and names the

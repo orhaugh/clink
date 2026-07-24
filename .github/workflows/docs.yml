@@ -1,0 +1,59 @@
+# Build and publish the documentation site (MkDocs Material -> GitHub Pages).
+#
+# The site serves only the tracked docs/ subdirectories; mkdocs.yml carries an
+# allowlist (exclude_docs) mirroring .gitignore, and a CI checkout contains
+# only tracked files anyway, so untracked internal notes cannot reach a
+# published build.
+
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - mkdocs.yml
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; let an in-flight deploy finish.
+concurrency:
+  group: docs-deploy
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install MkDocs Material
+        # Pinned below 10: the Material team has announced that the MkDocs 2.0
+        # generation breaks plugins and theming with no migration path.
+        run: pip install 'mkdocs-material>=9.7,<10'
+
+      - name: Build site
+        run: mkdocs build --site-dir _site
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

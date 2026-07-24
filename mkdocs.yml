@@ -1,0 +1,133 @@
+# clink documentation site. Built by .github/workflows/docs.yml (MkDocs
+# Material -> GitHub Pages) from the tracked subdirectories of docs/.
+#
+# docs/ also holds untracked internal work notes on developer machines, so
+# exclude_docs is an allowlist mirroring .gitignore: only the tracked,
+# published content can reach a build, even one run locally.
+
+site_name: clink
+site_description: >-
+  Embedded-first, Arrow-native stream processing engine in modern C++:
+  how it works, why it is designed this way, and what it can do.
+site_url: https://orhaugh.github.io/clink/
+repo_url: https://github.com/orhaugh/clink
+repo_name: orhaugh/clink
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: '(prefers-color-scheme: light)'
+      scheme: default
+      primary: black
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: '(prefers-color-scheme: dark)'
+      scheme: slate
+      primary: black
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - content.code.copy
+    - content.action.edit
+
+exclude_docs: |
+  /*
+  !/index.md
+  !/capabilities.md
+  !/internals/
+  !/connectors/
+  !/design/
+  !/consumer-examples/
+  consumer-examples/build/
+
+validation:
+  links:
+    # Internals pages cite engine sources by relative path (include/, src/);
+    # those are repository links, not site pages, so do not fail on them.
+    unrecognized_links: info
+    absolute_links: info
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Home: index.md
+  - Capabilities: capabilities.md
+  - Internals:
+      - internals/README.md
+      - internals/architecture.md
+      - internals/operator-model.md
+      - internals/task-lifecycle.md
+      - internals/jobs-and-scheduling.md
+      - internals/distributed-runtime.md
+      - internals/network-stack.md
+      - internals/time-and-windowing.md
+      - internals/state-and-backends.md
+      - internals/state-snapshot-format.md
+      - internals/testing-framework.md
+      - internals/replay-determinism.md
+      - internals/checkpointing.md
+      - internals/sink-committer-framework.md
+      - internals/fault-tolerance-and-rescale.md
+      - internals/columnar-execution.md
+      - internals/async-state-execution.md
+      - internals/sql-frontend.md
+      - internals/embedded.md
+      - internals/data-lineage.md
+  - Connectors:
+      - connectors/README.md
+      - connectors/avro.md
+      - connectors/aws.md
+      - connectors/azure-parquet.md
+      - connectors/builtin.md
+      - connectors/cassandra.md
+      - connectors/clickhouse.md
+      - connectors/gcs-parquet.md
+      - connectors/http.md
+      - connectors/iceberg.md
+      - connectors/kafka.md
+      - connectors/local.md
+      - connectors/mongodb.md
+      - connectors/mqtt.md
+      - connectors/mysql.md
+      - connectors/nats.md
+      - connectors/postgres.md
+      - connectors/pulsar.md
+      - connectors/rabbitmq.md
+      - connectors/redis.md
+      - connectors/s3-parquet.md
+      - connectors/s3.md
+      - connectors/webhdfs-parquet.md
+  - Design decisions:
+      - design/index.md
+      - design/001-arrow-native-data-plane.md
+      - design/002-embedded-first.md
+      - design/003-state-as-open-data.md
+      - design/004-jobs-as-compiled-plugins.md
+      - design/005-hand-rolled-sql-optimizer.md
+      - design/006-deterministic-replay.md
+  - Examples:
+      - consumer-examples/README.md
+      - consumer-examples/state_as_data/README.md

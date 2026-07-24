@@ -83,11 +83,18 @@ benchmarks/prod_compare/*/flink-job/target/
 benchmarks/prod_compare/*/rocksdb:/
 
 # Internal work-tracking docs live locally only; never under version control.
-# (the buildable consumer-examples and the published connector docs stay tracked)
+# (the buildable consumer-examples and the published connector docs stay tracked,
+# as do the docs-site pages: landing, capabilities, design decisions)
 /docs/*
 !/docs/consumer-examples/
 !/docs/connectors/
 !/docs/internals/
+!/docs/design/
+!/docs/index.md
+!/docs/capabilities.md
+
+# MkDocs build output
+/site/
 
 # Python package artifacts (pyclink)
 __pycache__/
