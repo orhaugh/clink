@@ -48,7 +48,17 @@ esac
 # full-featured prefix from a stripped one, and silently reusing the wrong one is
 # a confusing way to lose whole filesystems, so a mismatch forces the rebuild.
 stamp_file="${PREFIX}/.clink-arrow-features"
-stamp_want="arrow=${ARROW_VERSION} object_stores=${ARROW_OBJ_SETTING}"
+# The dependency-resolution mode is part of the identity too: with the object
+# stores off Arrow is built with NO Homebrew prefix hint, so its brotli/zstd/etc
+# are its own, compiled at the floor. A prefix built with the hint has different
+# (and, for a portable wheel, wrong) transitive libraries even though the version
+# and the object-store setting match, so the stamp must tell them apart.
+if [ "${ARROW_OBJ_SETTING}" = "ON" ]; then
+    ARROW_DEPS_MODE="system-hints"
+else
+    ARROW_DEPS_MODE="hermetic"
+fi
+stamp_want="arrow=${ARROW_VERSION} object_stores=${ARROW_OBJ_SETTING} deps=${ARROW_DEPS_MODE}"
 
 ver_file="${PREFIX}/lib/cmake/Arrow/ArrowConfigVersion.cmake"
 if [ -f "${ver_file}" ] && grep -q "\"${ARROW_VERSION}\"" "${ver_file}" 2>/dev/null; then
