@@ -771,13 +771,24 @@ if(TARGET clink::embed)
         # a connector impl (s3/aws/azure/gcs) drags them in; a lean build
         # (CLINK_BUILD_IMPLS=OFF, e.g. the pyclink wheel) links no impls, so
         # satisfy them explicitly whenever they are available.
-        find_package(CURL QUIET)
-        if(TARGET CURL::libcurl)
-            target_link_libraries(clink_shared PRIVATE CURL::libcurl)
+        #
+        # Conditioned on what the linked Arrow ACTUALLY contains (ArrowOptions.cmake
+        # exports ARROW_GCS / ARROW_AZURE), because these are not free: on macOS the
+        # only libcurl a lean build finds is Homebrew's, which drags in Homebrew's
+        # OpenSSL, and every Homebrew bottle carries the build host's minimum macOS
+        # version. Against an Arrow built without the object stores that pinned
+        # libclink above the pyclink wheel's floor for libraries nothing referenced.
+        if(ARROW_GCS)
+            find_package(CURL QUIET)
+            if(TARGET CURL::libcurl)
+                target_link_libraries(clink_shared PRIVATE CURL::libcurl)
+            endif()
         endif()
-        find_package(LibXml2 QUIET)
-        if(TARGET LibXml2::LibXml2)
-            target_link_libraries(clink_shared PRIVATE LibXml2::LibXml2)
+        if(ARROW_AZURE)
+            find_package(LibXml2 QUIET)
+            if(TARGET LibXml2::LibXml2)
+                target_link_libraries(clink_shared PRIVATE LibXml2::LibXml2)
+            endif()
         endif()
         if(APPLE)
             target_link_options(clink_shared PRIVATE "LINKER:-dead_strip_dylibs")
