@@ -22,6 +22,11 @@ option(CLINK_BUILD_EXAMPLES "Build clink examples" ON)
 # requires just Arrow/Parquet/Threads, so a downstream find_package(clink) needs
 # no connector SDKs.
 option(CLINK_BUILD_IMPLS    "Build the connector/backend impls" ON)
+# HTTPS in the HTTP subsystem (server + client). ON links OpenSSL when available.
+# OFF keeps plain HTTP only and takes no OpenSSL dependency - what a portable
+# artifact needs, since the OpenSSL a build finds on macOS is a Homebrew bottle
+# pinned to the build host's OS version. See the httplib block below.
+option(CLINK_HTTP_TLS       "Enable HTTPS in the HTTP subsystem (links OpenSSL)" ON)
 option(CLINK_BUILD_BENCH    "Build clink benchmarks (placeholder)" OFF)
 option(CLINK_BUILD_HTTP     "Build the HTTP subsystem (cluster dashboard + JSON API)" ON)
 # SQL frontend: parser (libpg_query), binder, logical/physical planner,
@@ -608,6 +613,19 @@ endif()
 # ---------------------------------------------------------------------------
 if(CLINK_BUILD_HTTP)
     include(FetchContent)
+    # httplib enables HTTPS whenever it FINDS OpenSSL, which then makes
+    # clink_core's http_server / http_client reference OpenSSL symbols and pulls
+    # libssl/libcrypto onto every consumer's link line. That is right for a normal
+    # build and wrong for a portable artifact: on macOS the only OpenSSL found is
+    # Homebrew's, whose bottle carries the BUILD HOST's minimum macOS version, so a
+    # wheel vendoring it cannot honestly claim a lower floor (delocate refuses:
+    # "libcrypto.3.dylib has a minimum target of 26.0"). CLINK_HTTP_TLS=OFF drops
+    # HTTPS from the HTTP subsystem and with it the OpenSSL dependency; plain HTTP
+    # is unaffected. The pyclink wheel sets it (scripts/build-libclink-wheel.sh).
+    if(NOT CLINK_HTTP_TLS)
+        set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+        message(STATUS "clink::core - HTTP subsystem without TLS (CLINK_HTTP_TLS=OFF)")
+    endif()
     FetchContent_Declare(
         httplib
         GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git

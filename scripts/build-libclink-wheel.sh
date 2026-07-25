@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # Build a lean, self-contained libclink for the pyclink wheel and stage it where
 # the wheel build can pick it up (CLINK_LIB). Lean = SQL on, connector impls off,
-# so the only shared deps are Arrow's (curl / xml2 / aws-sdk / openssl / lz4 /
-# zstd), which the wheel-repair step (delocate / auditwheel) then vendors in.
+# and HTTPS off, so the shared deps are Arrow's alone (lz4 / zstd / ...), which
+# the wheel-repair step (delocate / auditwheel) then vendors in.
+#
+# CLINK_HTTP_TLS=OFF is what keeps OpenSSL out. httplib enables HTTPS whenever it
+# finds OpenSSL, and clink_core's http_server / http_client then reference it; the
+# only OpenSSL on a macOS runner is a Homebrew bottle built for that runner's OS,
+# which would pin the wheel above its floor. The wheel therefore serves and
+# fetches plain HTTP only.
 #
 # Reused two ways:
 #   * locally, to produce a libclink to point `python -m build` at via CLINK_LIB;
@@ -46,6 +52,7 @@ cmake -S "${ROOT}" -B "${BUILD}" \
     -DCLINK_BUILD_IMPLS=OFF \
     -DCLINK_BUILD_TESTS=OFF \
     -DCLINK_BUILD_EXAMPLES=OFF \
+    -DCLINK_HTTP_TLS=OFF \
     ${OSX_ARG:+"${OSX_ARG}"} \
     ${ZSTD_ARG:+"${ZSTD_ARG}"}
 cmake --build "${BUILD}" --target clink_shared --parallel "${JOBS}"
