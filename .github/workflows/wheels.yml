@@ -224,17 +224,20 @@ jobs:
         # cmake is preinstalled but we pin it via brew for parity.
         run: brew install cmake aws-sdk-cpp
 
-      - name: Cache pinned toolchain (the wheel's S3-less prefix)
-        # The ~40 min from-source Arrow build. Keyed on versions.env, the macOS
-        # floor AND the object-store setting, so changing any busts it and Arrow is
-        # rebuilt with the right features at the right minos. build-arrow.sh is
-        # idempotent and exits early on a cache hit (it stamps the feature set
-        # beside the install, so a prefix built the other way is not reused).
+      - name: Restore pinned toolchain (the wheel's stripped prefix)
+        # Restore/save split rather than actions/cache: the Arrow source build is
+        # ~25 min and a run that fails LATER (at wheel repair, say) would otherwise
+        # discard it and pay again on the next attempt.
         #
-        # This prefix is the wheel's own: it holds an Arrow without the
-        # object-store filesystems, and a normal ~/.clink-deps must never be
-        # confused with it.
-        uses: actions/cache@v4
+        # Keyed on versions.env, the macOS floor AND the object-store setting, so
+        # changing any busts it and Arrow is rebuilt with the right features at the
+        # right minos. build-arrow.sh is idempotent and exits early on a hit (it
+        # stamps the feature set beside the install, so a prefix built the other way
+        # is not reused).
+        #
+        # This prefix is the wheel's own: it holds an Arrow without the object-store
+        # filesystems, and a normal ~/.clink-deps must never be confused with it.
+        uses: actions/cache/restore@v4
         with:
           path: ~/.clink-deps-wheel
           key: clink-deps-${{ runner.os }}-${{ runner.arch }}-macos${{ env.MACOSX_DEPLOYMENT_TARGET }}-obj${{ env.CLINK_ARROW_OBJECT_STORES }}-${{ hashFiles('scripts/versions.env') }}
@@ -254,6 +257,13 @@ jobs:
           set -euo pipefail
           scripts/build-arrow.sh
 
+      - name: Save pinned toolchain
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.clink-deps-wheel
+          key: clink-deps-${{ runner.os }}-${{ runner.arch }}-macos${{ env.MACOSX_DEPLOYMENT_TARGET }}-obj${{ env.CLINK_ARROW_OBJECT_STORES }}-${{ hashFiles('scripts/versions.env') }}
+
       - name: Wheel build tooling
         run: python -m pip install --upgrade pip build delocate pytest
 
@@ -272,6 +282,19 @@ jobs:
           python -m build --wheel \
             --outdir "${RUNNER_TEMP}/dist" \
             "${{ github.workspace }}/python"
+
+      - name: Report the wheel's shared-library closure
+        # Prints, for every external dylib the wheel needs, which library asks for
+        # it. When the repair step below refuses a dependency for carrying too high
+        # a macOS minimum, this is what identifies who dragged it in - otherwise the
+        # error names the offender but not the cause.
+        run: |
+          set -euo pipefail
+          export DYLD_LIBRARY_PATH="${CLINK_DEPS_PREFIX}/lib:/opt/homebrew/lib:${DYLD_LIBRARY_PATH:-}"
+          echo "--- delocate-listdeps --depending ---"
+          delocate-listdeps --all --depending "${RUNNER_TEMP}"/dist/*.whl || true
+          echo "--- otool -L on the staged libclink ---"
+          otool -L "${RUNNER_TEMP}/libclink-staged" || true
 
       - name: Repair wheel (delocate)
         # Vendors the Arrow transitive dylibs (curl / xml2 / lz4 / zstd / ...)
