@@ -23,12 +23,15 @@
 #     auditwheel on Linux - so we lose nothing on the vendoring step.
 #
 # PLATFORM SCOPE (read before you rely on a Linux wheel):
-#   macos-arm64  Shipped on every tag. Natively built + delocated + smoke-tested.
-#                This is the proven, self-contained path. ONE CAPABILITY CAVEAT:
-#                its Arrow is built without the object-store filesystems, so
-#                s3:// / gs:// / abfs:// paths do not work from the wheel (local
-#                files and SQL do). Build from source for those. Reason and
-#                measurements in the macos-wheel job's env block.
+#   macos-arm64  Shipped on every tag. Natively built + delocated + smoke-tested,
+#                and self-contained to the point of vendoring NO dylibs at all
+#                (static Arrow, system libs only). TWO CAPABILITY CAVEATS, both
+#                deliberate and both required to keep the macOS floor below the
+#                build host's: its Arrow has no object-store filesystems, so
+#                s3:// / gs:// / abfs:// do not work; and its HTTP subsystem has
+#                no TLS, so it serves and fetches plain HTTP only. Local files,
+#                SQL and the embedded engine are unaffected. Build from source
+#                for either capability. Reasons in the macos-wheel job env.
 #   linux        OPT-IN ONLY (workflow_dispatch input build_linux). The pinned
 #                toolchain image is Debian trixie, whose glibc is very new
 #                (2.4x). auditwheel derives the manylinux floor from the glibc
@@ -55,12 +58,19 @@
 name: wheels
 
 on:
-  # Manual for now, pending one green macos-26 run. The old note here blamed
-  # clink's std::jthread usage and an availability gate; that diagnosis was
-  # wrong. The types are gated to macOS 11.0, below this wheel's floor, and the
-  # real blocker was the build SDK not defining them at all (see the macos-wheel
-  # job). Restore `push: tags: ["v*"]` once a dispatch run is green, and a
-  # release tag produces wheels again.
+  # A release tag produces wheels again. This was manual-only from 2026-07-18 to
+  # 2026-07-25 under a note blaming clink's std::jthread usage; that diagnosis was
+  # wrong twice over. The C++20 sync library is gated to macOS 11.0, BELOW this
+  # wheel's floor and equal to Apple silicon's own first release, so it never cost
+  # anything. What actually blocked the build was the SDK (macos-15's libc++ does
+  # not define jthread at all), and what then blocked the REPAIR was every
+  # Homebrew bottle on the newer image carrying that image's minimum macOS
+  # version. Fixed by building on macos-26 and taking Homebrew off the wheel's
+  # link line entirely: no object stores, no HTTPS, Arrow's deps bundled at the
+  # floor. Result: pyclink-0.1.0-py3-none-macosx_14_0_arm64.whl with ZERO
+  # vendored dylibs.
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       build_linux:
