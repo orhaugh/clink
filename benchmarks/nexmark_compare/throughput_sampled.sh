@@ -115,6 +115,18 @@ fi
 
 step "2. Bring up Kafka + containers ($ENGINES)"
 PROFILES="--profile clink"; want_engine flink && PROFILES="$PROFILES --profile flink"
+# Whether the engine containers are CREATED here decides if memory.peak is
+# attributable to this run: the kernel will not let a container reset its own
+# peak, so on a reused stack it is the high-water mark of everything that has
+# ever run in it. Detected rather than declared - a hand-set flag is exactly the
+# kind of thing that quietly turns into a wrong number three months later.
+FRESH_STACK=1
+for _c in $CLINK_CTRS $FLINK_CTRS; do
+    if docker inspect "$_c" >/dev/null 2>&1; then FRESH_STACK=""; break; fi
+done
+export FRESH_STACK
+[ -n "$FRESH_STACK" ] && echo "  fresh stack: memory.peak is attributable to this run" \
+                      || echo "  REUSED stack: memory.peak spans earlier runs (anon is still current)"
 docker compose -p "$PROJECT" $PROFILES up -d >/dev/null 2>&1
 for i in $(seq 1 45); do docker exec ${PROJECT}-kafka-1 kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1 && break; sleep 2; done
 for i in $(seq 1 60); do curl -fsS "http://127.0.0.1:${CLINK_JM_HTTP}/api/v1/health" >/dev/null 2>&1 && break; sleep 2; done
@@ -148,6 +160,14 @@ run_clink() {  # query
     local q=$1 out="nx-out-$q-clink"
     [ "$SINK" = "kafka" ] && recreate_topic "$out" "$PAR" append
     sed -e "s#__OUT__#$out#" -e "s#__BROKERS__#kafka:29092#" "$ROOT/queries/clink/$q$QSUFFIX.tmpl.sql" > "$DATA_DIR/$q-clink.sql"
+    # Counter value BEFORE submit. clink's per-op counters are cumulative across
+    # jobs, so this is what makes the run's progress an exact delta - without it
+    # the sampler anchors on the first positive sample and subtracts the run's own
+    # head start, scoring a fully-drained run as incomplete (reached_target false).
+    local base0; base0=$("$PY" -c "
+import sys; sys.path.insert(0,'$ROOT/driver')
+from sample_rate import clink_prior_total
+print(clink_prior_total('http://127.0.0.1:$CLINK_JM_HTTP'))" 2>/dev/null || echo 0)
     local cpu_pre wall_pre; cpu_pre=$("$PY" "$ROOT/driver/cpu.py" read-flink $CLINK_CTRS); wall_pre=$(now_s)
     local jid; jid=$(../../build/clink_submit_sql --file "$DATA_DIR/$q-clink.sql" \
         --coordinator-host 127.0.0.1 --coordinator-port "$CLINK_JM_HTTP" --name "ts_$q" --parallelism "$PAR" \
@@ -157,7 +177,8 @@ run_clink() {  # query
     # metric-refresh plateau does not trip an early "drained" before the full
     # input is consumed - otherwise the run is INCOMPLETE and not comparable.
     local s; s=$("$PY" "$ROOT/driver/sample_rate.py" clink --base "http://127.0.0.1:$CLINK_JM_HTTP" \
-        --job "$jid" --target "$BIDS" --interval 0.08 --window 0.5 --quiet-timeout 20 --max-runtime 300)
+        --job "$jid" --target "$BIDS" --baseline "${base0:-0}" \
+        --interval 0.08 --window 0.5 --quiet-timeout 20 --max-runtime 300)
     local cpu_post wall_post; cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-flink $CLINK_CTRS); wall_post=$(now_s)
     # Memory BEFORE the cancel: the engine still holds its working set (state,
     # buffers), which is the figure a capacity or efficiency comparison wants.
@@ -194,6 +215,17 @@ d=json.load(sys.stdin); d.update({'query':'$q','sink':'$SINK','cpu_seconds':roun
     docker exec "$FLINK_JM" flink cancel "$jid" >/dev/null 2>&1
     sleep 2
 }
+
+# Broker serve-rate control. Both engines read this same unlimited broker, whose
+# CPU is in neither engine's account, so if it serves at about the rate the
+# engines drain at then the benchmark is measuring Kafka and no engine-vs-engine
+# throughput ratio taken from it means anything. Printed as a control row so that
+# cannot be overlooked. Non-fatal: a failure here must not abort a benchmark.
+step "3b. Broker serve-rate control"
+BROKER_CEILING=$("$PY" "$ROOT/driver/broker_ceiling.py" --brokers localhost:9092 \
+    --topic nx-bid --timeout-s 120 2>/dev/null || echo '{}')
+echo "  broker: $BROKER_CEILING"
+export BROKER_CEILING
 
 for q in $QUERIES; do
     if want_engine clink; then step "4. $q on clink (containers, par=$PAR)"; run_clink "$q"; fi

@@ -38,9 +38,24 @@ def main():
     print(f"  record to fully drained). Excludes deploy/JVM-warmup startup, averages over the")
     print(f"  whole drain (robust to coarse metric refresh). Not consumer-bound, not fooled by")
     print(f"  sink burst-flush. slope/whole-run shown as diagnostics only.\n")
-    hdr = f"  {'query':6} {'engine':6} {'DRAIN rec/s':>12} {'drain(s)':>9} {'CPU-s':>7} {'ev/CPU-s':>10} {'out_rows':>10}"
+    hdr = (f"  {'query':6} {'engine':6} {'DRAIN rec/s':>12} {'drain(s)':>9} {'CPU-s':>7} "
+           f"{'ev/CPU-s':>10} {'anon MB':>8} {'out_rows':>10}")
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
+
+    # The control row. If the broker serves at about the rate the engines drain
+    # at, the benchmark is measuring Kafka and no ratio below means anything.
+    bc = os.environ.get("BROKER_CEILING", "")
+    if bc:
+        try:
+            b = json.loads(bc)
+            if b.get("rate"):
+                print(f"  {'--':6} {'BROKER':6} {fmt(b['rate']):>12} {b.get('seconds', 0):>9.1f} "
+                      f"{'-':>7} {'-':>10} {'-':>8} {'control':>10}")
+                print(f"  (broker serve-rate control: if an engine's drain rate approaches this, "
+                      f"the run is input-bound and is not measuring the engine)\n")
+        except Exception:
+            pass
 
     issues = []
     geomean_terms = []
@@ -56,8 +71,10 @@ def main():
             ds = d.get("drain_seconds")
             orows = d.get("out_rows", 0)
             orows_s = "n/a(bh)" if orows is None or orows < 0 else str(orows)
+            anon = d.get("anon_mb")
+            anon_s = ("%.0f" % anon) if anon else "-"
             print(f"  {q:6} {eng:6} {fmt(d['drain_rate']):>12} {(('%.1f' % ds) if ds else '-'):>9} "
-                  f"{cpu:>7.1f} {fmt(evcpu):>10} {orows_s:>10}")
+                  f"{cpu:>7.1f} {fmt(evcpu):>10} {anon_s:>8} {orows_s:>10}")
         if c and fl:
             # Only a meaningful comparison if BOTH engines drained the input. Use
             # the drained FRACTION, not reached_target: clink's counter is
@@ -72,13 +89,21 @@ def main():
             blackhole = c.get("sink") == "blackhole" or fl.get("sink") == "blackhole"
             if incomplete:
                 issues.append(f"{q}: INCOMPLETE run ({', '.join(incomplete)} did not drain the full input "
-                              f"before the cap) - not comparable; raise --max-runtime / warm the engine")
+                              f"before the cap) - NO RATIO PRINTED; raise --max-runtime / warm the engine")
             elif blackhole:
                 # No output topic to count; completeness gate = both engines'
                 # counters drained the full input (reached_target, asserted above).
                 pass
             elif c.get("out_rows", -1) != fl.get("out_rows", -2):
                 issues.append(f"{q}: OUTPUT ROW MISMATCH clink={c.get('out_rows')} flink={fl.get('out_rows')}")
+            # Hard gate: a ratio between a completed run and a truncated one is not
+            # a comparison, and printing it anyway is how a caveat two screens down
+            # gets quoted as a headline. Refuse rather than annotate.
+            if incomplete:
+                print(f"  {q:6} {'RATIO':6} {'--':>12} {'':>9} {'':>7} {'--':>10}"
+                      f"  (suppressed: incomplete run)")
+                print()
+                continue
             ratio_drain = (c["drain_rate"] / fl["drain_rate"]) if fl["drain_rate"] else 0
             ratio_cpu = ((c["final_count"] / c["cpu_seconds"]) / (fl["final_count"] / fl["cpu_seconds"])) \
                 if c.get("cpu_seconds") and fl.get("cpu_seconds") else 0

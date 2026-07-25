@@ -90,6 +90,11 @@ public:
     void connect() {
         auto local = LocalDataPlane::instance().lookup_endpoint<T>(host_, port_);
         if (local) {
+            LocalDataPlane::instance().note_local_hit();
+        } else {
+            LocalDataPlane::instance().note_socket_fallback();
+        }
+        if (local) {
             local_channel_ = std::move(local);
             return;
         }

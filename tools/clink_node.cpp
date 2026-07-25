@@ -2485,6 +2485,12 @@ int run_worker(int argc, char** argv) {
     const auto coordinator_port =
         get_arg(argc, argv, "coordinator-port", std::to_string(kDefaultCoordinatorPort));
     const auto data_host = get_arg(argc, argv, "data-host", "127.0.0.1");
+    // Peers address this worker's data-plane endpoints by data_host, but the
+    // endpoints BIND to CLINK_DATA_BIND_HOST (0.0.0.0 in a container). Telling
+    // the local data plane its advertised identity lets it register under both,
+    // so two subtasks colocated in this process short-circuit instead of
+    // serialising to Arrow IPC and crossing a socket to their own hostname.
+    clink::network::LocalDataPlane::instance().set_advertised_host(data_host);
     const auto slot_str = get_arg(argc, argv, "slots", "4");
     const auto http_port_str = get_arg(argc, argv, "http-port", "0");
     const auto http_bind = get_arg(argc, argv, "http-bind", "127.0.0.1");

@@ -548,3 +548,37 @@ TEST(NetworkChannel, OversizedFrameHeaderIsRejectedNotAllocated) {
 
     attacker.join();
 }
+
+// The advertised-host alias. A worker BINDS its data-plane endpoints to
+// CLINK_DATA_BIND_HOST (0.0.0.0 in a container, 127.0.0.1 by default) but peers
+// address it by the host it advertised to the coordinator (--data-host, e.g.
+// "clink-worker3"). Registering only under the bind address meant a lookup by the
+// advertised name missed, the in-process fast path silently vanished, and two
+// subtasks colocated in one process serialised to Arrow IPC and crossed a TCP
+// socket to their own hostname. It went unnoticed because every non-container
+// deployment has both sides defaulting to 127.0.0.1, where the keys coincide.
+TEST(LocalDataPlaneAdvertisedHost, LookupByAdvertisedNameFindsAWildcardBoundEndpoint) {
+    auto& ldp = LocalDataPlane::instance();
+    const std::uint16_t port = 51999;
+    ldp.set_advertised_host("clink-worker3");
+    auto ch = std::make_shared<LocalEndpointChannel<std::int64_t>>(8);
+
+    ldp.register_endpoint<std::int64_t>("0.0.0.0", port, ch);
+
+    EXPECT_NE(ldp.lookup_endpoint<std::int64_t>("clink-worker3", port), nullptr)
+        << "a peer resolving this worker by its advertised name must hit the fast path";
+    EXPECT_NE(ldp.lookup_endpoint<std::int64_t>("0.0.0.0", port), nullptr)
+        << "the bind identity must keep working";
+    EXPECT_NE(ldp.lookup_endpoint<std::int64_t>("127.0.0.1", port), nullptr)
+        << "a wildcard bind is reachable in-process as loopback";
+    EXPECT_EQ(ldp.lookup_endpoint<std::int64_t>("clink-worker9", port), nullptr)
+        << "a DIFFERENT worker must not resolve locally - that would cross-wire subtasks";
+
+    // Every alias must be dropped, or a stale channel outlives its deploy and the
+    // next job pushes records into a queue nobody reads.
+    ldp.unregister_endpoint("0.0.0.0", port);
+    EXPECT_EQ(ldp.lookup_endpoint<std::int64_t>("clink-worker3", port), nullptr);
+    EXPECT_EQ(ldp.lookup_endpoint<std::int64_t>("0.0.0.0", port), nullptr);
+    EXPECT_EQ(ldp.lookup_endpoint<std::int64_t>("127.0.0.1", port), nullptr);
+    ldp.set_advertised_host("");
+}

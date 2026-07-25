@@ -57,6 +57,12 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
+        # The harness reads job vertex metrics from the JobManager's MetricFetcher
+        # cache. Left at the 10s default, every Flink rate the sampler computes is
+        # quantised to that period - the recorded 10.81s and 20.64s drains are 1x
+        # and 2x it - which reports Flink's LOWER BOUND as its measurement. 200ms
+        # makes the counter fresh enough to measure.
+        metrics.fetcher.update-interval: 200
         parallelism.default: 4
         state.backend.type: hashmap
 
@@ -71,6 +77,12 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
+        # The harness reads job vertex metrics from the JobManager's MetricFetcher
+        # cache. Left at the 10s default, every Flink rate the sampler computes is
+        # quantised to that period - the recorded 10.81s and 20.64s drains are 1x
+        # and 2x it - which reports Flink's LOWER BOUND as its measurement. 200ms
+        # makes the counter fresh enough to measure.
+        metrics.fetcher.update-interval: 200
         parallelism.default: 4
         state.backend.type: hashmap
 

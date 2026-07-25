@@ -39,6 +39,33 @@ def clink_frontier(base, job):
     return best, None
 
 
+def clink_prior_total(base):
+    """Cumulative frontier across every job the coordinator knows about.
+
+    clink's per-operator counters accumulate across job submissions on a
+    persistent worker, so a run's own progress must be measured as a delta from
+    whatever those counters already read BEFORE it was submitted. Anchoring on
+    the first strictly-positive sample instead (the old behaviour) subtracts the
+    run's own head start, which makes proc >= target unreachable and scores a
+    fully-drained run as incomplete. Called before submit; 0 on a fresh stack.
+    """
+    total = 0
+    try:
+        jobs = get_json(f"{base}/api/v1/jobs")
+        entries = jobs.get("jobs", jobs) if isinstance(jobs, dict) else jobs
+        for j in entries or []:
+            jid = j.get("job_id") or j.get("id") if isinstance(j, dict) else j
+            if not jid:
+                continue
+            try:
+                total = max(total, clink_frontier(base, jid)[0])
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return total
+
+
 def flink_frontier(base, job):
     # Returns (frontier, job_duration_seconds). Flink's aggregated job metrics lag
     # the metric-fetcher interval (~10s) before they populate, so host wall-time is
@@ -67,6 +94,11 @@ def main():
     ap.add_argument("--start-timeout", type=float, default=45.0,
                     help="give up if NO record flows within this long (job never deployed)")
     ap.add_argument("--max-runtime", type=float, default=180.0, help="absolute cap")
+    ap.add_argument("--baseline", type=int, default=None,
+                    help="counter value BEFORE this job was submitted. Given explicitly, "
+                         "the run's progress is an exact delta from it. Omitted, the "
+                         "sampler falls back to anchoring on the first positive sample, "
+                         "which subtracts the run's own head start.")
     args = ap.parse_args()
 
     frontier = clink_frontier if args.engine == "clink" else flink_frontier
@@ -88,6 +120,8 @@ def main():
     # submission with fresh vertices starting at 0, so its counts are absolute (no
     # baseline subtraction - subtracting would lose the metric-lagged ramp).
     cumulative = (args.engine == "clink")
+    if args.baseline is not None:
+        baseline = args.baseline
     while True:
         now = time.time()
         try:
@@ -97,7 +131,7 @@ def main():
             clock = None
         rel = clock if clock is not None else (now - t0)
         if cumulative:
-            if baseline is None:
+            if baseline is None and args.baseline is None:
                 if c <= 0:
                     samples.append((rel, 0))
                     if now - t0 > args.start_timeout or now - t0 > args.max_runtime:

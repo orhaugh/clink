@@ -37,19 +37,68 @@ public:
         return self;
     }
 
+    // The host name PEERS use to address this process, which is not the address
+    // it BINDS to. A receiver binds 0.0.0.0 (or 127.0.0.1) but is advertised to
+    // the coordinator as, say, "clink-worker3", and a sender resolves the peer
+    // through the coordinator - so it looks up "clink-worker3:PORT" while the
+    // receiver registered "0.0.0.0:PORT". The keys never match and the whole
+    // in-process fast path silently disappears, which is exactly what happened
+    // in the containerised benchmark: every co-located edge serialised to Arrow
+    // IPC and crossed a TCP socket to its own hostname. It worked everywhere
+    // else only because both sides defaulted to 127.0.0.1.
+    //
+    // Set once at worker startup from --data-host. Endpoints then register under
+    // BOTH identities so a lookup by either finds them.
+    void set_advertised_host(std::string host) {
+        std::lock_guard lock(mu_);
+        advertised_host_ = std::move(host);
+    }
+    std::string advertised_host() const {
+        std::lock_guard lock(mu_);
+        return advertised_host_;
+    }
+
     template <typename T>
     void register_endpoint(const std::string& host,
                            std::uint16_t port,
                            std::shared_ptr<LocalEndpointChannel<T>> ch) {
         std::lock_guard lock(mu_);
-        entries_.insert_or_assign(make_key(host, port),
-                                  Entry{std::move(ch), std::type_index(typeid(T))});
+        Entry e{std::move(ch), std::type_index(typeid(T))};
+        entries_.insert_or_assign(make_key(host, port), e);
+        // Also under the advertised identity (see set_advertised_host): a peer
+        // resolves this endpoint through the coordinator and will look it up by
+        // the advertised host, never by the bind address.
+        if (!advertised_host_.empty() && advertised_host_ != host) {
+            entries_.insert_or_assign(make_key(advertised_host_, port), e);
+        }
+        // A wildcard bind is reachable in-process as loopback too, and some
+        // callers resolve a peer to 127.0.0.1 directly.
+        if (host == "0.0.0.0") {
+            entries_.insert_or_assign(make_key("127.0.0.1", port), e);
+        }
     }
 
-    // Drop the registration so a port can be reused on a fresh deploy.
+    // Drop the registration so a port can be reused on a fresh deploy. Must
+    // mirror every alias register_endpoint created, or a stale channel outlives
+    // its deploy and the next job pushes into a dead queue.
     void unregister_endpoint(const std::string& host, std::uint16_t port) {
         std::lock_guard lock(mu_);
         entries_.erase(make_key(host, port));
+        if (!advertised_host_.empty() && advertised_host_ != host) {
+            entries_.erase(make_key(advertised_host_, port));
+        }
+        if (host == "0.0.0.0") {
+            entries_.erase(make_key("127.0.0.1", port));
+        }
+    }
+
+    // Hit/miss counters so a silent regression of the fast path is visible
+    // instead of merely slow. Incremented by NetworkChannelSink::connect.
+    void note_local_hit() { local_hits_.fetch_add(1, std::memory_order_relaxed); }
+    void note_socket_fallback() { socket_fallbacks_.fetch_add(1, std::memory_order_relaxed); }
+    std::uint64_t local_hits() const { return local_hits_.load(std::memory_order_relaxed); }
+    std::uint64_t socket_fallbacks() const {
+        return socket_fallbacks_.load(std::memory_order_relaxed);
     }
 
     template <typename T>
@@ -78,6 +127,10 @@ public:
     bool enabled() const { return enabled_.load(std::memory_order_acquire); }
 
 private:
+    std::string advertised_host_;
+    std::atomic<std::uint64_t> local_hits_{0};
+    std::atomic<std::uint64_t> socket_fallbacks_{0};
+
     // Diagnostic kill-switch: CLINK_DISABLE_LOCAL_DATA_PLANE=1 forces every
     // co-located edge onto the socket+codec path, so the fast path's
     // contribution can be measured A/B on an unmodified binary (and the
@@ -98,7 +151,7 @@ private:
         return host + ":" + std::to_string(port);
     }
 
-    std::mutex mu_;
+    mutable std::mutex mu_;  // mutable: advertised_host() is const
     std::unordered_map<std::string, Entry> entries_;
     std::atomic<bool> enabled_{true};
 };
