@@ -41,8 +41,9 @@
 # Shape when Linux is enabled ({macos-arm64, linux-x86_64, linux-aarch64}):
 #   toolchain-image  build + push the pinned image per arch on its NATIVE runner
 #                    (no QEMU), so the aarch64 wheel job can pull an arm64 image.
-#   macos-wheel      native macos-15 (Xcode 16 - older Xcode lacks the C++20
-#                    libc++ features clink needs); cached ~/.clink-deps; delocate.
+#   macos-wheel      native macos-26 (its SDK's libc++ defines std::jthread /
+#                    std::stop_token, which older SDKs do not); cached
+#                    ~/.clink-deps; delocate.
 #   linux-wheels     matrix {x86_64, aarch64}; runs INSIDE the pinned image
 #                    (toolchain at /usr/local, no Arrow rebuild); auditwheel.
 #   collect          gather whatever wheels were built into one artifact.
@@ -50,14 +51,12 @@
 name: wheels
 
 on:
-  # MANUAL ONLY for now. The tag trigger (push: tags: ["v*"]) is intentionally
-  # removed: the macOS wheel cannot build until clink's std::jthread /
-  # std::stop_token usage is resolved - Apple's libc++ gates the C++20 sync
-  # library to a macOS floor far above the wheel's target (even Xcode 17 on
-  # macos-15 lacks jthread at deployment target 14). So prebuilt wheels are
-  # deferred; v0.1.0 ships with the documented build-from-source path. Re-add
-  # the tag trigger once the jthread portability is fixed (see the tracked
-  # follow-up), then a release tag produces wheels again.
+  # Manual for now, pending one green macos-26 run. The old note here blamed
+  # clink's std::jthread usage and an availability gate; that diagnosis was
+  # wrong. The types are gated to macOS 11.0, below this wheel's floor, and the
+  # real blocker was the build SDK not defining them at all (see the macos-wheel
+  # job). Restore `push: tags: ["v*"]` once a dispatch run is green, and a
+  # release tag produces wheels again.
   workflow_dispatch:
     inputs:
       build_linux:
@@ -77,12 +76,16 @@ env:
   # (wheel's get_platform reads this env var), so binary and tag agree. Bumping
   # it busts the ~/.clink-deps cache so Arrow is rebuilt at the new floor.
   #
-  # 14.0, not a lower floor: clink is C++23 and uses libc++ features that are
-  # availability-gated to a recent macOS - std::jthread and std::stop_token
-  # (the C++20 sync library) and std::atomic<floating-point>::fetch_add. At an
-  # 11.0 target libc++ compiles those declarations out ("no type named
-  # 'jthread'"), so libclink cannot build. 14.0 makes the whole C++20 library
-  # surface available. The wheel therefore requires macOS 14+.
+  # It is also the wheel's runtime floor. std::jthread and std::stop_token carry libc++'s
+  # _LIBCPP_AVAILABILITY_SYNC, which resolves to macOS 11.0 (verified: at a
+  # 10.15 target they are "unavailable: introduced in macOS 11.0", at 11.0 they
+  # compile) - and 11.0 is also the first macOS on Apple silicon, so on an arm64
+  # wheel the C++20 sync library costs nothing at all in reach.
+  #
+  # 14.0 is kept because the availability floor is not the binding constraint
+  # here: whether the types EXIST is a property of the build SDK (see the
+  # macos-wheel job), and Arrow is compiled against this same value. Lower it if
+  # a macOS 11-13 user ever asks; nothing in clink's own source stands in the way.
   MACOSX_DEPLOYMENT_TARGET: "14.0"
   # Portable manylinux target. The Linux repair step warns if the wheel's actual
   # glibc floor exceeds this (see PLATFORM SCOPE). major.minor.
@@ -129,16 +132,60 @@ jobs:
   # Always built; this is the shippable path.
   macos-wheel:
     name: Wheel (macos-arm64)
-    # macos-15, not macos-14: the macos-14 image's Xcode 15.4 Apple-clang/libc++
-    # does not ship std::jthread, std::stop_token, or std::atomic<float>::fetch_add
-    # (they compile out entirely - "no type named 'jthread'"), which clink uses
-    # throughout, so libclink cannot build there. macos-15 ships Xcode 16, whose
-    # newer libc++ has them. The wheel still targets macOS 14 via
-    # MACOSX_DEPLOYMENT_TARGET, so the build host being 15 does not raise the
-    # runtime floor.
-    runs-on: macos-15
+    # The build host must be new enough that its SDK's libc++ DEFINES the C++20
+    # sync library. clink uses std::jthread / std::stop_token throughout, and on
+    # an older SDK they are simply absent from the headers ("no type named
+    # 'jthread' in namespace 'std'"), so libclink cannot compile.
+    #
+    # This is the SDK, not the compiler and not the deployment target. Measured on
+    # the 2026-07-25 runs: macos-15 gave AppleClang 17.0.0 - the same compiler
+    # version that builds clink fine locally - but paired with Xcode 16.4's SDK,
+    # and that SDK's libc++ has no jthread. The identical compiler against SDK 26
+    # compiles it at a deployment target of 11.0. A deployment-target problem
+    # would read "unavailable: introduced in macOS 11.0" instead, which is a
+    # different failure entirely.
+    #
+    # Hence a newer image. The step below then selects the newest Xcode installed
+    # on it, and the probe after that fails in two readable lines if the pairing
+    # still lacks the sync library.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select the newest installed Xcode
+        # The runner image's DEFAULT Xcode is not always its newest, and clink
+        # needs a libc++ that ships std::jthread / std::stop_token as non
+        # experimental. On an older one they are absent from the headers
+        # entirely - the failure reads "no type named 'jthread' in namespace
+        # 'std'", which is a toolchain-version problem and NOT the deployment
+        # target (that failure would instead say "unavailable: introduced in
+        # macOS 11.0"). Picking the highest-versioned Xcode present keeps this
+        # working as images roll forward, without pinning a version that will
+        # eventually be removed.
+        run: |
+          set -euo pipefail
+          newest="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -n "${newest}" ]; then
+            echo "Selecting ${newest}"
+            sudo xcode-select -s "${newest}"
+          fi
+          clang++ --version
+          echo "SDK: $(xcrun --show-sdk-version)"
+
+      - name: Check the toolchain has the C++20 sync library
+        # Fail here, in two lines of diagnostics, rather than 200 lines into
+        # libclink's template errors. Both facts that matter are asserted: the
+        # types exist, and they are available at the wheel's deployment target.
+        run: |
+          set -euo pipefail
+          cat > /tmp/sync_probe.cpp <<'CPP'
+          #include <thread>
+          #include <stop_token>
+          int main() { std::jthread t([](std::stop_token s) { (void)s; }); return 0; }
+          CPP
+          clang++ -std=c++20 -mmacosx-version-min="${MACOSX_DEPLOYMENT_TARGET}" \
+            /tmp/sync_probe.cpp -o /tmp/sync_probe
+          echo "std::jthread / std::stop_token available at macOS ${MACOSX_DEPLOYMENT_TARGET}"
 
       - uses: actions/setup-python@v5
         with:
