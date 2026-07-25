@@ -118,133 +118,144 @@ inline std::string to_utf8(const clink::config::JsonValue& v) {
     return v.serialize(0);
 }
 
-inline std::shared_ptr<arrow::Array> build_column(const std::string& name,
-                                                  const std::shared_ptr<arrow::DataType>& eff,
-                                                  const Batch<Row>& batch) {
-    const auto n = static_cast<std::int64_t>(batch.size());
-    std::shared_ptr<arrow::Array> out;
+// An empty typed builder for one effective column type. Pairs with
+// append_json_cell below: whatever builder this hands back, that function knows
+// how to append to.
+inline std::unique_ptr<arrow::ArrayBuilder> make_cell_builder(
+    const std::shared_ptr<arrow::DataType>& eff) {
     switch (eff->id()) {
+        case arrow::Type::INT64:
+            return std::make_unique<arrow::Int64Builder>();
+        case arrow::Type::INT32:
+            return std::make_unique<arrow::Int32Builder>();
+        case arrow::Type::DOUBLE:
+            return std::make_unique<arrow::DoubleBuilder>();
+        case arrow::Type::FLOAT:
+            return std::make_unique<arrow::FloatBuilder>();
+        case arrow::Type::BOOL:
+            return std::make_unique<arrow::BooleanBuilder>();
+        case arrow::Type::DECIMAL128:
+            return std::make_unique<arrow::Decimal128Builder>(eff);
+        case arrow::Type::LIST:  // list<float32>: an embedding vector
+            return std::make_unique<arrow::ListBuilder>(arrow::default_memory_pool(),
+                                                        std::make_shared<arrow::FloatBuilder>());
+        default:  // utf8 (declared STRING or the stringified fallback)
+            return std::make_unique<arrow::StringBuilder>();
+    }
+}
+
+// Append one JSON value (or a null, when `v` is nullptr) to a typed builder.
+//
+// This is the SINGLE definition of the Row-cell -> Arrow-cell mapping. Both
+// carriers go through it: build_column below converts an already-built row
+// batch (the wire and Parquet paths), and RowColumnarOutput
+// (row_columnar_output.hpp) converts an operator's output values as they are
+// produced, with no Row in between. Sharing this function is what makes the two
+// agree by construction rather than by a test that has to notice they drifted.
+//
+// A value of the wrong JSON kind for the column appends a null, which is the
+// long-standing behaviour of the row path and so is preserved deliberately.
+inline void append_json_cell(arrow::ArrayBuilder& builder,
+                             const arrow::DataType& eff,
+                             const clink::config::JsonValue* v) {
+    switch (eff.id()) {
         case arrow::Type::INT64: {
-            arrow::Int64Builder b;
-            (void)b.Reserve(n);
-            for (const auto& rec : batch) {
-                const auto* v = field(rec.value(), name);
-                if (v && v->is_number())
-                    (void)b.Append(static_cast<std::int64_t>(v->as_number()));
-                else
-                    (void)b.AppendNull();
-            }
-            (void)b.Finish(&out);
+            auto& b = static_cast<arrow::Int64Builder&>(builder);
+            if (v && v->is_number())
+                (void)b.Append(static_cast<std::int64_t>(v->as_number()));
+            else
+                (void)b.AppendNull();
             break;
         }
         case arrow::Type::INT32: {
-            arrow::Int32Builder b;
-            (void)b.Reserve(n);
-            for (const auto& rec : batch) {
-                const auto* v = field(rec.value(), name);
-                if (v && v->is_number())
-                    (void)b.Append(static_cast<std::int32_t>(v->as_number()));
-                else
-                    (void)b.AppendNull();
-            }
-            (void)b.Finish(&out);
+            auto& b = static_cast<arrow::Int32Builder&>(builder);
+            if (v && v->is_number())
+                (void)b.Append(static_cast<std::int32_t>(v->as_number()));
+            else
+                (void)b.AppendNull();
             break;
         }
         case arrow::Type::DOUBLE: {
-            arrow::DoubleBuilder b;
-            (void)b.Reserve(n);
-            for (const auto& rec : batch) {
-                const auto* v = field(rec.value(), name);
-                if (v && v->is_number())
-                    (void)b.Append(v->as_number());
-                else
-                    (void)b.AppendNull();
-            }
-            (void)b.Finish(&out);
+            auto& b = static_cast<arrow::DoubleBuilder&>(builder);
+            if (v && v->is_number())
+                (void)b.Append(v->as_number());
+            else
+                (void)b.AppendNull();
             break;
         }
         case arrow::Type::FLOAT: {
-            arrow::FloatBuilder b;
-            (void)b.Reserve(n);
-            for (const auto& rec : batch) {
-                const auto* v = field(rec.value(), name);
-                if (v && v->is_number())
-                    (void)b.Append(static_cast<float>(v->as_number()));
-                else
-                    (void)b.AppendNull();
-            }
-            (void)b.Finish(&out);
+            auto& b = static_cast<arrow::FloatBuilder&>(builder);
+            if (v && v->is_number())
+                (void)b.Append(static_cast<float>(v->as_number()));
+            else
+                (void)b.AppendNull();
             break;
         }
         case arrow::Type::BOOL: {
-            arrow::BooleanBuilder b;
-            (void)b.Reserve(n);
-            for (const auto& rec : batch) {
-                const auto* v = field(rec.value(), name);
-                if (v && v->is_bool())
-                    (void)b.Append(v->as_bool());
-                else
-                    (void)b.AppendNull();
-            }
-            (void)b.Finish(&out);
+            auto& b = static_cast<arrow::BooleanBuilder&>(builder);
+            if (v && v->is_bool())
+                (void)b.Append(v->as_bool());
+            else
+                (void)b.AppendNull();
             break;
         }
         case arrow::Type::DECIMAL128: {
-            const auto& dt = static_cast<const arrow::Decimal128Type&>(*eff);
-            const int scale = dt.scale();
-            arrow::Decimal128Builder b(eff);
-            (void)b.Reserve(n);
-            for (const auto& rec : batch) {
-                const auto* v = field(rec.value(), name);
-                std::optional<clink::config::Decimal> d;
-                if (v != nullptr) {
-                    d = clink::config::as_decimal(*v);
-                    if (d) {
-                        d = clink::config::dec_rescale(*d, scale);
-                    }
+            auto& b = static_cast<arrow::Decimal128Builder&>(builder);
+            const int scale = static_cast<const arrow::Decimal128Type&>(eff).scale();
+            std::optional<clink::config::Decimal> d;
+            if (v != nullptr) {
+                d = clink::config::as_decimal(*v);
+                if (d) {
+                    d = clink::config::dec_rescale(*d, scale);
                 }
-                if (d)
-                    (void)b.Append(d->unscaled);
-                else
-                    (void)b.AppendNull();
             }
-            (void)b.Finish(&out);
+            if (d)
+                (void)b.Append(d->unscaled);
+            else
+                (void)b.AppendNull();
             break;
         }
         case arrow::Type::LIST: {  // list<float32>: an embedding vector (VECTOR_SEARCH)
-            auto vb = std::make_shared<arrow::FloatBuilder>();
-            arrow::ListBuilder b(arrow::default_memory_pool(), vb);
-            for (const auto& rec : batch) {
-                const auto* v = field(rec.value(), name);
-                if (v != nullptr && v->is_array()) {
-                    (void)b.Append();  // open a new list slot
-                    for (const auto& e : v->as_array()) {
-                        if (e.is_number())
-                            (void)vb->Append(static_cast<float>(e.as_number()));
-                        else
-                            (void)vb->AppendNull();
-                    }
-                } else {
-                    (void)b.AppendNull();
+            auto& b = static_cast<arrow::ListBuilder&>(builder);
+            auto* vb = static_cast<arrow::FloatBuilder*>(b.value_builder());
+            if (v != nullptr && v->is_array()) {
+                (void)b.Append();  // open a new list slot
+                for (const auto& e : v->as_array()) {
+                    if (e.is_number())
+                        (void)vb->Append(static_cast<float>(e.as_number()));
+                    else
+                        (void)vb->AppendNull();
                 }
+            } else {
+                (void)b.AppendNull();
             }
-            (void)b.Finish(&out);
             break;
         }
         default: {  // utf8 (declared STRING or the stringified fallback)
-            arrow::StringBuilder b;
-            (void)b.Reserve(n);
-            for (const auto& rec : batch) {
-                const auto* v = field(rec.value(), name);
-                if (v != nullptr)
-                    (void)b.Append(to_utf8(*v));
-                else
-                    (void)b.AppendNull();
-            }
-            (void)b.Finish(&out);
+            auto& b = static_cast<arrow::StringBuilder&>(builder);
+            if (v != nullptr)
+                (void)b.Append(to_utf8(*v));
+            else
+                (void)b.AppendNull();
             break;
         }
     }
+}
+
+inline std::shared_ptr<arrow::Array> build_column(const std::string& name,
+                                                  const std::shared_ptr<arrow::DataType>& eff,
+                                                  const Batch<Row>& batch) {
+    auto builder = make_cell_builder(eff);
+    // The list builder's capacity is its child's, so reserving the offsets
+    // buffer only is not useful; every other builder takes the row count.
+    if (eff->id() != arrow::Type::LIST) {
+        (void)builder->Reserve(static_cast<std::int64_t>(batch.size()));
+    }
+    for (const auto& rec : batch) {
+        append_json_cell(*builder, *eff, field(rec.value(), name));
+    }
+    std::shared_ptr<arrow::Array> out;
+    (void)builder->Finish(&out);
     return out;
 }
 

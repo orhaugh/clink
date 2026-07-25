@@ -60,6 +60,7 @@
 #include "clink/sql/ptf_registry.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
+#include "clink/sql/row_columnar_output.hpp"
 #include "clink/sql/row_kind.hpp"
 #include "clink/time/watermark_strategy.hpp"
 
@@ -1397,7 +1398,8 @@ public:
                 std::vector<AggSpec> aggregates,
                 std::vector<std::string> group_key_outputs = {},
                 std::string window_start_output = "window_start",
-                std::string window_end_output = "window_end")
+                std::string window_end_output = "window_end",
+                std::vector<RowColumn> output_schema = {})
         : kind_(kind),
           time_column_(std::move(time_column)),
           size_ms_(size_ms),
@@ -1406,7 +1408,8 @@ public:
           aggregates_(std::move(aggregates)),
           group_key_outputs_(std::move(group_key_outputs)),
           window_start_output_(std::move(window_start_output)),
-          window_end_output_(std::move(window_end_output)) {
+          window_end_output_(std::move(window_end_output)),
+          output_schema_(std::move(output_schema)) {
         if (group_key_outputs_.size() != group_keys_.size()) {
             group_key_outputs_ = group_keys_;  // default: emit each key under its raw name
         }
@@ -1432,6 +1435,7 @@ public:
                 columnar_needed_.push_back(a.input_column);
             }
         }
+        init_columnar_output_();
     }
 
     // Grace band for late records (fire the window once at window_end + this).
@@ -1584,6 +1588,12 @@ public:
     void open() override {
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
+        // On the async path the fire happens in on_event_time_timers_async, which
+        // does not run through fire_due_, so a shared output builder would collect
+        // panes nothing flushes. Row-form output there.
+        if (effective_async_) {
+            columnar_out_.reset();
+        }
     }
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
     // The fire (on_event_time_timer) reads + writes the group's window map.
@@ -1949,9 +1959,116 @@ private:
         fold_record_into_(sit->second, row, nullptr, drop_horizon_());
     }
 
+    // Append one fired pane straight into the typed output builders: group values
+    // from the bucket, aggregates finalised in place, window bounds as int64. No
+    // output Row is built.
+    //
+    // Returns false, having appended nothing, when this pane cannot ride the
+    // columnar carrier: the row path OMITS a group column that was absent from
+    // the record, while a fixed column list would emit it as null, and those are
+    // different rows. Rare (a record missing a GROUP BY column) but silent, so it
+    // is checked per pane rather than assumed away.
+    bool append_pane_columnar_(const WindowBucket& b, std::int64_t win_end) {
+        if (b.group_values.values.size() != group_key_outputs_.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < pane_cols_.size(); ++i) {
+            switch (pane_cols_[i].src) {
+                case PaneSrc::Group: {
+                    const auto* v = row_columnar_detail::field(
+                        b.group_values, group_key_outputs_[pane_cols_[i].idx]);
+                    if (v == nullptr) {
+                        return false;  // as above: an absent group value, not a null one
+                    }
+                    columnar_out_->append(i, v);
+                    break;
+                }
+                case PaneSrc::Agg: {
+                    const auto v = finalize_agg(b.agg_states[pane_cols_[i].idx],
+                                                aggregates_[pane_cols_[i].idx]);
+                    columnar_out_->append(i, &v);
+                    break;
+                }
+                case PaneSrc::WinStart: {
+                    const clink::config::JsonValue v{static_cast<std::int64_t>(b.window_start)};
+                    columnar_out_->append(i, &v);
+                    break;
+                }
+                case PaneSrc::WinEnd: {
+                    const clink::config::JsonValue v{static_cast<std::int64_t>(win_end)};
+                    columnar_out_->append(i, &v);
+                    break;
+                }
+            }
+        }
+        columnar_out_->end_row();
+        return true;
+    }
+
+    // Resolve the planner-declared output schema against the fields a fired pane
+    // actually produces. Columnar output is enabled only when the two name sets
+    // match EXACTLY: a declared column with no source would be emitted as null,
+    // and a produced field with no column would be dropped. Either is a silent
+    // difference from the row path, so neither is allowed.
+    void init_columnar_output_() {
+        if (output_schema_.empty()) {
+            return;
+        }
+        std::vector<PaneCol> plan;
+        plan.reserve(output_schema_.size());
+        for (const auto& c : output_schema_) {
+            const auto g = std::find(group_key_outputs_.begin(), group_key_outputs_.end(), c.name);
+            if (g != group_key_outputs_.end()) {
+                plan.push_back(
+                    {PaneSrc::Group, static_cast<std::size_t>(g - group_key_outputs_.begin())});
+                continue;
+            }
+            const auto a = std::find_if(aggregates_.begin(),
+                                        aggregates_.end(),
+                                        [&](const AggSpec& s) { return s.output_name == c.name; });
+            if (a != aggregates_.end()) {
+                plan.push_back({PaneSrc::Agg, static_cast<std::size_t>(a - aggregates_.begin())});
+                continue;
+            }
+            if (c.name == window_start_output_) {
+                plan.push_back({PaneSrc::WinStart, 0});
+                continue;
+            }
+            if (c.name == window_end_output_) {
+                plan.push_back({PaneSrc::WinEnd, 0});
+                continue;
+            }
+            return;  // a declared column nothing produces: stay row form
+        }
+        // And nothing produced is left undeclared. finalize_window_ always emits
+        // both window bounds, so both must appear.
+        const std::size_t produced = group_key_outputs_.size() + aggregates_.size() +
+                                     (window_start_output_.empty() ? 0 : 1) +
+                                     (window_end_output_.empty() ? 0 : 1);
+        if (plan.size() != produced) {
+            return;
+        }
+        pane_cols_ = std::move(plan);
+        columnar_out_.emplace(output_schema_);
+    }
+
     void fire_due_(EventTime wm, Emitter<Row>& out) {
         const auto wm_value = wm.millis();
+        // Born-columnar fire: panes append into the typed builders and the batch
+        // is emitted with an Arrow sidecar. A pane the carrier cannot represent
+        // (see append_pane_columnar_) drops this WHOLE fire back to row form,
+        // converting whatever was appended so the emission order is preserved.
+        const bool columnar = columnar_out_.has_value() && damper_.active();
+        bool bailed = false;
         Batch<Row> emit_batch;
+        auto bail = [&] {
+            bailed = true;
+            if (auto rb = columnar_out_->finish(); rb != nullptr) {
+                for (const auto& rec : columnar_row_batch(rb)) {
+                    emit_batch.push(rec);
+                }
+            }
+        };
         for (auto& [k, by_window] : state_) {
             (void)k;
             for (auto it = by_window.begin(); it != by_window.end();) {
@@ -1965,12 +2082,32 @@ private:
                     ++it;
                     continue;
                 }
+                if (columnar && !bailed) {
+                    if (append_pane_columnar_(it->second, it->first)) {
+                        it = by_window.erase(it);
+                        continue;
+                    }
+                    bail();
+                }
                 emit_batch.push(Record<Row>{finalize_window_(it->second, it->first)});
                 it = by_window.erase(it);
             }
         }
+        std::size_t emitted = emit_batch.size();
+        if (columnar && !bailed) {
+            emitted += columnar_out_->rows();
+            if (auto rb = columnar_out_->finish(); rb != nullptr) {
+                out.emit_data(columnar_row_batch(rb));
+            }
+        }
         if (!emit_batch.empty())
             out.emit_data(std::move(emit_batch));
+        // A windowed fire emits one row per group per due window, which for most
+        // queries is far too few for a RecordBatch to pay for itself. The damper
+        // learns that from the first few fires and stops building them.
+        if (emitted > 0) {
+            damper_.observed(emitted);
+        }
     }
 
     // Record the latest event-time watermark seen, across every ingest path.
@@ -2030,6 +2167,19 @@ private:
         state_;
     mutable std::string key_scratch_;           // group_key_scratch_'s reused buffer
     std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
+
+    // Born-columnar output (D4): the planner-declared output schema, the typed
+    // builder over it, and where each of its columns comes from in a fired pane.
+    // columnar_out_ empty = the row-form fire, which is the default.
+    enum class PaneSrc : std::uint8_t { Group, Agg, WinStart, WinEnd };
+    struct PaneCol {
+        PaneSrc src;
+        std::size_t idx;  // into group_key_outputs_ / aggregates_; unused otherwise
+    };
+    std::vector<RowColumn> output_schema_;
+    std::optional<RowColumnarOutput> columnar_out_;
+    std::vector<PaneCol> pane_cols_;
+    ColumnarOutputDamper damper_;
 };
 
 // Session-window aggregate. Per-group state is an ordered map keyed
@@ -4233,14 +4383,16 @@ public:
                   std::string right_alias,
                   EquiJoinKind kind,
                   std::vector<std::string> left_columns,
-                  std::vector<std::string> right_columns)
+                  std::vector<std::string> right_columns,
+                  std::vector<RowColumn> output_schema = {})
         : left_key_column_(std::move(left_key_column)),
           right_key_column_(std::move(right_key_column)),
           left_alias_(std::move(left_alias)),
           right_alias_(std::move(right_alias)),
           kind_(kind),
           left_columns_(std::move(left_columns)),
-          right_columns_(std::move(right_columns)) {
+          right_columns_(std::move(right_columns)),
+          output_schema_(std::move(output_schema)) {
         // Precompute the joined row's output columns in FlatMap (sorted-key)
         // order, so build_ assembles each output row in ONE sorted pass via
         // from_entries instead of a binary-search-plus-memmove insert per
@@ -4265,6 +4417,7 @@ public:
                 break;
             }
         }
+        init_columnar_output_();
     }
 
     void process_element1(const StreamElement<Row>& element, Emitter<Row>& out) override {
@@ -4273,8 +4426,7 @@ public:
         Batch<Row> batch;
         for (const auto& rec : element.as_data())
             handle_(rec.value(), /*is_left=*/true, batch);
-        if (!batch.empty())
-            out.emit_data(std::move(batch));
+        emit_joined_(batch, out);
     }
     void process_element2(const StreamElement<Row>& element, Emitter<Row>& out) override {
         if (!element.is_data())
@@ -4282,8 +4434,7 @@ public:
         Batch<Row> batch;
         for (const auto& rec : element.as_data())
             handle_(rec.value(), /*is_left=*/false, batch);
-        if (!batch.empty())
-            out.emit_data(std::move(batch));
+        emit_joined_(batch, out);
     }
 
     // Auto-on the async/disaggregated KeyedState path (all join kinds) whenever
@@ -4297,6 +4448,12 @@ public:
     void open() override {
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
+        // The async path emits from inside its coroutines, which do not run
+        // through emit_joined_, so a shared output builder would accumulate rows
+        // nothing ever flushes. Row-form output only there.
+        if (effective_async_) {
+            columnar_out_.reset();
+        }
     }
 
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
@@ -4409,6 +4566,24 @@ private:
                     const Row& right,
                     Batch<Row>& batch,
                     std::string_view kind = {}) {
+        // Born-columnar output: append the joined cells straight into the typed
+        // builders, so no output Row (and no per-column string key) is built at
+        // all. Only for a pair that carries no changelog marker - a marker is a
+        // Row field the declared output schema does not have a column for, so a
+        // marked row cannot ride this carrier (see bail_columnar_to_rows_).
+        const bool needs_marker = !kind.empty() || kind_ != EquiJoinKind::Inner;
+        if (columnar_out_.has_value() && damper_.active() && !needs_marker) {
+            for (std::size_t i = 0; i < columnar_cols_.size(); ++i) {
+                const auto& oc = sorted_out_cols_[columnar_cols_[i]];
+                const Row* src = oc.from_left ? &left : &right;
+                columnar_out_->append(i, row_columnar_detail::field(*src, *oc.src));
+            }
+            columnar_out_->end_row();
+            return;
+        }
+        if (columnar_out_.has_value()) {
+            bail_columnar_to_rows_(batch);
+        }
         Row r = build_(&left, &right);
         if (!kind.empty()) {
             set_row_kind(r, kind);
@@ -4433,9 +4608,77 @@ private:
                      bool present_is_left,
                      std::string_view kind,
                      Batch<Row>& batch) {
+        // Always marked, so never columnar: fold any accumulated columnar rows
+        // back to row form first so the batch stays in emission order.
+        if (columnar_out_.has_value()) {
+            bail_columnar_to_rows_(batch);
+        }
         Row r = present_is_left ? build_(&present, nullptr) : build_(nullptr, &present);
         set_row_kind(r, kind);
         batch.push(Record<Row>{std::move(r)});
+    }
+
+    // Columnar output is planner-enabled for append-only INNER joins, where no
+    // emission carries a changelog marker. If a marked row turns up anyway, this
+    // converts the rows accumulated columnar so far back into `batch` (in order),
+    // drops the columnar carrier for the rest of this operator's life, and lets
+    // the caller continue on the row path. Correctness does not depend on the
+    // planner being right about the gate - only performance does.
+    void bail_columnar_to_rows_(Batch<Row>& batch) {
+        auto rb = columnar_out_->finish();
+        columnar_out_.reset();
+        if (rb == nullptr) {
+            return;
+        }
+        auto pending = columnar_row_batch(rb);
+        for (const auto& rec : pending) {
+            batch.push(rec);
+        }
+    }
+
+    // Emit whatever the input element produced. A columnar builder with rows in
+    // it emits first: bail_columnar_to_rows_ guarantees the two carriers are
+    // never both non-empty, so this cannot reorder output.
+    void emit_joined_(Batch<Row>& batch, Emitter<Row>& out) {
+        std::size_t emitted = batch.size();
+        if (columnar_out_.has_value() && !columnar_out_->empty()) {
+            emitted += columnar_out_->rows();
+            if (auto rb = columnar_out_->finish(); rb != nullptr) {
+                out.emit_data(columnar_row_batch(rb));
+            }
+        }
+        if (!batch.empty())
+            out.emit_data(std::move(batch));
+        // Feed the size back so the carrier for the next batch is chosen from what
+        // this operator actually emits, not from what the planner hoped.
+        if (emitted > 0) {
+            damper_.observed(emitted);
+        }
+    }
+
+    // Resolve the planner-declared output schema against this join's actual
+    // output columns. Columnar output is on only when every output column has a
+    // declared type and the names do not collide (the collision case has
+    // last-wins Row semantics that a fixed column list would not reproduce).
+    void init_columnar_output_() {
+        if (output_schema_.empty() || out_name_collision_) {
+            return;
+        }
+        std::vector<RowColumn> cols;
+        cols.reserve(sorted_out_cols_.size());
+        columnar_cols_.reserve(sorted_out_cols_.size());
+        for (std::size_t i = 0; i < sorted_out_cols_.size(); ++i) {
+            const auto& name = sorted_out_cols_[i].name;
+            auto it = std::find_if(output_schema_.begin(),
+                                   output_schema_.end(),
+                                   [&](const RowColumn& c) { return c.name == name; });
+            if (it == output_schema_.end()) {
+                return;  // planner schema does not describe this output: stay row form
+            }
+            cols.push_back(*it);
+            columnar_cols_.push_back(i);
+        }
+        columnar_out_.emplace(std::move(cols));
     }
 
     void handle_(const Row& row, bool is_left, Batch<Row>& batch) {
@@ -4759,6 +5002,15 @@ private:
     };
     std::vector<OutCol> sorted_out_cols_;
     bool out_name_collision_ = false;
+
+    // Born-columnar output (D4): the planner-declared output schema, the typed
+    // builder built from it, and the sorted_out_cols_ index each builder column
+    // draws from. columnar_out_ empty = row-form output, which is the default and
+    // what every join that is not an append-only INNER join keeps.
+    std::vector<RowColumn> output_schema_;
+    std::optional<RowColumnarOutput> columnar_out_;
+    std::vector<std::size_t> columnar_cols_;
+    ColumnarOutputDamper damper_;
 };
 
 // Inc 4: semi / anti join over Row - the runtime for IN / NOT IN and
@@ -8993,15 +9245,20 @@ void install(clink::plugin::PluginRegistry& reg) {
             decode_agg_extras(entry, spec);
             aggregates.push_back(std::move(spec));
         }
-        auto op = std::make_shared<WindowRowOp>(kind,
-                                                std::move(time_column),
-                                                size_ms,
-                                                slide_ms,
-                                                std::move(group_keys),
-                                                std::move(aggregates),
-                                                std::move(group_key_outputs),
-                                                std::move(window_start_output),
-                                                std::move(window_end_output));
+        auto op =
+            std::make_shared<WindowRowOp>(kind,
+                                          std::move(time_column),
+                                          size_ms,
+                                          slide_ms,
+                                          std::move(group_keys),
+                                          std::move(aggregates),
+                                          std::move(group_key_outputs),
+                                          std::move(window_start_output),
+                                          std::move(window_end_output),
+                                          // Born-columnar output: set by the
+                                          // planner only when the consumer
+                                          // can ingest columnar.
+                                          parse_row_schema(ctx.param_or("columnar_output", "")));
         op->set_allowed_lateness_ms(ctx.param_int64_or("allowed_lateness_ms", 0));
         op->set_report_late(ctx.param_or("late_records_to_dlq", "") == "true");
         return op;
@@ -9233,13 +9490,19 @@ void install(clink::plugin::PluginRegistry& reg) {
             // The nested multi-way join uses this for its sub-join side, whose
             // columns are already flat "<alias>_<col>". Only the key columns are
             // strictly required.
-            return std::make_shared<EquiJoinRowOp>(need("left_key_column"),
-                                                   need("right_key_column"),
-                                                   ctx.param_or("left_alias", ""),
-                                                   ctx.param_or("right_alias", ""),
-                                                   kind,
-                                                   split_csv(ctx.param_or("left_columns", "")),
-                                                   split_csv(ctx.param_or("right_columns", "")));
+            return std::make_shared<EquiJoinRowOp>(
+                need("left_key_column"),
+                need("right_key_column"),
+                ctx.param_or("left_alias", ""),
+                ctx.param_or("right_alias", ""),
+                kind,
+                split_csv(ctx.param_or("left_columns", "")),
+                split_csv(ctx.param_or("right_columns", "")),
+                // Born-columnar output: set by
+                // the planner only when the
+                // consumer can ingest columnar
+                // (see physical_plan.cpp).
+                parse_row_schema(ctx.param_or("columnar_output", "")));
         });
 
     // semi_join_row: IN / NOT IN / EXISTS lowering. Required params:

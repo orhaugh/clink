@@ -59,6 +59,7 @@
 #include "clink/sql/parser.hpp"
 #include "clink/sql/physical_plan.hpp"
 #include "clink/sql/ptf_registry.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/row_kind.hpp"
 #include "clink/sql/table_api.hpp"
 #include "clink/sql/view.hpp"
@@ -1331,7 +1332,242 @@ std::vector<Record<Row>> outer_join_rows(
     return rows;
 }
 
+// Records whether the element it was handed carried an Arrow sidecar, and
+// forwards it untouched (forwarding the whole element preserves the sidecar, so
+// the probe itself never materialises a row). Lets a test assert that a producer
+// emitted BORN columnar rather than inferring it from a row comparison.
+class ColumnarProbeOp final : public clink::Operator<Row, Row> {
+public:
+    void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
+        if (element.is_data()) {
+            ++batches_;
+            if (element.as_data().is_columnar())
+                ++columnar_batches_;
+        }
+        out.emit(element);
+    }
+    std::string name() const override { return "columnar_probe"; }
+
+    [[nodiscard]] int batches() const { return batches_; }
+    [[nodiscard]] int columnar_batches() const { return columnar_batches_; }
+
+private:
+    int batches_ = 0;
+    int columnar_batches_ = 0;
+};
+
+// run_equi_join, plus the born-columnar output schema param and a probe between
+// the join and the sink. `columnar_output` empty = the row-form default.
+struct JoinRun {
+    std::vector<Record<Row>> records;
+    int batches = 0;
+    int columnar_batches = 0;
+};
+
+JoinRun run_equi_join_probed(const std::string& join_type,
+                             const std::vector<Record<Row>>& left,
+                             const std::vector<Record<Row>>& right,
+                             const std::string& columnar_output) {
+    const auto* builder = cluster::DagBuilderRegistry::default_instance().find("equi_join_row");
+    Dag dag;
+    auto hl = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(left));
+    auto hr = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(right));
+    clink::plugin::BuildContext ctx;
+    ctx.params["left_key_column"] = "id";
+    ctx.params["right_key_column"] = "id";
+    ctx.params["left_alias"] = "l";
+    ctx.params["right_alias"] = "r";
+    ctx.params["join_type"] = join_type;
+    ctx.params["left_columns"] = "id,lv";
+    ctx.params["right_columns"] = "id,rv";
+    if (!columnar_output.empty()) {
+        ctx.params["columnar_output"] = columnar_output;
+    }
+    std::vector<std::any> upstream = {std::any{hl}, std::any{hr}};
+    auto out = (*builder)(dag, upstream, ctx);
+    auto h_join = std::any_cast<StageHandle<Row>>(out.main_handle);
+    auto probe = std::make_shared<ColumnarProbeOp>();
+    auto h_probe = dag.add_operator<Row, Row>(h_join, probe);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_probe, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return JoinRun{sink->collected_records(), probe->batches(), probe->columnar_batches()};
+}
+
+// Drive a tumbling window (COUNT(*) per key per 10s) through the registry with a
+// probe between it and the sink, so a test can see whether the fire emitted a
+// sidecar. `columnar_output` empty = the row-form default.
+JoinRun run_tumbling_window_probed(const std::vector<Record<Row>>& input,
+                                   const std::string& columnar_output) {
+    const auto* builder =
+        cluster::DagBuilderRegistry::default_instance().find("tumbling_window_row");
+    Dag dag;
+    auto h = dag.add_source<Row>(std::make_shared<VectorSource<Row>>(input));
+    clink::plugin::BuildContext ctx;
+    ctx.params["time_column"] = "ts";
+    ctx.params["size_ms"] = "10000";
+    ctx.params["group_keys"] = "k";
+    ctx.params["aggregates"] = R"([{"name":"c","fn":"count"}])";
+    if (!columnar_output.empty()) {
+        ctx.params["columnar_output"] = columnar_output;
+    }
+    std::vector<std::any> upstream = {std::any{h}};
+    auto out = (*builder)(dag, upstream, ctx);
+    auto h_win = std::any_cast<StageHandle<Row>>(out.main_handle);
+    auto probe = std::make_shared<ColumnarProbeOp>();
+    auto h_probe = dag.add_operator<Row, Row>(h_win, probe);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_probe, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return JoinRun{sink->collected_records(), probe->batches(), probe->columnar_batches()};
+}
+
+// Records with an event time, so the watermark advances and windows fire.
+std::vector<Record<Row>> window_rows(const std::vector<std::pair<std::int64_t, std::int64_t>>& kt) {
+    std::vector<Record<Row>> rows;
+    for (const auto& [k, ts] : kt) {
+        Row r;
+        r.values["k"] = clink::config::JsonValue{static_cast<double>(k)};
+        r.values["ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        rows.push_back(Record<Row>{std::move(r), EventTime{ts}});
+    }
+    return rows;
+}
+
+// The join's four output columns, aliased, with their declared types - what the
+// planner passes as columnar_output.
+std::string join_output_schema() {
+    return clink::sql::serialize_row_schema({{"l_id", arrow::int64()},
+                                             {"l_lv", arrow::int64()},
+                                             {"r_id", arrow::int64()},
+                                             {"r_rv", arrow::int64()}});
+}
+
+std::vector<std::string> serialized_rows(const std::vector<Record<Row>>& recs) {
+    std::vector<std::string> out;
+    out.reserve(recs.size());
+    for (const auto& rec : recs) {
+        out.push_back(
+            clink::config::JsonValue{clink::config::JsonObject{rec.value().values}}.serialize(0));
+    }
+    return out;
+}
+
 }  // namespace
+
+// D4 inc3: born-columnar join output. The join appends its joined cells straight
+// into typed Arrow builders instead of constructing an output Row per pair. The
+// oracle that matters is that the emitted relation is unchanged, so this runs the
+// same join both ways and compares the emissions in order.
+TEST(SqlRuntime, ColumnarJoinOutputMatchesRowOutputExactly) {
+    ensure_sql_installed_once();
+    const auto left = outer_join_rows({{1, 10}, {2, 20}, {3, 30}}, "lv");
+    const auto right = outer_join_rows({{1, 100}, {2, 200}, {2, 201}}, "rv");
+
+    const auto row_run = run_equi_join_probed("inner", left, right, "");
+    const auto col_run = run_equi_join_probed("inner", left, right, join_output_schema());
+
+    EXPECT_EQ(serialized_rows(col_run.records), serialized_rows(row_run.records))
+        << "born-columnar join output must emit the same relation, in the same order";
+    EXPECT_FALSE(row_run.records.empty()) << "the fixture must actually join something";
+}
+
+// ... and that it is genuinely BORN columnar: the batch reaching the consumer
+// carries the Arrow sidecar, so no output Row was built on the way.
+TEST(SqlRuntime, ColumnarJoinOutputIsBornColumnar) {
+    ensure_sql_installed_once();
+    const auto left = outer_join_rows({{1, 10}, {2, 20}}, "lv");
+    const auto right = outer_join_rows({{1, 100}, {2, 200}}, "rv");
+
+    const auto row_run = run_equi_join_probed("inner", left, right, "");
+    EXPECT_GT(row_run.batches, 0);
+    EXPECT_EQ(row_run.columnar_batches, 0) << "default output stays row form";
+
+    const auto col_run = run_equi_join_probed("inner", left, right, join_output_schema());
+    EXPECT_GT(col_run.batches, 0);
+    EXPECT_GT(col_run.columnar_batches, 0)
+        << "the emitted batch must carry the sidecar when columnar output is on";
+}
+
+// The windowed fire's born-columnar output, proved the same two ways as the
+// join's: the panes come out identical, and the batch that reaches the consumer
+// carries the sidecar rather than having been assembled as Rows. The declared
+// schema must name the window bounds too, because a fired pane always carries
+// them (see the planner comment at kOutputSchemaKey).
+TEST(SqlRuntime, ColumnarWindowFireIsBornColumnarAndMatchesRowFire) {
+    ensure_sql_installed_once();
+    const auto input = window_rows(
+        {{1, 1000}, {1, 2000}, {2, 3000}, {1, 11000}, {2, 12000}, {3, 13000}, {1, 40000}});
+    const auto schema = clink::sql::serialize_row_schema({{"k", arrow::int64()},
+                                                          {"c", arrow::int64()},
+                                                          {"window_start", arrow::int64()},
+                                                          {"window_end", arrow::int64()}});
+
+    const auto row_run = run_tumbling_window_probed(input, "");
+    const auto col_run = run_tumbling_window_probed(input, schema);
+
+    EXPECT_GT(row_run.batches, 0) << "the fixture must fire at least one window";
+    EXPECT_EQ(row_run.columnar_batches, 0) << "default fire stays row form";
+    EXPECT_GT(col_run.columnar_batches, 0)
+        << "the fired batch must carry the sidecar when columnar output is on";
+
+    auto sorted = [](std::vector<std::string> v) {
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    EXPECT_EQ(sorted(serialized_rows(col_run.records)), sorted(serialized_rows(row_run.records)))
+        << "born-columnar fire must emit the same panes as the row fire";
+}
+
+// A pane whose group column was absent from the record is the one case the fixed
+// column list cannot represent: the row path omits the column, a column list
+// would emit it as null, and those are different rows. The fire must notice and
+// fall back rather than quietly change the output.
+TEST(SqlRuntime, ColumnarWindowFireBailsWhenAGroupValueIsAbsent) {
+    ensure_sql_installed_once();
+    auto input = window_rows({{1, 1000}, {1, 2000}, {1, 40000}});
+    Row keyless;  // in a window, but carrying no group column at all
+    keyless.values["ts"] = clink::config::JsonValue{static_cast<double>(3000)};
+    input.insert(input.begin() + 2, Record<Row>{std::move(keyless), EventTime{3000}});
+
+    const auto schema = clink::sql::serialize_row_schema({{"k", arrow::int64()},
+                                                          {"c", arrow::int64()},
+                                                          {"window_start", arrow::int64()},
+                                                          {"window_end", arrow::int64()}});
+    const auto row_run = run_tumbling_window_probed(input, "");
+    const auto col_run = run_tumbling_window_probed(input, schema);
+
+    auto sorted = [](std::vector<std::string> v) {
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    EXPECT_EQ(sorted(serialized_rows(col_run.records)), sorted(serialized_rows(row_run.records)))
+        << "the keyless pane must be emitted exactly as the row fire emits it";
+}
+
+// An OUTER join marks every row with a changelog kind, which the declared output
+// schema has no column for. The operator must fall back to row form and still
+// produce the correct relation even if the schema is handed to it anyway - the
+// runtime bail, so a planner mistake cannot corrupt output.
+TEST(SqlRuntime, ColumnarJoinOutputBailsToRowsForMarkedEmissions) {
+    ensure_sql_installed_once();
+    const auto left = outer_join_rows({{1, 10}, {2, 20}}, "lv");
+    const auto right = outer_join_rows({{1, 100}}, "rv");
+
+    const auto expected = join_live_set(
+        run_equi_join("left_outer", left, right, std::make_shared<InMemoryStateBackend>()));
+    const auto forced = run_equi_join_probed("left_outer", left, right, join_output_schema());
+
+    EXPECT_EQ(join_live_set(forced.records), expected)
+        << "a marked emission must bail to row form with the relation intact";
+    EXPECT_EQ(forced.columnar_batches, 0) << "an OUTER join never emits columnar";
+}
 
 // OUTER joins ride the async/disaggregated path too (extends INNER): a match
 // RETRACTS the matched row's live null-padding by mutating the OTHER side's

@@ -608,3 +608,66 @@ TEST(EmbeddedEngine, CreateFunctionLanguageSqlRunsEndToEnd) {
     fs::remove(in_path);
     fs::remove(out_path);
 }
+
+// D4 inc3: born-columnar operator output, end to end through the real planner.
+//
+// A HAVING filter sits above the windowed aggregate, and filter_row_predicate
+// ingests columnar, so the planner enables born-columnar output on the window
+// (see SqlPhysical.ColumnarOutputOnWhenTheConsumerIngestsColumnar). The window
+// then appends fired panes straight into typed Arrow builders instead of building
+// an output Row each. The oracle is the row path: same query, same input,
+// CLINK_DISABLE_COLUMNAR_OUTPUT=1, byte-identical output lines.
+TEST(EmbeddedEngine, ColumnarWindowOutputMatchesRowOutput) {
+    const auto in_path = fs::temp_directory_path() / "clink_embed_cwo_in.ndjson";
+    fs::remove(in_path);
+    {
+        std::vector<std::string> lines;
+        // Three windows' worth of events over four keys, with per-key counts that
+        // straddle the HAVING threshold so some panes are filtered out.
+        for (int w = 0; w < 3; ++w) {
+            for (int k = 1; k <= 4; ++k) {
+                for (int n = 0; n < k; ++n) {
+                    lines.push_back("{\"k\":" + std::to_string(k) +
+                                    ",\"ts\":" + std::to_string((w * 10000) + 1000 + n) + "}");
+                }
+            }
+        }
+        // A trailing event well past the last window so the watermark fires them.
+        lines.push_back("{\"k\":1,\"ts\":100000}");
+        write_lines(in_path, lines);
+    }
+
+    auto run = [&](const fs::path& out_path) {
+        fs::remove(out_path);
+        clink::embed::EngineOptions opts;
+        std::ostringstream err;
+        opts.err = &err;
+        clink::embed::EmbeddedEngine engine{std::move(opts)};
+        const std::string script =
+            "CREATE TABLE cwo_src (k BIGINT, ts BIGINT) WITH (connector='file', format='json', "
+            "path='" +
+            in_path.string() +
+            "', event_time_column='ts', watermark_lag_ms='0');"
+            "CREATE TABLE cwo_out (k BIGINT, c BIGINT) WITH (connector='file', format='json', "
+            "path='" +
+            out_path.string() +
+            "');"
+            "INSERT INTO cwo_out SELECT k, COUNT(*) AS c FROM cwo_src "
+            "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k HAVING COUNT(*) > 1";
+        EXPECT_EQ(engine.execute_script(script), 0) << err.str();
+        EXPECT_TRUE(engine.await_all()) << err.str();
+        auto lines = read_lines(out_path);
+        std::sort(lines.begin(), lines.end());
+        return lines;
+    };
+
+    const auto columnar = run(fs::temp_directory_path() / "clink_embed_cwo_col.ndjson");
+    ASSERT_FALSE(columnar.empty()) << "the fixture must emit panes that pass HAVING";
+
+    setenv("CLINK_DISABLE_COLUMNAR_OUTPUT", "1", 1);
+    const auto rows = run(fs::temp_directory_path() / "clink_embed_cwo_row.ndjson");
+    unsetenv("CLINK_DISABLE_COLUMNAR_OUTPUT");
+
+    EXPECT_EQ(columnar, rows)
+        << "born-columnar window output must be indistinguishable from the row fire";
+}

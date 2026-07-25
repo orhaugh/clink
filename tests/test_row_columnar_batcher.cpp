@@ -21,6 +21,7 @@
 #include "clink/core/record.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
+#include "clink/sql/row_columnar_output.hpp"
 #include "clink/sql/vector_value.hpp"
 
 using namespace clink;
@@ -248,4 +249,175 @@ TEST(RowColumnarBatcher, UnsupportedTypeFallsBackToUtf8) {
     auto schema = batcher.schema();
     ASSERT_EQ(schema->num_fields(), 2);
     EXPECT_EQ(schema->field(1)->type()->id(), arrow::Type::STRING);
+}
+
+// --- Born-columnar operator output (RowColumnarOutput) -----------------------
+//
+// The builder an operator uses to emit a typed Arrow batch without ever
+// constructing a Row. Its whole safety argument is that it shares
+// append_json_cell with the row-batch converter, so these tests pin the two
+// against each other over the awkward cells (absent, JSON-null, wrong kind) as
+// well as the ordinary ones.
+
+TEST(RowColumnarOutput, MatchesTheRowBatchConverterCellForCell) {
+    const auto cols = trade_schema();
+
+    // Rows deliberately including the cases where a cell is not simply present
+    // and well-typed: a missing column, an explicit JSON null, and a value of
+    // the wrong JSON kind for its declared column.
+    std::vector<Row> rows;
+    rows.push_back(make_row(1, "AAPL", 1.5, 7, true, "12.34"));
+    rows.push_back(make_row(-2, "", -0.25, -8, false, "-0.01"));
+    Row sparse;  // id only: every other column absent
+    sparse.values["id"] = cfg::JsonValue{3};
+    rows.push_back(sparse);
+    Row nulled = make_row(4, "MSFT", 2.0, 1, true, "5.00");
+    nulled.values["symbol"] = cfg::JsonValue{};                   // explicit null
+    nulled.values["price"] = cfg::JsonValue{std::string{"nan"}};  // wrong kind
+    nulled.values["active"] = cfg::JsonValue{std::int64_t{1}};    // wrong kind
+    rows.push_back(nulled);
+
+    // Carrier A: build rows, then convert the row batch (wire / Parquet path).
+    Batch<Row> row_batch;
+    for (const auto& r : rows) {
+        row_batch.push(Record<Row>{r});
+    }
+    auto from_rows = make_row_columnar_arrow_batcher(cols).build(row_batch);
+    ASSERT_NE(from_rows, nullptr);
+
+    // Carrier B: append the same values straight into the columnar builder,
+    // never constructing an output Row (the operator-emission path).
+    clink::sql::RowColumnarOutput out{cols};
+    out.reserve(static_cast<std::int64_t>(rows.size()));
+    for (const auto& r : rows) {
+        out.append_row_projection(r);
+    }
+    auto from_output = out.finish();
+    ASSERT_NE(from_output, nullptr);
+
+    EXPECT_TRUE(from_output->schema()->Equals(*from_rows->schema()))
+        << from_output->schema()->ToString() << "\nvs\n"
+        << from_rows->schema()->ToString();
+    EXPECT_TRUE(from_output->Equals(*from_rows)) << from_output->ToString() << "\nvs\n"
+                                                 << from_rows->ToString();
+}
+
+TEST(RowColumnarOutput, MaterializesBackToTheSameRows) {
+    const auto cols = trade_schema();
+    const std::vector<Row> rows = {make_row(10, "A", 1.0, 1, true, "1.00"),
+                                   make_row(11, "B", 2.5, 2, false, "2.50")};
+
+    clink::sql::RowColumnarOutput out{cols};
+    for (const auto& r : rows) {
+        out.append_row_projection(r);
+    }
+    auto rb = out.finish();
+    ASSERT_NE(rb, nullptr);
+
+    // A row consumer downstream sees exactly the rows it would have been handed.
+    auto batch = clink::sql::columnar_row_batch(rb);
+    ASSERT_TRUE(batch.is_columnar());
+    ASSERT_EQ(batch.size(), rows.size());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const Row& got = batch[i].value();
+        for (const auto& c : cols) {
+            ASSERT_TRUE(got.values.find(c.name) != got.values.end()) << c.name;
+            EXPECT_EQ(got.values.find(c.name)->second.serialize(0),
+                      rows[i].values.find(c.name)->second.serialize(0))
+                << "row " << i << " column " << c.name;
+        }
+    }
+}
+
+TEST(RowColumnarOutput, CarriesTheEventTimeColumnSoValuesAreNotShifted) {
+    // Column 0 must be the nullable int64 event time: the self-describing
+    // reader takes value columns from index 1, so a builder that omitted it
+    // would have its first value column eaten as a timestamp.
+    std::vector<RowColumn> cols = {{"a", arrow::int64()}, {"b", arrow::int64()}};
+    clink::sql::RowColumnarOutput out{cols};
+    Row r;
+    r.values["a"] = cfg::JsonValue{std::int64_t{7}};
+    r.values["b"] = cfg::JsonValue{std::int64_t{9}};
+    out.append_row_projection(r, EventTime{1234});
+    auto rb = out.finish();
+    ASSERT_NE(rb, nullptr);
+
+    ASSERT_EQ(rb->num_columns(), 3);
+    EXPECT_EQ(rb->schema()->field(0)->name(), "event_time");
+    EXPECT_TRUE(rb->schema()->field(0)->nullable());
+
+    auto batch = clink::sql::columnar_row_batch(rb);
+    ASSERT_EQ(batch.size(), 1U);
+    EXPECT_EQ(batch[0].value().values.find("a")->second.as_number(), 7);
+    EXPECT_EQ(batch[0].value().values.find("b")->second.as_number(), 9);
+    ASSERT_TRUE(batch[0].event_time().has_value());
+    EXPECT_EQ(batch[0].event_time()->millis(), 1234);
+}
+
+TEST(RowColumnarOutput, EmptyBuilderYieldsNoBatch) {
+    clink::sql::RowColumnarOutput out{trade_schema()};
+    EXPECT_TRUE(out.empty());
+    EXPECT_EQ(out.finish(), nullptr);
+}
+
+TEST(RowColumnarOutput, ReusableAcrossBatches) {
+    const auto cols = trade_schema();
+    clink::sql::RowColumnarOutput out{cols};
+    out.append_row_projection(make_row(1, "A", 1.0, 1, true, "1.00"));
+    auto first = out.finish();
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->num_rows(), 1);
+    EXPECT_TRUE(out.empty());
+
+    out.append_row_projection(make_row(2, "B", 2.0, 2, false, "2.00"));
+    out.append_row_projection(make_row(3, "C", 3.0, 3, true, "3.00"));
+    auto second = out.finish();
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(second->num_rows(), 2);
+    // The first batch's arrays are untouched by the reuse.
+    EXPECT_EQ(first->num_rows(), 1);
+}
+
+// The emission-size damper. A RecordBatch costs a fixed amount per batch and
+// saves per row, so an operator emitting a handful of rows at a time is faster in
+// row form. The row count is only known after a batch is built, so the damper
+// chooses from the previous emissions.
+TEST(ColumnarOutputDamper, StartsActiveAndStaysActiveForLargeEmissions) {
+    clink::sql::ColumnarOutputDamper d;
+    EXPECT_TRUE(d.active());
+    for (int i = 0; i < 100; ++i) {
+        d.observed(clink::sql::kColumnarOutputMinRows);
+        EXPECT_TRUE(d.active()) << "iteration " << i;
+    }
+}
+
+TEST(ColumnarOutputDamper, BacksOffAfterARunOfSmallEmissions) {
+    clink::sql::ColumnarOutputDamper d;
+    // A short run is tolerated: one big batch resets the count, so an operator
+    // with mixed sizes is not condemned by a single small one.
+    d.observed(1);
+    d.observed(1);
+    d.observed(clink::sql::kColumnarOutputMinRows * 2);
+    EXPECT_TRUE(d.active());
+
+    for (int i = 0; i < 4; ++i) {
+        d.observed(1);
+    }
+    EXPECT_FALSE(d.active()) << "a sustained run of small emissions must back off";
+}
+
+TEST(ColumnarOutputDamper, ReprobesSoGrowingBatchesRecover) {
+    clink::sql::ColumnarOutputDamper d;
+    for (int i = 0; i < 4; ++i) {
+        d.observed(1);
+    }
+    ASSERT_FALSE(d.active());
+
+    // Backed off, it re-probes periodically rather than staying off forever.
+    bool recovered = false;
+    for (int i = 0; i < 200 && !recovered; ++i) {
+        d.observed(clink::sql::kColumnarOutputMinRows * 4);
+        recovered = d.active();
+    }
+    EXPECT_TRUE(recovered) << "a backed-off damper must eventually retry";
 }

@@ -9,6 +9,7 @@
 #include "clink/sql/optimizer.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/physical_plan.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 
 namespace clink::sql {
 
@@ -2737,6 +2738,61 @@ TEST(SqlPhysical, MidReorderThrowYieldsNullChildRejectedCleanly) {
     // The mid-reorder throw left a null child; the planner backstop rejects it
     // with a clean error instead of a null-deref crash.
     EXPECT_THROW(pp.compile(static_cast<const LogicalSink&>(*opt)), TranslationError);
+}
+
+// --- Born-columnar output gate (D4 inc3) -------------------------------------
+//
+// An operator emitting a columnar batch only wins when its consumer can ingest
+// one; a row consumer pays the Arrow build AND the materialise. So the planner,
+// which is the only thing that can see the chain, decides. These pin that
+// decision, because it is invisible at runtime until someone measures.
+
+TEST(SqlPhysical, ColumnarOutputOffWhenTheProducerFeedsTheSink) {
+    Catalog cat;
+    register_json(cat, "cw_src", "(k BIGINT, v BIGINT, ts BIGINT)", "event_time_column='ts'");
+    register_json(cat, "cw_dst", "(k BIGINT, c BIGINT)", "");
+    auto plan = bind_insert(cat,
+                            "INSERT INTO cw_dst SELECT k, COUNT(*) FROM cw_src "
+                            "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+
+    const auto* win = find_op(spec, "tumbling_window_row");
+    ASSERT_NE(win, nullptr);
+    EXPECT_EQ(win->params.count("columnar_output"), 0u)
+        << "the sink materialises rows, so emitting columnar would cost a build plus a decode";
+    EXPECT_EQ(win->params.count("__output_schema"), 0u)
+        << "the private staging key must never survive into a finished spec";
+}
+
+TEST(SqlPhysical, ColumnarOutputOnWhenTheConsumerIngestsColumnar) {
+    Catalog cat;
+    register_json(cat, "cw2_src", "(k BIGINT, v BIGINT, ts BIGINT)", "event_time_column='ts'");
+    register_json(cat, "cw2_dst", "(k BIGINT, c BIGINT)", "");
+    // A HAVING-style filter on the aggregate lands ABOVE the window, and
+    // filter_row_predicate ingests columnar - so the window should emit columnar.
+    auto plan = bind_insert(cat,
+                            "INSERT INTO cw2_dst SELECT k, COUNT(*) AS c FROM cw2_src "
+                            "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k HAVING COUNT(*) > 2");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+
+    const auto* win = find_op(spec, "tumbling_window_row");
+    ASSERT_NE(win, nullptr);
+    const auto* filt = find_op(spec, "filter_row_predicate");
+    ASSERT_NE(filt, nullptr) << "fixture assumption: HAVING compiles to a filter above the window";
+    ASSERT_EQ(win->params.count("columnar_output"), 1u)
+        << "a columnar-ingesting consumer means the window should emit columnar";
+
+    // The declared schema must name every field a fired pane produces, or the
+    // operator refuses it at construction and silently stays row form.
+    const auto cols = parse_row_schema(win->params.at("columnar_output"));
+    std::vector<std::string> names;
+    for (const auto& c : cols)
+        names.push_back(c.name);
+    std::sort(names.begin(), names.end());
+    EXPECT_NE(std::find(names.begin(), names.end(), "k"), names.end());
+    EXPECT_NE(std::find(names.begin(), names.end(), "c"), names.end());
 }
 
 }  // namespace clink::sql

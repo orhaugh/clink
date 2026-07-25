@@ -21,6 +21,7 @@ The path is strictly opt-in and degrades cleanly. The default for every operator
 | Columnar shuffle | `include/clink/runtime/subtask_emitter.hpp` | `partition_columnar_()` keeps each per-subtask sub-batch columnar |
 | Example operators / sources | `include/clink/operators/columnar_filter_operator.hpp`, `include/clink/operators/columnar_vector_source.hpp` | Reference int64 columnar filter and source |
 | SQL Row columnar | `include/clink/sql/row_columnar_batcher.hpp`, `src/sql/install.cpp` | `make_row_columnar_arrow_batcher`, `make_row_wire_batcher`, columnar SQL operators |
+| Born-columnar output | `include/clink/sql/row_columnar_output.hpp`, `enable_columnar_output()` in `src/sql/physical_plan.cpp` | `RowColumnarOutput` builds an operator's output as typed Arrow columns; the planner decides when that pays |
 | Parquet source | `include/clink/connectors/parquet_source.hpp` | Produces columnar batches via the batcher's `parse` |
 
 ## How it works
@@ -146,6 +147,24 @@ The SQL runtime (`src/sql/install.cpp`) implements `process_columnar` on several
 - A columnar windowed fold, the columnar row filter / project, and `ColumnarRowComputeKeyOp` (which appends a `__key` column to the sidecar so the keyed shuffle stays columnar) round out the SQL columnar surface.
 - `json_string_to_row_columnar` is a bridge operator: it decodes JSON the same way as `json_string_to_row` but *attaches* a typed Arrow sidecar built from the table's `schema_columns`, emitting a columnar batch only when every record round-trips exactly (otherwise byte-equivalent row-form decode, with an adaptive damper: after 8 consecutive fallback batches it stops attempting the columnar parse and probes every 64th batch, so a systematically unfaithful stream pays ~1.6% wasted parse instead of up to 2x). The SQL planner emits it BY DEFAULT for a Kafka JSON table; `columnar_decode='false'` opts out to the plain row bridge.
 
+### Born-columnar operator output
+
+Everything above is about *ingest*: a producer attaches a sidecar and a capable operator reads columns instead of rows. An operator's own OUTPUT was row form regardless, so an operator that produced rows paid for a name-keyed `FlatMap<string, JsonValue>` per emitted row: one string key copy per column per row, a pair-vector allocation per row, and the malloc churn both imply.
+
+`RowColumnarOutput` (`include/clink/sql/row_columnar_output.hpp`) closes that. An operator appends its output values straight into one typed Arrow builder per declared output column and emits the finished `RecordBatch` as a columnar `Batch<Row>`; the column names live in the schema, once, instead of in every row, and no `Row` is built at all. Two properties make it safe:
+
+- The per-cell conversion is `row_columnar_detail::append_json_cell`, the *same* function the row-batch converter (`build_column`) uses. The two carriers therefore produce identical Arrow cells by construction rather than by a test noticing they drifted.
+- The emitted batch carries `row_materialize_fn()`, so a row consumer downstream decodes it lazily exactly once and sees the rows it would have received anyway. Correctness never depends on the consumer being columnar.
+
+Whether emitting columnar is *faster* does depend on the consumer, because a row consumer pays the Arrow build and then the materialise. So the decision belongs to the planner, which can see the chain, and not to the operator, which cannot. `enable_columnar_output()` in `src/sql/physical_plan.cpp` promotes a producer's stashed typed output schema to a live `columnar_output` param only when every consumer of that producer ingests columnar; a producer feeding a sink directly is left row form, since no sink connector reads Arrow batches today.
+
+Two operators emit born-columnar output:
+
+- `EquiJoinRowOp` (append-only INNER joins). An OUTER join marks every row with a changelog kind, which the declared output schema has no column for, so it stays row form by construction. If a marked row reaches an INNER join anyway, `bail_columnar_to_rows_` converts what has been accumulated back to rows in emission order and drops the carrier for the rest of the operator's life: a wrong planner gate costs speed, never correctness.
+- `WindowRowOp`'s watermark-driven fire. The declared schema must name every field a fired pane produces, including the window bounds `finalize_window_` always emits, or the operator refuses it and stays row form - a column list missing a produced field would silently drop it. A pane whose group column was *absent* from its records also bails, because the row path omits such a column while a fixed column list would emit it as null, and those are different rows. The timer and async fire paths are row form.
+
+Emission size decides whether the carrier pays at all. A `RecordBatch` costs a fixed amount per batch and saves per row, so `ColumnarOutputDamper` learns from the previous emissions: it backs off after four consecutive emissions below `kColumnarOutputMinRows` (64) and re-probes every 64th batch, mirroring the source-side decode damper. Measured on the 4M-row embedded shapes: an equi-join under a filter emits thousands of rows per batch and takes **-11% CPU**; a windowed fire emits a handful of panes per watermark and **lost 12%** when it built a batch for them, which is what the damper exists to prevent (it returns that shape to parity). `CLINK_DISABLE_COLUMNAR_OUTPUT=1` keeps every operator's output row form, the A/B lever for this axis.
+
 ### Snapshots and Parquet
 
 The same Arrow IPC machinery underpins state snapshots. The in-memory, changelog, and sharded in-memory backends serialise their keyed state as Arrow IPC streams (see [./state-and-backends.md](./state-and-backends.md) and [./checkpointing.md](./checkpointing.md)); schema-evolution metadata is carried in the IPC schema metadata. Parquet sinks and sources reuse the `ArrowBatcher<T>` seam directly, so files written by clink are externally readable column-by-column (pyarrow, duckdb, polars) and a columnar batch is written without a row round-trip. Parquet connector configuration is documented in [../connectors/README.md](../connectors/README.md).
@@ -166,6 +185,8 @@ The same Arrow IPC machinery underpins state snapshots. The in-memory, changelog
 | `detail::try_process_columnar()` | `runtime/dag.hpp` | Shared runner dispatch into the fast path |
 | `partition_columnar_()` | `runtime/subtask_emitter.hpp` | Columnar-preserving keyed shuffle |
 | `make_row_columnar_arrow_batcher`, `make_row_wire_batcher` | `sql/row_columnar_batcher.hpp` | Schema-driven typed Row batcher and the sidecar-preserving Row wire batcher |
+| `append_json_cell`, `make_cell_builder` | `sql/row_columnar_batcher.hpp` | The single Row-cell to Arrow-cell mapping both carriers share |
+| `RowColumnarOutput`, `ColumnarOutputDamper`, `columnar_row_batch` | `sql/row_columnar_output.hpp` | Born-columnar operator output and its emission-size damper |
 | `ColumnarFilterOperator`, `ColumnarVectorSource` | `operators/columnar_filter_operator.hpp`, `operators/columnar_vector_source.hpp` | Reference columnar operator and source |
 
 ## Configuration and knobs
@@ -175,13 +196,15 @@ The same Arrow IPC machinery underpins state snapshots. The in-memory, changelog
 | `CLINK_HAS_ARROW` (CMake define on `clink_core`) | defined (`=1`) | Arrow is a required dependency; the whole columnar surface compiles in. Set unconditionally in `CMakeLists.txt`. |
 | `find_package(Arrow REQUIRED)` / `CLINK_PINNED_ARROW_VERSION` | required, version-pinned | Build fails if the resolved Arrow version differs from `scripts/versions.env`. |
 | `CLINK_DISABLE_COLUMNAR` (env var) | unset | When `=1`, `try_process_columnar()` always returns false so every operator takes `process()`. Diagnostic/benchmark A/B lever only; it can only make the engine slower and has no correctness effect, since `process()` is the authoritative path the columnar path must already match. |
+| `CLINK_DISABLE_COLUMNAR_OUTPUT` (env var) | unset | When `=1`, the planner enables no born-columnar operator output, so every operator emits row form. Diagnostic/benchmark A/B lever for the emission axis; like `CLINK_DISABLE_COLUMNAR` it can only make the engine slower and has no correctness effect. |
+| `columnar_output` (operator param) | set by the planner | A producer's typed output schema. Written by `enable_columnar_output()` only when every consumer of that producer ingests columnar; absent means row-form output. Not a user-facing option. |
 | `columnar_decode` (SQL table WITH-option) | on | The SQL planner emits `json_string_to_row_columnar` (attaches a sidecar) for a Kafka JSON table by default; set `'false'` to opt out to the row-form `json_string_to_row`. |
 | `schema_columns` (connector/source param) | none | The typed column schema the Row columnar batchers (`make_row_columnar_arrow_batcher`, Parquet Row source/sink) are built from. |
 
 ## Guarantees and caveats
 
 - Columnar is opt-in and transparent. A pure-row batch and every existing operator behave byte-for-byte as before. A columnar batch consumed by a row operator decodes lazily once.
-- The fast path fires only when a batch is born columnar. A columnar batch must originate from a columnar-native source: a Parquet (or other Arrow-native file) source carrying a typed schema, the in-tree `ColumnarVectorSource`, or the SQL `json_string_to_row_columnar` bridge - the default for Kafka JSON tables, so the common Kafka pipeline is born columnar for capable schemas; a `columnar_decode='false'` table (or an incapable schema / unfaithful batch) takes the row path. The Row wire batcher preserves columnar across a shuffle but does not manufacture columnar from rows: a row-form batch crossing a task boundary is shipped as binary JSON and arrives row-form.
+- The fast path fires only when a batch is born columnar. A columnar batch must originate from a columnar-native source: a Parquet (or other Arrow-native file) source carrying a typed schema, the in-tree `ColumnarVectorSource`, or the SQL `json_string_to_row_columnar` bridge - the default for Kafka JSON tables, so the common Kafka pipeline is born columnar for capable schemas; a `columnar_decode='false'` table (or an incapable schema / unfaithful batch) takes the row path. The Row wire batcher preserves columnar across a shuffle but does not manufacture columnar from rows: a row-form batch crossing a task boundary is shipped as binary JSON and arrives row-form. Since the born-columnar output work, an append-only INNER join and a windowed fire are also origins of columnar batches when the planner has enabled it.
 - `process_columnar` must not emit before returning `false`. A `false` return re-runs `process()`, so emitting and then returning `false` would double-emit. This is an explicit operator contract, not an engine safety net.
 - Coverage is partial. The built-in columnar operators target specific shapes (for example the int64 filter is int64-only, a single `>=`). The SQL columnar operators cover GROUP BY ingest and the vectorised fold for `COUNT` / integer `SUM` / integer `AVG`, a columnar window fold, columnar filter/project, and key computation; other operators run row-based. `AggregateRowOp` disables columnar when its async/disaggregated state path is active.
 - Arrow compute kernel availability is limited in this package. Only the core selection kernels (notably `filter`) are registered; arithmetic and comparison kernels are not auto-registered because `arrow::compute::Initialize()` is not exported. Columnar operators that need a comparison hand-roll a dense scan and use Arrow only for the gather. A true comparison-kernel mask is unblocked only by an Arrow build that exports `Initialize()` or auto-registers the kernels.

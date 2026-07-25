@@ -20,11 +20,12 @@
 # With the ForSt engine opted in, every tag above gains a `-forst` suffix so an
 # opt-in build can never silently overwrite the canonical image.
 #
-# ONE-TIME OWNER STEP: a package pushed to GHCR starts PRIVATE even from a
-# public repo. After the first successful run, open the clink-runtime package
-# settings and set its visibility to public, or `docker pull` still asks
-# strangers for credentials and the chart is no better off than before. The
-# same applies to the clink-build toolchain package (see ci.yml's header).
+# Visibility: the first run's package came out publicly pullable (verified by
+# fetching the manifest with an anonymous ghcr token: HTTP 200), so no manual
+# settings step was needed. If a future run or a fork produces a package that
+# needs credentials, that is where to look - GHCR does not always inherit the
+# repository's visibility, and a private runtime image leaves the chart no better
+# off than the local tag it replaced.
 
 name: runtime-image
 

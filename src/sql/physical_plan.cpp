@@ -1,8 +1,10 @@
 #include "clink/sql/physical_plan.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "clink/cluster/job_graph.hpp"
@@ -203,6 +205,12 @@ struct RowConnectorBinding {
     std::map<std::string, std::string> extra_params{};
 };
 
+// Private param key: a producer's typed output schema, parked on the op by
+// compile_node and either promoted to `columnar_output` or erased by
+// enable_columnar_output(). Underscore-prefixed so it cannot collide with a
+// connector option, and never present in a finished spec.
+constexpr const char* kOutputSchemaKey = "__output_schema";
+
 // Convert a table's declared columns to the RowColumn list the
 // schema-driven Row batcher (and its param serialiser) consume.
 std::vector<RowColumn> row_columns_of(const TableDef& table) {
@@ -210,6 +218,18 @@ std::vector<RowColumn> row_columns_of(const TableDef& table) {
     rc.reserve(table.columns.size());
     for (const auto& c : table.columns) {
         rc.push_back(RowColumn{c.name, c.type});
+    }
+    return rc;
+}
+
+// The same, for an intermediate node's output schema rather than a declared
+// table. Feeds the born-columnar output schema an operator builds its typed
+// Arrow columns from.
+std::vector<RowColumn> row_columns_of_schema(const arrow::Schema& schema) {
+    std::vector<RowColumn> rc;
+    rc.reserve(static_cast<std::size_t>(schema.num_fields()));
+    for (int i = 0; i < schema.num_fields(); ++i) {
+        rc.push_back(RowColumn{schema.field(i)->name(), schema.field(i)->type()});
     }
     return rc;
 }
@@ -1025,6 +1045,13 @@ std::string compile_node(const LogicalPlan& node,
         };
         op.params["left_columns"] = columns_csv(jn.left().schema());
         op.params["right_columns"] = columns_csv(jn.right().schema());
+        // The join's typed output schema, stashed for enable_columnar_output()
+        // below to promote to the real `columnar_output` param if this join's
+        // consumers can take a columnar batch. Held under a private key so a
+        // plan where columnar output is not enabled carries no trace of it.
+        if (jn.schema() != nullptr) {
+            op.params[kOutputSchemaKey] = serialize_row_schema(row_columns_of_schema(*jn.schema()));
+        }
         std::string id = op.id;
         spec.ops.push_back(std::move(op));
         return id;
@@ -1636,6 +1663,33 @@ std::string compile_node(const LogicalPlan& node,
         if (auto lr = first_source_property(agg.input(), "late_records_to_dlq"); !lr.empty())
             op.params["late_records_to_dlq"] = lr;
 
+        // The windowed aggregate's typed output schema, for enable_columnar_output()
+        // to promote if this node's consumers can take a columnar batch. The
+        // session window has no born-columnar fire yet, so it is not offered one.
+        //
+        // The node's schema is the RELATIONAL output, but a fired pane also always
+        // carries its window bounds (finalize_window_ sets both unconditionally,
+        // whether or not the query selected them). They have to be declared here or
+        // the operator would refuse the schema as incomplete - which is exactly what
+        // it should do, since a column list missing a produced field would silently
+        // drop it. Names must match the operator's effective ones, hence the same
+        // defaults the factory applies for an absent param.
+        if (agg.schema() != nullptr && w.kind != WindowSpec::Kind::Session) {
+            auto cols = row_columns_of_schema(*agg.schema());
+            const std::string ws =
+                agg.window_start_output().empty() ? "window_start" : agg.window_start_output();
+            const std::string we =
+                agg.window_end_output().empty() ? "window_end" : agg.window_end_output();
+            for (const auto& name : {ws, we}) {
+                const bool present = std::any_of(
+                    cols.begin(), cols.end(), [&](const RowColumn& c) { return c.name == name; });
+                if (!present) {
+                    cols.push_back(RowColumn{name, arrow::int64()});
+                }
+            }
+            op.params[kOutputSchemaKey] = serialize_row_schema(cols);
+        }
+
         std::string id = op.id;
         spec.ops.push_back(std::move(op));
         return id;
@@ -2198,6 +2252,72 @@ void mark_changelog_producers(cluster::JobGraphSpec& spec) {
 
 }  // namespace
 
+// Born-columnar operator output (D4): promote a producer's stashed output schema
+// to the live `columnar_output` param when, and only when, every consumer of that
+// producer can ingest a columnar batch.
+//
+// The gate is about SPEED, not correctness. An operator emitting columnar always
+// attaches the lazy row decoder, so a row consumer still sees the right rows - it
+// just pays the Arrow build and then the materialise, which is strictly worse
+// than having been handed rows. So the decision belongs here, where the whole
+// chain is visible, rather than in an operator that cannot see its consumer.
+void enable_columnar_output(cluster::JobGraphSpec& spec) {
+    // Diagnostic A/B lever, mirroring CLINK_DISABLE_COLUMNAR for the ingest side:
+    // =1 keeps every operator's output row-form. It can only make the engine
+    // slower and cannot change results, since the row path is the authoritative
+    // one the columnar carrier is proved against.
+    if (const char* off = std::getenv("CLINK_DISABLE_COLUMNAR_OUTPUT");
+        off != nullptr && std::string_view{off} == "1") {
+        for (auto& op : spec.ops) {
+            op.params.erase(kOutputSchemaKey);
+        }
+        return;
+    }
+    // Operators whose process_columnar ingests a sidecar without materialising.
+    // This list must track supports_columnar() in install.cpp: an op wrongly
+    // listed here costs performance (its input materialises anyway), an op
+    // wrongly missing costs an optimisation, and neither changes results.
+    auto ingests_columnar = [](const std::string& t) {
+        return t == "filter_row_predicate" || t == "project_row" || t == "row_compute_key" ||
+               t == "aggregate_row" || t == "window_row" || t == "session_window_row" ||
+               t == "assign_timestamps_row";
+    };
+    // id -> the ops taking it as input. An op with no consumer at all feeds the
+    // sink, which is row-form in every connector today.
+    std::unordered_map<std::string, std::vector<const cluster::OperatorSpec*>> consumers;
+    for (const auto& op : spec.ops) {
+        for (const auto& in : op.inputs) {
+            consumers[in].push_back(&op);
+        }
+    }
+    for (auto& op : spec.ops) {
+        auto stashed = op.params.find(kOutputSchemaKey);
+        if (stashed == op.params.end()) {
+            continue;
+        }
+        std::string schema = std::move(stashed->second);
+        op.params.erase(stashed);
+        // An OUTER join marks every row it emits with a changelog kind, which the
+        // declared output schema has no column for, so it is row-form by
+        // construction. (An INNER join fed a retraction bails to row form at
+        // runtime; see EquiJoinRowOp::bail_columnar_to_rows_.)
+        if (op.params.count("join_type") != 0 && op.params.at("join_type") != "inner") {
+            continue;
+        }
+        const auto it = consumers.find(op.id);
+        if (it == consumers.end() || it->second.empty()) {
+            continue;  // feeds a sink directly: the sink would materialise it
+        }
+        const bool all_columnar =
+            std::all_of(it->second.begin(), it->second.end(), [&](const cluster::OperatorSpec* c) {
+                return ingests_columnar(c->type);
+            });
+        if (all_columnar) {
+            op.params["columnar_output"] = std::move(schema);
+        }
+    }
+}
+
 cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
     const auto t0 = std::chrono::steady_clock::now();
     cluster::JobGraphSpec spec;
@@ -2222,6 +2342,7 @@ cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
     // cannot trace.
     spec.column_lineage = capture_column_lineage(root, sink_id);
     mark_changelog_producers(spec);
+    enable_columnar_output(spec);
     spec.validate();
     const auto dt =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
