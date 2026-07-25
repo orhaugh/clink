@@ -149,6 +149,25 @@ jobs:
     # on it, and the probe after that fails in two readable lines if the pairing
     # still lacks the sync library.
     runs-on: macos-26
+    env:
+      # The wheel's Arrow is built WITHOUT S3, and in its own prefix.
+      #
+      # Why: with S3 on, Arrow pulls the aws-sdk / aws-c-* / OpenSSL chain, delocate
+      # vendors those dylibs into the wheel, and each one carries the build host's
+      # minimum macOS version - 26.0 on this image. A wheel tagged macosx_14_0 cannot
+      # honestly ship them, and delocate rightly refuses ("Library dependencies do not
+      # satisfy target MacOS version 14.0"). Dropping S3 removes the whole chain.
+      #
+      # THE COST, stated plainly: s3:// paths do not work in the wheel. pyclink reads
+      # and writes local files and runs SQL; a pipeline needing S3 (or Iceberg on S3)
+      # must build clink from source, where S3 is on by default. clink's S3 usage is
+      # guarded on Arrow's ARROW_S3 macro, so those paths fail with that explanation
+      # rather than crashing.
+      #
+      # The separate prefix keeps this away from a normal ~/.clink-deps: nothing else
+      # should silently inherit an S3-less toolchain.
+      CLINK_ARROW_S3: "OFF"
+      CLINK_DEPS_PREFIX: "/Users/runner/.clink-deps-wheel"
     steps:
       - uses: actions/checkout@v4
 
@@ -196,15 +215,19 @@ jobs:
         # cmake is preinstalled but we pin it via brew for parity.
         run: brew install cmake aws-sdk-cpp
 
-      - name: Cache pinned toolchain (~/.clink-deps)
-        # The ~40 min from-source Arrow + iceberg-cpp build. Keyed on versions.env
-        # AND the macOS floor, so bumping either busts it and Arrow is rebuilt at
-        # the right minos. build-arrow / build-iceberg-cpp are idempotent and exit
-        # early on a cache hit.
+      - name: Cache pinned toolchain (the wheel's S3-less prefix)
+        # The ~40 min from-source Arrow build. Keyed on versions.env, the macOS
+        # floor AND the S3 setting, so changing any of them busts it and Arrow is
+        # rebuilt with the right features at the right minos. build-arrow.sh is
+        # idempotent and exits early on a cache hit (it stamps the feature set
+        # beside the install, so a prefix built the other way is not reused).
+        #
+        # This prefix is the wheel's own: it holds an Arrow WITHOUT S3, and a
+        # normal ~/.clink-deps must never be confused with it.
         uses: actions/cache@v4
         with:
-          path: ~/.clink-deps
-          key: clink-deps-${{ runner.os }}-${{ runner.arch }}-macos${{ env.MACOSX_DEPLOYMENT_TARGET }}-${{ hashFiles('scripts/versions.env') }}
+          path: ~/.clink-deps-wheel
+          key: clink-deps-${{ runner.os }}-${{ runner.arch }}-macos${{ env.MACOSX_DEPLOYMENT_TARGET }}-s3${{ env.CLINK_ARROW_S3 }}-${{ hashFiles('scripts/versions.env') }}
 
       - name: Bootstrap pinned Arrow (at the macOS floor)
         # MACOSX_DEPLOYMENT_TARGET is exported job-wide, so cmake inside this
@@ -241,15 +264,35 @@ jobs:
             "${{ github.workspace }}/python"
 
       - name: Repair wheel (delocate)
-        # Vendors the Arrow transitive dylibs (curl / xml2 / aws-sdk / openssl /
-        # lz4 / zstd / ...) into the wheel so it is self-contained.
+        # Vendors the Arrow transitive dylibs (curl / xml2 / lz4 / zstd / ...)
+        # into the wheel so it is self-contained. The aws-sdk / aws-c-* / OpenSSL
+        # chain is absent by construction here: this Arrow is built without S3
+        # (see the job env), which is what keeps the vendored set inside the
+        # wheel's macOS floor.
         run: |
           set -euo pipefail
-          export DYLD_LIBRARY_PATH="$HOME/.clink-deps/lib:/opt/homebrew/lib:${DYLD_LIBRARY_PATH:-}"
+          export DYLD_LIBRARY_PATH="${CLINK_DEPS_PREFIX}/lib:/opt/homebrew/lib:${DYLD_LIBRARY_PATH:-}"
           delocate-wheel --require-archs arm64 \
             -w "${RUNNER_TEMP}/wheelhouse" \
             "${RUNNER_TEMP}"/dist/*.whl
           ls -l "${RUNNER_TEMP}/wheelhouse"
+
+      - name: Assert the aws chain was not vendored
+        # The S3-less Arrow is the whole reason this wheel can carry a macOS floor
+        # below the build host's. If an Arrow or CMake change ever drags the aws
+        # libraries back in, delocate would vendor them and their 26.0 minimum
+        # would either fail the repair or, worse, quietly raise what the wheel
+        # actually requires. Fail here, naming the offender.
+        run: |
+          set -euo pipefail
+          whl="$(ls "${RUNNER_TEMP}"/wheelhouse/*.whl)"
+          vendored="$(unzip -Z1 "${whl}" | grep '\.dylibs/' || true)"
+          echo "vendored dylibs:"; echo "${vendored}"
+          if echo "${vendored}" | grep -Ei 'aws-|libssl|libcrypto'; then
+            echo "::error::the aws/OpenSSL chain was vendored into the wheel - the wheel's Arrow should be built with CLINK_ARROW_S3=OFF" >&2
+            exit 1
+          fi
+          echo "no aws/OpenSSL dylibs vendored"
 
       - name: Install + test in a fresh venv (bundled lib)
         run: |

@@ -27,9 +27,12 @@
 
 #include <arrow/filesystem/filesystem.h>
 #include <arrow/filesystem/localfs.h>
-#include <arrow/filesystem/s3fs.h>
 #include <arrow/result.h>
+#include <arrow/util/config.h>
 #include <arrow/util/uri.h>
+#ifdef ARROW_S3
+#include <arrow/filesystem/s3fs.h>
+#endif
 
 #include "clink/connectors/arrow_s3_lifecycle.hpp"
 
@@ -60,7 +63,10 @@ inline std::shared_ptr<arrow::fs::FileSystem> filesystem_from_uri(const std::str
     if (scheme == "s3") {
         // Same lifecycle the registry factory would have required; one init
         // per process, finalised by the entry point (arrow_s3_lifecycle.hpp).
+        // Against an Arrow built without S3 this throws with an explanation
+        // rather than the scheme silently falling through to the registry.
         ensure_arrow_s3_initialised();
+#ifdef ARROW_S3
         auto options = arrow::fs::S3Options::FromUri(uri, out_path);
         if (!options.ok()) {
             throw std::runtime_error("cannot parse " + uri + ": " + options.status().ToString());
@@ -70,6 +76,7 @@ inline std::shared_ptr<arrow::fs::FileSystem> filesystem_from_uri(const std::str
             throw std::runtime_error("cannot open " + uri + ": " + made.status().ToString());
         }
         return made.MoveValueUnsafe();
+#endif
     }
     // Foreign scheme: fall back to the registry. In a binary afflicted by the
     // duplicated-registration wart this can fail; none of clink's tools form

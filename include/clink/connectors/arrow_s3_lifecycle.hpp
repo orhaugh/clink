@@ -36,20 +36,46 @@
 // Include only from TUs that carry the Arrow include path (every S3-backed connector, plus
 // clink_core, does). The call_once guard keeps init to one InitializeS3.
 
+// BUILT WITHOUT ARROW S3. Arrow can be configured -DARROW_S3=OFF, and then
+// neither <arrow/filesystem/s3fs.h> nor the InitializeS3 / EnsureS3Finalized
+// symbols exist. Arrow advertises which way it was built in its own installed
+// config.h, so both functions below keep their signatures either way and the S3
+// one fails loudly instead of the whole library failing to link. The pyclink
+// wheel is built against such an Arrow deliberately (see
+// .github/workflows/wheels.yml); every other build has S3.
 #include <mutex>
 #include <stdexcept>
 #include <string>
 
+#include <arrow/util/config.h>
+#ifdef ARROW_S3
 #include <arrow/filesystem/s3fs.h>
+#endif
 
 #include "clink/connectors/openssl_atexit_guard.hpp"  // suppress_openssl_atexit
 
 namespace clink::connectors {
 
+// True iff this build's Arrow carries the S3 filesystem. Lets a caller give a
+// useful message rather than discovering it from a failed filesystem open.
+inline constexpr bool arrow_has_s3() noexcept {
+#ifdef ARROW_S3
+    return true;
+#else
+    return false;
+#endif
+}
+
 // THE canonical "I am about to use Arrow/AWS S3" call. Suppresses OpenSSL's heap-corrupting
 // atexit, then initialises Arrow's S3 subsystem (and therefore the AWS SDK) exactly once with a
 // quiet log level. Idempotent; robust to Arrow having already initialised S3 behind our back.
 inline void ensure_arrow_s3_initialised() {
+#ifndef ARROW_S3
+    throw std::runtime_error(
+        "this build of clink links an Arrow without S3 support, so s3:// paths are "
+        "unavailable; use a local path, or build clink against the default Arrow "
+        "(scripts/build-arrow.sh)");
+#else
     static std::once_flag once;
     std::call_once(once, [] {
         suppress_openssl_atexit();  // before InitializeS3 brings up the AWS CRT + OpenSSL
@@ -62,6 +88,7 @@ inline void ensure_arrow_s3_initialised() {
             }
         }
     });
+#endif
 }
 
 // Finalise Arrow S3 (joins the AWS CRT event-loop threads). Call this exactly once per process,
@@ -69,7 +96,9 @@ inline void ensure_arrow_s3_initialised() {
 // destruction - NEVER from an atexit handler or a static destructor (see note (b) above). A
 // no-op when S3 was never initialised, so it is safe to call from any entry point unconditionally.
 inline void finalize_arrow_s3() {
+#ifdef ARROW_S3
     (void)arrow::fs::EnsureS3Finalized();
+#endif
 }
 
 }  // namespace clink::connectors

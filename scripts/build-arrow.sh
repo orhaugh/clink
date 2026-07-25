@@ -23,10 +23,40 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "${HERE}/versions.env"
 PREFIX="${CLINK_DEPS_PREFIX:?CLINK_DEPS_PREFIX must be set}"
 
+# S3 is ON for every normal build (impls/s3, the Iceberg S3 FileIO, the
+# disaggregated state backends). CLINK_ARROW_S3=OFF drops it, and with it the
+# whole bundled aws-sdk / aws-c-* / OpenSSL chain: that is what the pyclink wheel
+# wants, because those dylibs would otherwise be vendored into the wheel and each
+# Homebrew-built one carries the build host's minimum macOS version, which
+# delocate refuses against a lower wheel floor. clink's own S3 usage is guarded on
+# Arrow's ARROW_S3 macro (see include/clink/connectors/arrow_s3_lifecycle.hpp), so
+# an S3-less Arrow still links; s3:// paths then fail with an explanation.
+ARROW_S3_SETTING="${CLINK_ARROW_S3:-ON}"
+case "${ARROW_S3_SETTING}" in
+    ON|OFF) ;;
+    *) echo "build-arrow: CLINK_ARROW_S3 must be ON or OFF (got '${ARROW_S3_SETTING}')" >&2; exit 2 ;;
+esac
+# Feature stamp beside the install. The version check below cannot tell an
+# S3-enabled prefix from an S3-less one, and silently reusing the wrong one is a
+# confusing way to lose a whole filesystem, so a mismatch forces the rebuild.
+stamp_file="${PREFIX}/.clink-arrow-features"
+stamp_want="arrow=${ARROW_VERSION} s3=${ARROW_S3_SETTING}"
+
 ver_file="${PREFIX}/lib/cmake/Arrow/ArrowConfigVersion.cmake"
 if [ -f "${ver_file}" ] && grep -q "\"${ARROW_VERSION}\"" "${ver_file}" 2>/dev/null; then
-    echo "build-arrow: Arrow ${ARROW_VERSION} already installed at ${PREFIX}; skipping."
-    exit 0
+    if [ "$(cat "${stamp_file}" 2>/dev/null)" = "${stamp_want}" ]; then
+        echo "build-arrow: Arrow ${ARROW_VERSION} (S3=${ARROW_S3_SETTING}) already installed at ${PREFIX}; skipping."
+        exit 0
+    fi
+    # A prefix installed before this stamp existed is an S3=ON build (the only
+    # thing that was ever produced), so honour it rather than rebuilding.
+    if [ ! -f "${stamp_file}" ] && [ "${ARROW_S3_SETTING}" = "ON" ]; then
+        echo "${stamp_want}" > "${stamp_file}"
+        echo "build-arrow: Arrow ${ARROW_VERSION} already installed at ${PREFIX}; stamped S3=ON; skipping."
+        exit 0
+    fi
+    echo "build-arrow: ${PREFIX} holds Arrow ${ARROW_VERSION} with different features" \
+         "($(cat "${stamp_file}" 2>/dev/null || echo 's3=ON (unstamped)')); rebuilding for ${stamp_want}."
 fi
 
 # Fast path: restore a prebuilt toolchain artifact (Arrow + Parquet +
@@ -37,7 +67,11 @@ fi
 # checksum mismatch, which must NOT be papered over by a silent rebuild.
 # The existence check matters: contexts that copy scripts selectively
 # (e.g. the Docker toolchain layer) may run this without fetch-deps.sh.
-if [ "${CLINK_DEPS_FROM_SOURCE:-0}" != "1" ] && [ -f "${HERE}/fetch-deps.sh" ]; then
+# The published archives are all S3-enabled builds, so an S3=OFF request must not
+# take this path - it would restore exactly what it is trying to avoid.
+if [ "${ARROW_S3_SETTING}" = "OFF" ]; then
+    echo "build-arrow: CLINK_ARROW_S3=OFF; skipping the prebuilt fast path (archives carry S3)."
+elif [ "${CLINK_DEPS_FROM_SOURCE:-0}" != "1" ] && [ -f "${HERE}/fetch-deps.sh" ]; then
     fetch_rc=0
     "${HERE}/fetch-deps.sh" || fetch_rc=$?
     if [ "${fetch_rc}" -eq 0 ]; then
@@ -93,7 +127,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
     fi
 fi
 
-echo "build-arrow: configuring (BUNDLED data-path deps, SYSTEM aws-sdk, Parquet+S3+Compute) -> ${PREFIX}"
+echo "build-arrow: configuring (BUNDLED data-path deps, SYSTEM aws-sdk, Parquet+Compute, S3=${ARROW_S3_SETTING}) -> ${PREFIX}"
 cmake -S "${SRC_DIR}/cpp" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
@@ -106,7 +140,7 @@ cmake -S "${SRC_DIR}/cpp" -B "${BUILD_DIR}" \
     -DARROW_POSITION_INDEPENDENT_CODE=ON \
     -DARROW_PARQUET=ON \
     -DARROW_FILESYSTEM=ON \
-    -DARROW_S3=ON \
+    -DARROW_S3="${ARROW_S3_SETTING}" \
     -DARROW_GCS=ON \
     -DARROW_AZURE=ON \
     -DARROW_COMPUTE=ON \
@@ -133,4 +167,5 @@ cmake -S "${SRC_DIR}/cpp" -B "${BUILD_DIR}" \
 echo "build-arrow: building with ${JOBS} jobs (this is the long pole - bundled aws-sdk etc.)"
 cmake --build "${BUILD_DIR}" --parallel "${JOBS}"
 cmake --install "${BUILD_DIR}"
-echo "build-arrow: installed Arrow + Parquet ${ARROW_VERSION} -> ${PREFIX}"
+echo "${stamp_want}" > "${stamp_file}"
+echo "build-arrow: installed Arrow + Parquet ${ARROW_VERSION} (S3=${ARROW_S3_SETTING}) -> ${PREFIX}"
