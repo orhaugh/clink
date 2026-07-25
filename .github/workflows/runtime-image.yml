@@ -1,0 +1,134 @@
+# Publish the clink runtime image (docker/Dockerfile.runtime) to GHCR.
+#
+# Why this workflow exists: the Helm chart, the k8s operator and the compose
+# topologies all reference a `clink-runtime` image. Until this existed, that
+# image only ever lived as a local tag on the author's machine, so the entire
+# Kubernetes path was unreachable for anyone else - `helm install` pulled an
+# image that does not exist on any registry. This publishes it.
+#
+# NOT on every push to main, deliberately. The image compiles clink_node in
+# Release with LTO and fetches + builds RocksDB, so `COPY . /src` invalidates
+# the expensive layer on every commit: roughly an hour of runner time per push
+# for an artifact nobody consumes between releases. Releases get an image
+# automatically; refresh the rolling `:main` tag by hand when you want one.
+#
+# Tags published (amd64 only - the toolchain image ci.yml publishes is amd64):
+#   push v*            :<version> and :latest   (e.g. v0.1.1 -> :0.1.1, :latest)
+#   workflow_dispatch  :main
+#   both               :sha-<short sha>, so any deployment can be traced back
+#                      to the commit that produced it
+# With the ForSt engine opted in, every tag above gains a `-forst` suffix so an
+# opt-in build can never silently overwrite the canonical image.
+#
+# ONE-TIME OWNER STEP: a package pushed to GHCR starts PRIVATE even from a
+# public repo. After the first successful run, open the clink-runtime package
+# settings and set its visibility to public, or `docker pull` still asks
+# strangers for credentials and the chart is no better off than before. The
+# same applies to the clink-build toolchain package (see ci.yml's header).
+
+name: runtime-image
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      toolchain_tag:
+        description: "Tag of the ghcr clink-build toolchain image to build against."
+        type: string
+        default: "main"
+      with_forst:
+        description: "Bake in the ForSt state backend (forst:// and the forst_s3 schemes). Adds ~5-8 min and publishes -forst suffixed tags."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+# One image build at a time: they are long, and two concurrent runs would race
+# on the shared registry build cache.
+concurrency:
+  group: runtime-image
+  cancel-in-progress: false
+
+env:
+  # Owner-scoped so a fork publishes under its own namespace (mirrors ci.yml).
+  IMAGE: ghcr.io/${{ github.repository_owner }}/clink-runtime
+  TOOLCHAIN: ghcr.io/${{ github.repository_owner }}/clink-build
+
+jobs:
+  publish:
+    name: Build + push clink-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        # The toolchain image is large (Arrow, the AWS SDK and iceberg-cpp all
+        # built from source), and on top of it this build compiles the engine in
+        # Release plus RocksDB. The hosted runner's default free space is not
+        # enough; these four directories are the standard reclaim and none of
+        # them is used by a C++/CMake build.
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags
+        id: tags
+        # A tag push publishes the released version plus :latest; a manual run
+        # refreshes :main. Both carry :sha-<short> so a running pod can always
+        # be traced to a commit.
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [ "${{ inputs.with_forst }}" = "true" ]; then suffix="-forst"; fi
+          short="$(echo "${GITHUB_SHA}" | cut -c1-12)"
+          tags="${IMAGE}:sha-${short}${suffix}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            tags="${tags},${IMAGE}:${version}${suffix},${IMAGE}:latest${suffix}"
+          else
+            tags="${tags},${IMAGE}:main${suffix}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "Publishing: ${tags}"
+
+      - name: Build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runtime
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            BASE_IMAGE=${{ env.TOOLCHAIN }}:${{ inputs.toolchain_tag || 'main' }}
+            CLINK_WITH_FORST=${{ inputs.with_forst == true && 'ON' || 'OFF' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=clink streaming runtime (clink_node + the clink client CLI)
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+
+      - name: Smoke the published image
+        # Cheap proof that what was pushed actually runs, rather than merely
+        # having compiled: both binaries must respond on their own.
+        run: |
+          set -euo pipefail
+          ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          echo "Smoking ${ref}"
+          docker run --rm --entrypoint clink_node "${ref}" --help
+          docker run --rm --entrypoint clink "${ref}" --help

@@ -6,7 +6,15 @@
 ##
 ## After that, docker-compose.yml (at the repo root) builds this image
 ## and spins up a 1 coordinator + 3 worker cluster.
-FROM clink-build:latest
+##
+## BASE_IMAGE exists so CI can build against the pinned toolchain image it
+## already published to GHCR instead of a local tag that only exists on a
+## developer's machine:
+##   docker build --build-arg BASE_IMAGE=ghcr.io/<owner>/clink-build:main \
+##     -t clink-runtime:latest -f docker/Dockerfile.runtime .
+## The default keeps the local workflow above unchanged.
+ARG BASE_IMAGE=clink-build:latest
+FROM ${BASE_IMAGE}
 
 USER root
 WORKDIR /src

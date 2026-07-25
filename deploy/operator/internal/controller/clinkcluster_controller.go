@@ -111,10 +111,10 @@ func (r *ClinkClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 func applyDefaults(cc *clinkv1alpha1.ClinkCluster) {
 	s := &cc.Spec
 	if s.Image.Repository == "" {
-		s.Image.Repository = "clink-runtime"
+		s.Image.Repository = "ghcr.io/orhaugh/clink-runtime"
 	}
 	if s.Image.Tag == "" {
-		s.Image.Tag = "latest"
+		s.Image.Tag = "main"
 	}
 	if s.Image.PullPolicy == "" {
 		s.Image.PullPolicy = corev1.PullIfNotPresent

@@ -43,18 +43,26 @@ Readiness and liveness probes hit `/api/v1/health` on each role's HTTP port
 
 ## Prerequisites
 
-- A `clink-runtime` image (built from `docker/Dockerfile.runtime`) pushed to a
-  registry your cluster can pull. Override `image.repository` / `image.tag`.
-- Helm 3 / Kubernetes 1.25+.
+- Helm 3 / Kubernetes 1.25+, and a cluster that can reach `ghcr.io`.
+
+The chart defaults to the published runtime image
+(`ghcr.io/orhaugh/clink-runtime:main`), so nothing needs building first. If you
+mirror it into your own registry, or build `docker/Dockerfile.runtime` yourself,
+override `image.repository` / `image.tag`.
 
 ## Install
 
 ```sh
 helm install my-clink deploy/helm/clink \
-  --set image.repository=<registry>/clink-runtime \
-  --set image.tag=<version> \
   --set worker.replicas=4 \
   --set worker.slots=4
+```
+
+Pin a released image rather than the rolling `main` build for anything
+long-lived:
+
+```sh
+helm install my-clink deploy/helm/clink --set image.tag=latest
 ```
 
 Open the dashboard:
@@ -68,7 +76,7 @@ kubectl port-forward svc/my-clink-coordinator 8081:8081
 
 | key | default | meaning |
 |---|---|---|
-| `image.repository` / `image.tag` | `clink-runtime` / `latest` | the runtime image |
+| `image.repository` / `image.tag` | `ghcr.io/orhaugh/clink-runtime` / `main` | the runtime image; `main` is the rolling default-branch build, `latest` the newest release |
 | `worker.replicas` | `3` | number of Workers |
 | `worker.slots` | `4` | task slots per Worker |
 | `coordinator.service.type` | `ClusterIP` | set NodePort/LoadBalancer to expose the dashboard |

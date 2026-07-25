@@ -1,10 +1,15 @@
 # Default values for the clink chart.
 
 image:
-  # The clink runtime image (built from docker/Dockerfile.runtime). Push it to a
-  # registry your cluster can pull, then set repository/tag here.
-  repository: clink-runtime
-  tag: latest
+  # The published clink runtime image (built from docker/Dockerfile.runtime by
+  # .github/workflows/runtime-image.yml). Any cluster with internet access can
+  # pull this; point repository at your own registry if you mirror it or build
+  # the image yourself.
+  repository: ghcr.io/orhaugh/clink-runtime
+  # `main` is the rolling build of the default branch. Pin a released tag
+  # (0.1.1, ...) or `latest` for anything you care about staying still: the
+  # same workflow publishes those on a version tag.
+  tag: main
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

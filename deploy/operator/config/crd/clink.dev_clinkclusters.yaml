@@ -90,67 +90,6 @@ spec:
                     - hostPath
                     type: string
                 type: object
-              ha:
-                description: |-
-                  HASpec turns on multi-Coordinator high availability with file-coordinator
-                  leader election over a shared RWX volume.
-                properties:
-                  enabled:
-                    type: boolean
-                  mountPath:
-                    default: /var/lib/clink/ha
-                    type: string
-                  replicas:
-                    default: 2
-                    format: int32
-                    minimum: 2
-                    type: integer
-                  size:
-                    default: 1Gi
-                    type: string
-                  storageClassName:
-                    description: StorageClassName for the shared HA PVC (must support
-                      ReadWriteMany).
-                    type: string
-                type: object
-              image:
-                description: ImageSpec pins the clink runtime image the Coordinator
-                  + Workers run.
-                properties:
-                  pullPolicy:
-                    default: IfNotPresent
-                    description: PullPolicy describes a policy for if/when to pull
-                      a container image
-                    enum:
-                    - Always
-                    - IfNotPresent
-                    - Never
-                    type: string
-                  repository:
-                    default: clink-runtime
-                    type: string
-                  tag:
-                    default: latest
-                    type: string
-                type: object
-              imagePullSecrets:
-                items:
-                  description: |-
-                    LocalObjectReference contains enough information to let you locate the
-                    referenced object inside the same namespace.
-                  properties:
-                    name:
-                      default: ""
-                      description: |-
-                        Name of the referent.
-                        This field is effectively required, but due to backwards compatibility is
-                        allowed to be empty. Instances of this type with an empty value here are
-                        almost certainly wrong.
-                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      type: string
-                  type: object
-                  x-kubernetes-map-type: atomic
-                type: array
               coordinator:
                 description: CoordinatorSpec configures the Coordinator role.
                 properties:
@@ -242,6 +181,71 @@ spec:
                       "rocksdb").
                     type: string
                 type: object
+              ha:
+                description: |-
+                  HASpec turns on multi-Coordinator high availability with file-coordinator
+                  leader election over a shared RWX volume.
+                properties:
+                  enabled:
+                    type: boolean
+                  mountPath:
+                    default: /var/lib/clink/ha
+                    type: string
+                  replicas:
+                    default: 2
+                    format: int32
+                    minimum: 2
+                    type: integer
+                  size:
+                    default: 1Gi
+                    type: string
+                  storageClassName:
+                    description: StorageClassName for the shared HA PVC (must support
+                      ReadWriteMany).
+                    type: string
+                type: object
+              image:
+                description: |-
+                  ImageSpec pins the clink runtime image the Coordinator + Workers run.
+
+                  The defaults are the published image, so a minimal ClinkCluster reconciles on
+                  any cluster that can reach ghcr.io. `main` is the rolling default-branch
+                  build; pin a released tag (or `latest`) for anything long-lived.
+                properties:
+                  pullPolicy:
+                    default: IfNotPresent
+                    description: PullPolicy describes a policy for if/when to pull
+                      a container image
+                    enum:
+                    - Always
+                    - IfNotPresent
+                    - Never
+                    type: string
+                  repository:
+                    default: ghcr.io/orhaugh/clink-runtime
+                    type: string
+                  tag:
+                    default: main
+                    type: string
+                type: object
+              imagePullSecrets:
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
               serviceAccountName:
                 type: string
               worker:

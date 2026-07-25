@@ -6,10 +6,14 @@ import (
 )
 
 // ImageSpec pins the clink runtime image the Coordinator + Workers run.
+//
+// The defaults are the published image, so a minimal ClinkCluster reconciles on
+// any cluster that can reach ghcr.io. `main` is the rolling default-branch
+// build; pin a released tag (or `latest`) for anything long-lived.
 type ImageSpec struct {
-	// +kubebuilder:default="clink-runtime"
+	// +kubebuilder:default="ghcr.io/orhaugh/clink-runtime"
 	Repository string `json:"repository,omitempty"`
-	// +kubebuilder:default="latest"
+	// +kubebuilder:default="main"
 	Tag string `json:"tag,omitempty"`
 	// +kubebuilder:validation:Enum=Always;IfNotPresent;Never
 	// +kubebuilder:default=IfNotPresent

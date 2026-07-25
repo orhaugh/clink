@@ -52,9 +52,11 @@ kind: ClinkCluster
 metadata:
   name: demo
 spec:
+  # Optional: these are the defaults. `main` is the rolling default-branch
+  # build; pin a released tag for anything long-lived.
   image:
-    repository: clink-runtime
-    tag: latest
+    repository: ghcr.io/orhaugh/clink-runtime
+    tag: main
   worker:
     replicas: 2
     slots: 4

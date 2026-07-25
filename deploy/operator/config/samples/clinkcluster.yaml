@@ -3,9 +3,12 @@ kind: ClinkCluster
 metadata:
   name: demo
 spec:
+  # These are the defaults; shown here so the sample is self-describing. `main`
+  # is the rolling default-branch build - pin a released tag for anything
+  # long-lived.
   image:
-    repository: clink-runtime
-    tag: latest
+    repository: ghcr.io/orhaugh/clink-runtime
+    tag: main
     pullPolicy: IfNotPresent
   coordinator:
     controlPort: 6123
