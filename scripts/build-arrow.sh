@@ -149,6 +149,17 @@ if [ "$(uname -s)" = "Darwin" ]; then
         EXTRA_ARGS+=(-DCMAKE_PREFIX_PATH=/opt/homebrew)
     else
         echo "build-arrow: object stores off; NOT pointing Arrow at /opt/homebrew (deps stay bundled at the floor)."
+        # Even without the prefix hint, Arrow's BUNDLED Thrift finds Homebrew's
+        # keg-only openssl@3 through its own search and links it, which propagates
+        # through the static Arrow bundle into libclink:
+        #   "Thrift: Found OpenSSL: /opt/homebrew/Cellar/openssl@3/.../libcrypto.dylib"
+        #   "ld: warning: building for macOS-14.0, but linking with dylib
+        #    '/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib' ... newer version 26.0"
+        # Nothing in this configuration needs OpenSSL - the object stores are off and
+        # Parquet compiles its encryption_internal_nossl variant - so refuse the
+        # find outright. CMake's per-package disable is the narrowest lever that
+        # covers Arrow AND everything it configures beneath it.
+        EXTRA_ARGS+=(-DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON)
     fi
     # Pin the macOS floor when set (CI builds portable wheels): the static Arrow
     # objects linked into a self-contained libclink must not pin minos above the
