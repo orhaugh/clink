@@ -464,13 +464,29 @@ What was wrong, in descending order of how badly it distorted the result:
    `assign_timestamps_row` stage - its own task, thread and channel hop - that
    Flink never ran. Removed from the throughput templates.
 
-5. **Nobody measured the input.** Both engines read the same unlimited broker
+5. **Nobody measured the input** (control still unverified - see note below). Both engines read the same unlimited broker
    container whose CPU is charged to neither. Three of the four recorded drain
    rates cluster in 718-851k rec/s across two engines and two queries, while
    neither engine exceeds about a third of a 12-vCPU box. That is the signature
    of a shared input ceiling. `driver/broker_ceiling.py` now measures the broker
    serve rate and prints it as a control row: **if an engine's drain rate
    approaches it, the run is input-bound and is not measuring the engine.**
+
+**On the broker control specifically: it has been got wrong twice and should not
+be quoted until one of its numbers is sanity-checked by hand.** A Python
+`confluent_kafka` loop reported 250k rec/s on one consumer and 77k on four -
+parallelism apparently making a broker three times slower, which is impossible
+and was the interpreter's GIL, not Kafka. Replacing it with the JVM
+`kafka-consumer-perf-test` and `--show-detailed-stats` then reported 11k rec/s
+at 1.4 MB/s, wrong by orders of magnitude, because that flag switches the output
+to windowed per-interval per-thread rows. The flag is now gone.
+
+There is, however, a stronger argument available than the control: **if the two
+engines diverge widely on the same input, the input is not the binding
+constraint.** With the 2026-07-26 fixes clink drains q12 at ~770k/s against
+Flink's ~305k/s on the identical topic - a 2.5x spread that a shared input
+ceiling could not produce. The earlier suspicion of input-boundness came from
+both engines clustering near 800k/s; they no longer do.
 
 The scoreboard now refuses to print a ratio or a geomean term when either side
 drained short, instead of printing one under a caveat further down the page, and

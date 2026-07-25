@@ -2,105 +2,110 @@
 """Measure how fast the Kafka broker can SERVE the benchmark input.
 
 Why this exists. Both engines read the same single unlimited broker container,
-whose CPU is charged to neither engine's account. Three of the four drain rates
-recorded before this control existed clustered in 718k-851k rec/s across two
-engines and two queries, while neither engine used more than about a third of a
-12-vCPU box. That is the signature of a shared input ceiling rather than of two
-engines that happen to perform alike.
+whose CPU is charged to neither engine's account. If the broker serves at roughly
+the rate the engines drain at, the benchmark is measuring Kafka and every
+engine-versus-engine throughput ratio taken from it is meaningless - no amount of
+engine optimisation moves a number set upstream of the engine. Printing this as a
+control row alongside the engines is what stops that being missed silently.
 
-If the broker serves at roughly the rate the engines drain at, then the benchmark
-is measuring Kafka and every engine-versus-engine throughput ratio taken from it
-is meaningless - no amount of engine optimisation moves a number set upstream of
-the engine. Printing this as a control row alongside the engines is what stops
-that mistake being made silently.
+Runs `kafka-consumer-perf-test` INSIDE the broker container, deliberately.
 
-Deliberately a floor, not a ceiling, in one respect: this consumes with a single
-consumer and does nothing per record, so a well-parallelised engine reading the
-same topic across N partitions may legitimately exceed it. Read it as "the broker
-serves AT LEAST this fast"; an engine drain rate close to it is the warning sign.
+The obvious implementation - a Python consumer loop over confluent_kafka - does
+not work, and fails in a way that looks like a result. confluent_kafka builds a
+Python object per message and the counting loop holds the GIL, so the measurement
+is bounded by Python, not by Kafka. Measured here: one Python consumer reported
+250k rec/s and FOUR reported 77k/s. Parallelism making a broker three times
+slower is impossible; both figures were measuring the interpreter. The JVM tool
+in the image is purpose-built, releases no such bottleneck, and reads from inside
+the same docker network the engines use.
 
-  broker_ceiling.py --brokers localhost:9092 --topic nx-bid [--max-records N]
-      -> JSON {records, seconds, rate, bytes, mb_per_s}
+Still a floor in one respect: it does no per-record work beyond counting, so an
+engine should not be expected to beat it - only to fall short of it. An engine
+drain rate approaching this number means the run is input-bound.
+
+  broker_ceiling.py --container nxcompare-kafka-1 --topic nx-bid --threads 4
+      -> JSON {records, seconds, rate, mb_per_s, threads}
 """
 import argparse
 import json
+import re
+import subprocess
 import sys
-import time
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--brokers", default="localhost:9092")
+    ap.add_argument("--container", default="nxcompare-kafka-1")
+    ap.add_argument("--bootstrap", default="localhost:9092",
+                    help="as seen from INSIDE the container")
     ap.add_argument("--topic", default="nx-bid")
-    ap.add_argument("--max-records", type=int, default=0, help="0 = drain to end of topic")
-    ap.add_argument("--timeout-s", type=float, default=120.0)
+    ap.add_argument("--messages", type=int, default=0, help="0 = whole topic")
+    ap.add_argument("--threads", type=int, default=4,
+                    help="match the engines' parallelism; a 1-thread control reads as a "
+                         "far lower ceiling than the truth")
+    ap.add_argument("--timeout-s", type=float, default=300.0)
     a = ap.parse_args()
 
-    try:
-        from confluent_kafka import Consumer, TopicPartition
-    except ImportError:
-        print(json.dumps({"error": "confluent_kafka not installed",
-                          "hint": "pip install confluent-kafka, or run this inside the "
-                                  "kafka container with kafka-consumer-perf-test"}))
-        return 3
-
-    c = Consumer({
-        "bootstrap.servers": a.brokers,
-        "group.id": f"broker-ceiling-{int(time.time())}",
-        "auto.offset.reset": "earliest",
-        "enable.auto.commit": False,
-        # Big fetches: measuring the broker's serve rate, not the client's
-        # round-trip behaviour under a conservative default.
-        "fetch.min.bytes": 1048576,
-        "fetch.wait.max.ms": 100,
-        "queued.max.messages.kbytes": 1048576,
-    })
-
-    md = c.list_topics(a.topic, timeout=20)
-    if a.topic not in md.topics or md.topics[a.topic].error is not None:
-        print(json.dumps({"error": f"topic {a.topic} not available"}))
+    messages = a.messages
+    if messages <= 0:
+        # Whole topic: sum the end offsets so the tool has a concrete target.
+        try:
+            out = subprocess.run(
+                ["docker", "exec", a.container, "kafka-run-class",
+                 "kafka.tools.GetOffsetShell", "--broker-list", a.bootstrap,
+                 "--topic", a.topic, "--time", "-1"],
+                capture_output=True, text=True, timeout=60).stdout
+            messages = sum(int(l.rsplit(":", 1)[1]) for l in out.splitlines() if ":" in l)
+        except Exception as e:
+            print(json.dumps({"error": f"offset probe failed: {e}"}))
+            return 3
+    if messages <= 0:
+        print(json.dumps({"error": "topic empty or offsets unreadable"}))
         return 4
-    parts = list(md.topics[a.topic].partitions.keys())
 
-    # End offsets first, so completion is decided out of band rather than by a
-    # quiet period - the same reason the engines should not be scored on their
-    # own counters going quiet.
-    total_available = 0
-    for p in parts:
-        lo, hi = c.get_watermark_offsets(TopicPartition(a.topic, p), timeout=20)
-        total_available += max(0, hi - lo)
-    target = min(total_available, a.max_records) if a.max_records else total_available
+    try:
+        r = subprocess.run(
+            ["docker", "exec", a.container, "kafka-consumer-perf-test",
+             "--bootstrap-server", a.bootstrap, "--topic", a.topic,
+             "--messages", str(messages), "--threads", str(a.threads),
+             "--group", f"broker-ceiling-{messages}"],
+            capture_output=True, text=True, timeout=a.timeout_s)
+    except Exception as e:
+        print(json.dumps({"error": f"perf test failed: {e}"}))
+        return 5
 
-    c.assign([TopicPartition(a.topic, p) for p in parts])
-
-    n = 0
-    nbytes = 0
-    t0 = None
-    deadline = time.time() + a.timeout_s
-    while n < target and time.time() < deadline:
-        msgs = c.consume(num_messages=10000, timeout=1.0)
-        if not msgs:
+    # ONE summary row: start.time, end.time, data.consumed.in.MB, MB.sec,
+    # data.consumed.in.nMsg, nMsg.sec, ...
+    #
+    # --show-detailed-stats is deliberately NOT passed. It switches the output to
+    # per-interval, per-thread rows whose rate columns are windowed, and parsing
+    # those as a summary produced 11k rec/s at 1.4 MB/s for a local broker - a
+    # figure wrong by two orders of magnitude that still looked like a result.
+    best = None
+    for line in r.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 6:
             continue
-        if t0 is None:
-            t0 = time.time()  # first byte: excludes assignment and metadata
-        for m in msgs:
-            if m.error():
-                continue
-            n += 1
-            v = m.value()
-            if v:
-                nbytes += len(v)
-    dt = max(time.time() - (t0 or time.time()), 1e-9)
-    c.close()
+        try:
+            mb_sec = float(parts[3]); nmsg = float(parts[4]); nmsg_sec = float(parts[5])
+        except ValueError:
+            continue  # header row
+        if nmsg_sec > 0 and (best is None or nmsg > best[1]):
+            best = (mb_sec, nmsg, nmsg_sec)
 
+    if best is None:
+        print(json.dumps({"error": "could not parse perf output",
+                          "stdout_tail": r.stdout[-400:], "stderr_tail": r.stderr[-400:]}))
+        return 6
+
+    mb_sec, nmsg, nmsg_sec = best
     print(json.dumps({
-        "records": n,
-        "available": total_available,
-        "seconds": round(dt, 3),
-        "rate": round(n / dt, 1),
-        "bytes": nbytes,
-        "mb_per_s": round(nbytes / dt / 1048576, 1),
-        "partitions": len(parts),
+        "records": int(nmsg),
+        "seconds": round(nmsg / nmsg_sec, 3) if nmsg_sec else 0,
+        "rate": round(nmsg_sec, 1),
+        "mb_per_s": round(mb_sec, 1),
+        "threads": a.threads,
+        "tool": "kafka-consumer-perf-test",
     }))
     return 0
 

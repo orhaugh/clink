@@ -222,8 +222,9 @@ d=json.load(sys.stdin); d.update({'query':'$q','sink':'$SINK','cpu_seconds':roun
 # throughput ratio taken from it means anything. Printed as a control row so that
 # cannot be overlooked. Non-fatal: a failure here must not abort a benchmark.
 step "3b. Broker serve-rate control"
-BROKER_CEILING=$("$PY" "$ROOT/driver/broker_ceiling.py" --brokers localhost:9092 \
-    --topic nx-bid --timeout-s 120 2>/dev/null || echo '{}')
+BROKER_CEILING=$("$PY" "$ROOT/driver/broker_ceiling.py" \
+    --container "${PROJECT}-kafka-1" --bootstrap localhost:9092 \
+    --topic nx-bid --threads "$PAR" 2>/dev/null || echo '{}')
 echo "  broker: $BROKER_CEILING"
 export BROKER_CEILING
 
