@@ -159,9 +159,13 @@ run_clink() {  # query
     local s; s=$("$PY" "$ROOT/driver/sample_rate.py" clink --base "http://127.0.0.1:$CLINK_JM_HTTP" \
         --job "$jid" --target "$BIDS" --interval 0.08 --window 0.5 --quiet-timeout 20 --max-runtime 300)
     local cpu_post wall_post; cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-flink $CLINK_CTRS); wall_post=$(now_s)
+    # Memory BEFORE the cancel: the engine still holds its working set (state,
+    # buffers), which is the figure a capacity or efficiency comparison wants.
+    local mem; mem=$("$PY" "$ROOT/driver/mem.py" read $CLINK_CTRS)
     local off=-1; [ "$SINK" = "kafka" ] && off=$(wait_stable_offset "$out")
     echo "$s" | python3 -c "import json,sys
 d=json.load(sys.stdin); d.update({'query':'$q','sink':'$SINK','state_backend':'${STATE_BACKEND}','cpu_seconds':round($cpu_post-$cpu_pre,2),'wall_seconds':round($wall_post-$wall_pre,2),'out_rows':$off}); open('$RESULTS/$q-clink$TAGSUF.json','w').write(json.dumps(d)); print('  clink drain',d['drain_rate'],'rec/s (',d.get('drain_seconds'),'s), reached',d['reached_target'],', out_rows',($off if $off>=0 else 'n/a(blackhole)'))"
+    "$PY" "$ROOT/driver/mem.py" merge "$RESULTS/$q-clink$TAGSUF.json" --mem "$mem" ${FRESH_STACK:+--fresh-stack} | sed 's/^/  clink mem /' 
     curl -fsS -X POST "http://127.0.0.1:$CLINK_JM_HTTP/api/v1/jobs/$jid/cancel" >/dev/null 2>&1
     sleep 2
 }
@@ -182,9 +186,11 @@ run_flink() {  # query
     local s; s=$("$PY" "$ROOT/driver/sample_rate.py" flink --base "http://127.0.0.1:$FLINK_REST" \
         --job "$jid" --target "$BIDS" --interval 0.2 --window 2.5 --quiet-timeout 18 --max-runtime 360)
     local cpu_post wall_post; cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-flink $FLINK_CTRS); wall_post=$(now_s)
+    local mem; mem=$("$PY" "$ROOT/driver/mem.py" read $FLINK_CTRS)
     local off=-1; [ "$SINK" = "kafka" ] && off=$(wait_stable_offset "$out")
     echo "$s" | python3 -c "import json,sys
 d=json.load(sys.stdin); d.update({'query':'$q','sink':'$SINK','cpu_seconds':round($cpu_post-$cpu_pre,2),'wall_seconds':round($wall_post-$wall_pre,2),'out_rows':$off}); open('$RESULTS/$q-flink.json','w').write(json.dumps(d)); print('  flink drain',d['drain_rate'],'rec/s (',d.get('drain_seconds'),'s), reached',d['reached_target'],', out_rows',($off if $off>=0 else 'n/a(blackhole)'))"
+    "$PY" "$ROOT/driver/mem.py" merge "$RESULTS/$q-flink.json" --mem "$mem" ${FRESH_STACK:+--fresh-stack} | sed 's/^/  flink mem /' 
     docker exec "$FLINK_JM" flink cancel "$jid" >/dev/null 2>&1
     sleep 2
 }
