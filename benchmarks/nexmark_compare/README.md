@@ -425,6 +425,67 @@ metrics sampling (each engine's records-out/sec mid-run) plus a much larger or
 rate-limited input so warmup amortizes and no downstream consumer is the
 bottleneck - which is exactly what `throughput_sampled.sh` does (next section).
 
+## Measurement corrections, 2026-07-26 (read before quoting any earlier number)
+
+An audit of why clink was not decisively beating Flink found that **neither
+headline number measured an engine**. Every cross-engine figure recorded in this
+README before this date is contaminated. The rig has been fixed; the numbers
+below this section have not yet been re-taken.
+
+What was wrong, in descending order of how badly it distorted the result:
+
+1. **Flink's rates were quantised to its metric-fetcher period.** The sampler
+   reads job vertex metrics from the JobManager's MetricFetcher cache, and
+   `metrics.fetcher.update-interval` was never set, so the 10s default applied.
+   The recorded Flink drains of 10.81s and 20.64s are 1x and 2x that period.
+   Flink's `drain_rate` was therefore a **lower bound reported as a
+   measurement**, and its true q0 rate could be anywhere up to ~4x what was
+   published. Now set to 200ms.
+
+2. **`sustained_slope` is not throughput and must never be compared across
+   engines.** It is a max-slope estimator whose bias is (counter staleness /
+   window), and the two engines were given different windows - clink 0.5s,
+   Flink 2.5s - over counters with very different freshness. The arithmetic is
+   damning: Flink's slope x its 2.5s window is 99.3% (q0) and 95.0% (q12) of the
+   event target, i.e. it was reporting `target / 2.5s`. It stays in the
+   per-engine JSON as a diagnostic and is out of the scoreboard.
+
+3. **clink was scored as never completing, and it was completing.** The sampler
+   anchored its baseline on the first strictly-positive sample, subtracting the
+   run's own head start, so `proc >= target` was unreachable on a fresh stack.
+   The on-disk q12 result proves it: `final_count 2713303 + baseline 46697 =
+   2760000` exactly - a full drain scored 98.3%, then charged a 20s
+   quiet-timeout that inflated its CPU window. The harness now reads the
+   cumulative counter before submit and passes it as an exact baseline.
+
+4. **q0 was not the same query on both engines.** clink's template declared
+   `event_time_column` + `watermark_lag_ms`; Flink's declares no `WATERMARK`. So
+   on the one query meant to isolate raw per-record overhead, clink ran an extra
+   `assign_timestamps_row` stage - its own task, thread and channel hop - that
+   Flink never ran. Removed from the throughput templates.
+
+5. **Nobody measured the input.** Both engines read the same unlimited broker
+   container whose CPU is charged to neither. Three of the four recorded drain
+   rates cluster in 718-851k rec/s across two engines and two queries, while
+   neither engine exceeds about a third of a 12-vCPU box. That is the signature
+   of a shared input ceiling. `driver/broker_ceiling.py` now measures the broker
+   serve rate and prints it as a control row: **if an engine's drain rate
+   approaches it, the run is input-bound and is not measuring the engine.**
+
+The scoreboard now refuses to print a ratio or a geomean term when either side
+drained short, instead of printing one under a caveat further down the page, and
+surfaces anon memory (which `driver/mem.py` records per container).
+
+A separate finding, not a measurement artefact: greedy first-fit placement
+(`coordinator.cpp`, first worker with a free slot) puts every subtask of these
+jobs on ONE worker, since each advertises 16 slots. Verified from per-container
+memory and CPU - one worker at 382 MB / 50 CPU-s, the other three at 10 MB /
+0.2 CPU-s. On a single box that is close to harmless, and now that the
+in-process fast path works it is arguably faster than spreading, but a real
+multi-node cluster would run the whole job on one node. Fixing it properly needs
+a slot-sharing concept (spread parallel instances, co-locate each instance's
+operators) rather than naive least-loaded placement.
+
 ## Engine-side metrics sampling (`throughput_sampled.sh`)
 
 The methodology fix for the caveat above. Instead of timing broker append
