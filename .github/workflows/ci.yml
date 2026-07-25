@@ -19,6 +19,9 @@
 #   release-sql-runtime - the two live queryable-state HTTP tests, built in
 #                     Release (they need optimized throughput; the Debug gate
 #                     excludes them).                                    [gate]
+#   operator        - build + vet the Go k8s operator. Cheap, and the only
+#                     thing that checks deploy/operator at all: without it a
+#                     dependency bump there merges unverified.           [gate]
 #
 # So a green pipeline requires: the pinned image builds, the full tree builds,
 # the unit + SQL suite passes, install-smoke consumes clink, and the Release
@@ -341,6 +344,35 @@ jobs:
         with:
           path: /root/.ccache
           key: ccache-release-sql-${{ github.run_id }}
+
+  operator:
+    # The Go control-plane operator (deploy/operator) is built by nothing else
+    # in this pipeline, so a Dependabot bump of its module graph would land
+    # with only the C++ gates green. This job is the check that makes such a
+    # bump honest: it compiles and vets the module at the toolchain its own
+    # go.mod asks for, so a directive raised by a transitive dependency shows
+    # up here rather than in someone's first `docker build`.
+    name: Operator (Go build + vet)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Read the version from go.mod: one source of truth, and it tracks
+          # directive bumps automatically.
+          go-version-file: deploy/operator/go.mod
+          cache-dependency-path: deploy/operator/go.sum
+      - name: Build
+        working-directory: deploy/operator
+        run: go build ./...
+      - name: Vet
+        working-directory: deploy/operator
+        run: go vet ./...
+      - name: Test
+        working-directory: deploy/operator
+        # No test files today, so this passes trivially; it is wired now so
+        # that adding controller tests needs no workflow change.
+        run: go test ./...
 
   # The sanitizer matrix lives in its own manually-triggered workflow
   # (sanitizers.yml): a full asan/tsan/ubsan pass takes over an hour per mode
