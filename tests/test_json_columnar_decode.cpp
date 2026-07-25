@@ -7,6 +7,7 @@
 // the row shape (extra / missing column): the operator must fall back to the
 // row form rather than emit a silently-divergent columnar batch.
 
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
@@ -73,6 +74,19 @@ MapOperator<std::string, Row> make_row_oracle() {
         "json_string_to_row");
 }
 
+// The row-path oracle for a TYPED schema: what json_string_to_row now does when
+// the planner hands it the table's columns (declared DECIMAL ingested exactly and
+// quantised, declared FLOAT rounded to float precision). This is the reference the
+// columnar decoder must match for a schema carrying either type - the plain oracle
+// above is only the reference for schemas that declare neither.
+MapOperator<std::string, Row> make_typed_row_oracle(const std::vector<RowColumn>& schema) {
+    auto fmt = std::make_shared<clink::TextFormat<Row>>(
+        clink::sql::row_json_text_format_for_columns(schema));
+    return MapOperator<std::string, Row>(
+        [fmt](const std::string& line) -> Row { return fmt->decode(line).value_or(Row{}); },
+        "json_string_to_row");
+}
+
 // Canonical NDJSON for each row. The same formatter on both sides yields equal
 // strings iff the rows are equal, so this is the byte-equivalence comparison.
 std::vector<std::string> encoded_rows(const Batch<Row>& b) {
@@ -80,6 +94,31 @@ std::vector<std::string> encoded_rows(const Batch<Row>& b) {
     std::vector<std::string> out;
     for (const auto& rec : b) {
         out.push_back(fmt.encode(rec.value()));
+    }
+    return out;
+}
+
+// FULL-PRECISION per-cell rendering, for cases where encoded_rows is not
+// discriminating enough. The text format encodes doubles with "%g" (6 significant
+// digits), so 0.1 and (double)(float)0.1 both render as "0.1" - meaning an
+// encoded_rows comparison alone would pass even if one carrier skipped a float
+// coercion entirely. This renders each numeric cell with all 17 digits, so the
+// FLOAT/DECIMAL parity tests actually bite. Non-numeric cells (including the
+// dec-string form a DECIMAL column carries) compare by their exact text.
+std::vector<std::string> exact_cells(const Batch<Row>& b) {
+    std::vector<std::string> out;
+    for (const auto& rec : b) {
+        std::string line;
+        for (const auto& [k, v] : rec.value().values) {
+            char buf[40] = {0};
+            if (v.is_number() && !clink::config::is_dec_string(v)) {
+                std::snprintf(buf, sizeof(buf), "%.17g", v.as_number());
+                line += k + "=" + buf + ";";
+            } else {
+                line += k + "=" + v.serialize(0) + ";";
+            }
+        }
+        out.push_back(std::move(line));
     }
     return out;
 }
@@ -192,34 +231,138 @@ TEST(JsonColumnarDecode, MissingColumnFallsBack) {
 
 // A declared FLOAT column is lossy on the double<->float round-trip, so the
 // whole schema is excluded from the columnar path (always row form here).
-TEST(JsonColumnarDecode, FloatSchemaTakesRowPath) {
-    auto oracle = make_row_oracle();
-    const std::vector<std::string> lines = {R"({"x":1.5})"};
+TEST(JsonColumnarDecode, FloatSchemaGoesColumnarAndMatchesTheTypedRowDecode) {
+    const std::vector<RowColumn> schema = {{"x", arrow::float32()}};
+    // 1.5 is exact in float32; 0.1 is not, and is where a carrier that did NOT
+    // round would diverge - which is why the row decode coerces too.
+    const std::vector<std::string> lines = {
+        R"({"x":1.5})", R"({"x":0.1})", R"({"x":3.4028235e38})"};
+
+    auto oracle = make_typed_row_oracle(schema);
     auto row_el = run_one(oracle, lines_batch(lines));
 
-    JsonStringToRowColumnarOperator col_op({{"x", arrow::float32()}});
+    JsonStringToRowColumnarOperator col_op(schema);
+    auto col_el = run_one(col_op, lines_batch(lines));
+    ASSERT_TRUE(col_el.is_data());
+    EXPECT_TRUE(col_el.as_data().is_columnar()) << "a declared FLOAT column is columnar-capable";
+    EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
+}
+
+// The declared width is honoured: a REAL column carries float precision, not the
+// full double the JSON numeral parsed to. Both carriers, identically - this is a
+// deliberate, documented behaviour change from before inc4.
+TEST(JsonColumnarDecode, FloatColumnRoundsToDeclaredPrecisionOnBothCarriers) {
+    const std::vector<RowColumn> schema = {{"x", arrow::float32()}};
+    const std::vector<std::string> lines = {R"({"x":0.1})"};
+
+    auto oracle = make_typed_row_oracle(schema);
+    auto row_el = run_one(oracle, lines_batch(lines));
+    JsonStringToRowColumnarOperator col_op(schema);
+    auto col_el = run_one(col_op, lines_batch(lines));
+
+    // Compared at full precision on purpose: the text encoder uses "%g", under
+    // which the coerced value and the raw double are indistinguishable.
+    EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
+
+    ASSERT_EQ(row_el.as_data().size(), 1U);
+    const double got = row_el.as_data()[0].value().values.find("x")->second.as_number();
+    EXPECT_EQ(got, static_cast<double>(static_cast<float>(0.1)))
+        << "a declared FLOAT column must carry float precision";
+    EXPECT_NE(got, 0.1) << "...which is NOT the double the numeral parsed to";
+}
+
+TEST(JsonColumnarDecode, DecimalSchemaGoesColumnarAndMatchesTheTypedRowDecode) {
+    const std::vector<RowColumn> schema = {{"x", arrow::decimal128(10, 2)}};
+    const std::vector<std::string> lines = {R"({"x":10.03})", R"({"x":0})", R"({"x":-7.5})"};
+
+    auto oracle = make_typed_row_oracle(schema);
+    auto row_el = run_one(oracle, lines_batch(lines));
+
+    JsonStringToRowColumnarOperator col_op(schema);
+    auto col_el = run_one(col_op, lines_batch(lines));
+    ASSERT_TRUE(col_el.is_data());
+    EXPECT_TRUE(col_el.as_data().is_columnar()) << "a declared DECIMAL column is columnar-capable";
+    EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
+}
+
+// The point of the exercise, for money columns: a numeral with more significant
+// digits than a double can hold is ingested EXACTLY on the columnar carrier, by
+// re-reading the raw token from the line rather than the already-rounded parse.
+// 17 significant digits, so the double parse is provably lossy.
+TEST(JsonColumnarDecode, DecimalColumnIngestsExactDigitsBeyondDoublePrecision) {
+    const std::vector<RowColumn> schema = {{"x", arrow::decimal128(30, 2)}};
+    const std::vector<std::string> lines = {R"({"x":12345678901234.57})"};
+
+    auto oracle = make_typed_row_oracle(schema);
+    const auto row_out = encoded_rows(run_one(oracle, lines_batch(lines)).as_data());
+
+    JsonStringToRowColumnarOperator col_op(schema);
+    auto col_el = run_one(col_op, lines_batch(lines));
+    ASSERT_TRUE(col_el.as_data().is_columnar());
+    const auto col_out = encoded_rows(col_el.as_data());
+
+    ASSERT_EQ(col_out.size(), 1U);
+    EXPECT_EQ(col_out, row_out) << "carriers must agree on an exact decimal";
+    EXPECT_EQ(col_out[0], R"({"x":12345678901234.57})") << "digits must survive: " << col_out[0];
+}
+
+// Quantisation to the declared scale, on both carriers: more input digits than
+// the column holds are rounded (HALF_UP), not truncated or carried.
+TEST(JsonColumnarDecode, DecimalColumnQuantisesToDeclaredScaleOnBothCarriers) {
+    const std::vector<RowColumn> schema = {{"x", arrow::decimal128(10, 2)}};
+    const std::vector<std::string> lines = {R"({"x":1.005})", R"({"x":2.994})"};
+
+    auto oracle = make_typed_row_oracle(schema);
+    const auto row_out = encoded_rows(run_one(oracle, lines_batch(lines)).as_data());
+
+    JsonStringToRowColumnarOperator col_op(schema);
+    auto col_el = run_one(col_op, lines_batch(lines));
+    const auto col_out = encoded_rows(col_el.as_data());
+
+    EXPECT_EQ(col_out, row_out);
+    ASSERT_EQ(row_out.size(), 2U);
+    EXPECT_EQ(row_out[0], R"({"x":1.01})") << row_out[0];
+    EXPECT_EQ(row_out[1], R"({"x":2.99})") << row_out[1];
+}
+
+// A value that does not denote a decimal at all (a non-numeric string) cannot be
+// stored in a DECIMAL128 column, and the row decode leaves it as-is - so the
+// batch must fall back rather than store something else.
+TEST(JsonColumnarDecode, NonDecimalValueInDecimalColumnFallsBack) {
+    const std::vector<RowColumn> schema = {{"x", arrow::decimal128(10, 2)}};
+    const std::vector<std::string> lines = {R"({"x":"not a number"})"};
+
+    auto oracle = make_typed_row_oracle(schema);
+    auto row_el = run_one(oracle, lines_batch(lines));
+
+    JsonStringToRowColumnarOperator col_op(schema);
     auto col_el = run_one(col_op, lines_batch(lines));
     ASSERT_TRUE(col_el.is_data());
     EXPECT_FALSE(col_el.as_data().is_columnar());
     EXPECT_EQ(encoded_rows(col_el.as_data()), encoded_rows(row_el.as_data()));
 }
 
-// A declared DECIMAL column keeps the row path: the byte-equivalence reference
-// (the plain json_string_to_row decode) stores a decimal value as a plain JSON
-// number, whereas a columnar DECIMAL128 column reads back as a dec-string
-// (make_dec_value) - so the schema is excluded and the batch stays row form.
-// (Analogous to FloatSchemaTakesRowPath; locks the exclusion in so a future
-// "add decimal to columnar_capable_type_" cannot silently break parity.)
-TEST(JsonColumnarDecode, DecimalSchemaTakesRowPath) {
-    auto oracle = make_row_oracle();
-    const std::vector<std::string> lines = {R"({"x":10.03})"};
+// A mixed schema - the ordinary types alongside both newly-capable ones - stays
+// columnar and equivalent, so the widening composes rather than working only in
+// isolation.
+TEST(JsonColumnarDecode, MixedSchemaWithFloatAndDecimalStaysColumnarAndEquivalent) {
+    const std::vector<RowColumn> schema = {{"id", arrow::int64()},
+                                           {"name", arrow::utf8()},
+                                           {"ratio", arrow::float32()},
+                                           {"amount", arrow::decimal128(12, 2)},
+                                           {"ok", arrow::boolean()}};
+    const std::vector<std::string> lines = {
+        R"({"id":1,"name":"a","ratio":0.25,"amount":10.05,"ok":true})",
+        R"({"id":2,"name":"b","ratio":0.1,"amount":-3.999,"ok":false})"};
+
+    auto oracle = make_typed_row_oracle(schema);
     auto row_el = run_one(oracle, lines_batch(lines));
 
-    JsonStringToRowColumnarOperator col_op({{"x", arrow::decimal128(10, 2)}});
+    JsonStringToRowColumnarOperator col_op(schema);
     auto col_el = run_one(col_op, lines_batch(lines));
     ASSERT_TRUE(col_el.is_data());
-    EXPECT_FALSE(col_el.as_data().is_columnar());  // decimal forces the row path
-    EXPECT_EQ(encoded_rows(col_el.as_data()), encoded_rows(row_el.as_data()));
+    EXPECT_TRUE(col_el.as_data().is_columnar());
+    EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
 }
 
 // A declared TIMESTAMP column is not a distinct columnar-capable type: it maps

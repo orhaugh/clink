@@ -963,9 +963,14 @@ std::string compile_node(const LogicalPlan& node,
                 bridge.type = binding.bridge_op;
                 bridge.inputs = {src_id};
                 bridge.out_channel = std::string{kChannelRow};
-                // The columnar JSON bridge builds its Arrow sidecar from the
-                // declared column schema; the plain row bridge ignores it.
-                if (binding.bridge_op == "json_string_to_row_columnar") {
+                // BOTH JSON bridges take the declared column schema, and they must:
+                // the columnar one builds its Arrow sidecar from it, and the plain
+                // one uses it to honour declared DECIMAL and FLOAT types at decode.
+                // Passing it to only one would make the two carriers disagree on
+                // those columns, which is precisely what kept the columnar decoder
+                // from handling them at all.
+                if (binding.bridge_op == "json_string_to_row_columnar" ||
+                    binding.bridge_op == "json_string_to_row") {
                     bridge.params["schema_columns"] = serialize_row_schema(row_columns_of(table));
                 }
                 after_src = bridge.id;

@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -65,7 +66,10 @@ class JsonStringToRowColumnarOperator final : public Operator<std::string, Row> 
 public:
     explicit JsonStringToRowColumnarOperator(std::vector<RowColumn> columns,
                                              std::string name = "json_string_to_row_columnar")
-        : fmt_(row_json_text_format()), name_(std::move(name)) {
+        // The row fallback MUST use the same schema-aware decode the columnar arms
+        // are written against, or this operator would disagree with itself
+        // depending on which carrier a batch took.
+        : fmt_(row_json_text_format_for_columns(columns)), name_(std::move(name)) {
         resolved_.reserve(columns.size());
         data_fields_.reserve(columns.size() + 1);
         data_fields_.push_back(clink::arrow_event_time_field());  // sidecar column 0
@@ -92,6 +96,10 @@ public:
             // row fallback for such a (malformed) schema.
             if (!seen.insert(c.name).second) {
                 schema_capable_ = false;
+            }
+            if (eff->id() == arrow::Type::DECIMAL128) {
+                // Needed per line to recover exact digits (see the parse loop).
+                decimal_scales_[c.name] = static_cast<const arrow::Decimal128Type&>(*eff).scale();
             }
             data_fields_.push_back(arrow::field(c.name, eff, /*nullable=*/true));
             resolved_.push_back({c.name, std::move(eff)});
@@ -168,24 +176,27 @@ private:
     };
 
     // Types whose JSON->Arrow->read_cell round-trip is an exact identity for a
-    // conforming value, measured against the byte-equivalence REFERENCE: the
-    // plain (non-schema-aware) json_string_to_row decode, which keeps every JSON
-    // number as a full-precision double and never produces a dec-string. So:
-    //   - FLOAT is excluded because the columnar path would truncate to float32
-    //     (build_column appends `(float)v`) while the row reference keeps the
-    //     full double - serialize(0) then differs.
-    //   - DECIMAL128 is excluded because the columnar path would emit a
-    //     dec-string (read_cell -> make_dec_value) while the row reference keeps
-    //     a plain double (the Kafka decode is NOT row_json_text_format_with_decimals).
-    // Widening to these would require the row reference itself to be schema-aware
-    // (a behaviour change to json_string_to_row, out of scope here). Temporal
-    // types are not listed: effective_type maps them to utf8, so they ride the
-    // STRING case (string round-trips) or fall back (a numeric epoch value).
+    // conforming value, measured against the byte-equivalence REFERENCE: the row
+    // decode this operator itself falls back to (fmt_).
+    //
+    // FLOAT and DECIMAL128 are here because that reference is now SCHEMA-AWARE
+    // (row_json_text_format_for_columns): it rounds declared FLOAT columns through
+    // float32 and ingests declared DECIMAL columns exactly, quantised to their
+    // scale. Both carriers therefore produce the same value for the same input,
+    // which is what previously blocked them - the old plain reference kept every
+    // number as a full-precision double and never produced a dec-string, so a
+    // columnar float32 truncation or dec-string was a visible difference.
+    //
+    // Temporal types are not listed: effective_type maps them to utf8, so they
+    // ride the STRING case (string round-trips) or fall back (a numeric epoch
+    // value).
     static bool columnar_capable_type_(arrow::Type::type id) {
         switch (id) {
             case arrow::Type::INT64:
             case arrow::Type::INT32:
             case arrow::Type::DOUBLE:
+            case arrow::Type::FLOAT:
+            case arrow::Type::DECIMAL128:
             case arrow::Type::BOOL:
             case arrow::Type::STRING:
                 return true;
@@ -200,13 +211,13 @@ private:
     // representable (the caller then abandons the columnar path). A JSON null
     // (present key, null value) appends a null cell, which round-trips to null -
     // faithful for every capable type.
-    static bool append_cell_(arrow::Type::type id,
+    static bool append_cell_(const arrow::DataType& eff,
                              arrow::ArrayBuilder* b,
                              const clink::config::JsonValue& v) {
         if (v.is_null()) {
             return b->AppendNull().ok();
         }
-        switch (id) {
+        switch (eff.id()) {
             case arrow::Type::INT64: {
                 if (!v.is_number()) {
                     return false;
@@ -242,6 +253,31 @@ private:
                     return false;
                 }
                 return static_cast<arrow::DoubleBuilder*>(b)->Append(v.as_number()).ok();
+            case arrow::Type::FLOAT: {
+                // read_cell returns (double)(float)v, and the row reference
+                // coerces the same way (coerce_row_floats), so the round trip is
+                // an identity for any number.
+                if (!v.is_number()) {
+                    return false;
+                }
+                return static_cast<arrow::FloatBuilder*>(b)
+                    ->Append(static_cast<float>(v.as_number()))
+                    .ok();
+            }
+            case arrow::Type::DECIMAL128: {
+                // The scale-quantised decimal the row reference would carry for
+                // this value, from the one shared resolver. nullopt means the
+                // value does not denote a decimal at this scale - the row path
+                // would leave it untouched (still a number or string) while this
+                // path can only store a decimal, so the batch must fall back
+                // rather than store something else.
+                const auto d =
+                    row_decimal_for(v, static_cast<const arrow::Decimal128Type&>(eff).scale());
+                if (!d) {
+                    return false;
+                }
+                return static_cast<arrow::Decimal128Builder*>(b)->Append(d->unscaled).ok();
+            }
             case arrow::Type::BOOL:
                 if (!v.is_bool()) {
                     return false;
@@ -299,12 +335,32 @@ private:
             if (obj.size() != resolved_.size()) {
                 return std::nullopt;  // extra or missing field
             }
+            // A DECIMAL column's digits cannot be recovered from the parsed value:
+            // the generic parse has already rounded the numeral to a double. Re-read
+            // the untruncated token straight from the line, exactly as the row
+            // decode does (ingest_exact_decimals), so a money column is ingested
+            // exactly on this carrier too. Only for schemas that declare one.
+            std::map<std::string, std::string> dec_tokens;
+            if (!decimal_scales_.empty()) {
+                dec_tokens = clink::config::raw_number_tokens(rec.value(), decimal_scales_);
+            }
             for (std::size_t ci = 0; ci < resolved_.size(); ++ci) {
                 auto it = obj.find(resolved_[ci].name);
                 if (it == obj.end()) {
                     return std::nullopt;  // declared column absent
                 }
-                if (!append_cell_(resolved_[ci].eff->id(), col_b[ci].get(), it->second)) {
+                const clink::config::JsonValue* value = &it->second;
+                clink::config::JsonValue exact;
+                if (!dec_tokens.empty() && it->second.is_number()) {
+                    auto tok = dec_tokens.find(resolved_[ci].name);
+                    if (tok != dec_tokens.end()) {
+                        if (auto d = clink::config::dec_parse(tok->second)) {
+                            exact = clink::config::make_dec_value(*d);
+                            value = &exact;
+                        }
+                    }
+                }
+                if (!append_cell_(*resolved_[ci].eff, col_b[ci].get(), *value)) {
                     return std::nullopt;
                 }
             }
@@ -409,6 +465,9 @@ private:
     }
 
     clink::TextFormat<Row> fmt_;
+    // Declared DECIMAL columns and their scales; empty for a schema without one,
+    // which is what keeps the per-line token scan off every other schema's path.
+    std::map<std::string, int> decimal_scales_;
     std::string name_;
     std::vector<Resolved> resolved_;
     std::vector<std::shared_ptr<arrow::Field>> data_fields_;  // [event_time, declared...]

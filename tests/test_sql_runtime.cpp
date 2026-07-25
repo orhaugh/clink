@@ -11752,6 +11752,85 @@ TEST(SqlRuntime, ColumnarDecodeParityOracle) {
     std::filesystem::remove(in_path);
 }
 
+// D4 inc4: the same parity oracle over the types the columnar decoder gained -
+// REAL (float32) and DECIMAL. These were excluded before, because the row bridge
+// was not schema-aware and so the two carriers genuinely disagreed on them; both
+// bridges now honour declared types, which is exactly what this oracle would
+// catch if only one of them did.
+//
+// The input mixes faithful lines with an unfaithful one, so the columnar run
+// interleaves both carriers, and includes a decimal with more significant digits
+// than a double holds - the case the whole increment exists for.
+TEST(SqlRuntime, ColumnarDecodeParityOracleOverFloatAndDecimal) {
+    ensure_sql_installed_once();
+
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_oracle_fd_in.ndjson";
+    const auto out_path = tmp / "clink_sql_oracle_fd_out.ndjson";
+    std::filesystem::remove(in_path);
+
+    write_lines(in_path,
+                {
+                    R"({"k":1,"r":0.1,"amt":10.05,"ts":1000})",
+                    R"({"k":2,"r":1.5,"amt":-3.999,"ts":2000})",
+                    R"({"k":1,"r":0.3333333333,"amt":12345678901234.57,"ts":3000})",
+                    R"({"k":3,"r":2.5,"amt":0,"ts":4000,"extra":1})",
+                    R"({"k":2,"r":null,"amt":null,"ts":5000})",
+                    R"({"k":1,"r":9.75,"amt":99.995,"ts":11000})",
+                });
+
+    const std::string cols = "k BIGINT, r REAL, amt DECIMAL(30,2), ts BIGINT";
+
+    // Projection: the decoded values themselves must match, cell for cell.
+    {
+        const std::string q = "INSERT INTO out_t SELECT k, r, amt FROM t";
+        auto columnar = run_kafka_parity_case(
+            cols, "", "k BIGINT, r REAL, amt DECIMAL(30,2)", q, in_path, out_path);
+        auto row_form = run_kafka_parity_case(cols,
+                                              "columnar_decode='false'",
+                                              "k BIGINT, r REAL, amt DECIMAL(30,2)",
+                                              q,
+                                              in_path,
+                                              out_path);
+        EXPECT_EQ(columnar, row_form) << "float/decimal projection parity broken";
+        EXPECT_FALSE(columnar.empty());
+        // The exact-digit case must survive the whole pipeline, not just the
+        // decoder: a double round-trip would render 12345678901234.57 lossily.
+        const bool has_exact = std::any_of(columnar.begin(), columnar.end(), [](const auto& l) {
+            return l.find("12345678901234.57") != std::string::npos;
+        });
+        EXPECT_TRUE(has_exact) << "exact decimal digits lost end to end";
+    }
+
+    // Aggregation over a DECIMAL column, at parallelism 2: the values are not
+    // merely carried but summed, so a carrier disagreement shows up in the total.
+    {
+        const std::string q =
+            "INSERT INTO out_t SELECT k, SUM(amt) AS total FROM t "
+            "GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k";
+        auto columnar = run_kafka_parity_case(cols,
+                                              "event_time_column='ts'",
+                                              "k BIGINT, total DECIMAL(30,2)",
+                                              q,
+                                              in_path,
+                                              out_path,
+                                              "tumbling_window_row",
+                                              2);
+        auto row_form = run_kafka_parity_case(cols,
+                                              "event_time_column='ts', columnar_decode='false'",
+                                              "k BIGINT, total DECIMAL(30,2)",
+                                              q,
+                                              in_path,
+                                              out_path,
+                                              "tumbling_window_row",
+                                              2);
+        EXPECT_EQ(columnar, row_form) << "decimal SUM parity broken";
+        EXPECT_FALSE(columnar.empty());
+    }
+
+    std::filesystem::remove(in_path);
+}
+
 // WS6 increment 5: windowed MAX/MIN over a numeric columnar source vectorises.
 // Window aggregates are non-retractable (only GROUP BY marks MIN/MAX retractable),
 // so MAX(price)/MIN(price) per window now fold column-at-a-time (no per-record Row)

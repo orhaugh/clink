@@ -306,6 +306,29 @@ inline clink::config::JsonValue read_cell(const std::shared_ptr<arrow::DataType>
 
 }  // namespace row_columnar_detail
 
+// The schema-aware NDJSON decoder for a declared column list: the DECIMAL scales
+// and FLOAT columns are read off the declared types, so a caller only has to hold
+// the schema it already has. Types are taken through effective_type, matching what
+// the columnar carriers actually store.
+//
+// Both JSON-source bridges build their decoder from this - the plain
+// json_string_to_row and the columnar decoder's row fallback - so the two agree
+// on every input by construction rather than by coincidence.
+inline clink::TextFormat<Row> row_json_text_format_for_columns(
+    const std::vector<RowColumn>& columns) {
+    std::map<std::string, int> decimal_scales;
+    std::vector<std::string> float_columns;
+    for (const auto& c : columns) {
+        const auto eff = row_columnar_detail::effective_type(c.type);
+        if (eff->id() == arrow::Type::DECIMAL128) {
+            decimal_scales[c.name] = static_cast<const arrow::Decimal128Type&>(*eff).scale();
+        } else if (eff->id() == arrow::Type::FLOAT) {
+            float_columns.push_back(c.name);
+        }
+    }
+    return row_json_text_format_typed(std::move(decimal_scales), std::move(float_columns));
+}
+
 // Build a columnar ArrowBatcher<Row> from a table's column schema.
 inline ArrowBatcher<Row> make_row_columnar_arrow_batcher(std::vector<RowColumn> columns) {
     // Resolve each column's effective Arrow type once.

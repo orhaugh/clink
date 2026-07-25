@@ -8527,8 +8527,18 @@ void install(clink::plugin::PluginRegistry& reg) {
     // decoder behaviour).
     reg.register_operator<std::string, Row>(
         "json_string_to_row",
-        [](const BuildContext&) -> std::shared_ptr<Operator<std::string, Row>> {
-            auto fmt = std::make_shared<clink::TextFormat<Row>>(row_json_text_format());
+        [](const BuildContext& ctx) -> std::shared_ptr<Operator<std::string, Row>> {
+            // Schema-aware when the planner passes the table's typed columns:
+            // declared DECIMAL columns are ingested exactly and quantised to their
+            // scale, declared FLOAT columns are rounded to float precision. Without
+            // the param (a programmatic or legacy construction) this is exactly
+            // row_json_text_format, as before.
+            //
+            // The columnar decoder is written against THIS decode, so the two
+            // carriers must derive their coercion from the same place; hence both
+            // read the same schema_columns param.
+            auto fmt = std::make_shared<clink::TextFormat<Row>>(
+                row_json_text_format_for_columns(parse_row_schema(ctx.param_or("schema_columns"))));
             return std::make_shared<MapOperator<std::string, Row>>(
                 [fmt](const std::string& line) -> Row {
                     auto decoded = fmt->decode(line);

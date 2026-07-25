@@ -204,23 +204,56 @@ inline std::string double_to_fixed_text(double d) {
 // still-numeric value came from a numeral inside double range (the JSON decode
 // substitutes the exact raw token for wider numerals before this runs, see
 // row_json_text_format_with_decimals).
+// THE definition of which Decimal a JSON value denotes for a declared
+// DECIMAL(p,scale) column, quantised to that scale. nullopt means the value does
+// not denote one (wrong JSON kind, unparseable text, or a rescale that overflows).
+//
+// Shared deliberately. requantise_row_decimals below is the row decoder, and the
+// columnar Kafka decoder (json_string_to_row_columnar) needs to append the SAME
+// decimal for the same input or the two carriers would disagree on money columns.
+// Note it is wider than config::as_decimal, which takes only dec-strings and
+// integral numbers: a decimal column may legitimately arrive as a plain string
+// ("12.34") or a fractional numeral, and both decoders must treat those alike.
+inline std::optional<clink::config::Decimal> row_decimal_for(const clink::config::JsonValue& v,
+                                                             int scale) {
+    std::optional<clink::config::Decimal> d;
+    if (clink::config::is_dec_string(v)) {
+        d = clink::config::as_decimal(v);
+    } else if (v.is_number()) {
+        d = clink::config::dec_parse(double_to_fixed_text(v.as_number()));
+    } else if (v.is_string()) {
+        d = clink::config::dec_parse(v.as_string());
+    }
+    if (!d)
+        return std::nullopt;
+    return clink::config::dec_rescale(*d, scale);
+}
+
 inline void requantise_row_decimals(Row& r, const std::map<std::string, int>& decimal_scales) {
     for (const auto& [col, scale] : decimal_scales) {
         auto it = r.values.find(col);
         if (it == r.values.end() || it->second.is_null())
             continue;
-        std::optional<clink::config::Decimal> d;
-        if (clink::config::is_dec_string(it->second)) {
-            d = clink::config::as_decimal(it->second);
-        } else if (it->second.is_number()) {
-            d = clink::config::dec_parse(double_to_fixed_text(it->second.as_number()));
-        } else if (it->second.is_string()) {
-            d = clink::config::dec_parse(it->second.as_string());
+        if (auto q = row_decimal_for(it->second, scale)) {
+            it->second = clink::config::make_dec_value(*q);
         }
-        if (d) {
-            if (auto q = clink::config::dec_rescale(*d, scale))
-                it->second = clink::config::make_dec_value(*q);
-        }
+    }
+}
+
+// Coerce declared FLOAT (float32) columns through float, so a REAL column carries
+// the precision its declared width can actually hold.
+//
+// This is what lets the columnar decoder handle FLOAT at all: it appends to a
+// FloatBuilder and reads back (double)(float)v, so the row decoder has to round
+// the same way or the two carriers differ on the same input. Applied at ingestion
+// only; a value already at float precision is unchanged by construction.
+inline void coerce_row_floats(Row& r, const std::vector<std::string>& float_columns) {
+    for (const auto& col : float_columns) {
+        auto it = r.values.find(col);
+        if (it == r.values.end() || !it->second.is_number())
+            continue;
+        it->second = clink::config::JsonValue{
+            static_cast<double>(static_cast<float>(it->second.as_number()))};
     }
 }
 
@@ -268,6 +301,36 @@ inline clink::TextFormat<Row> row_json_text_format_with_decimals(
             clink::config::JsonValue v{clink::config::JsonObject{q.values}};
             return clink::config::serialize_output(v);
         },
+    };
+}
+
+// Schema-aware NDJSON decode for a declared column list: DECIMAL columns ingested
+// exactly and quantised to their scale (as above), and FLOAT columns coerced to
+// float precision. Both bridges off a JSON source build their decoder from this,
+// so a table's declared column types are honoured at decode whichever carrier
+// runs - which is the precondition for the columnar decoder handling FLOAT and
+// DECIMAL at all (it can only go columnar where it matches the row decode).
+//
+// With neither type declared this IS row_json_text_format_with_decimals, and with
+// no decimals either it is row_json_text_format - so a schema without FLOAT or
+// DECIMAL columns decodes exactly as before.
+inline clink::TextFormat<Row> row_json_text_format_typed(std::map<std::string, int> decimal_scales,
+                                                         std::vector<std::string> float_columns) {
+    if (float_columns.empty())
+        return row_json_text_format_with_decimals(std::move(decimal_scales));
+    auto base = row_json_text_format_with_decimals(std::move(decimal_scales));
+    return clink::TextFormat<Row>{
+        .decode = [base,
+                   floats = std::move(float_columns)](std::string_view line) -> std::optional<Row> {
+            auto r = base.decode(line);
+            if (r) {
+                coerce_row_floats(*r, floats);
+            }
+            return r;
+        },
+        // Encode is the base's: a coerced value is already a double carrying float
+        // precision, so there is nothing further to do on the way out.
+        .encode = base.encode,
     };
 }
 
