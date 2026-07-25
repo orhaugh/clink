@@ -177,6 +177,11 @@ jobs:
       # should silently inherit a stripped toolchain.
       CLINK_ARROW_OBJECT_STORES: "OFF"
       CLINK_DEPS_PREFIX: "/Users/runner/.clink-deps-wheel"
+      # Do not let clink_core link Homebrew's zstd: on this image that bottle is
+      # built for macOS 26 and would pin libclink above the wheel's floor. IGNORE
+      # is CMake's not-found sentinel, so clink takes its Arrow-bundled zstd
+      # fallback instead (build-scope only, which is all a wheel needs).
+      CLINK_ZSTD_LIBRARY: "IGNORE"
     steps:
       - uses: actions/checkout@v4
 
@@ -220,9 +225,11 @@ jobs:
           python-version: "3.12"
 
       - name: System build deps (Homebrew)
-        # build-arrow.sh points Arrow at /opt/homebrew and uses the SYSTEM aws-sdk;
-        # cmake is preinstalled but we pin it via brew for parity.
-        run: brew install cmake aws-sdk-cpp
+        # cmake only. aws-sdk-cpp is deliberately NOT installed: this wheel's Arrow
+        # is built without the object stores, so nothing needs it, and every
+        # Homebrew bottle on this image targets macOS 26 - keeping them off the
+        # prefix path is what lets the wheel keep a lower floor.
+        run: brew install cmake
 
       - name: Restore pinned toolchain (the wheel's stripped prefix)
         # Restore/save split rather than actions/cache: the Arrow source build is

@@ -30,13 +30,24 @@ OSX_ARG=""
 if [[ -n "${MACOSX_DEPLOYMENT_TARGET:-}" ]]; then
     OSX_ARG="-DCMAKE_OSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET}"
 fi
+# Optional: forward a zstd choice. clink_core links a resolved zstd LIBRARY PATH,
+# and its find_library would otherwise pick up a Homebrew bottle - which on a
+# current macOS runner is built for that runner's OS and pins libclink above the
+# wheel's floor. Passing CLINK_ZSTD_LIBRARY=IGNORE makes CMake's if() treat it as
+# not-found, so clink falls back to Arrow's bundled zstd (build-scope only, which
+# is exactly right for a wheel: nothing downstream find_package()s this build).
+ZSTD_ARG=""
+if [[ -n "${CLINK_ZSTD_LIBRARY:-}" ]]; then
+    ZSTD_ARG="-DCLINK_ZSTD_LIBRARY=${CLINK_ZSTD_LIBRARY}"
+fi
 cmake -S "${ROOT}" -B "${BUILD}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCLINK_BUILD_SQL=ON \
     -DCLINK_BUILD_IMPLS=OFF \
     -DCLINK_BUILD_TESTS=OFF \
     -DCLINK_BUILD_EXAMPLES=OFF \
-    ${OSX_ARG:+"${OSX_ARG}"}
+    ${OSX_ARG:+"${OSX_ARG}"} \
+    ${ZSTD_ARG:+"${ZSTD_ARG}"}
 cmake --build "${BUILD}" --target clink_shared --parallel "${JOBS}"
 
 LIB="$(find "${BUILD}" \( -name libclink.dylib -o -name libclink.so \) -type f | head -1)"

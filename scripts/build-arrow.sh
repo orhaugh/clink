@@ -126,7 +126,20 @@ fi
 # Homebrew's aws-sdk; in Docker the image installs a system aws-sdk before this runs.
 EXTRA_ARGS=()
 if [ "$(uname -s)" = "Darwin" ]; then
-    EXTRA_ARGS+=(-DCMAKE_PREFIX_PATH=/opt/homebrew)
+    # The Homebrew prefix hint exists for ONE reason: the system aws-sdk that
+    # ARROW_S3 needs. With the object stores off there is nothing there Arrow
+    # should use, and pointing at it is actively harmful for a portable build -
+    # Arrow would resolve brotli / zstd / OpenSSL to Homebrew bottles, which on a
+    # current runner are built for that runner's macOS and pin the resulting
+    # library above the wheel's floor ("ld: warning: building for macOS-14.0, but
+    # linking with dylib ... built for newer version 26.0", and then delocate
+    # refuses them). Without the hint, ARROW_DEPENDENCY_SOURCE=BUNDLED compiles
+    # those deps itself at CMAKE_OSX_DEPLOYMENT_TARGET.
+    if [ "${ARROW_OBJ_SETTING}" = "ON" ]; then
+        EXTRA_ARGS+=(-DCMAKE_PREFIX_PATH=/opt/homebrew)
+    else
+        echo "build-arrow: object stores off; NOT pointing Arrow at /opt/homebrew (deps stay bundled at the floor)."
+    fi
     # Pin the macOS floor when set (CI builds portable wheels): the static Arrow
     # objects linked into a self-contained libclink must not pin minos above the
     # wheel's tag. Unset locally keeps the host default.
