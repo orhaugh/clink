@@ -2,7 +2,8 @@
 
 ## v0.2.0 (July 2026)
 
-45 commits since v0.1.0. No API or format breaks: state written by 0.1.0 restores
+Forty-four commits of engine, build and CI work since v0.1.0. No API or format
+breaks: state written by 0.1.0 restores
 unchanged, and every new behaviour below is either on by default with a
 documented opt-out or off by default.
 

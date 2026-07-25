@@ -3,7 +3,7 @@
 [![ci](https://github.com/orhaugh/clink/actions/workflows/ci.yml/badge.svg)](https://github.com/orhaugh/clink/actions/workflows/ci.yml)
 [![docs](https://github.com/orhaugh/clink/actions/workflows/docs.yml/badge.svg)](https://orhaugh.github.io/clink/)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
-[![changelog](https://img.shields.io/badge/changelog-v0.1.0-lightgrey.svg)](CHANGELOG.md)
+[![changelog](https://img.shields.io/badge/changelog-v0.2.0-lightgrey.svg)](CHANGELOG.md)
 
 `clink` is an embedded-first, Arrow-native stream processing engine in
 modern C++ (C++23): stateful stream processing with engine-grade
@@ -1229,7 +1229,7 @@ tools/               # clink (unified CLI), clink_node, clink_submit_sql, and
 
 ## Versioning and stability
 
-The current release is v0.1.0; changes land in the
+The current release is v0.2.0; changes land in the
 [CHANGELOG](CHANGELOG.md). clink is pre-1.0, so public C++ APIs may still
 change between minor releases - every such change is called out. Durable
 state is treated more conservatively: snapshots carry schema versions with a
