@@ -651,21 +651,99 @@ TEST(JsonColumnarDecode, EscapedAndUnicodeStringsMatchTheRowDecode) {
         << "on-demand string decoding must match the row decode byte for byte";
 }
 
-// An escaped KEY must resolve to its declared column, not be treated as an
-// undeclared field. The walk compares the unescaped key against the schema, so
-// this is the case where a naive raw-key comparison would silently bail (slow
-// but correct) or, worse, mis-map.
-TEST(JsonColumnarDecode, EscapedKeyStillResolvesToItsColumn) {
+// An escaped KEY must still produce the right row, and this test previously did not
+// check that: its JSON said "b" with a comment claiming the escape was there, so the
+// escape had been lost and the case went uncovered. With a real b in the input it
+// bites.
+//
+// The decoder compares the RAW (still-escaped) key against declared column names,
+// because unescaping every key first was a large share of decode cost. An escaped key
+// therefore does not match and the ON-DEMAND arm bails - but the fallback beneath it is
+// the DOM columnar arm, which parses with full unescaping, so the batch still comes out
+// COLUMNAR and correct. The escape costs the fastest path and nothing else. What must
+// never happen is the field being dropped or filed under the wrong column, which is
+// what the cell comparison asserts.
+TEST(JsonColumnarDecode, EscapedKeyFallsBackAndStillResolvesToItsColumn) {
     const std::vector<RowColumn> schema = {{"a", arrow::int64()}, {"b", arrow::int64()}};
-    // "b" is 'b'.
-    const std::vector<std::string> lines = {R"({"a":1,"b":2})"};
+    // "\u0062" is 'b', so this document IS {"a":1,"b":2} to any conforming reader.
+    const std::vector<std::string> lines = {R"({"a":1,"\u0062":2})"};
 
     auto oracle = make_typed_row_oracle(schema);
     auto row_el = run_one(oracle, lines_batch(lines));
     JsonStringToRowColumnarOperator col_op(schema);
     auto col_el = run_one(col_op, lines_batch(lines));
 
+    ASSERT_TRUE(col_el.is_data());
+    EXPECT_TRUE(col_el.as_data().is_columnar())
+        << "the DOM columnar arm unescapes, so an escaped key costs the on-demand path "
+           "but not the columnar carrier";
     EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
+}
+
+// The same dependency from the other side: an escaped key in the MIDDLE of a batch must
+// not corrupt the records around it.
+TEST(JsonColumnarDecode, EscapedKeyMidBatchDoesNotCorruptNeighbours) {
+    const std::vector<RowColumn> schema = {{"a", arrow::int64()}, {"b", arrow::int64()}};
+    const std::vector<std::string> lines = {
+        R"({"a":1,"b":2})",
+        R"({"a":3,"\u0062":4})",  // escaped key, mid-batch
+        R"({"a":5,"b":6})",
+    };
+    auto oracle = make_typed_row_oracle(schema);
+    auto row_el = run_one(oracle, lines_batch(lines));
+    JsonStringToRowColumnarOperator col_op(schema);
+    auto col_el = run_one(col_op, lines_batch(lines));
+
+    ASSERT_TRUE(col_el.is_data());
+    EXPECT_TRUE(col_el.as_data().is_columnar());
+    // The neighbours of the escaped record must be untouched, which is the point.
+    EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
+}
+
+// Reordered fields between two columns of the SAME TYPE. This is the case that can
+// detect a wrong-column error, and until it existed the suite could not: the decoder
+// caches which column each field POSITION matched last time as a first guess, and if
+// that guess were ever trusted without verifying the name, a record that reorders its
+// fields would put each value under the other column. Every other field-order test in
+// this file uses columns of DIFFERENT types, so a mis-filed value fails the type check,
+// bails the batch and lands on the row fallback with the right answer - the bug is
+// invisible. With both columns int64 there is no type check to save it.
+//
+// Verified to fail if the guess is trusted unverified.
+TEST(JsonColumnarDecode, ReorderedSameTypedFieldsLandInTheRightColumns) {
+    const std::vector<RowColumn> schema = {{"x", arrow::int64()}, {"y", arrow::int64()}};
+    const std::vector<std::string> lines = {
+        R"({"x":10,"y":20})",  // establishes the position -> column guess
+        R"({"y":21,"x":11})",  // swapped: an unverified guess files both wrongly
+        R"({"x":12,"y":22})",  // and back again
+    };
+
+    auto oracle = make_typed_row_oracle(schema);
+    auto row_el = run_one(oracle, lines_batch(lines));
+    ASSERT_TRUE(row_el.is_data());
+
+    JsonStringToRowColumnarOperator col_op(schema);
+    auto col_el = run_one(col_op, lines_batch(lines));
+    ASSERT_TRUE(col_el.is_data());
+
+    EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()))
+        << "a reordered field must decode into its own column, not the one that "
+           "position held on the previous record";
+}
+
+// A declared column name containing a BACKSLASH is the one case where a raw-key
+// comparison could match while the key's unescaped form differs - which would file a
+// field under the wrong column. Such a schema is refused for the columnar carrier up
+// front, so it always takes the row decode.
+TEST(JsonColumnarDecode, BackslashInColumnNameForcesRowPath) {
+    const std::vector<RowColumn> schema = {{R"(a\u0062)", arrow::int64()}, {"c", arrow::int64()}};
+    JsonStringToRowColumnarOperator col_op(schema);
+    Batch<std::string> in;
+    in.emplace(std::string(R"({"a\u0062":1,"c":2})"));
+    auto el = run_one(col_op, std::move(in));
+    ASSERT_TRUE(el.is_data());
+    EXPECT_FALSE(el.as_data().is_columnar())
+        << "a backslash-bearing column name must never take the columnar carrier";
 }
 
 // Field order is not schema order. The walk dispatches per field to a resolved

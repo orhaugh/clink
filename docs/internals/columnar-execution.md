@@ -48,6 +48,54 @@ Two constructors distinguish the cases. The row constructor takes a `vector<Reco
 
 A pure-row batch (`arrow_ == null`) behaves exactly as before: every row API and every existing operator keep working unchanged.
 
+### What the JSON decode costs, and what was tried
+
+`json_string_to_row_columnar` is the largest single stage on a Kafka JSON pipeline
+(34% of worker CPU on nexmark q0 after the July 2026 fixes). Its on-demand walk is
+~126 ns per record on a 6-column nexmark bid row, measured in isolation with
+`clink_hotpath_bench decode` minus `clink_hotpath_bench buildonly` - the latter being
+the `Batch<std::string>` assembly the runner does, which is 22 ns per record and not
+the bridge's to answer for.
+
+What moved it, in order of what it was worth:
+
+| change | effect |
+|--------|-------:|
+| compare keys with an inline byte loop instead of calling `memcmp` | +11.6% |
+| `escaped_key()` instead of `unescaped_key()` - no unescape pass, no copy into simdjson's string buffer | +5% |
+| split the column lookup's cold scan out of line so the hot path inlines | +2% |
+| **total** | **+19%** |
+
+Two things were tried and REJECTED on measurement, recorded so they are not retried
+blind:
+
+- **`iterate_many()` over the concatenated batch.** This is simdjson's API for streams
+  of small documents and it amortises `stage1` (the SIMD structural prescan, 15% of
+  decode self time) from once per record to once per batch. It measured *slower* -
+  5.85M rec/s against 6.26M - because streaming mode carries its own per-document
+  bookkeeping that costs more than the `stage1` it saves at ~120-byte documents. Tried
+  with `batch_size` at both 1MB and the exact buffer length.
+- **Caching `arrow::Type::type` and the decimal scale per column** to avoid reaching
+  through `eff` in the field loop. Measured neutral; `arrow::DataType::id()` is already
+  an inline member read. Kept only because it makes `append_ondemand`'s signature
+  honest about what it needs.
+
+Two costs are near the floor for this shape: `stage1` at 15% is what per-record
+`iterate()` charges, and the 9% `memmove` is copying each line into a buffer with
+SIMDJSON_PADDING slack, which cannot be avoided without assuming readable bytes past
+a `std::string`'s end.
+
+**The positional hint is the one hazard here.** The decoder remembers which column each
+field POSITION matched last time and tries that first, which is what makes the lookup
+one comparison on a homogeneous stream. The guess is always verified against the name,
+and a miss falls through to the scan - but a future edit that trusted it would silently
+file values under the wrong column. The suite could not catch that until
+`ReorderedSameTypedFieldsLandInTheRightColumns` was added: every other field-order test
+uses columns of DIFFERENT types, so a mis-filed value fails the type check, bails the
+batch to the row fallback and produces the right answer anyway. That test uses two
+int64 columns, where nothing else can save it, and it was confirmed to fail against an
+unverified-guess mutation.
+
 ### Verifying the path actually fires
 
 A columnar chain that is quietly undone costs MORE than never having been columnar:

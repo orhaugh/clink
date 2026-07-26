@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <optional>
@@ -144,6 +145,16 @@ private:
     struct Resolved {
         std::string name;
         std::shared_ptr<arrow::DataType> eff;
+        // Cached from `eff` at construction. The decode loop reached for eff->id()
+        // twice per FIELD - once to test for DECIMAL128 to pick up a scale, once to
+        // dispatch the append - which is a pointer chase and a virtual call each, a
+        // dozen or more per record, for a value that cannot change after construction.
+        arrow::Type::type type_id{arrow::Type::NA};
+        // Only meaningful for DECIMAL128; 0 elsewhere.
+        std::int32_t scale{0};
+        // Precomputed name length, so the lookup's reject test is two integer
+        // comparisons before it touches any bytes.
+        std::uint32_t name_len{0};
     };
 
     // Types whose JSON->Arrow->read_cell round-trip is an exact identity for a
@@ -267,15 +278,72 @@ private:
     }
 
     // Column index for a field name. Linear over a handful of declared columns,
-    // which beats a hash for these widths and keeps the comparison to a length
-    // check plus a short memcmp.
+    // which beats a hash for these widths, with a length and first-byte filter in
+    // front of the comparison so most candidates are rejected without a memcmp.
+    // Byte-compare two names of KNOWN-equal length, inline, without calling memcmp.
+    // Column names are a handful of bytes, and at that width the call to
+    // _platform_memcmp costs more than the comparison: it was 8.8% of decode self
+    // time on top of the lookup frame itself. An explicit loop the compiler can
+    // unroll and vectorise removes the call entirely. No over-read - it never
+    // touches a byte past `n`.
+    [[nodiscard]] static bool name_eq_(const char* a, const char* b, std::size_t n) noexcept {
+        for (std::size_t i = 0; i < n; ++i) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     [[nodiscard]] int column_index_(std::string_view name) const noexcept {
         for (std::size_t i = 0; i < resolved_.size(); ++i) {
-            if (resolved_[i].name.size() == name.size() && resolved_[i].name == name) {
+            const auto& r = resolved_[i];
+            if (r.name_len != name.size() || r.name[0] != name[0]) {
+                continue;
+            }
+            if (name_eq_(r.name.data(), name.data(), name.size())) {
                 return static_cast<int>(i);
             }
         }
         return -1;
+    }
+
+    // Column index for the field at POSITION k of the object, using the column that
+    // position matched last time as the first guess.
+    //
+    // A stream of JSON records is homogeneous in practice - the producer emits the
+    // same fields in the same order every time - so position k lands on the same
+    // column on essentially every record after the first. That turns the lookup from
+    // a scan averaging half the columns (21 string comparisons per nexmark bid
+    // record, which showed up as ~10% of decode self time in memcmp) into one
+    // comparison.
+    //
+    // The guess is always VERIFIED by comparing the name, and a miss falls through to
+    // the full scan, so this can never change which column a field decodes into - only
+    // how many comparisons it takes to find it. Field order is allowed to vary
+    // per record; it just costs the scan when it does.
+    [[nodiscard]] int column_index_at_(std::string_view name, std::size_t k) const noexcept {
+        if (k < pos_hint_.size()) {
+            const auto guess = pos_hint_[k];
+            const auto& r = resolved_[guess];  // pos_hint_ only ever holds valid indices
+            if (r.name_len == name.size() && name_eq_(r.name.data(), name.data(), name.size())) {
+                return static_cast<int>(guess);
+            }
+        }
+        return column_index_miss_(name, k);
+    }
+
+    // The out-of-order / first-record path, deliberately kept OUT of line and marked
+    // cold. Inlined, its scan loop made the whole lookup too large for the compiler to
+    // inline into the decode loop at all, and the lookup showed as its own 13% frame;
+    // splitting it leaves the hot path a length compare and a short byte compare.
+    [[gnu::noinline, gnu::cold]] int column_index_miss_(std::string_view name,
+                                                        std::size_t k) const noexcept {
+        const int found = column_index_(name);
+        if (found >= 0 && k < pos_hint_.size()) {
+            pos_hint_[k] = static_cast<std::uint32_t>(found);
+        }
+        return found;
     }
 
     // On-demand decode: walk each document's fields ONCE, straight into the typed
@@ -471,6 +539,10 @@ private:
     // single-threaded per subtask, so a plain mutable member suffices.
     struct Ondemand;
     mutable std::unique_ptr<Ondemand> od_;
+    // Field-position -> column-index guess for column_index_at_. Mutable because it
+    // is a pure cache: it changes nothing about the decode's result, only the number
+    // of comparisons taken to reach it. Sized to the column count in the constructor.
+    mutable std::vector<std::uint32_t> pos_hint_;
     std::string name_;
     std::vector<Resolved> resolved_;
     std::vector<std::shared_ptr<arrow::Field>> data_fields_;  // [event_time, declared...]

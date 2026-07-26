@@ -11,9 +11,11 @@
 
 #include "clink/sql/json_string_to_row_columnar.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <set>
@@ -58,6 +60,13 @@ JsonStringToRowColumnarOperator::JsonStringToRowColumnarOperator(std::vector<Row
         if (c.name.rfind("__", 0) == 0) {
             schema_capable_ = false;
         }
+        // A backslash in a declared name is the one case where comparing a RAW JSON
+        // key against it could match while the key's UNESCAPED form differs, which
+        // would put a field in the wrong column. Vanishingly rare and refused rather
+        // than reasoned about; the row fallback handles such a schema correctly.
+        if (c.name.find('\\') != std::string::npos) {
+            schema_capable_ = false;
+        }
         // A duplicated declared name defeats the count+per-key-find
         // faithfulness gate (obj.size() matches the inflated column count
         // and the duplicate key is found twice, so an undeclared field can
@@ -71,8 +80,19 @@ JsonStringToRowColumnarOperator::JsonStringToRowColumnarOperator(std::vector<Row
             // Needed per line to recover exact digits (see the parse loop).
             decimal_scales_[c.name] = static_cast<const arrow::Decimal128Type&>(*eff).scale();
         }
+        const auto tid = eff->id();
+        const std::int32_t sc = tid == arrow::Type::DECIMAL128
+                                    ? static_cast<const arrow::Decimal128Type&>(*eff).scale()
+                                    : 0;
         data_fields_.push_back(arrow::field(c.name, eff, /*nullable=*/true));
-        resolved_.push_back({c.name, std::move(eff)});
+        resolved_.push_back(
+            {c.name, std::move(eff), tid, sc, static_cast<std::uint32_t>(c.name.size())});
+    }
+    // Identity is the right initial guess: a producer emitting fields in declared
+    // order is the common case, so the first record already hits.
+    pos_hint_.resize(resolved_.size());
+    for (std::size_t i = 0; i < pos_hint_.size(); ++i) {
+        pos_hint_[i] = static_cast<std::uint32_t>(i);
     }
 }
 
@@ -83,18 +103,21 @@ namespace {
 // Append one on-demand value to a typed builder, mirroring append_cell_'s
 // acceptance rules exactly. Returns false to bail the batch.
 //
+// Takes the Arrow type id by value rather than the DataType, so the dispatch reads a
+// cached byte instead of chasing a shared_ptr and calling a virtual id() per field.
+//
 // Anything this cannot decide is refused rather than guessed: a false return
 // costs a fallback to the DOM path (and, failing that, to rows), which is always
 // correct. That asymmetry is deliberate - the columnar carrier only ever fires
 // where it provably matches the row decode.
-bool append_ondemand(const arrow::DataType& eff,
+bool append_ondemand(arrow::Type::type type_id,
                      arrow::ArrayBuilder* b,
                      simdjson::ondemand::value& v,
-                     int decimal_scale) {
+                     std::int32_t decimal_scale) {
     if (v.is_null()) {
         return b->AppendNull().ok();
     }
-    switch (eff.id()) {
+    switch (type_id) {
         case arrow::Type::INT64: {
             std::int64_t out{};
             if (v.get_int64().get(out) == simdjson::SUCCESS) {
@@ -223,10 +246,31 @@ std::optional<Batch<Row>> JsonStringToRowColumnarOperator::build_columnar_ondema
     bool any_partition = false;
     std::vector<char> seen(resolved_.size(), 0);
 
+    // Per-record iterate(), with the scratch buffer grown MONOTONICALLY and the line
+    // copied in - not assign() + resize() per record, which changed the vector's size
+    // twice and zero-filled SIMDJSON_PADDING bytes for every single line. simdjson
+    // requires the padding to be ALLOCATED and readable, not zeroed; only the first
+    // `len` bytes are parsed, so whatever a previous longer line left in the padding
+    // is never part of a document.
+    //
+    // MEASURED ALTERNATIVE, REJECTED: concatenating the batch into one buffer and
+    // parsing it with a single iterate_many(). That is the API designed for streams of
+    // small documents and it amortises stage1 (simdjson's SIMD structural prescan,
+    // 13% of decode self time) from once per record to once per batch - but it
+    // measured 5.85M rec/s against 5.87M... in fact SLOWER than 6.26M for the
+    // per-record path, on ~120-byte documents. Streaming mode carries its own
+    // per-document bookkeeping (document_reference, boundary rescan, _streaming
+    // disabling some fast paths) and on these document sizes that costs more than the
+    // stage1 it saves. Tried with batch_size at both 1MB and the exact buffer length,
+    // in case parser capacity was hurting cache locality; both lost. Do not re-try
+    // without measuring.
     for (const auto& rec : in) {
         const std::string& line = rec.value();
-        od_->pad.assign(line.begin(), line.end());
-        od_->pad.resize(line.size() + simdjson::SIMDJSON_PADDING, '\0');
+        const std::size_t need = line.size() + simdjson::SIMDJSON_PADDING;
+        if (od_->pad.size() < need) {
+            od_->pad.resize(need);
+        }
+        std::memcpy(od_->pad.data(), line.data(), line.size());
 
         simdjson::ondemand::document doc;
         if (od_->parser.iterate(od_->pad.data(), line.size(), od_->pad.size()).get(doc) !=
@@ -241,11 +285,23 @@ std::optional<Batch<Row>> JsonStringToRowColumnarOperator::build_columnar_ondema
         std::fill(seen.begin(), seen.end(), 0);
         std::size_t filled = 0;
         for (auto field : obj) {
+            // escaped_key(), not unescaped_key(): the raw key bytes as they sit in the
+            // input buffer, with no unescaping pass and no copy into simdjson's string
+            // buffer. Real column names contain no escapes, so for them the raw key IS
+            // the unescaped key and the comparison is identical.
+            //
+            // A key that DOES carry an escape simply fails to match, which returns -1,
+            // bails the batch and falls back to the DOM path where the key is properly
+            // unescaped - the same refuse-rather-than-guess asymmetry the rest of this
+            // decoder relies on. It cannot match the WRONG column either: raw bytes
+            // equal to a column name can only unescape to something else if the name
+            // itself contains a backslash, and such a schema is refused up front
+            // (schema_capable_).
             std::string_view key;
-            if (field.unescaped_key().get(key) != simdjson::SUCCESS) {
+            if (field.escaped_key().get(key) != simdjson::SUCCESS) {
                 return std::nullopt;
             }
-            const int ci = column_index_(key);
+            const int ci = column_index_at_(key, filled);
             if (ci < 0) {
                 return std::nullopt;  // undeclared field: the row decode would keep it
             }
@@ -257,11 +313,8 @@ std::optional<Batch<Row>> JsonStringToRowColumnarOperator::build_columnar_ondema
             if (field.value().get(val) != simdjson::SUCCESS) {
                 return std::nullopt;
             }
-            int scale = 0;
-            if (resolved_[uci].eff->id() == arrow::Type::DECIMAL128) {
-                scale = static_cast<const arrow::Decimal128Type&>(*resolved_[uci].eff).scale();
-            }
-            if (!append_ondemand(*resolved_[uci].eff, col_b[uci].get(), val, scale)) {
+            const auto& res = resolved_[uci];
+            if (!append_ondemand(res.type_id, col_b[uci].get(), val, res.scale)) {
                 return std::nullopt;
             }
             seen[uci] = 1;

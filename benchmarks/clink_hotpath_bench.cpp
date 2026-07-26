@@ -15,6 +15,10 @@
 //   clink_hotpath_bench q12  [lines]   decode -> STRING key -> windowed COUNT fold
 //   clink_hotpath_bench q12typed [n]   the same fold with a typed int64 key
 //   clink_hotpath_bench decode [lines] the JSON bridge alone
+//   clink_hotpath_bench buildonly [n]  Batch<std::string> assembly ALONE, to subtract
+//
+// A 4th argument repeats the measured loop (`decode 2000000 256 20`), which is how to
+// give `sample` a window that outlasts input generation.
 //
 // Records/sec is printed per stage so a change can be attributed.
 
@@ -115,16 +119,42 @@ void run_decode(const std::vector<std::string>& lines, std::size_t batch, Consum
     }
 }
 
-int bench_decode(const std::vector<std::string>& lines, std::size_t batch) {
+int bench_decode(const std::vector<std::string>& lines, std::size_t batch, std::size_t repeats) {
     std::size_t rows = 0, columnar = 0;
     Timer t;
-    run_decode(lines, batch, [&](const Batch<Row>& b) {
-        rows += b.size();  // size() answers from the sidecar; no materialisation
-        if (b.is_columnar())
-            ++columnar;
-    });
-    report("decode only", lines.size(), t.elapsed(), rows);
+    for (std::size_t r = 0; r < repeats; ++r) {
+        run_decode(lines, batch, [&](const Batch<Row>& b) {
+            rows += b.size();  // size() answers from the sidecar; no materialisation
+            if (b.is_columnar())
+                ++columnar;
+        });
+    }
+    report("decode only", lines.size() * repeats, t.elapsed(), rows);
     std::printf("  (columnar batches: %zu)\n", columnar);
+    return 0;
+}
+
+// Batch construction WITHOUT the decode: the same Batch<std::string> assembly
+// run_decode does, and nothing else. Its cost belongs to the runner rather than to
+// the bridge, so subtracting it is what turns "decode only" into the decode's own
+// per-record cost. It is not small - each record copies a line into a fresh
+// std::string, which for a ~120 byte nexmark bid line is a malloc and a memcpy.
+int bench_build_only(const std::vector<std::string>& lines,
+                     std::size_t batch,
+                     std::size_t repeats) {
+    std::size_t seen = 0;
+    Timer t;
+    for (std::size_t r = 0; r < repeats; ++r) {
+        for (std::size_t i = 0; i < lines.size(); i += batch) {
+            Batch<std::string> in;
+            in.reserve(batch);
+            for (std::size_t j = i; j < std::min(i + batch, lines.size()); ++j) {
+                in.emplace(std::string(lines[j]));
+            }
+            seen += in.size();
+        }
+    }
+    report("batch build only", lines.size() * repeats, t.elapsed(), seen);
     return 0;
 }
 
@@ -206,18 +236,25 @@ int main(int argc, char** argv) {
     const std::string shape = argc > 1 ? argv[1] : "q0";
     const std::size_t n = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 2000000;
     const std::size_t batch = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 256;
+    // Repeats keep the measured loop running long enough for a sampling profiler to
+    // see it. The first attempt at profiling the decode sampled the input GENERATOR
+    // instead, because generating 20M lines outlasted the sample window and snprintf
+    // dominated the result.
+    const std::size_t repeats = argc > 4 ? std::strtoull(argv[4], nullptr, 10) : 1;
 
     std::printf("clink_hotpath_bench: shape=%s lines=%zu batch=%zu\n", shape.c_str(), n, batch);
     const auto lines = generate(n);
 
     if (shape == "decode")
-        return bench_decode(lines, batch);
+        return bench_decode(lines, batch, repeats);
+    if (shape == "buildonly")
+        return bench_build_only(lines, batch, repeats);
     if (shape == "q0")
         return bench_q0(lines, batch);
     if (shape == "q12")
         return bench_q12(lines, batch);
     if (shape == "q12typed")
         return bench_q12_typed(lines, batch);
-    std::fprintf(stderr, "unknown shape '%s' (decode|q0|q12|q12typed)\n", shape.c_str());
+    std::fprintf(stderr, "unknown shape '%s' (decode|buildonly|q0|q12|q12typed)\n", shape.c_str());
     return 2;
 }
