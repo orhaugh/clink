@@ -73,6 +73,7 @@ submits to a cluster, unchanged.
 | Security | TLS and mTLS on the cluster transport | [Network stack](internals/network-stack.md) |
 | Kubernetes | Helm chart and a `ClinkCluster`/`ClinkJob` operator with savepoint-on-upgrade | [Distributed runtime](internals/distributed-runtime.md) |
 | HTTP API and console | JSON API, Prometheus metrics, SSE events, embedded dashboard; the full [operations console](https://github.com/orhaugh/clink-fe) is a separate project | [Distributed runtime](internals/distributed-runtime.md) |
+| Allocator choice | jemalloc as the process allocator, opt-in at build time (`CLINK_WITH_JEMALLOC=ON`, Linux); measured at +5% throughput on a windowed query, neutral elsewhere, no memory change. The allocator in use is reported by `clink_node --version` and at node startup | [Build options](https://github.com/orhaugh/clink#allocator-clink_with_jemalloc-opt-in-linux) |
 
 ## Observability and debugging
 

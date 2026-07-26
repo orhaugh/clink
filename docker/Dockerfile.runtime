@@ -36,14 +36,30 @@ ENV CMAKE_BUILD_PARALLEL_LEVEL=4
 # the ForSt engine's ExternalProject fetch + build (~5-8 min, needs
 # network). Usage: docker build --build-arg CLINK_WITH_FORST=ON ...
 ARG CLINK_WITH_FORST=OFF
+# Opt-in: link jemalloc as the process allocator. Default OFF on the measured
+# evidence - against the SAME clink binary with only the allocator changed, it
+# gave +5% sustained throughput on the windowed nexmark query, neutral on the
+# stateless one, neutral CPU per event, and no memory change
+# (benchmarks/nexmark_compare/cloud/README.md). Adds one apt package and no
+# build time. Usage:
+#   docker build --build-arg CLINK_WITH_JEMALLOC=ON -t clink-runtime:jemalloc \
+#     -f docker/Dockerfile.runtime .
+# `clink_node --version` prints the allocator, so an image can be checked rather
+# than assumed.
+ARG CLINK_WITH_JEMALLOC=OFF
 # CLINK_BUILD_SQL=ON so clink_node registers the SQL operator factories
 # (json_string_to_row, window_row, equi_join_row, ...) - required to run SQL
 # jobs (e.g. the Nexmark queries) against a containerized cluster; without it the
 # coordinator planner rejects the spec with "no operator factory registered".
 # Release + LTO (interprocedural optimisation) for a maximally-optimised runtime,
 # then strip the binaries (perf-neutral, smaller image). Throughput-grade build.
-RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCLINK_BUILD_SQL=ON \
+RUN if [ "${CLINK_WITH_JEMALLOC}" != "OFF" ]; then \
+        apt-get update -qq && apt-get install -y -qq --no-install-recommends libjemalloc-dev \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi \
+ && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCLINK_BUILD_SQL=ON \
         -DCLINK_WITH_FORST=${CLINK_WITH_FORST} \
+        -DCLINK_WITH_JEMALLOC=${CLINK_WITH_JEMALLOC} \
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
     && cmake --build build --target clink_node \
     && cmake --build build --target clink \

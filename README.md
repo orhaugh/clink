@@ -308,13 +308,58 @@ its pinned version in full.
 | Avro codec              | `find_package(AvroCpp)`                         | `avro-cpp` (source / homebrew)          |
 | TLS transport           | `find_package(OpenSSL)`                         | `libssl-dev`                            |
 | etcd HA coordinator     | `find_package(etcd-cpp-apiv3)`                  | built from source                       |
+| jemalloc allocator      | `find_library(jemalloc)` (opt-in, Linux only)    | `libjemalloc-dev`                       |
 
 Each `CLINK_WITH_*` cache variable is `AUTO` by default (the dep is used when
 found and skipped otherwise). Set `=ON` to make a missing dep a hard configure
 error or `=OFF` to always skip the impl. RocksDB is the exception: it is always
-built and cannot be turned off. Separately, the `CLINK_BUILD_*` options toggle
-whole subsystems: `CLINK_BUILD_TESTS` / `CLINK_BUILD_EXAMPLES` (on),
-`CLINK_BUILD_HTTP` (on), `CLINK_BUILD_SQL` (off), `CLINK_BUILD_BENCH` (off).
+built and cannot be turned off. Two options default to `OFF` rather than `AUTO`
+because they change the build rather than add a connector: `CLINK_WITH_FORST`
+(builds the pinned upstream tag) and `CLINK_WITH_JEMALLOC` (below). Separately,
+the `CLINK_BUILD_*` options toggle whole subsystems: `CLINK_BUILD_TESTS` /
+`CLINK_BUILD_EXAMPLES` (on), `CLINK_BUILD_HTTP` (on), `CLINK_BUILD_SQL` (off),
+`CLINK_BUILD_BENCH` (off).
+
+### Allocator: `CLINK_WITH_JEMALLOC` (opt-in, Linux)
+
+```bash
+cmake -S . -B build -DCLINK_WITH_JEMALLOC=ON          # needs libjemalloc-dev
+docker build --build-arg CLINK_WITH_JEMALLOC=ON \
+  -t clink-runtime:jemalloc -f docker/Dockerfile.runtime .
+```
+
+Links jemalloc as the process allocator, PUBLIC on `clink::core` so every binary
+and every consumer of the install uses it - an allocator only part of a process
+uses is worse than none.
+
+**Default OFF on measured evidence.** Against the same clink binary with only the
+allocator changed, on the two-node nexmark rig: **+5% sustained throughput on the
+windowed query (q12), neutral on the stateless one (q0), neutral CPU per event,
+and no change in memory.** That malloc is on the critical path is not in doubt -
+capping glibc to two arenas (`MALLOC_ARENA_MAX=2`) halves throughput, and
+jemalloc's per-thread caches are why it avoids that contention - but 5% on one
+query shape does not earn a hard dependency. Numbers and method:
+[`benchmarks/nexmark_compare/cloud/README.md`](benchmarks/nexmark_compare/cloud/README.md).
+
+It is **not** a fix for memory. clink's memory advantage comes from the engine
+(nexmark q0: 72 MB against a JVM engine's 1,146 MB) and jemalloc changed neither
+that nor the windowed query's footprint, which is dominated by un-fired window
+state that any engine has to hold.
+
+`ON` is refused on macOS with a configure error rather than accepted: jemalloc
+does not replace the system allocator by linking alone there, so the build would
+report success while leaving `malloc` untouched. `AUTO` skips quietly on macOS
+and uses jemalloc on Linux when it is installed.
+
+Whether it took effect is observable rather than assumed - `clink_node --version`
+prints the allocator, each node logs it at startup, and the version string is
+read from the loaded library via `mallctl` rather than from a build variable:
+
+```
+$ clink_node --version
+clink 0.2.0 (plugin ABI v1, ...)
+allocator: jemalloc 5.3.0-0-g54eaed1d8b56b1aa528be3bdd1877e59c56fa90c
+```
 
 ## Installing clink
 

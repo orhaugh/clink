@@ -96,13 +96,24 @@ set(CLINK_WITH_WASM       "OFF"  CACHE STRING "WebAssembly (wasmtime) scalar UDF
 # (needs network + a RocksDB-scale first build), so there is no AUTO tier -
 # nothing local to discover.
 set(CLINK_WITH_FORST      "OFF"  CACHE STRING "ForSt state backend, built from the pinned upstream tag (OFF/ON)")
+# jemalloc as the process allocator. Opt-in, and OFF by default on the evidence:
+# measured on the two-node nexmark rig against the SAME clink binary with only the
+# allocator changed, it gave +5% sustained throughput on the windowed query (q12),
+# neutral on the stateless one (q0), neutral on CPU per event, and NO memory change.
+# See benchmarks/nexmark_compare/cloud/README.md for the numbers.
+#
+# Worth having as an option because malloc is demonstrably on clink's critical path -
+# capping glibc to two arenas (MALLOC_ARENA_MAX=2) halves throughput - and jemalloc's
+# per-thread caches avoid that contention. Not worth a hard dependency for 5% on one
+# query shape.
+set(CLINK_WITH_JEMALLOC   "OFF"  CACHE STRING "Link jemalloc as the process allocator (OFF/AUTO/ON), Linux only")
 foreach(_opt CLINK_WITH_ROCKSDB CLINK_WITH_KAFKA CLINK_WITH_AWS_S3 CLINK_WITH_AWS
              CLINK_WITH_CLICKHOUSE CLINK_WITH_POSTGRES CLINK_WITH_TLS
              CLINK_WITH_ETCD CLINK_WITH_AVRO CLINK_WITH_HTTP CLINK_WITH_REDIS CLINK_WITH_MYSQL
              CLINK_WITH_MQTT CLINK_WITH_MONGODB CLINK_WITH_ICEBERG CLINK_WITH_RABBITMQ
              CLINK_WITH_NATS CLINK_WITH_PULSAR CLINK_WITH_CASSANDRA CLINK_WITH_GCS CLINK_WITH_AZURE
              CLINK_WITH_WEBHDFS CLINK_WITH_VECTOR_SEARCH CLINK_WITH_ONNX CLINK_WITH_WASM
-             CLINK_WITH_FORST)
+             CLINK_WITH_FORST CLINK_WITH_JEMALLOC)
     set_property(CACHE ${_opt} PROPERTY STRINGS AUTO ON OFF)
 endforeach()
 if(CLINK_WITH_ROCKSDB STREQUAL "OFF")
@@ -258,6 +269,48 @@ endif()
 set(CLINK_SIMDJSON_AMALGAMATED_DIR "${simdjson_src_SOURCE_DIR}/singleheader")
 
 # ---------------------------------------------------------------------------
+# Process allocator (opt-in).
+#
+# Linked into clink_core PUBLIC, so every binary built from this tree and every
+# consumer of the install picks it up - an allocator that only some of the
+# process uses is worse than none.
+#
+# LINUX ONLY, and a request on macOS is a hard error rather than a silent skip.
+# jemalloc replaces malloc on Linux simply by being linked; on macOS the
+# allocator is zone-based and interposition needs a different mechanism, so a
+# link there would leave the system allocator in charge while the build reported
+# success. A no-op that reports success is the exact failure mode this codebase
+# has been bitten by twice (a dead in-process fast path, a shadowed sink), so it
+# is refused instead.
+# ---------------------------------------------------------------------------
+set(CLINK_JEMALLOC_ACTIVE OFF)
+if(NOT CLINK_WITH_JEMALLOC STREQUAL "OFF")
+    if(APPLE)
+        if(CLINK_WITH_JEMALLOC STREQUAL "ON")
+            message(FATAL_ERROR
+                "CLINK_WITH_JEMALLOC=ON is not supported on macOS: jemalloc does not "
+                "replace the system allocator by linking alone there, so the build "
+                "would succeed while leaving malloc unchanged. Use AUTO (skips) or "
+                "build on Linux / in the Docker image.")
+        endif()
+        message(STATUS "clink: jemalloc - skipped on macOS (interposition unsupported)")
+    else()
+        find_library(CLINK_JEMALLOC_LIB NAMES jemalloc)
+        find_path(CLINK_JEMALLOC_INCLUDE_DIR jemalloc/jemalloc.h)
+        if(CLINK_JEMALLOC_LIB AND CLINK_JEMALLOC_INCLUDE_DIR)
+            set(CLINK_JEMALLOC_ACTIVE ON)
+            message(STATUS "clink: jemalloc - enabled (${CLINK_JEMALLOC_LIB})")
+        elseif(CLINK_WITH_JEMALLOC STREQUAL "ON")
+            message(FATAL_ERROR
+                "CLINK_WITH_JEMALLOC=ON but jemalloc was not found. Install it "
+                "(Debian/Ubuntu: libjemalloc-dev) or set the option to AUTO/OFF.")
+        else()
+            message(STATUS "clink: jemalloc - not found; using the system allocator")
+        endif()
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Core library - no external connector/state-backend deps.
 #
 # Everything in src/ here is the engine: cluster runtime, scheduler,
@@ -346,6 +399,16 @@ target_compile_features(clink_core PUBLIC cxx_std_23)
 
 find_package(Threads REQUIRED)
 target_link_libraries(clink_core PUBLIC Threads::Threads)
+if(CLINK_JEMALLOC_ACTIVE)
+    # PUBLIC so it reaches every executable and every consumer of the install: on Linux
+    # jemalloc takes over malloc by being present in the link, and a process where only
+    # part of the code allocates through it is worse than not using it at all.
+    target_link_libraries(clink_core PUBLIC ${CLINK_JEMALLOC_LIB})
+    target_include_directories(clink_core PUBLIC ${CLINK_JEMALLOC_INCLUDE_DIR})
+    # PUBLIC: allocator_info.hpp is a header, so a consumer's TU must see the same
+    # definition or it would report the wrong allocator.
+    target_compile_definitions(clink_core PUBLIC CLINK_HAS_JEMALLOC=1)
+endif()
 # simdjson is an implementation detail of src/config/json.cpp: the
 # amalgamated TU is a clink_core source (see the fetch block above) and
 # only json.cpp sees the header.

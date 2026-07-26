@@ -119,6 +119,11 @@ stage is touching a row accessor. Two real instances, both found this way:
   `install.cpp` by hand; there is no compile-time link between them, which is exactly
   why it drifted.
 
+A related habit worth keeping: an opt-in that cannot be observed will eventually be
+found to have done nothing. `clink_node --version` and the node startup log both report
+the process allocator for the same reason (`CLINK_WITH_JEMALLOC`), reading the version
+from the loaded library rather than from a build variable.
+
 `clink_dataplane_local_hits_total` and `clink_dataplane_socket_fallbacks_total` answer
 the adjacent question for the wire: whether a shuffle edge between two subtasks in the
 same process hands the element over in memory or pays to encode, socket and decode it.

@@ -63,6 +63,7 @@
 #include "clink/lineage/lineage_listener.hpp"
 #ifdef CLINK_HAS_HTTP
 #include "clink/cluster/snapshots.hpp"
+#include "clink/core/allocator_info.hpp"
 #include "clink/core/record.hpp"
 #include "clink/core/types.hpp"  // operator_id_from_uid
 #include "clink/http/dashboard_assets.hpp"
@@ -1914,6 +1915,7 @@ int run_coordinator(int argc, char** argv) {
         // grep stdout for "coordinator listening". Keep it on std::cout (NOT the logger)
         // so it survives --log-no-console and is not reordered by async logging.
         std::cout << "coordinator listening on " << advertise_host << ":" << bound << "\n";
+        clink::log::info("node.allocator", "allocator: " + clink::allocator_name());
         std::cout.flush();
     } else {
         // HA mode: defer coordinator.start until this coordinator wins the leadership
@@ -2710,6 +2712,7 @@ int run_worker(int argc, char** argv) {
     // child's captured stdout for "registered" at several sites. Keep it on
     // std::cout (NOT the logger) so it survives --log-no-console and is not
     // reordered by async logging.
+    clink::log::info("node.allocator", "allocator: " + clink::allocator_name());
     std::cout << "worker " << worker_id << " registered with " << discovered_coordinator_host << ":"
               << discovered_coordinator_port << "\n";
     std::cout.flush();
@@ -2864,6 +2867,7 @@ int main(int argc, char** argv) {
                       << clink::plugin::kAbiVersion << ", fp " << fp.substr(0, 12) << ", commit "
                       << clink::plugin::kAbiHash << (clink::plugin::kAbiHashIsClean ? "" : "-dirty")
                       << ")\n";
+            std::cout << "allocator: " << clink::allocator_name() << "\n";
             return 0;
         }
         if (has_flag(argc, argv, "help")) {

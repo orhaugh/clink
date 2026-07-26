@@ -103,6 +103,7 @@ add_executable(clink_core_tests
     test_async_keyed_process_function.cpp
     test_async_co_process_function.cpp
     test_watermark_assigner_operator.cpp
+    test_allocator_info.cpp
     test_metrics_registry.cpp
     test_histogram.cpp
     test_disagg_metrics.cpp
