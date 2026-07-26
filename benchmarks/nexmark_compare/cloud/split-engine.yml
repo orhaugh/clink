@@ -1,0 +1,90 @@
+# Both engines on ONE node, against a broker on ANOTHER node.
+#
+# There is no kafka service here: the broker lives on its own node and is reached
+# at ${BROKER}. That is the whole point of the split rig - on the laptop harness
+# the broker shared cores with both engines and its CPU was charged to neither,
+# so a drain rate could be the broker's limit with nothing in the result saying so.
+#
+# The two profiles are brought up ONE AT A TIME (see split-run.sh), never together,
+# so whichever engine is measured has the node's four dedicated cores to itself and
+# the hardware under each is identical.
+#
+# Shapes are matched deliberately: Flink gets 1 JobManager + 1 TaskManager with 4
+# slots; clink gets 1 coordinator + 1 worker. One worker, not four, so that a keyed
+# shuffle has the same in-process opportunity on both sides - a 4-worker clink would
+# shuffle over real TCP while a 1-TaskManager Flink shuffled in memory, and the
+# comparison would be measuring topology rather than engine.
+services:
+  flink-jobmanager:
+    image: flink:2.2.0-scala_2.12-java21
+    profiles: ["flink"]
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        # 200ms, not the 10s default: the sampler reads vertex counters from the
+        # JobManager's MetricFetcher cache, and at 10s every rate it computes is
+        # quantised to that period - which reports Flink's LOWER bound as its
+        # result. This rig exists to give Flink its true number.
+        metrics.fetcher.update-interval: 200
+        parallelism.default: 4
+        state.backend.type: hashmap
+
+  flink-taskmanager:
+    image: flink:2.2.0-scala_2.12-java21
+    profiles: ["flink"]
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        metrics.fetcher.update-interval: 200
+        parallelism.default: 4
+        state.backend.type: hashmap
+
+  clink-coordinator:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:main}
+    profiles: ["clink"]
+    hostname: clink-coordinator
+    command:
+      - --role=coordinator
+      - --port=6123
+      - --bind-host=0.0.0.0
+      - --advertise-host=clink-coordinator
+      - --http-port=8081
+      - --http-bind=0.0.0.0
+    # 8095, because the Flink profile claims 8081 on the host. Both profiles are
+    # mapped so either can be up without editing this file.
+    ports:
+      - "8095:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/api/v1/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 40
+      start_period: 2s
+
+  clink-worker1:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:main}
+    profiles: ["clink"]
+    hostname: clink-worker1
+    depends_on:
+      clink-coordinator:
+        condition: service_healthy
+    command:
+      - --role=worker
+      - --id=worker-1
+      - --coordinator-host=clink-coordinator
+      - --coordinator-port=6123
+      - --data-host=clink-worker1
+      - --slots=16
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+    environment:
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+    restart: on-failure

@@ -12,6 +12,11 @@
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
+    # Host networking here too, not just on kafka. With zookeeper on a bridge
+    # network, kafka's KAFKA_ZOOKEEPER_CONNECT=localhost:2181 resolves to the
+    # HOST's loopback where nothing is listening, and the broker dies in a
+    # connection-refused reconnect loop.
+    network_mode: host
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000

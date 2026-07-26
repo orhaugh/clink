@@ -101,3 +101,6 @@ __pycache__/
 *.egg-info/
 python/dist/
 python/build/
+
+# Split cloud rig results (raw per-run JSON; the summary lives in cloud/README.md)
+benchmarks/nexmark_compare/cloud/results-split*/
