@@ -24,15 +24,27 @@ namespace clink {
 // it falls back to the identical row predicate, so it is a drop-in for
 // FilterOperator<int64_t>.
 //
-// Arrow kernel availability (this build): the "filter" SELECTION kernel is
-// registered and used here for the gather. The arithmetic/comparison kernels
-// (greater_equal, etc.) are NOT registered - the Arrow package ships them
-// compiled-in but the default registry holds only ~13 core functions and the
-// public arrow::compute::Initialize() that would register the rest is not an
-// exported symbol in this package (verified against Arrow::arrow_shared). So
-// the comparison mask is hand-rolled (a dense autovectorizable scan); a true
-// greater_equal-kernel mask is unblocked only by a Docker Arrow build that
-// exports Initialize() / auto-registers the kernels.
+// Arrow kernel availability: CORRECTED 2026-07-26. This comment previously said the
+// arithmetic/comparison kernels could not be reached because
+// arrow::compute::Initialize() "is not an exported symbol in this package (verified
+// against Arrow::arrow_shared)". That verification looked in the wrong library. From
+// Arrow 15 the kernel set lives in libarrow_compute, a SEPARATE library, and
+// Initialize() is exported from there. Linking it and calling Initialize() takes the
+// function registry from 13 functions to 305, and greater_equal then answers correctly -
+// measured against both the Homebrew and the pinned Arrow 24 prefixes.
+//
+// The engine now links it when present and exposes clink::arrow_compute_available()
+// (include/clink/core/arrow_compute.hpp).
+//
+// The hand-rolled mask below is KEPT, deliberately, and is not dead code:
+//   * a build against an Arrow without the compute library is still supported;
+//   * kernel null-handling and type promotion are not automatically identical to this
+//     scan, so swapping carriers is a behavioural change that needs its own equivalence
+//     test, not a drop-in;
+//   * it is not where the time goes. clink's own per-stage attribution puts the
+//     arithmetic in a Kafka JSON pipeline at ~4% of worker CPU, so this is a capability
+//     unblock rather than a throughput one, and it should be swapped only behind a
+//     measurement on a filter-heavy shape.
 //
 // Scope: int64 only, a single >= comparison. Generic columnar map / other
 // types / keyed operators are out of scope.

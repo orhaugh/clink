@@ -31,11 +31,20 @@ enum class AggKind : std::uint8_t { Sum, Count, Min, Max };
 // identical row loop (the SAME fold_one_), so the columnar and row paths are
 // exactly equivalent; only the row decode is skipped.
 //
-// Why a hand-rolled scan and not an Arrow hash-aggregate kernel: arrow::compute
-// ::Initialize() is not an exported symbol in this Arrow package, so hash_sum /
-// group_by are not registered (same constraint ColumnarFilterOperator hit for
-// the comparison kernels). The win here is skipping the row decode + the
-// std::vector<Record<pair>> allocation the row arm pays, not a SIMD aggregate.
+// Why a hand-rolled scan and not an Arrow hash-aggregate kernel. The original reason
+// given here - that arrow::compute::Initialize() is not exported by this Arrow package -
+// was WRONG, and was corrected on 2026-07-26: from Arrow 15 the kernels live in
+// libarrow_compute and Initialize() is exported from there, which the engine now links
+// (clink::arrow_compute_available(), include/clink/core/arrow_compute.hpp). hash_sum and
+// hash_aggregate ARE reachable.
+//
+// The scan stays anyway, for a better reason than the wrong one it had: the win this
+// operator delivers is skipping the row decode and the std::vector<Record<pair>>
+// allocation the row arm pays, NOT the arithmetic. Per-stage attribution puts the
+// arithmetic in a Kafka JSON pipeline at ~4% of worker CPU, and an Arrow
+// hash-aggregate would still have to build its own grouper. Worth revisiting only
+// behind a measurement, and with an equivalence test, since kernel null-handling and
+// type promotion are not automatically identical to this fold.
 //
 // Scope: int64 key + int64 value, GLOBAL grouping (no windowing - emits final
 // per-key results at end-of-stream). Windowed columnar aggregation lives in the

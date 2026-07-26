@@ -501,6 +501,31 @@ target_link_libraries(clink_core PUBLIC Arrow::arrow_shared)
 target_compile_definitions(clink_core PUBLIC CLINK_HAS_ARROW=1)
 message(STATUS "clink::core - Arrow v${ARROW_VERSION} (pinned ${CLINK_PINNED_ARROW_VERSION})")
 
+# Arrow's COMPUTE kernels (comparison, arithmetic, boolean, ...) live in a SEPARATE
+# library from Arrow 15 onwards, and are registered on demand rather than at load. So
+# linking libarrow alone gives a function registry holding 13 entries - `filter` and a
+# handful of selection kernels - and `greater_equal` is simply absent.
+#
+# That was previously recorded in the engine as a package limitation: a comment in
+# columnar_filter_operator.hpp said arrow::compute::Initialize() "is not an exported
+# symbol in this package (verified against Arrow::arrow_shared)", and the comparison
+# masks were hand-rolled as a consequence. The check was against the wrong library.
+# Initialize() IS exported, from libarrow_compute, and calling it takes the registry
+# from 13 functions to 305 - measured against both the Homebrew and the pinned Arrow 24
+# prefixes, with greater_equal then returning correct results.
+#
+# Optional rather than REQUIRED: a build against an Arrow that does not ship the compute
+# library keeps working, and every caller of a kernel is expected to have a non-kernel
+# path anyway (see clink::arrow_compute_available()).
+find_package(ArrowCompute QUIET)
+if(TARGET ArrowCompute::arrow_compute_shared)
+    target_link_libraries(clink_core PUBLIC ArrowCompute::arrow_compute_shared)
+    target_compile_definitions(clink_core PUBLIC CLINK_HAS_ARROW_COMPUTE=1)
+    message(STATUS "clink::core - Arrow compute kernels available (arrow_compute)")
+else()
+    message(STATUS "clink::core - Arrow compute kernels NOT available; hand-rolled paths only")
+endif()
+
 # Parquet ships alongside Arrow in every standard distribution
 # (Homebrew, apt, conda). Required by the ParquetSink/Source built-ins
 # and the snapshot/wire layers that share the same batcher seam.
