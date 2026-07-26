@@ -320,6 +320,28 @@ the `CLINK_BUILD_*` options toggle whole subsystems: `CLINK_BUILD_TESTS` /
 `CLINK_BUILD_EXAMPLES` (on), `CLINK_BUILD_HTTP` (on), `CLINK_BUILD_SQL` (off),
 `CLINK_BUILD_BENCH` (off).
 
+### Instruction-set baseline: `CLINK_ISA_BASELINE` (opt-in)
+
+```bash
+cmake -S . -B build -DCLINK_ISA_BASELINE=x86-64-v3       # AVX2, Haswell 2013+
+gh workflow run runtime-image.yml -f isa_baseline=x86-64-v3
+```
+
+Empty by default, which means clink's own code compiles for the toolchain baseline
+(on x86-64 that is SSE2). Setting it raises the floor for clink's compiled loops. It
+is a portability decision first: a binary built this way faults on a CPU below the
+level, so an ISA-raised image is published under an `-isa<level>` tag suffix and
+never takes `:main` or `:latest`.
+
+**Measured, and it does not help.** Two images from the same commit, A/B'd on one
+node: `x86-64-v3` was neutral on a windowed query and ~4% *worse* on a stateless one.
+The flag took effect (256-bit `ymm` instructions rose from 7,379 to 27,570), so the
+result is real rather than a no-op. The reason is that arithmetic is ~4% of CPU on
+that pipeline, and the two heaviest stages are simdjson and Arrow, which compile every
+vector implementation and dispatch on the CPU at runtime regardless of clink's flags.
+Kept as a knob for a deployment with a known hardware floor, not as a recommendation.
+Numbers: [`benchmarks/nexmark_compare/cloud/README.md`](benchmarks/nexmark_compare/cloud/README.md).
+
 ### Allocator: `CLINK_WITH_JEMALLOC` (opt-in, Linux)
 
 ```bash

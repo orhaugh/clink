@@ -184,6 +184,48 @@ The efficiency and memory columns are the durable results; the throughput ratio 
 several tens of percent between provisions (1.56x and 1.30x for q0 on two different
 machines at effectively the same commit), so quote it as "ahead", not to two decimals.
 
+### Wider vectors (AVX2) buy nothing: measured, not argued
+
+The question was whether compiling the engine for a modern x86 ISA - rather than the
+toolchain baseline, which on x86-64 is SSE2 - would raise throughput. It does not.
+
+Two images built from the SAME commit (67a69a1), one default and one with
+`CLINK_ISA_BASELINE=x86-64-v3` (AVX2/FMA/BMI2, Haswell 2013+), A/B'd on one node,
+two trials each:
+
+| | baseline (SSE2) | x86-64-v3 (AVX2) |
+|---|---:|---:|
+| q0 sustained rec/s | 3,108,200 / 3,099,433 | 2,894,537 / 3,018,005 |
+| q0 events/cpu-s | **745,543 / 760,959** | 715,953 / 727,273 |
+| q12 sustained rec/s | 2,065,368 / 1,998,848 | 2,090,964 / 2,004,986 |
+| q12 events/cpu-s | 270,270 / 300,850 | 275,862 / 273,321 |
+
+Neutral on the windowed query, and about 4% WORSE on the stateless one. The flag
+demonstrably took effect - `objdump` counts 256-bit ymm instructions rising from 7,379
+to 27,570 and FMA/broadcast from 438 to 1,265, with the binary 246 KB larger - so this
+is not a case of the option doing nothing.
+
+Why there was nothing to win is visible in the CPU attribution above: **the arithmetic
+is about 4% of q0** (`project_row`), while the two largest stages are library code that
+already dispatches to AVX2 at RUNTIME regardless of our compile flags. Those 7,379 ymm
+instructions in the BASELINE binary are simdjson's and Arrow's own vectorised kernels,
+compiled with per-implementation target attributes and selected on the CPU at startup.
+Raising our floor widens loops that are not where the time goes, and pays for it in code
+size.
+
+The hardware note, for anyone tempted by AVX-512: the rig's AMD EPYC Milan (Zen 3)
+advertises avx2 and bmi2 but **not** avx512f, so an `x86-64-v4` build would fault on it.
+A published image cannot assume a level above v1 without knowing the deployment floor,
+which is why `CLINK_ISA_BASELINE` is empty by default and an ISA-raised image gets its
+own tag suffix instead of `:main`.
+
+What this rules out is a compile-flag win. It does not rule out targeted work where the
+profile actually points - the shuffle `hash` at 19.3% of q12, and Arrow's arithmetic and
+comparison kernels, which this build cannot reach because `arrow::compute::Initialize()`
+is not exported by the Arrow package clink links (see
+`include/clink/operators/columnar_filter_operator.hpp`). Both are about using kernels
+that are already vectorised, not about hand-writing intrinsics.
+
 ### jemalloc: measured, worth having, not a memory fix
 
 Tested by deriving an image from the SAME clink binary with `libjemalloc2` preloaded, so
