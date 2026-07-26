@@ -92,6 +92,8 @@ benchmarks/prod_compare/*/rocksdb:/
 !/docs/design/
 !/docs/index.md
 !/docs/capabilities.md
+!/docs/efficiency.md
+!/docs/assets/
 
 # MkDocs build output
 /site/

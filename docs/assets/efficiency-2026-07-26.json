@@ -1,0 +1,209 @@
+{
+  "_note": "Raw per-run output behind docs/efficiency.md. Produced by benchmarks/nexmark_compare/cloud/split-run.sh; not hand-edited. Each row is one measured run: one engine, one query, one trial, on the same engine node against the same isolated broker.",
+  "measured_utc_date": "2026-07-26",
+  "clink_commit": "1eb6fae",
+  "flink_version": "2.2.0-scala_2.12-java21 (upstream image, unmodified)",
+  "rig": {
+    "engine_node": "Hetzner ccx23, 4 dedicated vCPU, AMD EPYC Milan, fsn1",
+    "broker_node": "Hetzner ccx23, 4 dedicated vCPU, fsn1, runs the broker alone",
+    "network": "private network between the two nodes",
+    "note": "one engine at a time on the engine node; fresh cluster per measured run"
+  },
+  "workload": {
+    "source": "Kafka topic nx-bid, 4 partitions, 9.2M nexmark bid records",
+    "queries": "nexmark q0 (stateless projection), q12 (windowed GROUP BY)",
+    "parallelism": 4,
+    "sink": "blackhole (output discarded, so the engine is measured and not a sink)"
+  },
+  "how_read": {
+    "cpu": "cgroup v2 cpu.stat usage_usec across every container of the engine under test, sampled before and after the drain",
+    "memory": "cgroup v2 memory.stat anon (engine heap and stacks; excludes page cache), memory.peak for the high-water mark",
+    "rate": "the engine's own records-processed counter polled at 100ms; sustained_slope is the steepest 0.5s slope, drain_rate the whole-run average"
+  },
+  "correctness_gate": {
+    "harness": "benchmarks/nexmark_compare/run.sh (separate run, parallelism 4, 500k events)",
+    "q0_output_rows": {
+      "clink": 460000,
+      "flink": 460000,
+      "identical": true
+    },
+    "q12_output_rows": {
+      "clink": 184767,
+      "flink": 184767,
+      "identical": true
+    }
+  },
+  "not_measured": [
+    "wall power, PUE, grid carbon intensity, embodied carbon",
+    "workloads beyond nexmark q0 and q12",
+    "hardware generations other than AMD EPYC Milan",
+    "a tuning effort on either engine",
+    "long-run (days/weeks) memory behaviour"
+  ],
+  "caveat_throughput_variance": "The same clink commit measured 1.56x and 1.30x against Flink on two different machines of this same type. events_per_cpu_sec and anon_mb held steady across those runs; the raw throughput ratio did not.",
+  "caveat_q12_memory": "q12 memory is dominated by un-fired window state, which any engine computing that query must hold, not by engine overhead. Verified on the rig: jemalloc changed it not at all, disabling columnar execution RAISED it to 4663 MB, and it tracks records consumed then goes flat when ingest stops.",
+  "runs": [
+    {
+      "query": "q0",
+      "engine": "clink",
+      "trial": 1,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 2977002.1,
+      "drain_rate": 2791461.6,
+      "drain_seconds": 3.296,
+      "reached_target": true,
+      "cpu_seconds": 13.04,
+      "wall_seconds": 12.03,
+      "cores": 1.08,
+      "events_per_cpu_sec": 705521,
+      "anon_mb": 74.1,
+      "peak_mb": 86.8,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q0",
+      "engine": "clink",
+      "trial": 2,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 2937084.7,
+      "drain_rate": 2730722.3,
+      "drain_seconds": 3.369,
+      "reached_target": true,
+      "cpu_seconds": 12.96,
+      "wall_seconds": 11.08,
+      "cores": 1.17,
+      "events_per_cpu_sec": 709877,
+      "anon_mb": 69.9,
+      "peak_mb": 85.5,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q0",
+      "engine": "flink",
+      "trial": 1,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 2088165.4,
+      "drain_rate": 1021201.0,
+      "drain_seconds": 9.009,
+      "reached_target": true,
+      "cpu_seconds": 39.45,
+      "wall_seconds": 15.27,
+      "cores": 2.58,
+      "events_per_cpu_sec": 233207,
+      "anon_mb": 1146.4,
+      "peak_mb": 1513.3,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q0",
+      "engine": "flink",
+      "trial": 2,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 2289062.0,
+      "drain_rate": 1057957.7,
+      "drain_seconds": 8.696,
+      "reached_target": true,
+      "cpu_seconds": 40.35,
+      "wall_seconds": 14.78,
+      "cores": 2.73,
+      "events_per_cpu_sec": 228005,
+      "anon_mb": 1160.1,
+      "peak_mb": 1537.9,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q12",
+      "engine": "clink",
+      "trial": 1,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 1872541.7,
+      "drain_rate": 1587131.9,
+      "drain_seconds": 5.797,
+      "reached_target": true,
+      "cpu_seconds": 29.95,
+      "wall_seconds": 13.84,
+      "cores": 2.16,
+      "events_per_cpu_sec": 307179,
+      "anon_mb": 1230.0,
+      "peak_mb": 1275.0,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q12",
+      "engine": "clink",
+      "trial": 2,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 1837941.0,
+      "drain_rate": 1536769.6,
+      "drain_seconds": 5.987,
+      "reached_target": true,
+      "cpu_seconds": 29.6,
+      "wall_seconds": 13.67,
+      "cores": 2.17,
+      "events_per_cpu_sec": 310811,
+      "anon_mb": 1361.5,
+      "peak_mb": 1378.1,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q12",
+      "engine": "flink",
+      "trial": 1,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 1601015.3,
+      "drain_rate": 702772.9,
+      "drain_seconds": 13.091,
+      "reached_target": true,
+      "cpu_seconds": 59.32,
+      "wall_seconds": 19.64,
+      "cores": 3.02,
+      "events_per_cpu_sec": 155091,
+      "anon_mb": 1555.2,
+      "peak_mb": 1850.5,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q12",
+      "engine": "flink",
+      "trial": 2,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 1585431.9,
+      "drain_rate": 707311.4,
+      "drain_seconds": 13.007,
+      "reached_target": true,
+      "cpu_seconds": 59.39,
+      "wall_seconds": 19.85,
+      "cores": 2.99,
+      "events_per_cpu_sec": 154908,
+      "anon_mb": 1504.8,
+      "peak_mb": 1853.9,
+      "mem_fresh_stack": true
+    }
+  ],
+  "derived_ratios": {
+    "q0": {
+      "clink_events_per_cpu_sec": 709877,
+      "flink_events_per_cpu_sec": 233207,
+      "cpu_efficiency_ratio": 3.04,
+      "clink_anon_mb": 69.9,
+      "flink_anon_mb": 1146.4,
+      "memory_ratio": 16.4
+    },
+    "q12": {
+      "clink_events_per_cpu_sec": 310811,
+      "flink_events_per_cpu_sec": 155091,
+      "cpu_efficiency_ratio": 2.0,
+      "clink_anon_mb": 1230.0,
+      "flink_anon_mb": 1504.8,
+      "memory_ratio": 1.2
+    }
+  }
+}

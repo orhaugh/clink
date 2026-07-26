@@ -21,6 +21,16 @@ surface in one page: execution model, SQL, state, delivery guarantees,
 operations, observability, and embedding APIs, each row linking to the page
 that documents it in depth.
 
+## What it costs to run
+
+[Efficiency and environmental impact](efficiency.md) publishes the measured cost of
+processing an event: **3.04x less CPU per event and 16.4x less memory** than a JVM
+stream processor on the same hardware, producing byte-identical output on a
+correctness-gated comparison. It also states plainly where the advantage narrows
+(a large windowed aggregation, where both engines mostly hold the user's state) and
+what was not measured (wall power, so no kWh or CO2e figure is claimed). The raw
+per-run output is published alongside it.
+
 ## How it works
 
 The [internals references](internals/README.md) explain every subsystem the

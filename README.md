@@ -438,9 +438,13 @@ The full set lives in the [connector reference](docs/connectors/README.md). In b
 
 All of the documentation below is also published as a browsable site at
 [orhaugh.github.io/clink](https://orhaugh.github.io/clink/), together with a
-[capability catalogue](https://orhaugh.github.io/clink/capabilities/) and the
+[capability catalogue](https://orhaugh.github.io/clink/capabilities/), the
 [design decisions](https://orhaugh.github.io/clink/design/) behind the
-engine's architecture.
+engine's architecture, and
+[efficiency and environmental impact](https://orhaugh.github.io/clink/efficiency/) -
+the measured cost of processing an event (3.04x less CPU and 16.4x less memory than a
+JVM stream processor on the same hardware, byte-identical output), with the raw per-run
+data and an explicit account of what was not measured.
 
 For a deeper look at how the engine works inside, the [internals
 reference](docs/internals/README.md) documents each subsystem and names the
