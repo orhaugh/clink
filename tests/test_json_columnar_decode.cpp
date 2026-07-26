@@ -620,3 +620,71 @@ TEST(JsonColumnarDecode, AdaptiveDamperStopsAttemptingAndReArms) {
         EXPECT_TRUE(el.as_data().is_columnar());
     }
 }
+
+// Differential coverage for the on-demand decoder against the row decode, aimed
+// at where a hand-written field walk can realistically diverge from building a
+// DOM: string unescaping. The on-demand path takes keys through
+// unescaped_key() and values through get_string(), which are different code
+// from the DOM's unescaping, and a mismatch here would silently corrupt data
+// rather than fall back.
+TEST(JsonColumnarDecode, EscapedAndUnicodeStringsMatchTheRowDecode) {
+    const std::vector<RowColumn> schema = {{"a", arrow::int64()}, {"s", arrow::utf8()}};
+    const std::vector<std::string> lines = {
+        R"({"a":1,"s":"plain"})",
+        R"({"a":2,"s":"with \"quotes\" inside"})",
+        R"({"a":3,"s":"back\\slash"})",
+        R"({"a":4,"s":"tab\там"})",
+        R"({"a":5,"s":"newline\nsecond"})",
+        R"({"a":6,"s":"unicode éü中"})",
+        R"({"a":7,"s":""})",
+        R"({"a":8,"s":"emoji 😀 end"})",
+        R"({"a":9,"s":"slash\/escaped"})",
+    };
+
+    auto oracle = make_typed_row_oracle(schema);
+    auto row_el = run_one(oracle, lines_batch(lines));
+    JsonStringToRowColumnarOperator col_op(schema);
+    auto col_el = run_one(col_op, lines_batch(lines));
+
+    ASSERT_TRUE(col_el.is_data());
+    EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()))
+        << "on-demand string decoding must match the row decode byte for byte";
+}
+
+// An escaped KEY must resolve to its declared column, not be treated as an
+// undeclared field. The walk compares the unescaped key against the schema, so
+// this is the case where a naive raw-key comparison would silently bail (slow
+// but correct) or, worse, mis-map.
+TEST(JsonColumnarDecode, EscapedKeyStillResolvesToItsColumn) {
+    const std::vector<RowColumn> schema = {{"a", arrow::int64()}, {"b", arrow::int64()}};
+    // "b" is 'b'.
+    const std::vector<std::string> lines = {R"({"a":1,"b":2})"};
+
+    auto oracle = make_typed_row_oracle(schema);
+    auto row_el = run_one(oracle, lines_batch(lines));
+    JsonStringToRowColumnarOperator col_op(schema);
+    auto col_el = run_one(col_op, lines_batch(lines));
+
+    EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
+}
+
+// Field order is not schema order. The walk dispatches per field to a resolved
+// column index, so a document whose keys arrive in a different order (or vary
+// between records) must still land in the right columns.
+TEST(JsonColumnarDecode, FieldOrderIndependence) {
+    const std::vector<RowColumn> schema = {
+        {"a", arrow::int64()}, {"b", arrow::utf8()}, {"c", arrow::float64()}};
+    const std::vector<std::string> lines = {
+        R"({"a":1,"b":"x","c":1.5})",
+        R"({"c":2.5,"a":2,"b":"y"})",
+        R"({"b":"z","c":3.5,"a":3})",
+    };
+
+    auto oracle = make_typed_row_oracle(schema);
+    auto row_el = run_one(oracle, lines_batch(lines));
+    JsonStringToRowColumnarOperator col_op(schema);
+    auto col_el = run_one(col_op, lines_batch(lines));
+
+    ASSERT_TRUE(col_el.as_data().is_columnar()) << "reordered keys must still go columnar";
+    EXPECT_EQ(exact_cells(col_el.as_data()), exact_cells(row_el.as_data()));
+}

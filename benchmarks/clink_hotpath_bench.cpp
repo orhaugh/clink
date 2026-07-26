@@ -12,7 +12,8 @@
 // Its purpose is A/B under a profiler: run it, change one thing, run it again.
 //
 //   clink_hotpath_bench q0   [lines]   decode -> project -> sink
-//   clink_hotpath_bench q12  [lines]   decode -> key -> windowed COUNT fold
+//   clink_hotpath_bench q12  [lines]   decode -> STRING key -> windowed COUNT fold
+//   clink_hotpath_bench q12typed [n]   the same fold with a typed int64 key
 //   clink_hotpath_bench decode [lines] the JSON bridge alone
 //
 // Records/sec is printed per stage so a change can be attributed.
@@ -171,6 +172,34 @@ int bench_q12(const std::vector<std::string>& lines, std::size_t batch) {
     return 0;
 }
 
+// The same fold with a TYPED int64 group key instead of the serialised string
+// one the window operator uses today. Isolates what the key representation costs:
+// the profile of bench_q12 ranks serialize_append + string::append + itoa at 587
+// self-weight, plus a string-keyed hash insert at 328, to group by an integer
+// that was already an integer in the input.
+int bench_q12_typed(const std::vector<std::string>& lines, std::size_t batch) {
+    std::unordered_map<std::int64_t, std::map<std::int64_t, std::int64_t>> state;
+    std::size_t folded = 0;
+    Timer t;
+    run_decode(lines, batch, [&](const Batch<Row>& b) {
+        for (const auto& rec : b) {
+            const Row& r = rec.value();
+            auto bit = r.values.find("bidder");
+            auto tit = r.values.find("datetime");
+            if (bit == r.values.end() || tit == r.values.end())
+                continue;
+            const auto key = static_cast<std::int64_t>(bit->second.as_number());
+            const auto ts = static_cast<std::int64_t>(tit->second.as_number());
+            const std::int64_t win_end = ((ts / 10000) + 1) * 10000;
+            ++state[key][win_end];
+            ++folded;
+        }
+    });
+    report("q12 typed-key fold", lines.size(), t.elapsed(), folded);
+    std::printf("  (distinct group keys: %zu)\n", state.size());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -187,6 +216,8 @@ int main(int argc, char** argv) {
         return bench_q0(lines, batch);
     if (shape == "q12")
         return bench_q12(lines, batch);
-    std::fprintf(stderr, "unknown shape '%s' (decode|q0|q12)\n", shape.c_str());
+    if (shape == "q12typed")
+        return bench_q12_typed(lines, batch);
+    std::fprintf(stderr, "unknown shape '%s' (decode|q0|q12|q12typed)\n", shape.c_str());
     return 2;
 }

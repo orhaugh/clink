@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <simdjson.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -132,6 +133,11 @@ public:
             // forces the row fallback the moment any record is not faithfully
             // representable (so the result is byte-identical to the row decode).
             if (attempt) {
+                if (auto fast = build_columnar_ondemand_(in); fast.has_value()) {
+                    consecutive_fallbacks_ = 0;
+                    out.emit_data(std::move(*fast));
+                    return;
+                }
                 if (auto columnar = build_columnar_direct_(in); columnar.has_value()) {
                     consecutive_fallbacks_ = 0;
                     out.emit_data(std::move(*columnar));
@@ -293,6 +299,242 @@ private:
             default:
                 return false;  // unreachable: schema_capable_ excludes these
         }
+    }
+
+    // Column index for a field name. Linear over a handful of declared columns,
+    // which beats a hash for these widths and keeps the comparison to a length
+    // check plus a short memcmp.
+    [[nodiscard]] int column_index_(std::string_view name) const noexcept {
+        for (std::size_t i = 0; i < resolved_.size(); ++i) {
+            if (resolved_[i].name.size() == name.size() && resolved_[i].name == name) {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
+    // Append one simdjson on-demand value to a typed builder, mirroring
+    // append_cell_'s acceptance rules exactly. Returns false to bail the batch.
+    //
+    // Anything this cannot decide is refused rather than guessed: a false return
+    // costs a fallback to the DOM path (and, failing that, to rows), which is
+    // always correct. That asymmetry is deliberate - the columnar carrier only
+    // ever fires where it provably matches the row decode.
+    static bool append_ondemand_(const arrow::DataType& eff,
+                                 arrow::ArrayBuilder* b,
+                                 simdjson::ondemand::value& v,
+                                 int decimal_scale) {
+        if (v.is_null()) {
+            return b->AppendNull().ok();
+        }
+        switch (eff.id()) {
+            case arrow::Type::INT64: {
+                std::int64_t out{};
+                if (v.get_int64().get(out) == simdjson::SUCCESS) {
+                    return static_cast<arrow::Int64Builder*>(b)->Append(out).ok();
+                }
+                // A JSON numeral like 5.0 is integral to the row decode (which
+                // parses every number as a double), so accept it the same way
+                // rather than diverging.
+                double d{};
+                if (v.get_double().get(d) != simdjson::SUCCESS)
+                    return false;
+                if (!std::isfinite(d) || d != std::floor(d))
+                    return false;
+                if (d < -9223372036854775808.0 || d >= 9223372036854775808.0)
+                    return false;
+                return static_cast<arrow::Int64Builder*>(b)
+                    ->Append(static_cast<std::int64_t>(d))
+                    .ok();
+            }
+            case arrow::Type::INT32: {
+                double d{};
+                if (v.get_double().get(d) != simdjson::SUCCESS)
+                    return false;
+                if (!std::isfinite(d) || d != std::floor(d))
+                    return false;
+                if (d < -2147483648.0 || d > 2147483647.0)
+                    return false;
+                return static_cast<arrow::Int32Builder*>(b)
+                    ->Append(static_cast<std::int32_t>(d))
+                    .ok();
+            }
+            case arrow::Type::DOUBLE: {
+                double d{};
+                if (v.get_double().get(d) != simdjson::SUCCESS)
+                    return false;
+                return static_cast<arrow::DoubleBuilder*>(b)->Append(d).ok();
+            }
+            case arrow::Type::FLOAT: {
+                double d{};
+                if (v.get_double().get(d) != simdjson::SUCCESS)
+                    return false;
+                return static_cast<arrow::FloatBuilder*>(b)->Append(static_cast<float>(d)).ok();
+            }
+            case arrow::Type::BOOL: {
+                bool x{};
+                if (v.get_bool().get(x) != simdjson::SUCCESS)
+                    return false;
+                return static_cast<arrow::BooleanBuilder*>(b)->Append(x).ok();
+            }
+            case arrow::Type::STRING: {
+                std::string_view sv;
+                if (v.get_string().get(sv) != simdjson::SUCCESS)
+                    return false;
+                return static_cast<arrow::StringBuilder*>(b)
+                    ->Append(sv.data(), static_cast<std::int32_t>(sv.size()))
+                    .ok();
+            }
+            case arrow::Type::DECIMAL128: {
+                // The exact digits come from the raw token, read here during the
+                // walk - so unlike the DOM path there is no second scan of the
+                // line to recover them.
+                clink::config::JsonValue jv;
+                if (v.type() == simdjson::ondemand::json_type::number) {
+                    const std::string_view tok = v.raw_json_token();
+                    std::size_t n = 0;
+                    while (n < tok.size() &&
+                           (std::isdigit(static_cast<unsigned char>(tok[n])) || tok[n] == '-' ||
+                            tok[n] == '+' || tok[n] == '.' || tok[n] == 'e' || tok[n] == 'E')) {
+                        ++n;
+                    }
+                    auto d = clink::config::dec_parse(tok.substr(0, n));
+                    if (!d)
+                        return false;
+                    jv = clink::config::make_dec_value(*d);
+                } else {
+                    std::string_view sv;
+                    if (v.get_string().get(sv) != simdjson::SUCCESS)
+                        return false;
+                    jv = clink::config::JsonValue{std::string(sv)};
+                }
+                const auto q = row_decimal_for(jv, decimal_scale);
+                if (!q)
+                    return false;
+                return static_cast<arrow::Decimal128Builder*>(b)->Append(q->unscaled).ok();
+            }
+            default:
+                return false;
+        }
+    }
+
+    // On-demand decode: walk each document's fields ONCE, straight into the typed
+    // builders, with no intermediate JsonObject and no per-column lookup of a
+    // sorted vector.
+    //
+    // The DOM path it replaces claimed to decode "directly into typed Arrow
+    // column builders", but built a full generic JsonObject per record first -
+    // a std::string per key, a heap string for any value past SSO, a sorted
+    // insert - and then binary-searched it once per declared column. Profiling
+    // the q0 chain ranked from_dom, the pair-vector growth and memcmp far above
+    // simdjson itself, which was about 10% of decode.
+    //
+    // Returns nullopt to fall back to the DOM path, which then falls back to
+    // rows. Both fallbacks are correct, so any case this refuses is merely slow.
+    std::optional<Batch<Row>> build_columnar_ondemand_(const Batch<std::string>& in) const {
+        if (!schema_capable_) {
+            return std::nullopt;
+        }
+        const auto n = static_cast<std::int64_t>(in.size());
+        auto* pool = arrow::default_memory_pool();
+
+        arrow::Int64Builder t_b(pool);
+        if (!t_b.Reserve(n).ok()) {
+            return std::nullopt;
+        }
+        std::vector<std::unique_ptr<arrow::ArrayBuilder>> col_b(resolved_.size());
+        for (std::size_t ci = 0; ci < resolved_.size(); ++ci) {
+            if (!arrow::MakeBuilder(pool, resolved_[ci].eff, &col_b[ci]).ok()) {
+                return std::nullopt;
+            }
+            (void)col_b[ci]->Reserve(n);
+        }
+
+        std::vector<std::optional<std::int32_t>> parts;
+        parts.reserve(in.size());
+        bool any_partition = false;
+        std::vector<char> seen(resolved_.size(), 0);
+
+        for (const auto& rec : in) {
+            // On-demand requires SIMDJSON_PADDING readable bytes past the end.
+            // Reusing one grown-once buffer keeps that off the per-record path;
+            // a padded_string per line would allocate for every record.
+            const std::string& line = rec.value();
+            pad_buf_.assign(line.begin(), line.end());
+            pad_buf_.resize(line.size() + simdjson::SIMDJSON_PADDING, '\0');
+
+            simdjson::ondemand::document doc;
+            if (parser_.iterate(pad_buf_.data(), line.size(), pad_buf_.size()).get(doc) !=
+                simdjson::SUCCESS) {
+                return std::nullopt;
+            }
+            simdjson::ondemand::object obj;
+            if (doc.get_object().get(obj) != simdjson::SUCCESS) {
+                return std::nullopt;
+            }
+
+            std::fill(seen.begin(), seen.end(), 0);
+            std::size_t filled = 0;
+            for (auto field : obj) {
+                std::string_view key;
+                if (field.unescaped_key().get(key) != simdjson::SUCCESS) {
+                    return std::nullopt;
+                }
+                const int ci = column_index_(key);
+                if (ci < 0) {
+                    return std::nullopt;  // undeclared field: the row decode would keep it
+                }
+                if (seen[static_cast<std::size_t>(ci)]) {
+                    return std::nullopt;  // duplicate key
+                }
+                simdjson::ondemand::value val;
+                if (field.value().get(val) != simdjson::SUCCESS) {
+                    return std::nullopt;
+                }
+                int scale = 0;
+                if (resolved_[static_cast<std::size_t>(ci)].eff->id() == arrow::Type::DECIMAL128) {
+                    scale = static_cast<const arrow::Decimal128Type&>(
+                                *resolved_[static_cast<std::size_t>(ci)].eff)
+                                .scale();
+                }
+                if (!append_ondemand_(*resolved_[static_cast<std::size_t>(ci)].eff,
+                                      col_b[static_cast<std::size_t>(ci)].get(),
+                                      val,
+                                      scale)) {
+                    return std::nullopt;
+                }
+                seen[static_cast<std::size_t>(ci)] = 1;
+                ++filled;
+            }
+            if (filled != resolved_.size()) {
+                return std::nullopt;  // missing declared column
+            }
+            if (!clink::detail::append_event_time(t_b, rec.event_time()).ok()) {
+                return std::nullopt;
+            }
+            auto p = rec.source_partition();
+            if (p.has_value()) {
+                any_partition = true;
+            }
+            parts.push_back(p);
+        }
+
+        std::vector<std::shared_ptr<arrow::Array>> arrays;
+        arrays.reserve(resolved_.size() + 1);
+        std::shared_ptr<arrow::Array> t_arr;
+        if (!t_b.Finish(&t_arr).ok()) {
+            return std::nullopt;
+        }
+        arrays.push_back(std::move(t_arr));
+        for (std::size_t ci = 0; ci < resolved_.size(); ++ci) {
+            std::shared_ptr<arrow::Array> a;
+            if (!col_b[ci]->Finish(&a).ok()) {
+                return std::nullopt;
+            }
+            arrays.push_back(std::move(a));
+        }
+        auto rb = arrow::RecordBatch::Make(arrow::schema(data_fields_), n, std::move(arrays));
+        return wrap_columnar_(std::move(rb), parts, any_partition);
     }
 
     // Single-pass direct decode: parse each line once and append straight to the
@@ -468,6 +710,11 @@ private:
     // Declared DECIMAL columns and their scales; empty for a schema without one,
     // which is what keeps the per-line token scan off every other schema's path.
     std::map<std::string, int> decimal_scales_;
+    // On-demand parser and its padded scratch buffer. process() is
+    // single-threaded per subtask, so plain mutable members suffice; both are
+    // reused across records so the fast path allocates nothing per line.
+    mutable simdjson::ondemand::parser parser_;
+    mutable std::vector<char> pad_buf_;
     std::string name_;
     std::vector<Resolved> resolved_;
     std::vector<std::shared_ptr<arrow::Field>> data_fields_;  // [event_time, declared...]
