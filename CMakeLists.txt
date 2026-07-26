@@ -679,6 +679,7 @@ if(CLINK_BUILD_SQL)
         src/sql/script_runner.cpp
         src/sql/replay.cpp
         src/sql/install.cpp
+        src/sql/json_string_to_row_columnar.cpp
         src/sql/async_function_registry.cpp
         src/sql/table_api.cpp
     )
