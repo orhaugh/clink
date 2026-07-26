@@ -106,8 +106,15 @@ public:
             Emitter<KafkaMessage>::Forward([&out](StreamElement<KafkaMessage> e) -> bool {
                 if (e.is_data()) {
                     Batch<std::string> b;
-                    for (const auto& r : e.as_data()) {
-                        Record<std::string> rec(r.value().payload);
+                    // The batch is ours - the emitter moved it here and nothing
+                    // else observes it - so take each payload rather than copying
+                    // it. Copying was a second full copy of every record's bytes,
+                    // on top of the one kafka_source already makes out of
+                    // librdkafka's buffer.
+                    Batch<KafkaMessage>& in_batch = e.as_data();  // e is by value, so mutable
+                    b.reserve(in_batch.size());
+                    for (auto& r : in_batch) {
+                        Record<std::string> rec(std::move(r.value().payload));
                         // Carry the Kafka partition as engine-only metadata so a
                         // downstream watermark assigner can track event time per
                         // partition (min across partitions) instead of one global

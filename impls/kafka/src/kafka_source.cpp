@@ -274,6 +274,9 @@ bool KafkaSource::produce(Emitter<KafkaMessage>& out) {
         return false;
     }
     Batch<KafkaMessage> batch;
+    // The batch never exceeds max_batch_size, and its size is known here, so one
+    // allocation instead of the ~8 reallocations a geometric grow costs per batch.
+    batch.reserve(impl_->opts.max_batch_size);
     std::uint64_t bytes_read = 0;
     // batch_max_wait bounds TOTAL fill time: the first record may block up
     // to poll_timeout (idle stays cheap), but once the batch is non-empty

@@ -1,9 +1,8 @@
--- clink q0 (stateless pass-through)
--- NO event_time_column here, deliberately: q0 has no windowing, and Flink's
--- matching template declares no WATERMARK either. Declaring one made clink's
--- planner emit an extra assign_timestamps_row stage - its own task, thread and
--- channel hop - that Flink never ran, on the very query meant to isolate raw
--- per-record pipeline overhead., reads shared nx-bid, writes nx-out-q0-clink.
+-- clink q0 (stateless pass-through), reads shared nx-bid, writes nx-out-q0-clink.
+-- NO event_time_column: q0 has no windowing and Flink's matching template
+-- declares no WATERMARK either. Declaring one made clink's planner emit an extra
+-- assign_timestamps_row stage - its own task, thread and channel hop - that Flink
+-- never ran, on the very query meant to isolate raw per-record pipeline overhead.
 -- Brokers is the host-mapped port (clink runs on the host); the Flink side uses
 -- the in-network listener kafka:29092. Submitted via:
 --   clink_submit_sql --file q0.sql --coordinator-host 127.0.0.1 --coordinator-port 8081

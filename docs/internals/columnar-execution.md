@@ -16,6 +16,7 @@ The path is strictly opt-in and degrades cleanly. The default for every operator
 | Wire seam | `include/clink/core/arrow_batcher.hpp` | `ArrowBatcher<T>` (schema/build/parse), built-in batchers, binary fallback, IPC serialise/deserialise |
 | Generic user-type batcher | `include/clink/core/columnar_batcher.hpp` | `CLINK_ARROW_FIELDS` + `make_columnar_arrow_batcher<T>()` for plain or nested structs (recurses into nested structs, `std::vector`, `std::map`, `std::optional`) |
 | Operator hook | `include/clink/operators/operator_base.hpp` | `supports_columnar()` / `process_columnar()` virtuals and their contract |
+| Terminal sink hook | `include/clink/operators/operator_base.hpp`, `detail::try_sink_columnar()` in `include/clink/runtime/dag.hpp` | `Sink::supports_columnar()` / `on_data_columnar()`, so a columnar chain is not undone at the last hop |
 | Runner dispatch | `include/clink/runtime/dag.hpp` | `detail::try_process_columnar()`, called from serial and parallel runners |
 | Wire framing | `include/clink/runtime/network/wire.hpp`, `include/clink/runtime/network/network_channel.hpp` | `Kind::ArrowBatch`, send/recv of the IPC payload |
 | Columnar shuffle | `include/clink/runtime/subtask_emitter.hpp` | `partition_columnar_()` keeps each per-subtask sub-batch columnar |
@@ -112,6 +113,14 @@ flowchart TD
   R -->|"true"| DONE["done (columnar, zero row decode)"]
 ```
 
+### The terminal hook: columnar into a sink
+
+`Sink<In>` carries the same pair, `supports_columnar()` / `on_data_columnar()`, dispatched by `detail::try_sink_columnar()` from both sink runners under the same `CLINK_DISABLE_COLUMNAR` switch (`detail::columnar_enabled()`). Without it a columnar chain is undone at the last hop: `on_data` takes a `Batch<In>` and the first row accessor materialises the whole sidecar.
+
+That mattered more than it sounds. The discard sink was a `FunctionSink<Row>` iterating the batch to call a callback with an empty body, so every record became a name-keyed `FlatMap` first. Measured on the q0 chain, materialisation cost **+0.54s on top of a 1.02s decode**. `BlackholeRowSink` now answers the hook and counts via `batch.size()`, which the sidecar answers without decoding.
+
+The hook also unblocks the producer side: `enable_columnar_output()` treats a columnar-capable sink as a columnar consumer, lifting the rule that forbade the operator in front of a sink from emitting born-columnar. Note what this is *not* - a production win. `blackhole` exists to measure the engine without sink cost; a real Kafka or Parquet sink must still serialise per record. The seam is what a Parquet sink would use to write a `RecordBatch` directly.
+
 Watermarks and barriers never go through `process_columnar`; the runner routes those to `process()` (or the operator's `on_watermark` / `on_barrier`), so a columnar operator still implements `process()` for control elements and for the row-only fallback.
 
 ### Reference example: the int64 columnar filter
@@ -145,7 +154,11 @@ The SQL runtime (`src/sql/install.cpp`) implements `process_columnar` on several
 
 - `AggregateRowOp` (GROUP BY) reads only the columns it needs (group keys, each aggregate's input column, the changelog marker) straight from the sidecar into a narrow row, or runs a fully vectorised group fold for `COUNT` / integer `SUM` / integer `AVG` over a pure-append batch that builds no per-record `Row` at all. It declares `supports_columnar()` true only when the synchronous in-memory state path is active; with async/disaggregated state it routes through `process_async` instead (see [./async-state-execution.md](./async-state-execution.md)).
 - A columnar windowed fold, the columnar row filter / project, and `ColumnarRowComputeKeyOp` (which appends a `__key` column to the sidecar so the keyed shuffle stays columnar) round out the SQL columnar surface.
-- `json_string_to_row_columnar` is a bridge operator: it decodes JSON the same way as `json_string_to_row` but *attaches* a typed Arrow sidecar built from the table's `schema_columns`, emitting a columnar batch only when every record round-trips exactly (otherwise byte-equivalent row-form decode, with an adaptive damper: after 8 consecutive fallback batches it stops attempting the columnar parse and probes every 64th batch, so a systematically unfaithful stream pays ~1.6% wasted parse instead of up to 2x). The SQL planner emits it BY DEFAULT for a Kafka JSON table; `columnar_decode='false'` opts out to the plain row bridge.
+- `json_string_to_row_columnar` is a bridge operator: it decodes JSON and *attaches* a typed Arrow sidecar built from the table's `schema_columns`, emitting a columnar batch only when every record round-trips exactly (otherwise byte-equivalent row-form decode, with an adaptive damper: after 8 consecutive fallback batches it stops attempting the columnar parse and probes every 64th batch, so a systematically unfaithful stream pays ~1.6% wasted parse instead of up to 2x). The SQL planner emits it BY DEFAULT for a Kafka JSON table; `columnar_decode='false'` opts out to the plain row bridge.
+
+  It walks each document once with **simdjson on-demand**, dispatching each field straight to its resolved column's builder - no intermediate `JsonObject`, no per-column search of a sorted vector, and one grown-once padded buffer reused across records. DECIMAL columns take their exact digits from `raw_json_token()` during that same walk, so there is no second scan of the line to recover them. Anything the walk cannot decide it refuses, falling back to the older DOM path and then to rows; both are already proved against the row decode, so a refused case is slow rather than wrong.
+
+  This is worth knowing when reading old commentary: the DOM path it replaced *claimed* to decode "directly into typed Arrow column builders" while in fact building a full generic `JsonObject` per record and binary-searching it once per column. Profiling ranked `memcmp` at 974 self-weight, `from_dom` at 383 and pair-vector growth at 382, against simdjson's own stage1+stage2 at 410 - roughly 10% of decode. The parser was never the cost; the DOM around it was. Measured at **1.96M -> 4.88M rec/s** on 4M nexmark bid lines.
 
   The columnar-capable types are int64, int32, double, **float**, **decimal128**, bool and utf8. Float and decimal were excluded until D4 inc4 for a reason worth keeping in mind when adding a type: the faithfulness contract is measured against *the row decode this operator falls back to*, and that decode was not schema-aware, so it kept every JSON number as a full-precision double and never produced a dec-string - a columnar float32 truncation or exact dec-string was therefore a visible difference. Both bridges now build their decoder from the same `schema_columns` (`row_json_text_format_for_columns`), so declared FLOAT columns round to float precision and declared DECIMAL columns are ingested exactly and quantised to scale on *either* carrier. Adding a further type means making both sides agree first, not just widening the switch.
 

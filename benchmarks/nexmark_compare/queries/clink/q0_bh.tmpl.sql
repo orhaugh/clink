@@ -1,9 +1,8 @@
--- clink q0 (stateless pass-through)
--- NO event_time_column here, deliberately: q0 has no windowing, and Flink's
--- matching template declares no WATERMARK either. Declaring one made clink's
--- planner emit an extra assign_timestamps_row stage - its own task, thread and
--- channel hop - that Flink never ran, on the very query meant to isolate raw
--- per-record pipeline overhead., BLACKHOLE sink variant. Reads shared nx-bid,
+-- clink q0 (stateless pass-through), BLACKHOLE sink variant. Reads shared nx-bid,
+-- NO event_time_column: q0 has no windowing and Flink's matching template
+-- declares no WATERMARK either. Declaring one made clink's planner emit an extra
+-- assign_timestamps_row stage - its own task, thread and channel hop - that Flink
+-- never ran, on the very query meant to isolate raw per-record pipeline overhead.
 -- discards output (connector='blackhole' counts+drops every row) so the engine's
 -- read+process rate is measured without the Kafka output connector as a ceiling.
 -- Measured via the engine-side records_in counter (sample_rate.py), not an output
