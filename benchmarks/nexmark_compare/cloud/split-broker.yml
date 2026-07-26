@@ -1,0 +1,47 @@
+# Kafka on its OWN node, for the split-topology cloud rig.
+#
+# On the laptop harness the broker shares cores with both engines and its CPU is
+# charged to neither, so a drain rate could be the broker's limit rather than an
+# engine's and nothing in the result would say so. Here it gets a node to itself.
+#
+# ADVERTISED_LISTENERS carries the broker node's PRIVATE address, passed in as
+# BROKER_PRIVATE_IP: a Kafka client follows the advertised address after the
+# initial bootstrap, so advertising "localhost" (as the single-host compose does)
+# would send the engine node straight back to its own loopback and it would fail
+# to fetch with no obvious clue why.
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2181 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    # Host networking: the engine node reaches this broker over the private
+    # network, and a published-port hop would add a NAT layer to the very path
+    # being measured.
+    network_mode: host
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: localhost:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://${BROKER_PRIVATE_IP}:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 4
+      # The default heap is small for a broker asked to serve millions of
+      # records back to back; starving it here would look like an engine limit.
+      KAFKA_HEAP_OPTS: "-Xmx3G -Xms3G"

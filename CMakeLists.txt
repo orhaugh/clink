@@ -690,6 +690,17 @@ if(CLINK_BUILD_SQL)
         $<INSTALL_INTERFACE:include>
     )
     target_compile_features(clink_sql PUBLIC cxx_std_23)
+    # simdjson, for src/sql/json_string_to_row_columnar.cpp's on-demand decoder.
+    # PRIVATE and SYSTEM, exactly as clink_core has it: the header stays an
+    # implementation detail and never reaches a consumer's include path.
+    #
+    # Needed EXPLICITLY. clink_core's simdjson include is PRIVATE, so it does not
+    # propagate here, and the local build only compiled because Arrow vendors its
+    # own simdjson.h into the deps prefix - so this TU was silently building
+    # against ARROW's copy rather than the version pinned in
+    # CLINK_SIMDJSON_TAG. The container has no such accident and failed with
+    # "fatal error: simdjson.h: No such file or directory".
+    target_include_directories(clink_sql SYSTEM PRIVATE ${CLINK_SIMDJSON_AMALGAMATED_DIR})
     target_link_libraries(clink_sql
         PUBLIC clink::core
         PRIVATE libpg_query::libpg_query
