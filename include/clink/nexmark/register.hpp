@@ -20,6 +20,7 @@
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
+#include "clink/sql/blackhole_row_sink.hpp"
 #include "clink/sql/row.hpp"
 
 namespace clink::nexmark {
@@ -97,10 +98,18 @@ inline void register_nexmark_factories(clink::plugin::PluginRegistry& reg,
                 "nexmark_source",
                 bounded);
         });
+    // The SAME BlackholeRowSink the SQL factories register, not a FunctionSink.
+    // Factory registration is latest-wins and clink_node installs the SQL factories
+    // BEFORE these, so a different implementation here silently replaced the shared
+    // one for every build of the node - and a FunctionSink materialises the Arrow
+    // sidecar into rows per batch to call an empty callback. On nexmark q0 that was
+    // every batch in the run. Registering the same class makes the order irrelevant.
+    // Still registered here so this module stands alone (the nexmark benchmarks
+    // register these factories without installing the SQL ones).
     reg.register_sink<Row>(
         "blackhole_sink_row",
         [](const clink::plugin::BuildContext& /*ctx*/) -> std::shared_ptr<Sink<Row>> {
-            return std::make_shared<FunctionSink<Row>>([](const Row&) {}, "blackhole_sink_row");
+            return std::make_shared<clink::sql::BlackholeRowSink>();
         });
 }
 

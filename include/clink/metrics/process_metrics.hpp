@@ -40,6 +40,21 @@ inline constexpr const char* kWorkerSubtasksRunning = "clink_worker_subtasks_run
 inline constexpr const char* kWorkerSlotsCapacity = "clink_worker_slots_capacity";
 inline constexpr const char* kWorkerSlotsInUse = "clink_worker_slots_in_use";
 
+// Columnar-execution observability. The engine carries an Arrow sidecar alongside
+// a batch and only decodes it into rows when a row accessor is touched, so
+// "how often did a batch have to be materialised into rows" is the single number
+// that says whether the columnar path is actually reaching the end of a pipeline.
+// Without it the question is only answerable by inference from CPU profiles, which
+// is how a 0.37us-per-record cost in a sink that does nothing but increment a
+// counter went unexplained.
+//
+// A GAUGE of a cumulative count, deliberately: the underlying value is a plain
+// process-wide atomic incremented on the hot path (clink::detail::
+// batch_materialize_counter), and routing that through a registry lookup per
+// materialisation would cost more than the thing being measured. It is sampled at
+// scrape time instead, like the system gauges.
+inline constexpr const char* kBatchMaterializationsTotal = "clink_batch_materializations_total";
+
 inline constexpr const char* kHttpRequestsTotal = "clink_http_requests_total";
 inline constexpr const char* kHttpErrorsTotal = "clink_http_errors_total";
 

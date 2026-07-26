@@ -63,6 +63,7 @@
 #include "clink/lineage/lineage_listener.hpp"
 #ifdef CLINK_HAS_HTTP
 #include "clink/cluster/snapshots.hpp"
+#include "clink/core/record.hpp"
 #include "clink/core/types.hpp"  // operator_id_from_uid
 #include "clink/http/dashboard_assets.hpp"
 #include "clink/http/http_client.hpp"
@@ -1222,6 +1223,15 @@ clink::http::HttpResponse make_metrics_response() {
     // Sample CPU/memory/disk/FD/thread gauges right before snapshotting so the
     // exposition reflects the process state at scrape time.
     clink::metrics::sample_system_metrics();
+    // Columnar-path health, sampled the same way. The hot path only touches a
+    // process-wide atomic; publishing it here keeps the per-materialisation cost at
+    // one relaxed increment while still making the number visible on a running job.
+    // A rising count means batches are being decoded into rows somewhere, which is
+    // the cost the columnar path exists to avoid.
+    clink::MetricsRegistry::global()
+        .gauge(clink::metrics::kBatchMaterializationsTotal)
+        .set(static_cast<std::int64_t>(
+            clink::detail::batch_materialize_counter().load(std::memory_order_relaxed)));
     clink::http::HttpResponse resp;
     auto snap = clink::MetricsRegistry::global().snapshot();
     resp.body = clink::metrics::render_prometheus(snap);
@@ -2804,8 +2814,12 @@ void install_linked_impls() {
     // Synthetic 'nexmark' Row source (header-only generator): lets a SQL table
     // WITH (connector='nexmark', ...) run end to end with no external broker -
     // useful for trying the SQL workbench and for self-contained demos. Mirrors
-    // what the nexmark benchmarks register; re-registering the (already-installed)
-    // blackhole_sink_row is harmless (same as the benchmarks do).
+    // what the nexmark benchmarks register. It also re-registers
+    // blackhole_sink_row; that is safe ONLY because both sides now build the same
+    // clink::sql::BlackholeRowSink. It used to build a per-record FunctionSink, and
+    // since registration is latest-wins and this runs AFTER clink::sql::install,
+    // every node build silently ran the slow sink - a comment here called it
+    // harmless. See include/clink/sql/blackhole_row_sink.hpp.
     clink::nexmark::register_nexmark_factories(reg);
 #ifdef CLINK_LINKED_VECTOR_SEARCH
     // SQL-native AI: the vector_search_row operator. Registered after

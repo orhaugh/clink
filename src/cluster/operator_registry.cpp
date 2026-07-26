@@ -14,22 +14,61 @@
 #include "clink/operators/map_operator.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
+#include "clink/runtime/log_buffer.hpp"
 
 namespace clink::cluster {
 
+namespace {
+
+// Registration is latest-wins, which plugins rely on to override a built-in. The
+// cost of that is silence: a second registration of a name already taken replaces
+// a different implementation with no trace anywhere.
+//
+// That is not hypothetical. The nexmark register module registered
+// "blackhole_sink_row" as a per-record FunctionSink, clink_node installs the SQL
+// factories BEFORE it, and so every build of the node quietly ran a sink that
+// materialised the Arrow sidecar into rows for every batch - undoing the whole
+// columnar path at the last hop, in the very binary the nexmark benchmark measures.
+// It took a stack trace out of the row-materialisation site to find, because
+// nothing else distinguished the two.
+//
+// One line per replacement makes the next one visible. It cannot be noisy: it
+// only fires when a key is genuinely taken, which for a legitimate plugin override
+// is exactly the event worth recording.
+void note_replacement(const char* kind, const std::string& type) {
+    log::info("registry.replace",
+              std::string{"a "} + kind + " factory for '" + type +
+                  "' was already registered and has been REPLACED; "
+                  "latest registration wins");
+}
+
+}  // namespace
+
 void OperatorRegistry::register_source(std::string type, SourceFactory f) {
     std::lock_guard lock(mu_);
-    sources_[SourceKey{std::move(type), f.out}] = std::move(f);
+    const SourceKey key{std::move(type), f.out};
+    if (sources_.contains(key)) {
+        note_replacement("source", key.type);
+    }
+    sources_[key] = std::move(f);
 }
 
 void OperatorRegistry::register_operator(std::string type, OperatorFactory f) {
     std::lock_guard lock(mu_);
-    operators_[OpKey{std::move(type), f.in, f.out}] = std::move(f);
+    const OpKey key{std::move(type), f.in, f.out};
+    if (operators_.contains(key)) {
+        note_replacement("operator", key.type);
+    }
+    operators_[key] = std::move(f);
 }
 
 void OperatorRegistry::register_sink(std::string type, SinkFactory f) {
     std::lock_guard lock(mu_);
-    sinks_[SinkKey{std::move(type), f.in}] = std::move(f);
+    const SinkKey key{std::move(type), f.in};
+    if (sinks_.contains(key)) {
+        note_replacement("sink", key.type);
+    }
+    sinks_[key] = std::move(f);
 }
 
 const SourceFactory* OperatorRegistry::find_source(const std::string& type, ChannelType out) const {

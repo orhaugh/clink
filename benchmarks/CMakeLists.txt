@@ -83,6 +83,17 @@ if(TARGET clink::sql)
     clink_set_warnings(clink_columnar_groupby_bench)
 endif()
 
+# Operator FUSION A/B - the same three-stage chain as separate Dag operators (a
+# thread and a BoundedChannel per boundary) vs fused into one ChainedOperator. The
+# cloud rig measured an operator boundary at ~0.37us per record (what a blackhole
+# sink that only increments a counter cost, 16% of all worker CPU on q0), and the
+# cluster's chain dispatch stopped using ChainedOperator when it was generalised to
+# DagBuilders - so "chained" ops now share a slot but still get a thread and a
+# channel each. This measures the prize before the plumbing is rebuilt.
+add_executable(clink_fusion_bench clink_fusion_bench.cpp)
+target_link_libraries(clink_fusion_bench PRIVATE clink::sql)
+clink_set_warnings(clink_fusion_bench)
+
 # Kafka SOURCE read-rate bench. Isolates produce() - broker bytes to
 # Batch<KafkaMessage>, no decode, no operators, no channels. The split cloud rig
 # found the Kafka source to be the largest single consumer of worker CPU in every
