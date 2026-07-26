@@ -43,10 +43,38 @@ Two constructors distinguish the cases. The row constructor takes a `vector<Reco
 - `is_columnar()` returns true iff `arrow_ != nullptr`. A columnar-aware operator tests this to opt into the fast path.
 - `arrow()` hands back the `RecordBatch`.
 - `size()` / `empty()` answer from `arrow_rows_` without decoding any rows.
-- Any row accessor (`operator[]`, `begin`/`end`, `records()`) calls `materialize_rows_()`, which runs `materialize_(*arrow_)` exactly once, fills `records_`, and increments a process-wide `detail::batch_materialize_counter()`. That counter is the test/benchmark hook proving a path did zero row decode; a pure columnar chain never increments it.
+- Any row accessor (`operator[]`, `begin`/`end`, `records()`) calls `materialize_rows_()`, which runs `materialize_(*arrow_)` exactly once, fills `records_`, and increments a process-wide `detail::batch_materialize_counter()`. That counter is the test/benchmark hook proving a path did zero row decode; a pure columnar chain never increments it. It is also published on `/metrics` as **`clink_batch_materializations_total`**, sampled at scrape time so the hot path keeps costing one relaxed increment - see "Verifying the path actually fires" below, because this is the number that catches a chain being undone.
 - `with_arrow(rb, rows)` builds a sibling columnar batch over a *different* `RecordBatch` reusing this batch's `materialize_` closure. The shuffle and columnar operators use it to emit derived columnar batches (a filter result, a per-subtask gather) without naming the row type's batcher.
 
 A pure-row batch (`arrow_ == null`) behaves exactly as before: every row API and every existing operator keep working unchanged.
+
+### Verifying the path actually fires
+
+A columnar chain that is quietly undone costs MORE than never having been columnar:
+the pipeline builds the Arrow batch and then builds the rows as well. Nothing about
+the query's results changes, so it will not show up as a test failure - only as CPU.
+
+Scrape `clink_batch_materializations_total` on a running job. On a pipeline that is
+columnar end to end it stays at zero; a count that tracks the batch count means some
+stage is touching a row accessor. Two real instances, both found this way:
+
+- A **duplicate factory registration** replaced the counting `BlackholeRowSink` with a
+  per-record `FunctionSink`, so nexmark q0 materialised every batch (14,377 of 14,377)
+  and a sink whose body is `count_ += batch.size()` cost 0.37 us per record - 16% of
+  all worker CPU. Registration is latest-wins, and nothing distinguished the two
+  implementations; identifying it took a stack trace from inside `materialize_rows_()`.
+  `OperatorRegistry` now logs whenever a registration replaces an existing factory.
+- The planner's `ingests_columnar` gate in `src/sql/physical_plan.cpp` listed
+  `"window_row"`, which is not an operator type at all, while the three that do build
+  `WindowRowOp` were absent - so producers in front of a tumbling window were held back
+  to row output. That gate must be kept in step with `supports_columnar()` in
+  `install.cpp` by hand; there is no compile-time link between them, which is exactly
+  why it drifted.
+
+`clink_dataplane_local_hits_total` and `clink_dataplane_socket_fallbacks_total` answer
+the adjacent question for the wire: whether a shuffle edge between two subtasks in the
+same process hands the element over in memory or pays to encode, socket and decode it.
+On a single-worker job the fallback count should be zero.
 
 ### `ArrowBatcher<T>`: the wire seam
 

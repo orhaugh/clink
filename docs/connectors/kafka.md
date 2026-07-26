@@ -61,6 +61,34 @@ Options are read from `BuildContext` parameters in `impls/kafka/src/register_fac
 
 The `KafkaSource::Options` struct also carries `poll_timeout` (100 ms), `max_batch_size` (256), `commit_mode` (`Auto`), `enable_debug` (false) and `metric_prefix` (`default`). These are not parsed from `BuildContext` parameters in the registered factories, so they take their struct defaults unless the typed class is constructed directly.
 
+### How the source fetches
+
+`produce()` fills its batch with `rd_kafka_consume_batch_queue()` on the queue
+returned by `rd_kafka_queue_get_consumer()`, so a full batch is normally ONE fetch
+call rather than one call per record. The C++ `consume()` wrapper it replaced took
+the queue lock, dequeued a single op and heap-allocated a wrapper object for every
+record; measured against a real broker that cost 586 ns of CPU per record where the
+batched form costs 456 ns, a 22% reduction. Offset bookkeeping accumulates in a short
+scratch vector merged into the offset map once per batch (it was a red-black tree
+lookup per record for a value only the checkpoint reads), and the `consumed` /
+`consume_errors` counters increment once per batch.
+
+Polling that queue counts as a consumer poll, so `max.poll.interval.ms` keeps being
+reset and group membership behaves exactly as before. Rebalance ops travel on the same
+queue, so the seek-on-assignment callback that makes a clink checkpoint authoritative
+over Kafka's committed offset still fires - covered by
+`Kafka.SourceReplaysFromSnapshottedOffset`, which resumes at `payload-6` rather than
+`payload-0` against the mock cluster and could not do so otherwise.
+
+Roughly four fifths of the source's remaining per-record cost is librdkafka's own:
+measured with `CLINK_KAFKA_BENCH_RAW=1` (`benchmarks/clink_kafka_source_bench.cpp`),
+which runs the same batched fetch and destroys each message without building a
+`KafkaMessage`, the client library floor is 360 ns per record against clink's 456 ns.
+Wall-clock cannot see any of this: one reader against a containerised broker saturates
+the network pipe (~136 MB/s here) long before it saturates a core, so both fetch paths
+measure ~1.12M rec/s and the change reads as a 5% *regression* if judged on throughput.
+CPU per record is the metric to A/B against.
+
 ### Sink (`kafka_message_sink`, `kafka_text_sink`, `kafka_sink_string`)
 
 | Option | Required | Default | Description |

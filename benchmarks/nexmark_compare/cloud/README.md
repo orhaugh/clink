@@ -82,6 +82,69 @@ Read together rather than one column at a time:
 So the honest summary at this commit is: clink already wins decisively on cost per
 event and on memory, is ahead end to end, and is behind on peak burst rate.
 
+## Verified after the July 2026 performance pass, 2026-07-26
+
+Second provision of the same rig (2x ccx23, fsn1), clink at 00be5fe against Flink
+2.2.0 on java21, both engines on the same engine node one after the other, same 9.2M
+records across 4 partitions, parallelism 4, blackhole sink, two trials each. Flink was
+re-baselined on THIS provision rather than compared across provisions. Broker control
+from the engine node: 1.11M rec/s to four consumer threads, 2.04M rec/s fetch rate.
+
+| query | engine | sustained rec/s | end-to-end drain | cores of 4 | events/cpu-s | anon MB |
+|-------|--------|----------------:|-----------------:|-----------:|-------------:|--------:|
+| q0    | clink  | **3,252,744** | **2,967,742** | **1.08** | **799,305** | **69** |
+| q0    | flink  | 2,080,737 | 1,010,434 | 2.48 | 243,773 | 1,159 |
+| q12   | clink  | **2,175,089** | **1,540,088** | 2.09 | **322,581** | 1,412 |
+| q12   | flink  | 1,451,387 | 675,924 | 2.75 | 158,484 | 1,650 |
+
+Against the same rig's earlier baseline at 2102570:
+
+| | q0 then | q0 now | q12 then | q12 now |
+|---|---:|---:|---:|---:|
+| throughput vs Flink | 0.76x | **1.56x** | 0.83x | **1.50x** |
+| efficiency vs Flink | 1.84x | **3.28x** | 1.93x | **2.04x** |
+| events/cpu-s | 420,668 | **799,305** | 286,604 | **322,581** |
+| memory vs Flink | 6.9x lower | **16.7x lower** | 6.0x lower | 1.2x lower |
+
+Total worker CPU for the same 9.2M records fell from 20.9s to 11.2s, and the
+per-thread attribution says exactly which fixes did it:
+
+| stage | 2102570 | 00be5fe | |
+|-------|--------:|--------:|---|
+| kafka_text_source | 7.90s (37.8%) | 3.05s (27.3%) | batched fetch, -61% |
+| blackhole_sink | 3.36s (16.1%) | 0.28s (2.5%) | duplicate registration fixed, -92% |
+| json_string_to_row | 4.56s (21.8%) | 3.82s (34.1%) | now the largest single item |
+| rdk:broker1 | 3.71s (17.8%) | 2.94s (26.3%) | |
+| network_bridge | 0.89s (4.3%) | 0.62s (5.5%) | |
+| project_row | 0.45s (2.2%) | 0.48s (4.3%) | |
+| **total** | **20.9s** | **11.2s** | **1.87x less CPU** |
+
+The run is CPU-bound, so a 1.87x CPU reduction is what the 1.75x throughput rise on
+q0 comes from. Nothing here changed the amount of work the queries do.
+
+### One regression, unexplained
+
+q0 memory improved (69 MB anon, from 169 MB), which is consistent with no longer
+building name-keyed rows. **q12 memory went the other way: 1,412 MB against 277 MB at
+the baseline**, so clink's memory advantage on q12 fell from 6.0x to 1.2x. It is
+recorded here rather than left out of the table.
+
+Two candidate causes were tested on the rig and neither accounts for it:
+
+- **Born-columnar output into the window** (the `tumbling_window_row` gate fix):
+  ruled out. `CLINK_DISABLE_COLUMNAR_OUTPUT=1` measured 1,425 MB against 1,468 MB
+  with it on - no material difference.
+- **In-flight batching.** Channels are bounded by ELEMENT count (1024) rather than
+  by bytes or records, and each element is a batch of up to 1024 records, so a
+  channel can hold ~1M records and a faster source fills more of them. Shrinking the
+  source batch 8x (`max_batch_size='128'`) cut memory to 1,109 MB - a real effect, but
+  only about a quarter of the gap, so it is a contributor and not the cause.
+
+What remains is not diagnosed and no explanation is offered for it here. Byte-bounded
+(rather than element-bounded) channel capacity is worth having on its own merits, but
+choosing a capacity needs a measured sweep on a rig that can saturate the engine, not
+a guess.
+
 ## Where clink's CPU actually goes
 
 `thread_cpu.py` attributes a worker's CPU to thread names by differencing

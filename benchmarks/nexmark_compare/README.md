@@ -11,6 +11,21 @@ Read `pipeline.md` FIRST. It pins every dimension a quoted number depends on
 correctness gate, and the only honest headline). A number printed without that
 premise holding is not apples-to-apples.
 
+## The cross-engine numbers live on the cloud rig
+
+The single-box harness in this directory cannot separate the two engines: with the
+broker, both engines and every container on the same cores, clink's q0 has been
+recorded at both 1.06M and 571k rec/s for the SAME configuration. Use it for the
+correctness gate (`run.sh`, which verifies identical output-row counts between
+engines) and for clink-vs-clink A/B where the premise is held fixed.
+
+For a cross-engine throughput or efficiency claim, use `cloud/` - a two-node Hetzner
+rig with the broker on its own node and four dedicated vCPUs for whichever engine is
+being measured. Flink reproduces to within 4% there. `cloud/README.md` carries the
+current numbers, the per-thread CPU attribution, and one memory regression that is
+recorded rather than omitted.
+
+
 ## Why this exists
 
 clink's own Nexmark bench (`benchmarks/clink_nexmark_bench`) is clink-only:
