@@ -47,6 +47,12 @@ ARG CLINK_WITH_FORST=OFF
 # `clink_node --version` prints the allocator, so an image can be checked rather
 # than assumed.
 ARG CLINK_WITH_JEMALLOC=OFF
+# Raise the instruction-set baseline for compiled code, e.g. x86-64-v3 (AVX2) or
+# x86-64-v4 (AVX-512). Empty = the toolchain default, which on x86-64 is SSE2.
+# A PORTABILITY decision: an image built this way will not run on CPUs below the
+# chosen level, which is why it is empty by default for a published image.
+#   docker build --build-arg CLINK_ISA_BASELINE=x86-64-v3 ...
+ARG CLINK_ISA_BASELINE=
 # CLINK_BUILD_SQL=ON so clink_node registers the SQL operator factories
 # (json_string_to_row, window_row, equi_join_row, ...) - required to run SQL
 # jobs (e.g. the Nexmark queries) against a containerized cluster; without it the
@@ -60,6 +66,7 @@ RUN if [ "${CLINK_WITH_JEMALLOC}" != "OFF" ]; then \
  && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCLINK_BUILD_SQL=ON \
         -DCLINK_WITH_FORST=${CLINK_WITH_FORST} \
         -DCLINK_WITH_JEMALLOC=${CLINK_WITH_JEMALLOC} \
+        -DCLINK_ISA_BASELINE=${CLINK_ISA_BASELINE} \
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
     && cmake --build build --target clink_node \
     && cmake --build build --target clink \

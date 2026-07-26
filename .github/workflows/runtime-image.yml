@@ -38,6 +38,10 @@ on:
         description: "Tag of the ghcr clink-build toolchain image to build against."
         type: string
         default: "main"
+      isa_baseline:
+        description: "Raise the ISA baseline for compiled code (e.g. x86-64-v3 for AVX2). Empty = toolchain default. Publishes an -isa<level> suffixed tag so it never overwrites the portable image."
+        type: string
+        default: ""
       with_forst:
         description: "Bake in the ForSt state backend (forst:// and the forst_s3 schemes). Adds ~5-8 min and publishes -forst suffixed tags."
         type: boolean
@@ -95,6 +99,11 @@ jobs:
           set -euo pipefail
           suffix=""
           if [ "${{ inputs.with_forst }}" = "true" ]; then suffix="-forst"; fi
+          # An ISA-raised image is NOT portable (it faults on CPUs below the level),
+          # so it must never take the :main or :latest tag a deployment pulls blindly.
+          # The suffix keeps it addressable for an A/B while leaving those alone.
+          isa="${{ inputs.isa_baseline }}"
+          if [ -n "$isa" ]; then suffix="${suffix}-isa$(echo "$isa" | tr -cd 'a-zA-Z0-9')"; fi
           short="$(echo "${GITHUB_SHA}" | cut -c1-12)"
           tags="${IMAGE}:sha-${short}${suffix}"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
@@ -116,6 +125,7 @@ jobs:
           build-args: |
             BASE_IMAGE=${{ env.TOOLCHAIN }}:${{ inputs.toolchain_tag || 'main' }}
             CLINK_WITH_FORST=${{ inputs.with_forst == true && 'ON' || 'OFF' }}
+            CLINK_ISA_BASELINE=${{ inputs.isa_baseline }}
           tags: ${{ steps.tags.outputs.tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

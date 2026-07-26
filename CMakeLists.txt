@@ -269,6 +269,41 @@ endif()
 set(CLINK_SIMDJSON_AMALGAMATED_DIR "${simdjson_src_SOURCE_DIR}/singleheader")
 
 # ---------------------------------------------------------------------------
+# Instruction-set baseline (opt-in).
+#
+# Empty by default, which means clink's own code compiles for the toolchain's
+# baseline - on x86-64 that is SSE2, so a hand-written autovectorisable loop gets
+# 128-bit vectors on a machine that has 256- or 512-bit ones. The libraries doing
+# the heaviest lifting (simdjson, Arrow) are unaffected either way: they compile
+# every implementation and dispatch on the CPU at RUNTIME.
+#
+# Setting this raises the floor for OUR loops - e.g. x86-64-v3 for AVX2 (Haswell,
+# 2013+) or x86-64-v4 for AVX-512. It is a PORTABILITY decision, not just a
+# performance one: a binary built this way executes illegal instructions on an older
+# CPU, and clink ships a container image and Python wheels. Left off by default for
+# exactly that reason; set it for a deployment whose hardware floor is known.
+#
+# Applied globally (add_compile_options) rather than per-target, so bundled
+# third-party code compiled in this tree gets the same baseline as the engine.
+set(CLINK_ISA_BASELINE "" CACHE STRING
+    "Raise the instruction-set baseline for compiled code, e.g. x86-64-v3 (AVX2) or \
+x86-64-v4 (AVX-512). Empty = the toolchain default. Binaries will NOT run on CPUs \
+below the chosen level.")
+if(NOT CLINK_ISA_BASELINE STREQUAL "")
+    include(CheckCXXCompilerFlag)
+    set(_clink_isa_flag "-march=${CLINK_ISA_BASELINE}")
+    check_cxx_compiler_flag("${_clink_isa_flag}" CLINK_ISA_FLAG_OK)
+    if(NOT CLINK_ISA_FLAG_OK)
+        message(FATAL_ERROR
+            "CLINK_ISA_BASELINE=${CLINK_ISA_BASELINE} rejected by this compiler "
+            "(tried ${_clink_isa_flag}). Use a level this toolchain knows, or leave "
+            "the option empty.")
+    endif()
+    add_compile_options("${_clink_isa_flag}")
+    message(STATUS "clink: ISA baseline - ${_clink_isa_flag} (binaries require this level)")
+endif()
+
+# ---------------------------------------------------------------------------
 # Process allocator (opt-in).
 #
 # Linked into clink_core PUBLIC, so every binary built from this tree and every
