@@ -84,6 +84,10 @@ event and on memory, is ahead end to end, and is behind on peak burst rate.
 
 ## Verified after the July 2026 performance pass, 2026-07-26
 
+> Read the third-provision figures below for the current numbers; the ratios in this
+> section were measured on the second provision and the per-provision machine variance
+> is larger than the changes made since (see "The 2026-07-26 verification run").
+
 Second provision of the same rig (2x ccx23, fsn1), clink at 00be5fe against Flink
 2.2.0 on java21, both engines on the same engine node one after the other, same 9.2M
 records across 4 partitions, parallelism 4, blackhole sink, two trials each. Flink was
@@ -122,28 +126,110 @@ per-thread attribution says exactly which fixes did it:
 The run is CPU-bound, so a 1.87x CPU reduction is what the 1.75x throughput rise on
 q0 comes from. Nothing here changed the amount of work the queries do.
 
-### One regression, unexplained
+### Memory, and the q12 figure explained
 
-q0 memory improved (69 MB anon, from 169 MB), which is consistent with no longer
-building name-keyed rows. **q12 memory went the other way: 1,412 MB against 277 MB at
-the baseline**, so clink's memory advantage on q12 fell from 6.0x to 1.2x. It is
-recorded here rather than left out of the table.
+The stateless case is emphatic and is what a native engine should look like: on q0
+clink holds **72 MB** of anonymous memory against Flink's **1,146 MB - 16x lower**,
+reproducibly, and the peak is 87 MB against 1,513 MB.
 
-Two candidate causes were tested on the rig and neither accounts for it:
+q12 is the interesting one: 1,230-1,416 MB against Flink's 1,505-1,555 MB, only ~1.1x
+lower, which does not look like a C++-versus-JVM result at all. Four hypotheses were
+tested on the rig and three are wrong:
 
-- **Born-columnar output into the window** (the `tumbling_window_row` gate fix):
-  ruled out. `CLINK_DISABLE_COLUMNAR_OUTPUT=1` measured 1,425 MB against 1,468 MB
-  with it on - no material difference.
-- **In-flight batching.** Channels are bounded by ELEMENT count (1024) rather than
-  by bytes or records, and each element is a batch of up to 1024 records, so a
-  channel can hold ~1M records and a faster source fills more of them. Shrinking the
-  source batch 8x (`max_batch_size='128'`) cut memory to 1,109 MB - a real effect, but
-  only about a quarter of the gap, so it is a contributor and not the cause.
+| hypothesis | test | result |
+|---|---|---|
+| glibc arena retention | `MALLOC_ARENA_MAX=2` | 1,419 -> 405 MB, but throughput HALVED (q0 2.98M -> 1.57M rec/s). The memory fell because the pipeline slowed, not because retention was released. |
+| allocator generally | jemalloc via LD_PRELOAD, same binary | memory UNCHANGED (1,342-1,409 MB). Not retention. |
+| the columnar path retaining Arrow batches in panes | `CLINK_DISABLE_COLUMNAR=1` | 1,416 -> **4,663 MB**. The columnar path is *saving* 3.3x, not causing it. |
+| in-flight batching | source `max_batch_size` 1024 -> 128 | 1,468 -> 1,109 MB, about a quarter of it. A contributor, not the cause. |
 
-What remains is not diagnosed and no explanation is offered for it here. Byte-bounded
-(rather than element-bounded) channel capacity is worth having on its own merits, but
-choosing a capacity needs a measured sweep on a rig that can saturate the engine, not
-a guess.
+Sampling memory against records consumed settles it:
+
+    t=6s   3,825,920 records   861 MB
+    t=8s   8,484,608 records  1,309 MB
+    t=12s  9,200,000 records  1,260 MB   (ingest complete)
+    t=20s  9,200,000 records  1,260 MB   flat
+    t=30s  9,200,000 records  1,260 MB   flat
+
+It grows with ingest and then stops dead. That is **un-fired window state**: panes for
+(bidder, window) groups that no watermark has yet closed. It does not release after
+ingest because with no further input there is no watermark to advance and fire them,
+which is ordinary streaming behaviour at end of stream, not a leak.
+
+So the earlier "unexplained regression" (277 MB at 2102570 against 1,4xx MB now) has a
+cause, and it is the speed-up itself: at 2102570 the blackhole sink cost 0.37us per
+record and throttled ingest, so panes fired closer to real time and less window state
+was ever resident at once. A faster engine holds more concurrent window state for the
+same query. Both engines are dominated by that same state on q12, which is why clink's
+16x advantage on the stateless query narrows to ~1.1x here - and clink is still the
+lower of the two.
+
+Worth keeping in mind when quoting memory: **clink's advantage is in the engine, not in
+the state**. On stateless work it is an order of magnitude; on a large windowed
+aggregation both engines mostly hold the user's data.
+
+### Third provision, 2026-07-26: clink at 1eb6fae vs Flink on the same node
+
+| query | engine | sustained rec/s | end-to-end drain | cores of 4 | events/cpu-s | anon MB |
+|-------|--------|----------------:|-----------------:|-----------:|-------------:|--------:|
+| q0    | clink  | **2,977,002** | **2,791,462** | **1.08** | **709,877** | **70** |
+| q0    | flink  | 2,289,062 | 1,057,958 | 2.58 | 233,207 | 1,146 |
+| q12   | clink  | **1,872,542** | **1,587,132** | 2.16 | **310,811** | 1,230 |
+| q12   | flink  | 1,601,015 | 707,311 | 2.99 | 155,091 | 1,505 |
+
+    q0 : 1.30x throughput, 3.04x efficiency, 16.4x lower memory
+    q12: 1.17x throughput, 2.00x efficiency,  1.2x lower memory
+
+The efficiency and memory columns are the durable results; the throughput ratio moves
+several tens of percent between provisions (1.56x and 1.30x for q0 on two different
+machines at effectively the same commit), so quote it as "ahead", not to two decimals.
+
+### jemalloc: measured, worth having, not a memory fix
+
+Tested by deriving an image from the SAME clink binary with `libjemalloc2` preloaded, so
+the only variable is the allocator. Two trials each against glibc on the same node:
+
+| | glibc | jemalloc | |
+|---|---:|---:|---|
+| q0 sustained | 2.92-3.07M | 3.08-3.09M | ~neutral |
+| q0 events/cpu-s | 726k (mean) | 735k (mean) | ~neutral |
+| q0 anon MB | 70-74 | 72-73 | no change |
+| q12 sustained | 1.84-1.87M | 1.96M | **+5%** |
+| q12 events/cpu-s | 307-311k | 306-331k | ~neutral |
+| q12 anon MB | 1,230-1,362 | 1,342-1,409 | no change |
+
+So: a real ~5% throughput gain on the stateful query, nothing on the stateless one, and
+**no memory benefit at all** - which is itself the useful result, because it rules the
+allocator out as the explanation for q12's memory (see above).
+
+That malloc is on the critical path at all is not in doubt: capping glibc to two arenas
+halves throughput. jemalloc's per-thread caches are why it does not pay that contention
+while still not retaining like the arena-capped case.
+
+Not adopted as a hard dependency on a 5%-on-one-query result. The sensible shape is to
+keep it opt-in - preload it in a deployment that wants it, exactly as measured here -
+and revisit if a workload shows more. Recorded so the question is not re-opened without
+these numbers.
+
+### The 2026-07-26 verification run, and the decode work on top of it
+
+A third provision measured clink at 1eb6fae (the JSON-decode pass) against Flink
+re-baselined on that machine. Two things it established:
+
+**Machine-to-machine variance between provisions is real and larger than the decode
+change.** clink q0 read 799k events/cpu-s on the second provision and 710k on the
+third, at commits one apart. A SAME-MACHINE A/B settles it: pulling both
+`:sha-00be5fe7546d` and `:sha-1eb6faea2859` onto one node and running q0 twice each
+gave **726k events/cpu-s for both** - identical within noise. So a cross-engine ratio
+must come from one provision (Flink re-baselined alongside), and a clink-vs-clink delta
+of a few percent needs the two images on the same node.
+
+**The decode work does not show end to end on x86.** It is +19% on the decode measured
+in isolation - but that was measured on ARM (the development machine), and its largest
+single component was replacing a `memcmp` call with an inline byte loop, which is a win
+where the call dominates and a wash where the platform ships an AVX2 `memcmp`. Neutral
+on x86, not a regression. Worth remembering before optimising byte-level code on the
+dev machine and assuming it carries.
 
 ## Where clink's CPU actually goes
 
