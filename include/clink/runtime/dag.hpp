@@ -106,23 +106,43 @@ struct OperatorRunner {
 // no-double-emit) a false return happens BEFORE any emit, so the caller falls
 // back to op->process(). Templated on the operator pointer so it deduces In/Out
 // without the runner needing to name them.
-template <class OpPtr, class Elem, class Em>
-inline bool try_process_columnar(const OpPtr& op, const Elem& element, Em& out) {
-    // Diagnostic / benchmark lever: CLINK_DISABLE_COLUMNAR=1 forces the row path
-    // (op->process()) even when a columnar fast path is available, so an A/B can
-    // isolate the columnar-execution win on byte-identical input. Read once and
-    // cached; the branch is free when unset. Not a production tuning knob - it
-    // only ever makes the engine slower (no correctness effect: process() is the
-    // authoritative path the columnar fast path must already match).
-    static const bool columnar_disabled = [] {
+// Diagnostic / benchmark lever: CLINK_DISABLE_COLUMNAR=1 forces the row path
+// everywhere a columnar fast path exists - operator ingest AND the terminal sink
+// hook - so an A/B isolates the whole columnar axis on byte-identical input.
+// Read once and cached; the branch is free when unset. Not a production tuning
+// knob: it only ever makes the engine slower, with no correctness effect, since
+// the row path is the authoritative one the columnar path must already match.
+inline bool columnar_enabled() {
+    static const bool disabled = [] {
         const char* e = std::getenv("CLINK_DISABLE_COLUMNAR");
         return e != nullptr && e[0] == '1';
     }();
-    if (columnar_disabled) {
+    return !disabled;
+}
+
+template <class OpPtr, class Elem, class Em>
+inline bool try_process_columnar(const OpPtr& op, const Elem& element, Em& out) {
+    if (!columnar_enabled()) {
         return false;
     }
     return op->supports_columnar() && element.is_data() && element.as_data().is_columnar() &&
            op->process_columnar(element, out);
+}
+
+// Terminal mirror of try_process_columnar: hand a columnar batch straight to a
+// sink that can take one, so the sidecar is not materialised at the last hop just
+// to feed a per-record callback. Without this a columnar chain is undone at the
+// end - the blackhole sink builds a name-keyed row per record to call a callback
+// with an empty body (measured at +0.54s on a 1.02s q0 decode).
+//
+// Same no-double-consume contract as process_columnar: a sink returns false only
+// before consuming anything, and the caller then delivers via on_data.
+template <typename SinkPtr, typename T>
+[[nodiscard]] inline bool try_sink_columnar(SinkPtr* sink, const Batch<T>& batch) {
+    if (!columnar_enabled() || !sink->supports_columnar() || !batch.is_columnar()) {
+        return false;
+    }
+    return sink->on_data_columnar(batch);
 }
 
 }  // namespace detail
@@ -3644,7 +3664,9 @@ public:
                         }
                         any_progress = true;
                         if (m->is_data()) {
-                            sink->on_data(m->as_data());
+                            if (!detail::try_sink_columnar(sink.get(), m->as_data())) {
+                                sink->on_data(m->as_data());
+                            }
                         } else if (m->is_watermark()) {
                             if (auto adv = align.on_watermark(k, m->as_watermark()); adv.forward) {
                                 sink->on_watermark(adv.watermark);
@@ -3872,7 +3894,9 @@ public:
                     // Pass by rvalue so move-aware sinks (e.g.
                     // NetworkBridgeSink forwarding to a channel) can
                     // take ownership instead of deep-copying.
-                    sink->on_data(std::move(maybe->as_data()));
+                    if (!detail::try_sink_columnar(sink.get(), maybe->as_data())) {
+                        sink->on_data(std::move(maybe->as_data()));
+                    }
                 } else if (maybe->is_watermark()) {
                     sink->on_watermark(maybe->as_watermark());
                 } else if (maybe->is_drain()) {

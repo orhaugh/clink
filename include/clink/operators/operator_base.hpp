@@ -1128,6 +1128,28 @@ public:
     // owns the StreamElement that holds the batch and does not
     // observe it after the on_data call, so the move is safe.
     virtual void on_data(Batch<In>&& batch) { on_data(static_cast<const Batch<In>&>(batch)); }
+
+    // Columnar terminal hook, mirroring the operator-side supports_columnar() /
+    // process_columnar() pair (see above and docs/internals/columnar-execution.md).
+    //
+    // Without it a columnar batch is undone at the very last hop: on_data takes a
+    // Batch<In> and the first row accessor materialises the whole sidecar. On the
+    // blackhole sink that means building a name-keyed row per record - allocations,
+    // string keys, a binary search per column - so that a callback with an EMPTY
+    // BODY can be invoked. Measured on the q0 hot path: materialisation costs
+    // +0.54s on top of a 1.02s decode, i.e. half as much again as parsing the JSON.
+    //
+    // It also unblocks the producer side. enable_columnar_output() refuses to let
+    // the last operator before a sink emit born-columnar, precisely because the
+    // sink would materialise it; a sink that answers true here counts as a
+    // columnar consumer and that restriction lifts.
+    //
+    // Same contract as process_columnar: return false ONLY before consuming
+    // anything, because false means "fall back to on_data" and the runner will
+    // then deliver the same batch again.
+    [[nodiscard]] virtual bool supports_columnar() const noexcept { return false; }
+    virtual bool on_data_columnar(const Batch<In>& /*batch*/) { return false; }
+
     virtual void on_watermark(Watermark /*wm*/) {}
     virtual void on_barrier(CheckpointBarrier /*b*/) {}
     // 2PC phase-2 hook. Called when the coordinator has confirmed checkpoint

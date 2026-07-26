@@ -4375,6 +4375,34 @@ enum class EquiJoinKind { Inner, LeftOuter, RightOuter, FullOuter };
 // <alias>_<col> for every column on each side (built from the column
 // lists), with the absent side filled with nulls. State is unbounded;
 // bound the inputs or add TTL for production.
+// Discard sink that counts without materialising. A FunctionSink<Row> iterates
+// the batch, and the first row accessor decodes the whole Arrow sidecar into
+// name-keyed rows - allocations, string keys and a binary search per column, per
+// record - purely to call a callback whose body is empty. Answering the columnar
+// hook lets the runner hand over the batch untouched and take the row count from
+// the sidecar, and (via enable_columnar_output) lets the operator UPSTREAM emit
+// born-columnar too, which the planner otherwise forbids in front of a sink.
+//
+// Measured on the q0 hot path: materialisation cost +0.54s on a 1.02s decode.
+class BlackholeRowSink final : public Sink<Row> {
+public:
+    void on_data(const Batch<Row>& batch) override {
+        // Row form: count without touching a row accessor. size() answers from
+        // the sidecar when there is one and from the vector otherwise, so this
+        // never materialises either.
+        count_ += batch.size();
+    }
+    [[nodiscard]] bool supports_columnar() const noexcept override { return true; }
+    bool on_data_columnar(const Batch<Row>& batch) override {
+        count_ += batch.size();
+        return true;
+    }
+    [[nodiscard]] std::uint64_t count() const noexcept { return count_; }
+
+private:
+    std::uint64_t count_{0};
+};
+
 class EquiJoinRowOp final : public CoOperator<Row, Row, Row> {
 public:
     EquiJoinRowOp(std::string left_key_column,
@@ -8330,10 +8358,10 @@ void install(clink::plugin::PluginRegistry& reg) {
     // here (row_sink_binding_for). Lets a pipeline run without sink I/O so a
     // benchmark measures the engine, not the output connector; also handy for
     // driving a job whose output is irrelevant. No params.
-    reg.register_sink<Row>(
-        "blackhole_sink_row", [](const BuildContext& /*ctx*/) -> std::shared_ptr<Sink<Row>> {
-            return std::make_shared<FunctionSink<Row>>([](const Row&) {}, "blackhole_sink_row");
-        });
+    reg.register_sink<Row>("blackhole_sink_row",
+                           [](const BuildContext& /*ctx*/) -> std::shared_ptr<Sink<Row>> {
+                               return std::make_shared<BlackholeRowSink>();
+                           });
 
     // print_sink_row: line-per-record JSON to stdout - the demo/debug sink
     // behind the embedded runner's bare-SELECT output. connector='print' maps

@@ -2283,9 +2283,13 @@ void enable_columnar_output(cluster::JobGraphSpec& spec) {
     // listed here costs performance (its input materialises anyway), an op
     // wrongly missing costs an optimisation, and neither changes results.
     auto ingests_columnar = [](const std::string& t) {
+        // Operators whose process_columnar ingests a sidecar without materialising,
+        // AND sinks that answer the terminal hook (Sink::supports_columnar). Sinks
+        // count because a producer in front of one is otherwise forced back to row
+        // form - the restriction existed only because every sink materialised.
         return t == "filter_row_predicate" || t == "project_row" || t == "row_compute_key" ||
                t == "aggregate_row" || t == "window_row" || t == "session_window_row" ||
-               t == "assign_timestamps_row";
+               t == "assign_timestamps_row" || t == "blackhole_sink_row";
     };
     // id -> the ops taking it as input. An op with no consumer at all feeds the
     // sink, which is row-form in every connector today.
@@ -2311,7 +2315,7 @@ void enable_columnar_output(cluster::JobGraphSpec& spec) {
         }
         const auto it = consumers.find(op.id);
         if (it == consumers.end() || it->second.empty()) {
-            continue;  // feeds a sink directly: the sink would materialise it
+            continue;  // nothing consumes it at all
         }
         const bool all_columnar =
             std::all_of(it->second.begin(), it->second.end(), [&](const cluster::OperatorSpec* c) {

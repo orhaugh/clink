@@ -56,6 +56,15 @@ if(TARGET clink::sql)
     target_link_libraries(clink_nexmark_bench PRIVATE clink::sql)
     clink_set_warnings(clink_nexmark_bench)
 
+    # Hot-path rig for the nexmark shapes, meant to be run under a sampling
+    # profiler: the same operator chain in ONE process over pre-materialised
+    # input, with no broker, network or deploy in the way. Not a throughput
+    # claim - the containerised harness owns that - but the only way to see
+    # where engine time actually goes.
+    add_executable(clink_hotpath_bench clink_hotpath_bench.cpp)
+    target_link_libraries(clink_hotpath_bench PRIVATE clink::sql)
+    clink_set_warnings(clink_hotpath_bench)
+
     # nexmark_compare/INC 2: shared-input producer. Runs the Nexmark generator
     # once and dumps the canonical dataset as per-type NDJSON for the
     # cross-engine harness to load into Kafka (both engines read identical bytes).
