@@ -55,6 +55,19 @@ inline constexpr const char* kWorkerSlotsInUse = "clink_worker_slots_in_use";
 // scrape time instead, like the system gauges.
 inline constexpr const char* kBatchMaterializationsTotal = "clink_batch_materializations_total";
 
+// Data-plane routing. A shuffle edge between two subtasks in the SAME process can
+// hand the StreamElement over in memory instead of encoding it, sending it over a
+// socket and decoding it again. LocalDataPlane counted both outcomes already, but
+// nothing read the counters, so whether the fast path fires was unknowable from
+// outside a debugger - and it had in fact been dead in every container deployment
+// until 3cd2058, which nothing would have revealed either.
+//
+// A rising fallback count on a single-worker job means edges that could pass a
+// pointer are paying for serialisation instead.
+inline constexpr const char* kDataplaneLocalHitsTotal = "clink_dataplane_local_hits_total";
+inline constexpr const char* kDataplaneSocketFallbacksTotal =
+    "clink_dataplane_socket_fallbacks_total";
+
 inline constexpr const char* kHttpRequestsTotal = "clink_http_requests_total";
 inline constexpr const char* kHttpErrorsTotal = "clink_http_errors_total";
 

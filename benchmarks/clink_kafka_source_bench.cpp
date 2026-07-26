@@ -33,6 +33,14 @@
 // Knobs: CLINK_KAFKA_BATCH (max_batch_size, default 1024), CLINK_KAFKA_TRIALS
 // (default 3, each with a fresh consumer group so every trial re-reads from the
 // beginning rather than resuming at a committed offset and measuring nothing).
+//
+// CLINK_KAFKA_BENCH_RAW=1 measures the FLOOR instead: the same batched fetch, but
+// each message destroyed immediately without building a KafkaMessage. Everything
+// librdkafka charges to deliver a record - fetch-response parsing on its broker
+// threads, one op per message, the queue - is in that number and none of clink's
+// per-record work is. The difference between the two modes is the only part of the
+// source cost that optimising clink can address, and knowing it stops effort going
+// somewhere it cannot pay off.
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -40,8 +48,10 @@
 #include <iostream>
 #include <string>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
+#include <librdkafka/rdkafka.h>
 #include <sys/resource.h>
 
 #include "clink/connectors/kafka_source.hpp"
@@ -89,6 +99,93 @@ struct Tally {
     std::uint64_t batches{0};
 };
 
+// The librdkafka floor: subscribe, batch-fetch, destroy. No KafkaMessage, no
+// payload copy, no offset bookkeeping - so what remains is what the client library
+// charges to hand over a record, which clink cannot optimise away.
+int run_raw_floor(const std::string& brokers,
+                  const std::string& topic,
+                  std::uint64_t target,
+                  std::uint64_t batch_size,
+                  std::uint64_t trials) {
+    std::cout << "kafka source bench (RAW librdkafka floor): brokers=" << brokers
+              << " topic=" << topic << " records=" << target << " batch=" << batch_size << "\n\n";
+    double best_cpu_ns = 0.0;
+    for (std::uint64_t t = 1; t <= trials; ++t) {
+        char errstr[512];
+        rd_kafka_conf_t* conf = rd_kafka_conf_new();
+        const std::string gid = "clink-raw-bench-" + std::to_string(static_cast<long>(::getpid())) +
+                                "-" + std::to_string(t);
+        // Same settings the source sets, so the floor is measured under the same
+        // client configuration and not a more permissive one.
+        for (const auto& [k, v] :
+             std::vector<std::pair<std::string, std::string>>{{"bootstrap.servers", brokers},
+                                                              {"group.id", gid},
+                                                              {"auto.offset.reset", "earliest"},
+                                                              {"enable.partition.eof", "false"},
+                                                              {"enable.auto.commit", "false"}}) {
+            if (rd_kafka_conf_set(conf, k.c_str(), v.c_str(), errstr, sizeof(errstr)) !=
+                RD_KAFKA_CONF_OK) {
+                std::cerr << "conf " << k << ": " << errstr << "\n";
+                rd_kafka_conf_destroy(conf);
+                return 1;
+            }
+        }
+        rd_kafka_t* rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr, sizeof(errstr));
+        if (rk == nullptr) {
+            std::cerr << "rd_kafka_new: " << errstr << "\n";
+            return 1;
+        }
+        rd_kafka_poll_set_consumer(rk);
+        rd_kafka_topic_partition_list_t* subs = rd_kafka_topic_partition_list_new(1);
+        rd_kafka_topic_partition_list_add(subs, topic.c_str(), RD_KAFKA_PARTITION_UA);
+        rd_kafka_subscribe(rk, subs);
+        rd_kafka_topic_partition_list_destroy(subs);
+        rd_kafka_queue_t* q = rd_kafka_queue_get_consumer(rk);
+
+        std::vector<rd_kafka_message_t*> buf(static_cast<std::size_t>(batch_size));
+        std::uint64_t got_total = 0;
+        // Warm past the group join before the clock starts, as the non-raw path does.
+        const auto join_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (got_total == 0 && std::chrono::steady_clock::now() < join_deadline) {
+            const ssize_t n = rd_kafka_consume_batch_queue(q, 200, buf.data(), buf.size());
+            for (ssize_t i = 0; i < n; ++i) {
+                rd_kafka_message_destroy(buf[static_cast<std::size_t>(i)]);
+            }
+            if (n > 0) {
+                got_total += static_cast<std::uint64_t>(n);
+            }
+        }
+        const double cpu0 = cpu_seconds();
+        const auto t0 = std::chrono::steady_clock::now();
+        std::uint64_t measured = 0;
+        while (measured < target) {
+            const ssize_t n = rd_kafka_consume_batch_queue(q, 200, buf.data(), buf.size());
+            if (n <= 0) {
+                break;
+            }
+            for (ssize_t i = 0; i < n; ++i) {
+                rd_kafka_message_destroy(buf[static_cast<std::size_t>(i)]);
+            }
+            measured += static_cast<std::uint64_t>(n);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double cpu1 = cpu_seconds();
+        rd_kafka_queue_destroy(q);
+        rd_kafka_consumer_close(rk);
+        rd_kafka_destroy(rk);
+
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        const double cpu_ns =
+            measured > 0 ? (cpu1 - cpu0) / static_cast<double>(measured) * 1e9 : 0.0;
+        best_cpu_ns = best_cpu_ns > 0 ? std::min(best_cpu_ns, cpu_ns) : cpu_ns;
+        std::cout << "trial " << t << ": " << measured << " records in " << secs
+                  << "s = " << static_cast<std::uint64_t>(static_cast<double>(measured) / secs)
+                  << " rec/s wall, " << static_cast<std::uint64_t>(cpu_ns) << " ns/record CPU\n";
+    }
+    std::cout << "\nfloor: " << static_cast<std::uint64_t>(best_cpu_ns) << " ns/record CPU\n";
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -97,12 +194,16 @@ int main() {
     const std::uint64_t target = env_u64("CLINK_KAFKA_RECORDS", 1'000'000);
     const std::uint64_t batch_size = env_u64("CLINK_KAFKA_BATCH", 1024);
     const std::uint64_t trials = env_u64("CLINK_KAFKA_TRIALS", 3);
+    const bool raw = env_u64("CLINK_KAFKA_BENCH_RAW", 0) != 0;
 
     if (!clink::KafkaSource::is_real_implementation()) {
         std::cerr << "built without librdkafka - nothing to measure\n";
         return 77;
     }
 
+    if (raw) {
+        return run_raw_floor(brokers, topic, target, batch_size, trials);
+    }
     std::cout << "kafka source bench: brokers=" << brokers << " topic=" << topic
               << " records=" << target << " max_batch_size=" << batch_size << " trials=" << trials
               << "\n\n";

@@ -78,6 +78,7 @@
 #include "clink/queryable_state/live_export.hpp"
 #include "clink/queryable_state/registry.hpp"
 #include "clink/queryable_state/server.hpp"
+#include "clink/runtime/network/local_data_plane.hpp"
 #endif
 #include "clink/config/json.hpp"
 #include "clink/plugin/abi_version.hpp"
@@ -1232,6 +1233,17 @@ clink::http::HttpResponse make_metrics_response() {
         .gauge(clink::metrics::kBatchMaterializationsTotal)
         .set(static_cast<std::int64_t>(
             clink::detail::batch_materialize_counter().load(std::memory_order_relaxed)));
+    // Data-plane routing, same sampled-gauge treatment. Says whether same-process
+    // shuffle edges hand elements over in memory or fall back to a socket.
+    {
+        const auto& dp = clink::network::LocalDataPlane::instance();
+        clink::MetricsRegistry::global()
+            .gauge(clink::metrics::kDataplaneLocalHitsTotal)
+            .set(static_cast<std::int64_t>(dp.local_hits()));
+        clink::MetricsRegistry::global()
+            .gauge(clink::metrics::kDataplaneSocketFallbacksTotal)
+            .set(static_cast<std::int64_t>(dp.socket_fallbacks()));
+    }
     clink::http::HttpResponse resp;
     auto snap = clink::MetricsRegistry::global().snapshot();
     resp.body = clink::metrics::render_prometheus(snap);

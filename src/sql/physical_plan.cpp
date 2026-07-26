@@ -2287,8 +2287,16 @@ void enable_columnar_output(cluster::JobGraphSpec& spec) {
         // AND sinks that answer the terminal hook (Sink::supports_columnar). Sinks
         // count because a producer in front of one is otherwise forced back to row
         // form - the restriction existed only because every sink materialised.
+        // "window_row" is NOT an operator type. It is the param-error prefix the
+        // window factory prints, and it never matched anything here; the three
+        // types that actually build WindowRowOp (which does implement
+        // process_columnar) were absent, so every producer in front of a TUMBLING
+        // window - the shape nexmark q12 uses - was held back to row output for
+        // nothing. Verified against install.cpp: these eight are exactly the
+        // Row-channel ops and sinks that declare the hook.
         return t == "filter_row_predicate" || t == "project_row" || t == "row_compute_key" ||
-               t == "aggregate_row" || t == "window_row" || t == "session_window_row" ||
+               t == "aggregate_row" || t == "tumbling_window_row" || t == "hopping_window_row" ||
+               t == "cumulate_window_row" || t == "session_window_row" ||
                t == "assign_timestamps_row" || t == "blackhole_sink_row";
     };
     // id -> the ops taking it as input. An op with no consumer at all feeds the
