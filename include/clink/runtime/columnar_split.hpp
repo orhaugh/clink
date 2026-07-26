@@ -60,29 +60,54 @@ std::optional<std::vector<Batch<T>>> gather_columnar_by_target(const Batch<T>& b
         return std::nullopt;
     }
     const std::int64_t n = rb->num_rows();
-    std::vector<arrow::BooleanBuilder> masks(n_out);
-    for (auto& m : masks) {
-        if (!m.Reserve(n).ok()) {
+
+    // Per-target INDEX lists built in one pass, then one Take per target.
+    //
+    // The previous shape was a boolean mask per target followed by a Filter per target,
+    // which is O(rows x targets) twice over: it appended n_out booleans for every row
+    // (only one of them true), and then each Filter walked the whole batch again to
+    // select its subset. At parallelism 4 that scanned the batch four times to move each
+    // row once. Indices are O(rows) to build - one push_back per row, into the one list
+    // that wants it - and Take gathers only the rows it is given, so the total gathered
+    // across all targets is n rather than n per target.
+    //
+    // Row ORDER within a target is preserved either way: indices are appended in row
+    // order and Take emits in index order, which is what Filter did.
+    std::vector<arrow::Int32Builder> idx(n_out);
+    // Even split is the expectation, so reserve for it; a skewed key distribution just
+    // grows some of them.
+    const std::int64_t per_target_hint = n_out > 0 ? (n / static_cast<std::int64_t>(n_out)) + 1 : n;
+    for (auto& b : idx) {
+        if (!b.Reserve(per_target_hint).ok()) {
             return std::nullopt;
         }
     }
     for (std::int64_t i = 0; i < n; ++i) {
         const int target = targets[static_cast<std::size_t>(i)];
-        for (std::size_t t = 0; t < n_out; ++t) {
-            masks[t].UnsafeAppend(static_cast<int>(t) == target);
+        if (target < 0 || static_cast<std::size_t>(target) >= n_out) {
+            continue;  // out-of-range target drops the row, mirroring add_split
+        }
+        // Reserve above is a hint, not a bound (skew can exceed it), so this is the
+        // checked Append rather than UnsafeAppend.
+        if (!idx[static_cast<std::size_t>(target)].Append(static_cast<std::int32_t>(i)).ok()) {
+            return std::nullopt;
         }
     }
+
     std::vector<Batch<T>> out(n_out);
     for (std::size_t t = 0; t < n_out; ++t) {
-        std::shared_ptr<arrow::Array> mask;
-        if (!masks[t].Finish(&mask).ok()) {
+        if (idx[t].length() == 0) {
+            continue;  // no rows for this target; leave the empty batch in place
+        }
+        std::shared_ptr<arrow::Array> indices;
+        if (!idx[t].Finish(&indices).ok()) {
             return std::nullopt;
         }
-        auto filtered = arrow::compute::Filter(arrow::Datum(rb), arrow::Datum(mask));
-        if (!filtered.ok() || filtered->kind() != arrow::Datum::RECORD_BATCH) {
+        auto taken = arrow::compute::Take(arrow::Datum(rb), arrow::Datum(indices));
+        if (!taken.ok() || taken->kind() != arrow::Datum::RECORD_BATCH) {
             return std::nullopt;
         }
-        auto sub_rb = filtered->record_batch();
+        auto sub_rb = taken->record_batch();
         if (sub_rb->num_rows() > 0) {
             out[t] = batch.with_arrow(sub_rb, static_cast<std::size_t>(sub_rb->num_rows()));
         }

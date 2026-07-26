@@ -96,6 +96,42 @@ batch to the row fallback and produces the right answer anyway. That test uses t
 int64 columns, where nothing else can save it, and it was confirmed to fail against an
 unverified-guess mutation.
 
+### The keyed shuffle's split
+
+`gather_columnar_by_target` (`include/clink/runtime/columnar_split.hpp`) partitions one
+columnar batch into a sub-batch per destination subtask without materialising rows. On
+the two-node rig it was 19.3% of all worker CPU on nexmark q12, the largest non-library
+compute item in the engine and twice the cost of the window aggregation it feeds.
+
+It builds one INDEX list per target in a single pass and calls `arrow::compute::Take`
+once per target. The earlier shape built a boolean mask per target and called
+`Filter` per target, which appended `n_out` booleans for every row (one of them true) and
+then walked the whole batch again for each destination - so at parallelism 4 it scanned
+the batch four times to move each row once. Measured with
+`benchmarks/clink_shuffle_split_bench`, 1024-row batches:
+
+| targets | mask + Filter | index + Take | |
+|---|---:|---:|---:|
+| 2 | 20.9 ns/row | 14.4 ns/row | -31% |
+| 4 | 34.8 ns/row | 21.8 ns/row | -37% |
+| 8 | 60.0 ns/row | 37.0 ns/row | -38% |
+| 16 | 108.0 ns/row | 68.6 ns/row | -36% |
+
+Both still grow with the destination count, because each destination needs its own gather
+and its own output allocation; the change is a consistent constant factor, not a change in
+asymptotics.
+
+Order within a destination is preserved by construction: indices are appended in row order
+and `Take` emits in index order, which is what `Filter` did.
+
+**This function routes a keyed shuffle, so a mistake in it is silent** - a misrouted
+record does not throw, it lands in the wrong subtask's keyed state and corrupts an
+aggregate. It had no direct tests until `tests/test_columnar_split.cpp`, which compares it
+against a reference split computed from the same inputs (content and order per
+destination, not just counts), and covers skew, out-of-range targets, refusal on a
+row-only batch, and the no-materialisation property. Those tests pass against BOTH the old
+and new implementations, and three of them fail against a routing shifted by one slot.
+
 ### Verifying the path actually fires
 
 A columnar chain that is quietly undone costs MORE than never having been columnar:

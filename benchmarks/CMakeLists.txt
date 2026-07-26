@@ -94,6 +94,14 @@ add_executable(clink_fusion_bench clink_fusion_bench.cpp)
 target_link_libraries(clink_fusion_bench PRIVATE clink::sql)
 clink_set_warnings(clink_fusion_bench)
 
+# Keyed-shuffle split cost in isolation. The `hash` partitioner was 19.3% of all worker
+# CPU on nexmark q12 - the largest non-library compute item in the engine, ahead of the
+# window aggregation it feeds. This drives gather_columnar_by_target directly, since a
+# whole-pipeline figure cannot attribute a change to it.
+add_executable(clink_shuffle_split_bench clink_shuffle_split_bench.cpp)
+target_link_libraries(clink_shuffle_split_bench PRIVATE clink::sql)
+clink_set_warnings(clink_shuffle_split_bench)
+
 # Kafka SOURCE read-rate bench. Isolates produce() - broker bytes to
 # Batch<KafkaMessage>, no decode, no operators, no channels. The split cloud rig
 # found the Kafka source to be the largest single consumer of worker CPU in every
