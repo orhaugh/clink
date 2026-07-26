@@ -518,7 +518,12 @@ message(STATUS "clink::core - Arrow v${ARROW_VERSION} (pinned ${CLINK_PINNED_ARR
 # library keeps working, and every caller of a kernel is expected to have a non-kernel
 # path anyway (see clink::arrow_compute_available()).
 find_package(ArrowCompute QUIET)
+# Recorded into clinkConfig.cmake so an installed clink tells its consumers whether they
+# must resolve ArrowCompute too. Without that, the exported link interface names a target
+# the consumer never found and their configure step fails at generate time.
+set(CLINK_ARROW_COMPUTE_FOUND OFF)
 if(TARGET ArrowCompute::arrow_compute_shared)
+    set(CLINK_ARROW_COMPUTE_FOUND ON)
     target_link_libraries(clink_core PUBLIC ArrowCompute::arrow_compute_shared)
     target_compile_definitions(clink_core PUBLIC CLINK_HAS_ARROW_COMPUTE=1)
     message(STATUS "clink::core - Arrow compute kernels available (arrow_compute)")

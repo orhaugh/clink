@@ -40,6 +40,21 @@ if(NOT "@CLINK_PINNED_ARROW_VERSION@" STREQUAL ""
 endif()
 find_dependency(Parquet CONFIG)
 
+# Arrow's compute kernels live in a SEPARATE package from Arrow 15 onwards, and clink
+# links it when it is present at build time. That puts
+# ArrowCompute::arrow_compute_shared into clink::core's exported link interface, so a
+# consumer's find_package(clink) must resolve that imported target or CMake fails at
+# generate time with "the target was not found" - which is exactly what the downstream
+# consume gate caught.
+#
+# Conditional on how clink was actually built: a clink built without the compute package
+# must not force its consumers to have it.
+set(_clink_built_with_arrow_compute "@CLINK_ARROW_COMPUTE_FOUND@")
+if(_clink_built_with_arrow_compute)
+    find_dependency(ArrowCompute CONFIG)
+endif()
+unset(_clink_built_with_arrow_compute)
+
 # --- Impl-specific dependencies --------------------------------------------
 # Each block was emitted at install time by an impls/<x>/CMakeLists.txt
 # that actually built. Missing impls are silently absent.
