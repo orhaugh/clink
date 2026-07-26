@@ -26,9 +26,9 @@ that documents it in depth.
 [Efficiency and environmental impact](efficiency.md) publishes the measured cost of
 processing an event: **3.04x less CPU per event and 16.4x less memory** than a JVM
 stream processor on the same hardware, producing byte-identical output on a
-correctness-gated comparison. It also states plainly where the advantage narrows
-(a large windowed aggregation, where both engines mostly hold the user's state) and
-what was not measured (wall power, so no kWh or CO2e figure is claimed). The raw
+correctness-gated comparison. It also states plainly where clink currently LOSES (its per-group
+windowed state measured about 3.9 KB for an int64 key and a count, heavier than the JVM
+engine's) and what was not measured (wall power, so no kWh or CO2e figure is claimed). The raw
 per-run output is published alongside it.
 
 ## How it works

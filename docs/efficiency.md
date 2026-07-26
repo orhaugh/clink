@@ -18,12 +18,15 @@ Per event processed, on the same hardware, producing byte-identical output:
 | CPU time per event, stateless query (q0) | **709,877 events/cpu-second** | 233,207 | **3.04x less CPU** |
 | CPU time per event, windowed query (q12) | **310,811 events/cpu-second** | 155,091 | **2.00x less CPU** |
 | Memory, stateless query (q0) | **70 MB** | 1,146 MB | **16.4x less** |
-| Memory, windowed query (q12) | 1,230 MB | 1,505 MB | 1.2x less |
+| Memory, windowed query (q12) | 1,230 MB | 1,505 MB | 1.2x less, and see the caveat below |
 | Cores occupied of 4, q0 | **1.08** | 2.58 | |
 | Cores occupied of 4, q12 | **2.16** | 2.99 | |
 
 The memory result splits sharply between the two queries, and the reason matters more
-than the headline. See [Where the memory difference comes from](#where-the-memory-difference-comes-from).
+than the headline: on the windowed query clink's own state representation is currently
+the heavier of the two, and only its much smaller runtime keeps the total below. See
+[Where the memory difference comes from](#where-the-memory-difference-comes-from) before
+quoting the q12 row.
 
 ## How it was measured
 
@@ -104,27 +107,44 @@ narrower than the headline.
 
 **On stateless work the difference is an order of magnitude: 70 MB against 1,146 MB.**
 That is the engine itself, and it is what a native runtime buys. No JVM heap to size, no
-metaspace, no garbage collector headroom, no object header on every record.
+metaspace, no garbage collector headroom, no object header on every record. This is the
+figure that generalises to any pipeline whose working set is small.
 
-**On the windowed query the gap nearly closes: 1,230 MB against 1,505 MB.** clink is
-still lower, but only slightly, and the reason is that most of that memory is not the
-engine at all. It is window state: partial aggregates for every (key, window) group that
-no watermark has yet closed. Any engine computing that query has to hold it. This was
-established rather than assumed, by ruling out the alternatives on the rig:
+**On the windowed query the gap nearly closes: 1,230 MB against 1,505 MB, and that is
+not a good result for clink.** It was originally published here as "un-fired window state
+that any engine must hold". That explanation was wrong, and a later decomposition on the
+same rig says so.
 
-| tested | result |
-|---|---|
-| Is it allocator retention? | No. jemalloc preloaded into the same binary changed memory not at all. |
-| Is it the columnar path holding Arrow batches? | No, the opposite. Disabling columnar execution raised memory to 4,663 MB, so the columnar path is *saving* 3.3x. |
-| Is it records buffered in flight? | Partly. Shrinking the source batch eightfold recovered about a quarter of it. |
-| Is it state? | Yes. Memory tracks records consumed (861 MB at 3.8M records, 1,309 MB at 8.5M) then stops dead the moment ingest completes and stays flat. |
+Holding the records and the window fixed and changing only the number of groups
+separates the two components. The dataset spans one second of event time, so every record
+falls in a single 10-second window; `GROUP BY bidder` produces 195,710 groups and
+`GROUP BY channel` produces five:
 
-**So the claim this page makes is precise: clink's memory advantage is in the engine, not
-in your data.** On stateless or lightly-stateful pipelines that is roughly an order of
-magnitude. On a large windowed aggregation, both engines mostly hold the same user state
-and the advantage narrows to the engine's own overhead, which is a small share of the
-total. Anyone sizing a deployment should apply the first figure to the runtime and the
-second to the working set.
+| grouping | groups | clink memory |
+|---|---:|---:|
+| `GROUP BY bidder` | 195,710 | 1,407 MB |
+| `GROUP BY channel` | 5 | 641 MB |
+
+Which decomposes as:
+
+- **766 MB of per-group state across 195,710 groups: about 3.9 KB per group.** The group
+  holds an int64 key and a `COUNT(*)`. Tens of bytes of information is being stored in
+  kilobytes, roughly two orders of magnitude more than the data requires.
+- **641 MB that does not depend on the group count at all**, against 70 MB for the same
+  engine on the stateless query. That is clink's pipeline buffering: channels between
+  operators are bounded by a count of BATCHES rather than by bytes or records, so a deeper
+  pipeline holds proportionally more data in flight.
+
+For comparison, the JVM engine's memory rises by about 359 MB between the stateless and
+the windowed query, and it is holding the same 195,710 groups. So on the state itself
+clink is currently the heavier of the two, and it only appears level overall because its
+runtime is an order of magnitude smaller and absorbs the difference.
+
+**Stated plainly: clink's advantage is its runtime, and its windowed-state representation
+is a known weakness, not a law of nature.** Both components above are engineering defects
+with identifiable causes rather than inherent costs, and both are open. Anyone sizing a
+large windowed aggregation today should budget for the figures in the table rather than
+extrapolate from the stateless result.
 
 ## Translating this into a footprint
 
@@ -166,6 +186,9 @@ Stated plainly, because an efficiency page without this section should not be tr
   1.56x and 1.30x against the JVM engine on two different machines of the same type. The
   efficiency and memory columns held steady across those runs; the raw throughput ratio
   did not. Treat throughput as "ahead" and cost-per-event as the durable figure.
+- **A tuned windowed-state representation.** clink's per-group state measured about
+  3.9 KB for an int64 key and a count. That is a defect, not a floor, and the q12 memory
+  row should be read as "clink today", not "clink native".
 - **Long-run behaviour.** These are minutes-long runs, not weeks. Memory behaviour over
   a long-lived job with continuous watermark progress is not what this measured.
 

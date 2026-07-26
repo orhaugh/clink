@@ -126,7 +126,62 @@ per-thread attribution says exactly which fixes did it:
 The run is CPU-bound, so a 1.87x CPU reduction is what the 1.75x throughput rise on
 q0 comes from. Nothing here changed the amount of work the queries do.
 
-### Memory, and the q12 figure explained
+### Verifying the shuffle change end to end, 2026-07-26
+
+The index+Take split measured 37% faster in isolation. End to end it is real but small,
+and the honest way to see it is per-stage attribution rather than throughput. Same node,
+both images pulled by digest tag, q12:
+
+| | sha-67a69a1d (before) | sha-0702e95d (after) | |
+|---|---:|---:|---:|
+| `hash` stage CPU | 7.29s | 6.17s | **-15.4%** |
+| total worker CPU | 34.4s | 34.0s | -1.2% |
+
+So the split is roughly 40% of what the `hash` thread does (the rest is key extraction,
+the routing decision and pushing to four downstream channels), and the `hash` thread is
+about 20% of the pipeline. 15% of 20% is ~3% of worker CPU, at the edge of what this rig
+resolves.
+
+**The throughput A/B could not resolve it and is not quoted as evidence.** Two trials of
+the SAME image on q12 spanned 278,703 and 328,571 events/cpu-second, an 18% spread, so a
+~3% effect is well inside the noise floor of that measurement. q0, which has no keyed
+shuffle and served as the control, also drifted. Per-stage attribution is the right
+instrument for a change of this size; sustained throughput is not.
+
+### CORRECTION: q12 memory is not "state any engine must hold"
+
+The section below concluded that q12's ~1.4 GB was un-fired window state, on the strength
+of ruling out the allocator, the columnar path and in-flight batching, plus the
+observation that memory tracks records consumed and then goes flat. That conclusion was
+WRONG, and the test that should have been run first is the obvious one: hold the records
+and the window fixed and vary only the NUMBER OF GROUPS.
+
+The dataset spans 1.0 second of event time, so all 9.2M records fall in a single
+10-second window. `GROUP BY bidder` gives 195,710 groups; `GROUP BY channel` gives 5:
+
+| grouping | groups | clink anon |
+|---|---:|---:|
+| `GROUP BY bidder` | 195,710 | 1,407 MB |
+| `GROUP BY channel` | 5 | 641 MB |
+
+  766 MB attributable to grouping / 195,710 groups = **3,914 bytes PER GROUP**, for an
+  int64 key and a COUNT(*). Two orders of magnitude more than the data.
+
+  641 MB independent of group count, against 70 MB for the same engine on stateless q0.
+  That is pipeline buffering - channels bounded by a count of BATCHES rather than bytes.
+
+Flink's memory rises ~359 MB between q0 and q12 while holding the same 195,710 groups, so
+on state alone clink is currently the HEAVIER engine and only its far smaller runtime
+keeps the total below. Both components are defects with identifiable causes, and both are
+open work. `docs/efficiency.md` has been corrected accordingly.
+
+The methodological lesson is worth more than the number: "memory tracks records consumed
+then plateaus" is equally consistent with per-record retention AND with per-group state
+that happens to grow as new keys arrive. Ruling out three wrong explanations is not the
+same as establishing the fourth, and the decomposition that would have settled it took one
+extra run.
+
+### Memory, and the earlier (superseded) q12 analysis
 
 The stateless case is emphatic and is what a native engine should look like: on q0
 clink holds **72 MB** of anonymous memory against Flink's **1,146 MB - 16x lower**,
