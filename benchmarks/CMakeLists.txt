@@ -83,6 +83,18 @@ if(TARGET clink::sql)
     clink_set_warnings(clink_columnar_groupby_bench)
 endif()
 
+# Kafka SOURCE read-rate bench. Isolates produce() - broker bytes to
+# Batch<KafkaMessage>, no decode, no operators, no channels. The split cloud rig
+# found the Kafka source to be the largest single consumer of worker CPU in every
+# nexmark query measured (37.8% on q0, 27.3% on q12, ~0.9us per record against
+# 0.05us for the projection), and a whole-pipeline number cannot attribute a
+# change to the source. Needs a populated topic; see the file header.
+if(TARGET clink::kafka)
+    add_executable(clink_kafka_source_bench clink_kafka_source_bench.cpp)
+    target_link_libraries(clink_kafka_source_bench PRIVATE clink::kafka)
+    clink_set_warnings(clink_kafka_source_bench)
+endif()
+
 # flink_compare/clink-job: CLINK_REGISTER_JOB .so for the
 # clink-vs-Flink head-to-head harness. Requires the kafka impl
 # headers for the message_source / message_sink helpers.

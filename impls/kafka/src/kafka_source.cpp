@@ -15,6 +15,11 @@
 #include "clink/runtime/runtime_context.hpp"
 
 #ifdef CLINK_HAS_KAFKA
+// Both APIs: the C++ wrapper for configuration, subscription and the rebalance
+// callback, and the C API for the batched fetch in produce(). rdkafkacpp.h does
+// not pull in rdkafka.h, and the C++ wrapper has no batch-consume call - the one
+// that turns a per-record queue lock and wrapper allocation into one per batch.
+#include <librdkafka/rdkafka.h>
 #include <librdkafka/rdkafkacpp.h>
 #endif
 
@@ -89,25 +94,49 @@ std::map<std::int32_t, std::int64_t> KafkaSource::decode_offsets(std::string_vie
 
 namespace {
 
-// Headers come back from librdkafka as a pointer to a Headers object that
-// owns the bytes; we copy them into KafkaHeader by value so the caller
-// owns lifetime.
-std::vector<KafkaHeader> copy_headers(const RdKafka::Headers* hdrs) {
+// Headers come back from librdkafka owned by the message; they are copied into
+// KafkaHeader by value so the caller owns the lifetime. Reads them through the C
+// API because produce() fetches in batches, and the batch call is C-only.
+std::vector<KafkaHeader> copy_headers_c(const rd_kafka_message_t* msg) {
     std::vector<KafkaHeader> out;
-    if (hdrs == nullptr) {
+    rd_kafka_headers_t* hdrs = nullptr;
+    // Returns NO_ENT for the overwhelmingly common no-headers case, and this
+    // stays allocation-free on that path.
+    if (rd_kafka_message_headers(msg, &hdrs) != RD_KAFKA_RESP_ERR_NO_ERROR || hdrs == nullptr) {
         return out;
     }
-    const auto& vec = hdrs->get_all();
-    out.reserve(vec.size());
-    for (const auto& h : vec) {
-        const void* val_ptr = h.value();
-        const std::size_t val_len = h.value_size();
-        out.push_back(KafkaHeader{
-            .key = h.key(),
-            .value = val_ptr != nullptr ? std::string(static_cast<const char*>(val_ptr), val_len)
-                                        : std::string{}});
+    const std::size_t n = rd_kafka_header_cnt(hdrs);
+    out.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const char* name = nullptr;
+        const void* value = nullptr;
+        std::size_t size = 0;
+        if (rd_kafka_header_get_all(hdrs, i, &name, &value, &size) != RD_KAFKA_RESP_ERR_NO_ERROR) {
+            break;
+        }
+        out.push_back(KafkaHeader{.key = name != nullptr ? std::string{name} : std::string{},
+                                  .value = value != nullptr
+                                               ? std::string(static_cast<const char*>(value), size)
+                                               : std::string{}});
     }
     return out;
+}
+
+// Record "partition -> next offset" in a short scratch vector, overwriting any
+// earlier entry for the partition. Linear scan on purpose: a subtask owns a
+// handful of partitions, so this is one or two hot cache lines, where the
+// std::map it replaces cost a tree descent on every record for a value only the
+// checkpoint reads.
+void note_next_offset(std::vector<std::pair<std::int32_t, std::int64_t>>& scratch,
+                      std::int32_t partition,
+                      std::int64_t next) {
+    for (auto& [p, off] : scratch) {
+        if (p == partition) {
+            off = next;
+            return;
+        }
+    }
+    scratch.emplace_back(partition, next);
 }
 
 // Legacy whole-map operator-state key (pre per-partition rows). Still read
@@ -184,6 +213,25 @@ struct KafkaSource::Impl {
     std::atomic<bool> cancelled{false};
     Counter* consumed{nullptr};
     Counter* consume_errors{nullptr};
+    // The consumer's own queue - the one rd_kafka_consumer_poll() serves - held
+    // so produce() can fetch a WHOLE BATCH per call via
+    // rd_kafka_consume_batch_queue() instead of one message per call. The C++
+    // consume() wrapper takes the queue lock, dequeues one op and heap-allocates
+    // a MessageImpl every record; on the cloud rig the Kafka source was the
+    // largest single cost in every query measured (27-38% of all worker CPU,
+    // ~0.9us per record, against 0.05us for the projection the query actually
+    // asked for). One batched fetch amortises the lock and the wrapper away.
+    //
+    // MUST be destroyed before consumer->close() (librdkafka requires the
+    // reference released prior to close), which close() and the destructor do.
+    rd_kafka_queue_t* cqueue{nullptr};
+    // Reused across produce() calls: sized once to max_batch_size so the fetch
+    // never allocates.
+    std::vector<rd_kafka_message_t*> fetch_buf;
+    // Per-batch offset scratch. A subtask owns a handful of partitions, so a
+    // linear scan of a hot vector beats the red-black tree lookup that
+    // next_offsets[partition] did on EVERY record.
+    std::vector<std::pair<std::int32_t, std::int64_t>> offset_scratch;
     // partition -> next offset to read; advanced as records are emitted,
     // persisted at each checkpoint.
     std::map<std::int32_t, std::int64_t> next_offsets;
@@ -209,6 +257,14 @@ KafkaSource::KafkaSource(Options opts) : impl_(std::make_unique<Impl>()) {
 
 KafkaSource::~KafkaSource() {
     if (impl_ && impl_->consumer) {
+        // The queue reference MUST go before close(): librdkafka documents that
+        // rd_kafka_queue_destroy() has to be called on the consumer queue prior
+        // to rd_kafka_consumer_close(). Nulling it keeps this idempotent, since
+        // close() may already have run.
+        if (impl_->cqueue != nullptr) {
+            rd_kafka_queue_destroy(impl_->cqueue);
+            impl_->cqueue = nullptr;
+        }
         impl_->consumer->close();
     }
 }
@@ -261,6 +317,21 @@ void KafkaSource::open() {
         throw std::runtime_error("KafkaSource: subscribe failed: " + RdKafka::err2str(rc));
     }
 
+    // Hold the consumer queue for the batched fetch path. Polling this queue
+    // counts as a consumer poll (it is the queue rd_kafka_consumer_poll serves),
+    // so max.poll.interval.ms keeps being reset and group membership is
+    // maintained exactly as before; rebalance and error ops travel on the same
+    // queue, so the seek-on-assignment callback still fires. The suite's
+    // SourceReplayResumesFromCheckpoint case is the canary for that: without a
+    // firing rebalance callback the restored source resumes at payload-0 rather
+    // than payload-6 and the test fails.
+    impl_->cqueue = rd_kafka_queue_get_consumer(impl_->consumer->c_ptr());
+    if (impl_->cqueue == nullptr) {
+        throw std::runtime_error("KafkaSource: rd_kafka_queue_get_consumer returned null");
+    }
+    impl_->fetch_buf.resize(std::max<std::size_t>(1, impl_->opts.max_batch_size));
+    impl_->offset_scratch.reserve(8);
+
     if (auto* ctx = this->runtime();
         ctx != nullptr && ctx->metrics() != nullptr && !impl_->opts.metric_prefix.empty()) {
         const std::string prefix = "kafka_source." + impl_->opts.metric_prefix + ".";
@@ -285,12 +356,22 @@ bool KafkaSource::produce(Emitter<KafkaMessage>& out) {
     // max_batch_size records to accumulate.
     const auto wait_bound = impl_->opts.batch_max_wait;
     const auto fill_deadline = std::chrono::steady_clock::now() + wait_bound;
-    for (std::size_t i = 0; i < impl_->opts.max_batch_size; ++i) {
+    // Fill in BATCHED FETCHES rather than one message per call. Each
+    // rd_kafka_consume_batch_queue() takes the queue lock once and returns up to
+    // the remaining batch capacity, where the per-message path took the lock,
+    // dequeued one op and heap-allocated a wrapper object for every single
+    // record. The loop repeats only while the batch is still short and the fill
+    // deadline has not passed, so a full batch is normally ONE fetch call.
+    std::size_t filled = 0;
+    std::uint64_t consumed_ok = 0;
+    std::uint64_t error_count = 0;
+    impl_->offset_scratch.clear();
+    while (filled < impl_->opts.max_batch_size) {
         if (impl_->cancelled.load(std::memory_order_acquire)) {
             break;
         }
         int timeout_ms = static_cast<int>(impl_->opts.poll_timeout.count());
-        if (!batch.empty() && wait_bound > std::chrono::milliseconds::zero()) {
+        if (filled > 0 && wait_bound > std::chrono::milliseconds::zero()) {
             const auto now = std::chrono::steady_clock::now();
             if (now >= fill_deadline) {
                 break;
@@ -299,52 +380,65 @@ bool KafkaSource::produce(Emitter<KafkaMessage>& out) {
                 std::chrono::duration_cast<std::chrono::milliseconds>(fill_deadline - now);
             timeout_ms = std::min(timeout_ms, static_cast<int>(remaining.count()) + 1);
         }
-        std::unique_ptr<RdKafka::Message> msg(impl_->consumer->consume(timeout_ms));
-        const auto err = msg->err();
-        if (err == RdKafka::ERR__TIMED_OUT) {
+        const ssize_t got = rd_kafka_consume_batch_queue(impl_->cqueue,
+                                                         timeout_ms,
+                                                         impl_->fetch_buf.data() + filled,
+                                                         impl_->opts.max_batch_size - filled);
+        if (got <= 0) {
+            // 0 = the timeout elapsed with nothing available; <0 = a queue-level
+            // error, which the per-message path reached as ERR__TIMED_OUT too.
+            // Either way stop filling and emit whatever is already in hand.
             break;
         }
-        if (err == RdKafka::ERR_NO_ERROR) {
-            KafkaMessage m;
-            const void* payload_ptr = msg->payload();
-            if (payload_ptr != nullptr) {
-                m.payload.assign(static_cast<const char*>(payload_ptr), msg->len());
-                bytes_read += msg->len();
-            }
-            if (msg->key() != nullptr) {
-                m.key = *msg->key();  // librdkafka stores the key as std::string*
-            }
-            m.headers = copy_headers(msg->headers());
-            m.offset = msg->offset();
-            m.partition = msg->partition();
-            m.timestamp_ms = msg->timestamp().timestamp;
-            // Resume point for this partition is the offset AFTER the one we
-            // just emitted. Captured into the checkpoint by snapshot_offset.
-            impl_->next_offsets[msg->partition()] = msg->offset() + 1;
+        for (ssize_t k = 0; k < got; ++k) {
+            rd_kafka_message_t* msg = impl_->fetch_buf[filled + static_cast<std::size_t>(k)];
+            if (msg->err == RD_KAFKA_RESP_ERR_NO_ERROR) {
+                KafkaMessage m;
+                if (msg->payload != nullptr) {
+                    m.payload.assign(static_cast<const char*>(msg->payload), msg->len);
+                    bytes_read += msg->len;
+                }
+                if (msg->key != nullptr) {
+                    m.key = std::string(static_cast<const char*>(msg->key), msg->key_len);
+                }
+                m.headers = copy_headers_c(msg);
+                m.offset = msg->offset;
+                m.partition = msg->partition;
+                // librdkafka tags broker timestamps CreateTime / LogAppendTime /
+                // NotAvailable; the not-available case surfaces as -1, which is
+                // the convention the rest of the engine already reads.
+                rd_kafka_timestamp_type_t ts_type = RD_KAFKA_TIMESTAMP_NOT_AVAILABLE;
+                const int64_t ts = rd_kafka_message_timestamp(msg, &ts_type);
+                m.timestamp_ms = ts_type == RD_KAFKA_TIMESTAMP_NOT_AVAILABLE ? -1 : ts;
 
-            // librdkafka emits broker timestamps with a tag indicating
-            // CreateTime / LogAppendTime / NotAvailable. -1 leaks through
-            // as "not available"; preserve that convention.
-            if (msg->timestamp().type == RdKafka::MessageTimestamp::MSG_TIMESTAMP_NOT_AVAILABLE) {
-                m.timestamp_ms = -1;
-            }
+                // Resume point for this partition is the offset AFTER the one
+                // just emitted. Held in a short scratch vector and merged into
+                // next_offsets once per batch: the map form did a red-black tree
+                // lookup per record for a value only the checkpoint ever reads.
+                note_next_offset(impl_->offset_scratch, msg->partition, msg->offset + 1);
 
-            batch.emplace(std::move(m));
-            if (impl_->consumed != nullptr) {
-                impl_->consumed->increment();
+                batch.emplace(std::move(m));
+                ++consumed_ok;
+            } else {
+                // Real error - record it and continue. A single broken record
+                // must not tear down the whole pipeline.
+                ++error_count;
+                clink::metrics::connector::error_inc("kafka", "source");
             }
-        } else if (err == RdKafka::ERR__PARTITION_EOF) {
-            // Disabled via enable.partition.eof=false but defensive in
-            // case the broker forces it.
-            break;
-        } else {
-            // Real error - record it and continue. Single broken record
-            // shouldn't tear down the whole pipeline.
-            if (impl_->consume_errors != nullptr) {
-                impl_->consume_errors->increment();
-            }
-            clink::metrics::connector::error_inc("kafka", "source");
+            rd_kafka_message_destroy(msg);
         }
+        filled += static_cast<std::size_t>(got);
+    }
+    // Counters once per batch, not once per record: these are atomics, and the
+    // batch total is the same number.
+    if (impl_->consumed != nullptr && consumed_ok > 0) {
+        impl_->consumed->increment(consumed_ok);
+    }
+    if (impl_->consume_errors != nullptr && error_count > 0) {
+        impl_->consume_errors->increment(error_count);
+    }
+    for (const auto& [partition, next] : impl_->offset_scratch) {
+        impl_->next_offsets[partition] = next;
     }
     if (!batch.empty()) {
         clink::metrics::connector::records_in_inc("kafka", batch.size());
@@ -362,6 +456,12 @@ void KafkaSource::cancel() {
 
 void KafkaSource::close() {
     if (impl_ && impl_->consumer) {
+        // Queue reference first - librdkafka requires it released before
+        // rd_kafka_consumer_close().
+        if (impl_->cqueue != nullptr) {
+            rd_kafka_queue_destroy(impl_->cqueue);
+            impl_->cqueue = nullptr;
+        }
         impl_->consumer->close();
         impl_->consumer.reset();
     }
