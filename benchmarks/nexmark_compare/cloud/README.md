@@ -281,6 +281,74 @@ is not exported by the Arrow package clink links (see
 `include/clink/operators/columnar_filter_operator.hpp`). Both are about using kernels
 that are already vectorised, not about hand-writing intrinsics.
 
+### Fourth provision, 2026-07-27: after the audit fixes
+
+clink at 764e570 against Flink 2.2.0 re-baselined on the same node, same 9.2M records,
+parallelism 4, blackhole sink, two trials each.
+
+| query | engine | sustained rec/s | end-to-end drain | cores of 4 | events/cpu-s | anon MB |
+|-------|--------|----------------:|-----------------:|-----------:|-------------:|--------:|
+| q0    | clink  | **3,978,542** | **3,792,293** | **0.84** | **983,957** | **76** |
+| q0    | flink  | 2,735,414 | 1,156,942 | 2.61 | 254,425 | 1,176 |
+| q12   | clink  | **2,904,628** | **2,533,108** | **1.71** | **482,940** | **749** |
+| q12   | flink  | 1,609,556 | 740,264 | 2.94 | 168,993 | 1,625 |
+
+    q0 : 1.45x throughput, 3.87x efficiency, 15.5x lower memory
+    q12: 1.80x throughput, 2.86x efficiency,  2.2x lower memory
+
+Against the third provision (1eb6fae), which is the last comparable measurement:
+
+| | q0 then | q0 now | q12 then | q12 now |
+|---|---:|---:|---:|---:|
+| events/cpu-s | 709,877 | **983,957** | 310,811 | **482,940** |
+| efficiency vs Flink | 3.04x | **3.87x** | 2.00x | **2.86x** |
+| cores of 4 | 1.08 | **0.84** | 2.16 | **1.71** |
+| anon MB | 70 | 76 | 1,230 | **749** |
+
+**q0 now uses 0.84 of 4 cores** to out-drain a JVM engine using 2.61, and **q12's CPU per
+event improved 55%**.
+
+Per-stage attribution says which change did what. q12, same 9.2M records, whole drain
+covered in both windows:
+
+| stage | 67a69a1 | 764e570 | |
+|-------|--------:|--------:|---|
+| tumbling_window | 9.25s (26.9%) | 7.03s (33.2%) | -24%, AggState 264 -> 104 B |
+| **hash (keyed shuffle)** | **7.29s (21.2%)** | **2.50s (11.8%)** | **-66%**, projection + index/Take |
+| json_string_to_row | 4.91s (14.3%) | 2.77s (13.1%) | -44%, projection drops 2 of 6 columns |
+| kafka_text_source | 4.30s (12.5%) | 3.17s (15.0%) | -26%, not attributed (see below) |
+| network_bridge | - | 1.35s (6.4%) | |
+| **total** | **34.4s** | **21.2s** | **1.62x less CPU** |
+
+The shuffle result is the headline: 21.2% of worker CPU down to 11.8%, and in absolute terms
+a 66% cut. Projection pushdown and the index+Take gather compound there, because the split
+cost scales with the column count and the projection removed two of the wider columns.
+
+The kafka_text_source drop is NOT claimed as an effect of any change here. Nothing in this
+round touched the source, and it reads raw text either way, so projection cannot reach it.
+It is most likely less time spent blocked on a faster downstream, or run-to-run variance.
+Recorded as unattributed rather than credited.
+
+### The q12 memory picture has flipped
+
+The correction earlier in this file established that q12's memory was a clink DEFECT, not
+inherent window state: 3,914 bytes of per-group state for an int64 key and a COUNT, plus a
+group-independent pipeline-buffering floor. Both halves improved:
+
+| | before | after | |
+|---|---:|---:|---|
+| 195,710 groups | 1,407 MB | 831 MB | |
+| 5 groups (group-independent) | 641 MB | 444 MB | projection: narrower batches in flight |
+| **per-group state** | **3,914 B** | **1,977 B** | **2.0x lower** |
+
+Flink rises ~456 MB between q0 and q12 holding the same 195,710 groups; clink now rises
+387 MB. **So on the state itself clink is now 1.2x lighter, where it was roughly 2x
+heavier.** The overall q12 memory advantage went from 1.2x to 2.2x.
+
+1,977 bytes per group is still far more than an int64 key and a counter need, so this is
+progress rather than a finish. What remains is container overhead - a std::map node per open
+window, the Row group_values each bucket keeps, the keyed-state entry - not the accumulator.
+
 ### jemalloc: measured, worth having, not a memory fix
 
 Tested by deriving an image from the SAME clink binary with `libjemalloc2` preloaded, so

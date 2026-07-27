@@ -442,7 +442,7 @@ All of the documentation below is also published as a browsable site at
 [design decisions](https://orhaugh.github.io/clink/design/) behind the
 engine's architecture, and
 [efficiency and environmental impact](https://orhaugh.github.io/clink/efficiency/) -
-the measured cost of processing an event (3.04x less CPU and 16.4x less memory than a
+the measured cost of processing an event (3.87x less CPU and 15.5x less memory than a
 JVM stream processor on the same hardware, byte-identical output), with the raw per-run
 data and an explicit account of what was not measured.
 

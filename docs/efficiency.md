@@ -15,18 +15,20 @@ Per event processed, on the same hardware, producing byte-identical output:
 
 | | clink | JVM engine | ratio |
 |---|---:|---:|---:|
-| CPU time per event, stateless query (q0) | **709,877 events/cpu-second** | 233,207 | **3.04x less CPU** |
-| CPU time per event, windowed query (q12) | **310,811 events/cpu-second** | 155,091 | **2.00x less CPU** |
-| Memory, stateless query (q0) | **70 MB** | 1,146 MB | **16.4x less** |
-| Memory, windowed query (q12) | 1,230 MB | 1,505 MB | 1.2x less, and see the caveat below |
-| Cores occupied of 4, q0 | **1.08** | 2.58 | |
-| Cores occupied of 4, q12 | **2.16** | 2.99 | |
+| CPU time per event, stateless query (q0) | **983,957 events/cpu-second** | 254,425 | **3.87x less CPU** |
+| CPU time per event, windowed query (q12) | **482,940 events/cpu-second** | 168,993 | **2.86x less CPU** |
+| Memory, stateless query (q0) | **76 MB** | 1,169 MB | **15.5x less** |
+| Memory, windowed query (q12) | **749 MB** | 1,625 MB | **2.2x less** |
+| Cores occupied of 4, q0 | **0.84** | 2.57 | |
+| Cores occupied of 4, q12 | **1.71** | 2.94 | |
 
-The memory result splits sharply between the two queries, and the reason matters more
-than the headline: on the windowed query clink's own state representation is currently
-the heavier of the two, and only its much smaller runtime keeps the total below. See
-[Where the memory difference comes from](#where-the-memory-difference-comes-from) before
-quoting the q12 row.
+On the stateless query clink drains the same input faster than the JVM engine while
+occupying **0.84 of four cores against 2.57**.
+
+The memory result still splits between the two queries, and the reason is worth reading
+before quoting the q12 row: most of that 749 MB is window state the query genuinely
+requires, not engine overhead. See
+[Where the memory difference comes from](#where-the-memory-difference-comes-from).
 
 ## How it was measured
 
@@ -88,15 +90,15 @@ and taper:
 
 | | peak sustained | whole-run average | fraction of peak reached |
 |---|---:|---:|---:|
-| clink q0 | 2,977,002 rec/s | 2,791,462 rec/s | **94%** |
-| JVM engine q0 | 2,088,165 rec/s | 1,021,201 rec/s | 49% |
+| clink q0 | 3,978,542 rec/s | 3,792,293 rec/s | **95%** |
+| JVM engine q0 | 2,735,414 rec/s | 1,156,942 rec/s | 42% |
 
 For a long-running pipeline this matters little. For anything that starts, stops, scales
 or fails over, it is the difference between paying for warm-up repeatedly and not.
 
 The engine's own instrumentation shows where its remaining time goes, and it is not the
-query: on q0, the projection the query actually asks for is 4.3% of worker CPU, while
-JSON decoding is 34% and the Kafka client is 26%. That is published in full in
+query: on q0 the projection the query actually asks for is 2.9% of worker CPU, while JSON
+decoding is 31% and the Kafka source is 30%. That is published in full in
 [the benchmark record](https://github.com/orhaugh/clink/blob/main/benchmarks/nexmark_compare/cloud/README.md),
 including the optimisations that were tried and measured to be worthless.
 
@@ -105,46 +107,48 @@ including the optimisations that were tried and measured to be worthless.
 This is the figure most worth understanding properly, because the honest version is
 narrower than the headline.
 
-**On stateless work the difference is an order of magnitude: 70 MB against 1,146 MB.**
+**On stateless work the difference is an order of magnitude: 76 MB against 1,169 MB.**
 That is the engine itself, and it is what a native runtime buys. No JVM heap to size, no
 metaspace, no garbage collector headroom, no object header on every record. This is the
 figure that generalises to any pipeline whose working set is small.
 
-**On the windowed query the gap nearly closes: 1,230 MB against 1,505 MB, and that is
-not a good result for clink.** It was originally published here as "un-fired window state
-that any engine must hold". That explanation was wrong, and a later decomposition on the
-same rig says so.
-
-Holding the records and the window fixed and changing only the number of groups
-separates the two components. The dataset spans one second of event time, so every record
-falls in a single 10-second window; `GROUP BY bidder` produces 195,710 groups and
-`GROUP BY channel` produces five:
+**On the windowed query the gap is narrower: 749 MB against 1,625 MB.** Most of clink's
+figure is state the query genuinely requires - a partial aggregate per (key, window) group
+that no watermark has yet closed - rather than engine overhead. Holding the records and the
+window fixed and varying only the number of groups separates the two. The dataset spans one
+second of event time, so every record falls in a single 10-second window; `GROUP BY bidder`
+produces 195,710 groups and `GROUP BY channel` produces five:
 
 | grouping | groups | clink memory |
 |---|---:|---:|
-| `GROUP BY bidder` | 195,710 | 1,407 MB |
-| `GROUP BY channel` | 5 | 641 MB |
+| `GROUP BY bidder` | 195,710 | 831 MB |
+| `GROUP BY channel` | 5 | 444 MB |
 
-Which decomposes as:
+So about 387 MB is per-group state - **1,977 bytes per group** - and 444 MB is independent
+of the group count (pipeline buffering: channels are bounded by a count of batches rather
+than by bytes, so a deeper pipeline holds proportionally more data in flight).
 
-- **766 MB of per-group state across 195,710 groups: about 3.9 KB per group.** The group
-  holds an int64 key and a `COUNT(*)`. Tens of bytes of information is being stored in
-  kilobytes, roughly two orders of magnitude more than the data requires.
-- **641 MB that does not depend on the group count at all**, against 70 MB for the same
-  engine on the stateless query. That is clink's pipeline buffering: channels between
-  operators are bounded by a count of BATCHES rather than by bytes or records, so a deeper
-  pipeline holds proportionally more data in flight.
+For comparison, the JVM engine's memory rises about 456 MB between the stateless and the
+windowed query while holding the same 195,710 groups. **So clink is now lighter on the state
+itself as well, by about 1.2x.**
 
-For comparison, the JVM engine's memory rises by about 359 MB between the stateless and
-the windowed query, and it is holding the same 195,710 groups. So on the state itself
-clink is currently the heavier of the two, and it only appears level overall because its
-runtime is an order of magnitude smaller and absorbs the difference.
+An earlier version of this page reported the opposite, and the correction is worth being
+explicit about. Measured on 26 July, clink's per-group state was 3,914 bytes and it was
+roughly twice as heavy as the JVM engine on state alone; the page said so. That was a defect,
+not a floor: a per-group accumulator carried inline storage for aggregate features the query
+never used - two maps, two vectors, a decimal and two more values for a `COUNT(*)` that needs
+one integer. Moving the rarely-used members behind a lazily allocated pointer halved the
+per-group cost, and pushing the query's column projection down into the JSON decoder narrowed
+what the pipeline buffers. Both are in the repository history with their measurements.
 
-**Stated plainly: clink's advantage is its runtime, and its windowed-state representation
-is a known weakness, not a law of nature.** Both components above are engineering defects
-with identifiable causes rather than inherent costs, and both are open. Anyone sizing a
-large windowed aggregation today should budget for the figures in the table rather than
-extrapolate from the stateless result.
+**1,977 bytes per group is still more than an int64 key and a counter need**, so this is
+progress rather than a finished job. What remains is container overhead - a map node per open
+window, a retained row per bucket for reconstructing group columns, the keyed-state entry -
+not the accumulator.
+
+The honest summary: clink's advantage is largest where the engine dominates (an order of
+magnitude on stateless work) and narrows as the user's own state grows, which is what any
+engine should look like. It is now ahead on both.
 
 ## Translating this into a footprint
 
@@ -158,11 +162,11 @@ What the measurements do support is the input to that calculation. CPU time and 
 are what capacity planning is denominated in, and capacity is what draws power:
 
 - **CPU time per event** determines how many cores must be provisioned to sustain a
-  given event rate. Measured here at 3.04x lower (stateless) and 2.00x lower (windowed).
+  given event rate. Measured here at 3.87x lower (stateless) and 2.86x lower (windowed).
 - **Memory per instance** determines how much RAM must be provisioned, and often which
-  instance size must be bought. Measured here at 16.4x lower for the runtime itself.
-- **Cores occupied** was 1.08 of 4 against 2.58 of 4 on the stateless query, doing the
-  same work in the same wall time on the same machine.
+  instance size must be bought. Measured here at 15.5x lower for the runtime itself.
+- **Cores occupied** was 0.84 of 4 against 2.57 of 4 on the stateless query, while draining
+  the same input sooner on the same machine.
 
 To apply this to your own footprint, take your existing pipeline's provisioned CPU and
 RAM, scale by the ratios above for a comparable query shape, and multiply by your own
@@ -182,13 +186,14 @@ Stated plainly, because an efficiency page without this section should not be tr
 - **An untuned comparison.** The JVM engine ran its upstream image with the harness's
   configuration and one change made in its favour (the metrics interval). A tuning
   effort on either side would move the numbers.
-- **Throughput ratios are not stable to the decimal.** The same clink commit measured
-  1.56x and 1.30x against the JVM engine on two different machines of the same type. The
-  efficiency and memory columns held steady across those runs; the raw throughput ratio
-  did not. Treat throughput as "ahead" and cost-per-event as the durable figure.
-- **A tuned windowed-state representation.** clink's per-group state measured about
-  3.9 KB for an int64 key and a count. That is a defect, not a floor, and the q12 memory
-  row should be read as "clink today", not "clink native".
+- **Throughput ratios are not stable to the decimal.** One clink commit measured 1.56x and
+  1.30x against the JVM engine on two different machines of the same type. The efficiency and
+  memory columns held steady across those runs; the raw throughput ratio did not. Treat
+  throughput as "ahead" and cost-per-event as the durable figure.
+- **A finished windowed-state representation.** clink's per-group state measured 1,977
+  bytes for an int64 key and a count, down from 3,914, and the remainder is container
+  overhead rather than the accumulator. Read the q12 memory row as "clink today", not
+  "clink at its floor".
 - **Long-run behaviour.** These are minutes-long runs, not weeks. Memory behaviour over
   a long-lived job with continuous watermark progress is not what this measured.
 
@@ -215,12 +220,14 @@ QUERIES="q0 q12" PARALLELISM=4 EVENTS=500000 ./run.sh
 
 ## Provenance
 
-- **Measured** 26 July 2026, clink at commit `1eb6fae`, against Apache Flink 2.2.0 on
-  Java 21 (upstream image, unmodified).
+- **Measured** 27 July 2026, clink at commit `764e570`, against Apache Flink 2.2.0 on
+  Java 21 (upstream image, unmodified), re-baselined on the same machine in the same session.
 - **Rig** 2x Hetzner ccx23 nodes in `fsn1` (4 dedicated vCPU each, AMD EPYC Milan), one
   engine node and one broker node, private network between them.
 - **Raw output** every figure on this page comes from the eight per-run JSON files
-  published alongside it: [`assets/efficiency-2026-07-26.json`](assets/efficiency-2026-07-26.json).
+  published alongside it: [`assets/efficiency-2026-07-27.json`](assets/efficiency-2026-07-27.json).
+  The previous round is kept for comparison at
+  [`assets/efficiency-2026-07-26.json`](assets/efficiency-2026-07-26.json).
 - **Full record**, including the method corrections that voided earlier numbers, the
   per-stage CPU attribution, and the optimisations that were measured and rejected:
   [`benchmarks/nexmark_compare/cloud/README.md`](https://github.com/orhaugh/clink/blob/main/benchmarks/nexmark_compare/cloud/README.md).

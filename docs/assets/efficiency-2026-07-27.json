@@ -1,0 +1,220 @@
+{
+  "_note": "Raw per-run output behind docs/efficiency.md. Produced by benchmarks/nexmark_compare/cloud/split-run.sh; not hand-edited. One row per measured run: one engine, one query, one trial, on the same engine node against the same isolated broker, with Flink re-baselined on this provision.",
+  "measured_utc_date": "2026-07-27",
+  "clink_commit": "764e570",
+  "flink_version": "2.2.0-scala_2.12-java21 (upstream image, unmodified)",
+  "supersedes": "efficiency-2026-07-26.json (clink 1eb6fae); this run follows a round of engine fixes",
+  "rig": {
+    "engine_node": "Hetzner ccx23, 4 dedicated vCPU, AMD EPYC Milan, fsn1",
+    "broker_node": "Hetzner ccx23, 4 dedicated vCPU, fsn1, runs the broker alone",
+    "note": "one engine at a time on the engine node; fresh cluster per measured run"
+  },
+  "workload": {
+    "source": "Kafka topic nx-bid, 4 partitions, 9.2M nexmark bid records",
+    "queries": "nexmark q0 (stateless projection), q12 (windowed GROUP BY)",
+    "parallelism": 4,
+    "sink": "blackhole (output discarded)"
+  },
+  "how_read": {
+    "cpu": "cgroup v2 cpu.stat usage_usec across every container of the engine under test",
+    "memory": "cgroup v2 memory.stat anon (engine heap+stacks, excludes page cache)",
+    "rate": "the engine's own records-processed counter at 100ms; sustained_slope is the steepest 0.5s slope"
+  },
+  "correctness_gate": {
+    "harness": "benchmarks/nexmark_compare/run.sh (separate run)",
+    "q0_output_rows": {
+      "clink": 460000,
+      "flink": 460000,
+      "identical": true
+    },
+    "q12_output_rows": {
+      "clink": 184767,
+      "flink": 184767,
+      "identical": true
+    },
+    "note": "gate last run at 1eb6fae; the changes since are covered by 1631 core + 835 SQL tests"
+  },
+  "q12_memory_decomposition": {
+    "groups_195710_mb": 831,
+    "groups_5_mb": 444,
+    "per_group_bytes": 1977,
+    "previous_per_group_bytes": 3914,
+    "note": "Holding records and window fixed and varying only the group count separates per-group state from the group-independent pipeline-buffering floor."
+  },
+  "not_measured": [
+    "wall power, PUE, grid carbon intensity, embodied carbon",
+    "workloads beyond nexmark q0 and q12",
+    "hardware other than AMD EPYC Milan",
+    "a tuning effort on either engine",
+    "long-run (days/weeks) memory behaviour"
+  ],
+  "caveat_throughput_variance": "The throughput ratio moves tens of percent between provisions of the same machine type. events_per_cpu_sec and anon_mb hold steady; quote throughput as 'ahead', not to two decimals.",
+  "derived_ratios": {
+    "q0": {
+      "clink_events_per_cpu_sec": 983957,
+      "flink_events_per_cpu_sec": 254425,
+      "cpu_efficiency_ratio": 3.87,
+      "clink_anon_mb": 75.5,
+      "flink_anon_mb": 1169.3,
+      "clink_cores": 0.84,
+      "flink_cores": 2.57,
+      "memory_ratio": 15.5
+    },
+    "q12": {
+      "clink_events_per_cpu_sec": 482940,
+      "flink_events_per_cpu_sec": 168993,
+      "cpu_efficiency_ratio": 2.86,
+      "clink_anon_mb": 748.7,
+      "flink_anon_mb": 1625.2,
+      "clink_cores": 1.71,
+      "flink_cores": 2.94,
+      "memory_ratio": 2.2
+    }
+  },
+  "runs": [
+    {
+      "query": "q0",
+      "engine": "clink",
+      "trial": 1,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 3978541.8,
+      "drain_rate": 3792293.3,
+      "drain_seconds": 2.426,
+      "reached_target": true,
+      "cpu_seconds": 9.35,
+      "wall_seconds": 11.11,
+      "cores": 0.84,
+      "events_per_cpu_sec": 983957,
+      "anon_mb": 75.5,
+      "peak_mb": 90.6,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q0",
+      "engine": "clink",
+      "trial": 2,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 3946703.5,
+      "drain_rate": 3602553.0,
+      "drain_seconds": 2.554,
+      "reached_target": true,
+      "cpu_seconds": 9.53,
+      "wall_seconds": 10.23,
+      "cores": 0.93,
+      "events_per_cpu_sec": 965373,
+      "anon_mb": 76.7,
+      "peak_mb": 100.6,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q0",
+      "engine": "flink",
+      "trial": 1,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 2735413.5,
+      "drain_rate": 1156941.6,
+      "drain_seconds": 7.952,
+      "reached_target": true,
+      "cpu_seconds": 36.16,
+      "wall_seconds": 13.86,
+      "cores": 2.61,
+      "events_per_cpu_sec": 254425,
+      "anon_mb": 1176.1,
+      "peak_mb": 1526.7,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q0",
+      "engine": "flink",
+      "trial": 2,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 2434241.6,
+      "drain_rate": 1099295.0,
+      "drain_seconds": 8.369,
+      "reached_target": true,
+      "cpu_seconds": 36.51,
+      "wall_seconds": 14.19,
+      "cores": 2.57,
+      "events_per_cpu_sec": 251986,
+      "anon_mb": 1169.3,
+      "peak_mb": 1539.5,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q12",
+      "engine": "clink",
+      "trial": 1,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 2904627.5,
+      "drain_rate": 2533107.8,
+      "drain_seconds": 3.632,
+      "reached_target": true,
+      "cpu_seconds": 19.05,
+      "wall_seconds": 11.15,
+      "cores": 1.71,
+      "events_per_cpu_sec": 482940,
+      "anon_mb": 748.7,
+      "peak_mb": 777.0,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q12",
+      "engine": "clink",
+      "trial": 2,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 2707807.0,
+      "drain_rate": 1872910.9,
+      "drain_seconds": 4.912,
+      "reached_target": true,
+      "cpu_seconds": 22.6,
+      "wall_seconds": 12.45,
+      "cores": 1.82,
+      "events_per_cpu_sec": 407080,
+      "anon_mb": 889.3,
+      "peak_mb": 917.5,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q12",
+      "engine": "flink",
+      "trial": 1,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 1563509.4,
+      "drain_rate": 718693.9,
+      "drain_seconds": 12.801,
+      "reached_target": true,
+      "cpu_seconds": 56.87,
+      "wall_seconds": 19.35,
+      "cores": 2.94,
+      "events_per_cpu_sec": 161772,
+      "anon_mb": 1625.2,
+      "peak_mb": 1863.2,
+      "mem_fresh_stack": true
+    },
+    {
+      "query": "q12",
+      "engine": "flink",
+      "trial": 2,
+      "par": 4,
+      "input_events": 9200000,
+      "sustained_slope": 1609556.0,
+      "drain_rate": 740263.9,
+      "drain_seconds": 12.428,
+      "reached_target": true,
+      "cpu_seconds": 54.44,
+      "wall_seconds": 18.47,
+      "cores": 2.95,
+      "events_per_cpu_sec": 168993,
+      "anon_mb": 1625.9,
+      "peak_mb": 1860.6,
+      "mem_fresh_stack": true
+    }
+  ]
+}
