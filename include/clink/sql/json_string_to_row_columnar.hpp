@@ -67,7 +67,21 @@ class JsonStringToRowColumnarOperator final : public Operator<std::string, Row> 
 public:
     // Defined out of line alongside the on-demand decoder: the constructor's
     // cleanup path has to destroy od_, which needs the complete type.
+    // `projected` is an optional keep-list of column names. Empty means "keep
+    // everything", which is the behaviour every caller had before it existed.
+    //
+    // It is deliberately NOT a narrowing of `columns`. The faithfulness gate that makes
+    // the columnar carrier safe works by requiring the JSON object's fields to match the
+    // DECLARED schema exactly - an undeclared field bails the batch, because the row
+    // decode would have kept it. Narrowing the declared schema instead would make every
+    // record's unprojected fields "undeclared", so every batch would fail the gate, pay a
+    // partial columnar parse plus a full row re-parse, and after eight consecutive
+    // failures the damper would stop trying columnar on 63 of every 64 batches -
+    // surrendering the measured +69% columnar gain to buy a narrower batch. So the full
+    // schema stays in the gate and `projected` only decides which columns get BUILT:
+    // declared-but-unprojected means consume-and-discard.
     explicit JsonStringToRowColumnarOperator(std::vector<RowColumn> columns,
+                                             std::vector<std::string> projected = {},
                                              std::string name = "json_string_to_row_columnar");
 
     void process(const StreamElement<std::string>& element, Emitter<Row>& out) override {
@@ -152,6 +166,10 @@ private:
         arrow::Type::type type_id{arrow::Type::NA};
         // Only meaningful for DECIMAL128; 0 elsewhere.
         std::int32_t scale{0};
+        // False when the column is declared but not in the projection keep-list: its
+        // value is still parsed and type-checked by the gate, then discarded instead of
+        // appended to a builder, and it is omitted from the emitted Arrow schema.
+        bool projected{true};
         // Precomputed name length, so the lookup's reject test is two integer
         // comparisons before it touches any bytes.
         std::uint32_t name_len{0};
@@ -374,8 +392,14 @@ private:
         if (!t_b.Reserve(n).ok()) {
             return std::nullopt;
         }
+        // No builder for an unprojected column - see the on-demand arm; the two arms must
+        // make the same projection decision or one batch's schema would depend on which of
+        // them decoded it.
         std::vector<std::unique_ptr<arrow::ArrayBuilder>> col_b(resolved_.size());
         for (std::size_t ci = 0; ci < resolved_.size(); ++ci) {
+            if (!resolved_[ci].projected) {
+                continue;
+            }
             if (!arrow::MakeBuilder(pool, resolved_[ci].eff, &col_b[ci]).ok()) {
                 return std::nullopt;
             }
@@ -414,6 +438,11 @@ private:
                 if (it == obj.end()) {
                     return std::nullopt;  // declared column absent
                 }
+                // Declared but unprojected: its presence is still required (the check
+                // above), it is simply not stored.
+                if (!resolved_[ci].projected) {
+                    continue;
+                }
                 const clink::config::JsonValue* value = &it->second;
                 clink::config::JsonValue exact;
                 if (!dec_tokens.empty() && it->second.is_number()) {
@@ -447,6 +476,9 @@ private:
         }
         arrays.push_back(std::move(t_arr));
         for (std::size_t ci = 0; ci < resolved_.size(); ++ci) {
+            if (!resolved_[ci].projected) {
+                continue;  // matches data_fields_, which also skipped it
+            }
             std::shared_ptr<arrow::Array> a;
             if (!col_b[ci]->Finish(&a).ok()) {
                 return std::nullopt;
@@ -500,9 +532,17 @@ private:
                               : nullptr;
             const auto rn = b.num_rows();
             std::vector<Row> decoded(static_cast<std::size_t>(rn));
-            for (std::size_t ci = 0; ci < resolved.size(); ++ci) {
-                const auto& c = resolved[ci];
-                const auto& col = *b.column(static_cast<int>(ci) + 1);
+            // Walk the PROJECTED columns only, tracking the batch position separately.
+            // resolved[] carries every DECLARED column - unprojected ones included, because
+            // the decode gate needs them - while the batch carries only the projected ones,
+            // so `ci + 1` is not the batch index once a projection is in play. Using it read
+            // past the end of the batch and crashed in Arrow's lazy column boxing.
+            int out_idx = 1;  // 0 is the event-time column
+            for (const auto& c : resolved) {
+                if (!c.projected) {
+                    continue;
+                }
+                const auto& col = *b.column(out_idx++);
                 for (std::int64_t i = 0; i < rn; ++i) {
                     decoded[static_cast<std::size_t>(i)].values[c.name] =
                         row_columnar_detail::read_cell(c.eff, col, i);

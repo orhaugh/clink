@@ -37,11 +37,17 @@ struct JsonStringToRowColumnarOperator::Ondemand {
 };
 
 JsonStringToRowColumnarOperator::JsonStringToRowColumnarOperator(std::vector<RowColumn> columns,
+                                                                 std::vector<std::string> projected,
                                                                  std::string name)
     // The row fallback MUST use the same schema-aware decode the columnar arms
-    // are written against, or this operator would disagree with itself
-    // depending on which carrier a batch took.
-    : fmt_(row_json_text_format_for_columns(columns)), name_(std::move(name)) {
+    // are written against, or this operator would disagree with itself depending on which
+    // carrier a batch took - so it takes the SAME projection. row_json_text_format_projected
+    // already preserves the synthetic __row_kind changelog marker, which is why the keep-list
+    // goes through it rather than being applied by hand.
+    : fmt_(row_json_text_format_for_columns_projected(columns, projected)), name_(std::move(name)) {
+    // Empty keep-list means keep everything.
+    const bool project = !projected.empty();
+    const std::set<std::string> keep(projected.begin(), projected.end());
     resolved_.reserve(columns.size());
     data_fields_.reserve(columns.size() + 1);
     data_fields_.push_back(clink::arrow_event_time_field());  // sidecar column 0
@@ -84,9 +90,16 @@ JsonStringToRowColumnarOperator::JsonStringToRowColumnarOperator(std::vector<Row
         const std::int32_t sc = tid == arrow::Type::DECIMAL128
                                     ? static_cast<const arrow::Decimal128Type&>(*eff).scale()
                                     : 0;
-        data_fields_.push_back(arrow::field(c.name, eff, /*nullable=*/true));
+        const bool want = !project || keep.count(c.name) > 0;
+        // Only projected columns appear in the emitted Arrow schema. An unprojected one
+        // still gets a Resolved entry, because the field walk must recognise it as
+        // DECLARED - and type-check its value - rather than treat it as undeclared and bail
+        // the whole batch.
+        if (want) {
+            data_fields_.push_back(arrow::field(c.name, eff, /*nullable=*/true));
+        }
         resolved_.push_back(
-            {c.name, std::move(eff), tid, sc, static_cast<std::uint32_t>(c.name.size())});
+            {c.name, std::move(eff), tid, sc, want, static_cast<std::uint32_t>(c.name.size())});
     }
     // Identity is the right initial guess: a producer emitting fields in declared
     // order is the common case, so the first record already hits.
@@ -233,8 +246,14 @@ std::optional<Batch<Row>> JsonStringToRowColumnarOperator::build_columnar_ondema
     if (!t_b.Reserve(n).ok()) {
         return std::nullopt;
     }
+    // An unprojected column gets NO builder: nothing downstream reads it, so building it
+    // is the whole cost this projection exists to avoid. Its slot stays null and the field
+    // walk below skips the append for it.
     std::vector<std::unique_ptr<arrow::ArrayBuilder>> col_b(resolved_.size());
     for (std::size_t ci = 0; ci < resolved_.size(); ++ci) {
+        if (!resolved_[ci].projected) {
+            continue;
+        }
         if (!arrow::MakeBuilder(pool, resolved_[ci].eff, &col_b[ci]).ok()) {
             return std::nullopt;
         }
@@ -314,8 +333,13 @@ std::optional<Batch<Row>> JsonStringToRowColumnarOperator::build_columnar_ondema
                 return std::nullopt;
             }
             const auto& res = resolved_[uci];
-            if (!append_ondemand(res.type_id, col_b[uci].get(), val, res.scale)) {
-                return std::nullopt;
+            // Declared but unprojected: consume the field and drop it. It still counts
+            // toward `filled`, so the "every declared column present" gate below is
+            // unchanged - the projection must not turn a faithfulness check into a pass.
+            if (res.projected) {
+                if (!append_ondemand(res.type_id, col_b[uci].get(), val, res.scale)) {
+                    return std::nullopt;
+                }
             }
             seen[uci] = 1;
             ++filled;
@@ -340,7 +364,11 @@ std::optional<Batch<Row>> JsonStringToRowColumnarOperator::build_columnar_ondema
         return std::nullopt;
     }
     arrays.push_back(std::move(t_arr));
+    // Same order and count as data_fields_, which also skipped the unprojected columns.
     for (std::size_t ci = 0; ci < resolved_.size(); ++ci) {
+        if (!resolved_[ci].projected) {
+            continue;
+        }
         std::shared_ptr<arrow::Array> a;
         if (!col_b[ci]->Finish(&a).ok()) {
             return std::nullopt;

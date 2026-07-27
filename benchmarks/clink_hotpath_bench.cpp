@@ -15,6 +15,7 @@
 //   clink_hotpath_bench q12  [lines]   decode -> STRING key -> windowed COUNT fold
 //   clink_hotpath_bench q12typed [n]   the same fold with a typed int64 key
 //   clink_hotpath_bench decode [lines] the JSON bridge alone
+//   clink_hotpath_bench decodeproj [n]  the same decode with q12's projection applied
 //   clink_hotpath_bench buildonly [n]  Batch<std::string> assembly ALONE, to subtract
 //
 // A 4th argument repeats the measured loop (`decode 2000000 256 20`), which is how to
@@ -100,8 +101,11 @@ void report(const char* stage, std::size_t n, double secs, std::size_t sink) {
 // Drive the columnar JSON bridge over the input in batches, handing each emitted
 // element to `consume`. Mirrors how the runner feeds an operator.
 template <typename Consume>
-void run_decode(const std::vector<std::string>& lines, std::size_t batch, Consume&& consume) {
-    clink::sql::JsonStringToRowColumnarOperator op{bid_schema()};
+void run_decode(const std::vector<std::string>& lines,
+                std::size_t batch,
+                Consume&& consume,
+                const std::vector<std::string>& projected = {}) {
+    clink::sql::JsonStringToRowColumnarOperator op{bid_schema(), projected};
     for (std::size_t i = 0; i < lines.size(); i += batch) {
         Batch<std::string> in;
         in.reserve(batch);
@@ -119,17 +123,34 @@ void run_decode(const std::vector<std::string>& lines, std::size_t batch, Consum
     }
 }
 
-int bench_decode(const std::vector<std::string>& lines, std::size_t batch, std::size_t repeats) {
+// The projection q12 actually needs: it reads bidder and datetime out of six declared
+// columns, so an unprojected decode builds channel and url for nothing.
+const std::vector<std::string>& q12_projection() {
+    static const std::vector<std::string> p{"bidder", "datetime"};
+    return p;
+}
+
+int bench_decode(const std::vector<std::string>& lines,
+                 std::size_t batch,
+                 std::size_t repeats,
+                 bool projected = false) {
     std::size_t rows = 0, columnar = 0;
     Timer t;
     for (std::size_t r = 0; r < repeats; ++r) {
-        run_decode(lines, batch, [&](const Batch<Row>& b) {
-            rows += b.size();  // size() answers from the sidecar; no materialisation
-            if (b.is_columnar())
-                ++columnar;
-        });
+        run_decode(
+            lines,
+            batch,
+            [&](const Batch<Row>& b) {
+                rows += b.size();  // size() answers from the sidecar; no materialisation
+                if (b.is_columnar())
+                    ++columnar;
+            },
+            projected ? q12_projection() : std::vector<std::string>{});
     }
-    report("decode only", lines.size() * repeats, t.elapsed(), rows);
+    report(projected ? "decode (q12 projected)" : "decode only",
+           lines.size() * repeats,
+           t.elapsed(),
+           rows);
     std::printf("  (columnar batches: %zu)\n", columnar);
     return 0;
 }
@@ -247,6 +268,8 @@ int main(int argc, char** argv) {
 
     if (shape == "decode")
         return bench_decode(lines, batch, repeats);
+    if (shape == "decodeproj")
+        return bench_decode(lines, batch, repeats, /*projected=*/true);
     if (shape == "buildonly")
         return bench_build_only(lines, batch, repeats);
     if (shape == "q0")

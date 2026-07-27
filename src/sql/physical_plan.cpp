@@ -948,6 +948,11 @@ std::string compile_node(const LogicalPlan& node,
             }
             op.params["projected_columns"] = std::move(csv);
         }
+        // Kept separately because `op` is moved into the spec before the bridge is built.
+        std::map<std::string, std::string> op_params_projection;
+        if (auto pit = op.params.find("projected_columns"); pit != op.params.end()) {
+            op_params_projection["projected_columns"] = pit->second;
+        }
 
         std::string after_src;
         if (ch == Channel::Row) {
@@ -972,6 +977,31 @@ std::string compile_node(const LogicalPlan& node,
                 if (binding.bridge_op == "json_string_to_row_columnar" ||
                     binding.bridge_op == "json_string_to_row") {
                     bridge.params["schema_columns"] = serialize_row_schema(row_columns_of(table));
+                    // Projection pushdown for the JSON bridges. The hint was previously
+                    // written ONLY onto the source op, and for a Kafka JSON table the source
+                    // is kafka_source_string, which emits raw text and cannot act on it - so
+                    // the one operator able to use it never saw it, and a query reading two
+                    // of six columns still decoded, carried and shuffled all six.
+                    //
+                    // schema_columns above stays the FULL declared schema on purpose: the
+                    // columnar decoder's faithfulness gate is what makes that carrier safe,
+                    // and it works by requiring the JSON object to match the declared schema
+                    // exactly. Narrowing the schema would make unprojected fields
+                    // "undeclared", bail every batch, and after eight consecutive failures
+                    // the damper would abandon the columnar path - slower, not faster. The
+                    // decoder therefore treats declared-but-unprojected as
+                    // consume-and-discard.
+                    //
+                    // Safe to take verbatim from the optimizer: set_scan_projection unions
+                    // the table's event_time_column (the assign_timestamps_row op that reads
+                    // it is invisible to the logical analysis), and
+                    // apply_projection_pushdown fails closed - it never annotates a scan
+                    // reached through a node kind it does not recognise, so an unhandled
+                    // shape yields no hint rather than a short one.
+                    if (auto pit = op_params_projection.find("projected_columns");
+                        pit != op_params_projection.end() && !pit->second.empty()) {
+                        bridge.params["projected_columns"] = pit->second;
+                    }
                 }
                 after_src = bridge.id;
                 spec.ops.push_back(std::move(bridge));

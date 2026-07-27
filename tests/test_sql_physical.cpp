@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <sstream>
 
 #include <gtest/gtest.h>
 
@@ -81,6 +82,128 @@ TEST(SqlPhysical, FileSourceFileSinkCompilesToThreeOps) {
     ASSERT_EQ(snk->inputs.size(), 1u);
     EXPECT_EQ(snk->inputs[0], proj->id);
     EXPECT_EQ(src->out_channel, "string");
+}
+
+// ---- projection pushdown onto the JSON bridge --------------------------------------
+//
+// The hint used to be written only onto the SOURCE op. For a Kafka JSON table the source is
+// kafka_source_string, which emits raw text and cannot act on it, so the one operator that
+// could - the columnar JSON bridge - never saw it and a query reading two of six columns
+// decoded, carried and shuffled all six.
+
+// The bridge gets the projection, and schema_columns stays at FULL declared width. That
+// pairing is the whole safety property: the decoder's faithfulness gate needs the complete
+// schema, and narrowing it would make unprojected fields look undeclared, bail every batch
+// and make the columnar path slower than not having it.
+TEST(SqlPhysical, ProjectionReachesTheJsonBridgeWithoutNarrowingTheSchema) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
+        "url VARCHAR, dt BIGINT) WITH (connector='kafka', format='json', topic='b', "
+        "brokers='x:9092', event_time_column='dt');"
+        "CREATE TABLE o (bidder BIGINT, c BIGINT) WITH (connector='blackhole');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = optimize(bind_insert(
+        cat,
+        "INSERT INTO o SELECT bidder, COUNT(*) FROM bid GROUP BY TUMBLE(dt, INTERVAL '10' "
+        "SECOND), bidder"));
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+
+    const auto* bridge = find_op(spec, "json_string_to_row_columnar");
+    ASSERT_NE(bridge, nullptr);
+    ASSERT_EQ(bridge->params.count("projected_columns"), 1u)
+        << "the bridge is the only op able to act on the projection and must receive it";
+    const auto proj = bridge->params.at("projected_columns");
+    EXPECT_NE(proj.find("bidder"), std::string::npos);
+    EXPECT_NE(proj.find("dt"), std::string::npos) << "the event-time column must survive";
+    EXPECT_EQ(proj.find("channel"), std::string::npos) << "channel is unused and should be dropped";
+    EXPECT_EQ(proj.find("url"), std::string::npos) << "url is unused and should be dropped";
+
+    // The declared schema must NOT be narrowed.
+    ASSERT_EQ(bridge->params.count("schema_columns"), 1u);
+    const auto schema = bridge->params.at("schema_columns");
+    for (const char* col : {"auction", "bidder", "price", "channel", "url", "dt"}) {
+        EXPECT_NE(schema.find(col), std::string::npos)
+            << col
+            << " vanished from schema_columns; the faithfulness gate needs the full "
+               "declared schema or every batch bails and the columnar path is abandoned";
+    }
+}
+
+// The safety property that matters most: the projection must cover every column any
+// DOWNSTREAM op names. If it misses one, that op silently reads a column that is no longer
+// there - the timestamp assigner losing its column would put every record on processing
+// time, which is a wrong answer rather than a slow one.
+TEST(SqlPhysical, ProjectionCoversEveryColumnDownstreamOpsReference) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
+        "url VARCHAR, dt BIGINT) WITH (connector='kafka', format='json', topic='b', "
+        "brokers='x:9092', event_time_column='dt');"
+        "CREATE TABLE o (bidder BIGINT, c BIGINT) WITH (connector='blackhole');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    // Several shapes, because each wires a different set of column-naming ops between the
+    // bridge and the sink.
+    for (const char* q :
+         {"INSERT INTO o SELECT bidder, COUNT(*) FROM bid GROUP BY TUMBLE(dt, INTERVAL '10' "
+          "SECOND), bidder",
+          "INSERT INTO o SELECT bidder, SUM(price) FROM bid GROUP BY TUMBLE(dt, INTERVAL '5' "
+          "SECOND), bidder",
+          "INSERT INTO o SELECT bidder, COUNT(*) FROM bid WHERE price > 10 GROUP BY "
+          "TUMBLE(dt, INTERVAL '10' SECOND), bidder",
+          // No window and no reference to dt anywhere in the query. The logical analysis
+          // therefore does not collect it, and the ONLY thing keeping dt in the projection
+          // is set_scan_projection's explicit union of event_time_column - which exists
+          // because the assign_timestamps_row op that reads it is invisible to that
+          // analysis. Without this shape the assertion below never exercises that union,
+          // and starving the timestamp assigner puts every record on processing time: a
+          // wrong answer, not a slow one.
+          "INSERT INTO o SELECT bidder, price FROM bid"}) {
+        auto plan = optimize(bind_insert(cat, q));
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        const auto* bridge = find_op(spec, "json_string_to_row_columnar");
+        ASSERT_NE(bridge, nullptr) << q;
+        auto pit = bridge->params.find("projected_columns");
+        if (pit == bridge->params.end() || pit->second.empty()) {
+            continue;  // no projection armed for this shape: nothing can be starved
+        }
+        const std::string proj = pit->second;
+        auto kept = [&proj](const std::string& col) {
+            // Substring is enough here: the declared names share no prefixes.
+            return proj.find(col) != std::string::npos;
+        };
+        // Every param that names a source column on any op downstream of the bridge.
+        for (const auto& op : spec.ops) {
+            for (const char* key : {"column", "columns", "time_column", "group_keys"}) {
+                auto it = op.params.find(key);
+                if (it == op.params.end() || it->second.empty())
+                    continue;
+                std::stringstream ss(it->second);
+                std::string col;
+                while (std::getline(ss, col, ',')) {
+                    if (col.empty() || col.rfind("__", 0) == 0)
+                        continue;  // engine-only synthetic column, not from the source
+                    // Only assert for names that are actually source columns.
+                    bool declared = false;
+                    for (const char* d : {"auction", "bidder", "price", "channel", "url", "dt"}) {
+                        if (col == d)
+                            declared = true;
+                    }
+                    if (!declared)
+                        continue;
+                    EXPECT_TRUE(kept(col))
+                        << "query: " << q << "\n  op " << op.type << " param " << key
+                        << " names source column '" << col
+                        << "' but the projection dropped it - that op will read a column that "
+                           "is no longer in the batch";
+                }
+            }
+        }
+    }
 }
 
 TEST(SqlPhysical, KafkaConnectorMapsToKafkaFactories) {

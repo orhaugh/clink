@@ -522,6 +522,137 @@ TEST(JsonColumnarDecode, SourcePartitionColumnDoesNotLeakIntoMaterialisedRows) {
 // A declared column in the engine-reserved "__" namespace would collide with
 // the appended partition sidecar column (ambiguous name -> partition silently
 // lost -> global-watermark collapse). Such a schema must take the row path.
+// ---- projection pushdown ----------------------------------------------------------
+//
+// The bridge can be told to build only some declared columns. The design decision under
+// test: a declared-but-unprojected column is CONSUMED AND DISCARDED, not treated as
+// undeclared. Narrowing the declared schema instead would make every unprojected field
+// "undeclared", bail every batch on the faithfulness gate, and after eight consecutive
+// failures the damper would abandon the columnar path entirely - so the "optimisation"
+// would disable the fast path it was meant to speed up.
+
+// The projected columns come through; the unprojected ones are gone; the batch is still
+// COLUMNAR (that is the whole point).
+TEST(JsonColumnarDecode, ProjectionKeepsOnlyTheRequestedColumnsAndStaysColumnar) {
+    const std::vector<std::string> lines = {
+        R"({"a":1,"b":1.5,"c":"x","d":true})",
+        R"({"a":2,"b":2.5,"c":"y","d":false})",
+    };
+    JsonStringToRowColumnarOperator op(demo_schema(), {"a", "c"});
+    auto el = run_one(op, lines_batch(lines));
+    ASSERT_TRUE(el.is_data());
+    const Batch<Row>& b = el.as_data();
+
+    EXPECT_TRUE(b.is_columnar())
+        << "an unprojected column must be consumed and discarded, NOT treated as undeclared "
+           "- treating it as undeclared bails the batch and kills the columnar path";
+    EXPECT_EQ(b.size(), lines.size());
+
+    // The emitted Arrow schema carries only the projected columns (plus the mandatory
+    // event-time column 0 the carrier prepends).
+    const auto& rb = b.arrow();
+    ASSERT_NE(rb, nullptr);
+    EXPECT_EQ(rb->schema()->GetFieldIndex("a") >= 0, true);
+    EXPECT_EQ(rb->schema()->GetFieldIndex("c") >= 0, true);
+    EXPECT_EQ(rb->schema()->GetFieldIndex("b"), -1) << "unprojected column b was still built";
+    EXPECT_EQ(rb->schema()->GetFieldIndex("d"), -1) << "unprojected column d was still built";
+
+    for (const auto& rec : b) {
+        const auto& v = rec.value().values;
+        EXPECT_TRUE(v.find("a") != v.end());
+        EXPECT_TRUE(v.find("c") != v.end());
+        EXPECT_TRUE(v.find("b") == v.end());
+        EXPECT_TRUE(v.find("d") == v.end());
+    }
+}
+
+// The gate must NOT be weakened by projection. A genuinely undeclared field still bails,
+// even when it would have been unprojected anyway - otherwise projection would silently
+// turn a faithfulness check into a pass and let an unknown field be dropped.
+TEST(JsonColumnarDecode, ProjectionDoesNotWeakenTheUndeclaredFieldGate) {
+    JsonStringToRowColumnarOperator op(demo_schema(), {"a"});
+    Batch<std::string> in;
+    in.emplace(std::string(R"({"a":1,"b":1.5,"c":"x","d":true,"surprise":9})"));
+    auto el = run_one(op, std::move(in));
+    ASSERT_TRUE(el.is_data());
+    EXPECT_FALSE(el.as_data().is_columnar())
+        << "an undeclared field must still bail the columnar carrier under projection";
+}
+
+// A missing DECLARED column still bails, projected or not: the gate's job is to prove the
+// record matched the declared schema, and projection only changes what is stored.
+TEST(JsonColumnarDecode, ProjectionStillRequiresEveryDeclaredColumnPresent) {
+    JsonStringToRowColumnarOperator op(demo_schema(), {"a"});
+    Batch<std::string> in;
+    in.emplace(std::string(R"({"a":1,"b":1.5,"c":"x"})"));  // d missing
+    auto el = run_one(op, std::move(in));
+    ASSERT_TRUE(el.is_data());
+    EXPECT_FALSE(el.as_data().is_columnar())
+        << "a missing declared column must bail even when it is unprojected";
+}
+
+// Both carriers of this one operator must agree. The row FALLBACK has to drop exactly the
+// same columns, or a batch's shape would depend on which arm decoded it - and it must keep
+// the TYPED decode while doing so, which is why the projection goes through
+// row_json_text_format_for_columns_projected rather than the decimal-only helper.
+TEST(JsonColumnarDecode, ProjectedRowFallbackDropsTheSameColumns) {
+    // "surprise" forces the row fallback; the projection must still apply there.
+    JsonStringToRowColumnarOperator op(demo_schema(), {"a", "c"});
+    Batch<std::string> in;
+    in.emplace(std::string(R"({"a":7,"b":1.5,"c":"z","d":true,"surprise":1})"));
+    auto el = run_one(op, std::move(in));
+    ASSERT_TRUE(el.is_data());
+    ASSERT_FALSE(el.as_data().is_columnar()) << "expected the row fallback for this input";
+    ASSERT_EQ(el.as_data().size(), 1u);
+    const auto& v = el.as_data()[0].value().values;
+    EXPECT_TRUE(v.find("a") != v.end());
+    EXPECT_TRUE(v.find("c") != v.end());
+    EXPECT_TRUE(v.find("b") == v.end()) << "the row fallback kept an unprojected column, so "
+                                           "the two carriers disagree on row shape";
+    EXPECT_TRUE(v.find("d") == v.end());
+}
+
+// An empty keep-list means keep everything - the behaviour every caller had before
+// projection existed.
+TEST(JsonColumnarDecode, EmptyProjectionKeepsEveryColumn) {
+    const std::vector<std::string> lines = {R"({"a":1,"b":1.5,"c":"x","d":true})"};
+    JsonStringToRowColumnarOperator with_empty(demo_schema(), {});
+    JsonStringToRowColumnarOperator without(demo_schema());
+    auto a = run_one(with_empty, lines_batch(lines));
+    auto b = run_one(without, lines_batch(lines));
+    ASSERT_TRUE(a.is_data());
+    ASSERT_TRUE(b.is_data());
+    EXPECT_TRUE(a.as_data().is_columnar());
+    EXPECT_EQ(exact_cells(a.as_data()), exact_cells(b.as_data()));
+}
+
+// Values must be unchanged by projection: a projected column decodes to exactly what it
+// would have without the keep-list, including declared FLOAT and DECIMAL semantics.
+TEST(JsonColumnarDecode, ProjectedValuesMatchTheUnprojectedDecode) {
+    const std::vector<std::string> lines = {
+        R"({"a":1,"b":0.1,"c":"x","d":true})",
+        R"({"a":-2,"b":2.5,"c":"","d":false})",
+    };
+    JsonStringToRowColumnarOperator full(demo_schema());
+    JsonStringToRowColumnarOperator proj(demo_schema(), {"a", "b"});
+    auto f = run_one(full, lines_batch(lines));
+    auto p = run_one(proj, lines_batch(lines));
+    ASSERT_TRUE(f.is_data());
+    ASSERT_TRUE(p.is_data());
+    ASSERT_EQ(f.as_data().size(), p.as_data().size());
+    for (std::size_t i = 0; i < p.as_data().size(); ++i) {
+        const auto& fv = f.as_data()[i].value().values;
+        const auto& pv = p.as_data()[i].value().values;
+        for (const char* col : {"a", "b"}) {
+            auto fit = fv.find(col);
+            auto pit = pv.find(col);
+            ASSERT_TRUE(fit != fv.end() && pit != pv.end());
+            EXPECT_EQ(fit->second.serialize(0), pit->second.serialize(0))
+                << "column " << col << " decoded differently under projection";
+        }
+    }
+}
+
 TEST(JsonColumnarDecode, ReservedDunderColumnForcesRowPath) {
     std::vector<RowColumn> schema = {{"__source_partition", arrow::int64()}, {"a", arrow::int64()}};
     Batch<std::string> in;

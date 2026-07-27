@@ -13,7 +13,11 @@
 // CPU alongside wall for the same reason the other benches do: this runs inside an
 // operator thread and its cost is charged to the engine's CPU budget.
 //
-//   clink_shuffle_split_bench [rows_per_batch] [batches] [targets]
+//   clink_shuffle_split_bench [rows_per_batch] [batches] [targets] [extra_string_cols]
+//
+// extra_string_cols models projection: q12 reads bidder and datetime but declares six
+// columns, so an unprojected plan drags two unused VARCHARs (channel, url) through the
+// shuffle. Pass 2 for the unprojected width and 0 for the projected one.
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -50,7 +54,7 @@ double cpu_seconds() {
 
 // A batch shaped like the one q12's shuffle actually carries: the mandatory event-time
 // column at index 0, an int64 key, an int64 measure and a string, all nullable.
-std::shared_ptr<arrow::RecordBatch> make_batch(std::int64_t rows) {
+std::shared_ptr<arrow::RecordBatch> make_batch(std::int64_t rows, int extra_string_cols = 1) {
     arrow::Int64Builder ts, key, price;
     arrow::StringBuilder channel;
     std::mt19937_64 rng(11);
@@ -65,11 +69,24 @@ std::shared_ptr<arrow::RecordBatch> make_batch(std::int64_t rows) {
     (void)key.Finish(&a_key);
     (void)price.Finish(&a_price);
     (void)channel.Finish(&a_ch);
-    auto schema = arrow::schema({arrow::field("event_time", arrow::int64(), true),
-                                 arrow::field("bidder", arrow::int64(), true),
-                                 arrow::field("price", arrow::int64(), true),
-                                 arrow::field("channel", arrow::utf8(), true)});
-    return arrow::RecordBatch::Make(schema, rows, {a_ts, a_key, a_price, a_ch});
+    std::vector<std::shared_ptr<arrow::Field>> fields{
+        arrow::field("event_time", arrow::int64(), true),
+        arrow::field("bidder", arrow::int64(), true),
+        arrow::field("price", arrow::int64(), true)};
+    std::vector<std::shared_ptr<arrow::Array>> cols{a_ts, a_key, a_price};
+    // Realistic widths from a nexmark_dump run: channel averages 6.0 chars, url 23.9.
+    for (int e = 0; e < extra_string_cols; ++e) {
+        arrow::StringBuilder sb;
+        for (std::int64_t i = 0; i < rows; ++i) {
+            (void)sb.Append(e == 0 ? ("channel-" + std::to_string(i % 8))
+                                   : ("https://nexmark.dev/" + std::to_string(i % 10000)));
+        }
+        std::shared_ptr<arrow::Array> sa;
+        (void)sb.Finish(&sa);
+        fields.push_back(arrow::field(e == 0 ? "channel" : "url", arrow::utf8(), true));
+        cols.push_back(sa);
+    }
+    return arrow::RecordBatch::Make(arrow::schema(fields), rows, cols);
 }
 
 }  // namespace
@@ -85,7 +102,8 @@ int main(int argc, char** argv) {
                 static_cast<long long>(batches),
                 n_out);
 
-    auto rb = make_batch(rows);
+    const int extra = argc > 4 ? static_cast<int>(std::strtol(argv[4], nullptr, 10)) : 1;
+    auto rb = make_batch(rows, extra);
     Batch<Row> batch{rb, static_cast<std::size_t>(rows), clink::sql::row_materialize_fn()};
 
     // A spread of targets, as a real key hash produces. Built once so the measurement is

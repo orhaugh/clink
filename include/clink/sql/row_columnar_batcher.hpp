@@ -329,6 +329,52 @@ inline clink::TextFormat<Row> row_json_text_format_for_columns(
     return row_json_text_format_typed(std::move(decimal_scales), std::move(float_columns));
 }
 
+// row_json_text_format_for_columns, restricted to a keep-list of column names.
+//
+// The row FALLBACK of a projecting columnar decoder has to drop exactly the same columns
+// the columnar arm drops, or the two carriers of one operator disagree about the shape of
+// a row. It must also keep the TYPED decode: row_json_text_format_projected in row.hpp
+// honours declared decimals but not declared FLOATs, and a source column declared FLOAT
+// must be coerced to float precision on both carriers - a divergence there is invisible
+// to a %g-formatted comparison and was a real defect once.
+//
+// An empty keep-list means keep everything, which is row_json_text_format_for_columns.
+inline clink::TextFormat<Row> row_json_text_format_for_columns_projected(
+    const std::vector<RowColumn>& columns, const std::vector<std::string>& projected) {
+    if (projected.empty()) {
+        return row_json_text_format_for_columns(columns);
+    }
+    // Type handling is derived from the FULL declared schema, then applied to whatever
+    // survives the keep-list: a column's declared type does not change because another
+    // column was dropped.
+    auto typed = row_json_text_format_for_columns(columns);
+    // "__row_kind" rides on a source row without being a declared column, and dropping it
+    // would turn a changelog source into a plain insert stream (see
+    // row_json_text_format_projected, which owns the same invariant).
+    std::vector<std::string> keep = projected;
+    keep.emplace_back("__row_kind");
+    return clink::TextFormat<Row>{
+        .decode = [typed, keep = std::move(keep)](std::string_view line) -> std::optional<Row> {
+            auto r = typed.decode(line);
+            if (!r.has_value()) {
+                return r;
+            }
+            // Drop in place rather than re-parsing with a keep-list: the typed decode has
+            // already applied declared decimal and float semantics to the values, and a
+            // second parse would not.
+            for (auto it = r->values.begin(); it != r->values.end();) {
+                if (std::find(keep.begin(), keep.end(), it->first) == keep.end()) {
+                    it = r->values.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            return r;
+        },
+        .encode = typed.encode,
+    };
+}
+
 // Build a columnar ArrowBatcher<Row> from a table's column schema.
 inline ArrowBatcher<Row> make_row_columnar_arrow_batcher(std::vector<RowColumn> columns) {
     // Resolve each column's effective Arrow type once.

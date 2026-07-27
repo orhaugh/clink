@@ -7573,6 +7573,23 @@ std::int64_t hash_json_value(const clink::config::JsonValue& v) {
 
 constexpr const char* kRowKeyField = "__key";
 
+// Comma-separated column list -> names, skipping empties. The projected_columns idiom was
+// already open-coded in file_json_source and parquet_row_source; the columnar JSON bridge
+// is the third caller, so it lives here once.
+inline std::vector<std::string> projection_from_csv(const std::string& csv) {
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    while (pos <= csv.size()) {
+        auto end = csv.find(',', pos);
+        if (end == std::string::npos)
+            end = csv.size();
+        if (auto c = csv.substr(pos, end - pos); !c.empty())
+            out.push_back(std::move(c));
+        pos = end + 1;
+    }
+    return out;
+}
+
 // Columnar-native row_compute_key. Computes the synthetic __key column straight
 // from the named group columns' Arrow cells (FNV-1a over hash_json_value,
 // byte-identical to the row path) and appends it to the sidecar, so the keyed
@@ -8702,8 +8719,13 @@ void install(clink::plugin::PluginRegistry& reg) {
     reg.register_operator<std::string, Row>(
         "json_string_to_row_columnar",
         [](const BuildContext& ctx) -> std::shared_ptr<Operator<std::string, Row>> {
+            // schema_columns stays the FULL declared schema - the faithfulness gate needs
+            // it - while projected_columns (optional) narrows only what gets built. See
+            // the operator's constructor comment for why narrowing the schema instead
+            // would disable the columnar path rather than speed it up.
             return std::make_shared<JsonStringToRowColumnarOperator>(
-                parse_row_schema(ctx.param_or("schema_columns")));
+                parse_row_schema(ctx.param_or("schema_columns")),
+                projection_from_csv(ctx.param_or("projected_columns", "")));
         });
 
     // row_to_json_string: bridge from the Row channel back to the
