@@ -13514,9 +13514,19 @@ std::string canonical(const clink::config::JsonValue& js,
 
 // Columns the engine adds that are not part of the query's result: the changelog
 // marker, and a windowed aggregate's window bounds.
+// Columns to exclude for a given comparison: the engine-added ones always, plus
+// any the caller says are tie-dependent.
+std::vector<std::string> drop_cols_with(const std::vector<std::string>& extra);
+
 const std::vector<std::string>& drop_cols() {
     static const std::vector<std::string> v = {
         std::string{kRowKindField}, "window_start", "window_end"};
+    return v;
+}
+
+std::vector<std::string> drop_cols_with(const std::vector<std::string>& extra) {
+    std::vector<std::string> v = drop_cols();
+    v.insert(v.end(), extra.begin(), extra.end());
     return v;
 }
 
@@ -13540,7 +13550,9 @@ std::multiset<std::string> run_query(const std::string& ddl_sql,
                                      const std::vector<std::string>& source_order,
                                      bool changelog,
                                      std::string* error_out,
-                                     const std::string& worker_id) {
+                                     const std::string& worker_id,
+                                     std::uint32_t fan_out = 4,
+                                     const std::vector<std::string>& tie_columns = {}) {
     Catalog cat;
     auto ddl = parse(ddl_sql);
     for (const auto& st : ddl.statements) {
@@ -13568,7 +13580,7 @@ std::multiset<std::string> run_query(const std::string& ddl_sql,
     // forced-singleton skip - which meant breaking apply_job_parallelism changed
     // nothing about these tests, and a mutation run proved it: with BOTH shipped
     // fixes removed, 15 of 16 still passed. Verified now by the same mutation.
-    cluster::apply_job_parallelism(spec, 4);
+    cluster::apply_job_parallelism(spec, fan_out);
 
     // Then pin the connectors back to 1. A file source's parallel-read semantics
     // and a file sink's one-file-per-subtask naming are properties of those
@@ -13585,6 +13597,23 @@ std::multiset<std::string> run_query(const std::string& ddl_sql,
         application::SubmitOptions opts;
         opts.wait_timeout = 30s;
         auto r = submitter.submit(spec.to_json(), {}, opts);
+        // Report EVERY error the job raised, and report it HERE - before this scope
+        // ends. The InProcessCluster destructor joins the task threads, so if a job
+        // failed in a way that leaves a task wedged, the destructor blocks and the
+        // caller never runs: the errors are collected and then thrown away. That is
+        // how a failing job presented as an unexplained hang.
+        if (!r.completed || !r.ok) {
+            std::fprintf(stderr,
+                         "JOB FAILED completed=%d ok=%d reject=\"%s\" errors=%zu\n",
+                         static_cast<int>(r.completed),
+                         static_cast<int>(r.ok),
+                         r.reject_message.c_str(),
+                         r.errors.size());
+            for (std::size_t e = 0; e < r.errors.size(); ++e) {
+                std::fprintf(stderr, "  error[%zu]: %s\n", e, r.errors[e].c_str());
+            }
+            std::fflush(stderr);
+        }
         if (!r.completed) {
             *error_out = "not completed: " + r.reject_message;
             return {};
@@ -13599,13 +13628,17 @@ std::multiset<std::string> run_query(const std::string& ddl_sql,
     std::multiset<std::string> out;
     if (!changelog) {
         for (const auto& l : read_lines(out_path)) {
-            out.insert(canonical(clink::config::parse(l), drop_cols()));
+            out.insert(canonical(clink::config::parse(l), drop_cols_with(tie_columns)));
         }
         return out;
     }
     std::multiset<std::string> live;
     for (const auto& l : read_lines(out_path)) {
         auto js = clink::config::parse(l);
+        // FULL row identity here, not the projected form: a changelog's delete
+        // refers to a specific row, and projecting away a tie-dependent column
+        // first would make two different rows identical, so a delete for one would
+        // erase the other. Projection happens once, on the final state, below.
         const auto row = canonical(js, drop_cols());
         std::string kind{kRowKindInsert};
         if (auto it = js.as_object().find(std::string{kRowKindField});
@@ -13620,7 +13653,14 @@ std::multiset<std::string> run_query(const std::string& ddl_sql,
             live.insert(row);
         }
     }
-    return live;
+    if (tie_columns.empty()) {
+        return live;
+    }
+    std::multiset<std::string> projected;
+    for (const auto& r : live) {
+        projected.insert(canonical(clink::config::parse(r), tie_columns));
+    }
+    return projected;
 }
 
 std::multiset<std::string> expected_for(const std::string& q) {
@@ -13690,13 +13730,31 @@ protected:
                const std::string& ddl,
                const std::string& insert,
                const std::vector<std::string>& source_order = {"bid"},
-               bool changelog = false) {
+               bool changelog = false,
+               const std::vector<std::string>& tie_columns = {}) {
         std::filesystem::remove(out_path());
         std::string err;
-        const auto got = run_query(
-            ddl, insert, streams_, out_path(), source_order, changelog, &err, worker_id());
+        const auto got = run_query(ddl,
+                                   insert,
+                                   streams_,
+                                   out_path(),
+                                   source_order,
+                                   changelog,
+                                   &err,
+                                   worker_id(),
+                                   /*fan_out=*/4,
+                                   tie_columns);
         EXPECT_TRUE(err.empty()) << q << " reported an error: " << err;
-        const auto want = expected_for(q);
+        auto want = expected_for(q);
+        if (!tie_columns.empty()) {
+            // Project the expectation the same way, so both sides drop the columns
+            // whose value is only defined up to a tie.
+            std::multiset<std::string> projected;
+            for (const auto& w : want) {
+                projected.insert(canonical(clink::config::parse(w), tie_columns));
+            }
+            want = std::move(projected);
+        }
         ASSERT_FALSE(want.empty()) << q
                                    << " has no expectation - regenerate "
                                       "tests/data/nexmark_expected.inc";
@@ -13919,21 +13977,137 @@ TEST_F(NexmarkQueries, DISABLED_Q4AveragePricePerCategoryOverJoin) {
 // wstart is projected because the changelog revises one row PER WINDOW, so the
 // window start is its primary key; without it there is nothing to key on.
 //
-// DISABLED - it HANGS, past ten minutes, rather than failing. Two changelog-
-// producing stages in series (a HOP aggregate feeding a top-1 rank) is a shape no
-// other query here has, and it is also the shape whose 1:N stage broke the
-// throughput sampler's frontier. A hang is a stronger signal than a wrong answer
-// and wants its own investigation; leaving the test present and disabled keeps it
-// from being forgotten.
-TEST_F(NexmarkQueries, DISABLED_Q5HotItemsPerSlidingWindow) {
+// This hung for a long time and the cause was in the QUERY, not the engine: clink
+// takes HOP(time, SIZE, SLIDE) while Flink's table function takes
+// HOP(TABLE, DESCRIPTOR, SLIDE, SIZE), and this was written in Flink's order. slide
+// then exceeded size, the operator's own validation rejected it, and the task never
+// started - so its output channel was never closed and every downstream stage
+// blocked. The job reported no error until a watchdog declared the worker lost,
+// which is why it presented as a deadlock rather than a rejected parameter.
+TEST_F(NexmarkQueries, Q5HotItemsPerSlidingWindow) {
     check("q5",
           bid_ddl() + changelog_sink_ddl("wstart BIGINT, auction BIGINT, num BIGINT"),
           "INSERT INTO out_t SELECT wstart, auction, num FROM (SELECT *, ROW_NUMBER() OVER "
           "(PARTITION BY wstart ORDER BY num DESC) AS rn FROM (SELECT auction, COUNT(*) AS num, "
-          "window_start AS wstart FROM bid GROUP BY HOP(datetime, INTERVAL '2' SECOND, "
-          "INTERVAL '10' SECOND), auction) AS W) AS R WHERE rn <= 1",
+          "window_start AS wstart FROM bid GROUP BY HOP(datetime, INTERVAL '10' SECOND, "
+          "INTERVAL '2' SECOND), auction) AS W) AS R WHERE rn <= 1",
           {"bid"},
-          /*changelog=*/true);
+          /*changelog=*/true,
+          // `auction` is dropped: this is top-1 per window BY COUNT, and when two
+          // auctions tie on count either is a correct answer - ROW_NUMBER breaks the
+          // tie by arrival order, which is not deterministic across a shuffle. The
+          // (wstart, num) pairs ARE fully determined, and asserting them still
+          // catches any real ranking error, because picking an auction that did not
+          // have the maximum count would change num.
+          /*tie_columns=*/{"auction"});
+}
+
+// ---------------------------------------------------------------------------
+// The window operators, driven DIRECTLY - no DAG, no shuffle, no sink.
+//
+// q5 was the only query exercising a HOPPING window, and it never completed: the
+// job timed out with no task errors, all four inputs of the shuffle union upstream
+// of the window sat open and empty, and in containers the query consumed all
+// 7,360,000 input records while emitting ZERO output messages. Every attempt to
+// diagnose that through the full pipeline blamed something that turned out to be a
+// consequence - the union, the changelog sink, the teardown path.
+//
+// So this drives the operator itself, built from the registry by name and fed
+// records and a watermark by hand. If the operator is wrong, this fails in
+// milliseconds and says so; if it is right, the fault is in the plumbing and the
+// pipeline tests are where to look. Either answer is worth more than another run
+// of the whole job.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build a window operator by registry name and drive it. Returns the rows it
+// emitted, canonicalised.
+std::vector<std::string> drive_window_op(
+    const std::string& op_type,
+    const std::map<std::string, std::string>& params,
+    const std::vector<std::pair<std::int64_t, std::int64_t>>& ts_and_key,
+    std::int64_t final_watermark_ms) {
+    ensure_sql_installed_once();
+    const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+        op_type, std::string{kChannelRow}, std::string{kChannelRow});
+    if (f == nullptr) {
+        ADD_FAILURE() << "no operator factory registered for " << op_type;
+        return {};
+    }
+    cluster::OperatorBuildContext ctx;
+    ctx.params = params;
+    ctx.parallelism = 1;
+    auto boxed = f->build(ctx);
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(boxed);
+
+    std::vector<std::string> out_rows;
+    Emitter<Row> em([&](StreamElement<Row> e) {
+        if (e.is_data()) {
+            for (const auto& rec : e.as_data()) {
+                out_rows.push_back(canonical(
+                    clink::config::JsonValue{clink::sql::to_json_object(rec.value().values)},
+                    drop_cols()));
+            }
+        }
+        return true;
+    });
+
+    // One record per element, each carrying its event time both as a column and as
+    // the element's event time, which is what assign_timestamps_row would have done.
+    for (const auto& [ts, key] : ts_and_key) {
+        Row r;
+        r.values["datetime"] = clink::config::JsonValue{ts};
+        r.values["auction"] = clink::config::JsonValue{key};
+        Batch<Row> b;
+        b.emplace(r, EventTime{ts});
+        op->process(StreamElement<Row>::data(std::move(b)), em);
+    }
+    op->process(StreamElement<Row>::watermark(Watermark{EventTime{final_watermark_ms}}), em);
+    return out_rows;
+}
+
+std::map<std::string, std::string> window_params(const std::string& size_ms,
+                                                 const std::string& slide_ms) {
+    std::map<std::string, std::string> p{
+        {"time_column", "datetime"},
+        {"group_keys", "auction"},
+        {"group_key_outputs", "auction"},
+        {"aggregates", R"([{"name":"num","fn":"count","input_column":""}])"},
+        {"size_ms", size_ms},
+    };
+    if (!slide_ms.empty()) {
+        p["slide_ms"] = slide_ms;
+    }
+    return p;
+}
+
+}  // namespace
+
+// The control: a TUMBLING window over the same input must emit one row per
+// (window, key). This is the shape q12 already proves end to end, so if it fails
+// here the harness above is wrong rather than the operator.
+TEST(WindowOperatorDirect, TumblingEmitsOnePanePerWindowAndKey) {
+    // ts 1000 and 3000 fall in [0,10000); ts 11000 in [10000,20000).
+    const auto rows = drive_window_op("tumbling_window_row",
+                                      window_params("10000", ""),
+                                      {{1000, 7}, {3000, 7}, {11000, 7}},
+                                      /*final_watermark_ms=*/1'000'000);
+    EXPECT_EQ(rows.size(), 2u) << "expected two windows for one key";
+}
+
+// A HOPPING window with a 10s size and a 2s slide places each event in FIVE
+// overlapping panes, so a single event must produce five rows once the watermark
+// passes them. This is the operator q5 depends on and nothing else covers.
+TEST(WindowOperatorDirect, HoppingEmitsEveryOverlappingPane) {
+    const auto rows = drive_window_op("hopping_window_row",
+                                      window_params("10000", "2000"),
+                                      {{11000, 7}},
+                                      /*final_watermark_ms=*/1'000'000);
+    // Panes containing ts=11000 with starts that are multiples of 2000 and >= 0:
+    // 2000, 4000, 6000, 8000, 10000 -> five windows, each with count 1.
+    EXPECT_EQ(rows.size(), 5u)
+        << "a 10s/2s hop must place one event in five overlapping panes; got " << rows.size();
 }
 
 }  // namespace clink::sql

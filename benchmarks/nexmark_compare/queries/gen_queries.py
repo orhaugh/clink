@@ -194,7 +194,11 @@ QUERIES = {
     ),
     "q5": dict(
         note=("Hot items: the single most-bid-on auction per 10s sliding window, "
-              "advancing 2s. Sliding window aggregate feeding a top-1 rank."),
+              "advancing 2s. Sliding window aggregate feeding a top-1 rank. NOTE the "
+              "argument orders differ and are NOT interchangeable: clink is "
+              "HOP(time, SIZE, SLIDE) while Flink's table function is "
+              "HOP(TABLE, DESCRIPTOR, SLIDE, SIZE). Getting it backwards makes slide "
+              "exceed size, which the operator rejects."),
         streams=["bid"],
         # wstart is projected for the UPSERT variant's benefit: the changelog
         # revises one row per window, so the window start IS the primary key, and
@@ -204,7 +208,7 @@ QUERIES = {
         clink=("SELECT wstart, auction, num FROM ("
                "SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC) AS rn FROM ("
                "SELECT auction, COUNT(*) AS num, window_start AS wstart FROM bid "
-               "GROUP BY HOP(datetime, INTERVAL '2' SECOND, INTERVAL '10' SECOND), auction"
+               "GROUP BY HOP(datetime, INTERVAL '10' SECOND, INTERVAL '2' SECOND), auction"
                ") AS W) AS R WHERE rn <= 1"),
         flink=("SELECT wstart, auction, num FROM ("
                "SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC) AS rn FROM ("
