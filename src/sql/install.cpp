@@ -1336,7 +1336,17 @@ struct WindowBucket {
 // This assert exists to make the next such addition a deliberate decision. If a new family
 // needs per-group storage, put it in AggStateExtras (allocated only when used) rather than
 // inline here. Raise the bound only with a reason.
-static_assert(sizeof(AggState) <= 112,
+// The bound is EXPRESSED IN TERMS OF THE MEMBERS, not as a literal byte count, because a
+// literal is only correct on the standard library it was measured against. 112 was right on
+// libc++ (JsonValue 32) and wrong on libstdc++ (JsonValue 40, since std::string is 32 rather
+// than 24 there), so a macOS-calibrated constant broke the Linux container build - the exact
+// host-versus-target trap this codebase has been caught by before.
+//
+// What it is really guarding is that no CONTAINER sits inline: the two JsonValues that MIN
+// and MAX need, plus room for the scalars and flags and the extras pointer. Adding a
+// std::map or std::vector inline blows through it on either library (a map is 48 bytes on
+// libstdc++), which is the regression this exists to catch.
+static_assert(sizeof(AggState) <= 2 * sizeof(clink::config::JsonValue) + 6 * sizeof(std::int64_t),
               "AggState grew: new per-group aggregate storage belongs in AggStateExtras, "
               "which is allocated only when the aggregate family actually uses it. See the "
               "note on AggStateExtras.");
