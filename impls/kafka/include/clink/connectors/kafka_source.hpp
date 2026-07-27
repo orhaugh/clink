@@ -46,7 +46,31 @@ public:
         // "earliest" | "latest" | "none"
         std::string auto_offset_reset = "earliest";
         std::chrono::milliseconds poll_timeout = std::chrono::milliseconds{100};
-        std::size_t max_batch_size = 256;
+        // Records per Batch<KafkaMessage> handed downstream. 2048, not the 256
+        // this was: 256 records of a ~124-byte nexmark bid is about 32 KB, chosen
+        // as a network-buffer analogue, and on a saturated consumer it costs 4.6x
+        // the throughput.
+        //
+        // Measured on nexmark q0, 22,080,000 records, one freshly composed stack
+        // per variant, each drain over a multi-second window:
+        //
+        //   max_batch_size  batch_max_wait   drain      ev/CPU-s   anon
+        //   256 (was)       5ms              1.16M/s      632k     246 MB
+        //   2048 (now)      5ms              5.33M/s     1082k     184 MB
+        //   2048            0                3.14M/s     1037k     181 MB
+        //
+        // Note the third row: REMOVING batch_max_wait is worse than keeping it at
+        // the same batch size. The bound is not a throughput tax that truncates
+        // batches - it is a stall guard. With no bound the fill loop blocks
+        // whenever the local queue is momentarily short, and that wait costs more
+        // than the smaller batch would have. So the default raises the SIZE and
+        // leaves the bound alone, which also means per-record latency on a
+        // trickling input is unchanged: the bound still fires first when records
+        // are sparse, exactly as before.
+        //
+        // Larger batches also used LESS memory here, so the obvious objection does
+        // not hold. Measured on ARM; the x86 rig has to confirm the magnitude.
+        std::size_t max_batch_size = 2048;
         // Bounds TOTAL batch formation time in produce(). Waiting for the
         // FIRST record of a batch still blocks up to poll_timeout (idle
         // stays cheap); once a batch has begun, the fill loop stops when

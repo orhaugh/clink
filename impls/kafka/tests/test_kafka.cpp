@@ -218,9 +218,11 @@ TEST(Kafka, ProduceEmitsPartialBatchWithinBatchMaxWait) {
     // whose inter-arrival is far below poll_timeout (so the quiet-break
     // never fires), produce() must emit a PARTIAL batch once the bound
     // elapses instead of accumulating max_batch_size records. Without the
-    // bound, every paced call would return a full 256-record batch after
-    // ~256 * inter-arrival of waiting - the per-record latency defect the
-    // nexmark latency axis measured.
+    // bound, every paced call would return a full max_batch_size batch after
+    // ~max_batch_size * inter-arrival of waiting - the per-record latency defect
+    // the nexmark latency axis measured. The assertion below is written against
+    // src_opts.max_batch_size rather than a literal, so raising the default (256
+    // -> 2048 for throughput) does not silently weaken it.
     MockCluster mock;
     const std::string topic = "paced-batching";
     mock.create_topic(topic);
