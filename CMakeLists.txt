@@ -393,6 +393,7 @@ add_library(clink_core STATIC
     src/cluster/plugin_cache.cpp
     src/lineage/lineage_graph.cpp
     src/lineage/lineage_listener.cpp
+    src/config/interned_name.cpp
     src/config/json.cpp
     src/connectors/openssl_atexit_guard.cpp
 )

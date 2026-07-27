@@ -57,7 +57,7 @@ Batch<Row> make_batch(std::int64_t rows) {
 std::string render(const Row& r) {
     std::string out;
     for (const auto& [k, v] : r.values) {
-        out += k + "=" + v.serialize(0) + ";";
+        out += k.str() + "=" + v.serialize(0) + ";";
     }
     return out;
 }

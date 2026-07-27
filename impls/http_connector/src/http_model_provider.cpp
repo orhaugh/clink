@@ -160,7 +160,7 @@ public:
     // handshake per call.
     clink::sql::Row predict(const clink::sql::Row& features) override {
         const std::string body =
-            clink::config::JsonValue{clink::config::JsonObject{features.values}}.serialize(0);
+            clink::config::JsonValue{clink::sql::to_json_object(features.values)}.serialize(0);
         ClientLease lease(*pool_, pool_->acquire());
         clink::config::JsonValue root = post_and_root_(lease.get(), body);
         return extract_output_(root, output_columns_);
@@ -180,7 +180,7 @@ public:
         clink::config::JsonArray body_arr;
         body_arr.reserve(features_batch.size());
         for (const auto& f : features_batch) {
-            body_arr.push_back(clink::config::JsonValue{clink::config::JsonObject{f.values}});
+            body_arr.push_back(clink::config::JsonValue{clink::sql::to_json_object(f.values)});
         }
         const std::string body = clink::config::JsonValue{std::move(body_arr)}.serialize(0);
         ClientLease lease(*pool_, pool_->acquire());

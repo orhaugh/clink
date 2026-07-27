@@ -49,7 +49,7 @@ std::int64_t dump_type(const std::string& path,
     std::int64_t n = 0;
     while (auto rec = gen.next()) {
         const std::string line = clink::config::serialize_output(
-            clink::config::JsonValue{clink::config::JsonObject{rec->value().values}});
+            clink::config::JsonValue{clink::sql::to_json_object(rec->value().values)});
         out.write(line.data(), static_cast<std::streamsize>(line.size()));
         out.put('\n');
         ++n;

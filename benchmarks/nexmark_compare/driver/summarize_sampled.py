@@ -94,14 +94,24 @@ def main():
                 # No output topic to count; completeness gate = both engines'
                 # counters drained the full input (reached_target, asserted above).
                 pass
-            elif c.get("out_rows", -1) != fl.get("out_rows", -2):
+            mismatch = False
+            if not incomplete and not blackhole and c.get("out_rows", -1) != fl.get("out_rows", -2):
+                mismatch = True
                 issues.append(f"{q}: OUTPUT ROW MISMATCH clink={c.get('out_rows')} flink={fl.get('out_rows')}")
             # Hard gate: a ratio between a completed run and a truncated one is not
             # a comparison, and printing it anyway is how a caveat two screens down
             # gets quoted as a headline. Refuse rather than annotate.
-            if incomplete:
+            #
+            # A row-count mismatch is the same kind of non-comparison and is
+            # suppressed the same way: two engines that emitted different numbers
+            # of rows from the same input did different amounts of work, so
+            # whichever ran faster may simply have done less. That is the one
+            # failure a throughput figure cannot survive, and it used to print the
+            # ratio anyway with the mismatch noted further down the page.
+            if incomplete or mismatch:
+                why = "incomplete run" if incomplete else "output row mismatch"
                 print(f"  {q:6} {'RATIO':6} {'--':>12} {'':>9} {'':>7} {'--':>10}"
-                      f"  (suppressed: incomplete run)")
+                      f"  (suppressed: {why})")
                 print()
                 continue
             ratio_drain = (c["drain_rate"] / fl["drain_rate"]) if fl["drain_rate"] else 0

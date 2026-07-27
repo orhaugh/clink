@@ -113,16 +113,31 @@ def flink_source(name, tag):
     )
 
 
-def clink_sink(name, cols):
+def clink_sink(name, cols, kafka=False):
     decl = ", ".join(f"{c} {t}" for c, t in cols)
-    return f"CREATE TABLE {name} ({decl}) WITH (connector='blackhole');"
+    if not kafka:
+        return f"CREATE TABLE {name} ({decl}) WITH (connector='blackhole');"
+    return (
+        f"CREATE TABLE {name} ({decl})\n"
+        f"  WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='__OUT__');"
+    )
 
 
-def flink_sink(name, cols):
+def flink_sink(name, cols, kafka=False):
     decl = ", ".join(
         f"`{c}` STRING" if t == "VARCHAR" else f"`{c}` {t}" for c, t in cols
     )
-    return f"CREATE TABLE {name} ({decl}) WITH ('connector' = 'blackhole');"
+    if not kafka:
+        return f"CREATE TABLE {name} ({decl}) WITH ('connector' = 'blackhole');"
+    return (
+        f"CREATE TABLE {name} ({decl}) WITH (\n"
+        f"  'connector' = 'kafka',\n"
+        f"  'topic' = '__OUT__',\n"
+        f"  'properties.bootstrap.servers' = 'kafka:29092',\n"
+        f"  'format' = 'json',\n"
+        f"  'sink.delivery-guarantee' = 'at-least-once'\n"
+        f");"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -332,14 +347,17 @@ QUERIES = {
 }
 
 
-def render(q, engine):
+def render(q, engine, kafka=False):
     d = QUERIES[q]
-    tag = f"{q}bh"
+    # Distinct consumer groups per variant: a blackhole run and a Kafka-sink run
+    # of the same query must not share an offset commit position.
+    tag = q if kafka else f"{q}bh"
     sink_name = f"sink_{q}"
     src = clink_source if engine == "clink" else flink_source
     snk = clink_sink if engine == "clink" else flink_sink
+    which = "KAFKA-SINK" if kafka else "BLACKHOLE"
     header = textwrap.fill(
-        f"Nexmark {q} on {engine}, BLACKHOLE sink variant. {d['note']}",
+        f"Nexmark {q} on {engine}, {which} sink variant. {d['note']}",
         width=78,
         initial_indent="-- ",
         subsequent_indent="-- ",
@@ -350,7 +368,7 @@ def render(q, engine):
         "-- definition. Edit that file, not this one.",
     ]
     parts += [src(s, tag) for s in d["streams"]]
-    parts.append(snk(sink_name, d["sink"]))
+    parts.append(snk(sink_name, d["sink"], kafka))
     parts.append(f"INSERT INTO {sink_name}\n{d[engine]};")
     return "\n".join(parts) + "\n"
 
@@ -360,11 +378,13 @@ def main():
     n = 0
     for q in QUERIES:
         for engine, out_dir in (("clink", CLINK_DIR), ("flink", FLINK_DIR)):
-            path = os.path.join(out_dir, f"{q}_bh.tmpl.sql")
-            with open(path, "w") as f:
-                f.write(render(q, engine))
-            n += 1
-    print(f"wrote {n} templates for {len(QUERIES)} queries")
+            for kafka, suffix in ((False, "_bh"), (True, "")):
+                path = os.path.join(out_dir, f"{q}{suffix}.tmpl.sql")
+                with open(path, "w") as f:
+                    f.write(render(q, engine, kafka))
+                n += 1
+    print(f"wrote {n} templates for {len(QUERIES)} queries "
+          f"(blackhole + kafka-sink, both engines)")
     print("bid-only (sustained-throughput candidates):",
           " ".join(q for q, d in QUERIES.items() if d["streams"] == ["bid"]))
     print("multi-stream (gate candidates):",

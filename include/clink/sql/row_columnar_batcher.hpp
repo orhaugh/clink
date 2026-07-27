@@ -451,8 +451,10 @@ inline ArrowBatcher<Row> make_row_columnar_arrow_batcher(std::vector<RowColumn> 
                 continue;  // declared but not present: a narrowed batch, legitimately
             }
             const auto& col = *b.column(idx);
+            // Interned once per column per batch, not once per row (see Col above).
+            const clink::config::InternedName name{c.name};
             for (std::int64_t i = 0; i < n; ++i) {
-                rows[static_cast<std::size_t>(i)].values[c.name] =
+                rows[static_cast<std::size_t>(i)].values[name] =
                     row_columnar_detail::read_cell(c.eff, col, i);
             }
         }
@@ -547,7 +549,11 @@ inline std::optional<std::vector<Record<Row>>> rows_from_record_batch(
     const int ncol = batch.num_columns();
 
     struct Col {
-        std::string name;
+        // Interned once per batch. The inner loop below runs per ROW, and
+        // resolving a name through the intern table there would put a hash and a
+        // probe on every column of every record - the cost the interned key
+        // exists to avoid paying in memory, moved into CPU instead.
+        clink::config::InternedName name;
         std::shared_ptr<arrow::DataType> type;
         const arrow::Array* arr;
     };
@@ -579,7 +585,7 @@ inline std::optional<std::vector<Record<Row>>> rows_from_record_batch(
             default:
                 return std::nullopt;  // unknown type: refuse rather than mis-cast
         }
-        cols.push_back({f->name(), f->type(), batch.column(ci).get()});
+        cols.push_back({clink::config::InternedName{f->name()}, f->type(), batch.column(ci).get()});
     }
 
     std::vector<Record<Row>> out;

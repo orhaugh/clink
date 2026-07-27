@@ -27,6 +27,7 @@
 // std::string per probe.
 
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <initializer_list>
 #include <stdexcept>
@@ -37,12 +38,15 @@
 
 namespace clink::config {
 
-template <typename V>
+// Key defaults to std::string, which is what a parsed JSON document needs: its
+// keys are arbitrary input and must be owned. A SQL Row instead uses
+// InternedName, whose keys come from declared schemas - see row.hpp for why.
+template <typename V, typename Key = std::string>
 class FlatMap {
 public:
-    using key_type = std::string;
+    using key_type = Key;
     using mapped_type = V;
-    using value_type = std::pair<std::string, V>;
+    using value_type = std::pair<Key, V>;
     using size_type = std::size_t;
 
 private:
@@ -141,9 +145,40 @@ public:
     V& operator[](std::string_view key) {
         auto it = lower_bound_(key);
         if (it == data_.end() || it->first != key) {
-            it = data_.emplace(it, std::string(key), V{});
+            it = data_.emplace(it, Key(key), V{});
         }
         return it->second;
+    }
+
+    // Key-typed overloads, for a Key that is not std::string - i.e. a Row's
+    // InternedName. Without these, a caller holding an already-resolved key still
+    // pays for resolving it: the key converts to string_view, the string_view
+    // overload runs, and Key(key) constructs a fresh one. For an interned name
+    // that means an intern-table probe per column per record, which silently undid
+    // every attempt to hoist interning out of a hot loop (measured at 4.6% of q0
+    // before these existed). Equality here is also the Key's own, which for an
+    // interned name is a pointer compare rather than a string compare.
+    V& operator[](const Key& key)
+        requires(!std::same_as<Key, std::string>)
+    {
+        auto it = lower_bound_(key);
+        if (it == data_.end() || !(it->first == key)) {
+            it = data_.emplace(it, key, V{});
+        }
+        return it->second;
+    }
+
+    iterator find(const Key& key) noexcept
+        requires(!std::same_as<Key, std::string>)
+    {
+        auto it = lower_bound_(key);
+        return (it != data_.end() && it->first == key) ? it : data_.end();
+    }
+    const_iterator find(const Key& key) const noexcept
+        requires(!std::same_as<Key, std::string>)
+    {
+        auto it = lower_bound_(key);
+        return (it != data_.end() && it->first == key) ? it : data_.end();
     }
 
     // First-duplicate-wins, like std::map: an existing key is left
@@ -155,7 +190,7 @@ public:
         if (it != data_.end() && it->first == probe) {
             return {it, false};
         }
-        it = data_.emplace(it, std::string(std::forward<K>(key)), V(std::forward<M>(value)));
+        it = data_.emplace(it, Key(std::forward<K>(key)), V(std::forward<M>(value)));
         return {it, true};
     }
 
@@ -172,7 +207,7 @@ public:
             it->second = V(std::forward<M>(value));
             return {it, false};
         }
-        it = data_.emplace(it, std::string(std::forward<K>(key)), V(std::forward<M>(value)));
+        it = data_.emplace(it, Key(std::forward<K>(key)), V(std::forward<M>(value)));
         return {it, true};
     }
 
@@ -215,6 +250,22 @@ private:
     const_iterator lower_bound_(std::string_view key) const noexcept {
         return std::lower_bound(
             data_.begin(), data_.end(), key, [](const value_type& e, std::string_view k) noexcept {
+                return e.first < k;
+            });
+    }
+    iterator lower_bound_(const Key& key) noexcept
+        requires(!std::same_as<Key, std::string>)
+    {
+        return std::lower_bound(
+            data_.begin(), data_.end(), key, [](const value_type& e, const Key& k) noexcept {
+                return e.first < k;
+            });
+    }
+    const_iterator lower_bound_(const Key& key) const noexcept
+        requires(!std::same_as<Key, std::string>)
+    {
+        return std::lower_bound(
+            data_.begin(), data_.end(), key, [](const value_type& e, const Key& k) noexcept {
                 return e.first < k;
             });
     }

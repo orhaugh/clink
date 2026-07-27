@@ -1307,7 +1307,7 @@ std::vector<std::string> join_live_set(const std::vector<Record<Row>>& emissions
         const std::string kind = row_kind_of(r);
         r.values.erase(std::string{kRowKindField});
         const std::string id =
-            clink::config::JsonValue{clink::config::JsonObject{r.values}}.serialize(0);
+            clink::config::JsonValue{clink::sql::to_json_object(r.values)}.serialize(0);
         net[id] += is_delete_like(kind) ? -1 : 1;
     }
     std::vector<std::string> live;
@@ -1454,7 +1454,7 @@ std::vector<std::string> serialized_rows(const std::vector<Record<Row>>& recs) {
     out.reserve(recs.size());
     for (const auto& rec : recs) {
         out.push_back(
-            clink::config::JsonValue{clink::config::JsonObject{rec.value().values}}.serialize(0));
+            clink::config::JsonValue{clink::sql::to_json_object(rec.value().values)}.serialize(0));
     }
     return out;
 }

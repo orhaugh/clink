@@ -143,6 +143,7 @@ add_executable(clink_core_tests
     test_columnar_filter.cpp
     test_columnar_string_filter.cpp
     test_columnar_sql_filter.cpp
+    test_interned_name.cpp
     test_predicate_operand_exprs.cpp
     test_columnar_sql_project.cpp
     test_columnar_expr_program.cpp

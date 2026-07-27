@@ -113,9 +113,9 @@ std::vector<std::string> exact_cells(const Batch<Row>& b) {
             char buf[40] = {0};
             if (v.is_number() && !clink::config::is_dec_string(v)) {
                 std::snprintf(buf, sizeof(buf), "%.17g", v.as_number());
-                line += k + "=" + buf + ";";
+                line += k.str() + "=" + buf + ";";
             } else {
-                line += k + "=" + v.serialize(0) + ";";
+                line += k.str() + "=" + v.serialize(0) + ";";
             }
         }
         out.push_back(std::move(line));

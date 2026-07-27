@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "clink/config/decimal.hpp"
+#include "clink/config/interned_name.hpp"
 #include "clink/config/json.hpp"
 #include "clink/connectors/text_format.hpp"
 #include "clink/core/codec.hpp"
@@ -33,8 +34,46 @@
 
 namespace clink::sql {
 
+// The column map of a Row. Keyed by InternedName rather than std::string: the
+// names come from declared schemas, so one shared copy serves every row, and the
+// pair shrinks from 56 bytes to 40. See interned_name.hpp for the measurement
+// that motivated it.
+using RowColumns = clink::config::FlatMap<clink::config::JsonValue, clink::config::InternedName>;
+
+// A Row's columns and a JSON object do not share a representation: Row keys are
+// interned handles into one process-wide copy per name, a JSON object's keys are
+// arbitrary parsed input and must be owned. These convert at the boundary where a
+// row is serialised or parsed - the only places the two meet.
+[[nodiscard]] inline clink::config::JsonObject to_json_object(const RowColumns& cols) {
+    std::vector<std::pair<std::string, clink::config::JsonValue>> entries;
+    entries.reserve(cols.size());
+    for (const auto& [name, value] : cols) {
+        entries.emplace_back(name.str(), value);
+    }
+    // Already sorted by name, so from_entries adopts it without a re-sort.
+    return clink::config::JsonObject::from_entries(std::move(entries));
+}
+
+[[nodiscard]] inline RowColumns row_columns_from_json(clink::config::JsonObject&& obj) {
+    std::vector<std::pair<clink::config::InternedName, clink::config::JsonValue>> entries;
+    entries.reserve(obj.size());
+    for (auto& [name, value] : obj) {
+        entries.emplace_back(clink::config::InternedName{name}, std::move(value));
+    }
+    return RowColumns::from_entries(std::move(entries));
+}
+
+[[nodiscard]] inline RowColumns row_columns_from_json(const clink::config::JsonObject& obj) {
+    std::vector<std::pair<clink::config::InternedName, clink::config::JsonValue>> entries;
+    entries.reserve(obj.size());
+    for (const auto& [name, value] : obj) {
+        entries.emplace_back(clink::config::InternedName{name}, value);
+    }
+    return RowColumns::from_entries(std::move(entries));
+}
+
 struct Row {
-    clink::config::JsonObject values;
+    RowColumns values;
 
     [[nodiscard]] bool has_column(const std::string& name) const {
         return values.find(name) != values.end();
@@ -76,7 +115,7 @@ inline clink::Codec<Row> row_json_codec() {
     // same JSON object; encode_into appends to the caller-cleared buffer,
     // avoiding the per-put Bytes allocation. Byte-identical by construction.
     auto body = [](const Row& r, Bytes& out) {
-        clink::config::JsonValue v{clink::config::JsonObject{r.values}};
+        clink::config::JsonValue v{to_json_object(r.values)};
         std::string s = v.serialize(0);
         const auto* p = reinterpret_cast<const std::byte*>(s.data());
         out.insert(out.end(), p, p + s.size());
@@ -98,7 +137,7 @@ inline clink::Codec<Row> row_json_codec() {
             if (!obj)
                 return std::nullopt;
             Row r;
-            r.values = std::move(*obj);
+            r.values = row_columns_from_json(std::move(*obj));
             return r;
         },
         .encode_into = body,
@@ -118,7 +157,7 @@ inline clink::Codec<std::vector<Row>> row_list_json_codec() {
         clink::config::JsonArray arr;
         arr.reserve(rows.size());
         for (const auto& r : rows) {
-            arr.emplace_back(clink::config::JsonObject{r.values});
+            arr.emplace_back(to_json_object(r.values));
         }
         const std::string s = clink::config::JsonValue{std::move(arr)}.serialize(0);
         const auto* p = reinterpret_cast<const std::byte*>(s.data());
@@ -145,7 +184,7 @@ inline clink::Codec<std::vector<Row>> row_list_json_codec() {
                     }
                     Row r;
                     // j is local: gut each element instead of copying it.
-                    r.values = std::move(e.as_object());
+                    r.values = row_columns_from_json(std::move(e.as_object()));
                     rows.push_back(std::move(r));
                 }
                 return rows;
@@ -175,13 +214,13 @@ inline clink::TextFormat<Row> row_json_text_format() {
             if (!obj)
                 return std::nullopt;
             Row r;
-            r.values = std::move(*obj);
+            r.values = row_columns_from_json(std::move(*obj));
             return r;
         },
         .encode = [](const Row& r) -> std::string {
             // #56: render dec-strings as clean unquoted JSON numbers for
             // external output (the wire codec above keeps the tagged form).
-            clink::config::JsonValue v{clink::config::JsonObject{r.values}};
+            clink::config::JsonValue v{to_json_object(r.values)};
             return clink::config::serialize_output(v);
         },
     };
@@ -298,7 +337,7 @@ inline clink::TextFormat<Row> row_json_text_format_with_decimals(
         .encode = [decimal_scales](const Row& r) -> std::string {
             Row q = r;
             requantise_row_decimals(q, decimal_scales);
-            clink::config::JsonValue v{clink::config::JsonObject{q.values}};
+            clink::config::JsonValue v{to_json_object(q.values)};
             return clink::config::serialize_output(v);
         },
     };
@@ -341,13 +380,13 @@ inline clink::TextFormat<Row> row_json_text_format_typed(std::map<std::string, i
 inline void project_row(Row& r, const std::set<std::string>& want) {
     if (want.empty())
         return;
-    r.values.retain([&](const clink::config::JsonObject::value_type& e) {
+    r.values.retain([&](const RowColumns::value_type& e) {
         // Always preserve the synthetic "__row_kind" changelog marker (see
         // row_kind.hpp kRowKindField, not includable here without a cycle): it
         // rides on a source row but is never a declared column, so it is absent
         // from the projected set. Dropping it would turn a changelog source into
         // a plain insert stream and break retraction.
-        return e.first == "__row_kind" || want.count(e.first) != 0;
+        return e.first.str() == "__row_kind" || want.count(e.first.str()) != 0;
     });
 }
 
@@ -385,7 +424,7 @@ inline clink::TextFormat<Row> row_json_text_format_projected(
             if (!obj)
                 return std::nullopt;
             Row r;
-            r.values = std::move(*obj);
+            r.values = row_columns_from_json(std::move(*obj));
             if (!decimal_scales.empty()) {
                 ingest_exact_decimals(r, line, decimal_scales);
                 requantise_row_decimals(r, decimal_scales);

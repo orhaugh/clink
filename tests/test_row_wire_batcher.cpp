@@ -39,7 +39,7 @@ std::uint64_t materialize_count() {
 }
 
 std::string serialize(const Row& r) {
-    return clink::config::JsonValue{clink::config::JsonObject{r.values}}.serialize(0);
+    return clink::config::JsonValue{clink::sql::to_json_object(r.values)}.serialize(0);
 }
 
 // Push the batch through the real wire: build -> IPC stream bytes -> reparse.

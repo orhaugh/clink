@@ -30,12 +30,32 @@ def get_json(url, timeout=3.0):
 def clink_frontier(base, job):
     # Returns (processed_frontier, clock_seconds). clink's per-op counters update
     # at fine granularity, so host wall-time is a fine clock (clock=None -> caller
-    # uses wall). Frontier = max records_in across operators = input processed by
-    # the busiest stage.
+    # uses wall).
+    #
+    # Frontier = INPUT EVENTS READ, taken from the sources. A source is identified
+    # structurally rather than by name: it is the operator with nothing upstream,
+    # so records_in == 0 and records_out > 0.
+    #
+    # This used to be a max over every operator's records_in AND records_out,
+    # which is only equal to the input for a pipeline of 1:1 and N:1 stages. Any
+    # 1:N stage races ahead of it: a HOP window emits one row per overlapping
+    # pane, and a ranking operator emits a retraction alongside each insert. The
+    # frontier then reaches the target before the source has finished reading, the
+    # drain is timed over a fraction of the input, and the query is reported
+    # FASTER than the engine ran it. Nexmark q5 is both shapes at once.
     d = get_json(f"{base}/api/v1/jobs/{job}/operators")
+    ops = d.get("operators", [])
+    sources = [int(o.get("records_out", 0) or 0) for o in ops
+               if int(o.get("records_in", 0) or 0) == 0 and int(o.get("records_out", 0) or 0) > 0]
+    if sources:
+        # max, not sum: a multi-source query's target is its largest stream.
+        return max(sources), None
+    # Nothing looks like a source yet (counters not published, or a job shape this
+    # rule does not cover). Fall back to the old definition so a run degrades to
+    # the previous behaviour rather than reporting no progress forever.
     best = 0
-    for op in d.get("operators", []):
-        best = max(best, int(op.get("records_in", 0)), int(op.get("records_out", 0)))
+    for op in ops:
+        best = max(best, int(op.get("records_in", 0) or 0), int(op.get("records_out", 0) or 0))
     return best, None
 
 
@@ -72,11 +92,24 @@ def flink_frontier(base, job):
     # a bad clock for the drain. Instead we use Flink's OWN job clock ("duration",
     # ms since RUNNING) which advances in real time regardless of metric lag - so
     # target/duration_at_completion is a fetch-lag-immune throughput.
+    #
+    # Same source-anchored frontier as clink's, for the same reason, and by the
+    # same structural test: a source vertex has no upstream, so read-records == 0.
+    # Its write-records is the input count because Flink SQL only chains 1:1
+    # operators (a Calc) onto a source - anything that reshapes the cardinality
+    # needs a keyed shuffle, which starts a new vertex.
     d = get_json(f"{base}/jobs/{job}")
-    best = 0
-    for v in d.get("vertices", []):
+    vertices = d.get("vertices", [])
+    sources = []
+    for v in vertices:
         m = v.get("metrics", {})
-        best = max(best, int(m.get("read-records", 0) or 0), int(m.get("write-records", 0) or 0))
+        if int(m.get("read-records", 0) or 0) == 0 and int(m.get("write-records", 0) or 0) > 0:
+            sources.append(int(m.get("write-records", 0) or 0))
+    best = max(sources) if sources else 0
+    if not best:
+        for v in vertices:
+            m = v.get("metrics", {})
+            best = max(best, int(m.get("read-records", 0) or 0), int(m.get("write-records", 0) or 0))
     clock = float(d.get("duration", 0) or 0) / 1000.0
     return best, clock
 

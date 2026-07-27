@@ -73,9 +73,22 @@ using clink::plugin::BuildContext;
 namespace {
 
 // Aggregate-function dispatch over a single value at a time, with
+// Intern a list of column names once, at operator build. Every use of the result
+// is a per-record Row key, where interning would be a hash and a probe per column
+// per record - see interned_name.hpp.
+inline std::vector<clink::config::InternedName> intern_names(
+    const std::vector<std::string>& names) {
+    std::vector<clink::config::InternedName> out;
+    out.reserve(names.size());
+    for (const auto& n : names) {
+        out.emplace_back(n);
+    }
+    return out;
+}
+
 // per-(group, window) state stored alongside each output column.
 struct AggSpec {
-    std::string output_name;
+    clink::config::InternedName output_name;
     std::string fn;
     std::string input_column;  // "" for COUNT(*)
     bool distinct = false;     // COUNT(DISTINCT x) / STRING_AGG(DISTINCT x)
@@ -427,7 +440,7 @@ inline clink::Codec<AggBucket> agg_bucket_codec() {
     // the zero-alloc keyed-state path is byte-identical to encode by
     // construction. encode_into appends to the caller-cleared scratch buffer.
     auto body = [](const AggBucket& b, Bytes& o) {
-        clink::config::JsonValue gv{clink::config::JsonObject{b.group_values.values}};
+        clink::config::JsonValue gv{clink::sql::to_json_object(b.group_values.values)};
         agg_codec_detail::put_str(o, gv.serialize(0));
         agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(b.agg_states.size()));
         for (const auto& s : b.agg_states)
@@ -435,7 +448,7 @@ inline clink::Codec<AggBucket> agg_bucket_codec() {
         // prior_emitted (changelog path only): a flag + the bare row JSON.
         agg_codec_detail::put_u32(o, b.prior_emitted.has_value() ? 1u : 0u);
         if (b.prior_emitted.has_value()) {
-            clink::config::JsonValue pe{clink::config::JsonObject{b.prior_emitted->values}};
+            clink::config::JsonValue pe{clink::sql::to_json_object(b.prior_emitted->values)};
             agg_codec_detail::put_str(o, pe.serialize(0));
         }
     };
@@ -454,7 +467,8 @@ inline clink::Codec<AggBucket> agg_bucket_codec() {
             try {
                 auto j = clink::config::parse(gv_text);
                 if (j.is_object())
-                    b.group_values.values = std::move(j.as_object());
+                    b.group_values.values =
+                        clink::sql::row_columns_from_json(std::move(j.as_object()));
             } catch (...) {
                 return std::nullopt;
             }
@@ -472,7 +486,7 @@ inline clink::Codec<AggBucket> agg_bucket_codec() {
                     auto j = clink::config::parse(pe_text);
                     Row pr;
                     if (j.is_object())
-                        pr.values = std::move(j.as_object());
+                        pr.values = clink::sql::row_columns_from_json(std::move(j.as_object()));
                     b.prior_emitted = std::move(pr);
                 } catch (...) {
                     return std::nullopt;
@@ -1357,7 +1371,7 @@ namespace window_codec_detail {
 // AggBucket codec proves).
 inline void encode_bucket(std::vector<std::byte>& o, const WindowBucket& b) {
     agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(b.window_start));
-    clink::config::JsonValue gv{clink::config::JsonObject{b.group_values.values}};
+    clink::config::JsonValue gv{clink::sql::to_json_object(b.group_values.values)};
     agg_codec_detail::put_str(o, gv.serialize(0));
     agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(b.agg_states.size()));
     for (const auto& s : b.agg_states) {
@@ -1373,7 +1387,7 @@ inline bool decode_bucket(agg_codec_detail::Reader& r, WindowBucket& b) {
     try {
         auto j = clink::config::parse(gv_text);
         if (j.is_object()) {
-            b.group_values.values = std::move(j.as_object());
+            b.group_values.values = clink::sql::row_columns_from_json(std::move(j.as_object()));
         }
     } catch (...) {
         return false;
@@ -1486,12 +1500,13 @@ public:
           slide_ms_(slide_ms),
           group_keys_(std::move(group_keys)),
           aggregates_(std::move(aggregates)),
-          group_key_outputs_(std::move(group_key_outputs)),
-          window_start_output_(std::move(window_start_output)),
-          window_end_output_(std::move(window_end_output)),
+          group_key_outputs_(intern_names(group_key_outputs)),
+          window_start_output_(clink::config::InternedName{window_start_output}),
+          window_end_output_(clink::config::InternedName{window_end_output}),
           output_schema_(std::move(output_schema)) {
         if (group_key_outputs_.size() != group_keys_.size()) {
-            group_key_outputs_ = group_keys_;  // default: emit each key under its raw name
+            // default: emit each key under its raw name
+            group_key_outputs_ = intern_names(group_keys_);
         }
         if (size_ms_ <= 0)
             throw std::runtime_error("window_row: size_ms must be > 0");
@@ -1584,6 +1599,10 @@ public:
         }
         struct Col {
             const std::string* name;
+            // Interned once per batch: the row loop below writes this name into a
+            // Row per record, and interning there would put a hash and a probe on
+            // every column of every record.
+            clink::config::InternedName iname;
             int idx;
             std::shared_ptr<arrow::DataType> type;
         };
@@ -1592,7 +1611,8 @@ public:
         for (const auto& nm : columnar_needed_) {
             const int idx = rb->schema()->GetFieldIndex(nm);
             if (idx >= 0) {
-                cols.push_back({&nm, idx, rb->schema()->field(idx)->type()});
+                cols.push_back(
+                    {&nm, clink::config::InternedName{nm}, idx, rb->schema()->field(idx)->type()});
             }
         }
         // WS3 within-batch group-by: amortise the per-record state_[group_key]
@@ -1609,7 +1629,7 @@ public:
         for (std::int64_t i = 0; i < n; ++i) {
             Row row;
             for (const auto& c : cols) {
-                row.values[*c.name] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
+                row.values[c.iname] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
             }
             rows.push_back(std::move(row));
         }
@@ -2058,7 +2078,7 @@ private:
             switch (pane_cols_[i].src) {
                 case PaneSrc::Group: {
                     const auto* v = row_columnar_detail::field(
-                        b.group_values, group_key_outputs_[pane_cols_[i].idx]);
+                        b.group_values, group_key_outputs_[pane_cols_[i].idx].str());
                     if (v == nullptr) {
                         return false;  // as above: an absent group value, not a null one
                     }
@@ -2253,7 +2273,7 @@ private:
         if (rt == nullptr)
             return;
         clink::BadRecord br;
-        br.payload = clink::config::JsonValue{row.values}.serialize(0);
+        br.payload = clink::config::JsonValue{clink::sql::to_json_object(row.values)}.serialize(0);
         br.error = "late record dropped: window fired and purged";
         br.connector = "sql_window";
         br.direction = "operator";
@@ -2276,9 +2296,9 @@ private:
     std::int64_t slide_ms_;
     std::vector<std::string> group_keys_;
     std::vector<AggSpec> aggregates_;
-    std::vector<std::string> group_key_outputs_;
-    std::string window_start_output_;
-    std::string window_end_output_;
+    std::vector<clink::config::InternedName> group_key_outputs_;
+    clink::config::InternedName window_start_output_;
+    clink::config::InternedName window_end_output_;
     clink::FlatMap<std::string,
                    std::map<std::int64_t, WindowBucket>,
                    TransparentKeyHash,
@@ -2334,11 +2354,12 @@ public:
           gap_ms_(gap_ms),
           group_keys_(std::move(group_keys)),
           aggregates_(std::move(aggregates)),
-          group_key_outputs_(std::move(group_key_outputs)),
+          group_key_outputs_(intern_names(group_key_outputs)),
           window_start_output_(std::move(window_start_output)),
           window_end_output_(std::move(window_end_output)) {
         if (group_key_outputs_.size() != group_keys_.size()) {
-            group_key_outputs_ = group_keys_;  // default: emit each key under its raw name
+            // default: emit each key under its raw name
+            group_key_outputs_ = intern_names(group_keys_);
         }
         if (gap_ms_ <= 0)
             throw std::runtime_error("session_window_row: gap_ms must be > 0");
@@ -2428,7 +2449,7 @@ public:
         if (rt == nullptr)
             return;
         clink::BadRecord br;
-        br.payload = clink::config::JsonValue{row.values}.serialize(0);
+        br.payload = clink::config::JsonValue{clink::sql::to_json_object(row.values)}.serialize(0);
         br.error = "late record dropped: session fired and purged";
         br.connector = "sql_session_window";
         br.direction = "operator";
@@ -2466,6 +2487,10 @@ public:
         }
         struct Col {
             const std::string* name;
+            // Interned once per batch: the row loop below writes this name into a
+            // Row per record, and interning there would put a hash and a probe on
+            // every column of every record.
+            clink::config::InternedName iname;
             int idx;
             std::shared_ptr<arrow::DataType> type;
         };
@@ -2474,7 +2499,8 @@ public:
         for (const auto& nm : columnar_needed_) {
             const int idx = rb->schema()->GetFieldIndex(nm);
             if (idx >= 0) {
-                cols.push_back({&nm, idx, rb->schema()->field(idx)->type()});
+                cols.push_back(
+                    {&nm, clink::config::InternedName{nm}, idx, rb->schema()->field(idx)->type()});
             }
         }
         // WS3 within-batch group-by: amortise the per-record state_[group_key]
@@ -2491,7 +2517,7 @@ public:
         for (std::int64_t i = 0; i < n; ++i) {
             Row row;
             for (const auto& c : cols) {
-                row.values[*c.name] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
+                row.values[c.iname] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
             }
             rows.push_back(std::move(row));
         }
@@ -3034,7 +3060,7 @@ private:
             for (const auto& [start, s] : m) {
                 agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(start));
                 agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(s.end));
-                clink::config::JsonValue gv{clink::config::JsonObject{s.group_values.values}};
+                clink::config::JsonValue gv{clink::sql::to_json_object(s.group_values.values)};
                 agg_codec_detail::put_str(o, gv.serialize(0));
                 agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(s.agg_states.size()));
                 for (const auto& as : s.agg_states) {
@@ -3063,7 +3089,8 @@ private:
                     try {
                         auto j = clink::config::parse(gv_text);
                         if (j.is_object()) {
-                            s.group_values.values = std::move(j.as_object());
+                            s.group_values.values =
+                                clink::sql::row_columns_from_json(std::move(j.as_object()));
                         }
                     } catch (...) {
                         return std::nullopt;
@@ -3097,9 +3124,9 @@ private:
     bool report_late_ = false;
     std::vector<std::string> group_keys_;
     std::vector<AggSpec> aggregates_;
-    std::vector<std::string> group_key_outputs_;
-    std::string window_start_output_;
-    std::string window_end_output_;
+    std::vector<clink::config::InternedName> group_key_outputs_;
+    clink::config::InternedName window_start_output_;
+    clink::config::InternedName window_end_output_;
     // Finalised in open(): a deferring backend -> the async KeyedState path
     // (process_async + event-time timers); otherwise the sync in-memory state_.
     bool effective_async_ = false;
@@ -3113,7 +3140,7 @@ private:
 // One OVER output column. fn is one of sum/count/avg/min/max (running
 // aggregate) or first_value/last_value/lag (navigation).
 struct OverSpec {
-    std::string output_name;
+    clink::config::InternedName output_name;
     std::string fn;
     std::string input_column;     // "" for COUNT(*)
     std::int64_t lag_offset = 1;  // LAG only
@@ -3563,14 +3590,14 @@ private:
         using Bytes = clink::Codec<PartState>::Bytes;
         using BytesView = clink::Codec<PartState>::BytesView;
         auto row_text = [](const Row& r) {
-            return clink::config::JsonValue{clink::config::JsonObject{r.values}}.serialize(0);
+            return clink::config::JsonValue{clink::sql::to_json_object(r.values)}.serialize(0);
         };
         auto parse_row = [](const std::string& t) -> Row {
             Row r;
             try {
                 auto j = clink::config::parse(t);
                 if (j.is_object()) {
-                    r.values = std::move(j.as_object());
+                    r.values = clink::sql::row_columns_from_json(std::move(j.as_object()));
                 }
             } catch (...) {
             }
@@ -3768,7 +3795,7 @@ private:
     }
 
     static std::string serialize_bare_(const Row& r) {
-        return clink::config::JsonValue{clink::config::JsonObject{r.values}}.serialize(0);
+        return clink::config::JsonValue{clink::sql::to_json_object(r.values)}.serialize(0);
     }
 
     static bool rows_equal_(const Row& a, const Row& b) {
@@ -3880,12 +3907,13 @@ public:
                    bool emit_changelog = false)
         : group_keys_(std::move(group_keys)),
           aggregates_(std::move(aggregates)),
-          group_key_outputs_(std::move(group_key_outputs)),
+          group_key_outputs_(intern_names(group_key_outputs)),
           async_state_(async_state),
           effective_async_state_(async_state),
           emit_changelog_(emit_changelog) {
         if (group_key_outputs_.size() != group_keys_.size()) {
-            group_key_outputs_ = group_keys_;  // default: emit each key under its raw name
+            // default: emit each key under its raw name
+            group_key_outputs_ = intern_names(group_keys_);
         }
         // Columns this op actually reads from each input row: the group keys,
         // each aggregate's input column, and the changelog marker. The columnar
@@ -3976,6 +4004,10 @@ public:
         // Resolve the needed columns to (name, index, type) once per batch.
         struct Col {
             const std::string* name;
+            // Interned once per batch: the row loop below writes this name into a
+            // Row per record, and interning there would put a hash and a probe on
+            // every column of every record.
+            clink::config::InternedName iname;
             int idx;
             std::shared_ptr<arrow::DataType> type;
         };
@@ -3984,13 +4016,14 @@ public:
         for (const auto& nm : columnar_needed_) {
             const int idx = rb->schema()->GetFieldIndex(nm);
             if (idx >= 0) {
-                cols.push_back({&nm, idx, rb->schema()->field(idx)->type()});
+                cols.push_back(
+                    {&nm, clink::config::InternedName{nm}, idx, rb->schema()->field(idx)->type()});
             }
         }
         auto read_row = [&](std::int64_t i) {
             Row row;
             for (const auto& c : cols) {
-                row.values[*c.name] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
+                row.values[c.iname] = row_columnar_detail::read_cell(c.type, *rb->column(c.idx), i);
             }
             return row;
         };
@@ -4404,8 +4437,8 @@ private:
     // Deep value equality of two bare aggregate rows (no __row_kind on either),
     // via canonical JSON. JsonObject is an ordered map so the text is stable.
     static bool rows_equal_(const Row& a, const Row& b) {
-        return clink::config::JsonValue{clink::config::JsonObject{a.values}}.serialize(0) ==
-               clink::config::JsonValue{clink::config::JsonObject{b.values}}.serialize(0);
+        return clink::config::JsonValue{clink::sql::to_json_object(a.values)}.serialize(0) ==
+               clink::config::JsonValue{clink::sql::to_json_object(b.values)}.serialize(0);
     }
 
     // In-memory (default) per-record path.
@@ -4439,7 +4472,7 @@ private:
             result.values[aggregates_[i].output_name] =
                 finalize_agg(bucket.agg_states[i], aggregates_[i]);
         }
-        return clink::config::JsonValue{clink::config::JsonObject{result.values}}.serialize(0);
+        return clink::config::JsonValue{clink::sql::to_json_object(result.values)}.serialize(0);
     }
 
     void mark_dirty_(const std::string& key) {
@@ -4472,7 +4505,7 @@ private:
 
     std::vector<std::string> group_keys_;
     std::vector<AggSpec> aggregates_;
-    std::vector<std::string> group_key_outputs_;
+    std::vector<clink::config::InternedName> group_key_outputs_;
     bool async_state_ = false;
     // Effective decision: async_state_ OR the bound backend can defer reads.
     // Seeded from async_state_ in the ctor and finalised in open() once the
@@ -4544,11 +4577,15 @@ public:
         // (planner-anomalous) duplicate disables the fast path.
         for (const auto& c : left_columns_) {
             sorted_out_cols_.push_back(
-                {left_alias_.empty() ? c : left_alias_ + "_" + c, /*from_left=*/true, &c});
+                {clink::config::InternedName{left_alias_.empty() ? c : left_alias_ + "_" + c},
+                 /*from_left=*/true,
+                 &c});
         }
         for (const auto& c : right_columns_) {
             sorted_out_cols_.push_back(
-                {right_alias_.empty() ? c : right_alias_ + "_" + c, /*from_left=*/false, &c});
+                {clink::config::InternedName{right_alias_.empty() ? c : right_alias_ + "_" + c},
+                 /*from_left=*/false,
+                 &c});
         }
         std::stable_sort(sorted_out_cols_.begin(),
                          sorted_out_cols_.end(),
@@ -4667,7 +4704,7 @@ private:
             // Fast path: emit the pairs in the precomputed sorted order and
             // bulk-adopt them - from_entries takes its one-pass sorted branch,
             // so there is no per-column binary search or tail memmove.
-            std::vector<std::pair<std::string, clink::config::JsonValue>> entries;
+            std::vector<std::pair<clink::config::InternedName, clink::config::JsonValue>> entries;
             entries.reserve(sorted_out_cols_.size());
             for (const auto& oc : sorted_out_cols_) {
                 const Row* src = oc.from_left ? left : right;
@@ -4679,7 +4716,7 @@ private:
                 }
                 entries.emplace_back(oc.name, std::move(v));
             }
-            out.values = clink::config::JsonObject::from_entries(std::move(entries));
+            out.values = clink::sql::RowColumns::from_entries(std::move(entries));
             return out;
         }
         auto fill =
@@ -4740,7 +4777,7 @@ private:
     static std::string bare_row_key_(const Row& row) {
         Row b = row;
         b.values.erase(std::string{kRowKindField});
-        return clink::config::JsonValue{clink::config::JsonObject{b.values}}.serialize(0);
+        return clink::config::JsonValue{clink::sql::to_json_object(b.values)}.serialize(0);
     }
     static bool entries_match_(const Entry& e, const Row& row) {
         return bare_row_key_(e.row) == bare_row_key_(row);
@@ -5065,7 +5102,7 @@ private:
             arr.reserve(es.size());
             for (const auto& e : es) {
                 clink::config::JsonObject o;
-                o["r"] = clink::config::JsonValue{clink::config::JsonObject{e.row.values}};
+                o["r"] = clink::config::JsonValue{clink::sql::to_json_object(e.row.values)};
                 o["n"] = clink::config::JsonValue{e.null_emitted};
                 arr.emplace_back(std::move(o));
             }
@@ -5095,7 +5132,8 @@ private:
                         const auto& o = el.as_object();
                         Entry e;
                         if (auto it = o.find("r"); it != o.end() && it->second.is_object()) {
-                            e.row.values = it->second.as_object();
+                            e.row.values =
+                                clink::sql::row_columns_from_json(it->second.as_object());
                         }
                         if (auto it = o.find("n"); it != o.end() && it->second.is_bool()) {
                             e.null_emitted = it->second.as_bool();
@@ -5138,9 +5176,11 @@ private:
 
     // build_'s precomputed output layout (see the constructor).
     struct OutCol {
-        std::string name;        // final output column name (alias applied)
-        bool from_left;          // which side supplies the value
-        const std::string* src;  // source column name (points into *_columns_)
+        // Interned once here, so building an output row per record copies a
+        // pointer instead of hashing the name into the intern table.
+        clink::config::InternedName name;  // final output column name (alias applied)
+        bool from_left;                    // which side supplies the value
+        const std::string* src;            // source column name (points into *_columns_)
     };
     std::vector<OutCol> sorted_out_cols_;
     bool out_name_collision_ = false;
@@ -5641,7 +5681,7 @@ private:
             arr.reserve(es.size());
             for (const auto& e : es) {
                 clink::config::JsonObject o;
-                o["r"] = clink::config::JsonValue{clink::config::JsonObject{e.row.values}};
+                o["r"] = clink::config::JsonValue{clink::sql::to_json_object(e.row.values)};
                 o["e"] = clink::config::JsonValue{e.emitted};
                 arr.emplace_back(std::move(o));
             }
@@ -5671,7 +5711,8 @@ private:
                         const auto& o = el.as_object();
                         LeftEntry e;
                         if (auto it = o.find("r"); it != o.end() && it->second.is_object()) {
-                            e.row.values = it->second.as_object();
+                            e.row.values =
+                                clink::sql::row_columns_from_json(it->second.as_object());
                         }
                         if (auto it = o.find("e"); it != o.end() && it->second.is_bool()) {
                             e.emitted = it->second.as_bool();
@@ -5950,9 +5991,9 @@ private:
             o["rc"] = clink::config::JsonValue{static_cast<double>(b.right_count)};
             o["em"] = clink::config::JsonValue{static_cast<double>(b.emitted)};
             if (b.has_left_rep)
-                o["lr"] = clink::config::JsonValue{clink::config::JsonObject{b.left_rep.values}};
+                o["lr"] = clink::config::JsonValue{clink::sql::to_json_object(b.left_rep.values)};
             if (b.has_right_rep)
-                o["rr"] = clink::config::JsonValue{clink::config::JsonObject{b.right_rep.values}};
+                o["rr"] = clink::config::JsonValue{clink::sql::to_json_object(b.right_rep.values)};
             const std::string s = clink::config::JsonValue{std::move(o)}.serialize(0);
             const auto* p = reinterpret_cast<const std::byte*>(s.data());
             out.insert(out.end(), p, p + s.size());
@@ -5981,11 +6022,13 @@ private:
                     b.right_count = geti("rc");
                     b.emitted = geti("em");
                     if (auto it = o.find("lr"); it != o.end() && it->second.is_object()) {
-                        b.left_rep.values = it->second.as_object();
+                        b.left_rep.values =
+                            clink::sql::row_columns_from_json(it->second.as_object());
                         b.has_left_rep = true;
                     }
                     if (auto it = o.find("rr"); it != o.end() && it->second.is_object()) {
-                        b.right_rep.values = it->second.as_object();
+                        b.right_rep.values =
+                            clink::sql::row_columns_from_json(it->second.as_object());
                         b.has_right_rep = true;
                     }
                     return b;
@@ -6146,7 +6189,7 @@ public:
     std::string name() const override { return "scalar_project_row"; }
 
 private:
-    std::string output_column_;
+    clink::config::InternedName output_column_;
     std::string scalar_column_;
     std::vector<Row> main_buffer_;
     clink::config::JsonValue scalar_value_{nullptr};
@@ -6209,7 +6252,7 @@ public:
             for (const auto& [_k, row] : state_) {
                 Row q = row;  // #56: quantise DECIMAL columns to declared scale + clean render
                 requantise_row_decimals(q, decimal_scales_);
-                clink::config::JsonValue v{clink::config::JsonObject{q.values}};
+                clink::config::JsonValue v{clink::sql::to_json_object(q.values)};
                 auto s = clink::config::serialize_output(v);
                 out.write(s.data(), static_cast<std::streamsize>(s.size()));
                 out.put('\n');
@@ -6260,7 +6303,7 @@ public:
             Row bare = row;
             bare.values.erase(std::string{kRowKindField});
             const std::string key =
-                clink::config::JsonValue{clink::config::JsonObject{bare.values}}.serialize(0);
+                clink::config::JsonValue{clink::sql::to_json_object(bare.values)}.serialize(0);
             auto& slot = state_[key];
             slot.count += del ? -1 : 1;
             if (slot.count <= 0) {
@@ -6284,7 +6327,7 @@ public:
             for (const auto& [_k, slot] : state_) {
                 Row q = slot.row;
                 requantise_row_decimals(q, decimal_scales_);
-                clink::config::JsonValue v{clink::config::JsonObject{q.values}};
+                clink::config::JsonValue v{clink::sql::to_json_object(q.values)};
                 auto s = clink::config::serialize_output(v);
                 out.write(s.data(), static_cast<std::streamsize>(s.size()));
                 out.put('\n');
@@ -6331,7 +6374,7 @@ public:
             Row q = row;
             requantise_row_decimals(q, decimal_scales_);
             const std::string line = clink::config::serialize_output(
-                clink::config::JsonValue{clink::config::JsonObject{q.values}});
+                clink::config::JsonValue{clink::sql::to_json_object(q.values)});
             // Write incrementally to a per-partition file handle (opened once,
             // truncating; kept open until flush) rather than buffering all rows -
             // so memory stays bounded by the number of distinct partitions.
@@ -6437,7 +6480,7 @@ public:
             Row q = row;
             requantise_row_decimals(q, decimal_scales_);
             const std::string line = clink::config::serialize_output(
-                clink::config::JsonValue{clink::config::JsonObject{q.values}});
+                clink::config::JsonValue{clink::sql::to_json_object(q.values)});
             auto [it, inserted] = files_.try_emplace(key);
             if (inserted) {
                 const std::string path = staging_ + "/" + key;
@@ -6640,6 +6683,15 @@ private:
     // out. Ranks are monotonic non-decreasing down the buffer, so a
     // single cut point exists.
     std::size_t compute_cut_(const std::vector<Row>& part) const {
+        // ROW_NUMBER ranks by position, so its cut is the count itself and no
+        // comparison is needed to find it. Only RANK / DENSE_RANK have to locate
+        // tie-group boundaries, and each boundary test is two better_ calls -
+        // every one of which re-finds its sort columns in both rows' sorted
+        // column maps. Walking the buffer for ROW_NUMBER spent ~2N of those on
+        // a group_start / group_idx pair that ROW_NUMBER never reads.
+        if (rank_kind_ == OverRankKind::RowNumber) {
+            return std::min(static_cast<std::size_t>(count_), part.size());
+        }
         std::size_t group_start = 0;
         std::int64_t group_idx = 0;
         for (std::size_t i = 0; i < part.size(); ++i) {
@@ -6990,7 +7042,7 @@ private:
     // 1, no upstream keyer) - the historical dedup identity.
     std::string state_key_(const Row& row) const {
         if (columns_.empty()) {
-            clink::config::JsonObject obj = row.values;
+            clink::config::JsonObject obj = clink::sql::to_json_object(row.values);
             return clink::config::JsonValue{std::move(obj)}.serialize(0);
         }
         std::string key;
@@ -7172,7 +7224,7 @@ private:
         Row out;
         const std::string& present_alias = present_is_left ? left_alias_ : right_alias_;
         for (const auto& [k, v] : present.values) {
-            out.values[present_alias + "_" + k] = v;
+            out.values[present_alias + "_" + k.str()] = v;
         }
         const auto& absent_cols = present_is_left ? right_columns_ : left_columns_;
         const std::string& absent_alias = present_is_left ? right_alias_ : left_alias_;
@@ -7224,9 +7276,9 @@ private:
     Row build_joined_(const Row& l, const Row& r) const {
         Row out;
         for (const auto& [k, v] : l.values)
-            out.values[left_alias_ + "_" + k] = v;
+            out.values[left_alias_ + "_" + k.str()] = v;
         for (const auto& [k, v] : r.values)
-            out.values[right_alias_ + "_" + k] = v;
+            out.values[right_alias_ + "_" + k.str()] = v;
         return out;
     }
 
@@ -7477,7 +7529,7 @@ private:
             for (const auto& e : es) {
                 clink::config::JsonObject o;
                 o["t"] = clink::config::JsonValue{static_cast<double>(e.ts)};
-                o["r"] = clink::config::JsonValue{clink::config::JsonObject{e.row.values}};
+                o["r"] = clink::config::JsonValue{clink::sql::to_json_object(e.row.values)};
                 o["m"] = clink::config::JsonValue{e.matched};
                 arr.emplace_back(std::move(o));
             }
@@ -7510,7 +7562,8 @@ private:
                             e.ts = static_cast<std::int64_t>(it->second.as_number());
                         }
                         if (auto it = o.find("r"); it != o.end() && it->second.is_object()) {
-                            e.row.values = it->second.as_object();
+                            e.row.values =
+                                clink::sql::row_columns_from_json(it->second.as_object());
                         }
                         if (auto it = o.find("m"); it != o.end() && it->second.is_bool()) {
                             e.matched = it->second.as_bool();
@@ -7687,7 +7740,8 @@ public:
                     h ^= v;
                     h *= 0x100000001b3ULL;
                 }
-                o.values[kRowKeyField] = clink::config::JsonValue{static_cast<std::int64_t>(h)};
+                static const clink::config::InternedName kRowKeyName{kRowKeyField};
+                o.values[kRowKeyName] = clink::config::JsonValue{static_cast<std::int64_t>(h)};
                 Record<Row> out_rec(std::move(o));
                 if (const auto ts = rec.event_time(); ts.has_value()) {
                     out_rec.set_event_time(*ts);
@@ -7942,7 +7996,7 @@ public:
                 continue;
             }
             Row row;
-            row.values = entry.at("value").as_object();
+            row.values = clink::sql::row_columns_from_json(entry.at("value").as_object());
             batch.push(Record<Row>{std::move(row)});
             if (++in_batch >= batch_size_) {
                 out.emit_data(std::move(batch));
@@ -8519,7 +8573,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             return std::make_shared<FunctionSink<Row>>(
                 [](const Row& row) {
                     std::string prefix;
-                    auto vals = row.values;
+                    auto vals = clink::sql::to_json_object(row.values);
                     if (auto it = vals.find(std::string{kRowKindField}); it != vals.end()) {
                         const std::string kind =
                             it->second.is_string() ? it->second.as_string() : std::string{};
@@ -9423,7 +9477,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 throw std::runtime_error("window_row: aggregate entry must be an object");
             }
             AggSpec spec;
-            spec.output_name = entry.at("name").as_string();
+            spec.output_name = clink::config::InternedName{entry.at("name").as_string()};
             spec.fn = entry.at("fn").as_string();
             if (entry.contains("input_column") && entry.at("input_column").is_string()) {
                 spec.input_column = entry.at("input_column").as_string();
@@ -9506,7 +9560,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 if (!entry.is_object())
                     throw std::runtime_error("over_aggregate_row: output entry must be an object");
                 OverSpec s;
-                s.output_name = entry.at("name").as_string();
+                s.output_name = clink::config::InternedName{entry.at("name").as_string()};
                 s.fn = entry.at("fn").as_string();
                 if (entry.contains("input_column") && entry.at("input_column").is_string())
                     s.input_column = entry.at("input_column").as_string();
@@ -9561,7 +9615,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 if (!entry.is_object())
                     throw std::runtime_error("last_n_agg_row: output entry must be an object");
                 OverSpec s;
-                s.output_name = entry.at("name").as_string();
+                s.output_name = clink::config::InternedName{entry.at("name").as_string()};
                 s.fn = entry.at("fn").as_string();
                 if (entry.contains("input_column") && entry.at("input_column").is_string())
                     s.input_column = entry.at("input_column").as_string();
@@ -9847,7 +9901,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             std::vector<AggSpec> aggregates;
             for (const auto& entry : agg_json.as_array()) {
                 AggSpec spec;
-                spec.output_name = entry.at("name").as_string();
+                spec.output_name = clink::config::InternedName{entry.at("name").as_string()};
                 spec.fn = entry.at("fn").as_string();
                 if (entry.contains("input_column") && entry.at("input_column").is_string()) {
                     spec.input_column = entry.at("input_column").as_string();
@@ -10055,7 +10109,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                     throw std::runtime_error("aggregate_row: aggregate entry must be an object");
                 }
                 AggSpec spec;
-                spec.output_name = entry.at("name").as_string();
+                spec.output_name = clink::config::InternedName{entry.at("name").as_string()};
                 spec.fn = entry.at("fn").as_string();
                 if (entry.contains("input_column") && entry.at("input_column").is_string()) {
                     spec.input_column = entry.at("input_column").as_string();

@@ -54,13 +54,21 @@ inline bool is_delete_like(std::string_view kind) {
     return kind == kRowKindDelete || kind == kRowKindUpdateBefore;
 }
 
+// The marker's interned handle, resolved once. Every helper below runs per
+// record, and each used to build a throwaway std::string from a string_view just
+// to probe a map that accepts a string_view.
+inline clink::config::InternedName row_kind_name() {
+    static const clink::config::InternedName n{kRowKindField};
+    return n;
+}
+
 inline bool has_row_kind(const Row& row) {
-    auto it = row.values.find(std::string{kRowKindField});
+    auto it = row.values.find(kRowKindField);
     return it != row.values.end() && it->second.is_string();
 }
 
 inline std::string row_kind_of(const Row& row) {
-    auto it = row.values.find(std::string{kRowKindField});
+    auto it = row.values.find(kRowKindField);
     if (it == row.values.end() || !it->second.is_string()) {
         return std::string{kRowKindInsert};  // unmarked records are inserts
     }
@@ -68,15 +76,16 @@ inline std::string row_kind_of(const Row& row) {
 }
 
 inline void set_row_kind(Row& row, std::string_view kind) {
-    row.values[std::string{kRowKindField}] = clink::config::JsonValue{std::string{kind}};
+    row.values[row_kind_name()] = clink::config::JsonValue{std::string{kind}};
 }
 
 // Copy a __row_kind value from `src` onto `dst` if `src` carries one.
 // Used by project_row to preserve the privileged field even when the
 // user's projection doesn't include it in its outputs.
 inline void copy_row_kind(const Row& src, Row& dst) {
-    if (has_row_kind(src)) {
-        dst.values[std::string{kRowKindField}] = src.values.at(std::string{kRowKindField});
+    auto it = src.values.find(kRowKindField);
+    if (it != src.values.end() && it->second.is_string()) {
+        dst.values[row_kind_name()] = it->second;
     }
 }
 

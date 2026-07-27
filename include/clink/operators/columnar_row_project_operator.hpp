@@ -48,8 +48,10 @@ public:
                                         std::string name = "project_row")
         : outputs_(std::move(outputs)), name_(std::move(name)) {
         compiled_.reserve(outputs_.size());
+        out_names_.reserve(outputs_.size());
         for (const auto& [out_name, expr] : outputs_) {
             compiled_.push_back(clink::operators::CompiledValueExpr::compile(expr));
+            out_names_.emplace_back(out_name);
         }
     }
 
@@ -150,7 +152,7 @@ public:
                 const clink::operators::ColumnLookup lookup{resolve};
                 sql::Row projected;
                 for (std::size_t i = 0; i < outputs_.size(); ++i) {
-                    projected.values[outputs_[i].first] = compiled_[i].evaluate(lookup);
+                    projected.values[out_names_[i]] = compiled_[i].evaluate(lookup);
                 }
                 sql::copy_row_kind(r, projected);
                 Record<sql::Row> rec(std::move(projected));
@@ -176,6 +178,10 @@ public:
 
 private:
     std::vector<Output> outputs_;
+    // Output column names interned once at build. The projection writes them into
+    // a Row per record, and resolving each through the intern table there would
+    // trade the memory the interned key saves for CPU on the hottest path.
+    std::vector<clink::config::InternedName> out_names_;
     // One compiled program per output, parallel to outputs_. The JSON IR in
     // outputs_ is kept for the columnar fast path's shape checks.
     std::vector<clink::operators::CompiledValueExpr> compiled_;

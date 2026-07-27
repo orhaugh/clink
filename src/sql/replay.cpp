@@ -102,7 +102,7 @@ void ensure_row_factories_installed() {
 
 std::string format_replay_row(const Row& row) {
     std::string prefix;
-    auto vals = row.values;
+    auto vals = to_json_object(row.values);
     if (auto it = vals.find(std::string{kRowKindField}); it != vals.end()) {
         const std::string kind = it->second.is_string() ? it->second.as_string() : std::string{};
         if (kind == kRowKindDelete) {
