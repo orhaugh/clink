@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cmath>
 #include <coroutine>
 #include <cstdio>
@@ -1896,6 +1897,7 @@ private:
                         b.group_values.values[group_key_outputs_[i]] = v->second;
                 }
                 wit = by_window.emplace(win_end, std::move(b)).first;
+                earliest_win_end_ = std::min(earliest_win_end_, win_end);
                 if (new_win_ends != nullptr)
                     new_win_ends->push_back(win_end);
             }
@@ -1988,6 +1990,7 @@ private:
                         }
                     }
                     wit = by_window.emplace(win_end, std::move(b)).first;
+                    earliest_win_end_ = std::min(earliest_win_end_, win_end);
                 }
                 vectorised_fold_slice(aggregates_, agg_cols, slice.idxs, wit->second.agg_states);
             }
@@ -2123,6 +2126,32 @@ private:
 
     void fire_due_(EventTime wm, Emitter<Row>& out) {
         const auto wm_value = wm.millis();
+        // Nothing can be due: skip the scan of every group. A watermark arrives once per
+        // batch, so without this the operator walked all of state_ per batch even when no
+        // window was close to firing - O(batches x groups). earliest_win_end_ is a lower
+        // bound, so this can only ever skip a scan that would have found nothing.
+        if (earliest_win_end_ != std::numeric_limits<std::int64_t>::max() &&
+            earliest_win_end_ + allowed_lateness_ms_ > wm_value) {
+#ifndef NDEBUG
+            // The bound must never exceed the true minimum, or this early-out skips a due
+            // window and silently loses output. It is maintained at each window-creation
+            // site, so a NEW creation site that forgets to update it would break the
+            // invariant in a way no output test necessarily catches - the fully-columnar
+            // WS6 fold, for instance, is not reached by the file source at all, so a
+            // regression there would pass the SQL suite. This check makes any test that
+            // exercises a missed site fail loudly in a debug build.
+            for (const auto& [dbg_k, dbg_win] : state_) {
+                (void)dbg_k;
+                if (!dbg_win.empty()) {
+                    assert(earliest_win_end_ <= dbg_win.begin()->first &&
+                           "earliest_win_end_ exceeds the true minimum window_end: a window "
+                           "creation site is not updating it, so fire_due_ can skip a due "
+                           "window");
+                }
+            }
+#endif
+            return;
+        }
         // Born-columnar fire: panes append into the typed builders and the batch
         // is emitted with an Arrow sidecar. A pane the carrier cannot represent
         // (see append_pane_columnar_) drops this WHOLE fire back to row form,
@@ -2160,6 +2189,17 @@ private:
                 }
                 emit_batch.push(Record<Row>{finalize_window_(it->second, it->first)});
                 it = by_window.erase(it);
+            }
+        }
+        // The scan erased every due window, so the previous bound is stale (too low).
+        // Recompute it exactly - each group's window map is ordered, so its smallest
+        // window_end is begin(). O(groups), but only on a watermark that actually fired,
+        // where the scan above already cost that much.
+        earliest_win_end_ = std::numeric_limits<std::int64_t>::max();
+        for (const auto& [k, by_window] : state_) {
+            (void)k;
+            if (!by_window.empty()) {
+                earliest_win_end_ = std::min(earliest_win_end_, by_window.begin()->first);
             }
         }
         std::size_t emitted = emit_batch.size();
@@ -2234,6 +2274,21 @@ private:
                    TransparentKeyHash,
                    std::equal_to<>>
         state_;
+    // A LOWER BOUND on the smallest window_end held anywhere in state_, so a watermark
+    // that cannot fire anything costs one comparison instead of a scan of every group.
+    //
+    // fire_due_ used to walk the whole of state_ on EVERY watermark, and a watermark is
+    // emitted once per batch. That is O(batches x groups) for a query whose windows are
+    // not yet due - which is the normal case for a long window. Measured on 2M records
+    // with an advancing watermark and a 1-hour window: 1.23s at 1,000 groups against
+    // 5.29s at 200,000, on identical per-record work.
+    //
+    // The invariant is one-sided ON PURPOSE: this may be SMALLER than the true minimum
+    // (a stale-low bound costs a scan that finds nothing, which is merely slow) but must
+    // never be LARGER (that would skip a due window and lose output). Every window
+    // creation lowers it with min(); fire_due_ recomputes it exactly after a scan, when
+    // the O(groups) walk has been paid for anyway.
+    mutable std::int64_t earliest_win_end_ = std::numeric_limits<std::int64_t>::max();
     mutable std::string key_scratch_;           // group_key_scratch_'s reused buffer
     std::vector<std::string> columnar_needed_;  // time + group + agg-input columns
 
