@@ -349,6 +349,33 @@ heavier.** The overall q12 memory advantage went from 1.2x to 2.2x.
 progress rather than a finish. What remains is container overhead - a std::map node per open
 window, the Row group_values each bucket keeps, the keyed-state entry - not the accumulator.
 
+### CPU-per-event does NOT hold as parallelism rises, and the cause is the shuffle
+
+Measured locally (single host, 8-partition topic, 3.6M records, same query and data at every
+parallelism, worker CPU read from the OS). This matters for any attempt to extrapolate a
+par-4 measurement to a large cluster:
+
+| parallelism | 1 | 2 | 4 | 8 | |
+|---|---:|---:|---:|---:|---|
+| q0 events/cpu-s (stateless) | 751,566 | 733,198 | 718,563 | 715,706 | **1.05x, flat** |
+| q12 events/cpu-s (keyed shuffle) | 599,002 | 469,361 | 405,862 | 281,911 | **2.1x worse** |
+
+The stateless shape scales essentially flat: fanning out costs nothing per event. The keyed
+shuffle degrades 2.1x from par 1 to par 8, and that is where all of the loss sits.
+
+The mechanism is already documented above: the split gathers once per (batch, target), so its
+per-row cost grows with the destination count - measured directly at 14.4 ns/row at 2 targets
+against 68.6 ns/row at 16 on the same batch. Fan-out is inherent to a keyed shuffle, so some
+growth is unavoidable; the constant factor is what the index+Take change attacked and what a
+specialised gather would attack next.
+
+**Consequence for any cost or footprint estimate.** A per-event efficiency figure measured at
+one parallelism cannot be multiplied out to a cluster of arbitrary size. On a stateless shape
+that extrapolation is close to safe. On a keyed shape it is optimistic, and the error grows
+with fan-out. Absolute per-event costs must be measured at, or near, the parallelism being
+modelled. Whether the RATIO against another engine holds is a separate question and is NOT
+answered here: this sweep is clink-vs-clink, and Flink was not measured across parallelism.
+
 ### jemalloc: measured, worth having, not a memory fix
 
 Tested by deriving an image from the SAME clink binary with `libjemalloc2` preloaded, so
