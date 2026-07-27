@@ -25,7 +25,13 @@ Per event processed, on the same hardware, producing byte-identical output:
 On the stateless query clink drains the same input faster than the JVM engine while
 occupying **0.84 of four cores against 2.57**.
 
-Those are measured. If you want them in dollars and kilowatt-hours, see
+Those are measured **on a single worker node at parallelism 4**. On a multi-node rig at
+parallelism 12 the same comparison gives 2.60x (stateless) and 1.15x (windowed) - see
+[What would make this wrong](#what-would-make-this-wrong), because the cause is a clink task-
+placement defect and not an inherent limit. Treat the figures above as a best case for
+topology until that is fixed.
+
+If you want them in dollars and kilowatt-hours, see
 [Translating this into a footprint](#translating-this-into-a-footprint) - with the warning that
 a CPU ratio is **not** an energy ratio unless the freed capacity is actually surrendered. On a
 fixed fleet the same 3.87x becomes about 1.8x on power, because an idle core still draws
@@ -440,9 +446,31 @@ at all at single-instance scale; anything on a fixed fleet above about 1.8x.
 
 A hostile reader should find their objection here, already stated.
 
-**The extrapolation problem, which is the most serious, and it is now partly measured.** A
-parallelism sweep on a single host, same query and same data at every parallelism, shows that
-CPU-per-event does NOT hold as fan-out grows:
+**The extrapolation problem, which is the most serious, and it is now measured on real
+hardware - with a result that cuts against the headline.** A multi-node rig (1 control node,
+3 worker nodes, an isolated broker, 18 dedicated vCPU) swept BOTH engines across parallelism
+4, 8 and 12. Beyond parallelism 4 the job spans worker hosts, so this is the first measurement
+containing any cross-host cost. The efficiency ratio decays, and on the windowed query it
+nearly disappears:
+
+| clink / JVM engine | parallelism 4 | parallelism 8 | parallelism 12 |
+|---|---:|---:|---:|
+| q0 (stateless) | 3.44x | 2.84x | 2.60x |
+| q12 (windowed) | **2.00x** | **1.13x** | **1.15x** |
+
+clink degrades faster than the JVM engine as the job fans out: on q12 its CPU-per-event is
+2.55x worse at parallelism 12 than at 4, against the JVM engine's 1.47x.
+
+The cause is identified and it is a clink defect rather than a property of scale. On a
+parallelism-12 run of q0 - a query whose only edges are forward edges, with no shuffle at all -
+**67% of data-plane edges were serialised over a socket instead of being in-process pointer
+handoffs**, because task placement is greedy first-fit per task and does not co-locate the
+operators of one parallel pipeline instance on one host. The JVM engine avoids this by design
+through slot sharing. It is a scheduling fix, and until it lands, **the figures at the top of
+this page should be read as a single-worker best case.**
+
+An earlier single-host sweep, kept here because the contrast is the whole point, found clink's
+q0 CPU-per-event flat across parallelism (1.05x from parallelism 1 to 8):
 
 | parallelism | 1 | 2 | 4 | 8 | |
 |---|---:|---:|---:|---:|---|
