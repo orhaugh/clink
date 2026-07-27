@@ -28,6 +28,7 @@
 #include "clink/operators/filter_operator.hpp"
 #include "clink/operators/json_predicate.hpp"
 #include "clink/operators/map_operator.hpp"
+#include "clink/operators/predicate_operand_exprs.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -261,17 +262,25 @@ void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
             if (pred_text.empty()) {
                 throw std::runtime_error("filter_string_predicate: 'predicate' param is required");
             }
-            auto compiled =
-                clink::operators::CompiledPredicate::compile(clink::config::parse(pred_text));
+            // An expression operand (`WHERE LENGTH(c) > 3`) is bound to a
+            // synthetic column reference here, so the predicate handed to
+            // CompiledPredicate is the plain named-column shape and the
+            // resolver below answers the synthetic name by evaluating the
+            // compiled expression. Without this the catch-all resolver would
+            // hand back the raw record for the synthetic name too.
+            auto operands =
+                clink::operators::PredicateOperandExprs::build(clink::config::parse(pred_text));
+            auto compiled = clink::operators::CompiledPredicate::compile(operands.predicate());
             return std::make_shared<clink::FilterOperator<std::string>>(
-                [compiled](const std::string& v) -> bool {
+                [compiled, operands](const std::string& v) -> bool {
                     // Single-string-column path: every column lookup returns the
                     // input record as a JsonValue{string}. NULL doesn't apply here
                     // since clink's per-record string channel can't carry NULL.
                     auto resolve = [&](const std::string&) -> clink::config::JsonValue {
                         return clink::config::JsonValue{v};
                     };
-                    const clink::operators::ColumnLookup lookup{resolve};
+                    clink::operators::SynthOperandResolver synth{operands, resolve};
+                    const clink::operators::ColumnLookup lookup{synth};
                     return compiled.evaluate(lookup);
                 },
                 "filter_string_predicate");

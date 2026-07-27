@@ -838,6 +838,25 @@ const char* bin_op_to_predicate_op(ast::BinOp op) {
     return "eq";  // unreachable; switch is exhaustive
 }
 
+// The same comparison read right-to-left, for normalising an operand order.
+const char* mirrored_predicate_op(ast::BinOp op) {
+    switch (op) {
+        case ast::BinOp::Eq:
+            return "eq";
+        case ast::BinOp::Ne:
+            return "ne";
+        case ast::BinOp::Lt:
+            return "gt";
+        case ast::BinOp::Le:
+            return "ge";
+        case ast::BinOp::Gt:
+            return "lt";
+        case ast::BinOp::Ge:
+            return "le";
+    }
+    return "eq";  // unreachable; switch is exhaustive
+}
+
 // Resolve a column-ref Expression to the column name in the source
 // table. Throws on anything else (binary operands are
 // limited to column refs and string literals).
@@ -895,6 +914,15 @@ clink::config::JsonValue literal_to_json(const ast::Expression& expr) {
     bind_error("WHERE predicate RHS must be a literal", 0);
 }
 
+// Is this operand one of the literal forms literal_to_json accepts?
+bool is_literal_operand(const ast::Expression& expr) {
+    return std::holds_alternative<ast::StringLiteral>(expr) ||
+           std::holds_alternative<ast::IntLiteral>(expr) ||
+           std::holds_alternative<ast::FloatLiteral>(expr) ||
+           std::holds_alternative<ast::BoolLiteral>(expr) ||
+           std::holds_alternative<ast::NullLiteral>(expr);
+}
+
 // Walk the WHERE expression and produce a JSON predicate in the
 // shape consumed by filter_string_predicate at runtime. See
 // include/clink/operators/json_predicate.hpp for the format.
@@ -905,15 +933,37 @@ clink::config::JsonValue lower_predicate(const ast::Expression& expr, const Tabl
 
     if (std::holds_alternative<std::unique_ptr<ast::BinaryOp>>(expr)) {
         const auto& bin = *std::get<std::unique_ptr<ast::BinaryOp>>(expr);
+        // `WHERE 5 = price` is the same comparison as `price = 5`, so mirror it
+        // rather than treat the literal as an expression operand: the mirrored
+        // form is the column-against-literal shape the typed columnar predicate
+        // program accelerates, and the expression path is not.
+        if (is_literal_operand(bin.left) && std::holds_alternative<ast::ColumnRef>(bin.right)) {
+            JsonObject mirrored;
+            mirrored["op"] = JsonValue{std::string{mirrored_predicate_op(bin.op)}};
+            mirrored["col"] = JsonValue{resolve_column_name(bin.right, source)};
+            mirrored["literal"] = literal_to_json(bin.left);
+            return JsonValue{std::move(mirrored)};
+        }
         JsonObject obj;
         obj["op"] = JsonValue{std::string{bin_op_to_predicate_op(bin.op)}};
-        obj["col"] = JsonValue{resolve_column_name(bin.left, source)};
-        // The RHS is a literal, or another column of the same row
-        // (column-vs-column, e.g. a post-join residual a.x >= b.y).
+        // A bare column reference names a column directly, which is the shape
+        // the typed columnar predicate program can accelerate. Anything else -
+        // `MOD(auction, 123) = 0`, `0.908 * price > 1000000` - is a value
+        // expression, emitted as col_expr / rhs_expr and bound to a synthetic
+        // column reference by PredicateOperandExprs at operator build.
+        if (std::holds_alternative<ast::ColumnRef>(bin.left)) {
+            obj["col"] = JsonValue{resolve_column_name(bin.left, source)};
+        } else {
+            obj["col_expr"] = lower_value_expr(bin.left, source, "");
+        }
+        // The RHS is a literal, another column of the same row (column-vs-
+        // column, e.g. a post-join residual a.x >= b.y), or an expression.
         if (std::holds_alternative<ast::ColumnRef>(bin.right)) {
             obj["rhs_col"] = JsonValue{resolve_column_name(bin.right, source)};
-        } else {
+        } else if (is_literal_operand(bin.right)) {
             obj["literal"] = literal_to_json(bin.right);
+        } else {
+            obj["rhs_expr"] = lower_value_expr(bin.right, source, "");
         }
         return JsonValue{std::move(obj)};
     }

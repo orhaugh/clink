@@ -32,6 +32,7 @@
 #include "clink/operators/columnar_expr_program.hpp"
 #include "clink/operators/json_predicate.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/operators/predicate_operand_exprs.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 
@@ -41,7 +42,12 @@ class ColumnarRowFilterOperator final : public Operator<sql::Row, sql::Row> {
 public:
     explicit ColumnarRowFilterOperator(std::shared_ptr<clink::config::JsonValue> predicate,
                                        std::string name = "filter_row_predicate")
-        : predicate_(std::move(predicate)),
+        // Expression operands (`WHERE MOD(auction, 123) = 0`) are lowered to
+        // synthetic column references first, so everything downstream - the
+        // compiled predicate, the typed columnar program, both resolvers - sees
+        // the ordinary named-column shape it already handles.
+        : operand_exprs_(clink::operators::PredicateOperandExprs::build(*predicate)),
+          predicate_(std::make_shared<clink::config::JsonValue>(operand_exprs_.predicate())),
           compiled_(clink::operators::CompiledPredicate::compile(*predicate_)),
           name_(std::move(name)) {}
 
@@ -106,7 +112,8 @@ public:
                     return sql::row_columnar_detail::read_cell(
                         rb->schema()->field(idx)->type(), *rb->column(idx), i);
                 };
-                const clink::operators::ColumnLookup lookup{resolve};
+                clink::operators::SynthOperandResolver synth{operand_exprs_, resolve};
+                const clink::operators::ColumnLookup lookup{synth};
                 const bool keep = compiled_.evaluate(lookup);
                 mask_b.UnsafeAppend(keep);
                 kept += keep ? 1 : 0;
@@ -156,7 +163,8 @@ public:
                     }
                     return it->second;
                 };
-                const clink::operators::ColumnLookup lookup{resolve};
+                clink::operators::SynthOperandResolver synth{operand_exprs_, resolve};
+                const clink::operators::ColumnLookup lookup{synth};
                 if (compiled_.evaluate(lookup)) {
                     out_batch.push(record);
                 }
@@ -180,6 +188,8 @@ public:
     std::string name() const override { return name_; }
 
 private:
+    // Declared first: predicate_ is initialized from its rewrite.
+    clink::operators::PredicateOperandExprs operand_exprs_;
     std::shared_ptr<clink::config::JsonValue> predicate_;
     // The predicate compiled once at build; both the row path and the
     // columnar row-interpreter fallback evaluate it per record. The JSON

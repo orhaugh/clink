@@ -2881,13 +2881,78 @@ TEST(SqlBinder, WhereOnUnknownColumnRejected) {
                  TranslationError);
 }
 
-TEST(SqlBinder, WhereLiteralOnLeftSideRejected) {
-    // The binder expects column on the left, literal on the right.
+namespace {
+
+// The predicate JSON of the Filter under a bound SELECT's projection.
+std::string bound_predicate(const LogicalPlan& plan) {
+    const auto& proj = static_cast<const LogicalProject&>(plan);
+    return static_cast<const LogicalFilter&>(proj.input()).predicate_json();
+}
+
+}  // namespace
+
+// A literal on the left is the same comparison read the other way, so the
+// binder mirrors it into the column-against-literal shape rather than rejecting
+// it. Mirroring, not an expression operand: only the mirrored shape compiles to
+// the typed columnar predicate program.
+TEST(SqlBinder, WhereLiteralOnLeftSideIsMirrored) {
     Catalog cat;
     register_clicks(cat);
     Binder b(cat);
-    EXPECT_THROW(b.bind_select(as_select(parse("SELECT url FROM clicks WHERE 'x' = url"))),
-                 TranslationError);
+    auto plan = b.bind_select(as_select(parse("SELECT url FROM clicks WHERE 'x' = url")));
+    const auto pred = bound_predicate(*plan);
+    EXPECT_NE(pred.find(R"("op":"eq")"), std::string::npos) << pred;
+    EXPECT_NE(pred.find(R"("col":"url")"), std::string::npos)
+        << "the column must move to the left: " << pred;
+    EXPECT_NE(pred.find(R"("literal":"x")"), std::string::npos) << pred;
+    EXPECT_EQ(pred.find("col_expr"), std::string::npos)
+        << "a mirrored literal is not an expression operand: " << pred;
+}
+
+// An asymmetric operator must be mirrored, not merely reordered: `100 > n` is
+// `n < 100`. Reordering without inverting silently reverses the filter.
+TEST(SqlBinder, WhereMirroredComparisonInvertsAnAsymmetricOperator) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    auto plan = b.bind_select(as_select(parse("SELECT url FROM clicks WHERE 100 > user_id")));
+    const auto pred = bound_predicate(*plan);
+    EXPECT_NE(pred.find(R"("op":"lt")"), std::string::npos)
+        << "100 > user_id must become user_id < 100: " << pred;
+    EXPECT_NE(pred.find(R"("col":"user_id")"), std::string::npos) << pred;
+    EXPECT_NE(pred.find(R"("literal":100)"), std::string::npos) << pred;
+}
+
+// A comparison against an EXPRESSION of a column has no column to name, so the
+// binder emits the operand as a value expression for PredicateOperandExprs to
+// bind at operator build. Nexmark q2 and q14 are exactly this shape.
+TEST(SqlBinder, WhereOnAnExpressionLowersToAnExpressionOperand) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    auto plan =
+        b.bind_select(as_select(parse("SELECT url FROM clicks WHERE MOD(user_id, 123) = 0")));
+    const auto pred = bound_predicate(*plan);
+    EXPECT_NE(pred.find("col_expr"), std::string::npos)
+        << "expression operand not lowered: " << pred;
+    EXPECT_NE(pred.find(R"("op":"mod")"), std::string::npos) << pred;
+    // The column the expression reads must still be discoverable, or projection
+    // pushdown would prune it and the filter would resolve NULL.
+    EXPECT_NE(pred.find(R"("col":"user_id")"), std::string::npos) << pred;
+    EXPECT_NE(pred.find(R"("literal":0)"), std::string::npos) << pred;
+}
+
+TEST(SqlBinder, WhereWithAnExpressionOnTheRightLowersToRhsExpr) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    auto plan =
+        b.bind_select(as_select(parse("SELECT url FROM clicks WHERE user_id > user_id / 2")));
+    const auto pred = bound_predicate(*plan);
+    EXPECT_NE(pred.find("rhs_expr"), std::string::npos) << pred;
+    EXPECT_NE(pred.find(R"("op":"div")"), std::string::npos) << pred;
+    EXPECT_EQ(pred.find("col_expr"), std::string::npos)
+        << "a bare column on the left must stay a direct reference: " << pred;
 }
 
 // ---------------------------------------------------------------------------

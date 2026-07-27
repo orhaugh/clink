@@ -357,15 +357,20 @@ clink::config::JsonValue rewrite_cols(const clink::config::JsonValue& node,
             out[k] = (s.size() > prefix.size() && s.compare(0, prefix.size(), prefix) == 0)
                          ? clink::config::JsonValue{s.substr(prefix.size())}
                          : v;
-        } else if (k == "arg") {
-            out[k] = rewrite_cols(v, prefix);
-        } else if (k == "args" && v.is_array()) {
+        } else if (v.is_array()) {
             clink::config::JsonArray arr;
             arr.reserve(v.as_array().size());
             for (const auto& sub : v.as_array()) {
                 arr.push_back(rewrite_cols(sub, prefix));
             }
             out[k] = clink::config::JsonValue{std::move(arr)};
+        } else if (v.is_object()) {
+            // Recurse into EVERY nested object, not just arg/args, for the same
+            // reason collect_columns does: an operand can be a value expression
+            // (col_expr / rhs_expr) or a CASE branch, and a {"col"} left
+            // un-rewritten inside one keeps the join's flat "<alias>_<col>"
+            // name, which the side scan below the join does not expose.
+            out[k] = rewrite_cols(v, prefix);
         } else {
             out[k] = v;
         }
