@@ -1657,6 +1657,151 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
     throw std::runtime_error("json_value_expr: unknown op '" + name + "'");
 }
 
+inline ValueNodePtr compile_value_expr(const clink::config::JsonValue& expr);
+
+// ---------------------------------------------------------------------
+// Expression operands in a predicate
+// ---------------------------------------------------------------------
+//
+// The predicate format in json_predicate.hpp compares a NAMED COLUMN against a
+// literal or another column. `MOD(datetime, 2) = 0` and `0.908 * price > 250`
+// compare an EXPRESSION, and there is no column to name, so the binder emits such
+// an operand as `col_expr` / `rhs_expr` carrying a value expression.
+//
+// Every consumer of the predicate format therefore has to lift those operands
+// back to named references before compiling. There is more than one consumer: the
+// two filter operators, and a CASE's WHEN - which is a predicate embedded inside a
+// value expression, compiled right here. Teaching only the filters is how nexmark
+// q14 came to emit ZERO rows against Flink's 917,499 while processing all its
+// input without error: a predicate shape the evaluator does not recognise compiles
+// to a node that throws when evaluated, and the throw took the whole batch.
+//
+// So the WALK lives in one place. Each consumer compiles the lifted expressions
+// with whatever node type it holds, but none of them re-implements the traversal.
+
+inline constexpr std::string_view kSynthOperandPrefix = "$expr";
+
+// Index behind a synthetic operand name, or nullopt for an ordinary column. A
+// leading '$' cannot appear in an unquoted SQL identifier, so these never shadow
+// a declared column.
+[[nodiscard]] inline std::optional<std::size_t> synth_operand_index(
+    std::string_view name) noexcept {
+    if (name.size() <= kSynthOperandPrefix.size() || !name.starts_with(kSynthOperandPrefix)) {
+        return std::nullopt;
+    }
+    std::size_t idx = 0;
+    for (const char c : name.substr(kSynthOperandPrefix.size())) {
+        if (c < '0' || c > '9') {
+            return std::nullopt;
+        }
+        idx = (idx * 10) + static_cast<std::size_t>(c - '0');
+    }
+    return idx;
+}
+
+// Replace every col_expr / rhs_expr in `node` with a reference to a synthetic
+// name, appending the lifted expression JSON to `out` in index order.
+inline void lift_predicate_operand_exprs(clink::config::JsonValue& node,
+                                         std::vector<clink::config::JsonValue>& out) {
+    if (!node.is_object()) {
+        return;
+    }
+    auto& obj = node.as_object();
+    for (const auto& [expr_key, ref_key] :
+         {std::pair<const char*, const char*>{"col_expr", "col"},
+          std::pair<const char*, const char*>{"rhs_expr", "rhs_col"}}) {
+        const auto it = obj.find(expr_key);
+        if (it == obj.end()) {
+            continue;
+        }
+        out.push_back(it->second);
+        obj.erase(expr_key);
+        obj[ref_key] = clink::config::JsonValue{std::string{kSynthOperandPrefix} +
+                                                std::to_string(out.size() - 1)};
+    }
+    // and / or carry `args`; not carries `arg`.
+    if (const auto args = obj.find("args"); args != obj.end() && args->second.is_array()) {
+        for (auto& a : args->second.as_array()) {
+            lift_predicate_operand_exprs(a, out);
+        }
+    }
+    if (const auto arg = obj.find("arg"); arg != obj.end()) {
+        lift_predicate_operand_exprs(arg->second, out);
+    }
+}
+
+// True when `predicate` has an expression operand anywhere in it.
+[[nodiscard]] inline bool predicate_has_operand_exprs(const clink::config::JsonValue& node) {
+    if (!node.is_object()) {
+        return false;
+    }
+    const auto& obj = node.as_object();
+    if (obj.find("col_expr") != obj.end() || obj.find("rhs_expr") != obj.end()) {
+        return true;
+    }
+    if (const auto args = obj.find("args"); args != obj.end() && args->second.is_array()) {
+        for (const auto& a : args->second.as_array()) {
+            if (predicate_has_operand_exprs(a)) {
+                return true;
+            }
+        }
+    }
+    if (const auto arg = obj.find("arg"); arg != obj.end()) {
+        return predicate_has_operand_exprs(arg->second);
+    }
+    return false;
+}
+
+// A predicate whose operands include expressions: owns the compiled expressions
+// and answers their synthetic names out of the resolver it is handed.
+class PredWithOperandExprsNode final : public pred_detail::PredNode {
+public:
+    PredWithOperandExprsNode(pred_detail::PredNodePtr inner, std::vector<ValueNodePtr> exprs)
+        : inner_(std::move(inner)), exprs_(std::move(exprs)) {}
+
+    TriBool eval(const ColumnLookup& resolve) const override {
+        Synth synth{&exprs_, &resolve};
+        const ColumnLookup wrapped{synth};
+        return inner_->eval(wrapped);
+    }
+
+private:
+    struct Synth {
+        const std::vector<ValueNodePtr>* exprs;
+        const ColumnLookup* base;
+        clink::config::JsonValue operator()(const std::string& name) const {
+            if (const auto idx = synth_operand_index(name); idx.has_value()) {
+                if (*idx >= exprs->size()) {
+                    return clink::config::JsonValue{nullptr};
+                }
+                return (*exprs)[*idx]->eval(*base);
+            }
+            return (*base)(name);
+        }
+    };
+    pred_detail::PredNodePtr inner_;
+    std::vector<ValueNodePtr> exprs_;
+};
+
+// Compile a predicate that may carry expression operands. Use this, not
+// pred_detail::compile_pred, wherever a predicate arrives from the binder.
+[[nodiscard]] inline pred_detail::PredNodePtr compile_pred_with_operand_exprs(
+    const clink::config::JsonValue& predicate) {
+    if (!predicate_has_operand_exprs(predicate)) {
+        return pred_detail::compile_pred(predicate);
+    }
+    clink::config::JsonValue rewritten = predicate;
+    std::vector<clink::config::JsonValue> lifted;
+    lift_predicate_operand_exprs(rewritten, lifted);
+    std::vector<ValueNodePtr> compiled;
+    compiled.reserve(lifted.size());
+    for (const auto& e : lifted) {
+        compiled.push_back(compile_value_expr(e));
+    }
+    return std::make_unique<PredWithOperandExprsNode>(pred_detail::compile_pred(rewritten),
+                                                      std::move(compiled));
+}
+
 // Compile the value-expression JSON into a node tree. Never throws for
 // a malformed shape: the error is packaged as a ValueThrowNode so it
 // surfaces on evaluation, exactly where the interpreter surfaced it.
@@ -1696,7 +1841,7 @@ inline ValueNodePtr compile_value_expr(const clink::config::JsonValue& expr) {
         for (const auto& b : expr.at("branches").as_array()) {
             CaseNode::Branch br;
             if (b.is_object() && b.contains("when")) {
-                br.when = pred_detail::compile_pred(b.at("when"));
+                br.when = compile_pred_with_operand_exprs(b.at("when"));
             } else {
                 br.when = std::make_unique<pred_detail::PredThrowNode>(
                     "json_value_expr: case branch needs 'when'");

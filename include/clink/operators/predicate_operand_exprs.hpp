@@ -46,7 +46,7 @@ class PredicateOperandExprs {
 public:
     // Synthetic operand names. A leading '$' cannot appear in an unquoted SQL
     // identifier, so these never shadow a declared column.
-    static constexpr std::string_view kPrefix = "$expr";
+    static constexpr std::string_view kPrefix = value_expr_detail::kSynthOperandPrefix;
 
     // Walks a copy of `predicate`, replacing every `col_expr` with
     // `col: "$exprN"` and every `rhs_expr` with `rhs_col: "$exprN"`, and
@@ -55,27 +55,26 @@ public:
     static PredicateOperandExprs build(const clink::config::JsonValue& predicate) {
         PredicateOperandExprs out;
         out.predicate_ = predicate;
-        out.rewrite_(out.predicate_);
+        // ONE walk, shared with the CASE-when compile path in json_value_expr.hpp.
+        // Two copies of this traversal is how a consumer gets missed.
+        std::vector<clink::config::JsonValue> lifted;
+        value_expr_detail::lift_predicate_operand_exprs(out.predicate_, lifted);
+        out.compiled_.reserve(lifted.size());
+        for (const auto& e : lifted) {
+            out.compiled_.push_back(CompiledValueExpr::compile(e));
+        }
         return out;
     }
 
     [[nodiscard]] const clink::config::JsonValue& predicate() const noexcept { return predicate_; }
     [[nodiscard]] bool empty() const noexcept { return compiled_.empty(); }
 
-    // Index behind a synthetic name, or nullopt for an ordinary column.
+    // Index behind a synthetic name, or nullopt for an ordinary column. Shared
+    // grammar with json_value_expr.hpp, so a name minted by one consumer is
+    // recognised by the other.
     [[nodiscard]] static std::optional<std::size_t> synthetic_index(
         std::string_view name) noexcept {
-        if (name.size() <= kPrefix.size() || !name.starts_with(kPrefix)) {
-            return std::nullopt;
-        }
-        std::size_t idx = 0;
-        for (const char c : name.substr(kPrefix.size())) {
-            if (c < '0' || c > '9') {
-                return std::nullopt;
-            }
-            idx = (idx * 10) + static_cast<std::size_t>(c - '0');
-        }
-        return idx;
+        return value_expr_detail::synth_operand_index(name);
     }
 
     [[nodiscard]] clink::config::JsonValue evaluate(std::size_t idx,
@@ -87,35 +86,6 @@ public:
     }
 
 private:
-    void rewrite_(clink::config::JsonValue& node) {
-        if (!node.is_object()) {
-            return;
-        }
-        auto& obj = node.as_object();
-        // Operand positions, in the order the binder emits them.
-        for (const auto& [expr_key, ref_key] :
-             {std::pair<const char*, const char*>{"col_expr", "col"},
-              std::pair<const char*, const char*>{"rhs_expr", "rhs_col"}}) {
-            const auto it = obj.find(expr_key);
-            if (it == obj.end()) {
-                continue;
-            }
-            compiled_.push_back(CompiledValueExpr::compile(it->second));
-            obj.erase(expr_key);
-            obj[ref_key] = clink::config::JsonValue{std::string{kPrefix} +
-                                                    std::to_string(compiled_.size() - 1)};
-        }
-        // and / or carry `args`; not carries `arg`.
-        if (const auto args = obj.find("args"); args != obj.end() && args->second.is_array()) {
-            for (auto& a : args->second.as_array()) {
-                rewrite_(a);
-            }
-        }
-        if (const auto arg = obj.find("arg"); arg != obj.end()) {
-            rewrite_(arg->second);
-        }
-    }
-
     clink::config::JsonValue predicate_{nullptr};
     std::vector<CompiledValueExpr> compiled_;
 };

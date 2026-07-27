@@ -13324,4 +13324,79 @@ TEST(SqlRuntime, ApplyJobParallelismLeavesForcedSingletonsAtOne) {
     EXPECT_EQ(one.ops[1].parallelism, 1u);
 }
 
+// Nexmark q14 end-to-end: a float literal in both the WHERE and the SELECT.
+//
+//   SELECT auction, bidder, 0.908 * price AS price, CASE ... END
+//   FROM bid WHERE 0.908 * price > 250
+//
+// The cross-engine output gate found clink emitting ZERO rows here against
+// Flink's 917,499 of 920,000, having processed all 920,000 inputs without error.
+// The filter operator handles this predicate correctly in isolation - including
+// the exact-decimal literal, the plan's JSON round-trip of its 0x01 sentinel, and
+// nexmark's full price range - so the fault is in the composition, which is what
+// this exercises: the projected columnar decode feeding the filter, then a
+// projection whose CASE contains a predicate of its own.
+TEST(SqlRuntime, Q14FloatLiteralFilterAndCaseProjection) {
+    ensure_sql_installed_once();
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_q14_in.ndjson";
+    const auto out_path = tmp / "clink_sql_q14_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    // Real nexmark magnitudes. 0.908 * 8 = 7.264 is below 250; the rest are above,
+    // so 4 of 5 rows must survive.
+    write_lines(
+        in_path,
+        {R"({"auction":1,"bidder":11,"price":8,"channel":"apple","url":"u","datetime":1000})",
+         R"({"auction":2,"bidder":12,"price":276,"channel":"google","url":"u","datetime":1001})",
+         R"({"auction":3,"bidder":13,"price":21497,"channel":"apple","url":"u","datetime":1002})",
+         R"({"auction":4,"bidder":14,"price":49798,"channel":"baidu","url":"u","datetime":1003})",
+         R"({"auction":5,"bidder":15,"price":99988,"channel":"apple","url":"u","datetime":1004})"});
+
+    Catalog cat;
+    auto ddl =
+        parse(std::string{"CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, "
+                          "channel VARCHAR, url VARCHAR, datetime BIGINT) "
+                          "WITH (connector='kafka', format='json', brokers='b', topic='t', "
+                          "group_id='g', event_time_column='datetime', watermark_lag_ms='0');"
+                          "CREATE TABLE out_t (auction BIGINT, bidder BIGINT, price DOUBLE, "
+                          "bidtimetype VARCHAR) "
+                          "WITH (connector='file', format='json', path='"} +
+              out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT auction, bidder, 0.908 * price AS price, "
+                        "CASE WHEN MOD(datetime, 2) = 0 THEN 'even' ELSE 'odd' END AS bidtimetype "
+                        "FROM bid WHERE 0.908 * price > 250");
+    for (auto& op : spec.ops) {
+        if (op.type == "kafka_source_string") {
+            op.type = "file_text_source";
+            op.params.clear();
+            op.params["path"] = in_path.string();
+        }
+    }
+    {
+        InProcessCluster cluster("worker-sql-q14", 16);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 20s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    std::set<std::int64_t> survivors;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        survivors.insert(static_cast<std::int64_t>(js.at("auction").as_number()));
+    }
+    EXPECT_EQ(survivors, (std::set<std::int64_t>{2, 3, 4, 5}))
+        << "0.908 * price > 250 must keep the four rows above the threshold; got "
+        << survivors.size() << " rows";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 }  // namespace clink::sql

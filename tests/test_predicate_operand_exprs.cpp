@@ -28,6 +28,7 @@
 #include <arrow/api.h>
 #include <gtest/gtest.h>
 
+#include "clink/config/decimal.hpp"
 #include "clink/config/json.hpp"
 #include "clink/core/record.hpp"
 #include "clink/core/stream_element.hpp"
@@ -271,4 +272,159 @@ TEST(PredicateOperandExprs, OutOfRangeSyntheticNameResolvesNull) {
     auto em = cap.emitter();
     op.process(StreamElement<Row>::data(poe_rows(poe_sample())), em);
     EXPECT_TRUE(cap.amounts().empty()) << "NULL = 0 is Unknown, which drops the row";
+}
+
+// A FLOAT literal inside a WHERE expression, which the binder lowers as an EXACT
+// DECIMAL rather than a double.
+//
+// Nexmark q14 is `WHERE 0.908 * price > 250`, and the binder emits that 0.908 as a
+// dec-string - the sentinel-tagged exact-decimal form - not as a JSON number. Both
+// evaluators handle dec-strings on their own (arithmetic returns a dec-string,
+// comparison compares exactly), so the composite has to be checked rather than
+// assumed: the multiply's RESULT is itself a dec-string, and it is that result the
+// comparison then sees through a synthetic operand binding.
+//
+// The cross-engine gate caught this shape returning ZERO rows where Flink returned
+// 917,499 of 920,000. It was invisible until the gate's q14 threshold was lowered:
+// the official `> 1000000` excludes every row of the generated stream, so the gate
+// had been comparing 0 against 0 and passing.
+TEST(PredicateOperandExprs, FiltersOnAnExactDecimalTimesAColumn) {
+    const auto dec = clink::config::make_dec_value(*clink::config::dec_parse("0.908"));
+    ASSERT_TRUE(clink::config::is_dec_string(dec))
+        << "the binder lowers a float literal as a dec-string; this test is about that form";
+    clink::config::JsonObject mul;
+    clink::config::JsonArray args;
+    clink::config::JsonObject lit;
+    lit["lit"] = dec;  // the grammar's literal wrapper, exactly as the binder emits it
+    args.emplace_back(clink::config::JsonValue{std::move(lit)});
+    clink::config::JsonObject col;
+    col["col"] = clink::config::JsonValue{std::string{"amount"}};
+    args.emplace_back(clink::config::JsonValue{std::move(col)});
+    mul["op"] = clink::config::JsonValue{std::string{"mul"}};
+    mul["args"] = clink::config::JsonValue{std::move(args)};
+    clink::config::JsonObject pred;
+    pred["op"] = clink::config::JsonValue{std::string{"gt"}};
+    pred["col_expr"] = clink::config::JsonValue{std::move(mul)};
+    pred["literal"] = clink::config::JsonValue{static_cast<std::int64_t>(25)};
+
+    // 0.908 * amount > 25  ->  amount > 27.5  ->  33, 40, 55, 60 survive.
+    auto p = std::make_shared<clink::config::JsonValue>(clink::config::JsonValue{std::move(pred)});
+    {
+        ColumnarRowFilterOperator op(p);
+        PoeCapture cap;
+        auto em = cap.emitter();
+        op.process(StreamElement<Row>::data(poe_rows(poe_sample())), em);
+        EXPECT_EQ(cap.amounts(), (std::vector<std::int64_t>{33, 40, 55, 60})) << "row path";
+    }
+    {
+        ColumnarRowFilterOperator op(p);
+        PoeCapture cap;
+        auto em = cap.emitter();
+        const bool handled =
+            op.process_columnar(StreamElement<Row>::data(poe_columnar(poe_sample())), em);
+        ASSERT_TRUE(handled);
+        EXPECT_EQ(cap.amounts(), (std::vector<std::int64_t>{33, 40, 55, 60})) << "columnar path";
+    }
+}
+
+// The dec-string sentinel must survive the plan's JSON round-trip.
+//
+// A predicate reaches an operator as a STRING in the OperatorSpec params: the
+// planner serialises it, the worker parses it back. An exact-decimal literal is
+// tagged with a leading 0x01 control byte, so the round-trip has to preserve that
+// byte exactly - if it is lost, is_dec_string() stops recognising the literal, the
+// value becomes an ordinary string, arithmetic on it collapses to NULL, and every
+// row is dropped by a comparison that returns Unknown.
+//
+// This is the shape nexmark q14 runs, and it emitted 0 rows against Flink's
+// 917,499 while processing all 920,000 inputs without error.
+TEST(PredicateOperandExprs, DecStringLiteralSurvivesThePlanJsonRoundTrip) {
+    const auto dec = clink::config::make_dec_value(*clink::config::dec_parse("0.908"));
+    ASSERT_TRUE(clink::config::is_dec_string(dec));
+
+    clink::config::JsonObject lit;
+    lit["lit"] = dec;
+    clink::config::JsonArray args;
+    args.emplace_back(clink::config::JsonValue{std::move(lit)});
+    clink::config::JsonObject col;
+    col["col"] = clink::config::JsonValue{std::string{"amount"}};
+    args.emplace_back(clink::config::JsonValue{std::move(col)});
+    clink::config::JsonObject mul;
+    mul["op"] = clink::config::JsonValue{std::string{"mul"}};
+    mul["args"] = clink::config::JsonValue{std::move(args)};
+    clink::config::JsonObject pred;
+    pred["op"] = clink::config::JsonValue{std::string{"gt"}};
+    pred["col_expr"] = clink::config::JsonValue{std::move(mul)};
+    pred["literal"] = clink::config::JsonValue{static_cast<std::int64_t>(25)};
+    const clink::config::JsonValue original{std::move(pred)};
+
+    // Exactly what the planner and the worker do.
+    const std::string wire = original.serialize(0);
+    const auto reparsed = clink::config::parse(wire);
+    const auto& round_tripped_lit = reparsed.as_object()
+                                        .at("col_expr")
+                                        .as_object()
+                                        .at("args")
+                                        .as_array()[0]
+                                        .as_object()
+                                        .at("lit");
+    EXPECT_TRUE(clink::config::is_dec_string(round_tripped_lit))
+        << "the 0x01 decimal sentinel did not survive serialise+parse; the literal came back as "
+        << round_tripped_lit.serialize(0);
+
+    ColumnarRowFilterOperator op(std::make_shared<clink::config::JsonValue>(std::move(reparsed)));
+    PoeCapture cap;
+    auto em = cap.emitter();
+    op.process(StreamElement<Row>::data(poe_rows(poe_sample())), em);
+    EXPECT_EQ(cap.amounts(), (std::vector<std::int64_t>{33, 40, 55, 60}))
+        << "0.908 * amount > 25 after a plan round-trip";
+}
+
+// The same predicate over the value range nexmark actually produces.
+//
+// The earlier decimal cases used amounts of 10 to 60; nexmark bid prices run to
+// about 100,000, and an EXACT-decimal multiply's result grows in both digits and
+// scale. If the product exceeds what the decimal type can represent, dec_mul
+// returns nothing, the expression collapses to NULL, and the comparison returns
+// Unknown - which drops the row. That failure is invisible at small magnitudes.
+TEST(PredicateOperandExprs, ExactDecimalMultiplyHoldsAtNexmarkPriceMagnitudes) {
+    const auto dec = clink::config::make_dec_value(*clink::config::dec_parse("0.908"));
+    clink::config::JsonObject lit;
+    lit["lit"] = dec;
+    clink::config::JsonArray args;
+    args.emplace_back(clink::config::JsonValue{std::move(lit)});
+    clink::config::JsonObject col;
+    col["col"] = clink::config::JsonValue{std::string{"amount"}};
+    args.emplace_back(clink::config::JsonValue{std::move(col)});
+    clink::config::JsonObject mul;
+    mul["op"] = clink::config::JsonValue{std::string{"mul"}};
+    mul["args"] = clink::config::JsonValue{std::move(args)};
+    clink::config::JsonObject pred;
+    pred["op"] = clink::config::JsonValue{std::string{"gt"}};
+    pred["col_expr"] = clink::config::JsonValue{std::move(mul)};
+    pred["literal"] = clink::config::JsonValue{static_cast<std::int64_t>(250)};
+    auto p = std::make_shared<clink::config::JsonValue>(clink::config::JsonValue{std::move(pred)});
+
+    // Real nexmark magnitudes. 0.908 * 8 = 7.264, below 250; the rest are above.
+    const std::vector<Row> rows = {poe_row(8, "eu"),
+                                   poe_row(276, "us"),
+                                   poe_row(21497, "eu"),
+                                   poe_row(49798, "us"),
+                                   poe_row(99988, "eu")};
+    {
+        ColumnarRowFilterOperator op(p);
+        PoeCapture cap;
+        auto em = cap.emitter();
+        op.process(StreamElement<Row>::data(poe_rows(rows)), em);
+        EXPECT_EQ(cap.amounts(), (std::vector<std::int64_t>{276, 21497, 49798, 99988}))
+            << "row path at nexmark magnitudes";
+    }
+    {
+        ColumnarRowFilterOperator op(p);
+        PoeCapture cap;
+        auto em = cap.emitter();
+        ASSERT_TRUE(op.process_columnar(StreamElement<Row>::data(poe_columnar(rows)), em));
+        EXPECT_EQ(cap.amounts(), (std::vector<std::int64_t>{276, 21497, 49798, 99988}))
+            << "columnar path at nexmark magnitudes";
+    }
 }
