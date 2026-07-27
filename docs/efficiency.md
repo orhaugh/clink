@@ -25,6 +25,12 @@ Per event processed, on the same hardware, producing byte-identical output:
 On the stateless query clink drains the same input faster than the JVM engine while
 occupying **0.84 of four cores against 2.57**.
 
+Those are measured. If you want them in dollars and kilowatt-hours, see
+[Translating this into a footprint](#translating-this-into-a-footprint) - with the warning that
+a CPU ratio is **not** an energy ratio unless the freed capacity is actually surrendered. On a
+fixed fleet the same 3.87x becomes about 1.8x on power, because an idle core still draws
+roughly a quarter of its loaded power.
+
 The memory result still splits between the two queries, and the reason is worth reading
 before quoting the q12 row: most of that 749 MB is window state the query genuinely
 requires, not engine overhead. See
@@ -152,26 +158,423 @@ engine should look like. It is now ahead on both.
 
 ## Translating this into a footprint
 
-**clink has not measured wall power, and this page does not claim a figure in kWh or in
-CO2e.** Doing so honestly requires the power draw of the specific servers, the data
-centre's PUE, the grid's carbon intensity at the time of running, and the embodied
-carbon of the hardware. Those are properties of a deployment, not of an engine, and any
-number quoted without them would be decoration.
+**clink has not measured wall power, and nothing below changes that.** No kWh or CO2e figure
+on this page is a measurement. What follows is arithmetic over published coefficients, every
+one of them named and swappable, so a reader who disagrees with an input can substitute it and
+get their own answer.
 
-What the measurements do support is the input to that calculation. CPU time and memory
-are what capacity planning is denominated in, and capacity is what draws power:
+The measurements above stop at CPU-seconds and megabytes on purpose. This section goes
+further and prices them, because "3.87x less CPU" is not a number anyone budgets in. It is
+divided into two tracks, and they are not equally solid.
 
-- **CPU time per event** determines how many cores must be provisioned to sustain a
-  given event rate. Measured here at 3.87x lower (stateless) and 2.86x lower (windowed).
-- **Memory per instance** determines how much RAM must be provisioned, and often which
-  instance size must be bought. Measured here at 15.5x lower for the runtime itself.
-- **Cores occupied** was 0.84 of 4 against 2.57 of 4 on the stateless query, while draining
-  the same input sooner on the same machine.
+**Track A, cost,** converts the measured CPU figures into cloud instance-hours at published
+list prices. It is close to measurement: the only modelled inputs are a utilisation target
+and an instance choice.
 
-To apply this to your own footprint, take your existing pipeline's provisioned CPU and
-RAM, scale by the ratios above for a comparable query shape, and multiply by your own
-power, PUE and carbon-intensity figures. clink supplies the engine-side ratio; only you
-have the rest of the equation.
+**Track B, energy and CO2e,** needs a server power model, a PUE and a grid carbon intensity.
+None of those were measured on the rig. Track B is a model throughout and is labelled as
+such on every line.
+
+The earlier statement on this page stands: clink has not measured wall power. Nothing below
+changes that. What follows is arithmetic over published coefficients, shown step by step so
+you can substitute your own and get a different answer.
+
+### The boundary being priced
+
+Fixed once, applied identically to both engines, and never widened or narrowed between them:
+
+> Steady-state operational cost and energy of the engine containers running one query on one
+> node type. Excludes the broker, object storage, checkpoint storage, network egress, load
+> balancers, observability, CI, container images, cold starts, and the embodied carbon of the
+> hardware.
+
+That boundary is narrower than the Software Carbon Intensity specification requires, which
+mandates inclusion of idle machines, monitoring, build and deploy pipelines, backup and
+failover, and an embodied-emissions term M. So this is **not an SCI score and should not be
+described as one.** The embodied term is omitted because no product carbon footprint exists
+for the specific hardware and the total resources of the physical host are not published, so
+two of the four inputs to M would be guesses. Note that the omission works against clink:
+the excluded terms include cold start and image size, where clink's measured advantage is
+largest.
+
+### The scenario
+
+One million nexmark events per second, sustained, for one calendar month. Both query shapes.
+Both engines sized from their own measured events per CPU-second. A month is 730 hours
+(8,760/12), so the month processes 2.628 trillion events.
+
+One million events per second is chosen because it is a round number a reader can rescale,
+and because it is large enough that both engines need more than one instance on at least one
+query shape. It is not a claim that any particular pipeline runs at that rate.
+
+#### Step 1: vCPU demand
+
+A vCPU here is one SMT thread. The measurement reads cgroup `cpu.stat usage_usec`, which
+counts thread-seconds, and the rig's 4 dedicated vCPU sit on 2 physical AMD EPYC Milan
+cores. The instance chosen in step 2 is also SMT and also Milan, so the unit is consistent
+on both sides of the conversion. Applying a per-physical-core figure to these numbers would
+overstate power for both engines and overstate it more for the heavier CPU user.
+
+| query | engine | events per vCPU-second (measured) | vCPU-seconds per wall second at 1M events/s |
+|---|---|---:|---:|
+| q0 | clink | 983,957 | 1.02 |
+| q0 | JVM engine | 254,425 | 3.93 |
+| q12 | clink | 482,940 | 2.07 |
+| q12 | JVM engine | 168,993 | 5.92 |
+
+#### Step 2: provisioned vCPU and instances
+
+Nobody provisions to 100% of demand. The scenario targets **70% steady-state utilisation**,
+which is a normal figure for a latency-sensitive service with headroom for skew and
+recovery. Divide demand by 0.7, then round up to whole instances.
+
+Instance: **c6a.xlarge**, 4 vCPU and 8 GiB, AMD EPYC 7R13 (Milan), us-east-1, Linux, shared
+tenancy. This is the AWS family that matches the measured hardware on both generation and
+SMT convention. Newer families (c7a, c8a) are faster per vCPU but are non-SMT, so a vCPU
+there is a whole physical core and the measured numbers would not transfer without a
+re-benchmark.
+
+| query | engine | demand (vCPU) | at 70% target | instances (ceil) | provisioned vCPU | actual utilisation |
+|---|---|---:|---:|---:|---:|---:|
+| q0 | clink | 1.02 | 1.45 | **1** | 4 | 25.4% |
+| q0 | JVM engine | 3.93 | 5.61 | **2** | 8 | 49.1% |
+| q12 | clink | 2.07 | 2.96 | **1** | 4 | 51.8% |
+| q12 | JVM engine | 5.92 | 8.45 | **3** | 12 | 49.3% |
+
+The instance ratio is 2x on q0 and 3x on q12, against measured CPU ratios of 3.87x and
+2.86x. That mismatch is not noise. It is instance granularity, and it is discussed below.
+
+#### Step 3: dollars
+
+c6a.xlarge on-demand list is $0.15300 per instance-hour, so $111.69 per instance-month at
+730 hours.
+
+| query | clink | JVM engine | difference | ratio |
+|---|---:|---:|---:|---:|
+| q0 | $111.69 | $223.38 | $111.69 | 2.00x |
+| q12 | $111.69 | $335.07 | $223.38 | 3.00x |
+
+At ten million events per second, where whole-instance rounding stops dominating:
+
+| query | clink instances | JVM instances | clink $/month | JVM $/month | ratio |
+|---|---:|---:|---:|---:|---:|
+| q0 | 4 | 15 | $446.76 | $1,675.35 | 3.75x |
+| q12 | 8 | 22 | $893.52 | $2,457.18 | 2.75x |
+
+Normalised, at the ten-million-per-second scale: **q0 $17.00 against $63.75 per trillion
+events; q12 $34.00 against $93.50 per trillion events.**
+
+These are list on-demand prices, which almost no sustained deployment pays. A one-year
+Standard Reserved Instance, all upfront, is 38.3% below on-demand for c6a, which is
+$0.02360 per vCPU-hour or $68.91 per instance-month. Every figure in the two tables above
+scales by 0.617 and **no ratio changes.** Two honest caveats on that: a reservation is a
+sunk commitment, so an efficiency gain realised mid-term saves nothing until renewal; and a
+flexible Compute Savings Plan discounts materially less (20.5% to 33.1% for one year), so
+"Savings Plan" and "Reserved Instance" are not interchangeable words here.
+
+#### Step 4: kWh, and this is where the model starts
+
+Server power is **not** proportional to CPU utilisation, and getting this wrong is the single
+largest error available in this calculation. Cloud Carbon Footprint's model, which is the
+most widely used open methodology, is:
+
+```
+watts per provisioned vCPU = min_watts + utilisation x (max_watts - min_watts)
+```
+
+For AMD EPYC 3rd Generation (Milan), CCF's AWS coefficient set gives **min 0.46 W and max
+1.96 W per vCPU**, derived from SPECpower_ssj2008 submissions divided by thread count. So
+23% of a fully loaded vCPU's draw is charged whether the software does anything or not.
+
+Cross-checked directly against a measured Milan machine: a 2-socket EPYC 7763 (256 threads)
+drew 122 W at active idle and 406 W at 100% SPECpower load, which is 0.48 W and 1.59 W per
+thread. The idle figures agree closely; CCF's max is about 23% above that particular
+chassis, and a second 7763 result on the same benchmark drew 460 W, so the spread across
+identical CPUs is real. CCF's coefficient is used as central because it averages many
+machines; the measured 1.59 W appears in the sensitivity table as the low end.
+
+Facility overhead: **PUE 1.14**, AWS's reported fleet average for calendar 2025.
+
+| query | engine | provisioned vCPU | utilisation | W per vCPU | server W | with PUE | kWh/month |
+|---|---|---:|---:|---:|---:|---:|---:|
+| q0 | clink | 4 | 25.4% | 0.84 | 3.36 | 3.84 | **2.80** |
+| q0 | JVM engine | 8 | 49.1% | 1.20 | 9.57 | 10.91 | **7.97** |
+| q12 | clink | 4 | 51.8% | 1.24 | 4.95 | 5.64 | **4.12** |
+| q12 | JVM engine | 12 | 49.3% | 1.20 | 14.40 | 16.42 | **11.98** |
+
+Energy ratios: 2.85x on q0, 2.91x on q12. Note these differ from the cost ratios (2.00x and
+3.00x), because after rounding the two engines sit at different utilisations and the idle
+floor is spread over different vCPU counts. Cost tracks instances bought; energy tracks
+instances bought and how hard each is worked. They are not the same quantity.
+
+At ten million events per second, where both engines land near the same utilisation:
+
+| query | clink kWh/month | JVM kWh/month | ratio |
+|---|---:|---:|---:|
+| q0 | 18.8 | 72.1 | 3.83x |
+| q12 | 38.1 | 107.6 | 2.82x |
+
+Per trillion events: q0 **0.72 kWh against 2.74 kWh**; q12 **1.45 kWh against 4.09 kWh**.
+
+#### Step 5: CO2e
+
+Grid intensity **0.271 kg CO2e/kWh**: EPA eGRID2023 subregion SRVC (SERC Virginia/Carolina),
+total output emission rate, location-based, data year 2023, which covers us-east-1. This is
+an annual average of all generation, combustion emissions only, and it deliberately ignores
+any contractual clean-power instruments the operator holds. It is applied identically to
+both engines.
+
+| query | scale | clink kg CO2e/month | JVM kg CO2e/month | difference |
+|---|---|---:|---:|---:|
+| q0 | 1M events/s | 0.76 | 2.16 | 1.40 |
+| q12 | 1M events/s | 1.12 | 3.25 | 2.13 |
+| q0 | 10M events/s | 5.10 | 19.53 | 14.43 |
+| q12 | 10M events/s | 10.33 | 29.16 | 18.83 |
+
+**The absolute numbers are small, and saying so is more useful than dressing them up.** A
+ten-million-events-per-second windowed pipeline running all year is a modelled saving of
+about 834 kWh and 0.23 tonnes CO2e. That is a real saving and it is not a large one. The
+defensible headline from this work is capacity and cost, not tonnage. Anyone multiplying a
+per-event figure up to a global total to produce a megatonne number is compounding every
+assumption in this section and should be disbelieved, including if it is us.
+
+### When the CPU saving becomes fewer instances, and when it does not
+
+Three things stand between a CPU ratio and a bill.
+
+**Instance granularity.** AWS, Azure and GCP instance sizes double at each step, so a
+continuous 2.86x advantage rounds to a staircase. In the one-million-events-per-second case
+the q0 advantage rounds from 3.87x down to 2.00x, because clink's 1.02 vCPU of demand still
+has to buy a whole 4-vCPU instance and sits 75% idle. At ten million per second the same
+advantage rounds to 3.75x. **Below a few instances the granularity dominates the engine
+difference entirely.** At small scale, and particularly for a single-instance pipeline, the
+honest answer is that both engines cost the same.
+
+**Memory, and whether it binds.** The measured working sets, expressed per vCPU of demand:
+
+| query | engine | memory | vCPU demand | GiB per demanded vCPU |
+|---|---|---:|---:|---:|
+| q0 | clink | 76 MB | 1.02 | 0.07 |
+| q0 | JVM engine | 1,169 MB | 3.93 | 0.29 |
+| q12 | clink | 749 MB | 2.07 | 0.35 |
+| q12 | JVM engine | 1,625 MB | 5.92 | 0.27 |
+
+Every one of those is below the 2.0 GiB per vCPU that the cheapest compute-optimised family
+supplies. **So on these two workloads the memory advantage converts to exactly zero direct
+instance cost.** CPU is the binding constraint for both engines, and the 15.5x memory figure
+buys headroom, not money. Any model that multiplies a memory saving by a dollars-per-GB rate
+is wrong here.
+
+Memory starts to matter at three points, and only then. First, if state per vCPU exceeds
+2 GiB, the workload moves to a general-purpose family: m6a.xlarge is 4 GiB per vCPU at
+$0.04320 per vCPU-hour, 12.9% more than c6a, and at that point instance count is set by RAM
+rather than by CPU and the CPU saving stops reducing it. The memory ratio becomes the lever
+instead. Second, packing density: a smaller resident set is how you fit more jobs per host,
+which is a real saving that this scenario does not model because it prices one job. Third,
+reliability: an under-set JVM memory limit OOMKills rather than throttles, so operators set
+a floor with headroom and pay for the floor. That floor is a configuration decision and may
+bear little relation to the 1,169 MB and 1,625 MB actually observed.
+
+**Whether you actually resize.** This is the largest of the three and it is not a property of
+either engine.
+
+### The non-linearity, stated plainly
+
+A naive model of the form "cores times watts" assumes power scales linearly from zero. It
+does not. Take both engines on **the same fixed fleet**, sized for the heavier one, at one
+million events per second:
+
+| query | fleet | clink utilisation | clink W | JVM utilisation | JVM W | power ratio | CPU ratio |
+|---|---|---:|---:|---:|---:|---:|---:|
+| q0 | 2 x c6a.xlarge | 12.7% | 5.21 | 49.1% | 9.57 | **1.84x** | 3.87x |
+| q12 | 3 x c6a.xlarge | 17.3% | 8.63 | 49.3% | 14.40 | **1.67x** | 2.86x |
+
+**On a fixed fleet a 3.87x CPU saving is worth about 1.8x on power, and a 2.86x CPU saving
+about 1.7x.** The idle floor is charged either way. Quoting the CPU ratio as the energy ratio
+overstates the saving by roughly 1.7x to 2.1x, and it overstates it **in the direction that
+flatters clink**, which is the worst kind of error to make in your own favour.
+
+The saving only approaches the CPU ratio when the freed capacity is genuinely surrendered:
+fewer instances, so the idle draw of the removed machines goes with them. The resized figures
+in step 4 (3.83x and 2.82x) are close to the CPU ratios for exactly that reason.
+
+So the answer depends on an operational decision, not on the engine, and both bounds should
+be published:
+
+- **If the freed headroom is taken as fewer nodes:** energy falls by roughly the CPU ratio,
+  2.8x to 3.8x here.
+- **If it is taken as more throughput per node:** energy falls by the dynamic-power
+  difference only, 1.7x to 1.8x here, and the rest of the gain shows up as capacity.
+
+There is a third case worth naming: the freed headroom gets filled with additional work, and
+total energy does not fall at all. That is the rebound argument and it is not a strawman.
+
+### Sensitivity
+
+Which conclusions are robust and which are artefacts of an assumption. The critical
+structural point first: **electricity price, PUE and grid carbon intensity all cancel out of
+the ratio.** They multiply both engines identically, so they move only the absolute figures.
+If any assumption swing below changes the ratio, that is flagged; most do not.
+
+| assumption | central | plausible range | effect on the ratio | effect on absolutes |
+|---|---|---|---|---|
+| Instance price | $0.03825/vCPU-h (c6a on-demand) | $0.02360 (1yr RI, all upfront) to $0.05389 (c8a on-demand) | none | -38% to +41% |
+| PUE | 1.14 (AWS, CY2025) | 1.09 (Google TTM 2025) to 1.54 (Uptime 2025 industry) | none | -4% to +35% on kWh and CO2e |
+| Grid intensity | 0.271 kg/kWh (eGRID2023 SRVC) | 0.110 (NYUP) to 0.473 (RMPA) across data-centre subregions | none | 0.41x to 1.75x on CO2e |
+| Average vs marginal grid factor | average (0.271) | SRVC non-baseload 0.587 | none | 2.17x on CO2e |
+| min:max watts per vCPU | 0.46 : 1.96 (EPYC 3rd Gen) | 0.48 : 1.59 (measured 2x7763) to 0.58 : 2.53 (Granite Rapids) | **material at fixed fleet:** a higher idle share shrinks the ratio | ±25% on kWh |
+| Utilisation target | 70% | 50% to 90% | small; both sides scale together | inversely proportional |
+| **Consolidation** | fleet resized | fixed fleet | **large: 3.83x falls to 1.84x (q0), 2.82x to 1.67x (q12)** | large |
+| **Scale** | 1M events/s | 1M to 10M+ | **large at small scale: q0 cost ratio 2.00x at 1M/s, 3.75x at 10M/s** | proportional |
+| Memory binding | not binding (max 0.35 GiB/vCPU) | binds above 2.0 GiB/vCPU | **changes which resource sets instance count** | +12.9% per vCPU on m-family |
+| Self-hosted electricity price (not used above) | 8.85 c/kWh (EIA, US industrial, rolling 12m to May 2026) | 6 to 22 c/kWh site-dependent | none | factor of 3 to 4 on a self-hosted bill |
+
+Robust across the whole table: **cost and energy both fall, by a factor of roughly two to
+four, on these two query shapes, when the fleet is resized.** No assumption swing in the
+table reverses the direction or takes the ratio below about 1.7x.
+
+Not robust: any absolute kWh, dollar or CO2e figure to better than a factor of two; any ratio
+at all at single-instance scale; anything on a fixed fleet above about 1.8x.
+
+### What would make this wrong
+
+A hostile reader should find their objection here, already stated.
+
+**The extrapolation problem, which is the most serious, and it is now partly measured.** A
+parallelism sweep on a single host, same query and same data at every parallelism, shows that
+CPU-per-event does NOT hold as fan-out grows:
+
+| parallelism | 1 | 2 | 4 | 8 | |
+|---|---:|---:|---:|---:|---|
+| q0 events per vCPU-second | 751,566 | 733,198 | 718,563 | 715,706 | **1.05x, flat** |
+| q12 events per vCPU-second | 599,002 | 469,361 | 405,862 | 281,911 | **2.1x worse** |
+
+The stateless shape is flat: fanning out costs essentially nothing per event. The windowed
+shape degrades 2.1x from parallelism 1 to 8, and all of the loss is in the keyed shuffle,
+whose gather runs once per (batch, destination) so its per-row cost grows with the destination
+count. That is inherent to a keyed shuffle; the constant factor is an engineering target, the
+growth is not.
+
+**So the scenario above understates clink's own per-event cost at higher parallelism**, and it
+does so on the windowed shape only. It is not known whether the RATIO against the JVM engine
+holds, because that sweep was clink-against-clink and the JVM engine was not measured across
+parallelism. That is a real and unclosed gap, and until it is closed the multi-instance figures
+in this section should be read as an upper bound on the windowed advantage.
+
+Separately, and unchanged: the rig was one engine node at parallelism 4, with the broker on a
+second node. Every shuffle was intra-node. The
+measurement therefore contains **zero cross-node data-plane cost for either engine**: no
+serialisation across hosts, no cross-host barrier alignment, no distributed checkpoint
+coordination, no rescale, no failure recovery, no straggler effects, no rack or spine network
+energy. Those are precisely the terms that diverge between engines at scale. Scaling this to
+a fleet assumes linear scaling in node count, no coordination growth, an identical query mix,
+identical per-node utilisation, and the same relative advantage on cross-node shuffle as on
+intra-node shuffle. A single-node measurement cannot estimate contention or coherency terms
+at all: fitting them needs several load points, and one point leaves zero degrees of freedom.
+Those assumptions are not weakly supported. They are **entirely unconstrained by this data.**
+The scenario above is best read as N copies of a measured single-node result, not as a
+measurement of a cluster.
+
+**Two query shapes, one workload family.** q0 is a projection passthrough and q12 is a
+windowed GROUP BY. No joins, no large-state workloads, no CEP, no late data, no
+checkpoint-under-load, no rescale. The functional unit is "per nexmark q0 or q12 event", not
+"per event". Relative position on a wide-state interval join is unmeasured and could go
+either way.
+
+**The JVM engine was untuned.** Upstream image, harness configuration, one change made in its
+favour. That is a defaults-against-defaults comparison, which is a legitimate thing to
+measure and is **not** a claim about what a tuned deployment achieves. Object reuse, managed
+memory fractions, network buffers, serialiser choice, GC selection and state backend all move
+JVM CPU and heap. The memory figure is the most affected: 1,169 MB resident on a stateless
+projection is substantially a heap-sizing and GC-policy outcome, and a JVM given a smaller
+heap uses less memory and more CPU. Anyone who can produce a tuned counter-run should; the
+harness is in the repository for that purpose.
+
+**SMT allocation flatters clink.** cgroup CPU-seconds are hyperthread-seconds. The heavier
+CPU user had more co-resident SMT pairs, so its thread-seconds were individually cheaper in
+power terms than the lighter user's. The same correction is applied to both engines above,
+but the residual asymmetry is unquantified and it runs in clink's favour.
+
+**Utilisation-based power models are blind to memory intensity.** Two workloads at the same
+CPU share with different DRAM traffic do not draw the same power. A columnar Arrow engine and
+a JVM engine differ substantially in cache behaviour and DRAM traffic. Nothing in a
+CPU-seconds measurement resolves this, and it could move the energy result in either
+direction.
+
+**Coefficient quality.** CCF publishes point estimates with no confidence intervals, states
+it cannot guarantee their accuracy, and its upstream methodology has not been revised since
+2023 even though the coefficient data was refreshed in April 2026. eGRID2023 carries data
+year 2023, three years stale, and staleness does not run in the conservative direction: US
+power sector CO2 rose 4% in 2025 on 3% more generation, so 2026 intensity is plausibly at or
+slightly above the 2023 value. SPECpower configurations are tuned for efficiency by their
+sponsors and are not fleet-representative.
+
+**Host generation is not fully pinned.** The rig's CPU flags place it on Zen 3 (AVX2 and BMI2
+present, AVX-512 absent), but the provider does not publish per-instance CPU models and
+states its dedicated-vCPU fleet runs more than one EPYC generation. Carry roughly 25%
+uncertainty on the per-vCPU power coefficient on those grounds alone.
+
+**Engine CPU is one line of a bill.** Broker, storage, checkpoint storage, egress,
+observability and engineering time were not measured and are outside the declared boundary.
+In many deployments they exceed engine compute, which caps how far a 2.86x engine advantage
+can move a total cost of ownership.
+
+**Run-to-run variance.** Throughput ratios moved tens of percent between provisions of the
+same machine type. CPU-per-event and memory held across those runs, which is why the model is
+built on those two and not on throughput. That is a stated observation across a small number
+of runs, not a variance figure with an n and a spread, and it should be read as such.
+
+### Inputs and sources
+
+Every coefficient, visible and swappable. Substitute your own and rerun the arithmetic.
+
+| input | value used | plausible range | source | status |
+|---|---|---|---|---|
+| events per vCPU-second, q0 | clink 983,957 / JVM 254,425 | see run-to-run note | this page, 27 July 2026, commit `764e570` | **measured** |
+| events per vCPU-second, q12 | clink 482,940 / JVM 168,993 | see run-to-run note | as above | **measured** |
+| memory, anon, q0 / q12 | clink 76 / 749 MB; JVM 1,169 / 1,625 MB | JVM figure is heap-config dependent | as above | **measured** |
+| vCPU basis | 1 vCPU = 1 SMT thread | n/a | cgroup `usage_usec`; rig is 4 vCPU on 2 physical Milan cores | measured, host CPU model not published by provider |
+| ingest rate | 1,000,000 events/s | 1M and 10M both shown | scenario choice | assumption |
+| hours per month | 730 | 8,760/12 | convention | assumption |
+| utilisation target | 70% | 50% to 90% | scenario choice | assumption |
+| instance | c6a.xlarge, 4 vCPU / 8 GiB, EPYC 7R13 (Milan) | m6a.xlarge if memory binds | AWS Price List Bulk API, us-east-1, published 2026-07-24 | verified |
+| price, on-demand | $0.15300/instance-h, $0.03825/vCPU-h | c8a $0.05389/vCPU-h | as above, Linux, shared tenancy, no pre-installed software | verified |
+| price, 1yr Standard RI, all upfront | -38.3%, $0.02360/vCPU-h | Compute Savings Plan 1yr: -20.5% to -33.1% | as above | verified (product), derived (multiplication) |
+| watts per vCPU, min / max | 0.46 / 1.96 W, AMD EPYC 3rd Gen | 0.48 / 1.59 (measured 2x7763) to 0.58 / 2.53 (Granite Rapids) | Cloud Carbon Footprint AWS coefficient set, SPECpower data to 2026-03-09 | verified, point estimate with no confidence interval |
+| power cross-check | 122 W idle / 406 W at 100%, 2x EPYC 7763, 256 threads | second unit on same CPU: 94.6 W / 460 W | SPECpower_ssj2008, ASUSTeK RS700A-E11-RS4U, tested 16 June 2022, AC input at the wall | verified |
+| power model shape | `min + U x (max - min)` | measured curve is convex, not linear | Cloud Carbon Footprint methodology | verified (model), approximation (shape) |
+| PUE | 1.14 | 1.09 (Google TTM 2025) to 1.54 (Uptime 2025, n=681) | AWS sustainability disclosure, calendar 2025, metered to ISO/IEC 30134-2 | verified |
+| grid carbon intensity | 0.271 kg CO2e/kWh | 0.110 (NYUP) to 0.473 (RMPA); marginal SRVC 0.587 | EPA eGRID2023 rev2, Table 1, SRVC total output rate, data year 2023 | verified, three years stale, latest available |
+| grid basis | location-based, average, combustion only, at the busbar | delivered basis is 0.282 (SRVC gross loss 4.2%) | as above | verified, basis stated deliberately |
+| retail electricity price (not used) | 8.85 c/kWh, US industrial, rolling 12m to May 2026 | 6 to 22 c/kWh site-dependent | EIA Electric Power Monthly Table 5.3, 11 of 12 months preliminary | verified, for self-hosted readers only |
+| embodied carbon (M) | **not modelled** | unknown | no product carbon footprint or host resource total published for this hardware | **omitted, flagged** |
+| broker, storage, egress, CI | **not modelled** | unknown | outside declared boundary | **omitted, flagged** |
+
+### What you can take from this, and what you cannot
+
+**You can take this.** For a nexmark-shaped stream pipeline on AMD EPYC Milan class hardware,
+sized from measured CPU-per-event with a 70% utilisation target and a resized fleet:
+
+| | range | central |
+|---|---|---|
+| Cloud instance-hours | 2.0x to 3.8x fewer | 2.75x (windowed) to 3.75x (stateless) at multi-instance scale |
+| Modelled energy | 1.7x to 3.8x lower | 2.8x (windowed) to 3.8x (stateless) if the fleet shrinks; 1.7x to 1.8x if it does not |
+| Modelled CO2e | tracks energy exactly | same ratios; the grid factor cancels |
+| Absolute energy | 0.7 to 4.1 kWh per trillion events | small in absolute terms, and the honest headline is capacity, not tonnage |
+
+The cost track is close to measurement. The energy track is a model whose largest uncertainty
+is not the emissions factor, the PUE or the price, all of which cancel from the ratio, but
+whether the operator resizes the fleet.
+
+**You cannot take this.** Not a claim about any query shape other than a stateless projection
+and a windowed GROUP BY. Not a claim about a tuned JVM deployment. Not a claim about a
+multi-node cluster, because the measurement contains no cross-node cost for either engine.
+Not a measured energy figure, because no wall power was measured. Not an SCI score, because
+the embodied term is omitted and the boundary is narrower than the specification requires.
+Not a fleet-scale or industry-scale tonnage, under any multiplication.
+
+And not a ratio at single-instance scale. If your pipeline fits on one instance today, it
+will fit on one instance with either engine, and the saving is zero until you outgrow it.
 
 ## What was not measured
 
