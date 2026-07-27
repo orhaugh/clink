@@ -16,6 +16,6 @@ CREATE TABLE bid (
   'format' = 'json',
   'json.ignore-parse-errors' = 'false'
 );
-CREATE TABLE sink_q5 (`auction` BIGINT, `num` BIGINT) WITH ('connector' = 'blackhole');
+CREATE TABLE sink_q5 (`wstart` BIGINT, `auction` BIGINT, `num` BIGINT) WITH ('connector' = 'blackhole');
 INSERT INTO sink_q5
-SELECT auction, num FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC) AS rn FROM (SELECT auction, COUNT(*) AS num, window_start AS wstart FROM TABLE(HOP(TABLE bid, DESCRIPTOR(ts), INTERVAL '2' SECOND, INTERVAL '10' SECOND)) GROUP BY window_start, window_end, auction) AS W) AS R WHERE rn <= 1;
+SELECT wstart, auction, num FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC) AS rn FROM (SELECT auction, COUNT(*) AS num, window_start AS wstart FROM TABLE(HOP(TABLE bid, DESCRIPTOR(ts), INTERVAL '2' SECOND, INTERVAL '10' SECOND)) GROUP BY window_start, window_end, auction) AS W) AS R WHERE rn <= 1;

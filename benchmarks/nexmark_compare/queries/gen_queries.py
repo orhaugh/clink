@@ -113,6 +113,31 @@ def flink_source(name, tag):
     )
 
 
+def clink_upsert_sink(name, cols, pk):
+    decl = ", ".join(f"{c} {t}" for c, t in cols)
+    return (
+        f"CREATE TABLE {name} ({decl})\n"
+        f"  WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='__OUT__',\n"
+        f"        mode='upsert', primary_key='{','.join(pk)}');"
+    )
+
+
+def flink_upsert_sink(name, cols, pk):
+    decl = ", ".join(
+        f"`{c}` STRING" if t == "VARCHAR" else f"`{c}` {t}" for c, t in cols
+    )
+    keys = ", ".join(f"`{c}`" for c in pk)
+    return (
+        f"CREATE TABLE {name} ({decl}, PRIMARY KEY ({keys}) NOT ENFORCED) WITH (\n"
+        f"  'connector' = 'upsert-kafka',\n"
+        f"  'topic' = '__OUT__',\n"
+        f"  'properties.bootstrap.servers' = 'kafka:29092',\n"
+        f"  'key.format' = 'json',\n"
+        f"  'value.format' = 'json'\n"
+        f");"
+    )
+
+
 def clink_sink(name, cols, kafka=False):
     decl = ", ".join(f"{c} {t}" for c, t in cols)
     if not kafka:
@@ -171,13 +196,17 @@ QUERIES = {
         note=("Hot items: the single most-bid-on auction per 10s sliding window, "
               "advancing 2s. Sliding window aggregate feeding a top-1 rank."),
         streams=["bid"],
-        sink=[("auction", "BIGINT"), ("num", "BIGINT")],
-        clink=("SELECT auction, num FROM ("
+        # wstart is projected for the UPSERT variant's benefit: the changelog
+        # revises one row per window, so the window start IS the primary key, and
+        # without it in the output there is nothing to key an upsert on.
+        sink=[("wstart", "BIGINT"), ("auction", "BIGINT"), ("num", "BIGINT")],
+        pk=["wstart"],
+        clink=("SELECT wstart, auction, num FROM ("
                "SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC) AS rn FROM ("
                "SELECT auction, COUNT(*) AS num, window_start AS wstart FROM bid "
                "GROUP BY HOP(datetime, INTERVAL '2' SECOND, INTERVAL '10' SECOND), auction"
                ") AS W) AS R WHERE rn <= 1"),
-        flink=("SELECT auction, num FROM ("
+        flink=("SELECT wstart, auction, num FROM ("
                "SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC) AS rn FROM ("
                "SELECT auction, COUNT(*) AS num, window_start AS wstart FROM "
                "TABLE(HOP(TABLE bid, DESCRIPTOR(ts), INTERVAL '2' SECOND, INTERVAL '10' SECOND)) "
@@ -271,6 +300,7 @@ QUERIES = {
         streams=["bid"],
         sink=[("auction", "BIGINT"), ("bidder", "BIGINT"), ("price", "BIGINT"),
               ("channel", "VARCHAR"), ("url", "VARCHAR"), ("datetime", "BIGINT")],
+        pk=["bidder", "auction"],
         clink=("SELECT * FROM (SELECT *, ROW_NUMBER() OVER "
                "(PARTITION BY bidder, auction ORDER BY datetime DESC) AS rn FROM bid) AS R "
                "WHERE rn = 1"),
@@ -285,6 +315,10 @@ QUERIES = {
         streams=["bid"],
         sink=[("auction", "BIGINT"), ("bidder", "BIGINT"), ("price", "BIGINT"),
               ("channel", "VARCHAR"), ("url", "VARCHAR"), ("datetime", "BIGINT")],
+        # The bid's own identity, not (auction, rn): clink's top-N drops the
+        # synthetic rank column from its output, so rn is not available to key on.
+        # A bid is uniquely identified by these four in this dataset.
+        pk=["auction", "bidder", "price", "datetime"],
         clink=("SELECT * FROM (SELECT *, ROW_NUMBER() OVER "
                "(PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) AS R "
                "WHERE rn <= 10"),
@@ -352,15 +386,15 @@ QUERIES = {
 }
 
 
-def render(q, engine, kafka=False):
+def render(q, engine, kafka=False, upsert=False):
     d = QUERIES[q]
     # Distinct consumer groups per variant: a blackhole run and a Kafka-sink run
     # of the same query must not share an offset commit position.
-    tag = q if kafka else f"{q}bh"
+    tag = (q + "up") if upsert else (q if kafka else f"{q}bh")
     sink_name = f"sink_{q}"
     src = clink_source if engine == "clink" else flink_source
     snk = clink_sink if engine == "clink" else flink_sink
-    which = "KAFKA-SINK" if kafka else "BLACKHOLE"
+    which = "UPSERT-SINK" if upsert else ("KAFKA-SINK" if kafka else "BLACKHOLE")
     header = textwrap.fill(
         f"Nexmark {q} on {engine}, {which} sink variant. {d['note']}",
         width=78,
@@ -373,7 +407,11 @@ def render(q, engine, kafka=False):
         "-- definition. Edit that file, not this one.",
     ]
     parts += [src(s, tag) for s in d["streams"]]
-    parts.append(snk(sink_name, d["sink"], kafka))
+    if upsert:
+        up = clink_upsert_sink if engine == "clink" else flink_upsert_sink
+        parts.append(up(sink_name, d["sink"], d["pk"]))
+    else:
+        parts.append(snk(sink_name, d["sink"], kafka))
     parts.append(f"INSERT INTO {sink_name}\n{d[engine]};")
     return "\n".join(parts) + "\n"
 
@@ -387,6 +425,11 @@ def main():
                 path = os.path.join(out_dir, f"{q}{suffix}.tmpl.sql")
                 with open(path, "w") as f:
                     f.write(render(q, engine, kafka))
+                n += 1
+            if QUERIES[q].get("pk"):
+                path = os.path.join(out_dir, f"{q}_up.tmpl.sql")
+                with open(path, "w") as f:
+                    f.write(render(q, engine, kafka=True, upsert=True))
                 n += 1
     print(f"wrote {n} templates for {len(QUERIES)} queries "
           f"(blackhole + kafka-sink, both engines)")

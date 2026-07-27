@@ -7,3 +7,10 @@ __pycache__/
 results-containers/
 results-sampled/
 results-latency/
+
+# Every results-* directory. Raw per-run JSON is measurement output, not source:
+# it is machine- and moment-specific, and committing it means a diff on every run.
+# The named dirs above predate this; the glob covers the ones the gate, sweep,
+# scaling and A/B drivers create (results-gate, results-sweep, results-batch-ab,
+# results-upsert-gate, ...).
+results-*/

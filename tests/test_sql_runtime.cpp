@@ -13884,4 +13884,56 @@ TEST_F(NexmarkQueries, Q20BidJoinAuction) {
           {"bid", "auction"});
 }
 
+// q4: an AVERAGE per category over a join. DISABLED - it does not pass, and what it
+// found is worth keeping visible rather than deleting.
+//
+// TWO REAL DIVERGENCES, both needing a decision before this can assert anything:
+//
+//   1. clink names the output column `a_category`, not `category`. The query says
+//      `SELECT A.category`, the sink DDL declares `category`, and Flink produces
+//      `category`. clink is carrying the join's internal flat "<alias>_<col>" name
+//      through to the output instead of the declared sink column name.
+//   2. clink's aggregates emit UPDATES WITHOUT RETRACTIONS - the output holds both
+//      328.667 (the final average for category 10) and 358.333 (an intermediate).
+//      The check()' changelog replay keys on the whole row, which is correct for a
+//      delete+insert changelog (q18, q19) and wrong here: an update-only changelog
+//      has to be replayed by PRIMARY KEY, last value wins. That is what
+//      upsert_gate.sh does, and what this test would need.
+//
+// Divergence 1 also blocks the cross-engine gate for this query: the two engines
+// would disagree on a field NAME while agreeing on every value.
+TEST_F(NexmarkQueries, DISABLED_Q4AveragePricePerCategoryOverJoin) {
+    check("q4",
+          auction_ddl() + bid_ddl() + changelog_sink_ddl("category BIGINT, avgp DOUBLE"),
+          "INSERT INTO out_t SELECT A.category, AVG(B.price) AS avgp FROM auction AS A "
+          "JOIN bid AS B ON A.id = B.auction GROUP BY A.category",
+          {"auction", "bid"},
+          /*changelog=*/true);
+}
+
+// q5: the most-bid-on auction per 10s window sliding every 2s - a HOP aggregate
+// feeding a top-1 rank. Two changelog-producing stages in series, and the only
+// query here with a 1:N stage, which is what made the throughput sampler
+// over-count it before the frontier was anchored on the sources.
+//
+// wstart is projected because the changelog revises one row PER WINDOW, so the
+// window start is its primary key; without it there is nothing to key on.
+//
+// DISABLED - it HANGS, past ten minutes, rather than failing. Two changelog-
+// producing stages in series (a HOP aggregate feeding a top-1 rank) is a shape no
+// other query here has, and it is also the shape whose 1:N stage broke the
+// throughput sampler's frontier. A hang is a stronger signal than a wrong answer
+// and wants its own investigation; leaving the test present and disabled keeps it
+// from being forgotten.
+TEST_F(NexmarkQueries, DISABLED_Q5HotItemsPerSlidingWindow) {
+    check("q5",
+          bid_ddl() + changelog_sink_ddl("wstart BIGINT, auction BIGINT, num BIGINT"),
+          "INSERT INTO out_t SELECT wstart, auction, num FROM (SELECT *, ROW_NUMBER() OVER "
+          "(PARTITION BY wstart ORDER BY num DESC) AS rn FROM (SELECT auction, COUNT(*) AS num, "
+          "window_start AS wstart FROM bid GROUP BY HOP(datetime, INTERVAL '2' SECOND, "
+          "INTERVAL '10' SECOND), auction) AS W) AS R WHERE rn <= 1",
+          {"bid"},
+          /*changelog=*/true);
+}
+
 }  // namespace clink::sql

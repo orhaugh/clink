@@ -286,7 +286,7 @@ def q5():
     for s in sorted(per_window):
         counts = per_window[s]
         best = max(counts.items(), key=lambda kv: (kv[1], -kv[0]))
-        out.append(dict(auction=best[0], num=best[1]))
+        out.append(dict(wstart=s, auction=best[0], num=best[1]))
     return out
 
 

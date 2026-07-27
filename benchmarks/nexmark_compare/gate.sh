@@ -15,19 +15,20 @@
 #   QUERIES="q15 q16" ./gate.sh
 #   EVENTS=2000000 ./gate.sh
 #
-# WHAT IS NOT GATED, AND WHY. A plain Kafka sink is append-only. Six of the
-# queries emit a CHANGELOG - a retracting stream that revises rows it already
-# emitted:
+# WHAT IS NOT GATED HERE, AND WHY. A plain Kafka sink is append-only. THREE of the
+# queries emit a CHANGELOG - each revises rows it already emitted, so a row count
+# is not the right comparison even in principle:
 #
-#   q5           top-1 per sliding window: a new leader retracts the old one
-#   q18, q19     dedup / ranking per key: same
-#   q3, q4, q20  regular (non-time-windowed) joins, and an aggregate over one
+#   q5        top-1 per sliding window: a new leader retracts the old one
+#   q18, q19  dedup / ranking per key: same
 #
-# For those, a row count is not the right comparison even in principle - clink
-# emits delete+insert pairs, and Flink refuses an append-only sink outright - so
-# they are reported as ungated rather than quietly counted. Gating them needs an
-# upsert sink on both sides and a comparison of the COMPACTED result, which is a
-# different harness than this one.
+# Gating those needs an upsert sink on both sides and a comparison of the compacted
+# result, which is upsert_gate.sh.
+#
+# q3, q4 and q20 were also on that list, on the assumption that a multi-stream
+# query must produce a changelog. It does not: an inner join of two append-only
+# inputs cannot retract. Checked rather than assumed - each was compiled against a
+# plain Kafka sink and accepted - so all three are gated normally here.
 set -uo pipefail
 
 cd "$(dirname "$0")"
@@ -39,10 +40,16 @@ OUT="${OUT:-results-gate}"
 
 # Append-only queries: one output row per input row, or one per closed window.
 # A Kafka sink can carry these, so their row counts are directly comparable.
-APPEND_ONLY="q0 q1 q2 q7 q11 q12 q14 q15 q16 q17 q21 q22"
-# Changelog-emitting queries, listed so the report can name what it did not gate
-# instead of leaving a silent hole.
-CHANGELOG="q5 q18 q19 q3 q4 q20"
+# q3, q4 and q20 join two streams. Both inputs are append-only and an inner join
+# of two append-only inputs cannot retract, so clink accepts a plain Kafka sink for
+# all three - verified by compiling each against one. They belong here, not in the
+# ungated list where they sat on the assumption that "multi-stream" meant
+# "changelog".
+APPEND_ONLY="q0 q1 q2 q3 q4 q7 q11 q12 q14 q15 q16 q17 q20 q21 q22"
+# Changelog-emitting, so the report can name what it did not gate rather than leave
+# a silent hole. Determined by compiling each against a plain sink and reading which
+# are refused.
+CHANGELOG="q5 q18 q19"
 
 QUERIES="${QUERIES:-$APPEND_ONLY}"
 
@@ -120,6 +127,6 @@ if partial:
         print(f"      {p}")
 print(f"  not gated here     : {len(changelog)}  ({' '.join(changelog)})")
 print("      changelog-emitting; a plain append-only Kafka sink cannot carry them,")
-print("      so their row counts are not comparable. See the header of gate.sh.")
+print("      so their row counts are not comparable. Gated by upsert_gate.sh.")
 sys.exit(1 if failed else 0)
 PY
