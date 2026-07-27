@@ -1832,35 +1832,35 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                                     std::unique_ptr<JobBundle> bundle,
                                     std::string expected_state_versions_packed,
                                     std::string udfs_packed) {
-    // Resolve per-task placement (greedy first-fit). The plan's
-    // data_port values are taken as-is: 0 means "the worker will bind
-    // ephemerally and report via SubtaskListening", a non-zero port
-    // means "the caller pre-bound this and the address is already
-    // known". The legacy in-process API uses the latter.
+    // Resolve per-task placement. The grouping contract, and why it exists, is documented on
+    // assign_task_placement in coordinator.hpp; it lives there so it can be tested without a
+    // cluster. The plan's data_port values are taken as-is: 0 means "the worker will bind
+    // ephemerally and report via SubtaskListening", a non-zero port means "the caller pre-bound
+    // this and the address is already known". The legacy in-process API uses the latter.
     JobPlan resolved_plan = plan;
     {
         std::lock_guard lock(mu_);
-        for (auto& t : resolved_plan.tasks) {
-            if (!t.worker_id.empty()) {
-                continue;
+        std::vector<PlacementWorker> pool;
+        for (auto& [_, worker] : registered_) {
+            if (!worker->lost) {
+                pool.push_back(
+                    PlacementWorker{.worker_id = worker->worker_id,
+                                    .free_slots = worker->slots_in_use < worker->slot_capacity
+                                                      ? worker->slot_capacity - worker->slots_in_use
+                                                      : 0U});
             }
-            std::shared_ptr<WorkerConnection> picked;
-            for (auto& [_, worker] : registered_) {
-                if (worker->lost) {
-                    continue;
-                }
-                if (worker->slots_in_use < worker->slot_capacity) {
-                    picked = worker;
-                    break;
-                }
+        }
+        if (!assign_task_placement(resolved_plan.tasks, pool)) {
+            throw std::runtime_error(
+                "Coordinator::deploy: no worker with free slots for every "
+                "task in the plan");
+        }
+        // Charge the slots actually taken back to the live worker records.
+        for (const auto& t : resolved_plan.tasks) {
+            auto it = registered_.find(t.worker_id);
+            if (it != registered_.end()) {
+                ++it->second->slots_in_use;
             }
-            if (!picked) {
-                throw std::runtime_error(
-                    "Coordinator::deploy: no worker with free slots for task '" + t.role + "[" +
-                    std::to_string(t.subtask_idx) + "]'");
-            }
-            t.worker_id = picked->worker_id;
-            ++picked->slots_in_use;
         }
     }
 
@@ -3803,6 +3803,77 @@ void Coordinator::checkpoint_trigger_loop_() {
         }
         std::this_thread::sleep_for(sleep_for);
     }
+}
+
+bool assign_task_placement(std::vector<PlannedTask>& tasks, std::vector<PlacementWorker>& workers) {
+    // Deterministic worker order: the coordinator's registry is an unordered_map whose order is
+    // neither sorted nor stable across processes, which made placement - and any benchmark of
+    // it - unrepeatable.
+    std::sort(
+        workers.begin(), workers.end(), [](const PlacementWorker& a, const PlacementWorker& b) {
+            return a.worker_id < b.worker_id;
+        });
+
+    // Last resort for an instance no single worker can hold.
+    const auto place_one = [&workers](PlannedTask& t) {
+        for (auto& w : workers) {
+            if (w.free_slots > 0) {
+                t.worker_id = w.worker_id;
+                --w.free_slots;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Group by subtask index, in first-seen order so the result is a function of the plan
+    // rather than of a hash order.
+    std::vector<std::uint32_t> group_order;
+    std::unordered_map<std::uint32_t, std::vector<PlannedTask*>> groups;
+    for (auto& t : tasks) {
+        if (!t.worker_id.empty()) {
+            continue;  // caller pinned it
+        }
+        if (groups.find(t.subtask_idx) == groups.end()) {
+            group_order.push_back(t.subtask_idx);
+        }
+        groups[t.subtask_idx].push_back(&t);
+    }
+    if (group_order.empty()) {
+        return true;
+    }
+    if (workers.empty()) {
+        return false;
+    }
+
+    bool all_placed = true;
+    std::size_t rr = 0;
+    for (const auto idx : group_order) {
+        auto& group = groups[idx];
+        const auto need = static_cast<std::uint32_t>(group.size());
+        PlacementWorker* picked = nullptr;
+        for (std::size_t step = 0; step < workers.size(); ++step) {
+            auto& w = workers[(rr + step) % workers.size()];
+            if (w.free_slots >= need) {
+                picked = &w;
+                rr = (rr + step + 1) % workers.size();
+                break;
+            }
+        }
+        if (picked != nullptr) {
+            for (auto* t : group) {
+                t->worker_id = picked->worker_id;
+            }
+            picked->free_slots -= need;
+            continue;
+        }
+        for (auto* t : group) {
+            if (!place_one(*t)) {
+                all_placed = false;
+            }
+        }
+    }
+    return all_placed;
 }
 
 }  // namespace clink::cluster

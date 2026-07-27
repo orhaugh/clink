@@ -47,6 +47,36 @@ struct JobPlan {
     std::vector<PlannedTask> tasks;
 };
 
+// One worker's identity and remaining capacity, as placement sees it.
+struct PlacementWorker {
+    std::string worker_id;
+    std::uint32_t free_slots{};
+};
+
+// Assign a worker to every task whose worker_id is empty, CO-LOCATING the tasks that share a
+// subtask index - one parallel pipeline instance per worker.
+//
+// Why co-locate: tasks with the same subtask index are joined by FORWARD edges (subtask i of
+// the source feeds subtask i of the projection), and the data plane hands a batch across a
+// forward edge as a pointer when both ends are in one process and serialises it over a socket
+// when they are not. Placing one task at a time meant subtask i's operators landed on
+// different hosts: on a 3-worker rig at parallelism 12, nexmark q0 - four operators, forward
+// edges only, no shuffle - sent 67% of its data-plane edges over TCP.
+//
+// Groups are taken round-robin so instances still spread evenly, and workers are visited in
+// sorted worker-id order so placement is reproducible across deploys of the same plan.
+// A hash-shuffled edge is unaffected (subtask i sends to every downstream subtask either way),
+// so this can only convert forward edges from remote to local.
+//
+// An instance too large for any single worker is split across whatever capacity is free:
+// splitting is worse than co-locating but far better than refusing to deploy. Returns false
+// when capacity runs out entirely, having assigned what it could.
+//
+// Exposed (rather than left inline in deploy) so the placement contract can be tested without
+// standing up a cluster. `workers` is updated in place to reflect the capacity consumed.
+[[nodiscard]] bool assign_task_placement(std::vector<PlannedTask>& tasks,
+                                         std::vector<PlacementWorker>& workers);
+
 // CompletedJobRecord - HistoryServer entry. Captured at job
 // termination and kept in a bounded ring buffer on the coordinator so operators
 // can answer "what happened to job N?" even after the live JobState

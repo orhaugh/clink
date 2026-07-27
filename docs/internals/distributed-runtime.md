@@ -10,6 +10,51 @@ Jobs are not built into the cluster binaries. A job is a compiled shared library
 
 The single binary `tools/clink_node.cpp` runs as either a coordinator (`--role=coordinator`) or a worker (`--role=worker`); clients submit through the `clink::application::JobSubmitter` library rather than through `clink_node`.
 
+## Task placement co-locates a pipeline instance
+
+`assign_task_placement` (`include/clink/cluster/coordinator.hpp`, implemented in
+`src/cluster/coordinator.cpp`) assigns a worker to every planned task, grouping the tasks that
+share a **subtask index** and placing each group entirely on one worker.
+
+Tasks sharing a subtask index are joined by FORWARD edges: subtask *i* of the source feeds
+subtask *i* of the bridge feeds subtask *i* of the projection. The data plane hands a batch
+across a forward edge as a pointer when both ends live in one process (`LocalDataPlane`) and
+serialises it over a socket when they do not, so placement alone decides whether a forward edge
+costs a pointer copy or a network round trip.
+
+It used to place one task at a time, greedy first-fit, in plan order. Plan order is
+operator-major - every subtask of the source, then every subtask of the bridge - so filling one
+worker's slots before touching the next scattered each instance across hosts. Measured on a
+3-worker rig at parallelism 12, nexmark q0 (four operators, forward edges only, **no shuffle at
+all**) sent 16 of its 24 data-plane edges over TCP:
+
+    before   local=8   socket=16   67% of edges serialised
+    after    local=24  socket=0     0%
+
+and its CPU-per-event was 2.05x worse at parallelism 12 than at 4, where the same sweep on a
+single host was flat to within 5%.
+
+Two properties worth knowing:
+
+- **A hash-shuffled edge is unaffected.** Subtask *i* sends to every downstream subtask
+  regardless of placement, so co-location can only convert forward edges. Measured over
+  loopback, a forward-edge-only query (q0) gained about 20% CPU efficiency while a
+  shuffle-dominated one (q12) was neutral. Over a real network the forward-edge gain is larger
+  than the loopback figure, because that is the cost being avoided.
+- **Placement is deterministic.** Workers are visited in sorted worker-id order rather than in
+  the coordinator registry's order, which is an `unordered_map` and neither sorted nor stable
+  across processes. Placement was previously unrepeatable across deploys of the same plan, which
+  also made any measurement of it unrepeatable.
+
+An instance larger than any single worker's free capacity is split across whatever is free:
+splitting is worse than co-locating and much better than refusing to deploy. Running out of
+capacity entirely is a reported failure, not a silent partial placement.
+
+`tests/test_task_placement.cpp` pins the contract, including the split and out-of-capacity
+paths. It was verified against a faithful reproduction of the old behaviour - and note that a
+first attempt at that reproduction passed, because iterating group-by-group co-locates by
+accident; it is the operator-major PLAN order that scatters an instance.
+
 ## Where it lives
 
 | Concern | File(s) |
