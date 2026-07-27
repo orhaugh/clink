@@ -1,0 +1,164 @@
+# Comprehensive window test plan
+
+Windows are where clink's correctness is most exposed and was least tested. This
+plan enumerates what "comprehensively tested" means for them, why each item earns
+its place, and the order to build it in.
+
+## Why this exists
+
+A hopping window shipped with **no test anywhere**. Nexmark q5 was its only user,
+q5 was new, and a query written with Flink's argument order reached deployment,
+where the operator's constructor refused it. Because a task that fails to build
+never closes its output channel, every downstream stage blocked, and the job
+reported nothing until a watchdog fired. A rejected parameter presented as a
+deadlock and cost a long investigation.
+
+The test suite did not miss this for want of volume. It missed it along specific
+axes, and each one generalises:
+
+| axis | what was missed |
+|---|---|
+| feature | HOP had zero tests; SESSION and CUMULATE had almost none |
+| execution path | the row path was covered, the **columnar** path was not - and columnar is what a Kafka/JSON source runs |
+| parallelism | the unkeyed-aggregate bug is invisible at parallelism 1, and nearly everything ran at 1 |
+| test emulating production | a harness re-implemented the fan-out loop, so 15 of 16 tests passed with **both** shipped bugs reverted |
+| vacuous assertion | a gate compared 0 rows against 0 rows and passed |
+| expectation provenance | expectations captured from the implementation would have locked the bugs in |
+| rejection paths | invalid parameters were never asserted to be rejected |
+
+The plan below is organised by those axes, because that is where the bugs were.
+
+## The matrix
+
+Four kinds, and they are not variations on one implementation: `WindowRowOp`
+serves TUMBLE / HOP / CUMULATE, and SESSION is a separate class with its own
+state and its own gap logic.
+
+| kind | arguments | panes per record | state shape |
+|---|---|---|---|
+| TUMBLE | size | exactly 1 | one bucket per (key, window) |
+| HOP | size, slide | `ceil(size / slide)` | overlapping buckets |
+| CUMULATE | size, step | `size / step` | nested, sharing a start |
+| SESSION | gap | 1, but buckets MERGE | mutable extent per key |
+
+Every row below should hold for all four unless noted.
+
+## Phase 1 - semantics, per kind, on both paths (largely DONE)
+
+Driven directly against the operator built from the registry, no DAG involved, so
+a failure is milliseconds and unambiguous. Both the row path and
+`process_columnar` are exercised, because they are separate folds.
+
+- [x] TUMBLE: one pane per (window, key)
+- [x] TUMBLE: `window_end` is EXCLUSIVE - a record at the boundary lands in the next window
+- [x] HOP: a record appears in every overlapping pane
+- [x] HOP: only panes the watermark has passed fire
+- [x] SESSION: merges within the gap, splits at or beyond it
+- [x] CUMULATE: one cumulative pane per step
+- [x] no window fires before the watermark passes its end
+- [ ] HOP where `slide == size` behaves exactly like TUMBLE (the degenerate case binds; assert it also *computes* the same)
+- [ ] CUMULATE where `step == size` behaves exactly like TUMBLE
+- [ ] SESSION: three records where the middle one bridges two that would otherwise split - the merge must be transitive
+- [ ] SESSION: a record arriving between two existing sessions must merge BOTH into one
+- [ ] every kind: two keys interleaved, so per-key state cannot leak between them
+- [ ] every kind: a key whose records all fall in one window, and a key spread across many
+
+## Phase 2 - the argument surface (largely DONE)
+
+Every invariant a constructor enforces must be refused at bind time, or a bad
+query becomes a deployment failure instead of a compile error.
+
+- [x] TUMBLE size = 0 rejected
+- [x] SESSION gap = 0 rejected
+- [x] HOP slide = 0 rejected
+- [x] HOP slide > size rejected, with a message naming the argument order
+- [x] CUMULATE size not divisible by step rejected
+- [x] valid forms still bind (including `slide == size`)
+- [ ] negative values for every parameter
+- [ ] size or slide large enough to overflow when added to a timestamp near `int64` max
+- [ ] non-integer / non-literal arguments (an expression where a literal is required)
+- [ ] INTERVAL units: SECOND, MINUTE, HOUR all convert to the same milliseconds
+- [ ] a property test: for every kind, a randomly generated invalid parameter set is EITHER rejected at bind time OR builds successfully - never accepted at bind and refused at deploy
+
+That last item is the one that would have caught this class outright, and it is
+worth more than the individual cases above it.
+
+## Phase 3 - the differential axes (NOT STARTED, highest remaining yield)
+
+These are generated comparisons rather than hand-written expectations, which is
+where coverage multiplies without the test count exploding.
+
+- [ ] **Path parity.** For each kind and a generated input, row path output ==
+      columnar path output. No oracle needed: the two must agree.
+- [ ] **Parallelism parity.** Same query at parallelism 1 and 4 produces the same
+      multiset of rows. This is the axis that hid an unpartitioned aggregate
+      returning one answer per subtask; it would have failed instantly.
+- [ ] **Batch-boundary invariance.** The same records delivered as one batch, as
+      many single-record batches, and split randomly must give identical output.
+      Window state is per record but the columnar fold groups per batch, so a
+      batch-dependent result is a real bug this would catch.
+- [ ] **Watermark-granularity invariance.** One terminal watermark versus a
+      watermark after every record must give the same final output - only the
+      emission timing may differ.
+- [ ] **Degenerate-equivalence.** HOP with `slide == size`, CUMULATE with
+      `step == size`, and TUMBLE of the same size must agree exactly.
+
+## Phase 4 - time and lateness
+
+- [ ] a record later than the watermark by less than the allowed lateness is folded in
+- [ ] a record later than the allowed lateness is dropped, and counted as dropped
+- [ ] a window fires exactly ONCE even when late records keep arriving in band
+- [ ] timestamps at and around the epoch: negative window starts are clamped to 0
+      today, which silently drops pre-epoch panes. Decide whether that is the
+      intended contract, then pin it - my own oracle assumed the same clamp, so it
+      has never actually been checked against another engine
+- [ ] timestamps near `int64` max: window_end arithmetic must not overflow
+- [ ] an out-of-order stream within the watermark bound produces the same result as
+      a sorted one
+
+## Phase 5 - state, scale and recovery
+
+- [ ] a window's state is purged after it fires (no unbounded growth) - assert
+      state size returns to its floor after the terminal watermark
+- [ ] snapshot and restore mid-window: panes not yet fired must survive and fire
+      after restore
+- [ ] rescale: a window's keyed state redistributes correctly at a new parallelism
+- [ ] a large keyspace fires without an O(groups) scan per watermark - the
+      `earliest_win_end_` fast path has a debug assertion, so a test that exercises
+      a window-creation site which forgets to maintain it must fail loudly
+- [ ] memory per (key, window) has a documented bound and a test that notices a
+      regression, since a per-key state defect has shipped twice here
+
+## Phase 6 - end to end and cross engine
+
+- [ ] one nexmark query per kind, in-suite, at parallelism > 1 against an
+      independent oracle: q12 (TUMBLE), q5 (HOP), q11 (SESSION) exist; CUMULATE has
+      no nexmark query and needs its own
+- [ ] the cross-engine gate covers each kind, with the argument-order difference
+      handled per dialect rather than assumed
+- [ ] a job whose window cannot build fails FAST with the constructor's message
+      (done - `TaskThatFailsToBuildFailsTheJobRatherThanHanging`)
+
+## Order of work
+
+1. **Phase 3** first, despite being last-written. Path parity and parallelism
+   parity are ~100 lines of harness that generate dozens of comparisons and target
+   the two axes that hid the worst bugs.
+2. **Phase 2's property test**, which closes the bind-vs-deploy gap as a class
+   rather than case by case.
+3. **Phase 4**, because lateness is the least-tested behaviour that users will hit
+   in production.
+4. **Phase 1's remaining items** and **Phase 5**, which are valuable but narrower.
+5. **Phase 6** last: it is the slowest to run and the most environment-dependent,
+   and by then the fast tests should already have caught what it would.
+
+## What "done" looks like
+
+Not a test count. Three properties:
+
+- Every window kind is exercised on every execution path it can take, at more than
+  one parallelism, with expectations that do not come from the implementation.
+- Every argument a user can get wrong is refused before a task is deployed, and
+  the message says what to write instead.
+- A failure anywhere in the window path surfaces as a failed job with a real
+  message, never as a hang.
