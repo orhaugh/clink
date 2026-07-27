@@ -432,9 +432,25 @@ inline ArrowBatcher<Row> make_row_columnar_arrow_batcher(std::vector<RowColumn> 
         const auto* t_arr = dynamic_cast<const arrow::Int64Array*>(b.column(0).get());
         const auto n = b.num_rows();
         std::vector<Row> rows(static_cast<std::size_t>(n));
-        for (std::size_t ci = 0; ci < resolved->size(); ++ci) {
-            const auto& c = (*resolved)[ci];
-            const auto& col = *b.column(static_cast<int>(ci) + 1);
+        // Resolve each declared column BY NAME, once per batch.
+        //
+        // This used to be `b.column(ci + 1)`, i.e. it assumed the batch carries exactly the
+        // declared columns in declared order. That assumption is not the batcher's to make:
+        // a projected batch carries a SUBSET, and reading it positionally either pairs a
+        // column with the wrong name (silent corruption) or runs off the end of the batch
+        // (a segfault inside Arrow's lazy column boxing, which is how this was found).
+        // ParquetSource defends the invariant by hand - it reorders to the batcher schema
+        // and throws if a projected read lost a column - but nothing made the closure itself
+        // safe, so every future caller had to know.
+        //
+        // One GetFieldIndex per declared column per BATCH, not per row, so the per-record
+        // cost is unchanged.
+        for (const auto& c : *resolved) {
+            const int idx = b.schema()->GetFieldIndex(c.name);
+            if (idx < 0) {
+                continue;  // declared but not present: a narrowed batch, legitimately
+            }
+            const auto& col = *b.column(idx);
             for (std::int64_t i = 0; i < n; ++i) {
                 rows[static_cast<std::size_t>(i)].values[c.name] =
                     row_columnar_detail::read_cell(c.eff, col, i);

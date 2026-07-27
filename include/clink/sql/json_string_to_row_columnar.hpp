@@ -532,17 +532,17 @@ private:
                               : nullptr;
             const auto rn = b.num_rows();
             std::vector<Row> decoded(static_cast<std::size_t>(rn));
-            // Walk the PROJECTED columns only, tracking the batch position separately.
-            // resolved[] carries every DECLARED column - unprojected ones included, because
-            // the decode gate needs them - while the batch carries only the projected ones,
-            // so `ci + 1` is not the batch index once a projection is in play. Using it read
-            // past the end of the batch and crashed in Arrow's lazy column boxing.
-            int out_idx = 1;  // 0 is the event-time column
+            // Resolve BY NAME, once per batch. resolved[] carries every DECLARED column -
+            // unprojected ones included, because the decode gate needs them - while the
+            // batch carries only the projected ones, so a declared index is not a batch
+            // index. Name lookup is immune to that, and to reordering, where tracking the
+            // output position by hand is only correct as long as both loops agree.
             for (const auto& c : resolved) {
-                if (!c.projected) {
-                    continue;
+                const int idx = b.schema()->GetFieldIndex(c.name);
+                if (idx < 0) {
+                    continue;  // unprojected, so not in the batch
                 }
-                const auto& col = *b.column(out_idx++);
+                const auto& col = *b.column(idx);
                 for (std::int64_t i = 0; i < rn; ++i) {
                     decoded[static_cast<std::size_t>(i)].values[c.name] =
                         row_columnar_detail::read_cell(c.eff, col, i);

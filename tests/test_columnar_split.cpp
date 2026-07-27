@@ -163,6 +163,79 @@ TEST(ColumnarSplit, RefusesARowOnlyBatch) {
     EXPECT_FALSE(clink::gather_columnar_by_target<Row>(rows_only, targets, 2).has_value());
 }
 
+// ---- declared schema vs emitted batch ---------------------------------------------
+//
+// A materialise closure built from a table's DECLARED schema must resolve columns by NAME,
+// never by declared position. The batch it is handed may legitimately carry a SUBSET (a
+// projected read) or a different order, and a positional mapping then either pairs a column
+// with the wrong name - silent corruption - or indexes past the end of the batch, which
+// segfaults inside Arrow's lazy column boxing. That crash is how the bug was found; the
+// corruption variant would not have announced itself at all.
+
+// The batcher's parse() guards on column COUNT, so a narrowed batch is refused outright
+// rather than mis-read. Asserted because that refusal is the only thing standing between a
+// short batch and a positional read here - the closure itself no longer depends on it, but
+// if the guard is ever loosened, this records what it was doing.
+TEST(ColumnarSchemaBinding, NarrowedBatchIsRefusedByParseNotMisread) {
+    const std::vector<clink::sql::RowColumn> declared = {
+        {"a", arrow::int64()}, {"b", arrow::int64()}, {"c", arrow::int64()}};
+    auto batcher = clink::sql::make_row_columnar_arrow_batcher(declared);
+
+    arrow::Int64Builder ts_b, c_b;
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_TRUE(ts_b.Append(1'700'000'000'000 + i).ok());
+        EXPECT_TRUE(c_b.Append(300 + i).ok());
+    }
+    std::shared_ptr<arrow::Array> ts_a, c_a;
+    ASSERT_TRUE(ts_b.Finish(&ts_a).ok());
+    ASSERT_TRUE(c_b.Finish(&c_a).ok());
+    auto rb =
+        arrow::RecordBatch::Make(arrow::schema({arrow::field("event_time", arrow::int64(), true),
+                                                arrow::field("c", arrow::int64(), true)}),
+                                 4,
+                                 {ts_a, c_a});
+
+    EXPECT_FALSE(batcher.parse(*rb).has_value())
+        << "parse() must refuse a batch narrower than the declared schema rather than pair "
+           "columns with the wrong names";
+}
+
+// Declared order and batch order need not agree either.
+TEST(ColumnarSchemaBinding, ReorderedBatchMaterialisesByName) {
+    const std::vector<clink::sql::RowColumn> declared = {{"a", arrow::int64()},
+                                                         {"b", arrow::int64()}};
+    auto batcher = clink::sql::make_row_columnar_arrow_batcher(declared);
+
+    // Batch order is (event_time, b, a) - the reverse of the declared order.
+    arrow::Int64Builder ts_b, a_b, b_b;
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_TRUE(ts_b.Append(1'700'000'000'000).ok());
+        EXPECT_TRUE(a_b.Append(10 + i).ok());
+        EXPECT_TRUE(b_b.Append(90 + i).ok());
+    }
+    std::shared_ptr<arrow::Array> ts_a, a_a, b_a;
+    ASSERT_TRUE(ts_b.Finish(&ts_a).ok());
+    ASSERT_TRUE(a_b.Finish(&a_a).ok());
+    ASSERT_TRUE(b_b.Finish(&b_a).ok());
+    auto rb =
+        arrow::RecordBatch::Make(arrow::schema({arrow::field("event_time", arrow::int64(), true),
+                                                arrow::field("b", arrow::int64(), true),
+                                                arrow::field("a", arrow::int64(), true)}),
+                                 3,
+                                 {ts_a, b_a, a_a});
+
+    auto parsed = batcher.parse(*rb);
+    ASSERT_TRUE(parsed.has_value());
+    ASSERT_EQ(parsed->size(), 3u);
+    for (std::size_t i = 0; i < parsed->size(); ++i) {
+        const auto& v = (*parsed)[i].value().values;
+        ASSERT_TRUE(v.find("a") != v.end() && v.find("b") != v.end());
+        EXPECT_EQ(v.at("a").as_int(), 10 + static_cast<std::int64_t>(i))
+            << "a and b were swapped, so the closure read positionally";
+        EXPECT_EQ(v.at("b").as_int(), 90 + static_cast<std::int64_t>(i));
+    }
+}
+
 // Splitting must not force the parent's rows into existence: the point of the columnar
 // shuffle is that a batch crosses it without ever being decoded.
 TEST(ColumnarSplit, DoesNotMaterialiseTheParentBatch) {
