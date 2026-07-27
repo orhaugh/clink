@@ -8028,8 +8028,20 @@ void install(clink::plugin::PluginRegistry& reg) {
         auto it = r.values.find(kRowKeyField);
         if (it == r.values.end())
             return 0;
+        // as_int(), NOT as_number(). __key holds a full 64-bit FNV fold, and as_number()
+        // widens int64 to double, so everything below the 53-bit mantissa is lost. The
+        // COLUMNAR companion below reads the Int64Array cell exactly, so the two carriers
+        // of the SAME shuffle edge disagreed about where a key belongs: measured over
+        // 100,000 keys, 99.4% changed value on the int64 -> double -> int64 round trip and
+        // 74.5% landed on a different subtask at parallelism 4.
+        //
+        // A stream mixes carriers by design - the columnar JSON bridge falls back per
+        // batch and, once damped, emits one columnar probe every 64 row batches - so a key
+        // arriving on both split its group state across two subtasks and produced a
+        // silently wrong aggregate. Routing parity between the two extractors is a
+        // correctness requirement (see columnar_split.hpp), not an optimisation.
         if (it->second.is_number())
-            return static_cast<std::int64_t>(it->second.as_number());
+            return it->second.as_int();
         return hash_json_value(it->second);
     });
 
@@ -9248,7 +9260,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                     return 0;
                 }
                 if (it->second.is_number()) {
-                    return static_cast<std::int64_t>(it->second.as_number());
+                    return it->second.as_int();  // exact: see the row_key extractor
                 }
                 return hash_json_value(it->second);
             };
