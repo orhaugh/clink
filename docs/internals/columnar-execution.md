@@ -131,6 +131,51 @@ so the emit can reconstruct the group columns, and the keyed-state entry itself.
 at the cost of making a non-retractable MIN/MAX allocate per group - not obviously a good
 trade, and unmeasured.
 
+### Projection pushdown into the JSON bridge
+
+The optimizer computes which source columns a query actually reads
+(`set_scan_projection` in `src/sql/optimizer.cpp`). That hint used to be written onto the
+SOURCE operator only, and for a Kafka JSON table the source is `kafka_source_string`, which
+emits raw text and cannot act on it - so the operator that could, the columnar JSON bridge,
+never saw it. nexmark q12 reads two of six declared columns and decoded, carried and
+shuffled all six.
+
+| | before | after |
+|---|---:|---:|
+| shuffle split, 256-row batch, 4 targets | 88.9 ns/row | **49.1 ns/row** |
+| JSON decode (34% of a Kafka JSON profile) | 6.67M rec/s | **8.44M rec/s** |
+
+**Narrowing `schema_columns` would have been a regression, not a win.** The columnar
+decoder is safe because of a faithfulness gate: it requires each JSON object to match the
+DECLARED schema exactly and bails the batch on any undeclared field, because the row decode
+it is proved against would have kept that field. Narrow the declared schema and every
+unprojected field becomes undeclared, so every batch bails, pays a partial columnar parse
+plus a full row re-parse, and after `kFallbackThreshold` consecutive failures the damper
+stops attempting columnar on 63 of every 64 batches.
+
+So the schema stays at full width and `projected_columns` is a separate param governing only
+what gets BUILT:
+
+- **declared and projected** - parsed, type-checked, appended to a builder, present in the
+  emitted Arrow schema.
+- **declared but unprojected** - parsed, type-checked, required to be present, then
+  discarded. No builder is created and the field is omitted from the schema.
+- **undeclared** - still bails the batch, exactly as before. Projection must not turn a
+  faithfulness check into a pass.
+
+Both decode arms make the same decision, and the row fallback takes the same projection via
+`row_json_text_format_for_columns_projected`. That helper exists because the older
+`row_json_text_format_projected` honours declared decimals but not declared FLOATs, and a
+FLOAT column has to be coerced on both carriers - a divergence there is invisible to a
+`%g`-formatted comparison.
+
+**One hazard to know about if you touch this.** `wrap_columnar_`'s materialise closure used
+to map `resolved[ci]` to `b.column(ci + 1)` positionally. `resolved[]` holds every DECLARED
+column, including unprojected ones (the gate needs them), while the batch holds only the
+projected ones - so the positional mapping ran off the end of the batch and segfaulted
+inside Arrow's lazy column boxing. Any code that pairs the declared schema with the emitted
+batch by index has the same bug waiting in it.
+
 ### The keyed shuffle's split
 
 `gather_columnar_by_target` (`include/clink/runtime/columnar_split.hpp`) partitions one
