@@ -1097,6 +1097,18 @@ inline bool is_vectorisable_numeric(arrow::Type::type id) {
 // and NON-retractable MIN/MAX over int64/int32/double/float. string_agg,
 // array_agg, percentile, distinct, udaf, retractable MIN/MAX, decimal MIN/MAX
 // -> false (row path).
+// Read an event-time column EXACTLY.
+//
+// as_number() returns a double, and a double carries 53 bits of mantissa, so any
+// integer above 2^53 (about 9.0e15) is silently rounded. Epoch MILLISECONDS are
+// around 1.7e12 and survive that, which is why every test and every benchmark
+// passed - but epoch NANOSECONDS are around 1.7e18 and do not, so a
+// nanosecond-resolution timestamp column was being bucketed by a rounded value.
+// An integral JsonValue already holds the full int64; read it.
+[[nodiscard]] inline std::int64_t event_time_of(const clink::config::JsonValue& v) {
+    return v.is_integral_number() ? v.as_int() : static_cast<std::int64_t>(v.as_number());
+}
+
 inline bool aggs_vectorisable(const std::vector<AggSpec>& aggs, const arrow::RecordBatch& rb) {
     for (const auto& a : aggs) {
         // DISTINCT and UDAF are never column-foldable (the kernel drives only the
@@ -1740,7 +1752,7 @@ public:
             // trip: if every window it lands in is already purged, drop it. The
             // sync path reports this drop from fold_record_into_ (folded == 0);
             // the async fold never runs for these, so report here to match.
-            const auto ts = static_cast<std::int64_t>(tit->second.as_number());
+            const auto ts = event_time_of(tit->second);
             bool any_live = false;
             for (auto [ws, we] : windows_for_(ts)) {
                 (void)ws;
@@ -1768,7 +1780,8 @@ public:
                 for (std::int64_t we : new_win_ends) {
                     // Fire at window_end + allowed_lateness (the grace-band end);
                     // on_event_time_timer maps the timer time back to window_end.
-                    rt->timer_service()->register_event_time_timer(we + allowed_lateness_ms_, key);
+                    rt->timer_service()->register_event_time_timer(
+                        clink::sat_add(we, allowed_lateness_ms_), key);
                 }
                 co_return;
             };
@@ -1788,7 +1801,7 @@ public:
                              Emitter<Row>& out) override {
         // The timer was registered at window_end + allowed_lateness; recover the
         // window_end (the map key) by subtracting the grace band.
-        const std::int64_t win_end = timer_time - allowed_lateness_ms_;
+        const std::int64_t win_end = clink::sat_sub(timer_time, allowed_lateness_ms_);
         auto kv = keyed_state_();
         auto cur = kv.get(key);
         if (!cur.has_value()) {
@@ -1826,7 +1839,7 @@ public:
         Batch<Row> batch;
         bool changed = false;
         for (std::int64_t timer_time : win_ends) {
-            const std::int64_t win_end = timer_time - allowed_lateness_ms_;
+            const std::int64_t win_end = clink::sat_sub(timer_time, allowed_lateness_ms_);
             auto wit = by_window.find(win_end);
             if (wit == by_window.end()) {
                 continue;  // already fired / never existed
@@ -1870,17 +1883,23 @@ private:
         std::vector<std::pair<std::int64_t, std::int64_t>> windows;
         if (kind_ == Kind::Tumble) {
             const std::int64_t start = clink::window_start_for(ts, size_ms_);
-            windows.emplace_back(start, start + size_ms_);
+            windows.emplace_back(start, clink::window_end_for(start, size_ms_));
         } else if (kind_ == Kind::Hop) {
             for (const std::int64_t s : clink::hop_window_starts_for(ts, size_ms_, slide_ms_)) {
-                windows.emplace_back(s, s + size_ms_);
+                windows.emplace_back(s, clink::window_end_for(s, size_ms_));
             }
         } else {
             const std::int64_t anchor = clink::window_start_for(ts, size_ms_);
-            for (std::int64_t end = anchor + slide_ms_; end <= anchor + size_ms_;
-                 end += slide_ms_) {
-                if (ts < end)
+            // Counted by step rather than accumulating `end`, so neither the loop
+            // bound (anchor + size) nor the running value can overflow for a
+            // timestamp near INT64_MAX. The constructor guarantees size is divisible
+            // by step, so `steps` is exact.
+            const std::int64_t steps = size_ms_ / slide_ms_;
+            for (std::int64_t i = 1; i <= steps; ++i) {
+                const std::int64_t end = clink::window_end_for(anchor, slide_ms_ * i);
+                if (ts < end) {
                     windows.emplace_back(anchor, end);
+                }
             }
         }
         return windows;
@@ -1906,7 +1925,7 @@ private:
         auto it = row.values.find(time_column_);
         if (it == row.values.end() || !it->second.is_number())
             return;
-        const auto ts = static_cast<std::int64_t>(it->second.as_number());
+        const auto ts = event_time_of(it->second);
         int folded = 0;
         for (auto [win_start, win_end] : windows_for_(ts)) {
             if (win_end <= drop_horizon)
@@ -1978,7 +1997,7 @@ private:
             if (!tv.is_number()) {
                 continue;
             }
-            const auto ts = static_cast<std::int64_t>(tv.as_number());
+            const auto ts = event_time_of(tv);
             // Transparent probe with the reused scratch key: no per-record
             // string alloc; a NEW group's insert copies once. The entry is
             // created lazily on the FIRST surviving window so a record whose
@@ -2157,7 +2176,7 @@ private:
         // window was close to firing - O(batches x groups). earliest_win_end_ is a lower
         // bound, so this can only ever skip a scan that would have found nothing.
         if (earliest_win_end_ != std::numeric_limits<std::int64_t>::max() &&
-            earliest_win_end_ + allowed_lateness_ms_ > wm_value) {
+            clink::sat_add(earliest_win_end_, allowed_lateness_ms_) > wm_value) {
 #ifndef NDEBUG
             // The bound must never exceed the true minimum, or this early-out skips a due
             // window and silently loses output. It is maintained at each window-creation
@@ -2202,7 +2221,7 @@ private:
                 // the default lateness 0 this is "fire + purge at window_end <=
                 // watermark", unchanged. Past the band, the late guard in
                 // fold_record_into_ drops further records.
-                if (it->first + allowed_lateness_ms_ > wm_value) {
+                if (clink::sat_add(it->first, allowed_lateness_ms_) > wm_value) {
                     ++it;
                     continue;
                 }
@@ -2257,7 +2276,7 @@ private:
     // now is too late. Before the first watermark nothing is late.
     static constexpr std::int64_t kNoDropHorizon = std::numeric_limits<std::int64_t>::min();
     [[nodiscard]] std::int64_t drop_horizon_() const {
-        return have_wm_ ? current_wm_ - allowed_lateness_ms_ : kNoDropHorizon;
+        return have_wm_ ? clink::sat_sub(current_wm_, allowed_lateness_ms_) : kNoDropHorizon;
     }
 
     // Surface a dropped late record to the dead-letter channel (opt-in). Late
@@ -2435,7 +2454,8 @@ public:
     // watermark), so merge always proceeds. Sessions fold synchronously on the
     // sync and columnar paths, so the live watermark is the ingest watermark.
     [[nodiscard]] bool session_too_late_(std::int64_t ts) const {
-        return have_wm_ && ts + gap_ms_ <= current_wm_ - allowed_lateness_ms_;
+        return have_wm_ &&
+               clink::sat_add(ts, gap_ms_) <= clink::sat_sub(current_wm_, allowed_lateness_ms_);
     }
 
     // Surface a dropped late record to the dead-letter channel (opt-in); see the
@@ -2541,8 +2561,7 @@ public:
             auto& by_session = state_[group_keys[g]];
             for (const std::int64_t idx : groups[g]) {
                 const Row& r = rows[static_cast<std::size_t>(idx)];
-                const auto ts =
-                    static_cast<std::int64_t>(r.values.find(time_column_)->second.as_number());
+                const auto ts = event_time_of(r.values.find(time_column_)->second);
                 fold_session_(by_session, r, ts, late_bound);
             }
         }
@@ -2702,7 +2721,7 @@ private:
     // the deferred fold cannot drop a record that was on time when received;
     // the sync callers pass the live bound.
     [[nodiscard]] std::int64_t late_bound_() const {
-        return have_wm_ ? current_wm_ - allowed_lateness_ms_
+        return have_wm_ ? clink::sat_sub(current_wm_, allowed_lateness_ms_)
                         : std::numeric_limits<std::int64_t>::min();
     }
 
@@ -2720,9 +2739,9 @@ private:
         std::vector<std::int64_t> overlap_starts;
         for (auto it = by_session.begin(); it != by_session.end(); ++it) {
             const auto& s = it->second;
-            if (s.end + gap_ms_ < ts)
+            if (clink::sat_add(s.end, gap_ms_) < ts)
                 continue;  // session already ended
-            if (s.start > ts + gap_ms_)
+            if (s.start > clink::sat_add(ts, gap_ms_))
                 break;  // future session, no overlap
             overlap_starts.push_back(it->first);
         }
@@ -2731,7 +2750,7 @@ private:
             // No live session to extend: this record would open a fresh session.
             // If that session has already fired and been purged, the record is
             // late - drop it rather than re-create the window and re-fire.
-            if (ts + gap_ms_ <= late_bound) {
+            if (clink::sat_add(ts, gap_ms_) <= late_bound) {
                 if (report_late_)
                     emit_late_(row);
                 return std::nullopt;
@@ -2778,7 +2797,7 @@ private:
         auto tit = row.values.find(time_column_);
         if (tit == row.values.end() || !tit->second.is_number())
             return;
-        const auto ts = static_cast<std::int64_t>(tit->second.as_number());
+        const auto ts = event_time_of(tit->second);
         // Transparent probe with the scratch key (see WindowRowOp).
         const auto key = group_key_scratch_(row);
         auto sit = state_.find(key);
@@ -2803,9 +2822,9 @@ private:
         std::vector<std::int64_t> overlap_starts;
         for (auto it = by_session.begin(); it != by_session.end(); ++it) {
             const auto& s = it->second;
-            if (s.end + gap_ms_ < ts)
+            if (clink::sat_add(s.end, gap_ms_) < ts)
                 continue;
-            if (s.start > ts + gap_ms_)
+            if (s.start > clink::sat_add(ts, gap_ms_))
                 break;
             overlap_starts.push_back(it->first);
         }
@@ -2906,7 +2925,7 @@ private:
         out_row.values[window_start_output_] =
             clink::config::JsonValue{static_cast<std::int64_t>(s.start)};
         out_row.values[window_end_output_] =
-            clink::config::JsonValue{static_cast<std::int64_t>(s.end + gap_ms_)};
+            clink::config::JsonValue{clink::sat_add(s.end, gap_ms_)};
         return out_row;
     }
 
@@ -2918,7 +2937,8 @@ private:
     bool fire_due_sessions_(std::map<std::int64_t, Session>& by_session, Batch<Row>& batch) const {
         bool changed = false;
         for (auto it = by_session.begin(); it != by_session.end();) {
-            if (it->second.end + gap_ms_ + allowed_lateness_ms_ > current_wm_) {
+            if (clink::sat_add(clink::sat_add(it->second.end, gap_ms_), allowed_lateness_ms_) >
+                current_wm_) {
                 ++it;
                 continue;
             }
@@ -2938,7 +2958,8 @@ private:
                 // Fire-once-after-grace-band: a session closes at end + gap, and
                 // is held a further allowed_lateness_ms_ to absorb late records
                 // before the single emit. Default lateness 0 = fire at end + gap.
-                if (it->second.end + gap_ms_ + allowed_lateness_ms_ > wm_value) {
+                if (clink::sat_add(clink::sat_add(it->second.end, gap_ms_), allowed_lateness_ms_) >
+                    wm_value) {
                     ++it;
                     continue;
                 }
@@ -2969,7 +2990,7 @@ private:
             if (tit == row.values.end() || !tit->second.is_number()) {
                 continue;
             }
-            const auto ts = static_cast<std::int64_t>(tit->second.as_number());
+            const auto ts = event_time_of(tit->second);
             std::string key = group_key_(row);
             auto factory = [this, kv, row = std::move(row), key, ts, late_bound, rt]() mutable
                 -> async::Task<void> {
@@ -2978,8 +2999,8 @@ private:
                     cur.has_value() ? std::move(*cur) : std::map<std::int64_t, Session>{};
                 auto landed = fold_session_(by_session, row, ts, late_bound);
                 if (landed.has_value()) {
-                    const std::int64_t fire_at =
-                        by_session[*landed].end + gap_ms_ + allowed_lateness_ms_;
+                    const std::int64_t fire_at = clink::sat_add(
+                        clink::sat_add(by_session[*landed].end, gap_ms_), allowed_lateness_ms_);
                     kv.put(key, by_session);
                     rt->timer_service()->register_event_time_timer(fire_at, key);
                 }
@@ -7555,7 +7576,7 @@ private:
                         const auto& o = el.as_object();
                         Buffered e;
                         if (auto it = o.find("t"); it != o.end() && it->second.is_number()) {
-                            e.ts = static_cast<std::int64_t>(it->second.as_number());
+                            e.ts = event_time_of(it->second);
                         }
                         if (auto it = o.find("r"); it != o.end() && it->second.is_object()) {
                             e.row.values =
@@ -8623,7 +8644,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                     return EventTime::min();
                 }
                 if (it->second.is_number()) {
-                    return EventTime{static_cast<std::int64_t>(it->second.as_number())};
+                    return EventTime{event_time_of(it->second)};
                 }
                 if (it->second.is_string()) {
                     try {
@@ -8687,8 +8708,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                         }
                         const auto v = row_columnar_detail::read_cell(type, arr, i);
                         if (v.is_number()) {
-                            out[static_cast<std::size_t>(i)] =
-                                EventTime{static_cast<std::int64_t>(v.as_number())};
+                            out[static_cast<std::size_t>(i)] = EventTime{event_time_of(v)};
                         } else if (v.is_string()) {
                             try {
                                 out[static_cast<std::size_t>(i)] =

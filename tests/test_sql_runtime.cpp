@@ -14816,6 +14816,501 @@ TEST(WindowDifferential, ASingleRecordLandsInEveryWindowThatContainsItAndNoOther
 // The shared arithmetic itself, checked against hand-computed values. The operator
 // tests above would catch a regression here, but they would report it as a window
 // disagreement rather than as the two lines that caused it.
+// ---------------------------------------------------------------------------
+// TIME AND LATENESS.
+//
+// A window's whole purpose is to decide when it has seen enough, so the interesting
+// behaviour is at the edges of that decision: a record that arrives after the
+// watermark has passed its window, one that arrives after the grace band as well,
+// and a window that must fire exactly once regardless of how many arrive.
+//
+// None of this was covered. The existing tests all send one terminal watermark, which
+// is the case where lateness cannot arise.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Drive a window with an explicit script of records and watermarks, so a test can
+// place a record AFTER a watermark that has already passed its window. Returns the
+// emitted rows in order, since firing more than once is one of the things under
+// test and a multiset would hide it.
+struct WinEvent {
+    // Exactly one of these is used: a record at (ts, key), or a watermark.
+    bool is_watermark = false;
+    std::int64_t ts = 0;
+    std::int64_t key = 0;
+};
+
+WinEvent rec_at(std::int64_t ts, std::int64_t key = 7) {
+    return WinEvent{.is_watermark = false, .ts = ts, .key = key};
+}
+WinEvent wm_at(std::int64_t ts) {
+    return WinEvent{.is_watermark = true, .ts = ts, .key = 0};
+}
+
+std::vector<std::string> drive_window_script(const std::string& op_type,
+                                             const std::map<std::string, std::string>& params,
+                                             const std::vector<WinEvent>& script) {
+    ensure_sql_installed_once();
+    const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+        op_type, std::string{kChannelRow}, std::string{kChannelRow});
+    if (f == nullptr) {
+        ADD_FAILURE() << "no operator factory registered for " << op_type;
+        return {};
+    }
+    cluster::OperatorBuildContext ctx;
+    ctx.params = params;
+    ctx.parallelism = 1;
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(f->build(ctx));
+
+    std::vector<std::string> out_rows;
+    Emitter<Row> em([&](StreamElement<Row> e) {
+        if (e.is_data()) {
+            for (const auto& r : e.as_data()) {
+                out_rows.push_back(canonical(
+                    clink::config::JsonValue{clink::sql::to_json_object(r.value().values)},
+                    window_drop_cols()));
+            }
+        }
+        return true;
+    });
+    for (const auto& ev : script) {
+        if (ev.is_watermark) {
+            op->process(StreamElement<Row>::watermark(Watermark{EventTime{ev.ts}}), em);
+            continue;
+        }
+        Row r;
+        r.values["auction"] = clink::config::JsonValue{ev.key};
+        r.values["datetime"] = clink::config::JsonValue{ev.ts};
+        Batch<Row> b;
+        b.emplace(r, EventTime{ev.ts});
+        op->process(StreamElement<Row>::data(std::move(b)), em);
+    }
+    return out_rows;
+}
+
+// COUNT per 10s tumbling window, with a configurable grace band.
+std::map<std::string, std::string> lateness_params(std::int64_t allowed_lateness_ms) {
+    auto p = window_params("10000", "");
+    p["allowed_lateness_ms"] = std::to_string(allowed_lateness_ms);
+    return p;
+}
+
+}  // namespace
+
+// With no grace band, a record arriving after the watermark has passed its window is
+// too late: the window has fired and been purged, and re-folding it would emit a
+// second, partial row for a window already reported.
+TEST(WindowLateness, WithoutAGraceBandALateRecordIsDroppedAndDoesNotRefire) {
+    const auto rows = drive_window_script("tumbling_window_row",
+                                          lateness_params(0),
+                                          {
+                                              rec_at(1000),
+                                              wm_at(10'000),  // fires [0,10000) with count 1
+                                              rec_at(2000),   // late: its window has gone
+                                              wm_at(20'000),
+                                          });
+    ASSERT_EQ(rows.size(), 1u) << "the window must be reported once, not re-reported for a late "
+                                  "record; got "
+                               << rows.size() << " rows";
+    EXPECT_NE(rows[0].find("\"num\":1"), std::string::npos)
+        << "the one emitted row should hold only the on-time record: " << rows[0];
+}
+
+// With a grace band, the same record is IN TIME: the window is held open until the
+// watermark passes window_end + allowed_lateness, so the late record is folded in and
+// the window still fires exactly once, with the complete count.
+TEST(WindowLateness, WithinTheGraceBandALateRecordIsFoldedInAndTheWindowStillFiresOnce) {
+    const auto rows = drive_window_script("tumbling_window_row",
+                                          lateness_params(5'000),
+                                          {
+                                              rec_at(1000),
+                                              wm_at(10'000),  // window_end reached, but grace band
+                                                              // holds it open until 15000
+                                              rec_at(2000),   // arrives late, inside the band
+                                              wm_at(15'000),  // now the band has closed
+                                              wm_at(30'000),
+                                          });
+    ASSERT_EQ(rows.size(), 1u) << "the window must fire exactly ONCE, after its grace band - "
+                                  "firing at window_end and again after lateness would double-"
+                                  "report it; got "
+                               << rows.size() << " rows";
+    EXPECT_NE(rows[0].find("\"num\":2"), std::string::npos)
+        << "the late-but-in-band record must be counted: " << rows[0];
+}
+
+// Past the grace band it is dropped again. Both directions matter: a test that only
+// showed the in-band record being folded would pass an operator with an unbounded
+// grace band, which never purges and grows without limit.
+TEST(WindowLateness, PastTheGraceBandTheRecordIsDroppedAgain) {
+    const auto rows = drive_window_script("tumbling_window_row",
+                                          lateness_params(5'000),
+                                          {
+                                              rec_at(1000),
+                                              wm_at(16'000),  // past window_end + lateness: fired
+                                              rec_at(2000),   // beyond the band
+                                              wm_at(40'000),
+                                          });
+    ASSERT_EQ(rows.size(), 1u) << "got " << rows.size() << " rows";
+    EXPECT_NE(rows[0].find("\"num\":1"), std::string::npos)
+        << "a record past the grace band must not be counted: " << rows[0];
+}
+
+// An out-of-order stream that stays within the watermark bound must give the same
+// answer as the same records sorted. This is the ordering guarantee a windowed
+// aggregate actually offers, and nothing asserted it.
+TEST(WindowLateness, OutOfOrderWithinTheBoundMatchesTheSortedStream) {
+    auto shuffled = gen_input(/*seed=*/606,
+                              /*n=*/300,
+                              /*span_ms=*/50'000,
+                              /*keys=*/5,
+                              /*sorted=*/false);
+    auto sorted = shuffled;
+    std::sort(sorted.begin(), sorted.end());
+    for (const auto& k : all_window_kinds()) {
+        // One terminal watermark, so nothing is late in either run and the only
+        // difference between them is arrival order.
+        const auto a =
+            drive_window(k.op_type, k.params, shuffled, 1'000'000, WinDrive{.batch_size = 0});
+        const auto b =
+            drive_window(k.op_type, k.params, sorted, 1'000'000, WinDrive{.batch_size = 0});
+        ASSERT_FALSE(a.empty()) << k.label << ": nothing emitted";
+        EXPECT_EQ(a, b) << k.label << ": arrival order changed the answer, but every record was "
+                        << "inside the watermark bound";
+    }
+}
+
+// A watermark exactly AT window_end closes the window: window_end is exclusive, so
+// there is nothing further that can land in it. Off by one here either holds every
+// window open for an extra watermark or fires it a step early.
+TEST(WindowLateness, AWatermarkExactlyAtWindowEndClosesTheWindow) {
+    const auto at_end = drive_window_script(
+        "tumbling_window_row", lateness_params(0), {rec_at(1000), wm_at(10'000)});
+    EXPECT_EQ(at_end.size(), 1u)
+        << "window_end is exclusive, so a watermark of exactly 10000 has passed [0,10000)";
+    const auto before_end = drive_window_script(
+        "tumbling_window_row", lateness_params(0), {rec_at(1000), wm_at(9'999)});
+    EXPECT_TRUE(before_end.empty())
+        << "a watermark of 9999 has not passed [0,10000), so nothing may fire yet";
+}
+
+// An idle watermark carries no time, so it must not fire anything. A window that
+// fired on an idle marker would emit partial results whenever a source went quiet.
+TEST(WindowLateness, AnIdleWatermarkFiresNothing) {
+    ensure_sql_installed_once();
+    const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+        "tumbling_window_row", std::string{kChannelRow}, std::string{kChannelRow});
+    ASSERT_NE(f, nullptr);
+    cluster::OperatorBuildContext ctx;
+    ctx.params = window_params("10000", "");
+    ctx.parallelism = 1;
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(f->build(ctx));
+
+    std::size_t emitted = 0;
+    Emitter<Row> em([&](StreamElement<Row> e) {
+        if (e.is_data()) {
+            emitted += e.as_data().size();
+        }
+        return true;
+    });
+    Row r;
+    r.values["auction"] = clink::config::JsonValue{std::int64_t{7}};
+    r.values["datetime"] = clink::config::JsonValue{std::int64_t{1000}};
+    Batch<Row> b;
+    b.emplace(r, EventTime{1000});
+    op->process(StreamElement<Row>::data(std::move(b)), em);
+    op->process(StreamElement<Row>::watermark(Watermark::idle()), em);
+    EXPECT_EQ(emitted, 0u) << "an idle watermark carries no event time and must fire nothing";
+    // And a real watermark afterwards still works, so the idle marker did not wedge
+    // the operator.
+    op->process(StreamElement<Row>::watermark(Watermark{EventTime{100'000}}), em);
+    EXPECT_EQ(emitted, 1u) << "a real watermark after an idle one must still fire the window";
+}
+
+// A timestamp at the extremes of int64 must not overflow the window arithmetic.
+//
+// This is not an absurd input. INT64_MIN and INT64_MAX are exactly what an
+// uninitialised or sentinel-valued timestamp column carries, and all three of the
+// obvious 64-bit forms overflow there: window_end = start + size exceeds INT64_MAX,
+// the FLOORED start for a timestamp near INT64_MIN goes below INT64_MIN, and a hop's
+// `ts - size + slide` underflows. Signed overflow is undefined behaviour rather than
+// a wrong answer, so under UBSan this was a crash on bad input, not a bad number.
+TEST(WindowLateness, ExtremeTimestampsDoNotOverflowTheWindowArithmetic) {
+    const std::int64_t mx = std::numeric_limits<std::int64_t>::max();
+    const std::int64_t mn = std::numeric_limits<std::int64_t>::min();
+    for (const auto& k : all_window_kinds()) {
+        for (const std::int64_t ts : {mn, mn + 1, mn + 9999, mx - 9999, mx - 1, mx}) {
+            const auto rows =
+                drive_window(k.op_type, k.params, {{ts, 7}}, mx, WinDrive{.batch_size = 0});
+            for (const auto& r : rows) {
+                const auto js = clink::config::parse(r);
+                const auto& o = js.as_object();
+                const auto ws = o.find("window_start");
+                const auto we = o.find("window_end");
+                ASSERT_TRUE(ws != o.end() && we != o.end()) << k.label << ": no bounds: " << r;
+                // as_int(), NOT as_number(): the latter returns a double, and an
+                // int64 above 2^53 does not survive that round trip - the first
+                // version of this test reported a "wrong" window_start that was
+                // only the double rounding of the right one.
+                ASSERT_TRUE(ws->second.is_integral_number() && we->second.is_integral_number())
+                    << k.label << ": window bounds must stay exact integers: " << r;
+                const std::int64_t s = ws->second.as_int();
+                const std::int64_t e = we->second.as_int();
+                EXPECT_LE(s, e) << k.label << " at ts=" << ts << ": bounds inverted, which is what "
+                                << "a wrapped addition looks like: [" << s << ", " << e << ")";
+                EXPECT_LE(s, ts) << k.label << " at ts=" << ts << ": window_start " << s
+                                 << " is after the record";
+            }
+        }
+    }
+}
+
+// An event time above 2^53 must be bucketed by its EXACT value.
+//
+// The time column was read with static_cast<int64_t>(json.as_number()), and a double
+// carries 53 bits of mantissa - so every timestamp above about 9.0e15 was rounded
+// before the window arithmetic ever saw it. Epoch MILLISECONDS are around 1.7e12 and
+// survive that, which is why every test, benchmark and nexmark run passed. Epoch
+// NANOSECONDS are around 1.7e18 and do not: a nanosecond-resolution column was
+// bucketed by a rounded timestamp, so records near a window edge landed in the wrong
+// window and window_start came back as a value the source never contained.
+TEST(WindowLateness, TimestampsAboveTwoToThe53AreBucketedExactly) {
+    // 2^53 + 1 is the smallest integer a double cannot represent; it rounds to 2^53.
+    // Using a window size of 1 ms makes any rounding change the window outright.
+    const std::int64_t base = (std::int64_t{1} << 53);
+    for (const std::int64_t ts :
+         {base + 1, base + 3, base + 12345, std::int64_t{1'700'000'000'123'456'789}}) {
+        const auto rows = drive_window("tumbling_window_row",
+                                       window_params("1", ""),
+                                       {{ts, 7}},
+                                       std::numeric_limits<std::int64_t>::max(),
+                                       WinDrive{.batch_size = 0});
+        ASSERT_EQ(rows.size(), 1u) << "ts=" << ts << ": expected exactly one 1 ms window";
+        const auto js = clink::config::parse(*rows.begin());
+        const auto& o = js.as_object();
+        const auto ws = o.find("window_start");
+        ASSERT_NE(ws, o.end());
+        ASSERT_TRUE(ws->second.is_integral_number())
+            << "the window bound must be an exact integer, not a double";
+        EXPECT_EQ(ws->second.as_int(), ts)
+            << "a 1 ms window starting at " << ws->second.as_int() << " for a record at " << ts
+            << " means the timestamp was rounded through a double before bucketing";
+    }
+}
+
+TEST(WindowArithmetic, SaturatesRatherThanOverflowingAtTheInt64Extremes) {
+    const std::int64_t mx = std::numeric_limits<std::int64_t>::max();
+    const std::int64_t mn = std::numeric_limits<std::int64_t>::min();
+    // window_end saturates instead of wrapping. The topmost window is therefore
+    // closed at INT64_MAX rather than half-open, because no larger bound exists.
+    EXPECT_EQ(clink::window_end_for(clink::window_start_for(mx, 10'000), 10'000), mx);
+    EXPECT_GE(clink::window_end_for(clink::window_start_for(mx, 10'000), 10'000),
+              clink::window_start_for(mx, 10'000))
+        << "a wrapped addition would put the end BELOW the start";
+    // At the bottom, the floored start is not representable, so it saturates to
+    // INT64_MIN - which still satisfies start <= ts.
+    EXPECT_LE(clink::window_start_for(mn, 10'000), mn);
+    EXPECT_EQ(clink::window_start_for(mn, 10'000), mn);
+    // A hop near either extreme returns only panes that genuinely contain ts. At
+    // exactly INT64_MAX the upper bound is inclusive rather than exclusive, because
+    // saturation is the only alternative to overflow and there is no representable
+    // bound above INT64_MAX - so the check there is `ts <= end`, which is the
+    // contract the header states.
+    for (const std::int64_t ts : {mn, mn + 1, mx - 1, mx}) {
+        for (const std::int64_t s : clink::hop_window_starts_for(ts, 10'000, 2'000)) {
+            EXPECT_LE(s, ts) << "pane start " << s << " is after ts " << ts;
+            const std::int64_t e = clink::window_end_for(s, 10'000);
+            if (ts == mx) {
+                EXPECT_LE(ts, e) << "pane [" << s << ", " << e << "] must still hold INT64_MAX";
+            } else {
+                EXPECT_LT(ts, e) << "pane [" << s << ", " << e << ") does not contain ts " << ts;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE BIND-VERSUS-DEPLOY PROPERTY.
+//
+// Every named rejection test asserts that ONE bad parameter set is refused at bind
+// time. That is worth having, but it only ever covers the cases someone wrote down -
+// and the failure this all came from was a case nobody had. q5's HOP arguments were
+// accepted by the binder, planned, deployed, and then refused by the operator's
+// constructor, where the only symptom available was a job that would not finish.
+//
+// The property closes the class rather than the case: for ANY window parameters, the
+// binder accepting them must imply the operator can be built from them. A parameter
+// set may be rejected at bind (good) or accepted and buildable (good). Accepted at
+// bind and unbuildable is the defect, whatever the numbers are.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A minimal source and sink, so this block does not depend on the NexmarkQueries
+// fixture (whose DDL helpers are members).
+std::string window_probe_ddl() {
+    return "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
+           "url VARCHAR, datetime BIGINT) WITH (connector='kafka', format='json', "
+           "brokers='b', topic='bid', group_id='g', event_time_column='datetime', "
+           "watermark_lag_ms='0');"
+           "CREATE TABLE out_t (num BIGINT) WITH (connector='file', format='json', "
+           "path='/dev/null');";
+}
+
+// Bind a window query and, if it binds, try to BUILD every window operator the
+// planner emitted. Returns a description of the outcome.
+struct BindThenBuild {
+    bool bound = false;
+    bool built = false;
+    std::string bind_error;
+    std::string build_error;
+    bool saw_window_op = false;
+};
+
+BindThenBuild bind_then_build(const std::string& group_by) {
+    ensure_sql_installed_once();
+    BindThenBuild r;
+    cluster::JobGraphSpec spec;
+    try {
+        Catalog cat;
+        auto ddl = parse(window_probe_ddl());
+        for (const auto& st : ddl.statements) {
+            cat.register_table(std::get<ast::CreateTableStmt>(st));
+        }
+        const std::string sql =
+            "INSERT INTO out_t SELECT COUNT(*) AS num FROM bid GROUP BY " + group_by;
+        spec = compile(cat, sql.c_str());
+        r.bound = true;
+    } catch (const std::exception& e) {
+        r.bind_error = e.what();
+        return r;
+    }
+
+    r.built = true;
+    for (const auto& op : spec.ops) {
+        const bool is_window = op.type == "tumbling_window_row" ||
+                               op.type == "hopping_window_row" ||
+                               op.type == "cumulate_window_row" || op.type == "session_window_row";
+        if (!is_window) {
+            continue;
+        }
+        r.saw_window_op = true;
+        const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+            op.type, std::string{kChannelRow}, std::string{kChannelRow});
+        if (f == nullptr) {
+            r.built = false;
+            r.build_error = "no factory for " + op.type;
+            continue;
+        }
+        cluster::OperatorBuildContext ctx;
+        ctx.params = op.params;
+        ctx.parallelism = 1;
+        try {
+            (void)f->build(ctx);
+        } catch (const std::exception& e) {
+            r.built = false;
+            r.build_error = e.what();
+        }
+    }
+    return r;
+}
+
+}  // namespace
+
+// The property, over a grid that includes every invalid shape the four kinds have:
+// zero, negative, slide exceeding size, a size not divisible by its step, and values
+// large enough to overflow when added to a timestamp.
+TEST(WindowArgumentSurface, BindingAWindowImpliesTheOperatorCanBeBuilt) {
+    const std::int64_t big = std::numeric_limits<std::int64_t>::max() / 2;
+    std::vector<std::string> group_bys;
+    // TUMBLE: one size argument.
+    for (const auto& size : {"0", "-1", "-10000", "1", "10000", "9223372036854775807"}) {
+        group_bys.push_back(std::string{"TUMBLE(datetime, "} + size + ")");
+    }
+    // HOP and CUMULATE: size and slide/step, in every combination of the interesting
+    // values, so slide > size, slide == size, a non-divisor and the negatives are all
+    // covered without being enumerated by hand.
+    const std::vector<std::string> vals = {
+        "0", "-1", "-2000", "1", "1000", "2000", "3000", "10000", std::to_string(big)};
+    for (const auto& size : vals) {
+        for (const auto& slide : vals) {
+            group_bys.push_back("HOP(datetime, " + size + ", " + slide + ")");
+            group_bys.push_back("CUMULATE(datetime, " + size + ", " + slide + ")");
+        }
+    }
+    // SESSION: one gap argument.
+    for (const auto& gap : vals) {
+        group_bys.push_back("SESSION(datetime, " + gap + ")");
+    }
+
+    std::size_t rejected = 0;
+    std::size_t accepted = 0;
+    for (const auto& gb : group_bys) {
+        const auto r = bind_then_build(gb);
+        if (!r.bound) {
+            ++rejected;
+            // A bind error is a pass, but it must SAY something. "std::bad_alloc" or
+            // an empty message leaves the user with a query that will not run and no
+            // way to know why.
+            EXPECT_GT(r.bind_error.size(), 8u)
+                << gb << ": rejected with an unhelpful message: " << r.bind_error;
+            continue;
+        }
+        ++accepted;
+        EXPECT_TRUE(r.built) << gb << ": ACCEPTED at bind time but the operator refused to build: "
+                             << r.build_error
+                             << "\n      This is the defect class: a query that compiles, plans "
+                                "and deploys, then fails in a task constructor - where the only "
+                                "symptom is a job that does not finish.";
+    }
+    // Both outcomes must actually occur, or the property is being satisfied
+    // trivially by a grid that is all valid or all invalid.
+    EXPECT_GT(rejected, 0u) << "no parameter set was rejected, so this proves nothing";
+    EXPECT_GT(accepted, 0u) << "no parameter set was accepted, so this proves nothing";
+}
+
+// INTERVAL units must all reduce to milliseconds. A unit that converted wrongly
+// would give a window of the wrong width, which no rejection test can catch because
+// nothing is rejected.
+TEST(WindowArgumentSurface, IntervalUnitsAllReduceToTheSameMilliseconds) {
+    struct Case {
+        const char* group_by;
+        std::int64_t want_ms;
+    };
+    const std::vector<Case> cases = {
+        {"TUMBLE(datetime, INTERVAL '1' SECOND)", 1'000},
+        {"TUMBLE(datetime, INTERVAL '90' SECOND)", 90'000},
+        {"TUMBLE(datetime, INTERVAL '1' MINUTE)", 60'000},
+        {"TUMBLE(datetime, INTERVAL '2' MINUTE)", 120'000},
+        {"TUMBLE(datetime, INTERVAL '1' HOUR)", 3'600'000},
+        // A bare integer is already milliseconds.
+        {"TUMBLE(datetime, 60000)", 60'000},
+    };
+    for (const auto& c : cases) {
+        ensure_sql_installed_once();
+        Catalog cat;
+        auto ddl = parse(window_probe_ddl());
+        for (const auto& st : ddl.statements) {
+            cat.register_table(std::get<ast::CreateTableStmt>(st));
+        }
+        const std::string sql =
+            std::string{"INSERT INTO out_t SELECT COUNT(*) AS num FROM bid GROUP BY "} + c.group_by;
+        const auto spec = compile(cat, sql.c_str());
+        bool found = false;
+        for (const auto& op : spec.ops) {
+            if (op.type != "tumbling_window_row") {
+                continue;
+            }
+            found = true;
+            const auto it = op.params.find("size_ms");
+            ASSERT_NE(it, op.params.end()) << c.group_by << ": no size_ms param";
+            EXPECT_EQ(std::stoll(it->second), c.want_ms)
+                << c.group_by << ": converted to " << it->second << " ms, expected " << c.want_ms;
+        }
+        EXPECT_TRUE(found) << c.group_by << ": no tumbling window in the plan";
+    }
+}
+
 TEST(WindowArithmetic, FloorsRatherThanTruncatingTowardZero) {
     // C++ integer division truncates: -1 / 10 == 0. Flooring gives -1.
     EXPECT_EQ(clink::floor_div(-1, 10), -1);
