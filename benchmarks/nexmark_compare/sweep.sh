@@ -20,6 +20,16 @@ set -uo pipefail
 
 cd "$(dirname "$0")"
 
+# Tear the stack down if this driver is interrupted. throughput_sampled.sh cleans
+# up on its own exit, but a kill mid-run (a timeout, a Ctrl-C) leaves Kafka and
+# both engines running, which silently contaminates whatever is measured next on
+# this box - and the containers are easy to miss.
+cleanup() {
+    docker compose -p nxcompare --profile clink --profile flink down -v \
+        --remove-orphans >/dev/null 2>&1 || true
+}
+trap cleanup INT TERM
+
 EVENTS="${EVENTS:-5000000}"
 PARALLELISM="${PARALLELISM:-4}"
 SINK="${SINK:-blackhole}"

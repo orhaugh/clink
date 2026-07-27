@@ -13183,4 +13183,145 @@ TEST(SqlRuntime, FileSourceReadsBackPartitionedDirectory) {
     std::filesystem::remove(out);
 }
 
+// An UNPARTITIONED stateful operator must not be fanned out.
+//
+// A stateful operator keeps one state entry per partition key, and its input is
+// hash-partitioned by that key so each subtask owns a disjoint slice. With no
+// partition key there is no slice to own: `GROUP BY TUMBLE(...)` with no grouping
+// column, or ROW_NUMBER() OVER with no PARTITION BY, covers the WHOLE stream.
+// Fanned out to N subtasks, each computes its own answer over its own shard and
+// emits it, so the job returns N partial results instead of one - and each value
+// is an aggregate of 1/N of the data.
+//
+// This shipped. The cross-engine output gate caught it on nexmark q7 and q15,
+// which each emitted 396 rows against Flink's 99 at parallelism 4 - exactly
+// parallelism times too many, every MAX a quarter-of-the-data maximum. The
+// planner now marks such operators forced singletons and the parallelism fan-out
+// leaves them at 1.
+//
+// The test fans the SOURCE out and asserts ONE row per window with the GLOBAL
+// extremes, which is the property that broke; asserting a row count alone would
+// pass on four correct-looking rows.
+TEST(SqlRuntime, UnpartitionedWindowAggregateStaysASingletonUnderFanOut) {
+    ensure_sql_installed_once();
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto in_path = tmp / "clink_sql_singleton_in.ndjson";
+    const auto out_path = tmp / "clink_sql_singleton_out.ndjson";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+
+    // Eight bids inside ONE 10s window. Global MAX(price) = 800, MIN(bidder) = 1.
+    // Split across 4 source subtasks, a per-shard aggregate would report a
+    // maximum below 800 on three of the four.
+    std::vector<std::string> lines;
+    for (int i = 1; i <= 8; ++i) {
+        lines.push_back(R"({"bidder":)" + std::to_string(i) + R"(,"price":)" +
+                        std::to_string(i * 100) + R"(,"datetime":1000})");
+    }
+    write_lines(in_path, lines);
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE bid (bidder BIGINT, price BIGINT, datetime BIGINT) "
+                                 "WITH (connector='kafka', format='json', brokers='b', topic='t', "
+                                 "group_id='g', event_time_column='datetime', "
+                                 "watermark_lag_ms='0');"
+                                 "CREATE TABLE out_t (price BIGINT, bidder BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     out_path.string() + "')");
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT MAX(price) AS price, MIN(bidder) AS bidder "
+                        "FROM bid GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND)");
+
+    // Swap the Kafka source for a file source, then fan out exactly as a
+    // parallelism-4 submit does: every op except a declared forced singleton.
+    constexpr std::uint32_t kPar = 4;
+    bool saw_singleton = false;
+    for (auto& op : spec.ops) {
+        if (op.type == "kafka_source_string") {
+            // Left at parallelism 1: a file source's parallel-read semantics are
+            // not what is under test, and fanning it out would confound them with
+            // the aggregate's behaviour. One upstream feeding a fanned-out
+            // aggregate reproduces the bug exactly - a Rebalance edge scatters the
+            // rows round-robin across the aggregate's subtasks, and an unkeyed
+            // aggregate then keeps a separate state per subtask.
+            op.type = "file_text_source";
+            op.params.clear();
+            op.params["path"] = in_path.string();
+            continue;
+        }
+        // The file sink stays at 1 as well: at parallelism > 1 it writes one file
+        // per subtask (path + ".N"), which is a property of the sink, not of the
+        // aggregate under test.
+        if (op.type == "file_line_sink" || op.type == "file_row_sink" ||
+            op.type.find("sink") != std::string::npos) {
+            continue;
+        }
+        if (op.params.find(std::string{cluster::kForcedSingletonParam}) != op.params.end()) {
+            saw_singleton = true;
+            continue;  // exactly what the submit-time fan-out does
+        }
+        op.parallelism = kPar;
+    }
+    ASSERT_TRUE(saw_singleton) << "the planner did not mark the unpartitioned aggregate";
+
+    {
+        InProcessCluster cluster("worker-sql-singleton", 24);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 20s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        ASSERT_TRUE(r.completed) << "reject: " << r.reject_message;
+        EXPECT_TRUE(r.ok) << "errors: " << (r.errors.empty() ? "(none)" : r.errors[0]);
+    }
+
+    auto out = read_lines(out_path);
+    ASSERT_EQ(out.size(), 1u) << "expected ONE row for the single window; got " << out.size()
+                              << " (one per subtask means the operator was fanned out)";
+    auto js = clink::config::parse(out[0]);
+    EXPECT_EQ(static_cast<std::int64_t>(js.at("price").as_number()), 800)
+        << "MAX(price) must be the global maximum, not one shard's";
+    EXPECT_EQ(static_cast<std::int64_t>(js.at("bidder").as_number()), 1)
+        << "MIN(bidder) must be the global minimum, not one shard's";
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
+// The submit-time fan-out must leave forced singletons at 1.
+//
+// Both the embedded runner and the submit CLI call apply_job_parallelism, so this
+// covers the production path that the end-to-end test above can only emulate.
+TEST(SqlRuntime, ApplyJobParallelismLeavesForcedSingletonsAtOne) {
+    cluster::JobGraphSpec spec;
+    cluster::OperatorSpec src;
+    src.id = "src";
+    src.type = "kafka_source_string";
+    spec.ops.push_back(src);
+    cluster::OperatorSpec agg;
+    agg.id = "agg";
+    agg.type = "tumbling_window_row";
+    agg.inputs = {"src"};
+    agg.params[std::string{cluster::kForcedSingletonParam}] = "true";
+    spec.ops.push_back(agg);
+    cluster::OperatorSpec sink;
+    sink.id = "sink";
+    sink.type = "blackhole_sink_row";
+    sink.inputs = {"agg"};
+    spec.ops.push_back(sink);
+
+    cluster::apply_job_parallelism(spec, 8);
+    EXPECT_EQ(spec.ops[0].parallelism, 8u) << "an ordinary operator must fan out";
+    EXPECT_EQ(spec.ops[1].parallelism, 1u)
+        << "a forced singleton must stay at 1, or each subtask keeps its own state "
+           "over its own shard and the job emits parallelism partial results";
+    EXPECT_EQ(spec.ops[2].parallelism, 8u);
+
+    // parallelism 1 is a no-op, and must not disturb anything.
+    cluster::JobGraphSpec one = spec;
+    cluster::apply_job_parallelism(one, 1);
+    EXPECT_EQ(one.ops[0].parallelism, 8u);
+    EXPECT_EQ(one.ops[1].parallelism, 1u);
+}
+
 }  // namespace clink::sql

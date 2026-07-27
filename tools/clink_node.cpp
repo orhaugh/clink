@@ -801,12 +801,7 @@ clink::http::HttpResponse handle_sql(clink::cluster::Coordinator& coordinator,
     }
 
     auto apply_parallelism = [&](clink::cluster::JobGraphSpec& spec) {
-        if (parallelism <= 1) {
-            return;
-        }
-        for (auto& op : spec.ops) {
-            op.parallelism = parallelism;
-        }
+        clink::cluster::apply_job_parallelism(spec, parallelism);
     };
 
     // Accumulate results, then emit JSON only after the whole script succeeds -

@@ -152,15 +152,10 @@ int run_script(const std::string& sql,
         // Fan the compiled plan out to `opts.parallelism` subtasks per op. The
         // planner emits everything at parallelism 1; setting it uniformly here
         // lets the runtime hash-partition keyed ops by key and split Kafka
-        // partitions across source subtasks. Assumes a parallelizable plan (no
-        // forced-singleton op); the common SQL shapes qualify.
+        // partitions across source subtasks. Operators the planner marked as
+        // forced singletons are left at 1 (see cluster::kForcedSingletonParam).
         auto apply_parallelism = [&](cluster::JobGraphSpec& spec) {
-            if (opts.parallelism <= 1) {
-                return;
-            }
-            for (auto& op : spec.ops) {
-                op.parallelism = opts.parallelism;
-            }
+            cluster::apply_job_parallelism(spec, opts.parallelism);
         };
         // SQL-declared UDFs live in the catalog (CREATE FUNCTION registers
         // them there, persisted when the catalog has a dir). A registration

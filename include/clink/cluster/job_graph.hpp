@@ -38,6 +38,40 @@ struct SideOutputDecl {
     ChannelType channel_type;
 };
 
+// Param marking an operator that MUST run on a single subtask, whatever
+// parallelism the job is submitted at.
+//
+// A stateful operator keeps one state entry per partition key, and its input is
+// hash-partitioned by that key so each subtask owns a disjoint slice. With NO
+// partition key there is no slice to own: the operator's state covers the whole
+// stream. `SELECT MAX(price) FROM bid GROUP BY TUMBLE(datetime, INTERVAL '10'
+// SECOND)` groups by the window alone; `ROW_NUMBER() OVER (ORDER BY price)` has
+// no PARTITION BY; an uncorrelated scalar subquery produces one value. Fanned
+// out, each subtask computes its own answer over its own shard and emits it, so
+// the job produces `parallelism` partial results instead of one.
+//
+// The cross-engine output gate caught this: nexmark q7 and q15 each emitted 396
+// rows against Flink's 99 - exactly parallelism times too many - and every
+// MAX(price) was the maximum of a quarter of the data rather than the maximum.
+//
+// Whoever fans a compiled plan out to a submit-time parallelism must leave these
+// operators at 1. The alternative, hash-partitioning on a constant key so
+// everything lands on one subtask, was tried and rejected: it inserts an
+// operator into the plan, and doing that on the side input of a two-input
+// operator (a scalar-subquery broadcast, a join against a windowed aggregate)
+// deadlocks the pipeline.
+inline constexpr std::string_view kForcedSingletonParam = "forced_singleton";
+
+struct JobGraphSpec;
+
+// Fan a compiled plan out to `parallelism` subtasks per operator, leaving any
+// operator the planner marked a forced singleton at 1.
+//
+// One implementation, because there are two callers - the embedded script runner
+// and the submit CLI - and a plan that is correct through one path and wrong
+// through the other is worse than a plan that is wrong through both.
+void apply_job_parallelism(JobGraphSpec& spec, std::uint32_t parallelism);
+
 struct OperatorSpec {
     std::string type;
     std::string id;

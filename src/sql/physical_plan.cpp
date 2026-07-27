@@ -1204,6 +1204,8 @@ std::string compile_node(const LogicalPlan& node,
         cluster::OperatorSpec op;
         op.id = "scalarbcast_" + std::to_string(next_id++);
         op.type = "scalar_broadcast_filter_row";
+        // The comment above is only true if nothing fans this out afterwards.
+        op.params[std::string{cluster::kForcedSingletonParam}] = "true";
         op.inputs = {std::move(main_id), std::move(scalar_id)};
         op.out_channel = std::string{kChannelRow};
         op.params["test_column"] = sb.test_column();
@@ -1342,6 +1344,11 @@ std::string compile_node(const LogicalPlan& node,
             op.params["async_state"] = "true";
         if (!agg.group_keys().empty())
             op.key_by = "row_key";
+        // Unpartitioned: this operator's state covers the whole stream, so it must
+        // not be fanned out (see kForcedSingletonParam).
+        if (agg.group_keys().empty()) {
+            op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+        }
 
         std::string keys_csv;
         for (std::size_t i = 0; i < agg.group_keys().size(); ++i) {
@@ -1417,6 +1424,12 @@ std::string compile_node(const LogicalPlan& node,
         if (!mr.partition_columns().empty()) {
             op.key_by = "row_key";
         }
+        // Unpartitioned: this operator's state covers the whole stream, so it must
+        // not be fanned out (see kForcedSingletonParam).
+        if (mr.partition_columns().empty()) {
+            op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+        }
+
         op.params["partition_keys"] = keys_csv;
         op.params["order_column"] = mr.order_column();
         op.params["rows_per_match"] = mr.all_rows() ? "all" : "one";
@@ -1490,6 +1503,12 @@ std::string compile_node(const LogicalPlan& node,
         if (!ptf.partition_columns().empty()) {
             op.key_by = "row_key";
         }
+        // Unpartitioned: this operator's state covers the whole stream, so it must
+        // not be fanned out (see kForcedSingletonParam).
+        if (ptf.partition_columns().empty()) {
+            op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+        }
+
         op.params["function_name"] = ptf.fn_name();
         op.params["partition_keys"] = keys_csv;
         std::string id = op.id;
@@ -1624,6 +1643,9 @@ std::string compile_node(const LogicalPlan& node,
         op.out_channel = std::string{kChannelRow};
         if (!agg.group_keys().empty())
             op.key_by = "row_key";
+        if (agg.group_keys().empty()) {
+            op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+        }
         op.params["time_column"] = w.time_column;
         switch (w.kind) {
             case WindowSpec::Kind::Tumble:
@@ -2060,6 +2082,12 @@ std::string compile_node(const LogicalPlan& node,
         op.out_channel = std::string{kChannelRow};
         if (!ov.partition_columns().empty())
             op.key_by = "row_key";
+        // Unpartitioned: this operator's state covers the whole stream, so it must
+        // not be fanned out (see kForcedSingletonParam).
+        if (ov.partition_columns().empty()) {
+            op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+        }
+
         op.params["partition_columns"] = part_csv;
         op.params["time_column"] = ov.order_time_column();
         clink::config::JsonArray arr;
@@ -2110,6 +2138,12 @@ std::string compile_node(const LogicalPlan& node,
         op.out_channel = std::string{kChannelRow};
         if (!ln.partition_columns().empty())
             op.key_by = "row_key";
+        // Unpartitioned: this operator's state covers the whole stream, so it must
+        // not be fanned out (see kForcedSingletonParam).
+        if (ln.partition_columns().empty()) {
+            op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+        }
+
         op.params["partition_columns"] = part_csv;
         op.params["order_column"] = ln.order_column();
         clink::config::JsonArray arr;
@@ -2159,6 +2193,12 @@ std::string compile_node(const LogicalPlan& node,
         op.out_channel = std::string{kChannelRow};
         if (!tn.partition_columns().empty())
             op.key_by = "row_key";
+        // Unpartitioned: this operator's state covers the whole stream, so it must
+        // not be fanned out (see kForcedSingletonParam).
+        if (tn.partition_columns().empty()) {
+            op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+        }
+
         std::string part_csv;
         for (std::size_t i = 0; i < tn.partition_columns().size(); ++i) {
             if (i > 0)
