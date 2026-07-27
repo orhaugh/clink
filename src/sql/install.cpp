@@ -147,49 +147,97 @@ struct JsonValueLess {
     }
 };
 
+// Cold aggregate members, allocated only when an aggregate family actually needs them.
+//
+// These five cost 128 bytes of every AggState whether or not the query uses them, and
+// most queries do not: COUNT(DISTINCT) and STRING_AGG want value_counts, retractable
+// MIN/MAX wants minmax_counts, PERCENTILE wants percentile_values, ARRAY_AGG wants
+// array_values, a decimal SUM wants running_sum_dec, and a user-defined aggregate wants
+// udaf_acc. A COUNT(*) - the shape nexmark q12 runs - touches none of them and used to
+// carry all six anyway, in every group.
+//
+// Measured on the rig: q12 held 3.9 KB of state per group for an int64 key and a counter.
+// Locally, against the real operator through the embedded engine, the same query costs
+// 681 bytes per group, of which AggState at 264 bytes was the single largest item.
+struct AggStateExtras {
+    // COUNT(DISTINCT) and STRING_AGG: value -> multiplicity, sorted so STRING_AGG output
+    // is deterministic and retraction just decrements.
+    std::map<std::string, int> value_counts;
+    // Retractable MIN/MAX: type-ordered value -> multiplicity, so a delete can recompute
+    // the new extreme.
+    std::map<clink::config::JsonValue, int, JsonValueLess> minmax_counts;
+    // PERCENTILE / APPROX_PERCENTILE: live numeric values, sorted lazily at finalize.
+    std::vector<double> percentile_values;
+    // ARRAY_AGG: live values in insertion order.
+    std::vector<clink::config::JsonValue> array_values;
+    // #56 exact decimal SUM: accumulates every value exactly, in parallel with the double
+    // running_sum that AVG and the variance family need.
+    clink::config::Decimal running_sum_dec{};
+    // UDAF: the opaque accumulator a registered aggregate UDF manages.
+    clink::config::JsonValue udaf_acc{nullptr};
+};
+
 struct AggState {
-    // Tagged accumulators: SUM / AVG keep running double + count; the
-    // variance/stddev family also keeps sum-of-squares. COUNT(DISTINCT)
-    // and STRING_AGG keep a value -> multiplicity map (sorted, so
-    // STRING_AGG output is deterministic and retraction just decrements).
-    // MIN / MAX keep a single running value on the append-only path, or
-    // (when AggSpec.retractable) a type-ordered value -> multiplicity map
-    // so a delete recomputes the new extreme.
+    // Hot members, inline: every aggregate family reads or writes some of these.
     double running_sum = 0.0;
     double running_sum_sq = 0.0;
     std::int64_t running_count = 0;
+    // MIN / MAX keep a single running value on the append-only path; the retractable path
+    // additionally uses extras().minmax_counts.
     clink::config::JsonValue running_min{nullptr};
     clink::config::JsonValue running_max{nullptr};
     bool initialised = false;
-    std::map<std::string, int> value_counts;
-    std::map<clink::config::JsonValue, int, JsonValueLess> minmax_counts;
-    // #56: exact decimal SUM. running_sum (double, above) is kept in parallel
-    // for AVG/variance; running_sum_dec accumulates every value exactly (a
-    // dec-string or an integral number). The SUM result is emitted as a decimal
-    // iff a dec-string was summed AND the exact accumulation stayed complete (no
-    // non-integral double and no overflow broke it).
-    clink::config::Decimal running_sum_dec{};
+    // Decimal-SUM bookkeeping. The flags stay inline (4 bytes) while the Decimal itself
+    // moved to extras: the flags are read on every SUM, the value only when one is exact.
     bool sum_dec_started = false;
     bool sum_saw_decimal = false;
     bool sum_dec_complete = true;
-    // PERCENTILE / APPROX_PERCENTILE: live numeric values, sorted lazily at
-    // finalize. Retraction removes one occurrence (a late delete forces a
-    // recompute of the extreme from the remaining values).
-    std::vector<double> percentile_values;
-    // ARRAY_AGG: live values in insertion order. NULLs are skipped (the
-    // default IGNORE NULLS behaviour). Retraction erases the first matching occurrence;
-    // finalize emits a JSON array (deduplicated for ARRAY_AGG(DISTINCT)).
-    std::vector<clink::config::JsonValue> array_values;
-    // UDAF (SQLOPT-3): the opaque accumulator a registered aggregate UDF
-    // manages. Kept a JsonValue (not std::any / a closure) so it serialises on
-    // the Row wire and would ride any keyed-state snapshot exactly like the
-    // built-in AggState fields - i.e. at parity with them (these SQL aggregate
-    // operators hold per-group state in-process and do not currently persist it
-    // through a StateBackend, for built-ins or UDAFs alike). Lazily init()'d on
-    // first touch so finalize/merge over an empty group still see a well-formed
-    // value.
-    clink::config::JsonValue udaf_acc{nullptr};
     bool udaf_initialised = false;
+
+    // ---- cold members -----------------------------------------------------------
+    // Null until an aggregate family that needs them touches one. Access through
+    // extras() to write (allocates on first use) and extras_or_null() to read.
+    std::unique_ptr<AggStateExtras> cold;
+
+    AggStateExtras& extras() {
+        if (!cold) {
+            cold = std::make_unique<AggStateExtras>();
+        }
+        return *cold;
+    }
+    [[nodiscard]] const AggStateExtras* extras_or_null() const noexcept { return cold.get(); }
+    // Read-side default for the empty case, so a reader never allocates just to find
+    // nothing. Static because every absent extras block is equivalent.
+    [[nodiscard]] const AggStateExtras& extras_read() const noexcept {
+        static const AggStateExtras kEmpty{};
+        return cold ? *cold : kEmpty;
+    }
+
+    // AggState is copied (into and out of keyed state, and by the bucket codecs), so the
+    // unique_ptr needs a deep copy rather than the deleted default.
+    AggState() = default;
+    ~AggState() = default;
+    AggState(AggState&&) noexcept = default;
+    AggState& operator=(AggState&&) noexcept = default;
+    AggState(const AggState& o)
+        : running_sum(o.running_sum),
+          running_sum_sq(o.running_sum_sq),
+          running_count(o.running_count),
+          running_min(o.running_min),
+          running_max(o.running_max),
+          initialised(o.initialised),
+          sum_dec_started(o.sum_dec_started),
+          sum_saw_decimal(o.sum_saw_decimal),
+          sum_dec_complete(o.sum_dec_complete),
+          udaf_initialised(o.udaf_initialised),
+          cold(o.cold ? std::make_unique<AggStateExtras>(*o.cold) : nullptr) {}
+    AggState& operator=(const AggState& o) {
+        if (this != &o) {
+            AggState tmp(o);
+            *this = std::move(tmp);
+        }
+        return *this;
+    }
 };
 
 // A per-group accumulator bucket: the group-key column values plus one
@@ -306,31 +354,31 @@ inline void encode_agg_state(std::vector<std::byte>& o, const AggState& s) {
     put_json(o, s.running_min);
     put_json(o, s.running_max);
     put_bool(o, s.initialised);
-    put_u32(o, static_cast<std::uint32_t>(s.value_counts.size()));
-    for (const auto& [k, v] : s.value_counts) {
+    put_u32(o, static_cast<std::uint32_t>(s.extras_read().value_counts.size()));
+    for (const auto& [k, v] : s.extras_read().value_counts) {
         put_str(o, k);
         put_u32(o, static_cast<std::uint32_t>(v));
     }
-    put_u32(o, static_cast<std::uint32_t>(s.minmax_counts.size()));
-    for (const auto& [k, v] : s.minmax_counts) {
+    put_u32(o, static_cast<std::uint32_t>(s.extras_read().minmax_counts.size()));
+    for (const auto& [k, v] : s.extras_read().minmax_counts) {
         put_json(o, k);
         put_u32(o, static_cast<std::uint32_t>(v));
     }
     // exact-decimal sum: dec-string text (default Decimal -> "0").
     put_str(o,
-            clink::config::make_dec_value(s.running_sum_dec).is_string()
-                ? clink::config::make_dec_value(s.running_sum_dec).as_string()
+            clink::config::make_dec_value(s.extras_read().running_sum_dec).is_string()
+                ? clink::config::make_dec_value(s.extras_read().running_sum_dec).as_string()
                 : std::string{});
     put_bool(o, s.sum_dec_started);
     put_bool(o, s.sum_saw_decimal);
     put_bool(o, s.sum_dec_complete);
-    put_u32(o, static_cast<std::uint32_t>(s.percentile_values.size()));
-    for (double d : s.percentile_values)
+    put_u32(o, static_cast<std::uint32_t>(s.extras_read().percentile_values.size()));
+    for (double d : s.extras_read().percentile_values)
         put_double(o, d);
-    put_u32(o, static_cast<std::uint32_t>(s.array_values.size()));
-    for (const auto& v : s.array_values)
+    put_u32(o, static_cast<std::uint32_t>(s.extras_read().array_values.size()));
+    for (const auto& v : s.extras_read().array_values)
         put_json(o, v);
-    put_json(o, s.udaf_acc);
+    put_json(o, s.extras_read().udaf_acc);
     put_bool(o, s.udaf_initialised);
 }
 
@@ -344,27 +392,27 @@ inline AggState decode_agg_state(Reader& r) {
     s.initialised = r.boolean();
     for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i) {
         std::string k = r.str();
-        s.value_counts[k] = static_cast<int>(r.u32());
+        s.extras().value_counts[k] = static_cast<int>(r.u32());
     }
     for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i) {
         clink::config::JsonValue k = r.json();
-        s.minmax_counts[k] = static_cast<int>(r.u32());
+        s.extras().minmax_counts[k] = static_cast<int>(r.u32());
     }
     {
         const std::string dec = r.str();
         if (!dec.empty()) {
             if (auto d = clink::config::dec_parse(dec))
-                s.running_sum_dec = *d;
+                s.extras().running_sum_dec = *d;
         }
     }
     s.sum_dec_started = r.boolean();
     s.sum_saw_decimal = r.boolean();
     s.sum_dec_complete = r.boolean();
     for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i)
-        s.percentile_values.push_back(r.dbl());
+        s.extras().percentile_values.push_back(r.dbl());
     for (std::uint32_t n = r.u32(), i = 0; i < n && r.ok; ++i)
-        s.array_values.push_back(r.json());
-    s.udaf_acc = r.json();
+        s.extras().array_values.push_back(r.json());
+    s.extras().udaf_acc = r.json();
     s.udaf_initialised = r.boolean();
     return s;
 }
@@ -559,7 +607,7 @@ inline std::string udaf_distinct_key(const std::vector<clink::config::JsonValue>
 // so finalize/merge over an empty group still see a well-formed init() value.
 inline void ensure_udaf_init(AggState& st, const clink::AggFunctionRegistry::Entry& e) {
     if (!st.udaf_initialised) {
-        st.udaf_acc = e.init();
+        st.extras().udaf_acc = e.init();
         st.udaf_initialised = true;
     }
 }
@@ -622,22 +670,23 @@ void retract_agg(AggState& st, const AggSpec& spec, const Row& row) {
         if (spec.distinct) {
             // The accumulator folded each distinct tuple exactly once, so
             // retract only when the LAST live occurrence of the tuple goes.
-            auto vc = st.value_counts.find(udaf_distinct_key(*args));
-            if (vc == st.value_counts.end())
+            auto& vcs = st.extras().value_counts;
+            auto vc = vcs.find(udaf_distinct_key(*args));
+            if (vc == vcs.end())
                 return;  // never accumulated; nothing to undo
             if (--vc->second > 0)
                 return;  // other live occurrences keep the tuple folded
-            st.value_counts.erase(vc);
+            st.extras().value_counts.erase(vc);
         }
-        st.udaf_acc = spec.udaf->retract(std::move(st.udaf_acc), *args);
+        st.extras().udaf_acc = spec.udaf->retract(std::move(st.extras_read().udaf_acc), *args);
         return;
     }
     // Decrement the multiplicity map and erase a value at zero (used by
     // COUNT(DISTINCT) and STRING_AGG).
     auto retract_value = [&st](const std::string& key) {
-        auto vc = st.value_counts.find(key);
-        if (vc != st.value_counts.end() && --vc->second <= 0) {
-            st.value_counts.erase(vc);
+        auto vc = st.extras().value_counts.find(key);
+        if (vc != st.extras().value_counts.end() && --vc->second <= 0) {
+            st.extras().value_counts.erase(vc);
         }
     };
     if (spec.fn == "count") {
@@ -666,7 +715,7 @@ void retract_agg(AggState& st, const AggSpec& spec, const Row& row) {
     }
     if (is_percentile_fn(spec.fn)) {
         if (v.is_number()) {
-            auto& pv = st.percentile_values;
+            auto& pv = st.extras().percentile_values;
             auto found = std::find(pv.begin(), pv.end(), v.as_number());
             if (found != pv.end())
                 pv.erase(found);
@@ -677,7 +726,7 @@ void retract_agg(AggState& st, const AggSpec& spec, const Row& row) {
         // Remove one occurrence matching the deleted value (serialized
         // equality, so 1 and "1" stay distinct). Insertion order of the
         // survivors is preserved.
-        auto& av = st.array_values;
+        auto& av = st.extras().array_values;
         const std::string key = v.serialize(0);
         auto found = std::find_if(av.begin(), av.end(), [&key](const clink::config::JsonValue& x) {
             return x.serialize(0) == key;
@@ -689,8 +738,8 @@ void retract_agg(AggState& st, const AggSpec& spec, const Row& row) {
     if (spec.fn == "sum" || spec.fn == "avg") {
         if (auto dv = clink::config::as_decimal(v)) {  // #56: mirror the exact decimal sum
             if (st.sum_dec_started) {
-                if (auto s = clink::config::dec_sub(st.running_sum_dec, *dv))
-                    st.running_sum_dec = *s;
+                if (auto s = clink::config::dec_sub(st.extras_read().running_sum_dec, *dv))
+                    st.extras().running_sum_dec = *s;
                 else
                     st.sum_dec_complete = false;
             }
@@ -718,9 +767,9 @@ void retract_agg(AggState& st, const AggSpec& spec, const Row& row) {
         // is never called - only the changelog GROUP BY retracts, and it
         // sets retractable.)
         if (spec.retractable) {
-            auto mc = st.minmax_counts.find(v);
-            if (mc != st.minmax_counts.end() && --mc->second <= 0) {
-                st.minmax_counts.erase(mc);
+            auto mc = st.extras().minmax_counts.find(v);
+            if (mc != st.extras().minmax_counts.end() && --mc->second <= 0) {
+                st.extras().minmax_counts.erase(mc);
             }
         }
         return;
@@ -737,10 +786,10 @@ void update_agg(AggState& st, const AggSpec& spec, const Row& row) {
         if (spec.distinct) {
             // Fold each distinct argument tuple exactly once; further
             // occurrences only bump the multiplicity for retraction.
-            if (++st.value_counts[udaf_distinct_key(*args)] != 1)
+            if (++st.extras().value_counts[udaf_distinct_key(*args)] != 1)
                 return;
         }
-        st.udaf_acc = spec.udaf->accumulate(std::move(st.udaf_acc), *args);
+        st.extras().udaf_acc = spec.udaf->accumulate(std::move(st.extras_read().udaf_acc), *args);
         return;
     }
     if (spec.fn == "count") {
@@ -753,7 +802,7 @@ void update_agg(AggState& st, const AggSpec& spec, const Row& row) {
         auto it = row.values.find(spec.input_column);
         if (it != row.values.end() && !it->second.is_null()) {
             if (spec.distinct) {
-                ++st.value_counts[agg_value_key(it->second, spec)];
+                ++st.extras().value_counts[agg_value_key(it->second, spec)];
             } else {
                 ++st.running_count;
             }
@@ -765,18 +814,18 @@ void update_agg(AggState& st, const AggSpec& spec, const Row& row) {
         return;
     const auto& v = it->second;
     if (spec.fn == "string_agg") {
-        ++st.value_counts[agg_value_key(v, spec)];
+        ++st.extras().value_counts[agg_value_key(v, spec)];
         return;
     }
     if (is_percentile_fn(spec.fn)) {
         if (v.is_number())
-            st.percentile_values.push_back(v.as_number());
+            st.extras().percentile_values.push_back(v.as_number());
         return;
     }
     if (spec.fn == "array_agg") {
         // Append in arrival order; DISTINCT dedup happens at finalize so
         // retraction stays a simple erase-one-occurrence.
-        st.array_values.push_back(v);
+        st.extras().array_values.push_back(v);
         return;
     }
     if (spec.fn == "sum" || spec.fn == "avg") {
@@ -784,12 +833,12 @@ void update_agg(AggState& st, const AggSpec& spec, const Row& row) {
         // alongside the double running_sum used by AVG.
         if (auto dv = clink::config::as_decimal(v)) {
             if (st.sum_dec_started) {
-                if (auto s = clink::config::dec_add(st.running_sum_dec, *dv))
-                    st.running_sum_dec = *s;
+                if (auto s = clink::config::dec_add(st.extras_read().running_sum_dec, *dv))
+                    st.extras().running_sum_dec = *s;
                 else
                     st.sum_dec_complete = false;  // overflow -> fall back to double for the result
             } else {
-                st.running_sum_dec = *dv;
+                st.extras().running_sum_dec = *dv;
                 st.sum_dec_started = true;
             }
             if (clink::config::is_dec_string(v))
@@ -814,7 +863,7 @@ void update_agg(AggState& st, const AggSpec& spec, const Row& row) {
         if (spec.retractable) {
             // Retractable path: track every live value so a later delete
             // can recompute the extreme. finalize reads begin()/rbegin().
-            ++st.minmax_counts[v];
+            ++st.extras().minmax_counts[v];
             return;
         }
         const bool is_min = spec.fn == "min";
@@ -854,18 +903,19 @@ clink::config::JsonValue finalize_agg(const AggState& st, const AggSpec& spec) {
         if (!st.udaf_initialised) {
             return spec.udaf->result(spec.udaf->init());
         }
-        return spec.udaf->result(st.udaf_acc);
+        return spec.udaf->result(st.extras_read().udaf_acc);
     }
     if (spec.fn == "count") {
         if (spec.distinct) {
-            return clink::config::JsonValue{static_cast<std::int64_t>(st.value_counts.size())};
+            return clink::config::JsonValue{
+                static_cast<std::int64_t>(st.extras_read().value_counts.size())};
         }
         return clink::config::JsonValue{static_cast<std::int64_t>(st.running_count)};
     }
     if (is_percentile_fn(spec.fn)) {
-        if (st.percentile_values.empty())
+        if (st.extras_read().percentile_values.empty())
             return clink::config::JsonValue{nullptr};
-        std::vector<double> sorted = st.percentile_values;
+        std::vector<double> sorted = st.extras_read().percentile_values;
         std::sort(sorted.begin(), sorted.end());
         // PERCENTILE_CONT semantics: linear interpolation between the two
         // closest ranks. approx_percentile uses the same exact path here
@@ -882,26 +932,26 @@ clink::config::JsonValue finalize_agg(const AggState& st, const AggSpec& spec) {
         // SQL ARRAY_AGG over zero (non-null) rows is NULL, matching
         // PostgreSQL. DISTINCT dedups on serialized equality, keeping the
         // first occurrence so order stays deterministic.
-        if (st.array_values.empty())
+        if (st.extras_read().array_values.empty())
             return clink::config::JsonValue{nullptr};
         clink::config::JsonArray arr;
         if (spec.distinct) {
             std::set<std::string> seen;
-            for (const auto& val : st.array_values) {
+            for (const auto& val : st.extras_read().array_values) {
                 if (seen.insert(val.serialize(0)).second)
                     arr.push_back(val);
             }
         } else {
-            arr.assign(st.array_values.begin(), st.array_values.end());
+            arr.assign(st.extras_read().array_values.begin(), st.extras_read().array_values.end());
         }
         return clink::config::JsonValue{std::move(arr)};
     }
     if (spec.fn == "string_agg") {
-        if (st.value_counts.empty())
+        if (st.extras_read().value_counts.empty())
             return clink::config::JsonValue{nullptr};
         std::string out;
         bool first = true;
-        for (const auto& [key, count] : st.value_counts) {
+        for (const auto& [key, count] : st.extras_read().value_counts) {
             const int reps = spec.distinct ? 1 : count;
             for (int i = 0; i < reps; ++i) {
                 if (!first)
@@ -918,13 +968,14 @@ clink::config::JsonValue finalize_agg(const AggState& st, const AggSpec& spec) {
         // or it overflowed 128-bit (either clears sum_dec_complete).
         if (st.sum_dec_started && st.sum_dec_complete) {
             if (st.sum_saw_decimal)
-                return clink::config::make_dec_value(st.running_sum_dec);  // exact decimal
+                return clink::config::make_dec_value(
+                    st.extras_read().running_sum_dec);  // exact decimal
             // All-integer SUM: emit an exact int64 when it fits, else the exact
             // decimal - never rounding the total through a double (past 2^53 the
             // old running-double path lost precision).
-            if (auto i = clink::config::dec_to_int64(st.running_sum_dec))
+            if (auto i = clink::config::dec_to_int64(st.extras_read().running_sum_dec))
                 return clink::config::JsonValue{*i};
-            return clink::config::make_dec_value(st.running_sum_dec);
+            return clink::config::make_dec_value(st.extras_read().running_sum_dec);
         }
         // A fractional double was summed: the double running_sum is the answer.
         return clink::config::JsonValue{st.running_sum};
@@ -936,15 +987,17 @@ clink::config::JsonValue finalize_agg(const AggState& st, const AggSpec& spec) {
     }
     if (spec.fn == "min") {
         if (spec.retractable) {
-            return st.minmax_counts.empty() ? clink::config::JsonValue{nullptr}
-                                            : st.minmax_counts.begin()->first;
+            return st.extras_read().minmax_counts.empty()
+                       ? clink::config::JsonValue{nullptr}
+                       : st.extras_read().minmax_counts.begin()->first;
         }
         return st.running_min;
     }
     if (spec.fn == "max") {
         if (spec.retractable) {
-            return st.minmax_counts.empty() ? clink::config::JsonValue{nullptr}
-                                            : st.minmax_counts.rbegin()->first;
+            return st.extras_read().minmax_counts.empty()
+                       ? clink::config::JsonValue{nullptr}
+                       : st.extras_read().minmax_counts.rbegin()->first;
         }
         return st.running_max;
     }
@@ -1031,7 +1084,7 @@ inline bool is_vectorisable_numeric(arrow::Type::type id) {
 inline bool aggs_vectorisable(const std::vector<AggSpec>& aggs, const arrow::RecordBatch& rb) {
     for (const auto& a : aggs) {
         // DISTINCT and UDAF are never column-foldable (the kernel drives only the
-        // scalar accumulators, not value_counts / the udaf accumulator), matching
+        // scalar accumulators, not extras().value_counts / the udaf accumulator), matching
         // is_batch_foldable's first check. Critical for the WINDOW path, which
         // gates ONLY on this (the GROUP BY path is also gated on
         // batch_fold_eligible_): without this, a windowed COUNT(DISTINCT) would
@@ -1105,7 +1158,7 @@ inline std::vector<VecAggCol> resolve_vec_agg_cols(const std::vector<AggSpec>& a
 // Fold the records at `idxs` into `states` (one AggState per aggregate)
 // column-at-a-time, byte-identical to update_agg over the vectorisable set:
 // COUNT(*) = slice size, COUNT(col) = non-null count, SUM/AVG/variance skip nulls
-// and accumulate the double (and, for decimal SUM/AVG, the exact running_sum_dec).
+// and accumulate the double (and, for decimal SUM/AVG, the exact extras().running_sum_dec).
 inline void vectorised_fold_slice(const std::vector<AggSpec>& aggs,
                                   const std::vector<VecAggCol>& cols,
                                   const std::vector<std::int64_t>& idxs,
@@ -1157,10 +1210,11 @@ inline void vectorised_fold_slice(const std::vector<AggSpec>& aggs,
                     st.running_sum_sq += d * d;
                 } else {
                     if (!st.sum_dec_started) {
-                        st.running_sum_dec = dv;
+                        st.extras().running_sum_dec = dv;
                         st.sum_dec_started = true;
-                    } else if (auto s = clink::config::dec_add(st.running_sum_dec, dv)) {
-                        st.running_sum_dec = *s;
+                    } else if (auto s =
+                                   clink::config::dec_add(st.extras_read().running_sum_dec, dv)) {
+                        st.extras().running_sum_dec = *s;
                     } else {
                         st.sum_dec_complete = false;
                     }
@@ -1191,10 +1245,11 @@ inline void vectorised_fold_slice(const std::vector<AggSpec>& aggs,
                                                     : static_cast<std::int64_t>(ac.i32->Value(i));
                         const clink::config::Decimal dv{arrow::Decimal128(iv), 0};
                         if (!st.sum_dec_started) {
-                            st.running_sum_dec = dv;
+                            st.extras().running_sum_dec = dv;
                             st.sum_dec_started = true;
-                        } else if (auto s = clink::config::dec_add(st.running_sum_dec, dv)) {
-                            st.running_sum_dec = *s;
+                        } else if (auto s = clink::config::dec_add(st.extras_read().running_sum_dec,
+                                                                   dv)) {
+                            st.extras().running_sum_dec = *s;
                         } else {
                             st.sum_dec_complete = false;  // 128-bit overflow -> double result
                         }
@@ -1271,6 +1326,19 @@ struct WindowBucket {
     // window_end (CUMULATE slices share a start but differ by end).
     std::int64_t window_start = 0;
 };
+
+// AggState is allocated once per aggregate PER GROUP, so its size is a memory budget,
+// not a detail. It reached 264 bytes by accretion - every new aggregate family added its
+// container inline and nothing ever paid attention - which cost 264 bytes in every group
+// of every windowed query, including a COUNT(*) that uses 8 of them.
+//
+// This assert exists to make the next such addition a deliberate decision. If a new family
+// needs per-group storage, put it in AggStateExtras (allocated only when used) rather than
+// inline here. Raise the bound only with a reason.
+static_assert(sizeof(AggState) <= 112,
+              "AggState grew: new per-group aggregate storage belongs in AggStateExtras, "
+              "which is allocated only when the aggregate family actually uses it. See the "
+              "note on AggStateExtras.");
 
 namespace window_codec_detail {
 // (de)serialise one WindowBucket: window_start + group_values (Row JSON) + the
@@ -2434,7 +2502,8 @@ private:
                             " cannot merge SESSION windows (cross-session dedup is not possible "
                             "over an opaque accumulator); use TUMBLE/HOP/CUMULATE/GROUP BY");
                     }
-                    a.udaf_acc = spec.udaf->merge(std::move(a.udaf_acc), b.udaf_acc);
+                    a.extras().udaf_acc = spec.udaf->merge(std::move(a.extras_read().udaf_acc),
+                                                           b.extras_read().udaf_acc);
                 }
                 continue;
             }
@@ -2450,25 +2519,28 @@ private:
             // #56: merge the exact decimal sum across the combined sessions.
             if (b.sum_dec_started) {
                 if (a.sum_dec_started) {
-                    if (auto s = clink::config::dec_add(a.running_sum_dec, b.running_sum_dec))
-                        a.running_sum_dec = *s;
+                    if (auto s = clink::config::dec_add(a.extras_read().running_sum_dec,
+                                                        b.extras_read().running_sum_dec))
+                        a.extras().running_sum_dec = *s;
                     else
                         a.sum_dec_complete = false;
                 } else {
-                    a.running_sum_dec = b.running_sum_dec;
+                    a.extras().running_sum_dec = b.extras_read().running_sum_dec;
                     a.sum_dec_started = true;
                 }
             }
             a.sum_saw_decimal = a.sum_saw_decimal || b.sum_saw_decimal;
             a.sum_dec_complete = a.sum_dec_complete && b.sum_dec_complete;
-            for (const auto& [k, c] : b.value_counts)
-                a.value_counts[k] += c;
-            for (const auto& [k, c] : b.minmax_counts)
-                a.minmax_counts[k] += c;
-            a.percentile_values.insert(
-                a.percentile_values.end(), b.percentile_values.begin(), b.percentile_values.end());
-            a.array_values.insert(
-                a.array_values.end(), b.array_values.begin(), b.array_values.end());
+            for (const auto& [k, c] : b.extras_read().value_counts)
+                a.extras().value_counts[k] += c;
+            for (const auto& [k, c] : b.extras_read().minmax_counts)
+                a.extras().minmax_counts[k] += c;
+            a.extras().percentile_values.insert(a.extras_read().percentile_values.end(),
+                                                b.extras_read().percentile_values.begin(),
+                                                b.extras_read().percentile_values.end());
+            a.extras().array_values.insert(a.extras_read().array_values.end(),
+                                           b.extras_read().array_values.begin(),
+                                           b.extras_read().array_values.end());
             // Running MIN / MAX hold a single value (the append-only window
             // path); merge by comparison rather than addition.
             if (spec.fn == "min") {

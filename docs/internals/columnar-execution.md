@@ -96,6 +96,41 @@ batch to the row fallback and produces the right answer anyway. That test uses t
 int64 columns, where nothing else can save it, and it was confirmed to fail against an
 unverified-guess mutation.
 
+### Per-group state in a windowed aggregate
+
+A windowed `GROUP BY` allocates one `AggState` per aggregate per group, so that struct's
+size is a memory budget rather than a detail. It had reached **264 bytes** by accretion:
+every aggregate family that needed per-group storage had added its container inline, so a
+`COUNT(*)` - which uses one `int64` - still carried two `std::map`s, two `std::vector`s, a
+`Decimal`, and two `JsonValue`s for MIN/MAX it never touches.
+
+The rarely-used members now live in `AggStateExtras` behind a `std::unique_ptr`, allocated
+on first use by the families that need them (COUNT(DISTINCT), STRING_AGG, retractable
+MIN/MAX, PERCENTILE, ARRAY_AGG, exact decimal SUM, UDAF accumulators). Writers go through
+`extras()`, which allocates; readers through `extras_read()`, which returns a shared empty
+instance so a read never allocates to find nothing.
+
+    sizeof(AggState)          264 -> 104 bytes
+    per-group state cost      681 -> 454 bytes   (real operator, measured end to end)
+
+Measured with `benchmarks/clink_window_state_bench`, which runs the query through the
+embedded engine and differences peak RSS between many groups and one, so everything that
+does not scale with the group count cancels. It drives the REAL operator deliberately: the
+hot-path bench's q12 shape is a hand-written model of this state and cannot validate a
+change to it.
+
+`static_assert(sizeof(AggState) <= 112)` guards the result. The struct did not reach 264
+bytes through one bad decision but through several reasonable ones with nobody watching
+the total, so the next addition now has to be deliberate.
+
+**What is left, for whoever picks this up.** 454 bytes per group is still far more than
+an int64 key and a counter need. The remainder is container overhead rather than the
+accumulator: a `std::map` node per open window, the `Row group_values` each bucket keeps
+so the emit can reconstruct the group columns, and the keyed-state entry itself. The two
+`JsonValue`s for MIN/MAX are 64 of the remaining 104 bytes and could move to extras too,
+at the cost of making a non-retractable MIN/MAX allocate per group - not obviously a good
+trade, and unmeasured.
+
 ### The keyed shuffle's split
 
 `gather_columnar_by_target` (`include/clink/runtime/columnar_split.hpp`) partitions one

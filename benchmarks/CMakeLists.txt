@@ -94,6 +94,16 @@ add_executable(clink_fusion_bench clink_fusion_bench.cpp)
 target_link_libraries(clink_fusion_bench PRIVATE clink::sql)
 clink_set_warnings(clink_fusion_bench)
 
+# Per-group memory cost of a windowed aggregate, against the REAL operator via the
+# embedded engine. The rig attributed 3.9 KB per group to a COUNT(*) keyed by an int64;
+# this reproduces that locally so a fix can be iterated in seconds. The hot-path bench's
+# q12 shape is a hand-written MODEL of the state and cannot validate an operator change.
+if(TARGET clink::embed)
+    add_executable(clink_window_state_bench clink_window_state_bench.cpp)
+    target_link_libraries(clink_window_state_bench PRIVATE clink::embed clink::sql)
+    clink_set_warnings(clink_window_state_bench)
+endif()
+
 # Keyed-shuffle split cost in isolation. The `hash` partitioner was 19.3% of all worker
 # CPU on nexmark q12 - the largest non-library compute item in the engine, ahead of the
 # window aggregation it feeds. This drives gather_columnar_by_target directly, since a
