@@ -653,10 +653,23 @@ private:
     }
 
     void purge_(const StateKey& sk, const TimeWindow& window) {
+        // Erase BOTH tiers, unconditionally. store_ above writes mem_ on every path
+        // because mem_ is the authoritative hot-path copy in persistent mode too; this
+        // function kept the old keyed_-XOR-mem_ shape, so a purged window was removed from
+        // the backend but LEFT IN mem_ forever. Two consequences, both measured:
+        //
+        //  * the watermark sweep iterates mem_, so it re-walked every window ever purged
+        //    and issued a redundant keyed_->erase for each one. Backend erases grew as
+        //    N(N+1)/2 - 8,002,000 erases and 708ms at 4,000 windows, against 0 erases and
+        //    under a millisecond in memory mode. Quadratic, and on RocksDB it is a
+        //    tombstone write per stale window per sweep.
+        //  * the retained entry means persistent mode and in-memory mode disagree about
+        //    what a late record for a purged window does.
+        //
+        // Matches what the evicting and session operators in this family already do.
+        mem_.erase(sk);
         if (keyed_) {
             keyed_->erase(sk);
-        } else {
-            mem_.erase(sk);
         }
         trigger_->clear(window, ctx_);
     }
