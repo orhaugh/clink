@@ -3220,4 +3220,90 @@ TEST(SqlBinder, CyclicViewReferenceRejectedAtBind) {
     EXPECT_THROW(b.bind_select(as_select(parse("SELECT user_id FROM v1"))), TranslationError);
 }
 
+// ---------------------------------------------------------------------------
+// Window arguments must be rejected at BIND time, not at deploy time.
+//
+// The window operators do validate their own arguments, and they throw clear
+// messages - but they throw while a WORKER is building the task. A task that fails
+// to build never closes its output channel, so every downstream stage blocks, and
+// the job reports nothing until a watchdog declares the worker lost, which is
+// longer than a submit's own timeout. A rejected parameter therefore presented as a
+// DEADLOCK with no error attached: nexmark q5 cost a long investigation that ended
+// at an argument order.
+//
+// So every invariant a window operator's constructor enforces is mirrored here, and
+// these tests are what keep the two in step.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string window_bind_error(const char* sql) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    try {
+        b.bind_select(as_select(parse(sql)));
+    } catch (const TranslationError& e) {
+        return e.what();
+    }
+    return {};  // empty = accepted, which for these inputs is the failure
+}
+
+}  // namespace
+
+// THE REGRESSION. clink takes HOP(time, SIZE, SLIDE); Flink's table function takes
+// HOP(TABLE, DESCRIPTOR, SLIDE, SIZE). A query ported from Flink arrives with the
+// two swapped, which makes slide exceed size.
+TEST(SqlBinder, HopWithSlideExceedingSizeIsRejectedAtBindTime) {
+    const auto msg = window_bind_error(
+        "SELECT COUNT(*) FROM clicks GROUP BY HOP(ts, INTERVAL '2' SECOND, "
+        "INTERVAL '10' SECOND)");
+    ASSERT_FALSE(msg.empty()) << "slide > size must be a BIND error, not a deploy-time throw";
+    EXPECT_NE(msg.find("slide"), std::string::npos) << msg;
+    // The message must name the argument ORDER, or a reader who ported the query
+    // from Flink has no way to see what is wrong with it.
+    EXPECT_NE(msg.find("SIZE, SLIDE"), std::string::npos)
+        << "the error should explain the argument order, since that is the actual "
+           "mistake being made: "
+        << msg;
+}
+
+TEST(SqlBinder, HopWithZeroSlideIsRejectedAtBindTime) {
+    EXPECT_FALSE(window_bind_error("SELECT COUNT(*) FROM clicks "
+                                   "GROUP BY HOP(ts, INTERVAL '10' SECOND, 0)")
+                     .empty());
+}
+
+TEST(SqlBinder, TumbleWithZeroSizeIsRejectedAtBindTime) {
+    EXPECT_FALSE(window_bind_error("SELECT COUNT(*) FROM clicks GROUP BY TUMBLE(ts, 0)").empty());
+}
+
+TEST(SqlBinder, SessionWithZeroGapIsRejectedAtBindTime) {
+    EXPECT_FALSE(window_bind_error("SELECT COUNT(*) FROM clicks GROUP BY SESSION(ts, 0)").empty());
+}
+
+// CUMULATE was ALREADY validated at bind time (see CumulateRejectsNonMultipleSize
+// and CumulateRejectsZeroStep above), which is exactly why it never produced this
+// failure mode. Restated here so the sweep reads uniformly across the four kinds
+// and a future reader does not have to notice the asymmetry to trust it.
+TEST(SqlBinder, CumulateWithSizeNotDivisibleByStepIsRejectedAtBindTime) {
+    EXPECT_FALSE(window_bind_error("SELECT COUNT(*) FROM clicks GROUP BY CUMULATE(ts, 3000, 10000)")
+                     .empty());
+}
+
+// The valid forms must still bind, or the checks above are just breaking windows.
+TEST(SqlBinder, ValidWindowFormsStillBind) {
+    EXPECT_TRUE(
+        window_bind_error("SELECT COUNT(*) FROM clicks GROUP BY TUMBLE(ts, 10000)").empty());
+    EXPECT_TRUE(
+        window_bind_error("SELECT COUNT(*) FROM clicks GROUP BY HOP(ts, 10000, 2000)").empty());
+    EXPECT_TRUE(
+        window_bind_error("SELECT COUNT(*) FROM clicks GROUP BY SESSION(ts, 10000)").empty());
+    EXPECT_TRUE(window_bind_error("SELECT COUNT(*) FROM clicks GROUP BY CUMULATE(ts, 2000, 10000)")
+                    .empty());
+    // slide == size is the degenerate hop that equals a tumble, and is legal.
+    EXPECT_TRUE(
+        window_bind_error("SELECT COUNT(*) FROM clicks GROUP BY HOP(ts, 10000, 10000)").empty());
+}
+
 }  // namespace clink::sql

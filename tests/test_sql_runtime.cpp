@@ -14110,4 +14110,257 @@ TEST(WindowOperatorDirect, HoppingEmitsEveryOverlappingPane) {
         << "a 10s/2s hop must place one event in five overlapping panes; got " << rows.size();
 }
 
+// ---------------------------------------------------------------------------
+// WINDOW SWEEP. Every window kind, on both the row and the columnar path.
+//
+// The hopping window had NO test anywhere until q5 needed it, and q5 was new - so a
+// query written with Flink's argument order reached deployment, the operator threw
+// in its constructor, and the job deadlocked instead of failing. The lesson is not
+// specific to HOP: each kind has its own arithmetic and its own invariants, and
+// three of the four were only ever exercised through one nexmark query apiece.
+//
+// Both paths matter because they are separate code. A Kafka/JSON source produces
+// COLUMNAR batches, so the pipeline runs process_columnar - a different fold from
+// the row path, which is what the direct row tests alone would have missed.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The COLUMNAR variant. A Kafka/JSON source produces columnar batches, so the
+// pipeline runs process_columnar - a different fold from the row path. Testing only
+// the row path is what let the hopping window ship untested through the path that
+// actually runs.
+std::vector<std::string> drive_window_op_columnar(
+    const std::string& op_type,
+    const std::map<std::string, std::string>& params,
+    const std::vector<std::pair<std::int64_t, std::int64_t>>& ts_and_key,
+    std::int64_t final_watermark_ms) {
+    ensure_sql_installed_once();
+    const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+        op_type, std::string{kChannelRow}, std::string{kChannelRow});
+    if (f == nullptr) {
+        ADD_FAILURE() << "no factory for " << op_type;
+        return {};
+    }
+    cluster::OperatorBuildContext ctx;
+    ctx.params = params;
+    ctx.parallelism = 1;
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(f->build(ctx));
+
+    const std::vector<RowColumn> cols = {{"auction", arrow::int64()}, {"datetime", arrow::int64()}};
+    auto batcher = clink::sql::make_row_columnar_arrow_batcher(cols);
+    Batch<Row> in;
+    for (const auto& [ts, key] : ts_and_key) {
+        Row r;
+        r.values["auction"] = clink::config::JsonValue{key};
+        r.values["datetime"] = clink::config::JsonValue{ts};
+        in.emplace(r, EventTime{ts});
+    }
+    auto rb = batcher.build(in);
+    Batch<Row> columnar{std::move(rb), ts_and_key.size(), clink::sql::row_materialize_fn()};
+
+    std::vector<std::string> out_rows;
+    Emitter<Row> em([&](StreamElement<Row> e) {
+        if (e.is_data()) {
+            for (const auto& rec : e.as_data()) {
+                out_rows.push_back(canonical(
+                    clink::config::JsonValue{clink::sql::to_json_object(rec.value().values)},
+                    drop_cols()));
+            }
+        }
+        return true;
+    });
+    auto el = StreamElement<Row>::data(std::move(columnar));
+    if (!op->supports_columnar() || !op->process_columnar(el, em)) {
+        op->process(el, em);  // operator declined the fast path; row fallback
+    }
+    op->process(StreamElement<Row>::watermark(Watermark{EventTime{final_watermark_ms}}), em);
+    return out_rows;
+}
+
+std::map<std::string, std::string> session_params(const std::string& gap_ms) {
+    return {{"time_column", "datetime"},
+            {"group_keys", "auction"},
+            {"group_key_outputs", "auction"},
+            {"aggregates", R"([{"name":"num","fn":"count","input_column":""}])"},
+            {"gap_ms", gap_ms}};
+}
+
+std::map<std::string, std::string> cumulate_params(const std::string& size_ms,
+                                                   const std::string& step_ms) {
+    return {{"time_column", "datetime"},
+            {"group_keys", "auction"},
+            {"group_key_outputs", "auction"},
+            {"aggregates", R"([{"name":"num","fn":"count","input_column":""}])"},
+            {"size_ms", size_ms},
+            {"step_ms", step_ms}};
+}
+
+}  // namespace
+
+// --- TUMBLE ---------------------------------------------------------------
+
+// The boundary rule: window_end is EXCLUSIVE, so a record exactly at the boundary
+// belongs to the NEXT window. An off-by-one here silently mis-buckets every record
+// that lands on a boundary, which real timestamps do constantly.
+TEST(WindowOperatorDirect, TumblingBoundaryIsExclusive) {
+    const auto rows = drive_window_op(
+        "tumbling_window_row", window_params("10000", ""), {{9999, 7}, {10000, 7}}, 1'000'000);
+    EXPECT_EQ(rows.size(), 2u) << "9999 and 10000 must land in DIFFERENT windows";
+}
+
+// --- SESSION --------------------------------------------------------------
+
+// A gap shorter than the threshold merges; a gap at or beyond it splits. Both
+// directions are asserted, because a test that only merges would pass an operator
+// that never splits.
+TEST(WindowOperatorDirect, SessionMergesWithinGapAndSplitsBeyondIt) {
+    // 1000 and 5000 are 4s apart (< 10s gap) -> one session. 20000 is 15s after
+    // 5000 (>= gap) -> a second session.
+    const auto rows = drive_window_op("session_window_row",
+                                      session_params("10000"),
+                                      {{1000, 7}, {5000, 7}, {20000, 7}},
+                                      1'000'000);
+    EXPECT_EQ(rows.size(), 2u) << "expected two sessions: {1000,5000} then {20000}; got "
+                               << rows.size();
+}
+
+TEST(WindowOperatorDirect, SessionOverColumnarInput) {
+    const auto rows = drive_window_op_columnar("session_window_row",
+                                               session_params("10000"),
+                                               {{1000, 7}, {5000, 7}, {20000, 7}},
+                                               1'000'000);
+    EXPECT_EQ(rows.size(), 2u) << "session semantics must match on the columnar path";
+}
+
+// --- CUMULATE -------------------------------------------------------------
+
+// CUMULATE emits a pane per step up to size, each cumulative from the window start.
+// A record at ts belongs to every pane whose end exceeds it, so an early record
+// appears in ALL of them.
+TEST(WindowOperatorDirect, CumulateEmitsOnePanePerStep) {
+    // size 10s, step 2s -> panes ending at 2,4,6,8,10s. A record at 1000 is in all 5.
+    const auto rows = drive_window_op(
+        "cumulate_window_row", cumulate_params("10000", "2000"), {{1000, 7}}, 1'000'000);
+    EXPECT_EQ(rows.size(), 5u) << "a 10s window stepping 2s must emit five cumulative panes; got "
+                               << rows.size();
+}
+
+TEST(WindowOperatorDirect, CumulateOverColumnarInput) {
+    const auto rows = drive_window_op_columnar(
+        "cumulate_window_row", cumulate_params("10000", "2000"), {{1000, 7}}, 1'000'000);
+    EXPECT_EQ(rows.size(), 5u) << "cumulate semantics must match on the columnar path";
+}
+
+// --- the watermark contract, shared by every kind -------------------------
+
+// A window must NOT emit before the watermark passes its end. Firing early is as
+// wrong as never firing, and only the terminal-watermark case was covered.
+TEST(WindowOperatorDirect, WindowDoesNotFireBeforeTheWatermarkPassesItsEnd) {
+    // A watermark of 5000 is inside [0,10000), so nothing may be emitted yet.
+    const auto rows = drive_window_op("tumbling_window_row",
+                                      window_params("10000", ""),
+                                      {{1000, 7}},
+                                      /*final_watermark_ms=*/5000);
+    EXPECT_TRUE(rows.empty()) << "a window whose end is past the watermark must not fire; got "
+                              << rows.size() << " rows";
+}
+
+TEST(WindowOperatorDirect, HoppingFiresOnlyThePanesTheWatermarkHasPassed) {
+    // ts=11000 is in panes starting 2000..10000, ending 12000..20000. A watermark of
+    // 14000 has passed the panes ending 12000 and 14000 only.
+    const auto rows = drive_window_op("hopping_window_row",
+                                      window_params("10000", "2000"),
+                                      {{11000, 7}},
+                                      /*final_watermark_ms=*/14000);
+    EXPECT_EQ(rows.size(), 2u) << "only the panes ending at or before the watermark may fire; got "
+                               << rows.size();
+}
+
+TEST(WindowOperatorDirect, TumblingOverColumnarInputEmitsOnePanePerWindow) {
+    const auto rows = drive_window_op_columnar("tumbling_window_row",
+                                               window_params("10000", ""),
+                                               {{1000, 7}, {3000, 7}, {11000, 7}},
+                                               1'000'000);
+    EXPECT_EQ(rows.size(), 2u) << "two windows for one key over a columnar batch";
+}
+
+TEST(WindowOperatorDirect, HoppingOverColumnarInputEmitsEveryOverlappingPane) {
+    const auto rows = drive_window_op_columnar(
+        "hopping_window_row", window_params("10000", "2000"), {{11000, 7}}, 1'000'000);
+    EXPECT_EQ(rows.size(), 5u)
+        << "a 10s/2s hop must place one event in five panes on the COLUMNAR path too; got "
+        << rows.size();
+}
+
+// A task that cannot BUILD must fail the job promptly, not wedge it.
+//
+// The job completes only when every subtask reports, and a subtask that threw while
+// being built never closed its output channel - so its downstream peers block on an
+// open empty channel and never report either. The job then hung until a watchdog
+// declared the worker lost, which is longer than a submit's own timeout, and the
+// error the failed task DID raise never surfaced. That is how nexmark q5's rejected
+// HOP arguments presented as a deadlock instead of a bad parameter.
+//
+// The window parameters are now also rejected at bind time, so this drives the
+// failure the only way still available: by handing the operator a param set the
+// PLANNER would never emit. The point under test is the coordinator's response to an
+// unrecoverable subtask error, which is the general case - every operator that
+// validates in its constructor, and every required connector option checked only
+// there, reaches the runtime through this same path.
+TEST_F(NexmarkQueries, TaskThatFailsToBuildFailsTheJobRatherThanHanging) {
+    Catalog cat;
+    auto ddl = parse(bid_ddl() + sink_ddl("auction BIGINT, num BIGINT"));
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT auction, COUNT(*) AS num FROM bid "
+                        "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), auction");
+    for (auto& op : spec.ops) {
+        if (op.type == "kafka_source_string") {
+            op.type = "file_text_source";
+            op.params.clear();
+            op.params["path"] = streams_.bid.string();
+        }
+        // Corrupt the window's size AFTER planning, reproducing a constructor that
+        // refuses its arguments at deploy.
+        if (op.type == "tumbling_window_row") {
+            op.params["size_ms"] = "0";  // the operator requires size_ms > 0
+        }
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    bool completed = false;
+    bool ok = true;
+    std::vector<std::string> errors;
+    {
+        InProcessCluster cluster("worker-buildfail", 24);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 25s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        completed = r.completed;
+        ok = r.ok;
+        errors = r.errors;
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    EXPECT_TRUE(completed) << "the job must COMPLETE (as failed) rather than time out; a task "
+                              "that cannot build used to wedge its peers until a watchdog fired";
+    EXPECT_FALSE(ok) << "a job whose task could not build must not report success";
+    ASSERT_FALSE(errors.empty()) << "the failure must carry the operator's own message";
+    bool names_the_cause = false;
+    for (const auto& e : errors) {
+        if (e.find("size_ms") != std::string::npos) {
+            names_the_cause = true;
+        }
+    }
+    EXPECT_TRUE(names_the_cause)
+        << "the reported error should be the constructor's, not a generic timeout; got: "
+        << errors[0];
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 20)
+        << "it should fail in about the time a deploy takes, not wait for a watchdog";
+}
+
 }  // namespace clink::sql

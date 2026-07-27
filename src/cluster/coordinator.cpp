@@ -3187,6 +3187,46 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                                .count();
                 se.message = msg.error_message;
                 job.subtask_errors.push_back(std::move(se));
+
+                // An unrecoverable subtask error must take the job DOWN, not leave
+                // it waiting. The job completes only when completed_count reaches
+                // expected_completion, and a subtask that failed to BUILD never
+                // closed its output channel - so every downstream peer blocks on an
+                // open empty channel and never reports. completed_count then never
+                // reaches the target and the job hangs until the watchdog declares
+                // the worker lost, which is longer than a submit's own timeout.
+                //
+                // That is how a rejected parameter presented as a DEADLOCK with no
+                // error attached: nexmark q5's HOP arguments were in Flink's order,
+                // the operator's constructor correctly refused them, and the refusal
+                // never surfaced. The parameter is now also rejected at bind time,
+                // but the general shape - a task that cannot start wedging its peers
+                // - applies to every operator that validates in its constructor, and
+                // to every required connector option that is only checked there.
+                //
+                // Cancelling the peers makes each report SubtaskFinished, which
+                // drives completed_count to expected_completion and completes the
+                // job as FAILED, carrying the error above. The checkpointed-restart
+                // path already does exactly this to drain before redeploying; this
+                // is the same broadcast for the case where there is no restart to
+                // make.
+                //
+                // It sets error_cancel_broadcast, NOT cancel_requested. The latter
+                // decides the reported outcome, and it is checked before the error
+                // list - so reusing it made a FAILED job report "cancelled", which
+                // two history-server tests caught. Reordering that check instead
+                // would be worse: a user cancel routinely produces teardown errors,
+                // so a cancelled job would start reporting "failed".
+                if (!job.error_cancel_broadcast && !job.cancel_requested &&
+                    !job.completion_signalled) {
+                    job.error_cancel_broadcast = true;
+                    for (const auto& [worker_id2, _] : job.tasks_by_worker) {
+                        auto cit = registered_.find(worker_id2);
+                        if (cit != registered_.end() && !cit->second->lost && cit->second->conn) {
+                            error_restart_cancels.emplace_back(cit->second->conn.get(), job_id);
+                        }
+                    }
+                }
             }
             // Free this subtask's slot on the owning worker.
             auto pending_it = job.pending_per_worker.find(msg.worker_id);

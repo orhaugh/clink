@@ -587,6 +587,12 @@ private:
         // it to surface "cancelled by client" instead of the bare
         // SubtaskFinished error messages.
         bool cancel_requested{false};
+        // An unrecoverable subtask error has already broadcast CancelJob to the
+        // job's workers, so peers wedged by the failed task drain and the job can
+        // complete. Deliberately NOT cancel_requested: that flag decides the
+        // reported outcome, and a job that FAILED must report failed, not
+        // cancelled. This one only stops the broadcast repeating.
+        bool error_cancel_broadcast{false};
 
         // worker-crash recovery state.
         //

@@ -1295,6 +1295,38 @@ WindowSpec decode_window_call(const ast::FunctionCall& fc,
     if (spec.size_ms < 0 || spec.slide_ms < 0 || spec.gap_ms < 0 || spec.step_ms < 0) {
         bind_error(fc.name + " window parameters must be non-negative", fc.loc.pos);
     }
+    // Mirror EVERY invariant the window operator's constructor enforces, so a bad
+    // window is a bind error the user sees at submit rather than a task that throws
+    // at deploy.
+    //
+    // That distinction is not cosmetic. The operator does validate, and loudly - but
+    // it throws while a worker is building the task, and a task that fails to build
+    // never closes its output channel, so every downstream stage blocks. The job
+    // then reports nothing until a watchdog declares the worker lost, which is
+    // longer than the submit's own timeout. A rejected parameter therefore presented
+    // as a DEADLOCK with no error attached, and nexmark q5 spent a long
+    // investigation looking like an engine bug when it was an argument order.
+    //
+    // So: anything the constructor can refuse, refuse here first.
+    if (spec.kind != WindowSpec::Kind::Session && spec.size_ms <= 0) {
+        bind_error(fc.name + ": size must be > 0", fc.loc.pos);
+    }
+    if (spec.kind == WindowSpec::Kind::Session && spec.gap_ms <= 0) {
+        bind_error("SESSION: gap must be > 0", fc.loc.pos);
+    }
+    if (spec.kind == WindowSpec::Kind::Hop &&
+        (spec.slide_ms <= 0 || spec.slide_ms > spec.size_ms)) {
+        // Name the argument order in the message. clink takes HOP(time, SIZE,
+        // SLIDE); Flink's table function takes HOP(TABLE, DESCRIPTOR, SLIDE, SIZE),
+        // so a query ported from Flink lands here with the two swapped, and "slide
+        // must not exceed size" alone would not tell the reader why.
+        bind_error("HOP needs 0 < slide <= size, got size=" + std::to_string(spec.size_ms) +
+                       "ms slide=" + std::to_string(spec.slide_ms) +
+                       "ms. Note the argument order is HOP(time, SIZE, SLIDE); Flink's "
+                       "table function takes SLIDE before SIZE, so a query ported from it "
+                       "needs them swapped.",
+                   fc.loc.pos);
+    }
     return spec;
 }
 
