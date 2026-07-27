@@ -26,6 +26,7 @@
 #include "clink/runtime/output_tag.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/keyed_state.hpp"
+#include "clink/time/window_arithmetic.hpp"
 
 namespace clink {
 
@@ -328,7 +329,7 @@ public:
                         const Value& v,
                         std::int64_t ts,
                         Emitter<std::pair<Key, Agg>>& out) {
-        const std::int64_t window_start = (ts / window_size_.count()) * window_size_.count();
+        const std::int64_t window_start = window_start_for(ts, window_size_.count());
         const TimeWindow window{.start = window_start, .end = window_start + window_size_.count()};
         if (late_tag_.has_value()) {
             const std::int64_t purge_at = window.end + allowed_lateness_.count();
@@ -363,7 +364,7 @@ private:
                      const std::optional<EventTime>& et,
                      Emitter<std::pair<Key, Agg>>& out) {
         const std::int64_t ts = et.value_or(EventTime{0}).millis();
-        const std::int64_t window_start = (ts / window_size_.count()) * window_size_.count();
+        const std::int64_t window_start = window_start_for(ts, window_size_.count());
         const TimeWindow window{.start = window_start, .end = window_start + window_size_.count()};
         // Late-late check: if the user opted into a late-data side output AND
         // the current watermark has already crossed (window_end +

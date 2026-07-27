@@ -15,9 +15,11 @@
 #include <future>
 #include <map>
 #include <mutex>
+#include <random>
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <arrow/api.h>
@@ -68,6 +70,7 @@
 #include "clink/state/remote_read_backend.hpp"
 #include "clink/state_processor/savepoint.hpp"
 #include "clink/state_processor/state_diff.hpp"
+#include "clink/time/window_arithmetic.hpp"
 
 using namespace clink;
 using namespace std::chrono_literals;
@@ -11338,9 +11341,13 @@ TEST(SqlRuntime, ColumnarParquetHopWindowVectorised) {
     for (const auto& p : {in_path, pq_path, out_path})
         std::filesystem::remove(p);
 
-    // HOP(ts, size=2000, slide=1000): ts 500 -> [0,2000); 1500 -> [0,2000)+[1000,3000);
-    // 2500 -> [1000,3000)+[2000,4000). So windows (by end): 2000 {10+20=30, n2},
-    // 3000 {20+30=50, n2}, 4000 {30, n1}.
+    // HOP(ts, size=2000, slide=1000). Panes sit at every multiple of 1000,
+    // including the negative ones, so:
+    //   ts 500  -> [-1000,1000) + [0,2000)
+    //   ts 1500 -> [0,2000)     + [1000,3000)
+    //   ts 2500 -> [1000,3000)  + [2000,4000)
+    // Windows by end: 1000 {10, n1}, 2000 {10+20=30, n2}, 3000 {20+30=50, n2},
+    // 4000 {30, n1}.
     write_lines(in_path,
                 {
                     R"({"user_id":1,"ts":500,"amount":10})",
@@ -11398,15 +11405,16 @@ TEST(SqlRuntime, ColumnarParquetHopWindowVectorised) {
     EXPECT_EQ(clink::detail::batch_materialize_counter().load(std::memory_order_relaxed),
               mat_before);
 
-    // Collect (total, count) pairs; the three overlapping windows are
-    // {30,2}, {50,2}, {30,1} (count distinguishes the two total=30 windows).
+    // Collect (total, count) pairs; the four overlapping windows are
+    // {10,1}, {30,2}, {50,2}, {30,1} (count distinguishes the two total=30 windows).
     std::multiset<std::pair<std::int64_t, std::int64_t>> got;
     for (const auto& l : read_lines(out_path)) {
         auto js = clink::config::parse(l);
         got.emplace(static_cast<std::int64_t>(js.at("total").as_number()),
                     static_cast<std::int64_t>(js.at("cnt").as_number()));
     }
-    const std::multiset<std::pair<std::int64_t, std::int64_t>> want{{30, 2}, {50, 2}, {30, 1}};
+    const std::multiset<std::pair<std::int64_t, std::int64_t>> want{
+        {10, 1}, {30, 2}, {50, 2}, {30, 1}};
     EXPECT_EQ(got, want);
 
     for (const auto& p : {in_path, pq_path, out_path})
@@ -14361,6 +14369,494 @@ TEST_F(NexmarkQueries, TaskThatFailsToBuildFailsTheJobRatherThanHanging) {
         << errors[0];
     EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 20)
         << "it should fail in about the time a deploy takes, not wait for a watchdog";
+}
+
+// ---------------------------------------------------------------------------
+// WINDOW DIFFERENTIAL TESTS.
+//
+// Every test above asserts a hand-written expectation, which means each one covers
+// exactly the case someone thought of. These assert EQUIVALENCES instead: two ways
+// of running the same window must agree. That needs no oracle, because each side is
+// the other's expectation, and one generated input covers as many cases as it has
+// records.
+//
+// The four equivalences are chosen to sit on the axes that actually let bugs
+// through:
+//
+//   row path == columnar path      the columnar fold is separate code, and it is
+//                                  the one a Kafka/JSON source runs
+//   batching does not matter       the columnar fold groups PER BATCH, so a
+//                                  batch-dependent answer is a real defect
+//   watermark cadence does not     firing early or twice shows up here and
+//     change the final answer       nowhere else
+//   the degenerate forms agree     HOP with slide==size and CUMULATE with
+//                                  step==size are TUMBLE, computed three ways
+//
+// Unlike the tests above, these compare row VALUES and keep window_start and
+// window_end, which drop_cols() removes. Two windows that differ only in their
+// bounds are a different answer, and dropping the bounds would hide it.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// How to feed a window operator. Every field is an axis the answer must not depend
+// on.
+struct WinDrive {
+    bool columnar = false;
+    // Records per batch. 0 means one batch for everything.
+    std::size_t batch_size = 1;
+    // Emit a watermark at each batch's highest timestamp, not just a terminal one.
+    // Only meaningful for an in-order input: with out-of-order input this makes
+    // records legitimately late, which is a different question (Phase 4).
+    bool watermark_per_batch = false;
+};
+
+// Window bounds are part of the answer here, so only the changelog marker is
+// dropped.
+const std::vector<std::string>& window_drop_cols() {
+    static const std::vector<std::string> v = {std::string{kRowKindField}};
+    return v;
+}
+
+// Drive a window operator under `how` and return its output rows as a multiset, so
+// two runs compare by value and multiplicity while staying insensitive to the
+// order panes happen to fire in.
+std::multiset<std::string> drive_window(
+    const std::string& op_type,
+    const std::map<std::string, std::string>& params,
+    const std::vector<std::pair<std::int64_t, std::int64_t>>& input,
+    std::int64_t final_watermark_ms,
+    const WinDrive& how) {
+    ensure_sql_installed_once();
+    const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+        op_type, std::string{kChannelRow}, std::string{kChannelRow});
+    if (f == nullptr) {
+        ADD_FAILURE() << "no operator factory registered for " << op_type;
+        return {};
+    }
+    cluster::OperatorBuildContext ctx;
+    ctx.params = params;
+    ctx.parallelism = 1;
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(f->build(ctx));
+
+    std::multiset<std::string> out_rows;
+    Emitter<Row> em([&](StreamElement<Row> e) {
+        if (e.is_data()) {
+            for (const auto& rec : e.as_data()) {
+                out_rows.insert(canonical(
+                    clink::config::JsonValue{clink::sql::to_json_object(rec.value().values)},
+                    window_drop_cols()));
+            }
+        }
+        return true;
+    });
+
+    const std::size_t bs = how.batch_size == 0 ? input.size() : how.batch_size;
+    const std::vector<RowColumn> cols = {{"auction", arrow::int64()}, {"datetime", arrow::int64()}};
+    for (std::size_t i = 0; i < input.size(); i += bs) {
+        const std::size_t end = std::min(i + bs, input.size());
+        Batch<Row> b;
+        std::int64_t hi = std::numeric_limits<std::int64_t>::min();
+        for (std::size_t j = i; j < end; ++j) {
+            const auto [ts, key] = input[j];
+            Row r;
+            r.values["auction"] = clink::config::JsonValue{key};
+            r.values["datetime"] = clink::config::JsonValue{ts};
+            b.emplace(r, EventTime{ts});
+            hi = std::max(hi, ts);
+        }
+        if (how.columnar) {
+            auto batcher = clink::sql::make_row_columnar_arrow_batcher(cols);
+            auto rb = batcher.build(b);
+            Batch<Row> columnar{std::move(rb), end - i, clink::sql::row_materialize_fn()};
+            auto el = StreamElement<Row>::data(std::move(columnar));
+            // A columnar batch the operator declines must still be processed, or
+            // this would silently measure nothing. The row fallback is what the
+            // runner does too.
+            if (!op->supports_columnar() || !op->process_columnar(el, em)) {
+                op->process(el, em);
+            }
+        } else {
+            op->process(StreamElement<Row>::data(std::move(b)), em);
+        }
+        if (how.watermark_per_batch && hi != std::numeric_limits<std::int64_t>::min()) {
+            op->process(StreamElement<Row>::watermark(Watermark{EventTime{hi}}), em);
+        }
+    }
+    op->process(StreamElement<Row>::watermark(Watermark{EventTime{final_watermark_ms}}), em);
+    return out_rows;
+}
+
+// A deterministic input generator. A fixed seed keeps a failure reproducible - a
+// test that generates a different input each run reports a different failure each
+// run, which is worse than no test.
+std::vector<std::pair<std::int64_t, std::int64_t>> gen_input(std::uint64_t seed,
+                                                             std::size_t n,
+                                                             std::int64_t span_ms,
+                                                             std::int64_t keys,
+                                                             bool sorted,
+                                                             std::int64_t offset_ms = 0) {
+    std::mt19937_64 rng(seed);
+    std::vector<std::pair<std::int64_t, std::int64_t>> v;
+    v.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto ts = static_cast<std::int64_t>(rng() % static_cast<std::uint64_t>(span_ms));
+        const auto key = static_cast<std::int64_t>(rng() % static_cast<std::uint64_t>(keys));
+        v.emplace_back(ts + offset_ms, key);
+    }
+    if (sorted) {
+        std::sort(v.begin(), v.end());
+    }
+    return v;
+}
+
+// The four kinds under one name, so a differential test can loop over all of them
+// rather than being written four times.
+struct WinKind {
+    const char* label;
+    std::string op_type;
+    std::map<std::string, std::string> params;
+};
+
+std::vector<WinKind> all_window_kinds() {
+    return {
+        {"TUMBLE 10s", "tumbling_window_row", window_params("10000", "")},
+        {"HOP 10s/2s", "hopping_window_row", window_params("10000", "2000")},
+        {"CUMULATE 10s/2s", "cumulate_window_row", cumulate_params("10000", "2000")},
+        {"SESSION 5s", "session_window_row", session_params("5000")},
+    };
+}
+
+// A window whose aggregate the vectorised fold cannot do, so process_columnar takes
+// its OTHER branch. COUNT alone is vectorisable, which means every columnar test
+// written with COUNT exercises one of the two columnar paths and never the other.
+std::map<std::string, std::string> min_max_window_params(const std::string& size_ms,
+                                                         const std::string& slide_ms) {
+    auto p = window_params(size_ms, slide_ms);
+    p["aggregates"] = R"([{"name":"num","fn":"count","input_column":""},)"
+                      R"({"name":"lo","fn":"min","input_column":"datetime"},)"
+                      R"({"name":"hi","fn":"max","input_column":"datetime"}])";
+    return p;
+}
+
+}  // namespace
+
+// The row fold and the columnar fold are separate implementations of the same
+// semantics, and the columnar one is what a Kafka/JSON source actually runs. Only
+// the row path had tests until the sweep above, and the sweep asserts counts; this
+// asserts that every emitted VALUE agrees, over a generated input, for all four
+// kinds.
+TEST(WindowDifferential, RowAndColumnarPathsAgree) {
+    const auto input = gen_input(/*seed=*/20260728,
+                                 /*n=*/400,
+                                 /*span_ms=*/60'000,
+                                 /*keys=*/7,
+                                 /*sorted=*/false);
+    for (const auto& k : all_window_kinds()) {
+        for (const std::size_t bs : {std::size_t{1}, std::size_t{64}, std::size_t{0}}) {
+            WinDrive row{.columnar = false, .batch_size = bs, .watermark_per_batch = false};
+            WinDrive col{.columnar = true, .batch_size = bs, .watermark_per_batch = false};
+            const auto a = drive_window(k.op_type, k.params, input, 1'000'000, row);
+            const auto b = drive_window(k.op_type, k.params, input, 1'000'000, col);
+            // An equivalence between two empty sets holds and proves nothing. Every
+            // differential test here asserts it measured something first.
+            ASSERT_FALSE(a.empty()) << k.label << ": the row path emitted nothing, so the "
+                                    << "comparison below would be vacuous";
+            EXPECT_EQ(a, b) << k.label << ": the columnar fold disagreed with the row fold at "
+                            << "batch size " << bs << " (row " << a.size() << " rows, columnar "
+                            << b.size() << ")";
+        }
+    }
+}
+
+// The vectorised columnar fold handles COUNT/SUM/AVG; MIN and MAX fall through to
+// the per-record-Row columnar ingest, a third implementation of the same fold. A
+// COUNT-only test never reaches it.
+TEST(WindowDifferential, ColumnarPathAgreesForNonVectorisableAggregates) {
+    const auto input =
+        gen_input(/*seed=*/771, /*n=*/300, /*span_ms=*/40'000, /*keys=*/5, /*sorted=*/false);
+    for (const auto& [label, size_ms, slide_ms, op] :
+         std::vector<std::tuple<const char*, const char*, const char*, const char*>>{
+             {"TUMBLE", "10000", "", "tumbling_window_row"},
+             {"HOP", "10000", "2000", "hopping_window_row"}}) {
+        const auto params = min_max_window_params(size_ms, slide_ms);
+        const auto a = drive_window(op, params, input, 1'000'000, WinDrive{.batch_size = 0});
+        const auto b =
+            drive_window(op, params, input, 1'000'000, WinDrive{.columnar = true, .batch_size = 0});
+        ASSERT_FALSE(a.empty()) << label << ": nothing emitted, so the comparison is vacuous";
+        EXPECT_EQ(a, b) << label << " with MIN/MAX: the non-vectorisable columnar ingest disagreed "
+                        << "with the row fold";
+    }
+}
+
+// Window state is per record but the columnar fold groups per BATCH, so an answer
+// that depends on where the batch boundaries fell is a defect. One batch, one record
+// per batch, and an awkward size that splits windows mid-way must all agree.
+TEST(WindowDifferential, BatchBoundariesDoNotChangeTheResult) {
+    const auto input =
+        gen_input(/*seed=*/99, /*n=*/250, /*span_ms=*/45'000, /*keys=*/4, /*sorted=*/false);
+    for (const auto& k : all_window_kinds()) {
+        for (const bool columnar : {false, true}) {
+            const auto one_batch = drive_window(k.op_type,
+                                                k.params,
+                                                input,
+                                                1'000'000,
+                                                WinDrive{.columnar = columnar, .batch_size = 0});
+            ASSERT_FALSE(one_batch.empty()) << k.label << ": nothing emitted, comparison vacuous";
+            for (const std::size_t bs : {std::size_t{1}, std::size_t{7}, std::size_t{128}}) {
+                const auto split = drive_window(k.op_type,
+                                                k.params,
+                                                input,
+                                                1'000'000,
+                                                WinDrive{.columnar = columnar, .batch_size = bs});
+                EXPECT_EQ(one_batch, split)
+                    << k.label << (columnar ? " (columnar)" : " (row)")
+                    << ": splitting the input into batches of " << bs << " changed the answer";
+            }
+        }
+    }
+}
+
+// For an IN-ORDER stream, how often the watermark advances may change WHEN panes
+// fire but must not change WHAT fires. A window that fires early, or twice, shows up
+// here and in no count-based test.
+//
+// The input is sorted deliberately: with out-of-order input a per-batch watermark
+// makes later records genuinely late, and dropping them is correct rather than a
+// disagreement. That case is tested separately.
+TEST(WindowDifferential, WatermarkGranularityDoesNotChangeTheResult) {
+    const auto input =
+        gen_input(/*seed=*/4242, /*n=*/300, /*span_ms=*/50'000, /*keys=*/6, /*sorted=*/true);
+    for (const auto& k : all_window_kinds()) {
+        for (const bool columnar : {false, true}) {
+            const auto terminal_only =
+                drive_window(k.op_type,
+                             k.params,
+                             input,
+                             1'000'000,
+                             WinDrive{.columnar = columnar, .batch_size = 16});
+            const auto per_batch = drive_window(
+                k.op_type,
+                k.params,
+                input,
+                1'000'000,
+                WinDrive{.columnar = columnar, .batch_size = 16, .watermark_per_batch = true});
+            ASSERT_FALSE(terminal_only.empty())
+                << k.label << ": nothing emitted, comparison vacuous";
+            EXPECT_EQ(terminal_only, per_batch)
+                << k.label << (columnar ? " (columnar)" : " (row)")
+                << ": advancing the watermark as the data arrived changed the final answer";
+        }
+    }
+}
+
+// A HOP whose slide equals its size IS a tumbling window, and a CUMULATE whose step
+// equals its size is too. Both forms bind, and the bind tests assert they bind - but
+// nothing asserted they COMPUTE the same thing, which is the part that matters.
+TEST(WindowDifferential, DegenerateHopAndCumulateEqualTumble) {
+    const auto input =
+        gen_input(/*seed=*/31337, /*n=*/300, /*span_ms=*/50'000, /*keys=*/5, /*sorted=*/false);
+    const auto tumble = drive_window("tumbling_window_row",
+                                     window_params("10000", ""),
+                                     input,
+                                     1'000'000,
+                                     WinDrive{.batch_size = 0});
+    ASSERT_FALSE(tumble.empty()) << "the control produced nothing, so nothing below means anything";
+
+    const auto hop = drive_window("hopping_window_row",
+                                  window_params("10000", "10000"),
+                                  input,
+                                  1'000'000,
+                                  WinDrive{.batch_size = 0});
+    EXPECT_EQ(tumble, hop) << "HOP with slide == size must be exactly TUMBLE";
+
+    const auto cumulate = drive_window("cumulate_window_row",
+                                       cumulate_params("10000", "10000"),
+                                       input,
+                                       1'000'000,
+                                       WinDrive{.batch_size = 0});
+    EXPECT_EQ(tumble, cumulate) << "CUMULATE with step == size must be exactly TUMBLE";
+}
+
+// The same three-way equivalence for timestamps BEFORE the epoch. Every generated
+// input above is non-negative, because `rng() % span` is, so nothing above reaches
+// the negative branch of the window arithmetic - and integer division truncates
+// toward zero rather than flooring, so that branch is where the three kinds can
+// stop agreeing.
+//
+// Pre-epoch event time is real data: a historical backfill, or a source whose clock
+// is wrong. Whatever the engine does with it, the three kinds must do the SAME
+// thing, and a record must land in a window that contains it.
+TEST(WindowDifferential, DegenerateFormsAlsoAgreeBeforeTheEpoch) {
+    // Spans [-30s, +20s), so it straddles the epoch rather than sitting entirely
+    // one side of it: both branches of the arithmetic run in one input.
+    const auto input = gen_input(/*seed=*/5150,
+                                 /*n=*/200,
+                                 /*span_ms=*/50'000,
+                                 /*keys=*/4,
+                                 /*sorted=*/false,
+                                 /*offset_ms=*/-30'000);
+    const auto tumble = drive_window("tumbling_window_row",
+                                     window_params("10000", ""),
+                                     input,
+                                     1'000'000,
+                                     WinDrive{.batch_size = 0});
+    ASSERT_FALSE(tumble.empty()) << "the control produced nothing";
+    const auto hop = drive_window("hopping_window_row",
+                                  window_params("10000", "10000"),
+                                  input,
+                                  1'000'000,
+                                  WinDrive{.batch_size = 0});
+    const auto cumulate = drive_window("cumulate_window_row",
+                                       cumulate_params("10000", "10000"),
+                                       input,
+                                       1'000'000,
+                                       WinDrive{.batch_size = 0});
+    EXPECT_EQ(tumble, hop) << "HOP with slide == size must be TUMBLE for pre-epoch timestamps too";
+    EXPECT_EQ(tumble, cumulate) << "CUMULATE with step == size must be TUMBLE before the epoch too";
+}
+
+// Whatever a window does with a timestamp, the record must land ONLY in windows
+// that contain it, and in ALL of them.
+//
+// Driving one record at a time is what makes this precise. With many records every
+// window plausibly contains SOME of them, so a whole-input check cannot see a
+// one-window shift - and a one-window shift toward zero is exactly what truncating
+// division produced for negative timestamps. One record admits no such ambiguity:
+// window_start <= ts < window_end, or the answer is wrong.
+//
+// The expected pane count is derived from the window definition rather than from
+// the operator, so this is an oracle and not a snapshot of current behaviour.
+TEST(WindowDifferential, ASingleRecordLandsInEveryWindowThatContainsItAndNoOther) {
+    struct Kind {
+        const char* label;
+        std::string op_type;
+        std::map<std::string, std::string> params;
+        // Panes containing a record at `ts`, derived from the window DEFINITION.
+        std::function<std::size_t(std::int64_t)> expected_panes;
+    };
+    const std::int64_t size = 10'000;
+    const std::int64_t step = 2'000;
+    const std::vector<Kind> kinds = {
+        {"TUMBLE 10s",
+         "tumbling_window_row",
+         window_params("10000", ""),
+         [](std::int64_t) { return std::size_t{1}; }},
+        // A hop whose size divides evenly by its slide puts every record in exactly
+        // size/slide panes, wherever in the window it falls.
+        {"HOP 10s/2s",
+         "hopping_window_row",
+         window_params("10000", "2000"),
+         [size, step](std::int64_t) { return static_cast<std::size_t>(size / step); }},
+        // CUMULATE is the one kind whose pane count depends on WHERE in the window
+        // the record sits: the panes all share the window's start and end at
+        // successive steps, so a record only appears in those ending after it. A
+        // record 3456 ms into a 10s window stepping 2s is in the panes ending at
+        // 4000, 6000, 8000 and 10000 - four, not five.
+        {"CUMULATE 10s/2s",
+         "cumulate_window_row",
+         cumulate_params("10000", "2000"),
+         [size, step](std::int64_t ts) {
+             const std::int64_t offset = ts - clink::window_start_for(ts, size);
+             return static_cast<std::size_t>((size / step) - (offset / step));
+         }},
+        // A session window's extent is the record itself, so one record is one pane.
+        {"SESSION 5s",
+         "session_window_row",
+         session_params("5000"),
+         [](std::int64_t) { return std::size_t{1}; }},
+    };
+    // Chosen to hit both sides of every boundary the arithmetic can get wrong: the
+    // epoch itself, either side of it, a multiple of the size, a multiple of the
+    // slide, and values far from zero in both directions.
+    const std::vector<std::int64_t> timestamps = {
+        -1,
+        0,
+        1,
+        -9999,
+        -10000,
+        -10001,
+        9999,
+        10000,
+        10001,
+        -2000,
+        2000,
+        -123456,
+        123456,
+    };
+    for (const auto& k : kinds) {
+        for (const std::int64_t ts : timestamps) {
+            const auto rows = drive_window(k.op_type,
+                                           k.params,
+                                           {{ts, 7}},
+                                           /*final_watermark_ms=*/10'000'000,
+                                           WinDrive{.batch_size = 0});
+            const std::size_t want = k.expected_panes(ts);
+            EXPECT_EQ(rows.size(), want)
+                << k.label << " at ts=" << ts << ": a single record must produce exactly " << want
+                << " pane(s); got " << rows.size()
+                << (rows.empty() ? " - the record was DROPPED" : "");
+            for (const auto& r : rows) {
+                const auto js = clink::config::parse(r);
+                const auto& o = js.as_object();
+                const auto ws = o.find("window_start");
+                const auto we = o.find("window_end");
+                ASSERT_TRUE(ws != o.end() && we != o.end())
+                    << k.label << ": emitted row has no window bounds: " << r;
+                const auto s = static_cast<std::int64_t>(ws->second.as_number());
+                const auto e = static_cast<std::int64_t>(we->second.as_number());
+                EXPECT_TRUE(s <= ts && ts < e)
+                    << k.label << ": the record at ts=" << ts << " was folded into window [" << s
+                    << ", " << e << "), which does not contain it";
+            }
+        }
+    }
+}
+
+// The shared arithmetic itself, checked against hand-computed values. The operator
+// tests above would catch a regression here, but they would report it as a window
+// disagreement rather than as the two lines that caused it.
+TEST(WindowArithmetic, FloorsRatherThanTruncatingTowardZero) {
+    // C++ integer division truncates: -1 / 10 == 0. Flooring gives -1.
+    EXPECT_EQ(clink::floor_div(-1, 10), -1);
+    EXPECT_EQ(clink::floor_div(-10, 10), -1);
+    EXPECT_EQ(clink::floor_div(-11, 10), -2);
+    EXPECT_EQ(clink::floor_div(0, 10), 0);
+    EXPECT_EQ(clink::floor_div(9, 10), 0);
+    EXPECT_EQ(clink::floor_div(10, 10), 1);
+}
+
+TEST(WindowArithmetic, WindowStartAlwaysPrecedesItsTimestamp) {
+    for (const std::int64_t size : {std::int64_t{1}, std::int64_t{7}, std::int64_t{10'000}}) {
+        for (std::int64_t ts = -50'000; ts <= 50'000; ts += 997) {
+            const std::int64_t s = clink::window_start_for(ts, size);
+            EXPECT_LE(s, ts) << "window_start " << s << " must not exceed ts " << ts;
+            EXPECT_LT(ts, s + size)
+                << "ts " << ts << " must fall inside [" << s << ", " << s + size << ")";
+            EXPECT_EQ(s % size, 0) << "windows are anchored at the epoch, so the start must be a "
+                                   << "multiple of the size; got " << s;
+        }
+    }
+}
+
+TEST(WindowArithmetic, EveryHopPaneContainsTheTimestampAndThereAreSizeOverSlideOfThem) {
+    const std::int64_t size = 10'000;
+    const std::int64_t slide = 2'000;
+    for (std::int64_t ts = -50'000; ts <= 50'000; ts += 997) {
+        const auto starts = clink::hop_window_starts_for(ts, size, slide);
+        EXPECT_EQ(starts.size(), static_cast<std::size_t>(size / slide))
+            << "ts " << ts << " belongs to size/slide panes";
+        for (const std::int64_t s : starts) {
+            EXPECT_TRUE(s <= ts && ts < s + size)
+                << "pane [" << s << ", " << s + size << ") does not contain ts " << ts;
+            EXPECT_EQ(s % slide, 0) << "pane starts are multiples of the slide; got " << s;
+        }
+        // Ascending and evenly spaced, which is what callers that reserve on the
+        // count and iterate assume.
+        for (std::size_t i = 1; i < starts.size(); ++i) {
+            EXPECT_EQ(starts[i] - starts[i - 1], slide);
+        }
+    }
 }
 
 }  // namespace clink::sql

@@ -54,6 +54,7 @@
 #include "clink/runtime/timer_service.hpp"
 #include "clink/state/broadcast_state.hpp"
 #include "clink/state/keyed_state.hpp"
+#include "clink/time/window_arithmetic.hpp"
 
 namespace clink {
 
@@ -818,7 +819,7 @@ public:
             Collector<Out> col(&out);
             for (const auto& rec : element.as_data()) {
                 const std::int64_t ts = rec.event_time().value_or(EventTime{0}).millis();
-                const std::int64_t start = (ts / size_.count()) * size_.count();
+                const std::int64_t start = window_start_for(ts, size_.count());
                 const std::int64_t end = start + size_.count();
                 const std::int64_t purge_at = end + allowed_lateness_.count();
                 // Late-late: watermark has crossed (end + lateness),
@@ -1083,7 +1084,7 @@ public:
                 const std::int64_t ts = rec.event_time().value_or(EventTime{0}).millis();
                 const std::int64_t slide_ms = slide_.count();
                 const std::int64_t size_ms = size_.count();
-                const std::int64_t first_start = ((ts / slide_ms) * slide_ms);
+                const std::int64_t first_start = window_start_for(ts, slide_ms);
                 const std::int64_t latest_purge_at =
                     first_start + size_ms + allowed_lateness_.count();
                 if (late_tag_.has_value() && last_watermark_ms_ >= latest_purge_at &&

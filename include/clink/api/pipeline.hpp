@@ -36,6 +36,7 @@
 #include "clink/runtime/output_tag.hpp"
 #include "clink/time/event_time.hpp"
 #include "clink/time/watermark_strategy.hpp"
+#include "clink/time/window_arithmetic.hpp"
 
 namespace clink::api {
 
@@ -444,7 +445,7 @@ public:
                 // (latest_end + lateness), every covering window is
                 // gone. Route to side output if a tag is set;
                 // otherwise fall through (fresh-bucket behavior).
-                const std::int64_t latest_start = (t / slide_ms_) * slide_ms_;
+                const std::int64_t latest_start = window_start_for(t, slide_ms_);
                 const std::int64_t latest_purge_at = latest_start + size_ms_ + allowed_lateness_ms_;
                 if (late_tag_.has_value() && last_watermark_ms_ >= latest_purge_at &&
                     this->runtime() != nullptr) {
@@ -1003,7 +1004,7 @@ public:
                 }
                 const std::int64_t t = rec.event_time()->millis();
                 const std::int64_t k = key_fn_(rec.value());
-                const std::int64_t start = (t / size_ms_) * size_ms_;
+                const std::int64_t start = window_start_for(t, size_ms_);
                 const std::int64_t end = start + size_ms_;
                 const std::int64_t purge_at = end + allowed_lateness_ms_;
                 if (late_tag_.has_value() && last_watermark_ms_ >= purge_at &&

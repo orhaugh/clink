@@ -22,6 +22,7 @@
 #include "clink/operators/window_trigger.hpp"
 #include "clink/runtime/output_tag.hpp"
 #include "clink/state/keyed_state.hpp"
+#include "clink/time/window_arithmetic.hpp"
 
 namespace clink {
 
@@ -145,8 +146,7 @@ public:
         if (element.is_data()) {
             for (const auto& record : element.as_data()) {
                 const std::int64_t ts = record.event_time().value_or(EventTime{0}).millis();
-                const std::int64_t window_start =
-                    (ts / window_size_.count()) * window_size_.count();
+                const std::int64_t window_start = window_start_for(ts, window_size_.count());
                 const TimeWindow window{.start = window_start,
                                         .end = window_start + window_size_.count()};
 

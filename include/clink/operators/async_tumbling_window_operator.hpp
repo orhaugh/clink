@@ -7,6 +7,7 @@
 
 #include "clink/core/codec.hpp"
 #include "clink/operators/async_window_operator.hpp"
+#include "clink/time/window_arithmetic.hpp"
 
 namespace clink {
 
@@ -38,7 +39,7 @@ public:
 
 protected:
     std::vector<std::int64_t> assign_windows(std::int64_t ts) const override {
-        return {(ts / this->window_size_ms_) * this->window_size_ms_};
+        return {window_start_for(ts, this->window_size_ms_)};
     }
 };
 

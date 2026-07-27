@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -255,10 +256,19 @@ std::vector<std::pair<std::int64_t, std::int64_t>> drain_side(
 }  // namespace
 
 TEST(AsyncSlidingWindowOperator, SyncAndAsyncProduceIdenticalOverlappingWindows) {
-    // size=1000, slide=500. @200 -> window [0,1000). @700 -> windows [0,1000)
-    // AND [500,1500). So [0,1000) = 10+20 = 30, [500,1500) = 20.
+    // size=1000, slide=500. The panes are at every multiple of 500, INCLUDING the
+    // negative ones, so:
+    //   @200 -> [-500,500) and [0,1000)
+    //   @700 -> [0,1000) and [500,1500)
+    // giving [-500,500) = 10, [0,1000) = 10+20 = 30, [500,1500) = 20.
+    //
+    // The [-500,500) pane used to be missing: the assigner clamped a hop's first
+    // pane to the epoch, so a record within one window-width of it contributed to
+    // fewer panes than it belongs to. A record at ts=200 IS inside [-500,500), and
+    // dropping that pane made this operator disagree with a tumbling window of the
+    // same width for the same input.
     const auto input = recs({{1, 10, 200}, {1, 20, 700}});
-    const std::vector<KA> expected = {{1, 20}, {1, 30}};
+    const std::vector<KA> expected = {{1, 10}, {1, 20}, {1, 30}};
 
     const auto sync_out = run_windows(input, std::make_shared<InMemoryStateBackend>());
     const auto async_out = run_windows(input, std::make_shared<AswInlineAsyncBackend>());
@@ -303,23 +313,28 @@ TEST(AsyncSlidingWindowOperator, EpochGatedFiringObservesAllInFlightReads) {
     op->process_async(StreamElement<KV>::data(std::move(b)), em, aec);
     aec.poll();
 
-    // Watermark 1000 closes only [0,1000); its firing waits for both deferred
-    // reads, so it sees 10 + 30 = 40. [500,1500) (end 1500) does NOT fire yet.
+    // Watermark 1000 closes every pane ending at or before it: [-500,500) and
+    // [0,1000). It does NOT close [500,1500). The point under test is that firing
+    // waits for the deferred reads, so [0,1000) must see BOTH in-flight records:
+    // 10 + 30 = 40, not 10 or 30 alone.
     aec.on_watermark([&] { op->on_watermark(Watermark{EventTime{1000}}, em); });
     aec.drain();
 
     EXPECT_GE(backend->deferrals(), 2u);
-    std::vector<KA> fired;
+    std::multiset<std::int64_t> fired;
     for (const auto& e : drain_ch(ch)) {
         if (e.is_data()) {
             for (const auto& r : e.as_data()) {
-                fired.push_back(r.value());
+                EXPECT_EQ(r.value().first, 1);
+                fired.insert(r.value().second);
             }
         }
     }
-    ASSERT_EQ(fired.size(), 1u) << "only window [0,1000) is due at watermark 1000";
-    EXPECT_EQ(fired[0].first, 1);
-    EXPECT_EQ(fired[0].second, 40) << "firing must observe both in-flight records (10 + 30)";
+    // [-500,500) holds only the record at 200; [0,1000) holds both.
+    const std::multiset<std::int64_t> expected = {10, 40};
+    EXPECT_EQ(fired, expected)
+        << "the panes due at watermark 1000 are [-500,500) = 10 and [0,1000) = 10+30; a 30 here "
+           "would mean the firing did not wait for the in-flight read of the first record";
 }
 
 TEST(AsyncSlidingWindowOperator, OverlappingWindowsSurviveCheckpointRestore) {
@@ -335,7 +350,9 @@ TEST(AsyncSlidingWindowOperator, OverlappingWindowsSurviveCheckpointRestore) {
         op->open();
         BoundedChannel<StreamElement<KA>> ch(64);
         Emitter<KA> em(&ch);
-        // [0,1000) = 30, [500,1500) = 20; both OPEN (no firing watermark yet).
+        // [-500,500) = 10, [0,1000) = 30, [500,1500) = 20; all OPEN (no firing
+        // watermark yet). The leading pane is present because panes sit at every
+        // multiple of the slide, including the negative ones.
         Batch<KV> b;
         b.emplace(KV{1, 10}, EventTime{200});
         b.emplace(KV{1, 20}, EventTime{700});
@@ -367,8 +384,8 @@ TEST(AsyncSlidingWindowOperator, OverlappingWindowsSurviveCheckpointRestore) {
         }
     }
     std::sort(fired.begin(), fired.end());
-    const std::vector<KA> expected = {{1, 20}, {1, 30}};
-    EXPECT_EQ(fired, expected) << "both restored overlapping windows must re-fire with their sums";
+    const std::vector<KA> expected = {{1, 10}, {1, 20}, {1, 30}};
+    EXPECT_EQ(fired, expected) << "every restored overlapping window must re-fire with its sum";
 }
 
 TEST(AsyncSlidingWindowOperator, LateRecordSideOutputOnlyWhenAllOverlappingWindowsPurged) {

@@ -65,6 +65,7 @@
 #include "clink/sql/row_columnar_output.hpp"
 #include "clink/sql/row_kind.hpp"
 #include "clink/time/watermark_strategy.hpp"
+#include "clink/time/window_arithmetic.hpp"
 
 namespace clink::sql {
 
@@ -1868,19 +1869,14 @@ private:
     std::vector<std::pair<std::int64_t, std::int64_t>> windows_for_(std::int64_t ts) const {
         std::vector<std::pair<std::int64_t, std::int64_t>> windows;
         if (kind_ == Kind::Tumble) {
-            std::int64_t start = (ts / size_ms_) * size_ms_;
+            const std::int64_t start = clink::window_start_for(ts, size_ms_);
             windows.emplace_back(start, start + size_ms_);
         } else if (kind_ == Kind::Hop) {
-            std::int64_t last = (ts / slide_ms_) * slide_ms_;
-            std::int64_t first = ((ts - size_ms_ + slide_ms_) / slide_ms_) * slide_ms_;
-            if (first < 0)
-                first = 0;
-            for (std::int64_t s = first; s <= last; s += slide_ms_) {
-                if (ts >= s && ts < s + size_ms_)
-                    windows.emplace_back(s, s + size_ms_);
+            for (const std::int64_t s : clink::hop_window_starts_for(ts, size_ms_, slide_ms_)) {
+                windows.emplace_back(s, s + size_ms_);
             }
         } else {
-            std::int64_t anchor = (ts / size_ms_) * size_ms_;
+            const std::int64_t anchor = clink::window_start_for(ts, size_ms_);
             for (std::int64_t end = anchor + slide_ms_; end <= anchor + size_ms_;
                  end += slide_ms_) {
                 if (ts < end)

@@ -8,6 +8,7 @@
 
 #include "clink/core/codec.hpp"
 #include "clink/operators/async_window_operator.hpp"
+#include "clink/time/window_arithmetic.hpp"
 
 namespace clink {
 
@@ -54,22 +55,13 @@ public:
 
 protected:
     std::vector<std::int64_t> assign_windows(std::int64_t ts) const override {
-        const std::int64_t size = this->window_size_ms_;
         // Windows start at multiples of slide. The record at `ts` falls in the
         // windows from the earliest start that still covers it up to the latest.
-        std::int64_t last = (ts / slide_ms_) * slide_ms_;
-        std::int64_t first = ((ts - size + slide_ms_) / slide_ms_) * slide_ms_;
-        if (first < 0) {
-            first = 0;  // clamp negative-start windows (non-negative event times)
-        }
-        std::vector<std::int64_t> out;
-        out.reserve(static_cast<std::size_t>((last - first) / slide_ms_ + 1));
-        for (std::int64_t s = first; s <= last; s += slide_ms_) {
-            if (ts >= s && ts < s + size) {
-                out.push_back(s);
-            }
-        }
-        return out;
+        // The arithmetic is shared so every window kind agrees on pre-epoch event
+        // times; this used to divide with `/`, which truncates toward zero, and
+        // then clamp the first pane to the epoch, which together discarded every
+        // record before it.
+        return hop_window_starts_for(ts, this->window_size_ms_, slide_ms_);
     }
 
 private:

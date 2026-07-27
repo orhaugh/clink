@@ -274,13 +274,20 @@ def q5():
     # A bid at t belongs to every window [s, s+10000) with s = t - t%2000 - 2000*k
     # for k in 0..4 that contains t. Changelog; the expected value is the final
     # top-1 per window start.
+    #
+    # There is NO "s >= 0" filter, and there was one here until 2026-07-28. It was
+    # copied from the engine, which clamped a hop's first pane to the epoch - so on
+    # this one point the oracle was not independent, it was a restatement of the
+    # code, and it agreed with a defect instead of catching it. A 10s window sliding
+    # 2s has panes starting at -8000, -6000, -4000, -2000 and 0; a bid at t=1000
+    # falls inside all five, and every one of them is a window of this query.
     per_window = defaultdict(lambda: defaultdict(int))
     for b in BIDS:
         t = b["datetime"]
         first = (t // 2000) * 2000 - (WINDOW_MS - 2000)
         for k in range(5):
             s = first + 2000 * k
-            if s <= t < s + WINDOW_MS and s >= 0:
+            if s <= t < s + WINDOW_MS:
                 per_window[s][b["auction"]] += 1
     out = []
     for s in sorted(per_window):
