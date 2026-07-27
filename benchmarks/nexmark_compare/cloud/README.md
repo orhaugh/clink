@@ -376,6 +376,67 @@ with fan-out. Absolute per-event costs must be measured at, or near, the paralle
 modelled. Whether the RATIO against another engine holds is a separate question and is NOT
 answered here: this sweep is clink-vs-clink, and Flink was not measured across parallelism.
 
+### Co-location re-measured on the rig: a clear win at saturation, a regression below it
+
+Second multi-node run, clink at 47b92e7 (pipeline co-location) against Flink re-baselined on
+the same provision. Same sweep, same data, 12-partition topic.
+
+**The mechanism is fixed, confirmed on real hardware.** q0 at parallelism 12 across three
+separate hosts: `local=24 socket=0`, against `local=8 socket=16` before. Every forward edge is
+now a pointer handoff rather than a TCP round trip.
+
+| query | par | ev/cpu-s before | after | | sustained before | after | |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| q0 | 4 | 1,066,049 | 399,132 | **0.37x** | 4,626,309 | 4,637,419 | 1.00x |
+| q0 | 8 | 665,221 | 419,325 | 0.63x | 3,655,884 | 6,422,772 | **1.76x** |
+| q0 | 12 | 520,951 | 739,550 | **1.42x** | 4,715,925 | 9,470,857 | **2.01x** |
+| q12 | 4 | 405,108 | 234,814 | 0.58x | 2,987,969 | 3,687,600 | 1.23x |
+| q12 | 8 | 189,261 | 164,344 | 0.87x | 1,677,153 | 3,728,738 | **2.22x** |
+| q12 | 12 | 158,648 | 135,633 | 0.85x | 2,855,140 | 3,587,462 | 1.26x |
+
+The trend reversed on the query the fix targets. clink's q0 CPU-per-event was **2.05x worse**
+from parallelism 4 to 12; it now **improves** with parallelism. And the ratio against Flink
+went the same way:
+
+| clink/flink | par 4 | par 8 | par 12 |
+|---|---:|---:|---:|
+| q0 before | 3.44x | 2.84x | 2.60x |
+| q0 after | 1.49x | 1.86x | **3.97x** |
+| q12 before | 2.00x | 1.13x | 1.15x |
+| q12 after | 1.43x | 1.08x | 1.10x |
+
+**Throughput improved everywhere** - 2.01x on q0 at parallelism 12, 2.22x on q12 at 8 - and
+q0's advantage at saturation went from 2.60x to 3.97x.
+
+**But CPU-per-event regressed below saturation, and the reason matters.** Before the fix,
+greedy first-fit filled one worker's 16 slots before touching the next, so a parallelism-4 job
+(16 tasks) landed *entirely on worker-1*. Workers 2 and 3 held nothing and cost almost nothing,
+and every edge was local by accident. That is why the old par-4 figure was 1,066,049: it was
+measuring a single-machine job on a three-machine cluster.
+
+Co-location spreads four instances round-robin over three workers, which is Flink's slot-sharing
+semantics and what you want for headroom and fault isolation - losing one worker no longer kills
+the whole job. It also activates three worker processes where one was doing the work, and CPU is
+summed across every engine node, so the same throughput is charged three workers' worth of
+per-worker overhead: 0.64 cores before against 1.59 after, for identical sustained throughput.
+
+That overhead is not per-record work - with co-location a par-4 q0 instance has all its edges
+local, so there is no extra data-plane cost to pay. It is per-worker baseline: bridge threads
+polling, metrics, heartbeats. The earlier audit measured network_bridge threads at 4-6% of worker
+CPU with 24 to 72 threads for a par-4 plan, and flagged a 1ms polling sleep in the union path.
+Spreading a small job simply pays that on three workers instead of one.
+
+**So the honest summary:** the fix does what it was meant to do, and it is right for a cluster
+being used - the win grows with parallelism, exactly where the previous behaviour got worse. It
+also exposes that per-worker idle overhead is large enough to dominate a job that does not fill
+its cluster. Concentrating small jobs on fewer workers would recover that, at the cost of the
+headroom and fault isolation spreading buys; it is a policy question, not a defect, and it is not
+implemented.
+
+**q12 is unchanged at 1.10x, as predicted.** A hash-shuffled edge sends subtask *i* to every
+downstream subtask regardless of placement, so co-location cannot touch it. Closing the q12 gap
+needs work on the shuffle itself, which the split bench already points at.
+
 ### MULTI-NODE rig, 2026-07-27: the ratio does NOT hold as parallelism rises
 
 The first run on a rig with more than one worker node: 1 control (ccx13) + 3 workers (ccx23) +
