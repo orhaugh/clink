@@ -376,6 +376,82 @@ with fan-out. Absolute per-event costs must be measured at, or near, the paralle
 modelled. Whether the RATIO against another engine holds is a separate question and is NOT
 answered here: this sweep is clink-vs-clink, and Flink was not measured across parallelism.
 
+### MULTI-NODE rig, 2026-07-27: the ratio does NOT hold as parallelism rises
+
+The first run on a rig with more than one worker node: 1 control (ccx13) + 3 workers (ccx23) +
+1 broker (ccx23), 18 dedicated vCPU, 12-partition topic so parallelism 12 gets one partition
+per subtask. Beyond parallelism 4 a job spans worker hosts, so this is the first measurement
+that contains any cross-host data-plane cost at all. Both engines swept, same hardware, CPU
+summed across every engine node.
+
+| query | par | engine | sustained rec/s | events/cpu-s | cores | anon MB |
+|---|---:|---|---:|---:|---:|---:|
+| q0 | 4 | clink | 4,626,309 | **1,066,049** | 0.64 | 160 |
+| q0 | 4 | flink | 3,244,085 | 309,973 | 1.52 | 2,012 |
+| q0 | 8 | clink | 3,655,884 | 665,221 | 0.91 | 372 |
+| q0 | 8 | flink | 3,771,406 | 234,634 | 2.06 | 2,441 |
+| q0 | 12 | clink | 4,715,925 | 520,951 | 1.30 | 483 |
+| q0 | 12 | flink | 5,031,446 | 200,043 | 2.62 | 2,757 |
+| q12 | 4 | clink | 2,987,969 | 405,108 | 1.06 | 751 |
+| q12 | 4 | flink | 1,962,559 | 202,599 | 1.90 | 2,460 |
+| q12 | 8 | clink | 1,677,153 | 189,261 | 2.74 | 580 |
+| q12 | 8 | flink | 2,745,412 | 167,638 | 2.50 | 2,950 |
+| q12 | 12 | clink | 2,855,140 | 158,648 | 3.35 | 1,690 |
+| q12 | 12 | flink | 3,858,257 | 138,055 | 3.26 | 3,368 |
+
+**The efficiency ratio decays with parallelism, and on the keyed query it nearly vanishes:**
+
+| | par 4 | par 8 | par 12 |
+|---|---:|---:|---:|
+| q0 clink/flink | 3.44x | 2.84x | 2.60x |
+| q12 clink/flink | **2.00x** | **1.13x** | **1.15x** |
+
+Because clink degrades faster than Flink does:
+
+| | par 4 | par 12 | change |
+|---|---:|---:|---:|
+| q0 clink events/cpu-s | 1,066,049 | 520,951 | **2.05x worse** |
+| q0 flink events/cpu-s | 309,973 | 200,043 | 1.55x worse |
+| q12 clink events/cpu-s | 405,108 | 158,648 | **2.55x worse** |
+| q12 flink events/cpu-s | 202,599 | 138,055 | 1.47x worse |
+
+Note this contradicts an earlier single-host sweep, which found clink's q0 CPU-per-event FLAT
+across parallelism (1.05x from par 1 to 8). On one host it is flat. Across three hosts it
+degrades 2.05x. The difference is entirely the cross-host data plane, and it is not the
+shuffle: q0 has no shuffle.
+
+### The cause: pipeline instances are scattered across hosts
+
+`clink_dataplane_socket_fallbacks_total`, added earlier for exactly this kind of question,
+answers it directly. On a par-12 q0 across 3 workers - a query whose only edges are FORWARD
+edges, source to bridge to projection to sink:
+
+    worker-1  local_hits=0   socket_fallbacks=0
+    worker-2  local_hits=4   socket_fallbacks=4
+    worker-3  local_hits=4   socket_fallbacks=12
+    TOTAL     local=8        socket=16   =>  67% of edges went over a SOCKET
+
+Two thirds of the edges in a shuffle-free query were serialised and sent over TCP. They should
+all have been pointer handoffs.
+
+`Coordinator::deploy` (`src/cluster/coordinator.cpp:1835`) places tasks by **greedy first-fit
+over the registered-worker map, one task at a time**, with no notion of which tasks belong to
+the same parallel pipeline instance. With 16 slots per worker it fills worker-1, then
+worker-2, then worker-3; q0 at parallelism 12 is 48 tasks, so subtask *i*'s source and
+subtask *i*'s projection routinely land on different hosts and the forward edge between them
+becomes a network hop.
+
+Flink does not have this problem because of slot sharing: every operator of one parallel
+pipeline instance shares a slot, so a forward edge is always local. That is the design to
+copy, and it is a scheduling change rather than a data-plane one - the transport already
+prefers the in-process path when both ends are co-resident (`LocalDataPlane`), it is simply
+never given the chance.
+
+**So the par-4 figures published elsewhere are a best case for topology, not just for
+parallelism.** They were measured with a single worker, where every edge is necessarily local.
+Any figure quoted for a multi-node deployment must come from a multi-node rig until this is
+fixed.
+
 ### jemalloc: measured, worth having, not a memory fix
 
 Tested by deriving an image from the SAME clink binary with `libjemalloc2` preloaded, so

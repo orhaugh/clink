@@ -1,0 +1,54 @@
+# Control plane for the MULTI-NODE rig: clink coordinator, or Flink JobManager, one at a time.
+#
+# WHY A MULTI-NODE RIG AT ALL. The split rig put one engine node against an isolated broker,
+# which is enough to compare per-event cost but has a blind spot the results cannot see past:
+# every shuffle was intra-node. So it measured ZERO cross-host data-plane cost for either
+# engine - no serialisation between hosts, no cross-host barrier alignment, no distributed
+# checkpoint coordination. Those are exactly the terms that diverge between engines as a job
+# fans out, and they are what a per-event figure measured at one parallelism cannot be
+# extrapolated through. Three worker nodes make a keyed shuffle cross real network.
+#
+# HOST NETWORKING throughout. Each engine container binds the node's private address directly,
+# so a cross-node shuffle is a plain TCP connection over the private network rather than a
+# bridge-NAT hop added by the rig itself. The measurement is then of the engine's wire path.
+#
+# CONTROL_IP is this node's private address; it is what workers connect back to.
+services:
+  clink-coordinator:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:main}
+    profiles: ["clink"]
+    network_mode: host
+    command:
+      - --role=coordinator
+      - --port=6123
+      - --bind-host=0.0.0.0
+      # Advertised as the PRIVATE ip, not a container name: workers on other hosts resolve
+      # this, and a container name would only work inside one node's compose network.
+      - --advertise-host=${CONTROL_IP}
+      - --http-port=8095
+      - --http-bind=0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8095/api/v1/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 40
+      start_period: 2s
+
+  flink-jobmanager:
+    image: flink:2.2.0-scala_2.12-java21
+    profiles: ["flink"]
+    network_mode: host
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: ${CONTROL_IP}
+        jobmanager.bind-host: 0.0.0.0
+        rest.address: ${CONTROL_IP}
+        rest.bind-address: 0.0.0.0
+        taskmanager.numberOfTaskSlots: 4
+        # 200ms, not the 10s default: the sampler reads vertex counters from the
+        # JobManager's MetricFetcher cache, and at 10s every rate it computes is quantised
+        # to that period, which would report Flink BELOW its true speed.
+        metrics.fetcher.update-interval: 200
+        parallelism.default: 4
+        state.backend.type: hashmap

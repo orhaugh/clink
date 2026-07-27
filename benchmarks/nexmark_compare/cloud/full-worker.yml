@@ -1,0 +1,44 @@
+# A worker node for the MULTI-NODE rig: one clink worker, or one Flink TaskManager.
+#
+# Deployed identically to each worker host; the two variables are what make it that host's
+# worker. WORKER_IP is this node's private address (advertised so peers can open data
+# connections to it), WORKER_ID distinguishes it in the coordinator's registry, and
+# CONTROL_IP is where the control plane lives.
+#
+# Host networking, as on the control node: a shuffle between two workers is then a direct TCP
+# connection between two hosts on the private network, which is the path being measured.
+services:
+  clink-worker:
+    image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:main}
+    profiles: ["clink"]
+    network_mode: host
+    command:
+      - --role=worker
+      - --id=${WORKER_ID}
+      - --coordinator-host=${CONTROL_IP}
+      - --coordinator-port=6123
+      # The address PEERS dial for data. Must be the private IP: a container hostname is
+      # meaningless to a worker on another host, and localhost would silently make every
+      # cross-node edge fail to connect.
+      - --data-host=${WORKER_IP}
+      - --slots=16
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+    environment:
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+    restart: on-failure
+
+  flink-taskmanager:
+    image: flink:2.2.0-scala_2.12-java21
+    profiles: ["flink"]
+    network_mode: host
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: ${CONTROL_IP}
+        taskmanager.host: ${WORKER_IP}
+        taskmanager.bind-host: 0.0.0.0
+        taskmanager.numberOfTaskSlots: 4
+        metrics.fetcher.update-interval: 200
+        parallelism.default: 4
+        state.backend.type: hashmap
