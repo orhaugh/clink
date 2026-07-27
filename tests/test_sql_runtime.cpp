@@ -13399,4 +13399,489 @@ TEST(SqlRuntime, Q14FloatLiteralFilterAndCaseProjection) {
     std::filesystem::remove(out_path);
 }
 
+// ---------------------------------------------------------------------------
+// Every nexmark query, end to end, against an independently computed expectation.
+//
+// WHY THIS EXISTS. The nexmark queries kept regressing, and every regression was
+// found late or not at all:
+//
+//   * an unpartitioned aggregate was fanned out and returned one answer PER
+//     SUBTASK - q7 and q15 emitted 396 rows where 99 is correct, each MAX over a
+//     quarter of the data. Found by a cross-engine run against Flink.
+//   * a predicate's expression operands were understood by the filter operators
+//     but not by a CASE's WHEN, so q14 emitted nothing while reporting a clean
+//     run. Found by the same cross-engine run, and only after a vacuous threshold
+//     in the query was fixed - before that the check compared zero rows against
+//     zero rows and passed.
+//
+// Neither was caught here, because nothing here ran the nexmark queries. Now
+// everything does, in ctest, with no Kafka, no containers and no Flink.
+//
+// TWO PROPERTIES LET THESE CATCH WHAT WAS MISSED:
+//
+//   1. PARALLELISM 4. The fan-out bug is invisible at parallelism 1 - the whole
+//      class of "each subtask keeps its own state over its own shard" only appears
+//      with more than one subtask. Every query here runs fanned out.
+//   2. AN INDEPENDENT ORACLE. The expectations in data/nexmark_expected.inc are
+//      computed by tests/data/nexmark_oracle.py from the input data, in Python, by
+//      a second implementation that knows nothing about clink. Expectations
+//      captured from clink's own output would have locked in the bugs above.
+//
+// The comparison is a multiset of canonicalised rows: row ORDER across subtasks is
+// undefined, the set of rows and their values is not.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+#include "data/nexmark_expected.inc"
+
+// The dataset, byte-identical to the one tests/data/nexmark_oracle.py computes
+// the expectations from. Kept here rather than generated so a reader can check
+// both sides against each other without running anything.
+const std::vector<std::string>& bid_lines() {
+    static const std::vector<std::string> v = {
+        R"({"auction":1968,"bidder":1000,"price":100,"channel":"apple","url":"https://a/b/c/i.htm","datetime":1000})",
+        R"({"auction":1968,"bidder":1001,"price":300,"channel":"google","url":"https://a/b/d/i.htm","datetime":2000})",
+        R"({"auction":2001,"bidder":1002,"price":200,"channel":"apple","url":"https://a/b/c/i.htm","datetime":3000})",
+        R"({"auction":2001,"bidder":1000,"price":8,"channel":"baidu","url":"https://a/b/e/i.htm","datetime":4001})",
+        R"({"auction":2091,"bidder":1001,"price":500,"channel":"facebook","url":"https://a/b/f/i.htm","datetime":5000})",
+        R"({"auction":1968,"bidder":1000,"price":700,"channel":"apple","url":"https://a/b/c/i.htm","datetime":11000})",
+        R"({"auction":1968,"bidder":1002,"price":400,"channel":"google","url":"https://a/b/d/i.htm","datetime":12000})",
+        R"({"auction":2001,"bidder":1001,"price":400,"channel":"apple","url":"https://a/b/c/i.htm","datetime":13000})",
+        R"({"auction":2091,"bidder":1002,"price":900,"channel":"other","url":"https://a/b/g/i.htm","datetime":14001})",
+        R"({"auction":1968,"bidder":1001,"price":600,"channel":"apple","url":"https://a/b/c/i.htm","datetime":21000})",
+        R"({"auction":2001,"bidder":1000,"price":250,"channel":"google","url":"https://a/b/d/i.htm","datetime":22000})",
+        R"({"auction":2091,"bidder":1000,"price":250,"channel":"apple","url":"https://a/b/c/i.htm","datetime":23000})",
+    };
+    return v;
+}
+
+const std::vector<std::string>& auction_lines() {
+    static const std::vector<std::string> v = {
+        R"({"id":1968,"itemname":"lamp","initialbid":10,"reserve":100,"expires":30000,"seller":1000,"category":10,"datetime":800})",
+        R"({"id":2001,"itemname":"desk","initialbid":20,"reserve":200,"expires":30000,"seller":1001,"category":10,"datetime":900})",
+        R"({"id":2091,"itemname":"rug","initialbid":30,"reserve":300,"expires":30000,"seller":1002,"category":20,"datetime":1000})",
+    };
+    return v;
+}
+
+const std::vector<std::string>& person_lines() {
+    static const std::vector<std::string> v = {
+        R"({"id":1000,"name":"alice","emailaddress":"a@x","city":"york","state":"ny","datetime":500})",
+        R"({"id":1001,"name":"bob","emailaddress":"b@x","city":"leeds","state":"ca","datetime":600})",
+        R"({"id":1002,"name":"carol","emailaddress":"c@x","city":"bath","state":"wa","datetime":700})",
+    };
+    return v;
+}
+
+// write_lines / read_lines are the file-level helpers already in this file.
+
+// Serialise a row's declared columns in a canonical form matching the oracle's
+// json.dumps(sort_keys=True): keys sorted, no spaces. The synthetic __row_kind
+// marker is dropped - it is changelog metadata, not a query result.
+std::string canonical(const clink::config::JsonValue& js,
+                      const std::vector<std::string>& drop_keys) {
+    std::vector<std::pair<std::string, std::string>> kv;
+    for (const auto& [k, v] : js.as_object()) {
+        if (std::find(drop_keys.begin(), drop_keys.end(), k) != drop_keys.end()) {
+            continue;
+        }
+        // Integral doubles render as integers, matching Python's json for an int.
+        std::string rendered;
+        if (v.is_number() && !v.is_integral_number()) {
+            const double d = v.as_number();
+            if (d == static_cast<double>(static_cast<std::int64_t>(d))) {
+                rendered = std::to_string(static_cast<std::int64_t>(d));
+            } else {
+                rendered = v.serialize(0);
+            }
+        } else {
+            rendered = v.serialize(0);
+        }
+        kv.emplace_back(k, rendered);
+    }
+    std::sort(kv.begin(), kv.end());
+    std::string out = "{";
+    for (std::size_t i = 0; i < kv.size(); ++i) {
+        if (i > 0) {
+            out += ',';
+        }
+        out += '"' + kv[i].first + "\":" + kv[i].second;
+    }
+    out += '}';
+    return out;
+}
+
+// Columns the engine adds that are not part of the query's result: the changelog
+// marker, and a windowed aggregate's window bounds.
+const std::vector<std::string>& drop_cols() {
+    static const std::vector<std::string> v = {
+        std::string{kRowKindField}, "window_start", "window_end"};
+    return v;
+}
+
+struct Streams {
+    std::filesystem::path bid;
+    std::filesystem::path auction;
+    std::filesystem::path person;
+};
+
+// Run one nexmark query over the fixed dataset at PARALLELISM 4, and return its
+// output rows in canonical form.
+//
+// The source and the sink stay at 1: a file source's parallel-read semantics and a
+// file sink's one-file-per-subtask naming are properties of those connectors, not
+// of the query. Everything between them is fanned out, which is what exposes an
+// operator that keeps per-subtask state it should not.
+std::multiset<std::string> run_query(const std::string& ddl_sql,
+                                     const std::string& insert_sql,
+                                     const Streams& streams,
+                                     const std::filesystem::path& out_path,
+                                     const std::vector<std::string>& source_order,
+                                     bool changelog,
+                                     std::string* error_out,
+                                     const std::string& worker_id) {
+    Catalog cat;
+    auto ddl = parse(ddl_sql);
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    auto spec = compile(cat, insert_sql.c_str());
+
+    // Point each Kafka source at its file, in declaration order.
+    std::size_t src_i = 0;
+    for (auto& op : spec.ops) {
+        if (op.type == "kafka_source_string") {
+            const std::string& which = source_order[std::min(src_i, source_order.size() - 1)];
+            op.type = "file_text_source";
+            op.params.clear();
+            op.params["path"] = (which == "bid"       ? streams.bid
+                                 : which == "auction" ? streams.auction
+                                                      : streams.person)
+                                    .string();
+            ++src_i;
+        }
+    }
+
+    // Fan out through the PRODUCTION function, not a copy of it. An earlier
+    // version of this harness re-implemented the loop here, including its own
+    // forced-singleton skip - which meant breaking apply_job_parallelism changed
+    // nothing about these tests, and a mutation run proved it: with BOTH shipped
+    // fixes removed, 15 of 16 still passed. Verified now by the same mutation.
+    cluster::apply_job_parallelism(spec, 4);
+
+    // Then pin the connectors back to 1. A file source's parallel-read semantics
+    // and a file sink's one-file-per-subtask naming are properties of those
+    // connectors, not of the query, and fanning them out only tests them.
+    for (auto& op : spec.ops) {
+        if (op.type == "file_text_source" || op.type.find("sink") != std::string::npos) {
+            op.parallelism = 1;
+        }
+    }
+
+    {
+        InProcessCluster cluster(worker_id, 48);
+        application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+        application::SubmitOptions opts;
+        opts.wait_timeout = 30s;
+        auto r = submitter.submit(spec.to_json(), {}, opts);
+        if (!r.completed) {
+            *error_out = "not completed: " + r.reject_message;
+            return {};
+        }
+        if (!r.ok && !r.errors.empty()) {
+            *error_out = r.errors[0];
+        }
+    }
+
+    // A changelog query revises rows it already emitted, so the comparable value
+    // is the FINAL retained state: replay the delete/insert log in order.
+    std::multiset<std::string> out;
+    if (!changelog) {
+        for (const auto& l : read_lines(out_path)) {
+            out.insert(canonical(clink::config::parse(l), drop_cols()));
+        }
+        return out;
+    }
+    std::multiset<std::string> live;
+    for (const auto& l : read_lines(out_path)) {
+        auto js = clink::config::parse(l);
+        const auto row = canonical(js, drop_cols());
+        std::string kind{kRowKindInsert};
+        if (auto it = js.as_object().find(std::string{kRowKindField});
+            it != js.as_object().end() && it->second.is_string()) {
+            kind = it->second.as_string();
+        }
+        if (is_delete_like(kind)) {
+            if (auto f = live.find(row); f != live.end()) {
+                live.erase(f);
+            }
+        } else {
+            live.insert(row);
+        }
+    }
+    return live;
+}
+
+std::multiset<std::string> expected_for(const std::string& q) {
+    const auto& all = nexmark_expected();
+    auto it = all.find(q);
+    if (it == all.end()) {
+        return {};
+    }
+    return {it->second.begin(), it->second.end()};
+}
+
+// Fixture. Every case gets its OWN directory, named after the test: ctest runs
+// each case in a separate process and -j8 runs eight at once, so a directory or an
+// output file shared across the suite has them overwriting each other's results.
+// All 16 passed standalone and all 16 failed under -j8 before this.
+class NexmarkQueries : public ::testing::Test {
+protected:
+    void SetUp() override {
+        ensure_sql_installed_once();
+        const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+        dir_ = std::filesystem::temp_directory_path() /
+               ("clink_nexmark_" + std::string(info == nullptr ? "x" : info->name()));
+        std::filesystem::remove_all(dir_);
+        std::filesystem::create_directories(dir_);
+        streams_.bid = dir_ / "bid.ndjson";
+        streams_.auction = dir_ / "auction.ndjson";
+        streams_.person = dir_ / "person.ndjson";
+        write_lines(streams_.bid, bid_lines());
+        write_lines(streams_.auction, auction_lines());
+        write_lines(streams_.person, person_lines());
+    }
+    void TearDown() override { std::filesystem::remove_all(dir_); }
+
+    static std::string bid_ddl() {
+        return "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
+               "url VARCHAR, datetime BIGINT) WITH (connector='kafka', format='json', "
+               "brokers='b', topic='bid', group_id='g', event_time_column='datetime', "
+               "watermark_lag_ms='0');";
+    }
+    static std::string auction_ddl() {
+        return "CREATE TABLE auction (id BIGINT, itemname VARCHAR, initialbid BIGINT, "
+               "reserve BIGINT, expires BIGINT, seller BIGINT, category BIGINT, datetime BIGINT) "
+               "WITH (connector='kafka', format='json', brokers='b', topic='auction', "
+               "group_id='ga', event_time_column='datetime', watermark_lag_ms='0');";
+    }
+    static std::string person_ddl() {
+        return "CREATE TABLE person (id BIGINT, name VARCHAR, emailaddress VARCHAR, city VARCHAR, "
+               "state VARCHAR, datetime BIGINT) WITH (connector='kafka', format='json', "
+               "brokers='b', topic='person', group_id='gp', event_time_column='datetime', "
+               "watermark_lag_ms='0');";
+    }
+    std::string sink_ddl(const std::string& cols) const {
+        return "CREATE TABLE out_t (" + cols + ") WITH (connector='file', format='json', path='" +
+               out_path().string() + "');";
+    }
+    // A changelog SELECT revises rows it already emitted, so the sink has to keep
+    // the __row_kind marker; the test replays the log to the final state.
+    std::string changelog_sink_ddl(const std::string& cols) const {
+        return "CREATE TABLE out_t (" + cols +
+               ") WITH (connector='file', format='json', changelog='true', path='" +
+               out_path().string() + "');";
+    }
+    [[nodiscard]] std::filesystem::path out_path() const { return dir_ / "out.ndjson"; }
+
+    // Run and compare against the oracle.
+    void check(const std::string& q,
+               const std::string& ddl,
+               const std::string& insert,
+               const std::vector<std::string>& source_order = {"bid"},
+               bool changelog = false) {
+        std::filesystem::remove(out_path());
+        std::string err;
+        const auto got = run_query(
+            ddl, insert, streams_, out_path(), source_order, changelog, &err, worker_id());
+        EXPECT_TRUE(err.empty()) << q << " reported an error: " << err;
+        const auto want = expected_for(q);
+        ASSERT_FALSE(want.empty()) << q
+                                   << " has no expectation - regenerate "
+                                      "tests/data/nexmark_expected.inc";
+        if (got == want) {
+            return;
+        }
+        // Report the difference both ways: a count match alone hides a value bug.
+        std::vector<std::string> missing;
+        std::multiset<std::string> g = got;
+        for (const auto& w : want) {
+            if (auto it = g.find(w); it != g.end()) {
+                g.erase(it);
+            } else {
+                missing.push_back(w);
+            }
+        }
+        const std::vector<std::string> extra(g.begin(), g.end());
+        std::string msg = q + ": got " + std::to_string(got.size()) + " rows, expected " +
+                          std::to_string(want.size()) + "\n";
+        for (std::size_t i = 0; i < missing.size() && i < 6; ++i) {
+            msg += "  MISSING: " + missing[i] + "\n";
+        }
+        for (std::size_t i = 0; i < extra.size() && i < 6; ++i) {
+            msg += "  UNEXPECTED: " + extra[i] + "\n";
+        }
+        if (missing.size() > 6 || extra.size() > 6) {
+            msg += "  (truncated)\n";
+        }
+        ADD_FAILURE() << msg;
+    }
+
+    [[nodiscard]] std::string worker_id() const {
+        const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+        return "worker-nx-" + std::string(info == nullptr ? "x" : info->name());
+    }
+
+    std::filesystem::path dir_;
+    Streams streams_;
+};
+
+}  // namespace
+
+// --- per-record shapes -----------------------------------------------------
+
+TEST_F(NexmarkQueries, Q0Passthrough) {
+    check("q0",
+          bid_ddl() + sink_ddl("auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
+                               "url VARCHAR, datetime BIGINT"),
+          "INSERT INTO out_t SELECT auction, bidder, price, channel, url, datetime FROM bid");
+}
+
+TEST_F(NexmarkQueries, Q1CurrencyConversion) {
+    check("q1",
+          bid_ddl() + sink_ddl("auction BIGINT, bidder BIGINT, price DOUBLE, datetime BIGINT"),
+          "INSERT INTO out_t SELECT auction, bidder, price * 0.908 AS price, datetime FROM bid");
+}
+
+// The filter is on an EXPRESSION of a column, not the column.
+TEST_F(NexmarkQueries, Q2SelectionOnAnExpression) {
+    check("q2",
+          bid_ddl() + sink_ddl("auction BIGINT, price BIGINT"),
+          "INSERT INTO out_t SELECT auction, price FROM bid WHERE MOD(auction, 123) = 0");
+}
+
+// An expression filter AND a CASE whose condition is itself an expression
+// predicate - the pair that emitted zero rows.
+TEST_F(NexmarkQueries, Q14ExpressionFilterAndCaseProjection) {
+    check("q14",
+          bid_ddl() + sink_ddl("auction BIGINT, bidder BIGINT, price DOUBLE, "
+                               "bidtimetype VARCHAR"),
+          "INSERT INTO out_t SELECT auction, bidder, 0.908 * price AS price, "
+          "CASE WHEN MOD(datetime, 2) = 0 THEN 'even' ELSE 'odd' END AS bidtimetype "
+          "FROM bid WHERE 0.908 * price > 250");
+}
+
+TEST_F(NexmarkQueries, Q21CaseOverStrings) {
+    check("q21",
+          bid_ddl() + sink_ddl("auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR"),
+          "INSERT INTO out_t SELECT auction, bidder, price, "
+          "CASE WHEN channel = 'apple' THEN '0' WHEN channel = 'google' THEN '1' "
+          "WHEN channel = 'facebook' THEN '2' WHEN channel = 'baidu' THEN '3' "
+          "ELSE channel END AS channel FROM bid");
+}
+
+TEST_F(NexmarkQueries, Q22StringSplit) {
+    check("q22",
+          bid_ddl() + sink_ddl("auction BIGINT, bidder BIGINT, price BIGINT, dir VARCHAR"),
+          "INSERT INTO out_t SELECT auction, bidder, price, SPLIT_INDEX(url, '/', 3) AS dir "
+          "FROM bid");
+}
+
+// --- windowed aggregates ---------------------------------------------------
+
+// UNPARTITIONED windowed aggregate: one row per window for the WHOLE stream.
+// This is the shape that emitted one row per subtask, each aggregating a shard.
+TEST_F(NexmarkQueries, Q7GlobalWindowedAggregate) {
+    check("q7",
+          bid_ddl() + sink_ddl("price BIGINT, bidder BIGINT"),
+          "INSERT INTO out_t SELECT MAX(price) AS price, MIN(bidder) AS bidder FROM bid "
+          "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND)");
+}
+
+TEST_F(NexmarkQueries, Q12KeyedWindowedCount) {
+    check("q12",
+          bid_ddl() + sink_ddl("bidder BIGINT, bid_count BIGINT"),
+          "INSERT INTO out_t SELECT bidder, COUNT(*) AS bid_count FROM bid "
+          "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), bidder");
+}
+
+// The other unpartitioned aggregate, with COUNT(DISTINCT) on top.
+TEST_F(NexmarkQueries, Q15GlobalDistinctCounts) {
+    check("q15",
+          bid_ddl() + sink_ddl("total BIGINT, distinct_bidder BIGINT, distinct_auction BIGINT"),
+          "INSERT INTO out_t SELECT COUNT(*) AS total, COUNT(DISTINCT bidder) AS distinct_bidder, "
+          "COUNT(DISTINCT auction) AS distinct_auction FROM bid "
+          "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND)");
+}
+
+TEST_F(NexmarkQueries, Q16DistinctCountsByChannel) {
+    check("q16",
+          bid_ddl() + sink_ddl("channel VARCHAR, total BIGINT, distinct_bidder BIGINT"),
+          "INSERT INTO out_t SELECT channel, COUNT(*) AS total, "
+          "COUNT(DISTINCT bidder) AS distinct_bidder FROM bid "
+          "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), channel");
+}
+
+TEST_F(NexmarkQueries, Q17FiveAggregatesPerAuction) {
+    check("q17",
+          bid_ddl() + sink_ddl("auction BIGINT, total BIGINT, minp BIGINT, maxp BIGINT, "
+                               "avgp DOUBLE"),
+          "INSERT INTO out_t SELECT auction, COUNT(*) AS total, MIN(price) AS minp, "
+          "MAX(price) AS maxp, AVG(price) AS avgp FROM bid "
+          "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), auction");
+}
+
+TEST_F(NexmarkQueries, Q11SessionWindow) {
+    check("q11",
+          bid_ddl() + sink_ddl("bidder BIGINT, bid_count BIGINT"),
+          "INSERT INTO out_t SELECT bidder, COUNT(*) AS bid_count FROM bid "
+          "GROUP BY SESSION(datetime, INTERVAL '10' SECOND), bidder");
+}
+
+// --- ranking and dedup (changelog) ----------------------------------------
+
+TEST_F(NexmarkQueries, Q18LatestBidPerBidderAuction) {
+    check("q18",
+          bid_ddl() +
+              changelog_sink_ddl("auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
+                                 "url VARCHAR, datetime BIGINT"),
+          "INSERT INTO out_t SELECT * FROM (SELECT *, ROW_NUMBER() OVER "
+          "(PARTITION BY bidder, auction ORDER BY datetime DESC) AS rn FROM bid) AS R "
+          "WHERE rn = 1",
+          {"bid"},
+          /*changelog=*/true);
+}
+
+TEST_F(NexmarkQueries, Q19TopTenBidsPerAuction) {
+    check("q19",
+          bid_ddl() +
+              changelog_sink_ddl("auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
+                                 "url VARCHAR, datetime BIGINT"),
+          "INSERT INTO out_t SELECT * FROM (SELECT *, ROW_NUMBER() OVER "
+          "(PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) AS R WHERE rn <= 10",
+          {"bid"},
+          /*changelog=*/true);
+}
+
+// --- joins ----------------------------------------------------------------
+
+TEST_F(NexmarkQueries, Q3AuctionJoinPerson) {
+    check("q3",
+          auction_ddl() + person_ddl() +
+              sink_ddl("name VARCHAR, city VARCHAR, state VARCHAR, id BIGINT"),
+          "INSERT INTO out_t SELECT P.name, P.city, P.state, A.id FROM auction AS A "
+          "JOIN person AS P ON A.seller = P.id WHERE A.category = 10",
+          {"auction", "person"});
+}
+
+TEST_F(NexmarkQueries, Q20BidJoinAuction) {
+    check("q20",
+          bid_ddl() + auction_ddl() +
+              sink_ddl("auction BIGINT, bidder BIGINT, price BIGINT, itemname VARCHAR"),
+          "INSERT INTO out_t SELECT B.auction, B.bidder, B.price, A.itemname FROM bid AS B "
+          "JOIN auction AS A ON B.auction = A.id",
+          {"bid", "auction"});
+}
+
 }  // namespace clink::sql
