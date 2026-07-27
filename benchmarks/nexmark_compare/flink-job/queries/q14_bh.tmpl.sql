@@ -18,4 +18,4 @@ CREATE TABLE bid (
 );
 CREATE TABLE sink_q14 (`auction` BIGINT, `bidder` BIGINT, `price` DOUBLE, `bidtimetype` STRING) WITH ('connector' = 'blackhole');
 INSERT INTO sink_q14
-SELECT auction, bidder, 0.908 * price AS price, CASE WHEN MOD(`datetime`, 2) = 0 THEN 'even' ELSE 'odd' END AS bidtimetype FROM bid WHERE 0.908 * price > 1000000;
+SELECT auction, bidder, 0.908 * price AS price, CASE WHEN MOD(`datetime`, 2) = 0 THEN 'even' ELSE 'odd' END AS bidtimetype FROM bid WHERE 0.908 * price > 250;

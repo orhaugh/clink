@@ -213,12 +213,17 @@ QUERIES = {
         streams=["bid"],
         sink=[("auction", "BIGINT"), ("bidder", "BIGINT"), ("price", "DOUBLE"),
               ("bidtimetype", "VARCHAR")],
+        # The official query filters on price > 1000000, which excludes EVERY row
+        # of the generated stream at the sizes this harness runs - the output gate
+        # then compared 0 rows against 0 rows and proved nothing. The threshold is
+        # lowered so a substantial fraction survives and the filter is actually
+        # exercised on both engines.
         clink=("SELECT auction, bidder, 0.908 * price AS price, "
                "CASE WHEN MOD(datetime, 2) = 0 THEN 'even' ELSE 'odd' END AS bidtimetype "
-               "FROM bid WHERE 0.908 * price > 1000000"),
+               "FROM bid WHERE 0.908 * price > 250"),
         flink=("SELECT auction, bidder, 0.908 * price AS price, "
                "CASE WHEN MOD(`datetime`, 2) = 0 THEN 'even' ELSE 'odd' END AS bidtimetype "
-               "FROM bid WHERE 0.908 * price > 1000000"),
+               "FROM bid WHERE 0.908 * price > 250"),
     ),
     "q15": dict(
         note=("Bidding statistics: COUNT plus two COUNT(DISTINCT) per 10s window. "
