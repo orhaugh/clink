@@ -365,13 +365,20 @@ QUERIES = {
         note=("Average price per category: auction joined to bid, then aggregated. "
               "REDUCED from the official q4, which first takes the maximum bid per "
               "auction; this averages every bid in the category, so both engines "
-              "run one join plus one aggregate."),
+              "run one join plus one aggregate. Flink casts the price to DOUBLE "
+              "explicitly and clink does not, which is a DIALECT difference for the "
+              "same intent: AVG of an exact numeric type returns an exact numeric "
+              "type in Flink, so AVG(BIGINT) truncates - measured at 49975.0 where "
+              "clink gives 49975.9 - while clink's AVG already returns a real "
+              "number. clink cannot take the cast inside AVG (its AVG accepts only "
+              "a bare column reference), so the cast goes where it is needed."),
         streams=["auction", "bid"],
         sink=[("category", "BIGINT"), ("avgp", "DOUBLE")],
-        clink=("SELECT A.category, AVG(B.price) AS avgp FROM auction AS A "
+        pk=["category"],
+        clink=("SELECT A.category AS category, AVG(B.price) AS avgp FROM auction AS A "
                "JOIN bid AS B ON A.id = B.auction GROUP BY A.category"),
-        flink=("SELECT A.category, AVG(B.price) AS avgp FROM auction AS A "
-               "JOIN bid AS B ON A.id = B.auction GROUP BY A.category"),
+        flink=("SELECT A.category AS category, AVG(CAST(B.price AS DOUBLE)) AS avgp "
+               "FROM auction AS A JOIN bid AS B ON A.id = B.auction GROUP BY A.category"),
     ),
     "q20": dict(
         note="Expand bid with auction: bid joined to auction on the auction id.",

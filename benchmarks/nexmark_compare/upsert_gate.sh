@@ -92,7 +92,8 @@ for l in sys.stdin:
     if l.startswith("{"):
         try: print(json.loads(l).get("job_id","")); break
         except: pass')
-    if [ -z "$cjid" ]; then echo "  clink submit FAILED"; else
+    clink_ok=1
+    if [ -z "$cjid" ]; then echo "  clink submit FAILED"; clink_ok=0; else
         echo "  clink job $cjid running"
         # Wait for the source to drain, then a moment for the sink to flush.
         for _ in $(seq 1 60); do
@@ -119,9 +120,16 @@ print(max([int(o.get("records_out",0) or 0) for o in d.get("operators",[]) if in
     # --- Flink ---
     sed -e "s#__OUT__#$ft#" "flink-job/queries/${q}_up.tmpl.sql" > /tmp/nxq-up-flink.sql
     docker cp /tmp/nxq-up-flink.sql "$FLINK_JM:/tmp/up.sql" >/dev/null 2>&1
-    fjid=$(docker exec "$FLINK_JM" flink run -d -p "$PAR" /tmp/nexmark-sql.jar /tmp/up.sql 2>&1 \
-           | grep -oE '[0-9a-f]{32}' | head -1)
-    if [ -z "$fjid" ]; then echo "  flink submit FAILED"; else
+    docker exec "$FLINK_JM" flink run -d -p "$PAR" /tmp/nexmark-sql.jar /tmp/up.sql \
+        > /tmp/nxq-flink-submit.err 2>&1
+    fjid=$(grep -oE '[0-9a-f]{32}' /tmp/nxq-flink-submit.err | head -1)
+    flink_ok=1
+    if [ -z "$fjid" ]; then
+        echo "  flink submit FAILED:"
+        # DEFECT 3: the submit output was discarded, so a failure was undiagnosable.
+        sed -n '1,12p' /tmp/nxq-flink-submit.err 2>/dev/null | sed 's/^/      /'
+        flink_ok=0
+    else
         echo "  flink job $fjid running"
         prev=-1
         for _ in $(seq 1 90); do
@@ -141,14 +149,26 @@ print(max([int(v.get("metrics",{}).get("write-records",0) or 0) for v in d.get("
         > "$OUT/$q-clink.json" 2>/dev/null || echo '{}' > "$OUT/$q-clink.json"
     "$PY" driver/read_upsert_topic.py --bootstrap localhost:9092 --topic "$ft" --json \
         > "$OUT/$q-flink.json" 2>/dev/null || echo '{}' > "$OUT/$q-flink.json"
-    python3 - "$OUT/$q-clink.json" "$OUT/$q-flink.json" "$q" <<'PY'
+    python3 - "$OUT/$q-clink.json" "$OUT/$q-flink.json" "$q" "$clink_ok" "$flink_ok" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1])); f = json.load(open(sys.argv[2])); q = sys.argv[3]
+clink_ok, flink_ok = sys.argv[4] == "1", sys.argv[5] == "1"
+if not clink_ok or not flink_ok:
+    who = " and ".join(w for w, ok in (("clink", clink_ok), ("flink", flink_ok)) if not ok)
+    print(f"  {q}: NOT GATED - {who} failed to submit. Both topics are empty, so the")
+    print("      comparison below would be 0 rows against 0 rows and would 'pass'.")
+    raise SystemExit(0)
 if "error" in c or "error" in f:
     print(f"  {q}: could not read a topic - clink={c.get('error','ok')} flink={f.get('error','ok')}")
     raise SystemExit(0)
 cv = sorted((c.get("state") or {}).values())
 fv = sorted((f.get("state") or {}).values())
+if not cv or not fv:
+    # An empty side is never a pass: it means the query produced nothing, which is
+    # a failure to measure rather than agreement.
+    print(f"  {q}: NOT GATED - clink {len(cv)} rows, flink {len(fv)} rows; an empty "
+          f"side cannot agree with anything.")
+    raise SystemExit(0)
 print(f"  clink: {c.get('messages')} messages, {c.get('tombstones')} tombstones, "
       f"{len(cv)} live rows")
 print(f"  flink: {f.get('messages')} messages, {f.get('tombstones')} tombstones, "

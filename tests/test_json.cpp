@@ -311,8 +311,10 @@ TEST(FlatMap, EqualityComparesKeysAndValues) {
 // Group/join keys are built by appending serialize_into output, and the
 // state key format must stay byte-stable across releases. These pin
 // (a) serialize_into == serialize(0) appended, and (b) the exact double
-// rendering (ostream-default general format, precision 6) the writer
-// reproduces without an ostream.
+// rendering. (b) CHANGED: it was ostream's general format at precision 6,
+// which is lossy and merged distinct doubles into one key; it is now the
+// shortest round-tripping form. See DoubleRenderingIsShortestRoundTrip for
+// why the stability contract was given up and what it costs on restore.
 
 TEST(Json, SerializeIntoAppendsCompactForm) {
     auto v = parse(R"({"b": [1, 2.5, "x\n"], "a": null})");
@@ -321,18 +323,36 @@ TEST(Json, SerializeIntoAppendsCompactForm) {
     EXPECT_EQ(out, "prefix|" + v.serialize(0));
 }
 
-TEST(Json, DoubleRenderingMatchesOstreamGeneralFormat) {
+// This replaces DoubleRenderingMatchesOstreamGeneralFormat, which pinned "%g" -
+// ostream's general format, precision SIX - explicitly so the state key format
+// would stay byte-stable across releases.
+//
+// That contract was abandoned deliberately, because six significant digits is
+// LOSSY and serialize() builds group keys: 49946.81366242484 and
+// 49946.81366242485 both rendered "49946.8", so a GROUP BY or DISTINCT over a
+// double column silently merged two distinct groups. A byte-stable key format
+// that gives wrong answers is not worth keeping stable.
+//
+// CONSEQUENCE FOR RESTORE: a state snapshot written before this change whose keys
+// contain non-integral doubles will not match keys computed after it. Keys built
+// from integers or strings - which is every nexmark query and the overwhelmingly
+// common case - are unaffected, since the integral fast path below is unchanged.
+//
+// The new format is the shortest text that parses back to the same double, so it
+// is both exact and shorter than a fixed 17 digits would be. Note it is also more
+// readable than what it replaced: 1234567.5 no longer becomes "1.23457e+06".
+TEST(Json, DoubleRenderingIsShortestRoundTrip) {
     auto render = [](double d) {
         JsonValue v{d};
         return v.serialize(0);
     };
     EXPECT_EQ(render(0.5), "0.5");
     EXPECT_EQ(render(-0.5), "-0.5");
-    EXPECT_EQ(render(0.123456789), "0.123457");   // precision 6, rounded
-    EXPECT_EQ(render(1234567.5), "1.23457e+06");  // switches to scientific
+    EXPECT_EQ(render(0.123456789), "0.123456789");  // was "0.123457" - lossy
+    EXPECT_EQ(render(1234567.5), "1234567.5");      // was "1.23457e+06" - lossy
     EXPECT_EQ(render(1e300), "1e+300");
     EXPECT_EQ(render(-2.5e-08), "-2.5e-08");
-    EXPECT_EQ(render(42.0), "42");  // integral fast path
+    EXPECT_EQ(render(42.0), "42");  // integral fast path, unchanged
     EXPECT_EQ(render(-9007199254740992.0), "-9007199254740992");
 }
 
@@ -461,4 +481,64 @@ TEST(Json, RawNumberTokensEmptyForNonObjectOrNoFields) {
     EXPECT_TRUE(raw_number_tokens("[1,2,3]", fields).empty());
     EXPECT_TRUE(raw_number_tokens("not json", fields).empty());
     EXPECT_TRUE(raw_number_tokens(R"({"x":1})", {}).empty());  // empty field set
+}
+
+// A double must survive serialisation, and two distinct doubles must not collapse
+// into one.
+//
+// The writer used "%g", whose default precision is SIX SIGNIFICANT DIGITS, so
+// 49946.81366242484 was written as 49946.8. That surfaced as a cross-engine
+// mismatch on nexmark q4 - Flink emitted the full value, clink the rounded one -
+// but the serious half is that serialize() also builds GROUP BY, DISTINCT and
+// top-N partition KEYS. At six digits two distinct doubles produce identical key
+// text and are silently merged into one group, which is a wrong answer rather than
+// an ugly one.
+TEST(Json, DoubleRoundTripsThroughSerialisation) {
+    const std::vector<double> vals = {
+        49946.81366242484,  // from the q4 comparison that exposed this
+        49975.9102646238,
+        0.1,  // must stay "0.1", not "0.100000000000000006"
+        1.0 / 3.0,
+        -2.5e-8,
+        1234567.891,
+        123456789012345.6,
+        3.141592653589793,
+    };
+    for (const double d : vals) {
+        const clink::config::JsonValue v{d};
+        const std::string text = v.serialize(0);
+        const auto back = clink::config::parse(text);
+        ASSERT_TRUE(back.is_number()) << text;
+        EXPECT_EQ(back.as_number(), d)
+            << "serialised as " << text << " which parses back to a DIFFERENT double";
+    }
+}
+
+TEST(Json, DoubleKeepsShortValuesShort) {
+    // The round-trip requirement must not make ordinary numbers unreadable: the
+    // shortest exact form is used, not a fixed 17 digits.
+    EXPECT_EQ(clink::config::JsonValue{0.1}.serialize(0), "0.1");
+    EXPECT_EQ(clink::config::JsonValue{0.5}.serialize(0), "0.5");
+    EXPECT_EQ(clink::config::JsonValue{2.75}.serialize(0), "2.75");
+}
+
+TEST(Json, DistinctDoublesSerialiseDistinctly) {
+    // The group-key consequence, stated as its own test. These differ in the 16th
+    // significant digit and are genuinely different doubles; at six digits both
+    // rendered as "49946.8" and any GROUP BY or DISTINCT over them merged.
+    const double a = 49946.81366242484;
+    const double b = 49946.81366242485;
+    ASSERT_NE(a, b) << "the test's own premise: these must be different doubles";
+    const auto sa = clink::config::JsonValue{a}.serialize(0);
+    const auto sb = clink::config::JsonValue{b}.serialize(0);
+    EXPECT_NE(sa, sb) << "both serialised as " << sa
+                      << ", so a GROUP BY on this column would merge two groups";
+}
+
+// Integral doubles keep rendering without a decimal point, which the wire format
+// and every existing expectation rely on.
+TEST(Json, IntegralDoublesStillRenderAsIntegers) {
+    EXPECT_EQ(clink::config::JsonValue{42.0}.serialize(0), "42");
+    EXPECT_EQ(clink::config::JsonValue{-7.0}.serialize(0), "-7");
+    EXPECT_EQ(clink::config::JsonValue{0.0}.serialize(0), "0");
 }

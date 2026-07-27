@@ -1,4 +1,4 @@
--- Nexmark q4 on flink, BLACKHOLE sink variant. Average price per category:
+-- Nexmark q4 on flink, UPSERT-SINK sink variant. Average price per category:
 -- auction joined to bid, then aggregated. REDUCED from the official q4, which
 -- first takes the maximum bid per auction; this averages every bid in the
 -- category, so both engines run one join plus one aggregate. Flink casts the
@@ -18,7 +18,7 @@ CREATE TABLE auction (
   'connector' = 'kafka',
   'topic' = 'nx-auction',
   'properties.bootstrap.servers' = 'kafka:29092',
-  'properties.group.id' = 'flink-q4bh-auction',
+  'properties.group.id' = 'flink-q4up-auction',
   'scan.startup.mode' = 'earliest-offset',
   'format' = 'json',
   'json.ignore-parse-errors' = 'false'
@@ -31,11 +31,17 @@ CREATE TABLE bid (
   'connector' = 'kafka',
   'topic' = 'nx-bid',
   'properties.bootstrap.servers' = 'kafka:29092',
-  'properties.group.id' = 'flink-q4bh-bid',
+  'properties.group.id' = 'flink-q4up-bid',
   'scan.startup.mode' = 'earliest-offset',
   'format' = 'json',
   'json.ignore-parse-errors' = 'false'
 );
-CREATE TABLE sink_q4 (`category` BIGINT, `avgp` DOUBLE) WITH ('connector' = 'blackhole');
+CREATE TABLE sink_q4 (`category` BIGINT, `avgp` DOUBLE, PRIMARY KEY (`category`) NOT ENFORCED) WITH (
+  'connector' = 'upsert-kafka',
+  'topic' = '__OUT__',
+  'properties.bootstrap.servers' = 'kafka:29092',
+  'key.format' = 'json',
+  'value.format' = 'json'
+);
 INSERT INTO sink_q4
 SELECT A.category AS category, AVG(CAST(B.price AS DOUBLE)) AS avgp FROM auction AS A JOIN bid AS B ON A.id = B.auction GROUP BY A.category;

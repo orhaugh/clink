@@ -78,9 +78,11 @@ JsonValue from_dom(const simdjson::dom::element& e) {
 // Serialisation builds directly into a std::string. This runs on hot
 // per-record paths (group/join key building, DISTINCT, changelog
 // payloads), so there is deliberately no ostream layer; the output is
-// byte-identical to the previous ostringstream-based writer, including
-// the double rendering ("%g" is the printf conversion that ostream's
-// default general float format is specified in terms of).
+// byte-identical to the previous ostringstream-based writer EXCEPT for
+// the double rendering, which was "%g" (six significant digits, lossy)
+// and is now the shortest form that round-trips - see the comment at the
+// Double case below for why that is a correctness fix and not a
+// cosmetic one.
 void escape_string(std::string& out, const std::string& s) {
     out.push_back('"');
     for (const char c : s) {
@@ -158,7 +160,33 @@ void serialize_append(std::string& out, const JsonValue& v, int indent_width, in
                 auto res = std::to_chars(buf, buf + sizeof(buf), static_cast<std::int64_t>(d));
                 out.append(buf, static_cast<std::size_t>(res.ptr - buf));
             } else {
-                const int n = std::snprintf(buf, sizeof(buf), "%g", d);
+                // The SHORTEST representation that parses back to the same double.
+                //
+                // This was "%g", whose default precision is SIX SIGNIFICANT DIGITS,
+                // so every non-integral double was silently truncated on the way
+                // out: 49946.81366242484 became 49946.8. It surfaced as a
+                // cross-engine mismatch on nexmark q4, where Flink emitted the
+                // full value and clink the rounded one.
+                //
+                // Not merely cosmetic, because serialize() also builds GROUP BY,
+                // DISTINCT and top-N partition KEYS (see install.cpp): at six
+                // digits, 49946.81366242484 and 49946.81366242485 produce the same
+                // key text and are silently merged into one group.
+                //
+                // 15 digits round-trips most values and keeps short output short
+                // (0.1 stays "0.1"); 17 always round-trips a double. Trying them in
+                // order gives the shortest of the three that is exact. std::to_chars
+                // would give the truly shortest, but __cpp_lib_to_chars is not
+                // advertised by every toolchain here even where it works, so this
+                // stays portable rather than feature-detected.
+                int n = 0;
+                for (const int prec : {15, 16, 17}) {
+                    n = std::snprintf(buf, sizeof(buf), "%.*g", prec, d);
+                    if (n > 0 && static_cast<std::size_t>(n) < sizeof(buf) &&
+                        std::strtod(buf, nullptr) == d) {
+                        break;
+                    }
+                }
                 out.append(buf, static_cast<std::size_t>(n));
             }
             return;

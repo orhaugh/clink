@@ -1,4 +1,4 @@
--- Nexmark q4 on clink, KAFKA-SINK sink variant. Average price per category:
+-- Nexmark q4 on clink, UPSERT-SINK sink variant. Average price per category:
 -- auction joined to bid, then aggregated. REDUCED from the official q4, which
 -- first takes the maximum bid per auction; this averages every bid in the
 -- category, so both engines run one join plus one aggregate. Flink casts the
@@ -12,13 +12,14 @@
 -- definition. Edit that file, not this one.
 CREATE TABLE auction (id BIGINT, itemname VARCHAR, initialbid BIGINT, reserve BIGINT, expires BIGINT, seller BIGINT, category BIGINT, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-auction',
-        group_id='clink-q4-auction', auto_offset_reset='earliest',
+        group_id='clink-q4up-auction', auto_offset_reset='earliest',
         event_time_column='datetime', watermark_lag_ms='4000');
 CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='nx-bid',
-        group_id='clink-q4-bid', auto_offset_reset='earliest',
+        group_id='clink-q4up-bid', auto_offset_reset='earliest',
         event_time_column='datetime', watermark_lag_ms='4000');
 CREATE TABLE sink_q4 (category BIGINT, avgp DOUBLE)
-  WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='__OUT__');
+  WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='__OUT__',
+        mode='upsert', primary_key='category');
 INSERT INTO sink_q4
 SELECT A.category AS category, AVG(B.price) AS avgp FROM auction AS A JOIN bid AS B ON A.id = B.auction GROUP BY A.category;
