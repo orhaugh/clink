@@ -11,11 +11,13 @@
 # is the engine's true steady-state processing rate - not bounded by a consumer,
 # not inflated by sink flush.
 #
-# Input is large by default (5M events) so the FAST engine runs for a measurable
-# window (clink ~2-3s, Flink ~12-20s). Only q0/q12 are sampled: their input is
-# the full bid stream (~4.6M events). q8/q6 have tiny join inputs (<=400k) that
-# drain in well under a second on clink - no measurable sustained window - so
-# they stay in the correctness-gate harness, not here.
+# Input must be large enough that BOTH engines run for several multiples of the
+# slope window (see SLOPE_WINDOW below); at 8M events Flink's drain on the
+# fastest queries is barely one window and its slope comes back as zero. The
+# bid-only queries all read the full bid stream and are directly comparable.
+# q8/q6 read the tiny auction / person streams (<=400k), which drain in well
+# under a second on clink - no measurable sustained window - so they stay in the
+# correctness-gate harness, not here.
 #
 #   ./throughput_sampled.sh                          # q0 q12, par 4, 5M events
 #   EVENTS=10000000 PARALLELISM=4 ./throughput_sampled.sh
@@ -65,6 +67,20 @@ RUN_TAG="${RUN_TAG:-}"
 ENGINES="${ENGINES:-clink flink}"
 DATA_DIR="${DATA_DIR:-/tmp/nxcompare-sampled}"
 RESULTS="$ROOT/results-sampled"
+# The sliding window the sustained slope is the MAXIMUM over. It must be the
+# SAME for both engines: a shorter window can sit entirely inside a favourable
+# burst, so it reports a higher peak for the same true rate. clink was sampled at
+# 0.5s and Flink at 2.5s, which flattered clink on the headline metric by 5x the
+# averaging period - an accommodation for clink's much shorter drain that quietly
+# became a bias. Both now use 2.5s, the more conservative of the two, so the
+# figures stay comparable with everything already recorded on the Flink side.
+#
+# A window only yields a slope if it FITS inside the drain, so the event count has
+# to be large enough that the faster engine runs for several multiples of it.
+# EVENTS=8M leaves Flink about one window on the fastest queries, which is why its
+# slope came back as zero for q1 and q2; 24M gives both engines room.
+SLOPE_WINDOW="${SLOPE_WINDOW:-2.5}"
+
 QSUFFIX=""; [ "$SINK" = "blackhole" ] && QSUFFIX="_bh"
 TAGSUF=""; [ -n "$RUN_TAG" ] && TAGSUF="-$RUN_TAG"
 
@@ -178,7 +194,7 @@ print(clink_prior_total('http://127.0.0.1:$CLINK_JM_HTTP'))" 2>/dev/null || echo
     # input is consumed - otherwise the run is INCOMPLETE and not comparable.
     local s; s=$("$PY" "$ROOT/driver/sample_rate.py" clink --base "http://127.0.0.1:$CLINK_JM_HTTP" \
         --job "$jid" --target "$BIDS" --baseline "${base0:-0}" \
-        --interval 0.08 --window 0.5 --quiet-timeout 20 --max-runtime 300)
+        --interval 0.08 --window "$SLOPE_WINDOW" --quiet-timeout 20 --max-runtime 300)
     local cpu_post wall_post; cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-flink $CLINK_CTRS); wall_post=$(now_s)
     # Memory BEFORE the cancel: the engine still holds its working set (state,
     # buffers), which is the figure a capacity or efficiency comparison wants.
@@ -205,7 +221,8 @@ run_flink() {  # query
     # be slow, so a generous max-runtime lets it drain the full input (else the
     # output is partial and not comparable).
     local s; s=$("$PY" "$ROOT/driver/sample_rate.py" flink --base "http://127.0.0.1:$FLINK_REST" \
-        --job "$jid" --target "$BIDS" --interval 0.2 --window 2.5 --quiet-timeout 18 --max-runtime 360)
+        --job "$jid" --target "$BIDS" --interval 0.2 --window "$SLOPE_WINDOW" \
+        --quiet-timeout 18 --max-runtime 360)
     local cpu_post wall_post; cpu_post=$("$PY" "$ROOT/driver/cpu.py" read-flink $FLINK_CTRS); wall_post=$(now_s)
     local mem; mem=$("$PY" "$ROOT/driver/mem.py" read $FLINK_CTRS)
     local off=-1; [ "$SINK" = "kafka" ] && off=$(wait_stable_offset "$out")
