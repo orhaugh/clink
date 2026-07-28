@@ -2465,6 +2465,38 @@ public:
     void open() override {
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
+        // Durability for the in-memory path, the same shape WindowRowOp and
+        // AggregateRowOp use. A session carries strictly more state than a fixed
+        // window - its extent is mutable, so an unfired session holds records that
+        // may still merge - and without this it lived only in state_ and was lost
+        // on restore, with the source resuming past the records that built it.
+        persist_inmem_ =
+            !effective_async_ && this->runtime() != nullptr && this->runtime()->has_state_backend();
+        if (persist_inmem_ && state_.empty()) {
+            keyed_state_().scan(
+                [&](const std::string& key, const std::map<std::int64_t, Session>& by_session) {
+                    if (by_session.empty()) {
+                        return;
+                    }
+                    state_[key] = by_session;
+                });
+        }
+    }
+
+    // Flush the in-memory sessions to the backend at checkpoint time. fire_due_
+    // erases a fired session but keeps its (now empty) group entry, so the flush
+    // overwrites the group and a fired session is never resurrected by a restore.
+    void snapshot_timers(StateBackend& backend,
+                         OperatorId op_id,
+                         const std::string& slot = "") override {
+        Operator<Row, Row>::snapshot_timers(backend, op_id, slot);
+        if (!persist_inmem_) {
+            return;  // the async path already holds its sessions in KeyedState
+        }
+        auto kv = keyed_state_();
+        for (const auto& [key, by_session] : state_) {
+            kv.put(key, by_session);
+        }
     }
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
     // The fire (on_event_time_timers_async) reads + writes the group's session map.
@@ -3191,6 +3223,10 @@ private:
     // Finalised in open(): a deferring backend -> the async KeyedState path
     // (process_async + event-time timers); otherwise the sync in-memory state_.
     bool effective_async_ = false;
+    // True when a state backend is attached but the KeyedState paths are not: the
+    // in-memory sessions are then flushed to the "session" slot at snapshot time
+    // and reloaded in open(), so an open session survives a restore.
+    bool persist_inmem_ = false;
     clink::
         FlatMap<std::string, std::map<std::int64_t, Session>, TransparentKeyHash, std::equal_to<>>
             state_;

@@ -128,7 +128,11 @@ where coverage multiplies without the test count exploding.
       a window-creation site which forgets to maintain it must fail loudly
 - [ ] memory per (key, window) has a documented bound and a test that notices a
       regression, since a per-key state defect has shipped twice here
-- [ ] rescale: no test covers a windowed query changing parallelism across a restore
+- [x] rescale: a windowed query changing parallelism across a restore. Scale-up
+      filters one parent snapshot per new subtask, scale-down merges several
+      through `combine_snapshots`; the union over the new subtasks must equal what
+      the old parallelism fired. Covered for all four kinds at 1 -> 2, 1 -> 4,
+      4 -> 2 and 4 -> 1
 
 ## Phase 6 - end to end and cross engine
 
@@ -156,7 +160,7 @@ where coverage multiplies without the test count exploding.
 
 ## What this found
 
-Working the plan surfaced six defects, each in the phase written to look for it.
+Working the plan surfaced seven defects, each in the phase written to look for it.
 
 | defect | phase | severity |
 |---|---|---|
@@ -165,15 +169,22 @@ Working the plan surfaced six defects, each in the phase written to look for it.
 | the event-time column was read through a `double`, rounding any timestamp above 2^53 | 4 | wrong answers on nanosecond timestamps |
 | window time arithmetic overflowed at the `int64` extremes | 4 | undefined behaviour on corrupt input |
 | an open window did not survive a checkpoint restore | 5 | silent data loss on failover |
+| an open SESSION did not survive one either - the fix above was written against the fixed-window class, and sessions are a separate one | 5 | silent data loss on failover |
 | the nexmark oracle's q5 carried the engine's own clamp, so it agreed with the defect | 3 | the oracle was not independent |
 
-Four of the six were invisible to output tests over realistic data: epoch
+Five of the seven were invisible to output tests over realistic data: epoch
 milliseconds are around 1.7e12, comfortably inside both the `double` and the
 `int64` safe ranges, and no benchmark checkpoints. They were reachable only by
 asking what happens at the edges of the representation, which is what the
 differential and extreme-value phases are for.
 
-The seventh finding is not a defect but a decision: `HOP(time, SIZE, SLIDE)` puts
+The session one is the clearest case for the "feature" axis at the top of this
+page. The fix for it existed, in the class next door, with a test; sessions were
+simply not enumerated when it was applied. A per-kind loop over
+`all_window_kinds()` costs nothing and would have caught it the same day, which is
+why the Phase 5 and rescale tests are written that way rather than against TUMBLE.
+
+The eighth finding is not a defect but a decision: `HOP(time, SIZE, SLIDE)` puts
 the larger value first and `CUMULATE(time, STEP, SIZE)` puts the smaller first, so
 the two multi-argument window kinds disagree with each other, and `HOP` also
 disagrees with the same-named function in Flink. Both messages now name their order,

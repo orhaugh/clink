@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <random>
@@ -45,6 +46,7 @@
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/dead_letter.hpp"
 #include "clink/runtime/job_config.hpp"
+#include "clink/runtime/key_groups.hpp"
 #include "clink/runtime/local_executor.hpp"
 #include "clink/sql/analyze.hpp"
 #include "clink/sql/async_function_registry.hpp"
@@ -15158,6 +15160,299 @@ TEST(WindowStateLifecycle, AnOpenWindowSurvivesSnapshotAndRestore) {
                                << rows.size() << " rows";
     EXPECT_NE(rows[0].find("\"num\":2"), std::string::npos)
         << "both records folded before the snapshot must still be counted: " << rows[0];
+}
+
+// ---------------------------------------------------------------------------
+// RESCALE: a windowed query changing parallelism across a restore.
+//
+// Rescale is the one restore path where a subtask does not read back the state it
+// wrote. Each new subtask restores a key-group SLICE of a parent snapshot, so an
+// operator's state has to be keyed such that every open window lands in exactly
+// one new subtask: miss a slice and windows vanish, overlap two and they fire
+// twice. Neither failure is visible to a same-parallelism restore, which is all
+// AnOpenWindowSurvivesSnapshotAndRestore covers.
+//
+// The oracle is the unrescaled run, because the property under test is that
+// rescale is output-PRESERVING - the union over the new subtasks must equal, with
+// multiplicity, what one subtask emits from the same snapshot. Window semantics
+// are pinned elsewhere against independent expectations; nothing here re-derives
+// them. The non-vacuity guards matter as much as the equality: an empty baseline,
+// or a "split" in which one subtask kept everything, would satisfy it while
+// testing nothing.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Terminal watermark for the rescale cases: past every window end plus the
+// session gap, so a restored operator drains completely.
+constexpr std::int64_t kRescaleTerminalWm = 10'000'000;
+
+// One operator of `kind`, straight from the registry and not yet attached.
+std::shared_ptr<Operator<Row, Row>> build_window_op(const WinKind& kind) {
+    const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+        kind.op_type, std::string{kChannelRow}, std::string{kChannelRow});
+    if (f == nullptr) {
+        ADD_FAILURE() << "no operator factory registered for " << kind.op_type;
+        return nullptr;
+    }
+    cluster::OperatorBuildContext octx;
+    octx.params = kind.params;
+    octx.parallelism = 1;
+    return std::static_pointer_cast<Operator<Row, Row>>(f->build(octx));
+}
+
+// Feed `input` with NO watermark, so every window is still open, then flush and
+// snapshot. This is the cutover checkpoint a rescale restores from.
+Snapshot snapshot_open_windows(const WinKind& kind,
+                               const std::vector<std::pair<std::int64_t, std::int64_t>>& input,
+                               bool columnar,
+                               OperatorId op_id,
+                               MetricsRegistry& metrics) {
+    auto op = build_window_op(kind);
+    if (op == nullptr) {
+        return {};
+    }
+    auto backend = std::make_shared<InMemoryStateBackend>();
+    RuntimeContext ctx{op_id, "win", backend.get(), &metrics};
+    op->attach_runtime(&ctx);
+    op->open();
+
+    std::size_t fired = 0;
+    Emitter<Row> em([&](StreamElement<Row> e) {
+        if (e.is_data()) {
+            fired += e.as_data().size();
+        }
+        return true;
+    });
+    Batch<Row> b;
+    for (const auto& [ts, key] : input) {
+        Row r;
+        r.values["auction"] = clink::config::JsonValue{key};
+        r.values["datetime"] = clink::config::JsonValue{ts};
+        b.emplace(r, EventTime{ts});
+    }
+    if (columnar) {
+        // The columnar fold is a separate window-creation site, and it is the one a
+        // Kafka/JSON source actually runs, so the state a rescale slices has to be
+        // written correctly by it too.
+        const std::vector<RowColumn> cols = {{"auction", arrow::int64()},
+                                             {"datetime", arrow::int64()}};
+        auto batcher = clink::sql::make_row_columnar_arrow_batcher(cols);
+        auto rb = batcher.build(b);
+        Batch<Row> cb{std::move(rb), input.size(), clink::sql::row_materialize_fn()};
+        auto el = StreamElement<Row>::data(std::move(cb));
+        if (!op->supports_columnar() || !op->process_columnar(el, em)) {
+            op->process(el, em);
+        }
+    } else {
+        op->process(StreamElement<Row>::data(std::move(b)), em);
+    }
+    EXPECT_EQ(fired, 0u) << kind.label
+                         << ": no watermark was sent, so nothing may have fired and the "
+                            "snapshot must hold every window still open";
+
+    op->snapshot_timers(*backend, op_id);
+    auto snap = backend->snapshot(CheckpointId{1});
+    op->close();
+    return snap;
+}
+
+// Restore subtask `subtask` of `parallelism` from the parent snapshots it
+// inherits - one on scale-up (a slice of the parent), several on scale-down
+// (merged first) - and drain it with a terminal watermark.
+std::multiset<std::string> restore_subtask_and_drain(const WinKind& kind,
+                                                     std::vector<Snapshot> parts,
+                                                     std::uint32_t subtask,
+                                                     std::uint32_t parallelism,
+                                                     OperatorId op_id,
+                                                     MetricsRegistry& metrics) {
+    std::multiset<std::string> rows;
+    auto op = build_window_op(kind);
+    if (op == nullptr) {
+        return rows;
+    }
+    auto backend = std::make_shared<InMemoryStateBackend>();
+    const auto [first, last] = key_group_range_for_subtask(subtask, parallelism);
+    backend->restore(backend->combine_snapshots(std::move(parts)),
+                     KeyGroupRange{.first = first, .last = last});
+
+    RuntimeContext ctx{op_id, "win", backend.get(), &metrics};
+    op->attach_runtime(&ctx);
+    op->restore_timers(*backend, op_id);
+    op->open();
+
+    Emitter<Row> em([&](StreamElement<Row> e) {
+        if (e.is_data()) {
+            for (const auto& rec : e.as_data()) {
+                rows.insert(canonical(
+                    clink::config::JsonValue{clink::sql::to_json_object(rec.value().values)},
+                    window_drop_cols()));
+            }
+        }
+        return true;
+    });
+    op->process(StreamElement<Row>::watermark(Watermark{EventTime{kRescaleTerminalWm}}), em);
+    op->close();
+    return rows;
+}
+
+// A raw multiset comparison of JSON rows prints as an unreadable wall, and the
+// two failure modes here are opposites, so name them.
+std::string describe_row_diff(const std::multiset<std::string>& got,
+                              const std::multiset<std::string>& want) {
+    std::vector<std::string> lost;
+    std::set_difference(want.begin(), want.end(), got.begin(), got.end(), std::back_inserter(lost));
+    std::vector<std::string> extra;
+    std::set_difference(
+        got.begin(), got.end(), want.begin(), want.end(), std::back_inserter(extra));
+    std::string s = std::to_string(lost.size()) + " window(s) lost, " +
+                    std::to_string(extra.size()) + " duplicated or spurious";
+    if (!lost.empty()) {
+        s += "; first lost: " + lost.front();
+    }
+    if (!extra.empty()) {
+        s += "; first extra: " + extra.front();
+    }
+    return s;
+}
+
+// 32 keys inside one 10s window, so a 2-way and a 4-way key-group split both have
+// to carry real state, and nothing fires before the terminal watermark.
+std::vector<std::pair<std::int64_t, std::int64_t>> rescale_input() {
+    return gen_input(/*seed=*/20260728, /*n=*/400, /*span_ms=*/9'000, /*keys=*/32, /*sorted=*/true);
+}
+
+}  // namespace
+
+// EVERY kind, not just TUMBLE. SESSION is a separate class with its own state and
+// its own durability, so the flush-and-hydrate the fixed windows carry did not
+// reach it, and AnOpenWindowSurvivesSnapshotAndRestore above covers TUMBLE alone.
+// The oracle is the same input run straight through with no restore: a checkpoint
+// taken mid-window must not change the answer.
+TEST(WindowStateLifecycle, EveryKindSurvivesSnapshotAndRestore) {
+    ensure_sql_installed_once();
+    MetricsRegistry metrics;
+    const auto input = rescale_input();
+    const OperatorId op_id{9923};
+
+    for (const auto& kind : all_window_kinds()) {
+        const auto uninterrupted = drive_window(
+            kind.op_type, kind.params, input, kRescaleTerminalWm, WinDrive{.batch_size = 0});
+        ASSERT_FALSE(uninterrupted.empty())
+            << kind.label << ": the run without a restore emitted nothing, so there is no "
+            << "answer to preserve";
+
+        const auto snap = snapshot_open_windows(kind, input, /*columnar=*/false, op_id, metrics);
+        const auto restored = restore_subtask_and_drain(kind, {snap}, 0, 1, op_id, metrics);
+        EXPECT_EQ(restored, uninterrupted)
+            << kind.label << ": a checkpoint and restore mid-window changed the answer - "
+            << describe_row_diff(restored, uninterrupted);
+    }
+}
+
+// Scale UP: one subtask's open windows must redistribute across the new subtasks
+// with nothing lost and nothing restored into two of them.
+TEST(WindowRescale, ScaleUpSplitsOpenWindowsWithoutLossOrDuplication) {
+    ensure_sql_installed_once();
+    MetricsRegistry metrics;
+    const auto input = rescale_input();
+    const OperatorId op_id{9921};
+
+    for (const auto& kind : all_window_kinds()) {
+        for (const bool columnar : {false, true}) {
+            const std::string what =
+                std::string(kind.label) + (columnar ? " (columnar ingest)" : " (row ingest)");
+            const auto snap = snapshot_open_windows(kind, input, columnar, op_id, metrics);
+
+            // Same snapshot, unchanged parallelism: the oracle.
+            const auto baseline = restore_subtask_and_drain(kind, {snap}, 0, 1, op_id, metrics);
+            ASSERT_FALSE(baseline.empty())
+                << what << ": the unrescaled restore emitted nothing, so every comparison "
+                << "against it would be vacuous";
+            for (const auto& row : baseline) {
+                ASSERT_EQ(baseline.count(row), 1u)
+                    << what << ": the baseline emits a duplicate row, so the cross-subtask "
+                    << "duplicate check below cannot distinguish one: " << row;
+            }
+
+            for (const std::uint32_t p : {2u, 4u}) {
+                std::multiset<std::string> united;
+                std::map<std::string, std::vector<std::uint32_t>> producers;
+                std::size_t widest = 0;
+                for (std::uint32_t i = 0; i < p; ++i) {
+                    const auto rows = restore_subtask_and_drain(kind, {snap}, i, p, op_id, metrics);
+                    widest = std::max(widest, rows.size());
+                    for (const auto& row : rows) {
+                        producers[row].push_back(i);
+                    }
+                    united.insert(rows.begin(), rows.end());
+                }
+
+                for (const auto& [row, subtasks] : producers) {
+                    if (subtasks.size() > 1) {
+                        ADD_FAILURE()
+                            << what << " at parallelism " << p << ": one window was restored "
+                            << "into " << subtasks.size() << " subtasks and therefore fires "
+                            << "that many times: " << row;
+                    }
+                }
+                // A run where subtask 0 inherited everything would satisfy the
+                // equality below without exercising the split at all.
+                EXPECT_LT(widest, baseline.size())
+                    << what << " at parallelism " << p << ": one subtask restored every window, "
+                    << "so no key-group boundary was crossed and this asserts nothing";
+                EXPECT_EQ(united, baseline)
+                    << what << " at parallelism " << p << ": rescale changed the output - "
+                    << describe_row_diff(united, baseline);
+            }
+        }
+    }
+}
+
+// Scale DOWN: each new subtask merges several parents' snapshots, so a window in
+// ANY parent has to survive the merge. combine_snapshots is only reachable this
+// way, and a merge that dropped a part would look exactly like a clean run with
+// fewer groups.
+TEST(WindowRescale, ScaleDownMergesOpenWindowsFromEveryParent) {
+    ensure_sql_installed_once();
+    MetricsRegistry metrics;
+    const auto input = rescale_input();
+    const OperatorId op_id{9922};
+
+    for (const auto& kind : all_window_kinds()) {
+        const auto snap = snapshot_open_windows(kind, input, /*columnar=*/false, op_id, metrics);
+        const auto baseline = restore_subtask_and_drain(kind, {snap}, 0, 1, op_id, metrics);
+        ASSERT_FALSE(baseline.empty()) << kind.label << ": nothing to scale down";
+
+        // Four parents, each holding its own slice, which is the state a job would
+        // be carrying after running at parallelism 4.
+        std::vector<Snapshot> parents;
+        for (std::uint32_t i = 0; i < 4; ++i) {
+            auto b = std::make_shared<InMemoryStateBackend>();
+            const auto [first, last] = key_group_range_for_subtask(i, 4);
+            b->restore(snap, KeyGroupRange{.first = first, .last = last});
+            parents.push_back(b->snapshot(CheckpointId{2}));
+        }
+
+        // 4 -> 2: old_p / new_p = 2 consecutive parents per new subtask, the
+        // assignment rescale_dispatch plans.
+        std::multiset<std::string> halved;
+        for (std::uint32_t i = 0; i < 2; ++i) {
+            const auto rows = restore_subtask_and_drain(
+                kind, {parents[i * 2], parents[i * 2 + 1]}, i, 2, op_id, metrics);
+            EXPECT_FALSE(rows.empty())
+                << kind.label << ": subtask " << i << " of 2 inherited two parents' key-group "
+                << "slices and emitted nothing, so the merge dropped both";
+            halved.insert(rows.begin(), rows.end());
+        }
+        EXPECT_EQ(halved, baseline) << kind.label << ": 4 -> 2 changed the output - "
+                                    << describe_row_diff(halved, baseline);
+
+        // 4 -> 1: every parent into one subtask, the widest merge the planner emits.
+        const auto collapsed = restore_subtask_and_drain(kind, parents, 0, 1, op_id, metrics);
+        EXPECT_EQ(collapsed, baseline) << kind.label << ": 4 -> 1 changed the output - "
+                                       << describe_row_diff(collapsed, baseline);
+    }
 }
 
 // ---------------------------------------------------------------------------
