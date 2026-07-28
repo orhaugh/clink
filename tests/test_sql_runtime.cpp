@@ -15531,6 +15531,197 @@ TEST(WindowMemory, SerialisedStatePerOpenWindowStaysWithinItsBound) {
 }
 
 // ---------------------------------------------------------------------------
+// TOP-N OVER A WINDOW, AT PARALLELISM > 1.
+//
+// The cross-engine gate found clink's q5 disagreeing with an independent engine
+// on 153 of 247 windows at parallelism 4 while agreeing at parallelism 1, and the
+// disagreement is ONE-DIRECTIONAL: clink's winning count is never higher, only
+// equal or lower. The windowed aggregate feeding it was value-compared separately
+// and is exact at the same parallelism (734,382 keys, zero differing counts), so
+// the top-N is where it goes wrong.
+//
+// NexmarkQueries.Q5HotItemsPerSlidingWindow does not catch it, for two reasons
+// both visible at its call site. Its dataset is twelve bids over three auctions,
+// so no window has a contested top-1. And it passes `auction` as a tie column, so
+// WHICH auction won is projected away before comparison - leaving only (wstart,
+// num), on the reasoning that a wrong winner would show up as a wrong count. That
+// reasoning is sound; the dataset is what lets it down.
+//
+// This runs the same shape over a dataset where windows ARE contested, with an
+// ORDER BY that is TOTAL so exactly one answer is correct, and checks the whole
+// row against an oracle computed here from the input.
+//
+// IT PASSES, which is a result rather than a disappointment: the top-N over a
+// hopping window is correct at parallelism 4 on this shape, so the cross-engine
+// divergence needs something this does not have. What it does not have, and the
+// harness does:
+//
+//   - a Kafka source over four partitions, each spanning the whole time range,
+//     instead of one ordered file;
+//   - watermark_lag_ms=4000 and genuinely out-of-order arrival, instead of 0 and
+//     sorted input;
+//   - a SINK at parallelism 4. run_query pins every connector back to 1, so no
+//     in-suite test can exercise a fanned-out sink at all, and the harness runs
+//     kafka_upsert_sink_string at 4.
+//
+// The last of those is the one to try next, because the windowed aggregate
+// underneath q5 was value-compared over the same Kafka data at the same
+// parallelism and came out exact - so whatever it is sits between the top-N and
+// the topic, and a per-key delete/insert pair arriving out of order is the shape
+// that leaves a STALE value live, which is always an earlier and therefore
+// smaller one.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Bids dense enough that a 10s window holds many auctions with close counts, so
+// the top-1 is genuinely contested and a near-miss is a different answer. Fixed
+// seed: a generated input that differs per run reports a different failure per
+// run, which is worse than no test.
+struct ContestedBids {
+    std::vector<std::string> lines;                             // NDJSON, one bid each
+    std::vector<std::pair<std::int64_t, std::int64_t>> events;  // (datetime, auction)
+};
+
+ContestedBids contested_bids(std::size_t n, std::int64_t auctions, std::int64_t span_ms) {
+    // Epoch-scale timestamps like the harness, so every hop pane starts positive
+    // and pre-epoch clamping is not part of what this test is asking about.
+    constexpr std::int64_t kBase = 1'000'000'000'000;
+    std::mt19937_64 rng(20260728);
+    ContestedBids out;
+    out.events.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto ts =
+            kBase + static_cast<std::int64_t>(rng() % static_cast<std::uint64_t>(span_ms));
+        const auto auction =
+            static_cast<std::int64_t>(rng() % static_cast<std::uint64_t>(auctions));
+        out.events.emplace_back(ts, auction);
+    }
+    // Emit in event-time order. The table below declares watermark_lag_ms='0', so
+    // the watermark is the highest timestamp seen and anything behind it is late
+    // and dropped. Writing the lines in generation order rather than sorted made
+    // the first record set the watermark near the top of the span and had the
+    // engine legitimately discard most of the input - which reads exactly like a
+    // catastrophic undercount and is nothing of the sort. Out-of-order input is a
+    // real axis, but it is Phase 4's, and it needs a lag to be about lateness
+    // rather than about arrival order.
+    std::sort(out.events.begin(), out.events.end());
+    out.lines.reserve(n);
+    for (std::size_t i = 0; i < out.events.size(); ++i) {
+        const auto [ts, auction] = out.events[i];
+        out.lines.push_back(R"({"auction":)" + std::to_string(auction) + R"(,"bidder":)" +
+                            std::to_string(i % 97) + R"(,"price":)" + std::to_string(i % 991) +
+                            R"(,"channel":"c","url":"https://x/y/z/i.htm","datetime":)" +
+                            std::to_string(ts) + "}");
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(TopNOverWindow, HopTopOnePerWindowAtParallelismFour) {
+    ensure_sql_installed_once();
+    constexpr std::int64_t kSize = 10'000;
+    constexpr std::int64_t kSlide = 2'000;
+    const auto input = contested_bids(/*n=*/4'000, /*auctions=*/40, /*span_ms=*/20'000);
+
+    // Oracle. A bid at t belongs to every pane [s, s+size) whose start is a
+    // multiple of the slide; the winner is the highest count, ties broken by the
+    // SMALLEST auction, which is exactly what `ORDER BY num DESC, auction ASC`
+    // asks for. Computed from the input, never from the engine.
+    std::map<std::int64_t, std::map<std::int64_t, std::int64_t>> per_window;
+    for (const auto& [ts, auction] : input.events) {
+        // Plain arithmetic, deliberately not the engine's window_arithmetic.hpp:
+        // an oracle that calls the code under test is a restatement of it, which is
+        // how the q5 clamp defect hid behind an oracle that agreed with it. Every
+        // timestamp here is positive, so truncating division IS the floor.
+        for (std::int64_t s = (ts / kSlide) * kSlide; s > ts - kSize; s -= kSlide) {
+            ++per_window[s][auction];
+        }
+    }
+    std::multiset<std::string> want;
+    for (const auto& [wstart, counts] : per_window) {
+        const auto best =
+            std::max_element(counts.begin(), counts.end(), [](const auto& a, const auto& b) {
+                return a.second != b.second ? a.second < b.second : a.first > b.first;
+            });
+        want.insert(canonical(clink::config::JsonValue{clink::config::JsonObject{
+                                  {"wstart", clink::config::JsonValue{wstart}},
+                                  {"auction", clink::config::JsonValue{best->first}},
+                                  {"num", clink::config::JsonValue{best->second}}}},
+                              {}));
+    }
+    // A contested dataset is the whole point: if most windows have a runaway
+    // leader the test is the twelve-bid one again with more rows.
+    std::size_t contested = 0;
+    for (const auto& [wstart, counts] : per_window) {
+        (void)wstart;
+        std::vector<std::int64_t> c;
+        for (const auto& [a, n] : counts) {
+            (void)a;
+            c.push_back(n);
+        }
+        std::sort(c.rbegin(), c.rend());
+        if (c.size() > 1 && c[0] - c[1] <= 1) {
+            ++contested;
+        }
+    }
+    ASSERT_GT(contested, per_window.size() / 10)
+        << "only " << contested << " of " << per_window.size()
+        << " windows have their top two counts within one of each other, so this "
+        << "dataset does not actually contest the ranking";
+
+    const auto dir = std::filesystem::temp_directory_path() / "clink_topn_window_par4";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    Streams streams{.bid = dir / "bid.ndjson",
+                    .auction = dir / "auction.ndjson",
+                    .person = dir / "person.ndjson"};
+    write_lines(streams.bid, input.lines);
+    const auto out_path = dir / "out.ndjson";
+
+    const std::string ddl =
+        "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
+        "url VARCHAR, datetime BIGINT) WITH (connector='kafka', format='json', brokers='b', "
+        "topic='bid', group_id='g', event_time_column='datetime', watermark_lag_ms='0');"
+        "CREATE TABLE out_t (wstart BIGINT, auction BIGINT, num BIGINT) WITH (connector='file', "
+        "format='json', changelog='true', path='" +
+        out_path.string() + "');";
+    // ORDER BY num DESC, auction ASC - TOTAL, so there is one right answer and no
+    // tie column has to be projected away.
+    const std::string insert =
+        "INSERT INTO out_t SELECT wstart, auction, num FROM (SELECT *, ROW_NUMBER() OVER "
+        "(PARTITION BY wstart ORDER BY num DESC, auction ASC) AS rn FROM (SELECT auction, "
+        "COUNT(*) AS num, window_start AS wstart FROM bid GROUP BY HOP(datetime, "
+        "INTERVAL '10' SECOND, INTERVAL '2' SECOND), auction) AS W) AS R WHERE rn <= 1";
+
+    std::string err;
+    const auto got = run_query(ddl,
+                               insert,
+                               streams,
+                               out_path,
+                               {"bid"},
+                               /*changelog=*/true,
+                               &err,
+                               "topn_window_par4",
+                               /*fan_out=*/4);
+    ASSERT_TRUE(err.empty()) << "the job reported an error: " << err;
+    ASSERT_FALSE(got.empty()) << "the job emitted nothing";
+
+    EXPECT_EQ(got, want) << "top-1 per hopping window disagrees with the oracle at "
+                         << "parallelism 4 over " << per_window.size() << " windows (" << contested
+                         << " contested): " << describe_row_diff(got, want);
+    // Keep the input and the raw changelog when it fails. This one is only
+    // diagnosable by reading the delete/insert sequence for the window that went
+    // wrong, and regenerating it by hand from a seed is a waste of the failure.
+    if (!::testing::Test::HasFailure()) {
+        std::filesystem::remove_all(dir);
+    } else {
+        ADD_FAILURE() << "input and changelog kept at " << dir;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PER-KIND SEMANTICS: the cases the sweep above did not reach.
 //
 // The sweep asserts each kind's basic shape. These are the behaviours that only
