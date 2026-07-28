@@ -9,6 +9,28 @@
 #include <map>
 #include <optional>
 #include <simdjson.h>
+
+// LeakSanitizer's intent annotation, used at the one deliberate never-freed
+// allocation below. See the note there for why an annotation at the allocation site
+// beats an entry in lsan-suppressions.txt, whose stated policy is to suppress only
+// third-party leaks.
+//
+// Gated on ASAN BEING ACTIVE, not on the header existing. Clang ships
+// <sanitizer/lsan_interface.h> unconditionally, so __has_include is true on a plain
+// macOS build and the link then fails on an undefined ___lsan_ignore_object - the
+// symbol comes from the ASan runtime, which is only on the link line under
+// -fsanitize=address. Caught by building it.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define CLINK_ASAN_ACTIVE 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)  // GCC spells it this way
+#define CLINK_ASAN_ACTIVE 1
+#endif
+#if defined(CLINK_ASAN_ACTIVE)
+#include <sanitizer/lsan_interface.h>
+#endif
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -343,7 +365,23 @@ simdjson::dom::parser& thread_parser() {
     // destroyed: TLS destructor order at thread exit is not sequenced
     // against the rest of teardown, and reclaiming one per-thread buffer
     // is the OS's job at exit anyway.
-    thread_local auto* parser = new simdjson::dom::parser();
+    // __lsan_ignore_object marks this as DELIBERATE rather than lost. Without it
+    // LeakSanitizer reports one parser per thread, and a cluster test spawns a thread
+    // per subtask - which is most of what a sanitizer run reports for the in-process
+    // cluster tests (8 allocations, ~10 KB, exactly the subtask count).
+    //
+    // An annotation here rather than a rule in lsan-suppressions.txt on purpose: that
+    // file's policy is to suppress only leaks inside third-party libraries clink does
+    // not own, and this allocation IS clink's. A module- or symbol-level suppression
+    // would also hide any future, genuine leak on the same stack. This marks exactly
+    // one pointer and nothing else.
+    thread_local auto* parser = [] {
+        auto* p = new simdjson::dom::parser();
+#if defined(CLINK_ASAN_ACTIVE)
+        __lsan_ignore_object(p);
+#endif
+        return p;
+    }();
     return *parser;
 }
 
