@@ -18,6 +18,30 @@
 #   ./provision.sh --dry    print what it WOULD create, touch nothing
 set -euo pipefail
 
+# The hcloud ACTIVE CONTEXT decides which project gets billed, and this script
+# creates billable resources in whichever one it happens to find. On 2026-07-28 it
+# found `moontoor` - a project with a production server in it - because the context
+# had changed between the operator checking it and this script running. It created a
+# network and an ssh-key there before Hetzner refused the server on capacity.
+#
+# Recoverable only because teardown.sh deletes by LABEL and the production server
+# carried none. That is a thin margin to rely on, so the context is now asserted
+# rather than printed: a run in the wrong project should fail before it creates
+# anything, not be cleaned up afterwards.
+#
+# EXPECTED_CONTEXT= (empty) skips the check, for a deliberate run elsewhere.
+EXPECTED_CONTEXT="${EXPECTED_CONTEXT-clink-bench}"
+if [ -n "$EXPECTED_CONTEXT" ]; then
+    active="$(hcloud context active 2>/dev/null || true)"
+    if [ "$active" != "$EXPECTED_CONTEXT" ]; then
+        echo "REFUSING TO PROVISION: hcloud active context is '${active:-<none>}', expected" >&2
+        echo "  '${EXPECTED_CONTEXT}'. This script creates BILLABLE resources in the active" >&2
+        echo "  project. Switch with:  hcloud context use ${EXPECTED_CONTEXT}" >&2
+        echo "  Or set EXPECTED_CONTEXT= to run somewhere else on purpose." >&2
+        exit 1
+    fi
+fi
+
 LABEL="purpose=clink-bench"
 LOCATION="${LOCATION:-fsn1}"       # cheapest EU region
 IMAGE="${IMAGE:-ubuntu-24.04}"
