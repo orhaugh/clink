@@ -116,6 +116,38 @@
 #   (b) the window's per-(wstart, auction) counts are lower in q5's plan than in
 #       qhopv's, despite the two queries being semantically identical.
 #
+# ANSWERED: IT IS (a). q5 and qhopv run on ONE stack at the SAME event count
+# (300k, par=4), then for each disputed window look up clink's OWN qhopv count for
+# the auction Flink declared the winner. Over all 72 disputed windows:
+#
+#   clink's own aggregate contains Flink's winning auction        72/72
+#   ...with EXACTLY Flink's count                                 72/72
+#   Flink's winner absent from clink's aggregate                      0
+#   clink's own per-window MAX equals clink's top-1                   0
+#
+# e.g. wstart=1000000080000: clink's aggregate holds auction 66 at num 8 and
+# auction 1557 at num 7, and clink's top-1 returned 1557 num 7. The winning row
+# EXISTS in the window's output, with the right count, and the top-N did not
+# select it.
+#
+# Put with the raw-topic result - the top-N converges to the maximum of what it
+# saw - the three measurements only fit one way: the window emits the right rows,
+# the top-N faithfully maximises what reaches it, and its answer is not the maximum
+# of what was emitted. So rows do not all get from the window's output to the
+# top-N's input at parallelism 4.
+#
+# WHICH MEANS THE COUNTER GAP IS BACK ON THE TABLE, and my dismissal of it above
+# was made on a bad control. row_compute_key out=1,533,886 against
+# top_n_per_key_row in=461,334 is consistent with this. The par=1 run I used to
+# wave it away had read only 344k of 460k bids, so it was never a control. What is
+# still unverified is whether those two counters count the same thing across that
+# boundary; establish that with a COMPLETE par=1 run before quoting any ratio.
+#
+# The top-N is a single-input operator fed by FOUR window subtasks - the window is
+# keyed by auction, so every subtask holds rows for every window - and all four
+# hash the same wstart to the same top-N subtask. The channel merge on that input
+# is the first place to look.
+#
 # THE OBVIOUS-LOOKING EVIDENCE FOR (a) DOES NOT HOLD UP. The per-operator counters
 # at par=4 read row_compute_key out=1,533,886 and top_n_per_key_row in=461,334,
 # which looks like 70% of the rows vanishing in the shuffle. It is not safe to read
