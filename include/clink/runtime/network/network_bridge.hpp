@@ -124,6 +124,13 @@ private:
     std::string name_;
     // Set by close(). Distinguishes "we are shutting this down" from "the send
     // failed mid-job", which is the difference between a clean stop and data loss.
+    //
+    // A plain bool, not an atomic, because both accesses are on the RUNNER thread:
+    // Dag::add_sink calls open(), on_data() and close() from inside one runner
+    // lambda, and its `runner.cancel` closes the INPUT CHANNEL rather than calling
+    // close() on the sink. Checked, because if cancel ever did call close() this
+    // would become a data race - and an atomic here would hide that rather than
+    // surface it, so the invariant is written down instead.
     bool closing_ = false;
 };
 
