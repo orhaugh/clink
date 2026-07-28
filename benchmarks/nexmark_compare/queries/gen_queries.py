@@ -291,6 +291,25 @@ QUERIES = {
                "TABLE(HOP(TABLE bid, DESCRIPTOR(ts), INTERVAL '2' SECOND, "
                "INTERVAL '10' SECOND)) GROUP BY window_start, window_end, auction"),
     ),
+    "qhopv": dict(
+        note=("NOT a nexmark query. qhop's windowed counts with the window start "
+              "projected and a primary key, so upsert_gate.sh compares the "
+              "VALUES rather than the row count. This exists because a window "
+              "that fires early emits the same NUMBER of panes with lower counts "
+              "in them, so no row-count gate can see an undercount - which is the "
+              "failure mode a multi-partition watermark produces, and the one "
+              "34819d4 fixed once already. This is the check that would notice it "
+              "coming back."),
+        streams=["bid"],
+        sink=[("wstart", "BIGINT"), ("auction", "BIGINT"), ("num", "BIGINT")],
+        pk=["wstart", "auction"],
+        clink=("SELECT window_start AS wstart, auction, COUNT(*) AS num FROM bid "
+               "GROUP BY HOP(datetime, INTERVAL '10' SECOND, INTERVAL '2' SECOND), auction"),
+        flink=("SELECT CAST(UNIX_TIMESTAMP(CAST(window_start AS STRING)) * 1000 AS BIGINT) "
+               "AS wstart, auction, COUNT(*) AS num FROM "
+               "TABLE(HOP(TABLE bid, DESCRIPTOR(ts), INTERVAL '2' SECOND, "
+               "INTERVAL '10' SECOND)) GROUP BY window_start, window_end, auction"),
+    ),
     "qcum": dict(
         note=("NOT a nexmark query. Cumulative bids per bidder over a 10s window "
               "stepping 2s: the panes share a start and end at successive steps, so "

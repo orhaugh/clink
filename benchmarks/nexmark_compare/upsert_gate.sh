@@ -37,13 +37,34 @@
 #           so this is not two valid answers to an ambiguous query.
 #   par=1   247 of 248 rows identical. The whole divergence disappears.
 #
-# The shape fits an unpartitioned stateful operator: q5's top-1 is PARTITION BY
-# wstart while its input arrives partitioned by auction from the upstream GROUP
-# BY, so each subtask would hold a local top-1 over its own auctions and write it
-# under the shared wstart key - giving a local maximum, which can only ever be at
-# or below the global one. Same class as 066af45. NOT yet confirmed at the plan
-# level, and the windowed aggregate underneath has not been separately
-# value-compared at par=4, so the top-N is the suspect and not the proven cause.
+# WHAT HAS BEEN RULED OUT, each by measurement rather than by reading code:
+#
+#  1. NOT the plan's partitioning. The first guess was an unpartitioned stateful
+#     operator (same class as 066af45), the top-1 holding a per-subtask local
+#     maximum. Dumping the physical spec kills it: the planner emits a
+#     row_compute_key over `wstart` feeding a top_n_per_key_row with
+#     key_by="row_key", partition_columns=wstart, sort_columns=num,auction and
+#     sort_descending=1,0. The routing and the sort keys are all correct.
+#
+#  2. NOT an early cancel. The gate used to settle on the SOURCE's records_out,
+#     which for a windowed query stops long before the panes fire - a top-1 cut
+#     off mid-flight is a PREFIX maximum, always at or below the true one, which
+#     fits the signature exactly. It now settles on the whole pipeline and takes
+#     SETTLE_S seconds of quiet. With SETTLE_S=30 the divergence is byte-identical
+#     to the 4-second run, so it is deterministic, not truncation.
+#
+#  3. NOT the window aggregate or its watermarks. qhopv value-compares the HOP
+#     counts that feed the top-1. At par=4 over 300k events: 734,382 keys on both
+#     engines, ZERO differing counts, none missing on either side. The multi-
+#     partition watermark path 34819d4 fixed is behaving.
+#
+# So the window hands the top-N exact input at par=4 and the top-N gets it wrong,
+# 153 windows out of 247. The remaining suspects are the operator's own behaviour
+# at parallelism > 1 and the changelog's path to the upsert sink. The in-suite
+# nexmark q5 runs at par=4 against an independent oracle and PASSES, so whatever
+# this is needs the scale or the shape the harness has and the fixture does not -
+# reproducing it in-suite is the next step, since a 10-minute Docker round trip is
+# the wrong iteration loop for it.
 #
 # The one remaining par=1 row is a different and much smaller question: Flink has
 # one extra trailing window (wstart 1000000486000) that clink does not emit.
@@ -58,6 +79,8 @@ EVENTS="${EVENTS:-1000000}"
 PAR="${PARALLELISM:-4}"
 QUERIES="${QUERIES:-q5 q18 q19}"
 OUT="${OUT:-results-upsert-gate}"
+# Quiet period after the pipeline stops moving, before the job is cancelled.
+SETTLE_S="${SETTLE_S:-8}"
 PROJECT=nxcompare
 JM_HTTP=8095
 FLINK_JM=nxcompare-flink-jobmanager-1
@@ -124,16 +147,23 @@ print(max([int(o.get("records_out",0) or 0) for o in d.get("operators",[]) if in
             [ "${proc:-0}" -gt 0 ] && break
             sleep 1
         done
+        # Settle on the WHOLE pipeline, not just the source. A windowed query's
+        # panes fire when the watermark passes, which is after the source has
+        # finished, and the top-N and sink downstream of that are still moving
+        # long after records_out on the source has stopped. Watching the source
+        # alone cancelled the job mid-flight and left the sink holding a PREFIX of
+        # the answer - for a top-N that is a prefix maximum, which is always at or
+        # below the true one and reads exactly like an engine that undercounts.
         prev=-1
-        for _ in $(seq 1 90); do
+        for _ in $(seq 1 120); do
             cur=$(curl -fsS "http://127.0.0.1:$JM_HTTP/api/v1/jobs/$cjid/operators" 2>/dev/null \
                   | python3 -c 'import json,sys
 d=json.load(sys.stdin)
-print(max([int(o.get("records_out",0) or 0) for o in d.get("operators",[]) if int(o.get("records_in",0) or 0)==0] or [0]))' 2>/dev/null || echo 0)
+print(sum(int(o.get("records_out",0) or 0) for o in d.get("operators",[])))' 2>/dev/null || echo 0)
             [ "$cur" = "$prev" ] && break
             prev=$cur; sleep 2
         done
-        sleep 4
+        sleep "$SETTLE_S"
         curl -fsS -X POST "http://127.0.0.1:$JM_HTTP/api/v1/jobs/$cjid/cancel" >/dev/null 2>&1 || true
     fi
 
@@ -160,7 +190,7 @@ print(max([int(v.get("metrics",{}).get("write-records",0) or 0) for v in d.get("
             [ "$cur" = "$prev" ] && [ "$cur" != "0" ] && break
             prev=$cur; sleep 2
         done
-        sleep 4
+        sleep "$SETTLE_S"
         docker exec "$FLINK_JM" flink cancel "$fjid" >/dev/null 2>&1 || true
     fi
 
