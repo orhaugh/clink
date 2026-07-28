@@ -10,11 +10,12 @@ and the two dialects are rendered from that single definition. A difference
 between the engines' SQL is then always a deliberate dialect difference,
 visible in this file.
 
-Only the BLACKHOLE variants are generated (`q*_bh.tmpl.sql`), which is what
-throughput_sampled.sh runs: the sink is discarded so the measurement is the
+Three variants are generated per query and engine. `q*_bh.tmpl.sql` discards the
+output, which is what throughput_sampled.sh measures against so the figure is the
 engine's read-and-process rate rather than the output connector's ceiling.
-The Kafka-sink variants used by the correctness gate stay hand-written, since
-q0 / q12 are the only ones the gate covers.
+`q*.tmpl.sql` writes to Kafka, which is what gate.sh compares row counts from.
+`q*_up.tmpl.sql` writes to an upsert sink and is generated only for the queries
+that declare a `pk`, for upsert_gate.sh.
 
 q0 and q12 are deliberately NOT generated. Every recorded before/after number
 in this repository is against those two exact files, so regenerating them -
@@ -238,6 +239,59 @@ QUERIES = {
                "GROUP BY SESSION(datetime, INTERVAL '10' SECOND), bidder"),
         flink=("SELECT bidder, COUNT(*) AS bid_count FROM "
                "TABLE(SESSION(TABLE bid PARTITION BY bidder, DESCRIPTOR(ts), "
+               "INTERVAL '10' SECOND)) GROUP BY window_start, window_end, bidder"),
+    ),
+    # --- window-kind coverage. NOT nexmark queries.
+    #
+    # The gate is meant to cover every window kind, and on the nexmark set alone it
+    # cannot. TUMBLE has q12 and SESSION has q11, both bare windowed aggregates the
+    # row-count gate can carry. HOP's only nexmark query is q5, which wraps it in a
+    # top-1 rank and therefore emits a CHANGELOG, so it can only be gated by
+    # upsert_gate.sh - and the last run there produced zero rows on both engines, so
+    # HOP has never actually been compared. CUMULATE appears nowhere in nexmark at
+    # all.
+    #
+    # These two put both kinds on the same footing as q11 and q12: a bare aggregate
+    # over the window, append-only, row-count comparable. Same shape as q11
+    # deliberately, so a count difference is attributable to the window and nothing
+    # else.
+    #
+    # The window BOUNDS are not projected. The gate compares row counts, so a bound
+    # column would add nothing it checks, while requiring each dialect to render a
+    # window timestamp into a BIGINT sink column - a conversion difference that would
+    # show up as a submit failure rather than as anything about windowing. Bounds are
+    # pinned in-suite instead, against an independent oracle, by
+    # NexmarkQueries.CumulateWindowPanes.
+    "qhop": dict(
+        note=("NOT a nexmark query. Bids per auction per 10s window sliding every "
+              "2s, so each bid lands in five overlapping panes. HOP's only nexmark "
+              "query is q5, whose top-1 rank makes it a changelog the row-count gate "
+              "cannot carry. NOTE the argument orders differ and are NOT "
+              "interchangeable: clink is HOP(time, SIZE, SLIDE), Flink's table "
+              "function is HOP(TABLE, DESCRIPTOR, SLIDE, SIZE)."),
+        streams=["bid"],
+        sink=[("auction", "BIGINT"), ("num", "BIGINT")],
+        clink=("SELECT auction, COUNT(*) AS num FROM bid "
+               "GROUP BY HOP(datetime, INTERVAL '10' SECOND, INTERVAL '2' SECOND), auction"),
+        flink=("SELECT auction, COUNT(*) AS num FROM "
+               "TABLE(HOP(TABLE bid, DESCRIPTOR(ts), INTERVAL '2' SECOND, "
+               "INTERVAL '10' SECOND)) GROUP BY window_start, window_end, auction"),
+    ),
+    "qcum": dict(
+        note=("NOT a nexmark query. Cumulative bids per bidder over a 10s window "
+              "stepping 2s: the panes share a start and end at successive steps, so "
+              "a bid contributes to every pane of its window that ends after it and "
+              "the pane count depends on where in the window it falls. Here the two "
+              "dialects agree on argument order - clink is CUMULATE(time, STEP, "
+              "SIZE) and Flink is CUMULATE(TABLE, DESCRIPTOR, STEP, SIZE) - which is "
+              "the opposite situation to HOP above, and the reason each is written "
+              "out per dialect rather than assumed to follow the other."),
+        streams=["bid"],
+        sink=[("bidder", "BIGINT"), ("num", "BIGINT")],
+        clink=("SELECT bidder, COUNT(*) AS num FROM bid "
+               "GROUP BY CUMULATE(datetime, INTERVAL '2' SECOND, INTERVAL '10' SECOND), bidder"),
+        flink=("SELECT bidder, COUNT(*) AS num FROM "
+               "TABLE(CUMULATE(TABLE bid, DESCRIPTOR(ts), INTERVAL '2' SECOND, "
                "INTERVAL '10' SECOND)) GROUP BY window_start, window_end, bidder"),
     ),
     "q14": dict(

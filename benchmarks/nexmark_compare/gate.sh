@@ -45,7 +45,13 @@ OUT="${OUT:-results-gate}"
 # all three - verified by compiling each against one. They belong here, not in the
 # ungated list where they sat on the assumption that "multi-stream" meant
 # "changelog".
-APPEND_ONLY="q0 q1 q2 q3 q4 q7 q11 q12 q14 q15 q16 q17 q20 q21 q22"
+#
+# qhop and qcum are NOT nexmark queries. They exist because the gate is meant to
+# cover every window kind and the nexmark set alone cannot: TUMBLE has q12 and
+# SESSION has q11, but HOP's only query is q5, whose top-1 rank makes it a
+# changelog, and CUMULATE appears nowhere. Both are bare windowed aggregates of
+# the same shape as q11, so a count difference is attributable to the window.
+APPEND_ONLY="q0 q1 q2 q3 q4 q7 q11 q12 q14 q15 q16 q17 q20 q21 q22 qhop qcum"
 # Changelog-emitting, so the report can name what it did not gate rather than leave
 # a silent hole. Determined by compiling each against a plain sink and reading which
 # are refused.
@@ -107,6 +113,13 @@ for q in sorted(by_q, key=qnum):
     if cr < 0 or fr < 0:
         partial.append(f"{q} (no output count recorded)")
         verdict = "NO COUNT (blackhole sink?)"
+    elif cr == 0 and fr == 0:
+        # 0 == 0 is not agreement, it is two engines that produced nothing, and it
+        # is the failure this harness has already had once: a query whose filter
+        # excluded every row of the generated stream compared 0 against 0 and
+        # reported a pass. A query that emits nothing has not been gated.
+        partial.append(f"{q} (both engines emitted 0 rows)")
+        verdict = "NOT GATED  both emitted 0 rows"
     elif cr == fr:
         passed.append(q)
         verdict = "MATCH"
