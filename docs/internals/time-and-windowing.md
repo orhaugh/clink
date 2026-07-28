@@ -209,7 +209,18 @@ On watermark advance, `prune_expired_` evicts partials whose `start_ts` is older
   | `CUMULATE` | 117 B | as above, once per cumulative slice |
   | `SESSION` | 131 B | as above plus the session's explicit `end` |
 
-  Against 16 bytes of actual information. The dominant term is the group values, which every bucket carries as its own serialised JSON object so the emitted row can be built without a second lookup. Resident memory is higher again: `sizeof(WindowBucket)` is 56 bytes and `sizeof(Session)` 64 on libc++, on top of one `std::map` node per window, one vector allocation per bucket's `AggState`s (104 bytes each), and one for the group values.
+  Against 16 bytes of actual information. Instrumenting `encode_bucket` attributes it (row counts per pane, same run):
+
+  | component | B/pane | share |
+  |---|---|---|
+  | the encoded `AggState` | 75.0 | 70% |
+  | group values, as a JSON object string | 19.4 | 18% |
+  | `window_start` + `window_end` | 16.0 | 15% |
+  | aggregate-count prefix | 4.0 | 4% |
+
+  So the **encoded `AggState` is the dominant term**, not the group values. An earlier revision of this page said the opposite; that was arithmetic rather than measurement, and it was wrong. It matters because it points at a different fix. Of the 75 bytes an `AggState` writes for a `COUNT(*)`, only the 8-byte `running_count` carries information: the rest is unconditional scaffolding for aggregate families the query does not use - two null JSON values for `MIN`/`MAX` at 8 bytes each, four zero container counts, an empty exact-decimal string, a null UDAF accumulator, five flags. This is the same accretion that took `sizeof(AggState)` to 264 bytes in memory; that was fixed, the serialised form was not.
+
+  Resident memory is higher again: `sizeof(WindowBucket)` is 56 bytes and `sizeof(Session)` 64 on libc++, on top of one `std::map` node per window, one vector allocation per bucket's `AggState`s (104 bytes each), and one for the group values.
 
   Two guards, because the two costs need different instruments. `static_assert`s at the definitions in `src/sql/install.cpp` bound `sizeof` for `AggState`, `WindowBucket` and `Session`, written in terms of the members rather than byte literals so they hold on both libc++ and libstdc++; what they forbid is a second container going inline, which is how `AggState` reached 264 bytes. `WindowMemory.SerialisedStatePerOpenWindowStaysWithinItsBound` gates the serialised figure at 160 B per pane, which is a regression gate and not a target. Resident memory is not deterministic enough to assert on and stays with `benchmarks/clink_window_state_bench`, which differences peak RSS between many groups and one, in child processes because `ru_maxrss` is a high-water mark.
 - Window state redistributes correctly across a **parallelism change**. Both operators key their state by the group key, so `KeyedState` writes it under that key's key-group prefix byte and each new subtask restores exactly the slice `key_group_range_for_subtask` assigns it. Scale-up filters one parent snapshot per new subtask, scale-down merges several through `combine_snapshots` before restoring; in both directions the union over the new subtasks is the same set of panes the old parallelism would have fired. `WindowRescale` in `tests/test_sql_runtime.cpp` pins this for all four kinds at 1 -> 2, 1 -> 4, 4 -> 2 and 4 -> 1, on both the row and columnar ingest paths.
