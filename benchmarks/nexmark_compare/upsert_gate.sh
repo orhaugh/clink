@@ -37,7 +37,9 @@
 #           so this is not two valid answers to an ambiguous query.
 #   par=1   247 of 248 rows identical. The whole divergence disappears.
 #
-# WHAT HAS BEEN RULED OUT, each by measurement rather than by reading code:
+# WHAT HAS BEEN RULED OUT, each by measurement rather than by reading code. Four
+# hypotheses, all mine, all wrong - recorded so the next attempt does not re-walk
+# them:
 #
 #  1. NOT the plan's partitioning. The first guess was an unpartitioned stateful
 #     operator (same class as 066af45), the top-1 holding a per-subtask local
@@ -53,18 +55,38 @@
 #     SETTLE_S seconds of quiet. With SETTLE_S=30 the divergence is byte-identical
 #     to the 4-second run, so it is deterministic, not truncation.
 #
-#  3. NOT the window aggregate or its watermarks. qhopv value-compares the HOP
+#  3. NOT the window aggregate as written to a topic. qhopv value-compares the HOP
 #     counts that feed the top-1. At par=4 over 300k events: 734,382 keys on both
-#     engines, ZERO differing counts, none missing on either side. The multi-
-#     partition watermark path 34819d4 fixed is behaving.
+#     engines, ZERO differing counts, none missing on either side. Note the exact
+#     claim - it proves the aggregate's output is right WHEN A SINK CONSUMES IT,
+#     not when a top-N does. Those are different assertions and the gap between
+#     them has not been closed.
 #
-# So the window hands the top-N exact input at par=4 and the top-N gets it wrong,
-# 153 windows out of 247. The remaining suspects are the operator's own behaviour
-# at parallelism > 1 and the changelog's path to the upsert sink. The in-suite
-# nexmark q5 runs at par=4 against an independent oracle and PASSES, so whatever
-# this is needs the scale or the shape the harness has and the fixture does not -
-# reproducing it in-suite is the next step, since a 10-minute Docker round trip is
-# the wrong iteration loop for it.
+#  4. NOT the sink fan-out. SINK_PAR=1 with the rest at 4 (this script patches the
+#     spec, since --parallelism is uniform) gives a diff BYTE-IDENTICAL to the
+#     par=4 sink. Worth having tried: run_query pins every connector to 1, so a
+#     fanned-out sink is ground no in-suite test covers.
+#
+# AND THE IN-SUITE REPRODUCTION PASSES. TopNOverWindow.HopTopOnePerWindowAt-
+# ParallelismFour runs the same shape at par=4 over a contested dataset with a
+# total ORDER BY, against an oracle, and agrees. So the top-N over a window is
+# correct at parallelism 4 on an ordered file source.
+#
+# WHAT IS LEFT is the source side: a Kafka read over four partitions each spanning
+# the whole time range, out-of-order arrival, and watermark_lag_ms=4000. That is
+# the only structural difference remaining between the passing in-suite test and
+# this failing one - which sits awkwardly with (3), and that tension is the lead:
+# either the aggregate emits something different when a top-N consumes it than
+# when a sink does, or one of those two measurements is not measuring what it
+# looks like.
+#
+# ONE MORE DATA POINT, NOT A CLEAN ONE. SRC_PAR=1 with the rest at 4 flips the
+# error DIRECTION: clink then OVER-counts the early windows (auction 1 at num 78
+# for wstart 999999994000) where before it undercounted. Over-emission is the other
+# half of the failure the README's multi-partition watermark section describes. But
+# that configuration introduces a parallelism CHANGE mid-pipeline that the real
+# plan does not have, so it is a lead about watermark propagation across a
+# rebalance, not an isolation of the source axis. Do not quote it as one.
 #
 # The one remaining par=1 row is a different and much smaller question: Flink has
 # one extra trailing window (wstart 1000000486000) that clink does not emit.
@@ -126,15 +148,54 @@ for q in $QUERIES; do
     # --- clink ---
     sed -e "s#__BROKERS__#kafka:29092#" -e "s#__OUT__#$ct#" \
         "queries/clink/${q}_up.tmpl.sql" > /tmp/nxq-up-clink.sql
-    cjid=$("$CLINK_ROOT/build/clink_submit_sql" --file /tmp/nxq-up-clink.sql \
-            --coordinator-host 127.0.0.1 --coordinator-port "$JM_HTTP" \
-            --name "up_$q" --parallelism "$PAR" 2>/dev/null \
-          | python3 -c 'import json,sys
+    if [ -n "${SINK_PAR:-}${SRC_PAR:-}" ]; then
+        # Submit a hand-patched spec so the SINK runs at a different parallelism
+        # from the rest of the job. --parallelism is uniform and there is no
+        # per-operator flag, but the coordinator accepts a raw JobGraphSpec, so
+        # generate one, rewrite the sink's parallelism, and POST that.
+        #
+        # This exists to isolate one suspect in the q5 divergence: no in-suite test
+        # can exercise a fanned-out sink, because run_query pins every connector
+        # back to 1, so "sink at 4" is untested ground that only this harness
+        # reaches.
+        "$CLINK_ROOT/build/clink_submit_sql" --file /tmp/nxq-up-clink.sql \
+            --parallelism "$PAR" 2>/dev/null > /tmp/nxq-spec.json
+        python3 - "${SINK_PAR:-}" "${SRC_PAR:-}" > /tmp/nxq-spec-patched.json <<'PY'
+import json, sys
+raw = open("/tmp/nxq-spec.json").read()
+d = json.loads(raw[raw.index("{"):])
+sink_par, src_par = sys.argv[1], sys.argv[2]
+for o in d.get("ops", []):
+    t = o.get("type", "")
+    if sink_par and "sink" in t:
+        o["parallelism"] = int(sink_par)
+    # The source and the ops fused to it before the first keyed shuffle: a Kafka
+    # source at 1 feeding a decoder at 4 would still fan out, so the decode and
+    # timestamp-assign stages move with it. Everything from the first keyed
+    # operator onward stays at PAR.
+    if src_par and ("source" in t or t in ("json_string_to_row_columnar",
+                                           "json_string_to_row",
+                                           "assign_timestamps_row")):
+        o["parallelism"] = int(src_par)
+json.dump(d, sys.stdout)
+PY
+        cjid=$(curl -fsS -X POST --data-binary @/tmp/nxq-spec-patched.json \
+                 "http://127.0.0.1:$JM_HTTP/api/v1/jobs/spec?name=up_$q" 2>/dev/null \
+               | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("job_id",""))
+except Exception: pass')
+        echo "  (sink=${SINK_PAR:-$PAR} source=${SRC_PAR:-$PAR} rest=$PAR)"
+    else
+        cjid=$("$CLINK_ROOT/build/clink_submit_sql" --file /tmp/nxq-up-clink.sql \
+                --coordinator-host 127.0.0.1 --coordinator-port "$JM_HTTP" \
+                --name "up_$q" --parallelism "$PAR" 2>/dev/null \
+              | python3 -c 'import json,sys
 for l in sys.stdin:
     l=l.strip()
     if l.startswith("{"):
         try: print(json.loads(l).get("job_id","")); break
         except: pass')
+    fi
     clink_ok=1
     if [ -z "$cjid" ]; then echo "  clink submit FAILED"; clink_ok=0; else
         echo "  clink job $cjid running"
