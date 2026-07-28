@@ -28,7 +28,32 @@
 #   ./upsert_gate.sh                  # q5 q18 q19
 #   QUERIES="q18" EVENTS=500000 ./upsert_gate.sh
 #
-# OPEN DEFECT, found here 2026-07-28: q5 DIVERGES AT PARALLELISM > 1.
+# OPEN DEFECT, found here 2026-07-28, and now LOCATED: q5's divergence at
+# parallelism > 1 is RECORDS LOST ON A CROSS-WORKER KEYED ROW SHUFFLE.
+#
+# The controlled test is colocate_q5.sh: parallelism 4, but every clink subtask on
+# ONE worker so the keyer -> top-N shuffle is local. It MATCHES Flink - 147 windows,
+# zero differing - and the top-N receives 734,382 rows against a window that emitted
+# 734,382. The same job over FOUR workers has the top-N receiving a fraction and 72
+# of 147 windows wrong. Same parallelism, same query, same data; the only variable
+# is whether the shuffle crosses a worker boundary.
+#
+# That also settles the counter question below: records_in and records_out ARE
+# comparable across that boundary, because they agree exactly when the hop is local.
+# The 461,334-of-1,533,886 reading was real loss, and the caveat against quoting it
+# is withdrawn.
+#
+# WHAT IT DOES NOT EXPLAIN, which constrains the next step: the same job's
+# source -> keyer -> window shuffle ALSO crosses workers and loses nothing - q12 and
+# qhopv are both exact at par=4 over four workers. The difference downstream is batch
+# SIZE, the window firing thousands of rows per pane group where the Kafka source
+# delivers modest batches. A size-dependent failure on the wire fits; "cross-worker
+# shuffle is broken" does not.
+#
+# The per-operator eliminations below all stand, and they are why this is a wire
+# defect rather than an operator one.
+#
+# ORIGINAL SYMPTOM:
 #
 #   par=4   153 of 247 windows have a different top-1. clink's count is never
 #           HIGHER than Flink's - 104 lower, 0 higher - and in all 49 windows
