@@ -75,6 +75,34 @@ echo "topic   : $TOPIC, target $EVENTS events, par=$PAR, engines: $ENGINES"
 sshx "cd $REMOTE && git rev-parse --short HEAD" | sed 's/^/repo    : /'
 scpx "$HERE/split-engine.yml" "$HERE/record.py" root@"$ENGINE_IP":"$REMOTE/cloud/" || exit 1
 
+# REFUSE TO MEASURE AN EMPTY TOPIC.
+#
+# This script does not load the topic - that is a prerequisite step (see README) -
+# and on 2026-07-28 it ran to completion against a broker holding nothing, then
+# against a broker whose KAFKA_ADVERTISED_LISTENERS had an empty host because
+# BROKER_PRIVATE_IP was unset when split-broker.yml was brought up. In BOTH cases it
+# printed a full scoreboard of 0 rec/s with reached=False for every engine and trial,
+# and only fell over at the very end on a division by zero in summarize-split.py.
+#
+# Two engines both reporting zero is not a comparison, exactly as 0 rows against 0
+# rows is not a passing gate (see the same guard in ../gate.sh). Checking the depth
+# up front costs one round trip and turns 15 wasted minutes of billed rig time into
+# an immediate, self-explaining failure.
+step "0b. Broker depth"
+depth=$(sshx "docker run --rm --network host confluentinc/cp-kafka:7.6.0 \
+    kafka-run-class kafka.tools.GetOffsetShell --bootstrap-server $BROKER --topic $TOPIC 2>/dev/null \
+    | awk -F: '{sum += \$3} END {print sum+0}'" 2>/dev/null | tr -d '\r')
+echo "topic $TOPIC holds ${depth:-unknown} records (target $EVENTS)"
+if [ -z "$depth" ] || [ "$depth" = "0" ]; then
+    echo
+    echo "REFUSING TO RUN: $TOPIC on $BROKER holds no records, so every measurement" >&2
+    echo "  would be 0 rec/s and the comparison would be meaningless. Load it first," >&2
+    echo "  and check that split-broker.yml was brought up WITH BROKER_PRIVATE_IP set -" >&2
+    echo "  without it Kafka advertises an empty host, TCP connects, and consumers" >&2
+    echo "  silently read nothing. See the README setup order." >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------- clink -------
 run_clink() {  # query trial
     local q=$1 trial=$2

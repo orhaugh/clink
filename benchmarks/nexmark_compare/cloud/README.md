@@ -50,6 +50,56 @@ evidence, check the Hetzner console too.
   the public internet at a 100ms interval folds tens of ms of RTT into a 500ms
   slope window.
 
+## Re-verification, 2026-07-28 (post record-loss fix) - RATIOS ONLY
+
+Rig: 2x ccx23, **nbg1** (Nuremberg - `ccx23` had no capacity in fsn1 that day; check
+availability before provisioning). clink at 438cb93
+(`ghcr.io/orhaugh/clink-runtime:sha-438cb9312564`), Flink 2.2.0 on java21,
+parallelism 4, two trials each, both engines on one provision.
+
+The point of this run was to re-measure after b791306, which fixed a batch above the
+send-credit window being silently dropped on any cross-worker shuffle. Every prior
+figure for a query whose large batches crossed a worker boundary had been measured on
+a pipeline that could lose records.
+
+| query | engine | sustained rec/s | drain rec/s | cores of 4 | events/cpu-s | anon MB |
+|-------|--------|----------------:|------------:|-----------:|-------------:|--------:|
+| q0    | clink  | 3,965,398 | 3,555,102 | **0.87** | **915,423** | **74** |
+| q0    | flink  | 2,294,405 | 1,025,755 | 2.60 | 224,555 | 1,160 |
+| q12   | clink  | 2,651,508 | 2,498,085 | **1.39** | **589,366** | **92** |
+| q12   | flink  | 1,454,874 | 690,276 | 2.96 | 151,490 | 1,533 |
+
+  q0   throughput 1.73x   efficiency 4.08x   memory 16.3x lower
+  q12  throughput 1.82x   efficiency 3.89x   memory 16.7x lower
+
+**QUOTE THE RATIOS, NOT THE ABSOLUTE RATES, and here is why.** This script does not
+load the topic, and the engine node has no Linux clink build, so there was no
+`nexmark_dump` to generate 9.2M distinct records with. The topic was filled by
+`kafka-producer-perf-test --payload-file` cycling a 20,000-row bid-shaped file to 9.2M
+records. That means:
+
+- **The ratios hold.** Both engines read the identical topic on one provision, with
+  Flink re-baselined alongside, which is the whole premise the ratio needs.
+- **The absolute rates do not compare to the 2026-07-26 baseline above**, which used a
+  real nexmark_dump dataset. Repeated payloads decode and cache differently, and
+  clink's q0 reads 3.97M rec/s here against 1.86M there. Putting those two numbers in
+  one table would be comparing two different workloads.
+
+A canonical-dataset re-run needs `nexmark_dump` cross-compiled for the engine node, or
+the NDJSON generated on the laptop and uploaded (~1.3 GB). Until that exists, this run
+corroborates the direction and magnitude of the baseline; it does not supersede it.
+
+Three setup steps this script does not do, all of which cost billed time on
+2026-07-28 before the run worked:
+
+1. `ccx23` capacity is per-location. fsn1 had none; nbg1 did. `hcloud datacenter list`
+   before provisioning.
+2. The engine node needs the repo cloned at `/root/clink` for `driver/*.py`.
+3. The broker node needs `split-broker.yml` brought up **with `BROKER_PRIVATE_IP` set**.
+   Without it Kafka advertises an empty host: TCP connects, consumers read nothing, and
+   the run reports 0 rec/s for everything. `split-run.sh` now refuses to start against
+   an empty topic for exactly this reason.
+
 ## Baseline, 2026-07-26
 
 Rig: 2x ccx23 (4 dedicated vCPU each), fsn1. Engine node runs one engine at a time

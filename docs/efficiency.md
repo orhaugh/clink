@@ -37,6 +37,13 @@ a CPU ratio is **not** an energy ratio unless the freed capacity is actually sur
 fixed fleet the same 3.87x becomes about 1.8x on power, because an idle core still draws
 roughly a quarter of its loaded power.
 
+A later run on 28 July 2026, after a data-loss fix in clink's cross-worker shuffle,
+reproduced the same direction and magnitude on a fresh provision: 4.08x (stateless) and
+3.89x (windowed) less CPU per event, and memory 16x lower on both. Its absolute rates are
+**not** comparable to the table above, because its input was a synthetic payload rather
+than the nexmark dataset - see [Provenance](#provenance). It corroborates these figures
+rather than replacing them.
+
 The memory result still splits between the two queries, and the reason is worth reading
 before quoting the q12 row: most of that 749 MB is window state the query genuinely
 requires, not engine overhead. See
@@ -662,6 +669,37 @@ QUERIES="q0 q12" PARALLELISM=4 EVENTS=500000 ./run.sh
 - **Full record**, including the method corrections that voided earlier numbers, the
   per-stage CPU attribution, and the optimisations that were measured and rejected:
   [`benchmarks/nexmark_compare/cloud/README.md`](https://github.com/orhaugh/clink/blob/main/benchmarks/nexmark_compare/cloud/README.md).
+
+### Re-verified 28 July 2026, ratios only
+
+clink at commit `438cb93` on a fresh 2x ccx23 provision in `nbg1`, Flink 2.2.0 re-baselined
+alongside, parallelism 4, two trials each. Raw output:
+[`assets/efficiency-2026-07-28.json`](assets/efficiency-2026-07-28.json).
+
+| | clink | JVM engine | ratio |
+|---|---:|---:|---:|
+| CPU per event, q0 | 915,423 events/cpu-second | 224,555 | **4.08x less CPU** |
+| CPU per event, q12 | 589,366 events/cpu-second | 151,490 | **3.89x less CPU** |
+| Memory, q0 | 74 MB | 1,160 MB | **16.3x less** |
+| Memory, q12 | 92 MB | 1,533 MB | **16.7x less** |
+
+Why this is published as ratios and not as a replacement for the headline table: the rig
+scripts do not load the Kafka topic, and the engine node had no Linux clink build to
+generate a nexmark dataset with, so the topic was filled by `kafka-producer-perf-test`
+cycling a 20,000-row bid-shaped payload file to 9.2 million records. Both engines read the
+identical topic on one provision, which is what a ratio needs, so the ratios stand. But
+repeated payloads decode and cache differently from 9.2 million distinct records - clink's
+q0 reads 3.97M records per second here against 1.86M on the canonical dataset - so the
+absolute rates describe an easier workload and are not comparable to the rounds above.
+They are recorded here rather than promoted into the headline table for that reason.
+
+The run also matters for what preceded it. It is the first measurement taken after
+`b791306`, which fixed a data batch larger than the send-credit window being silently
+dropped on any shuffle that crossed a worker boundary - so any earlier figure for a query
+whose large batches crossed that boundary was measured on a pipeline that could lose
+records. The q12 memory figure moving from 749 MB to 92 MB across the two rounds is
+mostly the different dataset (far fewer distinct grouping keys in a cycled payload), not
+an engine change, and should not be read as a 8x memory improvement.
 
 An earlier round of measurements on a single machine was discarded rather than published:
 with the broker and both engines sharing cores, clink's q0 was recorded at both 1.06M and
