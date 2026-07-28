@@ -62,20 +62,30 @@ struct RunResult {
 //     allocated by  std::map<int, const char*>::map<apache::thrift::TEnumIterator>
 //                     in the `clink` binary
 //
-// That is Thrift's generated enum-name map existing TWICE: once statically linked
-// into the `clink` binary (confirmed - `nm -C build/clink` shows apache::thrift
-// symbols and a TEnumIterator instantiation) and once inside libparquet, which the
-// CLI loads dynamically because clink_core links Parquet::parquet_shared. Global
-// symbol interposition binds libparquet's reference to the binary's copy, both
-// register an exit-time destructor for it, and the second one double-frees.
+// Thrift's generated enum-name map therefore exists TWICE in the process: once from
+// libparquet.a, which reaches the `clink` link line via clink_cli_cmds ->
+// clink::iceberg -> iceberg::iceberg_bundle_static (confirmed - libparquet.a is in
+// CMakeFiles/clink.dir/link.txt and `nm libparquet.a` finds the TEnumIterator
+// instantiation), and once inside libparquet.so, which the CLI loads because
+// clink_core links Parquet::parquet_shared. Both register an exit-time destructor
+// and the second free aborts.
 //
-// So it is a LINK-CONFIGURATION defect, not a memory-safety bug in clink code, and
-// it predates any of the work that surfaced it - the identical failure set appears
-// at 2bbe8d6. The fix is to stop the same library being present both statically and
-// dynamically in one process, or to hide the static copy's symbols so libparquet
-// cannot bind to them. Both have blast radius (the self-contained embedding
-// artifact and the macOS wheel both depend on the static Arrow/Parquet linkage), so
-// it is deliberately not a drive-by change.
+// A LINK-CONFIGURATION defect, not a memory-safety bug in clink code, and it
+// predates the work that surfaced it - the identical failure set appears at 2bbe8d6.
+//
+// THE MECHANISM IS NOT ESTABLISHED, and one plausible explanation has been
+// DISPROVEN. The obvious candidate is that the executable exports the archive's
+// symbols and libparquet.so binds its references to them, which would make
+// `-Wl,--exclude-libs,libparquet.a` the fix. Measured on Linux in the toolchain
+// image, with iceberg enabled and libparquet.a on the link line: the executable
+// exports ZERO apache::thrift, TEnumIterator or parquet:: symbols, both with and
+// without that flag. So interposition through the executable's dynamic table is not
+// it, and --exclude-libs is a no-op here - it was written, measured, and dropped
+// rather than committed as a fix that changes nothing.
+//
+// Whatever the real path is, a fix needs it pinned first, and it needs care: the
+// self-contained embedding artifact and the macOS wheel both depend on that static
+// Arrow/Parquet linkage, and that linkage has its own hard-won history.
 //
 // USER-VISIBLE IMPACT, which is why this is worth fixing rather than suppressing:
 // anything scripting the `clink` CLI and checking its exit code sees 134 after a
