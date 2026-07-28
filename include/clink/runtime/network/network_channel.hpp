@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -150,10 +151,70 @@ public:
     }
 
 private:
-    // Serialize and send a StreamElement frame over the socket (the non-local
-    // path). Reads `el` by const-ref - moving would not help since the bytes
-    // are copied into the IPC payload either way.
+    // [offset, offset + len) of `batch` as its own Batch.
+    //
+    // Zero-copy on the columnar path: arrow::RecordBatch::Slice shares the
+    // parent's buffers, and with_arrow keeps the parent's materialize closure, so
+    // the chunk stays columnar and a row consumer downstream of the wire is
+    // unaffected. Materialising to rows instead would be a silent carrier
+    // downgrade on exactly the batches that are already the largest, which is the
+    // shape of regression this file has been caught by before.
+    std::optional<Batch<T>> slice_batch_(const Batch<T>& batch,
+                                         std::size_t offset,
+                                         std::size_t len) const {
+#ifdef CLINK_HAS_ARROW
+        if (batch.is_columnar() && batch.arrow() != nullptr) {
+            auto sub = batch.arrow()->Slice(static_cast<std::int64_t>(offset),
+                                            static_cast<std::int64_t>(len));
+            if (sub == nullptr) {
+                return std::nullopt;
+            }
+            return batch.with_arrow(std::move(sub), len);
+        }
+#endif
+        const auto& recs = batch.records();
+        if (offset + len > recs.size()) {
+            return std::nullopt;
+        }
+        return Batch<T>{
+            std::vector<Record<T>>(recs.begin() + static_cast<std::ptrdiff_t>(offset),
+                                   recs.begin() + static_cast<std::ptrdiff_t>(offset + len))};
+    }
+
+    // Split a data batch too large for the credit window into admissible frames,
+    // then hand each to push_frame_. Everything else goes straight through.
+    //
+    // Chunking is semantics-preserving. Batch boundaries carry no meaning - a
+    // batch is a transport grouping, and watermarks, barriers and drain markers
+    // travel as their own StreamElements - and the chunks are emitted in order on
+    // this thread with nothing interleaved between them, so a consumer sees the
+    // same records in the same order relative to every other element.
     bool push_remote_(const StreamElement<T>& el) {
+        if (el.is_data() && el.as_data().size() > kInitialNetworkCredit) {
+            const auto& batch = el.as_data();
+            const std::size_t total = batch.size();
+            for (std::size_t off = 0; off < total; off += kMaxRecordsPerFrame) {
+                const std::size_t len =
+                    std::min(static_cast<std::size_t>(kMaxRecordsPerFrame), total - off);
+                auto chunk = slice_batch_(batch, off, len);
+                if (!chunk.has_value()) {
+                    return false;
+                }
+                if (!push_frame_(StreamElement<T>::data(std::move(*chunk)))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return push_frame_(el);
+    }
+
+    // Serialize and send ONE StreamElement frame over the socket (the non-local
+    // path). Reads `el` by const-ref - moving would not help since the bytes
+    // are copied into the IPC payload either way. Callers must ensure a data
+    // element's record count is within the credit window; push_remote_ is what
+    // guarantees that.
+    bool push_frame_(const StreamElement<T>& el) {
         if (el.is_data()) {
             const auto needed = static_cast<std::uint32_t>(el.as_data().size());
             if (!acquire_credit_(needed)) {

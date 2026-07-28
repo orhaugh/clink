@@ -112,6 +112,34 @@ enum class Kind : std::uint8_t {
 // memory pressure tolerance.
 inline constexpr std::uint32_t kInitialNetworkCredit = 2048;
 
+// Largest record count in a single data frame.
+//
+// A frame has to be admissible under the credit window or it can never be sent
+// at all. Credit is CONSERVED - the receiver grants back exactly the record
+// count of each batch it pops - so remaining_credit_ never exceeds
+// kInitialNetworkCredit, and acquire_credit_(n) for n above that waits on a
+// condition that can never become true. Before this cap existed such a batch
+// blocked until teardown, then returned false into a bool the sink discarded, so
+// it vanished with no error and no failed task. That is what made nexmark q5
+// disagree with an independent engine on 153 of 247 windows at parallelism 4
+// across four workers while matching exactly when every subtask was co-located
+// on one; a windowed fire is thousands of rows where a Kafka source's batches are
+// modest, which is why the shuffle in front of the window was unaffected and the
+// one behind it was not. See docs/internals/network-stack.md.
+//
+// HALF the window rather than all of it: at exactly the window a frame needs the
+// entire budget free, which only happens once the receiver has drained
+// everything, and the sender would round-trip per frame. Half lets two frames be
+// in flight.
+//
+// Only batches ABOVE the window are split (see push_remote_), so any batch the
+// engine sent successfully before is framed byte-identically now - the cap
+// changes the previously-impossible case and nothing else.
+inline constexpr std::uint32_t kMaxRecordsPerFrame = kInitialNetworkCredit / 2;
+static_assert(kMaxRecordsPerFrame > 0 && kMaxRecordsPerFrame <= kInitialNetworkCredit,
+              "a data frame must be admissible under the credit window, or the sender waits "
+              "on a condition that can never hold");
+
 // Hard cap on a single wire frame's payload length. The 4-byte frame header is
 // attacker-controllable, so an unbounded `std::vector<std::byte>(frame_len)` is
 // a memory-amplification DoS: a peer that claims 4 GiB makes the reader allocate

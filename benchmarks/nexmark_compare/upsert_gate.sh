@@ -28,223 +28,35 @@
 #   ./upsert_gate.sh                  # q5 q18 q19
 #   QUERIES="q18" EVENTS=500000 ./upsert_gate.sh
 #
-# OPEN DEFECT, found here 2026-07-28, and now LOCATED: q5's divergence at
-# parallelism > 1 is RECORDS LOST ON A CROSS-WORKER KEYED ROW SHUFFLE.
+# q5 WAS a cross-engine failure at parallelism > 1 and is now FIXED. Kept here in
+# short because the investigation is worth not repeating.
 #
-# The controlled test is colocate_q5.sh: parallelism 4, but every clink subtask on
-# ONE worker so the keyer -> top-N shuffle is local. It MATCHES Flink - 147 windows,
-# zero differing - and the top-N receives 734,382 rows against a window that emitted
-# 734,382. The same job over FOUR workers has the top-N receiving a fraction and 72
-# of 147 windows wrong. Same parallelism, same query, same data; the only variable
-# is whether the shuffle crosses a worker boundary.
+# Symptom: at par=4 over four workers, 153 of 247 windows carried a different
+# top-1, clink's count never HIGHER than Flink's, and all 49 tied windows resolved
+# against the query's own ORDER BY. At par=1, or at par=4 with every subtask on one
+# worker (colocate_q5.sh), it matched exactly.
 #
-# That also settles the counter question below: records_in and records_out ARE
-# comparable across that boundary, because they agree exactly when the hop is local.
-# The 461,334-of-1,533,886 reading was real loss, and the caveat against quoting it
-# is withdrawn.
+# Cause: a data batch larger than the send-credit window could never be admitted.
+# Credit is conserved - the receiver grants back exactly what it pops - so
+# remaining_credit_ never exceeds kInitialNetworkCredit = 2048 records, and
+# acquire_credit_ for a bigger batch waited on a condition that could not hold. It
+# released at teardown, returned false, and every caller discards that bool, so the
+# batch vanished with no error. A windowed fire is thousands of rows where a Kafka
+# source's batches are modest, which is why the shuffle in FRONT of the window was
+# unaffected and the one BEHIND it was not, and why co-locating fixed it
+# (LocalDataPlane has no credit at all).
 #
-# ROOT CAUSE, read out of the code once the locus was known: A BATCH LARGER THAN THE
-# CREDIT WINDOW IS SILENTLY DROPPED. Credit is conserved - the receiver grants back
-# exactly the record count of each batch it pops - so remaining_credit_ can never
-# exceed the kInitialNetworkCredit = 2048 records it starts with. push_remote_
-# acquires credit for the WHOLE batch and does not chunk, so acquire_credit_(n) with
-# n > 2048 waits on a condition that can never become true, unblocks only when
-# closed_ is set at teardown, returns false - and NetworkBridgeSink discards that
-# bool. No error, no failed task, batch gone.
+# Fix: push_remote_ splits a batch above the window into kMaxRecordsPerFrame frames,
+# slicing the Arrow sidecar zero-copy so the columnar carrier survives. Batches
+# under the window are framed exactly as before. See
+# docs/internals/network-stack.md and NetworkChannelCredit.ABatchLargerThanThe-
+# CreditWindowArrivesWholeAndInOrder.
 #
-# Which is why the shuffle IN FRONT of the window is fine and the one BEHIND it is
-# not: a Kafka source delivers modest batches, a windowed fire here is ~4,996 rows.
-# And why the loss is partial: the 4-way split brings a typical fire to ~1,249 rows
-# per peer, under the window, so only skewed sub-batches exceed it.
-#
-# clink_net_bridge_credit_exhaustion_total already counts every credit block, which
-# is the signal that would have caught this; nothing watched it. See
-# docs/internals/network-stack.md.
-#
-# The per-operator eliminations below all stand, and they are why this is a wire
-# defect rather than an operator one.
-#
-# ORIGINAL SYMPTOM:
-#
-#   par=4   153 of 247 windows have a different top-1. clink's count is never
-#           HIGHER than Flink's - 104 lower, 0 higher - and in all 49 windows
-#           where the counts tie, clink picked the higher auction, against the
-#           query's `ORDER BY num DESC, auction ASC`. One-directional both ways,
-#           so this is not two valid answers to an ambiguous query.
-#   par=1   247 of 248 rows identical. The whole divergence disappears.
-#
-# WHAT HAS BEEN RULED OUT, each by measurement rather than by reading code. Five
-# hypotheses, all mine, all wrong - recorded so the next attempt does not re-walk
-# them:
-#
-#  1. NOT the plan's partitioning. The first guess was an unpartitioned stateful
-#     operator (same class as 066af45), the top-1 holding a per-subtask local
-#     maximum. Dumping the physical spec kills it: the planner emits a
-#     row_compute_key over `wstart` feeding a top_n_per_key_row with
-#     key_by="row_key", partition_columns=wstart, sort_columns=num,auction and
-#     sort_descending=1,0. The routing and the sort keys are all correct.
-#
-#  2. NOT an early cancel. The gate used to settle on the SOURCE's records_out,
-#     which for a windowed query stops long before the panes fire - a top-1 cut
-#     off mid-flight is a PREFIX maximum, always at or below the true one, which
-#     fits the signature exactly. It now settles on the whole pipeline and takes
-#     SETTLE_S seconds of quiet. With SETTLE_S=30 the divergence is byte-identical
-#     to the 4-second run, so it is deterministic, not truncation.
-#
-#  3. NOT the window aggregate as written to a topic. qhopv value-compares the HOP
-#     counts that feed the top-1. At par=4 over 300k events: 734,382 keys on both
-#     engines, ZERO differing counts, none missing on either side. Note the exact
-#     claim - it proves the aggregate's output is right WHEN A SINK CONSUMES IT,
-#     not when a top-N does. Those are different assertions and the gap between
-#     them has not been closed.
-#
-#  4. NOT the sink fan-out. SINK_PAR=1 with the rest at 4 (this script patches the
-#     spec, since --parallelism is uniform) gives a diff BYTE-IDENTICAL to the
-#     par=4 sink. Worth having tried: run_query pins every connector to 1, so a
-#     fanned-out sink is ground no in-suite test covers.
-#
-#  5. NOT the window's columnar emission. This one mattered because it showed (3)
-#     had measured the wrong path: enable_columnar_output promotes a producer to
-#     columnar only when EVERY consumer is in its allowlist, and q5's window feeds
-#     row_compute_key (in the list, so COLUMNAR) while qhopv's feeds
-#     row_to_json_string (not in it, so ROW). qhopv therefore cannot exercise the
-#     path q5 takes. Settled by the lever the code provides for it:
-#     CLINK_DISABLE_COLUMNAR_OUTPUT=1 forces the window back to row form, and the
-#     diff is again BYTE-IDENTICAL.
-#
-# WHICH GIVES THE DEDUCTION THAT MATTERS. qhopv's window emits rows and its output
-# is exact. q5 with CLINK_DISABLE_COLUMNAR_OUTPUT=1 also has its window emitting
-# rows - same query, same data, same parallelism - so q5's window output is exact
-# too. The top-N is therefore producing a wrong answer from CORRECT input, which is
-# what the in-suite test says it does not do.
-#
-# The diff is byte-identical across settle time, sink parallelism and columnar
-# emission. That stability is itself evidence: this is not a race and not routing.
-# It is deterministic, and the remaining structural difference between the passing
-# in-suite test and this failing one is the SINK TYPE - a file sink whose changelog
-# the test replays in order, versus kafka_upsert_sink_string whose changelog is
-# reduced to last-value-per-key with tombstoned keys removed. clink emits 1,030
-# tombstones here and Flink emits 0, because clink's top-N retracts the displaced
-# row (delete + insert, different row PKs) where Flink's upsert-kafka just
-# overwrites the wstart key. Whether that delete/insert pair survives the reduction
-# in the order it was emitted is the next thing to check, and it needs the RAW
-# topic rather than the reduced state this script keeps.
-#
-# AND THE IN-SUITE REPRODUCTION PASSES. TopNOverWindow.HopTopOnePerWindowAt-
-# ParallelismFour runs the same shape at par=4 over a contested dataset with a
-# total ORDER BY, against an oracle, and agrees. So the top-N over a window is
-# correct at parallelism 4 against a file sink whose changelog is replayed in
-# order.
-#
-#  6. NOT the upsert reduction, and NOT the top-N losing its own answer. Dumped the
-#     RAW topic (driver/read_upsert_topic.py --raw, and KEEP_UP=1 to keep it):
-#     247 keys, every one confined to a SINGLE partition so last-write-wins is
-#     well defined; the emission order is right (value, then the tombstone that
-#     retracts the displaced row, then the next value); NO key ends on a tombstone;
-#     and NO key's final value is lower than the best value ever inserted under it.
-#     The changelog is internally consistent and the reduction is faithful. So the
-#     top-N converges to the maximum of WHAT IT SAW - it simply never saw the
-#     higher counts.
-#
-# WHICH LEAVES exactly two possibilities, and they are distinguishable:
-#   (a) rows are lost between the window and the top-N, so the top-1 is a maximum
-#       over a subset; or
-#   (b) the window's per-(wstart, auction) counts are lower in q5's plan than in
-#       qhopv's, despite the two queries being semantically identical.
-#
-# ANSWERED: IT IS (a). q5 and qhopv run on ONE stack at the SAME event count
-# (300k, par=4), then for each disputed window look up clink's OWN qhopv count for
-# the auction Flink declared the winner. Over all 72 disputed windows:
-#
-#   clink's own aggregate contains Flink's winning auction        72/72
-#   ...with EXACTLY Flink's count                                 72/72
-#   Flink's winner absent from clink's aggregate                      0
-#   clink's own per-window MAX equals clink's top-1                   0
-#
-# e.g. wstart=1000000080000: clink's aggregate holds auction 66 at num 8 and
-# auction 1557 at num 7, and clink's top-1 returned 1557 num 7. The winning row
-# EXISTS in the window's output, with the right count, and the top-N did not
-# select it.
-#
-# Put with the raw-topic result - the top-N converges to the maximum of what it
-# saw - the three measurements only fit one way: the window emits the right rows,
-# the top-N faithfully maximises what reaches it, and its answer is not the maximum
-# of what was emitted. So rows do not all get from the window's output to the
-# top-N's input at parallelism 4.
-#
-# WHICH MEANS THE COUNTER GAP IS BACK ON THE TABLE, and my dismissal of it above
-# was made on a bad control. row_compute_key out=1,533,886 against
-# top_n_per_key_row in=461,334 is consistent with this. The par=1 run I used to
-# wave it away had read only 344k of 460k bids, so it was never a control. What is
-# still unverified is whether those two counters count the same thing across that
-# boundary; establish that with a COMPLETE par=1 run before quoting any ratio.
-#
-# THE CHANNEL MERGE AND THE SPLIT BOTH READ CORRECT. Dag::union_streams on the
-# top-N's input already carries the closed-AND-drained rule from the earlier fix
-# for exactly this symptom ("1-2% pane-count loss at par=4/16"), broadcasts
-# watermarks, and only breaks when every input is closed and empty.
-# Dag::add_split routes every record, broadcasts watermarks and barriers to all
-# branches, and closes all branches. Neither loses rows on reading. And the row
-# split and the columnar split produce the SAME wrong answer, so the split is not
-# the differentiator either.
-#
-# WHICH LEAVES THE ONE STRUCTURAL DIFFERENCE THAT SURVIVES EVERY ELIMINATION: how
-# a batch actually travels that edge. The in-suite test runs an InProcessCluster -
-# one worker, so LocalDataPlane serves every edge as a direct in-process push. The
-# harness runs FOUR worker containers, so a 4-way hash shuffle keeps roughly a
-# quarter of its rows local and sends the rest over a socket as Arrow IPC. The
-# top-N received 461,334 rows where the window emitted somewhere between 1.22M
-# (scaling qhopv's 734,382 at 300k) and 1,533,886 (the counter) - 30% to 38%,
-# which is the neighbourhood of "only the co-located slice arrived".
-#
-# Treat the arithmetic as suggestive and not as proof: the numerator's
-# comparability across that boundary is still unverified (see above), and if
-# exactly three quarters of rows vanished more than 49% of windows would be wrong.
-# Some loss, not all of it.
-#
-# This pair has diverged silently before. local_data_plane.hpp documents the
-# advertised-host bug that made the fast path disappear in this very benchmark
-# while working everywhere else, because both sides defaulted to 127.0.0.1. A
-# producer/consumer pair where the two ends can disagree needs an
-# ASYMMETRIC-construction test; a matched-ends end-to-end run cannot see it.
-#
-# TWO TESTS THAT WOULD SETTLE IT:
-#   - Place every clink subtask on ONE worker at parallelism 4, so the shuffle is
-#     local but the parallelism is unchanged. If q5 then matches Flink, the socket
-#     path is the culprit and the operator is exonerated.
-#   - Scrape clink_dataplane_local_hits_total and
-#     clink_dataplane_socket_fallbacks_total off /metrics for the run, which says
-#     how many batches took each path rather than leaving it inferred.
-#
-# THE OBVIOUS-LOOKING EVIDENCE FOR (a) DOES NOT HOLD UP. The per-operator counters
-# at par=4 read row_compute_key out=1,533,886 and top_n_per_key_row in=461,334,
-# which looks like 70% of the rows vanishing in the shuffle. It is not safe to read
-# them that way: the SAME gap appears at par=1 (1,148,337 -> 356,823) in a
-# configuration that MATCHES Flink, so the two counters are not comparable across
-# that boundary - one of them is not counting rows the way the other is, most likely
-# on the columnar ingest path. The par=1 control was also incomplete (344k of
-# 460k bids read before the settle loop broke), so it is not usable as one either.
-# Do not quote the 70%.
-#
-# THE EXPERIMENT THAT DISTINGUISHES (a) FROM (b), and it needs no code change: run
-# qhopv and q5 at the SAME event count on one stack, then for each disputed window
-# look up clink's OWN qhopv count for the auction Flink declared the winner. If
-# clink's aggregate says that auction had the higher count, the top-N never received
-# its row and it is (a). If clink's aggregate agrees with clink's top-1, the
-# aggregate undercounts in q5's plan shape and it is (b) - which would also mean
-# qhopv cannot stand in for q5's aggregate, exactly as it could not for its emission
-# mode.
-#
-# ONE MORE DATA POINT, NOT A CLEAN ONE. SRC_PAR=1 with the rest at 4 flips the
-# error DIRECTION: clink then OVER-counts the early windows (auction 1 at num 78
-# for wstart 999999994000) where before it undercounted. Over-emission is the other
-# half of the failure the README's multi-partition watermark section describes. But
-# that configuration introduces a parallelism CHANGE mid-pipeline that the real
-# plan does not have, so it is a lead about watermark propagation across a
-# rebalance, not an isolation of the source axis. Do not quote it as one.
-#
-# The one remaining par=1 row is a different and much smaller question: Flink has
-# one extra trailing window (wstart 1000000486000) that clink does not emit.
+# Six hypotheses were eliminated before the right one, all by measurement: the
+# plan's partitioning, an early cancel, the window aggregate, the sink fan-out, the
+# window's columnar emission, and the upsert reduction. The one that finally
+# localised it was colocate_q5.sh - same parallelism, one worker - because it varied
+# the wire and nothing else.
 set -uo pipefail
 
 cd "$(dirname "$0")"

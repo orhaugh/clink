@@ -289,3 +289,90 @@ TEST_F(NetworkChannelCreditTest, NoRecordLossOrReorderUnderSustainedBackpressure
             << "record out of order / wrong value at index " << i;
     }
 }
+
+// A batch LARGER THAN THE CREDIT WINDOW must still arrive, whole and in order.
+//
+// Credit is conserved: the receiver grants back exactly the record count of each
+// batch it pops, so remaining_credit_ can never exceed kInitialNetworkCredit. A
+// single batch above that therefore asked acquire_credit_ to wait for a budget
+// that can never exist. It blocked until teardown, returned false, and every
+// caller in the engine discards that bool - so the batch vanished with no error
+// and no failed task.
+//
+// That is not a hypothetical: it is what made nexmark q5 disagree with an
+// independent engine on 153 of 247 windows at parallelism 4 across four workers,
+// while matching exactly when every subtask was co-located on one worker and the
+// socket was bypassed entirely. A windowed fire is thousands of rows where a
+// Kafka source's batches are modest, which is why the shuffle in front of the
+// window was unaffected and the one behind it was not.
+//
+// push_remote_ now splits an oversized data batch into kMaxRecordsPerFrame
+// frames. WITHOUT that split this test HANGS rather than fails: the sender waits
+// on a credit condition that can never become true, and nothing here closes the
+// channel to release it. In the engine the release came at teardown, push returned
+// false, and the caller discarded it - so production silently lost the batch where
+// a test deadlocks. Verified by reverting the split.
+//
+// Sizes here straddle the window deliberately: one just under (the case
+// that always worked), one just over (the smallest that used to be lost), and one
+// several times over (which needs more than two chunks, so the credit gate has to
+// engage and replenish mid-batch rather than the whole thing fitting at once).
+TEST(NetworkChannelCredit, ABatchLargerThanTheCreditWindowArrivesWholeAndInOrder) {
+    for (const std::uint32_t rows :
+         {kInitialNetworkCredit - 1, kInitialNetworkCredit + 1, kInitialNetworkCredit * 5}) {
+        // FORCE THE SOCKET. listen() registers the receive queue with
+        // LocalDataPlane, so a same-process sink connecting to the same
+        // (host, port) short-circuits to a direct BoundedChannel push and never
+        // touches credit at all. The first version of this test did exactly that
+        // and passed with the fix REVERTED - a vacuous test for a defect whose
+        // whole signature is "works co-located, loses records over the wire".
+        // Unregistering the endpoint before connect() puts the pair on TCP, and
+        // the fd assertion below makes it impossible for that to regress
+        // silently.
+        ChannelPair p;
+        p.source = std::make_unique<NetworkChannelSource<std::int64_t>>(
+            /*port=*/0, int64_codec());
+        const auto port = p.source->listen();
+        LocalDataPlane::instance().unregister_endpoint(default_data_bind_host(), port);
+        p.sink =
+            std::make_unique<NetworkChannelSink<std::int64_t>>("127.0.0.1", port, int64_codec());
+        p.accept_thread = std::thread([&p] { p.source->accept(); });
+        p.sink->connect();
+        p.accept_thread.join();
+        ASSERT_GE(p.sink->fd(), 0)
+            << rows << " records: the sink resolved through LocalDataPlane instead of a socket, "
+            << "so the credit path this test exists to cover was never entered";
+        std::vector<std::int64_t> received;
+        std::thread consumer([&] {
+            while (auto e = p.source->pop()) {
+                if (e->is_data()) {
+                    for (const auto& r : e->as_data()) {
+                        received.push_back(r.value());
+                    }
+                }
+            }
+        });
+
+        Batch<std::int64_t> b;
+        b.reserve(rows);
+        for (std::uint32_t i = 0; i < rows; ++i) {
+            b.emplace(static_cast<std::int64_t>(i));
+        }
+        // A false return is the silent-loss path: the value was discarded
+        // everywhere in the engine, which is why this was invisible.
+        ASSERT_TRUE(p.sink->push(StreamElement<std::int64_t>::data(std::move(b))))
+            << rows << " records: push reported failure, which callers discard";
+        p.sink->close_send();
+        consumer.join();
+
+        ASSERT_EQ(received.size(), static_cast<std::size_t>(rows))
+            << rows << " records sent as ONE batch, " << received.size()
+            << " arrived. A batch above the " << kInitialNetworkCredit
+            << "-record credit window is unsendable unless it is split.";
+        for (std::uint32_t i = 0; i < rows; ++i) {
+            ASSERT_EQ(received[i], static_cast<std::int64_t>(i))
+                << rows << " records: value or order wrong at index " << i
+                << " - chunking must preserve record order across frame boundaries";
+        }
+    }
+}
