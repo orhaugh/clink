@@ -634,22 +634,41 @@ the memory column is how many times *less* anonymous memory clink held.
 | q15 | count-distinct per window | 739,880 | 120,238 | **6.15x** | 428 | 1,471 | 3.4x less |
 | q16 | count-distinct per channel | 528,206 | 138,432 | **3.82x** | 410 | 1,474 | 3.6x less |
 | q17 | per-auction aggregates | 417,708 | 52,605 | **7.94x** | 1,071 | 1,681 | 1.6x less |
-| q18 | dedup per key | 410,726 | 116,175 | 3.54x ‡ | 3,756 | 1,272 | **0.3x - clink worse** |
-| q19 | top-10 per auction | 324,560 | 78,048 | 4.16x †‡ | 2,234 | 1,405 | **0.6x - clink worse** |
+| q18 | dedup per key | 410,726 | - ‡ | - ‡ | 3,756 | - ‡ | not comparable ‡ |
+| q19 | top-10 per auction | 324,560 † | - ‡ | - ‡ | 2,234 | - ‡ | not comparable ‡ |
 | q21 | CASE over a string | 484,356 | 229,988 | **2.11x** | 360 | 1,182 | 3.3x less |
 | q22 | string splitting | 467,011 | 224,210 | **2.08x** | 464 | 1,180 | 2.5x less |
 | qcum | cumulate windows | 436,716 | 47,078 | **9.28x** | 688 | 1,832 | 2.7x less |
 | qhop | hopping windows | 414,232 | 32,944 | **12.57x** | 903 | 1,843 | 2.0x less |
 
 † trial-to-trial spread above 1.25x on clink's side (q11 1.42x, q19 1.72x) - indicative
-rather than firm. ‡ the JVM engine did not drain the input inside the sampler's window on
-q18 and q19, so its figures there describe a partial run.
+rather than firm.
 
-**Where clink loses, which is worth as much as where it wins.** On q18 and q19 - dedup and
-top-N per key - clink holds **three times more memory** than the JVM engine and about
-twice on q19. Both keep unbounded per-key state, and clink's per-key representation is the
-known weakness behind that; the same defect shows up in the q12 memory row on this page.
-It is not a measurement artefact and it is not fixed.
+‡ **the JVM engine has no comparable q18/q19 figures, and an earlier revision of this
+table published some anyway.** On both queries its source counter stopped advancing at a
+deterministic point - 1,083,142 and 1,084,008 records on q18's two trials, within 0.1% -
+and after six quiet seconds the sampler gave up with 12-21% of the input ingested. The
+figures this table briefly showed were then doubly wrong: efficiency divided the FULL
+9.2M events by the CPU of that truncated window (inflating the JVM figure roughly 8x, in
+its favour), and the memory column compared clink's footprint holding ALL 9.2M keys
+against the JVM engine's holding an eighth of them. Both cells are withdrawn rather than
+recomputed: a truncated window's CPU is dominated by deploy and warm-up, so no honest
+number exists for it. The recording harness now withholds efficiency on truncated runs.
+The likely cause of the stall is the image-default 1728 MB TaskManager memory meeting
+9.19 million keys of dedup state - consistent with every JVM memory reading in this table
+sitting at 1.1-1.8 GB - and the next rig run raises it to find out.
+
+**Where clink's memory goes on q18 and q19, measured rather than compared.** Dedup over
+this dataset retains nearly the whole input: 9,193,877 distinct (bidder, auction) pairs
+across 9.2M bids, one row kept per pair. clink's 3.7 GB is therefore ~428 bytes per
+retained row - including pipeline buffers - against a 124-byte serialized payload, so the
+in-memory representation costs about 3.4x the data it holds. That is a real overhead with
+a bounded remedy (storing retained rows encoded rather than materialized, estimated
+25-35% of the state back at some hot-path cost), and it is parked with that accounting
+rather than fixed here. It is NOT the pathological per-key overhead this page documents
+for the windowed-aggregate state, and the earlier claim in this section that clink "holds
+three times more memory than the JVM engine" on these queries is withdrawn - this data
+cannot establish a cross-engine ratio the JVM side never finished ingesting.
 
 **Why there is no throughput column.** The sampler's sustained-slope figure was not stable
 enough on the JVM engine to publish per query: two identical trials of q2 gave 10.05M and

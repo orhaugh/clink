@@ -80,9 +80,36 @@ Four things this run establishes about the harness, not about the engines:
 4. **clink q11 and q19 efficiency were themselves noisy** (1.42x and 1.72x between
    trials). Everything else was within 1.15x.
 
-And one about the engine, which is published rather than buried: clink holds **3x more
-memory than Flink on q18** and about 2x more on q19. Both are unbounded per-key state -
-the same weakness as the q12 memory figure - and it is not fixed.
+CORRECTED after publication, same day: the q18/q19 Flink figures first published from
+this sweep were unsound and are withdrawn. Flink's source stalled at a DETERMINISTIC
+point (1,083,142 vs 1,084,008 records on q18's two trials - within 0.1%) and the sampler
+quit after 6 quiet seconds with 12-21% of the input ingested. record.py then divided the
+full 9.2M-event target by the truncated window's CPU, inflating Flink's q18 efficiency
+~8x IN ITS FAVOUR, and the memory column compared clink-with-all-keys against
+Flink-with-an-eighth-of-them. The "clink holds 3x more memory on q18" conclusion from the
+first version of this section is withdrawn with them. record.py now withholds the
+headline efficiency whenever reached_target is false (a partial window's CPU is
+deploy-and-warm-up dominated, so no honest recomputation exists), and split-run.sh gained
+QUIET_TIMEOUT for probing the stall.
+
+What clink's own (sound, fully-drained) side establishes: q18 dedup over this dataset
+retains 9,193,877 distinct (bidder, auction) pairs from 9.2M bids - nearly the entire
+input - so its 3.7 GB is ~428 B per retained row against a 124 B serialized payload,
+about 3.4x representation overhead including pipeline buffers. q19 is ~416 B per retained
+row by the same arithmetic. A bounded optimization exists (store retained rows encoded,
+not materialized; estimated 25-35% back, at hot-path decode cost on eviction) and is
+PARKED with this accounting, not silently dropped.
+
+Next-run checklist, from what this sweep cost to learn:
+- Set taskmanager.memory.process.size explicitly (the compose ships the image default,
+  1728 MB, and every Flink anon_mb reading in this sweep sat at 1.1-1.8 GB - the likely
+  stall cause on the two per-key-state-heavy queries). Note it changes the premise of
+  Flink's memory column against earlier rounds.
+- QUIET_TIMEOUT=30 on q18/q19 to learn whether Flink resumes after the stall or is
+  wedged.
+- REPEATS=3 for the stateful queries: clink's q11 and q19 efficiency spread 1.42x and
+  1.72x between two trials while everything else held within 1.15x, and two samples
+  cannot say which trial to believe.
 
 ## Re-verification, 2026-07-28 (post record-loss fix) - RATIOS ONLY
 

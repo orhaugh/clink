@@ -47,8 +47,27 @@ def main():
         # this take" figure, and the one that makes a throughput ratio meaningful
         # when the two engines occupy different amounts of the node.
         "cores": round(cpu / wall, 2) if wall else None,
-        "events_per_cpu_sec": round(a.input_events / cpu) if cpu else None,
     })
+    # Efficiency divides events by the CPU that processed them, so the numerator
+    # must be what this run ACTUALLY processed. It used to be input_events
+    # unconditionally, which for a truncated run (sampler gave up mid-stall,
+    # reached_target false) credits the engine with the whole input over the CPU
+    # of a fraction of it. On the 2026-07-28 sweep that inflated Flink's q18
+    # efficiency ~8.5x - it stalled at 1.08M of 9.2M events, and 9.2M was divided
+    # by the CPU of the 1.08M-event window. A truncated run's efficiency is not
+    # comparable to a drained run's either way (deploy and JVM warm-up dominate a
+    # short window), so it is reported under a different key rather than the
+    # headline one, and the headline is null.
+    processed = int(d.get("processed") or 0)
+    if d.get("reached_target") and cpu:
+        d["events_per_cpu_sec"] = round(a.input_events / cpu)
+    else:
+        d["events_per_cpu_sec"] = None
+        d["events_per_cpu_sec_partial"] = round(processed / cpu) if cpu and processed else None
+        d["_efficiency_note"] = (
+            f"run truncated at {processed:,} of {a.input_events:,} events; "
+            "headline efficiency withheld - a partial window's CPU is dominated by "
+            "deploy and warm-up and is not comparable to a drained run")
     with open(a.out, "w") as f:
         json.dump(d, f)
 

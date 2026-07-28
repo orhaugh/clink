@@ -4,8 +4,9 @@
  "_what_is_not_reportable": {
   "per_query_throughput_ratios": "Flink's sustained-slope samples spread up to 3.99x between two identical trials (q2 10.05M vs 2.52M rec/s; q1 3.53x; q7 1.91x) while its drain rate stayed near 1.0M. The sampler is unreliable for Flink on this rig, so per-query throughput ratios are not published. Efficiency held within 1.15x on 31 of 33 (query, engine) pairs and is what the page reports.",
   "q5": "clink never ran it: 36 tasks at parallelism 4 against a 16-slot worker.",
-  "q18_q19": "Flink did not drain the input within the sampler window (reached_target false), so its throughput is a lower bound.",
-  "noisy_efficiency": "clink q11 (1.42x) and q19 (1.72x) spread between trials; treat those two ratios as indicative."
+  "q18_q19": "NO comparable Flink figures exist. Its source counter stalled at a deterministic point (q18: 1,083,142 and 1,084,008 records on two trials; q19: ~1.92M) and the sampler gave up after 6 quiet seconds with 12-21% of the input ingested. The events_per_cpu_sec recorded in those four runs is INVALID - record.py divided the full 9,200,000-event target by the CPU of the truncated window (inflating Flink ~8x on q18, ~5x on q19); record.py now withholds efficiency when reached_target is false. Flink's anon_mb in those runs is its footprint holding an eighth of the keys and is not comparable to clink's full-ingest footprint. Suspected cause: the image-default 1728 MB TaskManager process size meeting ~9.19M keys of per-key state; unverified until a run with taskmanager.memory.process.size raised.",
+  "noisy_efficiency": "clink q11 (1.42x) and q19 (1.72x) spread between trials; treat those two ratios as indicative.",
+  "q18_q19_clink_context": "clink's side is sound (full drain). Its 3.7 GB on q18 is 9,193,877 retained rows at ~428 B each against a 124 B serialized payload - dedup over this dataset retains nearly every input row, so most of that memory is the data itself at ~3.4x representation overhead, not a per-key pathology."
  },
  "measured_utc_date": "2026-07-28",
  "clink_commit": "438cb93",

@@ -46,6 +46,12 @@ EVENTS="${EVENTS:-9200000}"
 ENGINES="${ENGINES:-clink flink}"
 REPEATS="${REPEATS:-1}"
 TAG="${TAG:-}"
+# Sampler give-up threshold after the frontier stalls, seconds. The default 6 is
+# part of the method every published number was measured under, so it stays; the
+# knob exists because Flink's q18/q19 source stalled >6s at a DETERMINISTIC point
+# (~1.08M of 9.2M on both trials, within 0.1%) on 2026-07-28 and the sampler gave
+# up - a longer value on the next run answers whether Flink resumes or is wedged.
+QUIET_TIMEOUT="${QUIET_TIMEOUT:-6}"
 KEY="${KEY:-$HOME/.ssh/clink-bench-ed25519}"
 RESULTS="$HERE/results-split${TAG:+-$TAG}"
 REMOTE=/root/clink/benchmarks/nexmark_compare
@@ -154,7 +160,7 @@ run_clink() {  # query trial
     echo "  clink  job $jid"
 
     local s
-    s=$(sshx "cd $REMOTE && python3 driver/sample_rate.py clink --base http://127.0.0.1:8095 --job $jid --target $EVENTS --baseline $base0 --max-runtime 240")
+    s=$(sshx "cd $REMOTE && python3 driver/sample_rate.py clink --base http://127.0.0.1:8095 --job $jid --target $EVENTS --baseline $base0 --max-runtime 240 --quiet-timeout $QUIET_TIMEOUT")
     local cpu_post wall_post mem
     cpu_post=$(rcpu "$ctrs")
     wall_post=$(now_s)
@@ -203,7 +209,7 @@ run_flink() {  # query trial
     echo "  flink  job $jid"
 
     local s
-    s=$(sshx "cd $REMOTE && python3 driver/sample_rate.py flink --base http://127.0.0.1:8081 --job $jid --target $EVENTS --max-runtime 240")
+    s=$(sshx "cd $REMOTE && python3 driver/sample_rate.py flink --base http://127.0.0.1:8081 --job $jid --target $EVENTS --max-runtime 240 --quiet-timeout $QUIET_TIMEOUT")
     local cpu_post wall_post mem
     cpu_post=$(rcpu "$ctrs")
     wall_post=$(now_s)
