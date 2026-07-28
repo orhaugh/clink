@@ -110,6 +110,14 @@ def main():
     ap.add_argument("--bootstrap", default="localhost:9092")
     ap.add_argument("--topic", required=True)
     ap.add_argument("--json", action="store_true")
+    # The reduced state answers "do the engines agree". It cannot answer "why",
+    # because the reduction is exactly what discards the sequence. --raw keeps the
+    # per-partition message order so a delete/insert pair can be read back in the
+    # order the broker holds it, which is the order last-write-wins resolves.
+    ap.add_argument("--raw", action="store_true",
+                    help="dump every message as partition/offset/key/value, in order")
+    ap.add_argument("--key", default=None,
+                    help="with --raw, only messages whose key contains this substring")
     ap.add_argument("--timeout", type=float, default=20.0)
     args = ap.parse_args()
 
@@ -118,6 +126,15 @@ def main():
     except Exception as e:  # noqa: BLE001 - the caller only needs the reason
         print(json.dumps({"error": str(e), "topic": args.topic}))
         return 1
+    if args.raw:
+        for part, off, key, value in msgs:
+            k = key.decode("utf-8", "replace") if key is not None else "<null>"
+            if args.key is not None and args.key not in k:
+                continue
+            v = ("<TOMBSTONE>" if value is None or len(value) == 0
+                 else value.decode("utf-8", "replace"))
+            print(f"p{part} @{off:<7} key={k!r} {v}")
+        return 0
     state, tombstones = reduce_to_state(msgs)
     canon = canonical(state)
     if args.json:

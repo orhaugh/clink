@@ -37,7 +37,7 @@
 #           so this is not two valid answers to an ambiguous query.
 #   par=1   247 of 248 rows identical. The whole divergence disappears.
 #
-# WHAT HAS BEEN RULED OUT, each by measurement rather than by reading code. Four
+# WHAT HAS BEEN RULED OUT, each by measurement rather than by reading code. Five
 # hypotheses, all mine, all wrong - recorded so the next attempt does not re-walk
 # them:
 #
@@ -97,15 +97,43 @@
 # AND THE IN-SUITE REPRODUCTION PASSES. TopNOverWindow.HopTopOnePerWindowAt-
 # ParallelismFour runs the same shape at par=4 over a contested dataset with a
 # total ORDER BY, against an oracle, and agrees. So the top-N over a window is
-# correct at parallelism 4 on an ordered file source.
+# correct at parallelism 4 against a file sink whose changelog is replayed in
+# order.
 #
-# WHAT IS LEFT is the source side: a Kafka read over four partitions each spanning
-# the whole time range, out-of-order arrival, and watermark_lag_ms=4000. That is
-# the only structural difference remaining between the passing in-suite test and
-# this failing one - which sits awkwardly with (3), and that tension is the lead:
-# either the aggregate emits something different when a top-N consumes it than
-# when a sink does, or one of those two measurements is not measuring what it
-# looks like.
+#  6. NOT the upsert reduction, and NOT the top-N losing its own answer. Dumped the
+#     RAW topic (driver/read_upsert_topic.py --raw, and KEEP_UP=1 to keep it):
+#     247 keys, every one confined to a SINGLE partition so last-write-wins is
+#     well defined; the emission order is right (value, then the tombstone that
+#     retracts the displaced row, then the next value); NO key ends on a tombstone;
+#     and NO key's final value is lower than the best value ever inserted under it.
+#     The changelog is internally consistent and the reduction is faithful. So the
+#     top-N converges to the maximum of WHAT IT SAW - it simply never saw the
+#     higher counts.
+#
+# WHICH LEAVES exactly two possibilities, and they are distinguishable:
+#   (a) rows are lost between the window and the top-N, so the top-1 is a maximum
+#       over a subset; or
+#   (b) the window's per-(wstart, auction) counts are lower in q5's plan than in
+#       qhopv's, despite the two queries being semantically identical.
+#
+# THE OBVIOUS-LOOKING EVIDENCE FOR (a) DOES NOT HOLD UP. The per-operator counters
+# at par=4 read row_compute_key out=1,533,886 and top_n_per_key_row in=461,334,
+# which looks like 70% of the rows vanishing in the shuffle. It is not safe to read
+# them that way: the SAME gap appears at par=1 (1,148,337 -> 356,823) in a
+# configuration that MATCHES Flink, so the two counters are not comparable across
+# that boundary - one of them is not counting rows the way the other is, most likely
+# on the columnar ingest path. The par=1 control was also incomplete (344k of
+# 460k bids read before the settle loop broke), so it is not usable as one either.
+# Do not quote the 70%.
+#
+# THE EXPERIMENT THAT DISTINGUISHES (a) FROM (b), and it needs no code change: run
+# qhopv and q5 at the SAME event count on one stack, then for each disputed window
+# look up clink's OWN qhopv count for the auction Flink declared the winner. If
+# clink's aggregate says that auction had the higher count, the top-N never received
+# its row and it is (a). If clink's aggregate agrees with clink's top-1, the
+# aggregate undercounts in q5's plan shape and it is (b) - which would also mean
+# qhopv cannot stand in for q5's aggregate, exactly as it could not for its emission
+# mode.
 #
 # ONE MORE DATA POINT, NOT A CLEAN ONE. SRC_PAR=1 with the rest at 4 flips the
 # error DIRECTION: clink then OVER-counts the early windows (auction 1 at num 78
@@ -136,6 +164,14 @@ FLINK_JM=nxcompare-flink-jobmanager-1
 FLINK_REST=8081
 
 cleanup() {
+    # KEEP_UP=1 leaves the stack AND the output topics in place. The reduced state
+    # this script prints is the answer; the raw topic is the only thing that can
+    # explain it, and the reduction is what throws the sequence away. Pair with
+    # driver/read_upsert_topic.py --raw --key <pk>.
+    if [ -n "${KEEP_UP:-}" ]; then
+        echo "  (KEEP_UP set: stack and topics left running)"
+        return
+    fi
     docker compose -p "$PROJECT" --profile clink --profile flink down -v \
         --remove-orphans >/dev/null 2>&1 || true
 }
