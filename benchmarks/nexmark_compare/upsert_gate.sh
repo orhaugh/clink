@@ -43,12 +43,23 @@
 # The 461,334-of-1,533,886 reading was real loss, and the caveat against quoting it
 # is withdrawn.
 #
-# WHAT IT DOES NOT EXPLAIN, which constrains the next step: the same job's
-# source -> keyer -> window shuffle ALSO crosses workers and loses nothing - q12 and
-# qhopv are both exact at par=4 over four workers. The difference downstream is batch
-# SIZE, the window firing thousands of rows per pane group where the Kafka source
-# delivers modest batches. A size-dependent failure on the wire fits; "cross-worker
-# shuffle is broken" does not.
+# ROOT CAUSE, read out of the code once the locus was known: A BATCH LARGER THAN THE
+# CREDIT WINDOW IS SILENTLY DROPPED. Credit is conserved - the receiver grants back
+# exactly the record count of each batch it pops - so remaining_credit_ can never
+# exceed the kInitialNetworkCredit = 2048 records it starts with. push_remote_
+# acquires credit for the WHOLE batch and does not chunk, so acquire_credit_(n) with
+# n > 2048 waits on a condition that can never become true, unblocks only when
+# closed_ is set at teardown, returns false - and NetworkBridgeSink discards that
+# bool. No error, no failed task, batch gone.
+#
+# Which is why the shuffle IN FRONT of the window is fine and the one BEHIND it is
+# not: a Kafka source delivers modest batches, a windowed fire here is ~4,996 rows.
+# And why the loss is partial: the 4-way split brings a typical fire to ~1,249 rows
+# per peer, under the window, so only skewed sub-batches exceed it.
+#
+# clink_net_bridge_credit_exhaustion_total already counts every credit block, which
+# is the signal that would have caught this; nothing watched it. See
+# docs/internals/network-stack.md.
 #
 # The per-operator eliminations below all stand, and they are why this is a wire
 # defect rather than an operator one.
