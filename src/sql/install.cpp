@@ -1707,6 +1707,46 @@ public:
         if (effective_async_) {
             columnar_out_.reset();
         }
+        // Durability for the in-memory path, matching AggregateRowOp.
+        //
+        // On a synchronous backend every open window lived only in state_ and was
+        // never written to the backend, so a restore brought back a window operator
+        // with no windows. That is silent data loss rather than a slow recovery: the
+        // source resumes at the checkpointed offset, so the records that had already
+        // been folded into those windows are NOT replayed, and their contribution is
+        // simply gone. Same slot and codec the async paths use, so a job can move
+        // between storage modes across restarts.
+        persist_inmem_ =
+            !effective_async_ && this->runtime() != nullptr && this->runtime()->has_state_backend();
+        if (persist_inmem_ && state_.empty()) {
+            keyed_state_().scan(
+                [&](const std::string& key, const std::map<std::int64_t, WindowBucket>& by_window) {
+                    if (by_window.empty()) {
+                        return;
+                    }
+                    state_[key] = by_window;
+                    // fire_due_'s fast path skips the scan when this bound says
+                    // nothing is due, so a restore that did not rebuild it would
+                    // leave every restored window unfireable.
+                    earliest_win_end_ = std::min(earliest_win_end_, by_window.begin()->first);
+                });
+        }
+    }
+
+    // Flush the in-memory windows to the backend at checkpoint time. The runner
+    // calls this immediately before taking the snapshot, which is the same hook the
+    // aggregate operator uses.
+    void snapshot_timers(StateBackend& backend,
+                         OperatorId op_id,
+                         const std::string& slot = "") override {
+        Operator<Row, Row>::snapshot_timers(backend, op_id, slot);
+        if (!persist_inmem_) {
+            return;  // the async path already holds its windows in KeyedState
+        }
+        auto kv = keyed_state_();
+        for (const auto& [key, by_window] : state_) {
+            kv.put(key, by_window);
+        }
     }
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
     // The fire (on_event_time_timer) reads + writes the group's window map.
@@ -2296,6 +2336,10 @@ private:
     }
 
     bool effective_async_ = false;
+    // True when a state backend is attached but the KeyedState paths are not: the
+    // in-memory windows are then flushed to the "win" slot at snapshot time and
+    // reloaded in open(), so an open window survives a restore.
+    bool persist_inmem_ = false;
     bool have_wm_ = false;
     std::int64_t current_wm_ = 0;
     // Grace period a fired window is kept open: it fires once when the watermark

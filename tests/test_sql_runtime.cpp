@@ -14541,6 +14541,149 @@ std::map<std::string, std::string> min_max_window_params(const std::string& size
 
 }  // namespace
 
+namespace {
+
+// A minimal source and sink, so this block does not depend on the NexmarkQueries
+// fixture (whose DDL helpers are members).
+std::string window_probe_ddl() {
+    return "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
+           "url VARCHAR, datetime BIGINT) WITH (connector='kafka', format='json', "
+           "brokers='b', topic='bid', group_id='g', event_time_column='datetime', "
+           "watermark_lag_ms='0');"
+           "CREATE TABLE out_t (num BIGINT) WITH (connector='file', format='json', "
+           "path='/dev/null');";
+}
+
+// Bind a window query and, if it binds, try to BUILD every window operator the
+// planner emitted. Returns a description of the outcome.
+struct BindThenBuild {
+    bool bound = false;
+    bool built = false;
+    std::string bind_error;
+    std::string build_error;
+    bool saw_window_op = false;
+};
+
+BindThenBuild bind_then_build(const std::string& group_by) {
+    ensure_sql_installed_once();
+    BindThenBuild r;
+    cluster::JobGraphSpec spec;
+    try {
+        Catalog cat;
+        auto ddl = parse(window_probe_ddl());
+        for (const auto& st : ddl.statements) {
+            cat.register_table(std::get<ast::CreateTableStmt>(st));
+        }
+        const std::string sql =
+            "INSERT INTO out_t SELECT COUNT(*) AS num FROM bid GROUP BY " + group_by;
+        spec = compile(cat, sql.c_str());
+        r.bound = true;
+    } catch (const std::exception& e) {
+        r.bind_error = e.what();
+        return r;
+    }
+
+    r.built = true;
+    for (const auto& op : spec.ops) {
+        const bool is_window = op.type == "tumbling_window_row" ||
+                               op.type == "hopping_window_row" ||
+                               op.type == "cumulate_window_row" || op.type == "session_window_row";
+        if (!is_window) {
+            continue;
+        }
+        r.saw_window_op = true;
+        const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+            op.type, std::string{kChannelRow}, std::string{kChannelRow});
+        if (f == nullptr) {
+            r.built = false;
+            r.build_error = "no factory for " + op.type;
+            continue;
+        }
+        cluster::OperatorBuildContext ctx;
+        ctx.params = op.params;
+        ctx.parallelism = 1;
+        try {
+            (void)f->build(ctx);
+        } catch (const std::exception& e) {
+            r.built = false;
+            r.build_error = e.what();
+        }
+    }
+    return r;
+}
+
+}  // namespace
+
+namespace {
+
+// Drive a window with an explicit script of records and watermarks, so a test can
+// place a record AFTER a watermark that has already passed its window. Returns the
+// emitted rows in order, since firing more than once is one of the things under
+// test and a multiset would hide it.
+struct WinEvent {
+    // Exactly one of these is used: a record at (ts, key), or a watermark.
+    bool is_watermark = false;
+    std::int64_t ts = 0;
+    std::int64_t key = 0;
+};
+
+WinEvent rec_at(std::int64_t ts, std::int64_t key = 7) {
+    return WinEvent{.is_watermark = false, .ts = ts, .key = key};
+}
+WinEvent wm_at(std::int64_t ts) {
+    return WinEvent{.is_watermark = true, .ts = ts, .key = 0};
+}
+
+std::vector<std::string> drive_window_script(const std::string& op_type,
+                                             const std::map<std::string, std::string>& params,
+                                             const std::vector<WinEvent>& script) {
+    ensure_sql_installed_once();
+    const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+        op_type, std::string{kChannelRow}, std::string{kChannelRow});
+    if (f == nullptr) {
+        ADD_FAILURE() << "no operator factory registered for " << op_type;
+        return {};
+    }
+    cluster::OperatorBuildContext ctx;
+    ctx.params = params;
+    ctx.parallelism = 1;
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(f->build(ctx));
+
+    std::vector<std::string> out_rows;
+    Emitter<Row> em([&](StreamElement<Row> e) {
+        if (e.is_data()) {
+            for (const auto& r : e.as_data()) {
+                out_rows.push_back(canonical(
+                    clink::config::JsonValue{clink::sql::to_json_object(r.value().values)},
+                    window_drop_cols()));
+            }
+        }
+        return true;
+    });
+    for (const auto& ev : script) {
+        if (ev.is_watermark) {
+            op->process(StreamElement<Row>::watermark(Watermark{EventTime{ev.ts}}), em);
+            continue;
+        }
+        Row r;
+        r.values["auction"] = clink::config::JsonValue{ev.key};
+        r.values["datetime"] = clink::config::JsonValue{ev.ts};
+        Batch<Row> b;
+        b.emplace(r, EventTime{ev.ts});
+        op->process(StreamElement<Row>::data(std::move(b)), em);
+    }
+    return out_rows;
+}
+
+// COUNT per 10s tumbling window, with a configurable grace band.
+std::map<std::string, std::string> lateness_params(std::int64_t allowed_lateness_ms) {
+    auto p = window_params("10000", "");
+    p["allowed_lateness_ms"] = std::to_string(allowed_lateness_ms);
+    return p;
+}
+
+}  // namespace
+
 // The row fold and the columnar fold are separate implementations of the same
 // semantics, and the columnar one is what a Kafka/JSON source actually runs. Only
 // the row path had tests until the sweep above, and the sweep asserts counts; this
@@ -14828,75 +14971,320 @@ TEST(WindowDifferential, ASingleRecordLandsInEveryWindowThatContainsItAndNoOther
 // is the case where lateness cannot arise.
 // ---------------------------------------------------------------------------
 
-namespace {
+//
+// A window's state must go away once it has fired. If it does not, a long-running
+// job accumulates a bucket per (key, window) forever, which is a slow memory leak
+// with no wrong answer to point at - so no output test finds it.
+//
+// It is still observable from the outside, though: a window whose state survived
+// would be scanned and fired again by the next watermark. Firing exactly once, over
+// many windows and many watermarks, is the behavioural form of "the state was
+// purged", and that is what these assert.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// WINDOW STATE LIFECYCLE.
+//
+// A window's state must go away once it has fired. If it does not, a long-running
+// job accumulates a bucket per (key, window) forever, which is a slow memory leak
+// with no wrong answer to point at - so no output test finds it.
+//
+// It is still observable from the outside, though: a window whose state survived
+// would be scanned and fired again by the next watermark. Firing exactly once, over
+// many windows and many watermarks, is the behavioural form of "the state was
+// purged", and that is what these assert.
+// ---------------------------------------------------------------------------
 
-// Drive a window with an explicit script of records and watermarks, so a test can
-// place a record AFTER a watermark that has already passed its window. Returns the
-// emitted rows in order, since firing more than once is one of the things under
-// test and a multiset would hide it.
-struct WinEvent {
-    // Exactly one of these is used: a record at (ts, key), or a watermark.
-    bool is_watermark = false;
-    std::int64_t ts = 0;
-    std::int64_t key = 0;
-};
-
-WinEvent rec_at(std::int64_t ts, std::int64_t key = 7) {
-    return WinEvent{.is_watermark = false, .ts = ts, .key = key};
-}
-WinEvent wm_at(std::int64_t ts) {
-    return WinEvent{.is_watermark = true, .ts = ts, .key = 0};
-}
-
-std::vector<std::string> drive_window_script(const std::string& op_type,
-                                             const std::map<std::string, std::string>& params,
-                                             const std::vector<WinEvent>& script) {
-    ensure_sql_installed_once();
-    const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
-        op_type, std::string{kChannelRow}, std::string{kChannelRow});
-    if (f == nullptr) {
-        ADD_FAILURE() << "no operator factory registered for " << op_type;
-        return {};
+// Fifty windows, fired progressively, must produce fifty rows in total. A window
+// that stayed in state would be re-emitted by every subsequent watermark, so the
+// total would grow quadratically rather than linearly.
+TEST(WindowStateLifecycle, EachWindowFiresExactlyOnceAcrossManyWatermarks) {
+    constexpr int kWindows = 50;
+    std::vector<WinEvent> script;
+    for (int i = 0; i < kWindows; ++i) {
+        script.push_back(rec_at((i * 10'000) + 500, 7));
+        // A watermark after each record, so every window gets many chances to fire
+        // again after it already has.
+        script.push_back(wm_at((i * 10'000) + 501));
     }
-    cluster::OperatorBuildContext ctx;
-    ctx.params = params;
-    ctx.parallelism = 1;
-    auto op = std::static_pointer_cast<Operator<Row, Row>>(f->build(ctx));
+    script.push_back(wm_at(10'000'000));
+    const auto rows =
+        drive_window_script("tumbling_window_row", window_params("10000", ""), script);
+    EXPECT_EQ(rows.size(), static_cast<std::size_t>(kWindows))
+        << "each of " << kWindows << " windows must be reported once; " << rows.size()
+        << " rows means fired windows were left in state and re-scanned";
+    // And every one is distinct, which a re-emission would break even if some other
+    // window had failed to fire and kept the total right by accident.
+    const std::set<std::string> distinct(rows.begin(), rows.end());
+    EXPECT_EQ(distinct.size(), rows.size()) << "a window was reported more than once";
+}
 
-    std::vector<std::string> out_rows;
-    Emitter<Row> em([&](StreamElement<Row> e) {
-        if (e.is_data()) {
-            for (const auto& r : e.as_data()) {
-                out_rows.push_back(canonical(
-                    clink::config::JsonValue{clink::sql::to_json_object(r.value().values)},
-                    window_drop_cols()));
+// The same for a keyspace wide enough that a per-watermark scan of every group would
+// be visible, and driven through the COLUMNAR fold.
+//
+// fire_due_ has a fast path guarded by earliest_win_end_, a lower bound on the
+// minimum window_end across all groups, maintained at each window-creation site. A
+// new creation site that forgets to update it makes the fast path skip a window that
+// is due, silently losing output. There is a debug assertion for exactly that, and
+// this test exists to reach it: the vectorised columnar fold is a creation site that
+// a file-source test never touches.
+TEST(WindowStateLifecycle, TheFireFastPathHoldsAcrossManyGroupsOnTheColumnarFold) {
+    const auto input =
+        gen_input(/*seed=*/1234, /*n=*/2000, /*span_ms=*/200'000, /*keys=*/200, /*sorted=*/true);
+    for (const auto& k : all_window_kinds()) {
+        // Watermarks throughout, not just at the end, so the fast path is consulted
+        // repeatedly with state present - which is when a stale bound does damage.
+        const auto with_progressive_watermarks =
+            drive_window(k.op_type,
+                         k.params,
+                         input,
+                         10'000'000,
+                         WinDrive{.columnar = true, .batch_size = 64, .watermark_per_batch = true});
+        const auto terminal_only = drive_window(
+            k.op_type, k.params, input, 10'000'000, WinDrive{.columnar = true, .batch_size = 64});
+        ASSERT_FALSE(terminal_only.empty()) << k.label << ": nothing emitted";
+        EXPECT_EQ(with_progressive_watermarks, terminal_only)
+            << k.label << ": firing as the data arrived lost or duplicated windows against "
+            << "firing once at the end, which is what a stale earliest_win_end_ bound does";
+    }
+}
+
+// A window that has NOT fired must survive a snapshot and restore, and then fire with
+// its complete count. Only GROUP BY had this coverage; a window carries strictly more
+// state (a bucket per window, not per key) and none of it was checked.
+TEST(WindowStateLifecycle, AnOpenWindowSurvivesSnapshotAndRestore) {
+    ensure_sql_installed_once();
+    Catalog cat;
+    auto ddl = parse(window_probe_ddl());
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    const auto spec = compile(cat,
+                              "INSERT INTO out_t SELECT COUNT(*) AS num FROM bid "
+                              "GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), auction");
+    std::map<std::string, std::string> win_params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "tumbling_window_row") {
+            win_params = op.params;
+        }
+    }
+    ASSERT_FALSE(win_params.empty()) << "no tumbling window in the plan";
+
+    const OperatorId op_id{9911};
+    MetricsRegistry metrics;
+    auto backend = std::make_shared<InMemoryStateBackend>();
+    auto build = [&] {
+        const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+            "tumbling_window_row", std::string{kChannelRow}, std::string{kChannelRow});
+        EXPECT_NE(f, nullptr);
+        cluster::OperatorBuildContext octx;
+        octx.params = win_params;
+        octx.parallelism = 1;
+        return std::static_pointer_cast<Operator<Row, Row>>(f->build(octx));
+    };
+    auto feed = [](Operator<Row, Row>& op, std::int64_t ts, std::int64_t key) {
+        Row r;
+        r.values["auction"] = clink::config::JsonValue{key};
+        r.values["datetime"] = clink::config::JsonValue{ts};
+        Batch<Row> b;
+        b.emplace(r, EventTime{ts});
+        BoundedChannel<StreamElement<Row>> ch(64);
+        Emitter<Row> em(&ch);
+        op.process(StreamElement<Row>::data(std::move(b)), em);
+        std::size_t n = 0;
+        while (auto el = ch.try_pop()) {
+            if (el->is_data()) {
+                n += el->as_data().size();
             }
         }
-        return true;
-    });
-    for (const auto& ev : script) {
-        if (ev.is_watermark) {
-            op->process(StreamElement<Row>::watermark(Watermark{EventTime{ev.ts}}), em);
+        return n;
+    };
+
+    Snapshot snap;
+    {
+        auto op = build();
+        RuntimeContext ctx{op_id, "win", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        // Two records in [0,10000) and no watermark, so the window is still OPEN.
+        EXPECT_EQ(feed(*op, 1000, 7), 0u) << "nothing may fire before a watermark";
+        EXPECT_EQ(feed(*op, 2000, 7), 0u);
+        op->snapshot_timers(*backend, op_id);
+        snap = backend->snapshot(CheckpointId{1});
+        op->close();
+    }
+
+    auto restored_backend = std::make_shared<InMemoryStateBackend>();
+    restored_backend->restore(snap);
+    auto op2 = build();
+    RuntimeContext ctx2{op_id, "win", restored_backend.get(), &metrics};
+    op2->attach_runtime(&ctx2);
+    op2->restore_timers(*restored_backend, op_id);
+    op2->open();
+
+    BoundedChannel<StreamElement<Row>> ch(64);
+    Emitter<Row> em(&ch);
+    op2->process(StreamElement<Row>::watermark(Watermark{EventTime{100'000}}), em);
+    std::vector<std::string> rows;
+    while (auto el = ch.try_pop()) {
+        if (!el->is_data()) {
             continue;
         }
-        Row r;
-        r.values["auction"] = clink::config::JsonValue{ev.key};
-        r.values["datetime"] = clink::config::JsonValue{ev.ts};
-        Batch<Row> b;
-        b.emplace(r, EventTime{ev.ts});
-        op->process(StreamElement<Row>::data(std::move(b)), em);
+        for (const auto& rec : el->as_data()) {
+            rows.push_back(
+                canonical(clink::config::JsonValue{clink::sql::to_json_object(rec.value().values)},
+                          window_drop_cols()));
+        }
     }
-    return out_rows;
+    ASSERT_EQ(rows.size(), 1u) << "the open window must survive the restore and fire; got "
+                               << rows.size() << " rows";
+    EXPECT_NE(rows[0].find("\"num\":2"), std::string::npos)
+        << "both records folded before the snapshot must still be counted: " << rows[0];
 }
 
-// COUNT per 10s tumbling window, with a configurable grace band.
-std::map<std::string, std::string> lateness_params(std::int64_t allowed_lateness_ms) {
-    auto p = window_params("10000", "");
-    p["allowed_lateness_ms"] = std::to_string(allowed_lateness_ms);
-    return p;
+// ---------------------------------------------------------------------------
+// PER-KIND SEMANTICS: the cases the sweep above did not reach.
+//
+// The sweep asserts each kind's basic shape. These are the behaviours that only
+// appear with more than one record or more than one key - session merging in
+// particular, which is the only kind whose windows are MUTABLE, and therefore the
+// only one where the order records arrive in can change which windows exist.
+// ---------------------------------------------------------------------------
+
+// Session merging must be TRANSITIVE. Two records far enough apart to sit in separate
+// sessions must collapse into one when a third arrives between them, bridging the
+// gap. An implementation that merges a new record into at most one existing session
+// leaves two sessions here, which is wrong and is the natural way to write it.
+TEST(WindowSemantics, SessionMergingIsTransitiveWhenARecordBridgesTwoSessions) {
+    // Gap 5s, outer records at 1000 and 10000. They are 9s apart so on their own
+    // they are two sessions, and a bridge is only possible at all because they are
+    // within 2 x gap of each other - any wider and no single record can reach both.
+    //
+    // First the control, so a single session below is a merge and not the operator
+    // failing to split.
+    const auto separate = drive_window_script(
+        "session_window_row", session_params("5000"), {rec_at(1000), rec_at(10000), wm_at(90'000)});
+    EXPECT_EQ(separate.size(), 2u)
+        << "1000 and 10000 are 9s apart with a 5s gap, so they must be two sessions";
+
+    // 5500 is within 4.5s of both, so it belongs to each of them.
+    const auto bridged =
+        drive_window_script("session_window_row",
+                            session_params("5000"),
+                            {rec_at(1000), rec_at(10000), rec_at(5500), wm_at(90'000)});
+    ASSERT_EQ(bridged.size(), 1u)
+        << "5500 is within the 5s gap of both 1000 and 10000, so all three belong to ONE session; "
+           "getting "
+        << bridged.size() << " means the bridging record merged into only one side";
+    EXPECT_NE(bridged[0].find("\"num\":3"), std::string::npos)
+        << "the merged session must hold all three records: " << bridged[0];
 }
 
-}  // namespace
+// The gap boundary is INCLUSIVE: two records exactly `gap` apart belong to the same
+// session. Nothing pinned this - the sweep's session test uses 4s and 15s against a
+// 10s gap, so it passes whichever way the boundary falls, and the two readings differ
+// on every stream whose records are evenly spaced at the gap.
+TEST(WindowSemantics, TwoRecordsExactlyAGapApartAreOneSession) {
+    const auto at_gap = drive_window_script(
+        "session_window_row", session_params("5000"), {rec_at(1000), rec_at(6000), wm_at(90'000)});
+    EXPECT_EQ(at_gap.size(), 1u)
+        << "records exactly 5000 apart with a 5000 gap are one session; got " << at_gap.size();
+    const auto past_gap = drive_window_script(
+        "session_window_row", session_params("5000"), {rec_at(1000), rec_at(6001), wm_at(90'000)});
+    EXPECT_EQ(past_gap.size(), 2u)
+        << "one millisecond further apart must split; got " << past_gap.size();
+}
+
+// The bridge must work whichever order the records arrive in. The arriving record
+// can find zero, one or two neighbours depending on order, and all three paths have
+// to reach the same answer.
+TEST(WindowSemantics, SessionMergeIsIndependentOfArrivalOrder) {
+    // The bridging record is 5500; whether it arrives first, last or in the middle,
+    // it finds a different number of existing neighbours each time.
+    std::vector<std::vector<WinEvent>> orders = {
+        {rec_at(1000), rec_at(5500), rec_at(10000)},
+        {rec_at(10000), rec_at(5500), rec_at(1000)},
+        {rec_at(5500), rec_at(1000), rec_at(10000)},
+        {rec_at(1000), rec_at(10000), rec_at(5500)},
+        {rec_at(10000), rec_at(1000), rec_at(5500)},
+    };
+    for (std::size_t i = 0; i < orders.size(); ++i) {
+        auto script = orders[i];
+        script.push_back(wm_at(90'000));
+        const auto rows = drive_window_script("session_window_row", session_params("5000"), script);
+        ASSERT_EQ(rows.size(), 1u) << "arrival order " << i << " produced " << rows.size()
+                                   << " sessions; every order must collapse to one";
+        EXPECT_NE(rows[0].find("\"num\":3"), std::string::npos) << "order " << i << ": " << rows[0];
+    }
+}
+
+// Per-key isolation. Interleaved keys must not pool their state: a session for key A
+// must not be extended by a record for key B, and a window's count must cover only
+// its own key.
+TEST(WindowSemantics, KeysAreIsolatedWhenInterleaved) {
+    // Key 1 gets three records inside one 10s window; key 2 gets one, in the next.
+    const auto rows = drive_window_script(
+        "tumbling_window_row",
+        window_params("10000", ""),
+        {rec_at(1000, 1), rec_at(11000, 2), rec_at(2000, 1), rec_at(3000, 1), wm_at(90'000)});
+    ASSERT_EQ(rows.size(), 2u) << "expected one window for each key";
+    std::multiset<std::string> got(rows.begin(), rows.end());
+    const std::multiset<std::string> want = {
+        R"({"auction":1,"num":3,"window_end":10000,"window_start":0})",
+        R"({"auction":2,"num":1,"window_end":20000,"window_start":10000})",
+    };
+    EXPECT_EQ(got, want) << "keys shared state: a count here covers records from another key";
+}
+
+// The same for sessions, where a leaked record would silently EXTEND a window rather
+// than just miscount it - so the window bounds are asserted too, not only the count.
+TEST(WindowSemantics, SessionsForDifferentKeysDoNotMerge) {
+    // Interleaved in time but different keys: if key were ignored, 1000 and 3000
+    // would merge into one session spanning both.
+    const auto rows =
+        drive_window_script("session_window_row",
+                            session_params("5000"),
+                            {rec_at(1000, 1), rec_at(3000, 2), rec_at(20000, 1), wm_at(90'000)});
+    std::multiset<std::string> got(rows.begin(), rows.end());
+    const std::multiset<std::string> want = {
+        // Session end is the last event time plus the gap.
+        R"({"auction":1,"num":1,"window_end":6000,"window_start":1000})",
+        R"({"auction":1,"num":1,"window_end":25000,"window_start":20000})",
+        R"({"auction":2,"num":1,"window_end":8000,"window_start":3000})",
+    };
+    EXPECT_EQ(got, want) << "a session was extended by a record belonging to another key";
+}
+
+// One key confined to a single window, and one spread across many, in the same run.
+// A per-key structure that assumes one window per key, or one key per window, breaks
+// on exactly this shape.
+TEST(WindowSemantics, OneKeyConfinedAndAnotherSpreadAcrossWindows) {
+    std::vector<WinEvent> script;
+    for (int i = 0; i < 5; ++i) {  // key 1: five records, all inside [0,10000)
+        script.push_back(rec_at(1000 + i, 1));
+    }
+    for (int i = 0; i < 5; ++i) {  // key 2: one record in each of five windows
+        script.push_back(rec_at((i * 10'000) + 500, 2));
+    }
+    script.push_back(wm_at(900'000));
+    const auto rows =
+        drive_window_script("tumbling_window_row", window_params("10000", ""), script);
+    std::size_t k1 = 0;
+    std::size_t k2 = 0;
+    for (const auto& r : rows) {
+        if (r.find("\"auction\":1") != std::string::npos) {
+            ++k1;
+            EXPECT_NE(r.find("\"num\":5"), std::string::npos)
+                << "key 1's five records all fall in one window: " << r;
+        }
+        if (r.find("\"auction\":2") != std::string::npos) {
+            ++k2;
+            EXPECT_NE(r.find("\"num\":1"), std::string::npos)
+                << "each of key 2's windows holds exactly one record: " << r;
+        }
+    }
+    EXPECT_EQ(k1, 1u) << "key 1 must produce exactly one window";
+    EXPECT_EQ(k2, 5u) << "key 2 must produce five, one per window it touched";
+}
 
 // With no grace band, a record arriving after the watermark has passed its window is
 // too late: the window has fired and been purged, and re-folding it would emit a
@@ -15143,79 +15531,6 @@ TEST(WindowArithmetic, SaturatesRatherThanOverflowingAtTheInt64Extremes) {
 // set may be rejected at bind (good) or accepted and buildable (good). Accepted at
 // bind and unbuildable is the defect, whatever the numbers are.
 // ---------------------------------------------------------------------------
-
-namespace {
-
-// A minimal source and sink, so this block does not depend on the NexmarkQueries
-// fixture (whose DDL helpers are members).
-std::string window_probe_ddl() {
-    return "CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, "
-           "url VARCHAR, datetime BIGINT) WITH (connector='kafka', format='json', "
-           "brokers='b', topic='bid', group_id='g', event_time_column='datetime', "
-           "watermark_lag_ms='0');"
-           "CREATE TABLE out_t (num BIGINT) WITH (connector='file', format='json', "
-           "path='/dev/null');";
-}
-
-// Bind a window query and, if it binds, try to BUILD every window operator the
-// planner emitted. Returns a description of the outcome.
-struct BindThenBuild {
-    bool bound = false;
-    bool built = false;
-    std::string bind_error;
-    std::string build_error;
-    bool saw_window_op = false;
-};
-
-BindThenBuild bind_then_build(const std::string& group_by) {
-    ensure_sql_installed_once();
-    BindThenBuild r;
-    cluster::JobGraphSpec spec;
-    try {
-        Catalog cat;
-        auto ddl = parse(window_probe_ddl());
-        for (const auto& st : ddl.statements) {
-            cat.register_table(std::get<ast::CreateTableStmt>(st));
-        }
-        const std::string sql =
-            "INSERT INTO out_t SELECT COUNT(*) AS num FROM bid GROUP BY " + group_by;
-        spec = compile(cat, sql.c_str());
-        r.bound = true;
-    } catch (const std::exception& e) {
-        r.bind_error = e.what();
-        return r;
-    }
-
-    r.built = true;
-    for (const auto& op : spec.ops) {
-        const bool is_window = op.type == "tumbling_window_row" ||
-                               op.type == "hopping_window_row" ||
-                               op.type == "cumulate_window_row" || op.type == "session_window_row";
-        if (!is_window) {
-            continue;
-        }
-        r.saw_window_op = true;
-        const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
-            op.type, std::string{kChannelRow}, std::string{kChannelRow});
-        if (f == nullptr) {
-            r.built = false;
-            r.build_error = "no factory for " + op.type;
-            continue;
-        }
-        cluster::OperatorBuildContext ctx;
-        ctx.params = op.params;
-        ctx.parallelism = 1;
-        try {
-            (void)f->build(ctx);
-        } catch (const std::exception& e) {
-            r.built = false;
-            r.build_error = e.what();
-        }
-    }
-    return r;
-}
-
-}  // namespace
 
 // The property, over a grid that includes every invalid shape the four kinds have:
 // zero, negative, slide exceeding size, a size not divisible by its step, and values
