@@ -67,6 +67,33 @@
 #     par=4 sink. Worth having tried: run_query pins every connector to 1, so a
 #     fanned-out sink is ground no in-suite test covers.
 #
+#  5. NOT the window's columnar emission. This one mattered because it showed (3)
+#     had measured the wrong path: enable_columnar_output promotes a producer to
+#     columnar only when EVERY consumer is in its allowlist, and q5's window feeds
+#     row_compute_key (in the list, so COLUMNAR) while qhopv's feeds
+#     row_to_json_string (not in it, so ROW). qhopv therefore cannot exercise the
+#     path q5 takes. Settled by the lever the code provides for it:
+#     CLINK_DISABLE_COLUMNAR_OUTPUT=1 forces the window back to row form, and the
+#     diff is again BYTE-IDENTICAL.
+#
+# WHICH GIVES THE DEDUCTION THAT MATTERS. qhopv's window emits rows and its output
+# is exact. q5 with CLINK_DISABLE_COLUMNAR_OUTPUT=1 also has its window emitting
+# rows - same query, same data, same parallelism - so q5's window output is exact
+# too. The top-N is therefore producing a wrong answer from CORRECT input, which is
+# what the in-suite test says it does not do.
+#
+# The diff is byte-identical across settle time, sink parallelism and columnar
+# emission. That stability is itself evidence: this is not a race and not routing.
+# It is deterministic, and the remaining structural difference between the passing
+# in-suite test and this failing one is the SINK TYPE - a file sink whose changelog
+# the test replays in order, versus kafka_upsert_sink_string whose changelog is
+# reduced to last-value-per-key with tombstoned keys removed. clink emits 1,030
+# tombstones here and Flink emits 0, because clink's top-N retracts the displaced
+# row (delete + insert, different row PKs) where Flink's upsert-kafka just
+# overwrites the wstart key. Whether that delete/insert pair survives the reduction
+# in the order it was emitted is the next thing to check, and it needs the RAW
+# topic rather than the reduced state this script keeps.
+#
 # AND THE IN-SUITE REPRODUCTION PASSES. TopNOverWindow.HopTopOnePerWindowAt-
 # ParallelismFour runs the same shape at par=4 over a contested dataset with a
 # total ORDER BY, against an oracle, and agrees. So the top-N over a window is

@@ -15623,7 +15623,15 @@ TEST(TopNOverWindow, HopTopOnePerWindowAtParallelismFour) {
     ensure_sql_installed_once();
     constexpr std::int64_t kSize = 10'000;
     constexpr std::int64_t kSlide = 2'000;
-    const auto input = contested_bids(/*n=*/4'000, /*auctions=*/40, /*span_ms=*/20'000);
+    // 96 auctions, not 40. The window's COLUMNAR emission is gated by
+    // ColumnarOutputDamper, which backs off after four fires of fewer than
+    // kColumnarOutputMinRows = 64 rows. One fire emits one row per auction in the
+    // window, so at 40 auctions the damper switched columnar OFF after the fourth
+    // window and the rest of this test ran the row path - which is not the path the
+    // planner chooses here. A window whose consumer is row_compute_key emits
+    // columnar (enable_columnar_output promotes it), so that is the path to hold
+    // active.
+    const auto input = contested_bids(/*n=*/12'000, /*auctions=*/96, /*span_ms=*/20'000);
 
     // Oracle. A bid at t belongs to every pane [s, s+size) whose start is a
     // multiple of the slide; the winner is the highest count, ties broken by the
