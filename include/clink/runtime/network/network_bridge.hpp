@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -60,7 +61,8 @@ public:
         // Batch<T>&& overload below; this path stays for any sink
         // wrapper that still routes via the const-ref API.
         const auto sz = batch.size();
-        channel_.push(StreamElement<T>::data(Batch<T>{batch}));
+        require_sent_(channel_.push(StreamElement<T>::data(Batch<T>{batch})),
+                      "a batch of " + std::to_string(sz) + " records");
         clink::metrics::net::records_sent_inc(sz);
     }
 
@@ -70,15 +72,24 @@ public:
         // we can ship it through the channel by move - no per-record
         // refcount work, no realloc, no init_with_size cost.
         const auto sz = batch.size();
-        channel_.push(StreamElement<T>::data(std::move(batch)));
+        require_sent_(channel_.push(StreamElement<T>::data(std::move(batch))),
+                      "a batch of " + std::to_string(sz) + " records");
         clink::metrics::net::records_sent_inc(sz);
     }
 
-    void on_watermark(Watermark wm) override { channel_.push(StreamElement<T>::watermark(wm)); }
+    void on_watermark(Watermark wm) override {
+        require_sent_(channel_.push(StreamElement<T>::watermark(wm)), "a watermark");
+    }
 
-    void on_barrier(CheckpointBarrier b) override { channel_.push(StreamElement<T>::barrier(b)); }
+    void on_barrier(CheckpointBarrier b) override {
+        require_sent_(channel_.push(StreamElement<T>::barrier(b)), "a checkpoint barrier");
+    }
 
     void close() override {
+        // Set BEFORE close_send: an element racing teardown gets a false back
+        // from a channel we are deliberately closing, and that is an orderly
+        // shutdown rather than a lost record.
+        closing_ = true;
         clink::metrics::net::close_send();
         channel_.close_send();
     }
@@ -86,8 +97,34 @@ public:
     std::string name() const override { return name_; }
 
 private:
+    // A push that returns false has NOT been sent. Every call site here used to
+    // discard that bool, so a dropped element left no error, no failed task and no
+    // log line - the whole stream simply had fewer records in it than the operator
+    // emitted. That silence is what turned one lost-batch defect into a
+    // multi-day investigation: the symptom surfaced as a windowed top-N quietly
+    // disagreeing with another engine, six operators downstream of the actual
+    // fault. Throwing costs nothing on the happy path and the runner turns it into
+    // a reported task failure (local_executor.cpp catches and records it).
+    //
+    // Exempt only during our own shutdown: close() sets closing_ before closing the
+    // channel, so an element racing teardown is an orderly stop rather than loss.
+    void require_sent_(bool ok, const std::string& what) const {
+        if (ok || closing_) {
+            return;
+        }
+        throw std::runtime_error(
+            name_ + ": failed to send " + what +
+            " to its downstream peer, so those records are NOT in the stream. The channel "
+            "rejected the element while the job was still running (peer gone, or an element "
+            "the wire cannot admit). Failing the task rather than continuing with a silently "
+            "short stream.");
+    }
+
     NetworkChannelSink<T> channel_;
     std::string name_;
+    // Set by close(). Distinguishes "we are shutting this down" from "the send
+    // failed mid-job", which is the difference between a clean stop and data loss.
+    bool closing_ = false;
 };
 
 // Source that adapts a NetworkChannelSource<T> into the operator interface.
