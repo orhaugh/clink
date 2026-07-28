@@ -1378,6 +1378,21 @@ static_assert(sizeof(AggState) <= 2 * sizeof(clink::config::JsonValue) + 6 * siz
               "which is allocated only when the aggregate family actually uses it. See the "
               "note on AggStateExtras.");
 
+// The same discipline one level up. A WindowBucket is allocated once per (key, WINDOW),
+// not per key, so a HOP multiplies it by ceil(size / slide) - a 10s/2s hop holds five
+// per key - and a CUMULATE by size / step. Anything added inline here is paid that many
+// times over, which is why the unit to reason about is the pane and not the group.
+//
+// Bounds expressed in members rather than byte literals, for the reason given above: a
+// constant calibrated on libc++ is wrong on libstdc++, and this file builds on both. What
+// they guard is that no second container joins the two already here. The slack is one
+// int64 for padding, so a new scalar passes and a std::map or std::vector does not.
+static_assert(sizeof(WindowBucket) <=
+                  sizeof(std::vector<AggState>) + sizeof(Row) + 2 * sizeof(std::int64_t),
+              "WindowBucket grew, and it is allocated once per (key, window). Per-pane "
+              "storage for a new aggregate family belongs in AggStateExtras; anything "
+              "else needs a reason and a raised bound.");
+
 namespace window_codec_detail {
 // (de)serialise one WindowBucket: window_start + group_values (Row JSON) + the
 // agg states (reusing the exact AggState (de)serialisation the GROUP BY's
@@ -2653,6 +2668,12 @@ private:
         std::vector<AggState> agg_states;
         Row group_values;
     };
+    // One per live session, so the same per-pane budget as WindowBucket applies. See the
+    // note on that assert for why the bound is written in members rather than bytes.
+    static_assert(sizeof(Session) <=
+                      sizeof(std::vector<AggState>) + sizeof(Row) + 3 * sizeof(std::int64_t),
+                  "Session grew, and it is allocated once per live session. Per-session "
+                  "storage for a new aggregate family belongs in AggStateExtras.");
 
     static void merge_into(Session& dst, Session& src, const std::vector<AggSpec>& specs) {
         dst.start = std::min(dst.start, src.start);

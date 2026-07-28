@@ -15456,6 +15456,81 @@ TEST(WindowRescale, ScaleDownMergesOpenWindowsFromEveryParent) {
 }
 
 // ---------------------------------------------------------------------------
+// MEMORY PER (KEY, WINDOW).
+//
+// A per-group state defect has shipped twice. AggState reached 264 bytes by
+// accretion, every aggregate family having added its container inline. Nexmark
+// q12 held about 3.9 KB per group for an int64 key and a COUNT(*). Both were
+// found on a cloud rig, long after the fact, because nothing in the suite
+// noticed the state getting bigger - and a window is the worst place for that,
+// since a 10s/2s HOP pays the per-pane cost five times per key.
+//
+// What a test can bound deterministically is the SERIALISED footprint: the bytes
+// a checkpoint carries per (key, window). The snapshot holds them exactly, no
+// allocator or standard library shifts them, and they move the moment a field is
+// added to a bucket, to an AggState's encoding, or to the group values every pane
+// copies. That is the shape both shipped defects had.
+//
+// It does not cover container overhead - the map node per window, the vector
+// header per bucket, allocator rounding - which is real but not portable enough
+// to assert on. sizeof is pinned instead, at the definitions in
+// src/sql/install.cpp, and the resident figure stays with
+// benchmarks/clink_window_state_bench, which differences peak RSS between many
+// groups and one.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Serialised state per open (key, window) for the cheapest realistic shape - an
+// int64 group key and a COUNT(*) - measured on 2026-07-28 at 127 B (TUMBLE),
+// 116 (HOP), 117 (CUMULATE) and 131 (SESSION), against 16 bytes of actual
+// information. Most of the remainder is the group values, which each pane stores
+// as a JSON object string and a HOP stores once per overlapping pane.
+//
+// This is a REGRESSION gate, not a target. It sits roughly 25% above what the
+// code costs today: close enough that a field added to a bucket trips it, far
+// enough that a wider group key on its own does not.
+constexpr std::size_t kMaxStateBytesPerPane = 160;
+
+}  // namespace
+
+TEST(WindowMemory, SerialisedStatePerOpenWindowStaysWithinItsBound) {
+    ensure_sql_installed_once();
+    MetricsRegistry metrics;
+    const OperatorId op_id{9931};
+    // Many panes, so the per-key entry overhead amortises and no single outlier
+    // moves the mean.
+    const auto input =
+        gen_input(/*seed=*/7, /*n=*/20'000, /*span_ms=*/9'000, /*keys=*/2'000, /*sorted=*/true);
+
+    for (const auto& kind : all_window_kinds()) {
+        const auto snap = snapshot_open_windows(kind, input, /*columnar=*/false, op_id, metrics);
+        // Every open bucket fires exactly one row, so the drained row count IS the
+        // number of (key, window) panes the state was holding.
+        const auto panes = restore_subtask_and_drain(kind, {snap}, 0, 1, op_id, metrics).size();
+        ASSERT_GT(panes, 1'000u) << kind.label << ": only " << panes << " panes, too few for a "
+                                 << "mean to say anything";
+
+        auto backend = std::make_shared<InMemoryStateBackend>();
+        backend->restore(snap);
+        std::size_t bytes = 0;
+        backend->scan(op_id, [&](StateBackend::KeyView k, StateBackend::ValueView v) {
+            bytes += k.size() + v.size();
+        });
+        ASSERT_GT(bytes, 0u) << kind.label << ": the snapshot holds no state at all, so this "
+                             << "bound would pass whatever the operator does";
+
+        const auto per_pane = bytes / panes;
+        EXPECT_LE(per_pane, kMaxStateBytesPerPane)
+            << kind.label << ": " << bytes << " bytes of state across " << panes
+            << " open windows is " << per_pane << " per (key, window), over the "
+            << kMaxStateBytesPerPane << "-byte bound. One of these holds an int64 key and a "
+            << "count - 16 bytes of information. If the growth is deliberate, raise the "
+            << "bound and say what bought it.";
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PER-KIND SEMANTICS: the cases the sweep above did not reach.
 //
 // The sweep asserts each kind's basic shape. These are the behaviours that only

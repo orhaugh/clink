@@ -126,8 +126,15 @@ where coverage multiplies without the test count exploding.
 - [x] a large keyspace fires without an O(groups) scan per watermark - the
       `earliest_win_end_` fast path has a debug assertion, so a test that exercises
       a window-creation site which forgets to maintain it must fail loudly
-- [ ] memory per (key, window) has a documented bound and a test that notices a
-      regression, since a per-key state defect has shipped twice here
+- [x] memory per (key, window) has a documented bound and a test that notices a
+      regression, since a per-key state defect has shipped twice here. Two
+      instruments, because the two costs differ: `static_assert`s on
+      `sizeof(AggState/WindowBucket/Session)`, written in members so they hold on
+      both standard libraries, forbid a second container going inline; and a test
+      gates the SERIALISED bytes per pane, which a snapshot holds exactly. Resident
+      memory is not deterministic enough for the suite and stays with
+      `benchmarks/clink_window_state_bench`. Numbers in
+      `docs/internals/time-and-windowing.md`
 - [x] rescale: a windowed query changing parallelism across a restore. Scale-up
       filters one parent snapshot per new subtask, scale-down merges several
       through `combine_snapshots`; the union over the new subtasks must equal what
