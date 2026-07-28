@@ -7,6 +7,27 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+
+// LeakSanitizer's intent annotation. Every allocation in this file is deliberately
+// never freed - see the note on Table and the comments at each site - so without
+// this LSan reports the interning table as leaked on any run that interns a name.
+// Gated on ASAN BEING ACTIVE rather than on the header existing: Clang ships
+// <sanitizer/lsan_interface.h> unconditionally and the symbol only comes with the
+// ASan runtime, so an include-based guard links fine until it does not.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define CLINK_ASAN_ACTIVE 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)  // GCC spells it this way
+#define CLINK_ASAN_ACTIVE 1
+#endif
+#if defined(CLINK_ASAN_ACTIVE)
+#include <sanitizer/lsan_interface.h>
+#define CLINK_LSAN_INTENTIONAL(p) __lsan_ignore_object(p)
+#else
+#define CLINK_LSAN_INTENTIONAL(p) ((void)(p))
+#endif
 #include <vector>
 
 namespace clink::config {
@@ -43,7 +64,10 @@ struct Table {
     std::mutex grow_mu;
     std::atomic<std::size_t> count{0};
 
-    Table() : slots(new std::vector<std::atomic<const std::string*>>(kInitialSlots)) {}
+    Table() : slots(new std::vector<std::atomic<const std::string*>>(kInitialSlots)) {
+        // Lives for the process; see the struct comment.
+        CLINK_LSAN_INTENTIONAL(slots.load(std::memory_order_relaxed));
+    }
 };
 
 Table& table() {
@@ -113,6 +137,9 @@ const std::string& InternedName::intern(std::string_view v) {
     // publishing if this insert would breach it (or if the table is full).
     if (slot >= arr->size() || (t.count.load(std::memory_order_relaxed) + 1) * 2 >= arr->size()) {
         auto* bigger = new std::vector<std::atomic<const std::string*>>(arr->size() * 2);
+        // Both this and the array it replaces outlive the process by design: a
+        // lock-free reader may still be probing the old one.
+        CLINK_LSAN_INTENTIONAL(bigger);
         for (auto& s : *arr) {
             const std::string* name = s.load(std::memory_order_acquire);
             if (name == nullptr) {
@@ -130,6 +157,7 @@ const std::string& InternedName::intern(std::string_view v) {
 
     // Never freed, so the pointer stays valid for the life of the process.
     auto* owned = new std::string(v);
+    CLINK_LSAN_INTENTIONAL(owned);
     (*arr)[slot].store(owned, std::memory_order_release);
     t.count.fetch_add(1, std::memory_order_relaxed);
     return *owned;
