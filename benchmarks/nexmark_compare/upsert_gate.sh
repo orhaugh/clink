@@ -27,6 +27,26 @@
 #
 #   ./upsert_gate.sh                  # q5 q18 q19
 #   QUERIES="q18" EVENTS=500000 ./upsert_gate.sh
+#
+# OPEN DEFECT, found here 2026-07-28: q5 DIVERGES AT PARALLELISM > 1.
+#
+#   par=4   153 of 247 windows have a different top-1. clink's count is never
+#           HIGHER than Flink's - 104 lower, 0 higher - and in all 49 windows
+#           where the counts tie, clink picked the higher auction, against the
+#           query's `ORDER BY num DESC, auction ASC`. One-directional both ways,
+#           so this is not two valid answers to an ambiguous query.
+#   par=1   247 of 248 rows identical. The whole divergence disappears.
+#
+# The shape fits an unpartitioned stateful operator: q5's top-1 is PARTITION BY
+# wstart while its input arrives partitioned by auction from the upstream GROUP
+# BY, so each subtask would hold a local top-1 over its own auctions and write it
+# under the shared wstart key - giving a local maximum, which can only ever be at
+# or below the global one. Same class as 066af45. NOT yet confirmed at the plan
+# level, and the windowed aggregate underneath has not been separately
+# value-compared at par=4, so the top-N is the suspect and not the proven cause.
+#
+# The one remaining par=1 row is a different and much smaller question: Flink has
+# one extra trailing window (wstart 1000000486000) that clink does not emit.
 set -uo pipefail
 
 cd "$(dirname "$0")"

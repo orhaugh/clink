@@ -9,4 +9,4 @@ CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, 
         event_time_column='datetime', watermark_lag_ms='4000');
 CREATE TABLE sink_q19 (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT) WITH (connector='blackhole');
 INSERT INTO sink_q19
-SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) AS R WHERE rn <= 10;
+SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC, datetime DESC, bidder DESC) AS rn FROM bid) AS R WHERE rn <= 10;

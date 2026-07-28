@@ -206,16 +206,30 @@ QUERIES = {
         # without it in the output there is nothing to key an upsert on.
         sink=[("wstart", "BIGINT"), ("auction", "BIGINT"), ("num", "BIGINT")],
         pk=["wstart"],
+        # Two dialect differences here, both found by running it.
+        #
+        # `window_start` is BIGINT epoch millis in clink and TIMESTAMP(3) in
+        # Flink, so projecting it straight into a BIGINT sink column made Flink
+        # refuse the job outright: "Incompatible types for sink column 'wstart'".
+        # The conversion below is the one q8 already uses and gates on.
+        #
+        # ORDER BY num DESC alone is not TOTAL: two auctions tied on count within
+        # a window have no defined winner, and top-1 then picks arbitrarily per
+        # engine. auction breaks it - it is unique within a window group. This is
+        # the same defect q19 had, pre-empted here rather than waited for.
         clink=("SELECT wstart, auction, num FROM ("
-               "SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC) AS rn FROM ("
+               "SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC, "
+               "auction ASC) AS rn FROM ("
                "SELECT auction, COUNT(*) AS num, window_start AS wstart FROM bid "
                "GROUP BY HOP(datetime, INTERVAL '10' SECOND, INTERVAL '2' SECOND), auction"
                ") AS W) AS R WHERE rn <= 1"),
         flink=("SELECT wstart, auction, num FROM ("
-               "SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC) AS rn FROM ("
-               "SELECT auction, COUNT(*) AS num, window_start AS wstart FROM "
-               "TABLE(HOP(TABLE bid, DESCRIPTOR(ts), INTERVAL '2' SECOND, INTERVAL '10' SECOND)) "
-               "GROUP BY window_start, window_end, auction"
+               "SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC, "
+               "auction ASC) AS rn FROM ("
+               "SELECT auction, COUNT(*) AS num, "
+               "CAST(UNIX_TIMESTAMP(CAST(window_start AS STRING)) * 1000 AS BIGINT) AS wstart "
+               "FROM TABLE(HOP(TABLE bid, DESCRIPTOR(ts), INTERVAL '2' SECOND, "
+               "INTERVAL '10' SECOND)) GROUP BY window_start, window_end, auction"
                ") AS W) AS R WHERE rn <= 1"),
     ),
     "q7": dict(
@@ -377,13 +391,21 @@ QUERIES = {
         # synthetic rank column from its output, so rn is not available to key on.
         # A bid is uniquely identified by these four in this dataset.
         pk=["auction", "bidder", "price", "datetime"],
+        # The ORDER BY must be TOTAL or this query has no single right answer.
+        # With `price DESC` alone, two bids on one auction at the same price are
+        # tied and which one makes the top 10 is undefined - measured 2026-07-28
+        # as 3 differing rows out of 215,613, with the (auction, price) multiset
+        # IDENTICAL on both engines, so the engines agreed on every pair and
+        # disagreed only on which tied bid carried it. datetime and bidder break
+        # the tie; together with auction and price they are this dataset's bid
+        # identity, which is the same tuple the `pk` below uses.
         clink=("SELECT * FROM (SELECT *, ROW_NUMBER() OVER "
-               "(PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) AS R "
-               "WHERE rn <= 10"),
+               "(PARTITION BY auction ORDER BY price DESC, datetime DESC, bidder DESC) "
+               "AS rn FROM bid) AS R WHERE rn <= 10"),
         flink=("SELECT auction, bidder, price, channel, url, `datetime` FROM "
                "(SELECT *, ROW_NUMBER() OVER "
-               "(PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) AS R "
-               "WHERE rn <= 10"),
+               "(PARTITION BY auction ORDER BY price DESC, `datetime` DESC, bidder DESC) "
+               "AS rn FROM bid) AS R WHERE rn <= 10"),
     ),
     "q21": dict(
         note="Add channel id: a CASE over a string column, per record.",

@@ -13,4 +13,4 @@ CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, 
 CREATE TABLE sink_q5 (wstart BIGINT, auction BIGINT, num BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='__OUT__');
 INSERT INTO sink_q5
-SELECT wstart, auction, num FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC) AS rn FROM (SELECT auction, COUNT(*) AS num, window_start AS wstart FROM bid GROUP BY HOP(datetime, INTERVAL '10' SECOND, INTERVAL '2' SECOND), auction) AS W) AS R WHERE rn <= 1;
+SELECT wstart, auction, num FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY wstart ORDER BY num DESC, auction ASC) AS rn FROM (SELECT auction, COUNT(*) AS num, window_start AS wstart FROM bid GROUP BY HOP(datetime, INTERVAL '10' SECOND, INTERVAL '2' SECOND), auction) AS W) AS R WHERE rn <= 1;

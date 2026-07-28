@@ -10,4 +10,4 @@ CREATE TABLE bid (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, 
 CREATE TABLE sink_q19 (auction BIGINT, bidder BIGINT, price BIGINT, channel VARCHAR, url VARCHAR, datetime BIGINT)
   WITH (connector='kafka', format='json', brokers='__BROKERS__', topic='__OUT__');
 INSERT INTO sink_q19
-SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) AS R WHERE rn <= 10;
+SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC, datetime DESC, bidder DESC) AS rn FROM bid) AS R WHERE rn <= 10;

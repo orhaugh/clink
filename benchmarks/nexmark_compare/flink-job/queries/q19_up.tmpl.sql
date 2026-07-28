@@ -24,4 +24,4 @@ CREATE TABLE sink_q19 (`auction` BIGINT, `bidder` BIGINT, `price` BIGINT, `chann
   'value.format' = 'json'
 );
 INSERT INTO sink_q19
-SELECT auction, bidder, price, channel, url, `datetime` FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) AS R WHERE rn <= 10;
+SELECT auction, bidder, price, channel, url, `datetime` FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC, `datetime` DESC, bidder DESC) AS rn FROM bid) AS R WHERE rn <= 10;
