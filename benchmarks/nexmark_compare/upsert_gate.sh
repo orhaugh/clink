@@ -2,11 +2,13 @@
 # Cross-engine gate for the CHANGELOG queries, which the row-count gate cannot do.
 #
 # WHY A SECOND GATE. gate.sh compares output ROW COUNTS, which works for a query
-# whose output is append-only. Three queries are not: q5 (top-1 per sliding window -
-# a new leader retracts the old one), q18 and q19 (dedup and ranking per key -
-# same). For those, the row count depends on how many times a row was revised on
-# the way to the answer, which is an implementation detail. Two engines can be
-# equally correct and emit wildly different counts.
+# whose output is append-only. Four queries are not: q4 (an AVG per category over a
+# join - the aggregate revises its answer as rows arrive), q5 (top-1 per sliding
+# window - a new leader retracts the old one), q18 and q19 (dedup and ranking per
+# key - same). For those, the row count depends on how many times a row was revised
+# on the way to the answer, which is an implementation detail. Two engines can be
+# equally correct and emit wildly different counts - q4 at 300k events is 2,685
+# clink messages against 276,000 from Flink, converging on the same 5 rows.
 #
 # What IS comparable is the state the changelog converges to. Both engines write it
 # by the same convention - clink's kafka_upsert_sink_string and Flink's
@@ -66,7 +68,7 @@ PY="$CLINK_ROOT/benchmarks/flink_compare/.venv/bin/python"
 
 EVENTS="${EVENTS:-1000000}"
 PAR="${PARALLELISM:-4}"
-QUERIES="${QUERIES:-q5 q18 q19}"
+QUERIES="${QUERIES:-q4 q5 q18 q19}"
 OUT="${OUT:-results-upsert-gate}"
 # Quiet period after the pipeline stops moving, before the job is cancelled.
 SETTLE_S="${SETTLE_S:-8}"

@@ -15,20 +15,33 @@
 #   QUERIES="q15 q16" ./gate.sh
 #   EVENTS=2000000 ./gate.sh
 #
-# WHAT IS NOT GATED HERE, AND WHY. A plain Kafka sink is append-only. THREE of the
+# WHAT IS NOT GATED HERE, AND WHY. A plain Kafka sink is append-only. FOUR of the
 # queries emit a CHANGELOG - each revises rows it already emitted, so a row count
 # is not the right comparison even in principle:
 #
+#   q4        AVG per category over a join: the aggregate revises as rows arrive
 #   q5        top-1 per sliding window: a new leader retracts the old one
 #   q18, q19  dedup / ranking per key: same
 #
 # Gating those needs an upsert sink on both sides and a comparison of the compacted
 # result, which is upsert_gate.sh.
 #
-# q3, q4 and q20 were also on that list, on the assumption that a multi-stream
-# query must produce a changelog. It does not: an inner join of two append-only
-# inputs cannot retract. Checked rather than assumed - each was compiled against a
-# plain Kafka sink and accepted - so all three are gated normally here.
+# q3 and q20 were also on that list, on the assumption that a multi-stream query
+# must produce a changelog. It does not: an inner join of two append-only inputs
+# cannot retract, and both are gated normally here.
+#
+# q4 went the same way and that was WRONG. The join is not the issue - the GROUP BY
+# on top of it is. An aggregate over a stream revises its answer as rows arrive, so
+# q4 emits updates however append-only its inputs are. Flink refuses a plain Kafka
+# sink for it and produces nothing, which is why q4 reported "only clink produced a
+# result" (2026-07-28) rather than a mismatch. clink accepts the sink and writes its
+# changelog into an append-only topic, so the row count it produces is the number of
+# revisions, not the answer. Gated by upsert_gate.sh instead, where its final state
+# MATCHES Flink exactly - 5 categories, verified 2026-07-28.
+#
+# The lesson generalises: "can this query retract" is a property of the whole plan,
+# not of its inputs. Compiling against a plain sink and being accepted proves clink
+# tolerates it, not that the output is append-only.
 set -uo pipefail
 
 cd "$(dirname "$0")"
@@ -40,22 +53,20 @@ OUT="${OUT:-results-gate}"
 
 # Append-only queries: one output row per input row, or one per closed window.
 # A Kafka sink can carry these, so their row counts are directly comparable.
-# q3, q4 and q20 join two streams. Both inputs are append-only and an inner join
-# of two append-only inputs cannot retract, so clink accepts a plain Kafka sink for
-# all three - verified by compiling each against one. They belong here, not in the
-# ungated list where they sat on the assumption that "multi-stream" meant
-# "changelog".
+# q3 and q20 join two streams with no aggregate on top: both inputs are append-only
+# and an inner join of two append-only inputs cannot retract, so they belong here.
+# q4 has the same join and an AVG over it, which does retract - see the header.
 #
 # qhop and qcum are NOT nexmark queries. They exist because the gate is meant to
 # cover every window kind and the nexmark set alone cannot: TUMBLE has q12 and
 # SESSION has q11, but HOP's only query is q5, whose top-1 rank makes it a
 # changelog, and CUMULATE appears nowhere. Both are bare windowed aggregates of
 # the same shape as q11, so a count difference is attributable to the window.
-APPEND_ONLY="q0 q1 q2 q3 q4 q7 q11 q12 q14 q15 q16 q17 q20 q21 q22 qhop qcum"
+APPEND_ONLY="q0 q1 q2 q3 q7 q11 q12 q14 q15 q16 q17 q20 q21 q22 qhop qcum"
 # Changelog-emitting, so the report can name what it did not gate rather than leave
 # a silent hole. Determined by compiling each against a plain sink and reading which
 # are refused.
-CHANGELOG="q5 q18 q19"
+CHANGELOG="q4 q5 q18 q19"
 
 QUERIES="${QUERIES:-$APPEND_ONLY}"
 
