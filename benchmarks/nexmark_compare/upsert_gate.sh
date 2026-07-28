@@ -143,10 +143,42 @@
 # still unverified is whether those two counters count the same thing across that
 # boundary; establish that with a COMPLETE par=1 run before quoting any ratio.
 #
-# The top-N is a single-input operator fed by FOUR window subtasks - the window is
-# keyed by auction, so every subtask holds rows for every window - and all four
-# hash the same wstart to the same top-N subtask. The channel merge on that input
-# is the first place to look.
+# THE CHANNEL MERGE AND THE SPLIT BOTH READ CORRECT. Dag::union_streams on the
+# top-N's input already carries the closed-AND-drained rule from the earlier fix
+# for exactly this symptom ("1-2% pane-count loss at par=4/16"), broadcasts
+# watermarks, and only breaks when every input is closed and empty.
+# Dag::add_split routes every record, broadcasts watermarks and barriers to all
+# branches, and closes all branches. Neither loses rows on reading. And the row
+# split and the columnar split produce the SAME wrong answer, so the split is not
+# the differentiator either.
+#
+# WHICH LEAVES THE ONE STRUCTURAL DIFFERENCE THAT SURVIVES EVERY ELIMINATION: how
+# a batch actually travels that edge. The in-suite test runs an InProcessCluster -
+# one worker, so LocalDataPlane serves every edge as a direct in-process push. The
+# harness runs FOUR worker containers, so a 4-way hash shuffle keeps roughly a
+# quarter of its rows local and sends the rest over a socket as Arrow IPC. The
+# top-N received 461,334 rows where the window emitted somewhere between 1.22M
+# (scaling qhopv's 734,382 at 300k) and 1,533,886 (the counter) - 30% to 38%,
+# which is the neighbourhood of "only the co-located slice arrived".
+#
+# Treat the arithmetic as suggestive and not as proof: the numerator's
+# comparability across that boundary is still unverified (see above), and if
+# exactly three quarters of rows vanished more than 49% of windows would be wrong.
+# Some loss, not all of it.
+#
+# This pair has diverged silently before. local_data_plane.hpp documents the
+# advertised-host bug that made the fast path disappear in this very benchmark
+# while working everywhere else, because both sides defaulted to 127.0.0.1. A
+# producer/consumer pair where the two ends can disagree needs an
+# ASYMMETRIC-construction test; a matched-ends end-to-end run cannot see it.
+#
+# TWO TESTS THAT WOULD SETTLE IT:
+#   - Place every clink subtask on ONE worker at parallelism 4, so the shuffle is
+#     local but the parallelism is unchanged. If q5 then matches Flink, the socket
+#     path is the culprit and the operator is exonerated.
+#   - Scrape clink_dataplane_local_hits_total and
+#     clink_dataplane_socket_fallbacks_total off /metrics for the run, which says
+#     how many batches took each path rather than leaving it inferred.
 #
 # THE OBVIOUS-LOOKING EVIDENCE FOR (a) DOES NOT HOLD UP. The per-operator counters
 # at par=4 read row_compute_key out=1,533,886 and top_n_per_key_row in=461,334,
