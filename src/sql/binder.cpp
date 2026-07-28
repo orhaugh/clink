@@ -1289,7 +1289,17 @@ WindowSpec decode_window_call(const ast::FunctionCall& fc,
             bind_error("CUMULATE: step and size must be positive", fc.loc.pos);
         }
         if (spec.size_ms % spec.step_ms != 0) {
-            bind_error("CUMULATE: size must be an integer multiple of step", fc.loc.pos);
+            // Name the argument ORDER, as the HOP error does. CUMULATE takes the
+            // STEP before the SIZE, which is the opposite of HOP's (SIZE, SLIDE) -
+            // so "size is not a multiple of step" is exactly what a reader sees
+            // when they have written the two the way HOP wants them, and the
+            // message has to say so or it reads as a false complaint about values
+            // that are in fact divisible.
+            bind_error("CUMULATE: size must be an integer multiple of step, got step=" +
+                           std::to_string(spec.step_ms) + " size=" + std::to_string(spec.size_ms) +
+                           ". Note the argument order is CUMULATE(time, STEP, SIZE) - the step "
+                           "comes FIRST, unlike HOP(time, SIZE, SLIDE).",
+                       fc.loc.pos);
         }
     }
     if (spec.size_ms < 0 || spec.slide_ms < 0 || spec.gap_ms < 0 || spec.step_ms < 0) {

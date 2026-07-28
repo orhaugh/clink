@@ -13905,6 +13905,25 @@ TEST_F(NexmarkQueries, Q11SessionWindow) {
           "GROUP BY SESSION(datetime, INTERVAL '10' SECOND), bidder");
 }
 
+// NOT a nexmark query. Nexmark has no CUMULATE anywhere, so without this it is the
+// only window kind with no end-to-end coverage against an independent expectation -
+// which is precisely the state the hopping window was in when it shipped untested.
+//
+// It also asserts the window BOUNDS, which the other window queries project away.
+// CUMULATE is the one kind whose panes share a start and differ only in their end,
+// so dropping the bounds would collapse most of its output into indistinguishable
+// rows and hide a pane that ended in the wrong place.
+TEST_F(NexmarkQueries, CumulateWindowPanes) {
+    check("cumulate",
+          bid_ddl() + sink_ddl("wstart BIGINT, wend BIGINT, bidder BIGINT, num BIGINT"),
+          "INSERT INTO out_t SELECT window_start AS wstart, window_end AS wend, bidder, "
+          "COUNT(*) AS num FROM bid "
+          // CUMULATE takes the STEP first and the SIZE second, the opposite of
+          // HOP(time, SIZE, SLIDE). Written the other way round it is rejected at
+          // bind time with a message that says so.
+          "GROUP BY CUMULATE(datetime, INTERVAL '2' SECOND, INTERVAL '10' SECOND), bidder");
+}
+
 // --- ranking and dedup (changelog) ----------------------------------------
 
 TEST_F(NexmarkQueries, Q18LatestBidPerBidderAuction) {

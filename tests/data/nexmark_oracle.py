@@ -297,11 +297,35 @@ def q5():
     return out
 
 
+def cumulate():
+    # NOT a nexmark query. CUMULATE is the one window kind nexmark never exercises,
+    # so without this it is the only kind with no end-to-end coverage against an
+    # independent expectation - which is exactly how the hopping window shipped
+    # untested.
+    #
+    # Cumulative count per bidder over a 10s window stepping 2s. Each pane shares
+    # the window's start and ends at a successive step, so a bid contributes to
+    # every pane of its window that ends after it - which means the pane count
+    # depends on where in the window the bid falls, unlike TUMBLE or a divisible HOP.
+    step = 2000
+    panes = defaultdict(int)
+    for b in BIDS:
+        t = b["datetime"]
+        anchor = (t // WINDOW_MS) * WINDOW_MS
+        end = anchor + step
+        while end <= anchor + WINDOW_MS:
+            if t < end:
+                panes[(anchor, end, b["bidder"])] += 1
+            end += step
+    return [dict(wstart=ws, wend=we, bidder=bidder, num=n)
+            for (ws, we, bidder), n in sorted(panes.items())]
+
+
 QUERIES = OrderedDict([
     ("q0", q0), ("q1", q1), ("q2", q2), ("q3", q3), ("q4", q4), ("q5", q5),
     ("q7", q7), ("q11", q11), ("q12", q12), ("q14", q14), ("q15", q15),
     ("q16", q16), ("q17", q17), ("q18", q18), ("q19", q19), ("q20", q20),
-    ("q21", q21), ("q22", q22),
+    ("q21", q21), ("q22", q22), ("cumulate", cumulate),
 ])
 
 

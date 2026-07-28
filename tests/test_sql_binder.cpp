@@ -3268,6 +3268,47 @@ TEST(SqlBinder, HopWithSlideExceedingSizeIsRejectedAtBindTime) {
         << msg;
 }
 
+// THE ARGUMENT ORDERS DIVERGE BETWEEN THE TWO MULTI-ARGUMENT WINDOW KINDS, and
+// these pin that so it cannot drift silently:
+//
+//   HOP(time, SIZE, SLIDE)       - the larger value first
+//   CUMULATE(time, STEP, SIZE)   - the smaller value first
+//
+// A reader who has just written one has every reason to expect the other to match,
+// and gets a rejection whose numbers look perfectly valid to them. Both messages
+// therefore name the order explicitly, which is the only thing that turns the
+// rejection into something actionable.
+TEST(SqlBinder, CumulateTakesStepBeforeSizeAndSaysSoWhenReversed) {
+    // Correct order: step 2s, size 10s.
+    EXPECT_TRUE(window_bind_error("SELECT COUNT(*) FROM clicks GROUP BY "
+                                  "CUMULATE(ts, INTERVAL '2' SECOND, INTERVAL '10' SECOND)")
+                    .empty())
+        << "CUMULATE(time, STEP, SIZE) with step 2s and size 10s is valid";
+
+    // Reversed, which is how someone who just wrote a HOP would write it.
+    const auto msg = window_bind_error(
+        "SELECT COUNT(*) FROM clicks GROUP BY "
+        "CUMULATE(ts, INTERVAL '10' SECOND, INTERVAL '2' SECOND)");
+    ASSERT_FALSE(msg.empty()) << "step 10s with size 2s is not a valid cumulate";
+    EXPECT_NE(msg.find("STEP, SIZE"), std::string::npos)
+        << "the message must name the argument order, because 10s and 2s ARE divisible and the "
+           "bare complaint reads as wrong: "
+        << msg;
+}
+
+// And the converse, so the two are locked against each other rather than each being
+// free to change alone.
+TEST(SqlBinder, HopTakesSizeBeforeSlide) {
+    EXPECT_TRUE(window_bind_error("SELECT COUNT(*) FROM clicks GROUP BY "
+                                  "HOP(ts, INTERVAL '10' SECOND, INTERVAL '2' SECOND)")
+                    .empty())
+        << "HOP(time, SIZE, SLIDE) with size 10s and slide 2s is valid";
+    EXPECT_FALSE(window_bind_error("SELECT COUNT(*) FROM clicks GROUP BY "
+                                   "HOP(ts, INTERVAL '2' SECOND, INTERVAL '10' SECOND)")
+                     .empty())
+        << "the reverse must be rejected, or the two orders are indistinguishable";
+}
+
 TEST(SqlBinder, HopWithZeroSlideIsRejectedAtBindTime) {
     EXPECT_FALSE(window_bind_error("SELECT COUNT(*) FROM clicks "
                                    "GROUP BY HOP(ts, INTERVAL '10' SECOND, 0)")
