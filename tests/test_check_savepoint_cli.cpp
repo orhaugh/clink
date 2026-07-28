@@ -47,6 +47,39 @@ struct RunResult {
     std::string stderr_text;
 };
 
+// KNOWN: these tests FAIL UNDER ASAN AND UBSAN, and it is not the CLI's logic.
+//
+// Triaged 2026-07-28. The spawned binary does its work correctly - stdout carries
+// the expected "entries=1 versioned_ops=1" - and then aborts at process EXIT with
+// exit code 134. Under UBSan glibc reports `malloc_consolidate(): invalid chunk
+// size`; under ASan the same fault is named precisely:
+//
+//   attempting double-free
+//     freed by      std::_Rb_tree<int, pair<const int, const char*>>::_M_erase
+//                     in the `clink` binary
+//     then again in std::map<int, const char*>::~map() in libparquet.so.2400,
+//                     via __cxa_finalize
+//     allocated by  std::map<int, const char*>::map<apache::thrift::TEnumIterator>
+//                     in the `clink` binary
+//
+// That is Thrift's generated enum-name map existing TWICE: once statically linked
+// into the `clink` binary (confirmed - `nm -C build/clink` shows apache::thrift
+// symbols and a TEnumIterator instantiation) and once inside libparquet, which the
+// CLI loads dynamically because clink_core links Parquet::parquet_shared. Global
+// symbol interposition binds libparquet's reference to the binary's copy, both
+// register an exit-time destructor for it, and the second one double-frees.
+//
+// So it is a LINK-CONFIGURATION defect, not a memory-safety bug in clink code, and
+// it predates any of the work that surfaced it - the identical failure set appears
+// at 2bbe8d6. The fix is to stop the same library being present both statically and
+// dynamically in one process, or to hide the static copy's symbols so libparquet
+// cannot bind to them. Both have blast radius (the self-contained embedding
+// artifact and the macOS wheel both depend on the static Arrow/Parquet linkage), so
+// it is deliberately not a drive-by change.
+//
+// USER-VISIBLE IMPACT, which is why this is worth fixing rather than suppressing:
+// anything scripting the `clink` CLI and checking its exit code sees 134 after a
+// successful run. The work completes; the process still reports failure.
 RunResult run_cli(const std::string& args) {
     namespace fs = std::filesystem;
     static std::atomic<std::uint64_t> counter{0};
