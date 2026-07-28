@@ -611,6 +611,65 @@ Not a fleet-scale or industry-scale tonnage, under any multiplication.
 And not a ratio at single-instance scale. If your pipeline fits on one instance today, it
 will fit on one instance with either engine, and the saving is zero until you outgrow it.
 
+## The full nexmark suite, 17 queries
+
+The two headline queries above are the ones with the longest measurement history. This
+section reports the whole bid-only nexmark suite on one provision, measured 28 July 2026
+at clink `438cb93` against Flink 2.2.0 re-baselined alongside, parallelism 4, two trials
+each, 9.2 million canonical nexmark bid records. Raw output:
+[`assets/nexmark-full-2026-07-28.json`](assets/nexmark-full-2026-07-28.json).
+
+**CPU per event, and memory.** Mean of two trials. Higher is better for events/cpu-second;
+the memory column is how many times *less* anonymous memory clink held.
+
+| query | what it does | clink ev/cpu-s | JVM engine | CPU ratio | clink MB | JVM MB | memory |
+|---|---|---:|---:|---:|---:|---:|---:|
+| q0 | projection | 1,200,754 | 252,138 | **4.76x** | 70 | 1,159 | **16.4x less** |
+| q1 | currency conversion | 490,410 | 243,870 | **2.01x** | 301 | 1,161 | 3.9x less |
+| q2 | filter on an expression | 1,002,749 | 258,320 | **3.88x** | 78 | 1,206 | **15.5x less** |
+| q7 | windowed max/min | 1,043,853 | 194,464 | **5.37x** | 78 | 1,241 | **15.9x less** |
+| q11 | session windows | 370,776 | 43,584 | 8.51x † | 562 | 1,804 | 3.2x less |
+| q12 | windowed group-by | 424,206 | 68,970 | **6.15x** | 534 | 1,612 | 3.0x less |
+| q14 | expression filter + CASE | 403,237 | 233,170 | **1.73x** | 425 | 1,187 | 2.8x less |
+| q15 | count-distinct per window | 739,880 | 120,238 | **6.15x** | 428 | 1,471 | 3.4x less |
+| q16 | count-distinct per channel | 528,206 | 138,432 | **3.82x** | 410 | 1,474 | 3.6x less |
+| q17 | per-auction aggregates | 417,708 | 52,605 | **7.94x** | 1,071 | 1,681 | 1.6x less |
+| q18 | dedup per key | 410,726 | 116,175 | 3.54x ‡ | 3,756 | 1,272 | **0.3x - clink worse** |
+| q19 | top-10 per auction | 324,560 | 78,048 | 4.16x †‡ | 2,234 | 1,405 | **0.6x - clink worse** |
+| q21 | CASE over a string | 484,356 | 229,988 | **2.11x** | 360 | 1,182 | 3.3x less |
+| q22 | string splitting | 467,011 | 224,210 | **2.08x** | 464 | 1,180 | 2.5x less |
+| qcum | cumulate windows | 436,716 | 47,078 | **9.28x** | 688 | 1,832 | 2.7x less |
+| qhop | hopping windows | 414,232 | 32,944 | **12.57x** | 903 | 1,843 | 2.0x less |
+
+† trial-to-trial spread above 1.25x on clink's side (q11 1.42x, q19 1.72x) - indicative
+rather than firm. ‡ the JVM engine did not drain the input inside the sampler's window on
+q18 and q19, so its figures there describe a partial run.
+
+**Where clink loses, which is worth as much as where it wins.** On q18 and q19 - dedup and
+top-N per key - clink holds **three times more memory** than the JVM engine and about
+twice on q19. Both keep unbounded per-key state, and clink's per-key representation is the
+known weakness behind that; the same defect shows up in the q12 memory row on this page.
+It is not a measurement artefact and it is not fixed.
+
+**Why there is no throughput column.** The sampler's sustained-slope figure was not stable
+enough on the JVM engine to publish per query: two identical trials of q2 gave 10.05M and
+2.52M records per second, q1 gave a 3.53x spread and q7 1.91x, while the same engine's
+drain rate stayed near 1.0M throughout. clink's own throughput was stable everywhere
+(worst spread 1.12x), but a ratio is only as good as its weaker half. CPU per event held
+within 1.15x across 31 of the 33 query-engine pairs, which is why this table reports that
+instead.
+
+**q5 is absent from clink's column** because it never ran: its plan is 36 tasks at
+parallelism 4 and the rig's engine node has a 16-slot worker. That is a rig capacity limit,
+not an engine result, and it is the one query in the suite with no clink figure here.
+
+**These are blackhole-sink runs**, so nothing in them checks that either engine produced
+the right answer - a throughput or efficiency win from an engine doing *less* work would
+look identical to a real one. Correctness is gated separately and independently, and on the
+same commit: 16 of 16 append-only queries and 4 of 4 changelog queries produce output the
+two engines agree on, row for row. See
+[the correctness gate](#the-correctness-gate).
+
 ## What was not measured
 
 Stated plainly, because an efficiency page without this section should not be trusted:

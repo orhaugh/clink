@@ -50,6 +50,40 @@ evidence, check the Hetzner console too.
   the public internet at a 100ms interval folds tens of ms of RTT into a 500ms
   slope window.
 
+## Full suite on canonical data, 2026-07-28
+
+17 bid-only queries, both engines, two trials each, parallelism 4, on 2x ccx23 in nbg1.
+clink 438cb93 against Flink 2.2.0 re-baselined on the same provision. The topic held
+9,200,000 canonical nexmark bid records generated on the rig by `load-canonical.sh`,
+which drives clink's own deterministic generator - the same one `nexmark_dump` uses - so
+unlike the ratios-only round below, these absolute figures are comparable to the earlier
+canonical baselines.
+
+Published to `docs/efficiency.md`; raw output in
+`docs/assets/nexmark-full-2026-07-28.json` and `results-split-canonical-full-438cb93/`.
+
+CPU per event ranges from **1.73x (q14) to 12.57x (qhop)** in clink's favour, and memory
+from 16.4x less (q0) to **0.3x - clink WORSE - on q18**.
+
+Four things this run establishes about the harness, not about the engines:
+
+1. **Per-query throughput is not reportable from this rig.** The sustained-slope sampler
+   gave Flink 10.05M and 2.52M rec/s on two identical q2 trials (3.99x), 3.53x on q1 and
+   1.91x on q7, while its drain rate stayed near 1.0M throughout. clink's own spread was
+   at most 1.12x. Efficiency held within 1.15x on 31 of 33 pairs, so that is what gets
+   published. Do not quote a per-query throughput ratio from this data.
+2. **q5 cannot run on this rig.** Its plan is 36 tasks at parallelism 4 and the engine
+   node's worker has `--slots=16`, so `clink submit failed` on both trials. Raise the
+   worker's slots or drop parallelism to measure it.
+3. **q18 and q19 did not drain on Flink** inside the sampler's 240s window, so its
+   throughput there is a lower bound and its efficiency describes a partial run.
+4. **clink q11 and q19 efficiency were themselves noisy** (1.42x and 1.72x between
+   trials). Everything else was within 1.15x.
+
+And one about the engine, which is published rather than buried: clink holds **3x more
+memory than Flink on q18** and about 2x more on q19. Both are unbounded per-key state -
+the same weakness as the q12 memory figure - and it is not fixed.
+
 ## Re-verification, 2026-07-28 (post record-loss fix) - RATIOS ONLY
 
 Rig: 2x ccx23, **nbg1** (Nuremberg - `ccx23` had no capacity in fsn1 that day; check
