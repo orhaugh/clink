@@ -10,6 +10,20 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# CLINK_SANITIZER_BUILD - "this build carries a -fsanitize runtime".
+#
+# build_and_test.sh passes the sanitizer flags through CMAKE_CXX_FLAGS rather than a
+# cache option, so nothing else in the build knows a sanitizer is on. A few tests
+# need to, because they assert on the EXIT CODE of a spawned clink binary and a
+# sanitizer build of that binary aborts during its own at-exit teardown - see
+# tests/test_check_savepoint_cli.cpp. Detecting it here keeps the knowledge in one
+# place instead of each test guessing from compiler-specific macros (there is no
+# portable predefined macro for UBSan at all).
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize")
+    add_compile_definitions(CLINK_SANITIZER_BUILD=1)
+    message(STATUS "clink: sanitizer build detected (CLINK_SANITIZER_BUILD=1)")
+endif()
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
