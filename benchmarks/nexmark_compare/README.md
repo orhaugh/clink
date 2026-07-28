@@ -81,6 +81,16 @@ sustained load (see the Latency section below).
 - **q6** (SQL-only capability): clink runs it in SQL over Kafka (5,223
   sellers); the Flink reference suite has no SQL form for it. Documented, not
   gated.
+- **Every window kind** (`gate.sh`, 500k events, par=4): TUMBLE q12 184,767,
+  SESSION q11 73,468, CUMULATE `qcum` 678,007, HOP `qhop` 1,493,218, each
+  matching exactly. `qhop` and `qcum` are not nexmark queries and are marked as
+  such; they exist because nexmark cannot cover the set - HOP's only query is
+  q5, whose top-1 rank makes it a changelog the row-count gate cannot carry, and
+  CUMULATE appears nowhere. Both are bare windowed aggregates of the same shape
+  as q11, so a count difference is attributable to the window. The argument
+  orders are written per dialect rather than derived from each other: HOP
+  disagrees between the engines and CUMULATE agrees, so assuming either from the
+  other is wrong half the time.
 - **CPU normalisation** (Cores*Time): measured CPU per query (clink host
   procs via `ps`, Flink containers via cgroup v2 `cpu.stat`); the scoreboard
   adds an events-per-CPU-second efficiency column (parallelism-independent),

@@ -146,9 +146,21 @@ where coverage multiplies without the test count exploding.
 - [x] one nexmark query per kind, in-suite, at parallelism > 1 against an
       independent oracle: q12 (TUMBLE), q5 (HOP), q11 (SESSION) exist; CUMULATE has
       no nexmark query and needs its own
-- [ ] the cross-engine gate covers each kind, with the argument-order difference
-      handled per dialect rather than assumed. TUMBLE and HOP are gated; SESSION and
-      CUMULATE are not
+- [x] the cross-engine gate covers each kind, with the argument-order difference
+      handled per dialect rather than assumed. This entry originally read "TUMBLE and
+      HOP are gated; SESSION and CUMULATE are not", and two of the four were wrong:
+      SESSION was already gated by q11, while HOP's only query is q5, whose top-1
+      rank makes it a changelog, and whose last upsert-gate run emitted zero rows on
+      both engines. HOP and CUMULATE now have their own bare windowed aggregates,
+      `qhop` and `qcum`, generated for both dialects. Run at 500k events,
+      parallelism 4:
+
+      | kind | query | clink rows | flink rows |
+      |---|---|---|---|
+      | TUMBLE | q12 | 184,767 | 184,767 |
+      | SESSION | q11 | 73,468 | 73,468 |
+      | CUMULATE | `qcum` | 678,007 | 678,007 |
+      | HOP | `qhop` | 1,493,218 | 1,493,218 |
 - [x] a job whose window cannot build fails FAST with the constructor's message
       (done - `TaskThatFailsToBuildFailsTheJobRatherThanHanging`)
 
@@ -167,7 +179,7 @@ where coverage multiplies without the test count exploding.
 
 ## What this found
 
-Working the plan surfaced seven defects, each in the phase written to look for it.
+Working the plan surfaced eight defects, each in the phase written to look for it.
 
 | defect | phase | severity |
 |---|---|---|
@@ -178,8 +190,9 @@ Working the plan surfaced seven defects, each in the phase written to look for i
 | an open window did not survive a checkpoint restore | 5 | silent data loss on failover |
 | an open SESSION did not survive one either - the fix above was written against the fixed-window class, and sessions are a separate one | 5 | silent data loss on failover |
 | the nexmark oracle's q5 carried the engine's own clamp, so it agreed with the defect | 3 | the oracle was not independent |
+| the cross-engine gate counted 0 rows against 0 rows as a MATCH, so a query that emitted nothing on both engines reported as gated | 6 | a gate that cannot fail |
 
-Five of the seven were invisible to output tests over realistic data: epoch
+Five of the eight were invisible to output tests over realistic data: epoch
 milliseconds are around 1.7e12, comfortably inside both the `double` and the
 `int64` safe ranges, and no benchmark checkpoints. They were reachable only by
 asking what happens at the edges of the representation, which is what the
@@ -191,7 +204,13 @@ simply not enumerated when it was applied. A per-kind loop over
 `all_window_kinds()` costs nothing and would have caught it the same day, which is
 why the Phase 5 and rescale tests are written that way rather than against TUMBLE.
 
-The eighth finding is not a defect but a decision: `HOP(time, SIZE, SLIDE)` puts
+The gate one is the "vacuous assertion" axis again, at the other end of the plan
+from where it was first written down. It is worth noting that the plan's own
+account of what was gated was wrong in both directions until it was checked
+against the recorded results, which is the general lesson: a claim about coverage
+is not coverage.
+
+The ninth finding is not a defect but a decision: `HOP(time, SIZE, SLIDE)` puts
 the larger value first and `CUMULATE(time, STEP, SIZE)` puts the smaller first, so
 the two multi-argument window kinds disagree with each other, and `HOP` also
 disagrees with the same-named function in Flink. Both messages now name their order,
