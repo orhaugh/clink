@@ -37,6 +37,16 @@ QUERIES="${QUERIES:-q0 q12}"
 PARS="${PARS:-4 8 12}"
 EVENTS="${EVENTS:-9200000}"
 ENGINES="${ENGINES:-clink flink}"
+# Trials per (query, parallelism, engine). Two samples cannot adjudicate a spread
+# (clink q11/q19 read 1.42x/1.72x apart on two trials in the 2026-07-28 sweep).
+REPEATS="${REPEATS:-1}"
+# Sampler give-up after the frontier stalls; default matches every published
+# number. Raise for the q18/q19 stall probe (see split-run.sh for the history).
+QUIET_TIMEOUT="${QUIET_TIMEOUT:-6}"
+# clink worker slots and Flink TM process size, forwarded to every node's
+# compose. See full-worker.yml for what each changes and what it does NOT.
+CLINK_SLOTS="${CLINK_SLOTS:-16}"
+FLINK_TM_MEM="${FLINK_TM_MEM:-1728m}"
 TAG="${TAG:-}"
 KEY="${KEY:-$HOME/.ssh/clink-bench-ed25519}"
 RESULTS="$HERE/results-full${TAG:+-$TAG}"
@@ -93,6 +103,7 @@ up() {    # profile
         priv=${rest%%:*}; id=${rest#*:}
         sshx "$pub" "cd $REMOTE/cloud && CONTROL_IP=$CONTROL_PRIV WORKER_IP=$priv WORKER_ID=$id \
             CLINK_IMAGE=${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:main} \
+            CLINK_SLOTS=$CLINK_SLOTS FLINK_TM_MEM=$FLINK_TM_MEM \
             docker compose -p $PROJECT -f full-worker.yml --profile $profile up -d" >/dev/null 2>&1
     done
 }
@@ -118,8 +129,24 @@ for w in $WORKERS; do
     scpx "$HERE/full-worker.yml" root@"${w%%:*}":"$REMOTE/cloud/" >/dev/null || exit 1
 done
 
-run_one() {  # engine query par
-    local engine=$1 q=$2 par=$3
+# REFUSE TO MEASURE AN EMPTY TOPIC - the same guard split-run.sh grew after
+# producing two full scoreboards of zeros (no topic; then an advertised-listener
+# with an empty host). This script does not load the topic; full-load-canonical.sh
+# does.
+step "0b. Broker depth"
+depth=$(sshx "$CONTROL_IP" "docker run --rm --network host confluentinc/cp-kafka:7.6.0 \
+    kafka-run-class kafka.tools.GetOffsetShell --bootstrap-server $BROKER --topic nx-bid 2>/dev/null \
+    | awk -F: '{sum += \$3} END {print sum+0}'" 2>/dev/null | tr -d '\r')
+echo "topic nx-bid holds ${depth:-unknown} records (target $EVENTS)"
+if [ -z "$depth" ] || [ "$depth" = "0" ]; then
+    echo "REFUSING TO RUN: nx-bid on $BROKER holds no records. Load it first" >&2
+    echo "  (full-load-canonical.sh), and check the broker came up WITH" >&2
+    echo "  BROKER_PRIVATE_IP set - without it Kafka advertises an empty host." >&2
+    exit 1
+fi
+
+run_one() {  # engine query par trial
+    local engine=$1 q=$2 par=$3 trial=${4:-1}
     local gid="f-$engine-$q-$par-$$"
     down
     up "$engine"
@@ -178,7 +205,7 @@ run_one() {  # engine query par
         # positive sample and subtracts the run's own head start, which on a fast drain scores
         # a fully-completed run as incomplete (verified: the job reaches 9.2M of 9.2M, while
         # the sampler reported reached=False).
-        s=$(sshx "$CONTROL_IP" "cd $REMOTE && python3 driver/sample_rate.py clink --base http://127.0.0.1:8095 --job $jid --target $EVENTS --baseline 0 --max-runtime 300")
+        s=$(sshx "$CONTROL_IP" "cd $REMOTE && python3 driver/sample_rate.py clink --base http://127.0.0.1:8095 --job $jid --target $EVENTS --baseline 0 --max-runtime 300 --quiet-timeout $QUIET_TIMEOUT")
     else
         sed -e "s#kafka:29092#$BROKER#" -e "s#__OUT__#nx-out-$q#" \
             -e "s#'properties.group.id' = '[^']*'#'properties.group.id' = '$gid'#" \
@@ -188,7 +215,7 @@ run_one() {  # engine query par
         jid=$(sshx "$CONTROL_IP" "docker exec ${PROJECT}-flink-jobmanager-1 flink run -d -p $par /tmp/n.jar /tmp/fr.sql 2>&1" \
               | grep -oE 'JobID [0-9a-f]+' | awk '{print $2}' | tail -1)
         [ -z "$jid" ] && { echo "  submit failed"; down; return 1; }
-        s=$(sshx "$CONTROL_IP" "cd $REMOTE && python3 driver/sample_rate.py flink --base http://127.0.0.1:8081 --job $jid --target $EVENTS --max-runtime 300")
+        s=$(sshx "$CONTROL_IP" "cd $REMOTE && python3 driver/sample_rate.py flink --base http://127.0.0.1:8081 --job $jid --target $EVENTS --max-runtime 300 --quiet-timeout $QUIET_TIMEOUT")
     fi
 
     local cpu_post wall_post mem
@@ -196,11 +223,11 @@ run_one() {  # engine query par
     wall_post=$(now_s)
     mem=$(mem_all "$engine")
 
-    printf '%s' "$s" | python3 "$HERE/record.py" --out "$RESULTS/$q-$engine-p$par.json" \
-        --engine "$engine" --query "$q" --trial "$par" --par "$par" \
+    printf '%s' "$s" | python3 "$HERE/record.py" --out "$RESULTS/$q-$engine-p$par-t$trial.json" \
+        --engine "$engine" --query "$q" --trial "$trial" --par "$par" \
         --cpu-pre "$cpu_pre" --cpu-post "$cpu_post" \
         --wall-pre "$wall_pre" --wall-post "$wall_post" --input-events "$EVENTS"
-    python3 - "$RESULTS/$q-$engine-p$par.json" "$mem" <<'PY'
+    python3 - "$RESULTS/$q-$engine-p$par-t$trial.json" "$mem" <<'PY'
 import json, sys
 p, anon = sys.argv[1], float(sys.argv[2] or 0)
 d = json.load(open(p))
@@ -215,8 +242,10 @@ for q in $QUERIES; do
     for par in $PARS; do
         for eng in clink flink; do
             want "$eng" || continue
-            step "$q  parallelism=$par  $eng"
-            run_one "$eng" "$q" "$par"
+            for trial in $(seq 1 "$REPEATS"); do
+                step "$q  parallelism=$par  $eng  (trial $trial/$REPEATS)"
+                run_one "$eng" "$q" "$par" "$trial"
+            done
         done
     done
 done
@@ -237,7 +266,19 @@ for r in sorted(rows, key=lambda x: (x.get('query',''), x.get('par',0), x.get('e
           f"{(r.get('sustained_slope') or 0):>11,.0f} {(r.get('events_per_cpu_sec') or 0):>10,.0f} "
           f"{(r.get('cores') or 0):>6.2f} {(r.get('anon_mb') or 0):>8.0f} {str(r.get('reached_target')):>8}")
 # The question this rig exists for: does the RATIO hold as parallelism rises?
-by = {(r.get('query'), r.get('par'), r.get('engine')): r for r in rows}
+# Aggregate over trials: mean efficiency per (query, par, engine), with the
+# max/min spread kept so a noisy pair is visible rather than averaged away.
+import statistics
+groups = collections.defaultdict(list)
+for r in rows:
+    groups[(r.get('query'), r.get('par'), r.get('engine'))].append(r)
+by = {}
+for k, rs in groups.items():
+    eff = [r.get('events_per_cpu_sec') for r in rs if r.get('events_per_cpu_sec')]
+    agg = dict(rs[0])
+    agg['events_per_cpu_sec'] = statistics.mean(eff) if eff else None
+    agg['eff_spread'] = (max(eff) / min(eff)) if len(eff) > 1 and min(eff) else None
+    by[k] = agg
 qs = sorted({r.get('query') for r in rows}); ps = sorted({r.get('par') for r in rows})
 print()
 print("clink/flink efficiency ratio by parallelism (the question this rig exists to answer):")

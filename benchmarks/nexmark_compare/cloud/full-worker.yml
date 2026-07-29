@@ -21,7 +21,11 @@ services:
       # meaningless to a worker on another host, and localhost would silently make every
       # cross-node edge fail to connect.
       - --data-host=${WORKER_IP}
-      - --slots=16
+      # Slots are a scheduling cap, not hardware. 16 fits every query except q5,
+      # whose plan is 10 ops x parallelism: at par=12 that is 120 tasks against
+      # 48 total slots, so q5 was unrunnable on this rig until this became a
+      # knob. Raising it does not change what is measured for any other query.
+      - --slots=${CLINK_SLOTS:-16}
       - --http-port=8082
       - --http-bind=0.0.0.0
     environment:
@@ -39,6 +43,13 @@ services:
         taskmanager.host: ${WORKER_IP}
         taskmanager.bind-host: 0.0.0.0
         taskmanager.numberOfTaskSlots: 4
+        # Explicit, per the 2026-07-28 checklist: the image default (1728m, which
+        # is also this knob's default so an unset run is premise-identical to the
+        # old rounds) is the suspected cause of Flink's deterministic q18/q19
+        # source stall - every anon_mb reading in that sweep sat at 1.1-1.8 GB.
+        # Setting it CHANGES THE PREMISE of Flink's memory column; say so wherever
+        # a run that sets it is quoted.
+        taskmanager.memory.process.size: ${FLINK_TM_MEM:-1728m}
         metrics.fetcher.update-interval: 200
         parallelism.default: 4
         state.backend.type: hashmap
