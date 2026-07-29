@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -21,27 +22,33 @@ using clink::http::serve_static_file;
 class StaticFiles : public ::testing::Test {
 protected:
     void SetUp() override {
-        root_ = fs::temp_directory_path() / "clink_static_files_test";
-        fs::remove_all(root_);
+        // Unique per test: ctest runs each test as its own process in
+        // parallel, so a shared fixed directory gets set up and torn down
+        // concurrently by sibling tests. PID + test name keeps every
+        // instance disjoint; the secret lives inside base_ (outside the
+        // served root) so cleanup stays one remove_all.
+        const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+        base_ = fs::temp_directory_path() /
+                ("clink_static_" + std::to_string(::getpid()) + "_" + info->name());
+        root_ = base_ / "webroot";
+        fs::remove_all(base_);
         fs::create_directories(root_ / "assets");
         write(root_ / "index.html", "<html>console</html>");
         write(root_ / "assets" / "app.js", "console.log(1)");
         write(root_ / "assets" / "app.css", "body{}");
         // A secret OUTSIDE the served root, for the escape tests.
-        write(root_.parent_path() / "clink_static_secret.txt", "secret");
+        write(base_ / "clink_static_secret.txt", "secret");
         canonical_root_ = fs::weakly_canonical(root_);
     }
 
-    void TearDown() override {
-        fs::remove_all(root_);
-        fs::remove(root_.parent_path() / "clink_static_secret.txt");
-    }
+    void TearDown() override { fs::remove_all(base_); }
 
     static void write(const fs::path& p, const std::string& body) {
         std::ofstream out(p, std::ios::trunc | std::ios::binary);
         out << body;
     }
 
+    fs::path base_;
     fs::path root_;
     fs::path canonical_root_;
 };
@@ -86,7 +93,7 @@ TEST_F(StaticFiles, DotDotSegmentsNeverEscapeTheRoot) {
 
 TEST_F(StaticFiles, SymlinkPointingOutsideTheRootIsRefused) {
     std::error_code ec;
-    fs::create_symlink(root_.parent_path() / "clink_static_secret.txt", root_ / "leak.txt", ec);
+    fs::create_symlink(base_ / "clink_static_secret.txt", root_ / "leak.txt", ec);
     if (ec) {
         GTEST_SKIP() << "filesystem does not permit symlinks here";
     }
