@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.4.0 (July 2026)
+
+A small, focused release: a new connector, prebuilt Linux binaries, and one
+crash fix that lean builds of v0.3.0 need. No API or format breaks.
+
+**WebSocket source.** `connector='websocket'` connects to a `ws://` or
+`wss://` push feed - the delivery mechanism of most market-data and event
+APIs - sends the venue's subscribe message, and emits each text message as
+a record; a declared `format='json'` schema rides the columnar JSON decode
+exactly as a Kafka table does. RFC 6455 is implemented in-tree over POSIX
+sockets (the protocol layer is pinned in tests to the RFC's own worked
+examples), so the impl adds zero dependencies: plain `ws://` needs nothing,
+`wss://` uses OpenSSL when present. Delivery semantics are stated plainly:
+a push stream has no offsets, so at-most-once across restarts - the
+documented patterns are bridging to Kafka for durability, or pairing with
+the flight recorder, which makes an unreplayable feed locally replayable.
+Reconnect with capped backoff re-sends the subscription. Verified against a
+real venue: one inline `clink run` statement pulled live trades off a
+public exchange stream through TLS into a file
+([docs/connectors/websocket.md](docs/connectors/websocket.md)).
+
+**Prebuilt Linux binaries.** Every release now carries
+`clink-<ver>-linux-x86_64-ubuntu24.04.tar.gz`: a relocatable SDK prefix -
+CLI, daemon, static libs, headers, CMake package, with the pinned Arrow
+bundled and `$ORIGIN` rpaths - built at an honest Ubuntu 24.04 glibc floor
+and smoke-tested both as a CLI and as a `find_package(clink)` consumer.
+Scope is the dependency-free impl set (SQL, file/Parquet, RocksDB state,
+HTTP, TLS, WebSocket, Avro, vector search; no object stores, no broker
+connectors). A source build keeps everything.
+
+**Crash fix for lean builds.** v0.3.0's vector_search impl registered its
+Row-channel operator without registering the Row type, which took the
+embedded CLI down at startup ("In not registered") in any build without the
+Iceberg impl - whose install happened to register the type first in full
+builds. The impl now self-registers the type idempotently. Relatedly, the
+Iceberg impl now skips itself (with a clear message) against an Arrow built
+without S3, instead of every consumer of `clink::iceberg` failing at link
+with undefined `arrow::fs::S3*` symbols.
+
 ## v0.3.0 (July 2026)
 
 Ninety-nine commits of engine, benchmark and correctness work since v0.2.0,
