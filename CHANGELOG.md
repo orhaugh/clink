@@ -1,5 +1,69 @@
 # Changelog
 
+## v0.3.0 (July 2026)
+
+Ninety-nine commits of engine, benchmark and correctness work since v0.2.0,
+not counting this release commit. No public header was removed or renamed
+(header changes are additive), and snapshot and savepoint encodings are
+unchanged - the GROUP BY accumulator's byte layout was audited for this
+release. Operators that previously lost state at a restore now persist it, so
+a v0.2.0 snapshot still restores and simply carries none of that newly
+persisted state. One behavioural note: the keyed-shuffle routing fix below
+means a savepoint restored across the upgrade can move keys between subtasks,
+the same class of movement as a rescale.
+
+**The benchmark suite is published, and every query is gated.** The full
+17-query nexmark suite now runs on a five-node cluster against canonical data,
+each query correctness-gated against an independent oracle at parallelism 4,
+and every window kind gated cross-engine. Headline, measured: clink processes
+an event for 1.9x to 5.3x less CPU (median 2.45x) than a JVM stream processor
+producing identical output. Two earlier q18/q19 figures were found unsound,
+withdrawn and re-measured on the corrected harness. The docs site gained a
+[Benchmarks](https://orhaugh.github.io/clink/benchmarks/) page and a costed
+footprint model (instances, dollars, modelled CO2e).
+
+**Making that gate honest found real defects, now fixed.** The row and
+columnar carriers of a keyed shuffle disagreed about which subtask a key
+belongs to - the row side read the key through a double, so 74.5% of
+FNV-folded keys misrouted at parallelism 4, silently splitting group state
+across subtasks; both carriers now read the exact integer. A data batch larger
+than the send-credit window is split instead of silently dropped, a failed
+send fails the task instead of vanishing, and an unpartitioned stateful
+operator is no longer fanned out to produce N answers.
+
+**A restore now preserves what was open.** An open window survives a restore
+(tumbling, hopping, session and cumulate - previously every open window was
+silently lost), and so do top-N retained rows, LAST_N state, the OVER
+aggregate's sync path, and the upsert and netting sinks' compaction view.
+Window arithmetic is floored rather than truncated and shared by all ten
+sites, event-time reads are exact, window arguments fail at bind time, and a
+task that cannot build fails its job.
+
+**Performance.** Projection pushdown reaches the columnar JSON bridge (45% off
+the shuffle split, 27% off decode); per-group aggregate state fell by a third
+(AggState 264 -> 104 bytes, held there by a static_assert); the windowed fire
+stopped scanning every group on every watermark (4.4x at 200k groups); the
+keyed split gathers with index + Take (31-38% off); JSON decode is on-demand
+(2.5x on the biggest shared cost); the Kafka source fetches in batches (22%
+off source CPU per record, and its old batch default cost 4.6x on a saturated
+consumer); each parallel pipeline instance is co-located so forward edges stop
+crossing the network (+20% on a forward-only query at parallelism 12) - and
+the in-process fast path those edges use, dead in every container deployment,
+is live again.
+
+**SQL.** WHERE accepts expression operands, and predicates carrying them are
+understood beyond the filter operator; declared FLOAT and DECIMAL types are
+honoured at columnar JSON decode; non-integral doubles are no longer written
+at six significant digits; a batch materialises columns by name rather than by
+declared position.
+
+**Build and packaging.** `CLINK_ISA_BASELINE` makes the x86 ISA floor a
+decision rather than an accident (AVX2 was measured to buy nothing on this
+workload); `CLINK_WITH_JEMALLOC` is opt-in and observable (`clink_node
+--version` prints the loaded allocator); an installed clink now tells its
+consumers to resolve ArrowCompute, a `find_package(clink)` fix; simdjson is
+pinned and kept out of the public headers.
+
 ## v0.2.0 (July 2026)
 
 Forty-four commits of engine, build and CI work since v0.1.0. No API or format
