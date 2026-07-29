@@ -41,6 +41,14 @@ Three capabilities follow from that design:
   runtime: cold start in milliseconds, one artefact to ship, and the
   same behaviour embedded, in CI, and on a cluster.
 
+Measured, not asserted: across the 17-query nexmark suite on a five-node
+cluster, clink processes an event for **1.9x to 5.3x less CPU** (median 2.45x)
+than a JVM stream processor producing identical, correctness-gated output -
+method, caveats and raw per-run data at
+[Benchmarks](https://orhaugh.github.io/clink/benchmarks/), priced out in
+instances, dollars and modelled CO2e at
+[Cost and environmental footprint](https://orhaugh.github.io/clink/efficiency/).
+
 clink is heavily inspired by Apache Flink. Flink's model of typed operator
 DAGs, event-time processing, in-band watermarks and checkpoint barriers, keyed
 state, and exactly-once semantics is the conceptual foundation this engine
@@ -365,8 +373,8 @@ query shape does not earn a hard dependency. Numbers and method:
 
 It is **not** a fix for memory. clink's memory advantage comes from the engine
 (nexmark q0: 72 MB against a JVM engine's 1,146 MB) and jemalloc changed neither
-that nor the windowed query's footprint, which is dominated by un-fired window
-state that any engine has to hold.
+that nor the windowed query's footprint, which is dominated by the query's own
+retained window state.
 
 `ON` is refused on macOS with a configure error rather than accepted: jemalloc
 does not replace the system allocator by linking alone there, so the build would
@@ -440,11 +448,13 @@ All of the documentation below is also published as a browsable site at
 [orhaugh.github.io/clink](https://orhaugh.github.io/clink/), together with a
 [capability catalogue](https://orhaugh.github.io/clink/capabilities/), the
 [design decisions](https://orhaugh.github.io/clink/design/) behind the
-engine's architecture, and
-[efficiency and environmental impact](https://orhaugh.github.io/clink/efficiency/) -
-the measured cost of processing an event (3.87x less CPU and 15.5x less memory than a
-JVM stream processor on the same hardware, byte-identical output), with the raw per-run
-data and an explicit account of what was not measured.
+engine's architecture, the measured
+[benchmarks](https://orhaugh.github.io/clink/benchmarks/) (17 nexmark queries,
+five-node cluster, 1.9x to 5.3x less CPU per event than a JVM stream processor on
+correctness-gated identical output, raw per-run data published), and the
+[cost and environmental footprint](https://orhaugh.github.io/clink/efficiency/)
+those measurements translate into - with an explicit account of what was not
+measured, starting with wall power.
 
 For a deeper look at how the engine works inside, the [internals
 reference](docs/internals/README.md) documents each subsystem and names the
