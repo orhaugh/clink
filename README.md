@@ -139,6 +139,10 @@ aggregate. From here:
   [libclink](#libclink-embed-from-any-language-pure-c-abi);
 - the full C++ API: [Code examples](#code-examples) below and the
   compileable [`docs/consumer-examples/`](docs/consumer-examples/);
+- a complete downstream project - windows, lateness, joins,
+  MATCH_RECOGNIZE, a custom stateful operator, state-as-data, replay and a
+  cluster run over one market-data tape, all against the pinned release:
+  [market-pulse](https://github.com/orhaugh/market-pulse);
 - a local distributed cluster with the dashboard:
   `docker build -t clink-build:latest -f docker/Dockerfile .` then
   `docker compose up --build`, and open <http://localhost:8081>
