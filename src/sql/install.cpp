@@ -6509,7 +6509,33 @@ public:
         }
     }
 
+    // Durability of the compaction view. This sink materialises nothing until
+    // flush() at end-of-stream, so mid-job the WHOLE view lives in state_ - a
+    // restore used to lose every row whose last change predated the checkpoint,
+    // and the final file silently described only the post-restore suffix of the
+    // changelog. (The ledger had this recorded as a duplicate-emission class;
+    // reading the flush path showed it is a data-LOSS class, and the record was
+    // corrected with the fix.)
+    //
+    // The persistence is WRITE-THROUGH at on_data (dirty keys coalesced per
+    // batch), not barrier-time: the sink runner snapshots the backend BEFORE it
+    // delivers the barrier to the sink, so an on_barrier flush would always be
+    // one checkpoint stale and a restore would lose the last inter-barrier span.
+    // Write-through means the snapshot captures the aligned view by construction
+    // - the strict-write model the evicting window already uses. Deletes must
+    // reach the backend too, or the row comes back at the NEXT restore.
+    void open() override {
+        persist_inmem_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
+                         !this->runtime()->state_backend()->supports_async_get();
+        if (persist_inmem_ && state_.empty()) {
+            keyed_state_().scan([&](const std::string& key, const Row& row) { state_[key] = row; });
+        }
+    }
+
     void on_data(const Batch<Row>& batch) override {
+        // Dirty-key coalescing: several changes to one key inside a batch write
+        // through once, with the key's final state.
+        std::vector<std::string> dirty;
         for (const auto& rec : batch) {
             const auto& row = rec.value();
             auto key = make_key_(row);
@@ -6520,6 +6546,9 @@ public:
             // update_after both materialise the row.
             if (kind == kRowKindDelete) {
                 state_.erase(key);
+                if (persist_inmem_) {
+                    dirty.push_back(std::move(key));
+                }
                 continue;
             }
             if (kind == kRowKindUpdateBefore) {
@@ -6530,7 +6559,21 @@ public:
             // logical table).
             Row stored = row;
             stored.values.erase(std::string{kRowKindField});
+            if (persist_inmem_) {
+                dirty.push_back(key);
+            }
             state_[key] = std::move(stored);
+        }
+        if (persist_inmem_ && !dirty.empty()) {
+            auto kv = keyed_state_();
+            for (const auto& key : dirty) {
+                auto it = state_.find(key);
+                if (it != state_.end()) {
+                    kv.put(key, it->second);
+                } else {
+                    kv.erase(key);
+                }
+            }
         }
     }
 
@@ -6572,9 +6615,50 @@ private:
         return key;
     }
 
+    KeyedState<std::string, Row> keyed_state_() {
+        return this->runtime()->template keyed_state<std::string, Row>(
+            "upsert", clink::string_codec(), row_json_codec_());
+    }
+
+    // Row as its JSON-object text - the encoding whose exact round-trip the
+    // top-N and LAST_N restore work gated, byte-stability included.
+    static clink::Codec<Row> row_json_codec_() {
+        using Bytes = clink::Codec<Row>::Bytes;
+        using BytesView = clink::Codec<Row>::BytesView;
+        auto body = [](const Row& r, Bytes& o) {
+            agg_codec_detail::put_str(
+                o, clink::config::JsonValue{clink::sql::to_json_object(r.values)}.serialize(0));
+        };
+        return clink::Codec<Row>{
+            .encode = [body](const Row& r) -> Bytes {
+                Bytes o;
+                body(r, o);
+                return o;
+            },
+            .decode = [](BytesView buf) -> std::optional<Row> {
+                agg_codec_detail::Reader rd{buf, 0, true};
+                const std::string text = rd.str();
+                if (!rd.ok) {
+                    return std::nullopt;
+                }
+                auto j = clink::config::parse(text);
+                Row row;
+                if (j.is_object()) {
+                    row.values = clink::sql::row_columns_from_json(std::move(j.as_object()));
+                }
+                return row;
+            },
+            .encode_into = body,
+        };
+    }
+
     std::string path_;
     std::vector<std::string> primary_key_;
     std::map<std::string, int> decimal_scales_;  // #56: column -> declared scale
+    // True when a state backend is attached but not a deferring one; the view is
+    // then written through per dirty key and reloaded in open(). Same gate and
+    // same stated deferring-backend gap as the operator family.
+    bool persist_inmem_ = false;
     clink::FlatMap<std::string, Row> state_;
     bool flushed_{false};
 };
@@ -6592,6 +6676,7 @@ public:
         : path_(std::move(path)), decimal_scales_(std::move(decimal_scales)) {}
 
     void on_data(const Batch<Row>& batch) override {
+        std::vector<std::string> dirty;
         for (const auto& rec : batch) {
             const auto& row = rec.value();
             const bool del = is_delete_like(row_kind_of(row));
@@ -6606,6 +6691,35 @@ public:
             } else {
                 slot.row = std::move(bare);
             }
+            if (persist_inmem_) {
+                dirty.push_back(key);
+            }
+        }
+        if (persist_inmem_ && !dirty.empty()) {
+            auto kv = keyed_state_();
+            for (const auto& key : dirty) {
+                auto it = state_.find(key);
+                if (it != state_.end()) {
+                    kv.put(key, it->second);
+                } else {
+                    kv.erase(key);
+                }
+            }
+        }
+    }
+
+    // Same write-through durability, gate and rationale as FileJsonUpsertSink
+    // above; the netted MULTIPLICITY must survive a restore, not just the row -
+    // a count of 2 restored as 1 nets to empty one delete early.
+    void open() override {
+        persist_inmem_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
+                         !this->runtime()->state_backend()->supports_async_get();
+        if (persist_inmem_ && state_.empty()) {
+            keyed_state_().scan([&](const std::string& key, const Slot& slot) {
+                if (slot.count > 0) {
+                    state_[key] = slot;
+                }
+            });
         }
     }
 
@@ -6638,8 +6752,49 @@ private:
         Row row;
         std::int64_t count = 0;
     };
+
+    KeyedState<std::string, Slot> keyed_state_() {
+        return this->runtime()->template keyed_state<std::string, Slot>(
+            "net", clink::string_codec(), slot_codec_());
+    }
+
+    static clink::Codec<Slot> slot_codec_() {
+        using Bytes = clink::Codec<Slot>::Bytes;
+        using BytesView = clink::Codec<Slot>::BytesView;
+        auto body = [](const Slot& sl, Bytes& o) {
+            agg_codec_detail::put_u64(o, static_cast<std::uint64_t>(sl.count));
+            agg_codec_detail::put_str(
+                o,
+                clink::config::JsonValue{clink::sql::to_json_object(sl.row.values)}.serialize(0));
+        };
+        return clink::Codec<Slot>{
+            .encode = [body](const Slot& sl) -> Bytes {
+                Bytes o;
+                body(sl, o);
+                return o;
+            },
+            .decode = [](BytesView buf) -> std::optional<Slot> {
+                agg_codec_detail::Reader rd{buf, 0, true};
+                Slot sl;
+                sl.count = static_cast<std::int64_t>(rd.u64());
+                const std::string text = rd.str();
+                if (!rd.ok) {
+                    return std::nullopt;
+                }
+                auto j = clink::config::parse(text);
+                if (j.is_object()) {
+                    sl.row.values = clink::sql::row_columns_from_json(std::move(j.as_object()));
+                }
+                return sl;
+            },
+            .encode_into = body,
+        };
+    }
+
     std::string path_;
     std::map<std::string, int> decimal_scales_;
+    // Same gate and stated deferring-backend gap as FileJsonUpsertSink.
+    bool persist_inmem_ = false;
     clink::FlatMap<std::string, Slot> state_;
     bool flushed_{false};
 };

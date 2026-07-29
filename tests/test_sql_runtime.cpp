@@ -16192,6 +16192,185 @@ TEST(OverAggStateLifecycle, TheSyncTieBreakSequenceSurvivesARestore) {
 }
 
 // ---------------------------------------------------------------------------
+// UPSERT / NETTING SINK COMPACTION-VIEW LIFECYCLE.
+//
+// Both sinks materialise NOTHING until flush() at end-of-stream (tmp + atomic
+// rename), so mid-job their entire compacted view lives in memory. A restore
+// used to lose every row whose last change predated the checkpoint - the final
+// file then silently described only the post-restore suffix of the changelog.
+// (The pending-gaps ledger had this down as a duplicate-emission class; it is a
+// data-LOSS class, corrected with this fix.)
+//
+// The persistence is write-through at on_data, NOT on_barrier, because the sink
+// runner snapshots the backend BEFORE delivering the barrier to the sink - a
+// barrier-time flush would be one checkpoint stale, forever. The tests mirror
+// that ordering: no sink-side hook at snapshot time, just backend->snapshot().
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::shared_ptr<Sink<Row>> build_sink(const std::string& type,
+                                      std::map<std::string, std::string> params) {
+    const auto* f =
+        cluster::OperatorRegistry::default_instance().find_sink(type, std::string{kChannelRow});
+    EXPECT_NE(f, nullptr) << type;
+    cluster::OperatorBuildContext octx;
+    octx.params = std::move(params);
+    octx.parallelism = 1;
+    return std::static_pointer_cast<Sink<Row>>(f->build(octx));
+}
+
+void sink_feed(Sink<Row>& sink, std::int64_t k, const std::string& v, std::string_view kind) {
+    Row r;
+    r.values["k"] = clink::config::JsonValue{k};
+    r.values["v"] = clink::config::JsonValue{v};
+    r.values[std::string{kRowKindField}] = clink::config::JsonValue{std::string{kind}};
+    Batch<Row> b;
+    b.emplace(r, EventTime{0});
+    sink.on_data(b);
+}
+
+std::multiset<std::string> flushed_rows(Sink<Row>& sink, const std::filesystem::path& path) {
+    sink.flush();
+    std::multiset<std::string> out;
+    for (const auto& l : read_lines(path)) {
+        out.insert(canonical(clink::config::parse(l), {}));
+    }
+    return out;
+}
+
+}  // namespace
+
+// The primary loss: a row whose last change predates the checkpoint must still
+// be in the file the post-restore run writes.
+TEST(UpsertSinkLifecycle, APreSnapshotRowSurvivesARestoreIntoTheFinalFile) {
+    ensure_sql_installed_once();
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("upsert_restore_" + std::to_string(getpid()) + ".ndjson");
+    std::filesystem::remove(path);
+    const std::map<std::string, std::string> params{{"path", path.string()}, {"primary_key", "k"}};
+    const OperatorId op_id{9971};
+    MetricsRegistry metrics;
+    auto backend = std::make_shared<InMemoryStateBackend>();
+
+    Snapshot snap;
+    {
+        auto sink = build_sink("file_json_upsert_sink", params);
+        RuntimeContext ctx{op_id, "upsert", backend.get(), &metrics};
+        sink->attach_runtime(&ctx);
+        sink->open();
+        sink_feed(*sink, 1, "pre", kRowKindInsert);
+        // Production ordering: the backend snapshot happens with NO sink hook -
+        // write-through at on_data is what must have made this durable already.
+        snap = backend->snapshot(CheckpointId{1});
+        // The crashed run never flushes; nothing lands in the file.
+    }
+
+    auto restored = std::make_shared<InMemoryStateBackend>();
+    restored->restore(snap);
+    auto sink2 = build_sink("file_json_upsert_sink", params);
+    RuntimeContext ctx2{op_id, "upsert", restored.get(), &metrics};
+    sink2->attach_runtime(&ctx2);
+    sink2->open();
+    sink_feed(*sink2, 2, "post", kRowKindInsert);
+
+    const auto rows = flushed_rows(*sink2, path);
+    std::filesystem::remove(path);
+    EXPECT_EQ(rows.size(), 2u) << "the pre-snapshot row k=1 must survive into the final "
+                               << "file alongside the post-restore k=2";
+    EXPECT_TRUE(rows.count(R"({"k":1,"v":"pre"})")) << "k=1 lost across the restore";
+    EXPECT_TRUE(rows.count(R"({"k":2,"v":"post"})"));
+}
+
+// The zombie: a post-restore DELETE must reach the backend, or the SECOND
+// failover resurrects the row from the stale snapshot.
+TEST(UpsertSinkLifecycle, ADeletedRowStaysDeletedAcrossASecondRestore) {
+    ensure_sql_installed_once();
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("upsert_zombie_" + std::to_string(getpid()) + ".ndjson");
+    std::filesystem::remove(path);
+    const std::map<std::string, std::string> params{{"path", path.string()}, {"primary_key", "k"}};
+    const OperatorId op_id{9972};
+    MetricsRegistry metrics;
+
+    auto b1 = std::make_shared<InMemoryStateBackend>();
+    Snapshot snap1;
+    {
+        auto sink = build_sink("file_json_upsert_sink", params);
+        RuntimeContext ctx{op_id, "upsert", b1.get(), &metrics};
+        sink->attach_runtime(&ctx);
+        sink->open();
+        sink_feed(*sink, 1, "doomed", kRowKindInsert);
+        snap1 = b1->snapshot(CheckpointId{1});
+    }
+
+    auto b2 = std::make_shared<InMemoryStateBackend>();
+    b2->restore(snap1);
+    Snapshot snap2;
+    {
+        auto sink = build_sink("file_json_upsert_sink", params);
+        RuntimeContext ctx{op_id, "upsert", b2.get(), &metrics};
+        sink->attach_runtime(&ctx);
+        sink->open();
+        sink_feed(*sink, 1, "doomed", kRowKindDelete);  // must erase in the backend too
+        snap2 = b2->snapshot(CheckpointId{2});
+    }
+
+    auto b3 = std::make_shared<InMemoryStateBackend>();
+    b3->restore(snap2);
+    auto sink3 = build_sink("file_json_upsert_sink", params);
+    RuntimeContext ctx3{op_id, "upsert", b3.get(), &metrics};
+    sink3->attach_runtime(&ctx3);
+    sink3->open();
+
+    const auto rows = flushed_rows(*sink3, path);
+    std::filesystem::remove(path);
+    EXPECT_TRUE(rows.empty()) << "k=1 was deleted before the second checkpoint; a delete "
+                              << "that never reached the backend resurrects it: "
+                              << (rows.empty() ? "" : *rows.begin());
+}
+
+// The netting sink's MULTIPLICITY must survive, not just the row: a count of 2
+// restored as anything less nets to empty one delete early.
+TEST(UpsertSinkLifecycle, TheNettedMultiplicitySurvivesARestore) {
+    ensure_sql_installed_once();
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("net_restore_" + std::to_string(getpid()) + ".ndjson");
+    std::filesystem::remove(path);
+    const std::map<std::string, std::string> params{{"path", path.string()}};
+    const OperatorId op_id{9973};
+    MetricsRegistry metrics;
+    auto backend = std::make_shared<InMemoryStateBackend>();
+
+    Snapshot snap;
+    {
+        auto sink = build_sink("changelog_net_sink", params);
+        RuntimeContext ctx{op_id, "net", backend.get(), &metrics};
+        sink->attach_runtime(&ctx);
+        sink->open();
+        sink_feed(*sink, 1, "r", kRowKindInsert);
+        sink_feed(*sink, 1, "r", kRowKindInsert);  // net count 2
+        snap = backend->snapshot(CheckpointId{1});
+    }
+
+    auto restored = std::make_shared<InMemoryStateBackend>();
+    restored->restore(snap);
+    auto sink2 = build_sink("changelog_net_sink", params);
+    RuntimeContext ctx2{op_id, "net", restored.get(), &metrics};
+    sink2->attach_runtime(&ctx2);
+    sink2->open();
+    sink_feed(*sink2, 1, "r", kRowKindDelete);  // 2 - 1 = 1: the row SURVIVES
+
+    const auto rows = flushed_rows(*sink2, path);
+    std::filesystem::remove(path);
+    EXPECT_EQ(rows.size(), 1u) << "count restored as 2, minus one delete, must leave the "
+                               << "row live; an empty restore nets it to gone";
+    if (!rows.empty()) {
+        EXPECT_EQ(*rows.begin(), R"({"k":1,"v":"r"})");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PER-KIND SEMANTICS: the cases the sweep above did not reach.
 //
 // The sweep asserts each kind's basic shape. These are the behaviours that only
