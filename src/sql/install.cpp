@@ -3342,6 +3342,34 @@ public:
     void open() override {
         effective_async_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
                            this->runtime()->state_backend()->supports_async_get();
+        // Durability for the sync path - the sixth and last member of the family,
+        // and the one the durability inventory recorded as UNVERIFIED rather than
+        // assumed either way. Verified by test before this existed: a pending
+        // pre-checkpoint row was lost outright (the source does not replay it) and
+        // every post-restore running value was computed from an empty fold. Same
+        // slot and codec the async path already checkpoints through, so a job can
+        // move between storage modes across restarts.
+        persist_inmem_ =
+            !effective_async_ && this->runtime() != nullptr && this->runtime()->has_state_backend();
+        if (persist_inmem_ && state_.empty()) {
+            keyed_state_().scan([&](const std::string& key, const PartState& st) {
+                if (st.pending.empty() && st.agg.empty() && !st.first_row.has_value() &&
+                    st.recent.empty() && st.folded.empty()) {
+                    return;
+                }
+                // Belt and braces for the tie-break counter (also persisted in the
+                // over.wm blob below): whatever produced these pending seqs - this
+                // path's operator-global seq_ or the async path's per-partition
+                // next_seq - the sync counter must resume ABOVE all of them, or a
+                // new row at an already-pending timestamp emplaces onto the same
+                // (ts, seq) key and map::emplace silently drops it.
+                for (const auto& [ts_seq, row] : st.pending) {
+                    (void)row;
+                    seq_ = std::max(seq_, ts_seq.second + 1);
+                }
+                state_[key] = st;
+            });
+        }
     }
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
     [[nodiscard]] bool fires_state_touching_timers() const noexcept override {
@@ -3417,12 +3445,29 @@ public:
                          OperatorId op_id,
                          const std::string& slot = "") override {
         Operator<Row, Row>::snapshot_timers(backend, op_id, slot);
-        std::array<std::byte, 9> bytes{};
+        if (persist_inmem_) {
+            // handle_record_ never erases a partition entry, so overwriting every
+            // key each barrier also overwrites whatever an earlier snapshot held.
+            auto kv = keyed_state_();
+            for (const auto& [key, st] : state_) {
+                kv.put(key, st);
+            }
+        }
+        // 17 bytes: wm (8) + have_wm flag (1) + the sync tie-break seq_ (8). The
+        // seq_ tail is NEW; a reader of the old 9-byte blob ignores it and an old
+        // blob leaves seq_ at 0 on restore (the pending-seq max in open() still
+        // guards the collision) - same trailing-bytes-tolerant rule as the
+        // barrier mode byte on the wire.
+        std::array<std::byte, 17> bytes{};
         const auto v = static_cast<std::uint64_t>(current_wm_);
         for (int i = 0; i < 8; ++i) {
             bytes[static_cast<std::size_t>(i)] = static_cast<std::byte>((v >> (i * 8)) & 0xFF);
         }
         bytes[8] = static_cast<std::byte>(have_wm_ ? 1 : 0);
+        for (int i = 0; i < 8; ++i) {
+            bytes[static_cast<std::size_t>(9 + i)] =
+                static_cast<std::byte>((seq_ >> (i * 8)) & 0xFF);
+        }
         const std::string wm_key = std::string("over.wm") + slot;
         backend.put_operator_state(
             op_id,
@@ -3443,6 +3488,14 @@ public:
             }
             current_wm_ = static_cast<std::int64_t>(raw);
             have_wm_ = static_cast<std::uint8_t>((*v)[8]) != 0;
+            if (v->size() >= 17) {
+                std::uint64_t sq = 0;
+                for (int i = 0; i < 8; ++i) {
+                    sq |= static_cast<std::uint64_t>(static_cast<std::uint8_t>((*v)[9 + i]))
+                          << (i * 8);
+                }
+                seq_ = std::max(seq_, sq);
+            }
         }
     }
 
@@ -3791,6 +3844,12 @@ private:
     std::vector<OverSpec> specs_;
     std::vector<AggSpec> agg_specs_;  // parallel to specs_; used for aggregate fns
     std::int64_t max_lag_ = 0;
+    // True when a state backend is attached but not a deferring one; the sync
+    // in-memory partitions are then flushed to the "over" slot at snapshot time
+    // and reloaded in open(). Same gate and same stated deferring-backend gap as
+    // the rest of the family (on a deferring backend the ASYNC path owns state
+    // per-record, so unlike TopN/LastN there is no gap here).
+    bool persist_inmem_ = false;
     std::uint64_t seq_ = 0;
     bool have_wm_ = false;
     std::int64_t current_wm_ = 0;

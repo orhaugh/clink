@@ -16045,6 +16045,153 @@ TEST(LastNAggStateLifecycle, ADrainingRetractionAfterARestoreEmitsTheDelete) {
 }
 
 // ---------------------------------------------------------------------------
+// OVER-AGGREGATE (running frame) STATE LIFECYCLE - the sync path.
+//
+// Written to VERIFY the last unresolved entry in the durability inventory:
+// whether OverAggregateRowOp's sync path flushes its partitions. Its async path
+// checkpoints PartState through KeyedState ("over" slot) and snapshot_timers
+// persists the late-drop watermark - but the sync path buffers and folds in an
+// in-memory map. Two distinct hazards, one test each:
+//
+//   - the partition state: pending rows that arrived BEFORE the checkpoint are
+//     not replayed by the source, so losing them is lost OUTPUT, and losing the
+//     running aggregates makes every post-restore value wrong;
+//   - the sync tie-break counter seq_: operator-global, so a restart-to-zero can
+//     collide a new (ts, seq) key with a restored pending entry's, and
+//     map::emplace on a duplicate key silently drops the record.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::shared_ptr<Operator<Row, Row>> build_over() {
+    const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+        "over_aggregate_row", std::string{kChannelRow}, std::string{kChannelRow});
+    EXPECT_NE(f, nullptr);
+    cluster::OperatorBuildContext octx;
+    octx.params = {{"time_column", "t"},
+                   {"partition_columns", "k"},
+                   {"outputs", R"([{"name":"s","fn":"sum","input_column":"v"}])"}};
+    octx.parallelism = 1;
+    return std::static_pointer_cast<Operator<Row, Row>>(f->build(octx));
+}
+
+// Feed one (t, v) row; returns nothing (OVER emits on watermark, not arrival).
+void feed_over(Operator<Row, Row>& op, std::int64_t t, std::int64_t v) {
+    Row r;
+    r.values["k"] = clink::config::JsonValue{std::int64_t{1}};
+    r.values["t"] = clink::config::JsonValue{t};
+    r.values["v"] = clink::config::JsonValue{v};
+    Batch<Row> b;
+    b.emplace(r, EventTime{t});
+    BoundedChannel<StreamElement<Row>> ch(64);
+    Emitter<Row> em(&ch);
+    op.process(StreamElement<Row>::data(std::move(b)), em);
+    while (ch.try_pop()) {
+    }
+}
+
+// Advance the watermark and return what fired, as "t:s" strings in emission
+// order (order is the (ts, seq) fire order, which is part of the contract).
+std::vector<std::string> fire_over(Operator<Row, Row>& op, std::int64_t wm) {
+    BoundedChannel<StreamElement<Row>> ch(64);
+    Emitter<Row> em(&ch);
+    op.process(StreamElement<Row>::watermark(Watermark{EventTime{wm}}), em);
+    std::vector<std::string> out;
+    while (auto el = ch.try_pop()) {
+        if (!el->is_data()) {
+            continue;
+        }
+        for (const auto& rec : el->as_data()) {
+            const auto& vals = rec.value().values;
+            auto get = [&](const char* c) {
+                auto it = vals.find(c);
+                return it != vals.end()
+                           ? std::to_string(static_cast<std::int64_t>(it->second.as_number()))
+                           : std::string{"?"};
+            };
+            out.push_back(get("t") + ":" + get("s"));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+// A pending pre-snapshot row must still EMIT after a restore (the source will not
+// replay it), and post-restore running sums must include the folded pre-snapshot
+// history.
+TEST(OverAggStateLifecycle, PendingRowsAndTheRunningFoldSurviveARestore) {
+    ensure_sql_installed_once();
+    const OperatorId op_id{9961};
+    MetricsRegistry metrics;
+    auto backend = std::make_shared<InMemoryStateBackend>();
+
+    Snapshot snap;
+    {
+        auto op = build_over();
+        RuntimeContext ctx{op_id, "over", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        feed_over(*op, 1, 10);
+        EXPECT_EQ(fire_over(*op, 1), (std::vector<std::string>{"1:10"}));  // folded: sum=10
+        feed_over(*op, 3, 5);  // pending at the checkpoint
+        op->snapshot_timers(*backend, op_id);
+        snap = backend->snapshot(CheckpointId{1});
+        op->close();
+    }
+
+    auto restored = std::make_shared<InMemoryStateBackend>();
+    restored->restore(snap);
+    auto op2 = build_over();
+    RuntimeContext ctx2{op_id, "over", restored.get(), &metrics};
+    op2->attach_runtime(&ctx2);
+    op2->restore_timers(*restored, op_id);
+    op2->open();
+
+    feed_over(*op2, 4, 20);
+    EXPECT_EQ(fire_over(*op2, 10), (std::vector<std::string>{"3:15", "4:35"}))
+        << "the pre-snapshot pending row (t=3) must emit with the folded history "
+        << "in its sum (10+5), and t=4 must continue the run (10+5+20); an empty "
+        << "restore loses t=3 outright and computes t=4 as 20";
+}
+
+// The sync tie-break counter must survive the restore: restarted at zero, a new
+// row at an already-pending timestamp emplaces onto the SAME (ts, seq) key and
+// map::emplace silently drops it.
+TEST(OverAggStateLifecycle, TheSyncTieBreakSequenceSurvivesARestore) {
+    ensure_sql_installed_once();
+    const OperatorId op_id{9962};
+    MetricsRegistry metrics;
+    auto backend = std::make_shared<InMemoryStateBackend>();
+
+    Snapshot snap;
+    {
+        auto op = build_over();
+        RuntimeContext ctx{op_id, "over", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        feed_over(*op, 5, 1);  // the FIRST record ever -> sync seq 0, pending
+        op->snapshot_timers(*backend, op_id);
+        snap = backend->snapshot(CheckpointId{1});
+        op->close();
+    }
+
+    auto restored = std::make_shared<InMemoryStateBackend>();
+    restored->restore(snap);
+    auto op2 = build_over();
+    RuntimeContext ctx2{op_id, "over", restored.get(), &metrics};
+    op2->attach_runtime(&ctx2);
+    op2->restore_timers(*restored, op_id);
+    op2->open();
+
+    feed_over(*op2, 5, 2);  // same timestamp; a reset counter also assigns seq 0
+    EXPECT_EQ(fire_over(*op2, 10), (std::vector<std::string>{"5:1", "5:3"}))
+        << "both same-timestamp rows must fire, pre-snapshot first (arrival "
+        << "order); a reset tie-break counter collides the keys and one row "
+        << "silently vanishes";
+}
+
+// ---------------------------------------------------------------------------
 // PER-KIND SEMANTICS: the cases the sweep above did not reach.
 //
 // The sweep asserts each kind's basic shape. These are the behaviours that only
