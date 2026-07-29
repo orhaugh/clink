@@ -3872,6 +3872,59 @@ public:
 
     std::string name() const override { return "last_n_agg_row"; }
 
+    // Durability for the in-memory path - the fifth member of the family
+    // (Window, Session, Aggregate, TopNPerKey, now this), found by the
+    // inventory those fixes ended with rather than by a fourth production
+    // surprise. Same shape: flush state_ in snapshot_timers, hydrate in open().
+    //
+    // BOTH PartState fields are load-bearing, in different ways:
+    //
+    //   window          - the rows the bounded frames aggregate over. Restored
+    //                     empty, every post-restore result is computed over a
+    //                     partial frame (wrong values), and a retraction of a
+    //                     pre-snapshot row cannot find its match. Its ORDER is
+    //                     state too: ascending by the order column with
+    //                     arrival-order ties, and eviction pops the FRONT - so a
+    //                     restore that lost order would evict the wrong row.
+    //   prior_emitted   - what this key's changelog has already told the sink is
+    //                     live. Restored empty, a value change emits a bare
+    //                     insert instead of update_before + update_after (the
+    //                     sink now holds two live rows), and a drained window
+    //                     emits NOTHING instead of the delete - the stale row
+    //                     never leaves the sink.
+    //
+    // Neither is derivable from the other, so unlike TopNPerKeyRowOp's codec
+    // (which stores encoded rows only and rebuilds sort keys), this one
+    // serialises both fields.
+    void open() override {
+        persist_inmem_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
+                         !this->runtime()->state_backend()->supports_async_get();
+        if (persist_inmem_ && state_.empty()) {
+            keyed_state_().scan([&](const std::string& key, const PartState& st) {
+                if (st.window.empty() && !st.prior_emitted.has_value()) {
+                    return;
+                }
+                state_[key] = st;
+            });
+        }
+    }
+
+    void snapshot_timers(StateBackend& backend,
+                         OperatorId op_id,
+                         const std::string& slot = "") override {
+        Operator<Row, Row>::snapshot_timers(backend, op_id, slot);
+        if (!persist_inmem_) {
+            return;
+        }
+        // handle_ never erases a map entry (a drained partition keeps its
+        // empty PartState), so overwriting every key each barrier also
+        // overwrites whatever an earlier snapshot held for it.
+        auto kv = keyed_state_();
+        for (const auto& [key, st] : state_) {
+            kv.put(key, st);
+        }
+    }
+
 private:
     struct PartState {
         std::vector<Row> window;           // ascending by order_column_, bare rows
@@ -3993,11 +4046,76 @@ private:
         emit_batch.push(Record<Row>{std::move(result)});
     }
 
+    // Inverse of serialize_bare_, for the codec. Encoded by serialize_bare_, so a
+    // parse failure is impossible short of corruption; a throw propagates to the
+    // runner, which fails the task loudly.
+    static Row parse_bare_(const std::string& text) {
+        auto j = clink::config::parse(text);
+        Row row;
+        if (j.is_object()) {
+            row.values = clink::sql::row_columns_from_json(std::move(j.as_object()));
+        }
+        return row;
+    }
+
+    KeyedState<std::string, PartState> keyed_state_() {
+        return this->runtime()->template keyed_state<std::string, PartState>(
+            "lastn", clink::string_codec(), part_state_codec());
+    }
+
+    // Codec for ONE partition's state: the window rows IN VECTOR ORDER (the order
+    // is the eviction order and the tie-break - see the note on open()), then the
+    // prior emission. Rows ride as serialize_bare_ text, the same encoding whose
+    // exact round-trip the top-N change gated cross-engine; retraction matching
+    // compares that same text, so the retract-after-restore test doubles as the
+    // canonical-encoding gate.
+    static clink::Codec<PartState> part_state_codec() {
+        using Bytes = clink::Codec<PartState>::Bytes;
+        using BytesView = clink::Codec<PartState>::BytesView;
+        auto body = [](const PartState& st, Bytes& o) {
+            agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(st.window.size()));
+            for (const auto& r : st.window) {
+                agg_codec_detail::put_str(o, serialize_bare_(r));
+            }
+            agg_codec_detail::put_bool(o, st.prior_emitted.has_value());
+            if (st.prior_emitted.has_value()) {
+                agg_codec_detail::put_str(o, serialize_bare_(*st.prior_emitted));
+            }
+        };
+        return clink::Codec<PartState>{
+            .encode = [body](const PartState& st) -> Bytes {
+                Bytes o;
+                body(st, o);
+                return o;
+            },
+            .decode = [](BytesView buf) -> std::optional<PartState> {
+                agg_codec_detail::Reader r{buf, 0, true};
+                PartState st;
+                const std::uint32_t n = r.u32();
+                st.window.reserve(n);
+                for (std::uint32_t i = 0; i < n && r.ok; ++i) {
+                    st.window.push_back(parse_bare_(r.str()));
+                }
+                if (r.boolean()) {
+                    st.prior_emitted = parse_bare_(r.str());
+                }
+                if (!r.ok) {
+                    return std::nullopt;
+                }
+                return st;
+            },
+            .encode_into = body,
+        };
+    }
+
     std::vector<std::string> partition_columns_;
     std::string order_column_;
     std::vector<OverSpec> specs_;
     std::vector<AggSpec> agg_specs_;  // parallel to specs_
     std::int64_t capacity_ = 1;       // widest frame reach + 1
+    // True when a state backend is attached but not a deferring one; same gate
+    // and same stated deferring-backend gap as TopNPerKeyRowOp.
+    bool persist_inmem_ = false;
     clink::FlatMap<std::string, PartState> state_;
 };
 

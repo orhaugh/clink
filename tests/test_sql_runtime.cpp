@@ -15895,6 +15895,156 @@ TEST(TopNStateLifecycle, ArrivalOrderAmongTiedRowsSurvivesARestore) {
 }
 
 // ---------------------------------------------------------------------------
+// LAST-N OVER-AGGREGATE STATE LIFECYCLE.
+//
+// LastNAggRowOp holds two things per partition, both load-bearing across a
+// restore and in different ways: the bounded-frame WINDOW (restored empty, every
+// result is computed over a partial frame, and a retraction cannot find its
+// match) and PRIOR_EMITTED, the row its changelog has already told the sink is
+// live (restored empty, a change emits insert instead of update_before +
+// update_after, and a drained window emits NOTHING instead of the delete).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::shared_ptr<Operator<Row, Row>> build_lastn() {
+    const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+        "last_n_agg_row", std::string{kChannelRow}, std::string{kChannelRow});
+    EXPECT_NE(f, nullptr);
+    cluster::OperatorBuildContext octx;
+    octx.params = {
+        {"partition_columns", "k"},
+        {"order_column", "t"},
+        // AVG over the last 2 rows per key: frame_start=1 -> span 2,
+        // which also caps the window at 2 so a third arrival evicts
+        // the FRONT - making eviction order observable in the result.
+        {"outputs", R"([{"name":"avg2","fn":"avg","input_column":"v","frame_start":1}])"}};
+    octx.parallelism = 1;
+    return std::static_pointer_cast<Operator<Row, Row>>(f->build(octx));
+}
+
+// Feed one (k, t, v) row, optionally kind-tagged (a retraction), and return the
+// changelog as "kind:avg2" strings in emission order.
+std::vector<std::string> feed_lastn(Operator<Row, Row>& op,
+                                    std::int64_t t,
+                                    std::int64_t v,
+                                    const std::string& kind = "") {
+    Row r;
+    r.values["k"] = clink::config::JsonValue{std::int64_t{1}};
+    r.values["t"] = clink::config::JsonValue{t};
+    r.values["v"] = clink::config::JsonValue{v};
+    if (!kind.empty()) {
+        r.values[std::string{kRowKindField}] = clink::config::JsonValue{kind};
+    }
+    Batch<Row> b;
+    b.emplace(r, EventTime{t});
+    BoundedChannel<StreamElement<Row>> ch(64);
+    Emitter<Row> em(&ch);
+    op.process(StreamElement<Row>::data(std::move(b)), em);
+    std::vector<std::string> out;
+    while (auto el = ch.try_pop()) {
+        if (!el->is_data()) {
+            continue;
+        }
+        for (const auto& rec : el->as_data()) {
+            const auto& vals = rec.value().values;
+            auto kit = vals.find(std::string{kRowKindField});
+            auto ait = vals.find("avg2");
+            out.push_back((kit != vals.end() ? kit->second.as_string() : std::string{"?"}) + ":" +
+                          (ait != vals.end()
+                               ? std::to_string(static_cast<std::int64_t>(ait->second.as_number()))
+                               : std::string{"?"}));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+// The bounded frame must aggregate over PRE-snapshot rows after a restore, evict
+// them in the right order, and revise its prior emission rather than inserting a
+// second live row.
+TEST(LastNAggStateLifecycle, TheFrameAndThePriorEmissionSurviveARestore) {
+    ensure_sql_installed_once();
+    const OperatorId op_id{9951};
+    MetricsRegistry metrics;
+    auto backend = std::make_shared<InMemoryStateBackend>();
+
+    Snapshot snap;
+    {
+        auto op = build_lastn();
+        RuntimeContext ctx{op_id, "lastn", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        EXPECT_EQ(feed_lastn(*op, 1, 10),
+                  (std::vector<std::string>{std::string{kRowKindInsert} + ":10"}));
+        EXPECT_EQ(feed_lastn(*op, 2, 20),
+                  (std::vector<std::string>{std::string{kRowKindUpdateBefore} + ":10",
+                                            std::string{kRowKindUpdateAfter} + ":15"}));
+        op->snapshot_timers(*backend, op_id);
+        snap = backend->snapshot(CheckpointId{1});
+        op->close();
+    }
+
+    auto restored = std::make_shared<InMemoryStateBackend>();
+    restored->restore(snap);
+    auto op2 = build_lastn();
+    RuntimeContext ctx2{op_id, "lastn", restored.get(), &metrics};
+    op2->attach_runtime(&ctx2);
+    op2->restore_timers(*restored, op_id);
+    op2->open();
+
+    // Window was [10, 20]; a third row evicts 10 from the FRONT, so the frame is
+    // [20, 30] and the average 25. A restore that lost the window would compute
+    // AVG over [30] alone (30); one that lost prior_emitted would emit insert
+    // rather than the update pair.
+    EXPECT_EQ(feed_lastn(*op2, 3, 30),
+              (std::vector<std::string>{std::string{kRowKindUpdateBefore} + ":15",
+                                        std::string{kRowKindUpdateAfter} + ":25"}))
+        << "the post-restore frame must contain the pre-snapshot row 20 and evict "
+        << "10, and the changelog must revise avg=15 rather than insert";
+}
+
+// A retraction that drains the window after a restore must emit the DELETE for
+// what the key's changelog previously declared live. Restored empty, the
+// retraction matches nothing and prior_emitted is gone - the operator emits
+// NOTHING and the stale row sits in the sink forever. This also gates that
+// decode -> re-encode is canonical, because the retraction matches by comparing
+// the incoming row's serialized text against the RESTORED row's.
+TEST(LastNAggStateLifecycle, ADrainingRetractionAfterARestoreEmitsTheDelete) {
+    ensure_sql_installed_once();
+    const OperatorId op_id{9952};
+    MetricsRegistry metrics;
+    auto backend = std::make_shared<InMemoryStateBackend>();
+
+    Snapshot snap;
+    {
+        auto op = build_lastn();
+        RuntimeContext ctx{op_id, "lastn", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        EXPECT_EQ(feed_lastn(*op, 1, 10),
+                  (std::vector<std::string>{std::string{kRowKindInsert} + ":10"}));
+        op->snapshot_timers(*backend, op_id);
+        snap = backend->snapshot(CheckpointId{1});
+        op->close();
+    }
+
+    auto restored = std::make_shared<InMemoryStateBackend>();
+    restored->restore(snap);
+    auto op2 = build_lastn();
+    RuntimeContext ctx2{op_id, "lastn", restored.get(), &metrics};
+    op2->attach_runtime(&ctx2);
+    op2->restore_timers(*restored, op_id);
+    op2->open();
+
+    EXPECT_EQ(feed_lastn(*op2, 1, 10, std::string{kRowKindDelete}),
+              (std::vector<std::string>{std::string{kRowKindDelete} + ":10"}))
+        << "draining the restored window must retract the prior emission; an "
+        << "empty-restore emits nothing and the sink keeps the stale row";
+}
+
+// ---------------------------------------------------------------------------
 // PER-KIND SEMANTICS: the cases the sweep above did not reach.
 //
 // The sweep asserts each kind's basic shape. These are the behaviours that only
