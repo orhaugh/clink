@@ -24,14 +24,14 @@ that documents it in depth.
 ## What it costs to run
 
 [Efficiency and environmental impact](efficiency.md) publishes the measured cost of
-processing an event: **3.87x less CPU per event and 15.5x less memory** than a JVM
-stream processor on the same hardware, producing byte-identical output on a
-correctness-gated comparison - and on the stateless query it does so using 0.84 of four
-cores against 2.57. It is equally explicit about what is not measured (wall power, so no kWh
-or CO2e figure is claimed) and about where the advantage narrows: on a large windowed
-aggregation most of the memory is the user's own state, and clink leads there by 1.2x rather
-than an order of magnitude. The raw
-per-run output is published alongside it.
+processing an event across the whole 17-query nexmark suite on a five-node cluster at
+parallelism 12: **1.9x to 5.3x less CPU per event than a JVM stream processor** (median
+2.45x), every query in clink's favour, on a correctness-gated comparison where both
+engines produce identical output - and on stateless work the whole engine runs in 184 MB
+against the JVM engine's gigabytes. It is equally explicit about what is not measured
+(wall power, so no kWh or CO2e figure is claimed) and about where the advantage narrows:
+on dedup and ranking most of the memory is the query's own retained state, and the CPU
+lead there is 1.9x rather than 5x. The raw per-run output is published alongside it.
 
 ## How it works
 
