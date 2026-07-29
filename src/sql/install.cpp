@@ -6742,6 +6742,60 @@ public:
 
     std::string name() const override { return "top_n_per_key_row"; }
 
+    // Durability for the in-memory path, the same shape WindowRowOp,
+    // SessionWindowRowOp and AggregateRowOp use: flush state_ to the backend in
+    // snapshot_timers (the runner's pre-snapshot hook), hydrate it in open().
+    //
+    // What a restore must guarantee for a CHANGELOG producer is sharper than for
+    // an aggregate: this operator's retained rows are the rows it has told the
+    // downstream sink are LIVE. Restored without them, the next displacing record
+    // finds an empty partition and emits no delete for the row it displaces - the
+    // stale row sits in the upsert sink forever, and every rank is computed over a
+    // partial buffer. Nothing needs re-emitting on restore (the sink's state
+    // corresponds to the same checkpoint); the state just has to be there.
+    //
+    // Order round-trips too, deliberately: the codec writes each partition's rows
+    // in vector order and open() rebuilds in that order, because for ROW_NUMBER
+    // the order among tied rows IS the arrival-order tie-break, and it exists
+    // nowhere but the vector.
+    void open() override {
+        persist_inmem_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
+                         !this->runtime()->state_backend()->supports_async_get();
+        if (persist_inmem_ && state_.empty()) {
+            keyed_state_().scan([&](const std::string& key, const std::vector<StoredRow>& rows) {
+                if (rows.empty()) {
+                    return;
+                }
+                auto& part = state_[key];
+                part.reserve(rows.size());
+                for (const auto& sr : rows) {
+                    // The codec stores only the encoded row (see
+                    // topn_rows_codec); sort_vals are rebuilt here from the
+                    // decoded row against the LIVE sort_columns_, so they can
+                    // never be misaligned with the configuration doing the
+                    // comparing. One parse per retained row, on the rare path.
+                    part.push_back(StoredRow{sr.encoded, sort_vals_of_(decode_row_(sr.encoded))});
+                }
+            });
+        }
+    }
+
+    void snapshot_timers(StateBackend& backend,
+                         OperatorId op_id,
+                         const std::string& slot = "") override {
+        Operator<Row, Row>::snapshot_timers(backend, op_id, slot);
+        if (!persist_inmem_) {
+            return;
+        }
+        // handle_ shrinks a partition's vector but never erases the map entry, so
+        // overwriting every key each barrier also overwrites any snapshot rows a
+        // later eviction removed - a restored partition is exactly the barrier's.
+        auto kv = keyed_state_();
+        for (const auto& [key, rows] : state_) {
+            kv.put(key, rows);
+        }
+    }
+
 private:
     // A retained row. The full row is held ENCODED - the same JSON-object text the
     // window codec uses for group_values - and its sort-column values are held
@@ -6943,12 +6997,58 @@ private:
     std::vector<bool> sort_descending_;
     std::int64_t count_;
     OverRankKind rank_kind_;
-    // NOT DURABLE: nothing here snapshots or hydrates, so a restore brings this
-    // operator back with no retained rows - the same silent-loss-on-failover class
-    // WindowRowOp and SessionWindowRowOp had until 2026-07-28. Pre-existing, found
-    // while rebuilding the representation, and deliberately not bundled into that
-    // change; it needs the flush-and-hydrate pattern the other two now share, plus
-    // its own restore tests.
+    KeyedState<std::string, std::vector<StoredRow>> keyed_state_() {
+        return this->runtime()->template keyed_state<std::string, std::vector<StoredRow>>(
+            "topn", clink::string_codec(), topn_rows_codec());
+    }
+
+    // Codec for ONE partition's retained rows. It serialises the ENCODED row text
+    // only, in vector order; it does NOT serialise sort_vals, so a decoded
+    // StoredRow comes back with sort_vals EMPTY and open() - the sole consumer -
+    // rebuilds them against the live sort_columns_ before anything compares.
+    // Deliberate: sort_vals are derivable from the row, storing them would let
+    // them disagree with it, and rebuilding keeps a restored buffer correct even
+    // if the encoded rows outlive a change to the sort configuration.
+    static clink::Codec<std::vector<StoredRow>> topn_rows_codec() {
+        using Rows = std::vector<StoredRow>;
+        using Bytes = clink::Codec<Rows>::Bytes;
+        using BytesView = clink::Codec<Rows>::BytesView;
+        auto body = [](const Rows& rows, Bytes& o) {
+            agg_codec_detail::put_u32(o, static_cast<std::uint32_t>(rows.size()));
+            for (const auto& r : rows) {
+                agg_codec_detail::put_str(o, r.encoded);
+            }
+        };
+        return clink::Codec<Rows>{
+            .encode = [body](const Rows& rows) -> Bytes {
+                Bytes o;
+                body(rows, o);
+                return o;
+            },
+            .decode = [](BytesView buf) -> std::optional<Rows> {
+                agg_codec_detail::Reader r{buf, 0, true};
+                Rows rows;
+                const std::uint32_t n = r.u32();
+                rows.reserve(n);
+                for (std::uint32_t i = 0; i < n && r.ok; ++i) {
+                    rows.push_back(StoredRow{r.str(), {}});
+                }
+                if (!r.ok) {
+                    return std::nullopt;
+                }
+                return rows;
+            },
+            .encode_into = body,
+        };
+    }
+
+    // True when a state backend is attached but not a deferring one: state_ is
+    // then flushed to the "topn" slot at snapshot time and reloaded in open(), so
+    // the retained rows survive a restore. Mirrors the window/session gate; on a
+    // DEFERRING backend this operator has no KeyedState per-record path to fall
+    // back on, so its state is not durable there - a known, stated gap rather
+    // than a silent one.
+    bool persist_inmem_ = false;
     clink::FlatMap<std::string, std::vector<StoredRow>> state_;
 };
 

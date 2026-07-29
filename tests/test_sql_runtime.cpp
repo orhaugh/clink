@@ -15730,6 +15730,171 @@ TEST(TopNOverWindow, HopTopOnePerWindowAtParallelismFour) {
 }
 
 // ---------------------------------------------------------------------------
+// TOP-N / DEDUP STATE LIFECYCLE.
+//
+// TopNPerKeyRowOp is a CHANGELOG producer: its retained rows are the rows it has
+// told the downstream sink are live. Until 2026-07-29 it had no snapshot/hydrate,
+// so a restore brought it back empty - the last member of the same
+// silent-loss-on-restore family as the window and session operators fixed the day
+// before. The symptom is sharper than missing output: after a restore, a
+// displacing record finds an empty partition and emits NO DELETE for the row it
+// displaces, so the stale row sits in an upsert sink forever.
+//
+// These tests assert the failure mode, not the mechanism: the retraction of a
+// PRE-snapshot row by a POST-restore arrival.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::shared_ptr<Operator<Row, Row>> build_topn(std::map<std::string, std::string> params) {
+    const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+        "top_n_per_key_row", std::string{kChannelRow}, std::string{kChannelRow});
+    EXPECT_NE(f, nullptr);
+    cluster::OperatorBuildContext octx;
+    octx.params = std::move(params);
+    octx.parallelism = 1;
+    return std::static_pointer_cast<Operator<Row, Row>>(f->build(octx));
+}
+
+// Feed one (k, v, tag) row and return the changelog it produced as
+// "kind:v:tag" strings, in emission order - order is part of the contract
+// (delete before the insert that replaces it).
+std::vector<std::string> feed_topn(Operator<Row, Row>& op,
+                                   std::int64_t k,
+                                   std::int64_t v,
+                                   const std::string& tag) {
+    Row r;
+    r.values["k"] = clink::config::JsonValue{k};
+    r.values["v"] = clink::config::JsonValue{v};
+    r.values["tag"] = clink::config::JsonValue{tag};
+    Batch<Row> b;
+    b.emplace(r, EventTime{0});
+    BoundedChannel<StreamElement<Row>> ch(64);
+    Emitter<Row> em(&ch);
+    op.process(StreamElement<Row>::data(std::move(b)), em);
+    std::vector<std::string> out;
+    while (auto el = ch.try_pop()) {
+        if (!el->is_data()) {
+            continue;
+        }
+        for (const auto& rec : el->as_data()) {
+            const auto& vals = rec.value().values;
+            auto get = [&](const char* c) {
+                auto it = vals.find(c);
+                return it == vals.end()
+                           ? std::string{"?"}
+                           : (it->second.is_string() ? it->second.as_string()
+                                                     : std::to_string(static_cast<std::int64_t>(
+                                                           it->second.as_number())));
+            };
+            out.push_back(get(std::string{kRowKindField}.c_str()) + ":" + get("v") + ":" +
+                          get("tag"));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+// A row retained BEFORE the snapshot must still be retractable AFTER the restore:
+// the displacing arrival's changelog must carry a delete with the old row's exact
+// values, or an upsert sink keyed on those values never tombstones it.
+TEST(TopNStateLifecycle, ARetainedRowIsStillRetractedAfterARestore) {
+    ensure_sql_installed_once();
+    const std::map<std::string, std::string> params{{"partition_columns", "k"},
+                                                    {"sort_columns", "v"},
+                                                    {"sort_descending", "1"},
+                                                    {"count", "2"},
+                                                    {"rank_kind", "row_number"}};
+    const OperatorId op_id{9941};
+    MetricsRegistry metrics;
+    auto backend = std::make_shared<InMemoryStateBackend>();
+
+    Snapshot snap;
+    {
+        auto op = build_topn(params);
+        RuntimeContext ctx{op_id, "topn", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        EXPECT_EQ(feed_topn(*op, 1, 10, "ten").size(), 1u);  // insert ten
+        EXPECT_EQ(feed_topn(*op, 1, 5, "five").size(), 1u);  // insert five
+        op->snapshot_timers(*backend, op_id);
+        snap = backend->snapshot(CheckpointId{1});
+        op->close();
+    }
+
+    auto restored = std::make_shared<InMemoryStateBackend>();
+    restored->restore(snap);
+    auto op2 = build_topn(params);
+    RuntimeContext ctx2{op_id, "topn", restored.get(), &metrics};
+    op2->attach_runtime(&ctx2);
+    op2->restore_timers(*restored, op_id);
+    op2->open();
+
+    // v=8 lands between the two retained rows; with count=2 it displaces five.
+    const auto changelog = feed_topn(*op2, 1, 8, "eight");
+    ASSERT_EQ(changelog.size(), 2u)
+        << "a displacing arrival after a restore must retract the pre-snapshot row "
+        << "AND insert itself; an empty-partition restore emits only the insert";
+    EXPECT_EQ(changelog[0], std::string{kRowKindDelete} + ":5:five")
+        << "the delete must carry the displaced row's exact values - an upsert "
+        << "sink tombstones by them";
+    EXPECT_EQ(changelog[1], std::string{kRowKindInsert} + ":8:eight");
+}
+
+// ROW_NUMBER breaks ties by arrival order, and that order lives nowhere but the
+// retained vector - so the codec and the hydrate must round-trip ORDER, not just
+// membership. Two tied rows, snapshot, restore, then a third tied row: which one
+// gets retracted is determined entirely by the restored order.
+TEST(TopNStateLifecycle, ArrivalOrderAmongTiedRowsSurvivesARestore) {
+    ensure_sql_installed_once();
+    const std::map<std::string, std::string> params{{"partition_columns", "k"},
+                                                    {"sort_columns", "v"},
+                                                    {"sort_descending", "1"},
+                                                    {"count", "1"},
+                                                    {"rank_kind", "row_number"}};
+    const OperatorId op_id{9942};
+    MetricsRegistry metrics;
+    auto backend = std::make_shared<InMemoryStateBackend>();
+
+    Snapshot snap;
+    std::string live_tag;
+    {
+        auto op = build_topn(params);
+        RuntimeContext ctx{op_id, "topn", backend.get(), &metrics};
+        op->attach_runtime(&ctx);
+        op->open();
+        feed_topn(*op, 1, 5, "a");
+        const auto second = feed_topn(*op, 1, 5, "b");  // tie: displaces or is dropped
+        // Whichever row the operator reports live after the tie is the one the
+        // restore must preserve; derive it rather than hard-coding the tie rule.
+        live_tag = "a";
+        for (const auto& e : second) {
+            if (e.rfind(std::string{kRowKindInsert}, 0) == 0) {
+                live_tag = e.substr(e.rfind(':') + 1);
+            }
+        }
+        op->snapshot_timers(*backend, op_id);
+        snap = backend->snapshot(CheckpointId{1});
+        op->close();
+    }
+
+    auto restored = std::make_shared<InMemoryStateBackend>();
+    restored->restore(snap);
+    auto op2 = build_topn(params);
+    RuntimeContext ctx2{op_id, "topn", restored.get(), &metrics};
+    op2->attach_runtime(&ctx2);
+    op2->restore_timers(*restored, op_id);
+    op2->open();
+
+    const auto changelog = feed_topn(*op2, 1, 5, "c");
+    ASSERT_FALSE(changelog.empty()) << "a tied arrival at count=1 must produce a changelog";
+    EXPECT_EQ(changelog[0], std::string{kRowKindDelete} + ":5:" + live_tag)
+        << "the restored buffer's ORDER decides which tied row is retracted; a "
+        << "restore that loses order retracts the wrong row";
+}
+
+// ---------------------------------------------------------------------------
 // PER-KIND SEMANTICS: the cases the sweep above did not reach.
 //
 // The sweep asserts each kind's basic shape. These are the behaviours that only
