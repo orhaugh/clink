@@ -253,11 +253,15 @@ TEST(CompressingSink, PlainRotationPreservesContent) {
 
 // --------------------------------------------------------------------------
 // Integrated init() + facade: source becomes %n, level config gates, file +
-// ring both fed. init()/shutdown() bracket keeps this isolated within the
-// process-global logging state.
+// ring both fed. Each test opens its bracket with shutdown(): any earlier
+// test that touched ensure_built_ins_registered() left the library bootstrap
+// root configured (init_from_env_if_unconfigured), and init() is
+// first-call-wins, so the state must be reset for this test's config to
+// take. shutdown() on an unconfigured process is a no-op.
 // --------------------------------------------------------------------------
 
 TEST(LoggingInit, FacadeFeedsRingAndFileWithSourceAsName) {
+    clink::logging::shutdown();
     auto dir = temp_dir("init");
     const auto file = (dir / "node.log").string();
     clink::logging::LoggingConfig cfg;
@@ -297,6 +301,7 @@ TEST(LoggingInit, FacadeFeedsRingAndFileWithSourceAsName) {
 // flush thread + the mutex-guarded sinks (the surface ThreadSanitizer probes).
 // shutdown() drains the async queue, so after it the ring holds every record.
 TEST(LoggingInit, AsyncConcurrentProducersAllRecordsLandNoRace) {
+    clink::logging::shutdown();
     auto dir = temp_dir("async");
     clink::logging::LoggingConfig cfg;
     cfg.level = "info";
@@ -331,6 +336,7 @@ TEST(LoggingInit, AsyncConcurrentProducersAllRecordsLandNoRace) {
 }
 
 TEST(LoggingInit, ConfiguredLevelGatesLowerSeverities) {
+    clink::logging::shutdown();
     auto dir = temp_dir("gate");
     const auto file = (dir / "node.log").string();
     clink::logging::LoggingConfig cfg;

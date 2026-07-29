@@ -52,10 +52,17 @@ the in-process fast path those edges use, dead in every container deployment,
 is live again.
 
 **SQL.** WHERE accepts expression operands, and predicates carrying them are
-understood beyond the filter operator; declared FLOAT and DECIMAL types are
-honoured at columnar JSON decode; non-integral doubles are no longer written
-at six significant digits; a batch materialises columns by name rather than by
-declared position.
+understood beyond the filter operator; a MATCH_RECOGNIZE DEFINE predicate
+whose operand is an expression (`price < PREV(price) * 0.997`) now matches,
+where it previously compiled to a reference no row resolves and silently
+never fired; declared FLOAT and DECIMAL types are honoured at columnar JSON
+decode; non-integral doubles are no longer written at six significant digits;
+a batch materialises columns by name rather than by declared position.
+
+**Embedded.** The engine configures logging on first open and honours the
+`CLINK_LOG_LEVEL` env var (synchronous sinks; a host that initialised logging
+first wins), so `clink run` and pyclink stop printing registry chatter that
+could not be turned off.
 
 **Build and packaging.** Installed binaries now carry an rpath to the pinned
 toolchain, so a host `cmake --install` produces a runnable `clink` - on macOS

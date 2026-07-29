@@ -55,6 +55,16 @@ struct LoggingConfig {
 // later calls are a no-op (and warn). Safe to call before any logging.
 void init(const LoggingConfig& cfg);
 
+// Library-side bootstrap: configure logging once with the level taken from
+// the CLINK_LOG_LEVEL env var (default "info") and SYNCHRONOUS sinks - a
+// library must not spawn logging threads it cannot promise to join. A no-op
+// (without the init() warning) when logging is already configured, so a host
+// that called init() first always wins. ensure_built_ins_registered() calls
+// this before the first factory registration, which is how `clink run`,
+// libclink and pyclink honour CLINK_LOG_LEVEL exactly as `clink_node
+// --log-level` does; an empty node_name keeps the default root name.
+void init_from_env_if_unconfigured(std::string node_name);
+
 // Named logger sharing the root's sink set + thread pool, registered so a
 // second call with the same name returns the same logger. Use for rich daemon
 // subsystems. Before init(), returns a plain stderr logger so callers never

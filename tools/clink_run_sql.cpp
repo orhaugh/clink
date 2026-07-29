@@ -89,7 +89,10 @@ void usage() {
               << "  --explain                   Print LogicalPlans; nothing runs.\n"
               << "  --coordinator-host=<host> --coordinator-port=<port>\n"
               << "                              Submit the SAME script to a running\n"
-              << "                              Coordinator instead of running embedded.\n";
+              << "                              Coordinator instead of running embedded.\n"
+              << "\n"
+              << "Logging: set the CLINK_LOG_LEVEL env var (trace|debug|info|warn|error|off;\n"
+              << "default info), honoured by the embedded engine.\n";
 }
 
 // Accepts --flag=value and --flag value; returns false on a malformed

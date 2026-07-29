@@ -1,6 +1,7 @@
 #include "clink/embed/embedded_engine.hpp"
 
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>

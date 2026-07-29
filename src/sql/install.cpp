@@ -45,6 +45,7 @@
 #include "clink/operators/json_value_expr.hpp"
 #include "clink/operators/map_operator.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/operators/predicate_operand_exprs.hpp"
 #include "clink/operators/scalar_function_registry.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/udf_language_registry.hpp"
@@ -9831,7 +9832,18 @@ void install(clink::plugin::PluginRegistry& reg) {
                     pattern->next(name);
                 }
                 if (auto it = var_pred.find(name); it != var_pred.end()) {
-                    auto compiled = clink::operators::CompiledPredicate::compile(*it->second);
+                    // A DEFINE predicate arrives from the binder, so a
+                    // comparison operand can be an expression rather than a
+                    // named column (`price < PREV(price) * 0.997` emits
+                    // rhs_expr). Lift those to synthetic $exprN names exactly
+                    // as the filter operators do; compiling the raw predicate
+                    // directly leaves $exprN unresolvable, and the predicate
+                    // silently never matches.
+                    auto operand_exprs =
+                        std::make_shared<const clink::operators::PredicateOperandExprs>(
+                            clink::operators::PredicateOperandExprs::build(*it->second));
+                    auto compiled =
+                        clink::operators::CompiledPredicate::compile(operand_exprs->predicate());
                     // Step order for PREV resolution: the previous input row
                     // is the LAST row of the match so far (exact under the v1
                     // strict-contiguity patterns).
@@ -9841,7 +9853,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                         step_order.push_back(st.at("name").as_string());
                     }
                     pattern->where(
-                        [compiled, step_order](
+                        [compiled, operand_exprs, step_order](
                             const Row& r, const clink::cep::PatternMatch<Row>& so_far) -> bool {
                             const Row* prev = nullptr;
                             for (const auto& sn : step_order) {
@@ -9869,7 +9881,12 @@ void install(clink::plugin::PluginRegistry& reg) {
                                 }
                                 return vit->second;
                             };
-                            const clink::operators::ColumnLookup lookup{resolve};
+                            // Synthetic operand names evaluate their lifted
+                            // expression against this same resolver, so a
+                            // PREV reference inside the expression keeps its
+                            // match-relative meaning.
+                            clink::operators::SynthOperandResolver wrapped{*operand_exprs, resolve};
+                            const clink::operators::ColumnLookup lookup{wrapped};
                             return compiled.evaluate(lookup);
                         });
                 }

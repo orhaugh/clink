@@ -80,6 +80,13 @@ would (`rocksdb:///path`, `remote-read://bucket`, ...). Control and data
 planes ride loopback TCP; short-circuiting same-process edges is deliberate
 future work, not a correctness gap.
 
+The first engine in a process also configures the logging core, honouring
+the `CLINK_LOG_LEVEL` env var (`trace`..`error` / `off`, default `info`)
+exactly as `clink_node --log-level` does, with synchronous sinks - a library
+must not spawn logging threads it cannot promise to join. A host application
+that initialised `clink::logging` before opening an engine keeps its own
+configuration.
+
 ### Await and cancellation
 
 `await_all` polls every submitted job in 200 ms slices. A caller-supplied

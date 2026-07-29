@@ -175,6 +175,14 @@ void init(const LoggingConfig& cfg) {
     root->flush_on(spdlog::level::warn);
 
     st.root = root;
+    // A logger with this name can already sit in spdlog's registry even
+    // though st.root is null: shutdown() clears OUR state, and per-source
+    // loggers minted by logger() live in spdlog's registry until then. Any
+    // such entry belongs to a previous logging epoch, so evict it rather
+    // than let register_logger throw "logger with name X already exists" -
+    // thrown inside call_once, that exception also leaves the caller's
+    // once_flag unset, and every later caller retries and rethrows.
+    spdlog::drop(name);
     spdlog::register_logger(root);
     spdlog::set_default_logger(root);
     spdlog::flush_every(std::chrono::seconds(1));
@@ -226,6 +234,19 @@ spdlog::logger* host_logger() noexcept {
     auto& st = state();
     std::lock_guard lk(st.mu);
     return st.root.get();
+}
+
+void init_from_env_if_unconfigured(std::string node_name) {
+    if (root_logger() != nullptr) {
+        return;  // a host configured logging first; keep its configuration
+    }
+    LoggingConfig cfg;
+    cfg.node_name = std::move(node_name);
+    cfg.async = false;  // no logging threads a library cannot promise to join
+    if (const char* env = std::getenv("CLINK_LOG_LEVEL"); env != nullptr && *env != '\0') {
+        cfg.level = env;
+    }
+    init(cfg);
 }
 
 void shutdown() {

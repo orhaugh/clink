@@ -32,6 +32,7 @@
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
+#include "clink/runtime/logging.hpp"
 
 namespace clink::cluster {
 
@@ -385,6 +386,13 @@ void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
 void ensure_built_ins_registered() {
     static std::once_flag flag;
     std::call_once(flag, []() {
+        // Every runtime entry path funnels through here before its first
+        // registration, so this is the one place a library-embedded process
+        // can be given a configured logging core (CLINK_LOG_LEVEL honoured)
+        // before the registry starts talking. clink_node calls
+        // logging::init() from main() first, so daemons keep their explicit
+        // --log-* configuration; this is a no-op for them.
+        clink::logging::init_from_env_if_unconfigured("");
         // Explicit registry references to avoid recursive call_once
         // through PluginRegistry's default constructor.
         auto& tr = TypeRegistry::default_instance();
