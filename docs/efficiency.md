@@ -654,9 +654,11 @@ its favour), and the memory column compared clink's footprint holding ALL 9.2M k
 against the JVM engine's holding an eighth of them. Both cells are withdrawn rather than
 recomputed: a truncated window's CPU is dominated by deploy and warm-up, so no honest
 number exists for it. The recording harness now withholds efficiency on truncated runs.
-The likely cause of the stall is the image-default 1728 MB TaskManager memory meeting
-9.19 million keys of dedup state - consistent with every JVM memory reading in this table
-sitting at 1.1-1.8 GB - and the next rig run raises it to find out.
+The cause was confirmed a day later: the image-default 1728 MB TaskManager memory meeting
+9.19 million keys of dedup state. With that setting raised to 6 GB the JVM engine drains
+both queries in every trial, and comparable q18/q19 figures exist - see
+[the multi-node baseline](#the-multi-node-baseline-17-queries-parallelism-12-shuffles-across-real-hosts),
+where they read 1.89x and 1.97x CPU in clink's favour at roughly half the memory.
 
 **Where clink's memory goes on q18 and q19, measured rather than compared.** Dedup over
 this dataset retains nearly the whole input: 9,193,877 distinct (bidder, auction) pairs
