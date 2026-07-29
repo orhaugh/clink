@@ -129,7 +129,12 @@ public:
             arrays.push_back(rb->column(rk));
         }
 
-        auto out_rb = arrow::RecordBatch::Make(arrow::schema(fields), n, arrays);
+        // Fields and arrays are moved into the batch so no local reference outlives
+        // emit_data - see the TSan note in columnar_string_keyed_vector_source.hpp.
+        // (Pass-through columns stay co-owned by the input element until the runner
+        // drops it; that residual shape is documented there too.)
+        auto out_rb =
+            arrow::RecordBatch::Make(arrow::schema(std::move(fields)), n, std::move(arrays));
         out.emit_data(Batch<sql::Row>{
             std::move(out_rb), static_cast<std::size_t>(n), sql::row_materialize_fn()});
         return true;

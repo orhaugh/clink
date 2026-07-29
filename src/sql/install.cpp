@@ -8333,7 +8333,10 @@ public:
             fields.push_back(arrow::field(kRowKeyField, arrow::int64(), /*nullable=*/true));
             cols.push_back(std::move(karr));
         }
-        auto new_rb = arrow::RecordBatch::Make(arrow::schema(fields), n, cols);
+        // Fields and cols are moved into the batch so no local reference outlives
+        // emit_data - see the TSan note in columnar_string_keyed_vector_source.hpp.
+        auto new_rb =
+            arrow::RecordBatch::Make(arrow::schema(std::move(fields)), n, std::move(cols));
         out.emit_data(Batch<Row>{
             std::move(new_rb), static_cast<std::size_t>(n), clink::sql::row_materialize_fn()});
         return true;

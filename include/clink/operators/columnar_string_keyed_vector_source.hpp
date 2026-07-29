@@ -62,26 +62,43 @@ public:
         if (!ts_b.Finish(&ts_arr).ok() || !k_b.Finish(&k_arr).ok() || !v_b.Finish(&v_arr).ok()) {
             return false;
         }
-        // KNOWN FLAKY TSAN RACE, seen 2026-07-28. The three shared_ptr<arrow::Array>
-        // locals below release their references when this frame exits, which is AFTER
-        // emit_data has handed the batch downstream. TSan intermittently reports a
-        // data race between the last-use `operator delete` on this thread and a read
-        // of the same control block on the consumer thread, via
-        // ColumnarKeyedStringAggregate.EndToEndColumnarPipelineDecodesZeroRowsOnIngest.
+        // The arrays are handed over to the batch wholly - moved into an explicit
+        // vector (an initializer list would silently copy: its elements are const) -
+        // so after emit_data this thread holds no reference to any Arrow object in
+        // the emitted batch, and the final release always runs on the thread that
+        // read the data.
         //
-        // Attribution, so the next TSan failure here is not re-investigated: the SAME
-        // commit both failed and passed a full CI TSan run, so it is load-dependent and
-        // not tied to any recent change. Running the single test in isolation under
-        // TSan with tsan-suppressions.txt does NOT reproduce it (0 races over 3 runs at
-        // two commits); running it WITHOUT the suppressions file reports it every time,
-        // which is a measurement artefact rather than a second finding.
+        // That discipline exists because of a diagnosed TSan false positive (fired
+        // once in CI on 2026-07-28; same commit also passed, so load-dependent).
+        // When these locals outlived the emit, two release orders were possible.
+        // Normal order: this thread dropped its refs first (a visible atomic RMW on
+        // the control block), the consumer's element did the last release, and the
+        // frees landed on the thread that read - nothing to report. Flake order
+        // (this thread preempted between emit_data and scope exit): the consumer
+        // dropped FIRST, but that decrement runs inside ~SimpleRecordBatch in
+        // libarrow.so, which is not built with TSan (zero __tsan_* imports), so TSan
+        // recorded nothing; the last release then ran HERE, visibly, deleting the
+        // make_shared co-allocated array block whose bytes the consumer had just
+        // read via Value(i). Read on one thread, free on another, and the only
+        // ordering edge routed through an uninstrumented library: reported as a
+        // race. The refcount's acq_rel ordering makes the free correct on real
+        // hardware; the report was a tool blind spot, not a bug.
         //
-        // Not diagnosed. A refcount is atomic, so a plain concurrent inc/dec would not
-        // race - which means either the handoff lacks a happens-before edge TSan can
-        // see, or the reported stack is not the whole story. Worth pinning before
-        // anyone trusts a green TSan run completely: an intermittently-red gate is only
-        // marginally better than a red one.
-        auto rb = arrow::RecordBatch::Make(batcher_.schema(), n, {ts_arr, k_arr, v_arr});
+        // Established by experiment, not just by fit: a 500us sleep between
+        // emit_data and scope exit (forcing the flake order every batch) made the
+        // report fire 20/20 runs with the CI stack pair; with this handover in
+        // place and the sleep still forcing the order, 0/20. Residual class, never
+        // observed and not closable from clink code: two threads co-owning Arrow
+        // objects where the reader's release runs inside libarrow's destructor
+        // chain (an input element whose columns pass through to an emitted batch,
+        // or fan-out siblings sharing one batch) can in principle still produce
+        // this shape; closing it outright needs an Arrow built with TSan.
+        std::vector<std::shared_ptr<arrow::Array>> cols;
+        cols.reserve(3);
+        cols.push_back(std::move(ts_arr));
+        cols.push_back(std::move(k_arr));
+        cols.push_back(std::move(v_arr));
+        auto rb = arrow::RecordBatch::Make(batcher_.schema(), n, std::move(cols));
 
         out.emit_data(Batch<KV>{std::move(rb), static_cast<std::size_t>(n), materialize_});
         pos_ = end;

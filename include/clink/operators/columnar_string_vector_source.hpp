@@ -61,7 +61,13 @@ public:
         if (!ts_b.Finish(&ts_arr).ok() || !v_b.Finish(&v_arr).ok()) {
             return false;
         }
-        auto rb = arrow::RecordBatch::Make(batcher_.schema(), n, {ts_arr, v_arr});
+        // Arrays are moved into the batch so no reference outlives emit_data - see
+        // the TSan note in columnar_string_keyed_vector_source.hpp.
+        std::vector<std::shared_ptr<arrow::Array>> cols;
+        cols.reserve(2);
+        cols.push_back(std::move(ts_arr));
+        cols.push_back(std::move(v_arr));
+        auto rb = arrow::RecordBatch::Make(batcher_.schema(), n, std::move(cols));
 
         out.emit_data(Batch<std::string>{std::move(rb), static_cast<std::size_t>(n), materialize_});
         pos_ = end;
