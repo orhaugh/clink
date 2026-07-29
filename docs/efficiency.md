@@ -689,6 +689,71 @@ same commit: 16 of 16 append-only queries and 4 of 4 changelog queries produce o
 two engines agree on, row for row. See
 [the correctness gate](#the-correctness-gate).
 
+## The multi-node baseline: 17 queries, parallelism 12, shuffles across real hosts
+
+Everything above ran on the two-node split rig, where every shuffle stayed inside one
+worker. This section is the first **multi-node** baseline: a control node, three worker
+nodes and an isolated broker, parallelism 12, so every keyed shuffle crosses real hosts
+and the numbers include the cross-host data plane both engines actually pay in a
+deployment. Measured 29 July 2026 at clink `6cc4831` against Flink 2.2.0 re-baselined
+alongside, three trials per cell, 9.2 million canonical nexmark bid records over 12
+partitions. CPU and memory are summed over **every** engine node. Raw output:
+[`assets/nexmark-full-topo-2026-07-29.json`](assets/nexmark-full-topo-2026-07-29.json).
+
+**This is a new baseline, not an update to the tables above.** Different topology,
+different parallelism, and one deliberate premise change: Flink's TaskManager memory is
+set to 6 GB per node (the image default, 1728 MB, is what every earlier round ran - see
+the q18/q19 note below for why that had to change). Flink's memory column here is
+therefore not comparable to the split-rig rounds. clink's configuration is unchanged
+apart from a scheduling-slots cap raised to fit q5's plan.
+
+| query | what it does | clink ev/cpu-s | JVM engine | CPU ratio | clink MB | JVM MB |
+|---|---|---:|---:|---:|---:|---:|
+| q0 | projection | 857,676 | 179,327 | **4.78x** | 184 | 8,283 |
+| q1 | currency conversion | 403,644 | 176,093 | **2.29x** | 430 | 8,285 |
+| q2 | expression filter | 741,563 | 180,035 | **4.12x** | 188 | 8,319 |
+| q5 | hot items (windowed top-1) | 109,072 | 48,611 | **2.24x** | 3,284 | 9,021 |
+| q7 | windowed max/min | 669,953 | 138,404 | **4.84x** | 262 | 8,425 |
+| q11 | session windows | 160,031 | 55,890 | 2.86x † | 1,091 | 9,863 |
+| q12 | windowed group-by | 183,344 | 67,278 | **2.73x** | 1,050 | 9,279 |
+| q14 | filter + CASE | 321,492 | 170,965 | **1.88x** | 558 | 8,265 |
+| q15 | count-distinct / window | 564,148 | 106,484 | **5.30x** | 723 | 8,962 |
+| q16 | count-distinct / channel | 338,020 | 103,167 | **3.28x** | 817 | 8,715 |
+| q17 | per-auction aggregates | 149,708 | 62,178 | **2.41x** | 1,871 | 9,551 |
+| q18 | dedup per key | 144,862 | 76,654 | **1.89x** | 5,656 | 10,926 |
+| q19 | top-10 per auction | 132,036 | 67,163 | **1.97x** | 3,710 | 10,961 |
+| q21 | CASE over a string | 399,657 | 173,249 | **2.31x** | 500 | 8,249 |
+| q22 | string splitting | 397,328 | 161,952 | **2.45x** | 561 | 8,240 |
+| qcum | cumulate windows | 124,248 | 55,642 | **2.23x** | 1,728 | 9,313 |
+| qhop | hopping windows | 109,444 | 41,904 | 2.61x † | 2,321 | 9,406 |
+
+† clink's own trial spread exceeded 1.25x on q11 (1.28x) and qhop (1.29x); treat those two
+ratios as indicative. Every other cell held within 1.08x over three trials, both engines.
+
+**Every query drained, on both engines, in every trial** - the first round of which that
+is true. Three things this baseline settles:
+
+- **q5 has its first cross-engine figure** (2.24x). It was never a capacity problem on
+  clink's side: its 10-operator plan at parallelism 12 is 120 tasks, and the workers'
+  scheduling cap was 48 slots across the rig. Raising the cap is configuration, not
+  hardware - the rig's cores are unchanged.
+- **The Flink q18/q19 stall from 28 July is explained and closed: it was memory.** At
+  the image-default 1728 MB TaskManager size its source stalls at a deterministic point
+  (~1.08M of 9.2M records) and never drains; at 6 GB it drains every trial. The earlier
+  round's withdrawal of those figures stands - and with both engines finally draining,
+  the honest comparison is 1.89x/1.97x CPU in clink's favour with clink holding roughly
+  half the memory (5.7 vs 10.9 GB summed across nodes on q18) - a far narrower memory
+  margin than the stateless queries, consistent with the retained-state accounting in
+  the sections above.
+- **The efficiency lead survives the network.** The split rig could not say whether
+  clink's per-event advantage was an artifact of intra-node shuffles; at parallelism 12
+  across three hosts the ratios run 1.88x to 5.30x, every query in clink's favour.
+
+Same standing caveats as every round: blackhole sinks (nothing here checks output;
+correctness is gated separately - 16 of 16 append-only and 4 of 4 changelog queries
+agree row-for-row across engines), and throughput is not reported per query for the
+reasons established in the previous section.
+
 ## What was not measured
 
 Stated plainly, because an efficiency page without this section should not be trusted:

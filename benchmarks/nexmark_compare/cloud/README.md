@@ -50,6 +50,36 @@ evidence, check the Hetzner console too.
   the public internet at a 100ms interval folds tens of ms of RTT into a 500ms
   slope window.
 
+## Multi-node baseline (TOPOLOGY=full), 2026-07-29 - THE BASELINE GOING FORWARD
+
+First run of the full topology: ccx13 control + 3x ccx23 workers + ccx23 broker in nbg1,
+parallelism 12, every keyed shuffle crossing real hosts. clink 6cc4831
+(`:sha-6cc483137e07`) vs Flink 2.2.0 on one provision, 3 trials per cell, 17 queries,
+9.2M canonical bids over 12 partitions (full-load-canonical.sh). ALL 102 runs drained.
+Published to docs/efficiency.md; raw in docs/assets/nexmark-full-topo-2026-07-29.json
+and results-full-baseline-6cc4831/.
+
+Efficiency ratios 1.88x (q14) to 5.30x (q15), every query in clink's favour. clink q0
+sustained ~11.3M rec/s at par=12. Premise notes that MUST travel with any quote:
+FLINK_TM_MEM=6g (image default 1728m stalls q18/q19 - see below), CLINK_SLOTS=48,
+Flink memory column NOT comparable to earlier rounds because of the 6g setting.
+
+Findings the run itself established:
+
+1. **The 2026-07-28 q18/q19 Flink stall is CLOSED: memory.** At 1728m the source stalls
+   deterministically (~1.08M of 9.2M); at 6g it drains every trial. With both engines
+   draining, q18/q19 read 1.89x/1.97x CPU for clink at roughly HALF the memory.
+2. **q5's first cross-engine figure: 2.24x.** The blocker was the workers' 16-slot
+   scheduling cap vs a 120-task plan; CLINK_SLOTS is now a knob with the arithmetic at it.
+3. **A consumer-group-per-TRIAL bug, found by REPEATS:** the group id was unique per
+   (engine, query, par) only, so trials 2-3 resumed at the committed offset and read
+   NOTHING (trial 1: 11.2M rec/s; trials 2-3: exactly 0). Fixed - gid now carries the
+   trial index. A repeated measurement that shares its consumer group measures an empty
+   topic and looks like a catastrophic regression.
+4. clink q11/qhop trial spread 1.28x/1.29x (flagged indicative); all else within 1.08x.
+5. The Flink job jar is a PREREQUISITE on the control node (/root/nexmark-sql.jar);
+   q0/q1's first Flink trials burned on its absence and were re-run.
+
 ## Full suite on canonical data, 2026-07-28
 
 17 bid-only queries, both engines, two trials each, parallelism 4, on 2x ccx23 in nbg1.

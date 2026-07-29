@@ -147,7 +147,12 @@ fi
 
 run_one() {  # engine query par trial
     local engine=$1 q=$2 par=$3 trial=${4:-1}
-    local gid="f-$engine-$q-$par-$$"
+    # The consumer group must be unique PER TRIAL, not just per (engine, query,
+    # par): offsets commit to the broker, so a repeated trial under the same group
+    # resumes at the end of the topic and reads NOTHING - the first baseline
+    # attempt measured trial 1 at 11.2M rec/s and trials 2-3 at exactly 0 for this
+    # reason. $$ alone cannot distinguish trials inside one invocation.
+    local gid="f-$engine-$q-$par-t$trial-$$"
     down
     up "$engine"
 
