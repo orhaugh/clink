@@ -10,6 +10,18 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Installed binaries must be able to find the pinned toolchain's shared
+# libraries: Arrow and friends live under CLINK_DEPS_PREFIX (host default
+# ~/.clink-deps), which is on no default loader path, and their install
+# names are @rpath-relative. Build-tree binaries work because CMake gives
+# them an automatic build rpath, and the Docker image works because its
+# toolchain sits in /usr/local - but a host `cmake --install` produced a
+# binary with no LC_RPATH at all on macOS, which dyld refuses to load.
+# Carrying the external link directories into the installed rpath is the
+# standard fix, and covers any other out-of-prefix dependency (Homebrew's
+# aws-sdk, system librdkafka) the same way.
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
 # CLINK_SANITIZER_BUILD - "this build carries a -fsanitize runtime".
 #
 # build_and_test.sh passes the sanitizer flags through CMAKE_CXX_FLAGS rather than a

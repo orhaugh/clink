@@ -57,12 +57,15 @@ honoured at columnar JSON decode; non-integral doubles are no longer written
 at six significant digits; a batch materialises columns by name rather than by
 declared position.
 
-**Build and packaging.** `CLINK_ISA_BASELINE` makes the x86 ISA floor a
-decision rather than an accident (AVX2 was measured to buy nothing on this
-workload); `CLINK_WITH_JEMALLOC` is opt-in and observable (`clink_node
---version` prints the loaded allocator); an installed clink now tells its
-consumers to resolve ArrowCompute, a `find_package(clink)` fix; simdjson is
-pinned and kept out of the public headers.
+**Build and packaging.** Installed binaries now carry an rpath to the pinned
+toolchain, so a host `cmake --install` produces a runnable `clink` - on macOS
+the installed binary previously had no `LC_RPATH` at all and dyld refused to
+load it (the build tree and the Docker image had masked this). `CLINK_ISA_BASELINE`
+makes the x86 ISA floor a decision rather than an accident (AVX2 was measured
+to buy nothing on this workload); `CLINK_WITH_JEMALLOC` is opt-in and
+observable (`clink_node --version` prints the loaded allocator); an installed
+clink now tells its consumers to resolve ArrowCompute, a `find_package(clink)`
+fix; simdjson is pinned and kept out of the public headers.
 
 ## v0.2.0 (July 2026)
 
