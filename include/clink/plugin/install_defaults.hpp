@@ -58,6 +58,9 @@
 #ifdef CLINK_HAS_MQTT
 #include "clink/mqtt/install.hpp"
 #endif
+#ifdef CLINK_HAS_WEBSOCKET
+#include "clink/websocket/install.hpp"
+#endif
 #ifdef CLINK_HAS_MONGODB
 #include "clink/mongodb/install.hpp"
 #endif
@@ -128,6 +131,9 @@ inline void install_defaults(PluginRegistry& reg) {
 #endif
 #ifdef CLINK_HAS_MQTT
     clink::mqtt::install(reg);
+#endif
+#ifdef CLINK_HAS_WEBSOCKET
+    clink::websocket::install(reg);
 #endif
 #ifdef CLINK_HAS_MONGODB
     clink::mongodb::install(reg);

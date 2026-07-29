@@ -440,7 +440,7 @@ semantics.
 
 The full set lives in the [connector reference](docs/connectors/README.md). In brief:
 
-- Messaging and streaming: [Kafka](docs/connectors/kafka.md), [Pulsar](docs/connectors/pulsar.md), [RabbitMQ](docs/connectors/rabbitmq.md), [NATS JetStream](docs/connectors/nats.md), [MQTT](docs/connectors/mqtt.md)
+- Messaging and streaming: [Kafka](docs/connectors/kafka.md), [Pulsar](docs/connectors/pulsar.md), [RabbitMQ](docs/connectors/rabbitmq.md), [NATS JetStream](docs/connectors/nats.md), [MQTT](docs/connectors/mqtt.md), [WebSocket](docs/connectors/websocket.md)
 - Object storage and table formats (Parquet): [S3](docs/connectors/s3-parquet.md), [GCS](docs/connectors/gcs-parquet.md), [Azure Blob](docs/connectors/azure-parquet.md), [WebHDFS / HttpFS](docs/connectors/webhdfs-parquet.md), [Iceberg](docs/connectors/iceberg.md)
 - Databases and key-value: [PostgreSQL](docs/connectors/postgres.md), [MySQL / MariaDB](docs/connectors/mysql.md), [ClickHouse](docs/connectors/clickhouse.md), [Cassandra / ScyllaDB](docs/connectors/cassandra.md), [MongoDB](docs/connectors/mongodb.md), [Redis](docs/connectors/redis.md)
 - Cloud services and HTTP: [AWS (Kinesis / Firehose / DynamoDB)](docs/connectors/aws.md), [HTTP (Elasticsearch, OpenSearch, Splunk, InfluxDB, Prometheus, poll, Pub/Sub)](docs/connectors/http.md)

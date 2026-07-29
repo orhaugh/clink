@@ -79,6 +79,9 @@ std::string string_source_factory_for(const TableDef& table) {
     if (connector == "rabbitmq") {
         return "rabbitmq_source_string";
     }
+    if (connector == "websocket") {
+        return "websocket_source_string";
+    }
     if (connector == "nats") {
         return "nats_source_string";
     }
@@ -266,6 +269,20 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // channel) bridged to Row. At-least-once (manual ack at the checkpoint barrier).
         return RowConnectorBinding{"rabbitmq_source_string", kChannelString, "json_string_to_row"};
     }
+    if (connector == "websocket") {
+        // WebSocket push feed: each text message is a JSON object string
+        // (string channel) bridged to Row. At-most-once across restarts (an
+        // ephemeral push stream has no offset to replay). The columnar JSON
+        // bridge is the default exactly as on the kafka arm - a live feed's
+        // declared schema rides the columnar decode; columnar_decode='false'
+        // opts a table out.
+        const auto it = table.properties.find("columnar_decode");
+        const bool row_form =
+            it != table.properties.end() && (it->second == "false" || it->second == "0");
+        return RowConnectorBinding{"websocket_source_string",
+                                   kChannelString,
+                                   row_form ? "json_string_to_row" : "json_string_to_row_columnar"};
+    }
     if (connector == "nats") {
         // NATS JetStream source: each message body is a JSON object string (string channel)
         // bridged to Row. At-least-once (durable pull consumer, ack at the checkpoint barrier).
@@ -345,7 +362,8 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
     }
     unsupported(
         "format='json' source requires connector='file', 'kafka', 'parquet', 'nexmark', "
-        "'kinesis', 'http_poll', 'pubsub', 'redis', 'mysql', 'clickhouse' or 'postgres' (got '" +
+        "'kinesis', 'http_poll', 'pubsub', 'redis', 'mysql', 'clickhouse', 'postgres' or "
+        "'websocket' (got '" +
         connector + "')");
 }
 

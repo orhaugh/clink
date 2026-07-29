@@ -228,6 +228,45 @@ TEST(SqlPhysical, KafkaConnectorMapsToKafkaFactories) {
     EXPECT_EQ(src->params.at("bootstrap"), "localhost:9092");
 }
 
+// connector='websocket' lowers to websocket_source_string; a multi-column
+// format='json' table takes the columnar JSON bridge by default (the kafka
+// treatment - a live feed's declared schema rides the columnar decode) and
+// columnar_decode='false' opts back to the plain row bridge. Source only:
+// there is no websocket sink.
+TEST(SqlPhysical, WebSocketConnectorMapsToTheStringSourceAndColumnarBridge) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE ws_in (symbol TEXT, px DOUBLE, ts BIGINT) "
+        "WITH (connector='websocket', format='json', url='wss://feed.example.test/ws', "
+        "subscribe='{\"op\":\"subscribe\"}');"
+        "CREATE TABLE ws_row (symbol TEXT, px DOUBLE, ts BIGINT) "
+        "WITH (connector='websocket', format='json', url='ws://feed.example.test/ws', "
+        "columnar_decode='false');"
+        "CREATE TABLE f_out (symbol TEXT, px DOUBLE, ts BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/ws_out.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[2]));
+
+    PhysicalPlanner pp;
+    {
+        auto plan = bind_insert(cat, "INSERT INTO f_out SELECT symbol, px, ts FROM ws_in");
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        const auto* src = find_op(spec, "websocket_source_string");
+        ASSERT_NE(src, nullptr);
+        EXPECT_EQ(src->params.at("url"), "wss://feed.example.test/ws");
+        EXPECT_EQ(src->params.at("subscribe"), "{\"op\":\"subscribe\"}");
+        EXPECT_NE(find_op(spec, "json_string_to_row_columnar"), nullptr);
+    }
+    {
+        auto plan = bind_insert(cat, "INSERT INTO f_out SELECT symbol, px, ts FROM ws_row");
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        ASSERT_NE(find_op(spec, "websocket_source_string"), nullptr);
+        EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);
+        EXPECT_EQ(find_op(spec, "json_string_to_row_columnar"), nullptr);
+    }
+}
+
 // connector='rabbitmq' lowers to rabbitmq_source_string / rabbitmq_sink_string (string channel)
 // via the json_string_to_row + row_to_json_string bridges, carrying queue/routing_key/host.
 TEST(SqlPhysical, RabbitMqConnectorMapsToAmqpFactories) {

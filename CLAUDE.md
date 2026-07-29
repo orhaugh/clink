@@ -50,7 +50,7 @@ the source it cites. Keep these pages current when a subsystem changes.
 | SQL frontend (parse -> bind -> plan -> ops) | `include/clink/sql/`, `src/sql/` | `docs/internals/sql-frontend.md` |
 | Embedded execution (`clink run <file>.sql`, EmbeddedEngine) | `include/clink/embed/`, `src/embed/`, `include/clink/sql/script_runner.hpp`, `tools/clink_run_sql.cpp` | `docs/internals/embedded.md` |
 | Data lineage (capture + pluggable export) | `include/clink/lineage/`, `src/lineage/` | `docs/internals/data-lineage.md` |
-| Connectors (sources/sinks/backends) | `impls/<name>/` | `docs/connectors/<name>.md` |
+| Connectors (sources/sinks/backends) | `impls/<name>/` (WebSocket: RFC 6455 in-tree under `impls/websocket/`, no client lib) | `docs/connectors/<name>.md` |
 | Testing framework (public, for library consumers) | `include/clink/test/` | `docs/internals/testing-framework.md` |
 
 ## Pinned toolchain (one-time bootstrap)

@@ -124,6 +124,9 @@
 #ifdef CLINK_LINKED_MQTT
 #include "clink/mqtt/install.hpp"
 #endif
+#ifdef CLINK_LINKED_WEBSOCKET
+#include "clink/websocket/install.hpp"
+#endif
 #ifdef CLINK_LINKED_MONGODB
 #include "clink/mongodb/install.hpp"
 #endif
@@ -2772,6 +2775,9 @@ void install_linked_impls() {
 #endif
 #ifdef CLINK_LINKED_MQTT
     clink::mqtt::install(reg);  // MQTT source + sink
+#endif
+#ifdef CLINK_LINKED_WEBSOCKET
+    clink::websocket::install(reg);  // WebSocket push-feed source
 #endif
 #ifdef CLINK_LINKED_MONGODB
     clink::mongodb::install(reg);  // MongoDB change-streams CDC source + sink

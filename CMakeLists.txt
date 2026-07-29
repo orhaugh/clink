@@ -108,6 +108,7 @@ set(CLINK_WITH_CASSANDRA  "AUTO" CACHE STRING "Cassandra/ScyllaDB sink impl via 
 set(CLINK_WITH_GCS        "AUTO" CACHE STRING "GCS Parquet connector via Arrow's GcsFileSystem (AUTO/ON/OFF)")
 set(CLINK_WITH_AZURE      "AUTO" CACHE STRING "Azure Blob Parquet connector via Arrow's AzureFileSystem (AUTO/ON/OFF)")
 set(CLINK_WITH_WEBHDFS    "AUTO" CACHE STRING "WebHDFS/HttpFS Parquet connector over the HTTP client (AUTO/ON/OFF)")
+set(CLINK_WITH_WEBSOCKET  "AUTO" CACHE STRING "WebSocket source impl, RFC 6455 in-tree, OpenSSL for wss (AUTO/ON/OFF)")
 set(CLINK_WITH_VECTOR_SEARCH "AUTO" CACHE STRING "VECTOR_SEARCH KNN impl: SimSIMD kernels + usearch HNSW, header-only (AUTO/ON/OFF)")
 # ONNX Runtime local inference provider. OFF by default (heavy, optional dep): AUTO uses
 # a locally-discoverable runtime but never downloads (offline-safe); ON fetches a pinned
@@ -138,8 +139,8 @@ foreach(_opt CLINK_WITH_ROCKSDB CLINK_WITH_KAFKA CLINK_WITH_AWS_S3 CLINK_WITH_AW
              CLINK_WITH_ETCD CLINK_WITH_AVRO CLINK_WITH_HTTP CLINK_WITH_REDIS CLINK_WITH_MYSQL
              CLINK_WITH_MQTT CLINK_WITH_MONGODB CLINK_WITH_ICEBERG CLINK_WITH_RABBITMQ
              CLINK_WITH_NATS CLINK_WITH_PULSAR CLINK_WITH_CASSANDRA CLINK_WITH_GCS CLINK_WITH_AZURE
-             CLINK_WITH_WEBHDFS CLINK_WITH_VECTOR_SEARCH CLINK_WITH_ONNX CLINK_WITH_WASM
-             CLINK_WITH_FORST CLINK_WITH_JEMALLOC)
+             CLINK_WITH_WEBHDFS CLINK_WITH_WEBSOCKET CLINK_WITH_VECTOR_SEARCH CLINK_WITH_ONNX
+             CLINK_WITH_WASM CLINK_WITH_FORST CLINK_WITH_JEMALLOC)
     set_property(CACHE ${_opt} PROPERTY STRINGS AUTO ON OFF)
 endforeach()
 if(CLINK_WITH_ROCKSDB STREQUAL "OFF")
@@ -1027,7 +1028,7 @@ clink_set_warnings(clink_node)
 # up clink::<x>::install() calls without #ifdef on macros that
 # leaked from libclink's old build. Each impl sets a CLINK_LINKED_<X>
 # define at the consumer-link boundary.
-foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd http_connector redis mysql mqtt mongodb iceberg rabbitmq nats pulsar cassandra gcs azure webhdfs vector_search onnx wasm forst)
+foreach(_impl kafka postgres clickhouse s3 aws rocksdb tls etcd http_connector redis mysql mqtt mongodb iceberg rabbitmq nats pulsar cassandra gcs azure webhdfs websocket vector_search onnx wasm forst)
     if(TARGET clink::${_impl})
         string(TOUPPER ${_impl} _IMPL_UC)
         target_compile_definitions(clink_node PRIVATE CLINK_LINKED_${_IMPL_UC})

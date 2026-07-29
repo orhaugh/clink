@@ -29,6 +29,7 @@ is reachable through the programmatic API only.
 | [RabbitMQ (AMQP 0-9-1)](rabbitmq.md) | source + sink | rabbitmq-c | system pkg | `rabbitmq` |
 | [NATS JetStream](nats.md) | source + sink | nats.c | system pkg | `nats` |
 | [MQTT](mqtt.md) | source + sink | libmosquitto | system pkg | - |
+| [WebSocket](websocket.md) | source | none (OpenSSL for `wss://`) | - | `websocket` |
 
 ## Object storage and table formats (Parquet)
 

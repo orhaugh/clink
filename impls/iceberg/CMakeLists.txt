@@ -15,6 +15,23 @@ if(CLINK_WITH_ICEBERG STREQUAL "OFF")
     return()
 endif()
 
+# iceberg-cpp's bundle compiles arrow_s3_file_io.cc unconditionally, so it
+# references Arrow's S3 filesystem symbols whether or not a job ever touches
+# s3://. Against an Arrow built without the object stores
+# (CLINK_ARROW_OBJECT_STORES=OFF) that link can never succeed - every binary
+# pulling clink::iceberg dies with undefined arrow::fs::S3* references - so
+# gate the impl on the Arrow feature exactly as the GCS/Azure impls gate on
+# theirs. ARROW_S3 is set by find_package(Arrow) via ArrowOptions.cmake.
+if(NOT ARROW_S3)
+    if(CLINK_WITH_ICEBERG STREQUAL "ON")
+        message(FATAL_ERROR "CLINK_WITH_ICEBERG=ON but the pinned Arrow was built without "
+                            "ARROW_S3 (CLINK_ARROW_OBJECT_STORES=OFF?); iceberg-cpp's bundle "
+                            "cannot link against a no-S3 Arrow")
+    endif()
+    message(STATUS "clink::iceberg - the pinned Arrow has no S3 filesystem; target not defined")
+    return()
+endif()
+
 find_package(iceberg CONFIG QUIET)
 # The bundle ("battery-included") lib is what carries the Arrow / Parquet / Avro write
 # backend (MakeLocalFileIO, the Parquet/Avro writer factories, RegisterAll). The

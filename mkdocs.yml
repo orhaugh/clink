@@ -130,6 +130,7 @@ nav:
       - connectors/s3-parquet.md
       - connectors/s3.md
       - connectors/webhdfs-parquet.md
+      - connectors/websocket.md
   - Design decisions:
       - design/index.md
       - design/001-arrow-native-data-plane.md
