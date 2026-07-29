@@ -1,0 +1,207 @@
+# Prebuilt clink binaries as release assets, so a downstream project can
+# consume a release without building from source.
+#
+# WHAT THE ARTEFACT IS: a relocatable SDK prefix - bin/ (clink, clink_node,
+# clink_submit_sql), lib/ (the clink static libs AND the pinned Arrow/Parquet
+# shared libraries), include/ (clink + Arrow headers) and lib/cmake/ (the
+# clink + Arrow package configs) - tarred with a version-named top directory.
+# Extract it anywhere, point CMAKE_PREFIX_PATH at it, and both the CLI and
+# find_package(clink) work. Binaries carry an $ORIGIN/../lib rpath, so the
+# bundle resolves its own libraries wherever it lands.
+#
+# PLATFORM AND FLOOR, stated in the artefact name: built on ubuntu-24.04
+# x86_64 with gcc-14, so it runs on Ubuntu 24.04+ (glibc 2.39) and anything
+# newer. The Docker toolchain image cannot produce this artefact - it is
+# Debian trixie, whose glibc floor would exclude 24.04 hosts (the same
+# constraint that keeps Linux wheels opt-in; see wheels.yml).
+#
+# SCOPE, deliberate: the dependency-free impl set. SQL, file/parquet I/O,
+# RocksDB state, HTTP, TLS, WebSocket, Avro, vector search - everything that
+# needs no external client library or object-store SDK. The Arrow inside is
+# built WITHOUT the object-store filesystems (s3://, gs://, abfs://) because
+# those drag in an aws-sdk the runner does not have and the bundle could not
+# honestly ship; iceberg-cpp cannot link against a no-S3 Arrow, so the
+# Iceberg impl is skipped too (its CMake gate now says so). Broker connectors
+# (Kafka, Pulsar, ...) would each pin a client .so the consumer must also
+# have - out of scope for a portable bundle. Anything beyond this scope is a
+# from-source build, where every impl is available.
+#
+# TRIGGERS: a release tag uploads the artefact to that release. A manual
+# dispatch is the dry run - identical build and smoke, uploaded as a
+# workflow artifact only - so the mechanism is proven before a tag depends
+# on it.
+
+name: release-binaries
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write  # gh release upload
+
+env:
+  CC: gcc-14
+  CXX: g++-14
+  CLINK_ARROW_OBJECT_STORES: "OFF"
+
+jobs:
+  linux-x86_64:
+    name: linux-x86_64 (ubuntu-24.04 floor)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential g++-14 git curl ca-certificates pkg-config \
+            libssl-dev libcurl4-openssl-dev libsqlite3-dev libxml2-dev \
+            libzstd-dev zlib1g-dev
+
+      - name: Restore the pinned toolchain
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.clink-deps
+          key: release-bin-deps-${{ runner.os }}-${{ runner.arch }}-obj${{ env.CLINK_ARROW_OBJECT_STORES }}-gcc14-${{ hashFiles('scripts/versions.env', 'scripts/build-arrow.sh') }}
+
+      - name: Bootstrap pinned Arrow (no object stores)
+        # From source on a cache miss (~35 min once per pin), restored in
+        # seconds afterwards. iceberg-cpp is deliberately not bootstrapped:
+        # it cannot link against a no-S3 Arrow (impls/iceberg gates on
+        # ARROW_S3 and skips itself).
+        run: scripts/build-arrow.sh
+
+      - name: Build and install clink into a staging prefix
+        # $ORIGIN/../lib makes the bundle self-resolving wherever it is
+        # extracted. CMAKE_INSTALL_RPATH_USE_LINK_PATH (set by the project)
+        # additionally appends the runner's absolute dep paths - dangling on
+        # a consumer machine and harmless, since the $ORIGIN entry wins.
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCLINK_BUILD_SQL=ON \
+            -DCLINK_BUILD_TESTS=OFF \
+            -DCLINK_BUILD_EXAMPLES=OFF \
+            -DCLINK_WITH_ICEBERG=OFF \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN/../lib' \
+            -DCMAKE_INSTALL_PREFIX="${RUNNER_TEMP}/stage"
+          cmake --build build --parallel "$(nproc)"
+          cmake --install build
+
+      - name: Bundle the pinned toolchain into the prefix
+        # The Arrow/Parquet shared libraries the binaries link, plus the
+        # headers and CMake configs a find_package(clink) consumer needs
+        # (clinkConfig does find_dependency(Arrow); the bundled ArrowConfig
+        # resolves relative to its own location, so it relocates cleanly).
+        run: |
+          set -euo pipefail
+          stage="${RUNNER_TEMP}/stage"
+          cp -a "$HOME/.clink-deps/lib/." "$stage/lib/"
+          cp -a "$HOME/.clink-deps/include/." "$stage/include/"
+          # Prune pieces a consumer never needs from the bundle.
+          rm -rf "$stage/lib/pkgconfig" "$stage/share" || true
+
+      - name: Smoke test from a clean directory
+        # The artefact must work where nothing else does: move it, clear the
+        # toolchain from the environment, run SQL through the CLI, and build
+        # + run a find_package(clink) consumer against it.
+        run: |
+          set -euo pipefail
+          mv "${RUNNER_TEMP}/stage" "${RUNNER_TEMP}/clink-sdk"
+          sdk="${RUNNER_TEMP}/clink-sdk"
+          cd "${RUNNER_TEMP}"
+
+          echo '== CLI'
+          printf '{"u":"a","v":3}\n{"u":"b","v":4}\n{"u":"a","v":5}\n' > orders.ndjson
+          CLINK_LOG_LEVEL=warn "$sdk/bin/clink" run -e "
+            CREATE TABLE t (u VARCHAR, v BIGINT) WITH (connector='file', format='json', path='orders.ndjson');
+            CREATE TABLE o (u VARCHAR, total BIGINT) WITH (connector='file', format='json', path='out.ndjson');
+            INSERT INTO o SELECT u, SUM(v) AS total FROM t GROUP BY u"
+          grep -q '"total":8' out.ndjson
+          echo 'CLI smoke OK'
+
+          echo '== find_package(clink) consumer'
+          mkdir -p consumer && cd consumer
+          cat > main.cpp <<'CPP'
+          #include <clink/runtime/dag.hpp>
+          #include <clink/runtime/local_executor.hpp>
+          #include <clink/operators/source_operator.hpp>
+          #include <clink/operators/map_operator.hpp>
+          #include <clink/operators/sink_operator.hpp>
+          #include <cstdint>
+          #include <iostream>
+          #include <memory>
+          #include <vector>
+          int main() {
+              using namespace clink;
+              Dag dag;
+              auto src = std::make_shared<VectorSource<std::int64_t>>(
+                  std::vector<Record<std::int64_t>>{Record<std::int64_t>{20},
+                                                    Record<std::int64_t>{22}});
+              auto dbl = std::make_shared<MapOperator<std::int64_t, std::int64_t>>(
+                  [](const std::int64_t& v) { return v; });
+              std::int64_t sum = 0;
+              auto sink = std::make_shared<FunctionSink<std::int64_t>>(
+                  [&sum](const std::int64_t& v) { sum += v; });
+              auto h0 = dag.add_source<std::int64_t>(src);
+              auto h1 = dag.add_operator<std::int64_t, std::int64_t>(h0, dbl);
+              dag.add_sink<std::int64_t>(h1, sink);
+              LocalExecutor exec(std::move(dag));
+              exec.run();
+              std::cout << "sum=" << sum << "\n";
+              return sum == 42 ? 0 : 1;
+          }
+          CPP
+          cat > CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.24)
+          project(consumer LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 23)
+          find_package(clink REQUIRED COMPONENTS core)
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE clink::core)
+          CMAKE
+          cmake -S . -B build -DCMAKE_PREFIX_PATH="$sdk" > /dev/null
+          cmake --build build --parallel "$(nproc)" > /dev/null
+          ./build/consumer
+          echo 'consumer smoke OK'
+
+      - name: Pack
+        id: pack
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/}"
+          else
+            version="dev-${GITHUB_SHA::12}"
+          fi
+          name="clink-${version}-linux-x86_64-ubuntu24.04"
+          cd "${RUNNER_TEMP}"
+          mv clink-sdk "${name}"
+          tar czf "${name}.tar.gz" "${name}"
+          sha256sum "${name}.tar.gz" | tee "${name}.tar.gz.sha256"
+          echo "asset=${RUNNER_TEMP}/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=${RUNNER_TEMP}/${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to the release (tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF#refs/tags/}" \
+            "${{ steps.pack.outputs.asset }}" \
+            "${{ steps.pack.outputs.checksum }}" \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+
+      - name: Upload as a workflow artifact (dry runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: clink-linux-x86_64-ubuntu24.04
+          path: |
+            ${{ steps.pack.outputs.asset }}
+            ${{ steps.pack.outputs.checksum }}
+          if-no-files-found: error
