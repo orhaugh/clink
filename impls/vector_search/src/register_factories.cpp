@@ -6,6 +6,7 @@
 
 #include "clink/plugin/plugin.hpp"
 #include "clink/sql/row.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/vector_search/install.hpp"
 #include "clink/vector_search/knn_index.hpp"
 #include "clink/vector_search/vector_search_operator.hpp"
@@ -58,6 +59,21 @@ std::size_t param_size(const clink::plugin::BuildContext& ctx,
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    // Self-register the SQL Row channel type so vector_search::install() works
+    // regardless of whether clink::sql::install() has run yet - the
+    // register_operator<Row, Row> below needs the type registered at call
+    // time. Without this, any build where no earlier install had registered
+    // Row (for example one without the Iceberg impl, whose install
+    // self-registers it the same way) threw "In not registered" out of
+    // install_defaults, taking the whole embedded CLI down at startup.
+    // register_type is idempotent + last-write-wins, and this is
+    // byte-for-byte the registration clink::sql::install performs, so
+    // ordering does not change the final state.
+    reg.register_type<clink::sql::Row>(
+        std::string{clink::sql::kChannelRow},
+        clink::sql::row_json_codec(),
+        clink::sql::make_row_wire_batcher(clink::sql::row_json_codec()));
+
     reg.register_operator<clink::sql::Row, clink::sql::Row>(
         "vector_search_row",
         [](const clink::plugin::BuildContext& ctx)
