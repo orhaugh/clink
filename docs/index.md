@@ -23,15 +23,19 @@ that documents it in depth.
 
 ## What it costs to run
 
-[Efficiency and environmental impact](efficiency.md) publishes the measured cost of
-processing an event across the whole 17-query nexmark suite on a five-node cluster at
-parallelism 12: **1.9x to 5.3x less CPU per event than a JVM stream processor** (median
-2.45x), every query in clink's favour, on a correctness-gated comparison where both
-engines produce identical output - and on stateless work the whole engine runs in 184 MB
-against the JVM engine's gigabytes. It is equally explicit about what is not measured
-(wall power, so no kWh or CO2e figure is claimed) and about where the advantage narrows:
-on dedup and ranking most of the memory is the query's own retained state, and the CPU
-lead there is 1.9x rather than 5x. The raw per-run output is published alongside it.
+[Benchmarks](benchmarks.md) publishes the measured cost of processing an event across
+the whole 17-query nexmark suite on a five-node cluster at parallelism 12: **1.9x to
+5.3x less CPU per event than a JVM stream processor** (median 2.45x), every query in
+clink's favour, on a correctness-gated comparison where both engines produce identical
+output - and on stateless work the whole engine runs in 184 MB against the JVM engine's
+gigabytes. It is explicit about where the advantage narrows: on dedup and ranking most
+of the memory is the query's own retained state, and the CPU lead there is 1.9x rather
+than 5x. The raw per-run output is published alongside it.
+
+[Cost and environmental footprint](efficiency.md) prices those measurements - instance
+counts, dollars, modelled energy and CO2e - with every coefficient named and swappable,
+and is explicit that no wall power was measured, so no kWh or CO2e figure is a
+measurement.
 
 ## How it works
 

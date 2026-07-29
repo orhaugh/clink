@@ -73,7 +73,7 @@ submits to a cluster, unchanged.
 | Security | TLS and mTLS on the cluster transport | [Network stack](internals/network-stack.md) |
 | Kubernetes | Helm chart and a `ClinkCluster`/`ClinkJob` operator with savepoint-on-upgrade | [Distributed runtime](internals/distributed-runtime.md) |
 | HTTP API and console | JSON API, Prometheus metrics, SSE events, embedded dashboard; the full [operations console](https://github.com/orhaugh/clink-fe) is a separate project | [Distributed runtime](internals/distributed-runtime.md) |
-| Efficiency | Measured 3.87x less CPU per event and 15.5x less memory than a JVM stream processor on identical hardware with byte-identical output; raw per-run data published | [Efficiency and environmental impact](efficiency.md) |
+| Efficiency | Measured 1.9x to 5.3x less CPU per event than a JVM stream processor (median 2.45x, all 17 nexmark queries, five-node cluster, correctness-gated, raw per-run data published); a separate page prices it in instances, dollars and modelled CO2e | [Benchmarks](benchmarks.md) / [Cost and environmental footprint](efficiency.md) |
 | Allocator choice | jemalloc as the process allocator, opt-in at build time (`CLINK_WITH_JEMALLOC=ON`, Linux); measured at +5% throughput on a windowed query, neutral elsewhere, no memory change. The allocator in use is reported by `clink_node --version` and at node startup | [Build options](https://github.com/orhaugh/clink#allocator-clink_with_jemalloc-opt-in-linux) |
 
 ## Observability and debugging
