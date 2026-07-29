@@ -6743,6 +6743,61 @@ public:
     std::string name() const override { return "top_n_per_key_row"; }
 
 private:
+    // A retained row. The full row is held ENCODED - the same JSON-object text the
+    // window codec uses for group_values - and its sort-column values are held
+    // decoded beside it, so the insertion probe and the RANK tie tests never touch
+    // the encoding.
+    //
+    // Why not a materialized Row: this state retains one row per rank slot per
+    // partition, and on a dedup-shaped query that is nearly the whole stream. On
+    // the 2026-07-28 rig run, nexmark q18 retained 9,193,877 rows at ~428 bytes
+    // each for a 124-byte serialized payload - the column map's array block, the
+    // per-string heap blocks and the allocator rounding all paid once per retained
+    // row. One string plus the sort keys prices the same row at roughly half that
+    // (measured by benchmarks/clink_topn_state_bench, before/after in its header
+    // commit). The costs the encoding adds sit off the per-record fast path: one
+    // encode per arrival, one decode per EVICTED row (needed only to emit its
+    // changelog delete), and none per comparison.
+    //
+    // The decode round-trip is exact - integral JSON numbers parse to exact int64,
+    // doubles print at full precision, dec-strings ride as strings - so the delete
+    // a decoded row emits carries the same column values as the insert emitted
+    // from the original. The upsert sink keys its tombstone from those values and
+    // the changelog tests replay them, both of which gate this change.
+    struct StoredRow {
+        std::string encoded;
+        std::vector<clink::config::JsonValue> sort_vals;  // aligned to sort_columns_
+    };
+
+    static std::string encode_row_(const Row& row) {
+        return clink::config::JsonValue{clink::sql::to_json_object(row.values)}.serialize(0);
+    }
+
+    static Row decode_row_(const std::string& encoded) {
+        // Encoded by encode_row_ above, so a parse failure is impossible short of
+        // memory corruption; a throw here propagates to the runner, which fails
+        // the task loudly - the correct behaviour for impossible states.
+        auto j = clink::config::parse(encoded);
+        Row row;
+        if (j.is_object()) {
+            row.values = clink::sql::row_columns_from_json(std::move(j.as_object()));
+        }
+        return row;
+    }
+
+    // The incoming row's sort-column values, extracted once per arrival. Absent
+    // columns become explicit nulls so the comparison semantics match the old
+    // find-or-null lookup exactly.
+    std::vector<clink::config::JsonValue> sort_vals_of_(const Row& row) const {
+        std::vector<clink::config::JsonValue> vals;
+        vals.reserve(sort_columns_.size());
+        for (const auto& col : sort_columns_) {
+            auto it = row.values.find(col);
+            vals.push_back(it != row.values.end() ? it->second : clink::config::JsonValue{nullptr});
+        }
+        return vals;
+    }
+
     std::string partition_key_(const Row& row) const {
         std::string key;
         for (std::size_t i = 0; i < partition_columns_.size(); ++i) {
@@ -6756,32 +6811,32 @@ private:
         return key;
     }
 
+    // One sort-column comparison, type-aware. Byte-for-byte the ordering the old
+    // Row-based comparator applied; only the value lookup moved (done once at
+    // arrival instead of on every comparison).
+    static int cmp_val_(const clink::config::JsonValue& av, const clink::config::JsonValue& bv) {
+        if (av.is_null() && bv.is_null())
+            return 0;
+        if (av.is_null())
+            return -1;
+        if (bv.is_null())
+            return 1;
+        if (av.is_number() && bv.is_number()) {
+            const double ad = av.as_number(), bd = bv.as_number();
+            return (ad < bd) ? -1 : (ad > bd ? 1 : 0);
+        }
+        if (av.is_string() && bv.is_string()) {
+            return av.as_string().compare(bv.as_string());
+        }
+        return av.serialize(0).compare(bv.serialize(0));
+    }
+
     // Returns true if `a` should sort before `b` under the configured
     // (column, direction) tuple list.
-    bool better_(const Row& a, const Row& b) const {
+    bool better_(const std::vector<clink::config::JsonValue>& a,
+                 const std::vector<clink::config::JsonValue>& b) const {
         for (std::size_t i = 0; i < sort_columns_.size(); ++i) {
-            const auto& col = sort_columns_[i];
-            const auto ait = a.values.find(col);
-            const auto bit = b.values.find(col);
-            const auto& av =
-                ait != a.values.end() ? ait->second : clink::config::JsonValue{nullptr};
-            const auto& bv =
-                bit != b.values.end() ? bit->second : clink::config::JsonValue{nullptr};
-            int cmp;
-            if (av.is_null() && bv.is_null())
-                cmp = 0;
-            else if (av.is_null())
-                cmp = -1;
-            else if (bv.is_null())
-                cmp = 1;
-            else if (av.is_number() && bv.is_number()) {
-                double ad = av.as_number(), bd = bv.as_number();
-                cmp = (ad < bd) ? -1 : (ad > bd ? 1 : 0);
-            } else if (av.is_string() && bv.is_string()) {
-                cmp = av.as_string().compare(bv.as_string());
-            } else {
-                cmp = av.serialize(0).compare(bv.serialize(0));
-            }
+            const int cmp = cmp_val_(a[i], b[i]);
             if (cmp == 0)
                 continue;
             return sort_descending_[i] ? cmp > 0 : cmp < 0;
@@ -6793,14 +6848,17 @@ private:
     // configured (column, direction) tuple list - i.e. equal on every
     // sort column. This is the equality predicate RANK / DENSE_RANK
     // need; ROW_NUMBER ignores it and breaks ties by arrival order.
-    bool tied_(const Row& a, const Row& b) const { return !better_(a, b) && !better_(b, a); }
+    bool tied_(const std::vector<clink::config::JsonValue>& a,
+               const std::vector<clink::config::JsonValue>& b) const {
+        return !better_(a, b) && !better_(b, a);
+    }
 
     // Given a partition buffer sorted best-first, return the index of
     // the first row whose rank exceeds count_ (the cut point). Rows
     // before the cut stay in the top-N; rows from the cut onward are
     // out. Ranks are monotonic non-decreasing down the buffer, so a
     // single cut point exists.
-    std::size_t compute_cut_(const std::vector<Row>& part) const {
+    std::size_t compute_cut_(const std::vector<StoredRow>& part) const {
         // ROW_NUMBER ranks by position, so its cut is the count itself and no
         // comparison is needed to find it. Only RANK / DENSE_RANK have to locate
         // tie-group boundaries, and each boundary test is two better_ calls -
@@ -6813,7 +6871,7 @@ private:
         std::size_t group_start = 0;
         std::int64_t group_idx = 0;
         for (std::size_t i = 0; i < part.size(); ++i) {
-            if (i > 0 && !tied_(part[i], part[i - 1])) {
+            if (i > 0 && !tied_(part[i].sort_vals, part[i - 1].sort_vals)) {
                 group_start = i;
                 ++group_idx;
             }
@@ -6840,14 +6898,16 @@ private:
             return;
         auto key = partition_key_(row);
         auto& part = state_[key];
+        auto in_vals = sort_vals_of_(row);
         // Insertion position = number of strictly-better rows. The new
         // row sorts ahead of any existing rows it ties with; that
         // arrival-order tiebreak is irrelevant for RANK / DENSE_RANK,
         // which treat a tie group as a unit.
         std::size_t pos = 0;
-        while (pos < part.size() && better_(part[pos], row))
+        while (pos < part.size() && better_(part[pos].sort_vals, in_vals))
             ++pos;
-        part.insert(part.begin() + static_cast<std::ptrdiff_t>(pos), row);
+        part.insert(part.begin() + static_cast<std::ptrdiff_t>(pos),
+                    StoredRow{encode_row_(row), std::move(in_vals)});
         const std::size_t cut = compute_cut_(part);
         // Rows from the cut onward are no longer in the top-N. Existing
         // rows there were previously emitted as inserts and must be
@@ -6862,7 +6922,7 @@ private:
         for (std::size_t i = cut; i < part.size(); ++i) {
             if (i == pos)
                 continue;
-            Row evicted = part[i];
+            Row evicted = decode_row_(part[i].encoded);
             set_row_kind(evicted, kRowKindDelete);
             emit_batch.push(Record<Row>{std::move(evicted)});
         }
@@ -6883,7 +6943,13 @@ private:
     std::vector<bool> sort_descending_;
     std::int64_t count_;
     OverRankKind rank_kind_;
-    clink::FlatMap<std::string, std::vector<Row>> state_;
+    // NOT DURABLE: nothing here snapshots or hydrates, so a restore brings this
+    // operator back with no retained rows - the same silent-loss-on-failover class
+    // WindowRowOp and SessionWindowRowOp had until 2026-07-28. Pre-existing, found
+    // while rebuilding the representation, and deliberately not bundled into that
+    // change; it needs the flush-and-hydrate pattern the other two now share, plus
+    // its own restore tests.
+    clink::FlatMap<std::string, std::vector<StoredRow>> state_;
 };
 
 // UNION ALL. Single-input identity map; the OperatorSpec

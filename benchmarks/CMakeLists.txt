@@ -102,6 +102,10 @@ if(TARGET clink::embed)
     add_executable(clink_window_state_bench clink_window_state_bench.cpp)
     target_link_libraries(clink_window_state_bench PRIVATE clink::embed clink::sql)
     clink_set_warnings(clink_window_state_bench)
+
+    add_executable(clink_topn_state_bench clink_topn_state_bench.cpp)
+    target_link_libraries(clink_topn_state_bench PRIVATE clink::embed clink::sql)
+    clink_set_warnings(clink_topn_state_bench)
 endif()
 
 # Keyed-shuffle split cost in isolation. The `hash` partitioner was 19.3% of all worker
