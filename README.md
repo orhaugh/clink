@@ -143,7 +143,9 @@ aggregate. From here:
   MATCH_RECOGNIZE, a custom stateful operator, state-as-data, replay and a
   cluster run over one market-data tape, all against the pinned release:
   [market-pulse](https://github.com/orhaugh/market-pulse);
-- a local distributed cluster with the dashboard:
+- a local distributed cluster with the HTTP API (add the
+  [clink-fe](https://github.com/orhaugh/clink-fe) console via
+  `--http-static-dir` for the full UI):
   `docker build -t clink-build:latest -f docker/Dockerfile .` then
   `docker compose up --build`, and open <http://localhost:8081>
   (see [docker-compose.yml](docker-compose.yml)).
@@ -220,7 +222,7 @@ correctness caveat, the caveat is stated in the row.
 | Autoscaler                 | load-driven rescale trigger (`autoscaler.hpp`)      |
 | TLS / mTLS transport       | `clink_node --tls-cert` / `--tls-ca` (and `--tls-client-*` for mTLS) install custom accept/connect factories on coordinator and worker |
 | etcd HA coordinator        | leader election via etcd v3 (optional, `CLINK_WITH_ETCD`). Job persistence is filesystem-backed (`--ha-dir`) regardless of the election backend |
-| HTTP / JSON API + dashboard| `CLINK_BUILD_HTTP` (on by default): `clink_node` serves `/api/v1/jobs`, `/api/v1/jobs/:id`, `/api/v1/cluster`, `/metrics` (Prometheus), an SSE event stream, and an embedded SPA at `/`. Off unless `--http-port` is set (default 0 = disabled) |
+| HTTP / JSON API + console  | `CLINK_BUILD_HTTP` (on by default): `clink_node` serves `/api/v1/jobs`, `/api/v1/jobs/:id`, `/api/v1/cluster`, `/metrics` (Prometheus), and an SSE event stream. Off unless `--http-port` is set (default 0 = disabled). `--http-static-dir=<dir>` additionally serves a built console (the [clink-fe](https://github.com/orhaugh/clink-fe) ops console's `dist/`, or any SPA bundle) same-origin at `/`; without it `/` answers with a JSON signpost |
 
 ### Connectors
 
@@ -1279,7 +1281,7 @@ include/clink/
     config/          # configuration types (incl. exact decimal)
     connectors/      # built-in sources/sinks (file, parquet, text, 2PC)
     core/            # types, records, batches, stream elements, Arrow batcher
-    http/            # HTTP server + JSON API + dashboard assets
+    http/            # HTTP server + JSON API + same-origin console serving
     job/             # job registration and lifecycle (CLINK_REGISTER_JOB)
     metrics/         # registry, counter, gauge, otel boundary
     operators/       # source/map/filter/key_by/window/reduce/sink, UDF registries

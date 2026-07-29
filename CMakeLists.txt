@@ -430,16 +430,6 @@ if(CLINK_BUILD_HTTP)
         src/http/http_client.cpp
         src/lineage/openlineage_exporter.cpp
     )
-    # Embed the dashboard SPA. configure_file runs at configure time, so
-    # re-run `cmake -S . -B build` after editing dashboard.html to
-    # refresh the generated header. (For routine iteration on the SPA
-    # the dev path is usually to mount static/dashboard.html via a
-    # local web server instead.)
-    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/static/dashboard.html" DASHBOARD_HTML_CONTENT)
-    configure_file(
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/clink/http/dashboard_assets.hpp.in"
-        "${CMAKE_CURRENT_BINARY_DIR}/include/clink/http/dashboard_assets.hpp"
-        @ONLY)
 endif()
 add_library(clink::core ALIAS clink_core)
 set_target_properties(clink_core PROPERTIES EXPORT_NAME core)

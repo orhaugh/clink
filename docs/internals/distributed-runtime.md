@@ -228,7 +228,7 @@ The same `.so` is therefore dlopen'd on every process that touches the job: the 
 The default posture is loopback + plain TCP + no auth - correct for a trusted single host, unsafe on a shared or public network. The baseline that makes a cluster safe to expose:
 
 - **Frame caps.** Every wire frame is length-prefixed by an attacker-controllable `u32`. The readers cap it at `kMaxFrameBytes` (256 MiB, `network/wire.hpp`) and drop the connection on anything larger, closing the memory-amplification DoS where a peer that claims 4 GiB makes the reader allocate 4 GiB and OOM the process. Always on.
-- **Token auth on the HTTP control plane.** Set `CLINK_AUTH_TOKEN` on the node (`clink_node` reads it for both the coordinator and worker HTTP servers) and every request must carry `Authorization: Bearer <token>` or gets 401 before its handler runs - the dashboard, the `/api/v1` routes, and SQL submission over HTTP (`POST /api/v1/jobs/spec`). Clients present it automatically from the same env var (`clink run` / the SQL submitter and the queryable-state reader call `HttpClient::set_bearer_token`). Unset leaves auth off (backward compatible). The token rides an env var, not a flag, so it does not leak in `ps`; a CORS preflight (`OPTIONS`) is allowed through so a browser can present credentials on the real request.
+- **Token auth on the HTTP control plane.** Set `CLINK_AUTH_TOKEN` on the node (`clink_node` reads it for both the coordinator and worker HTTP servers) and every request must carry `Authorization: Bearer <token>` or gets 401 before its handler runs - the console, the `/api/v1` routes, and SQL submission over HTTP (`POST /api/v1/jobs/spec`). Clients present it automatically from the same env var (`clink run` / the SQL submitter and the queryable-state reader call `HttpClient::set_bearer_token`). Unset leaves auth off (backward compatible). The token rides an env var, not a flag, so it does not leak in `ps`; a CORS preflight (`OPTIONS`) is allowed through so a browser can present credentials on the real request.
 - **Control-plane TLS/mTLS.** The coordinator/worker control connections run through injectable accept/connect factories; a TLS factory (build-gated, `clink::tls`) encrypts and can mutually authenticate the control plane. Pair it with `bind_host=0.0.0.0` for multi-host.
 - **Secret indirection (`env://`).** A connector option may reference a secret as `env://VAR` instead of embedding it, so a job spec or persisted catalog stores a reference, not a plaintext password or key. `BuildContext::param_or` resolves it from the environment at deploy time; an unset variable yields empty (a clear failure, never a leak). `password='env://PGPASSWORD'` is the shape.
 
@@ -281,6 +281,22 @@ Per-job `CheckpointConfig` (`protocol.hpp`): `checkpoint_dir` (empty disables ch
 `clink_node` (`tools/clink_node.cpp`) flags: `--role={coordinator|worker}`, `--id` (worker), `--coordinator-host`/`--coordinator-port`, `--ha-dir`, `--etcd-endpoints`/`--etcd-cluster`/`--etcd-lease-ttl-s`, `--http-port`, `--slots`, `--sql-catalog-dir` (coordinator, see below), and TLS flags. The etcd path additionally requires building with the etcd impl (`CLINK_WITH_ETCD`, linked as `clink_etcd`).
 
 ### SQL over HTTP
+
+**Serving a console same-origin.** The coordinator's HTTP server carries no
+embedded UI (the ops console lives in its own repository,
+[clink-fe](https://github.com/orhaugh/clink-fe)); `clink_node
+--http-static-dir=<dir>` mounts a built console bundle at `/` beside the
+JSON API, so one port serves both and the console needs no CORS setup and
+no separate web server. Serving rules (`include/clink/http/static_files.hpp`,
+unit-tested): files resolve under a canonicalised root with content types by
+extension; an extensionless miss falls back to `index.html` (browser-history
+deep links land on the SPA router); a missed asset with an extension is a
+real 404; anything escaping the root - `..` segments, symlinks pointing out -
+is refused. The catch-all registers after every API route, and handlers
+match in registration order, so it can never shadow `/api/v1` or `/metrics`.
+Without the flag, `/` answers with a JSON signpost to the API. Wildcard
+routes are a first-class `HttpServer` feature now: a trailing `*` in a route
+pattern matches any tail and surfaces it as `path_params["*"]`.
 
 When the coordinator is built with the SQL frontend linked (`CLINK_LINKED_SQL`, the default), three HTTP endpoints let a client compile and run SQL without the `clink_submit_sql` CLI:
 

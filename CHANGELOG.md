@@ -30,6 +30,18 @@ Scope is the dependency-free impl set (SQL, file/Parquet, RocksDB state,
 HTTP, TLS, WebSocket, Avro, vector search; no object stores, no broker
 connectors). A source build keeps everything.
 
+**The embedded dashboard SPA is gone; the coordinator serves the real
+console instead.** The hand-rolled page compiled into `clink_node` predated
+the [clink-fe](https://github.com/orhaugh/clink-fe) ops console and is
+removed. In its place, `clink_node --http-static-dir=<dir>` serves any built
+console bundle (clink-fe's `dist/`) same-origin at `/` beside the JSON API -
+one port, no CORS setup, no separate web server - with SPA deep-link
+fallback, extension-derived content types, and a traversal-guarded,
+unit-tested resolver; without the flag, `/` answers with a JSON signpost.
+The REST API is untouched. Wildcard HTTP routes (`/foo/*` ->
+`path_params["*"]`), documented since the server's first version, are now
+actually implemented.
+
 **Crash fix for lean builds.** v0.3.0's vector_search impl registered its
 Row-channel operator without registering the Row type, which took the
 embedded CLI down at startup ("In not registered") in any build without the

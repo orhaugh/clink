@@ -70,6 +70,12 @@ HttpRequest build_request(const httplib::Request& req) {
         // path_params.at(":id").
         r.path_params.emplace(k, v);
     }
+    // Wildcard routes ("/foo/*", see HttpServer::get) register as a regex
+    // whose single capture group is the tail; surface it under the
+    // documented "*" key. matches[0] is the whole path.
+    if (req.matches.size() >= 2) {
+        r.path_params.emplace("*", req.matches[1].str());
+    }
     // Multipart form data: cpp-httplib parses each part into name +
     // filename + content + content_type. We flatten into a simple map;
     // duplicate part names get the last one (uncommon for our routes
@@ -141,6 +147,19 @@ HttpServer::~HttpServer() {
 }
 
 void HttpServer::get(const std::string& path, Handler handler) {
+    // The header's documented wildcard: a trailing "*" matches any tail,
+    // surfaced as path_params["*"]. cpp-httplib has no native wildcard -
+    // ":name" segments cannot span slashes - so the route registers as a
+    // regex with the tail as its capture group (build_request maps the
+    // first capture to "*"). Everything before the "*" is used verbatim,
+    // so wildcard route prefixes must be plain paths. Handlers match in
+    // registration order, so a catch-all registered last cannot shadow
+    // earlier routes.
+    if (!path.empty() && path.back() == '*') {
+        impl_->server.Get(path.substr(0, path.size() - 1) + "(.*)",
+                          Impl::adapt(std::move(handler)));
+        return;
+    }
     impl_->server.Get(path, Impl::adapt(std::move(handler)));
 }
 

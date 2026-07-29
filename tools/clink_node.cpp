@@ -66,10 +66,10 @@
 #include "clink/core/allocator_info.hpp"
 #include "clink/core/record.hpp"
 #include "clink/core/types.hpp"  // operator_id_from_uid
-#include "clink/http/dashboard_assets.hpp"
 #include "clink/http/http_client.hpp"
 #include "clink/http/http_server.hpp"
 #include "clink/http/json_writer.hpp"
+#include "clink/http/static_files.hpp"
 #include "clink/metrics/checkpoint_metrics.hpp"
 #include "clink/metrics/process_metrics.hpp"
 #include "clink/metrics/prometheus.hpp"
@@ -2429,29 +2429,61 @@ int run_coordinator(int argc, char** argv) {
             return make_log_components_response();
         });
 
-        // Embedded SPA. Both `/` and `/dashboard` serve the same page
-        // so curl-friendly paths (`curl host/`) and -muscle-memory
-        // paths (`/dashboard`) both work. worker HTTP servers don't mount
-        // this - the coordinator is the single human-facing entry point;
-        // individual worker data is reachable through /api/v1/workers/:id/*
-        // proxies.
-        auto dashboard_handler = [](const clink::http::HttpRequest&) {
-            clink::metrics::http::request_seen();
-            clink::http::HttpResponse resp;
-            resp.body = clink::http::kDashboardHtml;
-            resp.content_type = "text/html; charset=utf-8";
-            return resp;
-        };
-        http_srv->get("/", dashboard_handler);
-        http_srv->get("/dashboard", dashboard_handler);
-
-        // Server-Sent Events stream - the dashboard's live wake-up signal.
+        // Server-Sent Events stream - the console's live wake-up signal.
         // Federated /api/v1/workers/:id/events is deliberately NOT wired:
         // proxying a chunked stream through HttpClient::Get is non-
         // trivial (httplib's blocking response API doesn't surface the
         // body in pieces). For HTTP-5 the coordinator stream is the canonical
-        // feed; per-worker SSE comes in HTTP-6 if the dashboard needs it.
+        // feed; per-worker SSE comes in HTTP-6 if the console needs it.
         http_srv->sse("/api/v1/events", make_event_bus_sse_factory());
+
+        // The human-facing UI. The embedded dashboard SPA is gone - the ops
+        // console lives in its own repository (clink-fe) - and the
+        // coordinator instead offers same-origin serving of any built
+        // console via --http-static-dir: one port carries both the JSON API
+        // and the UI, so the console needs no CORS setup and no separate web
+        // server. Registered LAST on purpose: cpp-httplib matches handlers
+        // in registration order, so the catch-all can never shadow an
+        // /api/v1 or /metrics route. Worker HTTP servers don't mount this -
+        // the coordinator is the single human-facing entry point.
+        const std::string http_static_dir = get_arg(argc, argv, "http-static-dir", "");
+        if (!http_static_dir.empty()) {
+            std::error_code static_ec;
+            const auto static_root = std::filesystem::weakly_canonical(
+                std::filesystem::path{http_static_dir}, static_ec);
+            if (static_ec || !std::filesystem::is_directory(static_root)) {
+                std::cerr << "clink_node: --http-static-dir=" << http_static_dir
+                          << " is not a readable directory\n";
+                return 1;
+            }
+            if (!std::filesystem::is_regular_file(static_root / "index.html")) {
+                std::cerr << "clink_node: --http-static-dir=" << http_static_dir
+                          << " has no index.html (expected a built console bundle, e.g. "
+                             "clink-fe's dist/)\n";
+                return 1;
+            }
+            auto static_handler = [static_root](const clink::http::HttpRequest& req) {
+                clink::metrics::http::request_seen();
+                const auto it = req.path_params.find("*");
+                return clink::http::serve_static_file(
+                    static_root, it == req.path_params.end() ? std::string{} : it->second);
+            };
+            http_srv->get("/", static_handler);
+            http_srv->get("/*", static_handler);
+            std::cout << "coordinator serving console from " << static_root.string() << "\n";
+        } else {
+            // No console mounted: `/` answers with a signpost rather than a
+            // 404, so `curl host:8081/` tells a human where everything is.
+            http_srv->get("/", [](const clink::http::HttpRequest&) {
+                clink::metrics::http::request_seen();
+                clink::http::HttpResponse resp;
+                resp.body = R"json({"service":"clink coordinator","api":"/api/v1",)json"
+                            R"json("metrics":"/metrics","console":"serve a built console )json"
+                            R"json(same-origin with --http-static-dir=<dir>; )json"
+                            R"json(see https://github.com/orhaugh/clink-fe"})json";
+                return resp;
+            });
+        }
 
         const auto http_bound = http_srv->start(http_bind, http_port);
         std::cout << "coordinator HTTP on " << http_bind << ":" << http_bound << "\n";
@@ -2908,6 +2940,10 @@ int main(int argc, char** argv) {
                 << "  --http-cors-origin=<origin>  Send CORS headers for this origin "
                    "(e.g. '*' or http://host:5181) so a standalone console can call the\n"
                    "                               API cross-origin. Unset = same-origin only.\n"
+                << "  --http-static-dir=<dir>      Serve a built console bundle (e.g. clink-fe's "
+                   "dist/) same-origin at '/', beside the JSON API. Coordinator only;\n"
+                   "                               SPA deep links fall back to index.html. Unset "
+                   "= '/' answers with a JSON signpost.\n"
                 << "  --metrics-disk-path=<path>   Report disk usage for this filesystem as the "
                    "'checkpoint' volume in /metrics (coordinator defaults to --ha-dir).\n"
                 << "\n"

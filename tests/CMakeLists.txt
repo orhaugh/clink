@@ -66,6 +66,7 @@ add_executable(clink_core_tests
     test_io_uring_completion_executor.cpp
     test_http_pool_io_uring.cpp
     test_http_auth.cpp
+    test_http_static_files.cpp
     test_pid_controller.cpp
     test_rescale_coordinator.cpp
     test_rescale_dispatch.cpp
