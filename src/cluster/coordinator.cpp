@@ -2368,33 +2368,44 @@ void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
             // restart_drain_timeout, the watchdog fails the job rather than
             // wedge (e.g. a survivor that hangs without acking the cancel).
             job->restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
-            // Redeploy set on worker loss = lost-worker subtasks (restart_pending, from
-            // it->second) plus surviving in-flight subtasks to drain
-            // (restart_drain_expected, below). Both halves draw ONLY from
-            // pending_per_worker, so a subtask that finished cleanly on a survivor
-            // is in NEITHER set and is not redeployed. This is the one
-            // deliberate difference from the subtask-error / EOS-timeout restart
-            // path in handle_subtask_finished_, which redeploys the FULL
-            // topology (tasks_by_worker) including already-finished peers. The
-            // narrower set here is safe, not accidental: peers[] point
-            // downstream, and in a bounded job a downstream reaches clean EOS
-            // only after every upstream has finished and forwarded EOS, so no
-            // still-pending subtask holds a peer reference to a cleanly-finished
-            // one. That no-loss property assumes forward-only network edges; a
-            // future back-edge topology (a downstream peer pointing upstream)
-            // would break it, at which point this set should be built like the
-            // error path's (tasks_by_worker minus in-flight).
-            for (const auto& [role, sub] : it->second) {
-                job->restart_pending.emplace_back(role, sub);
-            }
+            // Redeploy set on worker loss = the FULL topology rolled back to
+            // the last checkpoint: drain every surviving in-flight subtask
+            // (restart_drain_expected) and redeploy every subtask that is not
+            // draining (restart_pending = tasks_by_worker minus in-flight,
+            // which covers the lost worker's tasks AND cleanly-finished
+            // survivors). This mirrors the subtask-error / EOS-timeout path in
+            // handle_subtask_finished_.
+            //
+            // A narrower set - relocating only the lost worker's tasks and
+            // leaving survivors running - is safe ONLY at EOS: a still-running
+            // upstream survivor keeps a live downstream bridge to a peer on the
+            // lost worker, and when that peer is relocated the bridge send fails
+            // ("network_bridge_sink: peer gone"). That failure is itself a
+            // subtask error, which escalated to a fresh whole-job restart and,
+            // over a few hundred milliseconds, burned the entire restart budget
+            // - a mid-stream worker kill cascaded to job failure. Rolling the
+            // whole job back atomically leaves no survivor holding a stale
+            // bridge, so the redeploy converges in one attempt.
+            std::unordered_set<std::string> in_flight;
             for (const auto& [other_worker_id, pending] : job->pending_per_worker) {
-                if (other_worker_id == worker.worker_id)
+                if (other_worker_id == worker.worker_id) {
                     continue;
+                }
                 auto other_it = registered_.find(other_worker_id);
-                if (other_it == registered_.end() || other_it->second->lost)
+                if (other_it == registered_.end() || other_it->second->lost) {
                     continue;
+                }
                 for (const auto& [role, sub] : pending) {
-                    job->restart_drain_expected.insert(role + ":" + std::to_string(sub));
+                    in_flight.insert(role + ":" + std::to_string(sub));
+                }
+            }
+            job->restart_drain_expected = in_flight;
+            for (const auto& [other_worker_id, dts] : job->tasks_by_worker) {
+                for (const auto& dt : dts) {
+                    const std::string k = dt.role + ":" + std::to_string(dt.subtask_idx);
+                    if (in_flight.count(k) == 0) {
+                        job->restart_pending.emplace_back(dt.role, dt.subtask_idx);
+                    }
                 }
             }
             log::warn("coordinator.watchdog",
