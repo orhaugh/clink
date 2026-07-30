@@ -927,11 +927,15 @@ TEST(TestFramework, TestClusterRoutesCepTimedOutSideOutputThroughChainedMap) {
                            [](const cep::PatternMatch<std::int64_t>& m) -> std::int64_t {
                                return m.at("a").front() + 100;
                            });
-    matches.map<std::int64_t>([](const std::int64_t& v) { return v * 10; })
-        .sink(api::FileInt64Sink::builder().path(main_path.string()).build());
+    // The SIDE consumer is declared FIRST - the ordering that bit in
+    // production: the planner's chain-extension walk matched consumers by
+    // upstream id alone, ignoring the side tag, so the first-declared
+    // side consumer was fused into the chain and received the MAIN stream.
     matches.side_output<std::int64_t>(expired)
         .map<std::int64_t>([](const std::int64_t& v) { return v * 10; })
         .sink(api::FileInt64Sink::builder().path(expired_path.string()).build());
+    matches.map<std::int64_t>([](const std::int64_t& v) { return v * 10; })
+        .sink(api::FileInt64Sink::builder().path(main_path.string()).build());
 
     test::TestCluster mini({.workers = 2, .slots_per_worker = 8});
     mini.execute(env.graph());

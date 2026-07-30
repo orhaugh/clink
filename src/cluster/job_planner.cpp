@@ -711,11 +711,19 @@ JobPlan plan_job(const JobGraphSpec& graph,
         if (main_consumer_count[op.id] != 1) {
             continue;
         }
-        // Find the unique consumer.
+        // Find the unique MAIN consumer. A side-output consumer (an input
+        // ref of the form "id::tag") reads a DIFFERENT stream and must
+        // never be fused as the chain's next op: matching by id alone used
+        // to fuse the first-declared side consumer, which then received
+        // the producer's main output in-chain while the real main consumer
+        // starved and the tag's records were dropped (found by
+        // card-sentry's OTP detector, whose side sink was declared before
+        // its main sink).
         const OperatorSpec* consumer = nullptr;
         for (const auto& dop : graph.ops) {
             for (const auto& raw : dop.inputs) {
-                if (parse_input_ref(raw).id == op.id) {
+                const auto ref = parse_input_ref(raw);
+                if (ref.id == op.id && ref.side_tag.empty()) {
                     consumer = &dop;
                     break;
                 }
@@ -730,7 +738,11 @@ JobPlan plan_job(const JobGraphSpec& graph,
         if (!is_operator_kind(*consumer)) {
             continue;
         }
-        if (consumer->inputs.size() != 1 || parse_input_ref(consumer->inputs.front()).id != op.id) {
+        if (consumer->inputs.size() != 1) {
+            continue;
+        }
+        const auto chain_in_ref = parse_input_ref(consumer->inputs.front());
+        if (chain_in_ref.id != op.id || !chain_in_ref.side_tag.empty()) {
             continue;
         }
         if (consumer->parallelism != op.parallelism) {
