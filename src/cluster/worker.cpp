@@ -1027,6 +1027,11 @@ void Worker::run_generic_subtask_(JobId job_id,
     const RunnerRegistry* job_rr = nullptr;
     const OperatorRegistry* job_or = nullptr;
     const DagBuilderRegistry* job_dbr = nullptr;
+    // Side-output attachers for plugin types live in the bundle's registry
+    // (populated through the host PluginRegistry the plugin registered
+    // into); the .so's own default-instance singleton is a DIFFERENT copy
+    // under RTLD_LOCAL, so the process-wide default only covers built-ins.
+    const SideOutputAttacherRegistry* job_soar = &SideOutputAttacherRegistry::default_instance();
     // Per-subtask state-backend URI (decoupled from checkpoint_dir). Empty
     // keeps the legacy behaviour where checkpoint_dir is the backend URI.
     std::string state_backend_uri;
@@ -1041,6 +1046,7 @@ void Worker::run_generic_subtask_(JobId job_id,
             job_rr = &it->second->runner_registry();
             job_or = &it->second->operator_registry();
             job_dbr = &it->second->dag_builder_registry();
+            job_soar = &it->second->side_output_attacher_registry();
         }
         if (auto ck = per_job_checkpoint_.find(job_id); ck != per_job_checkpoint_.end()) {
             state_backend_uri = ck->second.state_backend_uri;
@@ -1702,8 +1708,10 @@ void Worker::run_generic_subtask_(JobId job_id,
                 throw std::runtime_error("generic subtask: side output tag '" + g.side_output_tag +
                                          "' not declared by any chain op");
             }
-            const auto* attach =
-                SideOutputAttacherRegistry::default_instance().find(g.channel_type);
+            // The bundle-scoped registry (parent-falls-through to the
+            // default for built-ins) - a plugin type's attacher only
+            // exists there, never in the process-wide default.
+            const auto* attach = job_soar->find(g.channel_type);
             if (attach == nullptr) {
                 throw std::runtime_error("generic subtask: no side-output attacher for channel '" +
                                          g.channel_type + "' (tag '" + g.side_output_tag + "')");
