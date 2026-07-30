@@ -26,6 +26,13 @@
 //     than (wm - within). When a `timed_out_tag` + selector are set,
 //     each pruned partial is emitted as a side output via the tag
 //     before being dropped.
+//   * within() also binds at match time: a record whose event time is
+//     past (partial start_ts + within) expires that partial before any
+//     predicate sees the record, so a late completing event arriving
+//     between watermarks can never produce a match whose event-time
+//     span exceeds within(). Expired partials route exactly as
+//     watermark pruning routes them (trailing-negative success on the
+//     main output, otherwise the timed-out side output).
 //
 // Non-keyed CEP routes through a sentinel key 0 - the non-keyed
 // fluent helper wires a constant int64-extractor. Either path uses
@@ -544,6 +551,11 @@ private:
         std::vector<detail::PartialMatch<T>> next_partials;
         next_partials.reserve(partials.size() + 1);
         const auto& strategy = pattern_.skip_strategy();
+        const auto rec_ts = rec.event_time();
+        std::optional<std::int64_t> within_ms;
+        if (const auto w = pattern_.within_duration(); w.has_value()) {
+            within_ms = w->count();
+        }
         // For skip strategies that suppress sibling partials within
         // the SAME dispatch cycle (SkipPastLastEvent, SkipToNext,
         // SkipToFirst/Last), we apply the strategy after EACH
@@ -570,6 +582,24 @@ private:
 
         for (std::size_t i = 0; i < partials.size(); ++i) {
             auto& p = partials[i];
+            // within() bounds the MATCH's event-time span, so it must hold
+            // at match time, not only at watermark-pruning time: a record
+            // whose event time is already past (start_ts + within) can
+            // never legally extend this partial, however far the watermark
+            // lags. Expire the partial exactly as watermark pruning would
+            // - a pending trailing negative completes as a success stamped
+            // at its deadline, anything else goes to the timed-out side
+            // output when configured - and never let the record touch it.
+            if (within_ms.has_value() && rec_ts.has_value() && !p.matched.empty() &&
+                rec_ts->millis() - p.start_ts > *within_ms) {
+                if (is_pending_trailing_negative_(p)) {
+                    emit_match_(
+                        p, batch_out, std::optional<EventTime>{EventTime{p.start_ts + *within_ms}});
+                } else if (timed_out_emit_) {
+                    timed_out_emit_(this->runtime(), build_match_view_(p));
+                }
+                continue;
+            }
             switch (advance_one_(p, rec, batch_out)) {
                 case StepOutcome::Keep:
                 case StepOutcome::Advanced:

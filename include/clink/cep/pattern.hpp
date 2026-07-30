@@ -297,7 +297,10 @@ public:
 
     // Bound on event-time span between the first matched event and
     // the last. A partial match whose start_event_time is older than
-    // (current_watermark - within) is evicted on watermark advance.
+    // (current_watermark - within) is evicted on watermark advance,
+    // and the bound equally holds at match time: a record whose event
+    // time is past (start + within) expires the partial instead of
+    // extending it, however far the watermark lags behind.
     // Optional - without within(), partials live indefinitely.
     Pattern<T>& within(std::chrono::milliseconds w) {
         within_ = w;

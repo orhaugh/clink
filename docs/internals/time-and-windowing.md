@@ -136,7 +136,7 @@ Quantifiers apply to a step after `.where(...)`: `.times(n)`, `.times(min,max)`,
 
 #### The matcher
 
-`CepOperator<T,U>` is an NFA-style matcher. Partial matches are stored per key in `KeyedState<int64_t, vector<PartialMatch<T>>>` under slot `"__cep_partials__"` (one row per user key, keeping routing-by-key correct under parallelism). A `PartialMatch<T>` tracks the captured events, a parallel list of which step captured each event, per-event timestamps, the current step index, and the capture count within the current step (for quantifiers).
+`CepOperator<T,U>` is an NFA-style matcher. Partial matches are stored per key in `KeyedState<int64_t, vector<PartialMatch<T>>>` under slot `"__cep_partials__"` (one row per user key, keeping routing-by-key correct under parallelism). A `PartialMatch<T>` tracks the captured events, a parallel list of which step captured each event, per-event timestamps, the current step index, and the capture count within the current step (for quantifiers). The matcher consumes events in ARRIVAL order - it does not buffer and re-sort by event time (event time governs `within` bounds and watermark eviction, not step sequencing). A stream whose arrival order can invert the steps of a pattern - out-of-orderness comparable to the event-time gap between consecutive pattern steps - needs a reordering stage upstream of the operator, or pattern gaps wider than the arrival skew.
 
 ```mermaid
 flowchart TD
@@ -150,7 +150,7 @@ flowchart TD
 
 `advance_one_` walks steps from the partial's current step, evaluating the predicate (iterative predicates receive a `PatternMatch<T>` view of events captured so far). A positive match captures the event up to `max_count` and auto-advances when the count is met; a non-match either advances (if the quantifier minimum is met) or dies (strict `Next`) or waits (`FollowedBy`). Negative steps do not capture: a match kills the partial, a non-match advances past it. A trailing `NotFollowedBy` stays pending until its `within` window closes, at which point `prune_expired_` completes it as a success (emitted on the operator's main output with the watermark as event time) rather than timing it out.
 
-On watermark advance, `prune_expired_` evicts partials whose `start_ts` is older than `(watermark - within)`. When a timed-out side output is wired (`with_timed_out_output` / `with_timed_out_flat_output`), each pruned partial that is not a pending trailing-negative success is emitted on that tag before being dropped; otherwise it is silently dropped. `flush()` drops incomplete partials at end of stream.
+On watermark advance, `prune_expired_` evicts partials whose `start_ts` is older than `(watermark - within)`. When a timed-out side output is wired (`with_timed_out_output` / `with_timed_out_flat_output`), each pruned partial that is not a pending trailing-negative success is emitted on that tag before being dropped; otherwise it is silently dropped. The `within` bound equally holds at match time: `advance_for_key_` expires a partial - routing it exactly as pruning would (trailing-negative success on the main output, else the timed-out tag) - when an incoming record's event time is already past `(start_ts + within)`, so a record arriving between watermarks can never extend or complete a match whose event-time span would exceed `within`. `flush()` drops incomplete partials at end of stream.
 
 #### Entry points and SQL
 

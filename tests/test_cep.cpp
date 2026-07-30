@@ -547,6 +547,90 @@ TEST(CepV2, TimedOutTagReceivesExpiredPartials) {
     EXPECT_EQ(timed_out_sink->collected().front(), 11);
 }
 
+TEST(CepV2, WithinBindsMatchSpanBetweenWatermarks) {
+    // within() is a bound on the MATCH's event-time span, so it must hold
+    // even when no watermark has advanced between the partial's start and
+    // the completing event. Key 0's completion arrives 100ms after its
+    // start under within(50ms) - it must NOT match, watermark or no
+    // watermark. Key 1 completes at 40ms - inside the bound - and must.
+    Dag dag;
+    auto src = std::make_shared<VectorSource<Event>>(std::vector<Record<Event>>{
+        Record<Event>{Event{0, 1, 11}, EventTime{0}},
+        Record<Event>{Event{1, 1, 21}, EventTime{0}},
+        Record<Event>{Event{1, 3, 22}, EventTime{40}},
+        Record<Event>{Event{0, 3, 12}, EventTime{100}},
+    });
+    auto h_src = dag.add_source<Event>(src);
+
+    auto p = Pattern<Event>::begin("a")
+                 .where([](const Event& e) { return e.kind == 1; })
+                 .followed_by("b")
+                 .where([](const Event& e) { return e.kind == 3; })
+                 .within(50ms);
+
+    auto op = make_op<int>(
+        p,
+        [](const Event& e) -> std::int64_t { return e.key; },
+        [](const PatternMatch<Event>& m) -> int {
+            return m.at("a").front().payload + m.at("b").front().payload;
+        });
+    auto h_op = dag.add_operator<Event, int>(h_src, op);
+    auto sink = std::make_shared<CollectingSink<int>>();
+    dag.add_sink<int>(h_op, sink);
+
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    ASSERT_EQ(sink->collected().size(), 1u);
+    EXPECT_EQ(sink->collected().front(), 21 + 22);
+}
+
+TEST(CepV2, WithinExpiredPartialRoutesToTimedOutOnLateEvent) {
+    // The event that discovers a partial's expiry (rather than a watermark)
+    // must route the expired partial to the timed-out side output, exactly
+    // as watermark pruning would.
+    Dag dag;
+    auto src = std::make_shared<VectorSource<Event>>(std::vector<Record<Event>>{
+        Record<Event>{Event{0, 1, 11}, EventTime{0}},
+        Record<Event>{Event{0, 3, 12}, EventTime{100}},
+    });
+    auto h_src = dag.add_source<Event>(src);
+
+    auto p = Pattern<Event>::begin("a")
+                 .where([](const Event& e) { return e.kind == 1; })
+                 .followed_by("b")
+                 .where([](const Event& e) { return e.kind == 3; })
+                 .within(50ms);
+
+    auto op = make_op<int>(
+        p,
+        [](const Event& e) -> std::int64_t { return e.key; },
+        [](const PatternMatch<Event>&) -> int { return 0; });
+    OutputTag<int> timed_out_tag("timed_out");
+    op->template with_timed_out_output<int>(timed_out_tag, [](const PatternMatch<Event>& m) -> int {
+        auto it = m.find("a");
+        return it == m.end() || it->second.empty() ? 0 : it->second.front().payload;
+    });
+
+    auto h_op = dag.add_operator<Event, int>(h_src, op);
+    auto h_side = dag.template side_output<int>(h_op, timed_out_tag);
+    auto main_sink = std::make_shared<CollectingSink<int>>();
+    dag.add_sink<int>(h_op, main_sink);
+    auto timed_out_sink = std::make_shared<CollectingSink<int>>();
+    dag.add_sink<int>(h_side, timed_out_sink);
+
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    EXPECT_TRUE(main_sink->collected().empty());
+    ASSERT_EQ(timed_out_sink->collected().size(), 1u);
+    EXPECT_EQ(timed_out_sink->collected().front(), 11);
+}
+
 TEST(CepV2, LazyQuantifierAdvancesAtMinWhenNextStepCouldAlsoMatch) {
     // begin(start, kind=10) next(loop, kind=1).one_or_more().lazy()
     // followed_by(b, kind=1). The loop step matches kind=1 events;
