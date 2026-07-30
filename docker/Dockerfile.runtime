@@ -64,20 +64,32 @@ RUN if [ "${CLINK_WITH_JEMALLOC}" != "OFF" ]; then \
         && rm -rf /var/lib/apt/lists/*; \
     fi \
  && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCLINK_BUILD_SQL=ON \
+        -DCLINK_BUILD_TESTS=OFF \
         -DCLINK_WITH_FORST=${CLINK_WITH_FORST} \
         -DCLINK_WITH_JEMALLOC=${CLINK_WITH_JEMALLOC} \
         -DCLINK_ISA_BASELINE=${CLINK_ISA_BASELINE} \
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
-    && cmake --build build --target clink_node \
-    && cmake --build build --target clink \
-    && cmake --build build --target clink_k8s_smoke_job \
-    && cmake --build build --target clink_rescale_test_job \
+    # Build EVERYTHING (tests off): `cmake --install` below installs every
+    # tool the install rules cover, and a selective build leaves some of
+    # them missing (clink_submit_sql was the one that failed). The extra
+    # cost over the historic selective build is a handful of thin CLI
+    # binaries over the already-compiled core.
+    && cmake --build build \
     && cp build/clink_node /usr/local/bin/clink_node \
     && cp build/clink     /usr/local/bin/clink \
-    && strip /usr/local/bin/clink_node /usr/local/bin/clink \
+    && cp build/clink_submit_job /usr/local/bin/clink_submit_job \
+    && strip /usr/local/bin/clink_node /usr/local/bin/clink /usr/local/bin/clink_submit_job \
     && mkdir -p /opt/clink/jobs \
     && cp build/examples/k8s_smoke_job.so /opt/clink/jobs/k8s_smoke_job.so \
     && cp build/examples/rescale_test_job.so /opt/clink/jobs/rescale_test_job.so \
+    # Install the SDK (headers, static libs, CMake package) into /usr/local
+    # before dropping the build tree: a job plugin must be compiled on the
+    # WORKERS' platform against the SAME clink commit (the ABI gate compares
+    # git SHAs), and this image is the one place both are guaranteed. With
+    # the SDK baked in, `docker run --entrypoint cmake` against a mounted
+    # consumer checkout builds a submittable .so in seconds - no second
+    # toolchain image, no in-container engine rebuild.
+    && cmake --install build > /dev/null \
     && rm -rf build
 
 WORKDIR /var/lib/clink
