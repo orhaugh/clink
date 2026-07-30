@@ -121,8 +121,16 @@ struct TypeOps {
 
     // add_fused_sink_to_dag: terminates the dag by attaching the
     // typed sink to the chain tail's StageHandle<T> (wrapped in
-    // std::any).
-    std::function<void(clink::Dag&, std::any /*upstream*/, std::shared_ptr<void> /*sink*/)>
+    // std::any). `sink_uid` stamps the sink's stable identity before
+    // add_sink so a STATEFUL sink (e.g. a 2PC / committing sink) gets a
+    // unique, restart-stable OperatorId: without it, sibling sinks of the
+    // same type in same-shaped subtasks all position-hash to one id and
+    // collide on their per-operator state (and any external transaction id
+    // keyed on it). Empty leaves the legacy position-hash (stateless sinks).
+    std::function<void(clink::Dag&,
+                       std::any /*upstream*/,
+                       std::shared_ptr<void> /*sink*/,
+                       const std::string& /*sink_uid*/)>
         add_fused_sink_to_dag;
 
     // fused_source_commit_hooks: recover the typed Source<T> from the boxed
@@ -407,8 +415,17 @@ inline void TypeRegistry::register_typed(const std::string& name,
         auto typed = std::static_pointer_cast<clink::Source<T>>(std::move(source));
         return std::any{dag.template add_source<T>(std::move(typed))};
     };
-    ops.add_fused_sink_to_dag = [](clink::Dag& dag, std::any upstream, std::shared_ptr<void> sink) {
+    ops.add_fused_sink_to_dag = [](clink::Dag& dag,
+                                   std::any upstream,
+                                   std::shared_ptr<void> sink,
+                                   const std::string& sink_uid) {
         auto typed_sink = std::static_pointer_cast<clink::Sink<T>>(std::move(sink));
+        // Stamp identity before add_sink: derive_id_with_uid_ then hashes
+        // the uid into a stable, unique OperatorId instead of the
+        // position hash that collides across sibling sinks.
+        if (!sink_uid.empty()) {
+            typed_sink->set_uid(sink_uid);
+        }
         auto handle = std::any_cast<clink::StageHandle<T>>(std::move(upstream));
         dag.template add_sink<T>(handle, std::move(typed_sink));
     };

@@ -1671,7 +1671,15 @@ void Worker::run_generic_subtask_(JobId job_id,
                 per_job_committers_[job_id][task.subtask_idx].push_back(std::move(commit_cb));
                 per_job_aborters_[job_id][task.subtask_idx].push_back(std::move(abort_cb));
             }
-            out_ops->add_fused_sink_to_dag(dag, std::move(prev), std::move(boxed));
+            // Stamp the fused sink's stable identity: its uid if set, else
+            // its unique graph-local spec id. A stateful sink (2PC /
+            // committing) keys per-operator state and external transaction
+            // ids on its OperatorId, so a uid-less position hash would
+            // collide across sibling same-type sinks in same-shaped
+            // subtasks (observed: five postgres_2pc_sink instances sharing
+            // one PREPARE TRANSACTION gid).
+            const std::string fused_sink_uid = fk.uid.empty() ? fk.id : fk.uid;
+            out_ops->add_fused_sink_to_dag(dag, std::move(prev), std::move(boxed), fused_sink_uid);
         } else {
             if (!out_ops->attach_chain_main_outputs) {
                 throw std::runtime_error(
@@ -1861,11 +1869,17 @@ void Worker::run_generic_subtask_(JobId job_id,
             throw std::runtime_error("generic subtask: sink has no input bridges");
         }
         auto raw = fac->build(ctx);
+        // Same stable-identity stamp as the fused-sink path: a standalone
+        // stateful sink (its own subtask) must not position-hash to an id
+        // shared with sibling sinks. uid if set, else the unique spec id.
+        const std::string sink_uid = op.uid.empty() ? op.id : op.uid;
         if (op.in_channel == kChannelInt64) {
             auto sink = std::static_pointer_cast<Sink<std::int64_t>>(raw);
+            sink->set_uid(sink_uid);
             run_sink_dispatch<std::int64_t>(in_bridges, sink);
         } else if (op.in_channel == kChannelString) {
             auto sink = std::static_pointer_cast<Sink<std::string>>(raw);
+            sink->set_uid(sink_uid);
             run_sink_dispatch<std::string>(in_bridges, sink);
         } else {
             throw std::runtime_error("generic subtask: unsupported sink in_channel '" +
