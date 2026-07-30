@@ -65,6 +65,11 @@ inline clink::cluster::ReplayDriver make_replay_driver(
         }
         clink::MetricsRegistry metrics;
         clink::RuntimeContext ctx{clink::OperatorId{op_id}, spec.op_type, backend.get(), &metrics};
+        // A replayed operator may emit to side outputs (e.g. a CEP op's
+        // timed-out tag); no side channel is wired for a single-op replay,
+        // so discard those emits rather than throw. The main output is what
+        // --verify / --emit-test compare.
+        ctx.set_discard_unregistered_side_outputs(true);
         auto replay_now = std::make_shared<std::int64_t>(0);
         ctx.timer_service()->set_now_fn([replay_now] { return *replay_now; });
         op->attach_runtime(&ctx);

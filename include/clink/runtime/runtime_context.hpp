@@ -299,13 +299,26 @@ public:
     }
     const SideOutputChannelMap& side_output_channels() const noexcept { return side_outputs_; }
 
+    // Offline-replay mode: an operator replayed in isolation (clink replay)
+    // still calls side_output<T>(tag) from its process()/timer hooks, but no
+    // side channel is wired. Rather than throw, hand back a discarding
+    // Emitter - the replay compares the MAIN output; side emissions are out
+    // of scope for a single-operator epoch replay. Set by the ReplayDriver.
+    void set_discard_unregistered_side_outputs(bool v) noexcept {
+        discard_unregistered_side_outputs_ = v;
+    }
+
     // Look up the side output channel for `tag` and return a typed
     // Emitter<T> wrapping it. Throws if the tag wasn't registered on
-    // this operator's Dag stage.
+    // this operator's Dag stage (unless discard-unregistered mode is on,
+    // e.g. offline replay, where it returns a headless discarding Emitter).
     template <typename T>
     Emitter<T> side_output(const OutputTag<T>& tag) {
         auto it = side_outputs_.find(tag.id);
         if (it == side_outputs_.end()) {
+            if (discard_unregistered_side_outputs_) {
+                return Emitter<T>(static_cast<BoundedChannel<StreamElement<T>>*>(nullptr));
+            }
             throw std::runtime_error("RuntimeContext::side_output: tag '" + tag.id +
                                      "' was not registered via Dag::side_output() on this stage");
         }
@@ -443,6 +456,7 @@ private:
     std::size_t runner_subtask_idx_{0};
     TimerService timer_service_{};
     SideOutputChannelMap side_outputs_;
+    bool discard_unregistered_side_outputs_{false};
     CheckpointAckFn ack_fn_;
     RequestFinalCheckpointFn request_final_ckpt_;
     WaitFinalCommittedFn wait_final_committed_;
