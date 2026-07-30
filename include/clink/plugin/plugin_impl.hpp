@@ -408,6 +408,19 @@ void PluginRegistry::register_sink(
     clink::cluster::SubtaskRunner runner = [factory](const clink::cluster::RunnerContext& rctx) {
         auto sink = factory(detail::build_ctx_from(rctx));
         detail::apply_chain_identity(sink, rctx);
+        // A STATEFUL sink (2PC / committing) keys its per-checkpoint
+        // committable state and external transaction ids on its
+        // OperatorId. Without a uid, derive_id_with_uid_ position-hashes
+        // it, so sibling sinks of the same type in same-shaped subtasks
+        // collide - five postgres_2pc_sink instances sharing one PREPARE
+        // TRANSACTION gid. Fall back to the unique graph-local spec id
+        // (stable across restarts for a given graph) so each sink gets a
+        // distinct, restart-stable identity even when the author set no
+        // uid. Sinks are terminal, so this never affects routing; stateless
+        // sinks are unaffected by the id.
+        if (sink->uid().empty() && !rctx.chain.ops.empty() && !rctx.chain.ops[0].id.empty()) {
+            sink->set_uid(rctx.chain.ops[0].id);
+        }
         // 2PC support: route CommitCheckpoint -> sink->on_commit.
         // Non-2PC sinks have the default no-op so this is harmless.
         // Weak-capture the sink: the runner returns when the
