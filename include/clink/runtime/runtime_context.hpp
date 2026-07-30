@@ -38,9 +38,18 @@ class MetricsRegistry;
 // knowing T; RuntimeContext casts back to BoundedChannel<StreamElement<T>>*
 // at the typed accessor. The `close_fn` closes the typed channel from
 // type-erased context at end-of-stream, so downstream consumers drain.
+// `forward_barrier_fn` / `forward_watermark_fn` push a control element
+// onto the typed channel from type-erased context: a checkpoint barrier
+// (or watermark) must propagate on EVERY output edge, side outputs
+// included, or a side-output consumer never aligns/snapshots/acks the
+// checkpoint - which stalls the whole checkpoint (its pending-ack set
+// never empties). Captured at side_output_by_index<T> registration,
+// where T is known.
 struct SideOutputChannelEntry {
     std::shared_ptr<void> channel;   // shared_ptr<BoundedChannel<StreamElement<T>>>
     std::function<void()> close_fn;  // invokes channel->close()
+    std::function<void(const CheckpointBarrier&)> forward_barrier_fn;
+    std::function<void(const Watermark&)> forward_watermark_fn;
 };
 using SideOutputChannelMap = std::unordered_map<std::string, SideOutputChannelEntry>;
 

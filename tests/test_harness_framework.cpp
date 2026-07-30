@@ -828,6 +828,59 @@ TEST(TestFramework, TestClusterRoutesTypedSideOutputsLikeTheLocalPath) {
     std::filesystem::remove(odds_path);
 }
 
+TEST(TestFramework, CheckpointedBoundedJobWithSideOutputReachesEosFinalCheckpoint) {
+    // A checkpointed BOUNDED job whose operator has a side output must
+    // complete: the EOS final checkpoint only commits once EVERY subtask
+    // acks it, and a checkpoint barrier reaches a side-output consumer only
+    // if the operator forwards barriers onto its side channel. Before that
+    // fix the side-output sink never saw a barrier, never acked, and the
+    // source's EOS final checkpoint timed out - the whole bounded job hung.
+    const auto evens_path =
+        std::filesystem::temp_directory_path() / "clink_test_cluster_ckpt_side_evens.txt";
+    const auto odds_path =
+        std::filesystem::temp_directory_path() / "clink_test_cluster_ckpt_side_odds.txt";
+    const auto ckpt_dir = std::filesystem::temp_directory_path() / "clink_test_cluster_ckpt_side";
+    std::filesystem::remove(evens_path);
+    std::filesystem::remove(odds_path);
+    std::filesystem::remove_all(ckpt_dir);
+
+    auto env = api::Pipeline::create();
+    auto src = env.source<std::int64_t>(api::IntRangeSource::builder().count(6).start(1).build());
+    auto split = src.process<std::int64_t>(std::make_shared<ClusterSplitEvensOddsProcess>());
+    split.sink(api::FileInt64Sink::builder().path(evens_path.string()).build());
+    split.side_output<std::string>(ClusterSplitEvensOddsProcess::odd_tag())
+        .sink(api::FileTextSink::builder().path(odds_path.string()).build());
+
+    test::TestCluster::Options opts;
+    opts.workers = 2;
+    opts.slots_per_worker = 8;
+    opts.checkpoint.checkpoint_dir = ckpt_dir.string();
+    opts.checkpoint.interval_ms = 200;
+    test::TestCluster mini(opts);
+    // execute() throws on the EOS-final-checkpoint timeout, so reaching the
+    // assertions at all is the core of the regression.
+    mini.execute(env.graph(), std::chrono::seconds{45});
+
+    auto read_sorted = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty()) {
+                lines.push_back(line);
+            }
+        }
+        std::sort(lines.begin(), lines.end());
+        return lines;
+    };
+    EXPECT_EQ(read_sorted(evens_path), (std::vector<std::string>{"2", "4", "6"}));
+    EXPECT_EQ(read_sorted(odds_path), (std::vector<std::string>{"1", "3", "5"}));
+
+    std::filesystem::remove(evens_path);
+    std::filesystem::remove(odds_path);
+    std::filesystem::remove_all(ckpt_dir);
+}
+
 TEST(TestFramework, TestClusterRoutesCepTimedOutSideOutput) {
     // The fluent CEP timed-out surface on a real two-worker cluster: a
     // KEYED producer whose side output carries the expirations. The same

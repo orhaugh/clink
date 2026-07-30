@@ -229,6 +229,17 @@ public:
         SideOutputChannelEntry entry;
         entry.channel = std::static_pointer_cast<void>(channel);
         entry.close_fn = [channel] { channel->close(); };
+        // Control elements (barriers, watermarks) must ride the side channel
+        // too - a checkpoint barrier that reaches only the main output leaves
+        // a side-output consumer unable to align/snapshot/ack, stalling the
+        // whole checkpoint. Captured here where T is known; the operator
+        // runner invokes them alongside its main-output emit.
+        entry.forward_barrier_fn = [channel](const CheckpointBarrier& b) {
+            channel->push(StreamElement<T>::barrier(b));
+        };
+        entry.forward_watermark_fn = [channel](const Watermark& w) {
+            channel->push(StreamElement<T>::watermark(w));
+        };
         map.emplace(tag.id, std::move(entry));
         return StageHandle<T>{channel, runner_index};
     }
@@ -560,6 +571,18 @@ public:
             Emitter<Out> emitter(out_channel.get());
             emitter.set_operator_id(id.value());
             emitter.set_metrics_registry(ctx.metrics());
+            // Fan checkpoint barriers + watermarks out to this operator's
+            // side-output channels too. A barrier that reaches only the main
+            // output leaves a side-output consumer unable to align/snapshot/
+            // ack the checkpoint, so the checkpoint never completes (its
+            // pending-ack set never empties) and a bounded job's EOS final
+            // checkpoint hangs. No side outputs -> no fan-out registered.
+            if (side_channels) {
+                for (auto& [_, entry] : *side_channels) {
+                    emitter.add_control_fanout(entry.forward_barrier_fn,
+                                               entry.forward_watermark_fn);
+                }
+            }
             // If this operator carries a per-operator mode
             // override, stamp every emitted barrier with it. Source
             // operators have already stamped from JobConfig in their

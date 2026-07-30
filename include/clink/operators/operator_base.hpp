@@ -141,6 +141,19 @@ public:
     // RuntimeContext::side_output alongside the op id + registry.
     void set_side_output(bool v) noexcept { is_side_output_ = v; }
 
+    // Register a control-element sink: invoked by emit_barrier / emit_watermark
+    // AFTER the main-output emit, so a checkpoint barrier (or watermark)
+    // propagates on every side-output edge of this operator as well. Without
+    // this a side-output consumer never sees a barrier and can never
+    // align/snapshot/ack the checkpoint, which stalls the whole checkpoint.
+    // The runner wires one per side channel from the side-channel map. No-op
+    // when unset (the common case: no side outputs).
+    void add_control_fanout(std::function<void(const CheckpointBarrier&)> on_barrier,
+                            std::function<void(const Watermark&)> on_watermark) {
+        control_barrier_fanout_.push_back(std::move(on_barrier));
+        control_watermark_fanout_.push_back(std::move(on_watermark));
+    }
+
     // Blocking emit. Returns false only when the downstream has been closed.
     bool emit(Element e) {
         if (forward_) {
@@ -192,25 +205,37 @@ public:
             clink::metrics::op::watermark_set(
                 metrics_for_op_, op_id_for_metrics_, wm.timestamp().millis());
         }
+        bool ok;
         if (forward_) {
-            return forward_(Element::watermark(wm));
+            ok = forward_(Element::watermark(wm));
+        } else if (sub_ != nullptr) {
+            ok = sub_->emit_watermark(wm);
+        } else {
+            ok = emit(Element::watermark(wm));
         }
-        if (sub_ != nullptr) {
-            return sub_->emit_watermark(wm);
+        for (auto& fan : control_watermark_fanout_) {
+            fan(wm);
         }
-        return emit(Element::watermark(wm));
+        return ok;
     }
     bool emit_barrier(CheckpointBarrier b) {
         if (default_barrier_mode_.has_value() && b.mode() != *default_barrier_mode_) {
             b = CheckpointBarrier{b.id(), b.is_terminal(), *default_barrier_mode_};
         }
+        bool ok;
         if (forward_) {
-            return forward_(Element::barrier(b));
+            ok = forward_(Element::barrier(b));
+        } else if (sub_ != nullptr) {
+            ok = sub_->emit_barrier(b);
+        } else {
+            ok = emit(Element::barrier(b));
         }
-        if (sub_ != nullptr) {
-            return sub_->emit_barrier(b);
+        // Propagate the barrier on every side-output edge too, so
+        // side-output consumers align/snapshot/ack this checkpoint.
+        for (auto& fan : control_barrier_fanout_) {
+            fan(b);
         }
-        return emit(Element::barrier(b));
+        return ok;
     }
 
     // Drain marker. Source runners and stateful
@@ -240,6 +265,10 @@ private:
     std::uint64_t op_id_for_metrics_{0};
     clink::MetricsRegistry* metrics_for_op_{nullptr};
     bool is_side_output_{false};
+    // Side-output control fan-out: barriers/watermarks emitted here are also
+    // pushed onto every registered side channel (see add_control_fanout).
+    std::vector<std::function<void(const CheckpointBarrier&)>> control_barrier_fanout_;
+    std::vector<std::function<void(const Watermark&)>> control_watermark_fanout_;
 };
 
 // Base interface for any single-input single-output operator.
