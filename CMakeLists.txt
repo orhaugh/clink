@@ -785,6 +785,36 @@ if(CLINK_BUILD_HTTP)
     # the header.
     set(HTTPLIB_COMPILE OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(httplib)
+
+    # When httplib resolves OpenSSL (CLINK_HTTP_TLS=ON and OpenSSL present),
+    # clink_core's http_server / http_client objects reference OpenSSL
+    # symbols. httplib::httplib itself rides clink_core as BUILD_INTERFACE
+    # only (a non-installed FetchContent target cannot appear in the export
+    # set), which would silently strip the OpenSSL usage requirement from
+    # the INSTALLED package - leaving every find_package(clink) consumer of
+    # the HTTP surface with undefined OpenSSL symbols at link (found by the
+    # card-sentry queryable-state scene). The OpenSSL imported targets ARE
+    # exportable: link them directly and teach the generated
+    # clinkConfig.cmake to resolve them. TLS-off builds (the portable
+    # wheel) take no OpenSSL dependency, exactly as before.
+    #
+    # Gate on clink's own terms, not httplib's HTTPLIB_IS_USING_OPENSSL -
+    # that variable is set inside the FetchContent subdirectory scope and
+    # is invisible here. Our find_package resolves the same OpenSSL
+    # httplib's did (one configure, one result); "if available" semantics
+    # match by using a non-REQUIRED find gated on CLINK_HTTP_TLS.
+    if(CLINK_HTTP_TLS)
+        find_package(OpenSSL)
+        if(OpenSSL_FOUND)
+            target_link_libraries(clink_core PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+            set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
+                "# clink_core was built with HTTPS (CLINK_HTTP_TLS=ON): its archive\n")
+            set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
+                "# references OpenSSL symbols, so every consumer must resolve them.\n")
+            set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
+                "find_dependency(OpenSSL)\n")
+        endif()
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
