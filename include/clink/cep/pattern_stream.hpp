@@ -32,6 +32,7 @@
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/plugin/plugin.hpp"
+#include "clink/runtime/output_tag.hpp"
 
 namespace clink::cep {
 
@@ -75,6 +76,58 @@ public:
             [pattern, t_codec, key_fn, fn = std::move(fn), op_type](
                 const ::clink::plugin::BuildContext&) -> std::shared_ptr<Operator<T, U>> {
                 return std::make_shared<CepOperator<T, U>>(pattern, t_codec, key_fn, fn, op_type);
+            });
+        cluster::OperatorSpec op;
+        op.id = std::move(id);
+        op.type = op_type;
+        op.inputs = {upstream_id_};
+        op.out_channel = api::ChannelName<U>::get();
+        op.key_by = key_by_;
+        auto new_id = env_->append_op(std::move(op));
+        return api::DataStream<U>(env_, std::move(new_id), api::ChannelName<U>::get());
+    }
+
+    // Like select<U>(), but additionally routes TIMED-OUT partials -
+    // those whose within() window closed before the pattern completed -
+    // to `timed_out_tag` as a side output, each mapped through
+    // `timed_out_fn`. Obtain the side stream with the standard fluent
+    // idiom on the returned stream:
+    //
+    //   auto matches = cep::pattern(keyed, p, codec)
+    //                      .select_with_timed_out<Alert>(fn, tag, timed_out_fn);
+    //   auto expired = matches.side_output<Alert>(tag);
+    //
+    // The returned (main) stream carries the completed matches; the
+    // side stream carries the expirations, whether discovered by
+    // watermark pruning or by a record arriving past the partial's
+    // within() deadline. Requires .within() on the pattern - without a
+    // bound, partials never time out and the tag never fires. Same
+    // in-process-only lambda contract as select(): package as a plugin
+    // for cross-process jobs.
+    template <typename U>
+    api::DataStream<U> select_with_timed_out(std::function<U(const PatternMatch<T>&)> fn,
+                                             OutputTag<U> timed_out_tag,
+                                             std::function<U(const PatternMatch<T>&)> timed_out_fn,
+                                             std::string id = {}) {
+        cluster::ensure_built_ins_registered();
+        const std::string op_type = env_->mint_inline_op_type("cep_timed_out");
+        auto& reg = env_->registry();
+        auto pattern = pattern_;
+        auto t_codec = t_codec_;
+        auto key_fn = key_fn_;
+        reg.template register_operator<T, U>(
+            op_type,
+            [pattern,
+             t_codec,
+             key_fn,
+             fn = std::move(fn),
+             timed_out_tag,
+             timed_out_fn = std::move(timed_out_fn),
+             op_type](const ::clink::plugin::BuildContext&) -> std::shared_ptr<Operator<T, U>> {
+                auto op =
+                    std::make_shared<CepOperator<T, U>>(pattern, t_codec, key_fn, fn, op_type);
+                op->template with_timed_out_output<U>(timed_out_tag, timed_out_fn);
+                return op;
             });
         cluster::OperatorSpec op;
         op.id = std::move(id);

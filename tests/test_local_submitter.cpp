@@ -19,6 +19,7 @@
 
 #include "clink/api/builtin_connectors.hpp"
 #include "clink/api/pipeline.hpp"
+#include "clink/cep/cep.hpp"
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/operators/process_function.hpp"
@@ -508,4 +509,60 @@ TEST(LocalSubmitter, MultiConsumerFanOutAtParallelismGreaterThanOneSubmitsWithou
     EXPECT_NO_THROW(cluster::LocalSubmitter::submit(env));
     std::filesystem::remove(path_a);
     std::filesystem::remove(path_b);
+}
+
+TEST(LocalSubmitter, FluentCepTimedOutSideOutputRoutesExpiredPartials) {
+    // The fluent CEP timed-out surface, end to end through the spec
+    // path: select_with_timed_out() configures the CepOperator's
+    // timed-out emitter, the standard .side_output<U>(tag) idiom hands
+    // back the "<op>::<tag>" stream, and an expired partial - here
+    // discovered by a record arriving past the within() deadline, no
+    // watermark needed - lands on the side sink while the main output
+    // stays empty.
+    cluster::ensure_built_ins_registered();
+    const auto main_path =
+        std::filesystem::temp_directory_path() / "clink_local_submitter_cep_main.txt";
+    const auto expired_path =
+        std::filesystem::temp_directory_path() / "clink_local_submitter_cep_expired.txt";
+    std::filesystem::remove(main_path);
+    std::filesystem::remove(expired_path);
+
+    auto env = Pipeline::create();
+    OutputTag<std::int64_t> expired{"expired"};
+
+    // Values double as event times: 1 starts a partial, 3 would
+    // complete it, 500 arrives far past (1 + within 50ms) instead.
+    auto p = cep::Pattern<std::int64_t>::begin("a")
+                 .where([](const std::int64_t& v) { return v == 1; })
+                 .followed_by("b")
+                 .where([](const std::int64_t& v) { return v == 3; })
+                 .within(std::chrono::milliseconds(50));
+
+    auto keyed =
+        env.from_elements<std::int64_t>({1, 500})
+            .assign_timestamps_monotonic([](const std::int64_t& v) { return EventTime{v}; })
+            .key_by([](const std::int64_t&) -> std::int64_t { return 0; });
+
+    auto matches = cep::pattern(keyed, p, int64_codec())
+                       .select_with_timed_out<std::int64_t>(
+                           [](const cep::PatternMatch<std::int64_t>& m) -> std::int64_t {
+                               return m.at("a").front() + m.at("b").front();
+                           },
+                           expired,
+                           [](const cep::PatternMatch<std::int64_t>& m) -> std::int64_t {
+                               return m.at("a").front();
+                           });
+    matches.sink(FileInt64Sink::builder().path(main_path.string()).build());
+    matches.side_output<std::int64_t>(expired).sink(
+        FileInt64Sink::builder().path(expired_path.string()).build());
+
+    cluster::LocalSubmitter::submit(env);
+
+    EXPECT_TRUE(read_lines(main_path).empty());
+    const auto timed_out = read_lines(expired_path);
+    ASSERT_EQ(timed_out.size(), 1u);
+    EXPECT_EQ(timed_out[0], "1");
+
+    std::filesystem::remove(main_path);
+    std::filesystem::remove(expired_path);
 }
