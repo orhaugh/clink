@@ -66,6 +66,7 @@ void usage() {
         << "                          [--state-backend=<scheme>[:<path>]]\n"
         << "                          [--checkpoint-interval-ms=N] "
            "[--max-restarts-on-worker-loss=N]\n"
+        << "                          [--capture-dir=<dir>] [--capture-records=N]\n"
         << "       clink run <file>.sql | -e \"<sql>\"   (embedded SQL: run with --help for "
            "flags)\n"
         << "\n"
@@ -168,6 +169,12 @@ int clink_cmd_run(int argc, char** argv) {
     const auto restore_dir = get_arg(argc, argv, "restore-from-dir", "");
     const auto restore_id_str = get_arg(argc, argv, "restore-from-checkpoint-id", "0");
     const auto max_restarts_str = get_arg(argc, argv, "max-restarts-on-worker-loss", "0");
+    // Record-capture flight recorder: arm the per-epoch .cap tee so the run
+    // is replayable offline with `clink replay`. Pairs with a checkpoint dir
+    // (epochs align with checkpoints). CheckpointConfig has carried these
+    // fields end to end; this just exposes them on the submit CLI.
+    const auto capture_dir = get_arg(argc, argv, "capture-dir", "");
+    const auto capture_records_str = get_arg(argc, argv, "capture-records", "0");
 
     if (job_path.empty()) {
         std::cerr << "clink_submit_job: --job=<path.so> is required\n";
@@ -241,6 +248,9 @@ int clink_cmd_run(int argc, char** argv) {
             static_cast<std::uint64_t>(std::stoull(restore_id_str));
         opts.checkpoint.max_restarts_on_worker_loss =
             static_cast<std::uint32_t>(std::stoul(max_restarts_str));
+        opts.checkpoint.capture_dir = capture_dir;
+        opts.checkpoint.capture_records =
+            static_cast<std::uint64_t>(std::stoull(capture_records_str));
     }
 
     const auto result = submitter.submit(graph_json, {job_abs.string()}, opts);
