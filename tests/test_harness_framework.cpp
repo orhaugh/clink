@@ -669,7 +669,12 @@ TEST(TestFramework, TransactionalTestSinkModelsTheTwoPhaseCommitLifecycle) {
 #include <filesystem>
 #include <fstream>
 
+#include "clink/api/builtin_connectors.hpp"
+#include "clink/api/pipeline.hpp"
+#include "clink/cep/cep.hpp"
 #include "clink/operators/map_operator.hpp"
+#include "clink/operators/process_function.hpp"
+#include "clink/runtime/output_tag.hpp"
 #include "clink/test/local_environment.hpp"
 #include "clink/test/test_cluster.hpp"
 
@@ -753,6 +758,206 @@ TEST(TestFramework, TestClusterRunsAJobGraphSpecToCompletion) {
     std::sort(written.begin(), written.end());
     EXPECT_EQ(written, (std::vector<std::int64_t>{1, 2, 3, 4, 5}));
     std::filesystem::remove(out_path);
+}
+
+namespace {
+
+// Splits ints into main (evens) + a typed side output (odds-as-string).
+// Mirrors the LocalSubmitter side-output test's function; named uniquely
+// for this TU (same-named anon-namespace classes across test TUs ODR-collide).
+class ClusterSplitEvensOddsProcess : public ProcessFunction<std::int64_t, std::int64_t> {
+public:
+    static const OutputTag<std::string>& odd_tag() {
+        static const OutputTag<std::string> t{"odds"};
+        return t;
+    }
+    void process_element(const std::int64_t& v,
+                         ProcessFunctionContext<std::int64_t>& ctx,
+                         Collector<std::int64_t>& out) override {
+        if (v % 2 == 0) {
+            out.collect(v);
+        } else {
+            ctx.template side_output<std::string>(odd_tag()).emit_data(Batch<std::string>{
+                std::vector<Record<std::string>>{Record<std::string>{std::to_string(v)}}});
+        }
+    }
+    std::string name() const override { return "cluster_split_evens_odds"; }
+};
+
+}  // namespace
+
+TEST(TestFramework, TestClusterRoutesTypedSideOutputsLikeTheLocalPath) {
+    // The SAME fluent pipeline the LocalSubmitter side-output test proves
+    // in-process, through a real coordinator + two workers: main output to
+    // one sink, a typed side output to another. Found by card-sentry's
+    // cluster scene: the side sink received the MAIN records, the main
+    // consumer starved (job stuck), and the side records vanished.
+    const auto evens_path =
+        std::filesystem::temp_directory_path() / "clink_test_cluster_side_evens.txt";
+    const auto odds_path =
+        std::filesystem::temp_directory_path() / "clink_test_cluster_side_odds.txt";
+    std::filesystem::remove(evens_path);
+    std::filesystem::remove(odds_path);
+
+    auto env = api::Pipeline::create();
+    auto src = env.source<std::int64_t>(api::IntRangeSource::builder().count(6).start(1).build());
+    auto split = src.process<std::int64_t>(std::make_shared<ClusterSplitEvensOddsProcess>());
+    split.sink(api::FileInt64Sink::builder().path(evens_path.string()).build());
+    split.side_output<std::string>(ClusterSplitEvensOddsProcess::odd_tag())
+        .sink(api::FileTextSink::builder().path(odds_path.string()).build());
+
+    test::TestCluster mini({.workers = 2, .slots_per_worker = 4});
+    mini.execute(env.graph());
+
+    auto read_sorted = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty()) {
+                lines.push_back(line);
+            }
+        }
+        std::sort(lines.begin(), lines.end());
+        return lines;
+    };
+    EXPECT_EQ(read_sorted(evens_path), (std::vector<std::string>{"2", "4", "6"}));
+    EXPECT_EQ(read_sorted(odds_path), (std::vector<std::string>{"1", "3", "5"}));
+
+    std::filesystem::remove(evens_path);
+    std::filesystem::remove(odds_path);
+}
+
+TEST(TestFramework, TestClusterRoutesCepTimedOutSideOutput) {
+    // The fluent CEP timed-out surface on a real two-worker cluster: a
+    // KEYED producer whose side output carries the expirations. The same
+    // pipeline passes through LocalSubmitter; card-sentry's cluster scene
+    // found the side sink receiving MAIN records instead.
+    const auto main_path =
+        std::filesystem::temp_directory_path() / "clink_test_cluster_cep_main.txt";
+    const auto expired_path =
+        std::filesystem::temp_directory_path() / "clink_test_cluster_cep_expired.txt";
+    std::filesystem::remove(main_path);
+    std::filesystem::remove(expired_path);
+
+    auto env = api::Pipeline::create();
+    OutputTag<std::int64_t> expired{"expired"};
+
+    auto p = cep::Pattern<std::int64_t>::begin("a")
+                 .where([](const std::int64_t& v) { return v == 1; })
+                 .followed_by("b")
+                 .where([](const std::int64_t& v) { return v == 3; })
+                 .within(std::chrono::milliseconds(50));
+
+    auto keyed =
+        env.from_elements<std::int64_t>({1, 500})
+            .assign_timestamps_monotonic([](const std::int64_t& v) { return EventTime{v}; })
+            .key_by([](const std::int64_t&) -> std::int64_t { return 0; });
+    auto matches = cep::pattern(keyed, p, int64_codec())
+                       .select_with_timed_out<std::int64_t>(
+                           [](const cep::PatternMatch<std::int64_t>& m) -> std::int64_t {
+                               return m.at("a").front() + m.at("b").front();
+                           },
+                           expired,
+                           [](const cep::PatternMatch<std::int64_t>& m) -> std::int64_t {
+                               return m.at("a").front();
+                           });
+    matches.sink(api::FileInt64Sink::builder().path(main_path.string()).build());
+    matches.side_output<std::int64_t>(expired).sink(
+        api::FileInt64Sink::builder().path(expired_path.string()).build());
+
+    test::TestCluster mini({.workers = 2, .slots_per_worker = 4});
+    mini.execute(env.graph());
+
+    auto read_sorted = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty()) {
+                lines.push_back(line);
+            }
+        }
+        std::sort(lines.begin(), lines.end());
+        return lines;
+    };
+    EXPECT_TRUE(read_sorted(main_path).empty());
+    EXPECT_EQ(read_sorted(expired_path), (std::vector<std::string>{"1"}));
+
+    std::filesystem::remove(main_path);
+    std::filesystem::remove(expired_path);
+}
+
+TEST(TestFramework, TestClusterRoutesCepTimedOutSideOutputThroughChainedMap) {
+    // Same as above but with a MAP between the CEP op and each sink, which
+    // makes the planner CHAIN the cep with its main-consumer map (side
+    // consumers don't block chaining) and routes the worker through the
+    // multi-op chain dispatch instead of the fused-sink branch - the shape
+    // card-sentry's cluster scene deployed, where the side sink received
+    // the MAIN records and the main sink starved.
+    const auto main_path =
+        std::filesystem::temp_directory_path() / "clink_test_cluster_cep_chain_main.txt";
+    const auto expired_path =
+        std::filesystem::temp_directory_path() / "clink_test_cluster_cep_chain_expired.txt";
+    std::filesystem::remove(main_path);
+    std::filesystem::remove(expired_path);
+
+    auto env = api::Pipeline::create();
+    OutputTag<std::int64_t> expired{"chain_expired"};
+
+    auto p = cep::Pattern<std::int64_t>::begin("a")
+                 .where([](const std::int64_t& v) { return v == 1; })
+                 .followed_by("b")
+                 .where([](const std::int64_t& v) { return v == 3; })
+                 .within(std::chrono::milliseconds(50));
+
+    auto keyed =
+        env.from_elements<std::int64_t>({1, 3, 500})
+            .assign_timestamps_monotonic([](const std::int64_t& v) { return EventTime{v}; })
+            .key_by([](const std::int64_t&) -> std::int64_t { return 0; });
+    // 1@1 spawns a partial, 3@3 completes it inside within() -> exactly one
+    // MAIN record (1 + 3 = 4). 500@500 matches nothing and no partial is
+    // left alive to expire -> the side output must stay EMPTY.
+    auto matches = cep::pattern(keyed, p, int64_codec())
+                       .select_with_timed_out<std::int64_t>(
+                           [](const cep::PatternMatch<std::int64_t>& m) -> std::int64_t {
+                               return m.at("a").front() + m.at("b").front();
+                           },
+                           expired,
+                           [](const cep::PatternMatch<std::int64_t>& m) -> std::int64_t {
+                               return m.at("a").front() + 100;
+                           });
+    matches.map<std::int64_t>([](const std::int64_t& v) { return v * 10; })
+        .sink(api::FileInt64Sink::builder().path(main_path.string()).build());
+    matches.side_output<std::int64_t>(expired)
+        .map<std::int64_t>([](const std::int64_t& v) { return v * 10; })
+        .sink(api::FileInt64Sink::builder().path(expired_path.string()).build());
+
+    test::TestCluster mini({.workers = 2, .slots_per_worker = 8});
+    mini.execute(env.graph());
+
+    auto read_sorted = [](const std::filesystem::path& p) {
+        std::ifstream in(p);
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty()) {
+                lines.push_back(line);
+            }
+        }
+        std::sort(lines.begin(), lines.end());
+        return lines;
+    };
+    // Main: the completed match (1 + 3) mapped x10 = 40. Side: no expired
+    // partials remain (the match consumed them under the default NoSkip the
+    // pattern uses; a fresh partial from the completing event cannot start
+    // since 3 does not satisfy step a) - so the side file must be EMPTY,
+    // and above all must NOT contain the main stream's records.
+    EXPECT_EQ(read_sorted(main_path), (std::vector<std::string>{"40"}));
+    EXPECT_TRUE(read_sorted(expired_path).empty());
+
+    std::filesystem::remove(main_path);
+    std::filesystem::remove(expired_path);
 }
 
 // ---- Increment 7: assertions, sequences, side outputs, dogfooding ----
