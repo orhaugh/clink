@@ -423,6 +423,7 @@ if(CLINK_BUILD_SQL)
         test_sql_queryable_state.cpp
         test_embedded_engine.cpp
         test_replay_cli.cpp
+        test_replay_plugin_types.cpp
     )
     target_link_libraries(clink_sql_tests PRIVATE
         clink::sql

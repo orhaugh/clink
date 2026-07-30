@@ -78,6 +78,11 @@ private:
     std::uint64_t state_id_{0};
     bool flush_{false};
     const cluster::OperatorFactory* factory_{nullptr};
+    // Non-row (plugin-typed) path: the raw capture bytes, replayed via the
+    // factory's type-erased ReplayDriver instead of the Row drive loop.
+    // Empty for the row path.
+    std::vector<std::byte> raw_capture_;
+    bool use_driver_{false};
 };
 
 // Every (op, subtask) with a capture directory under `capture_dir`,

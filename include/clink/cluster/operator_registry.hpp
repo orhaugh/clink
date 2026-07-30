@@ -13,6 +13,8 @@
 #include <utility>
 #include <vector>
 
+#include "clink/cluster/replay_driver_registry.hpp"  // ReplayDriver (on OperatorFactory)
+
 namespace clink {
 template <typename T>
 class Batch;  // core/record.hpp; forward-declared so the columnar key
@@ -75,6 +77,10 @@ struct OperatorFactory {
     ChannelType in;
     ChannelType out;
     BoxedFactory build;
+    // Offline-replay driver for `clink replay` of a plugin-typed operator
+    // (set by register_operator<In, Out>; empty for ops that don't supply
+    // one, e.g. the SQL row path, which replays through EpochReplay directly).
+    ReplayDriver replay_driver;
 };
 
 struct SinkFactory {

@@ -28,6 +28,91 @@ namespace clink::plugin {
 
 namespace detail {
 
+// Build a ReplayDriver for a plugin operator In->Out: read the captured
+// epoch with In's codec, rebuild the operator, drive the event stream
+// through its production hooks over a fresh (or snapshot-restored) backend
+// with a manual clock, and return each emitted Out record as its codec
+// bytes hex-encoded (a deterministic, comparable form). Mirrors the SQL
+// EpochReplay loop, generalised over arbitrary In/Out. Instantiated at
+// register_operator<In, Out> where both codecs are in hand.
+template <typename In, typename Out>
+inline clink::cluster::ReplayDriver make_replay_driver(
+    std::function<std::shared_ptr<Operator<In, Out>>(const BuildContext&)> factory,
+    Codec<In> in_codec,
+    Codec<Out> out_codec) {
+    return [factory, in_codec, out_codec](std::uint64_t op_id,
+                                          std::span<const std::byte> cap_bytes,
+                                          const clink::capture::OpSpecSidecar& spec,
+                                          std::optional<std::span<const std::byte>> snapshot,
+                                          std::uint64_t state_id,
+                                          bool flush) -> std::vector<std::string> {
+        auto parsed = clink::capture::read_capture_events<In>(cap_bytes, in_codec);
+        if (!parsed.has_value()) {
+            throw std::runtime_error("replay: not a capture file for op '" + spec.op_type + "'");
+        }
+        auto backend = std::make_shared<clink::InMemoryStateBackend>();
+        if (snapshot.has_value()) {
+            clink::Snapshot snap{
+                .checkpoint_id = clink::CheckpointId{state_id},
+                .bytes = std::vector<std::byte>(snapshot->begin(), snapshot->end())};
+            backend->restore(snap);
+        }
+        BuildContext bctx;
+        bctx.params = spec.params;
+        auto op = factory(bctx);
+        if (!spec.uid.empty()) {
+            op->set_uid(spec.uid);
+        }
+        clink::MetricsRegistry metrics;
+        clink::RuntimeContext ctx{clink::OperatorId{op_id}, spec.op_type, backend.get(), &metrics};
+        auto replay_now = std::make_shared<std::int64_t>(0);
+        ctx.timer_service()->set_now_fn([replay_now] { return *replay_now; });
+        op->attach_runtime(&ctx);
+        op->restore_timers(*backend, clink::OperatorId{op_id});
+        op->open();
+
+        std::vector<std::string> out_rows;
+        auto hex = [](const typename Codec<Out>::Bytes& b) {
+            static constexpr char kHex[] = "0123456789abcdef";
+            std::string s;
+            s.reserve(b.size() * 2);
+            for (const auto byte : b) {
+                const auto v = static_cast<unsigned char>(byte);
+                s.push_back(kHex[v >> 4]);
+                s.push_back(kHex[v & 0x0F]);
+            }
+            return s;
+        };
+        clink::Emitter<Out> emitter([&out_rows, &out_codec, &hex](clink::StreamElement<Out> el) {
+            if (el.is_data()) {
+                for (const auto& rec : el.as_data()) {
+                    out_rows.push_back(hex(out_codec.encode(rec.value())));
+                }
+            }
+            return true;
+        });
+        for (const auto& e : parsed->second) {
+            if (const auto* rec = std::get_if<clink::Record<In>>(&e)) {
+                clink::Batch<In> b;
+                b.push(*rec);
+                op->process(clink::StreamElement<In>::data(std::move(b)), emitter);
+            } else if (const auto* wm = std::get_if<clink::capture::WatermarkEvent>(&e)) {
+                const auto mark = wm->idle ? clink::Watermark{clink::EventTime{wm->ts_ms}, true}
+                                           : clink::Watermark{clink::EventTime{wm->ts_ms}};
+                op->process(clink::StreamElement<In>::watermark(mark), emitter);
+            } else {
+                *replay_now = std::get<clink::capture::ClockEvent>(e).now_ms;
+                op->fire_due_timers(emitter, *replay_now);
+            }
+        }
+        if (flush) {
+            op->flush(emitter);
+        }
+        op->close();
+        return out_rows;
+    };
+}
+
 // Build a plugin-side BuildContext (with params map + subtask info)
 // from a RunnerContext. Pulls params from the leading op of the chain;
 // for length-1 chains that's the only op.
@@ -595,6 +680,17 @@ void PluginRegistry::register_operator(
         auto op = factory(pc);
         return std::static_pointer_cast<void>(op);
     };
+    // Offline-replay driver (clink replay of a plugin-typed operator). Row
+    // ops replay through the SQL EpochReplay path; a custom In->Out op needs
+    // a driver instantiated where both codecs are known, so build one here
+    // and hang it on the factory - it then crosses the dlopen boundary on the
+    // OperatorFactory the registry already carries, and `clink replay` finds
+    // it by the same find_operator lookup. Skipped if either codec is
+    // unavailable (replay unsupported for that op, not a registration error).
+    if (auto out_codec = codec_for<Out>(); capture_codec && out_codec) {
+        op_factory.replay_driver =
+            detail::make_replay_driver<In, Out>(factory, *capture_codec, *out_codec);
+    }
     operator_registry_.register_operator(op_type, std::move(op_factory));
 
     auto db = [factory, capture_codec](clink::Dag& dag,

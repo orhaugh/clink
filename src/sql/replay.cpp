@@ -190,7 +190,54 @@ EpochReplay EpochReplay::load(const ReplayRequest& request) {
     const bool is_final = request.epoch == "final";
     const auto cap_path = subdir / (is_final ? "final.cap" : ("epoch-" + request.epoch + ".cap"));
     r.info_.capture_path = cap_path.string();
-    const auto cap_bytes = read_bytes_file(cap_path);
+    auto cap_bytes = read_bytes_file(cap_path);
+
+    // Non-row (plugin-typed) operators replay through the factory's
+    // type-erased ReplayDriver, instantiated at register_operator<In,Out>
+    // (which the caller made available by loading the job plugin via
+    // --plugin). The Row drive loop below stays the SQL frontend's path.
+    const bool is_row = r.info_.spec.in_channel == "row" && r.info_.spec.out_channel == "row";
+    if (!is_row) {
+        r.factory_ = cluster::OperatorRegistry::default_instance().find_operator(
+            r.info_.spec.op_type, r.info_.spec.in_channel, r.info_.spec.out_channel);
+        if (r.factory_ == nullptr) {
+            throw std::runtime_error("no registered factory for op type '" + r.info_.spec.op_type +
+                                     "' (" + r.info_.spec.in_channel + "->" +
+                                     r.info_.spec.out_channel +
+                                     "); load the job plugin with --plugin=<so>");
+        }
+        if (!r.factory_->replay_driver) {
+            throw std::runtime_error(
+                "replay: op '" + r.info_.spec.op_type + "' (" + r.info_.spec.in_channel + "->" +
+                r.info_.spec.out_channel +
+                ") has no replay driver (its plugin registered no codec for one channel)");
+        }
+        r.use_driver_ = true;
+        r.raw_capture_ = std::move(cap_bytes);
+        r.info_.state_desc = "fresh state";
+        if (request.state_from.has_value()) {
+            r.state_id_ = *request.state_from;
+        } else if (!is_final) {
+            const auto epoch = std::stoull(request.epoch);
+            r.state_id_ = epoch > 0 ? epoch - 1 : 0;
+        } else {
+            throw std::runtime_error("epoch 'final' requires an explicit state_from checkpoint id");
+        }
+        if (r.state_id_ > 0) {
+            if (request.checkpoint_dir.empty()) {
+                throw std::runtime_error("state from checkpoint " + std::to_string(r.state_id_) +
+                                         " requires checkpoint_dir");
+            }
+            const auto snap_path =
+                find_snapshot(request.checkpoint_dir, r.info_.subtask, r.state_id_);
+            r.snap_bytes_ = read_bytes_file(snap_path);
+            r.info_.state_desc = "state from " + snap_path.string();
+            r.info_.state_snapshot_path = snap_path.string();
+        }
+        r.flush_ = request.flush;
+        return r;
+    }
+
     auto parsed = capture::read_capture_events(
         std::span<const std::byte>{cap_bytes.data(), cap_bytes.size()}, row_json_codec());
     if (!parsed.has_value()) {
@@ -208,12 +255,6 @@ EpochReplay EpochReplay::load(const ReplayRequest& request) {
         } else {
             ++r.info_.clock_count;
         }
-    }
-
-    // Row-channel operators (the SQL frontend's set).
-    if (r.info_.spec.in_channel != "row" || r.info_.spec.out_channel != "row") {
-        throw std::runtime_error("replay supports row->row operators; this op is " +
-                                 r.info_.spec.in_channel + "->" + r.info_.spec.out_channel);
     }
     ensure_row_factories_installed();
 
@@ -251,6 +292,23 @@ EpochReplay EpochReplay::load(const ReplayRequest& request) {
 }
 
 std::vector<std::string> EpochReplay::run() const {
+    // Non-row (plugin-typed) path: delegate to the operator's type-erased
+    // ReplayDriver, which reads the capture with In's codec, drives the op,
+    // and returns emissions as Out-codec bytes (hex) - deterministic and
+    // comparable, which is all --verify / --emit-test need.
+    if (use_driver_) {
+        std::optional<std::span<const std::byte>> snap;
+        if (snap_bytes_.has_value()) {
+            snap = std::span<const std::byte>{snap_bytes_->data(), snap_bytes_->size()};
+        }
+        return factory_->replay_driver(
+            info_.op_id,
+            std::span<const std::byte>{raw_capture_.data(), raw_capture_.size()},
+            info_.spec,
+            snap,
+            state_id_,
+            flush_);
+    }
     // Fresh backend (snapshot restored), fresh operator, manual clock,
     // then the event stream through the production paths.
     auto backend = std::make_shared<InMemoryStateBackend>();
