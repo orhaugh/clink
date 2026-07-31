@@ -49,6 +49,7 @@ exclude_docs: |
   !/capabilities.md
   !/benchmarks.md
   !/efficiency.md
+  !/sql.md
   /*/
   !/internals/
   !/connectors/
@@ -83,6 +84,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Capabilities: capabilities.md
+  - SQL: sql.md
   - Benchmarks: benchmarks.md
   - Cost and environmental footprint: efficiency.md
   - Internals:
