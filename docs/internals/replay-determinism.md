@@ -4,7 +4,7 @@
 
 ## The model
 
-The flight recorder captures, per operator per checkpoint epoch, the ordered EVENT stream the runner handed the operator: data records, watermarks (with idleness), and the clock positions at which due processing-time timers fired (`.cap` format v2 - see [fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md)). Replay rebuilds the operator from its `op.json` sidecar, restores its keyed state and timers from checkpoint N-1, puts its `TimerService` on a manual clock, and feeds the events back through the production paths: data and watermarks via `process()`, captured clock positions via `fire_due_timers`.
+The flight recorder captures, per operator per checkpoint epoch, the ordered EVENT stream the runner handed the operator: data records, watermarks (with idleness), and the clock positions at which due processing-time timers fired (`.cap` format v2 - see [fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md)). Replay rebuilds the operator from its `op.json` sidecar, restores its keyed state and timers from checkpoint N-1, puts its `TimerService` on a manual clock, and feeds the events back through the production paths: data and watermarks via `process()`, captured clock positions via `fire_due_timers`. The replay tool registers clink's built-in AND linked-impl operator factories the same way `clink run` does, so any operator a job could run - the core SQL Row operators and the impls alike (VECTOR_SEARCH, ML_PREDICT, the connectors) - reconstructs from its `op.json` with no plugin. `--plugin=<so>` is needed only for an operator a downstream job plugin defines (a custom C++ channel type register_operator&lt;In, Out&gt; hangs a replay driver on).
 
 Determinism therefore rests on three pillars:
 

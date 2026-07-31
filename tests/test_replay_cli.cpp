@@ -240,6 +240,70 @@ TEST(ReplayCli, WindowedEpochReplaysTheLiveEmissionsAndVerifiesDeterministic) {
     fs::remove_all(dir);
 }
 
+// A job CONTAINING an IMPL operator (VECTOR_SEARCH). Before `clink replay` installed
+// the linked impls, replaying this skipped vector_search_row with "no registered
+// factory"; the replay path now registers the impl operators exactly as `clink run`
+// does, so the whole-job sweep reconstructs and verifies the impl operator with NO
+// plugin. Literal 2-D vectors keep the job dependency-free (no embedding model).
+TEST(ReplayCli, ImplOperatorJobReplaysWithoutAPlugin) {
+    const std::string cli = CLINK_CLI_BINARY;
+    const auto dir = fs::temp_directory_path() / "clink_replay_cli_impl";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    write_file(dir / "docs.jsonl",
+               R"({"doc_id":"d1","vec":[1.0,0.0],"title":"a"})"
+               "\n"
+               R"({"doc_id":"d2","vec":[0.0,1.0],"title":"b"})"
+               "\n");
+    write_file(dir / "q.jsonl",
+               R"({"qid":"q1","emb":[1.0,0.1]})"
+               "\n");
+    {
+        std::ofstream sql(dir / "job.sql");
+        sql << "CREATE TABLE q (qid TEXT, emb DOUBLE PRECISION ARRAY) WITH (connector='file', "
+               "format='json', path='"
+            << (dir / "q.jsonl").string() << "');\n"
+            << "CREATE TABLE docs (doc_id TEXT, vec DOUBLE PRECISION ARRAY, title TEXT) WITH "
+               "(connector='file', format='json', path='"
+            << (dir / "docs.jsonl").string() << "');\n"
+            << "CREATE TABLE out (qid TEXT, emb DOUBLE PRECISION ARRAY, doc_id TEXT, vec DOUBLE "
+               "PRECISION ARRAY, title TEXT, score DOUBLE PRECISION) WITH (connector='file', "
+               "format='json', path='"
+            << (dir / "out.jsonl").string() << "');\n"
+            << "INSERT INTO out SELECT * FROM VECTOR_SEARCH(TABLE q, emb, docs, DESCRIPTOR(vec), "
+               "2, metric='cosine');\n";
+    }
+
+    const auto run = run_captured(cli, dir);
+    ASSERT_EQ(run.exit_code, 0) << run.output;
+    ASSERT_FALSE(read_file(dir / "out.jsonl").empty());
+
+    // A vector_search_row capture must exist...
+    bool found = false;
+    for (const auto& entry : fs::directory_iterator(dir / "capture")) {
+        const auto op_json = entry.path() / "subtask-1" / "op.json";
+        if (fs::exists(op_json)) {
+            auto js = clink::config::parse(read_file(op_json));
+            if (js.is_object() && js.at("op_type").is_string() &&
+                js.at("op_type").as_string() == "vector_search_row") {
+                found = true;
+            }
+        }
+    }
+    ASSERT_TRUE(found) << "no vector_search_row capture found";
+
+    // ...and the whole-job sweep replays it with NO plugin: skipped 0, deterministic.
+    const auto whole = whole_job_verify(cli, dir);
+    EXPECT_EQ(whole.exit_code, 0) << whole.output;
+    EXPECT_NE(whole.output.find("vector_search_row"), std::string::npos) << whole.output;
+    EXPECT_NE(whole.output.find("skipped 0"), std::string::npos) << whole.output;
+    EXPECT_NE(whole.output.find("every replayed operator byte-identical"), std::string::npos)
+        << whole.output;
+
+    fs::remove_all(dir);
+}
+
 // A job CONTAINING a stream-stream join: the single-input operators around the
 // join (timestamp assign, project, key_by) capture and replay deterministically,
 // and the whole-job sweep is byte-identical. The two-input join operator itself

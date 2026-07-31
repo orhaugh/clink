@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "clink/cluster/plugin_loader.hpp"
+#include "clink/plugin/install_defaults.hpp"
 #include "clink/sql/replay.hpp"
 
 namespace {
@@ -295,6 +296,16 @@ int clink_cmd_replay(int argc, char** argv) {
         return 2;
     }
     try {
+        // Register the built-in AND linked-impl operators, so replay can reconstruct
+        // any job `clink run` can run - VECTOR_SEARCH, ML_PREDICT, Kafka, and the rest -
+        // from its op.json sidecar, not only the core SQL Row operators. Without this a
+        // captured SQL/embedded job using an impl operator failed with "no registered
+        // factory". Mirrors the impl install `clink run` performs; --plugin still layers
+        // a downstream job plugin's own operators on top.
+        {
+            clink::plugin::PluginRegistry impl_reg;
+            clink::plugin::install_defaults(impl_reg);
+        }
         if (!plugin_path.empty()) {
             // Candidate-build A/B: load the job plugin so the operator
             // factories resolve from THAT .so (ABI-gated like a cluster
