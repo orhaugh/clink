@@ -57,9 +57,10 @@ gid). Fixed across all three sink-build paths: fused, standalone, and the plugin
 side-output attachers through the job bundle rather than the process-wide
 default (invisible to a dlopen'd plugin under `RTLD_LOCAL`).
 
-**Packaging.** The installed CMake package declares its OpenSSL dependency when
-built with HTTP TLS, so a consumer linking the HTTP surface (queryable state) no
-longer fails to resolve OpenSSL symbols.
+**Packaging.** The installed CMake package declares its OpenSSL (HTTP TLS) and
+ZLIB (httplib gzip) dependencies, so a consumer linking the HTTP surface
+(queryable state) through the prebuilt SDK no longer fails at link with undefined
+OpenSSL or zlib symbols.
 
 Every fix ships with a regression test; the new cluster behaviours are pinned by
 in-process `TestCluster` tests where reproducible.

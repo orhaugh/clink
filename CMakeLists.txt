@@ -815,6 +815,29 @@ if(CLINK_BUILD_HTTP)
                 "find_dependency(OpenSSL)\n")
         endif()
     endif()
+
+    # httplib also enables gzip whenever it FINDS zlib
+    # (HTTPLIB_USE_ZLIB_IF_AVAILABLE, on by default), which makes clink_core's
+    # http_server / http_client reference zlib's inflate/deflate. Same export gap
+    # as OpenSSL above: httplib::httplib rides clink_core as BUILD_INTERFACE only,
+    # so the installed package drops the zlib usage requirement, and a
+    # find_package(clink) consumer of the HTTP surface fails at link with undefined
+    # inflate/deflate. This bites the prebuilt-SDK path (static clink_core.a, whose
+    # deps the consumer's final link must supply); a source build on macOS resolved
+    # zlib transitively and hid it. Unlike OpenSSL this takes no gate: httplib uses
+    # zlib whenever present, and zlib is safe to require - it is ubiquitous and
+    # find_dependency(Arrow) already pulls it onto every consumer. Resolve the same
+    # zlib httplib did and export it.
+    find_package(ZLIB)
+    if(ZLIB_FOUND)
+        target_link_libraries(clink_core PRIVATE ZLIB::ZLIB)
+        set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
+            "# clink_core's bundled httplib was built with gzip (zlib present): its\n")
+        set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
+            "# archive references zlib symbols, so every consumer must resolve them.\n")
+        set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
+            "find_dependency(ZLIB)\n")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
