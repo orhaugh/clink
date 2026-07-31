@@ -1,5 +1,7 @@
 #include "clink/vector_search/vector_search_operator.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <stdexcept>
 #include <utility>
 
@@ -48,6 +50,7 @@ void VectorSearchOperator::rebuild_corpus_() {
     // each corpus row contributes its index vector + the projected emit columns. Clear
     // any prior corpus first so a refresh replaces (not appends to) the old set.
     corpus_payloads_.clear();
+    corpus_vectors_.clear();
     std::vector<std::vector<float>> corpus_vectors;
     clink::Dag dag;
     auto handle = dag.add_source<Row>(source);
@@ -81,7 +84,53 @@ void VectorSearchOperator::rebuild_corpus_() {
         cfg_.index.dim = corpus_vectors.front().size();
     }
     index_ = make_knn_index(cfg_.index, corpus_vectors.size());
+    if (!cfg_.filter_eq.empty()) {
+        corpus_vectors_ = corpus_vectors;  // retain for the exact filtered scan
+    }
     index_->build(std::move(corpus_vectors));
+}
+
+std::vector<Neighbour> VectorSearchOperator::filtered_search_(const float* q,
+                                                              std::size_t dim,
+                                                              const Row& in) const {
+    std::vector<Neighbour> cand;
+    cand.reserve(corpus_vectors_.size());
+    for (std::size_t i = 0; i < corpus_vectors_.size(); ++i) {
+        bool keep = true;
+        for (const auto& [qcol, ccol] : cfg_.filter_eq) {
+            const auto qit = in.values.find(qcol);
+            // A null / absent / empty-string query value is "unset": no constraint.
+            if (qit == in.values.end() || qit->second.is_null()) {
+                continue;
+            }
+            if (qit->second.is_string() && qit->second.as_string().empty()) {
+                continue;
+            }
+            const auto& payload = corpus_payloads_[i].values;
+            const auto cit = payload.find(ccol);
+            if (cit == payload.end() || cit->second.serialize(0) != qit->second.serialize(0)) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep) {
+            cand.push_back(
+                Neighbour{i, distance(cfg_.index.metric, q, corpus_vectors_[i].data(), dim)});
+        }
+    }
+    const std::size_t k = std::min<std::size_t>(static_cast<std::size_t>(cfg_.top_k), cand.size());
+    const Metric m = cfg_.index.metric;
+    std::partial_sort(cand.begin(),
+                      cand.begin() + static_cast<std::ptrdiff_t>(k),
+                      cand.end(),
+                      [m](const Neighbour& a, const Neighbour& b) {
+                          if (a.score != b.score) {
+                              return metric_nearer(m, a.score, b.score);
+                          }
+                          return a.row_index < b.row_index;  // stable, deterministic ties
+                      });
+    cand.resize(k);
+    return cand;
 }
 
 void VectorSearchOperator::process(const clink::StreamElement<Row>& element,
@@ -104,7 +153,9 @@ void VectorSearchOperator::process(const clink::StreamElement<Row>& element,
             if (!q.present || !q.dim_ok || q.data.empty()) {
                 continue;  // no usable query vector: emit nothing for this row
             }
-            const auto hits = index_->search(q.data.data(), q.data.size(), cfg_.top_k);
+            const std::vector<Neighbour> hits =
+                cfg_.filter_eq.empty() ? index_->search(q.data.data(), q.data.size(), cfg_.top_k)
+                                       : filtered_search_(q.data.data(), q.data.size(), in);
             for (const auto& h : hits) {
                 Row out_row = in;  // carry every input column (and __row_kind) through
                 if (h.row_index < corpus_payloads_.size()) {

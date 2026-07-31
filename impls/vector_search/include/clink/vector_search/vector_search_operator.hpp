@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "clink/operators/operator_base.hpp"
@@ -36,6 +37,13 @@ public:
         std::size_t top_k = 10;
         std::int64_t corpus_refresh_ms = 0;  // 0 = never refresh (corpus fixed at open)
         IndexParams index;                   // metric / kind / dim / hnsw knobs
+        // Optional metadata equality pre-filter: each pair is (query_column,
+        // corpus_column). A corpus row is a candidate for a query row only if, for
+        // every pair, the query column is null/absent OR equals the corpus column.
+        // When set, the operator scores the FILTERED corpus subset EXACTLY (a true
+        // pre-filter over the distance kernel), so scoping retrieval by metadata does
+        // not lose recall the way post-filtering a top-k would.
+        std::vector<std::pair<std::string, std::string>> filter_eq;
     };
 
     explicit VectorSearchOperator(Config cfg) : cfg_(std::move(cfg)) {}
@@ -51,9 +59,17 @@ private:
     // interval elapses.
     void rebuild_corpus_();
 
+    // Exact top-k over the corpus rows that satisfy filter_eq for this query row (a
+    // query filter value that is null/absent/empty imposes no constraint). Used only
+    // when filter_eq is set; ties break by corpus row index so the result is stable.
+    std::vector<Neighbour> filtered_search_(const float* q,
+                                            std::size_t dim,
+                                            const clink::sql::Row& in) const;
+
     Config cfg_;
     std::unique_ptr<KnnIndex> index_;
-    std::vector<clink::sql::Row> corpus_payloads_;  // parallel to the index's row order
+    std::vector<clink::sql::Row> corpus_payloads_;    // parallel to the index's row order
+    std::vector<std::vector<float>> corpus_vectors_;  // retained only when filter_eq is set
     std::chrono::steady_clock::time_point last_build_{};
 };
 

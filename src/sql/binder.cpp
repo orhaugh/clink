@@ -2680,6 +2680,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_vector_search(const ast::VectorSearchC
     // corpus index so a slowly-changing vector table is picked up without a restart.
     std::string metric = "cosine";
     std::int64_t corpus_refresh_ms = 0;
+    std::string filter_eq;
     for (const auto& opt : vs.options) {
         if (opt.key == "metric") {
             metric = opt.value;
@@ -2693,6 +2694,42 @@ std::unique_ptr<LogicalPlan> Binder::bind_vector_search(const ast::VectorSearchC
             if (corpus_refresh_ms < 0) {
                 bind_error("VECTOR_SEARCH: corpus_refresh_ms must be >= 0", vs.loc.pos);
             }
+        } else if (opt.key == "filter_eq") {
+            // A comma-separated list of query_col:corpus_col equality bindings. Each
+            // named column must exist (query column in the input, corpus column in the
+            // vector table); the operator applies them as a per-query metadata
+            // pre-filter, scoring only the corpus rows that match.
+            std::size_t start = 0;
+            while (start <= opt.value.size()) {
+                const auto comma = opt.value.find(',', start);
+                const auto stop = comma == std::string::npos ? opt.value.size() : comma;
+                const std::string pair = opt.value.substr(start, stop - start);
+                if (!pair.empty()) {
+                    const auto colon = pair.find(':');
+                    if (colon == std::string::npos) {
+                        bind_error(
+                            "VECTOR_SEARCH: filter_eq entries must be 'query_col:corpus_col'",
+                            vs.loc.pos);
+                    }
+                    const std::string qc = pair.substr(0, colon);
+                    const std::string cc = pair.substr(colon + 1);
+                    if (find_in(input, qc) == nullptr) {
+                        bind_error("VECTOR_SEARCH: filter_eq query column '" + qc +
+                                       "' not found in input table '" + input.name + "'",
+                                   vs.loc.pos);
+                    }
+                    if (find_in(*vtab, cc) == nullptr) {
+                        bind_error("VECTOR_SEARCH: filter_eq corpus column '" + cc +
+                                       "' not found in vector table '" + vtab->name + "'",
+                                   vs.loc.pos);
+                    }
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                start = comma + 1;
+            }
+            filter_eq = opt.value;
         }
     }
     if (metric != "cosine" && metric != "l2" && metric != "dot") {
@@ -2739,6 +2776,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_vector_search(const ast::VectorSearchC
                                                  corpus_refresh_ms,
                                                  std::move(input_cols),
                                                  std::move(vector_cols),
+                                                 std::move(filter_eq),
                                                  std::move(schema));
 }
 

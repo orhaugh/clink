@@ -1,5 +1,6 @@
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -201,6 +202,91 @@ TEST(VectorSearchOperator, CorpusRefreshPicksUpChangedCorpus) {
     auto d2 = drain_docs(ch2);
     ASSERT_EQ(d2.size(), 1U);
     EXPECT_EQ(d2[0], "b");
+}
+
+TEST(VectorSearchOperator, FilterEqRestrictsToMatchingSystem) {
+    using clink::sql::Row;
+
+    // A two-system corpus. 'pay' sits at [1,0] (the nearer match to the query
+    // below); 'net' at [0,1] is farther. A query scoped to system='net' must still
+    // retrieve 'net', which proves filter_eq is a genuine PRE-filter and not a
+    // post-filter of a top-k that would have returned 'pay'.
+    auto& reg = clink::cluster::OperatorRegistry::default_instance();
+    if (reg.find_source("vs_test_corpus_multi", std::string{"row"}) == nullptr) {
+        reg.register_source(
+            "vs_test_corpus_multi",
+            clink::cluster::SourceFactory{
+                std::string{"row"},
+                [](const clink::cluster::OperatorBuildContext&) -> std::shared_ptr<void> {
+                    auto make =
+                        [](const std::string& sys, const std::string& doc, double x, double y) {
+                            Row r;
+                            clink::config::JsonArray v;
+                            v.push_back(clink::config::JsonValue{x});
+                            v.push_back(clink::config::JsonValue{y});
+                            r.values["vec"] = clink::config::JsonValue{std::move(v)};
+                            r.values["system"] = clink::config::JsonValue{sys};
+                            r.values["doc"] = clink::config::JsonValue{doc};
+                            return r;
+                        };
+                    std::vector<clink::Record<Row>> rows;
+                    rows.emplace_back(make("net", "net-doc", 0.0, 1.0));
+                    rows.emplace_back(make("pay", "pay-doc", 1.0, 0.0));
+                    std::shared_ptr<clink::Source<Row>> src =
+                        std::make_shared<clink::VectorSource<Row>>(std::move(rows),
+                                                                   "vs_test_corpus_multi");
+                    return src;
+                }});
+    }
+
+    VectorSearchOperator::Config cfg;
+    cfg.source_factory = "vs_test_corpus_multi";
+    cfg.query_column = "q";
+    cfg.index_column = "vec";
+    cfg.vector_columns = {"doc", "system"};
+    cfg.top_k = 1;
+    cfg.index.kind = "flat";
+    cfg.index.metric = Metric::Cosine;
+    cfg.index.dim = 2;
+    cfg.filter_eq = {{"f_system", "system"}};
+    VectorSearchOperator op(std::move(cfg));
+    op.open();
+
+    auto run = [&op](const std::optional<std::string>& f_system) {
+        Row r;
+        clink::config::JsonArray q;
+        q.push_back(clink::config::JsonValue{1.0});
+        q.push_back(clink::config::JsonValue{0.1});  // nearest to pay [1,0]
+        r.values["q"] = clink::config::JsonValue{std::move(q)};
+        if (f_system.has_value()) {
+            r.values["f_system"] = clink::config::JsonValue{*f_system};
+        }
+        clink::Batch<Row> b;
+        b.push(clink::Record<Row>{std::move(r)});
+        auto el = clink::StreamElement<Row>::data(std::move(b));
+        clink::BoundedChannel<clink::StreamElement<Row>> ch(16);
+        clink::Emitter<Row> em(&ch);
+        op.process(el, em);
+        std::vector<std::string> docs;
+        while (auto e = ch.try_pop()) {
+            if (e->is_data()) {
+                for (const auto& rec : e->as_data()) {
+                    docs.push_back(rec.value().values.at("doc").as_string());
+                }
+            }
+        }
+        return docs;
+    };
+
+    // Scoped to 'net': retrieves net-doc, even though pay-doc is the nearer vector.
+    auto scoped = run(std::string{"net"});
+    ASSERT_EQ(scoped.size(), 1U);
+    EXPECT_EQ(scoped[0], "net-doc");
+
+    // No filter value (null / absent): no constraint, so the nearer pay-doc wins.
+    auto unscoped = run(std::nullopt);
+    ASSERT_EQ(unscoped.size(), 1U);
+    EXPECT_EQ(unscoped[0], "pay-doc");
 }
 
 }  // namespace

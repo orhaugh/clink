@@ -2,6 +2,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "clink/plugin/plugin.hpp"
@@ -102,6 +103,13 @@ void install(clink::plugin::PluginRegistry& reg) {
             cfg.index.ef_construction = param_size(ctx, "hnsw_ef_construction", 128);
             cfg.index.ef_search = param_size(ctx, "hnsw_ef_search", 64);
             cfg.index.hnsw_auto_threshold = param_size(ctx, "hnsw_auto_threshold", 50000);
+            // Metadata equality pre-filter: "query_col:corpus_col,..." from the planner.
+            for (const auto& pair : split_csv(ctx.param_or("filter_eq", ""))) {
+                const auto colon = pair.find(':');
+                if (colon != std::string::npos) {
+                    cfg.filter_eq.emplace_back(pair.substr(0, colon), pair.substr(colon + 1));
+                }
+            }
             return std::make_shared<VectorSearchOperator>(std::move(cfg));
         });
 }

@@ -449,6 +449,7 @@ public:
                         std::int64_t corpus_refresh_ms,
                         std::vector<std::string> input_columns,
                         std::vector<std::string> vector_columns,
+                        std::string filter_eq,
                         std::shared_ptr<arrow::Schema> schema)
         : input_(std::move(input)),
           vector_table_(vector_table),
@@ -459,6 +460,7 @@ public:
           corpus_refresh_ms_(corpus_refresh_ms),
           input_columns_(std::move(input_columns)),
           vector_columns_(std::move(vector_columns)),
+          filter_eq_(std::move(filter_eq)),
           schema_(std::move(schema)) {}
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
@@ -475,6 +477,9 @@ public:
     [[nodiscard]] const std::vector<std::string>& vector_columns() const noexcept {
         return vector_columns_;
     }
+    // Metadata equality pre-filter as a "query_col:corpus_col,..." string (empty =
+    // none), validated at bind and threaded to the vector_search_row operator.
+    [[nodiscard]] const std::string& filter_eq() const noexcept { return filter_eq_; }
 
     [[nodiscard]] std::string kind() const override { return "VectorSearch"; }
     [[nodiscard]] std::shared_ptr<arrow::Schema> schema() const override { return schema_; }
@@ -490,6 +495,7 @@ private:
     std::int64_t corpus_refresh_ms_;
     std::vector<std::string> input_columns_;
     std::vector<std::string> vector_columns_;
+    std::string filter_eq_;
     std::shared_ptr<arrow::Schema> schema_;
 };
 

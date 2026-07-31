@@ -1622,6 +1622,9 @@ std::string compile_node(const LogicalPlan& node,
             op.params["corpus_refresh_ms"] = std::to_string(vs.corpus_refresh_ms());
         }
         op.params["vector_columns"] = csv(vs.vector_columns());
+        if (!vs.filter_eq().empty()) {
+            op.params["filter_eq"] = vs.filter_eq();
+        }
         std::string id = op.id;
         spec.ops.push_back(std::move(op));
         return id;

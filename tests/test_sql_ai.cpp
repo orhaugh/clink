@@ -282,6 +282,17 @@ TEST(SqlAiBind, VectorSearchColumnCollisionRejected) {
         TranslationError);
 }
 
+TEST(SqlAiBind, VectorSearchRejectsUnknownFilterColumn) {
+    Catalog cat;
+    register_json(cat, "queries", "(id BIGINT, emb DOUBLE PRECISION ARRAY)");
+    register_json(cat, "docs", "(doc_id BIGINT, system TEXT, vec DOUBLE PRECISION ARRAY)");
+    // f_system is not a column of `queries`, so the filter_eq binding is rejected.
+    EXPECT_THROW(bind_select(cat,
+                             "SELECT * FROM VECTOR_SEARCH(TABLE queries, emb, docs, "
+                             "DESCRIPTOR(vec), 3, filter_eq='f_system:system')"),
+                 TranslationError);
+}
+
 // --- Physical ---------------------------------------------------------------
 
 TEST(SqlAiPhysical, MlPredictLowersToMlPredictRow) {
@@ -354,6 +365,24 @@ TEST(SqlAiPhysical, VectorSearchThreadsCorpusRefreshOption) {
     const auto* op = find_op(spec, "vector_search_row");
     ASSERT_NE(op, nullptr);
     EXPECT_EQ(op->params.at("corpus_refresh_ms"), "60000");
+}
+
+TEST(SqlAiPhysical, VectorSearchThreadsFilterEq) {
+    Catalog cat;
+    register_json(cat, "queries", "(id BIGINT, f_system TEXT, emb DOUBLE PRECISION ARRAY)");
+    register_json(cat, "docs", "(doc_id BIGINT, system TEXT, vec DOUBLE PRECISION ARRAY)");
+    register_json(cat,
+                  "out",
+                  "(id BIGINT, f_system TEXT, emb DOUBLE PRECISION ARRAY, doc_id BIGINT, "
+                  "system TEXT, vec DOUBLE PRECISION ARRAY, score DOUBLE PRECISION)");
+    auto plan = bind_insert(cat,
+                            "INSERT INTO out SELECT * FROM VECTOR_SEARCH(TABLE queries, emb, docs, "
+                            "DESCRIPTOR(vec), 3, filter_eq='f_system:system')");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+    const auto* op = find_op(spec, "vector_search_row");
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->params.at("filter_eq"), "f_system:system");
 }
 
 TEST(SqlAiBind, VectorSearchRejectsNegativeCorpusRefresh) {
