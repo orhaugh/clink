@@ -84,3 +84,10 @@ race:libgrpc
 race:libgpr
 called_from_lib:libgrpc.so
 called_from_lib:libgpr.so
+# etcd-cpp-apiv3 also ships a cpprest (pplx) HTTP transport whose async task
+# threads outlive the client object: etcd::SyncClient's destructor races a pplx
+# worker deleting an etcdv3::Action (a shared_ptr refcount) at teardown of the
+# EtcdHaCoordinator failover test. Both frames are inside the pre-built etcd
+# client / cpprest - no clink frame in the report.
+race:libetcd-cpp-api.so
+race:libcpprest.so
