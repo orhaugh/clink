@@ -6,11 +6,11 @@ image:
   # pull this; point repository at your own registry if you mirror it or build
   # the image yourself.
   repository: ghcr.io/orhaugh/clink-runtime
-  # A released tag, published by runtime-image.yml on v0.4.0. `main` is also
+  # A released tag, published by runtime-image.yml on v0.5.0. `main` is also
   # available as the rolling build of the default branch, and `latest` tracks the
   # newest release - pin a version like this one for anything you care about
   # staying still.
-  tag: "0.4.0"
+  tag: "0.5.0"
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

@@ -1,5 +1,69 @@
 # Changelog
 
+## v0.5.0 (July 2026)
+
+This release hardens the cluster path for a shape the earlier releases never
+exercised end to end: a bounded source, checkpointing on, side-output sinks,
+and a fan-out topology, deployed as a compiled job plugin and recovered across
+a hard worker kill. Every fix below was found by driving that shape with a real
+downstream consumer. No REST API or state-format breaks; the plugin ABI is
+unchanged (v1).
+
+**Fluent CEP timed-out side output.** `PatternStream::select_with_timed_out<U>(fn, tag, timed_out_fn)`
+mints a `CepOperator` with its timed-out emitter wired, and the side stream
+comes from the standard `.side_output<U>(tag)` idiom. A spec-built (and
+therefore cluster) job can now alert on the absence of a pattern's completion,
+not only on a match.
+
+**`clink replay` for plugin-typed operators.** `EpochReplay` was Row-only.
+`register_operator<In, Out>` now hangs a type-erased replay driver on the
+operator's factory (capturing `In`'s codec to read the capture and `Out`'s to
+serialise emissions), so `clink replay --plugin=<so> --verify` and `--emit-test`
+work on custom C++ channel types, not just SQL Row. A single-operator replay
+discards emissions to unregistered side outputs rather than aborting.
+
+**`clink_submit_job --capture-dir` / `--capture-records`.** The flight recorder
+can be armed on a cluster job from the CLI; the fields were already carried end
+to end, only the flags were missing.
+
+**The runtime image is a job SDK.** `docker/Dockerfile.runtime` now installs the
+headers, static libraries and CMake package and ships `clink_submit_job`, so a
+job plugin builds and submits inside the image against the exact engine commit
+the cluster runs (the ABI gate is git-SHA equality).
+
+**`within()` binds at match time.** A completing event arriving between
+watermarks can no longer produce a match whose event-time span exceeds the
+bound; the check no longer waits for watermark-time pruning.
+
+**Checkpoint barriers and watermarks reach side-output channels.** A
+side-output consumer previously never saw a barrier, so a checkpointed bounded
+job with a side-output sink hung at its end-of-stream final checkpoint (the
+pending-ack set never emptied). This is the fix that lets the whole cluster +
+checkpoint + side-output shape complete.
+
+**Worker-loss recovery rolls the whole job back** rather than relocating only
+the lost worker's subtasks. A mid-stream kill left surviving upstreams holding
+stale bridges to relocated peers, whose send failures cascaded into
+restart-budget exhaustion.
+
+**Cluster-built sinks get a stable, unique identity** from their spec node id
+when no uid is set, so sibling stateful sinks of the same type no longer collide
+on one `OperatorId` (which, for the 2PC sink, collided the `PREPARE TRANSACTION`
+gid). Fixed across all three sink-build paths: fused, standalone, and the plugin
+`register_sink` runner.
+
+**The planner never fuses a side-output consumer** as a chain's next operator
+(it had matched by upstream id, ignoring the side tag), and the worker resolves
+side-output attachers through the job bundle rather than the process-wide
+default (invisible to a dlopen'd plugin under `RTLD_LOCAL`).
+
+**Packaging.** The installed CMake package declares its OpenSSL dependency when
+built with HTTP TLS, so a consumer linking the HTTP surface (queryable state) no
+longer fails to resolve OpenSSL symbols.
+
+Every fix ships with a regression test; the new cluster behaviours are pinned by
+in-process `TestCluster` tests where reproducible.
+
 ## v0.4.0 (July 2026)
 
 A small, focused release: a new connector, prebuilt Linux binaries, and one
