@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.6.0 (July 2026)
+
+Two engine improvements, both surfaced by driving the SQL-native AI surface with a
+real downstream consumer. No REST API or state-format breaks; plugin ABI unchanged (v1).
+
+**Metadata pre-filter on `VECTOR_SEARCH`.** A trailing
+`filter_eq='query_col:corpus_col,...'` option scopes each query to the corpus rows
+whose named columns equal the query's (a null query value imposes no constraint). It
+is a genuine per-query PRE-filter - the operator scores only the matching corpus
+subset exactly - so restricting a similarity search by metadata (a document's system,
+tenant, and so on) does not lose recall the way post-filtering a top-k would. The
+bound columns are validated at plan time to exist in the query input and the vector
+table; it combines with the exact flat index, and pairing it with the approximate
+HNSW index is a follow-on.
+
+**`clink replay` reconstructs linked-impl operators.** Replay rebuilt an operator from
+its `op.json` capture sidecar using only the core SQL Row factories, so a captured job
+using an impl operator (`VECTOR_SEARCH`, `ML_PREDICT`, a connector) failed with "no
+registered factory" unless a plugin happened to register it. The replay command now
+installs the linked impls the same way `clink run` does, so any job clink can run it
+can also replay, with no plugin; `--plugin` still layers a downstream job plugin's own
+operators on top.
+
+Both ship with tests (`VectorSearchOperator.FilterEqRestrictsToMatchingSystem`,
+`ReplayCli.ImplOperatorJobReplaysWithoutAPlugin`, plus the SQL bind and physical-plan
+cases) and updated internals docs.
+
 ## v0.5.0 (July 2026)
 
 This release hardens the cluster path for a shape the earlier releases never
