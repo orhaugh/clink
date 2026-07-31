@@ -112,6 +112,22 @@ public:
     // typically pass the current key so on_timer can route by key.
     TimerService* timer_service() noexcept { return timers_; }
 
+    // How far event time has advanced, or nullopt before the first
+    // watermark. An operator that keeps its own ordering needs this to
+    // decide whether a record can still be placed: at or below the
+    // watermark, it cannot. See TimerService::current_watermark for what
+    // it does and does not survive.
+    std::optional<EventTime> current_watermark() const noexcept {
+        if (timers_ == nullptr) {
+            return std::nullopt;
+        }
+        const auto wm = timers_->current_watermark();
+        if (!wm.has_value()) {
+            return std::nullopt;
+        }
+        return EventTime{*wm};
+    }
+
     // Emit to a named side output. The tag must have been registered
     // on this operator's stage via Dag::side_output() (or via the
     // fluent API's equivalent).

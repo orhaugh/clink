@@ -42,6 +42,17 @@ add_executable(09_testing_framework 09_testing_framework.cpp)
 target_link_libraries(09_testing_framework PRIVATE clink::core clink::test_support)
 add_test(NAME 09_testing_framework COMMAND 09_testing_framework)
 
+# 10 links the embedded HTTP server and client. It is self-checking like 09, but
+# its real job is at LINK time: the bundled httplib is a BUILD_INTERFACE
+# dependency of clink_core, so anything it needs (OpenSSL, zlib, and on macOS the
+# CoreFoundation and Security frameworks) has to be re-declared as a usage
+# requirement on the exported target or a consumer of the static archive fails to
+# link. Nothing else here touches the HTTP surface, which is why that gap reached
+# three separate downstream projects before this example existed.
+add_executable(10_http_surface 10_http_surface.cpp)
+target_link_libraries(10_http_surface PRIVATE clink::core)
+add_test(NAME 10_http_surface COMMAND 10_http_surface)
+
 # 08 is a plugin .so (clink_submit_job loads it). It must be linked as
 # MODULE, not an executable. Built only when CLINK_BUILD_PLUGIN_EXAMPLE
 # is set, since most consumers don't need the cluster-submit flow.

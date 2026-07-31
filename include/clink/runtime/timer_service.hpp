@@ -123,6 +123,13 @@ public:
     // fired in the same poll. Returns the count fired.
     template <typename F>
     std::size_t poll_due_event_time(std::int64_t watermark_ts, F&& cb) {
+        // The runner calls this on every watermark it forwards, whether or not
+        // any timer is due, so this is where the operator's notion of event-time
+        // progress lives. Recording it is what makes current_watermark()
+        // available to operator code (see the accessor below).
+        if (!current_watermark_.has_value() || watermark_ts > *current_watermark_) {
+            current_watermark_ = watermark_ts;
+        }
         std::vector<std::pair<std::int64_t, std::string>> to_fire;
         for (auto it = event_timers_.begin();
              it != event_timers_.end() && it->first <= watermark_ts;) {
@@ -134,6 +141,22 @@ public:
         }
         return to_fire.size();
     }
+
+    // The highest watermark this operator has been driven with, or nullopt
+    // before the first one arrives.
+    //
+    // Event-time timers already fire from it, but an operator that keeps its own
+    // ordering - a reordering buffer, a custom join, anything that has to decide
+    // whether a record can still be placed - needs to read it directly: a record
+    // at or below the watermark cannot be ordered against records still to come.
+    // The built-in window operators express that as allowed_lateness plus a late
+    // output tag; this is the same information for an operator writing its own
+    // policy.
+    //
+    // Not part of the timer snapshot: after a restore it is empty again until the
+    // next watermark arrives, so an operator whose correctness depends on it
+    // across a restore should keep its own high-water mark in keyed state.
+    std::optional<std::int64_t> current_watermark() const noexcept { return current_watermark_; }
 
     bool event_timers_empty() const noexcept { return event_timers_.empty(); }
     std::size_t event_timers_size() const noexcept { return event_timers_.size(); }
@@ -274,6 +297,8 @@ private:
     TimerSet timers_;
     TimerSet event_timers_;
     NowFn now_fn_;
+    // Highest watermark seen; see current_watermark().
+    std::optional<std::int64_t> current_watermark_;
 };
 
 }  // namespace clink

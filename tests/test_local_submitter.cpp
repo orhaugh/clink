@@ -28,6 +28,7 @@
 #include "clink/runtime/output_tag.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/keyed_state.hpp"
+#include "clink/state_processor/savepoint.hpp"
 
 using namespace clink;
 using namespace clink::api;
@@ -565,4 +566,53 @@ TEST(LocalSubmitter, FluentCepTimedOutSideOutputRoutesExpiredPartials) {
 
     std::filesystem::remove(main_path);
     std::filesystem::remove(expired_path);
+}
+
+// A uid is what pins a stateful operator's OperatorId, and the OperatorId is what
+// every keyed-state slot is written under. On this path the operators are built
+// by DagBuilder closures that never see the uid, so unless the submitter stamps
+// it the operator ends up with a position-derived id - and then a restore lands
+// under one id while the operator reads another. Nothing fails: the operator
+// simply sees empty state, which is indistinguishable from a first run.
+//
+// Seed the running-sum slot for key 1 with 100 under the uid-derived id, restore
+// it, and require the sums to continue from there.
+TEST(LocalSubmitter, UidPinsTheOperatorIdSoSeededStateRestores) {
+    cluster::ensure_built_ins_registered();
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_local_submitter_uid_restore.txt";
+    std::filesystem::remove(out_path);
+
+    constexpr std::uint64_t kCheckpointId = 7;
+    auto savepoint = clink::state_processor::Savepoint::create();
+    savepoint
+        .keyed_state<std::int64_t, std::int64_t>(clink::operator_id_from_uid("running-sum"),
+                                                 "sum",
+                                                 clink::int64_codec(),
+                                                 clink::int64_codec())
+        .put(1, 100);
+
+    auto env = Pipeline::create();
+    env.source<std::int64_t>(IntRangeSource::builder().count(5).start(1).build())
+        .key_by([](const std::int64_t& v) { return v % 2; })
+        .process<std::int64_t>(std::make_shared<RunningSumFn>())
+        .uid("running-sum")
+        .sink(FileInt64Sink::builder().path(out_path.string()).build());
+
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    cfg.restore_from = savepoint.snapshot(clink::CheckpointId{kCheckpointId});
+    cluster::LocalSubmitter::submit(env, std::move(cfg));
+
+    auto lines = read_lines(out_path);
+    std::sort(lines.begin(), lines.end());
+    // key=1 continues from the seeded 100: 101, 104, 109. key=0 starts empty: 2, 6.
+    ASSERT_EQ(lines.size(), 5u);
+    EXPECT_EQ(lines[0], "101") << "the seeded value must be visible to the operator";
+    EXPECT_EQ(lines[1], "104");
+    EXPECT_EQ(lines[2], "109");
+    EXPECT_EQ(lines[3], "2");
+    EXPECT_EQ(lines[4], "6");
+
+    std::filesystem::remove(out_path);
 }

@@ -263,9 +263,23 @@ public:
     // chain identity, so it stamps each runner here from the chain spec. This
     // lets LocalExecutor emit clink_op_info{op_id,node,uid} for every operator.
     // No-op if runner_index is out of range.
+    // A non-empty uid also re-derives the runner's OperatorId, which is the id
+    // LocalExecutor builds the RuntimeContext with and therefore the id every
+    // keyed-state slot is written under. Without this a uid'd operator built by a
+    // DagBuilder keeps a position-derived id, and its state cannot be restored -
+    // silently, because a restore that lands under a different id looks exactly
+    // like state that was never written. That is the whole contract .uid() exists
+    // to provide.
+    //
+    // Deliberately not checked against assigned_uids_: the add_* paths already
+    // registered the uid when the operator carried one, so re-stamping the same
+    // uid here is expected rather than a duplicate.
     void set_runner_identity(std::size_t runner_index, std::string spec_node_id, std::string uid) {
         if (runner_index < runners_.size()) {
             runners_[runner_index].spec_node_id = std::move(spec_node_id);
+            if (!uid.empty()) {
+                runners_[runner_index].id = derive_id_from_uid_(uid);
+            }
             runners_[runner_index].spec_uid = std::move(uid);
         }
     }

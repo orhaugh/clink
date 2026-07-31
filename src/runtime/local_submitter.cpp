@@ -219,6 +219,11 @@ void LocalSubmitter::submit(api::Pipeline& env, JobConfig config) {
                                      "'). The builder probably predates the parallel-mode "
                                      "extension; recompile against the latest plugin.hpp.");
         }
+        // Stamp the spec node id and uid onto the runner the builder just made.
+        // The DagBuilder closures know nothing about either, so without this a
+        // stateful operator's OperatorId comes from its position in the graph
+        // instead of from its uid, and its state does not restore.
+        dag.set_runner_identity(built.runner_index, op.id, op.uid);
         handles.emplace(op.id, built);
 
         // Wire any declared side outputs. The DagBuilder returns the

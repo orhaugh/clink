@@ -59,6 +59,7 @@ cmake --build build --target 08_cluster_job_plugin --parallel 10
 | 07 | [`07_parquet_io.cpp`](07_parquet_io.cpp) | `ParquetSink<T>` + `ParquetSource<T>` over the shared `ArrowBatcher<T>` seam. The resulting file is a vanilla Parquet stream - open it from pyarrow / duckdb / polars to confirm. |
 | 08 | [`08_cluster_job_plugin.cpp`](08_cluster_job_plugin.cpp) | Pipeline packaged as a job plugin `.so` using `Pipeline` + `CLINK_REGISTER_JOB`. Submit to a running cluster via `clink run`. |
 | 09 | [`09_testing_framework.cpp`](09_testing_framework.cpp) | Testing a stateful operator with `clink::test_support` (the public testing framework): a `KeyedProcessFunction` driven through `make_keyed_process_function_harness`, per-key state inspected via the production read path, and a snapshot → restore round trip. Links `clink::test_support` and registers with CTest (it exits non-zero on failure). |
+| 10 | [`10_http_surface.cpp`](10_http_surface.cpp) | The embedded HTTP server and client: serve a route from inside an application, then call it. Mainly a link-time guard - the bundled httplib is a `BUILD_INTERFACE` dependency of `clink_core`, so what it needs (OpenSSL, zlib, and the CoreFoundation / Security frameworks on macOS) has to be re-declared as a usage requirement on the exported target. Nothing else here touches that surface. Registers with CTest. |
 
 ## Picking targets vs. linking everything
 

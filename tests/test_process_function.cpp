@@ -1088,3 +1088,66 @@ TEST(CoProcessFunction, EventTimeTimerSurvivesCheckpointRestore) {
     EXPECT_TRUE(fn2->fired()) << "restored co-op event-time timer must fire on watermark advance";
     EXPECT_NE(std::find(emitted2.begin(), emitted2.end(), 8000), emitted2.end());  // 7000 + 1000
 }
+
+// An operator that keeps its own ordering has to know how far event time has
+// advanced: a record at or below the watermark can no longer be placed against
+// records still to come. The window operators express that as allowed_lateness
+// plus a late output tag; an operator writing its own policy reads the watermark
+// off the context.
+namespace {
+
+class ProcessFnWatermarkObserver final : public ProcessFunction<int, int> {
+public:
+    void process_element(const int& value,
+                         ProcessFunctionContext<int>& ctx,
+                         Collector<int>& out) override {
+        const auto wm = ctx.current_watermark();
+        seen_.push_back(wm.has_value() ? wm->millis() : -1);
+        out.collect(value);
+    }
+
+    const std::vector<std::int64_t>& seen() const { return seen_; }
+
+private:
+    std::vector<std::int64_t> seen_;
+};
+
+}  // namespace
+
+TEST(ProcessFunction, ContextExposesTheCurrentWatermark) {
+    const OperatorId op_id{123};
+    auto backend = std::make_shared<InMemoryStateBackend>();
+    RuntimeContext rc(op_id, "wm", backend.get(), nullptr);
+    auto fn = std::make_shared<ProcessFnWatermarkObserver>();
+    auto op = std::make_shared<::clink::detail::ProcessFunctionAdapter<int, int>>(fn, "wm");
+    op->set_id(op_id);
+    op->attach_runtime(&rc);
+    op->open();
+
+    std::vector<int> emitted;
+    auto em = recording_emitter(emitted);
+    const auto send = [&](int v) {
+        Batch<int> b;
+        b.push(Record<int>{v});
+        op->process(StreamElement<int>::data(std::move(b)), em);
+    };
+
+    send(1);
+    EXPECT_EQ(fn->seen().at(0), -1) << "no watermark has arrived yet";
+
+    op->on_watermark(Watermark{EventTime{5000}}, em);
+    send(2);
+    EXPECT_EQ(fn->seen().at(1), 5000) << "the watermark the operator was driven with";
+
+    // Watermarks do not regress, so neither may the reported value.
+    op->on_watermark(Watermark{EventTime{4000}}, em);
+    send(3);
+    EXPECT_EQ(fn->seen().at(2), 5000) << "a lower watermark must not move it backwards";
+
+    op->on_watermark(Watermark{EventTime{9000}}, em);
+    send(4);
+    EXPECT_EQ(fn->seen().at(3), 9000);
+
+    op->close();
+    op->attach_runtime(nullptr);
+}

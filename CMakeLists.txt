@@ -813,6 +813,20 @@ if(CLINK_BUILD_HTTP)
                 "# references OpenSSL symbols, so every consumer must resolve them.\n")
             set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
                 "find_dependency(OpenSSL)\n")
+            # On macOS httplib's TLS client loads its trust anchors from the
+            # system Keychain, so http_client.cpp references CoreFoundation and
+            # Security. Same export gap as OpenSSL and zlib, with one
+            # difference: a framework is a link flag, not an imported target, so
+            # PRIVATE linking is the whole fix - CMake records it in
+            # clink_core's INTERFACE_LINK_LIBRARIES as $<LINK_ONLY:...>, which a
+            # consumer of the static archive picks up, and there is no
+            # find_dependency to add. Without it a find_package(clink) consumer
+            # that touches the HTTP client fails at link with undefined
+            # _CFArrayGetCount / _SecItemCopyMatching.
+            if(APPLE)
+                target_link_libraries(clink_core PRIVATE
+                    "-framework CoreFoundation" "-framework Security")
+            endif()
         endif()
     endif()
 

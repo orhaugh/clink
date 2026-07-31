@@ -85,6 +85,19 @@ public:
         rt_->timer_service()->register_event_time_timer(ts, gate_key_);
     }
 
+    // How far event time has advanced, or nullopt before the first watermark.
+    // Same meaning as the synchronous context's accessor.
+    std::optional<EventTime> current_watermark() const noexcept {
+        if (rt_ == nullptr) {
+            return std::nullopt;
+        }
+        const auto wm = rt_->timer_service()->current_watermark();
+        if (!wm.has_value()) {
+            return std::nullopt;
+        }
+        return EventTime{*wm};
+    }
+
     template <typename U>
     Emitter<U> side_output(const OutputTag<U>& tag) {
         return rt_->template side_output<U>(tag);
