@@ -147,6 +147,35 @@ Registry& Registry::instance() {
     return reg;
 }
 
+namespace {
+
+// Force the registry to exist during static initialisation.
+//
+// Without this the environment form is dead code. reach() checks
+// g_any_armed inline and returns immediately when it is false - which is
+// the whole point of the fast path - so on a process where nothing armed
+// anything programmatically, Registry::instance() is never called, the
+// constructor never runs, and CLINK_FAULT_INJECT is never read. Every
+// fault point stays inert while the operator believes a fault is armed.
+//
+// This is safe on ordering: g_any_armed is a constant-initialised
+// std::atomic<bool> in the same TU, so it is zero-initialised before any
+// dynamic initialiser here runs. The TU is always linked because the
+// inline reach() references g_any_armed.
+std::atomic<bool> g_env_seeding_ran{false};
+
+const bool g_env_seeded = [] {
+    (void)Registry::instance();
+    g_env_seeding_ran.store(true, std::memory_order_relaxed);
+    return true;
+}();
+
+}  // namespace
+
+bool Registry::env_seeding_ran() noexcept {
+    return g_env_seeding_ran.load(std::memory_order_relaxed);
+}
+
 Registry::Registry() {
     // Seed once from the environment. Read here rather than per-reach so a
     // setenv() after first use cannot change behaviour halfway through a

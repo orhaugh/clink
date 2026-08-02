@@ -230,6 +230,19 @@ TEST_F(FaultInjectionTest, AvailabilityIsReportedTrueInThisBuild) {
     EXPECT_TRUE(clink::fault::available());
 }
 
+TEST_F(FaultInjectionTest, EnvironmentSeedingRunsAtStaticInit) {
+    // Regression guard. The inline reach() checks g_any_armed and returns
+    // before touching Registry::instance(), so on a process that arms
+    // nothing programmatically the constructor - and therefore the
+    // CLINK_FAULT_INJECT read - would never run. Every fault point stayed
+    // inert while an operator believed a fault was armed, which made the
+    // whole cross-process story dead code. A static initialiser forces the
+    // construction; this asserts it still happens.
+    EXPECT_TRUE(clink::fault::Registry::env_seeding_ran())
+        << "CLINK_FAULT_INJECT is not being read: the static initialiser that constructs "
+           "the registry has been dropped, and every env-armed fault is silently inert";
+}
+
 }  // namespace
 
 #else  // !CLINK_FAULT_INJECTION

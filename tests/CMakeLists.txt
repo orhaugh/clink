@@ -299,6 +299,7 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_cluster_tls.cpp
         integration/test_two_phase_commit.cpp
         integration/test_worker_crash_recovery.cpp
+        integration/test_fault_recovery.cpp
         integration/test_coordinator_ha_failover.cpp
         integration/test_coordinator_rescale.cpp
         integration/test_schema_evo_check.cpp

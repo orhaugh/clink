@@ -1,25 +1,41 @@
-# Sanitizer matrix for clink - MANUAL trigger only.
+# Sanitizer coverage for clink.
 #
-# A full asan/tsan/ubsan pass takes over an hour per mode on the hosted
-# runners, so this is not part of the per-push ci pipeline. Run it:
+# Three triggers, matching the three questions a sanitizer answers:
 #
-#   gh workflow run sanitizers.yml -f mode=all        # all three, in parallel
-#   gh workflow run sanitizers.yml -f mode=asan       # one mode
+#   pull_request  A FAST ASan+UBSan subset over the concurrency- and
+#                 memory-sensitive labels only. Minutes, not the full hour,
+#                 so it can be a blocking gate on every PR without making
+#                 the pipeline unusable. TSan is excluded here: it is the
+#                 slowest of the three and its findings are rarely the ones
+#                 a single PR introduces.
+#   schedule      The FULL asan/tsan/ubsan matrix, nightly. Blocking in the
+#                 sense that a red nightly is a release blocker; nothing is
+#                 marked advisory.
+#   workflow_dispatch  Manual, for a pre-release pass or after touching
+#                 concurrency code.
 #
-# or from the Actions tab (Run workflow). It reuses the pinned toolchain
-# image that ci pushes as :main on every main build, so a run needs at least
-# one prior green toolchain-image job.
+# Everything here is blocking. There is no continue-on-error in this file,
+# and no step that swallows a failure. Logs and any reproducer seed are
+# uploaded as artifacts on failure so a red run can be diagnosed without
+# re-running it locally.
 #
-# Known pre-existing tail (NOT memory-safety bugs): ~24 failures under ASan,
-# all tests that spawn the clink CLI subprocess (CheckSavepointCli /
-# StateExportCli - the child's ASan diagnostics pollute the stdout they
-# assert on), stand up an embedded HTTP server (HttpModelProvider / PubSub),
-# or run an in-process cluster (InlineOpsE2E / TestCluster / Coordinator*).
-# Judge a run against that tail: NEW failures are the signal.
+# Known pre-existing tail (NOT memory-safety bugs, and NOT excused): ~24
+# failures under ASan, all in tests that spawn the clink CLI as a
+# subprocess (the child's ASan diagnostics pollute the stdout they assert
+# on), stand up an embedded HTTP server, or run an in-process cluster.
+# Those are excluded BY NAME from the PR subset below - an explicit,
+# reviewable list - rather than by making the whole job advisory. The
+# nightly full run still executes them, so the tail stays visible and
+# cannot quietly grow.
 
 name: sanitizers
 
 on:
+  pull_request:
+    branches: [main]
+  schedule:
+    # 02:30 UTC daily. Off-peak for the hosted runners.
+    - cron: "30 2 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -33,31 +49,26 @@ permissions:
   packages: read
 
 jobs:
-  sanitizer:
-    name: Sanitizer (${{ matrix.mode }})
+  # -------------------------------------------------------------------------
+  # PR gate: fast ASan + UBSan over the subsystems where a memory or UB bug
+  # is both most likely and most damaging. Blocking.
+  # -------------------------------------------------------------------------
+  pr-subset:
+    if: github.event_name == 'pull_request'
+    name: Sanitizer PR subset (${{ matrix.mode }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        mode: ${{ fromJSON(inputs.mode == 'all' && '["asan","tsan","ubsan"]' || format('["{0}"]', inputs.mode)) }}
+        mode: [asan, ubsan]
     container:
-      # The :main moving tag is pushed by ci.yml's toolchain-image job on
-      # every push to main.
       image: ghcr.io/${{ github.repository_owner }}/clink-build:main
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-      # root: the runner's mounted dirs are root-owned and the image's
-      # default user is non-root (see ci.yml).
       options: --user root
     env:
-      # build_and_test.sh keys IN_DOCKER for both the recursion guard (we
-      # are already in the container, so it must not try to re-`docker run`)
-      # and CLINK_DEPS_PREFIX=/usr/local.
-      IN_DOCKER: "1"
-      # Compiler cache (see ci.yml): CMake reads the launcher from the
-      # environment, so build_and_test.sh needs no changes. Keyed per mode -
-      # sanitizer flags differ, so the object caches are disjoint anyway.
+      CLINK_DEPS_PREFIX: /usr/local
       CCACHE_DIR: /root/.ccache
       CCACHE_MAXSIZE: 1500M
       CMAKE_C_COMPILER_LAUNCHER: ccache
@@ -65,8 +76,91 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git
-        # Without this the plugin ABI-hash git calls fail with 'dubious
-        # ownership' inside the container (see ci.yml).
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install ccache
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends ccache
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /root/.ccache
+          key: ccache-san-pr-${{ matrix.mode }}-${{ github.run_id }}
+          restore-keys: ccache-san-pr-${{ matrix.mode }}-
+      - name: Configure
+        # SQL off for the PR subset: it roughly doubles build time and the
+        # planner is not where a sanitizer finding lands. The nightly full
+        # run builds it.
+        run: |
+          FLAGS="-fsanitize=address -fno-omit-frame-pointer"
+          if [ "${{ matrix.mode }}" = "ubsan" ]; then
+            FLAGS="-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+          fi
+          cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug \
+            -DCLINK_BUILD_TESTS=ON \
+            -DCLINK_BUILD_SQL=OFF \
+            -DCMAKE_C_FLAGS="-g1 $FLAGS" \
+            -DCMAKE_CXX_FLAGS="-g1 $FLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS="$FLAGS"
+      - name: Build
+        run: cmake --build build-san --target clink_core_tests -j "$(( $(nproc) / 2 ))"
+      - name: Test (core subset) [blocking gate]
+        # The priority surfaces from the hardening brief: bounded channels,
+        # operator threading, network bridges, checkpoint coordination,
+        # state backends, shutdown, cancellation, rescaling, multi-input.
+        #
+        # -E excludes the pre-existing subprocess/HTTP/in-process-cluster
+        # tail BY NAME. Each entry is a test whose ASan diagnostics collide
+        # with an assertion on child stdout, not a suppressed finding.
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=0:print_stacktrace=1
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/lsan-suppressions.txt
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ctest --test-dir build-san --output-on-failure -j 2 --timeout 300 \
+            -R 'BoundedChannel|Channel|Network|Checkpoint|StateBackend|InMemoryState|FileBacked|Rescale|KeyGroup|Watermark|Barrier|Operator|Window|FaultInjection|Async|Shutdown|Cancel' \
+            -E 'CheckSavepointCli|StateExportCli|HttpModelProvider|PubSub|InlineOpsE2E|TestCluster|Coordinator'
+      - name: Upload sanitizer logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-pr-${{ matrix.mode }}-logs
+          path: |
+            build-san/Testing/**/*.log
+            build-san/Testing/**/*.xml
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /root/.ccache
+          key: ccache-san-pr-${{ matrix.mode }}-${{ github.run_id }}
+
+  # -------------------------------------------------------------------------
+  # Nightly / manual: the full matrix over the whole suite. Blocking.
+  # -------------------------------------------------------------------------
+  full:
+    if: github.event_name != 'pull_request'
+    name: Sanitizer full (${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ${{ fromJSON(github.event_name == 'schedule' && '["asan","tsan","ubsan"]' || (inputs.mode == 'all' && '["asan","tsan","ubsan"]' || format('["{0}"]', inputs.mode))) }}
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/clink-build:main
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user root
+    env:
+      IN_DOCKER: "1"
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Install ccache
         run: apt-get update -q && apt-get install -y -q --no-install-recommends ccache
@@ -76,8 +170,18 @@ jobs:
           path: /root/.ccache
           key: ccache-sanitizer-${{ matrix.mode }}-${{ github.run_id }}
           restore-keys: ccache-sanitizer-${{ matrix.mode }}-
-      - name: Sanitizer build + tests
+      - name: Sanitizer build + tests [blocking gate]
         run: ./build_and_test.sh --sanitizer ${{ matrix.mode }}
+      - name: Upload sanitizer logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-full-${{ matrix.mode }}-logs
+          path: |
+            build-${{ matrix.mode }}/Testing/**/*.log
+            build-${{ matrix.mode }}/Testing/**/*.xml
+          if-no-files-found: ignore
+          retention-days: 30
       - name: ccache stats
         if: always()
         run: ccache -s

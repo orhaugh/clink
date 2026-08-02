@@ -185,6 +185,14 @@ public:
 
     [[nodiscard]] bool any_armed() const;
 
+    // True once the static initialiser that seeds from CLINK_FAULT_INJECT
+    // has run. Exposed purely so a test can assert it: the seeding lives
+    // in a static initialiser precisely BECAUSE the inline fast path
+    // short-circuits before instance() would otherwise be called, and if
+    // that initialiser is ever dropped the environment form goes silently
+    // dead again (it did once).
+    [[nodiscard]] static bool env_seeding_ran() noexcept;
+
 private:
     Registry();
 

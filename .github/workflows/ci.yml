@@ -12,9 +12,13 @@
 # Jobs and what gates the pipeline:
 #   toolchain-image - build + push the pinned image (cached). Push events
 #                     only; pull_request runs reuse the :main image.     [gate]
-#   build           - build with SQL + WASM + integration on; the unit + SQL
-#                     ctest run is the hard gate, the multi-process integration
-#                     run is advisory (see the step comments).           [gate + advisory step]
+#   build           - build with SQL + WASM + integration on. The unit + SQL
+#                     ctest runs are hard gates, and so is the multi-process
+#                     FAULT-TOLERANCE subset (tests/integration/
+#                     test_fault_recovery.cpp on the deterministic harness).
+#                     The remaining integration tests stay advisory until
+#                     they are converted off the sleep/bind-close-race
+#                     patterns onto that harness.        [gates + advisory step]
 #   install-smoke   - install + consume from an out-of-tree find_package. [gate]
 #   release-sql-runtime - the two live queryable-state HTTP tests, built in
 #                     Release (they need optimized throughput; the Debug gate
@@ -24,10 +28,14 @@
 #                     dependency bump there merges unverified.           [gate]
 #
 # So a green pipeline requires: the pinned image builds, the full tree builds,
-# the unit + SQL suite passes, install-smoke consumes clink, and the Release
-# queryable-state HTTP tests pass. The integration step runs advisory until
-# its pre-existing timing tail is triaged. The sanitizer matrix is a separate
-# MANUAL workflow (sanitizers.yml) - over an hour per mode, too heavy per push.
+# the unit + SQL suite passes, the multi-process fault-tolerance scenarios
+# pass, install-smoke consumes clink, and the Release queryable-state HTTP
+# tests pass. The remaining integration tests run advisory with a named
+# reason (see the step comment) and a shrinking scope.
+#
+# Sanitizers are their own workflow (sanitizers.yml) and are no longer
+# manual-only: a fast ASan+UBSan subset gates every pull request and the
+# full asan/tsan/ubsan matrix runs nightly. Both are blocking.
 
 name: ci
 
@@ -187,16 +195,49 @@ jobs:
           ctest --test-dir build --output-on-failure -j 2 --timeout 300
           -L sql -LE integration
           -E 'SqlQueryableState\.Live(GroupByStateServedOverHttp|WholeJobStateExportOverHttp)'
-      - name: Test (integration, serial) [advisory]
-        # Multi-process integration tests (incl. the exactly-once failover
-        # test). Advisory until the pre-existing multi-process flakiness is
-        # triaged: some spawn/kill cluster tests are timing-sensitive and at
-        # least one (RecoveryCommitsPreCommittedFilesOnRestart) fails on macOS
-        # with a submit-RPC race; their Linux status is not yet established.
-        # continue-on-error surfaces the results (and any NEW regression) as a
-        # warning without red-lighting the gate.
+      - name: Test (fault tolerance, serial) [blocking gate]
+        # The multi-process failure/recovery scenarios, built on the
+        # deterministic harness in tests/integration/cluster_harness.hpp.
+        #
+        # These GATE. What makes that defensible is that none of them waits
+        # for a duration: every step waits for the condition it actually
+        # depends on (port accepting, worker registered, COMPLETED-N marker
+        # present, process gone, submitter exited) with a monotonic deadline
+        # as a failure bound only. The sleep-based approximations of those
+        # conditions are what made the older tests unfit to gate.
+        #
+        # Serial: each test stands up its own coordinator + workers.
+        run: >-
+          ctest --test-dir build --output-on-failure --parallel 1 --timeout 300
+          -L integration -R 'FaultRecovery'
+      - name: Test (remaining integration, serial) [advisory]
+        # Everything else under the integration label. Still advisory, and
+        # deliberately so rather than gated-and-hoped: these tests use the
+        # pre-harness patterns - a bind-close-race free-port probe
+        # (duplicated in 26 files) and sleep_for standing in for readiness
+        # conditions - which are the identified causes of the flakiness, not
+        # a mystery. The fix is to convert them onto the harness, not to
+        # remove this line; each conversion moves a test into the gate above
+        # and shrinks this set.
+        #
+        # -E FaultRecovery so the gated tests are not run twice.
         continue-on-error: true
-        run: ctest --test-dir build --output-on-failure --parallel 1 --timeout 240 -L integration
+        run: >-
+          ctest --test-dir build --output-on-failure --parallel 1 --timeout 240
+          -L integration -E 'FaultRecovery'
+      - name: Upload integration artifacts on failure
+        # A multi-process failure with no child logs cannot be diagnosed
+        # from a CI transcript. The harness keeps its scratch tree (with
+        # every coordinator/worker log) when a test fails; collect it.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs
+          path: |
+            /tmp/clink_it_*/logs/**
+            build/Testing/**/*.log
+          if-no-files-found: ignore
+          retention-days: 14
       - name: ccache stats
         if: always()
         run: ccache -s
