@@ -171,6 +171,16 @@ Two implementations exist:
 
 In `clink_node`, passing `--ha-dir` (or `--etcd-endpoints`) puts the coordinator in HA mode: `coordinator.start()` is deferred until `on_become_leader` fires, at which point the coordinator binds the control port and calls `recover_persisted_jobs()`. A standby coordinator just sits on the coordinator poll thread.
 
+#### Protocol version negotiation
+
+Every node declares two numbers at the handshake: `protocol_version`, the wire protocol it speaks, and `min_compatible_protocol_version`, the oldest peer it will talk to. `check_protocol_compatibility` (`include/clink/cluster/protocol.hpp`) accepts only when each side falls inside the other's range, and the coordinator applies it at both `Register` and `HelloClient` while the worker applies it to the `RegisterAck`. The check is symmetric on purpose: "the coordinator can read the worker" does not imply the reverse, and a one-sided handshake admits a pairing that half-works.
+
+This is deliberately NOT the mechanism that handles a message gaining a field. That is the additive-tail idiom - encoders append at the end, decoders read `r.eof() ? default : read()` - and it must keep working without negotiation, because it is what lets a cluster be rolled one node at a time. `kClusterProtocolVersion` is bumped only for a change additive tails cannot express: a field changing meaning or width, a `MessageKind` repurposed, a semantic contract changed under an unchanged encoding. Bumping it for an additive change would refuse the very upgrade the idiom exists to allow.
+
+A peer built before versioning sends no fields, which decode as `0` and are read as version 1. Refusals name both versions and say which end to upgrade, and increment `clink_protocol_mismatches_total`. A refused client receives a `SubmitJobAck` nack; CLI tools other than `clink submit` surface its message through `protocol_rejection_message` rather than reporting an unexpected frame kind.
+
+Raising `kMinCompatibleClusterProtocolVersion` is an end-of-support decision, not a routine bump: it strands every peer below it, loudly and at the handshake.
+
 #### Fencing: a coordinator that has lost leadership cannot act
 
 Losing leadership is not something a leader can detect on its own. A coordinator partitioned from the coordination store, or paused past its lease, keeps every worker connection open, keeps its in-memory job state, and keeps its checkpoint timer running. Fencing is what stops it acting on that stale belief.
@@ -261,6 +271,7 @@ Remaining hardening, still trusted-network today: the inter-operator **data plan
 | `CheckpointConfig`, `effective_max_restarts` (`protocol.hpp`) | Per-job checkpoint/restore/restart and state-backend settings, and the restart-policy resolution |
 | `HaCoordinator`, `make_file_ha_coordinator`, `make_etcd_ha_coordinator` | Leader election and leader-endpoint discovery |
 | `Coordinator::set_epoch` / `epoch()`, `Worker::bound_epoch()` / `fenced_frame_count()` | Fencing epoch: stamped on every control frame, enforced worker-side |
+| `kClusterProtocolVersion`, `check_protocol_compatibility` | Wire-protocol version negotiation at the handshake |
 | `ServiceDiscovery` and subclasses | worker-side discovery of the coordinator endpoint (static, env var, file) |
 | `JobSubmitter` (`job_submitter.hpp`) | Programmatic client: connect, `HelloClient` + `SubmitJob`, await ack/completion |
 | `PluginRegistry` (`plugin.hpp`) | Registration sink for a job/plugin's types, sources, operators, sinks, selectors and key extractors |

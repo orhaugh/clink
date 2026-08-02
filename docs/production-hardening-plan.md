@@ -359,6 +359,40 @@ both were fixed; `EachLeadershipTakesAnEpochAboveEveryEarlierOne` pins the
 property with distinct coordinator objects, each with its own
 zero-initialised counter, which is the condition that hid the bug.
 
+### F19. The cluster wire protocol carried no version at all
+
+`RegisterMsg` declared nothing, `HelloClientMsg` was literally an empty
+struct, and no code path compared versions anywhere. The protocol's only
+compatibility mechanism was the additive-tail idiom, which is good at what
+it does and covers exactly one kind of change: a message gaining a field.
+
+Everything else is invisible on the wire. A field changing meaning or
+width, a `MessageKind` value repurposed, a semantic contract changed under
+an unchanged encoding - a mixed-version cluster would run into any of those
+with no handshake failure and no diagnostic, and the symptom would surface
+later as a job that will not deploy or a checkpoint that never commits.
+
+**Risk:** a rolling upgrade across an incompatible boundary corrupts or
+stalls running jobs instead of refusing to start.
+
+### F20. The snapshot format version was written and never read
+
+`docs/internals/state-snapshot-format.md` states the rule as a
+requirement: "readers MUST reject a version above the highest they know
+rather than guess." The writer stamps `clink.format_version` on every
+stream. Nothing read it - a grep for the key found the writer, and tests
+asserting the writer wrote it.
+
+The schema check present at each read site is not a substitute. A format
+version is bumped precisely for a change the previous reader MISREADS, and
+such a change need not alter the column shape: a key-layout change would
+not. A future version-2 stream would have passed the schema check and been
+restored as version 1.
+
+**Risk:** silently wrong state after a restore, which is the failure mode
+with the longest gap between cause and symptom. This is the same class as
+F10 - a rule enforced by documentation.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -396,7 +430,7 @@ lives; evidence is in section 4.
 | W13 | Strict rejection of unsupported SQL semantics | P0.4 | F14, F15 | **Partial** |
 | W14 | Resource and overload limits | P1.9 | - | **Open** |
 | W15 | Coordinator fencing: epoch on the wire, worker enforcement, metadata guard | P1.11 | F16 | **Partial** |
-| W16 | Protocol version negotiation across RPC/frames/state | P1.12 | - | **Open** |
+| W16 | Protocol version negotiation across RPC/frames/state | P1.12 | F19, F20 | **Partial** |
 | W17 | Config profiles + linter | P1.13 | - | **Open** |
 | W18 | OpenTelemetry tracing | P1.14 | - | **Open** |
 | W19 | Production metrics completion | P1.15 | - | **Open** |
@@ -1300,6 +1334,91 @@ accepting, a registration counted - with a deadline as a failure bound only.
 
 ---
 
+### W16 - Protocol version negotiation — Partial
+
+**Source:** `include/clink/cluster/protocol.hpp`,
+`include/clink/cluster/messages.hpp`,
+`include/clink/cluster/client_handshake.hpp`, `src/cluster/coordinator.cpp`,
+`src/cluster/worker.cpp`, `include/clink/state/snapshot_arrow_writer.hpp`,
+`src/state/*.cpp`
+
+**Two mechanisms, deliberately kept separate.** Additive tails already
+handle a message gaining a field, and they must keep handling it without
+negotiation: bumping a version for an additive change would refuse the
+rolling upgrade the idiom exists to allow. `kClusterProtocolVersion` is for
+everything additive tails cannot express - a field changing meaning or
+width, a kind repurposed, a semantic contract changed under an unchanged
+encoding. The header says which is which, because getting that wrong in
+either direction is costly: bump too eagerly and every upgrade is an
+outage, bump too rarely and the version means nothing.
+
+**The rule is symmetric.** Each side declares `protocol_version` and
+`min_compatible_protocol_version`; `check_protocol_compatibility` accepts
+only when each is inside the other's range. "Can the coordinator read the
+worker?" is a different question from "can the worker read the
+coordinator?", and a one-sided check admits a pairing that half-works -
+which surfaces later as a decode failure far from the cause. The
+coordinator checks at `Register` and at `HelloClient`; the worker checks
+the `RegisterAck`.
+
+**Zero means version 1.** A peer built before this change sends no fields,
+so they decode as 0. Reading that as "invalid" would fence off every node
+that had not restarted yet, turning the deployment of a compatibility
+feature into an outage. `ARealCoordinatorAdmitsAPeerThatDeclaresNothing`
+sends the exact truncated frame an older build puts on the wire.
+
+**The refusal is legible.** A refused worker gets a `RegisterAck` nack
+naming both versions and which end to upgrade. A refused client gets a
+`SubmitJobAck`, which is right for `clink submit` and wrong for every other
+tool - so `protocol_rejection_message` lets those report the reason instead
+of "unexpected reply kind 12". Refusals increment
+`clink_protocol_mismatches_total`.
+
+**Snapshot format version, now enforced.** `verify_snapshot_format_version`
+is called at all six read sites (three in `InMemoryStateBackend`, plus
+changelog restore, state migration, and canonicalisation). Absence is
+version 1 permanently, because pre-marker streams are valid. The parse is
+strict - every character a digit - because `std::stoul` alone skips leading
+whitespace and stops at the first non-digit, so `" 1"` and `"1.0"` would
+both have read as 1 and let a stream clink never wrote past the gate.
+
+**Tests:** `tests/test_protocol_versioning.cpp`, 17 cases.
+
+Four of them go through a real coordinator or a real restore rather than
+calling the predicate, because the predicate was never the risk - a gate
+nothing calls is exactly the defect F20 describes, and it can be
+reintroduced one call site at a time. Both were mutation-checked: deleting
+the coordinator's negotiation makes
+`ARealCoordinatorRefusesAWorkerItCannotSpeakTo` report "a worker from an
+unsupported protocol version was admitted", and deleting the gate from
+`InMemoryStateBackend::restore` makes `ARestoreActuallyRunsTheGate` report
+"a snapshot from a newer format was restored as though it were the current
+one". The unit-level cases alone survive both.
+
+**What makes this Partial - stated plainly:**
+
+- **The version is declared, not exercised.** Everything is at version 1,
+  so no test has run two genuinely incompatible builds against each other.
+  What is verified is that the mechanism refuses the pairings it should and
+  admits the ones it should, using synthetic version numbers. The first
+  real bump will be the first real test.
+- **Only the handshake is checked.** Per-message versioning does not exist:
+  a frame is trusted once the connection is admitted. That is the right
+  trade for a control plane where both ends are pinned at connect time, but
+  it means a version bump can only ever be enforced connection-wide.
+- **The data plane is not covered.** Arrow IPC between operators carries no
+  clink version; it relies on Arrow's own format compatibility. A change to
+  clink's sidecar conventions would not be caught.
+- **Plugin ABI is a separate mechanism and stays that way.** `.so` loading
+  gates on a build hash (`cluster_abi_hash`), which is stricter than a
+  version and correct for shared objects. It is not unified with this, and
+  should not be.
+- **No CLI surface reports the negotiated version.** An operator diagnosing
+  a mixed cluster reads it out of a refusal message or the coordinator log,
+  not from `clink list` or `--capabilities-json`.
+
+---
+
 ## 5. Test evidence
 
 Commands run, on macOS 26.3 (arm64), Apple clang, `RelWithDebInfo`.
@@ -1319,6 +1438,8 @@ cmake -S . -B build && cmake --build build --parallel 10
     -> 13 tests from 1 test suite ran. [  PASSED  ] 13 tests.
 ./build/tests/clink_core_tests --gtest_filter='CoordinatorFencing*:WireProtocolFencing*'
     -> 15 tests from 2 test suites ran. [  PASSED  ] 15 tests.
+./build/tests/clink_core_tests --gtest_filter='ProtocolVersioning*:SnapshotFormatVersion*'
+    -> 17 tests from 2 test suites ran. [  PASSED  ] 17 tests.
 
 # Whole suite, after the changes
 cmake -S . -B build -DCLINK_BUILD_SQL=ON && cmake --build build --parallel 10

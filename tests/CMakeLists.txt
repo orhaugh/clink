@@ -82,6 +82,7 @@ add_executable(clink_core_tests
     test_distributed_bridge.cpp
     test_cluster.cpp
     test_coordinator_fencing.cpp
+    test_protocol_versioning.cpp
     test_ha_coordinator.cpp
     test_key_groups.cpp
     test_service_discovery.cpp

@@ -15,6 +15,8 @@
 #include <arrow/io/memory.h>
 #include <arrow/ipc/api.h>
 
+#include "clink/state/snapshot_arrow_writer.hpp"
+
 namespace clink {
 
 namespace {
@@ -147,6 +149,7 @@ std::vector<std::byte> arrow_migrate_bytes(std::span<const std::byte> input,
     if (!reader_result.ok())
         throw_arrow("auto_migrate (open reader)", reader_result.status());
     auto reader = *reader_result;
+    verify_snapshot_format_version(reader->schema()->metadata(), "state migration");
 
     // Validate the input schema actually matches the registered
     // from_schema. We can't auto-migrate if the data on disk is for

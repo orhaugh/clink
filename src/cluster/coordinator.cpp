@@ -707,6 +707,20 @@ bool Coordinator::handle_first_frame_(std::unique_ptr<network::Connection> conn)
         return true;
     }
     if (kind == MessageKind::HelloClient) {
+        // Same negotiation as a worker's. A CLI built against one cluster
+        // version and pointed at another used to find out by submitting.
+        const auto hello = decode_hello_client(r);
+        if (const auto compat = check_protocol_compatibility(
+                hello.protocol_version, hello.min_compatible_protocol_version, "client");
+            !compat.compatible) {
+            log::error("coordinator.client", "refusing client: " + compat.reason);
+            metrics::orch::protocol_mismatch();
+            const auto frame =
+                encode_frame(MessageKind::SubmitJobAck,
+                             SubmitJobAckMsg{.job_id = 0, .ok = false, .message = compat.reason});
+            (void)send_frame(*conn, frame);
+            return false;  // conn destructor closes
+        }
         // Client connection: spawn a per-client thread that reads
         // SubmitJob frames and writes acks/completions. shared_ptr
         // ownership lets stop() safely call shutdown_read() even if
@@ -723,6 +737,26 @@ bool Coordinator::handle_first_frame_(std::unique_ptr<network::Connection> conn)
 
 void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, MessageReader& r) {
     auto reg = decode_register(r);
+
+    // Protocol negotiation, before anything else is done with this worker.
+    //
+    // Refusing at the handshake is the whole point: an incompatible peer
+    // admitted here does not fail here, it fails later on some control
+    // frame it could not decode, at which point the symptom (a job that
+    // will not deploy, a checkpoint that never commits) is a long way from
+    // the cause. The refusal carries both versions so the operator knows
+    // which end to upgrade without reading two logs.
+    if (const auto compat = check_protocol_compatibility(reg.protocol_version,
+                                                         reg.min_compatible_protocol_version,
+                                                         "worker '" + reg.worker_id + "'");
+        !compat.compatible) {
+        log::error("coordinator.register", "refusing registration: " + compat.reason);
+        metrics::orch::protocol_mismatch();
+        RegisterAckMsg nack{.ok = false, .message = compat.reason};
+        const auto frame = fenced_frame_(MessageKind::RegisterAck, nack);
+        (void)send_frame(*conn, frame);
+        return;  // conn destructor closes
+    }
 
     auto worker = std::make_shared<WorkerConnection>();
     worker->worker_id = reg.worker_id;

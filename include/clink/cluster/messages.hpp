@@ -15,6 +15,10 @@ inline void encode_body(MessageBuilder& b, const RegisterMsg& m) {
     // frame, get http_port=0 on the decoded struct, treat the worker as
     // HTTP-disabled. Same wire-compat pattern as slot_count.
     b.put_u16_be(m.http_port);
+    // Protocol version declaration, appended last. A peer that stops
+    // reading here is pre-versioning and decodes 0, which reads as v1.
+    b.put_u32_be(m.protocol_version);
+    b.put_u32_be(m.min_compatible_protocol_version);
 }
 
 inline void encode_body(MessageBuilder& b, const RegisterAckMsg& m) {
@@ -23,6 +27,10 @@ inline void encode_body(MessageBuilder& b, const RegisterAckMsg& m) {
     // Fencing epoch, appended last so an older peer that stops
     // reading here still decodes the rest correctly.
     b.put_u64_be(m.coordinator_epoch);
+    // Protocol version declaration, appended last. A peer that stops
+    // reading here is pre-versioning and decodes 0, which reads as v1.
+    b.put_u32_be(m.protocol_version);
+    b.put_u32_be(m.min_compatible_protocol_version);
 }
 
 // Append a PluginBinary's wire encoding. The bytes blob can be large
@@ -176,7 +184,12 @@ inline void encode_body(MessageBuilder& b, const HeartbeatMsg& m) {
     b.put_string(m.worker_id);
 }
 
-inline void encode_body(MessageBuilder& /*b*/, const HelloClientMsg&) {}
+inline void encode_body(MessageBuilder& b, const HelloClientMsg& m) {
+    // Protocol version declaration, appended last. A peer that stops
+    // reading here is pre-versioning and decodes 0, which reads as v1.
+    b.put_u32_be(m.protocol_version);
+    b.put_u32_be(m.min_compatible_protocol_version);
+}
 
 inline void encode_body(MessageBuilder& b, const SubmitJobMsg& m) {
     b.put_string(m.graph_json);
@@ -339,6 +352,10 @@ inline RegisterMsg decode_register(MessageReader& r) {
     m.data_host = r.read_string();
     m.slot_count = r.eof() ? std::uint32_t{1} : r.read_u32_be();
     m.http_port = r.eof() ? std::uint16_t{0} : r.read_u16_be();
+    // Protocol version declaration. Absent from a pre-versioning peer,
+    // which decodes 0 and is read as v1 by check_protocol_compatibility.
+    m.protocol_version = r.eof() ? std::uint32_t{0} : r.read_u32_be();
+    m.min_compatible_protocol_version = r.eof() ? std::uint32_t{0} : r.read_u32_be();
     return m;
 }
 
@@ -349,6 +366,10 @@ inline RegisterAckMsg decode_register_ack(MessageReader& r) {
     // Fencing epoch. Absent from a pre-fencing peer, which reads
     // as 0 = unfenced and preserves the old behaviour.
     m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
+    // Protocol version declaration. Absent from a pre-versioning peer,
+    // which decodes 0 and is read as v1 by check_protocol_compatibility.
+    m.protocol_version = r.eof() ? std::uint32_t{0} : r.read_u32_be();
+    m.min_compatible_protocol_version = r.eof() ? std::uint32_t{0} : r.read_u32_be();
     return m;
 }
 
@@ -554,8 +575,13 @@ inline FinalCheckpointAssignedMsg decode_final_checkpoint_assigned(MessageReader
     return m;
 }
 
-inline HelloClientMsg decode_hello_client(MessageReader&) {
-    return {};
+inline HelloClientMsg decode_hello_client(MessageReader& r) {
+    HelloClientMsg m;
+    // Protocol version declaration. Absent from a pre-versioning peer,
+    // which decodes 0 and is read as v1 by check_protocol_compatibility.
+    m.protocol_version = r.eof() ? std::uint32_t{0} : r.read_u32_be();
+    m.min_compatible_protocol_version = r.eof() ? std::uint32_t{0} : r.read_u32_be();
+    return m;
 }
 
 inline SubmitJobMsg decode_submit_job(MessageReader& r) {

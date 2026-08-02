@@ -132,6 +132,7 @@ void InMemoryStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg
     if (!reader_result.ok())
         throw_arrow("restore (open reader)", reader_result.status());
     auto reader = *reader_result;
+    verify_snapshot_format_version(reader->schema()->metadata(), "InMemoryStateBackend restore");
 
     // Validate schema matches what we wrote. The stream reader gives us
     // the schema for free; a mismatch means someone tried to restore
@@ -290,6 +291,8 @@ std::vector<std::byte> InMemoryStateBackend::merge_snapshot_bytes(
         if (!reader_result.ok())
             throw_arrow("merge (open reader)", reader_result.status());
         auto reader = *reader_result;
+        verify_snapshot_format_version(reader->schema()->metadata(),
+                                       "InMemoryStateBackend merge_snapshot_bytes");
         if (!reader->schema()->Equals(*schema, /*check_metadata=*/false)) {
             throw std::runtime_error(
                 "InMemoryStateBackend merge_snapshot_bytes: input schema mismatch - got " +
@@ -336,6 +339,8 @@ std::vector<std::byte> InMemoryStateBackend::extract_operator_state_bytes(
         if (!reader_result.ok())
             throw_arrow("extract_operator_state (open reader)", reader_result.status());
         auto reader = *reader_result;
+        verify_snapshot_format_version(reader->schema()->metadata(),
+                                       "InMemoryStateBackend extract_operator_state_bytes");
         if (!reader->schema()->Equals(*schema, /*check_metadata=*/false)) {
             throw std::runtime_error(
                 "InMemoryStateBackend extract_operator_state_bytes: input schema mismatch");

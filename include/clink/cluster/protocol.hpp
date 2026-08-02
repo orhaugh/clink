@@ -5,6 +5,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace clink::cluster {
@@ -16,6 +17,85 @@ namespace clink::cluster {
 //
 // String fields: [u32 length BE][bytes].
 // All multi-byte integers are big-endian on the wire.
+
+// --- protocol versioning ---------------------------------------------
+//
+// The wire format above is the contract between every process in a
+// cluster, and a rolling upgrade necessarily runs two versions of it at
+// once. Two mechanisms carry that, and they cover different things:
+//
+//   * ADDITIVE TAILS handle a message gaining a field. Encoders append at
+//     the end; decoders read `r.eof() ? default : read()`. An older peer
+//     stops reading early and gets the default, a newer peer reads the
+//     value. No negotiation is needed and none happens.
+//
+//   * THIS VERSION handles everything additive tails cannot: a field
+//     changing meaning or width, a message kind being repurposed, a
+//     semantic contract changing under an unchanged encoding. Those are
+//     invisible on the wire, so the only defence is for both ends to say
+//     what they speak and refuse a pairing neither can honour.
+//
+// Bump kClusterProtocolVersion for the second kind and NEVER for the
+// first: bumping on an additive change would refuse a rolling upgrade the
+// protocol was explicitly designed to survive.
+//
+// kMinCompatibleClusterProtocolVersion is the oldest peer this build will
+// talk to. Raise it only when carrying the compatibility shim for an old
+// version stops being worth it - that is a deliberate end-of-support
+// decision, and it strands any peer below it, loudly.
+inline constexpr std::uint32_t kClusterProtocolVersion = 1;
+inline constexpr std::uint32_t kMinCompatibleClusterProtocolVersion = 1;
+
+// What a peer that predates versioning looks like on the wire: the field
+// is absent, so it decodes as 0. Treated as version 1 rather than as an
+// error, because every such peer speaks exactly the protocol that was
+// version 1 when the field was introduced.
+inline constexpr std::uint32_t kUnversionedPeerProtocolVersion = 1;
+
+// Decide whether two peers can talk, given what each declares.
+//
+// Symmetric on purpose. "Can the coordinator read the worker?" is not the
+// same question as "can the worker read the coordinator?", and a handshake
+// that checks only one direction admits a pairing that half-works - which
+// shows up later as a decode failure on a control frame, far from the
+// cause.
+struct ProtocolCompatibility {
+    bool compatible{};
+    std::string reason;  // empty when compatible
+};
+
+[[nodiscard]] inline ProtocolCompatibility check_protocol_compatibility(
+    std::uint32_t peer_version,
+    std::uint32_t peer_min_compatible,
+    std::string_view peer_role,
+    std::uint32_t own_version = kClusterProtocolVersion,
+    std::uint32_t own_min_compatible = kMinCompatibleClusterProtocolVersion) {
+    // A peer from before versioning declares nothing. Fill in what it
+    // must have been rather than refusing it.
+    if (peer_version == 0) {
+        peer_version = kUnversionedPeerProtocolVersion;
+    }
+    if (peer_min_compatible == 0) {
+        peer_min_compatible = kUnversionedPeerProtocolVersion;
+    }
+    const std::string versions =
+        std::string(peer_role) + " speaks protocol v" + std::to_string(peer_version) + " (min v" +
+        std::to_string(peer_min_compatible) + "); this build speaks v" +
+        std::to_string(own_version) + " (min v" + std::to_string(own_min_compatible) + ")";
+    if (peer_version < own_min_compatible) {
+        return {false,
+                versions +
+                    ". The peer is older than this build supports. Upgrade the peer, "
+                    "or run a build that still carries the compatibility shim for it."};
+    }
+    if (own_version < peer_min_compatible) {
+        return {false,
+                versions +
+                    ". This build is older than the peer supports. Upgrade this node "
+                    "before the rest of the cluster."};
+    }
+    return {true, {}};
+}
 
 // JobId is the coordinator-assigned monotonic identifier for one submitted job.
 // 0 is reserved as "no job" / unset.
@@ -182,6 +262,11 @@ struct RegisterMsg {
     // proxy to it. Backward-compatible: old workers that don't send this
     // field just look like "HTTP disabled" to the coordinator.
     std::uint16_t http_port{0};
+    // Wire-protocol version this worker speaks, and the oldest peer it can
+    // talk to. Appended at the tail; 0 from a peer that predates
+    // versioning, which reads as v1.
+    std::uint32_t protocol_version{kClusterProtocolVersion};
+    std::uint32_t min_compatible_protocol_version{kMinCompatibleClusterProtocolVersion};
 };
 
 struct RegisterAckMsg {
@@ -198,6 +283,12 @@ struct RegisterAckMsg {
     // unfenced peer" and preserves the pre-fencing behaviour exactly, so
     // a mixed-version cluster keeps working while it is being upgraded.
     std::uint64_t coordinator_epoch{0};
+    // The coordinator's side of the same declaration. A worker checks it
+    // and refuses to run against a coordinator neither can honour, rather
+    // than discovering the mismatch later as a decode failure on a
+    // control frame far from the cause.
+    std::uint32_t protocol_version{kClusterProtocolVersion};
+    std::uint32_t min_compatible_protocol_version{kMinCompatibleClusterProtocolVersion};
 };
 
 struct DeployMsg {
@@ -395,7 +486,13 @@ struct FinalCheckpointAssignedMsg {
 // Sent by the client as the first frame on a control connection so the coordinator
 // can route the connection to its client handler instead of the worker
 // register-and-reader path. Empty body.
-struct HelloClientMsg {};
+// The client handshake. Empty until protocol versioning: a CLI built
+// against one cluster version and pointed at another had no way to find
+// out before it started submitting.
+struct HelloClientMsg {
+    std::uint32_t protocol_version{kClusterProtocolVersion};
+    std::uint32_t min_compatible_protocol_version{kMinCompatibleClusterProtocolVersion};
+};
 
 // Alignment mode for distributed checkpoints. Aligned (the default
 // and historical mode) waits at multi-input operators until

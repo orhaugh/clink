@@ -1,5 +1,7 @@
 #include "clink/state/snapshot_canonicalise.hpp"
 
+#include "clink/state/snapshot_arrow_writer.hpp"
+
 #ifndef CLINK_HAS_ARROW
 #error "clink requires CLINK_BUILD_ARROW=ON. The state-snapshot format is Arrow-IPC-only."
 #endif
@@ -34,6 +36,7 @@ std::vector<std::byte> canonicalise_state_snapshot(
                                  reader_result.status().ToString());
     }
     const auto schema = (*reader_result)->schema();
+    verify_snapshot_format_version(schema->metadata(), "canonicalise_state_snapshot");
 
     const bool canonical = schema->num_fields() == 3 && schema->field(0)->name() == "op_id";
     if (canonical) {

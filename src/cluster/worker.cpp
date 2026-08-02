@@ -27,6 +27,7 @@
 #include "clink/core/base64.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/metrics/metrics_registry.hpp"
+#include "clink/metrics/orchestration_metrics.hpp"
 #include "clink/metrics/process_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/operators/udf_language_registry.hpp"
@@ -472,6 +473,17 @@ void Worker::connect_to_coordinator(const std::string& coordinator_host,
     if (!ack.ok) {
         throw std::runtime_error("Worker::connect_to_coordinator: register rejected: " +
                                  ack.message);
+    }
+    // The worker's half of the negotiation. The coordinator has already
+    // checked the worker; this checks the coordinator. Both directions are
+    // needed - "the coordinator can read me" does not imply "I can read
+    // the coordinator", and a half-compatible pairing shows up later as a
+    // decode failure on a control frame, far from the cause.
+    if (const auto compat = check_protocol_compatibility(
+            ack.protocol_version, ack.min_compatible_protocol_version, "coordinator");
+        !compat.compatible) {
+        metrics::orch::protocol_mismatch();
+        throw std::runtime_error("Worker::connect_to_coordinator: " + compat.reason);
     }
     // Bind to the epoch of the coordinator that admitted us. Every later
     // control frame is measured against this. Reconnecting - which is how

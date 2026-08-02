@@ -97,7 +97,11 @@ Version 1 (current) guarantees:
 3. Zero-row streams are valid. Row order is unspecified.
 4. Metadata is open for additive extension; readers ignore unknown keys.
 
-A change that any version-1 reader would misread (column changes, key-layout changes, container changes) bumps `clink.format_version`, and readers MUST reject a version above the highest they know rather than guess. Absence of the marker always reads as version 1. Compatible changes (new metadata keys, new derived projections, new writers) do not bump the version.
+A change that any version-1 reader would misread (column changes, key-layout changes, container changes) bumps `clink.format_version`, and readers reject a version above the highest they know rather than guess. Absence of the marker always reads as version 1. Compatible changes (new metadata keys, new derived projections, new writers) do not bump the version.
+
+That rejection is `verify_snapshot_format_version` (`include/clink/state/snapshot_arrow_writer.hpp`), called at every read site: the three `InMemoryStateBackend` paths, changelog restore, state migration, and canonicalisation. `kMaxReadableSnapshotFormatVersion` is the ceiling and is bumped alongside `kSnapshotFormatVersion`. The parse is strict - the value must be a plain decimal number, so a stream carrying `" 1"` or `"1.0"` is treated as corrupt rather than leniently read as version 1.
+
+Until 2026-08-02 this paragraph described a rule that nothing implemented: the marker was written by the writer and read by nobody. The schema check present at each read site is not a substitute, because a version bump means precisely "a change the previous reader misreads" and such a change need not alter the column shape.
 
 ## Reading it externally
 

@@ -20,6 +20,7 @@
 #include <string_view>
 #include <vector>
 
+#include "clink/cluster/client_handshake.hpp"
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/protocol.hpp"
 #include "clink/runtime/network/network_socket.hpp"
@@ -131,7 +132,14 @@ int clink_cmd_rescale_op(int argc, char** argv) {
     clink::cluster::MessageReader r(std::move(body));
     const auto kind = static_cast<clink::cluster::MessageKind>(r.read_u8());
     if (kind != clink::cluster::MessageKind::RescaleOperatorAck) {
-        std::cerr << "clink_rescale_op: unexpected reply kind " << static_cast<int>(kind) << "\n";
+        // A refused handshake arrives as a SubmitJobAck rather than the ack
+        // this tool asked for. Report why rather than reporting the number.
+        if (const auto why = clink::cluster::protocol_rejection_message(kind, r)) {
+            std::cerr << "clink_rescale_op: coordinator refused the connection: " << *why << "\n";
+        } else {
+            std::cerr << "clink_rescale_op: unexpected reply kind " << static_cast<int>(kind)
+                      << "\n";
+        }
         clink::network::NetworkSocket::close(fd);
         return 7;
     }

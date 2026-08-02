@@ -658,10 +658,13 @@ namespace {
 // what MessageReader sees is byte-identical to what a pre-fencing peer
 // would have sent.
 template <typename Msg, typename Decoder>
-Msg round_trip_without_epoch_field(MessageKind kind, const Msg& original, Decoder decode) {
+Msg round_trip_without_epoch_field(MessageKind kind,
+                                   const Msg& original,
+                                   Decoder decode,
+                                   std::size_t tail_bytes = 8) {
     auto body = body_of(encode_frame(kind, original));
-    EXPECT_GE(body.size(), 8U);
-    body.resize(body.size() - 8);
+    EXPECT_GT(body.size(), tail_bytes);
+    body.resize(body.size() - tail_bytes);
     MessageReader r(std::move(body));
     EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), kind);
     return decode(r);
@@ -759,11 +762,21 @@ TEST(WireProtocolFencing, AFrameFromAPreFencingPeerDecodesAsUnfenced) {
     // every field that came before the epoch, and report epoch 0.
     {
         RegisterAckMsg in{.ok = true, .message = "welcome", .coordinator_epoch = 9};
-        auto out =
-            round_trip_without_epoch_field(MessageKind::RegisterAck, in, decode_register_ack);
+        auto out = round_trip_without_epoch_field(MessageKind::RegisterAck,
+                                                  in,
+                                                  decode_register_ack,
+                                                  // RegisterAck's tail has grown: the fencing epoch
+                                                  // (8 bytes) plus the protocol version declaration
+                                                  // (two u32s). A peer that predates BOTH sends
+                                                  // neither, so 16 bytes come off, not 8. The
+                                                  // 8-byte case - a peer that has fencing but not
+                                                  // versioning - is covered in
+                                                  // test_protocol_versioning.cpp.
+                                                  /*tail_bytes=*/16);
         EXPECT_TRUE(out.ok);
         EXPECT_EQ(out.message, "welcome");
         EXPECT_EQ(out.coordinator_epoch, 0U);
+        EXPECT_EQ(out.protocol_version, 0U);
     }
     {
         DeployMsg in;

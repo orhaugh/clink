@@ -13,6 +13,7 @@
 //                       cooldown, mid_rescale, no_bounds}
 //   - clink_ha_leader_takeovers_total
 //   - clink_ha_recovered_jobs_total
+//   - clink_protocol_mismatches_total
 //
 // The metrics surface here is sized for dashboards and alert rules
 // rather than per-operator inner loops. Costs are bounded by the
@@ -53,6 +54,11 @@ inline constexpr const char* kRescaleAborts = "clink_rescale_aborts_total";
 inline constexpr const char* kAutoscalerTicks = "clink_autoscaler_ticks_total";
 inline constexpr const char* kHaLeaderTakeovers = "clink_ha_leader_takeovers_total";
 inline constexpr const char* kHaRecoveredJobs = "clink_ha_recovered_jobs_total";
+// Handshakes refused because the peer speaks a wire protocol this build
+// cannot honour. Non-zero during a rolling upgrade means the roll has
+// reached a version boundary it cannot cross; non-zero otherwise means a
+// node is running the wrong binary.
+inline constexpr const char* kProtocolMismatches = "clink_protocol_mismatches_total";
 
 namespace orch {
 
@@ -79,6 +85,9 @@ inline void autoscaler_decision(const char* outcome) {
 }
 inline void ha_leader_takeover() {
     MetricsRegistry::global().counter(kHaLeaderTakeovers).increment();
+}
+inline void protocol_mismatch() {
+    MetricsRegistry::global().counter(kProtocolMismatches).increment();
 }
 inline void ha_recovered_jobs_inc(std::uint64_t n = 1) {
     MetricsRegistry::global().counter(kHaRecoveredJobs).increment(n);

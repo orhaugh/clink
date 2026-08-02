@@ -1,5 +1,7 @@
 #include "clink/state/changelog_state_backend.hpp"
 
+#include "clink/state/snapshot_arrow_writer.hpp"
+
 #ifndef CLINK_HAS_ARROW
 #error \
     "clink requires CLINK_BUILD_ARROW=ON. ChangelogStateBackend::snapshot/restore are Arrow-IPC-only."
@@ -330,6 +332,8 @@ void ChangelogStateBackend::restore(const Snapshot& snap, const KeyGroupRange& k
             throw_arrow("restore (open reader)", reader_result.status());
         }
         auto reader = *reader_result;
+        verify_snapshot_format_version(reader->schema()->metadata(),
+                                       "ChangelogStateBackend restore");
         if (!reader->schema()->Equals(*changelog_schema(), /*check_metadata=*/false)) {
             throw std::runtime_error(
                 "ChangelogStateBackend restore: snapshot schema mismatch - got " +
