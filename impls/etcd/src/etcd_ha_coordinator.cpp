@@ -1,5 +1,6 @@
 #include "clink/etcd/etcd_ha_coordinator.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -187,7 +188,21 @@ private:
         // 2. Atomic create. etcd::Client::add only succeeds if the
         // key doesn't already exist - the classic compare-and-set
         // primitive for leader election.
-        const auto candidate_epoch = epoch_.load(std::memory_order_acquire) + 1;
+        //
+        // The epoch must be monotonic across LEADERSHIPS, not across this
+        // process's lifetime. A standby is a fresh process whose counter
+        // starts at zero, so a bare per-process bump handed every new
+        // leader epoch 1 - the same one the leader it displaced had been
+        // stamping on every control frame, which makes fencing inert. Read
+        // the epoch the last leader published and go above it. The read is
+        // racy with respect to the create below, but the create is the
+        // atomic step: if it loses, this candidate epoch is discarded with
+        // the lease.
+        std::uint64_t prior = epoch_.load(std::memory_order_acquire);
+        if (const auto previous = current_leader_endpoint(); previous.has_value()) {
+            prior = std::max(prior, previous->epoch);
+        }
+        const auto candidate_epoch = prior + 1;
         const auto payload = serialize_leader_endpoint(advertise_, candidate_epoch);
         auto add_resp = client->add(leader_key_, payload, lease_id).get();
         if (!add_resp.is_ok()) {

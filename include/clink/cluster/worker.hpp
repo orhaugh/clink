@@ -112,6 +112,20 @@ public:
     // find the new leader.
     bool disconnected() const noexcept { return disconnected_.load(std::memory_order_acquire); }
 
+    // Fencing epoch this worker is bound to: the epoch carried by the
+    // RegisterAck that admitted it, raised if a later frame carries a
+    // higher one. Zero means the coordinator is unfenced (non-HA, or an
+    // older build), which reproduces the pre-fencing behaviour.
+    [[nodiscard]] std::uint64_t bound_epoch() const noexcept {
+        return bound_epoch_.load(std::memory_order_acquire);
+    }
+    // Control frames refused because they carried a lower epoch than the
+    // bound one - i.e. arrived from a coordinator that has since been
+    // superseded. Non-zero is a split-brain signal worth alerting on.
+    [[nodiscard]] std::uint64_t fenced_frame_count() const noexcept {
+        return fenced_frames_.load(std::memory_order_acquire);
+    }
+
     // Set the HTTP port this worker will advertise to the coordinator at register
     // time. Call AFTER starting the HttpServer (so the actually-bound
     // port is known, esp. when --http-port=0 lets the OS pick) but
@@ -149,6 +163,14 @@ public:
 
 private:
     void reader_loop_();
+    // Fencing check, run on every control frame that changes what this
+    // worker is doing. Returns false - meaning DROP the frame - when it
+    // carries a lower epoch than the one bound at registration, so a
+    // partitioned old leader cannot deploy, cancel, or commit behind the
+    // current leader's back. A higher epoch re-binds, which is what a
+    // failover looks like from here.
+    [[nodiscard]] bool accept_epoch_(std::uint64_t frame_epoch, const char* what);
+
     void handle_deploy_(MessageReader& r);
     void handle_peer_update_(MessageReader& r);
     void run_task_(JobId job_id,
@@ -212,6 +234,8 @@ private:
     bool deployed_{false};
 
     std::atomic<bool> stop_{false};
+    std::atomic<std::uint64_t> bound_epoch_{0};
+    std::atomic<std::uint64_t> fenced_frames_{0};
     std::atomic<bool> cancelled_{false};
     std::atomic<bool> disconnected_{false};
     mutable std::mutex mu_;

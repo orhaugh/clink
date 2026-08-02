@@ -4,9 +4,11 @@
 // flow. Two coordinators on the same ha-dir; only one acquires
 // leadership at a time; the other reads the leader endpoint.
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -112,6 +114,37 @@ TEST(HaCoordinator, StandbyAcquiresAfterLeaderStops) {
     ASSERT_TRUE(ep.has_value());
     EXPECT_EQ(ep->port, 6200);
     b->stop();
+}
+
+TEST(HaCoordinator, EachLeadershipTakesAnEpochAboveEveryEarlierOne) {
+    // The property fencing rests on, and the one that was broken.
+    //
+    // The epoch used to be a bare per-process counter. A standby is a
+    // SEPARATE PROCESS whose counter starts at zero, so every successor
+    // announced epoch 1 - the same epoch the leader it displaced had been
+    // stamping on every control frame. A worker comparing the two could
+    // never tell them apart, so fencing refused nothing. Distinct
+    // coordinator objects stand in for distinct processes here: each has
+    // its own zero-initialised counter, which is exactly the condition
+    // that made the bug invisible in a single process.
+    const auto dir = fresh_ha_dir();
+    std::vector<std::uint64_t> epochs;
+    for (int i = 0; i < 4; ++i) {
+        auto c = make_file_ha_coordinator(
+            dir.string(), {"127.0.0.1", static_cast<std::uint16_t>(6400 + i), 0, 0}, 50ms);
+        std::atomic<std::uint64_t> seen{0};
+        c->set_on_become_leader([&](std::uint64_t e) { seen.store(e, std::memory_order_release); });
+        c->start();
+        ASSERT_TRUE(wait_for([&] { return seen.load(std::memory_order_acquire) != 0; }, kHaWait))
+            << "leadership " << i << " was never acquired";
+        epochs.push_back(seen.load(std::memory_order_acquire));
+        c->stop();
+    }
+    for (std::size_t i = 1; i < epochs.size(); ++i) {
+        EXPECT_GT(epochs[i], epochs[i - 1])
+            << "leadership " << i << " took epoch " << epochs[i] << ", not above the previous "
+            << epochs[i - 1] << "; a repeated epoch fences nothing";
+    }
 }
 
 TEST(HaCoordinator, BecomesLeaderCallbackFiresOnAcquire) {

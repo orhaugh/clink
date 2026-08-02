@@ -1,5 +1,6 @@
 #include "clink/cluster/ha_coordinator.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -123,9 +124,28 @@ private:
             // around the file's existence.
             return;
         }
-        // Acquired. Bump epoch, write active-leader.json, fire
-        // callback.
-        const auto new_epoch = epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        // Acquired. The epoch must be monotonic across LEADERSHIPS, not
+        // across this process's lifetime.
+        //
+        // It used to be a bare per-process counter, and that made fencing
+        // inert exactly where it matters: a standby is a FRESH PROCESS, its
+        // counter starts at zero, so every new leader announced epoch 1 -
+        // the same epoch the leader it displaced had been stamping on every
+        // frame. Nothing could ever be refused. Caught by
+        // HaFailoverTest.FailoverAdvancesTheEpoch, which killed a real
+        // leader and found the successor claiming the same number.
+        //
+        // The previous leader's epoch is recorded in active-leader.json, so
+        // read it and go above it. This runs while holding the lock, after
+        // acquisition, so no other leader can be writing that file. The
+        // process-local counter is still taken into account for the case
+        // where THIS process regains leadership after the file was removed.
+        std::uint64_t prior = epoch_.load(std::memory_order_acquire);
+        if (const auto previous = current_leader_endpoint(); previous.has_value()) {
+            prior = std::max(prior, previous->epoch);
+        }
+        const auto new_epoch = prior + 1;
+        epoch_.store(new_epoch, std::memory_order_release);
         is_leader_.store(true, std::memory_order_release);
         clink::metrics::orch::ha_leader_takeover();
         refresh_active_leader_();

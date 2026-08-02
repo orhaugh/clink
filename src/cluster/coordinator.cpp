@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -207,13 +208,56 @@ bool atomic_write_file(const std::filesystem::path& path, const std::string& bod
     return true;
 }
 
+// Write control-plane metadata only if this coordinator has not been
+// superseded, judged by the epoch already recorded in the file. The rule
+// itself is metadata_write_allowed, in the header alongside the other
+// submit-time policies; see there for what this does and does not close.
+bool fenced_write_file(const std::filesystem::path& path,
+                       const std::string& body,
+                       std::uint64_t writer_epoch) {
+    const auto on_disk = metadata_stored_epoch(path.string());
+    if (!metadata_write_allowed(writer_epoch, on_disk)) {
+        clink::log::error("coordinator.metadata",
+                          "refusing to overwrite " + path.string() + ": it was written by epoch " +
+                              std::to_string(on_disk) + " and this coordinator is epoch " +
+                              std::to_string(writer_epoch) +
+                              ". Leadership has moved; this process is no longer authoritative.");
+        return false;
+    }
+    return atomic_write_file(path, body);
+}
+
 }  // namespace
+
+// Deliberately the same hand-rolled scan the manifest readers use rather
+// than a JSON parser: the field is written by this file and read by this
+// file, and pulling in a parser for one integer would be the tail wagging
+// the dog.
+std::uint64_t metadata_stored_epoch(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) {
+        return 0;
+    }
+    const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto key = std::string("\"coordinator_epoch\":");
+    const auto pos = body.find(key);
+    if (pos == std::string::npos) {
+        return 0;
+    }
+    try {
+        return std::stoull(body.substr(pos + key.size()));
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
 
 // Serialize a terminal-state record to <ha_dir>/history/<job_id>.json.
 // One file per job mirrors HistoryServer archive layout and
 // avoids needing a DB. Atomic-rename so a partially-written file is
 // never observed by reload.
-void persist_history_record_(const std::string& ha_dir, const CompletedJobRecord& rec) {
+void persist_history_record_(const std::string& ha_dir,
+                             const CompletedJobRecord& rec,
+                             std::uint64_t writer_epoch) {
     if (ha_dir.empty())
         return;
     const auto history_dir = std::filesystem::path{ha_dir} / "history";
@@ -233,8 +277,12 @@ void persist_history_record_(const std::string& ha_dir, const CompletedJobRecord
         ",\"latest_completed_checkpoint_id\":" + std::to_string(rec.latest_completed_checkpoint_id);
     body += ",\"duration_ms\":" + std::to_string(rec.duration_ms.count());
     body += ",\"completed_at_unix_seconds\":" + std::to_string(rec.completed_at_unix_seconds);
+    // Stamped and fenced for the same reason the manifest is: a superseded
+    // coordinator recording "cancelled" over the current leader's "ok" is a
+    // false operational record, even though it changes no running work.
+    body += ",\"coordinator_epoch\":" + std::to_string(writer_epoch);
     body += "}";
-    atomic_write_file(history_dir / (std::to_string(rec.job_id) + ".json"), body);
+    fenced_write_file(history_dir / (std::to_string(rec.job_id) + ".json"), body, writer_epoch);
 }
 
 void apply_default_state_backend(CheckpointConfig& checkpoint, const std::string& default_uri) {
@@ -264,7 +312,8 @@ void persist_job_manifest_(const std::string& ha_dir,
                            JobId job_id,
                            const std::string& graph_json,
                            const std::vector<PluginBinary>& plugins,
-                           const CheckpointConfig& checkpoint) {
+                           const CheckpointConfig& checkpoint,
+                           std::uint64_t writer_epoch) {
     if (ha_dir.empty())
         return;
     const auto job_dir = std::filesystem::path{ha_dir} / "jobs" / std::to_string(job_id);
@@ -303,8 +352,11 @@ void persist_job_manifest_(const std::string& ha_dir,
         manifest += "{\"name\":" + q(plugins[i].name) +
                     ",\"content_hash\":" + q(plugins[i].content_hash) + "}";
     }
-    manifest += "]}";
-    atomic_write_file(job_dir / "manifest.json", manifest);
+    manifest += "]";
+    // Stamped so a later writer can tell whether it has been superseded.
+    manifest += ",\"coordinator_epoch\":" + std::to_string(writer_epoch);
+    manifest += "}";
+    fenced_write_file(job_dir / "manifest.json", manifest, writer_epoch);
 }
 
 namespace {
@@ -707,8 +759,9 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
             replaced = it->second;
         }
         registered_[reg.worker_id] = worker;
-        const auto ack =
-            encode_frame(MessageKind::RegisterAck, RegisterAckMsg{.ok = true, .message = ""});
+        // Binds the worker to this leader's epoch.
+        RegisterAckMsg ack_msg{.ok = true, .message = ""};
+        const auto ack = fenced_frame_(MessageKind::RegisterAck, ack_msg);
         if (!send_frame(*worker->conn, ack)) {
             // Handshake failed (the client vanished mid-register). Restore
             // the previous session: a failed re-registration must not retire
@@ -1229,7 +1282,7 @@ CancelJobAckMsg Coordinator::cancel_job(JobId job_id) {
     if (ack.ok) {
         CancelJobMsg cj;
         cj.job_id = job_id;
-        const auto frame = encode_frame(MessageKind::CancelJob, cj);
+        const auto frame = fenced_frame_(MessageKind::CancelJob, cj);
         for (auto* c : worker_conns) {
             send_frame(*c, frame);
         }
@@ -1385,7 +1438,7 @@ RescaleJobAckMsg Coordinator::rescale_job(
     // now picks up rescale_overrides and emits the rescaled deploys.
     CancelJobMsg cj;
     cj.job_id = job_id;
-    const auto frame = encode_frame(MessageKind::CancelJob, cj);
+    const auto frame = fenced_frame_(MessageKind::CancelJob, cj);
     for (auto* c : worker_conns) {
         send_frame(*c, frame);
     }
@@ -1520,7 +1573,7 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
     TriggerCheckpointMsg tc;
     tc.job_id = job_id;
     tc.checkpoint_id = ckpt_id;
-    const auto frame = encode_frame(MessageKind::TriggerCheckpoint, tc);
+    const auto frame = fenced_frame_(MessageKind::TriggerCheckpoint, tc);
     for (auto* c : worker_conns) {
         send_frame(*c, frame);
     }
@@ -1838,7 +1891,8 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
             }
         }
         if (!ha_dir_.empty()) {
-            persist_job_manifest_(ha_dir_, job_id, graph_json, plugins_copy, checkpoint_copy);
+            persist_job_manifest_(
+                ha_dir_, job_id, graph_json, plugins_copy, checkpoint_copy, epoch());
         }
     }
 
@@ -2061,7 +2115,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         deploy_msg.unaligned_checkpoints = checkpoint.alignment == CheckpointAlignment::Unaligned;
         deploy_msg.expected_state_versions_packed = job->expected_state_versions_packed;
         deploy_msg.udfs_packed = job->udfs_packed;
-        const auto frame = encode_frame(MessageKind::Deploy, deploy_msg);
+        const auto frame = fenced_frame_(MessageKind::Deploy, deploy_msg);
         if (!conn->conn || !send_frame(*conn->conn, frame)) {
             throw std::runtime_error("Coordinator::deploy: send failed for " + worker_id);
         }
@@ -2218,7 +2272,7 @@ void Coordinator::send_peer_updates_locked_(JobState& job) {
         if (worker_it == registered_.end() || worker_it->second->lost) {
             continue;
         }
-        const auto frame = encode_frame(MessageKind::PeerUpdate, msg);
+        const auto frame = fenced_frame_(MessageKind::PeerUpdate, msg);
         if (worker_it->second->conn)
             send_frame(*worker_it->second->conn, frame);
     }
@@ -2240,7 +2294,7 @@ void Coordinator::send_peer_updates_locked_(JobState& job) {
         }
         PeerUpdateMsg empty;
         empty.job_id = job.id;
-        const auto frame = encode_frame(MessageKind::PeerUpdate, empty);
+        const auto frame = fenced_frame_(MessageKind::PeerUpdate, empty);
         if (worker_it->second->conn)
             send_frame(*worker_it->second->conn, frame);
     }
@@ -2341,7 +2395,7 @@ void Coordinator::watchdog_loop_() {
         for (const auto& [conn, jid] : survivor_cancels) {
             CancelJobMsg cj;
             cj.job_id = jid;
-            send_frame(*conn, encode_frame(MessageKind::CancelJob, cj));
+            send_frame(*conn, fenced_frame_(MessageKind::CancelJob, cj));
         }
         for (auto& d : deferred_restart_deploys) {
             if (d.conn)
@@ -2869,7 +2923,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;
         deploy_msg.udfs_packed = job.udfs_packed;
         out.push_back(
-            {worker_it->second->conn.get(), encode_frame(MessageKind::Deploy, deploy_msg)});
+            {worker_it->second->conn.get(), fenced_frame_(MessageKind::Deploy, deploy_msg)});
     }
     return out;
 }
@@ -2899,7 +2953,7 @@ void Coordinator::dispatch_begin_rescale_locked_(JobState& job,
     msg.op_id = op_id;
     msg.target_parallelism = target_parallelism;
     msg.cutover_checkpoint = cutover_checkpoint;
-    const auto frame = encode_frame(MessageKind::BeginRescale, msg);
+    const auto frame = fenced_frame_(MessageKind::BeginRescale, msg);
     for (const auto& worker_id : workers_with_op) {
         auto worker_it = registered_.find(worker_id);
         if (worker_it == registered_.end() || worker_it->second->lost || !worker_it->second->conn) {
@@ -3068,7 +3122,7 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         deploy_msg.expected_state_versions_packed = job.expected_state_versions_packed;
         deploy_msg.udfs_packed = job.udfs_packed;
         out.push_back(
-            {worker_it->second->conn.get(), encode_frame(MessageKind::Deploy, deploy_msg)});
+            {worker_it->second->conn.get(), fenced_frame_(MessageKind::Deploy, deploy_msg)});
     }
 }
 
@@ -3355,7 +3409,7 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
         if (conn) {
             CancelJobMsg cj;
             cj.job_id = jid;
-            send_frame(*conn, encode_frame(MessageKind::CancelJob, cj));
+            send_frame(*conn, fenced_frame_(MessageKind::CancelJob, cj));
         }
     }
 
@@ -3363,7 +3417,7 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
         DeployMsg deploy_msg;
         deploy_msg.job_id = job_id;
         deploy_msg.tasks.push_back(std::move(retry_task));
-        const auto frame = encode_frame(MessageKind::Deploy, deploy_msg);
+        const auto frame = fenced_frame_(MessageKind::Deploy, deploy_msg);
         send_frame(*target_conn->conn, frame);
     }
     // Slot freed: wake any submit_job waiting on capacity.
@@ -3414,7 +3468,7 @@ void Coordinator::signal_job_completion_locked_(JobState& job) {
         rec.completed_at_unix_seconds = std::chrono::duration_cast<std::chrono::seconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-        persist_history_record_(ha_dir_, rec);
+        persist_history_record_(ha_dir_, rec, epoch());
         history_.push_back(std::move(rec));
         while (history_.size() > kCoordinatorHistoryCap) {
             history_.pop_front();
@@ -3641,7 +3695,7 @@ void Coordinator::handle_request_final_checkpoint_(MessageReader& r,
     reply.role = msg.role;
     reply.subtask_idx = msg.subtask_idx;
     reply.final_checkpoint_id = final_id;
-    send_frame(reply_conn, encode_frame(MessageKind::FinalCheckpointAssigned, reply));
+    send_frame(reply_conn, fenced_frame_(MessageKind::FinalCheckpointAssigned, reply));
 }
 
 void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
@@ -3814,7 +3868,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         AbortCheckpointMsg ac;
         ac.job_id = jid;
         ac.checkpoint_id = ckpt_id;
-        const auto frame = encode_frame(MessageKind::AbortCheckpoint, ac);
+        const auto frame = fenced_frame_(MessageKind::AbortCheckpoint, ac);
         for (auto* c : worker_conns)
             send_frame(*c, frame);
     }
@@ -3885,7 +3939,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         CommitCheckpointMsg cc;
         cc.job_id = jid;
         cc.checkpoint_id = ckpt_id;
-        const auto frame = encode_frame(MessageKind::CommitCheckpoint, cc);
+        const auto frame = fenced_frame_(MessageKind::CommitCheckpoint, cc);
         for (auto* c : worker_conns)
             send_frame(*c, frame);
     }
@@ -3955,7 +4009,7 @@ void Coordinator::checkpoint_trigger_loop_() {
             TriggerCheckpointMsg m;
             m.job_id = jid;
             m.checkpoint_id = ckpt_id;
-            const auto frame = encode_frame(MessageKind::TriggerCheckpoint, m);
+            const auto frame = fenced_frame_(MessageKind::TriggerCheckpoint, m);
             for (const auto& worker_id : worker_ids) {
                 network::Connection* c = nullptr;
                 {

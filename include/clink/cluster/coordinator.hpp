@@ -141,6 +141,24 @@ void apply_default_state_backend(CheckpointConfig& checkpoint, const std::string
 // no-op. Exposed for direct testing of the recovery policy.
 void pin_recovered_state_backend(CheckpointConfig& checkpoint);
 
+// Read the fencing epoch recorded in a control-plane metadata file, or 0
+// when the file is absent, unreadable, or predates fencing.
+[[nodiscard]] std::uint64_t metadata_stored_epoch(const std::string& path);
+
+// The metadata fencing rule: a coordinator may overwrite a record only if
+// the record was not written by a LATER epoch than its own. Exposed
+// (alongside the two policies above) so the rule can be tested without
+// standing up two coordinators.
+//
+// Read-then-write, not an atomic compare-and-set: two writers racing inside
+// the window between read and rename can both pass. What it closes is the
+// realistic shape - a partitioned leader is stale for seconds or minutes,
+// and every write it attempts reads back an epoch above its own.
+[[nodiscard]] inline bool metadata_write_allowed(std::uint64_t writer_epoch,
+                                                 std::uint64_t stored_epoch) noexcept {
+    return stored_epoch <= writer_epoch;
+}
+
 class Coordinator {
 public:
     struct Config {
@@ -470,6 +488,25 @@ public:
     // the coordinator's in-memory state, attaching restore_from at the latest
     // COMPLETED-N marker for that job. Must be called before start().
     void set_ha_dir(std::string dir);
+
+    // Fencing epoch, bumped by HaCoordinator on every leadership
+    // acquisition and set here by whoever drives election (clink_node).
+    //
+    // Stamped on every control message this coordinator sends, so a
+    // worker can refuse a frame from a coordinator that has since been
+    // superseded. Zero - the default, and what a non-HA single-coordinator
+    // deployment leaves it at - means "unfenced" and reproduces the
+    // pre-fencing behaviour exactly.
+    //
+    // Without this the epoch existed only in the leader-endpoint file and
+    // was read by nothing: a partitioned old leader that still believed it
+    // held the lock could deploy jobs, cancel jobs and broadcast sink
+    // commits behind the new leader's back, with no mechanism anywhere to
+    // notice.
+    void set_epoch(std::uint64_t epoch) noexcept { epoch_.store(epoch, std::memory_order_release); }
+    [[nodiscard]] std::uint64_t epoch() const noexcept {
+        return epoch_.load(std::memory_order_acquire);
+    }
 
     // Replay every persisted job manifest under the configured ha_dir
     // back into this coordinator, with restore_from set per job. Called by
@@ -864,6 +901,27 @@ private:
     // HA persistence root. When empty, no manifests are written.
     // Format: <ha_dir>/jobs/<job_id>/manifest.json + plugin-<hash>.so.
     std::string ha_dir_;
+    std::atomic<std::uint64_t> epoch_{0};
+
+    // Encode a coordinator -> worker control frame, stamping this
+    // coordinator's fencing epoch on it.
+    //
+    // Every such frame goes through here rather than each send site
+    // assigning the field itself. That was the first shape of this code and
+    // it was already wrong on arrival: four separate paths build a DeployMsg
+    // (submit, two rescale paths, restart-after-failure) and only one of
+    // them had been stamped. An unstamped frame carries epoch 0, which a
+    // worker bound to a real epoch REFUSES - so the omission presents as a
+    // deploy that silently never happens, not as a compile error.
+    //
+    // Takes a non-const reference deliberately: the caller's message is a
+    // local about to be encoded, and DeployMsg carries plugin bytes that
+    // are not worth copying to preserve constness.
+    template <typename Msg>
+    [[nodiscard]] std::vector<std::byte> fenced_frame_(MessageKind kind, Msg& m) const {
+        m.coordinator_epoch = epoch();
+        return encode_frame(kind, m);
+    }
     int listener_fd_{-1};
     std::uint16_t bound_port_{0};
     std::thread accept_thread_;

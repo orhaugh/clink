@@ -36,6 +36,10 @@ inline constexpr const char* kWorkerSubtasksStartedTotal = "clink_worker_subtask
 inline constexpr const char* kWorkerSubtasksCompletedTotal =
     "clink_worker_subtasks_completed_total";
 inline constexpr const char* kWorkerSubtasksFailedTotal = "clink_worker_subtasks_failed_total";
+// Control frames dropped because they came from a coordinator that had
+// already been superseded. Any non-zero value is a split-brain signal:
+// two processes believed they held leadership at the same moment.
+inline constexpr const char* kWorkerFencedFramesTotal = "clink_worker_fenced_frames_total";
 inline constexpr const char* kWorkerSubtasksRunning = "clink_worker_subtasks_running";
 inline constexpr const char* kWorkerSlotsCapacity = "clink_worker_slots_capacity";
 inline constexpr const char* kWorkerSlotsInUse = "clink_worker_slots_in_use";
@@ -99,6 +103,7 @@ inline void init_worker_metrics() {
     (void)r.counter(kWorkerSubtasksStartedTotal);
     (void)r.counter(kWorkerSubtasksCompletedTotal);
     (void)r.counter(kWorkerSubtasksFailedTotal);
+    (void)r.counter(kWorkerFencedFramesTotal);
     (void)r.counter(kHttpRequestsTotal);
     (void)r.counter(kHttpErrorsTotal);
     (void)r.gauge(kWorkerSubtasksRunning);
@@ -168,6 +173,11 @@ inline void subtask_completed_ok() {
     MetricsRegistry::global().counter(kWorkerSubtasksCompletedTotal).increment();
     MetricsRegistry::global().gauge(kWorkerSubtasksRunning).sub(1);
     MetricsRegistry::global().gauge(kWorkerSlotsInUse).sub(1);
+}
+
+// A control frame arrived from a superseded coordinator and was dropped.
+inline void frame_fenced() {
+    MetricsRegistry::global().counter(kWorkerFencedFramesTotal).increment();
 }
 
 inline void subtask_failed() {

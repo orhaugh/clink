@@ -473,6 +473,11 @@ void Worker::connect_to_coordinator(const std::string& coordinator_host,
         throw std::runtime_error("Worker::connect_to_coordinator: register rejected: " +
                                  ack.message);
     }
+    // Bind to the epoch of the coordinator that admitted us. Every later
+    // control frame is measured against this. Reconnecting - which is how
+    // a worker follows a failover - re-registers and so re-binds, which is
+    // why binding unconditionally here is right rather than max()-ing.
+    bound_epoch_.store(ack.coordinator_epoch, std::memory_order_release);
 
     reader_ = std::thread([this] { reader_loop_(); });
     if (cfg_.heartbeat_interval.count() > 0) {
@@ -500,6 +505,30 @@ void Worker::heartbeat_loop_() {
             return;
         }
     }
+}
+
+bool Worker::accept_epoch_(std::uint64_t frame_epoch, const char* what) {
+    const auto bound = bound_epoch_.load(std::memory_order_acquire);
+    if (frame_epoch >= bound) {
+        // A higher epoch means leadership moved while this connection
+        // stayed up. Follow it: the new leader is authoritative, and
+        // staying on the old epoch would fence US off from it.
+        if (frame_epoch > bound) {
+            bound_epoch_.store(frame_epoch, std::memory_order_release);
+            log::info("worker.fencing",
+                      "coordinator epoch advanced " + std::to_string(bound) + " -> " +
+                          std::to_string(frame_epoch) + "; following the new leader");
+        }
+        return true;
+    }
+    fenced_frames_.fetch_add(1, std::memory_order_acq_rel);
+    log::error("worker.fencing",
+               std::string("dropped ") + what + " from a superseded coordinator (frame epoch " +
+                   std::to_string(frame_epoch) + " < bound epoch " + std::to_string(bound) +
+                   "). This is a split-brain signal: a coordinator that has lost leadership is "
+                   "still issuing commands.");
+    metrics::worker::frame_fenced();
+    return false;
 }
 
 void Worker::reader_loop_() {
@@ -534,6 +563,9 @@ void Worker::reader_loop_() {
                 break;
             case MessageKind::CancelJob: {
                 auto cj = decode_cancel_job(r);
+                if (!accept_epoch_(cj.coordinator_epoch, "CancelJob")) {
+                    break;
+                }
                 cancelled_.store(true, std::memory_order_release);
                 std::lock_guard lock(mu_);
                 // Wake any subtasks blocked in await_peer_update_ - for
@@ -596,6 +628,9 @@ void Worker::reader_loop_() {
 
 void Worker::handle_commit_checkpoint_(MessageReader& r) {
     auto msg = decode_commit_checkpoint(r);
+    if (!accept_epoch_(msg.coordinator_epoch, "CommitCheckpoint")) {
+        return;
+    }
     // Record the committed high-water mark + wake any source blocked in
     // wait_final_committed() for its final checkpoint id (see EOS handling).
     {
@@ -669,6 +704,9 @@ void Worker::handle_commit_checkpoint_(MessageReader& r) {
 
 void Worker::handle_final_checkpoint_assigned_(MessageReader& r) {
     auto msg = decode_final_checkpoint_assigned(r);
+    if (!accept_epoch_(msg.coordinator_epoch, "FinalCheckpointAssigned")) {
+        return;
+    }
     const std::string key =
         std::to_string(msg.job_id) + ":" + msg.role + ":" + std::to_string(msg.subtask_idx);
     {
@@ -685,6 +723,9 @@ void Worker::handle_final_checkpoint_assigned_(MessageReader& r) {
 
 void Worker::handle_begin_rescale_(MessageReader& r) {
     auto msg = decode_begin_rescale(r);
+    if (!accept_epoch_(msg.coordinator_epoch, "BeginRescale")) {
+        return;
+    }
     // Snapshot the drain callbacks for the addressed (job, op) under
     // the lock, invoke outside it. Same lock-discipline as
     // handle_commit_checkpoint_: drain choreography may block on
@@ -714,6 +755,9 @@ void Worker::handle_begin_rescale_(MessageReader& r) {
 
 void Worker::handle_abort_checkpoint_(MessageReader& r) {
     auto msg = decode_abort_checkpoint(r);
+    if (!accept_epoch_(msg.coordinator_epoch, "AbortCheckpoint")) {
+        return;
+    }
     // Same dispatch shape as handle_commit_checkpoint_: snapshot the
     // aborter callbacks under the lock, invoke outside it. on_abort
     // must be best-effort (any single failure shouldn't stall the
@@ -743,6 +787,12 @@ void Worker::handle_abort_checkpoint_(MessageReader& r) {
 
 void Worker::handle_trigger_checkpoint_(MessageReader& r) {
     auto msg = decode_trigger_checkpoint(r);
+    // A stale leader triggering checkpoints is not benign: it picks
+    // checkpoint ids from its own counter, so two coordinators writing
+    // into one checkpoint dir would produce two different checkpoint 7s.
+    if (!accept_epoch_(msg.coordinator_epoch, "TriggerCheckpoint")) {
+        return;
+    }
     // Snapshot per-job injectors under the lock; release before
     // invoking so injection (which pushes into BoundedChannels and may
     // block) doesn't contend with deploy / peer-update bookkeeping.
@@ -777,6 +827,9 @@ void Worker::handle_trigger_checkpoint_(MessageReader& r) {
 
 void Worker::handle_deploy_(MessageReader& r) {
     auto msg = decode_deploy(r);
+    if (!accept_epoch_(msg.coordinator_epoch, "Deploy")) {
+        return;
+    }
 
     // Allocate (or reuse) the per-job bundle. Plugin .so bytes that
     // come with this Deploy will register their op factories INTO this
@@ -871,6 +924,9 @@ void Worker::handle_deploy_(MessageReader& r) {
 
 void Worker::handle_peer_update_(MessageReader& r) {
     auto msg = decode_peer_update(r);
+    if (!accept_epoch_(msg.coordinator_epoch, "PeerUpdate")) {
+        return;
+    }
     std::lock_guard lock(mu_);
     if (msg.tasks.empty()) {
         // Empty PeerUpdate = "go" signal for tasks with no peers. Mark

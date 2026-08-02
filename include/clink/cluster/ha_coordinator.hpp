@@ -23,8 +23,9 @@
 // Epoch: each leadership acquisition bumps a monotonic epoch counter
 // written to the leader-endpoint file. Fencing - workers / messages can be
 // tagged with the epoch they were issued in; consumers ignore older
-// epochs. v1 doesn't yet propagate epoch into the wire protocol, but
-// the field is in place for when it does.
+// epochs. Coordinator::set_epoch carries this onto the wire: every
+// control frame the leader sends is stamped with it, and a worker drops
+// any frame from a lower epoch than the one it registered under.
 
 #include <atomic>
 #include <chrono>

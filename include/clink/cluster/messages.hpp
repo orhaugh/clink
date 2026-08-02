@@ -20,6 +20,9 @@ inline void encode_body(MessageBuilder& b, const RegisterMsg& m) {
 inline void encode_body(MessageBuilder& b, const RegisterAckMsg& m) {
     b.put_u8(m.ok ? 1 : 0);
     b.put_string(m.message);
+    // Fencing epoch, appended last so an older peer that stops
+    // reading here still decodes the rest correctly.
+    b.put_u64_be(m.coordinator_epoch);
 }
 
 // Append a PluginBinary's wire encoding. The bytes blob can be large
@@ -99,6 +102,9 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
     // Trailing packed UDF declarations. Older workers see EOF and leave it
     // empty (no deploy-time registration).
     b.put_string(m.udfs_packed);
+    // Fencing epoch, appended last so an older peer that stops
+    // reading here still decodes the rest correctly.
+    b.put_u64_be(m.coordinator_epoch);
 }
 
 inline void encode_body(MessageBuilder& b, const StartJobMsg& m) {
@@ -106,6 +112,9 @@ inline void encode_body(MessageBuilder& b, const StartJobMsg& m) {
 }
 inline void encode_body(MessageBuilder& b, const CancelJobMsg& m) {
     b.put_u64_be(m.job_id);
+    // Fencing epoch, appended last so an older peer that stops
+    // reading here still decodes the rest correctly.
+    b.put_u64_be(m.coordinator_epoch);
 }
 inline void encode_body(MessageBuilder& b, const CancelJobAckMsg& m) {
     b.put_u64_be(m.job_id);
@@ -213,16 +222,25 @@ inline void encode_body(MessageBuilder& /*b*/, const ListJobsMsg&) {}
 inline void encode_body(MessageBuilder& b, const TriggerCheckpointMsg& m) {
     b.put_u64_be(m.job_id);
     b.put_u64_be(m.checkpoint_id);
+    // Fencing epoch, appended last so an older peer that stops
+    // reading here still decodes the rest correctly.
+    b.put_u64_be(m.coordinator_epoch);
 }
 
 inline void encode_body(MessageBuilder& b, const CommitCheckpointMsg& m) {
     b.put_u64_be(m.job_id);
     b.put_u64_be(m.checkpoint_id);
+    // Fencing epoch, appended last so an older peer that stops
+    // reading here still decodes the rest correctly.
+    b.put_u64_be(m.coordinator_epoch);
 }
 
 inline void encode_body(MessageBuilder& b, const AbortCheckpointMsg& m) {
     b.put_u64_be(m.job_id);
     b.put_u64_be(m.checkpoint_id);
+    // Fencing epoch, appended last so an older peer that stops
+    // reading here still decodes the rest correctly.
+    b.put_u64_be(m.coordinator_epoch);
 }
 
 inline void encode_body(MessageBuilder& b, const BeginRescaleMsg& m) {
@@ -230,6 +248,9 @@ inline void encode_body(MessageBuilder& b, const BeginRescaleMsg& m) {
     b.put_string(m.op_id);
     b.put_u32_be(m.target_parallelism);
     b.put_u64_be(m.cutover_checkpoint);
+    // Fencing epoch, appended last so an older peer that stops
+    // reading here still decodes the rest correctly.
+    b.put_u64_be(m.coordinator_epoch);
 }
 
 inline void encode_body(MessageBuilder& b, const SubtaskCheckpointedMsg& m) {
@@ -279,6 +300,9 @@ inline void encode_body(MessageBuilder& b, const PeerUpdateMsg& m) {
             b.put_u16_be(p.data_port);
         }
     }
+    // Fencing epoch, appended last so an older peer that stops
+    // reading here still decodes the rest correctly.
+    b.put_u64_be(m.coordinator_epoch);
 }
 
 inline void encode_body(MessageBuilder& b, const RequestFinalCheckpointMsg& m) {
@@ -292,6 +316,9 @@ inline void encode_body(MessageBuilder& b, const FinalCheckpointAssignedMsg& m) 
     b.put_string(m.role);
     b.put_u32_be(m.subtask_idx);
     b.put_u64_be(m.final_checkpoint_id);
+    // Fencing epoch, appended last so an older peer that stops
+    // reading here still decodes the rest correctly.
+    b.put_u64_be(m.coordinator_epoch);
 }
 
 // Wrap any typed message: produces the final framed byte buffer ready
@@ -319,6 +346,9 @@ inline RegisterAckMsg decode_register_ack(MessageReader& r) {
     RegisterAckMsg m;
     m.ok = r.read_u8() != 0;
     m.message = r.read_string();
+    // Fencing epoch. Absent from a pre-fencing peer, which reads
+    // as 0 = unfenced and preserves the old behaviour.
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }
 
@@ -401,6 +431,9 @@ inline DeployMsg decode_deploy(MessageReader& r) {
     if (!r.eof()) {
         m.udfs_packed = r.read_string();
     }
+    // Fencing epoch. Absent from a pre-fencing peer, which reads
+    // as 0 = unfenced and preserves the old behaviour.
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }
 
@@ -416,6 +449,9 @@ inline CancelJobMsg decode_cancel_job(MessageReader& r) {
     if (!r.eof()) {
         m.job_id = r.read_u64_be();
     }
+    // Fencing epoch. Absent from a pre-fencing peer, which reads
+    // as 0 = unfenced and preserves the old behaviour.
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }
 inline CancelJobAckMsg decode_cancel_job_ack(MessageReader& r) {
@@ -512,6 +548,9 @@ inline FinalCheckpointAssignedMsg decode_final_checkpoint_assigned(MessageReader
     m.role = r.read_string();
     m.subtask_idx = r.read_u32_be();
     m.final_checkpoint_id = r.read_u64_be();
+    // Fencing epoch. Absent from a pre-fencing peer, which reads
+    // as 0 = unfenced and preserves the old behaviour.
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }
 
@@ -573,6 +612,9 @@ inline TriggerCheckpointMsg decode_trigger_checkpoint(MessageReader& r) {
     TriggerCheckpointMsg m;
     m.job_id = r.read_u64_be();
     m.checkpoint_id = r.read_u64_be();
+    // Fencing epoch. Absent from a pre-fencing peer, which reads
+    // as 0 = unfenced and preserves the old behaviour.
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }
 
@@ -580,6 +622,9 @@ inline CommitCheckpointMsg decode_commit_checkpoint(MessageReader& r) {
     CommitCheckpointMsg m;
     m.job_id = r.read_u64_be();
     m.checkpoint_id = r.read_u64_be();
+    // Fencing epoch. Absent from a pre-fencing peer, which reads
+    // as 0 = unfenced and preserves the old behaviour.
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }
 
@@ -587,6 +632,9 @@ inline AbortCheckpointMsg decode_abort_checkpoint(MessageReader& r) {
     AbortCheckpointMsg m;
     m.job_id = r.read_u64_be();
     m.checkpoint_id = r.read_u64_be();
+    // Fencing epoch. Absent from a pre-fencing peer, which reads
+    // as 0 = unfenced and preserves the old behaviour.
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }
 
@@ -596,6 +644,9 @@ inline BeginRescaleMsg decode_begin_rescale(MessageReader& r) {
     m.op_id = r.read_string();
     m.target_parallelism = r.read_u32_be();
     m.cutover_checkpoint = r.read_u64_be();
+    // Fencing epoch. Absent from a pre-fencing peer, which reads
+    // as 0 = unfenced and preserves the old behaviour.
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }
 
@@ -677,6 +728,9 @@ inline PeerUpdateMsg decode_peer_update(MessageReader& r) {
         }
         m.tasks.push_back(std::move(tp));
     }
+    // Fencing epoch. Absent from a pre-fencing peer, which reads
+    // as 0 = unfenced and preserves the old behaviour.
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }
 

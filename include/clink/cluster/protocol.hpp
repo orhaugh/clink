@@ -187,6 +187,17 @@ struct RegisterMsg {
 struct RegisterAckMsg {
     bool ok{};
     std::string message;
+    // Fencing epoch of the coordinator that sent this. Bumped on every
+    // leadership acquisition (HaCoordinator). A worker binds the epoch it
+    // saw at registration and REFUSES any later frame carrying a lower
+    // one, so a partitioned old leader that still believes it holds the
+    // lock cannot deploy, cancel, or commit behind the new leader's back.
+    //
+    // Appended at the tail and defaulted to 0 on read, matching the
+    // additive-field idiom the rest of this protocol uses: 0 means "an
+    // unfenced peer" and preserves the pre-fencing behaviour exactly, so
+    // a mixed-version cluster keeps working while it is being upgraded.
+    std::uint64_t coordinator_epoch{0};
 };
 
 struct DeployMsg {
@@ -233,6 +244,18 @@ struct DeployMsg {
     // each before running the job's subtasks. Trailing wire field - old
     // workers see EOF and leave it empty (no deploy-time registration).
     std::string udfs_packed;
+
+    // Fencing epoch of the coordinator that sent this. Bumped on every
+    // leadership acquisition (HaCoordinator). A worker binds the epoch it
+    // saw at registration and REFUSES any later frame carrying a lower
+    // one, so a partitioned old leader that still believes it holds the
+    // lock cannot deploy, cancel, or commit behind the new leader's back.
+    //
+    // Appended at the tail and defaulted to 0 on read, matching the
+    // additive-field idiom the rest of this protocol uses: 0 means "an
+    // unfenced peer" and preserves the pre-fencing behaviour exactly, so
+    // a mixed-version cluster keeps working while it is being upgraded.
+    std::uint64_t coordinator_epoch{0};
 };
 
 struct StartJobMsg {
@@ -241,6 +264,17 @@ struct StartJobMsg {
 
 struct CancelJobMsg {
     JobId job_id{};
+    // Fencing epoch of the coordinator that sent this. Bumped on every
+    // leadership acquisition (HaCoordinator). A worker binds the epoch it
+    // saw at registration and REFUSES any later frame carrying a lower
+    // one, so a partitioned old leader that still believes it holds the
+    // lock cannot deploy, cancel, or commit behind the new leader's back.
+    //
+    // Appended at the tail and defaulted to 0 on read, matching the
+    // additive-field idiom the rest of this protocol uses: 0 means "an
+    // unfenced peer" and preserves the pre-fencing behaviour exactly, so
+    // a mixed-version cluster keeps working while it is being upgraded.
+    std::uint64_t coordinator_epoch{0};
 };
 
 // coordinator -> Client reply to a client-initiated CancelJob. `ok` is false
@@ -352,6 +386,10 @@ struct FinalCheckpointAssignedMsg {
     std::string role;
     std::uint32_t subtask_idx{};
     std::uint64_t final_checkpoint_id{};
+    // Fencing epoch of the sending coordinator; see CommitCheckpointMsg.
+    // Zero means an unfenced coordinator and reproduces the pre-fencing
+    // behaviour, so a mixed-version cluster keeps working mid-upgrade.
+    std::uint64_t coordinator_epoch{0};
 };
 
 // Sent by the client as the first frame on a control connection so the coordinator
@@ -502,6 +540,10 @@ struct ListJobsAckMsg {
 struct TriggerCheckpointMsg {
     JobId job_id{};
     std::uint64_t checkpoint_id{};
+    // Fencing epoch of the sending coordinator; see CommitCheckpointMsg.
+    // Zero means an unfenced coordinator and reproduces the pre-fencing
+    // behaviour, so a mixed-version cluster keeps working mid-upgrade.
+    std::uint64_t coordinator_epoch{0};
 };
 
 // coordinator → worker. The commit phase of the 2PC sink protocol. Broadcast to every worker
@@ -513,6 +555,17 @@ struct TriggerCheckpointMsg {
 struct CommitCheckpointMsg {
     JobId job_id{};
     std::uint64_t checkpoint_id{};
+    // Fencing epoch of the coordinator that sent this. Bumped on every
+    // leadership acquisition (HaCoordinator). A worker binds the epoch it
+    // saw at registration and REFUSES any later frame carrying a lower
+    // one, so a partitioned old leader that still believes it holds the
+    // lock cannot deploy, cancel, or commit behind the new leader's back.
+    //
+    // Appended at the tail and defaulted to 0 on read, matching the
+    // additive-field idiom the rest of this protocol uses: 0 means "an
+    // unfenced peer" and preserves the pre-fencing behaviour exactly, so
+    // a mixed-version cluster keeps working while it is being upgraded.
+    std::uint64_t coordinator_epoch{0};
 };
 
 // coordinator → worker. Broadcast when the coordinator decides a checkpoint
@@ -523,6 +576,17 @@ struct CommitCheckpointMsg {
 struct AbortCheckpointMsg {
     JobId job_id{};
     std::uint64_t checkpoint_id{};
+    // Fencing epoch of the coordinator that sent this. Bumped on every
+    // leadership acquisition (HaCoordinator). A worker binds the epoch it
+    // saw at registration and REFUSES any later frame carrying a lower
+    // one, so a partitioned old leader that still believes it holds the
+    // lock cannot deploy, cancel, or commit behind the new leader's back.
+    //
+    // Appended at the tail and defaulted to 0 on read, matching the
+    // additive-field idiom the rest of this protocol uses: 0 means "an
+    // unfenced peer" and preserves the pre-fencing behaviour exactly, so
+    // a mixed-version cluster keeps working while it is being upgraded.
+    std::uint64_t coordinator_epoch{0};
 };
 
 // coordinator -> worker. Signal the worker hosting one or more old
@@ -541,6 +605,10 @@ struct BeginRescaleMsg {
     std::string op_id;  // matches OperatorSpec.id / role on the worker
     std::uint32_t target_parallelism{};
     std::uint64_t cutover_checkpoint{};
+    // Fencing epoch of the sending coordinator; see CommitCheckpointMsg.
+    // Zero means an unfenced coordinator and reproduces the pre-fencing
+    // behaviour, so a mixed-version cluster keeps working mid-upgrade.
+    std::uint64_t coordinator_epoch{0};
 };
 
 // worker → coordinator. One ack per subtask that completed its slice of checkpoint
@@ -589,6 +657,10 @@ struct PeerUpdateMsg {
     };
     JobId job_id{};
     std::vector<TaskPeers> tasks;
+    // Fencing epoch of the sending coordinator; see CommitCheckpointMsg.
+    // Zero means an unfenced coordinator and reproduces the pre-fencing
+    // behaviour, so a mixed-version cluster keeps working mid-upgrade.
+    std::uint64_t coordinator_epoch{0};
 };
 
 // ----- Binary builder / reader -----

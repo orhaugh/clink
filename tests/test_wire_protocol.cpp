@@ -634,3 +634,203 @@ TEST(WireProtocol, ClientRequestKindsAreDistinct) {
     EXPECT_NE(static_cast<int>(MessageKind::Savepoint),
               static_cast<int>(MessageKind::RescaleOperator));
 }
+
+// ----- fencing epoch on the coordinator -> worker control frames -----
+//
+// Every control frame that changes what a worker is DOING carries the
+// sending coordinator's fencing epoch, so the worker can refuse a command
+// from a coordinator that has since lost leadership. Two properties matter
+// and are pinned separately below:
+//
+//   1. The epoch survives the round trip on every one of those frames. A
+//      frame that silently loses it decodes as epoch 0, which is the
+//      "unfenced" value - so a dropped field does not fail loudly, it
+//      turns fencing off. That is exactly the failure a test must catch.
+//
+//   2. A frame produced by a PRE-FENCING peer - one whose body ends before
+//      the epoch field - still decodes, and decodes as 0. Without this a
+//      rolling upgrade would break the moment the first upgraded node
+//      talked to a node that had not restarted yet.
+
+namespace {
+
+// Encode `original`, then chop the trailing 8-byte epoch off the body, so
+// what MessageReader sees is byte-identical to what a pre-fencing peer
+// would have sent.
+template <typename Msg, typename Decoder>
+Msg round_trip_without_epoch_field(MessageKind kind, const Msg& original, Decoder decode) {
+    auto body = body_of(encode_frame(kind, original));
+    EXPECT_GE(body.size(), 8U);
+    body.resize(body.size() - 8);
+    MessageReader r(std::move(body));
+    EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), kind);
+    return decode(r);
+}
+
+}  // namespace
+
+TEST(WireProtocolFencing, EveryControlFrameCarriesTheCoordinatorEpoch) {
+    {
+        RegisterAckMsg in{.ok = true, .message = "welcome", .coordinator_epoch = 9};
+        EXPECT_EQ(round_trip(MessageKind::RegisterAck, in, decode_register_ack).coordinator_epoch,
+                  9U);
+    }
+    {
+        DeployMsg in;
+        in.job_id = 1;
+        in.tasks.push_back(DeploymentTask{.role = "r", .subtask_idx = 0});
+        in.coordinator_epoch = 9;
+        EXPECT_EQ(round_trip(MessageKind::Deploy, in, decode_deploy).coordinator_epoch, 9U);
+    }
+    {
+        CancelJobMsg in;
+        in.job_id = 1;
+        in.coordinator_epoch = 9;
+        EXPECT_EQ(round_trip(MessageKind::CancelJob, in, decode_cancel_job).coordinator_epoch, 9U);
+    }
+    {
+        TriggerCheckpointMsg in{.job_id = 1, .checkpoint_id = 2, .coordinator_epoch = 9};
+        EXPECT_EQ(round_trip(MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint)
+                      .coordinator_epoch,
+                  9U);
+    }
+    {
+        CommitCheckpointMsg in{.job_id = 1, .checkpoint_id = 2, .coordinator_epoch = 9};
+        EXPECT_EQ(round_trip(MessageKind::CommitCheckpoint, in, decode_commit_checkpoint)
+                      .coordinator_epoch,
+                  9U);
+    }
+    {
+        AbortCheckpointMsg in{.job_id = 1, .checkpoint_id = 2, .coordinator_epoch = 9};
+        EXPECT_EQ(
+            round_trip(MessageKind::AbortCheckpoint, in, decode_abort_checkpoint).coordinator_epoch,
+            9U);
+    }
+    {
+        FinalCheckpointAssignedMsg in;
+        in.job_id = 1;
+        in.role = "src";
+        in.subtask_idx = 0;
+        in.final_checkpoint_id = 4;
+        in.coordinator_epoch = 9;
+        EXPECT_EQ(
+            round_trip(MessageKind::FinalCheckpointAssigned, in, decode_final_checkpoint_assigned)
+                .coordinator_epoch,
+            9U);
+    }
+    {
+        BeginRescaleMsg in;
+        in.job_id = 1;
+        in.op_id = "agg";
+        in.target_parallelism = 4;
+        in.cutover_checkpoint = 7;
+        in.coordinator_epoch = 9;
+        EXPECT_EQ(round_trip(MessageKind::BeginRescale, in, decode_begin_rescale).coordinator_epoch,
+                  9U);
+    }
+    {
+        PeerUpdateMsg in;
+        in.job_id = 1;
+        in.coordinator_epoch = 9;
+        auto out = round_trip(MessageKind::PeerUpdate, in, decode_peer_update);
+        EXPECT_EQ(out.coordinator_epoch, 9U);
+
+        // Again with a populated task list, so the epoch is proven to survive
+        // AFTER a variable-length section rather than only on an empty body.
+        PeerUpdateMsg with_peers;
+        with_peers.job_id = 1;
+        with_peers.coordinator_epoch = 9;
+        PeerUpdateMsg::TaskPeers tp;
+        tp.role = "sink";
+        tp.subtask_idx = 1;
+        tp.peers.push_back(
+            PeerAddress{.role = "src", .subtask_idx = 0, .host = "h", .data_port = 5});
+        with_peers.tasks.push_back(std::move(tp));
+        auto out2 = round_trip(MessageKind::PeerUpdate, with_peers, decode_peer_update);
+        ASSERT_EQ(out2.tasks.size(), 1U);
+        EXPECT_EQ(out2.tasks[0].peers.at(0).data_port, 5);
+        EXPECT_EQ(out2.coordinator_epoch, 9U);
+    }
+}
+
+TEST(WireProtocolFencing, AFrameFromAPreFencingPeerDecodesAsUnfenced) {
+    // Truncating the tail is what a node running the previous build
+    // actually puts on the wire. Each of these must decode cleanly, keep
+    // every field that came before the epoch, and report epoch 0.
+    {
+        RegisterAckMsg in{.ok = true, .message = "welcome", .coordinator_epoch = 9};
+        auto out =
+            round_trip_without_epoch_field(MessageKind::RegisterAck, in, decode_register_ack);
+        EXPECT_TRUE(out.ok);
+        EXPECT_EQ(out.message, "welcome");
+        EXPECT_EQ(out.coordinator_epoch, 0U);
+    }
+    {
+        DeployMsg in;
+        in.job_id = 11;
+        in.tasks.push_back(DeploymentTask{.role = "r", .subtask_idx = 3});
+        in.coordinator_epoch = 9;
+        auto out = round_trip_without_epoch_field(MessageKind::Deploy, in, decode_deploy);
+        EXPECT_EQ(out.job_id, 11U);
+        ASSERT_EQ(out.tasks.size(), 1U);
+        EXPECT_EQ(out.tasks[0].subtask_idx, 3U);
+        EXPECT_EQ(out.coordinator_epoch, 0U);
+    }
+    {
+        CommitCheckpointMsg in{.job_id = 1, .checkpoint_id = 22, .coordinator_epoch = 9};
+        auto out = round_trip_without_epoch_field(
+            MessageKind::CommitCheckpoint, in, decode_commit_checkpoint);
+        EXPECT_EQ(out.checkpoint_id, 22U);
+        EXPECT_EQ(out.coordinator_epoch, 0U);
+    }
+    {
+        TriggerCheckpointMsg in{.job_id = 1, .checkpoint_id = 33, .coordinator_epoch = 9};
+        auto out = round_trip_without_epoch_field(
+            MessageKind::TriggerCheckpoint, in, decode_trigger_checkpoint);
+        EXPECT_EQ(out.checkpoint_id, 33U);
+        EXPECT_EQ(out.coordinator_epoch, 0U);
+    }
+    {
+        BeginRescaleMsg in;
+        in.job_id = 1;
+        in.op_id = "agg";
+        in.target_parallelism = 8;
+        in.cutover_checkpoint = 44;
+        in.coordinator_epoch = 9;
+        auto out =
+            round_trip_without_epoch_field(MessageKind::BeginRescale, in, decode_begin_rescale);
+        EXPECT_EQ(out.op_id, "agg");
+        EXPECT_EQ(out.cutover_checkpoint, 44U);
+        EXPECT_EQ(out.coordinator_epoch, 0U);
+    }
+    {
+        PeerUpdateMsg in;
+        in.job_id = 1;
+        in.coordinator_epoch = 9;
+        PeerUpdateMsg::TaskPeers tp;
+        tp.role = "sink";
+        tp.subtask_idx = 1;
+        tp.peers.push_back(
+            PeerAddress{.role = "src", .subtask_idx = 0, .host = "h", .data_port = 6});
+        in.tasks.push_back(std::move(tp));
+        auto out = round_trip_without_epoch_field(MessageKind::PeerUpdate, in, decode_peer_update);
+        ASSERT_EQ(out.tasks.size(), 1U);
+        EXPECT_EQ(out.tasks[0].peers.at(0).data_port, 6);
+        EXPECT_EQ(out.coordinator_epoch, 0U);
+    }
+}
+
+TEST(WireProtocolFencing, ADefaultConstructedControlFrameIsUnfenced) {
+    // Zero is the value that means "no fencing", so every message must
+    // default to it. A message that defaulted to 1 would fence off every
+    // worker registered under an unfenced (non-HA) coordinator.
+    EXPECT_EQ(RegisterAckMsg{}.coordinator_epoch, 0U);
+    EXPECT_EQ(DeployMsg{}.coordinator_epoch, 0U);
+    EXPECT_EQ(CancelJobMsg{}.coordinator_epoch, 0U);
+    EXPECT_EQ(TriggerCheckpointMsg{}.coordinator_epoch, 0U);
+    EXPECT_EQ(CommitCheckpointMsg{}.coordinator_epoch, 0U);
+    EXPECT_EQ(AbortCheckpointMsg{}.coordinator_epoch, 0U);
+    EXPECT_EQ(FinalCheckpointAssignedMsg{}.coordinator_epoch, 0U);
+    EXPECT_EQ(BeginRescaleMsg{}.coordinator_epoch, 0U);
+    EXPECT_EQ(PeerUpdateMsg{}.coordinator_epoch, 0U);
+}

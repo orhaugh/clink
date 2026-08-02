@@ -171,6 +171,18 @@ Two implementations exist:
 
 In `clink_node`, passing `--ha-dir` (or `--etcd-endpoints`) puts the coordinator in HA mode: `coordinator.start()` is deferred until `on_become_leader` fires, at which point the coordinator binds the control port and calls `recover_persisted_jobs()`. A standby coordinator just sits on the coordinator poll thread.
 
+#### Fencing: a coordinator that has lost leadership cannot act
+
+Losing leadership is not something a leader can detect on its own. A coordinator partitioned from the coordination store, or paused past its lease, keeps every worker connection open, keeps its in-memory job state, and keeps its checkpoint timer running. Fencing is what stops it acting on that stale belief.
+
+Every coordinator-to-worker control frame carries the sending coordinator's epoch: `RegisterAck`, `Deploy`, `PeerUpdate`, `CancelJob`, `TriggerCheckpoint`, `CommitCheckpoint`, `AbortCheckpoint`, `FinalCheckpointAssigned` and `BeginRescale`. `clink_node` calls `Coordinator::set_epoch` from the become-leader callback before the listener opens, and `Coordinator::fenced_frame_` stamps the epoch as it encodes, so no send site can forget it.
+
+A worker binds the epoch carried by the `RegisterAck` that admitted it. `Worker::accept_epoch_` then drops any later frame carrying a **lower** epoch, incrementing `clink_worker_fenced_frames_total` and logging at error - a non-zero count is a split-brain signal. A **higher** epoch re-binds the worker rather than being refused: a failover that keeps the connection up presents that way, and refusing it would fence the worker off from the legitimate new leader.
+
+Epoch `0` means "unfenced". A non-HA coordinator never sets one, so a single-coordinator cluster behaves exactly as it did before fencing existed. The field is appended at the tail of each message body and read with the additive idiom the rest of the protocol uses (`r.eof() ? 0 : r.read_u64_be()`), so a node running a pre-fencing build decodes as `0` and a cluster keeps working while it is rolled.
+
+Control-plane metadata is fenced too: the job manifest and the history record each carry `"coordinator_epoch"`, and a write from a lower epoch than the one already stored is refused. That check is a read-then-write, not an atomic compare-and-set - two writers racing between the read and the rename can both pass. It closes the realistic shape, where a partitioned leader is stale for seconds or minutes and every write it attempts reads back a higher epoch, but making it airtight needs the metadata in a store with a real conditional write, which clink does not yet have.
+
 #### Job persistence and recovery
 
 When HA is active the coordinator persists each submitted job. `set_ha_dir` creates `<ha_dir>/jobs/` and `<ha_dir>/history/`. On submit, the coordinator writes `<ha_dir>/jobs/<job_id>/manifest.json` plus the plugin `.so` bytes (`persist_job_manifest_`). On takeover, `recover_persisted_jobs()` scans `<ha_dir>/jobs/`, re-reads each manifest, reloads its plugins into a fresh `JobBundle`, and re-submits the job with `restore_from` set to the latest `COMPLETED-N` marker found on disk for that job. It is idempotent (already-running ids are skipped) and pins each recovered job's state-backend URI to the one it originally ran with (`pin_recovered_state_backend`) so a cluster default configured after the job was submitted cannot silently rebind it. Terminal-state records are also persisted to `<ha_dir>/history/` and reloaded into a bounded in-memory ring (`reload_history_from_disk_`).
@@ -248,6 +260,7 @@ Remaining hardening, still trusted-network today: the inter-operator **data plan
 | `DeploymentTask`, `PeerAddress` (`protocol.hpp`) | One subtask's placement, bind port, peers, restore directives and key-group range |
 | `CheckpointConfig`, `effective_max_restarts` (`protocol.hpp`) | Per-job checkpoint/restore/restart and state-backend settings, and the restart-policy resolution |
 | `HaCoordinator`, `make_file_ha_coordinator`, `make_etcd_ha_coordinator` | Leader election and leader-endpoint discovery |
+| `Coordinator::set_epoch` / `epoch()`, `Worker::bound_epoch()` / `fenced_frame_count()` | Fencing epoch: stamped on every control frame, enforced worker-side |
 | `ServiceDiscovery` and subclasses | worker-side discovery of the coordinator endpoint (static, env var, file) |
 | `JobSubmitter` (`job_submitter.hpp`) | Programmatic client: connect, `HelloClient` + `SubmitJob`, await ack/completion |
 | `PluginRegistry` (`plugin.hpp`) | Registration sink for a job/plugin's types, sources, operators, sinks, selectors and key extractors |
@@ -309,7 +322,9 @@ The session catalog is in-memory by default (lost on coordinator restart). Passi
 ## Guarantees and caveats
 
 - **Single active coordinator.** There is one coordinator at a time. HA provides standby failover via leader election, not active-active. The file coordinator requires a shared filesystem and relies on OS lock release on process death; the header notes that pathological cases (for example an NFS hang) can leak stale ownership.
-- **etcd is optional and build-gated.** The etcd coordinator only exists when the cluster is built with the etcd impl; otherwise `--etcd-endpoints` is rejected at startup. The HA fencing epoch is written to the leader file/key but, per the `ha_coordinator.hpp` note, is not yet propagated into the wire protocol.
+- **etcd is optional and build-gated.** The etcd coordinator only exists when the cluster is built with the etcd impl; otherwise `--etcd-endpoints` is rejected at startup.
+- **Fencing is coordinator-to-worker only.** Worker-to-coordinator frames carry no epoch, so a superseded coordinator can still receive and act on status from workers it no longer owns. It cannot make them do anything, which is the dangerous direction, but its own view is not fenced.
+- **The metadata guard is not a compare-and-set.** See the fencing section above: it is a read-then-write, and the remaining race needs a metadata store with a conditional write to close.
 - **Transport security.** The control plane defaults to loopback and plain TCP. TLS is wired through injectable accept/connect factories in `clink_node` (and is itself build-gated); any deployment beyond a trusted local network should enable it.
 - **ABI gate is a structural fingerprint.** By default a plugin and the cluster must agree on a SHA-256 over the public header contents plus the ABI-relevant build options and `CLINK_ABI_VERSION`, and on the target triple - so a cluster rebuild that does not change the ABI surface (a `.cpp`, doc, or test-only change) keeps existing plugin binaries deployable. `CLINK_STRICT_PLUGIN_ABI=1` restores the legacy exact-commit-hash comparison. There is no sandbox: a crash in plugin code terminates the worker process, after which the coordinator restarts the job per its restart policy (the contract is "trust your own plugins").
 - **Plugins are not unloaded.** `PluginLoader` tracks handles but keeps them loaded for the process lifetime; `dlclose` with registered closures pointing back into plugin code is deferred.

@@ -272,6 +272,93 @@ append, `changelog='yes'` reads as false.
 **Risk:** a one-character typo silently changes a job's delivery guarantee
 or retention, with the DDL still reading as though it had not.
 
+### F16. The HA fencing epoch was computed and then ignored
+
+`HaCoordinator` bumps a monotonic epoch on every leadership acquisition and
+writes it to the leader-endpoint file. Its own header said the field was
+"in place for when it does" propagate into the wire protocol. A grep for
+every use confirmed nothing else read it: no control frame carried it, no
+worker checked it, no metadata record stored it.
+
+A coordinator cannot detect on its own that it has lost leadership. One
+partitioned from the coordination store, or paused past its lease, keeps
+every worker connection open and its checkpoint timer running. With no
+fencing it could deploy a second copy of a running job, cancel a job the
+new leader had just started, number checkpoints from a stale counter into
+the same directory, redistribute state via `BeginRescale`, and broadcast
+`CommitCheckpoint` - publishing 2PC sink transactions the new leader never
+agreed to.
+
+**Risk:** duplicated or destroyed work, and externally-visible commits from
+a coordinator with no authority to make them. The last of these cannot be
+undone.
+
+### F17. The fault framework lost a wake-up to a thread on its way to parking (found and fixed in this pass)
+
+Found on Linux, by `FaultInjectionTest.ResetReleasesAParkedThread` timing
+out in a full-suite run. Not a flake, and not a test-timing artefact - a
+real lost-wakeup deadlock in `Registry::reach`.
+
+`reach()` takes `mu_`, counts the hit and matches a rule, then RELEASES the
+mutex before the `Action::Block` case re-takes it to park. A `reset()` or
+`release()` landing in that window bumped the release epoch and notified
+with nobody yet waiting. The thread then took the lock, read the
+already-bumped epoch as its OWN baseline, evaluated the predicate as false,
+and slept forever.
+
+This is the second bug in the same three lines. The first was the mirror
+image: `reset()` used to CLEAR the per-point epoch, so a woken thread
+re-read a zeroed counter and parked again. That was fixed with a monotonic
+global epoch, which is correct as far as it goes and does nothing for a
+thread that has not yet parked.
+
+**Risk:** any test or harness that arms `Block` can wedge its whole binary,
+and a hung process in CI reads as an infrastructure problem rather than as
+the defect it is. The fault framework is what several of the gates in this
+document are built on, so a deadlock in it undermines them.
+
+**Fix:** capture both epoch baselines in the SAME critical section that
+matches the rule. A wake landing after that point necessarily moves the
+epoch above the baseline, so the predicate is already true and the thread
+never parks. `ResetReleasesAThreadStillOnItsWayToParking` and
+`ReleaseReachesAThreadStillOnItsWayToParking` cover both wake paths - the
+per-point epoch has the identical shape and would otherwise have been
+fixed by accident rather than on purpose.
+
+The window is inside `reach()` and cannot be opened deterministically from
+a test without a hook into the function under test, so both cases hammer it
+(500 iterations, resetting the instant the hit lands) rather than claiming
+a determinism they do not have. That is stated in the tests themselves.
+
+### F18. The HA epoch restarted at 1 for every new leader, making fencing inert (found and fixed in this pass)
+
+Found by `HaFailoverTest.FailoverAdvancesTheEpoch` the first time it ran:
+two `clink_node` coordinators, the leader SIGKILLed, and the successor
+announcing `epoch=1` - the same epoch the leader it displaced had been
+stamping on every control frame.
+
+Both `HaCoordinator` implementations bumped a **per-process** atomic that
+starts at zero. A standby is a separate process, so its first acquisition
+always produced 1. Nothing carried the epoch across leaderships. Every
+worker-side fencing comparison was therefore `1 >= 1`, and no frame from a
+displaced leader would ever have been refused.
+
+This is worth dwelling on: the fencing work of W15 was complete, correct in
+isolation, and covered by twelve passing unit tests - and would have
+protected nothing in a real deployment. The unit tests could not see it,
+because they choose the epochs themselves. Only a test that let the SYSTEM
+produce the epochs could, which is the reason the multi-process failover
+tests exist rather than being a belt-and-braces extra.
+
+**Risk:** the entire split-brain protection was decorative.
+
+**Fix:** on acquisition, read the epoch the previous leader published
+(`active-leader.json` for the file coordinator, the leader key for etcd) and
+take `max(that, own) + 1`. Both implementations had the identical defect and
+both were fixed; `EachLeadershipTakesAnEpochAboveEveryEarlierOne` pins the
+property with distinct coordinator objects, each with its own
+zero-initialised counter, which is the condition that hid the bug.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -308,7 +395,7 @@ lives; evidence is in section 4.
 | W12 | State TTL depth: event time, incremental cleanup, metrics, SQL `state_ttl` enforced by GROUP BY | P0.3 | F9 | **Partial** |
 | W13 | Strict rejection of unsupported SQL semantics | P0.4 | F14, F15 | **Partial** |
 | W14 | Resource and overload limits | P1.9 | - | **Open** |
-| W15 | Coordinator metadata abstraction with CAS/fencing | P1.11 | - | **Open** |
+| W15 | Coordinator fencing: epoch on the wire, worker enforcement, metadata guard | P1.11 | F16 | **Partial** |
 | W16 | Protocol version negotiation across RPC/frames/state | P1.12 | - | **Open** |
 | W17 | Config profiles + linter | P1.13 | - | **Open** |
 | W18 | OpenTelemetry tracing | P1.14 | - | **Open** |
@@ -1063,6 +1150,156 @@ A hand-assembled domain list is only safe when it was read off the code.
 
 ---
 
+### W15 - Coordinator fencing — Partial
+
+**Source:** `include/clink/cluster/protocol.hpp`,
+`include/clink/cluster/messages.hpp`, `include/clink/cluster/coordinator.hpp`,
+`src/cluster/coordinator.cpp`, `include/clink/cluster/worker.hpp`,
+`src/cluster/worker.cpp`, `tools/clink_node.cpp`
+
+**The finding (F16).** `HaCoordinator` already computed a monotonic epoch,
+bumped on every leadership acquisition, and its own header said: "v1
+doesn't yet propagate epoch into the wire protocol, but the field is in
+place for when it does." A grep confirmed the epoch was read by exactly one
+thing - the leader-endpoint file - and by nothing else in the engine. There
+was no fencing anywhere.
+
+That matters because losing leadership is not something a leader can
+detect on its own. A coordinator partitioned from the coordination store,
+or merely paused past its lease, keeps every worker connection open, keeps
+its in-memory job state, and keeps its checkpoint timer running. In that
+state it could:
+
+- deploy a job the new leader had also deployed, running two copies;
+- cancel a job the new leader had just started;
+- issue `TriggerCheckpoint` numbered from its own stale counter into the
+  same checkpoint directory, so two different coordinators write two
+  different "checkpoint 7";
+- broadcast `CommitCheckpoint`, which publishes 2PC sink transactions
+  externally - the one action in the list that cannot be undone;
+- issue `BeginRescale`, redistributing state under the new leader.
+
+**What was implemented.** The epoch now rides the wire on all nine
+coordinator-to-worker control frames: `RegisterAck`, `Deploy`,
+`PeerUpdate`, `CancelJob`, `TriggerCheckpoint`, `CommitCheckpoint`,
+`AbortCheckpoint`, `FinalCheckpointAssigned`, `BeginRescale`.
+`clink_node` binds it via `Coordinator::set_epoch` inside the
+become-leader callback, before the listener opens, so no frame this leader
+ever sends is unstamped.
+
+A worker binds the epoch carried by the `RegisterAck` that admitted it,
+and `Worker::accept_epoch_` drops any later frame carrying a lower one,
+counting it on `clink_worker_fenced_frames_total` and logging it at error.
+A HIGHER epoch re-binds rather than being refused: a failover that keeps
+the connection up presents that way, and refusing it would fence the worker
+off from the legitimate new leader - the same outage as split brain and
+harder to diagnose.
+
+**A mistake worth recording.** The first cut assigned the epoch at each
+message-construction site. That was already wrong when written: four
+separate paths build a `DeployMsg` - submit, two rescale paths, and
+restart-after-failure - and only the submit one had been stamped. The
+failure mode is quiet and the wrong way round: an unstamped frame carries
+epoch 0, a worker bound to a real epoch REFUSES it, so forgetting to stamp
+presents as a rescale or a restart that silently never happens. The
+behavioural tests could not catch it either, because they drive the worker
+directly rather than through the coordinator's send paths.
+
+The fix is structural rather than another assignment: every
+coordinator-to-worker frame is now encoded through `Coordinator::
+fenced_frame_`, which stamps as it encodes, and no send site sets the field
+itself. `AnEpochedCoordinatorDoesNotFenceOffItsOwnDeploy` and
+`AnEpochedCoordinatorCanStillRestartAFailedTask` run a real coordinator at
+a non-zero epoch and assert its own worker never fences it, so a future
+site that bypasses the helper fails a test rather than going quiet.
+
+**Compatibility.** The field is appended at the tail of each body and read
+with the additive idiom the rest of this protocol already uses
+(`r.eof() ? 0 : r.read_u64_be()`). Zero means "unfenced" and reproduces the
+previous behaviour exactly, so a non-HA cluster is untouched and a
+mixed-version cluster keeps working while it is rolled. This is pinned by
+`AFrameFromAPreFencingPeerDecodesAsUnfenced`, which truncates the tail off
+a real encoded frame - what a previous-build node actually puts on the
+wire - and asserts the rest still decodes.
+
+**Metadata guard.** The job manifest now carries `"coordinator_epoch"`, and
+`fenced_write_file` refuses to overwrite a record stamped by a LATER epoch.
+The rule is `metadata_write_allowed`, exposed in the header alongside the
+other submit-time policies so it can be tested directly.
+
+**Tests:** `tests/test_coordinator_fencing.cpp` (12 cases),
+`tests/test_wire_protocol.cpp` (3 fencing cases),
+`tests/test_ha_coordinator.cpp` (1 new case, epoch monotonicity),
+`tests/integration/test_ha_failover.cpp` (5 multi-process cases).
+
+The behavioural tests drive the worker through `set_connect_factory`, the
+transport seam `Worker` already exposes, so each frame kind is delivered at
+a chosen epoch through the real decoder and the real dispatch switch. Two
+live coordinators could not produce this: a coordinator stamps one epoch at
+a time. Every frame kind is checked in both directions - refused when
+stale, accepted at the bound epoch - because a test that only asserts
+"refused" passes just as well if the frames were never being processed.
+
+The coverage was verified by mutation rather than assumed: deleting the
+check from `handle_trigger_checkpoint_` and rebuilding made
+`EveryControlFrameFromASupersededCoordinatorIsRefused` fail and name the
+handler ("TriggerCheckpoint from a superseded coordinator was NOT
+refused"). A per-handler check that no test can distinguish from its
+absence is not covered, whatever the line count says.
+
+**Multi-process failover.** The unit tests pin the rule against epochs a
+test hands the worker. `tests/integration/test_ha_failover.cpp` pins it
+against epochs the system produces: two `clink_node` coordinator processes
+contend for one `fcntl` lock, the leader is SIGKILLed, and the standby
+takes over. It checks both directions, which fail in opposite ways:
+
+- the epoch must ADVANCE across the failover, because a reused epoch fences
+  nothing and every unit test would still pass;
+- nothing legitimate must be fenced. A worker that registers with the new
+  leader binds the new epoch and refuses nothing, and a job submitted to it
+  deploys, checkpoints and completes. Adding fencing to a control plane can
+  break the failover it exists to protect, and that failure is silent.
+
+The harness gained `start_ha_coordinators`, `kill_leader_and_await_failover`
+and `start_ha_worker` for this. As with the rest of that harness, every step
+waits on an observed condition - a leader announced in a log, a port
+accepting, a registration counted - with a deadline as a failure bound only.
+
+**What makes this Partial - stated plainly:**
+
+- **The epoch is carried through the leader record, not a consensus
+  counter.** A new leader reads the previous one's published epoch and goes
+  above it. If that record is lost - the HA directory wiped, the etcd key
+  expired and garbage-collected before the successor reads it - the
+  successor restarts from 1 and a displaced leader stamping a higher epoch
+  would fence the legitimate new leader off. The window is narrow and the
+  precondition is destructive, but it is a real ordering assumption rather
+  than a guarantee.
+- **No test produces a genuine split brain.** The failover tests kill the
+  old leader, so it is not alive to send anything. A real split brain needs
+  the displaced leader to keep its sockets while losing the lock, and the
+  file coordinator cannot produce that: the `fcntl` lock is released only on
+  process death, so a SIGSTOPped leader keeps it and no standby takes over.
+  It needs a lease-based store (etcd), and would be build-gated on it. What
+  is demonstrated is that the rule holds given the epochs, and that the
+  election produces advancing epochs - not the two together under partition.
+- **The metadata guard is a read-then-write, not a compare-and-set.** Two
+  writers racing inside the window between the read and the rename can both
+  pass. It closes the realistic shape of the problem, where a partitioned
+  leader is stale for seconds or minutes and every write it attempts reads
+  back an epoch above its own, but it is not a distributed CAS and must not
+  be described as one. A POSIX filesystem offers no primitive that would
+  close the remaining window.
+- **No object-store or etcd metadata backend with a real conditional
+  write.** That is what would make the above airtight, and it was not
+  built. The brief asked for it; this is the part that is missing.
+- **Fencing is coordinator-to-worker only.** Worker-to-coordinator frames
+  carry no epoch, so a stale coordinator can still receive and act on
+  status from workers it no longer owns. It cannot make them do anything,
+  which is the dangerous direction, but its view is not fenced.
+
+---
+
 ## 5. Test evidence
 
 Commands run, on macOS 26.3 (arm64), Apple clang, `RelWithDebInfo`.
@@ -1080,10 +1317,13 @@ cmake -S . -B build && cmake --build build --parallel 10
     -> 20 tests from 1 test suite ran. [  PASSED  ] 20 tests.
 ./build/tests/clink_core_tests --gtest_filter='StateBackendFactory*'
     -> 13 tests from 1 test suite ran. [  PASSED  ] 13 tests.
+./build/tests/clink_core_tests --gtest_filter='CoordinatorFencing*:WireProtocolFencing*'
+    -> 15 tests from 2 test suites ran. [  PASSED  ] 15 tests.
 
 # Whole suite, after the changes
-ctest --test-dir build -j8 --timeout 300
-    -> 100% tests passed, 0 tests failed out of 3279
+cmake -S . -B build -DCLINK_BUILD_SQL=ON && cmake --build build --parallel 10
+ctest --test-dir build -j8
+    -> 100% tests passed, 0 tests failed out of 3432
 
 # CLI, end to end
 ./build/clink --capabilities-json | python3 -c "import json,sys; json.load(sys.stdin)"
@@ -1102,7 +1342,13 @@ cmake --build build-it --parallel 10
 ctest --test-dir build-it --parallel 1 --timeout 300 -R FaultRecovery
     -> 100% tests passed, 0 tests failed out of 7   (x4 consecutive runs)
     -> 73 s wall for the suite; 1 DISABLED (F12, see section 7)
+
+./build-it/tests/clink_integration_tests --gtest_filter='HaFailoverTest.*'
+    -> 5 tests from 1 test suite ran. [  PASSED  ] 5 tests. (12 s)
 ```
+
+The first run of that HA suite is what found F18: `FailoverAdvancesTheEpoch`
+failed with both coordinators announcing `epoch=1`.
 
 Cross-process fault arming, verified end to end:
 
@@ -1112,6 +1358,43 @@ CLINK_FAULT_INJECT="checkpoint.before_write=exit:70@1" \
     -> exit 70; no sidecar written
 (without the variable: exit 0; sidecar written)
 ```
+
+**The fault-framework race (F17).** Reproduced locally before fixing:
+
+```
+# With the epoch baseline read inside the Block case (the old shape)
+./build/tests/clink_core_tests --gtest_filter='FaultInjectionTest.*Parking'
+    -> hangs indefinitely; the worker thread never leaves the fault point
+
+# With the baseline captured under the matching lock (the fix)
+./build/tests/clink_core_tests --gtest_filter='FaultInjection*'
+    -> 20 tests from 1 test suite ran. [  PASSED  ] 20 tests. (299 ms)
+```
+
+1000 race iterations in under 300 ms against an indefinite hang. The Linux
+CI symptom was a `(Timeout)` on `ResetReleasesAParkedThread`, which is the
+same deadlock arrived at by luck rather than by hammering.
+
+**Mutation checks.** Two of the fencing tests were verified by breaking the
+code rather than by reading it:
+
+```
+# Delete the epoch check from handle_trigger_checkpoint_ and rebuild
+./build/tests/clink_core_tests \
+  --gtest_filter='CoordinatorFencing.EveryControlFrameFromASupersededCoordinatorIsRefused'
+    -> FAILED: "TriggerCheckpoint from a superseded coordinator was NOT refused"
+       (and CommitCheckpoint, AbortCheckpoint - the frames behind it in the queue)
+
+# Revert the restart path's Deploy to an unstamped encode_frame and rebuild
+./build/tests/clink_core_tests \
+  --gtest_filter='CoordinatorFencing.AnEpochedCoordinator*'
+    -> FAILED: "the restart never completed" (the redeploy was fenced off by
+       the coordinator's own worker)
+```
+
+Both were restored and the suite re-run green. A per-handler check that no
+test can distinguish from its absence is not covered, whatever the line
+count says.
 
 Two numbers worth noting. The harness smoke test
 (`HarnessBringsUpAClusterAndReapsIt`) completes in **304 ms** - the
@@ -1145,10 +1428,11 @@ document that only lists wins is worse than none.
 - **No soak testing.** Everything here runs in seconds to minutes. State
   growth, memory stability, checkpoint-interval drift and connector
   reconnection behaviour over hours or days are untested.
-- **Single platform.** Results above are from macOS/arm64. The repository's
-  history records four classes of bug that appear only on Linux (`size_t`
-  typedefs, `inet_pton`, close-vs-shutdown on `accept`, malloc strictness),
-  so a Linux CI run is required before any of these claims are portable.
+- **Two platforms, not many.** Every round is verified on macOS/arm64 and on
+  Debian/x86-64 in the project's Docker image, and that has earned its keep:
+  F17 (the fault-framework deadlock) was found ONLY by the Linux run, having
+  passed on macOS repeatedly. Nothing here has been run on any other
+  platform, libc, or architecture.
 - **No independent review.** Single-author work.
 
 ### Known gaps in what was implemented

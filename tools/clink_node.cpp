@@ -1943,6 +1943,11 @@ int run_coordinator(int argc, char** argv) {
         ha_coord->set_on_become_leader(
             [&coordinator, want_port, advertise_host, sql_catalog_dir](std::uint64_t epoch) {
                 try {
+                    // Bind the fencing epoch BEFORE the listener opens, so
+                    // every frame this leader ever sends carries it and a
+                    // worker can refuse commands from the leader we just
+                    // displaced.
+                    coordinator.set_epoch(epoch);
                     const auto bound = coordinator.start(want_port);
                     std::cout << "coordinator became leader (epoch=" << epoch << "), listening on "
                               << advertise_host << ":" << bound << "\n";

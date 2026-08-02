@@ -257,6 +257,23 @@ std::size_t Registry::release(std::string_view point) {
 Outcome Registry::reach(std::string_view point) {
     Rule matched;
     bool found = false;
+    // Release-epoch baselines for Action::Block, captured HERE rather than
+    // in the Block case below.
+    //
+    // The mutex is dropped between matching a rule and parking on it, and a
+    // release() or reset() landing in that window used to be lost entirely:
+    // the waker bumped the epoch and notified with nobody yet waiting, then
+    // the thread took the lock, read the ALREADY-BUMPED epoch as its own
+    // baseline, found the predicate false, and slept forever. Capturing the
+    // baseline under the same lock that matched the rule makes the window
+    // empty - a wake that lands after this point necessarily moves the
+    // epoch ABOVE the baseline, so the predicate is true before the thread
+    // ever parks.
+    //
+    // Found on Linux by ResetReleasesAParkedThread timing out. It is a race
+    // the macOS scheduler almost always won.
+    std::uint64_t point_epoch_at_entry = 0;
+    std::uint64_t global_epoch_at_entry = 0;
     {
         std::lock_guard lock(mu_);
         if (rules_.empty()) {
@@ -274,6 +291,10 @@ Outcome Registry::reach(std::string_view point) {
             matched = r;
             found = true;
             break;
+        }
+        if (found && matched.action == Action::Block) {
+            point_epoch_at_entry = release_epoch_[key];
+            global_epoch_at_entry = global_release_epoch_;
         }
     }
     if (!found) {
@@ -299,8 +320,6 @@ Outcome Registry::reach(std::string_view point) {
         case Action::Block: {
             std::unique_lock lock(mu_);
             const std::string key(matched.point);
-            const auto point_epoch_at_entry = release_epoch_[key];
-            const auto global_epoch_at_entry = global_release_epoch_;
             ++blocked_[key];
             const auto released = [&] {
                 return global_release_epoch_ != global_epoch_at_entry ||

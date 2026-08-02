@@ -175,6 +175,74 @@ TEST_F(FaultInjectionTest, ResetReleasesAParkedThread) {
     EXPECT_TRUE(past.load(std::memory_order_acquire));
 }
 
+TEST_F(FaultInjectionTest, ResetReleasesAThreadStillOnItsWayToParking) {
+    // The race the single-shot test above only sometimes catches.
+    //
+    // A thread that has MATCHED a Block rule has not yet parked: reach()
+    // drops the mutex between matching and waiting. A reset() landing in
+    // that window bumps the release epoch and notifies with nobody waiting.
+    // If the parking thread then reads the already-bumped epoch as its own
+    // baseline, the wake is lost and it sleeps forever.
+    //
+    // The window is inside reach() and cannot be opened deterministically
+    // from out here without a hook into the function under test, so this
+    // hammers it instead: each iteration resets the instant the hit lands,
+    // which is exactly when the worker is between the two critical
+    // sections. On the unfixed code this wedges within a few iterations.
+    // The 5 s bound below is a failure bound, not a wait - the loop
+    // finishes in milliseconds when the code is correct.
+    constexpr int kIterations = 500;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (int i = 0; i < kIterations; ++i) {
+        Registry::instance().reset();
+        const std::string point = "test.park_race";
+        Registry::instance().arm(Rule{.point = point, .action = Action::Block});
+        std::atomic<bool> past{false};
+        std::thread worker([&] {
+            CLINK_FAULT_POINT("test.park_race");
+            past.store(true, std::memory_order_release);
+        });
+        while (Registry::instance().hits(point) == 0) {
+            std::this_thread::yield();
+        }
+        Registry::instance().reset();
+        worker.join();
+        ASSERT_TRUE(past.load(std::memory_order_acquire))
+            << "iteration " << i << ": the worker never got past the fault point";
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+            << "iteration " << i
+            << ": the loop exceeded its failure bound, which means a "
+               "release is being lost rather than merely being slow";
+    }
+}
+
+TEST_F(FaultInjectionTest, ReleaseReachesAThreadStillOnItsWayToParking) {
+    // Same window, reached through release(point) rather than reset(). The
+    // per-point epoch has the identical lost-wakeup shape and the identical
+    // fix, so it needs its own case: a fix applied to one and not the other
+    // would leave this passing by accident.
+    constexpr int kIterations = 500;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (int i = 0; i < kIterations; ++i) {
+        Registry::instance().reset();
+        const std::string point = "test.release_race";
+        Registry::instance().arm(Rule{.point = point, .action = Action::Block});
+        std::atomic<bool> past{false};
+        std::thread worker([&] {
+            CLINK_FAULT_POINT("test.release_race");
+            past.store(true, std::memory_order_release);
+        });
+        while (Registry::instance().hits(point) == 0) {
+            std::this_thread::yield();
+        }
+        Registry::instance().release(point);
+        worker.join();
+        ASSERT_TRUE(past.load(std::memory_order_acquire))
+            << "iteration " << i << ": release(point) did not reach the worker";
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "iteration " << i;
+    }
+}
+
 TEST_F(FaultInjectionTest, ScopedFaultResetsOnScopeExit) {
     {
         const clink::fault::ScopedFault guard("test.scoped=throw");

@@ -345,6 +345,11 @@ struct ClusterSpec {
     int slots_per_worker{4};
     std::int64_t checkpoint_interval_ms{0};  // 0 = no periodic checkpointing
     bool http{false};
+    // Run the coordinator(s) under file-based leader election. Standbys
+    // hold the control port closed until they win, and workers discover
+    // the active leader from <root>/ha/active-leader.json rather than
+    // being told an address.
+    bool ha{false};
 };
 
 // A coordinator plus N workers, owned and reaped as a unit.
@@ -369,6 +374,9 @@ public:
         std::filesystem::create_directories(spec_.root);
         std::filesystem::create_directories(log_dir());
         std::filesystem::create_directories(checkpoint_dir());
+        if (spec_.ha) {
+            std::filesystem::create_directories(ha_dir());
+        }
     }
 
     Cluster(const Cluster&) = delete;
@@ -382,6 +390,12 @@ public:
             w->kill_and_reap();
         }
         coordinator_.reset();
+        for (auto& c : ha_coordinators_) {
+            if (c) {
+                c->kill_and_reap();
+            }
+        }
+        ha_coordinators_.clear();
         if (!keep_artifacts_) {
             std::error_code ec;
             std::filesystem::remove_all(spec_.root, ec);
@@ -393,6 +407,7 @@ public:
     [[nodiscard]] std::filesystem::path checkpoint_dir() const {
         return spec_.root / "checkpoints";
     }
+    [[nodiscard]] std::filesystem::path ha_dir() const { return spec_.root / "ha"; }
     [[nodiscard]] std::uint16_t coordinator_port() const noexcept { return coordinator_port_; }
     [[nodiscard]] std::uint16_t http_port() const noexcept { return http_port_; }
     [[nodiscard]] Process& worker(std::size_t i) { return *workers_.at(i); }
@@ -464,6 +479,163 @@ public:
             workers_[idx]->kill_and_reap();
         }
         return start_worker(idx, opts);
+    }
+
+    // --- HA: two coordinators, one lock ------------------------------------
+    //
+    // Both processes are given the SAME control port. Only the one that
+    // wins the lock on <ha_dir>/leader.lock binds it; the other sits on its
+    // poll thread with the port closed. That is what makes "start two, kill
+    // one" a real failover rather than a port collision.
+
+    // Bring up `n` coordinator processes under leader election and wait for
+    // one to win. Requires ClusterSpec::ha.
+    [[nodiscard]] bool start_ha_coordinators(std::size_t n, const ProcOptions& opts = {}) {
+        if (!spec_.ha || n == 0) {
+            return false;
+        }
+        ReservedPort rpc;
+        if (!rpc.valid()) {
+            return false;
+        }
+        coordinator_port_ = rpc.port();
+        rpc.release();
+        for (std::size_t i = 0; i < n; ++i) {
+            std::vector<std::string> argv{spec_.node_binary.string(),
+                                          "--role=coordinator",
+                                          "--bind-host=127.0.0.1",
+                                          "--advertise-host=127.0.0.1",
+                                          "--port=" + std::to_string(coordinator_port_),
+                                          "--ha-dir=" + ha_dir().string()};
+            ha_coordinators_.push_back(std::make_unique<Process>());
+            if (!ha_coordinators_.back()->spawn("coordinator-" + std::to_string(i),
+                                                spec_.node_binary,
+                                                std::move(argv),
+                                                log_dir(),
+                                                opts)) {
+                return false;
+            }
+        }
+        return await_leader_elected() && await_coordinator_ready();
+    }
+
+    // Index of the process currently holding leadership, by its own log.
+    // A coordinator that has been superseded keeps its old "became leader"
+    // line, so liveness is checked too.
+    [[nodiscard]] std::optional<std::size_t> current_leader_index() const {
+        for (std::size_t i = 0; i < ha_coordinators_.size(); ++i) {
+            const auto& p = ha_coordinators_[i];
+            if (p && p->running() &&
+                p->read_log().find("coordinator became leader") != std::string::npos) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // The epoch a coordinator announced when it took leadership, parsed out
+    // of its own startup line. Absent if it never led.
+    [[nodiscard]] std::optional<std::uint64_t> announced_epoch(std::size_t idx) const {
+        if (idx >= ha_coordinators_.size() || !ha_coordinators_[idx]) {
+            return std::nullopt;
+        }
+        const auto text = ha_coordinators_[idx]->read_log();
+        const std::string needle = "coordinator became leader (epoch=";
+        const auto pos = text.find(needle);
+        if (pos == std::string::npos) {
+            return std::nullopt;
+        }
+        try {
+            return std::stoull(text.substr(pos + needle.size()));
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    }
+
+    [[nodiscard]] bool await_leader_elected(
+        std::chrono::milliseconds t =
+            std::chrono::duration_cast<std::chrono::milliseconds>(kDefaultDeadline)) const {
+        return await([this] { return current_leader_index().has_value(); }, t);
+    }
+
+    // Kill the current leader and wait for a survivor to take over. Returns
+    // the index of the killed process.
+    [[nodiscard]] std::optional<std::size_t> kill_leader_and_await_failover(
+        std::chrono::milliseconds t = std::chrono::seconds{20}) {
+        const auto before = current_leader_index();
+        if (!before.has_value()) {
+            return std::nullopt;
+        }
+        ha_coordinators_[*before]->kill_and_reap();
+        const bool took_over = await(
+            [this, before] {
+                const auto now = current_leader_index();
+                return now.has_value() && *now != *before;
+            },
+            t);
+        return took_over ? before : std::nullopt;
+    }
+
+    // Start a worker that finds the coordinator through leader election
+    // rather than a fixed address. This is the path a real HA deployment
+    // uses, and the only one that survives a failover.
+    [[nodiscard]] bool start_ha_worker(std::size_t idx, const ProcOptions& opts = {}) {
+        ReservedPort data;
+        if (!data.valid()) {
+            return false;
+        }
+        const auto port = data.port();
+        std::vector<std::string> argv{spec_.node_binary.string(),
+                                      "--role=worker",
+                                      "--id=worker-" + std::to_string(idx),
+                                      "--ha-dir=" + ha_dir().string(),
+                                      "--port=" + std::to_string(port),
+                                      "--slots=" + std::to_string(spec_.slots_per_worker)};
+        if (workers_.size() <= idx) {
+            workers_.resize(idx + 1);
+        }
+        workers_[idx] = std::make_unique<Process>();
+        worker_ports_.resize(std::max(worker_ports_.size(), idx + 1));
+        worker_ports_[idx] = port;
+        data.release();
+        return workers_[idx]->spawn(
+            "worker-" + std::to_string(idx), spec_.node_binary, std::move(argv), log_dir(), opts);
+    }
+
+    // The epoch a worker bound to, from its own HA discovery line. This is
+    // the value the fencing check compares every later frame against.
+    [[nodiscard]] std::optional<std::uint64_t> worker_discovered_epoch(std::size_t idx) const {
+        if (idx >= workers_.size() || !workers_[idx]) {
+            return std::nullopt;
+        }
+        const auto text = workers_[idx]->read_log();
+        const std::string needle = "(epoch=";
+        const auto pos = text.rfind(needle);
+        if (pos == std::string::npos) {
+            return std::nullopt;
+        }
+        try {
+            return std::stoull(text.substr(pos + needle.size()));
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    }
+
+    // Frames a worker refused because they came from a superseded
+    // coordinator. Non-zero means split brain actually happened.
+    [[nodiscard]] std::size_t worker_fenced_frames(std::size_t idx) const {
+        if (idx >= workers_.size() || !workers_[idx]) {
+            return 0;
+        }
+        const auto text = workers_[idx]->read_log();
+        std::size_t n = 0;
+        std::size_t pos = 0;
+        const std::string needle = "[worker.fencing]";
+        while ((pos = text.find(needle, pos)) != std::string::npos) {
+            ++n;
+            pos += needle.size();
+        }
+        return n;
     }
 
     // --- readiness conditions ---------------------------------------------
@@ -575,18 +747,30 @@ public:
         return await([this, worker_idx] { return !workers_.at(worker_idx)->running(); }, t);
     }
 
+    // Counts across the single coordinator, or across every HA coordinator
+    // process - a registration that lands on whichever node is leading is
+    // still a registration.
     [[nodiscard]] std::size_t count_in_coordinator_log(std::string_view needle) const {
-        if (!coordinator_) {
-            return 0;
+        const auto count_one = [needle](const Process& p) {
+            const auto text = p.read_log();
+            std::size_t n = 0;
+            std::size_t pos = 0;
+            while ((pos = text.find(needle, pos)) != std::string::npos) {
+                ++n;
+                pos += needle.size();
+            }
+            return n;
+        };
+        std::size_t total = 0;
+        if (coordinator_) {
+            total += count_one(*coordinator_);
         }
-        const auto text = coordinator_->read_log();
-        std::size_t n = 0;
-        std::size_t pos = 0;
-        while ((pos = text.find(needle, pos)) != std::string::npos) {
-            ++n;
-            pos += needle.size();
+        for (const auto& c : ha_coordinators_) {
+            if (c) {
+                total += count_one(*c);
+            }
         }
-        return n;
+        return total;
     }
 
     // --- diagnostics -------------------------------------------------------
@@ -602,6 +786,11 @@ public:
         if (coordinator_) {
             emit(*coordinator_);
         }
+        for (const auto& c : ha_coordinators_) {
+            if (c) {
+                emit(*c);
+            }
+        }
         for (const auto& w : workers_) {
             if (w) {
                 emit(*w);
@@ -612,6 +801,7 @@ public:
 private:
     ClusterSpec spec_;
     std::unique_ptr<Process> coordinator_;
+    std::vector<std::unique_ptr<Process>> ha_coordinators_;
     std::vector<std::unique_ptr<Process>> workers_;
     std::vector<std::uint16_t> worker_ports_;
     std::uint16_t coordinator_port_{0};
