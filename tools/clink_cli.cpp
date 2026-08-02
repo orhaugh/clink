@@ -6,9 +6,13 @@
 // The server-side daemon (`clink_node --role=coordinator|worker`) is a separate
 // binary, matching `coordinator.sh` / `worker.sh` split.
 
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string_view>
+
+#include "clink/cluster/built_in_factories.hpp"
+#include "clink/connectors/capability.hpp"
 
 // Subcommand entry points. Each lives in its own .cpp under tools/.
 // Signatures match the original per-binary main(): the dispatcher
@@ -32,6 +36,7 @@ int clink_cmd_flight_sql(int argc, char** argv);
 int clink_cmd_rescale(int argc, char** argv);
 int clink_cmd_rescale_op(int argc, char** argv);
 int clink_cmd_list(int argc, char** argv);
+int clink_cmd_checkpoint_verify(int argc, char** argv);
 
 namespace {
 
@@ -60,6 +65,13 @@ void usage() {
         << "  rescale           Change a running job's per-role parallelism.\n"
         << "  rescale-op        Rescale ONE operator within a job to a new parallelism.\n"
         << "  list              List active and recently-completed jobs (alias of  list).\n"
+        << "  checkpoint-verify Verify a checkpoint directory's integrity; --repair mints\n"
+        << "                    sidecars for a directory written before they existed.\n"
+        << "\n"
+        << "Flags:\n"
+        << "  --capabilities        What THIS BINARY can do: connectors compiled in, their\n"
+        << "                        declared delivery guarantees, and build surfaces.\n"
+        << "  --capabilities-json   The same manifest as JSON.\n"
         << "\n"
         << "Each command accepts --help to print its own flag list.\n";
 }
@@ -74,6 +86,30 @@ int main(int argc, char** argv) {
     const std::string_view cmd = argv[1];
     if (cmd == "--help" || cmd == "-h" || cmd == "help") {
         usage();
+        return 0;
+    }
+    // The manifest describes the binary, so it must be produced AFTER the
+    // built-ins have registered (that is what declares them) and must not
+    // need a running cluster.
+    if (cmd == "--capabilities" || cmd == "--capabilities-json") {
+        // A query command must not interleave operational logs with its
+        // answer - the JSON form is meant to be piped into a parser.
+        // Only defaulted, so an explicit CLINK_LOG_LEVEL still wins.
+        ::setenv("CLINK_LOG_LEVEL", "off", /*overwrite=*/0);
+        clink::cluster::ensure_built_ins_registered();
+        auto facts = clink::connectors::current_build_facts();
+#ifdef CLINK_CLI_HAS_SQL
+        // The frontend is LINKED into this binary even though nothing has
+        // called its install() yet on this path. current_build_facts() can
+        // only see the installed-in-this-process signal, so the binary
+        // that knows it linked the frontend supplies the fact.
+        facts.sql = true;
+#endif
+        const auto caps = clink::connectors::CapabilityRegistry::instance().all();
+        std::cout << (cmd == "--capabilities-json"
+                          ? clink::connectors::render_manifest_json(facts, caps)
+                          : clink::connectors::render_manifest_text(facts, caps))
+                  << "\n";
         return 0;
     }
 
@@ -140,6 +176,9 @@ int main(int argc, char** argv) {
     }
     if (cmd == "list") {
         return clink_cmd_list(sub_argc, sub_argv);
+    }
+    if (cmd == "checkpoint-verify") {
+        return clink_cmd_checkpoint_verify(sub_argc, sub_argv);
     }
 
     std::cerr << "clink: unknown command '" << cmd << "'\n\n";

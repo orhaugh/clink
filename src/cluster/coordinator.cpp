@@ -22,6 +22,7 @@
 #include "clink/cluster/plugin_loader.hpp"
 #include "clink/cluster/rescale_dispatch.hpp"
 #include "clink/cluster/restore_compat_gate.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/checkpoint_metrics.hpp"
 #include "clink/metrics/orchestration_metrics.hpp"
 #include "clink/metrics/process_metrics.hpp"
@@ -29,6 +30,7 @@
 #include "clink/runtime/key_groups.hpp"
 #include "clink/runtime/log_buffer.hpp"
 #include "clink/runtime/network/network_socket.hpp"
+#include "clink/state/durable_file_write.hpp"
 
 namespace clink::cluster {
 
@@ -180,22 +182,28 @@ void Coordinator::set_ha_dir(std::string dir) {
 
 namespace {
 
-// Atomic-rename file write. Avoids a reader (or standby coordinator) seeing a
-// partial JSON / .so file mid-write.
+// Durable atomic file write for control-plane metadata. Avoids a reader (or
+// standby coordinator) seeing a partial JSON / .so file mid-write, AND makes
+// the bytes survive an OS/power loss rather than only a process crash.
+//
+// This used to be an ofstream to a fixed "<path>.tmp" followed by a rename.
+// Two defects: the bytes reached only the page cache, so a machine that lost
+// power after a rename could come back with the job record gone while the
+// work it describes had already happened; and the fixed temp name let two
+// concurrent writers to the same path interleave into one temp file and race
+// the rename. Both are closed by write_string_fsync_rename.
 bool atomic_write_file(const std::filesystem::path& path, const std::string& body) {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
-    const auto tmp = path.string() + ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out)
-            return false;
-        out.write(body.data(), static_cast<std::streamsize>(body.size()));
-        if (!out)
-            return false;
+    CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeMetadataWrite);
+    try {
+        clink::state::detail::write_string_fsync_rename(path, body);
+    } catch (const std::exception& e) {
+        clink::log::error("coordinator.metadata",
+                          "durable write failed for " + path.string() + ": " + e.what());
+        return false;
     }
-    std::filesystem::rename(tmp, path, ec);
-    return !ec;
+    return true;
 }
 
 }  // namespace
@@ -3737,19 +3745,53 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
     // Write the COMPLETED marker outside the lock so a slow filesystem
     // doesn't block reader threads.
     for (const auto& [jid, ckpt_id] : just_completed) {
+        // The COMPLETED-N marker is the authoritative record that a
+        // checkpoint reached global completion, and the 2PC sinks key their
+        // commit-on-restore on finding it. It therefore has to be durable
+        // BEFORE any worker is told to commit, and a failure to write it has
+        // to stop the commit rather than be ignored.
+        //
+        // It used to be a bare `std::ofstream out(marker); out << ...;` with
+        // no fsync and no error check. Two ways that lost exactly-once:
+        //   * ENOSPC / EACCES produced no marker at all, yet the commit
+        //     broadcast went out anyway. The sinks committed externally, the
+        //     coordinator restarted, found no COMPLETED-N, rewound to an
+        //     older checkpoint and re-emitted already-committed output.
+        //   * Even on success the bytes sat in the page cache, so a power
+        //     loss after the external commits left the same hole.
+        // Now: durable write first, and on failure abort this job's commit
+        // for this checkpoint. Skipping the broadcast is the safe side of
+        // the trade - the prepared transactions stay prepared and are
+        // resolved on the next successful checkpoint or at restore, whereas
+        // committing without a durable marker is unrecoverable.
         if (!completed_marker_dir.empty()) {
+            const std::filesystem::path marker = std::filesystem::path{completed_marker_dir} /
+                                                 ("COMPLETED-" + std::to_string(ckpt_id));
             std::error_code ec;
-            std::filesystem::path marker = std::filesystem::path{completed_marker_dir} /
-                                           ("COMPLETED-" + std::to_string(ckpt_id));
             std::filesystem::create_directories(marker.parent_path(), ec);
-            std::ofstream out(marker);
-            out << "job=" << jid << "\ncheckpoint=" << ckpt_id << "\n";
+            CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeCompletedMarker);
+            try {
+                clink::state::detail::write_string_fsync_rename(
+                    marker,
+                    "job=" + std::to_string(jid) + "\ncheckpoint=" + std::to_string(ckpt_id) +
+                        "\n");
+            } catch (const std::exception& e) {
+                clink::log::error(
+                    "coordinator.checkpoint",
+                    "could not durably record completion of checkpoint " + std::to_string(ckpt_id) +
+                        " for job " + std::to_string(jid) + " (" + e.what() +
+                        "); withholding the commit broadcast so no sink commits externally "
+                        "without a recoverable record of it");
+                continue;
+            }
+            CLINK_FAULT_POINT(clink::fault::points::kCoordinatorAfterCompletedMarker);
         }
         // The commit phase of the 2PC sink protocol: broadcast CommitCheckpoint
         // to every worker hosting tasks for this job. The marker write
         // ordering matters - by the time workers commit their pre-staged
         // transactions, the marker is durable, so a crash mid-broadcast
         // still lets recovery find COMPLETED-N and commit on restore.
+        CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeCommitBroadcast);
         std::vector<network::Connection*> worker_conns;
         {
             std::lock_guard lock(mu_);

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "clink/config/json.hpp"
+#include "clink/connectors/capability.hpp"
 #include "clink/connectors/cdc_event.hpp"
 #include "clink/connectors/cdc_json.hpp"
 #include "clink/connectors/postgres_cdc_source.hpp"
@@ -278,6 +279,90 @@ private:
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "postgres",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"libpq"},
+        .runtime_dependencies = {"postgresql server"},
+        .formats = {"json", "text", "cdc-event"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = true,
+        .offset_model = clink::connectors::OffsetModel::Lsn,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .schema_evolution = false,
+        .partition_discovery = false,
+        .auth_methods = {"password", "md5", "scram-sha-256", "trust"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {"connect_timeout", "statement_timeout"},
+        .available_in_sql = true,
+        .limitations = {"CDC needs a logical replication slot; an unconsumed slot pins WAL on "
+                        "the server",
+                        "the plain sink is at-least-once - use postgres_2pc or the upsert sink"},
+    });
+
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "postgres_2pc",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"libpq"},
+        .runtime_dependencies = {"postgresql server with max_prepared_transactions > 0"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::ExactlyOnceTwoPhaseCommit,
+        .transactional = true,
+        .schema_evolution = false,
+        .partition_discovery = false,
+        .auth_methods = {"password", "md5", "scram-sha-256", "trust"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {"connect_timeout", "statement_timeout"},
+        .available_in_sql = true,
+        .limitations = {"requires max_prepared_transactions > 0 on the server; a prepared "
+                        "transaction that is never resolved holds locks and pins WAL "
+                        "indefinitely",
+                        "the prepared-transaction id must be unique per subtask and stable "
+                        "across restarts for recovery to find it"},
+        .required_options_for_exactly_once = {"table"},
+    });
+
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "postgres_upsert",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"libpq"},
+        .runtime_dependencies = {"postgresql server"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::EffectivelyOnceIdempotent,
+        .transactional = false,
+        .idempotency_key_option = "primary_key",
+        .schema_evolution = false,
+        .partition_discovery = false,
+        .auth_methods = {"password", "md5", "scram-sha-256", "trust"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {"connect_timeout", "statement_timeout"},
+        .available_in_sql = true,
+        .limitations = {"duplicates collapse only if primary_key really is unique for the row; "
+                        "clink cannot verify the target schema"},
+    });
+
     using clink::plugin::BuildContext;
 
     // Register the typed channels for PostgresRow and CdcEvent so

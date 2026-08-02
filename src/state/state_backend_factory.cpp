@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "clink/state/changelog_state_backend.hpp"
+#include "clink/state/checkpoint_integrity.hpp"
+#include "clink/state/durable_file_write.hpp"
 #include "clink/state/file_backed_state_backend.hpp"
 #include "clink/state/file_materialization_store.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
@@ -221,8 +223,21 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
         const std::filesystem::path dst_file = subtask_dir / ckpt_name;
         std::filesystem::create_directories(dst_file.parent_path(), ec);
 
+        // Read one parent snapshot, refusing anything that fails its
+        // integrity check. A parent whose bytes are damaged would otherwise
+        // be merged straight into the child's state and the rescaled job
+        // would come up quietly missing (or holding garbage for) whatever
+        // key groups that parent owned. Absent files stay non-fatal - not
+        // every parent index necessarily has a snapshot.
         const auto read_file = [&](const std::filesystem::path& p) -> std::vector<std::byte> {
             std::vector<std::byte> bytes;
+            const auto verdict = clink::state::verify_checkpoint(p);
+            if (verdict.status == clink::state::CheckpointStatus::Missing) {
+                return bytes;
+            }
+            if (!verdict.ok() && !clink::state::unverified_checkpoints_allowed(verdict)) {
+                throw clink::state::CheckpointIntegrityError(verdict.status, verdict.detail);
+            }
             std::ifstream in(p, std::ios::binary);
             if (!in) {
                 return bytes;
@@ -294,11 +309,17 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
             std::vector<std::byte> final_bytes =
                 parts.size() == 1 ? std::move(parts.front())
                                   : InMemoryStateBackend::merge_snapshot_bytes(parts);
-            std::ofstream out_stream(dst_file, std::ios::binary | std::ios::trunc);
-            if (out_stream && !final_bytes.empty()) {
-                out_stream.write(reinterpret_cast<const char*>(final_bytes.data()),
-                                 static_cast<std::streamsize>(final_bytes.size()));
-            }
+            // Durable write + sidecar, same contract as any other published
+            // checkpoint. This used to be a bare ofstream whose failure was
+            // silently swallowed by `if (out_stream && ...)` while
+            // restore_from was set regardless - so a rescale that could not
+            // write its stitched state came up believing it had restored,
+            // holding nothing.
+            const auto tmp = dst_file.string() + ".part";
+            clink::state::detail::write_fsync_rename(
+                dst_file, tmp, final_bytes.data(), final_bytes.size());
+            clink::state::write_checkpoint_meta(
+                dst_file, spec.restore_checkpoint_id, final_bytes.data(), final_bytes.size());
             out.restore_from = Snapshot{CheckpointId{spec.restore_checkpoint_id}, {}};
         }
     }

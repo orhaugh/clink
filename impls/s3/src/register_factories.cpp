@@ -10,6 +10,7 @@
 #include <arrow/filesystem/filesystem.h>
 #include <arrow/filesystem/s3fs.h>
 
+#include "clink/connectors/capability.hpp"
 #include "clink/connectors/multi_object_parquet_source.hpp"
 #include "clink/connectors/parquet_fs_2pc_sink.hpp"
 #include "clink/connectors/parquet_s3_sink.hpp"
@@ -24,6 +25,65 @@
 namespace clink::s3 {
 
 void install(clink::plugin::PluginRegistry& reg) {
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "s3",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"aws-sdk-cpp", "arrow"},
+        .runtime_dependencies = {"s3-compatible object store"},
+        .formats = {"parquet", "bytes", "text"},
+        .boundedness = clink::connectors::Boundedness::Bounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = false,
+        .delivery = clink::connectors::DeliveryGuarantee::AtMostOnce,
+        .transactional = false,
+        .schema_evolution = true,
+        .partition_discovery = true,
+        .auth_methods = {"env-credentials", "instance-profile", "static-key"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"the plain sink writes objects as it goes; use s3_2pc for output tied "
+                        "to checkpoint completion",
+                        "the source keeps no intra-object position"},
+    });
+
+    // s3_sink_2pc.hpp: parts are uploaded during the epoch, the multipart
+    // handle is the committable, and the object does not exist until
+    // CompleteMultipartUpload on the commit broadcast. Atomic publication
+    // rather than a distributed transaction.
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "s3_2pc",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"aws-sdk-cpp"},
+        .runtime_dependencies = {"s3-compatible object store with multipart upload"},
+        .formats = {"bytes", "text", "parquet"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::ExactlyOnceAtomicPublish,
+        .transactional = true,
+        .schema_evolution = false,
+        .partition_discovery = false,
+        .auth_methods = {"env-credentials", "instance-profile", "static-key"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"an abandoned multipart upload keeps consuming storage until an "
+                        "expiry lifecycle rule removes it - configure one",
+                        "S3 requires every part except the last to be at least 5 MiB"},
+        .required_options_for_exactly_once = {"bucket"},
+    });
+
     using clink::plugin::BuildContext;
 
     // s3_text_sink: writes batches of string records to S3 objects under

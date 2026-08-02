@@ -76,6 +76,21 @@ option(CLINK_USE_FLAT_HASH_MAP "Use ankerl::unordered_dense for the clink::FlatM
 # user code that wants to gate Arrow-specific extensions; inside
 # clink we treat it as always-defined.
 option(CLINK_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+# Deterministic fault injection inside clink's own runtime paths
+# (include/clink/fault/fault_injection.hpp). AUTO follows CLINK_BUILD_TESTS:
+# a test build carries the fault surface, a tests-off build does not. ON
+# forces it in (needed for the multi-process integration harness, which arms
+# faults in a spawned clink_node via CLINK_FAULT_INJECT); OFF compiles every
+# CLINK_FAULT_POINT to nothing, so a shipped binary has no fault surface at
+# all. The state is reported by `clink --capabilities`.
+set(CLINK_ENABLE_FAULT_INJECTION "AUTO" CACHE STRING
+    "Compile in runtime fault-injection points (AUTO|ON|OFF)")
+set_property(CACHE CLINK_ENABLE_FAULT_INJECTION PROPERTY STRINGS AUTO ON OFF)
+if(CLINK_ENABLE_FAULT_INJECTION STREQUAL "AUTO")
+    set(CLINK_FAULT_INJECTION_ACTIVE ${CLINK_BUILD_TESTS})
+else()
+    set(CLINK_FAULT_INJECTION_ACTIVE ${CLINK_ENABLE_FAULT_INJECTION})
+endif()
 # Per-dependency tri-state: AUTO uses the dep when found, ON requires
 # the dep at configure time, OFF skips the impl module entirely.
 # Each impl reads its own knob from impls/<x>/CMakeLists.txt - the
@@ -381,6 +396,10 @@ endif()
 # state backend live under impls/ and link in as separate static libs.
 # ---------------------------------------------------------------------------
 add_library(clink_core STATIC
+    src/fault/fault_injection.cpp
+    src/connectors/capability.cpp
+    src/connectors/builtin_capabilities.cpp
+    src/connectors/delivery_guarantee.cpp
     src/checkpoint/checkpoint_coordinator.cpp
     src/metrics/metrics_registry.cpp
     src/metrics/prometheus.cpp
@@ -442,6 +461,18 @@ set_target_properties(clink_core PROPERTIES EXPORT_NAME core)
 if(CLINK_USE_FLAT_HASH_MAP)
     target_compile_definitions(clink_core PUBLIC CLINK_USE_FLAT_HASH_MAP=1)
 endif()
+
+# PUBLIC, and it must stay PUBLIC: fault_injection.hpp changes what the
+# Registry class declares based on this macro, so a TU that sees it and a
+# TU that does not would be an ODR violation waiting for a link-time
+# surprise. Everything that links clink::core therefore agrees.
+if(CLINK_FAULT_INJECTION_ACTIVE)
+    target_compile_definitions(clink_core PUBLIC CLINK_FAULT_INJECTION=1)
+endif()
+
+# The capability manifest reports the version of the binary it is running
+# in, so it needs the project version as a compile-time string.
+target_compile_definitions(clink_core PUBLIC CLINK_VERSION_STRING="${PROJECT_VERSION}")
 
 target_include_directories(clink_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -807,6 +838,9 @@ if(CLINK_BUILD_HTTP)
         find_package(OpenSSL)
         if(OpenSSL_FOUND)
             target_link_libraries(clink_core PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+            # PUBLIC: the capability manifest reports whether THIS binary
+            # carries TLS, so the fact has to reach any TU that renders it.
+            target_compile_definitions(clink_core PUBLIC CLINK_HAS_OPENSSL=1)
             set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
                 "# clink_core was built with HTTPS (CLINK_HTTP_TLS=ON): its archive\n")
             set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
@@ -1156,6 +1190,7 @@ add_library(clink_cli_cmds OBJECT
     tools/clink_state_diff.cpp
     tools/clink_capture_sync.cpp
     tools/clink_list.cpp
+    tools/clink_checkpoint_verify.cpp
 )
 target_link_libraries(clink_cli_cmds PUBLIC clink::core)
 # `clink run <file>.sql` and `clink replay` need the SQL frontend +
@@ -1218,6 +1253,12 @@ clink_set_warnings(clink_cli_cmds)
 # split.
 add_executable(clink tools/clink_cli.cpp)
 target_link_libraries(clink PRIVATE clink_cli_cmds clink::core ${CMAKE_DL_LIBS})
+# `clink --capabilities` reports whether THIS binary carries the SQL
+# frontend. Only the binary knows what it linked, so the fact is supplied
+# here rather than sniffed from a lower layer.
+if(TARGET clink::embed)
+    target_compile_definitions(clink PRIVATE CLINK_CLI_HAS_SQL=1)
+endif()
 if(TARGET clink::tls)
     target_link_libraries(clink PRIVATE clink::tls)
 endif()

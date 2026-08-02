@@ -6,15 +6,34 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
+#include "clink/state/checkpoint_integrity.hpp"
 #include "clink/state/file_backed_state_backend.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/remote_read_backend.hpp"
 #include "clink/state/state_backend_factory.hpp"
 
 namespace {
+
+// Publish a checkpoint payload the way the production writer does:
+// payload first, then the integrity sidecar that certifies it. A fixture
+// that writes only the payload is, by the on-disk contract, an UNPUBLISHED
+// checkpoint - the factory is right to refuse it, so the fixtures have to
+// produce the real thing.
+void publish_snapshot(const std::filesystem::path& path,
+                      const std::vector<std::byte>& bytes,
+                      std::uint64_t ckpt_id) {
+    std::filesystem::create_directories(path.parent_path());
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+    clink::state::write_checkpoint_meta(path, ckpt_id, bytes.data(), bytes.size());
+}
 
 std::filesystem::path make_temp_dir(const std::string& label) {
     const auto p = std::filesystem::temp_directory_path() /
@@ -67,8 +86,9 @@ TEST(StateBackendFactory, FileSchemeStagesRestoreFile) {
     std::filesystem::create_directories(restore_subtask);
     const auto snap_file = restore_subtask / ("checkpoint-" + std::to_string(ckpt_id) + ".snap");
     {
-        std::ofstream out(snap_file, std::ios::binary);
-        out << "sentinel";  // non-empty payload so restore is observable
+        const std::string sentinel = "sentinel";  // non-empty payload so restore is observable
+        const auto* p = reinterpret_cast<const std::byte*>(sentinel.data());
+        publish_snapshot(snap_file, std::vector<std::byte>(p, p + sentinel.size()), ckpt_id);
     }
 
     clink::StateBackendSpec spec;
@@ -110,11 +130,8 @@ TEST(StateBackendFactory, ScaleDownMergesMultipleParentSnapshotFiles) {
         backend.put(op, clink::StateBackend::KeyView{key}, clink::StateBackend::ValueView{value});
         auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
         const auto dir = restore_root / std::to_string(parent_idx);
-        std::filesystem::create_directories(dir);
-        std::ofstream out(dir / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
-                          std::ios::binary);
-        out.write(reinterpret_cast<const char*>(snap.bytes.data()),
-                  static_cast<std::streamsize>(snap.bytes.size()));
+        publish_snapshot(
+            dir / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"), snap.bytes, ckpt_id);
     };
     write_parent(0, "key_from_parent_0", "v0");
     write_parent(1, "key_from_parent_1", "v1");
@@ -164,11 +181,8 @@ TEST(StateBackendFactory, RescaleUnionsOperatorStateFromAllParents) {
             op, clink::StateBackend::KeyView{off_key}, clink::StateBackend::ValueView{off_val});
         auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
         const auto dir = restore_root / std::to_string(idx);
-        std::filesystem::create_directories(dir);
-        std::ofstream out(dir / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
-                          std::ios::binary);
-        out.write(reinterpret_cast<const char*>(snap.bytes.data()),
-                  static_cast<std::streamsize>(snap.bytes.size()));
+        publish_snapshot(
+            dir / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"), snap.bytes, ckpt_id);
     };
     write_parent(0, "keyed0", "off:0", "P0OFF");
     write_parent(1, "keyed1", "off:1", "P1OFF");

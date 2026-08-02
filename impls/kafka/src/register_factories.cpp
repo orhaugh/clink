@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "clink/config/json.hpp"
+#include "clink/connectors/capability.hpp"
 #include "clink/connectors/kafka_message.hpp"
 #include "clink/connectors/kafka_sink.hpp"
 #include "clink/connectors/kafka_source.hpp"
@@ -332,6 +333,74 @@ private:
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    // Capability declaration. Read out of this file and kafka_source.hpp,
+    // not out of what Kafka is capable of in general.
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "kafka",
+        .version = "1",
+        .is_source = true,
+        .is_sink = true,
+        .build_dependencies = {"librdkafka"},
+        .runtime_dependencies = {"kafka broker >= 0.11 for transactions"},
+        .formats = {"text", "json", "bytes"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        // KafkaSource::snapshot_offset / restore_offset persist the
+        // per-partition next-offset map into operator state, so the source
+        // replays from clink's checkpoint rather than the broker's
+        // committed offset.
+        .replayable = true,
+        .offset_model = clink::connectors::OffsetModel::LogOffset,
+        .checkpoint_integrated = true,
+        // The DEFAULT sink is a plain producer: at-least-once. The
+        // transactional variant is a separate factory (kafka_2pc_sink_*)
+        // and is what earns the exactly-once label below.
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .schema_evolution = false,
+        .partition_discovery = true,
+        .auth_methods = {"none", "sasl_plaintext", "sasl_ssl", "ssl"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {"poll_timeout_ms"},
+        .available_in_sql = true,
+        .limitations = {"the plain sink is at-least-once; use the kafka_2pc connector for "
+                        "transactional output"},
+    });
+
+    // The transactional sink is a DISTINCT connector for capability
+    // purposes: same broker, different guarantee, different required
+    // options. Conflating them is how a job ends up believing it has
+    // exactly-once because it named a Kafka sink.
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "kafka_2pc",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"librdkafka"},
+        .runtime_dependencies = {"kafka broker >= 0.11"},
+        .formats = {"text", "json", "bytes"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::ExactlyOnceTwoPhaseCommit,
+        .transactional = true,
+        .schema_evolution = false,
+        .partition_discovery = true,
+        .auth_methods = {"none", "sasl_plaintext", "sasl_ssl", "ssl"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {"poll_timeout_ms", "transaction_timeout_ms"},
+        .available_in_sql = true,
+        .limitations = {"transactional_id must be unique per job AND stable across restarts; "
+                        "the factory suffixes the subtask index onto it",
+                        "consumers must read with isolation.level=read_committed or they will "
+                        "see aborted records"},
+        .required_options_for_exactly_once = {"transactional_id"},
+    });
+
     using clink::plugin::BuildContext;
 
     // Register the typed channel for KafkaMessage so pipelines can carry

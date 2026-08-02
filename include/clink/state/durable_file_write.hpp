@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdlib>
@@ -8,9 +9,12 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 
 #include <sys/types.h>
+
+#include "clink/fault/fault_injection.hpp"
 
 // Crash-safe, durable file write for state-backend snapshots.
 //
@@ -73,6 +77,8 @@ inline void write_fsync_rename(const std::filesystem::path& final_path,
                                std::size_t size) {
     const bool do_fsync = fsync_enabled();
 
+    CLINK_FAULT_POINT(clink::fault::points::kCheckpointBeforeWrite);
+
     // Write the temp file and fsync it through the SAME descriptor that
     // wrote it. Using one fd for write+fsync is the correct durable
     // pattern: a writeback error is reported once, to an open fd, so an
@@ -83,9 +89,15 @@ inline void write_fsync_rename(const std::filesystem::path& final_path,
         throw std::runtime_error("durable_write: cannot open " + tmp_path.string() + ": " +
                                  std::strerror(errno));
     }
+    // A Truncate fault here short-writes the temp file, reproducing the
+    // "the device took some of it" case that a length+checksum envelope has
+    // to catch. The write still completes normally from the caller's point
+    // of view, so the only thing that can detect it is validation at read.
+    const std::size_t to_write =
+        CLINK_FAULT_POINT(clink::fault::points::kCheckpointDuringWrite).truncate_to(size);
     std::size_t off = 0;
-    while (off < size) {
-        const ssize_t n = ::write(fd, data + off, size - off);
+    while (off < to_write) {
+        const ssize_t n = ::write(fd, data + off, to_write - off);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -97,6 +109,7 @@ inline void write_fsync_rename(const std::filesystem::path& final_path,
         }
         off += static_cast<std::size_t>(n);
     }
+    CLINK_FAULT_POINT(clink::fault::points::kCheckpointBeforeFsync);
     if (do_fsync) {
         if (::fsync(fd) != 0) {
             const int e = errno;
@@ -109,6 +122,11 @@ inline void write_fsync_rename(const std::filesystem::path& final_path,
     // above, so a close error cannot undo it.
     ::close(fd);
 
+    // Between here and the rename the checkpoint exists only as a temp
+    // file: a death at this point must leave the PREVIOUS checkpoint as
+    // the newest visible one, never a half-published new one.
+    CLINK_FAULT_POINT(clink::fault::points::kCheckpointBeforePublish);
+
     std::error_code ec;
     std::filesystem::rename(tmp_path, final_path, ec);
     if (ec) {
@@ -119,6 +137,25 @@ inline void write_fsync_rename(const std::filesystem::path& final_path,
     if (do_fsync) {
         fsync_directory_best_effort(final_path.parent_path());
     }
+
+    CLINK_FAULT_POINT(clink::fault::points::kCheckpointAfterPublish);
+}
+
+// String overload for the control-plane metadata writers (coordinator job
+// manifests, history records, the COMPLETED-N marker). Same contract: on
+// return the bytes and the directory entry naming them are durable.
+//
+// The temp name is made unique per write. A fixed ".tmp" suffix is a real
+// hazard, not a nicety: two threads publishing the same path interleave
+// their writes into one temp file and then race the rename, so one of them
+// can publish the other's half-written bytes.
+inline void write_string_fsync_rename(const std::filesystem::path& final_path,
+                                      std::string_view body) {
+    static std::atomic<std::uint64_t> seq{0};
+    const auto tmp = final_path.string() + ".tmp." + std::to_string(::getpid()) + "." +
+                     std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
+    write_fsync_rename(
+        final_path, tmp, reinterpret_cast<const std::byte*>(body.data()), body.size());
 }
 
 }  // namespace clink::state::detail

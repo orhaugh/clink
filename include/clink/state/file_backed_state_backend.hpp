@@ -1,15 +1,22 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include "clink/metrics/state_metrics.hpp"
+#include "clink/runtime/log_buffer.hpp"
+#include "clink/state/checkpoint_integrity.hpp"
 #include "clink/state/durable_file_write.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/state_backend.hpp"
@@ -112,6 +119,24 @@ public:
             clink::metrics::state::restore_completed("file_backed", static_cast<std::uint64_t>(dt));
             return;
         }
+        // A payload that exists but does not verify must NOT be loaded. The
+        // old behaviour read whatever bytes were there and handed them to
+        // the Arrow reader; a truncated stream that happens to end on a
+        // record-batch boundary decodes as a smaller, plausible-looking
+        // state and the job resumes having silently dropped keys. Raising
+        // here is what lets the caller fall back to an older checkpoint
+        // (latest_valid_checkpoint below) instead of continuing on state
+        // nobody certified.
+        CLINK_FAULT_POINT(clink::fault::points::kStateBeforeRestore);
+        if (const auto verdict = state::verify_checkpoint(path); !verdict.ok()) {
+            if (!state::unverified_checkpoints_allowed(verdict)) {
+                throw state::CheckpointIntegrityError(verdict.status, verdict.detail);
+            }
+            clink::log::warn("state.restore",
+                             "loading an unverified checkpoint because "
+                             "CLINK_ALLOW_UNVERIFIED_CHECKPOINTS is set: " +
+                                 verdict.detail);
+        }
         std::ifstream in(path, std::ios::binary);
         if (!in) {
             throw std::runtime_error("FileBackedStateBackend: cannot open " + path.string());
@@ -137,7 +162,68 @@ public:
     // live in-memory state and any other checkpoint files are untouched.
     void purge_checkpoint(CheckpointId id) override {
         std::error_code ec;
+        // Sidecar first: a payload with no sidecar reads as incomplete and
+        // is skipped, whereas a sidecar with no payload would be a dangling
+        // record. Removing in this order means an interrupted purge always
+        // leaves the directory in a state recovery already handles.
+        std::filesystem::remove(state::meta_path_for(path_for(id)), ec);
         std::filesystem::remove(path_for(id), ec);
+    }
+
+    // Verify one checkpoint without loading it.
+    [[nodiscard]] state::VerifyResult verify_checkpoint(CheckpointId id) const {
+        return state::verify_checkpoint(path_for(id));
+    }
+
+    // Highest checkpoint id in this directory that passes verification,
+    // considering only ids <= `at_most` (0 = no ceiling).
+    //
+    // This is the fallback rule the recovery path needs: a corrupt or
+    // half-written NEWEST checkpoint must not strand a job that has a
+    // perfectly good older one. Every id it rejects is reported through
+    // `rejected` so the caller can log precisely what was skipped and why -
+    // silently rewinding to an older checkpoint would hide data loss.
+    [[nodiscard]] std::optional<CheckpointId> latest_valid_checkpoint(
+        std::uint64_t at_most = 0,
+        std::vector<std::pair<CheckpointId, state::VerifyResult>>* rejected = nullptr) const {
+        std::vector<std::uint64_t> ids;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(snapshot_dir_, ec)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const auto name = entry.path().filename().string();
+            constexpr std::string_view kPrefix = "checkpoint-";
+            constexpr std::string_view kSuffix = ".snap";
+            if (name.rfind(kPrefix, 0) != 0 || name.size() <= kPrefix.size() + kSuffix.size()) {
+                continue;
+            }
+            if (name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+                continue;
+            }
+            const auto digits =
+                name.substr(kPrefix.size(), name.size() - kPrefix.size() - kSuffix.size());
+            if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
+                continue;
+            }
+            const auto id = std::stoull(digits);
+            if (at_most != 0 && id > at_most) {
+                continue;
+            }
+            ids.push_back(id);
+        }
+        std::sort(ids.begin(), ids.end(), std::greater<>());
+        for (const auto id : ids) {
+            const CheckpointId cid{id};
+            auto verdict = state::verify_checkpoint(path_for(cid));
+            if (verdict.ok()) {
+                return cid;
+            }
+            if (rejected != nullptr) {
+                rejected->emplace_back(cid, std::move(verdict));
+            }
+        }
+        return std::nullopt;
     }
 
     std::string description() const override {
@@ -181,6 +267,11 @@ private:
         const auto tmp = path.string() + ".part." +
                          std::to_string(part_seq_.fetch_add(1, std::memory_order_relaxed));
         state::detail::write_fsync_rename(path, tmp, bytes.data(), bytes.size());
+        // Publication point. The payload is durable; the sidecar is what
+        // certifies it. Written second and separately so that dying between
+        // the two leaves an unpublished (incomplete) checkpoint rather than
+        // a valid-looking one - see checkpoint_integrity.hpp.
+        state::write_checkpoint_meta(path, id.value(), bytes.data(), bytes.size());
     }
 
     [[nodiscard]] std::filesystem::path path_for(CheckpointId id) const {

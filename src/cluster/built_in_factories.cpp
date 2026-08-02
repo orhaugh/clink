@@ -16,6 +16,7 @@
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/type_registry.hpp"
 #include "clink/config/json.hpp"
+#include "clink/connectors/builtin_capabilities.hpp"
 #include "clink/connectors/file_2pc_sink.hpp"
 #include "clink/connectors/file_sink.hpp"
 #include "clink/connectors/file_source.hpp"
@@ -401,6 +402,10 @@ void ensure_built_ins_registered() {
         clink::plugin::PluginRegistry reg(tr, rr, sr);
         register_built_ins_via_plugin_api(reg);
         register_builtin_joins(rr);
+        // Declare what these connectors can actually do, from the same
+        // call that makes them usable. Registered-but-undeclared is the
+        // state that let free-text delivery claims drift from the code.
+        clink::connectors::declare_builtin_capabilities();
     });
 }
 

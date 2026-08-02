@@ -141,6 +141,9 @@ add_executable(clink_core_tests
     test_file_backed_state.cpp
     test_snapshot_worker.cpp
     test_durable_file_write.cpp
+    test_fault_injection.cpp
+    test_checkpoint_integrity.cpp
+    test_connector_capability.cpp
     test_columnar_filter.cpp
     test_columnar_string_filter.cpp
     test_columnar_sql_filter.cpp

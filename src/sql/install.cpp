@@ -27,6 +27,7 @@
 #include "clink/cep/pattern.hpp"
 #include "clink/cluster/job_planner.hpp"
 #include "clink/config/json.hpp"
+#include "clink/connectors/capability.hpp"
 #include "clink/connectors/directory_file_source.hpp"
 #include "clink/connectors/file_2pc_sink.hpp"
 #include "clink/connectors/file_sink.hpp"
@@ -8642,6 +8643,12 @@ private:
 };
 
 void install(clink::plugin::PluginRegistry& reg) {
+    // Announce the SQL frontend to the capability manifest. clink_core (which
+    // renders the manifest) sits below clink_sql and cannot detect it with a
+    // preprocessor check, and "is the frontend in this process" is the
+    // question that actually matters to someone reading the manifest.
+    clink::connectors::mark_sql_frontend_present();
+
     // ---- CREATE FUNCTION ... LANGUAGE SQL ----
     // Expression-bodied scalar UDFs interpreted by the engine's own
     // expression evaluator - no wasm module, no C++ registration:
