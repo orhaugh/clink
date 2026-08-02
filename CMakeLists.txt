@@ -914,6 +914,7 @@ if(CLINK_BUILD_SQL)
         src/sql/parser.cpp
         src/sql/preparse.cpp
         src/sql/bounded_state.cpp
+        src/sql/table_option_check.cpp
         src/sql/ast_builder.cpp
         src/sql/type.cpp
         src/sql/catalog.cpp

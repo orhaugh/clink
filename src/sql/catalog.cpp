@@ -8,6 +8,7 @@
 
 #include "clink/config/json.hpp"
 #include "clink/sql/parser.hpp"
+#include "clink/sql/table_option_check.hpp"
 #include "clink/sql/type.hpp"
 
 namespace clink::sql {
@@ -61,6 +62,12 @@ void write_file_atomic(const fs::path& target, const std::string& text) {
 // Lift primary_key from the WITH-options bag into the typed TableDef
 // field. Trims whitespace per entry so `'a, b'`
 // works as expected.
+//
+// Clears unconditionally: this also runs from ALTER TABLE, where the
+// properties bag is authoritative and dropping the primary_key option must
+// actually drop the key. An inline PRIMARY KEY is therefore applied by the
+// CREATE TABLE path AFTER this runs, rather than by making the clear
+// conditional - which broke exactly that ALTER case.
 void lift_typed_fields(TableDef& def) {
     def.primary_key.clear();
     auto pk_it = def.properties.find("primary_key");
@@ -134,7 +141,48 @@ void Catalog::register_table(const ast::CreateTableStmt& stmt) {
     TableDef def;
     def.name = stmt.table_name;
     def.columns.reserve(stmt.columns.size());
+    // Inline column constraints. Two jobs here, and the split is the
+    // point: HONOUR the one clink implements, REFUSE the ones it does not.
+    //
+    // Before the AST carried constraints at all, every one of these was
+    // dropped silently. The worst case was PRIMARY KEY: this file's own
+    // comment on TableDef::primary_key promised "both are accepted; the
+    // in-column form is canonical", and the in-column form produced an
+    // EMPTY primary key. A user writing
+    //
+    //   CREATE TABLE t (k BIGINT PRIMARY KEY, ...) WITH (mode='upsert')
+    //
+    // got an upsert sink with no key to upsert on, and the
+    // effectively-once guarantee that sink advertises was void - with no
+    // diagnostic anywhere. That is now honoured.
+    std::vector<std::string> inline_primary_key;
     for (const auto& col : stmt.columns) {
+        for (const auto& c : col.constraints) {
+            switch (c.kind) {
+                case ast::ColumnConstraintKind::PrimaryKey:
+                    inline_primary_key.push_back(col.name);
+                    break;
+                case ast::ColumnConstraintKind::Null:
+                case ast::ColumnConstraintKind::Other:
+                    // NULL is the default and says nothing; deferrability
+                    // attributes are meaningless without a constraint to
+                    // defer. Both are harmless to ignore.
+                    break;
+                default:
+                    // Everything else is a per-row rule clink does not
+                    // evaluate. Accepting it would let a user believe
+                    // their data is being validated when nothing checks
+                    // it - the failure mode this whole audit is about.
+                    throw TranslationError(
+                        std::string(ast::to_string(c.kind)) + " on column '" + col.name +
+                            "' of table '" + stmt.table_name +
+                            "' is not supported: clink does not evaluate per-row constraints, "
+                            "and silently ignoring one would let a job appear to validate data "
+                            "it never checks. Enforce it in the source system, or in a WHERE "
+                            "clause / user function in the pipeline.",
+                        c.loc.pos);
+            }
+        }
         def.columns.push_back(ColumnSpec{col.name, sql_type_to_arrow(col.type)});
     }
     for (const auto& opt : stmt.options) {
@@ -143,6 +191,24 @@ void Catalog::register_table(const ast::CreateTableStmt& stmt) {
         def.properties[opt.key] = opt.value;
     }
     lift_typed_fields(def);
+    // Inline PRIMARY KEY applies only when the WITH-option did not set one:
+    // the explicit list is the more specific statement, and it is the form
+    // that survives a catalog JSON round trip. Applied AFTER
+    // lift_typed_fields because that clears unconditionally for ALTER.
+    if (def.primary_key.empty() && !inline_primary_key.empty()) {
+        def.primary_key = std::move(inline_primary_key);
+    }
+    // Near-miss and value checks on the options clink itself interprets.
+    // A misspelt `delivery_guarantee` or an out-of-domain `mode` is
+    // otherwise indistinguishable from connector passthrough: ignored, and
+    // silent about it.
+    if (auto problems = check_table_options(def.name, def.properties); !problems.empty()) {
+        std::string msg = problems.front().message;
+        for (std::size_t i = 1; i < problems.size(); ++i) {
+            msg += "\n" + problems[i].message;
+        }
+        throw TranslationError(msg, 0);
+    }
     register_table(std::move(def));
 }
 

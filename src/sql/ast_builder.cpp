@@ -23,6 +23,37 @@
 
 namespace clink::sql {
 
+namespace ast {
+
+std::string_view to_string(ColumnConstraintKind k) noexcept {
+    switch (k) {
+        case ColumnConstraintKind::PrimaryKey:
+            return "PRIMARY KEY";
+        case ColumnConstraintKind::NotNull:
+            return "NOT NULL";
+        case ColumnConstraintKind::Null:
+            return "NULL";
+        case ColumnConstraintKind::Unique:
+            return "UNIQUE";
+        case ColumnConstraintKind::Check:
+            return "CHECK";
+        case ColumnConstraintKind::Default:
+            return "DEFAULT";
+        case ColumnConstraintKind::References:
+            return "REFERENCES";
+        case ColumnConstraintKind::Generated:
+            return "GENERATED";
+        case ColumnConstraintKind::Identity:
+            return "IDENTITY";
+        case ColumnConstraintKind::Collate:
+            return "COLLATE";
+        case ColumnConstraintKind::Other:
+            return "constraint";
+    }
+    return "constraint";
+}
+}  // namespace ast
+
 using clink::config::JsonArray;
 using clink::config::JsonObject;
 using clink::config::JsonValue;
@@ -1042,6 +1073,45 @@ ast::TypeName translate_type_name(const JsonValue& body) {
     return type;
 }
 
+// Map libpg_query's CONSTR_* discriminator onto the AST enum. The set of
+// spellings was read out of an actual parse tree rather than assumed - see
+// the CONSTR_NOTNULL / CONSTR_PRIMARY / CONSTR_UNIQUE / CONSTR_CHECK
+// values PG emits for inline constraints.
+ast::ColumnConstraintKind column_constraint_kind_from_pg(std::string_view contype) {
+    if (contype == "CONSTR_PRIMARY") {
+        return ast::ColumnConstraintKind::PrimaryKey;
+    }
+    if (contype == "CONSTR_NOTNULL") {
+        return ast::ColumnConstraintKind::NotNull;
+    }
+    if (contype == "CONSTR_NULL") {
+        return ast::ColumnConstraintKind::Null;
+    }
+    if (contype == "CONSTR_UNIQUE") {
+        return ast::ColumnConstraintKind::Unique;
+    }
+    if (contype == "CONSTR_CHECK") {
+        return ast::ColumnConstraintKind::Check;
+    }
+    if (contype == "CONSTR_DEFAULT") {
+        return ast::ColumnConstraintKind::Default;
+    }
+    if (contype == "CONSTR_FOREIGN") {
+        return ast::ColumnConstraintKind::References;
+    }
+    if (contype == "CONSTR_GENERATED") {
+        return ast::ColumnConstraintKind::Generated;
+    }
+    if (contype == "CONSTR_IDENTITY") {
+        return ast::ColumnConstraintKind::Identity;
+    }
+    if (contype == "CONSTR_ATTR_DEFERRABLE" || contype == "CONSTR_ATTR_NOT_DEFERRABLE" ||
+        contype == "CONSTR_ATTR_DEFERRED" || contype == "CONSTR_ATTR_IMMEDIATE") {
+        return ast::ColumnConstraintKind::Other;
+    }
+    return ast::ColumnConstraintKind::Other;
+}
+
 ast::ColumnDef translate_column_def(const JsonValue& body) {
     ast::ColumnDef def;
     def.loc = loc_from(body);
@@ -1057,6 +1127,30 @@ ast::ColumnDef translate_column_def(const JsonValue& body) {
     // the body directly. Same convention applies to CreateStmt /
     // InsertStmt .relation (always RangeVar).
     def.type = translate_type_name(body.at("typeName"));
+    // Inline column constraints. These were previously dropped here, so
+    // `k BIGINT NOT NULL PRIMARY KEY CHECK (k > 0)` registered and behaved
+    // exactly like `k BIGINT`. Capturing them is what lets the catalog
+    // honour PRIMARY KEY and the validator refuse the rest, instead of
+    // both pretending the text was not there.
+    if (body.contains("constraints") && body.at("constraints").is_array()) {
+        for (const auto& wrapper : body.at("constraints").as_array()) {
+            if (!wrapper.is_object()) {
+                continue;
+            }
+            for (const auto& [wrapper_key, inner] : wrapper.as_object()) {
+                if (wrapper_key != "Constraint" || !inner.is_object()) {
+                    continue;
+                }
+                ast::ColumnConstraint c;
+                c.loc = def.loc;
+                if (inner.contains("contype") && inner.at("contype").is_string()) {
+                    c.raw = inner.at("contype").as_string();
+                }
+                c.kind = column_constraint_kind_from_pg(c.raw);
+                def.constraints.push_back(std::move(c));
+            }
+        }
+    }
     return def;
 }
 

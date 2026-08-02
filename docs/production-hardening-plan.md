@@ -230,6 +230,48 @@ attributed to an engine recovery gap. It was not. With the fault firing
 correctly, that scenario passes - the job **does** recover from a worker
 killed during state restore. Only F12 is a real engine gap.
 
+### F14. Every inline column constraint was silently dropped
+
+`ast::ColumnDef` carried only `name`, `type` and `loc`, and
+`translate_column_def` read nothing else. So
+
+```sql
+CREATE TABLE t (k BIGINT NOT NULL PRIMARY KEY CHECK (k > 0) DEFAULT 1, ...)
+```
+
+parsed, registered and behaved **exactly** like `k BIGINT`. Found by
+compiling each construct and observing it accepted, then checking whether
+anything downstream consumed it. Nothing did.
+
+The worst instance is PRIMARY KEY, because it has a consequence beyond the
+constraint itself. `catalog.hpp` promised:
+
+> primary_key ... Populated from a `PRIMARY KEY (col, ...)` column
+> constraint OR from the WITH-option. Both are accepted; the in-column form
+> is canonical.
+
+Measured: the in-column form produced `primary_key.size() == 0`; only the
+WITH-option worked. A user writing
+`CREATE TABLE t (k BIGINT PRIMARY KEY, ...) WITH (mode='upsert')` got an
+upsert sink **with no key to upsert on**, so the effectively-once guarantee
+that sink's capability record advertises was void - with no diagnostic
+anywhere. Another F10: the documentation was the only thing implementing it.
+
+**Risk:** silent loss of the upsert key, and users believing rows are
+validated when nothing checks them.
+
+### F15. A misspelt interpreted table option is silent
+
+A table's `WITH` clause carries two kinds of option: ones clink reads and
+acts on, and ones it passes through to the connector. An unrecognised key
+takes the passthrough path, so `delivery_gurantee='exactly_once'` leaves an
+at-least-once sink and says nothing; `primary_keys='id'` leaves an upsert
+sink with no key. The same applies to values: `mode='upsrt'` reads as
+append, `changelog='yes'` reads as false.
+
+**Risk:** a one-character typo silently changes a job's delivery guarantee
+or retention, with the DDL still reading as though it had not.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -264,7 +306,7 @@ lives; evidence is in section 4.
 | W10 | `clink checkpoint-verify` + migration path | P1.10, P1.12 | F4 | **Done** |
 | W11 | SQL bounded-state validator, enforced in the planner | P0.3 | F9 | **Done** |
 | W12 | State TTL depth: event time, incremental cleanup, metrics, SQL `state_ttl` enforced by GROUP BY | P0.3 | F9 | **Partial** |
-| W13 | Strict rejection of unsupported SQL semantics | P0.4 | - | **Open** |
+| W13 | Strict rejection of unsupported SQL semantics | P0.4 | F14, F15 | **Partial** |
 | W14 | Resource and overload limits | P1.9 | - | **Open** |
 | W15 | Coordinator metadata abstraction with CAS/fencing | P1.11 | - | **Open** |
 | W16 | Protocol version negotiation across RPC/frames/state | P1.12 | - | **Open** |
@@ -961,6 +1003,63 @@ them stays a real choice rather than a coin flip.
 - The expiry-compaction hook is implemented for RocksDB only. ForSt and the
   S3-backed variants inherit the default (no hook), so they fall back to
   scanning - correct, just slower to give memory back.
+
+### W13 - Strict rejection of unsupported SQL semantics — Partial
+
+**Source:** `include/clink/sql/ast.hpp` (constraint capture),
+`src/sql/ast_builder.cpp`, `src/sql/catalog.cpp`,
+`include/clink/sql/table_option_check.hpp`, `src/sql/table_option_check.cpp`
+
+**Method.** Rather than reading the parser and guessing, every candidate
+construct was compiled and observed. The audit output is reproducible: a
+temporary probe printed ACCEPTED / rejected per construct, and the work
+below addresses what it found. Several constructs turned out to be
+correctly rejected already (schema-qualified names, CROSS/NATURAL JOIN,
+non-equi join conditions, `CURRENT_TIMESTAMP`, TABLESAMPLE, `DISTINCT ON`,
+GROUPING SETS) and were left alone.
+
+**Column constraints.** `ColumnDef` now carries them, and the PG
+discriminator mapping (`CONSTR_NOTNULL`, `CONSTR_PRIMARY`, ...) was read
+off a real parse tree rather than assumed. Then:
+
+- `PRIMARY KEY` is **honoured** - it populates `TableDef::primary_key`,
+  making the header's long-standing promise true (F14).
+- `NOT NULL`, `UNIQUE`, `CHECK`, `DEFAULT`, `REFERENCES` are **refused**,
+  naming the column and offering an alternative (a `WHERE` clause or the
+  source system). clink evaluates no per-row constraints, and accepting one
+  lets a job appear to validate data it never checks.
+- `NULL` is ignored, because it is the default and asserts nothing.
+
+The WITH-option form wins over an inline PRIMARY KEY: it is the more
+specific statement and the form that survives a catalog JSON round trip.
+
+**Option checking.** Near-miss detection plus closed-domain value
+validation, NOT an allowlist. The passthrough option space is open-ended
+and connector-specific, so rejecting anything unrecognised would break most
+connectors. Only keys within a small edit distance of an option clink
+itself interprets are refused - which is precisely where a typo changes
+semantics silently.
+
+**A mistake worth recording.** The first closed domain for `mode` listed
+`append` and `upsert`, and rejected every CDC table in the suite because
+`cdc` is also valid. The list is now derived from the `== "cdc"` sites in
+`physical_plan.cpp`, and `EveryLegitimateModeValueIsAccepted` guards it.
+A hand-assembled domain list is only safe when it was read off the code.
+
+**Tests:** `tests/test_sql_unsupported_semantics.cpp`, 15 cases.
+
+**What makes this Partial.** Still accepted and ignored, and NOT addressed:
+
+- `HAVING` with no `GROUP BY`.
+- `LIMIT` / `OFFSET` / `FETCH FIRST` - the brief asks specifically whether
+  `LIMIT` is global or per-subtask; that was not determined, so nothing was
+  changed. Answering it needs a runtime experiment at parallelism > 1.
+- `FOR UPDATE`, which is meaningless on a stream.
+- `NOW()` and `RANDOM()` are accepted while `CURRENT_TIMESTAMP` is refused
+  - an inconsistency in the existing non-determinism guard, not something
+  this change introduced, but it should be made uniform.
+- Unknown or absent `connector` is accepted at DDL time and only fails at
+  plan time. Late rather than silent, so lower severity.
 
 ---
 

@@ -27,6 +27,7 @@
 // include dir), NOT the bundled RocksDB's - ForSt keeps the `rocksdb/`
 // include layout but compiles everything under the `forstdb` namespace,
 // which is what keeps the two engines link-compatible in one binary.
+#include <rocksdb/compaction_filter.h>
 #include <rocksdb/db.h>
 #include <rocksdb/iterator.h>
 #include <rocksdb/options.h>
@@ -106,10 +107,89 @@ std::vector<std::string> list_sst_basenames(const std::filesystem::path& dir) {
 // MemTable sizing rationale as the bundled RocksDB backend: a compact
 // per-operator MemTable keeps skip-lists shallow and comparator paths
 // short on the Put hot path.
+// Late-installable expiry predicate, shared with every CF's compaction
+// filter factory. Same shape and same reasoning as the bundled RocksDB
+// backend (see impls/rocksdb): a CF fixes its filter at creation, but
+// clink creates CFs lazily per operator and the TTL is only known once an
+// operator binds its state, so the indirection through a factory is what
+// lets a predicate installed later take effect.
+//
+// Consulted on ForSt's background compaction threads, so the slot is
+// mutex-guarded and the predicate contract (thread-safe, no re-entry into
+// the backend, cheap) is the one stated on StateBackend.
+class ExpiryFilterSlot {
+public:
+    void set(StateBackend::ExpiryPredicate pred) {
+        std::lock_guard lk(mu_);
+        pred_ = std::move(pred);
+    }
+    [[nodiscard]] StateBackend::ExpiryPredicate get() const {
+        std::lock_guard lk(mu_);
+        return pred_;
+    }
+
+private:
+    mutable std::mutex mu_;
+    StateBackend::ExpiryPredicate pred_;
+};
+
+class ExpiryCompactionFilter final : public forstdb::CompactionFilter {
+public:
+    ExpiryCompactionFilter(StateBackend::ExpiryPredicate pred, OperatorId op)
+        : pred_(std::move(pred)), op_(op) {}
+
+    bool Filter(int /*level*/,
+                const forstdb::Slice& key,
+                const forstdb::Slice& existing_value,
+                std::string* /*new_value*/,
+                bool* /*value_changed*/) const override {
+        if (!pred_) {
+            return false;  // keep
+        }
+        return pred_(op_,
+                     std::string_view{key.data(), key.size()},
+                     std::string_view{existing_value.data(), existing_value.size()});
+    }
+
+    [[nodiscard]] const char* Name() const override { return "clink.ExpiryCompactionFilter"; }
+
+private:
+    StateBackend::ExpiryPredicate pred_;
+    OperatorId op_;
+};
+
+class ExpiryFilterFactory final : public forstdb::CompactionFilterFactory {
+public:
+    ExpiryFilterFactory(std::shared_ptr<ExpiryFilterSlot> slot, OperatorId op)
+        : slot_(std::move(slot)), op_(op) {}
+
+    std::unique_ptr<forstdb::CompactionFilter> CreateCompactionFilter(
+        const forstdb::CompactionFilter::Context& /*ctx*/) override {
+        auto pred = slot_->get();
+        if (!pred) {
+            return nullptr;  // nothing installed: keep everything
+        }
+        return std::make_unique<ExpiryCompactionFilter>(std::move(pred), op_);
+    }
+
+    [[nodiscard]] const char* Name() const override { return "clink.ExpiryFilterFactory"; }
+
+private:
+    std::shared_ptr<ExpiryFilterSlot> slot_;
+    OperatorId op_;
+};
+
 [[nodiscard]] forstdb::ColumnFamilyOptions make_cf_options() {
     forstdb::ColumnFamilyOptions cfo;
     cfo.write_buffer_size = 64ull * 1024 * 1024;
     cfo.max_write_buffer_number = 4;
+    return cfo;
+}
+
+[[nodiscard]] forstdb::ColumnFamilyOptions make_cf_options_with_expiry(
+    const std::shared_ptr<ExpiryFilterSlot>& slot, OperatorId op) {
+    auto cfo = make_cf_options();
+    cfo.compaction_filter_factory = std::make_shared<ExpiryFilterFactory>(slot, op);
     return cfo;
 }
 
@@ -204,6 +284,9 @@ struct ForStStateBackend::Impl {
     // The WriteBatch supports per-CF entries via Put(cf, key, value);
     // mixing CFs in a single batch is fine.
     mutable std::mutex buffer_mu_;
+    // Shared with every CF's compaction-filter factory; outlives any
+    // individual compaction.
+    std::shared_ptr<ExpiryFilterSlot> expiry_slot_ = std::make_shared<ExpiryFilterSlot>();
     forstdb::WriteBatch write_batch_;
     // Default 1 MiB flush threshold; overridable via CLINK_FORST_WB_BYTES
     // for tuning. The flush amortises WriteThread + memtable arena cost
@@ -262,7 +345,8 @@ struct ForStStateBackend::Impl {
         }
         forstdb::ColumnFamilyHandle* handle = nullptr;
         const auto name = cf_name_for(op);
-        auto st = db->CreateColumnFamily(make_cf_options(), name, &handle);
+        auto st =
+            db->CreateColumnFamily(make_cf_options_with_expiry(expiry_slot_, op), name, &handle);
         if (!st.ok()) {
             throw std::runtime_error("ForStStateBackend::cf_for create failed: " + st.ToString());
         }
@@ -1053,6 +1137,40 @@ Snapshot ForStStateBackend::combine_snapshots(std::vector<Snapshot> parts) const
     out.bytes.assign(reinterpret_cast<const std::byte*>(joined.data()),
                      reinterpret_cast<const std::byte*>(joined.data() + joined.size()));
     return out;
+}
+
+// --- expiry compaction ------------------------------------------------------
+
+bool ForStStateBackend::supports_expiry_compaction() const noexcept {
+    return true;
+}
+
+void ForStStateBackend::set_expiry_filter(ExpiryPredicate pred) {
+    impl_->expiry_slot_->set(std::move(pred));
+}
+
+std::optional<std::size_t> ForStStateBackend::compact_expired(OperatorId op) {
+    auto* cf = impl_->cf_for(op);
+    // Drain the buffered WriteBatch and flush the MemTable before
+    // compacting. A compaction filter only sees SST contents, and this
+    // backend buffers Puts behind a 64 MB write buffer, so without both
+    // steps the call would silently no-op on exactly the recent state a
+    // TTL sweep exists to reclaim. Same trap as the RocksDB backend; the
+    // reasoning is spelled out there.
+    {
+        std::lock_guard lock(impl_->buffer_mu_);
+        impl_->flush_write_batch_locked();
+    }
+    forstdb::FlushOptions flush_opts;
+    flush_opts.wait = true;
+    (void)impl_->db->Flush(flush_opts, cf);
+
+    forstdb::CompactRangeOptions opts;
+    opts.bottommost_level_compaction = forstdb::BottommostLevelCompaction::kForce;
+    (void)impl_->db->CompactRange(opts, cf, /*begin=*/nullptr, /*end=*/nullptr);
+    // nullopt: ForSt does not report how many entries a filter dropped, and
+    // counting by scanning would cost more than the compaction saved.
+    return std::nullopt;
 }
 
 std::string ForStStateBackend::description() const {

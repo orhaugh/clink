@@ -169,6 +169,14 @@ public:
     // Merge several ForSt snapshots into one (scale-down): joins their
     // checkpoint-dir paths so restore() iterate-merges them.
     Snapshot combine_snapshots(std::vector<Snapshot> parts) const override;
+
+    // Expiry compaction. ForSt is a RocksDB derivative and keeps the same
+    // compaction-filter surface, so TTL'd state is reclaimed during work
+    // the backend already does rather than by a scan competing with the
+    // write path.
+    [[nodiscard]] bool supports_expiry_compaction() const noexcept override;
+    void set_expiry_filter(ExpiryPredicate pred) override;
+    std::optional<std::size_t> compact_expired(OperatorId op) override;
     std::string description() const override;
 
     // Returns the SnapshotStats for the most recent snapshot() call.

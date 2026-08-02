@@ -366,9 +366,41 @@ struct TypeName {
     Loc loc;
 };
 
+// A column constraint written inline in CREATE TABLE.
+//
+// These used to be dropped on the floor: translate_column_def read only
+// the name and type, so `k BIGINT NOT NULL PRIMARY KEY CHECK (k > 0)`
+// parsed, registered, and behaved exactly like `k BIGINT`. Capturing them
+// is the prerequisite for both honouring the ones clink implements and
+// refusing the ones it does not.
+enum class ColumnConstraintKind : std::uint8_t {
+    PrimaryKey,
+    NotNull,
+    Null,
+    Unique,
+    Check,
+    Default,
+    References,
+    Generated,
+    Identity,
+    Collate,
+    Other,
+};
+
+[[nodiscard]] std::string_view to_string(ColumnConstraintKind k) noexcept;
+
+struct ColumnConstraint {
+    ColumnConstraintKind kind{ColumnConstraintKind::Other};
+    // The raw PG constraint type name, for a diagnostic that can name what
+    // it saw even for a kind this enum does not model.
+    std::string raw;
+    Loc loc;
+};
+
 struct ColumnDef {
     std::string name;
     TypeName type;
+    std::vector<ColumnConstraint> constraints;
     Loc loc;
 };
 
