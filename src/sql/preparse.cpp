@@ -1,6 +1,7 @@
 #include "clink/sql/preparse.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cstdint>
@@ -1469,8 +1470,68 @@ std::string rewrite_create_model(std::string_view sql, std::vector<ast::CreateMo
     return out;
 }
 
+namespace {
+
+// Strip a trailing `ALLOW UNBOUNDED STATE` (case-insensitive, any internal
+// whitespace, optional trailing semicolon) and report whether it was
+// present. Text-level, like the rest of this shim: teaching libpg_query a
+// new clause would mean forking the PostgreSQL grammar and re-applying the
+// fork on every version bump.
+//
+// Anchored at the END of the statement so it cannot match an identifier or
+// a string literal that happens to contain the words.
+bool strip_allow_unbounded_state(std::string& sql) {
+    const auto is_space = [](unsigned char c) { return std::isspace(c) != 0; };
+    // Work on a trimmed copy's tail, remembering whether a semicolon was
+    // there so it can be put back.
+    std::size_t end = sql.size();
+    while (end > 0 && is_space(static_cast<unsigned char>(sql[end - 1]))) {
+        --end;
+    }
+    bool had_semicolon = false;
+    if (end > 0 && sql[end - 1] == ';') {
+        had_semicolon = true;
+        --end;
+        while (end > 0 && is_space(static_cast<unsigned char>(sql[end - 1]))) {
+            --end;
+        }
+    }
+
+    // Match the three words backwards, tolerating any whitespace between.
+    static constexpr std::array<std::string_view, 3> kWords{"state", "unbounded", "allow"};
+    std::size_t cursor = end;
+    for (const auto& word : kWords) {
+        while (cursor > 0 && is_space(static_cast<unsigned char>(sql[cursor - 1]))) {
+            --cursor;
+        }
+        if (cursor < word.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < word.size(); ++i) {
+            const auto c = static_cast<unsigned char>(sql[cursor - word.size() + i]);
+            if (std::tolower(c) != static_cast<unsigned char>(word[i])) {
+                return false;
+            }
+        }
+        cursor -= word.size();
+    }
+    // The clause must be preceded by whitespace, not glued to an
+    // identifier ("...FROM tallow unbounded state" is not a match).
+    if (cursor > 0 && (std::isalnum(static_cast<unsigned char>(sql[cursor - 1])) != 0 ||
+                       sql[cursor - 1] == '_')) {
+        return false;
+    }
+    sql = sql.substr(0, cursor) + (had_semicolon ? ";" : "");
+    return true;
+}
+
+}  // namespace
+
 PreparseResult preparse(std::string_view sql) {
     PreparseResult res;
+    std::string with_clause_stripped{sql};
+    res.allow_unbounded_state = strip_allow_unbounded_state(with_clause_stripped);
+    sql = with_clause_stripped;
     // Rewrite the FROM-clause islands PG cannot grammar-parse to placeholder
     // table refs (MATCH_RECOGNIZE, then the table-function family: process-table
     // functions plus the SQL-native-AI ML_PREDICT / VECTOR_SEARCH), then rewrite

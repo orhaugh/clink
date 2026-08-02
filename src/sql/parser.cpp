@@ -44,6 +44,9 @@ ast::Script parse(std::string_view sql) {
         preparse::reattach_create_models(script, pre.models);
         preparse::reattach_ml_predicts(script, pre.ml_predicts);
         preparse::reattach_vector_searches(script, pre.vector_searches);
+        // Carry the bounded-state opt-out through to the planner. Stripped
+        // at text level, so this is the only route it has.
+        script.allow_unbounded_state = pre.allow_unbounded_state;
         pg_query_free_parse_result(result);
         const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - t0)

@@ -28,13 +28,16 @@
 // Syntax (clink extensions, in the existing dialect's style):
 //
 //   SELECT ... FROM t GROUP BY k              -- rejected when t is unbounded
-//   SELECT ... FROM t GROUP BY k
-//     WITH ('state.ttl' = '1h')               -- accepted, retention chosen
+//   CREATE TABLE t (...) WITH (connector='kafka', state_ttl='1h')
+//     ... GROUP BY k                          -- accepted, retention chosen
 //   SELECT ... FROM t GROUP BY k
 //     ALLOW UNBOUNDED STATE                   -- accepted, explicitly unsafe
 //
-// A TTL may also be set per table (`WITH ('state.ttl' = '30m')` in the DDL)
-// or for a whole script (`SET 'state.ttl' = '30m'`).
+// The retention option is `state_ttl` on a table's WITH clause. A bare
+// identifier, not a dotted one: PostgreSQL's WITH grammar takes
+// identifiers, so `state.ttl` is a syntax error - and the dialect already
+// spells its options this way (delivery_guarantee, primary_key,
+// commit_group).
 
 #include <cstdint>
 #include <memory>
@@ -71,6 +74,11 @@ struct BoundedStateReport {
     // Set when the query relies on ALLOW UNBOUNDED STATE. The caller logs
     // this prominently and bumps a metric.
     bool used_unsafe_override{false};
+    // Connectors in this plan with no capability declaration, so their
+    // boundedness is unknown. These do NOT trip the gate - see
+    // check_plan_bounded_state for why - but they are the gate's blind
+    // spot, and naming them is how it gets smaller.
+    std::vector<std::string> unknown_boundedness_connectors;
 
     [[nodiscard]] bool ok() const noexcept { return findings.empty(); }
     // The rejection message, empty when ok().
@@ -90,6 +98,20 @@ struct BoundedStateReport {
 [[nodiscard]] BoundedStateReport check_bounded_state(const LogicalPlan& plan,
                                                      const StateRetention& retention,
                                                      bool sources_bounded);
+
+// The planner-facing entry point: resolve boundedness and retention from
+// the plan's own scans, then gate.
+//
+// Boundedness comes from the connector capability registry, which already
+// declares it per connector and is derived from the implementation. An
+// UNDECLARED connector is treated as unbounded - the safe assumption,
+// since guessing "bounded" would silently disable the gate for exactly the
+// connectors nobody has characterised yet.
+//
+// Retention is read from any participating table's `state_ttl` WITH
+// option. `allow_unbounded` is the statement's ALLOW UNBOUNDED STATE flag.
+[[nodiscard]] BoundedStateReport check_plan_bounded_state(const LogicalPlan& plan,
+                                                          bool allow_unbounded);
 
 // True when this node kind retains per-key state for the life of the job.
 // Exposed so EXPLAIN can annotate the same nodes the gate looks at.

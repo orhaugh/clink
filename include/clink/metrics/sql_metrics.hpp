@@ -38,6 +38,8 @@ inline constexpr const char* kSqlParseNs = "clink_sql_parse_duration_ns";
 inline constexpr const char* kSqlBindNs = "clink_sql_bind_duration_ns";
 inline constexpr const char* kSqlOptimizeNs = "clink_sql_optimize_duration_ns";
 inline constexpr const char* kSqlPhysicalNs = "clink_sql_physical_plan_duration_ns";
+inline constexpr const char* kSqlUnboundedStateOverrides =
+    "clink_sql_unbounded_state_overrides_total";
 
 namespace sql {
 
@@ -65,6 +67,12 @@ inline void optimize_failed() {
 inline void physical_plan_completed(std::uint64_t duration_ns) {
     MetricsRegistry::global().counter(kSqlPhysicalPlans).increment();
     MetricsRegistry::global().histogram(kSqlPhysicalNs).observe(static_cast<double>(duration_ns));
+}
+// A query compiled with ALLOW UNBOUNDED STATE. Counted so a cluster
+// operator can answer "how many jobs here are running without a bound on
+// their state" without grepping submitted SQL.
+inline void unbounded_state_override() {
+    MetricsRegistry::global().counter(kSqlUnboundedStateOverrides).increment();
 }
 
 }  // namespace sql

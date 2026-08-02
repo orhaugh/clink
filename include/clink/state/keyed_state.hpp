@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -19,27 +20,80 @@
 
 namespace clink {
 
-// Optional time-to-live for a KeyedState slot. The  equivalent
-// is StateTtlConfig - every entry is implicitly stamped on write and
-// expires `ttl` after the last refreshing operation. v1 supports the
-// two semantics  ships with:
+// Which clock a TTL is measured against.
 //
-//   refresh_on_write  : every put() resets the expiry. The default
-//                       - common for things like "have I seen this
-//                       user recently?" caches.
-//   refresh_on_read   : get() also resets the expiry (LRU-ish), so
-//                       active keys live forever and inactive keys
-//                       fade. Set both fields true.
+// This distinction is not a nicety. A processing-time TTL is measured
+// against the wall clock of the machine doing the processing, so on a
+// backfill - a replay of six months of history through a job with a
+// one-hour TTL - every entry is already older than the TTL the instant it
+// is written, and the job silently produces nothing. Conversely a job that
+// stalls for two hours expires state that, in the stream's own terms, is
+// seconds old.
 //
-// Expired entries are not reported by get/scan and are lazy-purged
-// on first observation. There's no background sweep in v1 - that
-// would add a thread;  does it incrementally on access too.
+// Event time measures against the watermark, so retention means what a
+// user means by it: "keep a key for an hour of DATA time". A replay then
+// behaves identically to the original run, which is also what makes a
+// TTL'd job deterministically replayable.
+enum class TtlTimeDomain : std::uint8_t {
+    ProcessingTime,  // wall clock on the processing machine
+    EventTime,       // the operator's current watermark
+};
+
+// Optional time-to-live for a KeyedState slot. Every entry is stamped on
+// write and expires `ttl` after the last refreshing operation.
+//
+//   refresh_on_write  : every put() resets the expiry. The default -
+//                       common for "have I seen this user recently?".
+//   refresh_on_read   : get() also resets the expiry (LRU-ish), so active
+//                       keys live and inactive keys fade. Set both true.
+//
+// Semantics, stated so they can be relied on:
+//
+//   * An expired entry is never returned by get/get_many/scan, whether or
+//     not it has been physically removed yet.
+//   * Expiry is lazy on read AND incremental on cleanup (see
+//     `cleanup_batch`), so memory is actually released rather than merely
+//     hidden. Lazy-only expiry means a key that is written once and never
+//     read again is retained for ever - which defeats the purpose.
+//   * Snapshots carry the stamp, not a remaining duration, so a restore
+//     resumes the same absolute expiry rather than silently extending
+//     every entry's life by the length of the outage.
+//   * Under EventTime, an entry whose stamp is in the future relative to
+//     the current watermark is live. Before the FIRST watermark arrives
+//     the domain has no time yet, and `expire_before_first_watermark`
+//     decides whether that means "nothing expires" (the default, and the
+//     safe reading) or "treat time as zero".
+//   * Rescaling moves an entry to its new subtask with its stamp intact.
+//     The stamp is absolute, so it survives the move unchanged.
+//   * A late record targeting an expired key sees no state, exactly as if
+//     the key had never existed. That is the documented behaviour, not an
+//     accident: resurrecting expired state on a late arrival would make
+//     retention unbounded again.
 struct TtlConfig {
     std::chrono::milliseconds ttl{0};  // 0 = disabled
     bool refresh_on_write{true};
     bool refresh_on_read{false};
+    TtlTimeDomain domain{TtlTimeDomain::ProcessingTime};
+    // EventTime only. False (default): nothing expires until a watermark
+    // has been seen, so a job that has not yet established event time
+    // cannot mass-expire its state on the strength of a zero watermark.
+    bool expire_before_first_watermark{false};
 
     [[nodiscard]] bool enabled() const noexcept { return ttl.count() > 0; }
+};
+
+// Counters for one TTL-enabled slot. Read by the operator's metrics
+// reporting; the brief asks for live entries, expirations, cleanup lag and
+// an estimate of state size, and these are the raw numbers behind them.
+struct TtlStats {
+    std::uint64_t expired_on_read{0};     // entries found dead and purged by a read
+    std::uint64_t expired_in_cleanup{0};  // entries removed by incremental cleanup
+    std::uint64_t live_entries{0};        // live entries at the last cleanup sweep
+    std::uint64_t scanned_entries{0};     // entries visited at the last cleanup sweep
+    std::uint64_t estimated_bytes{0};     // key+value bytes at the last cleanup sweep
+    // Entries the last sweep did NOT reach because it hit its budget. The
+    // cleanup lag: while this is non-zero, expired state is still resident.
+    std::uint64_t unscanned_backlog{0};
 };
 
 // KeyedState<K, V> is the typed view over a StateBackend that operators use.
@@ -105,7 +159,7 @@ public:
         // expire-at is "now + ttl" on every put; refresh_on_write
         // is the always-true behavior here. On get with
         // refresh_on_read, the value is re-put with a fresh expiry.
-        const auto expire_at = now_ms_() + ttl_.ttl.count();
+        const auto expire_at = this->expire_at_();
         std::vector<std::byte> stamped;
         stamped.reserve(8 + v_bytes.size());
         write_i64_le_(stamped, expire_at);
@@ -128,7 +182,8 @@ public:
             return std::nullopt;  // truncated; treat as missing
         }
         const auto expire_at = read_i64_le_(v->data());
-        if (expire_at <= now_ms_()) {
+        if (this->is_expired_(expire_at)) {
+            ++this->stats_.expired_on_read;
             // Lazy purge: a stale entry is observed once and erased
             // so subsequent gets short-circuit and snapshots shrink.
             backend_->erase(op_, key_str);
@@ -142,7 +197,7 @@ public:
         if (ttl_.refresh_on_read) {
             // Re-put with a refreshed expiry. The user value bytes
             // didn't change; only the leading expire_at advances.
-            const auto new_expire_at = now_ms_() + ttl_.ttl.count();
+            const auto new_expire_at = this->expire_at_();
             std::vector<std::byte> stamped(v->size());
             write_i64_le_at_(stamped.data(), new_expire_at);
             std::copy(v->data() + 8, v->data() + v->size(), stamped.data() + 8);
@@ -223,7 +278,7 @@ public:
     using Visitor = std::function<void(const K& key, const V& value)>;
     void scan(const Visitor& visit) const {
         const std::string& slot = slot_name_;
-        const auto now = now_ms_();
+        const auto now_opt = this->now_for_ttl_();
         const bool ttl_on = ttl_.enabled();
         backend_->scan(op_, [&](StateBackend::KeyView k, StateBackend::ValueView v) {
             // Stored-key layout: [kg_byte][slot_name][|][user_key_bytes].
@@ -243,7 +298,7 @@ public:
                     return;
                 }
                 const auto expire_at = read_i64_le_(v_bytes_ptr);
-                if (expire_at <= now) {
+                if (now_opt.has_value() && expire_at <= *now_opt) {
                     return;  // expired; skip silently (purged on next get())
                 }
                 v_bytes_ptr += 8;
@@ -262,6 +317,131 @@ public:
     OperatorId operator_id() const noexcept { return op_; }
     const std::string& slot_name() const noexcept { return slot_name_; }
     const TtlConfig& ttl_config() const noexcept { return ttl_; }
+
+    // --- event-time TTL ------------------------------------------------
+    //
+    // The operator feeds its current watermark in. KeyedState has no route
+    // to the watermark of its own (it sees a backend, a codec pair and a
+    // slot name), and threading a RuntimeContext in would couple state to
+    // the runtime for one field. A setter the operator calls once per
+    // watermark advance is cheaper and keeps the dependency out.
+    //
+    // Monotonic by construction: a watermark that went backwards would
+    // resurrect state that had already expired, so a regression is ignored
+    // rather than applied.
+    void advance_watermark(std::int64_t watermark_ms) noexcept {
+        if (!this->has_watermark_ || watermark_ms > this->watermark_ms_) {
+            this->watermark_ms_ = watermark_ms;
+            this->has_watermark_ = true;
+        }
+    }
+
+    [[nodiscard]] bool has_watermark() const noexcept { return this->has_watermark_; }
+
+    [[nodiscard]] const TtlStats& ttl_stats() const noexcept { return this->stats_; }
+
+    // --- incremental cleanup -------------------------------------------
+    //
+    // Sweep up to `budget` entries in this slot and erase the expired
+    // ones. Bounded on purpose: an unbounded sweep over a large keyspace
+    // would stall the operator thread for as long as the scan takes, which
+    // is a latency spike proportional to state size - exactly what a job
+    // running a TTL is trying to avoid. Calling this once per checkpoint
+    // (or every N records) walks the space over many small steps.
+    //
+    // Resumes from where the previous call stopped, so repeated calls make
+    // progress through the whole slot rather than re-scanning the front of
+    // it. Returns the number of entries erased.
+    //
+    // Without this, expiry is lazy only: an entry written once and never
+    // read again is hidden from readers but never released, so a TTL that
+    // was supposed to bound memory does not.
+    std::size_t cleanup_batch(std::size_t budget = 256) {
+        if (!ttl_.enabled() || budget == 0) {
+            return 0;
+        }
+        const auto now = this->now_for_ttl_();
+        if (!now.has_value()) {
+            return 0;  // event time not yet established; nothing can be judged
+        }
+
+        std::vector<std::string> doomed;
+        std::uint64_t scanned = 0;
+        std::uint64_t live = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t skipped_before_cursor = 0;
+        std::uint64_t backlog = 0;
+        bool budget_hit = false;
+        std::string last_visited;
+
+        const std::string prefix = this->slot_prefix_();
+        backend_->scan(op_, [&](StateBackend::KeyView k, StateBackend::ValueView v) {
+            const std::string key{k};
+            if (key.find(prefix) == std::string::npos) {
+                return;  // another slot in the same operator
+            }
+            if (budget_hit) {
+                ++backlog;
+                return;
+            }
+            // Resume point: skip everything at or before the previous
+            // sweep's stopping key so successive calls advance.
+            if (!this->cleanup_cursor_.empty() && key <= this->cleanup_cursor_) {
+                ++skipped_before_cursor;
+                return;
+            }
+            ++scanned;
+            bytes += key.size() + v.size();
+            if (v.size() >= 8) {
+                const auto expire_at = read_i64_le_(v.data());
+                if (expire_at <= *now) {
+                    doomed.push_back(key);
+                } else {
+                    ++live;
+                }
+            } else {
+                ++live;  // not TTL-stamped; leave it alone
+            }
+            last_visited = key;
+            if (scanned >= budget) {
+                budget_hit = true;
+            }
+        });
+
+        for (const auto& key : doomed) {
+            backend_->erase(op_, key);
+        }
+        // A sweep that reached the end restarts from the beginning next
+        // time; one that stopped early resumes at its stopping key.
+        this->cleanup_cursor_ = budget_hit ? last_visited : std::string{};
+
+        this->stats_.expired_in_cleanup += doomed.size();
+        this->stats_.scanned_entries = scanned;
+        this->stats_.live_entries = live + skipped_before_cursor;
+        this->stats_.estimated_bytes = bytes;
+        this->stats_.unscanned_backlog = backlog;
+        return doomed.size();
+    }
+
+    // Sweep the entire slot in one pass, ignoring the incremental budget.
+    // For a test that needs a settled answer, or a snapshot path that
+    // wants to avoid persisting known-dead entries. NOT for the hot path.
+    std::size_t cleanup_all() {
+        this->cleanup_cursor_.clear();
+        std::size_t total = 0;
+        // Bounded loop rather than while(true): each pass either erases
+        // something or completes, and the cursor reset above guarantees
+        // the first pass sees everything.
+        for (;;) {
+            const auto n = this->cleanup_batch(std::numeric_limits<std::size_t>::max());
+            total += n;
+            if (n == 0) {
+                break;
+            }
+            this->cleanup_cursor_.clear();
+        }
+        return total;
+    }
 
 private:
     // Apply TTL decode to one raw backend value: nullopt passthrough, no-TTL
@@ -283,7 +463,8 @@ private:
             return std::nullopt;  // truncated; treat as missing
         }
         const auto expire_at = read_i64_le_(v->data());
-        if (expire_at <= now_ms_()) {
+        if (this->is_expired_(expire_at)) {
+            ++this->stats_.expired_on_read;
             backend_->erase(op_, key_str);  // lazy purge
             return std::nullopt;
         }
@@ -296,7 +477,7 @@ private:
             // Re-put with a refreshed expiry; only the leading expire_at
             // advances, user value bytes unchanged. `stamped` is a frame local
             // consumed by the synchronous put below.
-            const auto new_expire_at = now_ms_() + ttl_.ttl.count();
+            const auto new_expire_at = this->expire_at_();
             std::vector<std::byte> stamped(v->size());
             write_i64_le_at_(stamped.data(), new_expire_at);
             std::copy(v->data() + 8, v->data() + v->size(), stamped.data() + 8);
@@ -364,6 +545,51 @@ private:
             .count();
     }
 
+    // The clock this slot's TTL is measured against.
+    //
+    // nullopt means "this domain has no time yet", which happens only for
+    // EventTime before the first watermark. Every TTL decision treats that
+    // as "nothing can be judged expired" rather than as time zero: a zero
+    // watermark would make every stamped entry look expired and wipe the
+    // slot the moment a job starts. `expire_before_first_watermark` opts
+    // into the other reading for a job that genuinely wants it.
+    [[nodiscard]] std::optional<std::int64_t> now_for_ttl_() const {
+        if (ttl_.domain == TtlTimeDomain::ProcessingTime) {
+            return now_ms_();
+        }
+        if (!has_watermark_) {
+            return ttl_.expire_before_first_watermark ? std::optional<std::int64_t>{0}
+                                                      : std::nullopt;
+        }
+        return watermark_ms_;
+    }
+
+    // The stamp to write for an entry created or refreshed now. Falls back
+    // to the wall clock when event time is not yet established, so the
+    // entry gets a sane absolute expiry rather than one relative to zero
+    // (which would place it in 1970 and make it instantly dead).
+    [[nodiscard]] std::int64_t expire_at_() const {
+        const auto now = now_for_ttl_();
+        const auto base =
+            now.has_value()
+                ? *now
+                : (ttl_.domain == TtlTimeDomain::EventTime ? std::int64_t{0} : now_ms_());
+        return base + ttl_.ttl.count();
+    }
+
+    // True when `expire_at` is in the past for this slot's domain. False
+    // when the domain has no time yet - an entry cannot be proven dead
+    // against a clock that has not started.
+    [[nodiscard]] bool is_expired_(std::int64_t expire_at) const {
+        const auto now = now_for_ttl_();
+        return now.has_value() && expire_at <= *now;
+    }
+
+    // "<slot>|" - the marker that identifies a key as belonging to this
+    // slot within the operator's keyspace (see encode_key_into: the layout
+    // is <2B key group><slot name>'|'<user key>).
+    [[nodiscard]] std::string slot_prefix_() const { return slot_name_ + "|"; }
+
     static void write_i64_le_(std::vector<std::byte>& out, std::int64_t v) {
         const auto u = static_cast<std::uint64_t>(v);
         for (int i = 0; i < 8; ++i) {
@@ -393,6 +619,14 @@ private:
     Codec<K> key_codec_;
     Codec<V> value_codec_;
     TtlConfig ttl_{};
+    // Event-time TTL state. mutable because the read path is const and has
+    // to record that it purged something.
+    std::int64_t watermark_ms_{0};
+    bool has_watermark_{false};
+    mutable TtlStats stats_{};
+    // Resume point for incremental cleanup, so successive bounded sweeps
+    // walk the whole slot instead of re-scanning its front.
+    std::string cleanup_cursor_;
 };
 
 }  // namespace clink

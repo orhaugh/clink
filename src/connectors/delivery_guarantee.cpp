@@ -28,6 +28,28 @@ bool has_option(const PipelineConnector& c, std::string_view opt) {
            c.supplied_options.end();
 }
 
+// A requirement may name ALTERNATIVES, pipe-separated: "dir|path" means the
+// connector needs one of them. Real connectors do accept alternatives -
+// file_2pc_sink_row takes `dir` or `path` depending on whether it was built
+// from the C++ API or from a SQL DDL - and a requirement that listed only
+// one spelling would reject a perfectly valid SQL job.
+bool requirement_satisfied(const PipelineConnector& c, const std::string& requirement) {
+    std::size_t pos = 0;
+    while (pos <= requirement.size()) {
+        const auto bar = requirement.find('|', pos);
+        const auto alt =
+            requirement.substr(pos, bar == std::string::npos ? std::string::npos : bar - pos);
+        if (!alt.empty() && has_option(c, alt)) {
+            return true;
+        }
+        if (bar == std::string::npos) {
+            break;
+        }
+        pos = bar + 1;
+    }
+    return false;
+}
+
 }  // namespace
 
 GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
@@ -138,11 +160,26 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
         // transactional Kafka sink without a transactional.id is not a
         // transactional sink.
         for (const auto& required : caps->required_options_for_exactly_once) {
-            if (!has_option(c, required)) {
+            if (!requirement_satisfied(c, required)) {
+                // Render alternatives readably: "'dir' or 'path'" beats
+                // echoing the raw "dir|path" back at whoever has to fix it.
+                std::string named;
+                std::size_t p = 0;
+                while (p <= required.size()) {
+                    const auto bar = required.find('|', p);
+                    const auto alt =
+                        required.substr(p, bar == std::string::npos ? std::string::npos : bar - p);
+                    if (!alt.empty()) {
+                        named += (named.empty() ? "'" : " or '") + alt + "'";
+                    }
+                    if (bar == std::string::npos) {
+                        break;
+                    }
+                    p = bar + 1;
+                }
                 reasons.emplace_back("sink '" + c.op_type + "' declares " +
-                                     std::string(to_string(caps->delivery)) + " but option '" +
-                                     required +
-                                     "' was not supplied, so it degrades to at-least-once");
+                                     std::string(to_string(caps->delivery)) + " but option " +
+                                     named + " was not supplied, so it degrades to at-least-once");
                 sink_level = DeliveryGuarantee::AtLeastOnce;
                 break;
             }

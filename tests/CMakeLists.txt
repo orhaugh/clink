@@ -143,6 +143,8 @@ add_executable(clink_core_tests
     test_durable_file_write.cpp
     test_fault_injection.cpp
     test_checkpoint_integrity.cpp
+    test_exactly_once_windows.cpp
+    test_guarantee_gate.cpp
     test_connector_capability.cpp
     test_columnar_filter.cpp
     test_columnar_string_filter.cpp
@@ -166,6 +168,7 @@ add_executable(clink_core_tests
     test_pipe_throughput_floor.cpp
     test_source_replay.cpp
     test_keyed_state_ttl.cpp
+    test_keyed_state_ttl_depth.cpp
     test_async_map_operator.cpp
     test_dag_iteration.cpp
     test_process_function.cpp
@@ -416,6 +419,7 @@ if(CLINK_BUILD_SQL)
         test_sql_cli.cpp
         test_sql_row.cpp
         test_sql_runtime.cpp
+        test_sql_bounded_state.cpp
         test_columnar_split.cpp
         test_key_routing_parity.cpp
         test_json_columnar_decode.cpp

@@ -236,7 +236,11 @@ TEST_F(ConnectorCapabilityTest, MissingRequiredOptionDowngradesAClaimedExactlyOn
     EXPECT_EQ(r.level, EndToEndGuarantee::StateExactlyOnceOutputAtLeastOnce) << r.render_text();
     bool explained = false;
     for (const auto& reason : r.reasons) {
-        explained = explained || reason.find("'dir' was not supplied") != std::string::npos;
+        // file_2pc's requirement is "dir|path" (the C++ factory takes one
+        // spelling, the SQL DDL the other), rendered readably for whoever
+        // has to act on it.
+        explained =
+            explained || reason.find("'dir' or 'path' was not supplied") != std::string::npos;
     }
     EXPECT_TRUE(explained) << r.render_text();
 }

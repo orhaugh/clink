@@ -54,6 +54,19 @@ struct PreparseResult {
     std::vector<ast::CreateModelStmt> models;                      // indexed by placeholder suffix
     std::vector<ast::MlPredictClause> ml_predicts;                 // indexed by placeholder suffix
     std::vector<ast::VectorSearchClause> vector_searches;          // indexed by placeholder suffix
+
+    // clink extension: a trailing `ALLOW UNBOUNDED STATE` on a query.
+    //
+    // Stripped here rather than taught to the grammar, matching how every
+    // other clink-only clause in this file is handled: libpg_query owns the
+    // PostgreSQL grammar and a local grammar fork would have to be
+    // re-applied on every bump. Text-level removal keeps the statement
+    // PG-parseable and lands the flag where the planner can read it.
+    //
+    // It is deliberately verbose to type. It disables the bounded-state
+    // gate for the statement, which is a decision an operator should have
+    // to make on purpose and be able to grep the codebase for.
+    bool allow_unbounded_state{false};
 };
 
 // Scan + rewrite. Throws TranslationError on a malformed island (e.g. an

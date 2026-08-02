@@ -77,7 +77,9 @@ void declare_builtin_capabilities() {
                         "staging/ for manual cleanup - recovery will not auto-abort it, "
                         "because a half-written file cannot be told apart from a "
                         "commit that failed"},
-        .required_options_for_exactly_once = {"dir"},
+        // dir OR path: the C++ factory takes `dir`, the SQL DDL supplies
+        // `path`. Naming only one spelling would reject valid SQL jobs.
+        .required_options_for_exactly_once = {"dir|path"},
     });
 
     // ---- parquet --------------------------------------------------------
@@ -134,7 +136,9 @@ void declare_builtin_capabilities() {
         .timeout_options = {},
         .available_in_sql = true,
         .limitations = {"same staging-file cleanup caveat as file_2pc"},
-        .required_options_for_exactly_once = {"dir"},
+        // dir OR path: the C++ factory takes `dir`, the SQL DDL supplies
+        // `path`. Naming only one spelling would reject valid SQL jobs.
+        .required_options_for_exactly_once = {"dir|path"},
     });
 
     // ---- generator / range sources --------------------------------------

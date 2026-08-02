@@ -4162,6 +4162,17 @@ TEST(SqlRuntime, FileExactlyOnceSinkProducesCommittedRecords) {
     application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 15s;
+    // Checkpointing must be on. delivery_guarantee='exactly_once' in the DDL
+    // is a request, and the submission gate now refuses it when the pipeline
+    // cannot honour it - a 2PC sink commits on the coordinator's
+    // CommitCheckpoint broadcast, which never fires without checkpointing, so
+    // the previous configuration was asking for a guarantee it could not get.
+    // The assertion below is unchanged and still tolerant of records sitting
+    // in staging/ rather than committed/.
+    const auto ckpt_dir = std::filesystem::temp_directory_path() / "clink_sql_e2e_eo_ckpt";
+    std::filesystem::remove_all(ckpt_dir);
+    opts.checkpoint.checkpoint_dir = ckpt_dir.string();
+    opts.checkpoint.interval_ms = 200;
     auto result = submitter.submit(spec.to_json(), {}, opts);
     ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
 

@@ -76,7 +76,14 @@ std::uint64_t latest_completed(const std::filesystem::path& ckpt_root) {
             continue;
         }
         try {
-            latest = std::max(latest, std::stoull(name.substr(10)));
+            // Explicit cast, not std::max(latest, std::stoull(...)): stoull
+            // returns unsigned long long, and std::uint64_t is unsigned long
+            // on Linux/gcc but unsigned long long on macOS. The two-arg
+            // std::max cannot deduce T from mismatched types, so this builds
+            // on macOS and fails on Linux - the exact typedef trap this
+            // repository has been bitten by before.
+            const auto id = static_cast<std::uint64_t>(std::stoull(name.substr(10)));
+            latest = std::max(latest, id);
         } catch (const std::exception&) {
         }
     }

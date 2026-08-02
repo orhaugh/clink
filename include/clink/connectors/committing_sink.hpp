@@ -50,6 +50,7 @@
 #include <vector>
 
 #include "clink/core/types.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/state_backend.hpp"
@@ -106,9 +107,16 @@ public:
 
     void on_barrier(CheckpointBarrier b) final {
         const auto ckpt = b.id().value();
+        // Fault windows around prepare. Dying BEFORE prepare must leave no
+        // external side effect at all; dying AFTER prepare but before the
+        // handle is persisted must leave a prepared transaction that
+        // nothing will ever commit - which is why the persist follows
+        // immediately and recover_all_() exists.
+        CLINK_FAULT_POINT(clink::fault::points::kSinkBeforePrepare);
         auto committable = prepare_commit(ckpt);
         if (!committable.has_value())
             return;  // nothing to commit for this checkpoint
+        CLINK_FAULT_POINT(clink::fault::points::kSinkAfterPrepare);
         auto* state = state_backend_();
         if (state == nullptr)
             return;
@@ -204,7 +212,23 @@ private:
             return;  // idempotent: already finalised
         const Committable committable = deserialize(blob_of_(*stored));
         if (is_commit) {
+            // The three windows that decide whether 2PC actually holds:
+            //
+            //   before_commit          the handle is persisted and nothing
+            //                          external has happened. A death here
+            //                          must be recovered by recover_all_().
+            //   during_commit          inside the external commit. Whether
+            //                          it took effect is unknown, so the
+            //                          recovery commit MUST be idempotent.
+            //   after_external_commit  the external system has committed
+            //                          but the local handle is still
+            //                          persisted. Recovery will commit
+            //                          AGAIN - the case that only an
+            //                          idempotent commit() survives, and
+            //                          the one the brief singles out.
+            CLINK_FAULT_POINT(clink::fault::points::kSinkBeforeCommit);
             commit(committable);
+            CLINK_FAULT_POINT(clink::fault::points::kSinkAfterExternalCommit);
         } else {
             abort(committable);
         }

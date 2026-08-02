@@ -257,13 +257,13 @@ lives; evidence is in section 4.
 | W3 | Durable + race-free coordinator writes; withhold commit on marker failure | P1.10 | F1, F2 | **Done** |
 | W4 | Durable rescale snapshot write with parent verification | P1.10 | F3 | **Done** |
 | W5 | Connector capability contract + runtime/CLI manifest | P0.5 | F5 | **Partial** |
-| W6 | End-to-end delivery-guarantee analyser | P0.6 | F5 | **Partial** |
+| W6 | End-to-end delivery-guarantee analyser, enforced at submission | P0.6 | F5 | **Done** |
 | W7 | Deterministic multi-process harness | P0.1 | F7 | **Done** |
-| W8 | Fault-tolerance scenarios on the harness (gating) | P0.1 | F7 | **Partial** |
+| W8 | Fault-tolerance scenarios on the harness (gating), + sink exactly-once windows | P0.1 | F7 | **Partial** |
 | W9 | Automated sanitizers (PR subset + nightly full), blocking | P1.7 | F8 | **Done** |
 | W10 | `clink checkpoint-verify` + migration path | P1.10, P1.12 | F4 | **Done** |
-| W11 | SQL bounded-state validator | P0.3 | F9 | **Partial** |
-| W12 | State TTL depth (event-time, map/list, SQL surface, background cleanup, metrics) | P0.3 | F9 | **Open** |
+| W11 | SQL bounded-state validator, enforced in the planner | P0.3 | F9 | **Done** |
+| W12 | State TTL depth: event time, incremental cleanup, metrics, SQL retention option | P0.3 | F9 | **Partial** |
 | W13 | Strict rejection of unsupported SQL semantics | P0.4 | - | **Open** |
 | W14 | Resource and overload limits | P1.9 | - | **Open** |
 | W15 | Coordinator metadata abstraction with CAS/fencing | P1.11 | - | **Open** |
@@ -614,6 +614,149 @@ implemented: detecting non-determinism automatically (wall-clock reads,
 `RANDOM()`, HTTP calls in `ML_PREDICT`, non-deterministic UDFs), the API for
 a user to declare it, and exposure through `EXPLAIN`. The facts must
 currently be supplied by the caller.
+
+
+### W6 (continued) - the analyser now enforces
+
+**Source:** `include/clink/cluster/guarantee_gate.hpp`, `src/cluster/guarantee_gate.cpp`,
+called from `Coordinator::submit_job`.
+
+The bridge from a real `JobGraphSpec` to the analyser. Roles are derived
+from the graph's edges (no inputs = source, nothing consumes it = sink)
+rather than guessed from type names, because a `*_sink` heuristic misses
+every connector that does not follow the convention.
+
+Op type resolves to connector by **longest prefix**:
+`kafka_2pc_sink_string` must resolve to `kafka_2pc`, never `kafka`. The two
+carry different guarantees, and taking the shorter match would
+systematically over-promise - the exact failure the mechanism exists to
+prevent.
+
+The gate rejects only when the submitter ASKED for more than the pipeline
+can provide. A job that asks for nothing gets its computed guarantee
+logged and proceeds; most jobs are at-least-once and that is a legitimate
+choice, not an error.
+
+**Two things it caught in the existing suite, both genuine:**
+
+- `SqlRuntime.FileExactlyOnceSinkProducesCommittedRecords` declared
+  `delivery_guarantee='exactly_once'` with checkpointing **off**. A 2PC
+  sink commits on the coordinator's `CommitCheckpoint` broadcast, which
+  never fires without checkpointing, so the test was asking for a
+  guarantee it could not get - as its own comment admitted. Configuration
+  made coherent; the assertion is unchanged.
+- A false positive in my own declaration: `file_2pc` requires `dir`, but
+  the SQL DDL supplies `path`. Requirements now support alternatives
+  (`"dir|path"`), rendered readably as `'dir' or 'path'`.
+
+**Tests:** `tests/test_guarantee_gate.cpp`, 13 cases.
+
+### W8 (continued) - exactly-once at the sink, per crash window
+
+**Source:** fault points in `include/clink/connectors/committing_sink.hpp`;
+`tests/test_exactly_once_windows.cpp`.
+
+The multi-process suite proves a job RECOVERS. That is weaker than "each
+record reached the external system exactly once", which is what the phrase
+is usually taken to mean and what nothing in this tree asserted.
+
+These assert the output **multiset** after a crash at each window of the
+2PC choreography, using the real `CommittingSink` base over a real durable
+backend. A crash is modelled by discarding the sink and constructing a
+fresh one over the same state directory - what the runtime does after a
+worker is lost.
+
+| Window | Must guarantee | Result |
+|---|---|---|
+| before prepare | no external effect; replay commits once | pass |
+| after prepare, before the handle is persisted | staged output not visible; replay does not double it | pass |
+| after global completion, before commit | recovery MUST commit, or the records are lost | pass |
+| after the external commit, before local ack | recovery commits AGAIN; only an idempotent commit survives | pass |
+| duplicate commit broadcast, no crash | harmless | pass |
+| abort | publishes nothing; replay commits once | pass |
+| crash between two checkpoints | output is exactly the union | pass |
+
+8 cases. The fourth is the one that matters most: it is the single hardest
+case in the protocol and the only direct test that `commit()` is genuinely
+idempotent rather than merely documented as needing to be.
+
+### W11 (continued) - the bounded-state gate now enforces
+
+**Source:** `ALLOW UNBOUNDED STATE` stripped in `src/sql/preparse.cpp`
+(text level, like every other clink-only clause - a grammar fork would have
+to be re-applied on each libpg_query bump), carried on `ast::Script`,
+checked in `PhysicalPlanner::compile`, counted by
+`clink_sql_unbounded_state_overrides_total`.
+
+**Boundedness is tri-state, and that is the load-bearing decision.**
+The first cut treated an undeclared connector as unbounded. That was wrong
+and the test suite said so immediately: capability declarations cover a
+subset of the catalogue, so unknown is the COMMON case, and the gate
+rejected 19 planner tests reading plain files. A gate that cries wolf gets
+switched off wholesale, which is worse than one with a known blind spot.
+
+Only KNOWN-unbounded rejects. The blind spot shrinks as connectors are
+declared, which is the right incentive: declaring a connector strictly
+increases what the gate catches and never decreases it.
+
+The retention option is `state_ttl`, a bare identifier. `state.ttl` is a
+syntax error in PostgreSQL's WITH grammar, and the dialect already spells
+options this way (`delivery_guarantee`, `primary_key`, `commit_group`).
+
+**Tests:** `tests/test_sql_bounded_state.cpp`, 15 cases, including
+end-to-end through the planner: a windowless GROUP BY over a known
+unbounded source is refused; the same query over a file is accepted; and
+both `state_ttl` and `ALLOW UNBOUNDED STATE` unlock it.
+
+### W12 - State TTL depth — Partial
+
+**Source:** `include/clink/state/keyed_state.hpp`
+
+**Event-time TTL.** Not a nicety. A processing-time TTL is measured against
+the wall clock of the processing machine, so on a backfill - six months of
+history replayed through a job with a one-hour TTL - every entry is already
+older than the TTL the instant it is written, and the job silently produces
+nothing. Conversely a job that stalls for two hours expires state that is
+seconds old in the stream's own terms. Event time measures against the
+watermark, so retention means what a user means by it, and a replay behaves
+identically to the original run.
+
+Semantics pinned by test:
+
+- Expiry follows the watermark, not the wall clock.
+- Nothing expires before the FIRST watermark (a zero watermark would make
+  every stamped entry look expired and wipe the slot at job start).
+  `expire_before_first_watermark` opts into the other reading.
+- A watermark regression is ignored - honouring it would resurrect expired
+  state, making retention depend on arrival order.
+- A snapshot carries the ABSOLUTE stamp, so a restore resumes the same
+  deadline rather than silently extending every entry's life by the length
+  of the outage.
+- A late record targeting expired state sees nothing. Resurrecting on a
+  late arrival would make retention unbounded again.
+
+**Incremental cleanup.** `cleanup_batch(budget)` sweeps a bounded number of
+entries and erases the expired ones, resuming from where the last sweep
+stopped. This exists because lazy expiry alone never releases memory: an
+entry written once and never read again is hidden from readers but stays
+resident, so a TTL that was supposed to bound memory does not. Bounded
+because an unbounded sweep stalls the operator thread proportionally to
+state size - the latency spike a TTL'd job is trying to avoid.
+
+**Metrics.** `TtlStats`: expired-on-read, expired-in-cleanup, live entries,
+scanned entries, estimated bytes, and unscanned backlog - the backlog being
+the cleanup lag, since while it is non-zero expired state is still resident.
+
+**Tests:** `tests/test_keyed_state_ttl_depth.cpp`, 17 cases.
+
+**What makes this Partial.** Covered: keyed value state. NOT covered: map
+and list state, the SQL aggregation/join/dedup operators actually calling
+`cleanup_batch` on a timer (the mechanism exists; no operator drives it
+yet), CEP partial matches, and backend-specific compaction hooks. The SQL
+`state_ttl` option currently satisfies the bounded-state gate but is not
+yet threaded into the operators' `TtlConfig`, so it declares an intent the
+runtime does not yet enforce - the most important remaining gap in this
+item, and it is stated here rather than glossed.
 
 ---
 

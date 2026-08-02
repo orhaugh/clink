@@ -3,6 +3,8 @@
 #include <cctype>
 #include <stdexcept>
 
+#include "clink/connectors/capability.hpp"
+#include "clink/sql/catalog.hpp"
 #include "clink/sql/logical_plan.hpp"
 
 namespace clink::sql {
@@ -24,23 +26,23 @@ struct KnownUnbounded {
 constexpr KnownUnbounded kUnboundedKinds[] = {
     {"Aggregate",
      "one accumulator per group, kept for the life of the job",
-     "add a window (TUMBLE / HOP / SESSION), set 'state.ttl', or write ALLOW UNBOUNDED STATE"},
+     "add a window (TUMBLE / HOP / SESSION), set 'state_ttl', or write ALLOW UNBOUNDED STATE"},
     {"Distinct",
      "every distinct row seen so far",
-     "add a window, set 'state.ttl', or write ALLOW UNBOUNDED STATE"},
+     "add a window, set 'state_ttl', or write ALLOW UNBOUNDED STATE"},
     {"EquiJoin",
      "every row from both inputs, so either side can match a future row from the other",
-     "use an interval join (a time-bounded ON condition), set 'state.ttl', or write ALLOW "
+     "use an interval join (a time-bounded ON condition), set 'state_ttl', or write ALLOW "
      "UNBOUNDED STATE"},
     {"SemiJoin",
      "every row from the probed side",
-     "use an interval join, set 'state.ttl', or write ALLOW UNBOUNDED STATE"},
+     "use an interval join, set 'state_ttl', or write ALLOW UNBOUNDED STATE"},
     {"SetOp",
      "every row seen on both sides, to evaluate the set semantics",
-     "set 'state.ttl' or write ALLOW UNBOUNDED STATE"},
+     "set 'state_ttl' or write ALLOW UNBOUNDED STATE"},
     {"RowNumber",
      "the running row count per partition",
-     "bound the query with a window, set 'state.ttl', or write ALLOW UNBOUNDED STATE"},
+     "bound the query with a window, set 'state_ttl', or write ALLOW UNBOUNDED STATE"},
 };
 
 void walk(const LogicalPlan& node, std::vector<UnboundedStateFinding>& out) {
@@ -83,7 +85,7 @@ std::int64_t parse_retention_ms(const std::string& text) {
         ++i;
     }
     if (i == digits_begin) {
-        throw std::invalid_argument("state.ttl: '" + text +
+        throw std::invalid_argument("state_ttl: '" + text +
                                     "' does not start with a number; expected forms are "
                                     "'30s', '15m', '1h', '7d', or a bare millisecond count");
     }
@@ -91,7 +93,7 @@ std::int64_t parse_retention_ms(const std::string& text) {
     try {
         value = std::stoll(text.substr(digits_begin, i - digits_begin));
     } catch (const std::exception&) {
-        throw std::invalid_argument("state.ttl: '" + text + "' is out of range");
+        throw std::invalid_argument("state_ttl: '" + text + "' is out of range");
     }
     std::string unit;
     while (i < text.size()) {
@@ -115,8 +117,84 @@ std::int64_t parse_retention_ms(const std::string& text) {
     if (unit == "d" || unit == "day" || unit == "days") {
         return value * 24 * 60 * 60 * 1000;
     }
-    throw std::invalid_argument("state.ttl: unknown unit '" + unit + "' in '" + text +
+    throw std::invalid_argument("state_ttl: unknown unit '" + unit + "' in '" + text +
                                 "'; expected ms, s, m, h or d");
+}
+
+namespace {
+
+// Collect every scan's TableDef, walking the whole plan.
+void collect_scans(const LogicalPlan& node, std::vector<const TableDef*>& out) {
+    if (const auto* scan = dynamic_cast<const LogicalScan*>(&node)) {
+        out.push_back(&scan->table());
+    }
+    for (const auto* in : node.inputs()) {
+        if (in != nullptr) {
+            collect_scans(*in, out);
+        }
+    }
+}
+
+}  // namespace
+
+BoundedStateReport check_plan_bounded_state(const LogicalPlan& plan, bool allow_unbounded) {
+    std::vector<const TableDef*> scans;
+    collect_scans(plan, scans);
+
+    StateRetention retention;
+    retention.allow_unbounded = allow_unbounded;
+
+    // Boundedness is a TRI-state, and the distinction decides whether this
+    // gate is useful or merely annoying.
+    //
+    //   known bounded    the input ends; retention is a non-issue.
+    //   known unbounded  the input never ends; unbounded state is a real
+    //                    incident waiting to happen. REJECT.
+    //   unknown          the connector has no capability declaration.
+    //
+    // Only KNOWN-unbounded rejects. Treating unknown as unbounded was the
+    // first cut and it was wrong: capability declarations cover a subset of
+    // the connector catalogue, so unknown is the common case, and a gate
+    // that fires on it rejects ordinary correct queries (it took out 19
+    // planner tests reading plain files). A gate that cries wolf gets
+    // switched off wholesale, which is worse than one with a known blind
+    // spot.
+    //
+    // The blind spot shrinks as connectors are declared, which is the right
+    // incentive: declaring a connector strictly increases what the gate can
+    // catch, and never decreases it.
+    bool any_known_unbounded = false;
+    std::vector<std::string> unknown_connectors;
+    for (const auto* t : scans) {
+        if (t == nullptr) {
+            continue;
+        }
+        // A table may set retention directly. The shortest non-zero TTL
+        // across the plan wins: it is the one that actually bounds things.
+        if (const auto it = t->properties.find("state_ttl"); it != t->properties.end()) {
+            const auto ms = parse_retention_ms(it->second);
+            if (ms > 0 && (retention.ttl_ms == 0 || ms < retention.ttl_ms)) {
+                retention.ttl_ms = ms;
+            }
+        }
+        const auto conn = t->properties.find("connector");
+        if (conn == t->properties.end()) {
+            unknown_connectors.emplace_back("(unnamed connector)");
+            continue;
+        }
+        const auto* caps = connectors::CapabilityRegistry::instance().find(conn->second);
+        if (caps == nullptr) {
+            unknown_connectors.push_back(conn->second);
+            continue;
+        }
+        if (caps->boundedness == connectors::Boundedness::Unbounded) {
+            any_known_unbounded = true;
+        }
+    }
+
+    auto report = check_bounded_state(plan, retention, /*sources_bounded=*/!any_known_unbounded);
+    report.unknown_boundedness_connectors = std::move(unknown_connectors);
+    return report;
 }
 
 BoundedStateReport check_bounded_state(const LogicalPlan& plan,

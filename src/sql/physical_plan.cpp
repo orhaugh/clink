@@ -10,6 +10,8 @@
 #include "clink/cluster/job_graph.hpp"
 #include "clink/config/json.hpp"
 #include "clink/metrics/sql_metrics.hpp"
+#include "clink/runtime/log_buffer.hpp"
+#include "clink/sql/bounded_state.hpp"
 #include "clink/sql/column_lineage.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
@@ -2435,6 +2437,34 @@ cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
     // so this must run first. A well-formed plan never trips it; it converts a
     // mid-rewrite optimizer failure (null slot) into a clean error, not a crash.
     require_no_null_children(root);
+
+    // Bounded-state gate. Runs before any compilation work: a query that
+    // will exhaust the worker should be refused at plan time, not after
+    // it has been deployed and has spent an afternoon growing.
+    //
+    // A windowless GROUP BY over an unbounded source keeps one accumulator
+    // per group for the life of the job; SELECT DISTINCT keeps every
+    // distinct row it has ever seen; an unwindowed join keeps both sides.
+    // Over a bounded input all three are fine, which is why the gate asks
+    // about the sources rather than banning the constructs.
+    {
+        auto report = check_plan_bounded_state(root, allow_unbounded_state_);
+        if (!report.ok()) {
+            // -1: the finding is about the plan as a whole, not a source
+            // position, and inventing one would point somewhere wrong.
+            throw TranslationError(report.error_message(), /*cursor_position=*/-1);
+        }
+        if (report.used_unsafe_override) {
+            // Prominent, and counted. An operator needs to be able to find
+            // every job on their cluster that is running without a bound.
+            clink::metrics::sql::unbounded_state_override();
+            clink::log::warn(
+                "sql.bounded_state",
+                "this query runs with ALLOW UNBOUNDED STATE: its state is not bounded by a "
+                "window, a TTL, or a finite input, and will grow for as long as the job runs");
+        }
+    }
+
     // Determine the channel from the source side first; cross-check
     // against the sink so users get a clear error before deploy time.
     Channel ch = decide_channel(root);

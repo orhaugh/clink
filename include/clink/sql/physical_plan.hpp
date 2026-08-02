@@ -55,8 +55,14 @@ public:
     // the runner. Default off keeps the in-memory aggregate path unchanged.
     void set_async_state_for_aggregation(bool v) noexcept { async_state_for_aggregation_ = v; }
 
+    // Opt out of the bounded-state gate for this statement. Set from the
+    // script's `ALLOW UNBOUNDED STATE` clause. Deliberately not a
+    // constructor default: a caller has to reach for it.
+    void set_allow_unbounded_state(bool v) noexcept { allow_unbounded_state_ = v; }
+
 private:
     bool async_state_for_aggregation_ = false;
+    bool allow_unbounded_state_ = false;
 };
 
 // The Row-channel source factory + build params to scan `table` in process (for

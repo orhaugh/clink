@@ -435,6 +435,7 @@ add_library(clink_core STATIC
     src/cluster/refresh_scheduler.cpp
     src/cluster/dag_builder_registry.cpp
     src/cluster/built_in_factories.cpp
+    src/cluster/guarantee_gate.cpp
     src/cluster/plugin_loader.cpp
     src/cluster/plugin_cache.cpp
     src/lineage/lineage_graph.cpp
@@ -912,6 +913,7 @@ if(CLINK_BUILD_SQL)
     add_library(clink_sql STATIC
         src/sql/parser.cpp
         src/sql/preparse.cpp
+        src/sql/bounded_state.cpp
         src/sql/ast_builder.cpp
         src/sql/type.cpp
         src/sql/catalog.cpp

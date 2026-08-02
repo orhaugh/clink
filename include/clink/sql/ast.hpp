@@ -705,6 +705,13 @@ struct ExplainStmt {
 // the AST captures whatever the parser saw.
 struct Script {
     std::vector<Statement> statements;
+
+    // clink extension: the script carried a trailing
+    // `ALLOW UNBOUNDED STATE`, opting out of the bounded-state gate.
+    // Carried on the Script rather than a statement because the
+    // pre-parser strips it at text level before libpg_query sees it, so
+    // there is no grammar node to hang it on. See preparse.hpp.
+    bool allow_unbounded_state{false};
 };
 
 }  // namespace clink::sql::ast

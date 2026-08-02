@@ -787,6 +787,13 @@ private:
     void start_reader_for_(std::shared_ptr<WorkerConnection> worker);
     void watchdog_loop_();
     void mark_worker_lost_locked_(WorkerConnection& worker);
+
+    // Fold a re-registered worker's PREVIOUS session's in-flight subtasks
+    // into any restart drain that is waiting on them. The old process is
+    // gone, so those subtasks can never report; without this the drain
+    // waits out its deadline and fails a job that was recovering.
+    // Takes the lock itself (called from the register path, outside it).
+    void retire_previous_session_subtasks_(const std::string& worker_id);
     void send_peer_updates_locked_(JobState& job);
     void signal_job_completion_locked_(JobState& job);
     // After every surviving-worker subtask of `job` has drained on

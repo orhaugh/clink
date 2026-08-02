@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/guarantee_gate.hpp"
 #include "clink/cluster/job_bundle.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/job_planner.hpp"
@@ -729,6 +730,24 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
         }
         log::info("coordinator.register",
                   "worker=" + reg.worker_id + " re-registered; previous session retired");
+        // Retiring the session is not enough: whatever the OLD process had
+        // in flight for a job can never report now, and any restart drain
+        // waiting on those subtasks would wait until its deadline and then
+        // fail the job.
+        //
+        // This is how a restarted worker deadlocked recovery. A worker dies,
+        // the coordinator starts a restart drain, an external supervisor
+        // brings the worker back under the SAME id (which is correct - the id
+        // must be stable for the coordinator to recognise it), and the drain
+        // is now waiting on a subtask whose owning PROCESS no longer exists.
+        // The re-registered worker is alive and heartbeating, so the watchdog
+        // never declares it lost and never folds it in.
+        //
+        // The same treatment a lost worker's subtasks get: drop them from the
+        // expected-drain set and queue them for redeploy. No restart attempt
+        // is consumed - this is still the same restart, now correctly aware
+        // that one of the survivors it was waiting for has been replaced.
+        retire_previous_session_subtasks_(reg.worker_id);
     }
     cv_.notify_all();
 
@@ -1654,6 +1673,19 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
     // sets a non-empty URI and wins; an empty default preserves the legacy
     // resolution (empty -> memory, bare checkpoint_dir -> file).
     apply_default_state_backend(checkpoint, cfg_.default_state_backend_uri);
+
+    // Delivery-guarantee gate. Runs AFTER the default state backend has
+    // been resolved, because durability is one of its inputs and an
+    // unresolved empty URI would be analysed as the wrong thing.
+    //
+    // This rejects only when the submitter ASKED for a guarantee the
+    // pipeline cannot provide. A job that asks for nothing gets its
+    // computed guarantee logged and proceeds - most jobs are at-least-once
+    // and that is a legitimate choice, not an error.
+    if (auto reject = check_delivery_guarantee(graph, checkpoint, /*out_report=*/nullptr);
+        !reject.empty()) {
+        throw std::runtime_error(reject);
+    }
     // Use the bundle's OperatorRegistry (parent-fallback to default
     // singleton for built-ins) when one is provided so the planner's
     // chain-eligibility check can find inline-lambda ops registered by
@@ -2448,6 +2480,50 @@ void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
     log::warn("coordinator.watchdog", "worker lost: " + worker.worker_id);
     events::publish("coordinator.worker_lost",
                     "{\"worker_id\":" + js_quote(worker.worker_id) + "}");
+}
+
+// A worker re-registered under an id that already had a live session. The
+// previous PROCESS is gone, so anything it had in flight can never report.
+// Fold those subtasks into an in-progress restart drain exactly as
+// mark_worker_lost_locked_ does for a lost worker; without this the drain
+// waits on a subtask whose owner no longer exists, hits its deadline, and
+// fails a job that was recovering perfectly well.
+void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id) {
+    std::vector<JobId> folded;
+    {
+        std::lock_guard lock(mu_);
+        for (auto& [_, job] : jobs_) {
+            auto it = job->pending_per_worker.find(worker_id);
+            if (it == job->pending_per_worker.end() || it->second.empty()) {
+                continue;
+            }
+            if (!job->awaiting_restart || job->completion_signalled || job->cancel_requested) {
+                continue;
+            }
+            for (const auto& [role, sub] : it->second) {
+                const std::string k = role + ":" + std::to_string(sub);
+                job->restart_drain_expected.erase(k);
+                job->restart_drained_keys.erase(k);
+                job->restart_pending.emplace_back(role, sub);
+            }
+            log::warn("coordinator.register",
+                      "job_id=" + std::to_string(job->id) + " worker=" + worker_id +
+                          " re-registered mid-restart-drain; folded " +
+                          std::to_string(it->second.size()) +
+                          " subtask(s) from the retired session into the pending restart, "
+                          "drain_expected=" +
+                          std::to_string(job->restart_drain_expected.size()));
+            it->second.clear();
+            folded.push_back(job->id);
+        }
+    }
+    // The drain may now be empty, which is the condition that fires the
+    // redeploy. The watchdog checks that on its next tick; nudge it so
+    // recovery does not wait a whole interval for a state change that has
+    // already happened.
+    if (!folded.empty()) {
+        cv_.notify_all();
+    }
 }
 
 std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobState& job) {
