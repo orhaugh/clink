@@ -869,19 +869,98 @@ cleanup releases rather than hides, keys expire independently, restore
 resumes the original deadline, and nothing expires before the first
 watermark.
 
+**CEP partial matches.** `cep_operator.hpp` and `pattern.hpp` both said
+"without within(), partials live indefinitely". A pattern whose first step
+matches often and whose later steps rarely complete accumulates one partial
+per unmatched start, for ever - the same unbounded shape the SQL gate
+refuses for a windowless GROUP BY, in a surface the gate cannot see.
+
+`Pattern::state_ttl()` bounds it, reusing the existing prune-on-watermark
+machinery (which already routes evicted partials to the timed-out side
+output and erases keys whose partial list empties). `eviction_bound()`
+returns the tighter of the two.
+
+The distinction between the bounds is enforced, not just documented:
+
+| | `within()` | `state_ttl()` |
+|---|---|---|
+| kind | semantic | resource |
+| binds at match time | yes | **no** |
+| prunes on watermark | yes | yes |
+
+`within()` binds at match time because a match spanning more than the bound
+IS NOT A MATCH. A resource bound must not do that, or results would depend
+on where watermarks happen to fall between records. A TTL can nonetheless
+suppress a match that would have completed - which is why an evicted
+partial reaches the timed-out side output, making the loss visible rather
+than silent.
+
+**Backend expiry-compaction hook.** `cleanup_batch` scans. On an LSM
+backend that is the wrong shape twice: the scan competes with the write
+path, and the backend is already rewriting every live SST during
+compaction, so it can drop expired entries for free while it is there.
+
+`StateBackend` gains `supports_expiry_compaction` / `set_expiry_filter` /
+`compact_expired`; `KeyedState` delegates when the backend can and keeps
+its scan as the portable fallback. RocksDB implements it via a
+`CompactionFilterFactory` - a factory rather than a filter because CFs are
+created lazily per operator while the TTL is only known once an operator
+binds its state.
+
+Two things had to happen before the filter saw anything, and finding them
+is what makes this a real implementation rather than an interface with a
+fake behind it: **drain the pending WriteBatch** (this backend buffers
+Puts) and **flush the MemTable** (a filter is only consulted on SST
+contents, and the write buffer is 64 MB). Missing either makes the hook
+silently no-op on exactly the recent state retention is meant to reclaim,
+while appearing to work in a long-running job where memtables flush on
+their own. The RocksDB test forces a real compaction and asserts the dead
+entries are gone and the live ones are not.
+
+The predicate is scoped to its own operator AND its own slot: a slot with
+no TTL must not have its first eight bytes read as a deadline, or the
+filter would drop live state belonging to something else.
+
+**Per-element expiry.** `ExpiringMapState` / `ExpiringListState`
+(`expiring_collection_state.hpp`) give each element its own backend entry
+and therefore its own deadline. Added ALONGSIDE the per-key types rather
+than replacing them, because the trade-off is real and neither answer is
+right for every case:
+
+| | `typed_state.hpp` | `expiring_collection_state.hpp` |
+|---|---|---|
+| representation | one value per key | one entry per element |
+| expiry granularity | per key | per element |
+| read one element | O(collection) | O(1) |
+| read whole collection | O(1) backend read | **O(slot) scan** |
+| write one element | O(collection) read-modify-write | O(1) |
+
+The O(slot) whole-collection read is the price, and it is stated in the
+header rather than discovered later. List elements are discriminated by a
+big-endian sequence so insertion order survives, and the high-water
+sequence is recovered from stored keys on the first append after a restart
+- without that, the first append would reuse seq 0 and overwrite the
+oldest surviving element.
+
+**Tests:** `test_cep_state_ttl.cpp` (9), `test_expiry_compaction.cpp` (9)
+plus two real-RocksDB cases, `test_expiring_collection_state.cpp` (15).
+`PerKeyAndPerElementDifferObservably` runs the same workload through both
+collection types and asserts they behave differently, so the choice between
+them stays a real choice rather than a coin flip.
+
 **What makes this Partial.** NOT covered:
 
-- CEP partial matches.
-- Backend-specific compaction hooks.
-- Per-element expiry within a collection (see above).
 - The interval join and windowed operators, which are bounded by their
   time condition or window and so are not flagged by the gate - correct
   today, but they would still benefit from a retention ceiling on a
   pathological key space.
-- No operator currently drives `cleanup_batch` on a collection slot; the
-  method is exposed and tested, but a user of `ListState` must call it
-  themselves. The SQL operators drive their own eviction; the typed C++
-  API leaves the schedule to the caller.
+- No operator drives `cleanup_batch` on a collection slot; the method is
+  exposed and tested, but a user of `ListState` must call it themselves.
+  The SQL operators drive their own eviction; the typed C++ API leaves the
+  schedule to the caller.
+- The expiry-compaction hook is implemented for RocksDB only. ForSt and the
+  S3-backed variants inherit the default (no hook), so they fall back to
+  scanning - correct, just slower to give memory back.
 
 ---
 

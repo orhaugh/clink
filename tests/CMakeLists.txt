@@ -171,6 +171,7 @@ add_executable(clink_core_tests
     test_keyed_state_ttl_depth.cpp
     test_typed_state_ttl.cpp
     test_expiry_compaction.cpp
+    test_expiring_collection_state.cpp
     test_async_map_operator.cpp
     test_dag_iteration.cpp
     test_process_function.cpp
