@@ -137,11 +137,54 @@ void collect_scans(const LogicalPlan& node, std::vector<const TableDef*>& out) {
 
 }  // namespace
 
+StateRetention resolve_plan_retention(const LogicalPlan& plan) {
+    std::vector<const TableDef*> scans;
+    collect_scans(plan, scans);
+    StateRetention retention;
+    for (const auto* t : scans) {
+        if (t == nullptr) {
+            continue;
+        }
+        const auto it = t->properties.find("state_ttl");
+        if (it == t->properties.end()) {
+            continue;
+        }
+        const auto ms = parse_retention_ms(it->second);
+        // Shortest non-zero wins: it is the one that actually bounds
+        // things. Taking the longest would let a generous setting on one
+        // table silently relax a strict one on another.
+        if (ms > 0 && (retention.ttl_ms == 0 || ms < retention.ttl_ms)) {
+            retention.ttl_ms = ms;
+        }
+    }
+    return retention;
+}
+
+bool plan_retention_uses_event_time(const LogicalPlan& plan) {
+    std::vector<const TableDef*> scans;
+    collect_scans(plan, scans);
+    for (const auto* t : scans) {
+        if (t == nullptr) {
+            continue;
+        }
+        if (const auto it = t->properties.find("state_ttl_domain"); it != t->properties.end()) {
+            // Any table asking for processing time gets it: mixing domains
+            // within one operator is not representable, and the
+            // processing-time reading is the one that still expires
+            // something on a stream with no watermarks.
+            if (it->second == "processing_time") {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 BoundedStateReport check_plan_bounded_state(const LogicalPlan& plan, bool allow_unbounded) {
     std::vector<const TableDef*> scans;
     collect_scans(plan, scans);
 
-    StateRetention retention;
+    StateRetention retention = resolve_plan_retention(plan);
     retention.allow_unbounded = allow_unbounded;
 
     // Boundedness is a TRI-state, and the distinction decides whether this
@@ -168,14 +211,6 @@ BoundedStateReport check_plan_bounded_state(const LogicalPlan& plan, bool allow_
     for (const auto* t : scans) {
         if (t == nullptr) {
             continue;
-        }
-        // A table may set retention directly. The shortest non-zero TTL
-        // across the plan wins: it is the one that actually bounds things.
-        if (const auto it = t->properties.find("state_ttl"); it != t->properties.end()) {
-            const auto ms = parse_retention_ms(it->second);
-            if (ms > 0 && (retention.ttl_ms == 0 || ms < retention.ttl_ms)) {
-                retention.ttl_ms = ms;
-            }
         }
         const auto conn = t->properties.find("connector");
         if (conn == t->properties.end()) {

@@ -263,7 +263,7 @@ lives; evidence is in section 4.
 | W9 | Automated sanitizers (PR subset + nightly full), blocking | P1.7 | F8 | **Done** |
 | W10 | `clink checkpoint-verify` + migration path | P1.10, P1.12 | F4 | **Done** |
 | W11 | SQL bounded-state validator, enforced in the planner | P0.3 | F9 | **Done** |
-| W12 | State TTL depth: event time, incremental cleanup, metrics, SQL retention option | P0.3 | F9 | **Partial** |
+| W12 | State TTL depth: event time, incremental cleanup, metrics, SQL `state_ttl` enforced by GROUP BY | P0.3 | F9 | **Partial** |
 | W13 | Strict rejection of unsupported SQL semantics | P0.4 | - | **Open** |
 | W14 | Resource and overload limits | P1.9 | - | **Open** |
 | W15 | Coordinator metadata abstraction with CAS/fencing | P1.11 | - | **Open** |
@@ -749,14 +749,63 @@ the cleanup lag, since while it is non-zero expired state is still resident.
 
 **Tests:** `tests/test_keyed_state_ttl_depth.cpp`, 17 cases.
 
-**What makes this Partial.** Covered: keyed value state. NOT covered: map
-and list state, the SQL aggregation/join/dedup operators actually calling
-`cleanup_batch` on a timer (the mechanism exists; no operator drives it
-yet), CEP partial matches, and backend-specific compaction hooks. The SQL
-`state_ttl` option currently satisfies the bounded-state gate but is not
-yet threaded into the operators' `TtlConfig`, so it declares an intent the
-runtime does not yet enforce - the most important remaining gap in this
-item, and it is stated here rather than glossed.
+**`state_ttl` is now enforced by the running GROUP BY.** The option used to
+satisfy the gate and change nothing at runtime - an intent nothing acted
+on, which is worse than declaring nothing. The path is now complete:
+
+```
+CREATE TABLE src (...) WITH (connector='kafka', state_ttl='1h')
+  -> resolve_plan_retention()      shortest non-zero TTL across the inputs
+  -> op.params["state_ttl_ms"]     stamped on the aggregate_row spec
+  -> AggregateRowOp(state_ttl_ms)  deadline per group, evicted on watermark
+```
+
+**Why the deadline lives in the operator and not in `KeyedState`'s own
+`TtlConfig`.** This operator's hot path is an in-memory map that is flushed
+into the "agg" slot at every checkpoint. A `KeyedState` TTL stamps on every
+put, so each flush would refresh the deadline and a group touched once
+would nonetheless live for ever - the TTL would appear to work while
+bounding nothing. The operator owns the deadline, so a group's clock starts
+when the DATA last touched it, not when the checkpoint last wrote it.
+
+Deadlines persist in their own `agg_ttl` slot rather than inside
+`AggBucket`: additive, so no existing checkpoint's bucket encoding changes,
+and a job that sets no retention writes nothing extra. They are absolute,
+so a restored group resumes its original deadline instead of getting a
+fresh full TTL - otherwise every restart would silently extend retention,
+and a job that restarts often would never expire anything.
+
+Eviction is driven by watermark advance rather than only at checkpoint
+time, so a running job reclaims memory as it goes.
+
+`state_ttl_domain` selects the clock, defaulting to `event_time`. A stream
+with no watermarks must say `processing_time`; under event time, nothing
+expires until the first watermark arrives, matching `KeyedState`'s rule so
+the two cannot disagree.
+
+**Tests:** `tests/test_sql_state_ttl_runtime.cpp`, 8 cases driving the real
+operator through the registry. The load-bearing one asserts that an expired
+group's accumulator is RELEASED, not merely hidden: it feeds a key, expires
+it, feeds it again, and requires the running total to restart from zero. An
+aggregate that stops reporting a group while still holding its accumulator
+has bounded nothing, and only this distinguishes the two.
+
+**What makes this Partial.** Covered: keyed value state, and the SQL
+windowless GROUP BY end to end. NOT covered:
+
+- **Distinct, joins, semi-joins, set operations, RowNumber.** The gate
+  flags all of them; only `Aggregate` enforces. The planner resolves the
+  retention for any plan, so extending each is a matter of accepting the
+  two params and reusing the same deadline/evict pattern - but none of it
+  is done, and a `state_ttl` on a query whose only unbounded construct is a
+  DISTINCT currently satisfies the gate without bounding anything. That is
+  the same defect this item just fixed for GROUP BY, still present for the
+  other five node kinds.
+- Map and list state.
+- CEP partial matches.
+- Backend-specific compaction hooks.
+- `KeyedState::cleanup_batch` exists and is tested, but no operator drives
+  it on a timer; the GROUP BY evicts through its own deadline map instead.
 
 ---
 

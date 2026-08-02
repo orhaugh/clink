@@ -4201,13 +4201,17 @@ public:
                    std::vector<AggSpec> aggregates,
                    std::vector<std::string> group_key_outputs = {},
                    bool async_state = false,
-                   bool emit_changelog = false)
+                   bool emit_changelog = false,
+                   std::int64_t state_ttl_ms = 0,
+                   bool ttl_event_time = true)
         : group_keys_(std::move(group_keys)),
           aggregates_(std::move(aggregates)),
           group_key_outputs_(intern_names(group_key_outputs)),
           async_state_(async_state),
           effective_async_state_(async_state),
-          emit_changelog_(emit_changelog) {
+          emit_changelog_(emit_changelog),
+          state_ttl_ms_(state_ttl_ms),
+          ttl_event_time_(ttl_event_time) {
         if (group_key_outputs_.size() != group_keys_.size()) {
             // default: emit each key under its raw name
             group_key_outputs_ = intern_names(group_keys_);
@@ -4225,6 +4229,25 @@ public:
             }
         }
         columnar_needed_.push_back(std::string{kRowKindField});
+    }
+
+    // Event-time retention is driven from here: the watermark IS the clock,
+    // so an advance is exactly when a group can newly become expired.
+    // Evicting on the watermark (rather than only at checkpoint time) means
+    // a running job reclaims memory as it goes, which is the whole point of
+    // asking for a TTL.
+    void on_watermark(Watermark wm, Emitter<Row>& out) override {
+        if (ttl_enabled_()) {
+            const auto ts = wm.timestamp().millis();
+            // Monotonic: a regression must not resurrect expired groups, so
+            // the clock only ever moves forward. Same rule as KeyedState.
+            if (!seen_watermark_ || ts > last_watermark_ms_) {
+                last_watermark_ms_ = ts;
+                seen_watermark_ = true;
+            }
+            ttl_evict_();
+        }
+        Operator<Row, Row>::on_watermark(wm, out);
     }
 
     void process(const StreamElement<Row>& element, Emitter<Row>& out) override {
@@ -4507,6 +4530,10 @@ public:
             keyed_state_().scan(
                 [&](const std::string& key, const AggBucket& bucket) { state_[key] = bucket; });
         }
+        // Deadlines are absolute, so a restored group resumes its original
+        // expiry rather than getting a fresh full TTL. Without this a job
+        // that restarts often would never expire anything.
+        restore_ttl_();
         // WS3: within-batch group-by is eligible only for append-mode GROUP BY
         // whose every aggregate is batch-foldable (commutative, no per-value
         // memory). Static decision; the per-batch insert-only check is in
@@ -4776,9 +4803,18 @@ private:
         if (persist_inmem_) {
             dirty_.insert(key);
         }
+        // Retention is refreshed by DATA touching the group, and this is
+        // the one place every write path funnels through. Note it is
+        // outside the persist_inmem_ guard: the async/KeyedState path holds
+        // its buckets in the backend but still needs deadlines.
+        ttl_touch_(key);
     }
 
     void flush_dirty_() {
+        // Deadlines flush even when the buckets do not: the async path
+        // keeps its buckets in the backend already, but its deadlines live
+        // here and would be lost on a restart without this.
+        flush_ttl_dirty_();
         if (!persist_inmem_ || dirty_.empty()) {
             return;
         }
@@ -4800,9 +4836,157 @@ private:
             "agg", clink::string_codec(), agg_bucket_codec());
     }
 
+    // --- state_ttl -------------------------------------------------------
+    //
+    // Retention for a windowless GROUP BY, which otherwise keeps one
+    // accumulator per group for the life of the job. The SQL gate refuses
+    // such a query over an unbounded source unless the table declares
+    // `state_ttl`; this is where that declaration is actually enforced.
+    //
+    // Why the deadline lives HERE and not in KeyedState's own TtlConfig:
+    // this operator's hot path is the in-memory `state_` map, which is
+    // flushed into the "agg" slot at every checkpoint. A KeyedState TTL
+    // stamps on every put, so each flush would refresh the deadline and a
+    // group touched once would nonetheless live for ever. The operator
+    // owns the deadline, so a group's clock starts when the DATA last
+    // touched it, not when the checkpoint last wrote it.
+    //
+    // Deadlines persist in their own slot rather than inside AggBucket:
+    // additive, so no existing checkpoint's bucket encoding changes, and a
+    // job that never sets state_ttl writes nothing extra.
+    KeyedState<std::string, std::int64_t> deadline_state_() {
+        return this->runtime()->template keyed_state<std::string, std::int64_t>(
+            "agg_ttl", clink::string_codec(), clink::int64_codec());
+    }
+
+    [[nodiscard]] bool ttl_enabled_() const noexcept { return state_ttl_ms_ > 0; }
+
+    // The clock this operator's TTL runs on. nullopt means "event time has
+    // not started", and nothing can be judged expired against a clock that
+    // has not started - the same rule KeyedState applies, kept identical so
+    // the two cannot disagree.
+    [[nodiscard]] std::optional<std::int64_t> ttl_now_() const {
+        if (!ttl_event_time_) {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        }
+        return seen_watermark_ ? std::optional<std::int64_t>{last_watermark_ms_} : std::nullopt;
+    }
+
+    // Record that `key` was touched by data now. Called from every write
+    // path, so a live group keeps its deadline pushed out.
+    void ttl_touch_(const std::string& key) {
+        if (!ttl_enabled_()) {
+            return;
+        }
+        const auto now = ttl_now_();
+        if (!now.has_value()) {
+            // No event time yet. Stamp nothing: a deadline computed from a
+            // zero watermark would place the group in 1970 and evict it on
+            // the first watermark that arrives.
+            return;
+        }
+        deadlines_[key] = *now + state_ttl_ms_;
+        ttl_dirty_.insert(key);
+    }
+
+    // Evict every group whose deadline has passed, from the in-memory map,
+    // the deadline map, and both backing slots. Driven by watermark
+    // advance (event time) or by the same hook on a wall clock, so a job
+    // that is receiving data reclaims memory as it goes rather than only
+    // at checkpoint time.
+    void ttl_evict_() {
+        if (!ttl_enabled_() || deadlines_.empty()) {
+            return;
+        }
+        const auto now = ttl_now_();
+        if (!now.has_value()) {
+            return;
+        }
+        std::vector<std::string> doomed;
+        for (const auto& [key, deadline] : deadlines_) {
+            if (deadline <= *now) {
+                doomed.push_back(key);
+            }
+        }
+        if (doomed.empty()) {
+            return;
+        }
+        // Serving lock: a queryable-state lookup must not observe the map
+        // mid-erase (the same discipline the fold paths use).
+        std::lock_guard serving_lock(serving_mu_);
+        const bool have_backend =
+            this->runtime() != nullptr && this->runtime()->has_state_backend();
+        std::optional<KeyedState<std::string, AggBucket>> agg;
+        std::optional<KeyedState<std::string, std::int64_t>> dl;
+        if (have_backend) {
+            agg.emplace(keyed_state_());
+            dl.emplace(deadline_state_());
+        }
+        for (const auto& key : doomed) {
+            state_.erase(key);
+            deadlines_.erase(key);
+            dirty_.erase(key);
+            ttl_dirty_.erase(key);
+            if (have_backend) {
+                agg->erase(key);
+                dl->erase(key);
+            }
+            ++ttl_expired_groups_;
+        }
+    }
+
+    // Persist the deadlines touched since the last flush. Runs alongside
+    // flush_dirty_ so a restore sees deadlines consistent with the buckets
+    // they belong to.
+    void flush_ttl_dirty_() {
+        if (!ttl_enabled_() || ttl_dirty_.empty() || this->runtime() == nullptr ||
+            !this->runtime()->has_state_backend()) {
+            return;
+        }
+        auto dl = deadline_state_();
+        for (const auto& key : ttl_dirty_) {
+            if (const auto it = deadlines_.find(key); it != deadlines_.end()) {
+                dl.put(key, it->second);
+            }
+        }
+        ttl_dirty_.clear();
+    }
+
+    // Reload deadlines after a restore. The stored value is ABSOLUTE, so a
+    // group resumes its original deadline rather than getting a fresh full
+    // TTL - otherwise every restart would silently extend retention by up
+    // to one TTL, and a job that restarts often would never expire.
+    void restore_ttl_() {
+        if (!ttl_enabled_() || this->runtime() == nullptr ||
+            !this->runtime()->has_state_backend()) {
+            return;
+        }
+        deadline_state_().scan([&](const std::string& key, const std::int64_t& deadline) {
+            deadlines_[key] = deadline;
+        });
+    }
+
+public:
+    // Groups evicted by retention so far. Read by the TTL tests and
+    // available for metrics reporting.
+    [[nodiscard]] std::uint64_t ttl_expired_groups() const noexcept { return ttl_expired_groups_; }
+    [[nodiscard]] std::size_t live_group_count() const noexcept { return state_.size(); }
+
+private:
     std::vector<std::string> group_keys_;
     std::vector<AggSpec> aggregates_;
     std::vector<clink::config::InternedName> group_key_outputs_;
+    // Retention (0 = off) and the clock it runs on. Set from the table's
+    // `state_ttl` / `state_ttl_domain` options via the physical planner.
+    std::int64_t state_ttl_ms_ = 0;
+    bool ttl_event_time_ = true;
+    std::int64_t last_watermark_ms_ = 0;
+    bool seen_watermark_ = false;
+    std::unordered_map<std::string, std::int64_t> deadlines_;
+    std::unordered_set<std::string> ttl_dirty_;
+    std::uint64_t ttl_expired_groups_ = 0;
     bool async_state_ = false;
     // Effective decision: async_state_ OR the bound backend can defer reads.
     // Seeded from async_state_ in the ctor and finalised in open() once the
@@ -10768,11 +10952,19 @@ void install(clink::plugin::PluginRegistry& reg) {
             // (set by the planner when this aggregate feeds a retraction-aware
             // consumer) instead of an append snapshot. Default off.
             const bool emit_changelog = ctx.param_or("emit_changelog", "false") == "true";
+            // state_ttl_ms / state_ttl_domain: retention resolved by the
+            // planner from the tables' `state_ttl` option. Absent = no
+            // retention, which is the historic behaviour.
+            const auto state_ttl_ms = ctx.param_int64_or("state_ttl_ms", 0);
+            const bool ttl_event_time =
+                ctx.param_or("state_ttl_domain", "event_time") != "processing_time";
             return std::make_shared<AggregateRowOp>(std::move(group_keys),
                                                     std::move(aggregates),
                                                     std::move(group_key_outputs),
                                                     async_state,
-                                                    emit_changelog);
+                                                    emit_changelog,
+                                                    state_ttl_ms,
+                                                    ttl_event_time);
         });
 
     // project_row: per-row expression evaluation. The 'outputs' param

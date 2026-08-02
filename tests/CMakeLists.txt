@@ -420,6 +420,7 @@ if(CLINK_BUILD_SQL)
         test_sql_row.cpp
         test_sql_runtime.cpp
         test_sql_bounded_state.cpp
+        test_sql_state_ttl_runtime.cpp
         test_columnar_split.cpp
         test_key_routing_parity.cpp
         test_json_columnar_decode.cpp

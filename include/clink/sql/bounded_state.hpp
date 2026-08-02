@@ -113,6 +113,24 @@ struct BoundedStateReport {
 [[nodiscard]] BoundedStateReport check_plan_bounded_state(const LogicalPlan& plan,
                                                           bool allow_unbounded);
 
+// Resolve the retention this plan's tables declare, without gating.
+//
+// The physical planner needs the same answer the gate computes, because
+// the number has to reach the operators that will enforce it - a retention
+// that satisfies the gate but never reaches the runtime declares an intent
+// nothing acts on, which is worse than declaring nothing.
+//
+// The SHORTEST non-zero `state_ttl` across the plan's tables wins: it is
+// the one that actually bounds things, and picking the longest would let a
+// generous setting on one table silently relax a strict one on another.
+[[nodiscard]] StateRetention resolve_plan_retention(const LogicalPlan& plan);
+
+// Which clock a resolved retention is measured against, from the tables'
+// `state_ttl_domain` option. Default event time: a processing-time TTL on
+// a backfill expires everything the instant it is written. A stream with
+// no watermarks must say `state_ttl_domain='processing_time'`.
+[[nodiscard]] bool plan_retention_uses_event_time(const LogicalPlan& plan);
+
 // True when this node kind retains per-key state for the life of the job.
 // Exposed so EXPLAIN can annotate the same nodes the gate looks at.
 [[nodiscard]] bool retains_unbounded_state(const std::string& node_kind);

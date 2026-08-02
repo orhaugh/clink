@@ -12,6 +12,7 @@
 // pin each of those four routes plus the shape of the diagnostic, because
 // a rejection a user cannot act on is only marginally better than silence.
 
+#include <map>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -39,6 +40,10 @@ namespace {
 // Supplying the fact under test is the point.
 void ensure_sql_installed_for_bounded_state_tests() {
     static const bool once = [] {
+        // Built-ins first: install() registers Row-channel operators, and
+        // register_operator<In,Out> throws unless register_type<Row> has
+        // already run.
+        clink::cluster::ensure_built_ins_registered();
         clink::plugin::PluginRegistry reg;
         clink::sql::install(reg);
         clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
@@ -244,6 +249,105 @@ TEST(SqlBoundedState, TheOverrideClauseUnlocksTheSameUnboundedQuery) {
                   "INSERT INTO dst SELECT k, SUM(v) FROM src GROUP BY k ALLOW UNBOUNDED STATE"),
               "")
         << "the documented escape hatch does not work";
+}
+
+// --- state_ttl reaches the operator ------------------------------------------
+
+namespace {
+
+// Compile and return the emitted aggregate op's params, so a test can
+// assert what the RUNTIME will actually be told.
+std::map<std::string, std::string> aggregate_params(const std::string& ddl,
+                                                    const std::string& query) {
+    clink::cluster::ensure_built_ins_registered();
+    ensure_sql_installed_for_bounded_state_tests();
+    Catalog cat;
+    for (const auto& st : parse(ddl).statements) {
+        if (const auto* ct = std::get_if<ast::CreateTableStmt>(&st)) {
+            cat.register_table(*ct);
+        }
+    }
+    const auto script = parse(query);
+    const Binder binder(cat);
+    auto plan = binder.bind_insert(std::get<ast::InsertStmt>(script.statements.front()));
+    PhysicalPlanner planner;
+    planner.set_allow_unbounded_state(script.allow_unbounded_state);
+    const auto spec = planner.compile(*dynamic_cast<const LogicalSink*>(plan.get()));
+    for (const auto& op : spec.ops) {
+        if (op.type == "aggregate_row") {
+            return op.params;
+        }
+    }
+    return {};
+}
+
+const char* kKafkaSrcWithTtl =
+    "CREATE TABLE src (k BIGINT, v BIGINT) WITH (connector='kafka', format='json', topic='t', "
+    "bootstrap_servers='localhost:9092', state_ttl='1h');"
+    "CREATE TABLE dst (k BIGINT, s BIGINT) WITH (connector='file', format='json', path='/tmp/o');";
+
+}  // namespace
+
+TEST(SqlBoundedState, StateTtlReachesTheAggregateOperatorNotJustTheGate) {
+    // The gap this closes: `state_ttl` used to satisfy the gate and change
+    // nothing at runtime, declaring an intent nothing acted on. The
+    // operator has to be TOLD.
+    const auto params =
+        aggregate_params(kKafkaSrcWithTtl, "INSERT INTO dst SELECT k, SUM(v) FROM src GROUP BY k");
+    ASSERT_FALSE(params.empty()) << "no aggregate_row operator was emitted";
+    ASSERT_TRUE(params.count("state_ttl_ms")) << "the aggregate was not given the retention, so "
+                                                 "the declared TTL would do nothing at runtime";
+    EXPECT_EQ(params.at("state_ttl_ms"), "3600000");
+    // Event time by default: a processing-time TTL on a backfill expires
+    // everything the instant it is written.
+    EXPECT_EQ(params.at("state_ttl_domain"), "event_time");
+}
+
+TEST(SqlBoundedState, TheDomainIsSelectableAndProcessingTimeIsHonoured) {
+    const std::string ddl =
+        "CREATE TABLE src (k BIGINT, v BIGINT) WITH (connector='kafka', format='json', topic='t', "
+        "bootstrap_servers='localhost:9092', state_ttl='30s', "
+        "state_ttl_domain='processing_time');"
+        "CREATE TABLE dst (k BIGINT, s BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/o');";
+    const auto params =
+        aggregate_params(ddl, "INSERT INTO dst SELECT k, SUM(v) FROM src GROUP BY k");
+    ASSERT_TRUE(params.count("state_ttl_ms"));
+    EXPECT_EQ(params.at("state_ttl_ms"), "30000");
+    EXPECT_EQ(params.at("state_ttl_domain"), "processing_time");
+}
+
+TEST(SqlBoundedState, NoRetentionMeansNoParamsRatherThanAZero) {
+    // A job that never asked for retention must be byte-identical to
+    // before: absent, not "state_ttl_ms=0".
+    const std::string ddl =
+        "CREATE TABLE src (k BIGINT, v BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/in');"
+        "CREATE TABLE dst (k BIGINT, s BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/o');";
+    const auto params =
+        aggregate_params(ddl, "INSERT INTO dst SELECT k, SUM(v) FROM src GROUP BY k");
+    ASSERT_FALSE(params.empty());
+    EXPECT_EQ(params.count("state_ttl_ms"), 0U);
+    EXPECT_EQ(params.count("state_ttl_domain"), 0U);
+}
+
+TEST(SqlBoundedState, TheShortestDeclaredRetentionAcrossTheInputsWins) {
+    // Taking the longest would let a generous setting on one table
+    // silently relax a strict one on another.
+    const std::string ddl =
+        "CREATE TABLE a (k BIGINT, v BIGINT) WITH (connector='kafka', format='json', topic='a', "
+        "bootstrap_servers='localhost:9092', state_ttl='6h');"
+        "CREATE TABLE b (k BIGINT, v BIGINT) WITH (connector='kafka', format='json', topic='b', "
+        "bootstrap_servers='localhost:9092', state_ttl='10m');"
+        "CREATE TABLE dst (k BIGINT, s BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/o');";
+    const auto params = aggregate_params(
+        ddl,
+        "INSERT INTO dst SELECT k, SUM(v) FROM (SELECT k, v FROM a UNION ALL SELECT k, v "
+        "FROM b) u GROUP BY k");
+    ASSERT_TRUE(params.count("state_ttl_ms"));
+    EXPECT_EQ(params.at("state_ttl_ms"), "600000") << "the longer retention won";
 }
 
 TEST(SqlBoundedState, RetentionIsSatisfiedByAnyOfTheFourRoutes) {

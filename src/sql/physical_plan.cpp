@@ -1377,6 +1377,19 @@ std::string compile_node(const LogicalPlan& node,
             keys_csv += agg.group_keys()[i];
         }
         op.params["group_keys"] = std::move(keys_csv);
+        // Retention, if the tables declared any. This is what turns
+        // `state_ttl` from a claim the gate accepts into a bound the
+        // operator enforces: without it the option would satisfy the gate
+        // and change nothing at runtime.
+        // Resolved from THIS aggregate's own inputs, not the whole job: the
+        // retention that applies to a group-by is the one its sources
+        // declare, and a two-branch plan may legitimately have different
+        // retention on each branch.
+        if (const auto ttl_ms = resolve_plan_retention(node).ttl_ms; ttl_ms > 0) {
+            op.params["state_ttl_ms"] = std::to_string(ttl_ms);
+            op.params["state_ttl_domain"] =
+                plan_retention_uses_event_time(node) ? "event_time" : "processing_time";
+        }
 
         // group_key_outputs: the output column name per group key (parallel to
         // group_keys), so the aggregate emits the key under its SELECT alias.
