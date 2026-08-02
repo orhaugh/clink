@@ -15,6 +15,7 @@
 #include "clink/sql/column_lineage.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
+#include "clink/sql/state_ttl.hpp"
 #include "clink/sql/type.hpp"
 
 namespace clink::sql {
@@ -925,6 +926,20 @@ void require_no_null_children(const LogicalPlan& node) {
 // Compile-node carries the active channel down the tree. Every node
 // in the chain emits ops on the same channel; root (Sink) decides it
 // when it first compiles the source-side scan.
+// Stamp the plan's declared retention onto a stateful operator. Shared by
+// every op kind the bounded-state gate flags, so a query that declares
+// `state_ttl` bounds ALL of its unbounded constructs rather than whichever
+// one happened to be wired up.
+void stamp_state_ttl(cluster::OperatorSpec& op, const LogicalPlan& node) {
+    const auto ttl_ms = resolve_plan_retention(node).ttl_ms;
+    if (ttl_ms <= 0) {
+        return;
+    }
+    op.params[kStateTtlMsParam] = std::to_string(ttl_ms);
+    op.params[kStateTtlDomainParam] =
+        plan_retention_uses_event_time(node) ? "event_time" : "processing_time";
+}
+
 std::string compile_node(const LogicalPlan& node,
                          Channel ch,
                          cluster::JobGraphSpec& spec,
@@ -1066,6 +1081,7 @@ std::string compile_node(const LogicalPlan& node,
         cluster::OperatorSpec op;
         op.id = "ejoin_" + std::to_string(next_id++);
         op.type = "equi_join_row";
+        stamp_state_ttl(op, node);
         op.inputs = {std::move(left_id), std::move(right_id)};
         op.out_channel = std::string{kChannelRow};
         op.key_by = "row_key";
@@ -1200,6 +1216,7 @@ std::string compile_node(const LogicalPlan& node,
         cluster::OperatorSpec op;
         op.id = "semijoin_" + std::to_string(next_id++);
         op.type = "semi_join_row";
+        stamp_state_ttl(op, node);
         op.inputs = {std::move(left_id), std::move(right_id)};
         op.out_channel = std::string{kChannelRow};
         op.key_by = "row_key";
@@ -1385,11 +1402,7 @@ std::string compile_node(const LogicalPlan& node,
         // retention that applies to a group-by is the one its sources
         // declare, and a two-branch plan may legitimately have different
         // retention on each branch.
-        if (const auto ttl_ms = resolve_plan_retention(node).ttl_ms; ttl_ms > 0) {
-            op.params["state_ttl_ms"] = std::to_string(ttl_ms);
-            op.params["state_ttl_domain"] =
-                plan_retention_uses_event_time(node) ? "event_time" : "processing_time";
-        }
+        stamp_state_ttl(op, node);
 
         // group_key_outputs: the output column name per group key (parallel to
         // group_keys), so the aggregate emits the key under its SELECT alias.
@@ -1849,6 +1862,7 @@ std::string compile_node(const LogicalPlan& node,
         cluster::OperatorSpec op;
         op.id = "setop_" + std::to_string(next_id++);
         op.type = "set_op_row";
+        stamp_state_ttl(op, node);
         op.inputs = {std::move(left_id), std::move(right_id)};
         op.out_channel = std::string{kChannelRow};
         op.key_by = "row_key";
@@ -1943,6 +1957,7 @@ std::string compile_node(const LogicalPlan& node,
         cluster::OperatorSpec op;
         op.id = "dst_" + std::to_string(next_id++);
         op.type = "distinct_row";
+        stamp_state_ttl(op, node);
         op.inputs = {std::move(input_id)};
         op.out_channel = std::string{kChannelRow};
         op.key_by = "row_key";

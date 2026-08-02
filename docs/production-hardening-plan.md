@@ -790,22 +790,65 @@ it, feeds it again, and requires the running total to restart from zero. An
 aggregate that stops reporting a group while still holding its accumulator
 has bounded nothing, and only this distinguishes the two.
 
-**What makes this Partial.** Covered: keyed value state, and the SQL
-windowless GROUP BY end to end. NOT covered:
+**Every node kind the gate flags now enforces.** A gate that refuses a
+DISTINCT without `state_ttl` and then compiles it with the TTL going
+nowhere has moved the problem, not fixed it. The coverage:
 
-- **Distinct, joins, semi-joins, set operations, RowNumber.** The gate
-  flags all of them; only `Aggregate` enforces. The planner resolves the
-  retention for any plan, so extending each is a matter of accepting the
-  two params and reusing the same deadline/evict pattern - but none of it
-  is done, and a `state_ttl` on a query whose only unbounded construct is a
-  DISTINCT currently satisfies the gate without bounding anything. That is
-  the same defect this item just fixed for GROUP BY, still present for the
-  other five node kinds.
-- Map and list state.
+| Gate flags | Operator | Enforcement |
+|---|---|---|
+| `Aggregate` | `aggregate_row` | operator-owned deadlines |
+| `Distinct` | `distinct_row` | `KeyedState` TtlConfig + `cleanup_batch` |
+| `EquiJoin` | `equi_join_row` | operator-owned deadlines, both sides |
+| `SemiJoin` | `semi_join_row` | operator-owned deadlines, both sides |
+| `SetOp` | `set_op_row` | `KeyedState` TtlConfig + `cleanup_batch` |
+| `RowNumber` | - | never compiles: the planner rejects it outright |
+
+**Two mechanisms, chosen by where the state lives.** This is the design
+decision, and getting it wrong would produce a TTL that appears to work
+while bounding nothing:
+
+- `aggregate_row`, `equi_join_row` and `semi_join_row` keep their hot state
+  in in-memory maps that are flushed to the backend at every checkpoint. A
+  `KeyedState` TtlConfig stamps on every put, so each flush would refresh
+  the deadline and a key touched once would live for ever. These use
+  `StateTtlTracker` (`clink/sql/state_ttl.hpp`), where the OPERATOR owns
+  the deadline, so a key's clock starts when the DATA last touched it.
+- `distinct_row` and `set_op_row` keep ALL their state in `KeyedState` -
+  no hot map, so no re-stamping flush. `KeyedState`'s own TtlConfig is
+  correct there, and reusing it beats a second mechanism: the stamping,
+  hiding, lazy purge and incremental cleanup are already tested.
+
+`StateTtlTracker` is shared rather than reimplemented four times because
+the interesting parts are decisions that must be identical everywhere -
+absolute deadlines, nothing expires before the first watermark, a
+monotonic clock - and four copies would drift.
+
+**Joins evict a key from both sides at once.** Keeping one side of an
+expired key would leave a half-join that can never complete but still
+occupies memory, and a key is touched from EITHER side: expiring a key
+whose left side went quiet but whose right side is active would drop
+matches that are still arriving.
+
+`RowNumber` needs nothing: `PhysicalPlanner` rejects a top-level
+`ROW_NUMBER() OVER` outright ("must be paired with a WHERE rn <= N"), so it
+cannot reach execution. The gate flagging it is harmless belt-and-braces.
+
+**Tests:** `test_sql_state_ttl_runtime.cpp` (12) and
+`test_sql_bounded_state.cpp` (23). The runtime cases assert RELEASE, not
+concealment: for the aggregate, an expired group's running total restarts
+from zero; for DISTINCT, twenty expired values leave zero entries resident
+in the backend. An operator that stops reporting a key while still holding
+it has bounded nothing, and only that distinction separates the two.
+
+**What makes this Partial.** NOT covered:
+
+- Map and list state (`KeyedState<K,V>` value state only).
 - CEP partial matches.
 - Backend-specific compaction hooks.
-- `KeyedState::cleanup_batch` exists and is tested, but no operator drives
-  it on a timer; the GROUP BY evicts through its own deadline map instead.
+- The interval join and windowed operators, which are bounded by their
+  time condition or window and so are not flagged by the gate - correct
+  today, but they would still benefit from a retention ceiling on a
+  pathological key space.
 
 ---
 

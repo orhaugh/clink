@@ -218,6 +218,116 @@ TEST(SqlStateTtlRuntime, AWatermarkRegressionDoesNotResurrectAnEvictedGroup) {
     EXPECT_EQ(p.running_total_after_feeding(1, 1), 6);
 }
 
+// --- DISTINCT ---------------------------------------------------------------
+
+namespace {
+
+// A generic single-input driver for an operator built from the registry.
+class OpProbe {
+public:
+    OpProbe(const std::string& type, std::map<std::string, std::string> params)
+        : backend_(std::make_shared<InMemoryStateBackend>()) {
+        ensure_installed();
+        const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+            type, std::string{kChannelRow}, std::string{kChannelRow});
+        EXPECT_NE(factory, nullptr) << type;
+        cluster::OperatorBuildContext octx;
+        octx.params = std::move(params);
+        op_ = std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+        op_->set_id(OperatorId{77});
+        rctx_ = std::make_unique<RuntimeContext>(
+            OperatorId{77}, type, backend_.get(), /*metrics=*/nullptr);
+        op_->attach_runtime(rctx_.get());
+        op_->open();
+    }
+
+    // Feed one row and report whether the operator emitted anything.
+    bool emits(std::int64_t k, std::int64_t v) {
+        collected_.clear();
+        Batch<Row> b;
+        b.emplace(row_of(k, v));
+        op_->process(StreamElement<Row>::data(std::move(b)), emitter_);
+        return !collected_.empty();
+    }
+
+    void watermark(std::int64_t ms) {
+        op_->process(StreamElement<Row>::watermark(Watermark{EventTime::from_millis(ms)}),
+                     emitter_);
+    }
+
+    // Entries physically resident in the backend for this operator. The
+    // distinction between hiding and releasing.
+    std::size_t resident() const {
+        std::size_t n = 0;
+        backend_->scan(OperatorId{77}, [&](std::string_view, std::string_view) { ++n; });
+        return n;
+    }
+
+private:
+    std::shared_ptr<InMemoryStateBackend> backend_;
+    std::shared_ptr<Operator<Row, Row>> op_;
+    std::unique_ptr<RuntimeContext> rctx_;
+    std::vector<Row> collected_;
+    Emitter<Row> emitter_{Emitter<Row>::Forward{[this](StreamElement<Row> e) {
+        if (e.is_data()) {
+            for (const auto& rec : e.as_data().records()) {
+                collected_.push_back(rec.value());
+            }
+        }
+        return true;
+    }}};
+};
+
+}  // namespace
+
+TEST(SqlStateTtlRuntime, DistinctWithoutRetentionRemembersForEver) {
+    OpProbe p("distinct_row", {{"columns", "k"}});
+    EXPECT_TRUE(p.emits(1, 10));
+    p.watermark(1'000'000);
+    EXPECT_FALSE(p.emits(1, 10)) << "DISTINCT forgot a value with no retention configured";
+}
+
+TEST(SqlStateTtlRuntime, DistinctForgetsAndReleasesAnExpiredValue) {
+    OpProbe p("distinct_row",
+              {{"columns", "k"}, {"state_ttl_ms", "1000"}, {"state_ttl_domain", "event_time"}});
+    p.watermark(10'000);
+    EXPECT_TRUE(p.emits(1, 10));
+    EXPECT_FALSE(p.emits(1, 10)) << "a duplicate inside the window was emitted";
+    ASSERT_GT(p.resident(), 0U);
+
+    p.watermark(20'000);
+    // Forgotten, so the value is emitted again...
+    EXPECT_TRUE(p.emits(1, 10)) << "DISTINCT did not forget the expired value";
+    // ... and the sweep released it rather than merely hiding it. A
+    // DISTINCT that hides without releasing still grows without bound.
+    OpProbe q("distinct_row",
+              {{"columns", "k"}, {"state_ttl_ms", "1000"}, {"state_ttl_domain", "event_time"}});
+    q.watermark(10'000);
+    for (int i = 0; i < 20; ++i) {
+        q.emits(i, i);
+    }
+    ASSERT_EQ(q.resident(), 20U);
+    q.watermark(100'000);
+    EXPECT_EQ(q.resident(), 0U) << "expired DISTINCT values were hidden but not released";
+}
+
+TEST(SqlStateTtlRuntime, DistinctKeepsALiveValue) {
+    OpProbe p("distinct_row",
+              {{"columns", "k"}, {"state_ttl_ms", "10000"}, {"state_ttl_domain", "event_time"}});
+    p.watermark(10'000);
+    EXPECT_TRUE(p.emits(1, 10));
+    p.watermark(15'000);  // inside the 10 s deadline
+    EXPECT_FALSE(p.emits(1, 10)) << "a live DISTINCT value was forgotten early";
+}
+
+TEST(SqlStateTtlRuntime, DistinctEvictsNothingBeforeTheFirstWatermark) {
+    OpProbe p("distinct_row",
+              {{"columns", "k"}, {"state_ttl_ms", "1"}, {"state_ttl_domain", "event_time"}});
+    EXPECT_TRUE(p.emits(1, 10));
+    EXPECT_FALSE(p.emits(1, 10))
+        << "the value was expired against a watermark that had not arrived";
+}
+
 TEST(SqlStateTtlRuntime, ProcessingTimeDomainIsHonoured) {
     // With processing time selected, watermarks are irrelevant and the
     // wall clock decides. A 1 ms TTL plus a real sleep must evict.

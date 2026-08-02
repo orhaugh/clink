@@ -350,6 +350,90 @@ TEST(SqlBoundedState, TheShortestDeclaredRetentionAcrossTheInputsWins) {
     EXPECT_EQ(params.at("state_ttl_ms"), "600000") << "the longer retention won";
 }
 
+namespace {
+
+// Params of the first op of `type` in the compiled plan.
+std::map<std::string, std::string> op_params(const std::string& ddl,
+                                             const std::string& query,
+                                             const std::string& type) {
+    clink::cluster::ensure_built_ins_registered();
+    ensure_sql_installed_for_bounded_state_tests();
+    Catalog cat;
+    for (const auto& st : parse(ddl).statements) {
+        if (const auto* ct = std::get_if<ast::CreateTableStmt>(&st)) {
+            cat.register_table(*ct);
+        }
+    }
+    const auto script = parse(query);
+    const Binder binder(cat);
+    auto plan = binder.bind_insert(std::get<ast::InsertStmt>(script.statements.front()));
+    PhysicalPlanner planner;
+    planner.set_allow_unbounded_state(script.allow_unbounded_state);
+    const auto spec = planner.compile(*dynamic_cast<const LogicalSink*>(plan.get()));
+    for (const auto& op : spec.ops) {
+        if (op.type == type) {
+            return op.params;
+        }
+    }
+    return {};
+}
+
+std::string kafka_table(const std::string& name, const std::string& topic) {
+    return "CREATE TABLE " + name +
+           " (k BIGINT, v BIGINT) WITH (connector='kafka', format='json', topic='" + topic +
+           "', bootstrap_servers='localhost:9092', state_ttl='1h');";
+}
+const char* kFileDst =
+    "CREATE TABLE dst (k BIGINT, v BIGINT) WITH (connector='file', format='json', path='/tmp/o');";
+
+}  // namespace
+
+// Every node kind the gate flags must also RECEIVE the retention. A gate
+// that refuses a DISTINCT without `state_ttl`, then compiles it with the
+// TTL going nowhere, has moved the problem rather than fixed it.
+
+TEST(SqlBoundedState, DistinctReceivesTheRetention) {
+    const auto params = op_params(kafka_table("src", "t") + kFileDst,
+                                  "INSERT INTO dst SELECT DISTINCT k, v FROM src",
+                                  "distinct_row");
+    ASSERT_FALSE(params.empty()) << "no distinct_row op emitted";
+    ASSERT_TRUE(params.count("state_ttl_ms")) << "DISTINCT was not given the declared retention";
+    EXPECT_EQ(params.at("state_ttl_ms"), "3600000");
+}
+
+TEST(SqlBoundedState, EquiJoinReceivesTheRetention) {
+    const auto params = op_params(kafka_table("a", "a") + kafka_table("b", "b") + kFileDst,
+                                  "INSERT INTO dst SELECT a.k, b.v FROM a JOIN b ON a.k = b.k",
+                                  "equi_join_row");
+    ASSERT_FALSE(params.empty()) << "no equi_join_row op emitted";
+    ASSERT_TRUE(params.count("state_ttl_ms")) << "the join was not given the declared retention";
+    EXPECT_EQ(params.at("state_ttl_ms"), "3600000");
+}
+
+TEST(SqlBoundedState, SemiJoinReceivesTheRetention) {
+    const auto params = op_params(kafka_table("a", "a") + kafka_table("b", "b") + kFileDst,
+                                  "INSERT INTO dst SELECT k, v FROM a WHERE k IN (SELECT k FROM b)",
+                                  "semi_join_row");
+    ASSERT_FALSE(params.empty()) << "no semi_join_row op emitted";
+    ASSERT_TRUE(params.count("state_ttl_ms"))
+        << "the semi-join was not given the declared retention";
+    EXPECT_EQ(params.at("state_ttl_ms"), "3600000");
+}
+
+TEST(SqlBoundedState, SetOperationReceivesTheRetention) {
+    // INTERSECT emits a changelog, and a plain file sink is append-only -
+    // an unrelated pre-existing constraint, so the sink declares it.
+    const char* changelog_dst =
+        "CREATE TABLE dst (k BIGINT, v BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/o', changelog='true');";
+    const auto params = op_params(kafka_table("a", "a") + kafka_table("b", "b") + changelog_dst,
+                                  "INSERT INTO dst SELECT k, v FROM a INTERSECT SELECT k, v FROM b",
+                                  "set_op_row");
+    ASSERT_FALSE(params.empty()) << "no set_op_row op emitted";
+    ASSERT_TRUE(params.count("state_ttl_ms")) << "the set op was not given the declared retention";
+    EXPECT_EQ(params.at("state_ttl_ms"), "3600000");
+}
+
 TEST(SqlBoundedState, RetentionIsSatisfiedByAnyOfTheFourRoutes) {
     EXPECT_TRUE(StateRetention{.ttl_ms = 1000}.bounded());
     EXPECT_TRUE(StateRetention{.allow_unbounded = true}.bounded());

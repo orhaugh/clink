@@ -66,6 +66,7 @@
 #include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/row_columnar_output.hpp"
 #include "clink/sql/row_kind.hpp"
+#include "clink/sql/state_ttl.hpp"
 #include "clink/time/watermark_strategy.hpp"
 #include "clink/time/window_arithmetic.hpp"
 
@@ -4210,8 +4211,7 @@ public:
           async_state_(async_state),
           effective_async_state_(async_state),
           emit_changelog_(emit_changelog),
-          state_ttl_ms_(state_ttl_ms),
-          ttl_event_time_(ttl_event_time) {
+          ttl_(state_ttl_ms, ttl_event_time) {
         if (group_key_outputs_.size() != group_keys_.size()) {
             // default: emit each key under its raw name
             group_key_outputs_ = intern_names(group_keys_);
@@ -4237,14 +4237,7 @@ public:
     // a running job reclaims memory as it goes, which is the whole point of
     // asking for a TTL.
     void on_watermark(Watermark wm, Emitter<Row>& out) override {
-        if (ttl_enabled_()) {
-            const auto ts = wm.timestamp().millis();
-            // Monotonic: a regression must not resurrect expired groups, so
-            // the clock only ever moves forward. Same rule as KeyedState.
-            if (!seen_watermark_ || ts > last_watermark_ms_) {
-                last_watermark_ms_ = ts;
-                seen_watermark_ = true;
-            }
+        if (ttl_.advance_watermark(wm.timestamp().millis())) {
             ttl_evict_();
         }
         Operator<Row, Row>::on_watermark(wm, out);
@@ -4841,75 +4834,29 @@ private:
     // Retention for a windowless GROUP BY, which otherwise keeps one
     // accumulator per group for the life of the job. The SQL gate refuses
     // such a query over an unbounded source unless the table declares
-    // `state_ttl`; this is where that declaration is actually enforced.
-    //
-    // Why the deadline lives HERE and not in KeyedState's own TtlConfig:
-    // this operator's hot path is the in-memory `state_` map, which is
-    // flushed into the "agg" slot at every checkpoint. A KeyedState TTL
-    // stamps on every put, so each flush would refresh the deadline and a
-    // group touched once would nonetheless live for ever. The operator
-    // owns the deadline, so a group's clock starts when the DATA last
-    // touched it, not when the checkpoint last wrote it.
+    // `state_ttl`; this is where that declaration is enforced. The
+    // deadline bookkeeping is shared with the other stateful SQL operators
+    // (clink/sql/state_ttl.hpp) so the semantics cannot drift between them.
     //
     // Deadlines persist in their own slot rather than inside AggBucket:
     // additive, so no existing checkpoint's bucket encoding changes, and a
     // job that never sets state_ttl writes nothing extra.
-    KeyedState<std::string, std::int64_t> deadline_state_() {
+    StateTtlTracker::DeadlineSlot deadline_state_() {
         return this->runtime()->template keyed_state<std::string, std::int64_t>(
             "agg_ttl", clink::string_codec(), clink::int64_codec());
     }
 
-    [[nodiscard]] bool ttl_enabled_() const noexcept { return state_ttl_ms_ > 0; }
+    [[nodiscard]] bool ttl_enabled_() const noexcept { return ttl_.enabled(); }
 
-    // The clock this operator's TTL runs on. nullopt means "event time has
-    // not started", and nothing can be judged expired against a clock that
-    // has not started - the same rule KeyedState applies, kept identical so
-    // the two cannot disagree.
-    [[nodiscard]] std::optional<std::int64_t> ttl_now_() const {
-        if (!ttl_event_time_) {
-            return std::chrono::duration_cast<std::chrono::milliseconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                .count();
-        }
-        return seen_watermark_ ? std::optional<std::int64_t>{last_watermark_ms_} : std::nullopt;
-    }
+    void ttl_touch_(const std::string& key) { ttl_.touch(key); }
 
-    // Record that `key` was touched by data now. Called from every write
-    // path, so a live group keeps its deadline pushed out.
-    void ttl_touch_(const std::string& key) {
-        if (!ttl_enabled_()) {
-            return;
-        }
-        const auto now = ttl_now_();
-        if (!now.has_value()) {
-            // No event time yet. Stamp nothing: a deadline computed from a
-            // zero watermark would place the group in 1970 and evict it on
-            // the first watermark that arrives.
-            return;
-        }
-        deadlines_[key] = *now + state_ttl_ms_;
-        ttl_dirty_.insert(key);
-    }
-
-    // Evict every group whose deadline has passed, from the in-memory map,
-    // the deadline map, and both backing slots. Driven by watermark
-    // advance (event time) or by the same hook on a wall clock, so a job
-    // that is receiving data reclaims memory as it goes rather than only
-    // at checkpoint time.
+    // Evict every group whose deadline has passed, from the in-memory map
+    // and from both backing slots.
     void ttl_evict_() {
-        if (!ttl_enabled_() || deadlines_.empty()) {
+        if (!ttl_.enabled()) {
             return;
         }
-        const auto now = ttl_now_();
-        if (!now.has_value()) {
-            return;
-        }
-        std::vector<std::string> doomed;
-        for (const auto& [key, deadline] : deadlines_) {
-            if (deadline <= *now) {
-                doomed.push_back(key);
-            }
-        }
+        const auto doomed = ttl_.expired();
         if (doomed.empty()) {
             return;
         }
@@ -4919,74 +4866,53 @@ private:
         const bool have_backend =
             this->runtime() != nullptr && this->runtime()->has_state_backend();
         std::optional<KeyedState<std::string, AggBucket>> agg;
-        std::optional<KeyedState<std::string, std::int64_t>> dl;
+        std::optional<StateTtlTracker::DeadlineSlot> dl;
         if (have_backend) {
             agg.emplace(keyed_state_());
             dl.emplace(deadline_state_());
         }
         for (const auto& key : doomed) {
             state_.erase(key);
-            deadlines_.erase(key);
             dirty_.erase(key);
-            ttl_dirty_.erase(key);
+            ttl_.forget(key);
             if (have_backend) {
                 agg->erase(key);
-                dl->erase(key);
+                StateTtlTracker::erase_persisted(*dl, key);
             }
-            ++ttl_expired_groups_;
         }
     }
 
-    // Persist the deadlines touched since the last flush. Runs alongside
-    // flush_dirty_ so a restore sees deadlines consistent with the buckets
-    // they belong to.
     void flush_ttl_dirty_() {
-        if (!ttl_enabled_() || ttl_dirty_.empty() || this->runtime() == nullptr ||
+        if (!ttl_.enabled() || this->runtime() == nullptr ||
             !this->runtime()->has_state_backend()) {
             return;
         }
         auto dl = deadline_state_();
-        for (const auto& key : ttl_dirty_) {
-            if (const auto it = deadlines_.find(key); it != deadlines_.end()) {
-                dl.put(key, it->second);
-            }
-        }
-        ttl_dirty_.clear();
+        ttl_.flush(dl);
     }
 
-    // Reload deadlines after a restore. The stored value is ABSOLUTE, so a
-    // group resumes its original deadline rather than getting a fresh full
-    // TTL - otherwise every restart would silently extend retention by up
-    // to one TTL, and a job that restarts often would never expire.
     void restore_ttl_() {
-        if (!ttl_enabled_() || this->runtime() == nullptr ||
+        if (!ttl_.enabled() || this->runtime() == nullptr ||
             !this->runtime()->has_state_backend()) {
             return;
         }
-        deadline_state_().scan([&](const std::string& key, const std::int64_t& deadline) {
-            deadlines_[key] = deadline;
-        });
+        auto dl = deadline_state_();
+        ttl_.restore(dl);
     }
 
 public:
     // Groups evicted by retention so far. Read by the TTL tests and
     // available for metrics reporting.
-    [[nodiscard]] std::uint64_t ttl_expired_groups() const noexcept { return ttl_expired_groups_; }
+    [[nodiscard]] std::uint64_t ttl_expired_groups() const noexcept { return ttl_.expired_total(); }
     [[nodiscard]] std::size_t live_group_count() const noexcept { return state_.size(); }
 
 private:
     std::vector<std::string> group_keys_;
     std::vector<AggSpec> aggregates_;
     std::vector<clink::config::InternedName> group_key_outputs_;
-    // Retention (0 = off) and the clock it runs on. Set from the table's
-    // `state_ttl` / `state_ttl_domain` options via the physical planner.
-    std::int64_t state_ttl_ms_ = 0;
-    bool ttl_event_time_ = true;
-    std::int64_t last_watermark_ms_ = 0;
-    bool seen_watermark_ = false;
-    std::unordered_map<std::string, std::int64_t> deadlines_;
-    std::unordered_set<std::string> ttl_dirty_;
-    std::uint64_t ttl_expired_groups_ = 0;
+    // Retention. Set from the table's `state_ttl` / `state_ttl_domain`
+    // options via the physical planner; disabled (and free) when unset.
+    StateTtlTracker ttl_;
     bool async_state_ = false;
     // Effective decision: async_state_ OR the bound backend can defer reads.
     // Seeded from async_state_ in the ctor and finalised in open() once the
@@ -5040,7 +4966,9 @@ public:
                   EquiJoinKind kind,
                   std::vector<std::string> left_columns,
                   std::vector<std::string> right_columns,
-                  std::vector<RowColumn> output_schema = {})
+                  std::vector<RowColumn> output_schema = {},
+                  std::int64_t state_ttl_ms = 0,
+                  bool ttl_event_time = true)
         : left_key_column_(std::move(left_key_column)),
           right_key_column_(std::move(right_key_column)),
           left_alias_(std::move(left_alias)),
@@ -5048,6 +4976,7 @@ public:
           kind_(kind),
           left_columns_(std::move(left_columns)),
           right_columns_(std::move(right_columns)),
+          ttl_(state_ttl_ms, ttl_event_time),
           output_schema_(std::move(output_schema)) {
         // Precompute the joined row's output columns in FlatMap (sorted-key)
         // order, so build_ assembles each output row in ONE sorted pass via
@@ -5078,6 +5007,17 @@ public:
             }
         }
         init_columnar_output_();
+    }
+
+    // Retention sweep. The watermark is the clock under event time, and its
+    // advance is exactly when a key can newly become expired. Evicting here
+    // rather than only at checkpoint time means a running join reclaims
+    // memory as it goes.
+    void on_watermark(Watermark wm, Emitter<Row>& out) override {
+        if (ttl_.advance_watermark(wm.timestamp().millis())) {
+            ttl_evict_();
+        }
+        CoOperator<Row, Row, Row>::on_watermark(wm, out);
     }
 
     void process_element1(const StreamElement<Row>& element, Emitter<Row>& out) override {
@@ -5406,6 +5346,11 @@ private:
         }
         sit->second.push_back(Entry{row, false});
         Entry& me = sit->second.back();
+        // Retention: a join key is alive while EITHER side keeps receiving
+        // rows for it. Touching from both sides is the point - expiring a
+        // key whose left side went quiet but whose right side is active
+        // would drop matches that are still arriving.
+        ttl_.touch(std::string(*key));
 
         auto oit = other.find(*key);
         if (oit == other.end() || oit->second.empty()) {
@@ -5630,6 +5575,49 @@ private:
         };
     }
 
+    // --- state_ttl -------------------------------------------------------
+    //
+    // An unwindowed equi-join retains every row from both inputs so that
+    // either side can match a future row from the other, which is exactly
+    // the unbounded growth the SQL gate refuses without a declared
+    // retention. Eviction drops a key from BOTH sides at once: keeping one
+    // side of an expired key would leave a half-join that can never
+    // complete but still occupies memory.
+    StateTtlTracker::DeadlineSlot deadline_state_() {
+        return this->runtime()->template keyed_state<std::string, std::int64_t>(
+            "ej_ttl", clink::string_codec(), clink::int64_codec());
+    }
+
+    void ttl_evict_() {
+        if (!ttl_.enabled()) {
+            return;
+        }
+        const auto doomed = ttl_.expired();
+        if (doomed.empty()) {
+            return;
+        }
+        const bool have_backend =
+            this->runtime() != nullptr && this->runtime()->has_state_backend();
+        std::optional<KeyedState<std::string, std::vector<Entry>>> kl;
+        std::optional<KeyedState<std::string, std::vector<Entry>>> kr;
+        std::optional<StateTtlTracker::DeadlineSlot> dl;
+        if (have_backend) {
+            kl.emplace(kv_left_());
+            kr.emplace(kv_right_());
+            dl.emplace(deadline_state_());
+        }
+        for (const auto& key : doomed) {
+            left_state_.erase(key);
+            right_state_.erase(key);
+            ttl_.forget(key);
+            if (have_backend) {
+                kl->erase(key);
+                kr->erase(key);
+                StateTtlTracker::erase_persisted(*dl, key);
+            }
+        }
+    }
+
     KeyedState<std::string, std::vector<Entry>> kv_left_() {
         return this->runtime()->template keyed_state<std::string, std::vector<Entry>>(
             "ejL", clink::string_codec(), entry_list_codec());
@@ -5646,6 +5634,8 @@ private:
     EquiJoinKind kind_;
     std::vector<std::string> left_columns_;
     std::vector<std::string> right_columns_;
+    // Retention, from the table's `state_ttl` option via the planner.
+    StateTtlTracker ttl_;
     // Finalised in open(): INNER + a deferring backend -> the async KeyedState
     // path (process_async{1,2}); otherwise the sync in-memory path below.
     bool effective_async_ = false;
@@ -5694,11 +5684,24 @@ public:
     SemiAntiJoinRowOp(std::vector<std::string> left_key_columns,
                       std::vector<std::string> right_key_columns,
                       bool anti,
-                      bool null_aware)
+                      bool null_aware,
+                      std::int64_t state_ttl_ms = 0,
+                      bool ttl_event_time = true)
         : left_key_columns_(std::move(left_key_columns)),
           right_key_columns_(std::move(right_key_columns)),
           anti_(anti),
-          null_aware_(null_aware) {}
+          null_aware_(null_aware),
+          ttl_(state_ttl_ms, ttl_event_time) {}
+
+    // Retention sweep on watermark advance. A semi/anti join retains every
+    // probed key so a later build row can match it, which is the unbounded
+    // growth the SQL gate refuses without a declared retention.
+    void on_watermark(Watermark wm, Emitter<Row>& out) override {
+        if (ttl_.advance_watermark(wm.timestamp().millis())) {
+            ttl_evict_();
+        }
+        CoOperator<Row, Row, Row>::on_watermark(wm, out);
+    }
 
     // The PLAIN semi / anti path (IN / EXISTS / NOT EXISTS) is per-key: the
     // left entries and the right presence-count key by the join tuple, so it
@@ -5925,6 +5928,7 @@ private:
         }
         auto& entries = left_state_[*key];
         entries.push_back(LeftEntry{row, false});
+        ttl_.touch(*key);
         LeftEntry& e = entries.back();
         if (!anti_) {
             if (right_count_[*key] > 0) {  // semi: key present -> matched
@@ -5973,6 +5977,8 @@ private:
         }
         const int before = right_count_[*key];
         right_count_[*key] = before + 1;
+        // A key is alive while EITHER side keeps receiving rows for it.
+        ttl_.touch(*key);
         if (before != 0)
             return;  // key already present; no transition (poison already applied)
         // Exact-match transition: emit (semi) / retract (anti) the no-null
@@ -6218,10 +6224,44 @@ private:
             "saR", clink::string_codec(), clink::int64_codec());
     }
 
+    // Drop an expired key from BOTH the probed entries and the build-side
+    // presence count: keeping one without the other would leave a key that
+    // reports matches it can no longer justify.
+    StateTtlTracker::DeadlineSlot deadline_state_() {
+        return this->runtime()->template keyed_state<std::string, std::int64_t>(
+            "sj_ttl", clink::string_codec(), clink::int64_codec());
+    }
+
+    void ttl_evict_() {
+        if (!ttl_.enabled()) {
+            return;
+        }
+        const auto doomed = ttl_.expired();
+        if (doomed.empty()) {
+            return;
+        }
+        const bool have_backend =
+            this->runtime() != nullptr && this->runtime()->has_state_backend();
+        std::optional<StateTtlTracker::DeadlineSlot> dl;
+        if (have_backend) {
+            dl.emplace(deadline_state_());
+        }
+        for (const auto& key : doomed) {
+            left_state_.erase(key);
+            right_count_.erase(key);
+            ttl_.forget(key);
+            if (have_backend) {
+                StateTtlTracker::erase_persisted(*dl, key);
+            }
+        }
+    }
+
     std::vector<std::string> left_key_columns_;
     std::vector<std::string> right_key_columns_;
     bool anti_;
     bool null_aware_;
+    // Retention, from the table's `state_ttl` option via the planner.
+    StateTtlTracker ttl_;
     // Finalised in open(): the plain path on a deferring backend -> async
     // process_async{1,2}; otherwise the sync path above.
     bool effective_async_ = false;
@@ -6259,11 +6299,38 @@ public:
     SetOpRowOp(std::vector<std::string> left_columns,
                std::vector<std::string> right_columns,
                bool is_except,
-               bool all)
+               bool all,
+               std::int64_t state_ttl_ms = 0,
+               bool ttl_event_time = true)
         : left_columns_(std::move(left_columns)),
           right_columns_(std::move(right_columns)),
           is_except_(is_except),
-          all_(all) {}
+          all_(all),
+          state_ttl_ms_(state_ttl_ms),
+          ttl_event_time_(ttl_event_time) {}
+
+    // Retention. Like DISTINCT and unlike the aggregate and the joins, a
+    // set operation keeps ALL of its state in KeyedState - no in-memory hot
+    // map, so no checkpoint flush that would re-stamp deadlines, so
+    // KeyedState's own TtlConfig is exactly right and reusing it beats a
+    // second deadline mechanism.
+    void on_watermark(Watermark wm, Emitter<Row>& out) override {
+        if (state_ttl_ms_ > 0) {
+            const auto ts = wm.timestamp().millis();
+            // Monotonic: a regression must not resurrect expired rows.
+            if (!seen_watermark_ || ts > last_watermark_ms_) {
+                last_watermark_ms_ = ts;
+                seen_watermark_ = true;
+            }
+            // Sweep, because lazy expiry hides an expired row from readers
+            // without releasing it - the set would still grow without bound.
+            if (this->runtime() != nullptr && this->runtime()->has_state_backend()) {
+                auto kv = keyed_state_();
+                kv.cleanup_batch();
+            }
+        }
+        CoOperator<Row, Row, Row>::on_watermark(wm, out);
+    }
 
     // Ride the async/disaggregated KeyedState path whenever the bound backend
     // can genuinely defer reads (supports_async_get()); on a non-deferring
@@ -6521,15 +6588,38 @@ private:
         };
     }
 
+    [[nodiscard]] TtlConfig ttl_config_() const {
+        if (state_ttl_ms_ <= 0) {
+            return {};
+        }
+        return TtlConfig{
+            .ttl = std::chrono::milliseconds{state_ttl_ms_},
+            .refresh_on_write = true,
+            .refresh_on_read = false,
+            .domain = ttl_event_time_ ? TtlTimeDomain::EventTime : TtlTimeDomain::ProcessingTime};
+    }
+
     KeyedState<std::string, Bucket> keyed_state_() {
-        return this->runtime()->template keyed_state<std::string, Bucket>(
-            "setop", clink::string_codec(), bucket_codec());
+        auto ks = this->runtime()->template keyed_state<std::string, Bucket>(
+            "setop", clink::string_codec(), bucket_codec(), ttl_config_());
+        // KeyedState is constructed per call, so each instance is handed
+        // the operator's event-time clock.
+        if (state_ttl_ms_ > 0 && seen_watermark_) {
+            ks.advance_watermark(last_watermark_ms_);
+        }
+        return ks;
     }
 
     std::vector<std::string> left_columns_;
     std::vector<std::string> right_columns_;
     bool is_except_;
     bool all_;
+    // Retention (0 = off) and the clock it runs on, from the table's
+    // `state_ttl` / `state_ttl_domain` options via the physical planner.
+    std::int64_t state_ttl_ms_ = 0;
+    bool ttl_event_time_ = true;
+    std::int64_t last_watermark_ms_ = 0;
+    bool seen_watermark_ = false;
     // Finalised in open(): a deferring backend -> the async KeyedState path
     // (process_async{1,2}); otherwise the sync path above.
     bool effective_async_ = false;
@@ -7765,7 +7855,12 @@ private:
 // state lands in the same key-group its record routes to.
 class DistinctRowOp final : public Operator<Row, Row> {
 public:
-    explicit DistinctRowOp(std::vector<std::string> columns = {}) : columns_(std::move(columns)) {}
+    explicit DistinctRowOp(std::vector<std::string> columns = {},
+                           std::int64_t state_ttl_ms = 0,
+                           bool ttl_event_time = true)
+        : columns_(std::move(columns)),
+          state_ttl_ms_(state_ttl_ms),
+          ttl_event_time_(ttl_event_time) {}
 
     // Ride the async/disaggregated KeyedState path whenever the bound
     // backend can genuinely defer reads (supports_async_get()); on a
@@ -7795,6 +7890,27 @@ public:
         } else {
             this->on_barrier(element.as_barrier(), out);
         }
+    }
+
+    // Retention needs the watermark for its clock, and needs to sweep:
+    // lazy expiry hides an expired value from readers but leaves it
+    // resident, so a DISTINCT over a high-cardinality stream would still
+    // grow without bound. The sweep is budgeted, so it costs a bounded
+    // amount per watermark rather than stalling proportionally to state.
+    void on_watermark(Watermark wm, Emitter<Row>& out) override {
+        if (state_ttl_ms_ > 0) {
+            const auto ts = wm.timestamp().millis();
+            // Monotonic: a regression must not resurrect expired values.
+            if (!seen_watermark_ || ts > last_watermark_ms_) {
+                last_watermark_ms_ = ts;
+                seen_watermark_ = true;
+            }
+            if (this->runtime() != nullptr && this->runtime()->has_state_backend()) {
+                auto kv = keyed_state_();
+                kv.cleanup_batch();
+            }
+        }
+        Operator<Row, Row>::on_watermark(wm, out);
     }
 
     [[nodiscard]] bool supports_async() const noexcept override { return effective_async_; }
@@ -7859,15 +7975,51 @@ private:
         return key;
     }
 
+    // Unlike the aggregate, DISTINCT keeps ALL of its state in KeyedState -
+    // there is no in-memory hot map and therefore no checkpoint flush that
+    // would re-stamp deadlines. KeyedState's own TtlConfig is exactly right
+    // here, and reusing it is strictly better than a second deadline
+    // mechanism: the stamping, hiding, lazy purge and incremental cleanup
+    // are already tested (test_keyed_state_ttl_depth.cpp).
+    //
+    // refresh_on_read stays FALSE deliberately. Refreshing on read would
+    // mean a value that keeps arriving is retained for ever, so retention
+    // would depend on duplicate rate. False gives the predictable reading:
+    // a value is remembered for `state_ttl` after it was FIRST seen, and a
+    // sighting after that re-emits it.
+    [[nodiscard]] TtlConfig ttl_config_() const {
+        if (state_ttl_ms_ <= 0) {
+            return {};
+        }
+        return TtlConfig{
+            .ttl = std::chrono::milliseconds{state_ttl_ms_},
+            .refresh_on_write = true,
+            .refresh_on_read = false,
+            .domain = ttl_event_time_ ? TtlTimeDomain::EventTime : TtlTimeDomain::ProcessingTime};
+    }
+
     KeyedState<std::string, std::string> keyed_state_() {
-        return this->runtime()->template keyed_state<std::string, std::string>(
-            "distinct", clink::string_codec(), clink::string_codec());
+        auto ks = this->runtime()->template keyed_state<std::string, std::string>(
+            "distinct", clink::string_codec(), clink::string_codec(), ttl_config_());
+        // KeyedState is constructed per call, so the event-time clock has to
+        // be handed to each instance. Cheap, and it keeps the watermark in
+        // one place (this operator) rather than duplicated in state.
+        if (state_ttl_ms_ > 0 && seen_watermark_) {
+            ks.advance_watermark(last_watermark_ms_);
+        }
+        return ks;
     }
 
     // Value is a presence marker only; get().has_value() answers "seen?".
     static inline const std::string kSeen = "1";
 
     std::vector<std::string> columns_;
+    // Retention (0 = off) and the clock it runs on, from the table's
+    // `state_ttl` / `state_ttl_domain` options via the physical planner.
+    std::int64_t state_ttl_ms_ = 0;
+    bool ttl_event_time_ = true;
+    std::int64_t last_watermark_ms_ = 0;
+    bool seen_watermark_ = false;
     bool effective_async_ = false;
 };
 
@@ -8825,6 +8977,25 @@ private:
     std::size_t batch_size_;
     bool done_{false};
 };
+
+// The two retention params, read identically by every operator that can
+// enforce a TTL. One place, so a future third param cannot be wired into
+// three factories and forgotten in the fourth.
+namespace {
+
+struct TtlParams {
+    std::int64_t ms{0};
+    bool event_time{true};
+};
+
+TtlParams read_ttl_params(const BuildContext& ctx) {
+    TtlParams p;
+    p.ms = ctx.param_int64_or(kStateTtlMsParam, 0);
+    p.event_time = ctx.param_or(kStateTtlDomainParam, "event_time") != "processing_time";
+    return p;
+}
+
+}  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
     // Announce the SQL frontend to the capability manifest. clink_core (which
@@ -10568,7 +10739,9 @@ void install(clink::plugin::PluginRegistry& reg) {
                 // the planner only when the
                 // consumer can ingest columnar
                 // (see physical_plan.cpp).
-                parse_row_schema(ctx.param_or("columnar_output", "")));
+                parse_row_schema(ctx.param_or("columnar_output", "")),
+                read_ttl_params(ctx).ms,
+                read_ttl_params(ctx).event_time);
         });
 
     // semi_join_row: IN / NOT IN / EXISTS lowering. Required params:
@@ -10608,10 +10781,13 @@ void install(clink::plugin::PluginRegistry& reg) {
                 }
                 return out;
             };
+            const auto ttl = read_ttl_params(ctx);
             return std::make_shared<SemiAntiJoinRowOp>(split_csv(need("left_key_column")),
                                                        split_csv(need("right_key_column")),
                                                        anti,
-                                                       null_aware);
+                                                       null_aware,
+                                                       ttl.ms,
+                                                       ttl.event_time);
         });
 
     // set_op_row: INTERSECT / EXCEPT (distinct). Params:
@@ -10640,10 +10816,13 @@ void install(clink::plugin::PluginRegistry& reg) {
                 throw std::runtime_error("set_op_row: 'mode' must be 'intersect' or 'except'");
             }
             const bool all = ctx.param_or("all", "false") == "true";
+            const auto ttl = read_ttl_params(ctx);
             return std::make_shared<SetOpRowOp>(split_csv(ctx.param_or("left_columns", "")),
                                                 split_csv(ctx.param_or("right_columns", "")),
                                                 mode == "except",
-                                                all);
+                                                all,
+                                                ttl.ms,
+                                                ttl.event_time);
         });
 
     // scalar_broadcast_filter_row: uncorrelated scalar-subquery filter.
@@ -10890,7 +11069,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                     break;
                 pos = end + 1;
             }
-            return std::make_shared<DistinctRowOp>(std::move(columns));
+            const auto ttl = read_ttl_params(ctx);
+            return std::make_shared<DistinctRowOp>(std::move(columns), ttl.ms, ttl.event_time);
         });
 
     // aggregate_row: unbounded GROUP BY (no window TVF). Params mirror
@@ -10952,19 +11132,16 @@ void install(clink::plugin::PluginRegistry& reg) {
             // (set by the planner when this aggregate feeds a retraction-aware
             // consumer) instead of an append snapshot. Default off.
             const bool emit_changelog = ctx.param_or("emit_changelog", "false") == "true";
-            // state_ttl_ms / state_ttl_domain: retention resolved by the
-            // planner from the tables' `state_ttl` option. Absent = no
-            // retention, which is the historic behaviour.
-            const auto state_ttl_ms = ctx.param_int64_or("state_ttl_ms", 0);
-            const bool ttl_event_time =
-                ctx.param_or("state_ttl_domain", "event_time") != "processing_time";
+            // Retention resolved by the planner from the tables'
+            // `state_ttl` option. Absent = none, the historic behaviour.
+            const auto ttl = read_ttl_params(ctx);
             return std::make_shared<AggregateRowOp>(std::move(group_keys),
                                                     std::move(aggregates),
                                                     std::move(group_key_outputs),
                                                     async_state,
                                                     emit_changelog,
-                                                    state_ttl_ms,
-                                                    ttl_event_time);
+                                                    ttl.ms,
+                                                    ttl.event_time);
         });
 
     // project_row: per-row expression evaluation. The 'outputs' param
