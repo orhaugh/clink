@@ -383,11 +383,25 @@ public:
 
     // Typed keyed-state primitives (FOUND-1), each scoped to this operator via
     // its own slot name. Throw if no state backend is configured.
+    //
+    // Each has a TTL-taking overload. Retention on a collection slot is PER
+    // KEY, not per element - the whole collection is one KeyedState value -
+    // and any mutation refreshes it. See typed_state.hpp for the full
+    // semantics; the short version is "retain a key for `ttl` after its last
+    // activity", which is usually what a caller wants and is emphatically
+    // not "expire individual map entries".
     template <typename K, typename E>
     ListState<K, E> list_state(std::string slot_name, Codec<K> kc, Codec<E> ec) {
         require_backend_("list_state");
         return ListState<K, E>(
             *backend_, op_id_, std::move(slot_name), std::move(kc), std::move(ec));
+    }
+
+    template <typename K, typename E>
+    ListState<K, E> list_state(std::string slot_name, Codec<K> kc, Codec<E> ec, TtlConfig ttl) {
+        require_backend_("list_state");
+        return ListState<K, E>(
+            *backend_, op_id_, std::move(slot_name), std::move(kc), std::move(ec), ttl);
     }
 
     template <typename K, typename MK, typename MV>
@@ -398,6 +412,19 @@ public:
         require_backend_("map_state");
         return MapState<K, MK, MV>(
             *backend_, op_id_, std::move(slot_name), std::move(kc), std::move(mkc), std::move(mvc));
+    }
+
+    template <typename K, typename MK, typename MV>
+    MapState<K, MK, MV> map_state(
+        std::string slot_name, Codec<K> kc, Codec<MK> mkc, Codec<MV> mvc, TtlConfig ttl) {
+        require_backend_("map_state");
+        return MapState<K, MK, MV>(*backend_,
+                                   op_id_,
+                                   std::move(slot_name),
+                                   std::move(kc),
+                                   std::move(mkc),
+                                   std::move(mvc),
+                                   ttl);
     }
 
     template <typename K, typename In, typename Acc, typename Out>
@@ -419,6 +446,27 @@ public:
                                                  std::move(result_fn));
     }
 
+    template <typename K, typename In, typename Acc, typename Out>
+    AggregatingState<K, In, Acc, Out> aggregating_state(
+        std::string slot_name,
+        Codec<K> kc,
+        Codec<Acc> acc_codec,
+        typename AggregatingState<K, In, Acc, Out>::Initial initial,
+        typename AggregatingState<K, In, Acc, Out>::AddFn add_fn,
+        typename AggregatingState<K, In, Acc, Out>::ResultFn result_fn,
+        TtlConfig ttl) {
+        require_backend_("aggregating_state");
+        return AggregatingState<K, In, Acc, Out>(*backend_,
+                                                 op_id_,
+                                                 std::move(slot_name),
+                                                 std::move(kc),
+                                                 std::move(acc_codec),
+                                                 std::move(initial),
+                                                 std::move(add_fn),
+                                                 std::move(result_fn),
+                                                 ttl);
+    }
+
     template <typename K, typename V>
     ReducingState<K, V> reducing_state(std::string slot_name,
                                        Codec<K> kc,
@@ -431,6 +479,22 @@ public:
                                    std::move(kc),
                                    std::move(vc),
                                    std::move(reduce_fn));
+    }
+
+    template <typename K, typename V>
+    ReducingState<K, V> reducing_state(std::string slot_name,
+                                       Codec<K> kc,
+                                       Codec<V> vc,
+                                       typename ReducingState<K, V>::ReduceFn reduce_fn,
+                                       TtlConfig ttl) {
+        require_backend_("reducing_state");
+        return ReducingState<K, V>(*backend_,
+                                   op_id_,
+                                   std::move(slot_name),
+                                   std::move(kc),
+                                   std::move(vc),
+                                   std::move(reduce_fn),
+                                   ttl);
     }
 
 private:

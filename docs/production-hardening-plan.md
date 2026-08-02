@@ -840,15 +840,48 @@ from zero; for DISTINCT, twenty expired values leave zero entries resident
 in the backend. An operator that stops reporting a key while still holding
 it has bounded nothing, and only that distinction separates the two.
 
+**Collection state now has retention too, and the docs no longer lie
+about it.** `typed_state.hpp` claimed `ListState` / `MapState` /
+`AggregatingState` / `ReducingState` inherited TTL "for free". They did
+not: the constructors never accepted or forwarded a `TtlConfig`, so a
+caller who read that sentence and expected bounded state got unbounded
+state. A textbook instance of finding F10 - behaviour controlled by
+documentation rather than by code - sitting in the header the whole time.
+
+All four now take an optional `TtlConfig` (with matching `RuntimeContext`
+factory overloads) and forward `advance_watermark`, `cleanup_batch` and
+`ttl_stats`.
+
+**Retention on a collection is PER KEY, not per element.** The whole
+collection for a key is one `KeyedState` value, so it lives and dies as a
+unit: a map with one hot entry and a thousand cold ones retains all
+thousand, and touching any entry refreshes them all. That is a legitimate
+design given the representation, but it is emphatically not what "TTL on a
+map" suggests, and a caller who assumed per-entry expiry would size their
+state completely wrongly. It is pinned as a named test
+(`MapRetentionIsPerKeyNotPerEntry`) rather than left in a comment for
+exactly that reason. Per-element expiry needs one backend key per element -
+a different representation, not done.
+
+**Tests:** `tests/test_typed_state_ttl.cpp`, 14 cases across all four
+types: expired-reads-empty, mutation refreshes, reads do not refresh,
+cleanup releases rather than hides, keys expire independently, restore
+resumes the original deadline, and nothing expires before the first
+watermark.
+
 **What makes this Partial.** NOT covered:
 
-- Map and list state (`KeyedState<K,V>` value state only).
 - CEP partial matches.
 - Backend-specific compaction hooks.
+- Per-element expiry within a collection (see above).
 - The interval join and windowed operators, which are bounded by their
   time condition or window and so are not flagged by the gate - correct
   today, but they would still benefit from a retention ceiling on a
   pathological key space.
+- No operator currently drives `cleanup_batch` on a collection slot; the
+  method is exposed and tested, but a user of `ListState` must call it
+  themselves. The SQL operators drive their own eviction; the typed C++
+  API leaves the schedule to the caller.
 
 ---
 
