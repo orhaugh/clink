@@ -349,8 +349,13 @@ public:
     }
 
     void on_watermark(Watermark wm, Emitter<U>& out) override {
-        if (auto within = pattern_.within_duration(); within.has_value()) {
-            prune_expired_(wm.timestamp().millis() - within->count(), wm, out);
+        // The eviction bound is the tighter of within() and state_ttl().
+        // Both prune the same way and route evicted partials to the same
+        // timed-out side output; they differ only in that within() ALSO
+        // binds at match time (see Pattern::state_ttl for why a resource
+        // bound deliberately does not).
+        if (auto bound = pattern_.eviction_bound(); bound.has_value()) {
+            prune_expired_(wm.timestamp().millis() - bound->count(), wm, out);
         }
         Operator<T, U>::on_watermark(wm, out);
     }

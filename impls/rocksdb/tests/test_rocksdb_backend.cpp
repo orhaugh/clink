@@ -698,4 +698,79 @@ TEST(RocksDBStateBackend, ArrowExportsCarryStateVersions) {
     EXPECT_EQ(ref2.restored_state_versions().pack(), versions.pack());
 }
 
+// --- expiry compaction ------------------------------------------------------
+
+TEST(RocksDBStateBackend, ExpiryFilterDropsEntriesDuringCompaction) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    // The reason the compaction hook exists: RocksDB is already rewriting
+    // every live SST during compaction, so an expiry predicate consulted
+    // there reclaims TTL'd state for free instead of paying for a scan
+    // that competes with the write path.
+    //
+    // This is the test that makes the hook real rather than an interface
+    // with a fake behind it: a genuine forced compaction, a genuine
+    // CompactionFilterFactory, and an assertion that the dead entries are
+    // gone and the live ones are not.
+    auto base_dir = std::filesystem::temp_directory_path() / "clink_rocks_expiry";
+    std::filesystem::remove_all(base_dir);
+    std::filesystem::create_directories(base_dir);
+    {
+        RocksDBStateBackend backend(RocksDBStateBackend::Options{.path = (base_dir / "db").string(),
+                                                                 .create_if_missing = true});
+        EXPECT_TRUE(backend.supports_expiry_compaction());
+
+        const OperatorId op{7};
+        for (int i = 0; i < 50; ++i) {
+            backend.put(op, sv("doomed_" + std::to_string(i)), sv(std::string{"x"}));
+            backend.put(op, sv("keep_" + std::to_string(i)), sv(std::string{"x"}));
+        }
+
+        backend.set_expiry_filter([](OperatorId, std::string_view key, std::string_view) {
+            return key.rfind("doomed_", 0) == 0;
+        });
+        backend.compact_expired(op);
+
+        std::size_t doomed = 0;
+        std::size_t kept = 0;
+        backend.scan(op, [&](std::string_view k, std::string_view) {
+            if (k.rfind("doomed_", 0) == 0) {
+                ++doomed;
+            } else if (k.rfind("keep_", 0) == 0) {
+                ++kept;
+            }
+        });
+        EXPECT_EQ(doomed, 0U) << "the compaction filter did not drop the expired entries";
+        EXPECT_EQ(kept, 50U) << "the compaction filter dropped live entries";
+    }
+    std::filesystem::remove_all(base_dir);
+}
+
+TEST(RocksDBStateBackend, NoExpiryFilterMeansCompactionKeepsEverything) {
+    if (!RocksDBStateBackend::is_real_implementation()) {
+        GTEST_SKIP() << "Built without RocksDB support";
+    }
+    // A compaction with no predicate installed must be a plain compaction.
+    // The factory returns nullptr in that case; if it returned a filter
+    // that defaulted to "drop", a job with no TTL would lose its state the
+    // first time RocksDB compacted.
+    auto base_dir = std::filesystem::temp_directory_path() / "clink_rocks_no_expiry";
+    std::filesystem::remove_all(base_dir);
+    std::filesystem::create_directories(base_dir);
+    {
+        RocksDBStateBackend backend(RocksDBStateBackend::Options{.path = (base_dir / "db").string(),
+                                                                 .create_if_missing = true});
+        const OperatorId op{8};
+        for (int i = 0; i < 20; ++i) {
+            backend.put(op, sv("k" + std::to_string(i)), sv(std::string{"v"}));
+        }
+        backend.compact_expired(op);
+        std::size_t n = 0;
+        backend.scan(op, [&](std::string_view, std::string_view) { ++n; });
+        EXPECT_EQ(n, 20U) << "compaction dropped state with no expiry filter installed";
+    }
+    std::filesystem::remove_all(base_dir);
+}
+
 #endif  // __has_include rocksdb_state_backend.hpp

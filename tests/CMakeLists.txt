@@ -170,10 +170,12 @@ add_executable(clink_core_tests
     test_keyed_state_ttl.cpp
     test_keyed_state_ttl_depth.cpp
     test_typed_state_ttl.cpp
+    test_expiry_compaction.cpp
     test_async_map_operator.cpp
     test_dag_iteration.cpp
     test_process_function.cpp
     test_cep.cpp
+    test_cep_state_ttl.cpp
     test_state_processor.cpp
     test_harness_framework.cpp
     test_record_capture.cpp

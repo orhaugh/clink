@@ -364,6 +364,19 @@ public:
         if (!now.has_value()) {
             return 0;  // event time not yet established; nothing can be judged
         }
+        // Hand the work to the backend when it can do it as part of
+        // maintenance it already performs (an LSM compaction rewrites every
+        // live SST anyway, so dropping expired entries there is free). The
+        // scan below is the portable fallback for backends that cannot.
+        if (backend_->supports_expiry_compaction()) {
+            install_expiry_filter_once_();
+            const auto reclaimed = backend_->compact_expired(op_);
+            // nullopt means "reclaimed, count unknown" - RocksDB does not
+            // report filter drops. Either way the backend has handled it and
+            // a scan on top would be pure duplicated cost.
+            stats_.expired_in_cleanup += reclaimed.value_or(0);
+            return reclaimed.value_or(0);
+        }
 
         std::vector<std::string> doomed;
         std::uint64_t scanned = 0;
@@ -545,6 +558,54 @@ private:
             .count();
     }
 
+    // Give the backend a predicate it can consult during its own
+    // compaction. Installed once per slot, lazily: a backend that never
+    // compacts pays nothing, and a slot with no TTL installs nothing.
+    //
+    // The predicate runs on a BACKGROUND thread, so it must not touch this
+    // object's mutable state. It reads the TTL stamp out of the value's
+    // leading eight bytes and compares against a clock captured by value -
+    // the event-time watermark at install, or the wall clock. That means an
+    // event-time filter judges against a slightly stale watermark, which is
+    // conservative in the safe direction: it keeps an entry a little longer
+    // than strictly necessary, never drops a live one.
+    void install_expiry_filter_once_() {
+        if (filter_installed_ || !ttl_.enabled()) {
+            return;
+        }
+        filter_installed_ = true;
+        const bool event_time = ttl_.domain == TtlTimeDomain::EventTime;
+        const auto wm = watermark_ms_;
+        const bool have_wm = has_watermark_;
+        const auto prefix = slot_prefix_();
+        const auto my_op = op_;
+        backend_->set_expiry_filter(
+            [event_time, wm, have_wm, prefix, my_op](
+                OperatorId op, StateBackend::KeyView key, StateBackend::ValueView value) {
+                if (op != my_op) {
+                    return false;
+                }
+                // Only this slot's keys: another slot in the same operator
+                // may not be TTL-stamped at all, and reading its first
+                // eight bytes as a deadline would drop live state.
+                if (key.find(prefix) == std::string_view::npos) {
+                    return false;
+                }
+                if (value.size() < 8) {
+                    return false;  // not stamped; leave it alone
+                }
+                const auto expire_at =
+                    read_i64_le_(reinterpret_cast<const std::byte*>(value.data()));
+                if (event_time) {
+                    return have_wm && expire_at <= wm;
+                }
+                const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+                return expire_at <= now;
+            });
+    }
+
     // The clock this slot's TTL is measured against.
     //
     // nullopt means "this domain has no time yet", which happens only for
@@ -627,6 +688,7 @@ private:
     // Resume point for incremental cleanup, so successive bounded sweeps
     // walk the whole slot instead of re-scanning its front.
     std::string cleanup_cursor_;
+    bool filter_installed_{false};
 };
 
 }  // namespace clink

@@ -21,6 +21,7 @@
 #include "clink/state/snapshot_store.hpp"
 
 #ifdef CLINK_HAS_ROCKSDB
+#include <rocksdb/compaction_filter.h>
 #include <rocksdb/db.h>
 #include <rocksdb/iterator.h>
 #include <rocksdb/options.h>
@@ -107,10 +108,97 @@ std::vector<std::string> list_sst_basenames(const std::filesystem::path& dir) {
 // so each operator's MemTable stays compact - small MemTable means
 // shallower skip-lists and shorter BytewiseComparator paths on Put,
 // which was the dominant hot frame in the strict-A:A profile.
+// Shared, late-installable expiry predicate.
+//
+// RocksDB fixes a column family's compaction_filter at open time, but
+// clink creates a CF lazily per operator (cf_for) and the TTL is only
+// known once an operator binds its state - so a plain filter pointer
+// cannot work. A FACTORY can: RocksDB consults it at compaction time, and
+// it reads whatever predicate has been installed by then.
+//
+// The predicate is called on RocksDB's background compaction threads, so
+// the slot is mutex-guarded and the predicate contract (thread-safe, no
+// re-entry into the backend, cheap) is stated on StateBackend.
+class ExpiryFilterSlot {
+public:
+    void set(StateBackend::ExpiryPredicate pred) {
+        std::lock_guard lk(mu_);
+        pred_ = std::move(pred);
+    }
+    [[nodiscard]] StateBackend::ExpiryPredicate get() const {
+        std::lock_guard lk(mu_);
+        return pred_;
+    }
+
+private:
+    mutable std::mutex mu_;
+    StateBackend::ExpiryPredicate pred_;
+};
+
+// Drops entries the predicate calls dead, during compaction RocksDB was
+// going to do anyway. This is the whole point of the hook: reclaiming
+// expired state for free instead of paying for a separate scan that
+// competes with the write path.
+class ExpiryCompactionFilter final : public rocksdb::CompactionFilter {
+public:
+    ExpiryCompactionFilter(StateBackend::ExpiryPredicate pred, OperatorId op)
+        : pred_(std::move(pred)), op_(op) {}
+
+    bool Filter(int /*level*/,
+                const rocksdb::Slice& key,
+                const rocksdb::Slice& existing_value,
+                std::string* /*new_value*/,
+                bool* /*value_changed*/) const override {
+        if (!pred_) {
+            return false;  // keep
+        }
+        return pred_(op_,
+                     std::string_view{key.data(), key.size()},
+                     std::string_view{existing_value.data(), existing_value.size()});
+    }
+
+    [[nodiscard]] const char* Name() const override { return "clink.ExpiryCompactionFilter"; }
+
+private:
+    StateBackend::ExpiryPredicate pred_;
+    OperatorId op_;
+};
+
+class ExpiryFilterFactory final : public rocksdb::CompactionFilterFactory {
+public:
+    ExpiryFilterFactory(std::shared_ptr<ExpiryFilterSlot> slot, OperatorId op)
+        : slot_(std::move(slot)), op_(op) {}
+
+    std::unique_ptr<rocksdb::CompactionFilter> CreateCompactionFilter(
+        const rocksdb::CompactionFilter::Context& /*ctx*/) override {
+        auto pred = slot_->get();
+        if (!pred) {
+            return nullptr;  // no filter installed: keep everything
+        }
+        return std::make_unique<ExpiryCompactionFilter>(std::move(pred), op_);
+    }
+
+    [[nodiscard]] const char* Name() const override { return "clink.ExpiryFilterFactory"; }
+
+private:
+    std::shared_ptr<ExpiryFilterSlot> slot_;
+    OperatorId op_;
+};
+
 [[nodiscard]] rocksdb::ColumnFamilyOptions make_cf_options() {
     rocksdb::ColumnFamilyOptions cfo;
     cfo.write_buffer_size = 64ull * 1024 * 1024;
     cfo.max_write_buffer_number = 4;
+    return cfo;
+}
+
+// Same, plus the expiry-filter factory bound to this operator's CF. The
+// factory is attached at CF creation (RocksDB requires that) but reads the
+// predicate lazily, so a TTL installed later still takes effect.
+[[nodiscard]] rocksdb::ColumnFamilyOptions make_cf_options_with_expiry(
+    const std::shared_ptr<ExpiryFilterSlot>& slot, OperatorId op) {
+    auto cfo = make_cf_options();
+    cfo.compaction_filter_factory = std::make_shared<ExpiryFilterFactory>(slot, op);
     return cfo;
 }
 
@@ -170,6 +258,9 @@ struct RocksDBStateBackend::Impl {
     // inside cf_for() keeps the hot path lock-free for already-known
     // operators.
     mutable std::shared_mutex cf_mu_;
+    // Shared with every CF's compaction-filter factory. Lives on Impl so
+    // it outlives any individual compaction.
+    std::shared_ptr<ExpiryFilterSlot> expiry_slot_ = std::make_shared<ExpiryFilterSlot>();
     std::unordered_map<std::uint64_t, rocksdb::ColumnFamilyHandle*> cfs_;
     rocksdb::ColumnFamilyHandle* default_cf_{nullptr};
 
@@ -240,7 +331,8 @@ struct RocksDBStateBackend::Impl {
         }
         rocksdb::ColumnFamilyHandle* handle = nullptr;
         const auto name = cf_name_for(op);
-        auto st = db->CreateColumnFamily(make_cf_options(), name, &handle);
+        auto st =
+            db->CreateColumnFamily(make_cf_options_with_expiry(expiry_slot_, op), name, &handle);
         if (!st.ok()) {
             throw std::runtime_error("RocksDBStateBackend::cf_for create failed: " + st.ToString());
         }
@@ -814,6 +906,62 @@ Snapshot RocksDBStateBackend::combine_snapshots(std::vector<Snapshot> parts) con
     out.bytes.assign(reinterpret_cast<const std::byte*>(joined.data()),
                      reinterpret_cast<const std::byte*>(joined.data() + joined.size()));
     return out;
+}
+
+// --- expiry compaction ------------------------------------------------------
+
+bool RocksDBStateBackend::supports_expiry_compaction() const noexcept {
+    return true;
+}
+
+void RocksDBStateBackend::set_expiry_filter(ExpiryPredicate pred) {
+    impl_->expiry_slot_->set(std::move(pred));
+}
+
+std::optional<std::size_t> RocksDBStateBackend::compact_expired(OperatorId op) {
+    // Force a full compaction of this operator's column family. Every live
+    // SST is rewritten, and the filter drops whatever the predicate calls
+    // dead as part of that pass.
+    //
+    // Returns nullopt rather than a count: RocksDB does not report how many
+    // entries a filter dropped, and inventing a number by scanning before
+    // and after would cost more than the compaction saved. The contract on
+    // StateBackend says nullopt means "reclaimed, count unknown", which is
+    // the honest answer.
+    auto* cf = impl_->cf_for(op);
+    // Two things have to happen before a compaction filter can see
+    // anything, and both were needed to make this hook do real work:
+    //
+    //   1. Drain the pending WriteBatch. This backend buffers Puts and
+    //      writes them in batches, so recent state is not in the DB at all
+    //      until the batch is flushed - a compaction would run against
+    //      whatever was written some time ago.
+    //   2. Flush the MemTable. A compaction filter is only consulted on
+    //      SST contents, and with this backend's 64 MB write buffer most
+    //      of the state a TTL sweep cares about is still in memory.
+    //
+    // Missing either makes the hook silently no-op on exactly the recent
+    // state retention is meant to reclaim - and appear to work in a
+    // long-running job, where memtables flush on their own eventually.
+    {
+        std::lock_guard lock(impl_->buffer_mu_);
+        impl_->flush_write_batch_locked();
+    }
+    rocksdb::FlushOptions flush_opts;
+    flush_opts.wait = true;
+    (void)impl_->db->Flush(flush_opts, cf);
+
+    rocksdb::CompactRangeOptions opts;
+    // Rewrite even SSTs that would otherwise be skipped as already-compacted:
+    // without this a level whose files have not changed is left alone, and
+    // the expired entries inside it survive the call the caller just made
+    // specifically to remove them.
+    opts.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kForce;
+    const auto st = impl_->db->CompactRange(opts, cf, /*begin=*/nullptr, /*end=*/nullptr);
+    if (!st.ok()) {
+        return std::nullopt;
+    }
+    return std::nullopt;
 }
 
 std::string RocksDBStateBackend::description() const {

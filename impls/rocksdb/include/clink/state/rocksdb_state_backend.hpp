@@ -108,6 +108,14 @@ public:
     // Merge several RocksDB snapshots into one (scale-down): joins their
     // checkpoint-dir paths so restore() iterate-merges them.
     Snapshot combine_snapshots(std::vector<Snapshot> parts) const override;
+
+    // Expiry compaction. RocksDB is the backend this hook exists for: it is
+    // already rewriting every live SST during compaction, so dropping
+    // expired entries there costs nothing beyond the predicate call, and
+    // avoids a scan that would compete with the write path.
+    [[nodiscard]] bool supports_expiry_compaction() const noexcept override;
+    void set_expiry_filter(ExpiryPredicate pred) override;
+    std::optional<std::size_t> compact_expired(OperatorId op) override;
     std::string description() const override;
 
     // Returns the SnapshotStats for the most recent snapshot()

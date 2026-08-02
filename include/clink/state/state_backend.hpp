@@ -285,6 +285,48 @@ public:
     // in-memory backends that keep no per-checkpoint artefacts.
     virtual void purge_checkpoint(CheckpointId /*id*/) {}
 
+    // --- expiry compaction hook -------------------------------------------
+    //
+    // TTL'd state has to be physically reclaimed, not merely hidden from
+    // readers, or a retention that was supposed to bound memory does not
+    // (see keyed_state.hpp). The portable way is KeyedState::cleanup_batch,
+    // which scans. On an LSM backend that is the wrong shape twice over:
+    // the scan competes with the write path, and the backend is ALREADY
+    // rewriting every live SST during compaction, so it can drop expired
+    // entries for free while it is there.
+    //
+    // This is the seam for that. A backend that reclaims during its own
+    // maintenance reports true from supports_expiry_compaction(); a caller
+    // can then leave the sweeping to the backend and keep cleanup_batch as
+    // a fallback for the backends that cannot.
+    //
+    // The predicate is consulted on a BACKGROUND thread for backends where
+    // compaction is asynchronous (RocksDB), so it must be thread-safe,
+    // must not call back into the backend, and must be cheap. In practice
+    // it reads the TTL stamp out of the value's first eight bytes and
+    // compares it to a clock - see keyed_state.hpp for that layout.
+    //
+    // Returning false from the predicate means "keep"; true means "this
+    // entry is dead and may be dropped".
+    using ExpiryPredicate = std::function<bool(OperatorId, KeyView, ValueView)>;
+
+    // True when the backend drops expired entries as part of maintenance it
+    // already performs. False (the default) means the caller must sweep.
+    [[nodiscard]] virtual bool supports_expiry_compaction() const noexcept { return false; }
+
+    // Install the predicate. A no-op where unsupported, so a caller can
+    // install unconditionally and consult supports_expiry_compaction() to
+    // decide whether it still needs to sweep.
+    virtual void set_expiry_filter(ExpiryPredicate /*pred*/) {}
+
+    // Ask the backend to run its maintenance now, synchronously where it
+    // can. Returns the number of entries reclaimed when the backend can
+    // report it, nullopt when it cannot (RocksDB compaction does not
+    // count drops) or has no maintenance path. Best-effort throughout:
+    // this is an optimisation, and a backend that ignores it is correct,
+    // just slower to give memory back.
+    virtual std::optional<std::size_t> compact_expired(OperatorId /*op*/) { return std::nullopt; }
+
     // Record the codec version for each (operator, state_type)
     // before the next snapshot fires. The default is to ignore - backends
     // that support versioned state override these. snapshot() writes the

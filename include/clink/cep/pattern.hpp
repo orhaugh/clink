@@ -52,6 +52,7 @@
 //   - after-match skip strategies beyond implicit SKIP_PAST_LAST
 //   - PatternFlatSelectFunction (emit 0..N matches per partial)
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -301,9 +302,39 @@ public:
     // and the bound equally holds at match time: a record whose event
     // time is past (start + within) expires the partial instead of
     // extending it, however far the watermark lags behind.
-    // Optional - without within(), partials live indefinitely.
+    // Optional - without within() or state_ttl(), partials live
+    // indefinitely.
     Pattern<T>& within(std::chrono::milliseconds w) {
         within_ = w;
+        return *this;
+    }
+
+    // Retention bound on partial matches, for a pattern that has no
+    // within(). A partial older than (current_watermark - state_ttl) is
+    // evicted on watermark advance.
+    //
+    // This is a RESOURCE bound, not a semantic one, and the difference
+    // from within() matters:
+    //
+    //   * within() is part of the pattern's meaning - a match spanning
+    //     more than `within` is not a match - so it also binds at MATCH
+    //     time, expiring a partial the moment a too-late record arrives.
+    //   * state_ttl() only prunes on watermark advance. It never changes
+    //     what a match IS, so it cannot make results depend on where
+    //     watermarks happen to fall between records.
+    //
+    // It can nonetheless SUPPRESS a match: a pattern that would have
+    // completed after the TTL elapsed will not, because its partial is
+    // gone. That is the cost of bounding the state, and it is why an
+    // evicted partial routes to the timed-out side output exactly as a
+    // within()-evicted one does - the loss is visible rather than silent.
+    // Prefer within() when the pattern genuinely has a time span; reach
+    // for state_ttl() when it does not but the state still has to be
+    // bounded.
+    //
+    // With both set, the TIGHTER bound wins.
+    Pattern<T>& state_ttl(std::chrono::milliseconds ttl) {
+        state_ttl_ = ttl;
         return *this;
     }
 
@@ -316,6 +347,21 @@ public:
     }
 
     [[nodiscard]] const std::vector<Step<T>>& steps() const noexcept { return steps_; }
+    // The effective eviction bound: the tighter of within() and
+    // state_ttl(), or nullopt when neither is set (partials live for
+    // ever, which the bounded-state audit treats as a deliberate choice
+    // the user has to make rather than a default).
+    [[nodiscard]] std::optional<std::chrono::milliseconds> eviction_bound() const noexcept {
+        if (within_.has_value() && state_ttl_.has_value()) {
+            return std::min(*within_, *state_ttl_);
+        }
+        return within_.has_value() ? within_ : state_ttl_;
+    }
+
+    [[nodiscard]] std::optional<std::chrono::milliseconds> state_ttl_duration() const noexcept {
+        return state_ttl_;
+    }
+
     [[nodiscard]] std::optional<std::chrono::milliseconds> within_duration() const noexcept {
         return within_;
     }
@@ -399,6 +445,7 @@ private:
 
     std::vector<Step<T>> steps_;
     std::optional<std::chrono::milliseconds> within_;
+    std::optional<std::chrono::milliseconds> state_ttl_;
     SkipStrategy skip_{SkipStrategy::no_skip()};
 };
 
