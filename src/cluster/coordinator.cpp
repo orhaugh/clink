@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/config_lint.hpp"
 #include "clink/cluster/frame_io.hpp"
 #include "clink/cluster/guarantee_gate.hpp"
 #include "clink/cluster/job_bundle.hpp"
@@ -1851,6 +1852,22 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
     // pipeline cannot provide. A job that asks for nothing gets its
     // computed guarantee logged and proceeds - most jobs are at-least-once
     // and that is a legitimate choice, not an error.
+    // Configuration coherence, before the guarantee analysis. Deliberately
+    // first: "your checkpoint interval will never fire" is more useful than
+    // "your pipeline is at-least-once", and the second is a CONSEQUENCE of
+    // the first when the cause is a directory nobody set.
+    {
+        std::vector<ConfigProblem> problems;
+        const auto reject = check_config(checkpoint, &problems);
+        for (const auto& p : problems) {
+            if (!p.is_error()) {
+                log::warn("coordinator.config", p.setting + ": " + p.message);
+            }
+        }
+        if (!reject.empty()) {
+            throw std::runtime_error(reject);
+        }
+    }
     if (auto reject = check_delivery_guarantee(graph, checkpoint, /*out_report=*/nullptr);
         !reject.empty()) {
         throw std::runtime_error(reject);

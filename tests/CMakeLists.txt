@@ -86,6 +86,7 @@ add_executable(clink_core_tests
     test_frame_robustness.cpp
     test_checkpoint_completion.cpp
     test_fuzz_corpus.cpp
+    test_config_lint.cpp
     test_ha_coordinator.cpp
     test_key_groups.cpp
     test_service_discovery.cpp

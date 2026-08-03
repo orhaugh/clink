@@ -692,6 +692,71 @@ Worth recording as its own mistake rather than folded into F30. A test that
 waits for a condition nothing will cause is a specific error, and I made it
 while fixing a different flake of the same family.
 
+### F31. Six checkpoint settings were accepted and silently ignored
+
+Found by enumerating what `CheckpointConfig` accepts and comparing it to
+what the engine reads. Each of these submits cleanly today and does
+nothing:
+
+- `interval_ms` with no `checkpoint_dir` - `checkpoint_trigger_loop_` skips
+  any job whose directory is empty, so a job that asked for periodic
+  checkpoints takes none at all.
+- `max_restarts_on_worker_loss` with no `checkpoint_dir` - the field's own
+  comment says "has no effect without checkpoint_dir". The job fails fast
+  on the first worker loss, having asked not to.
+- `restore_from_checkpoint_id` without `restore_from_dir`, and the reverse -
+  the engine restores only when both are set, so half a resume request is a
+  silent cold start. That is the worst outcome available to someone
+  deliberately resuming.
+- `capture_records` with no `capture_dir` - a bound on a capture that is
+  not happening.
+- A memory `state_backend_uri` alongside a `checkpoint_dir` - the
+  durability illusion. `COMPLETED-N` markers get written, so the control
+  plane believes checkpoints are completing, while the state they describe
+  dies with the process. A restore finds markers and no state.
+
+And two liveness settings that are accepted while guaranteeing the failure
+they exist to prevent: a heartbeat interval at or above the heartbeat
+timeout declares a HEALTHY worker lost on schedule, and a watchdog interval
+longer than the timeout means the configured timeout is not the one in
+effect.
+
+**Risk:** an operator sets a flag, reads their own configuration back, and
+believes something that is not true. The memory-backend case is the
+dangerous one: it manufactures evidence of durability.
+
+### F32. The CLI made the documented recovery default unreachable
+
+Found by the new linter, on its first real use: a `--profile=production`
+submission that never mentioned restarts warned about fail-fast restarts.
+
+`CheckpointConfig::max_restarts_on_worker_loss` uses `kRestartAuto` as an
+UNSET sentinel, documented to resolve to self-heal
+(`kDefaultSelfHealRestarts = 10`) when `checkpoint_dir` is set and
+fail-fast otherwise. `clink_submit_job` defaulted its flag to the string
+`"0"`, which wrote an EXPLICIT zero into every submission.
+
+So the sentinel was unreachable through the CLI, and every job submitted
+with `clink_submit_job` failed fast on the first worker loss - including
+jobs configured with checkpointing, whose entire purpose is to survive one.
+The self-healing default described in the header applied to nothing that
+went through the tool.
+
+**Risk:** a job with checkpointing configured stops on a single worker loss
+instead of recovering, and the operator has read documentation saying it
+would not.
+
+**Fix:** the flag defaults to `auto`, which maps to the sentinel. This is a
+behaviour change for anyone relying on the old default - a CLI-submitted
+job with checkpointing will now restart up to 10 times rather than failing
+- and it is a change TOWARD the documented behaviour rather than away from
+it. `--max-restarts-on-worker-loss=0` still forces fail-fast.
+
+Worth noting how it was found. Not by reading the CLI, and not by a test:
+by a linter warning about a combination on a command line that had not
+asked for that combination. The warning was correct and the thing it
+pointed at was upstream of it.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -730,7 +795,7 @@ lives; evidence is in section 4.
 | W14 | Resource and overload limits: frame size cap, bounded element counts, exception boundaries | P1.9 | F21, F22, F23 | **Partial** |
 | W15 | Coordinator fencing: epoch on the wire, worker enforcement, metadata guard | P1.11 | F16 | **Partial** |
 | W16 | Protocol version negotiation across RPC/frames/state | P1.12 | F19, F20 | **Partial** |
-| W17 | Config profiles + linter | P1.13 | - | **Open** |
+| W17 | Config linter + recovery profiles, enforced at submission | P1.13 | F31 | **Partial** |
 | W18 | OpenTelemetry tracing | P1.14 | - | **Open** |
 | W19 | Production metrics completion | P1.15 | - | **Open** |
 | W20 | Non-determinism detection API | P2.16 | - | **Partial** |
@@ -2056,6 +2121,86 @@ hard CMake error naming the fix, not a silent skip.
   targets.
 - **`state.during_flush` is declared and wired nowhere.** Noticed while
   listing fault points for a target; recorded here rather than fixed.
+
+---
+
+### W17 - Config linter and recovery profiles — Partial
+
+**Source:** `include/clink/cluster/config_lint.hpp`,
+`src/cluster/config_lint.cpp`, wired into `Coordinator::submit_job`,
+`tests/test_config_lint.cpp` (22 cases), `tools/clink_submit_job.cpp`, `tools/clink_node.cpp`
+
+**Every check cites a line of engine code, not a preference.** That
+constraint did the design work: it is what kept "your checkpoint interval
+is quite short" out of the file and kept "your checkpoint interval will
+never fire, because the trigger loop skips a job with no directory" in. A
+linter assembled from taste produces the `mode='cdc'` failure - it refuses
+things that work, and people learn to switch it off, at which point the
+true positives are worth nothing.
+
+Errors reject the submission; warnings are logged and let it through. The
+split is not cosmetic: a checkpoint directory with no interval is normal
+for a bounded job and must submit, while an interval with no directory
+cannot do what it says and must not.
+
+**The negatives are the expensive half of the tests and the point of
+them.** Every check has both a configuration it must refuse and the nearby
+one it must accept: `kRestartAuto` (the unset sentinel) must not be flagged
+where an explicit `3` is; an explicit `0` means fail-fast and is honoured;
+five durable backend URIs must pass where `memory://` does not. Two
+assertions exist purely to catch a linter that has turned on its own
+product - the shipped liveness defaults (500 ms / 2000 ms / 100 ms) must
+not even warn, and neither must a coherent baseline config.
+
+The strongest evidence is negative and came free: the gate runs at every
+submission across the whole suite, and 3505 tests pass. A false positive
+anywhere in the cluster or SQL submission paths would have shown up as a
+failure rather than as a judgement call.
+
+**Profiles** are `development` and `production`. A profile fills in only
+what the submitter left alone - an explicit `interval_ms = 0` means "no
+periodic checkpoints" and survives, because quietly rewriting a flag
+someone set is the same failure as ignoring it. `production` REFUSES what
+it cannot deliver (no checkpoint directory, or a memory backend) rather
+than downgrading, because the name is the request; a silent downgrade
+leaves an operator believing they have guarantees they do not.
+`development` deliberately changes nothing: it exists so a submission can
+SAY it wants no recovery rather than arriving there by omission.
+
+**Mutation-checked.** Disabling the gate in `submit_job` fails
+`ARealSubmissionIsRejectedForAnIncoherentConfig`; the predicate-level tests
+alone survive it. That is the snapshot-format-version lesson applied
+without having to relearn it - a gate tested only through its predicate is
+not proven to be wired.
+
+**What makes this Partial - stated plainly:**
+
+- **The linter is not exposed as a standalone command.** There is no
+  `clink lint --config ...`, so an operator cannot check a configuration
+  without submitting a job. The enforcement path (submission) and the
+  profile path (`--profile`) both run it, so this is a convenience rather
+  than a hole, but it is not done.
+
+Two gaps recorded in the first draft of this section are now closed,
+because "the mechanism exists and nothing calls it" is the exact pattern
+this document criticises elsewhere and it would have been indefensible to
+leave:
+
+- `--profile=development|production` is wired into `clink_submit_job`. It
+  applies the profile's defaults, runs both `lint_profile` and the general
+  checks, prints every problem, and refuses on any error before opening a
+  connection.
+- `lint_liveness_config` is called at coordinator startup in `clink_node`,
+  warning rather than refusing: an operator may have a reason, and
+  declining to start a coordinator over a heartbeat ratio would be a worse
+  failure than the one being warned about.
+
+Using the profile flag for the first time is what found F32.
+- **Job-graph settings are not linted.** Only `CheckpointConfig`.
+  Per-operator parallelism against slot capacity, key-group counts against
+  parallelism, and TTL against checkpoint interval are all unchecked.
+- **No cross-check against the guarantee analyser.** The two gates run in
+  sequence and could in principle disagree; nothing asserts they cannot.
 
 ---
 

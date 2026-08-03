@@ -32,6 +32,7 @@
 #include <string_view>
 
 #include "clink/application/job_submitter.hpp"
+#include "clink/cluster/config_lint.hpp"
 
 namespace {
 
@@ -49,6 +50,21 @@ std::string get_arg(int argc,
     return std::string{default_value};
 }
 
+// Was the flag actually given? get_arg cannot say - a default is
+// indistinguishable from an explicit value equal to it - and a profile has
+// to know. An explicit `--checkpoint-interval-ms=0` means "no periodic
+// checkpoints" and must survive; filling it in because it looks unset would
+// be the same failure the config linter exists to catch.
+bool has_arg(int argc, char** argv, std::string_view flag) {
+    const std::string prefix = "--" + std::string{flag} + "=";
+    for (int i = 1; i < argc; ++i) {
+        if (std::string{argv[i]}.starts_with(prefix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool has_flag(int argc, char** argv, std::string_view flag) {
     const std::string needle = "--" + std::string{flag};
     for (int i = 1; i < argc; ++i) {
@@ -64,8 +80,9 @@ void usage() {
         << "Usage: clink run --job=<path.so> --coordinator-host=<host> --coordinator-port=<port>\n"
         << "                          [--wait-timeout-s=N] [--name=<label>]\n"
         << "                          [--state-backend=<scheme>[:<path>]]\n"
+        << "                          [--profile=development|production] "
         << "                          [--checkpoint-interval-ms=N] "
-           "[--max-restarts-on-worker-loss=N]\n"
+           "[--max-restarts-on-worker-loss=auto|N]\n"
         << "                          [--capture-dir=<dir>] [--capture-records=N]\n"
         << "       clink run <file>.sql | -e \"<sql>\"   (embedded SQL: run with --help for "
            "flags)\n"
@@ -168,7 +185,20 @@ int clink_cmd_run(int argc, char** argv) {
     const auto ckpt_interval_str = get_arg(argc, argv, "checkpoint-interval-ms", "0");
     const auto restore_dir = get_arg(argc, argv, "restore-from-dir", "");
     const auto restore_id_str = get_arg(argc, argv, "restore-from-checkpoint-id", "0");
-    const auto max_restarts_str = get_arg(argc, argv, "max-restarts-on-worker-loss", "0");
+    // "auto" rather than "0", which is what this defaulted to and why the
+    // documented recovery default never applied.
+    //
+    // CheckpointConfig::max_restarts_on_worker_loss uses kRestartAuto as an
+    // UNSET sentinel that resolves to self-heal when checkpoint_dir is set
+    // and fail-fast otherwise. Defaulting the flag to "0" wrote an EXPLICIT
+    // zero into every submission, so the sentinel was unreachable through
+    // the CLI and every CLI-submitted job failed fast on the first worker
+    // loss - including jobs configured with checkpointing, whose whole
+    // point is to survive one.
+    //
+    // Found by the config linter warning about a production profile with
+    // fail-fast restarts, on a command line that never mentioned restarts.
+    const auto max_restarts_str = get_arg(argc, argv, "max-restarts-on-worker-loss", "auto");
     // Record-capture flight recorder: arm the per-epoch .cap tee so the run
     // is replayable offline with `clink replay`. Pairs with a checkpoint dir
     // (epochs align with checkpoints). CheckpointConfig has carried these
@@ -247,10 +277,47 @@ int clink_cmd_run(int argc, char** argv) {
         opts.checkpoint.restore_from_checkpoint_id =
             static_cast<std::uint64_t>(std::stoull(restore_id_str));
         opts.checkpoint.max_restarts_on_worker_loss =
-            static_cast<std::uint32_t>(std::stoul(max_restarts_str));
+            max_restarts_str == "auto" ? clink::cluster::kRestartAuto
+                                       : static_cast<std::uint32_t>(std::stoul(max_restarts_str));
         opts.checkpoint.capture_dir = capture_dir;
         opts.checkpoint.capture_records =
             static_cast<std::uint64_t>(std::stoull(capture_records_str));
+    }
+
+    // --profile fills in a coherent set of recovery defaults and then
+    // refuses what the named profile cannot deliver. Applied after the
+    // explicit flags above so it can only fill gaps, never overwrite a
+    // choice.
+    if (const auto profile_str = get_arg(argc, argv, "profile", ""); !profile_str.empty()) {
+        const auto profile = clink::cluster::profile_from_string(profile_str);
+        if (!profile.has_value()) {
+            std::cerr << "submit: unknown --profile=" << profile_str
+                      << " (expected 'development' or 'production')\n";
+            return 9;
+        }
+        clink::cluster::apply_profile(*profile,
+                                      opts.checkpoint,
+                                      has_arg(argc, argv, "checkpoint-dir"),
+                                      has_arg(argc, argv, "checkpoint-interval-ms"));
+        auto problems = clink::cluster::lint_profile(*profile, opts.checkpoint);
+        // The general config checks too: a profile does not exempt a
+        // submission from being coherent, and catching it here means a bad
+        // flag combination fails before a connection is opened.
+        for (auto& p : clink::cluster::lint_checkpoint_config(opts.checkpoint)) {
+            problems.push_back(std::move(p));
+        }
+        bool fatal = false;
+        for (const auto& p : problems) {
+            std::cerr << (p.is_error() ? "error" : "warning") << ": " << p.setting << ": "
+                      << p.message << "\n";
+            fatal = fatal || p.is_error();
+        }
+        if (fatal) {
+            std::cerr << "submit: refusing to submit under profile=" << profile_str << "\n";
+            return 9;
+        }
+        std::cout << "submit: profile=" << clink::cluster::to_string(*profile)
+                  << " checkpoint_interval_ms=" << opts.checkpoint.interval_ms << "\n";
     }
 
     const auto result = submitter.submit(graph_json, {job_abs.string()}, opts);

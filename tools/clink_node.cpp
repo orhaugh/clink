@@ -51,6 +51,7 @@
 #ifdef CLINK_LINKED_ETCD
 #include "clink/etcd/etcd_ha_coordinator.hpp"
 #endif
+#include "clink/cluster/config_lint.hpp"
 #include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/job_bundle.hpp"
 #include "clink/cluster/job_graph.hpp"
@@ -1847,6 +1848,27 @@ int run_coordinator(int argc, char** argv) {
         // connection died with the old leader. Wait up to 15s for
         // slots before failing the recovery.
         cfg.submit_wait_for_slots = 15s;
+    }
+
+    // Lint the liveness settings before the coordinator starts listening.
+    //
+    // These are the settings that guarantee the failure they exist to
+    // prevent when they are wrong: a heartbeat interval at or above the
+    // timeout declares a HEALTHY worker lost on schedule, and a watchdog
+    // slower than the timeout means the configured timeout is not the one
+    // in effect. Both are accepted silently otherwise.
+    //
+    // A warning rather than a refusal, unlike the job-config gate: the
+    // operator may have a reason, and refusing to start a coordinator over
+    // a heartbeat ratio would be a worse failure than the one being warned
+    // about. The worker's interval is fixed at 500ms (see the worker role
+    // below), so that is what these are measured against.
+    for (const auto& problem : clink::cluster::lint_liveness_config(
+             /*heartbeat_interval_ms=*/500,
+             std::chrono::duration_cast<std::chrono::milliseconds>(cfg.heartbeat_timeout).count(),
+             std::chrono::duration_cast<std::chrono::milliseconds>(cfg.watchdog_interval)
+                 .count())) {
+        clink::log::warn("node.config", problem.setting + ": " + problem.message);
     }
 
     Coordinator coordinator(cfg);
