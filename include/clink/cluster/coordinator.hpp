@@ -174,6 +174,12 @@ public:
         // NIC address for multi-machine clusters. Pair with TLS for any
         // deployment beyond a trusted local network.
         std::string bind_host{"127.0.0.1"};
+        // Most client connections the coordinator will service at once.
+        // Beyond this a new client is refused with a reason rather than
+        // being accepted into an unbounded thread pool. Generous by
+        // default - a CLI is short-lived and a dashboard holds one - so
+        // reaching it means something is wrong rather than busy.
+        std::size_t max_client_connections{256};
         // Host advertised to clients/peers in resolved peer addresses
         // when bind_host is a wildcard. Defaults to bind_host. Set to a
         // routable hostname/IP when bind_host = "0.0.0.0".
@@ -506,6 +512,18 @@ public:
     void set_epoch(std::uint64_t epoch) noexcept { epoch_.store(epoch, std::memory_order_release); }
     [[nodiscard]] std::uint64_t epoch() const noexcept {
         return epoch_.load(std::memory_order_acquire);
+    }
+
+    // Client sessions currently held, live or awaiting reaping.
+    //
+    // Exposed because "the coordinator does not leak a thread per
+    // client" is not observable from outside otherwise, and it was not
+    // true: sessions were only ever dropped by stop(). A test that
+    // connects and disconnects repeatedly watches this rather than
+    // inferring health from the absence of a crash.
+    [[nodiscard]] std::size_t client_session_count() const {
+        std::lock_guard lock(client_mu_);
+        return client_sessions_.size();
     }
 
     // Replay every persisted job manifest under the configured ha_dir
@@ -954,9 +972,31 @@ private:
     // thread and the back-pointer both keep the Connection alive;
     // dangling-pointer risk if the thread exits before stop()
     // would otherwise let close() touch freed memory.
-    std::vector<std::thread> client_threads_;
-    std::vector<std::shared_ptr<network::Connection>> client_conns_;
-    std::mutex client_mu_;
+    // One live client connection: its socket, its reader thread, and a
+    // flag the thread raises as its last act so the accept loop can tell
+    // a finished session from a running one without blocking on a join.
+    //
+    // This replaces two parallel vectors that were only ever drained by
+    // stop(). Every client that connected and went away left a joinable
+    // std::thread and a shared_ptr behind for the lifetime of the
+    // coordinator, so a script polling `clink list` once a second grew
+    // the process by 86,400 thread handles a day until thread creation
+    // began to fail.
+    struct ClientSession {
+        std::shared_ptr<network::Connection> conn;
+        std::thread thread;
+        // shared_ptr rather than a member flag: the thread outlives the
+        // vector element across a reallocation, and must not write into
+        // a moved-from slot.
+        std::shared_ptr<std::atomic<bool>> finished;
+    };
+    std::vector<ClientSession> client_sessions_;
+    mutable std::mutex client_mu_;
+
+    // Join and drop every session whose thread has finished. Called on
+    // each new client, so the cost is paid by the connection that would
+    // otherwise have grown the list. Returns the number still live.
+    std::size_t reap_finished_clients_();
 
     // Wraps an accepted listener fd into a Connection. Default plain
     // TCP via make_plain_connection. TLS callers replace via

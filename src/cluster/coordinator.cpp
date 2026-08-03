@@ -714,14 +714,47 @@ bool Coordinator::handle_first_frame_(std::unique_ptr<network::Connection> conn)
             (void)send_frame(*conn, frame);
             return false;  // conn destructor closes
         }
+        // Reap before admitting. A client that connected and went away
+        // has an exited thread still holding a joinable handle; joining
+        // it here is what keeps the list bounded by CONCURRENT clients
+        // rather than by total clients ever seen.
+        const auto live = reap_finished_clients_();
+        if (live >= cfg_.max_client_connections) {
+            log::warn("coordinator.client",
+                      "refusing a client: " + std::to_string(live) +
+                          " connections already open (max_client_connections=" +
+                          std::to_string(cfg_.max_client_connections) +
+                          "). Refusing is deliberate - accepting would spawn a thread the "
+                          "coordinator cannot account for.");
+            metrics::orch::client_connection_refused();
+            const auto frame = encode_frame(
+                MessageKind::SubmitJobAck,
+                SubmitJobAckMsg{.job_id = 0,
+                                .ok = false,
+                                .message = "coordinator is at its client-connection limit (" +
+                                           std::to_string(cfg_.max_client_connections) +
+                                           "); retry, or raise max_client_connections"});
+            (void)send_frame(*conn, frame);
+            return false;  // conn destructor closes
+        }
+
         // Client connection: spawn a per-client thread that reads
         // SubmitJob frames and writes acks/completions. shared_ptr
         // ownership lets stop() safely call shutdown_read() even if
         // the handler thread has already exited and dropped its share.
         std::shared_ptr<network::Connection> shared_conn(conn.release());
+        auto finished = std::make_shared<std::atomic<bool>>(false);
         std::lock_guard lock(client_mu_);
-        client_conns_.push_back(shared_conn);
-        client_threads_.emplace_back([this, shared_conn] { handle_client_loop_(shared_conn); });
+        client_sessions_.push_back(
+            ClientSession{.conn = shared_conn,
+                          .thread = std::thread([this, shared_conn, finished] {
+                              handle_client_loop_(shared_conn);
+                              // Last act: the accept loop reads this to
+                              // decide the session is joinable without
+                              // blocking on one that is still serving.
+                              finished->store(true, std::memory_order_release);
+                          }),
+                          .finished = finished});
         return true;
     }
     // Protocol violation - drop the connection.
@@ -843,6 +876,35 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
                         ",\"http_port\":" + std::to_string(worker->http_port) + "}");
 
     start_reader_for_(worker);
+}
+
+std::size_t Coordinator::reap_finished_clients_() {
+    std::vector<std::thread> to_join;
+    std::size_t live = 0;
+    {
+        std::lock_guard lock(client_mu_);
+        std::vector<ClientSession> keep;
+        keep.reserve(client_sessions_.size());
+        for (auto& session : client_sessions_) {
+            if (session.finished->load(std::memory_order_acquire)) {
+                to_join.push_back(std::move(session.thread));
+            } else {
+                keep.push_back(std::move(session));
+            }
+        }
+        client_sessions_ = std::move(keep);
+        live = client_sessions_.size();
+    }
+    // Joined OUTSIDE client_mu_. Each of these has already run to
+    // completion, so the join returns at once - but holding a lock across
+    // a join is how a future change to the client loop turns into a
+    // deadlock, and the cost of not doing it is nothing.
+    for (auto& t : to_join) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    return live;
 }
 
 void Coordinator::handle_client_loop_(std::shared_ptr<network::Connection> conn) {
@@ -3678,20 +3740,22 @@ void Coordinator::stop() {
     // its handler thread's recv() so the thread can exit; the shared_ptr
     // keeps the Connection alive even if the thread has already exited.
     {
-        std::vector<std::shared_ptr<network::Connection>> conns;
-        std::vector<std::thread> threads;
+        std::vector<ClientSession> sessions;
         {
             std::lock_guard lock(client_mu_);
-            conns = std::move(client_conns_);
-            threads = std::move(client_threads_);
+            sessions = std::move(client_sessions_);
+            client_sessions_.clear();
         }
-        for (auto& c : conns) {
-            if (c)
-                c->shutdown_read();
+        // Shut every socket down first, THEN join. Doing it one session
+        // at a time would wait out each blocked recv() in turn.
+        for (auto& session : sessions) {
+            if (session.conn) {
+                session.conn->shutdown_read();
+            }
         }
-        for (auto& t : threads) {
-            if (t.joinable()) {
-                t.join();
+        for (auto& session : sessions) {
+            if (session.thread.joinable()) {
+                session.thread.join();
             }
         }
     }

@@ -24,10 +24,13 @@
 // reject it.
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -87,6 +90,20 @@ private:
     std::size_t recv_calls_{0};
     bool open_{true};
 };
+
+// Wait for `pred` or give up. The deadline is a failure bound, not a
+// synchronisation mechanism.
+template <typename Pred>
+bool fencing_await(Pred pred, std::chrono::milliseconds bound = std::chrono::seconds{2}) {
+    const auto deadline = std::chrono::steady_clock::now() + bound;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return pred();
+}
 
 std::vector<std::byte> be32(std::uint32_t v) {
     return {static_cast<std::byte>((v >> 24) & 0xFF),
@@ -418,6 +435,89 @@ TEST(FrameRobustness, AMalformedFrameDoesNotKillTheCoordinator) {
         << "the coordinator accepted the connection but no longer registers workers";
 
     worker.stop();
+    coordinator.stop();
+}
+
+TEST(FrameRobustness, ClientConnectionsAreReapedRatherThanAccumulated) {
+    // Every client used to leave a joinable std::thread and a shared_ptr
+    // behind for the coordinator's whole lifetime - the two vectors
+    // holding them were drained only by stop(). A script polling
+    // `clink list` once a second grew the process by 86,400 thread
+    // handles a day until thread creation started failing.
+    //
+    // Nothing crashed while that was true, which is why the assertion has
+    // to be on the count rather than on survival.
+    Coordinator coordinator;
+    const auto port = coordinator.start();
+
+    constexpr int kCycles = 40;
+    for (int i = 0; i < kCycles; ++i) {
+        auto conn = network::connect_plain("127.0.0.1", port);
+        ASSERT_NE(conn, nullptr) << "connect failed on cycle " << i
+                                 << "; the coordinator may already have run out of threads";
+        HelloClientMsg hello;
+        ASSERT_TRUE(send_frame(*conn, encode_frame(MessageKind::HelloClient, hello)));
+        conn->close();
+    }
+
+    // Reaping happens when the NEXT client is admitted, so the count
+    // settles at a small number rather than zero. What matters is that it
+    // is bounded well below the number of clients seen.
+    EXPECT_TRUE(fencing_await([&] { return coordinator.client_session_count() <= 2; }))
+        << "after " << kCycles << " connect/disconnect cycles the coordinator still holds "
+        << coordinator.client_session_count()
+        << " client sessions; they are accumulating rather than being reaped";
+
+    coordinator.stop();
+}
+
+TEST(FrameRobustness, TheCoordinatorRefusesClientsBeyondItsLimitRatherThanSpawningThem) {
+    // The bound that makes the reaping meaningful: concurrent clients,
+    // not total clients, and a refusal a caller can read rather than a
+    // silent close or an unbounded thread pool.
+    Coordinator::Config cfg;
+    cfg.max_client_connections = 2;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+
+    // Hold two open. These stay connected, so nothing is reapable.
+    std::vector<std::unique_ptr<network::Connection>> held;
+    for (int i = 0; i < 2; ++i) {
+        auto conn = network::connect_plain("127.0.0.1", port);
+        ASSERT_NE(conn, nullptr);
+        ASSERT_TRUE(send_frame(*conn, encode_frame(MessageKind::HelloClient, HelloClientMsg{})));
+        held.push_back(std::move(conn));
+    }
+    ASSERT_TRUE(fencing_await([&] { return coordinator.client_session_count() == 2; }));
+
+    // The third must be refused, and told why.
+    auto extra = network::connect_plain("127.0.0.1", port);
+    ASSERT_NE(extra, nullptr);
+    ASSERT_TRUE(send_frame(*extra, encode_frame(MessageKind::HelloClient, HelloClientMsg{})));
+    auto reply = read_frame(*extra);
+    ASSERT_TRUE(reply.has_value()) << "the coordinator closed on the third client without a reason";
+    MessageReader rr(std::move(*reply));
+    ASSERT_EQ(static_cast<MessageKind>(rr.read_u8()), MessageKind::SubmitJobAck);
+    const auto ack = decode_submit_job_ack(rr);
+    EXPECT_FALSE(ack.ok);
+    EXPECT_NE(ack.message.find("client-connection limit"), std::string::npos) << ack.message;
+
+    EXPECT_EQ(coordinator.client_session_count(), 2U) << "the refused client was admitted anyway";
+
+    // And once one goes away, a new client fits again - the limit is on
+    // concurrency, not a lifetime quota.
+    held.front()->close();
+    held.erase(held.begin());
+    auto after = network::connect_plain("127.0.0.1", port);
+    ASSERT_NE(after, nullptr);
+    ASSERT_TRUE(send_frame(*after, encode_frame(MessageKind::HelloClient, HelloClientMsg{})));
+    EXPECT_TRUE(fencing_await([&] { return coordinator.client_session_count() == 2; }))
+        << "a slot freed by a departing client was never reclaimed";
+
+    after->close();
+    for (auto& c : held) {
+        c->close();
+    }
     coordinator.stop();
 }
 

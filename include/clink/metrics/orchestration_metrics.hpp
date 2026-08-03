@@ -15,6 +15,7 @@
 //   - clink_ha_recovered_jobs_total
 //   - clink_protocol_mismatches_total
 //   - clink_malformed_frames_total
+//   - clink_client_connections_refused_total
 //
 // The metrics surface here is sized for dashboards and alert rules
 // rather than per-operator inner loops. Costs are bounded by the
@@ -64,6 +65,10 @@ inline constexpr const char* kProtocolMismatches = "clink_protocol_mismatches_to
 // produce a well-formed frame is either badly version-skewed or hostile;
 // either way this counts it rather than letting it pass unnoticed.
 inline constexpr const char* kMalformedFrames = "clink_malformed_frames_total";
+// Clients turned away because the coordinator was already at its
+// connection limit. Non-zero means either a client leak somewhere or a
+// limit set too low - both worth knowing before it becomes an outage.
+inline constexpr const char* kClientConnectionsRefused = "clink_client_connections_refused_total";
 
 namespace orch {
 
@@ -90,6 +95,9 @@ inline void autoscaler_decision(const char* outcome) {
 }
 inline void ha_leader_takeover() {
     MetricsRegistry::global().counter(kHaLeaderTakeovers).increment();
+}
+inline void client_connection_refused() {
+    MetricsRegistry::global().counter(kClientConnectionsRefused).increment();
 }
 inline void malformed_frame() {
     MetricsRegistry::global().counter(kMalformedFrames).increment();

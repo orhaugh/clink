@@ -517,6 +517,30 @@ is opt-in, the default is independent commit, and nothing told anyone.
 **Risk:** an operator reads "end-to-end exactly-once" and reasonably
 concludes the outputs cannot disagree. They can.
 
+### F27. The coordinator leaked a thread per client connection
+
+Every `HelloClient` spawned a reader thread and pushed it, with its
+socket, into two parallel vectors. Nothing drained them except `stop()`.
+
+So the cost was per client EVER SEEN, not per client currently connected.
+A client that connected, did its work and went away left a joinable
+`std::thread` and a `shared_ptr` behind for the coordinator's whole
+lifetime. A monitoring script running `clink list` once a second adds
+86,400 thread handles a day, until thread creation begins to fail.
+
+Nothing crashes while this is true, and no existing test noticed, because
+every test creates a handful of clients and then stops the coordinator -
+which is exactly when the vectors are finally drained.
+
+There was also no limit on concurrent clients: the thread pool was
+whatever arrived.
+
+**Risk:** unbounded resource growth from ordinary polling, ending in a
+coordinator that can no longer accept connections. The exhaustion throw
+lands in the accept loop, which W14's exception boundary now catches - so
+the failure mode is a control plane that stops accepting rather than one
+that dies, which is quieter and no better.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -1578,6 +1602,20 @@ been enough: four bytes claiming 256 MiB would still have allocated 256 MiB
 up front, so the amplification would have survived at a smaller constant.
 Chunking removes it - a byte costs a byte.
 
+**Connection lifetime and count (F27).** Client sessions are now one
+vector of `{connection, thread, finished}` rather than two parallel ones,
+reaped on each new accept, and capped by
+`Config::max_client_connections` (default 256). The cost is now per
+CONCURRENT client rather than per client ever seen. A refused client gets
+a `SubmitJobAck` saying so rather than a silent close.
+
+The reaping is what makes the cap meaningful: a cap over a list that never
+shrinks is a lifetime quota, not a concurrency limit. `ClientConnections
+AreReapedRatherThanAccumulated` asserts on the retained count rather than
+on survival, because nothing crashed while the leak was live - that is why
+it lasted. Mutation-checked: disabling the reap leaves 40 sessions after
+40 connect/disconnect cycles, and the test names the number.
+
 **Element counts.** `MessageReader::read_count` replaces `read_u32_be` at
 all eleven container sites. The bound needs no arbitrary constant: every
 element costs at least one byte on the wire, so a count above the bytes
@@ -1590,7 +1628,7 @@ extracted into `dispatch_client_frame_`, `dispatch_worker_frame_` and
 `Worker::dispatch_control_frame_` so the boundary is around a function
 call rather than smeared through a loop body.
 
-**Tests:** `tests/test_frame_robustness.cpp`, 12 cases.
+**Tests:** `tests/test_frame_robustness.cpp`, 14 cases.
 
 Two of them are property tests rather than examples: every decoder against
 400 seeded random payloads each, and three valid frames truncated at every
@@ -1608,13 +1646,15 @@ production failure.
 
 **What makes this Partial - stated plainly:**
 
-- **These are input limits, not overload limits.** Nothing bounds the
-  NUMBER of connections, the rate of frames, the number of in-flight jobs,
-  or per-connection memory in aggregate. A peer that opens ten thousand
-  connections and sends well-formed frames on all of them is still
-  unbounded. That is the larger half of P1.9 and it is not done.
+- **Frame RATE is still unbounded.** A peer holding one connection and
+  sending well-formed frames as fast as it can is not throttled. Neither
+  is the number of in-flight jobs.
 - **No backpressure or admission control on the control plane.** Submit is
   synchronous and unthrottled.
+- **Worker connections are not capped.** Only client connections are. A
+  worker connection is a registration, which is bounded by the cluster's
+  own size in any sane deployment - but "in any sane deployment" is the
+  same reasoning that left client connections unbounded.
 - **The cap is a constant, not configuration.** An operator shipping a
   plugin above 256 MiB has to rebuild rather than set a flag.
 - **No fuzzing engine.** The property tests are deterministic and bounded,
