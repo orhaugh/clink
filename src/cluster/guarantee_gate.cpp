@@ -86,6 +86,11 @@ connectors::PipelineFacts pipeline_facts_from_graph(const JobGraphSpec& graph,
         for (const auto& [k, _] : op.params) {
             pc.supplied_options.push_back(k);
         }
+        // Carried so the analyser can tell whether transactional sinks
+        // commit as a unit or independently.
+        if (const auto cg = op.params.find("commit_group"); cg != op.params.end()) {
+            pc.commit_group = cg->second;
+        }
         facts.connectors.push_back(std::move(pc));
     }
 

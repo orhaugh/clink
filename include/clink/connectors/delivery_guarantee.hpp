@@ -70,6 +70,14 @@ struct PipelineConnector {
     // Present when the connector has no capability declaration; the
     // analysis then has to assume the worst rather than guess.
     bool declaration_missing{false};
+    // The commit_group this sink was given, empty when it has none.
+    //
+    // Per-sink exactly-once does not compose into job-level atomicity.
+    // Two transactional sinks that commit independently can be left in
+    // disagreement by a failure between their commits - one published,
+    // one not - and each sink is still, correctly, exactly-once on its
+    // own. Sinks sharing a commit_group commit as a unit instead.
+    std::string commit_group;
 };
 
 struct PipelineFacts {

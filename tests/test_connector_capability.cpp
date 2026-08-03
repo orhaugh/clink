@@ -6,6 +6,7 @@
 // rather than believed by the planner. Second, that the analyser computes
 // the weakest link and refuses a request the pipeline cannot honour.
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -182,6 +183,20 @@ PipelineConnector snk(std::string connector, std::vector<std::string> opts = {})
                              .supplied_options = std::move(opts)};
 }
 
+// The same, with a commit_group, and a distinct op_type so two sinks of
+// the same connector kind are distinguishable in the diagnostic.
+PipelineConnector snk_grouped(std::string connector,
+                              std::string group,
+                              std::string suffix,
+                              std::vector<std::string> opts = {}) {
+    return PipelineConnector{.op_type = connector + "_sink" + suffix,
+                             .connector_name = std::move(connector),
+                             .is_source = false,
+                             .supplied_options = std::move(opts),
+                             .declaration_missing = false,
+                             .commit_group = std::move(group)};
+}
+
 TEST_F(ConnectorCapabilityTest, NoCheckpointingMeansNoRecoveryGuarantee) {
     PipelineFacts f;
     f.connectors = {src("file"), snk("file_2pc", {"dir"})};
@@ -335,6 +350,91 @@ TEST_F(ConnectorCapabilityTest, SinkOnlyPipelineWithNoSinksStillReportsSomething
     f.durable_state_backend = true;
     const auto r = analyse_pipeline(f);
     EXPECT_EQ(r.level, EndToEndGuarantee::StateExactlyOnceOutputAtLeastOnce);
+}
+
+// --- cross-sink atomicity -------------------------------------------
+
+// Every step of the analysis before this reasons about connectors one at
+// a time and takes the weakest, so two strong sinks produce a strong
+// answer - and per-sink exactly-once does not compose into job-level
+// atomicity. A failure between two independent commits publishes one and
+// not the other, with both sinks still correctly exactly-once on their own.
+
+bool mentions(const GuaranteeReport& r, std::string_view needle) {
+    return std::any_of(r.warnings.begin(), r.warnings.end(), [needle](const std::string& w) {
+        return w.find(needle) != std::string::npos;
+    });
+}
+
+TEST_F(ConnectorCapabilityTest, TwoUngroupedTransactionalSinksAreFlaggedAsNonAtomic) {
+    PipelineFacts f;
+    f.connectors = {src("file"),
+                    snk_grouped("file_2pc", "", "_a", {"dir"}),
+                    snk_grouped("file_2pc", "", "_b", {"dir"})};
+    f.checkpointing_enabled = true;
+    f.durable_state_backend = true;
+    const auto r = analyse_pipeline(f);
+
+    // The LEVEL is still exactly-once, and correctly so: each sink is.
+    // Downgrading would misreport the opposite way and would refuse jobs
+    // whose two outputs are genuinely independent.
+    EXPECT_EQ(r.level, EndToEndGuarantee::EndToEndExactlyOnce) << r.render_text();
+    EXPECT_TRUE(r.acceptable());
+
+    EXPECT_TRUE(mentions(r, "commit INDEPENDENTLY"))
+        << "two independent transactional sinks were reported as end-to-end exactly-once with "
+           "nothing said about cross-sink atomicity: "
+        << r.render_text();
+    EXPECT_TRUE(mentions(r, "commit_group"))
+        << "the warning does not say how to fix it: " << r.render_text();
+    EXPECT_TRUE(mentions(r, "file_2pc_sink_a") && mentions(r, "file_2pc_sink_b"))
+        << "the warning does not name the sinks: " << r.render_text();
+}
+
+TEST_F(ConnectorCapabilityTest, TransactionalSinksSharingACommitGroupAreNotFlagged) {
+    PipelineFacts f;
+    f.connectors = {src("file"),
+                    snk_grouped("file_2pc", "atomic-out", "_a", {"dir"}),
+                    snk_grouped("file_2pc", "atomic-out", "_b", {"dir"})};
+    f.checkpointing_enabled = true;
+    f.durable_state_backend = true;
+    const auto r = analyse_pipeline(f);
+    EXPECT_EQ(r.level, EndToEndGuarantee::EndToEndExactlyOnce);
+    EXPECT_FALSE(mentions(r, "commit INDEPENDENTLY"))
+        << "sinks that DO commit as a unit were warned about anyway: " << r.render_text();
+}
+
+TEST_F(ConnectorCapabilityTest, TransactionalSinksInDifferentGroupsAreFlagged) {
+    // Grouped is not the same as grouped TOGETHER. Two sinks in two
+    // groups still commit independently of each other.
+    PipelineFacts f;
+    f.connectors = {src("file"),
+                    snk_grouped("file_2pc", "group-a", "_a", {"dir"}),
+                    snk_grouped("file_2pc", "group-b", "_b", {"dir"})};
+    f.checkpointing_enabled = true;
+    f.durable_state_backend = true;
+    EXPECT_TRUE(mentions(analyse_pipeline(f), "commit INDEPENDENTLY"));
+}
+
+TEST_F(ConnectorCapabilityTest, ASingleTransactionalSinkIsNotFlagged) {
+    // One sink cannot disagree with itself, and a spurious warning here
+    // would fire on the commonest pipeline there is.
+    PipelineFacts f;
+    f.connectors = {src("file"), snk("file_2pc", {"dir"})};
+    f.checkpointing_enabled = true;
+    f.durable_state_backend = true;
+    EXPECT_FALSE(mentions(analyse_pipeline(f), "commit INDEPENDENTLY"));
+}
+
+TEST_F(ConnectorCapabilityTest, ANonTransactionalSecondSinkIsNotFlagged) {
+    // The warning is about two things that could disagree about a
+    // TRANSACTION. A plain at-least-once sink alongside a 2PC one has no
+    // transaction to be atomic with, and the level already reflects it.
+    PipelineFacts f;
+    f.connectors = {src("file"), snk("file_2pc", {"dir"}), snk("file")};
+    f.checkpointing_enabled = true;
+    f.durable_state_backend = true;
+    EXPECT_FALSE(mentions(analyse_pipeline(f), "commit INDEPENDENTLY"));
 }
 
 }  // namespace

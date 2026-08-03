@@ -496,6 +496,27 @@ behaviour. Both are refused at plan time with actionable messages
 `table t missing required property: connector`). No change was needed and
 none was made.
 
+### F26. Per-sink exactly-once was reported as if it composed
+
+The guarantee analyser reasons about connectors one at a time and takes
+the weakest, which is right for every question it was built to answer and
+wrong for one it was not asked: two transactional sinks produce a strong
+answer, and per-sink exactly-once does not compose into job-level
+atomicity.
+
+A job with two 2PC sinks and no shared `commit_group` commits them
+independently. A failure between the two commits publishes one and not the
+other, leaving the outputs disagreeing - while each sink is still,
+correctly, exactly-once on its own. The analyser reported
+`END_TO_END_EXACTLY_ONCE` and said nothing about it.
+
+The mechanism to avoid this already existed: sinks sharing a
+`commit_group` commit as a unit, gated on the group's collective ack. It
+is opt-in, the default is independent commit, and nothing told anyone.
+
+**Risk:** an operator reads "end-to-end exactly-once" and reasonably
+concludes the outputs cannot disagree. They can.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -1652,7 +1673,10 @@ and "survives a real rollout" are the same claim.
 
 ### W22 - Side-output propagation — Partial
 
-**Source:** `tests/test_side_output.cpp` (one new case)
+**Source:** `tests/test_side_output.cpp` (one new case),
+`include/clink/connectors/delivery_guarantee.hpp`,
+`src/connectors/delivery_guarantee.cpp`, `src/cluster/guarantee_gate.cpp`,
+`tests/test_connector_capability.cpp` (five new cases)
 
 **No defect found, and that is the finding.** Side outputs already had four
 tests, all about where DATA goes. None asserted that the CONTROL stream -
@@ -1671,18 +1695,44 @@ The test asserts on the MAIN branch first. Without that, a version of the
 test where nothing reached either sink would report a side-output bug that
 did not exist.
 
+**Multi-sink atomicity (F26).** The other half of P2.18, and the one that
+turned up a defect. `commit_group` already existed - sinks sharing one
+commit as a unit, gated on the group's collective ack - but it is opt-in,
+the default is independent commit, and the analyser did not mention it.
+Two 2PC sinks with no shared group were reported as
+`END_TO_END_EXACTLY_ONCE` full stop.
+
+The analyser now carries each sink's `commit_group` and warns when a
+pipeline has more than one transactional sink that do not all share one:
+it names them, says they commit independently, and says what to set.
+
+A warning rather than a downgrade or a rejection, deliberately. For many
+jobs two independent outputs are exactly what was wanted and their mutual
+consistency is not a property anyone needs; refusing those would be wrong,
+and downgrading the level would misreport in the opposite direction, since
+each sink IS exactly-once. What must not happen is reporting end-to-end
+exactly-once and leaving the reader to discover it means per sink.
+
+Four of the five new cases are negatives - one sink, sinks sharing a
+group, sinks in DIFFERENT groups (grouped is not grouped together), and a
+non-transactional second sink. A warning that fires on the commonest
+pipeline there is would be worse than none. Mutation-checked: disabling the
+condition fails the two positives and leaves the negatives green.
+
 **What makes this Partial - stated plainly:**
 
-- **One property, one topology.** A single operator with one side output,
-  in-process. Not covered: side outputs across a network shuffle, more than
-  one side output on an operator, or a side output from an operator that is
-  itself inside a chain.
-- **Multi-sink atomicity is untested.** Two 2PC sinks on the same job either
-  both commit for a checkpoint or the checkpoint is not complete. Nothing
-  asserts that, and it is the more valuable half of P2.18.
-- **No failure interaction.** The barrier reaching a side sink was tested on
-  a healthy run. Whether a side branch recovers correctly when a worker is
-  lost mid-checkpoint was not exercised.
+- **One property, one topology, for side outputs.** A single operator with
+  one side output, in-process. Not covered: side outputs across a network
+  shuffle, more than one side output on an operator, or a side output from
+  an operator inside a chain.
+- **The cross-sink warning is analysis, not enforcement.** Nothing verifies
+  that a `commit_group` actually delivers atomicity under failure - that
+  both members commit or neither, across a worker loss between their
+  commits. The gating code exists and is read; it is not exercised by a
+  failure test.
+- **No failure interaction for side outputs.** The barrier reaching a side
+  sink was tested on a healthy run. Whether a side branch recovers
+  correctly when a worker is lost mid-checkpoint was not exercised.
 
 ---
 

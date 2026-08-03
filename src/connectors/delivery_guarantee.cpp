@@ -1,6 +1,7 @@
 #include "clink/connectors/delivery_guarantee.hpp"
 
 #include <algorithm>
+#include <set>
 #include <sstream>
 
 namespace clink::connectors {
@@ -268,6 +269,58 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
         if (r.level == EndToEndGuarantee::EndToEndExactlyOnce) {
             reasons.emplace_back(
                 "delivery is exactly-once, but the OUTPUT is not reproducible across a replay");
+        }
+    }
+
+    // ---- 6b. Cross-sink atomicity.
+    //
+    // Per-sink exactly-once does not compose. Two transactional sinks that
+    // commit independently can be left disagreeing by a failure between
+    // their commits - one published, one not - and each sink is still,
+    // correctly, exactly-once on its own. Nothing above notices, because
+    // every step so far reasons about connectors one at a time and takes
+    // the weakest; two strong sinks produce a strong answer.
+    //
+    // A warning rather than a downgrade or a rejection. For many jobs two
+    // independent outputs are exactly what was wanted and their mutual
+    // consistency is not a property anyone needs; refusing those would be
+    // wrong. What must not happen is reporting end-to-end exactly-once
+    // while leaving the reader to work out that it is per sink.
+    if (r.level == EndToEndGuarantee::EndToEndExactlyOnce) {
+        std::vector<std::string> transactional_sinks;
+        std::set<std::string> unique_groups;
+        bool any_ungrouped = false;
+        for (const auto& c : facts.connectors) {
+            if (c.is_source) {
+                continue;
+            }
+            const auto* cap = CapabilityRegistry::instance().find(c.connector_name);
+            if (cap == nullptr) {
+                continue;
+            }
+            if (cap->delivery != DeliveryGuarantee::ExactlyOnceTwoPhaseCommit &&
+                cap->delivery != DeliveryGuarantee::ExactlyOnceAtomicPublish) {
+                continue;
+            }
+            transactional_sinks.push_back(c.op_type);
+            if (c.commit_group.empty()) {
+                any_ungrouped = true;
+            } else {
+                unique_groups.insert(c.commit_group);
+            }
+        }
+        if (transactional_sinks.size() > 1 && (any_ungrouped || unique_groups.size() > 1)) {
+            std::string names;
+            for (std::size_t i = 0; i < transactional_sinks.size(); ++i) {
+                names += (i > 0 ? ", " : "") + transactional_sinks[i];
+            }
+            r.warnings.emplace_back(
+                "this job has " + std::to_string(transactional_sinks.size()) +
+                " transactional sinks (" + names +
+                ") that do not all share one commit_group, so they commit INDEPENDENTLY. Each is "
+                "exactly-once on its own, but a failure between their commits can publish some "
+                "and not others, leaving the outputs disagreeing. Set the same "
+                "commit_group='<name>' on all of them if they must commit as a unit.");
         }
     }
 
