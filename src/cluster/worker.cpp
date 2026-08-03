@@ -2048,6 +2048,35 @@ void Worker::stop() {
             pt->cancelled = true;
             pt->cv.notify_all();
         }
+        // Wind down every RUNNING subtask, not just the ones still waiting
+        // to start.
+        //
+        // stop_ is not enough. A running subtask's LocalExecutor watches
+        // JobConfig::external_cancel_token - this token - and nothing
+        // else; it has no view of the Worker at all. So stop() used to set
+        // a flag no runner was looking at and then block forever in the
+        // join below, for any job whose source had not finished on its
+        // own. An unbounded source never does.
+        //
+        // That made SIGTERM work on an idle worker and hang on a busy one,
+        // which is the wrong way round: a container runtime waits out its
+        // grace period and then SIGKILLs, so the case where a clean
+        // shutdown was worth something is exactly the case that did not
+        // get one. The idle-worker test passed throughout.
+        //
+        // Same flip CancelJob performs. Cancelling on shutdown is correct
+        // rather than merely expedient: the subtasks are going away with
+        // the process either way, and a cancelled subtask runs its normal
+        // teardown - sinks abort their pending transactions instead of
+        // leaving them dangling for recovery to resolve.
+        for (auto& [job_id, per_subtask] : per_job_cancel_tokens_) {
+            for (auto& [subtask_idx, token] : per_subtask) {
+                if (token) {
+                    token->store(true, std::memory_order_release);
+                }
+            }
+        }
+        cv_.notify_all();
     }
     // Wake any source blocked in the EOS final-checkpoint waits (their
     // predicates check stop_) so the runner threads can be joined promptly.
@@ -2066,6 +2095,17 @@ void Worker::stop() {
     if (heartbeat_.joinable()) {
         heartbeat_.join();
     }
+    // These joins are unbounded on purpose: once cancellation has been
+    // signalled, a subtask that still will not exit is a bug in that
+    // operator, and cutting the join short would detach a thread that is
+    // still touching this Worker's members while it is being destroyed.
+    // A hang here is a loud symptom with a stack to look at; a use-after-
+    // free is neither.
+    //
+    // The one case cancellation cannot reach is a role registered through
+    // register_role, which receives no cancel token - there is no way to
+    // interrupt an arbitrary callback. That path is the in-process test
+    // API, not how clink_node runs work.
     for (auto& t : task_threads_) {
         if (t.joinable()) {
             t.join();

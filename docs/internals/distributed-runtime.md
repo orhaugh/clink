@@ -171,6 +171,16 @@ Two implementations exist:
 
 In `clink_node`, passing `--ha-dir` (or `--etcd-endpoints`) puts the coordinator in HA mode: `coordinator.start()` is deferred until `on_become_leader` fires, at which point the coordinator binds the control port and calls `recover_persisted_jobs()`. A standby coordinator just sits on the coordinator poll thread.
 
+#### Shutdown
+
+`clink_node` installs a SIGTERM/SIGINT handler and calls `Worker::stop()` or `Coordinator::stop()` on the way out.
+
+`Worker::stop()` flips every registered per-subtask cancel token before joining the task threads - the same flip `CancelJob` performs. That matters because a running subtask's `LocalExecutor` watches `JobConfig::external_cancel_token` and nothing else; it has no view of the Worker. Setting the worker's own `stop_` flag reaches the pending-task waiters and the EOS waits, but not a runner that is mid-stream. Until 2026-08-03 `stop()` did only the latter, so SIGTERM exited an idle worker promptly and hung a busy one indefinitely - the reverse of what a container grace period needs.
+
+Cancelling rather than draining is deliberate. The subtasks are going away with the process either way, and a cancelled subtask runs its normal teardown, so a 2PC sink aborts its pending transaction instead of leaving it for recovery. What clink does NOT do on SIGTERM is take a final checkpoint or drain the sources: records since the last checkpoint are replayed on restart. There is no "stop with savepoint" path.
+
+The joins are unbounded on purpose. Once cancellation is signalled, a subtask that will not exit is a bug in that operator, and detaching a thread still touching the Worker's members during destruction trades a diagnosable hang for a use-after-free.
+
 #### Limits on what a peer can make a node do
 
 Frame IO is one shared implementation (`include/clink/cluster/frame_io.hpp`), and it does not trust the peer. A frame longer than `kMaxFrameBytes` (256 MiB) is refused on the header alone, and the body is read in 64 KiB chunks so memory tracks the bytes that have actually arrived rather than the number the header claimed. Both matter: a cap alone still lets four bytes cause a 256 MiB allocation.

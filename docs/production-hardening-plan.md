@@ -438,6 +438,33 @@ MessageReader: truncated string` and takes the whole test binary with it.
 **Risk:** remote unauthenticated denial of service against the control
 plane.
 
+### F24. SIGTERM worked on an idle worker and hung on a busy one
+
+`tests/integration/test_sigterm_shutdown.cpp` covers SIGTERM and passes.
+It signals a worker that registered and has been idle ever since. No test
+signalled a worker with a job running on it, and that is the case that
+fails.
+
+`Worker::stop()` set `stop_`, woke the pending-task waiters, and then
+joined every task thread. But a RUNNING subtask's `LocalExecutor` watches
+`JobConfig::external_cancel_token` and nothing else - it has no view of the
+Worker. `stop()` never touched those tokens; only the `CancelJob` handler
+did. So `stop()` set a flag no runner was looking at, then blocked in the
+join for any job whose source had not already finished. An unbounded source
+never does.
+
+This is the wrong way round in the way that costs most. A container runtime
+sends SIGTERM, waits out a grace period, and SIGKILLs. So the node exited
+promptly when there was nothing to lose and had to be killed when there
+was - and the existing test reported green throughout.
+
+Measured, not inferred: before the fix, `AWorkerRunningAJobExitsOnSigterm`
+timed out at 15 s; after, the worker exits in 2.1 s.
+
+**Risk:** every rolling restart of a busy cluster ends in SIGKILL. Sinks
+lose the chance to abort pending transactions, so recovery has to resolve
+them instead.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -480,7 +507,7 @@ lives; evidence is in section 4.
 | W18 | OpenTelemetry tracing | P1.14 | - | **Open** |
 | W19 | Production metrics completion | P1.15 | - | **Open** |
 | W20 | Non-determinism detection API | P2.16 | - | **Partial** |
-| W21 | Cancellation/shutdown audit | P2.17 | - | **Open** |
+| W21 | Cancellation/shutdown audit | P2.17 | F24 | **Partial** |
 | W22 | Side-output / multi-sink propagation validation | P2.18 | - | **Open** |
 | W23 | Fuzz targets | P1.8 | - | **Open** |
 
@@ -1532,6 +1559,52 @@ production failure.
 
 ---
 
+### W21 - Cancellation and shutdown — Partial
+
+**Source:** `src/cluster/worker.cpp` (`Worker::stop`),
+`tests/integration/test_graceful_shutdown.cpp` (new)
+
+`Worker::stop()` now flips every registered per-subtask cancel token before
+joining - the same flip `CancelJob` performs. Cancelling on shutdown is
+correct rather than merely expedient: the subtasks are going away with the
+process either way, and a cancelled subtask runs its normal teardown, so
+sinks abort their pending transactions instead of leaving them for recovery
+to resolve.
+
+The joins stay unbounded, deliberately. Once cancellation has been
+signalled, a subtask that still will not exit is a bug in that operator,
+and cutting the join short would detach a thread still touching the
+Worker's members as it is destroyed. A hang is a loud symptom with a stack
+to look at; a use-after-free is neither.
+
+**Tests:** 3 multi-process cases - a worker with a running job, a
+coordinator with a running job, and a repeated SIGTERM. Each brings up a
+real cluster, submits a long-running job, waits for it to actually be
+checkpointing, and then signals. The 15 s bound is chosen to sit inside a
+realistic Kubernetes `terminationGracePeriodSeconds`, so "passes the test"
+and "survives a real rollout" are the same claim.
+
+**What makes this Partial - stated plainly:**
+
+- **A `register_role` handler still cannot be cancelled.** It receives no
+  token, and there is no way to interrupt an arbitrary callback. That path
+  is the in-process test API rather than how `clink_node` runs work, but a
+  test that blocks in one will still hang `stop()`.
+- **Shutdown is cancellation, not draining.** Nothing attempts a final
+  checkpoint or a clean source drain on SIGTERM; in-flight records since
+  the last checkpoint are replayed on restart. That is consistent with the
+  at-least-once story but it is not a graceful drain, and a "stop with
+  savepoint" path does not exist.
+- **Only SIGTERM at the process level was audited.** Cancellation of an
+  individual job mid-checkpoint, mid-rescale, or during 2PC commit was not
+  systematically exercised; nor was the HTTP server's shutdown, nor
+  connector-level cancellation (a source blocked in a broker poll).
+- **No leak check.** Nothing asserts that threads, file descriptors or
+  temporary files are released on shutdown. A clean exit code is not
+  evidence of a clean teardown.
+
+---
+
 ## 5. Test evidence
 
 Commands run, on macOS 26.3 (arm64), Apple clang, `RelWithDebInfo`.
@@ -1581,6 +1654,11 @@ ctest --test-dir build-it --parallel 1 --timeout 300 -R FaultRecovery
 
 ./build-it/tests/clink_integration_tests --gtest_filter='HaFailoverTest.*'
     -> 5 tests from 1 test suite ran. [  PASSED  ] 5 tests. (12 s)
+
+./build-it/tests/clink_integration_tests --gtest_filter='GracefulShutdownTest.*'
+    -> before the fix: AWorkerRunningAJobExitsOnSigterm FAILED after 17.7 s
+       ("did not exit within 15s of SIGTERM")
+    -> after:          3 tests. [  PASSED  ] 3 tests; the worker exits in 2.1 s
 ```
 
 The first run of that HA suite is what found F18: `FailoverAdvancesTheEpoch`
