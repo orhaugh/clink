@@ -514,6 +514,13 @@ public:
         return epoch_.load(std::memory_order_acquire);
     }
 
+    // The job's recovery point: the highest checkpoint that reached
+    // GLOBAL completion. This is the id a restore would use, so it is
+    // the value a test asserting "a failed checkpoint did not become the
+    // recovery point" has to read. Zero for an unknown job or one that
+    // has not completed a checkpoint.
+    [[nodiscard]] std::uint64_t latest_completed_checkpoint(JobId job_id) const;
+
     // Client sessions currently held, live or awaiting reaping.
     //
     // Exposed because "the coordinator does not leak a thread per
@@ -738,6 +745,21 @@ private:
         // <checkpoint_dir>/<job_id>/COMPLETED-<id> marker and updates
         // `latest_completed_checkpoint_id`.
         std::unordered_map<std::uint64_t, std::unordered_set<std::string>> pending_checkpoint_acks;
+        // Subtasks that acked a checkpoint with ok=false, per checkpoint id.
+        //
+        // A failed ack means the subtask's snapshot did not happen: the
+        // operator caught the exception, reported it, and carried on. It
+        // used to be erased from the pending set exactly like a success,
+        // so the set still emptied and the checkpoint was recorded as
+        // globally complete - COMPLETED-N written, latest_completed
+        // advanced, commit broadcast - for state that was never written.
+        // A later restore would then restore FROM a checkpoint that does
+        // not exist in full.
+        //
+        // Tracked rather than inferred, because "did every subtask ack?"
+        // and "did every subtask SUCCEED?" are different questions and
+        // the pending set only answers the first.
+        std::unordered_map<std::uint64_t, std::unordered_set<std::string>> failed_checkpoint_acks;
         // Start time per in-flight
         // checkpoint id. Stamped at trigger; consumed at completion
         // to feed clink_ckpt_duration_ms_sum / count. Entries are

@@ -878,6 +878,12 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
     start_reader_for_(worker);
 }
 
+std::uint64_t Coordinator::latest_completed_checkpoint(JobId job_id) const {
+    std::lock_guard lock(mu_);
+    const auto it = jobs_.find(job_id);
+    return it == jobs_.end() ? 0 : it->second->latest_completed_checkpoint_id;
+}
+
 std::size_t Coordinator::reap_finished_clients_() {
     std::vector<std::thread> to_join;
     std::size_t live = 0;
@@ -3879,6 +3885,9 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             }
         }
         ckpt_it->second.erase(key);
+        if (!msg.ok) {
+            job.failed_checkpoint_acks[msg.checkpoint_id].insert(key);
+        }
 
         // Commit-group progress accounting. If this subtask
         // belongs to a commit_group, update group state. A failed ack
@@ -3919,7 +3928,53 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             clink::metrics::ckpt::subtask_ack_failure();
         }
 
-        if (ckpt_it->second.empty()) {
+        // Every subtask has answered. Whether the checkpoint COMPLETED is
+        // a different question: an answer of "I could not snapshot" is
+        // still an answer.
+        //
+        // Read the emptiness ONCE, before either branch touches the map:
+        // the failure branch erases ckpt_it, and re-testing it afterwards
+        // would be a use-after-free.
+        const bool all_subtasks_answered = ckpt_it->second.empty();
+        bool checkpoint_failed = false;
+        if (all_subtasks_answered) {
+            const auto failed_it = job.failed_checkpoint_acks.find(msg.checkpoint_id);
+            if (failed_it != job.failed_checkpoint_acks.end() && !failed_it->second.empty()) {
+                // At least one subtask failed to take its snapshot, so
+                // this checkpoint does not exist in full and must not be
+                // recorded as if it did. Withholding COMPLETED-N is the
+                // whole point: the marker is what recovery restores from,
+                // and restoring from a checkpoint a subtask never wrote
+                // means restoring that operator's state from nowhere.
+                //
+                // latest_completed_checkpoint_id is deliberately left
+                // where it was, so recovery falls back to the last
+                // checkpoint that really did complete.
+                std::string who;
+                for (const auto& k : failed_it->second) {
+                    who += (who.empty() ? "" : ", ") + k;
+                }
+                log::error("coordinator.checkpoint",
+                           "checkpoint " + std::to_string(msg.checkpoint_id) + " of job " +
+                               std::to_string(msg.job_id) + " FAILED: subtask(s) " + who +
+                               " could not snapshot. No COMPLETED marker is written and the "
+                               "job's recovery point stays at checkpoint " +
+                               std::to_string(job.latest_completed_checkpoint_id) +
+                               "; staged sink transactions for this checkpoint are aborted.");
+                clink::metrics::ckpt::failed();
+                // Roll back anything staged for it. Sinks that pre-committed
+                // must not be left holding a transaction no commit will ever
+                // arrive for.
+                groups_to_abort.emplace_back(msg.job_id, msg.checkpoint_id);
+                job.failed_checkpoint_acks.erase(msg.checkpoint_id);
+                job.pending_checkpoint_start_times.erase(msg.checkpoint_id);
+                job.commit_group_progress.erase(msg.checkpoint_id);
+                job.pending_checkpoint_acks.erase(msg.checkpoint_id);
+                checkpoint_failed = true;
+            }
+        }
+        if (all_subtasks_answered && !checkpoint_failed) {
+            job.failed_checkpoint_acks.erase(msg.checkpoint_id);
             job.latest_completed_checkpoint_id =
                 std::max(job.latest_completed_checkpoint_id, msg.checkpoint_id);
             just_completed.emplace_back(msg.job_id, msg.checkpoint_id);

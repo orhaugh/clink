@@ -541,6 +541,67 @@ lands in the accept loop, which W14's exception boundary now catches - so
 the failure mode is a control plane that stops accepting rather than one
 that dies, which is quieter and no better.
 
+### F28. A checkpoint a subtask FAILED to take was recorded as complete
+
+The `COMPLETED-<id>` marker is the definition of a checkpoint having
+reached global completion, and it is what recovery restores from. It was
+written whenever every subtask had ANSWERED, not whenever every subtask
+had SUCCEEDED.
+
+Those differ, and the difference is reachable in normal operation. A
+subtask whose snapshot throws catches the exception, acks `ok=false`, and
+carries on running - nothing fails the job. The coordinator erased its key
+from the pending set exactly as if it had succeeded, the set emptied, the
+marker was written, `latest_completed_checkpoint_id` advanced, and
+`CommitCheckpoint` went out. For a checkpoint in which one operator's
+state was never written at all.
+
+`msg.ok` was consulted in precisely two places in the entire ack handler:
+aborting a `commit_group`, and incrementing a metric. Neither is on the
+completion path. So for the default case - no commit groups - a failed
+snapshot and a successful one were indistinguishable.
+
+**Risk:** the job's recovery point advances onto a checkpoint that does
+not exist in full. A later restart restores that operator's state from a
+checkpoint it never wrote, and the records the failed snapshot should have
+covered are neither committed nor replayed.
+
+**Fix:** failed acks are tracked per checkpoint. When every subtask has
+answered and any answer was a failure, the checkpoint is failed rather
+than completed: no marker, the recovery point stays where it was, and
+`AbortCheckpoint` goes out so staged sink transactions are rolled back
+instead of left waiting for a commit that will never come.
+
+Measured either side. With the guard disabled the tests report "checkpoint
+1 became the job's recovery point even though a subtask reported it could
+not snapshot" and "a failed checkpoint moved the recovery point off the
+last good one (now 2, was 1)".
+
+### F29. The completion marker is written flat and read job-scoped
+
+Found while writing F28's test, by looking at the filesystem rather than
+the comments - which disagree with each other.
+
+The marker is WRITTEN to `<checkpoint_dir>/COMPLETED-<id>`
+(`handle_subtask_checkpointed_`). `latest_completed_id_on_disk`, which HA
+recovery uses to decide what to restore from, READS
+`<checkpoint_dir>/<job_id>/COMPLETED-<id>`. The header comment on
+`pending_checkpoint_acks` describes the job-scoped path; the code writes
+the flat one.
+
+**Not yet established:** whether this means HA recovery always resolves
+`restore_from_checkpoint_id = 0`. It looks that way from the two paths,
+but the deployment may scope `checkpoint_dir` per job somewhere upstream,
+and asserting a defect of that severity on a code reading alone is exactly
+what this document is supposed to avoid. It is recorded as a
+**discrepancy to resolve**, with the evidence: a real coordinator run
+under test produces `<dir>/COMPLETED-1` and nothing under `<dir>/<job>/`.
+
+Also noted: `tests/integration/cluster_harness.hpp`'s
+`await_checkpoint_completed` looks under the job-scoped path, so it can
+only ever have timed out. The tests using it pass because the assertions
+around it do not depend on it finding anything - which is its own problem.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -1773,6 +1834,53 @@ condition fails the two positives and leaves the negatives green.
 - **No failure interaction for side outputs.** The barrier reaching a side
   sink was tested on a healthy run. Whether a side branch recovers
   correctly when a worker is lost mid-checkpoint was not exercised.
+
+---
+
+### F28/F29 - Checkpoint completion — Done (F28) / Open (F29)
+
+**Source:** `include/clink/cluster/coordinator.hpp`,
+`src/cluster/coordinator.cpp`, `tests/test_checkpoint_completion.cpp` (new)
+
+F28 is fixed and covered. A checkpoint with any failed subtask ack is
+failed, not completed: no `COMPLETED-N`, recovery point unchanged,
+`AbortCheckpoint` broadcast to roll back anything staged.
+
+**Tests:** 4 cases, driving a real coordinator over a real socket with the
+test playing the worker. That shape is necessary rather than clever: the
+defect is in what the coordinator concludes from a specific sequence of
+acks, and nothing above the wire can produce `ok=false` on demand.
+
+Getting the fake worker accepted took three corrections, each of which is
+a fact about the coordinator worth having in one place:
+
+- it must send heartbeats, or the watchdog declares it lost and kills the
+  job before any checkpoint can be acked (fixed by heartbeating, not by
+  turning the watchdog off);
+- it must report `SubtaskListening` for every generic subtask, because
+  periodic checkpointing is gated on `peer_updates_sent`;
+- it must read frames on its own thread, because a deadline checked
+  between blocking reads is never checked.
+
+Two of the four cases are controls - the fixture really does produce
+triggers, and an all-success checkpoint still completes. Without the
+second, a guard written as "never complete" would pass the headline test
+and leave checkpointing dead.
+
+Mutation-checked: disabling the guard fails both positives with the
+specific claim, and leaves both controls green.
+
+**A defect introduced and caught during the fix.** The first version of
+the guard erased `ckpt_it` in the failure branch and then re-tested
+`ckpt_it->second.empty()` in the next condition - a use-after-free. The
+emptiness is now read once, before either branch touches the map.
+
+**F29 is not fixed.** See the finding: the write path and the recovery
+read path disagree about where the marker lives, and establishing what
+that costs needs a deployment-level check rather than a code reading.
+Fixing it blind - by making one path match the other - risks changing
+where markers are looked for in a system that may have been relying on
+the flat layout since it was written.
 
 ---
 
