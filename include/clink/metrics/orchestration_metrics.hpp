@@ -14,6 +14,7 @@
 //   - clink_ha_leader_takeovers_total
 //   - clink_ha_recovered_jobs_total
 //   - clink_protocol_mismatches_total
+//   - clink_malformed_frames_total
 //
 // The metrics surface here is sized for dashboards and alert rules
 // rather than per-operator inner loops. Costs are bounded by the
@@ -59,6 +60,10 @@ inline constexpr const char* kHaRecoveredJobs = "clink_ha_recovered_jobs_total";
 // reached a version boundary it cannot cross; non-zero otherwise means a
 // node is running the wrong binary.
 inline constexpr const char* kProtocolMismatches = "clink_protocol_mismatches_total";
+// Connections dropped because a frame did not decode. A peer that cannot
+// produce a well-formed frame is either badly version-skewed or hostile;
+// either way this counts it rather than letting it pass unnoticed.
+inline constexpr const char* kMalformedFrames = "clink_malformed_frames_total";
 
 namespace orch {
 
@@ -85,6 +90,9 @@ inline void autoscaler_decision(const char* outcome) {
 }
 inline void ha_leader_takeover() {
     MetricsRegistry::global().counter(kHaLeaderTakeovers).increment();
+}
+inline void malformed_frame() {
+    MetricsRegistry::global().counter(kMalformedFrames).increment();
 }
 inline void protocol_mismatch() {
     MetricsRegistry::global().counter(kProtocolMismatches).increment();

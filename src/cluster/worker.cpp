@@ -15,6 +15,7 @@
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/dag_builder_registry.hpp"
+#include "clink/cluster/frame_io.hpp"
 #include "clink/cluster/job_bundle.hpp"
 #include "clink/cluster/job_planner.hpp"
 #include "clink/cluster/messages.hpp"
@@ -78,25 +79,6 @@ void register_shipped_udfs(const std::string& packed) {
         }
         UdfLanguageRegistry::global().load(u.language, decl);
     }
-}
-
-std::optional<std::vector<std::byte>> read_frame(network::Connection& conn) {
-    std::array<std::byte, 4> hdr{};
-    if (!conn.recv_all(hdr.data(), hdr.size())) {
-        return std::nullopt;
-    }
-    std::uint32_t len = 0;
-    for (std::size_t i = 0; i < hdr.size(); ++i) {
-        len = (len << 8) | static_cast<unsigned char>(hdr[i]);
-    }
-    if (len == 0) {
-        return std::vector<std::byte>{};
-    }
-    std::vector<std::byte> body(len);
-    if (!conn.recv_all(body.data(), body.size())) {
-        return std::nullopt;
-    }
-    return body;
 }
 
 // Type-erased handle for a bound NetworkBridgeSource. The cast back to
@@ -565,6 +547,36 @@ void Worker::reader_loop_() {
             return;
         }
         MessageReader r(std::move(*frame));
+        // A malformed control frame must not terminate the worker.
+        //
+        // The decoders throw by design on a truncated or nonsensical
+        // payload, and nothing here caught it: the throw left this thread
+        // function, which is std::terminate. A coordinator with a version
+        // skew, or anything else able to write to this socket, could kill
+        // every task the worker was running.
+        try {
+            dispatch_control_frame_(r);
+        } catch (const std::exception& e) {
+            log::error("worker.protocol",
+                       std::string{"control frame did not decode; dropping the coordinator "
+                                   "connection: "} +
+                           e.what());
+            metrics::orch::malformed_frame();
+            disconnected_.store(true, std::memory_order_release);
+            std::lock_guard lock(mu_);
+            for (auto& [_, pt] : pending_) {
+                pt->cancelled = true;
+                pt->cv.notify_all();
+            }
+            return;
+        }
+    }
+}
+
+// Dispatch one decoded control frame. Extracted from reader_loop_ so the
+// loop can bound a throw to a single frame.
+void Worker::dispatch_control_frame_(MessageReader& r) {
+    {
         const auto kind = static_cast<MessageKind>(r.read_u8());
         switch (kind) {
             case MessageKind::Deploy:

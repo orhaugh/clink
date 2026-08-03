@@ -171,6 +171,10 @@ private:
     // failover looks like from here.
     [[nodiscard]] bool accept_epoch_(std::uint64_t frame_epoch, const char* what);
 
+    // Dispatch one decoded control frame. Separate from reader_loop_ so a
+    // decode throw costs one connection rather than the process.
+    void dispatch_control_frame_(MessageReader& r);
+
     void handle_deploy_(MessageReader& r);
     void handle_peer_update_(MessageReader& r);
     void run_task_(JobId job_id,

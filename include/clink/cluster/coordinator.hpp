@@ -812,6 +812,10 @@ private:
     bool handle_first_frame_(std::unique_ptr<network::Connection> conn);
     void handle_register_(std::unique_ptr<network::Connection> conn, MessageReader& r);
     void handle_client_loop_(std::shared_ptr<network::Connection> conn);
+    // Dispatch one decoded client frame; false means close the connection.
+    // Separate from the loop so the loop can bound a throw to one frame.
+    [[nodiscard]] bool dispatch_client_frame_(network::Connection& conn, MessageReader& r);
+    void dispatch_worker_frame_(const std::shared_ptr<WorkerConnection>& worker, MessageReader& r);
     void handle_submit_(network::Connection& conn, MessageReader& r);
     void handle_list_jobs_(network::Connection& conn);
     void handle_cancel_job_(network::Connection& conn, MessageReader& r);

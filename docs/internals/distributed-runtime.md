@@ -171,6 +171,16 @@ Two implementations exist:
 
 In `clink_node`, passing `--ha-dir` (or `--etcd-endpoints`) puts the coordinator in HA mode: `coordinator.start()` is deferred until `on_become_leader` fires, at which point the coordinator binds the control port and calls `recover_persisted_jobs()`. A standby coordinator just sits on the coordinator poll thread.
 
+#### Limits on what a peer can make a node do
+
+Frame IO is one shared implementation (`include/clink/cluster/frame_io.hpp`), and it does not trust the peer. A frame longer than `kMaxFrameBytes` (256 MiB) is refused on the header alone, and the body is read in 64 KiB chunks so memory tracks the bytes that have actually arrived rather than the number the header claimed. Both matter: a cap alone still lets four bytes cause a 256 MiB allocation.
+
+`MessageReader::read_count` bounds every container length by the bytes remaining in the frame. An element cannot cost less than a byte on the wire, so a larger count is malformed by construction - no arbitrary limit is involved.
+
+Each of the four frame-handling loops - the coordinator's accept loop, its per-client and per-worker readers, and `Worker::reader_loop_` - wraps a single frame in a try. A frame that does not decode costs the peer its connection, is logged, and increments `clink_malformed_frames_total`. This is load-bearing rather than defensive: the decoders throw by design on a malformed payload, and an exception leaving a thread function is `std::terminate`, so before this a single malformed frame killed the process.
+
+None of that bounds the number of connections, the rate of frames, or aggregate memory across peers. See `docs/production-hardening-plan.md`, W14.
+
 #### Protocol version negotiation
 
 Every node declares two numbers at the handshake: `protocol_version`, the wire protocol it speaks, and `min_compatible_protocol_version`, the oldest peer it will talk to. `check_protocol_compatibility` (`include/clink/cluster/protocol.hpp`) accepts only when each side falls inside the other's range, and the coordinator applies it at both `Register` and `HelloClient` while the worker applies it to the `RegisterAck`. The check is symmetric on purpose: "the coordinator can read the worker" does not imply the reverse, and a one-sided handshake admits a pairing that half-works.
@@ -272,6 +282,7 @@ Remaining hardening, still trusted-network today: the inter-operator **data plan
 | `HaCoordinator`, `make_file_ha_coordinator`, `make_etcd_ha_coordinator` | Leader election and leader-endpoint discovery |
 | `Coordinator::set_epoch` / `epoch()`, `Worker::bound_epoch()` / `fenced_frame_count()` | Fencing epoch: stamped on every control frame, enforced worker-side |
 | `kClusterProtocolVersion`, `check_protocol_compatibility` | Wire-protocol version negotiation at the handshake |
+| `read_frame`, `kMaxFrameBytes`, `MessageReader::read_count` | Bounded frame and container decoding; refuses a peer-chosen allocation |
 | `ServiceDiscovery` and subclasses | worker-side discovery of the coordinator endpoint (static, env var, file) |
 | `JobSubmitter` (`job_submitter.hpp`) | Programmatic client: connect, `HelloClient` + `SubmitJob`, await ack/completion |
 | `PluginRegistry` (`plugin.hpp`) | Registration sink for a job/plugin's types, sources, operators, sinks, selectors and key extractors |

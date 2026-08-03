@@ -49,7 +49,7 @@ inline PluginBinary decode_plugin_binary(MessageReader& r) {
     PluginBinary p;
     p.name = r.read_string();
     p.content_hash = r.read_string();
-    const std::uint32_t n = r.read_u32_be();
+    const std::uint32_t n = r.read_count();
     p.bytes.reserve(n);
     for (std::uint32_t i = 0; i < n; ++i) {
         p.bytes.push_back(static_cast<std::byte>(r.read_u8()));
@@ -376,14 +376,14 @@ inline RegisterAckMsg decode_register_ack(MessageReader& r) {
 inline DeployMsg decode_deploy(MessageReader& r) {
     DeployMsg m;
     m.job_id = r.read_u64_be();
-    const std::uint32_t n = r.read_u32_be();
+    const std::uint32_t n = r.read_count();
     m.tasks.reserve(n);
     for (std::uint32_t i = 0; i < n; ++i) {
         DeploymentTask t;
         t.role = r.read_string();
         t.subtask_idx = r.read_u32_be();
         t.data_port = r.read_u16_be();
-        const std::uint32_t pn = r.read_u32_be();
+        const std::uint32_t pn = r.read_count();
         t.peers.reserve(pn);
         for (std::uint32_t j = 0; j < pn; ++j) {
             PeerAddress p;
@@ -397,7 +397,7 @@ inline DeployMsg decode_deploy(MessageReader& r) {
         m.tasks.push_back(std::move(t));
     }
     if (!r.eof()) {
-        const std::uint32_t pcount = r.read_u32_be();
+        const std::uint32_t pcount = r.read_count();
         m.plugins.reserve(pcount);
         for (std::uint32_t i = 0; i < pcount; ++i) {
             m.plugins.push_back(decode_plugin_binary(r));
@@ -488,7 +488,7 @@ inline CancelJobAckMsg decode_cancel_job_ack(MessageReader& r) {
 inline RescaleJobMsg decode_rescale_job(MessageReader& r) {
     RescaleJobMsg m;
     m.job_id = r.read_u64_be();
-    const std::uint32_t n = r.read_u32_be();
+    const std::uint32_t n = r.read_count();
     m.role_parallelism.reserve(n);
     for (std::uint32_t i = 0; i < n; ++i) {
         std::string role = r.read_string();
@@ -588,7 +588,7 @@ inline SubmitJobMsg decode_submit_job(MessageReader& r) {
     SubmitJobMsg m;
     m.graph_json = r.read_string();
     if (!r.eof()) {
-        const std::uint32_t pcount = r.read_u32_be();
+        const std::uint32_t pcount = r.read_count();
         m.plugins.reserve(pcount);
         for (std::uint32_t i = 0; i < pcount; ++i) {
             m.plugins.push_back(decode_plugin_binary(r));
@@ -689,7 +689,7 @@ inline SubtaskCheckpointedMsg decode_subtask_checkpointed(MessageReader& r) {
 
 inline ListJobsAckMsg decode_list_jobs_ack(MessageReader& r) {
     ListJobsAckMsg m;
-    const std::uint32_t n = r.read_u32_be();
+    const std::uint32_t n = r.read_count();
     m.jobs.reserve(n);
     for (std::uint32_t i = 0; i < n; ++i) {
         JobInfo j;
@@ -706,7 +706,7 @@ inline JobCompletedMsg decode_job_completed(MessageReader& r) {
     JobCompletedMsg m;
     m.job_id = r.read_u64_be();
     m.ok = r.read_u8() != 0;
-    const std::uint32_t n = r.read_u32_be();
+    const std::uint32_t n = r.read_count();
     m.errors.reserve(n);
     for (std::uint32_t i = 0; i < n; ++i) {
         m.errors.push_back(r.read_string());
@@ -721,7 +721,7 @@ inline SubtaskListeningMsg decode_subtask_listening(MessageReader& r) {
     m.role = r.read_string();
     m.subtask_idx = r.read_u32_be();
     m.host = r.read_string();
-    const std::uint32_t n = r.read_u32_be();
+    const std::uint32_t n = r.read_count();
     m.edge_ports.reserve(n);
     for (std::uint32_t i = 0; i < n; ++i) {
         SubtaskListeningMsg::EdgePort ep;
@@ -736,13 +736,13 @@ inline SubtaskListeningMsg decode_subtask_listening(MessageReader& r) {
 inline PeerUpdateMsg decode_peer_update(MessageReader& r) {
     PeerUpdateMsg m;
     m.job_id = r.read_u64_be();
-    const std::uint32_t n = r.read_u32_be();
+    const std::uint32_t n = r.read_count();
     m.tasks.reserve(n);
     for (std::uint32_t i = 0; i < n; ++i) {
         PeerUpdateMsg::TaskPeers tp;
         tp.role = r.read_string();
         tp.subtask_idx = r.read_u32_be();
-        const std::uint32_t pn = r.read_u32_be();
+        const std::uint32_t pn = r.read_count();
         tp.peers.reserve(pn);
         for (std::uint32_t j = 0; j < pn; ++j) {
             PeerAddress p;

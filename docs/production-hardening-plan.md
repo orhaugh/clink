@@ -393,6 +393,51 @@ restored as version 1.
 with the longest gap between cause and symptom. This is the same class as
 F10 - a rule enforced by documentation.
 
+### F21. A four-byte header could ask for a four-gigabyte allocation
+
+`read_frame` trusted the length prefix: `std::vector<std::byte> body(len)`
+allocated and zeroed up to 4 GB before a single byte of body arrived.
+Anything that could open a TCP connection to the control port could send
+`FF FF FF FF`, repeatedly, before authenticating.
+
+Three copies of that function existed - `coordinator.cpp`, `worker.cpp`,
+`job_submitter.cpp` - and all three had it, which is the usual argument for
+having one.
+
+**Risk:** trivial remote memory exhaustion of the coordinator or a worker.
+
+### F22. Eleven decoders reserved on a peer-supplied element count
+
+Every container decoder read a `u32` and handed it straight to `reserve()`.
+`decode_deploy` with a task count of `0xFFFFFFFF` asks for roughly 400 GB
+for a `vector<DeploymentTask>`; `decode_plugin_binary` asks for 4 GB of
+bytes. No bounds check preceded any of them.
+
+**Risk:** as F21, and reachable through any message carrying a list.
+
+### F23. A malformed frame terminated the process
+
+The most serious of the three, and the one that makes the other two acute.
+
+`MessageReader` throws on a truncated or malformed payload. That is
+deliberate - `MessageReader.ThrowsOnTruncatedBody` has always asserted it -
+and it implies somebody catches. Nobody did. The throw propagated out of
+the coordinator's accept thread, its per-client thread, its per-worker
+reader thread, and the worker's own reader thread. Leaving a thread
+function by exception is `std::terminate`.
+
+So: one malformed frame, from anything that could reach the control port,
+killed the coordinator process and every job it was managing. No
+authentication was required, because the decode happens before any.
+
+Demonstrated rather than reasoned about. With the boundary removed, the
+test that sends a truncated `Register` does not fail - it prints
+`libc++abi: terminating due to uncaught exception of type std::runtime_error:
+MessageReader: truncated string` and takes the whole test binary with it.
+
+**Risk:** remote unauthenticated denial of service against the control
+plane.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -428,7 +473,7 @@ lives; evidence is in section 4.
 | W11 | SQL bounded-state validator, enforced in the planner | P0.3 | F9 | **Done** |
 | W12 | State TTL depth: event time, incremental cleanup, metrics, SQL `state_ttl` enforced by GROUP BY | P0.3 | F9 | **Partial** |
 | W13 | Strict rejection of unsupported SQL semantics | P0.4 | F14, F15 | **Partial** |
-| W14 | Resource and overload limits | P1.9 | - | **Open** |
+| W14 | Resource and overload limits: frame size cap, bounded element counts, exception boundaries | P1.9 | F21, F22, F23 | **Partial** |
 | W15 | Coordinator fencing: epoch on the wire, worker enforcement, metadata guard | P1.11 | F16 | **Partial** |
 | W16 | Protocol version negotiation across RPC/frames/state | P1.12 | F19, F20 | **Partial** |
 | W17 | Config profiles + linter | P1.13 | - | **Open** |
@@ -1419,6 +1464,74 @@ one". The unit-level cases alone survive both.
 
 ---
 
+### W14 - Resource and overload limits — Partial
+
+**Source:** `include/clink/cluster/frame_io.hpp` (new),
+`include/clink/cluster/protocol.hpp` (`MessageReader::read_count`),
+`include/clink/cluster/messages.hpp`, `src/cluster/coordinator.cpp`,
+`src/cluster/worker.cpp`, `src/application/job_submitter.cpp`
+
+**How these were found.** Not by reading the code looking for limits, but
+by working out what to fuzz. Listing the places that parse bytes from a
+peer led straight to the length prefix, and from there to the element
+counts and then to the question of who catches what the decoders throw.
+The answer to the last one was nobody.
+
+**Frame size.** One shared `read_frame`, replacing three copies. It caps a
+frame at `kMaxFrameBytes` (256 MiB - well clear of a plugin-carrying
+Deploy, well short of nonsense) and reads the body in 64 KiB chunks so
+memory tracks what the peer has actually sent. The cap alone would not have
+been enough: four bytes claiming 256 MiB would still have allocated 256 MiB
+up front, so the amplification would have survived at a smaller constant.
+Chunking removes it - a byte costs a byte.
+
+**Element counts.** `MessageReader::read_count` replaces `read_u32_be` at
+all eleven container sites. The bound needs no arbitrary constant: every
+element costs at least one byte on the wire, so a count above the bytes
+remaining in the frame cannot be honest whatever the element type.
+
+**Exception boundaries.** Each of the four frame-handling loops now wraps
+exactly one frame. A malformed frame costs the peer its connection, is
+logged, and increments `clink_malformed_frames_total`. Dispatch was
+extracted into `dispatch_client_frame_`, `dispatch_worker_frame_` and
+`Worker::dispatch_control_frame_` so the boundary is around a function
+call rather than smeared through a loop body.
+
+**Tests:** `tests/test_frame_robustness.cpp`, 12 cases.
+
+Two of them are property tests rather than examples: every decoder against
+400 seeded random payloads each, and three valid frames truncated at every
+byte offset. The property is narrow and total - for any byte string, a
+decoder returns or throws `std::exception`; it never aborts and never
+allocates from a number it was handed. A fixed seed makes a failure
+reproduce exactly, and it runs in the normal suite rather than needing a
+fuzzing engine and an unbounded time budget.
+
+The two that matter most assert survival rather than rejection: after being
+sent four kinds of garbage, the coordinator must still register a real
+worker. Verified by mutation - removing the accept-loop boundary does not
+make the test fail, it terminates the test binary, which is precisely the
+production failure.
+
+**What makes this Partial - stated plainly:**
+
+- **These are input limits, not overload limits.** Nothing bounds the
+  NUMBER of connections, the rate of frames, the number of in-flight jobs,
+  or per-connection memory in aggregate. A peer that opens ten thousand
+  connections and sends well-formed frames on all of them is still
+  unbounded. That is the larger half of P1.9 and it is not done.
+- **No backpressure or admission control on the control plane.** Submit is
+  synchronous and unthrottled.
+- **The cap is a constant, not configuration.** An operator shipping a
+  plugin above 256 MiB has to rebuild rather than set a flag.
+- **No fuzzing engine.** The property tests are deterministic and bounded,
+  which makes them gateable; they are not a substitute for libFuzzer over
+  a corpus, and no such target exists (W23 remains open).
+- **Only the control plane.** The data-plane Arrow IPC path was not
+  audited for the same class of defect.
+
+---
+
 ## 5. Test evidence
 
 Commands run, on macOS 26.3 (arm64), Apple clang, `RelWithDebInfo`.
@@ -1440,6 +1553,8 @@ cmake -S . -B build && cmake --build build --parallel 10
     -> 15 tests from 2 test suites ran. [  PASSED  ] 15 tests.
 ./build/tests/clink_core_tests --gtest_filter='ProtocolVersioning*:SnapshotFormatVersion*'
     -> 17 tests from 2 test suites ran. [  PASSED  ] 17 tests.
+./build/tests/clink_core_tests --gtest_filter='FrameRobustness*'
+    -> 12 tests from 1 test suite ran. [  PASSED  ] 12 tests.
 
 # Whole suite, after the changes
 cmake -S . -B build -DCLINK_BUILD_SQL=ON && cmake --build build --parallel 10

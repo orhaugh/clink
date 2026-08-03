@@ -838,6 +838,32 @@ public:
         return s;
     }
 
+    // Read a length/count prefix for a container that follows.
+    //
+    // The count is peer-controlled, and every decoder used to hand it
+    // straight to reserve(): a Deploy claiming 0xFFFFFFFF tasks made the
+    // coordinator ask for roughly 400 GB before reading a single element.
+    // Ten decoders had that shape.
+    //
+    // The bound needs no magic number. Every element costs at least one
+    // byte on the wire, so a count larger than the bytes REMAINING in this
+    // payload cannot be honest, whatever the element type. Rejecting here
+    // turns an allocation the peer chose into a decode error.
+    std::uint32_t read_count() {
+        const auto n = read_u32_be();
+        if (static_cast<std::size_t>(n) > remaining()) {
+            throw std::runtime_error(
+                "MessageReader: element count " + std::to_string(n) + " exceeds the " +
+                std::to_string(remaining()) +
+                " bytes left in this frame; the frame is malformed or truncated");
+        }
+        return n;
+    }
+
+    [[nodiscard]] std::size_t remaining() const noexcept {
+        return pos_ >= bytes_.size() ? 0 : bytes_.size() - pos_;
+    }
+
     bool eof() const noexcept { return pos_ >= bytes_.size(); }
 
 private:

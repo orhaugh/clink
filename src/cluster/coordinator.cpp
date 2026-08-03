@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/frame_io.hpp"
 #include "clink/cluster/guarantee_gate.hpp"
 #include "clink/cluster/job_bundle.hpp"
 #include "clink/cluster/job_graph.hpp"
@@ -83,31 +84,6 @@ std::string js_quote(const std::string& s) {
     }
     out += '"';
     return out;
-}
-
-// Read one length-prefixed frame from a Connection. Returns the payload
-// without the 4-byte length header. Empty optional on connection close.
-std::optional<std::vector<std::byte>> read_frame(network::Connection& conn) {
-    std::array<std::byte, 4> hdr{};
-    if (!conn.recv_all(hdr.data(), hdr.size())) {
-        return std::nullopt;
-    }
-    std::uint32_t len = 0;
-    for (int i = 0; i < 4; ++i) {
-        len = (len << 8) | static_cast<unsigned char>(hdr[i]);
-    }
-    if (len == 0) {
-        return std::vector<std::byte>{};
-    }
-    std::vector<std::byte> body(len);
-    if (!conn.recv_all(body.data(), body.size())) {
-        return std::nullopt;
-    }
-    return body;
-}
-
-bool send_frame(network::Connection& conn, const std::vector<std::byte>& frame) {
-    return conn.send_all(frame.data(), frame.size());
 }
 
 }  // namespace
@@ -689,8 +665,25 @@ void Coordinator::accept_loop_() {
                 return;
             continue;  // transient: malformed handshake, peer disappeared
         }
-        if (!handle_first_frame_(std::move(conn))) {
-            continue;  // connection ended (rejected client / bad frame)
+        // A decoder throwing must not take the coordinator with it.
+        //
+        // MessageReader throws BY DESIGN on a truncated or malformed
+        // payload - there is a test for it - and nothing caught it. The
+        // throw propagated out of this thread function, which is
+        // std::terminate: one malformed frame from anything that could
+        // reach the control port killed the whole control plane, before
+        // any authentication. Dropping the connection is the correct
+        // response; the peer's framing cannot be trusted after this.
+        try {
+            if (!handle_first_frame_(std::move(conn))) {
+                continue;  // connection ended (rejected client / bad frame)
+            }
+        } catch (const std::exception& e) {
+            log::warn(
+                "coordinator.accept",
+                std::string{"dropping a connection whose first frame did not decode: "} + e.what());
+            metrics::orch::malformed_frame();
+            continue;
         }
     }
 }
@@ -868,38 +861,59 @@ void Coordinator::handle_client_loop_(std::shared_ptr<network::Connection> conn)
             return;  // conn destructor closes
         }
         MessageReader r(std::move(*frame));
-        const auto kind = static_cast<MessageKind>(r.read_u8());
-        // Every handled client->coordinator kind returns via `continue`. Do not let a
-        // handler fall through to the next `if`: MessageKind values must be
-        // distinct, but a missing `continue` here would still double-dispatch
-        // a frame to two handlers and read past its payload.
-        if (kind == MessageKind::SubmitJob) {
-            handle_submit_(*conn, r);
-            continue;
+        // Same boundary as the accept loop. A client sending a malformed
+        // frame must lose its own connection, not the coordinator.
+        try {
+            if (!dispatch_client_frame_(*conn, r)) {
+                return;  // unknown kind; conn destructor closes
+            }
+        } catch (const std::exception& e) {
+            log::warn("coordinator.client",
+                      std::string{"dropping a client whose frame did not decode: "} + e.what());
+            metrics::orch::malformed_frame();
+            return;  // conn destructor closes
         }
-        if (kind == MessageKind::ListJobs) {
-            handle_list_jobs_(*conn);
-            continue;
-        }
-        if (kind == MessageKind::CancelJob) {
-            handle_cancel_job_(*conn, r);
-            continue;
-        }
-        if (kind == MessageKind::RescaleOperator) {
-            handle_rescale_operator_(*conn, r);
-            continue;
-        }
-        if (kind == MessageKind::RescaleJob) {
-            handle_rescale_job_(*conn, r);
-            continue;
-        }
-        if (kind == MessageKind::Savepoint) {
-            handle_savepoint_(*conn, r);
-            continue;
-        }
-        // Unknown frame from a client - drop the connection.
-        return;
     }
+}
+
+// Dispatch one decoded client frame. Returns false to close the
+// connection (unknown kind), true to keep reading.
+//
+// Extracted from handle_client_loop_ so the loop can put a try around
+// exactly one frame: a client sending something malformed loses its own
+// connection, and the coordinator carries on.
+bool Coordinator::dispatch_client_frame_(network::Connection& conn, MessageReader& r) {
+    const auto kind = static_cast<MessageKind>(r.read_u8());
+    // Every handled client->coordinator kind returns immediately. Do not let a
+    // handler fall through to the next `if`: MessageKind values must be
+    // distinct, but a missing return here would still double-dispatch
+    // a frame to two handlers and read past its payload.
+    if (kind == MessageKind::SubmitJob) {
+        handle_submit_(conn, r);
+        return true;
+    }
+    if (kind == MessageKind::ListJobs) {
+        handle_list_jobs_(conn);
+        return true;
+    }
+    if (kind == MessageKind::CancelJob) {
+        handle_cancel_job_(conn, r);
+        return true;
+    }
+    if (kind == MessageKind::RescaleOperator) {
+        handle_rescale_operator_(conn, r);
+        return true;
+    }
+    if (kind == MessageKind::RescaleJob) {
+        handle_rescale_job_(conn, r);
+        return true;
+    }
+    if (kind == MessageKind::Savepoint) {
+        handle_savepoint_(conn, r);
+        return true;
+    }
+    // Unknown frame from a client - drop the connection.
+    return false;
 }
 
 ClusterSnapshot Coordinator::snapshot_cluster() const {
@@ -2179,30 +2193,48 @@ void Coordinator::start_reader_for_(std::shared_ptr<WorkerConnection> worker) {
                 continue;
             }
             MessageReader r(std::move(*frame));
-            const auto kind = static_cast<MessageKind>(r.read_u8());
-            switch (kind) {
-                case MessageKind::SubtaskFinished:
-                    handle_subtask_finished_(r);
-                    break;
-                case MessageKind::SubtaskListening:
-                    handle_subtask_listening_(r);
-                    break;
-                case MessageKind::Heartbeat:
-                    (void)decode_heartbeat(r);
-                    break;
-                case MessageKind::SubtaskCheckpointed:
-                    handle_subtask_checkpointed_(r);
-                    break;
-                case MessageKind::RequestFinalCheckpoint:
-                    if (worker->conn) {
-                        handle_request_final_checkpoint_(r, *worker->conn);
-                    }
-                    break;
-                default:
-                    break;
+            // A registered worker sending a malformed frame is either a
+            // version skew or a bug in the worker. Either way it must cost
+            // that worker its connection, not the coordinator its life.
+            try {
+                dispatch_worker_frame_(worker, r);
+            } catch (const std::exception& e) {
+                log::warn("coordinator.worker",
+                          "dropping worker '" + worker->worker_id +
+                              "': frame did not decode: " + e.what());
+                metrics::orch::malformed_frame();
+                return;
             }
         }
     });
+}
+
+// Dispatch one decoded worker frame. Extracted from the reader thread so
+// the thread can bound a throw to a single frame.
+void Coordinator::dispatch_worker_frame_(const std::shared_ptr<WorkerConnection>& worker,
+                                         MessageReader& r) {
+    const auto kind = static_cast<MessageKind>(r.read_u8());
+    switch (kind) {
+        case MessageKind::SubtaskFinished:
+            handle_subtask_finished_(r);
+            break;
+        case MessageKind::SubtaskListening:
+            handle_subtask_listening_(r);
+            break;
+        case MessageKind::Heartbeat:
+            (void)decode_heartbeat(r);
+            break;
+        case MessageKind::SubtaskCheckpointed:
+            handle_subtask_checkpointed_(r);
+            break;
+        case MessageKind::RequestFinalCheckpoint:
+            if (worker->conn) {
+                handle_request_final_checkpoint_(r, *worker->conn);
+            }
+            break;
+        default:
+            break;
+    }
 }
 
 void Coordinator::handle_subtask_listening_(MessageReader& r) {

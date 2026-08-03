@@ -1,5 +1,6 @@
 #include "clink/application/job_submitter.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/cluster/frame_io.hpp"
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/plugin_cache.hpp"
 #include "clink/cluster/protocol.hpp"
@@ -37,9 +39,25 @@ std::optional<std::vector<std::byte>> read_frame_with_timeout(int fd, int timeou
     for (std::size_t i = 0; i < hdr.size(); ++i) {
         len = (len << 8) | static_cast<unsigned char>(hdr[i]);
     }
-    std::vector<std::byte> body(len);
-    if (len > 0 && !NetworkSocket::recv_all(fd, body.data(), body.size())) {
+    // Same bound as the Connection-based reader in frame_io.hpp: this is
+    // the fd-based copy, which needs poll() for its timeout and so cannot
+    // share that code, but it must not trust the length prefix either. A
+    // submitter pointed at a wrong or hostile port would otherwise try to
+    // allocate 4 GB from four bytes.
+    if (static_cast<std::size_t>(len) > kMaxFrameBytes) {
         return std::nullopt;
+    }
+    std::vector<std::byte> body;
+    body.reserve(std::min<std::size_t>(len, kFrameReadChunkBytes));
+    std::array<std::byte, kFrameReadChunkBytes> chunk{};
+    std::size_t got = 0;
+    while (got < len) {
+        const auto want = std::min<std::size_t>(chunk.size(), len - got);
+        if (!NetworkSocket::recv_all(fd, chunk.data(), want)) {
+            return std::nullopt;
+        }
+        body.insert(body.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(want));
+        got += want;
     }
     return body;
 }
