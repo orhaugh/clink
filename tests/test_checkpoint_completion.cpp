@@ -278,6 +278,15 @@ JobGraphSpec two_subtask_graph(const std::filesystem::path& out) {
     return g;
 }
 
+// Where the coordinator WRITES its completion marker, established by
+// running one rather than by reading the comments - which disagree.
+// Exposed so the recovery test below can state the premise it depends on.
+std::filesystem::path written_marker_path(const std::filesystem::path& checkpoint_dir,
+                                          JobId job_id,
+                                          std::uint64_t ckpt_id) {
+    return checkpoint_dir / std::to_string(job_id) / ("COMPLETED-" + std::to_string(ckpt_id));
+}
+
 // A cluster with one fake worker and one submitted job, ready to be told
 // its checkpoints have or have not succeeded.
 struct CheckpointFixture {
@@ -374,16 +383,12 @@ struct CheckpointFixture {
     CheckpointFixture(const CheckpointFixture&) = delete;
     CheckpointFixture& operator=(const CheckpointFixture&) = delete;
 
-    // The marker the coordinator actually writes: FLAT under the
-    // configured checkpoint dir, not under a per-job subdirectory.
-    //
-    // Worth stating because the engine's own recovery lookup
-    // (latest_completed_id_on_disk) reads <dir>/<job_id>/COMPLETED-N
-    // instead. Verified against the filesystem rather than the comments,
-    // which disagree with each other. See the plan doc, F29.
-    [[nodiscard]] bool marker_exists(JobId /*job_id*/, std::uint64_t ckpt_id) const {
+    // <checkpoint_dir>/<job_id>/COMPLETED-<id>: the path recovery reads,
+    // and - since F29 - the path the coordinator writes.
+    [[nodiscard]] bool marker_exists(JobId job_id, std::uint64_t ckpt_id) const {
         std::error_code ec;
-        return std::filesystem::exists(dir / ("COMPLETED-" + std::to_string(ckpt_id)), ec);
+        return std::filesystem::exists(
+            dir / std::to_string(job_id) / ("COMPLETED-" + std::to_string(ckpt_id)), ec);
     }
 
     std::filesystem::path dir;
@@ -481,4 +486,113 @@ TEST(CheckpointCompletion, TheRecoveryPointSurvivesALaterFailedCheckpoint) {
     EXPECT_FALSE(fx.marker_exists(job_id, *bad));
     EXPECT_TRUE(fx.marker_exists(job_id, *good))
         << "the failed checkpoint took the good one's marker with it";
+}
+
+// --- what recovery restores from ----------------------------------------
+
+// The marker is written flat at <checkpoint_dir>/COMPLETED-N. The recovery
+// lookup (latest_completed_id_on_disk) reads
+// <checkpoint_dir>/<job_id>/COMPLETED-N. Those cannot both be right.
+//
+// A code reading says recovery must therefore always resolve to 0 and
+// restore a job from scratch, throwing away every completed checkpoint.
+// That is too severe a claim to make from reading, so this establishes it
+// by running the real thing: complete a checkpoint under one coordinator,
+// recover the job in a second, and read the restore point off the Deploy
+// frame the new coordinator actually sends.
+TEST(CheckpointCompletion, RecoveryRestoresFromTheLastCompletedCheckpoint) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_ckpt_recovery_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    const auto ha_dir = root / "ha";
+    const auto ckpt_dir = root / "ckpt";
+    std::filesystem::create_directories(ha_dir);
+    std::filesystem::create_directories(ckpt_dir);
+
+    JobId job_id = 0;
+    std::uint64_t completed = 0;
+
+    // --- first leader: run a job and complete a checkpoint ---
+    {
+        Coordinator a;
+        a.set_ha_dir(ha_dir.string());
+        const auto port = a.start();
+        a.expect_workers({"w"});
+
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(a.await_registrations(2s));
+
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = ckpt_dir.string();
+        ckpt.interval_ms = 100;
+        ckpt.max_restarts_on_worker_loss = 0;
+        job_id = a.submit_job(
+            two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+        ASSERT_GT(job_id, 0U);
+
+        auto deploy = w.await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(deploy.has_value());
+        const auto tasks = decode_deploy(*deploy).tasks;
+        ASSERT_FALSE(tasks.empty());
+        std::uint16_t port_seed = 41000;
+        for (const auto& t : tasks) {
+            ASSERT_TRUE(w.report_listening(job_id, t.role, t.subtask_idx, port_seed++));
+        }
+
+        auto trigger = w.await_frame(MessageKind::TriggerCheckpoint);
+        ASSERT_TRUE(trigger.has_value());
+        completed = decode_trigger_checkpoint(*trigger).checkpoint_id;
+        ASSERT_GT(completed, 0U);
+        for (const auto& t : tasks) {
+            ASSERT_TRUE(w.ack_checkpoint(job_id, completed, t.role, t.subtask_idx, /*ok=*/true));
+        }
+        ASSERT_TRUE(ckpt_await([&] { return a.latest_completed_checkpoint(job_id) == completed; }))
+            << "the checkpoint never completed, so there is nothing for recovery to find";
+
+        // The premise, stated rather than assumed: this is where the
+        // marker landed.
+        ASSERT_TRUE(ckpt_await([&] {
+            return std::filesystem::exists(written_marker_path(ckpt_dir, job_id, completed));
+        })) << "no marker at "
+            << written_marker_path(ckpt_dir, job_id, completed).string();
+
+        w.close();
+        a.stop();
+    }
+
+    // --- second leader: recover, and see what it restores from ---
+    {
+        Coordinator b;
+        b.set_ha_dir(ha_dir.string());
+        const auto port = b.start();
+        b.expect_workers({"w"});
+
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(b.await_registrations(2s));
+
+        b.recover_persisted_jobs();
+
+        auto deploy = w.await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(deploy.has_value()) << "the recovered job was never deployed";
+        const auto msg = decode_deploy(*deploy);
+
+        EXPECT_EQ(msg.restore_from_checkpoint_id, completed)
+            << "recovery restored the job from checkpoint " << msg.restore_from_checkpoint_id
+            << " when checkpoint " << completed
+            << " had completed and its marker is on disk. The marker is written to "
+            << written_marker_path(ckpt_dir, job_id, completed).string()
+            << " and the recovery lookup reads <checkpoint_dir>/<job_id>/COMPLETED-N; every "
+               "completed checkpoint is invisible to recovery and the job restarts from "
+               "scratch.";
+
+        w.close();
+        b.stop();
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
 }

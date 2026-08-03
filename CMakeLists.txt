@@ -887,6 +887,32 @@ if(CLINK_BUILD_HTTP)
         set_property(GLOBAL APPEND_STRING PROPERTY CLINK_FIND_DEPS_BODY
             "find_dependency(ZLIB)\n")
     endif()
+
+    # And Brotli, for exactly the same reason and by the same mechanism:
+    # httplib enables Brotli whenever it finds it
+    # (HTTPLIB_USE_BROTLI_IF_AVAILABLE), so clink_core's http_server
+    # references BrotliDecoderDecompressStream / BrotliEncoderCompressStream.
+    # Third instance of this gap after OpenSSL and zlib, and it broke CI's
+    # "Install + downstream consume" job the moment a runner image started
+    # shipping libbrotli-dev: the build finds Brotli and uses it, the
+    # installed package does not say so, and the consumer's link fails.
+    #
+    # Unlike OpenSSL and zlib, Brotli ships no CMake config or FindBrotli
+    # module, so there is nothing to find_dependency() and nothing to
+    # target_link_libraries() by imported target. pkg-config is the only
+    # portable handle. Link the libraries directly - CMake records them in
+    # INTERFACE_LINK_LIBRARIES as $<LINK_ONLY:...>, which is what a consumer
+    # of the static archive needs - and emit no find_dependency, because
+    # there is no package for a consumer to find. Same shape as the
+    # CoreFoundation/Security frameworks above: a link flag, not a package.
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(BROTLI QUIET libbrotlienc libbrotlidec libbrotlicommon)
+        if(BROTLI_FOUND)
+            target_link_libraries(clink_core PRIVATE ${BROTLI_LINK_LIBRARIES})
+            message(STATUS "clink::core - httplib Brotli support: linking ${BROTLI_LIBRARIES}")
+        endif()
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

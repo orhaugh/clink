@@ -4080,7 +4080,25 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         // resolved on the next successful checkpoint or at restore, whereas
         // committing without a durable marker is unrecoverable.
         if (!completed_marker_dir.empty()) {
+            // <checkpoint_dir>/<job_id>/COMPLETED-<id>.
+            //
+            // The job id used to be missing, which broke two things at
+            // once. Recovery could not find the marker at all -
+            // latest_completed_id_on_disk reads the job-scoped path, so
+            // every completed checkpoint was invisible and a recovered
+            // job restarted from scratch, silently. And two jobs sharing
+            // a checkpoint directory wrote COMPLETED-5 to the same file,
+            // so one job's progress was read as the other's.
+            //
+            // Established by running it, not by reading: a recovered job
+            // came back with restore_from_checkpoint_id=0 while
+            // COMPLETED-1 sat on disk.
+            //
+            // Markers written by an older build sit at the flat path and
+            // are not migrated. Nothing ever read them, so nothing is
+            // lost by leaving them.
             const std::filesystem::path marker = std::filesystem::path{completed_marker_dir} /
+                                                 std::to_string(jid) /
                                                  ("COMPLETED-" + std::to_string(ckpt_id));
             std::error_code ec;
             std::filesystem::create_directories(marker.parent_path(), ec);

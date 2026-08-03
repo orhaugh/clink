@@ -577,30 +577,50 @@ Measured either side. With the guard disabled the tests report "checkpoint
 not snapshot" and "a failed checkpoint moved the recovery point off the
 last good one (now 2, was 1)".
 
-### F29. The completion marker is written flat and read job-scoped
+### F29. HA recovery could not see any completed checkpoint
 
 Found while writing F28's test, by looking at the filesystem rather than
 the comments - which disagree with each other.
 
-The marker is WRITTEN to `<checkpoint_dir>/COMPLETED-<id>`
-(`handle_subtask_checkpointed_`). `latest_completed_id_on_disk`, which HA
-recovery uses to decide what to restore from, READS
-`<checkpoint_dir>/<job_id>/COMPLETED-<id>`. The header comment on
-`pending_checkpoint_acks` describes the job-scoped path; the code writes
-the flat one.
+The marker was WRITTEN to `<checkpoint_dir>/COMPLETED-<id>`.
+`latest_completed_id_on_disk`, which HA recovery uses to decide what to
+restore from, READS `<checkpoint_dir>/<job_id>/COMPLETED-<id>`. The header
+comment describes the job-scoped path; the code wrote the flat one.
 
-**Not yet established:** whether this means HA recovery always resolves
-`restore_from_checkpoint_id = 0`. It looks that way from the two paths,
-but the deployment may scope `checkpoint_dir` per job somewhere upstream,
-and asserting a defect of that severity on a code reading alone is exactly
-what this document is supposed to avoid. It is recorded as a
-**discrepancy to resolve**, with the evidence: a real coordinator run
-under test produces `<dir>/COMPLETED-1` and nothing under `<dir>/<job>/`.
+**Established by running it, not by reading it.** This was first recorded
+here as a discrepancy of unknown severity, because concluding "recovery is
+broken" from two paths that disagree is exactly the kind of claim this
+document should not contain unverified. `RecoveryRestoresFromTheLast
+CompletedCheckpoint` completes a checkpoint under one coordinator, recovers
+the job in a second, and reads the restore point off the Deploy frame the
+new coordinator actually sends. It came back **0** with `COMPLETED-1` on
+disk.
 
-Also noted: `tests/integration/cluster_harness.hpp`'s
-`await_checkpoint_completed` looks under the job-scoped path, so it can
-only ever have timed out. The tests using it pass because the assertions
-around it do not depend on it finding anything - which is its own problem.
+So: every completed checkpoint was invisible to HA recovery, and a
+recovered job silently restarted from scratch, discarding all its state.
+Nothing failed and nothing was logged; the job simply came back empty.
+
+The flat layout had a second consequence: two jobs sharing a checkpoint
+directory both wrote `COMPLETED-5` to the same file, so one job's progress
+was read as the other's.
+
+**Risk:** total state loss on coordinator failover - the one event HA
+exists to survive.
+
+**Fix:** the write is now job-scoped, matching the read, the documented
+layout, and the harness. Markers written by an older build stay at the
+flat path and are not migrated; nothing ever read them, so nothing is
+lost.
+
+Why the WRITE side rather than the read: the job-scoped path is what the
+header, the recovery lookup and `cluster_harness.hpp` all already assume,
+and it is the one that does not collide across jobs.
+
+**Why no test caught this.** `tests/integration/cluster_harness.hpp`'s
+`await_checkpoint_completed` looks under the job-scoped path, so it could
+only ever have timed out - and the tests calling it pass because the
+assertions around it do not depend on it finding anything. A helper whose
+failure is invisible is worse than no helper.
 
 ### F10. Behaviour controlled by documentation rather than by code
 
@@ -1837,7 +1857,7 @@ condition fails the two positives and leaves the negatives green.
 
 ---
 
-### F28/F29 - Checkpoint completion — Done (F28) / Open (F29)
+### F28/F29 - Checkpoint completion and recovery — Done
 
 **Source:** `include/clink/cluster/coordinator.hpp`,
 `src/cluster/coordinator.cpp`, `tests/test_checkpoint_completion.cpp` (new)
@@ -1846,7 +1866,7 @@ F28 is fixed and covered. A checkpoint with any failed subtask ack is
 failed, not completed: no `COMPLETED-N`, recovery point unchanged,
 `AbortCheckpoint` broadcast to roll back anything staged.
 
-**Tests:** 4 cases, driving a real coordinator over a real socket with the
+**Tests:** 5 cases, driving a real coordinator over a real socket with the
 test playing the worker. That shape is necessary rather than clever: the
 defect is in what the coordinator concludes from a specific sequence of
 acks, and nothing above the wire can produce `ok=false` on demand.
@@ -1875,12 +1895,11 @@ the guard erased `ckpt_it` in the failure branch and then re-tested
 `ckpt_it->second.empty()` in the next condition - a use-after-free. The
 emptiness is now read once, before either branch touches the map.
 
-**F29 is not fixed.** See the finding: the write path and the recovery
-read path disagree about where the marker lives, and establishing what
-that costs needs a deployment-level check rather than a code reading.
-Fixing it blind - by making one path match the other - risks changing
-where markers are looked for in a system that may have been relying on
-the flat layout since it was written.
+**F29 is fixed too, once it was established rather than suspected.** The
+recovery test above is the establishing evidence and the regression guard
+in one: it asserts on the restore point in the Deploy frame the recovering
+coordinator sends, so a future change that puts the marker back out of
+recovery's reach fails with the two ids side by side.
 
 ---
 
