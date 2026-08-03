@@ -2307,9 +2307,25 @@ and "survives a real rollout" are the same claim.
   individual job mid-checkpoint, mid-rescale, or during 2PC commit was not
   systematically exercised; nor was the HTTP server's shutdown, nor
   connector-level cancellation (a source blocked in a broker poll).
-- **No leak check.** Nothing asserts that threads, file descriptors or
-  temporary files are released on shutdown. A clean exit code is not
-  evidence of a clean teardown.
+- ~~No leak check.~~ **Partly closed.** `tests/test_shutdown_leaks.cpp`
+  cycles a coordinator through start/stop eight times and asserts that open
+  descriptors and live threads come back to where they started. It matters
+  for the long-lived processes specifically: a coordinator leaking two
+  descriptors per stopped job is invisible for a day and then hits the
+  process limit, surfacing as an unrelated `accept()` failure. Nothing in
+  the suite would have caught that, because every other test starts a
+  cluster, asserts a behaviour, and lets the process exit take the evidence
+  with it.
+
+  Cycles rather than one start/stop, because a single iteration cannot tell
+  a leak from a fixture that is legitimately kept once - a lazily-created
+  log sink, a cached handle. A leak scales with the cycle count; a fixture
+  does not. A warm-up cycle runs before the baseline for the same reason.
+  Mutation-checked by leaking one descriptor per cycle: `4 -> 12`, caught.
+
+  Still open: only the coordinator, and only descriptors and threads.
+  Workers, temporary files and the HTTP server are not covered, and neither
+  is memory - a leak of heap rather than handles would pass all three cases.
 
 ---
 
