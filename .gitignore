@@ -114,3 +114,35 @@ python/build/
 
 # Split cloud rig results (raw per-run JSON; the summary lives in cloud/README.md)
 benchmarks/nexmark_compare/cloud/results-split*/
+
+# ---------------------------------------------------------------------------
+# Fuzz corpus.
+#
+# Three kinds of file live under fuzz/corpus/<target>/ and only two are
+# tracked, on purpose.
+#
+#   seed-*        GENERATED at build time by clink_fuzz_seeds, from the real
+#                 encoders. Not tracked: a committed seed goes stale the
+#                 first time a message gains a field, and a stale seed
+#                 narrows what the fuzzer explores without anyone noticing.
+#                 Regenerating is a build target.
+#
+#   crash-*       REPRODUCERS. Tracked, always. Their whole value is being
+#   leak-*        the exact bytes that broke something, so
+#   timeout-*     tests/test_fuzz_corpus.cpp replays them forever on builds
+#   oom-*         that cannot run a fuzzer at all. This is what makes a
+#                 fuzzer finding into a permanent regression test.
+#
+#   <hex hash>    Coverage inputs libFuzzer discovered. NOT tracked: a
+#                 minimised cluster_frame corpus alone is 308 files and
+#                 1.2 MB of blobs nobody can review, and the marginal
+#                 coverage over the deterministic property tests in
+#                 tests/test_frame_robustness.cpp is modest. Keep them
+#                 locally - they make your next run start warm - and let a
+#                 long campaign publish a corpus out of tree.
+/fuzz/corpus/*/*
+!/fuzz/corpus/*/.gitkeep
+!/fuzz/corpus/*/crash-*
+!/fuzz/corpus/*/leak-*
+!/fuzz/corpus/*/timeout-*
+!/fuzz/corpus/*/oom-*

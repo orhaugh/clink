@@ -622,6 +622,76 @@ only ever have timed out - and the tests calling it pass because the
 assertions around it do not depend on it finding anything. A helper whose
 failure is invisible is worse than no helper.
 
+### F30. Processing-time TTL tests assert order by betting on the scheduler
+
+Found by `KeyedStateGetAsync.RefreshOnReadAdvancesExpiry` failing on Linux
+after passing on the host repeatedly - the same shape as F17, and the
+second time this round that a Linux run caught what macOS did not.
+
+The test is structurally flaky rather than unlucky. TTL is 100 ms; it
+sleeps 70 ms, reads (expecting a refresh), sleeps 70 ms again, and expects
+the entry alive. The margin is 30 ms on either side, and a loaded box or a
+container loses it: if the first sleep overshoots 100 ms the entry is
+already gone and the second read fails.
+
+Nothing about the property under test is a timing contract. "A read
+refreshes the expiry" is a statement about ORDER. Expressing order by
+sleeping asserts the order AND bets on the scheduler, and only one of those
+is wanted.
+
+It is a family, not one test: 18 `sleep_for` calls across 8 TTL test files.
+
+**Risk:** intermittent CI failures in the area the brief singles out, which
+train people to re-run rather than to read. Under sanitizers, where
+everything is several times slower, the margins are worse.
+
+**Fix:** `TtlConfig::clock_ms`, a nullable function pointer for the
+processing-time clock. Null means the wall clock, so nothing changes for
+production. A raw pointer rather than a `std::function` because it is
+consulted on every TTL decision - a null check and at most an indirect
+call, no allocation, no type erasure - and per-slot rather than a global
+hook so one test cannot perturb another. The event-time domain needed no
+equivalent: its clock is already the watermark the caller advances.
+
+The three sleeps in `test_async_state_get.cpp` are now clock advances. The
+test runs in microseconds instead of 290 ms of sleeping, and passed 10/10
+consecutive runs.
+
+**A test that did not test what it claimed.** Mutation-checking this
+revealed the first thing I disabled - `refresh_on_read` in the sync `get()`
+path - left the test passing. The async path has its own refresh in
+`decode_one_`; disabling THAT fails it. Worth recording because the test's
+name says `get_async` and the obvious reading of "where does refresh_on_read
+live" is the wrong one.
+
+Also added while there: an assertion that a refreshed entry still expires
+eventually. Without it the test passes against a TTL that has been
+accidentally disabled altogether.
+
+**Not done:** the other 15 sleeps, in 7 files. The seam they need now
+exists; converting them is mechanical and is left as recorded work rather
+than done under a fuzzing item.
+
+**A second flake, this one mine.** The same Linux run then failed
+`FrameRobustness.ClientConnectionsAreReapedRatherThanAccumulated`, written
+one round earlier - holding 6 sessions of 40 rather than the expected 2.
+
+Reaping WAS working; the assertion was wrong. Reaping is driven by
+ADMISSION - a finished session is joined and dropped when the next client
+arrives - so waiting for the count to fall on its own cannot work: after
+the last client is admitted there is nothing left to do the reaping. The
+test waited anyway, and passed on macOS only because the reader threads
+happened to keep up.
+
+Fixed by making the test DRIVE what it depends on: each poll admits a probe
+client, which reaps whatever has finished. What is proven is that reaping
+makes progress, not that it happened before a deadline. 10/10 consecutive
+runs.
+
+Worth recording as its own mistake rather than folded into F30. A test that
+waits for a condition nothing will cause is a specific error, and I made it
+while fixing a different flake of the same family.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -666,7 +736,7 @@ lives; evidence is in section 4.
 | W20 | Non-determinism detection API | P2.16 | - | **Partial** |
 | W21 | Cancellation/shutdown audit | P2.17 | F24 | **Partial** |
 | W22 | Side-output / multi-sink propagation validation | P2.18 | - | **Partial** |
-| W23 | Fuzz targets | P1.8 | - | **Open** |
+| W23 | Fuzz targets + committed-corpus regression replay | P1.8 | - | **Partial** |
 
 ---
 
@@ -1903,6 +1973,92 @@ recovery's reach fails with the two ids side by side.
 
 ---
 
+### W23 - Fuzz targets — Partial
+
+**Source:** `fuzz/` (new: `fuzz_targets.hpp`, five entry points,
+`generate_seeds.cpp`, `CMakeLists.txt`, `README.md`),
+`tests/test_fuzz_corpus.cpp` (new), `scripts/fuzz.sh` (new),
+`scripts/install-system-deps.sh`
+
+**The design decision that matters: discovery and regression are split.**
+
+Discovery needs a clang that ships libFuzzer and an unbounded time budget,
+so it cannot be a required check - an unbounded search is not a gate, and
+pretending otherwise buys either a flaky required job or a time limit so
+short it finds nothing.
+
+Regression replays every committed corpus input through the SAME functions
+under plain gtest. No fuzzing engine, milliseconds, gates on every platform
+and compiler the project builds on. So the workflow is: a campaign finds a
+crash, the input is committed, and from then on it is a permanent
+regression test that runs even on builds that could not run a fuzzer.
+
+That last part is what the brief's "add a regression test for every bug
+discovered" actually requires. A fuzzer alone does not provide it: nobody
+reruns the exact input, and the next campaign starts from a different
+random seed.
+
+**Targets** are the places that parse bytes clink did not write:
+control-plane message bodies (from an unauthenticated peer), the checkpoint
+integrity sidecar (from disk, so also whatever survived a partial write),
+the packed schema-version map, the `CLINK_FAULT_INJECT` schedule, and SQL
+text. `cluster_frame` takes the message kind from byte 0, so one corpus
+entry mutates into any decoder rather than only the one it first reached.
+
+**Seeds are generated, not committed.** `clink_fuzz_seeds` writes them from
+the real encoders at build time. A hand-written seed goes stale the first
+time a message gains a field, and a stale seed narrows what the fuzzer
+explores without anyone noticing - the same reasoning that has the
+guarantee analyser read the capability registry rather than a literal list.
+Reproducers ARE committed bytes, because their whole value is being the
+exact input that broke something.
+
+**Results of the first campaign** (macOS/arm64, `-fsanitize=fuzzer,address,
+undefined`, 45 s per target):
+
+| Target | Executions | Findings |
+|---|---|---|
+| `cluster_frame` | 1,408,440 | none |
+| `checkpoint_meta` | 12,882,991 | none |
+| `state_version_map` | 6,559,848 | none |
+
+20.8 million executions, no crashes. Stated precisely: the W14 hardening
+holds against inputs nobody wrote down. It does not say the decoders are
+correct - a fuzzer finds crashes, not wrong answers.
+
+**A toolchain gap found and declared.** The project's Debian image has
+`clang-tidy`, which pulls the clang COMPILER but not the sanitizer
+runtimes, so `-fsanitize=fuzzer` failed at link with a missing
+`libclang_rt.fuzzer.a`. `libclang-rt-19-dev` is now declared in
+`install-system-deps.sh`, so the next image rebuild can run these. Until
+that rebuild, discovery runs on the host only - and
+`CLINK_BUILD_FUZZERS=ON` on a toolchain that cannot link libFuzzer is a
+hard CMake error naming the fix, not a silent skip.
+
+**What makes this Partial - stated plainly:**
+
+- **No sustained campaign.** 45 seconds per target is a smoke test. A real
+  campaign is hours per target, ideally continuous, and would very likely
+  find things this did not.
+- **Discovery is not in CI at all.** It cannot be until the image is
+  rebuilt with the runtime, and even then it belongs in a scheduled job
+  rather than a required check. Only the corpus replay gates today.
+- **No coverage corpus is published.** Discovered inputs are kept locally
+  and deliberately untracked: a minimised `cluster_frame` corpus alone is
+  ~1.2 MB of unreviewable blobs, and the marginal coverage over
+  `test_frame_robustness.cpp`'s deterministic property tests is modest.
+  The cost is that every campaign restarts from seeds.
+- **Crashes only.** These targets assert "does not crash". They do not
+  check that a decode round-trips, or that two paths agree - differential
+  and property fuzzing would catch wrong answers, and neither exists.
+- **The data plane is not fuzzed.** Arrow IPC between operators, and the
+  connector wire formats, take input from outside the process and have no
+  targets.
+- **`state.during_flush` is declared and wired nowhere.** Noticed while
+  listing fault points for a target; recorded here rather than fixed.
+
+---
+
 ## 5. Test evidence
 
 Commands run, on macOS 26.3 (arm64), Apple clang, `RelWithDebInfo`.
@@ -1925,7 +2081,14 @@ cmake -S . -B build && cmake --build build --parallel 10
 ./build/tests/clink_core_tests --gtest_filter='ProtocolVersioning*:SnapshotFormatVersion*'
     -> 17 tests from 2 test suites ran. [  PASSED  ] 17 tests.
 ./build/tests/clink_core_tests --gtest_filter='FrameRobustness*'
-    -> 12 tests from 1 test suite ran. [  PASSED  ] 12 tests.
+    -> 14 tests from 1 test suite ran. [  PASSED  ] 14 tests.
+./build/tests/clink_core_tests --gtest_filter='FuzzCorpus*'
+    -> 3 tests from 1 test suite ran. [  PASSED  ] 3 tests. (5 ms)
+
+# Fuzz discovery (host only until the image carries libclang-rt)
+scripts/fuzz.sh cluster_frame 45      -> 1,408,440 execs, no findings
+scripts/fuzz.sh checkpoint_meta 45    -> 12,882,991 execs, no findings
+scripts/fuzz.sh state_version_map 45  -> 6,559,848 execs, no findings
 
 # Whole suite, after the changes
 cmake -S . -B build -DCLINK_BUILD_SQL=ON && cmake --build build --parallel 10

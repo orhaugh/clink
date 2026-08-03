@@ -36,6 +36,12 @@ export DEBIAN_FRONTEND=noninteractive
 #   libxml2-dev          - azure-sdk-for-cpp's storage libs (bundled by Arrow's ARROW_AZURE)
 #                          parse XML storage responses via system libxml2 at build time
 #   libzstd-dev, zlib1g-dev - compression libs the toolchain links
+#   llvm, libclang-rt-19-dev - libFuzzer. clang-tidy alone pulls clang the
+#                          COMPILER but not the sanitizer runtimes, so
+#                          -fsanitize=fuzzer failed at link with a missing
+#                          libclang_rt.fuzzer.a. Needed only for the opt-in
+#                          fuzz targets (CLINK_BUILD_FUZZERS=ON); the corpus
+#                          REPLAY that gates CI needs none of it.
 # All are stable - they do not change when a connector is added - so they cache here.
 apt-get update && apt-get install -y --no-install-recommends \
     cmake \
@@ -46,6 +52,7 @@ apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     clang-format \
     clang-tidy \
+    llvm \
     lcov \
     gcovr \
     libssl-dev \
@@ -53,7 +60,8 @@ apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-dev \
     libxml2-dev \
     libzstd-dev \
-    zlib1g-dev
+    zlib1g-dev \
+    libclang-rt-19-dev
 
 # -- AWS SDK for C++ (S3 transport for Arrow's S3FileSystem) --
 # MUST be built BEFORE Arrow: Arrow's S3 uses the SYSTEM aws-sdk (Arrow 24's OWN bundled

@@ -42,6 +42,13 @@ endif()
 
 option(CLINK_BUILD_TESTS    "Build clink tests"    ON)
 option(CLINK_BUILD_EXAMPLES "Build clink examples" ON)
+# libFuzzer discovery targets under fuzz/. OFF by default and hard-errors
+# when the toolchain cannot link libFuzzer, rather than skipping quietly -
+# someone who asked for fuzzers and silently got none would believe a
+# fuzzing gate exists. The REGRESSION half (replaying fuzz/corpus/ through
+# the same functions) is part of the normal test suite and needs none of
+# this.
+option(CLINK_BUILD_FUZZERS  "Build libFuzzer discovery targets" OFF)
 # Connector/backend impls (kafka, postgres, s3, rocksdb, ...). ON by default.
 # Turn OFF for a lean core + test-framework build: the install then carries only
 # clink::core / clink::clink / clink::test_support and a clinkConfig that
@@ -1319,6 +1326,14 @@ endforeach()
 # ---------------------------------------------------------------------------
 if(CLINK_BUILD_TESTS)
     add_subdirectory(tests)
+endif()
+
+# fuzz/ carries the seed generator (needed by the corpus-replay test in
+# tests/) AND the libFuzzer discovery targets. Gated on EITHER flag rather
+# than nested inside the tests block: a fuzz-only build turns tests off, and
+# a tests-only build still needs the seeds.
+if(CLINK_BUILD_TESTS OR CLINK_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
 endif()
 
 # Embedded first-row latency regression gate (roadmap D5). RELEASE ONLY: a Debug

@@ -74,6 +74,26 @@ struct TtlConfig {
     bool refresh_on_write{true};
     bool refresh_on_read{false};
     TtlTimeDomain domain{TtlTimeDomain::ProcessingTime};
+    // Processing-time clock, in epoch milliseconds. Null (the default)
+    // means the wall clock.
+    //
+    // A seam rather than a convenience. Every property worth asserting
+    // about processing-time TTL is a statement about ORDER - a read
+    // refreshes an expiry, a lapsed entry is purged - and a test that
+    // expresses order by sleeping is asserting the order AND betting on
+    // the scheduler. With a 100 ms TTL and a 70 ms sleep the bet is a
+    // 30 ms margin, which a loaded CI box or a container loses; that is
+    // how KeyedStateGetAsync.RefreshOnReadAdvancesExpiry failed on Linux
+    // having passed on the host.
+    //
+    // A raw function pointer, not std::function: this is consulted on
+    // every TTL decision, so it must cost a null check and at most an
+    // indirect call - no allocation, no type erasure. Per-slot rather than
+    // a global hook, so one test cannot perturb another.
+    //
+    // The event-time domain needs no equivalent: its clock is already the
+    // watermark the caller advances.
+    std::int64_t (*clock_ms)(){nullptr};
     // EventTime only. False (default): nothing expires until a watermark
     // has been seen, so a job that has not yet established event time
     // cannot mass-expire its state on the strength of a zero watermark.
@@ -552,7 +572,11 @@ private:
         out.append(reinterpret_cast<const char*>(key_bytes.data()), key_bytes.size());
     }
 
-    static std::int64_t now_ms_() {
+    // Wall clock, or the injected one when a slot supplies it.
+    [[nodiscard]] std::int64_t now_ms_() const {
+        if (ttl_.clock_ms != nullptr) {
+            return ttl_.clock_ms();
+        }
         return std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::system_clock::now().time_since_epoch())
             .count();
@@ -579,8 +603,14 @@ private:
         const bool have_wm = has_watermark_;
         const auto prefix = slot_prefix_();
         const auto my_op = op_;
+        // Captured by value like every other input here: the predicate runs
+        // on a background thread and must not reach back into this object.
+        // Without it a slot on an injected clock would have its compaction
+        // judging against the wall clock, so a deterministic test would see
+        // entries reaped at times it never asked for.
+        const auto clock = ttl_.clock_ms;
         backend_->set_expiry_filter(
-            [event_time, wm, have_wm, prefix, my_op](
+            [event_time, wm, have_wm, prefix, my_op, clock](
                 OperatorId op, StateBackend::KeyView key, StateBackend::ValueView value) {
                 if (op != my_op) {
                     return false;
@@ -599,9 +629,11 @@ private:
                 if (event_time) {
                     return have_wm && expire_at <= wm;
                 }
-                const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::system_clock::now().time_since_epoch())
-                                     .count();
+                const auto now = clock != nullptr
+                                     ? clock()
+                                     : std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::system_clock::now().time_since_epoch())
+                                           .count();
                 return expire_at <= now;
             });
     }

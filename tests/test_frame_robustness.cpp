@@ -460,11 +460,31 @@ TEST(FrameRobustness, ClientConnectionsAreReapedRatherThanAccumulated) {
         conn->close();
     }
 
-    // Reaping happens when the NEXT client is admitted, so the count
-    // settles at a small number rather than zero. What matters is that it
-    // is bounded well below the number of clients seen.
-    EXPECT_TRUE(fencing_await([&] { return coordinator.client_session_count() <= 2; }))
-        << "after " << kCycles << " connect/disconnect cycles the coordinator still holds "
+    // Reaping is driven by ADMISSION - a session is joined and dropped when
+    // the next client arrives - so waiting for the count to fall on its own
+    // cannot work: after the last client is admitted there is nothing left
+    // to do the reaping. The first version of this test waited anyway and
+    // failed on Linux holding 6 of 40, which is reaping working and the
+    // assertion being wrong.
+    //
+    // So drive it. Each probe admits a client, which reaps whatever has
+    // finished; the loop is bounded, so what is proven is that reaping
+    // makes progress rather than that it happened before a deadline. The
+    // floor is 1 - the probe that has not been reaped yet - so 2 is the
+    // headroom for one straggler.
+    EXPECT_TRUE(fencing_await(
+        [&] {
+            auto probe = network::connect_plain("127.0.0.1", port);
+            if (probe != nullptr) {
+                (void)send_frame(*probe, encode_frame(MessageKind::HelloClient, HelloClientMsg{}));
+                probe->close();
+            }
+            return coordinator.client_session_count() <= 2;
+        },
+        5s))
+        << "after " << kCycles
+        << " connect/disconnect cycles, and repeated admissions to drive the reaper, the "
+           "coordinator still holds "
         << coordinator.client_session_count()
         << " client sessions; they are accumulating rather than being reaped";
 

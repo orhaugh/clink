@@ -48,6 +48,37 @@ TtlConfig short_ttl(bool refresh_on_read = false) {
     return c;
 }
 
+// A processing-time clock the test drives, in epoch milliseconds.
+//
+// Every property here is a statement about ORDER: a read refreshes an
+// expiry, a lapsed entry is purged. Expressing order by sleeping asserts
+// the order AND bets on the scheduler - with a 100 ms TTL and a 70 ms
+// sleep the bet is a 30 ms margin, and a container loses it. That is how
+// RefreshOnReadAdvancesExpiry failed on Linux having passed on the host
+// repeatedly.
+//
+// A namespace-scope counter rather than a member, because TtlConfig takes
+// a plain function pointer (see keyed_state.hpp for why it is not a
+// std::function). Each test that uses it resets it first, so no test
+// inherits another's time.
+std::int64_t g_fake_now_ms = 1'700'000'000'000;  // an arbitrary fixed epoch
+std::int64_t fake_clock() {
+    return g_fake_now_ms;
+}
+void advance_clock(std::chrono::milliseconds by) {
+    g_fake_now_ms += by.count();
+}
+void reset_clock() {
+    g_fake_now_ms = 1'700'000'000'000;
+}
+
+// short_ttl on the controlled clock.
+TtlConfig short_ttl_fake_clock(bool refresh_on_read = false) {
+    auto c = short_ttl(refresh_on_read);
+    c.clock_ms = &fake_clock;
+    return c;
+}
+
 // Count the raw rows physically stored under `op` for a slot (does NOT
 // skip TTL-expired entries, unlike KeyedState::scan), so a test can prove
 // the lazy-purge erase actually fired.
@@ -231,10 +262,11 @@ TEST(KeyedStateGetAsync, MatchesSyncGetForPresentAndAbsent) {
 // sync get()'s own purge).
 TEST(KeyedStateGetAsync, TtlExpiredReturnsNulloptAndPurges) {
     InMemoryStateBackend backend;
+    reset_clock();
     KeyedState<std::string, std::int64_t> kv(
-        backend, OperatorId{3}, "ttl", string_codec(), int64_codec(), short_ttl());
+        backend, OperatorId{3}, "ttl", string_codec(), int64_codec(), short_ttl_fake_clock());
     kv.put("alice", 1);
-    std::this_thread::sleep_for(150ms);  // cross the 100ms expiry
+    advance_clock(150ms);  // cross the 100ms expiry, exactly
 
     EXPECT_EQ(raw_rows(backend, OperatorId{3}, "ttl"), 1);  // still physically present
 
@@ -250,26 +282,39 @@ TEST(KeyedStateGetAsync, TtlExpiredReturnsNulloptAndPurges) {
 // advanced expiry, so it survives past the original TTL window.
 TEST(KeyedStateGetAsync, RefreshOnReadAdvancesExpiry) {
     InMemoryStateBackend backend;
+    reset_clock();
     KeyedState<std::string, std::int64_t> kv(backend,
                                              OperatorId{4},
                                              "ttl",
                                              string_codec(),
                                              int64_codec(),
-                                             short_ttl(/*refresh_on_read=*/true));
+                                             short_ttl_fake_clock(/*refresh_on_read=*/true));
     kv.put("k", 9);
 
-    std::this_thread::sleep_for(70ms);  // not yet expired
+    advance_clock(70ms);  // inside the 100ms window
     auto t = kv.get_async(std::string{"k"});
     t.resume();
     ASSERT_TRUE(t.done());
-    ASSERT_TRUE(t.get().has_value());  // present, and re-put with a fresh expiry
+    ASSERT_TRUE(t.get().has_value()) << "the entry expired before the window closed";
+    // That read re-put it with a fresh expiry, so the deadline is now
+    // 170ms rather than 100ms.
 
-    std::this_thread::sleep_for(70ms);  // 140ms since put, 70ms since refresh -> alive
+    advance_clock(70ms);  // 140ms since the put, 70ms since the refresh
     auto t2 = kv.get_async(std::string{"k"});
     t2.resume();
     ASSERT_TRUE(t2.done());
     EXPECT_TRUE(t2.get().has_value())
         << "refresh_on_read via get_async should have advanced the expiry";
+
+    // And it really does still expire - a refresh extends the deadline, it
+    // does not remove it. Without this the test above would pass against a
+    // TTL that had been accidentally disabled.
+    advance_clock(101ms);  // past the refreshed deadline
+    auto t3 = kv.get_async(std::string{"k"});
+    t3.resume();
+    ASSERT_TRUE(t3.done());
+    EXPECT_FALSE(t3.get().has_value())
+        << "refresh_on_read extended the deadline indefinitely rather than resetting it";
 }
 
 // The key is taken by value, so it survives into the coroutine frame even
