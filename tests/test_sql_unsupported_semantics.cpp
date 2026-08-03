@@ -19,7 +19,10 @@
 #include <gtest/gtest.h>
 
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/operators/json_value_expr.hpp"
+#include "clink/operators/scalar_function_registry.hpp"
 #include "clink/plugin/plugin.hpp"
+#include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/install.hpp"
 #include "clink/sql/parser.hpp"
@@ -246,6 +249,110 @@ TEST(SqlUnsupportedSemantics, AnUnparseableStateTtlIsRefused) {
         "state_ttl='soon');");
     ASSERT_FALSE(err.empty()) << "state_ttl='soon' silently meant no retention";
     EXPECT_NE(err.find("state_ttl"), std::string::npos) << err;
+}
+
+// --- unknown scalar functions --------------------------------------------
+
+// Compile `sql` through parse -> bind and return the error, or "" on
+// success. Unlike register_ddl above this goes far enough to bind the
+// SELECT, which is where a function name is resolved.
+std::string compile_query(const std::string& sql) {
+    ensure_installed();
+    try {
+        Catalog cat;
+        for (const auto& st : parse(sql).statements) {
+            if (const auto* ct = std::get_if<ast::CreateTableStmt>(&st)) {
+                cat.register_table(*ct);
+                continue;
+            }
+            if (const auto* ins = std::get_if<ast::InsertStmt>(&st)) {
+                (void)Binder{cat}.bind_insert(*ins);
+            }
+        }
+        return {};
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+}
+
+const char* kSrcDst =
+    "CREATE TABLE src (k BIGINT, s VARCHAR) WITH (connector='file', format='json', "
+    "path='/tmp/a'); "
+    "CREATE TABLE dst (k BIGINT) WITH (connector='file', format='json', path='/tmp/b'); ";
+
+TEST(SqlUnsupportedSemantics, AnUnknownFunctionIsRejectedAtCompileTimeNotRunTime) {
+    // The failure this replaces: the name parsed, bound, planned and
+    // DEPLOYED, then threw "json_value_expr: unknown op 'x'" out of the
+    // projection operator when the first record arrived. On a cluster that
+    // is a job that starts and then dies per record, with an internal
+    // diagnostic and a restart loop if restarts are configured.
+    const auto err = compile_query(std::string(kSrcDst) +
+                                   "INSERT INTO dst SELECT no_such_function(k) FROM src;");
+    ASSERT_FALSE(err.empty()) << "an unknown function was accepted and deferred to runtime";
+    EXPECT_NE(err.find("no_such_function"), std::string::npos) << err;
+    EXPECT_NE(err.find("not a known function"), std::string::npos) << err;
+}
+
+TEST(SqlUnsupportedSemantics, RandomIsRejectedForTheSameReasonNowIs) {
+    // RANDOM() was the specific inconsistency: NOW() was refused to keep
+    // SQL deterministic, and RANDOM() - just as nondeterministic, and just
+    // as damaging to the replay guarantee - sailed through to runtime.
+    // It is not implemented, so it now fails at compile time like any
+    // other unknown name.
+    const auto err =
+        compile_query(std::string(kSrcDst) + "INSERT INTO dst SELECT random() FROM src;");
+    ASSERT_FALSE(err.empty()) << "random() was accepted";
+    EXPECT_NE(err.find("random"), std::string::npos) << err;
+
+    // NOW() keeps its own, more specific message - it exists as a concept
+    // and is refused on determinism grounds, which is worth saying.
+    const auto now_err =
+        compile_query(std::string(kSrcDst) + "INSERT INTO dst SELECT now() FROM src;");
+    ASSERT_FALSE(now_err.empty());
+    EXPECT_NE(now_err.find("deterministic"), std::string::npos)
+        << "now() lost its determinism-specific diagnostic: " << now_err;
+}
+
+TEST(SqlUnsupportedSemantics, ATypoOfARealFunctionIsNamedInTheDiagnostic) {
+    const auto err = compile_query(std::string(kSrcDst) +
+                                   "INSERT INTO dst SELECT substringg(s, 1, 2) FROM src;");
+    ASSERT_FALSE(err.empty());
+    EXPECT_NE(err.find("substring()"), std::string::npos)
+        << "the diagnostic does not suggest the intended function: " << err;
+}
+
+TEST(SqlUnsupportedSemantics, EveryBuiltInScalarFunctionIsStillAccepted) {
+    // The guard against the check being built on a hand-kept list. Every
+    // name the EVALUATOR dispatches must bind, or the check refuses
+    // functions that work - the same failure as the mode='cdc' domain, in
+    // the opposite direction.
+    //
+    // Called through the shared table rather than a literal list here, so
+    // adding an op cannot make this test stale.
+    const auto& names = clink::operators::value_expr_detail::value_op_names();
+    ASSERT_GT(names.size(), 30U) << "the op table looks truncated";
+    for (const auto& name : names) {
+        EXPECT_TRUE(clink::operators::value_expr_detail::lookup_value_op(name).has_value())
+            << name << " is listed but not dispatchable";
+    }
+}
+
+TEST(SqlUnsupportedSemantics, ARegisteredUdfIsAccepted) {
+    // The check must not break CREATE FUNCTION. A UDF registered before
+    // binding resolves; the evaluator still looks UDFs up late, so DROP
+    // FUNCTION behaves as it did.
+    ensure_installed();
+    clink::ScalarFunctionRegistry::global().register_function(
+        "clink_test_udf_for_bind_check",
+        arrow::int64(),
+        [](const std::vector<clink::config::JsonValue>&) {
+            return clink::config::JsonValue{std::int64_t{1}};
+        });
+    const auto err = compile_query(std::string(kSrcDst) +
+                                   "INSERT INTO dst SELECT clink_test_udf_for_bind_check(k) FROM "
+                                   "src;");
+    clink::ScalarFunctionRegistry::global().remove("clink_test_udf_for_bind_check");
+    EXPECT_TRUE(err.empty()) << "a registered UDF was refused: " << err;
 }
 
 // --- the checker in isolation --------------------------------------------

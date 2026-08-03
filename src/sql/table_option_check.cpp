@@ -7,37 +7,11 @@
 
 #include "clink/connectors/capability.hpp"
 #include "clink/sql/bounded_state.hpp"
+#include "clink/sql/name_suggest.hpp"
 
 namespace clink::sql {
 
 namespace {
-
-// Levenshtein, capped: we only care whether the distance is small, so bail
-// out as soon as it cannot be.
-std::size_t edit_distance(std::string_view a, std::string_view b, std::size_t cap) {
-    if (a.size() > b.size() + cap || b.size() > a.size() + cap) {
-        return cap + 1;
-    }
-    std::vector<std::size_t> prev(b.size() + 1);
-    std::vector<std::size_t> cur(b.size() + 1);
-    for (std::size_t j = 0; j <= b.size(); ++j) {
-        prev[j] = j;
-    }
-    for (std::size_t i = 1; i <= a.size(); ++i) {
-        cur[0] = i;
-        std::size_t row_min = cur[0];
-        for (std::size_t j = 1; j <= b.size(); ++j) {
-            const auto cost = a[i - 1] == b[j - 1] ? 0U : 1U;
-            cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost});
-            row_min = std::min(row_min, cur[j]);
-        }
-        if (row_min > cap) {
-            return cap + 1;
-        }
-        std::swap(prev, cur);
-    }
-    return prev[b.size()];
-}
 
 // A value domain for an option that only accepts a fixed set. Silently
 // accepting `mode='upsrt'` would leave an append-only sink where the user

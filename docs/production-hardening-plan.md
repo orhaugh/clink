@@ -465,6 +465,37 @@ timed out at 15 s; after, the worker exits in 2.1 s.
 lose the chance to abort pending transactions, so recovery has to resolve
 them instead.
 
+### F25. Any unknown scalar function failed at runtime, per record
+
+`RANDOM()` was the case that led here - `NOW()` is refused on determinism
+grounds and `RANDOM()`, just as nondeterministic and just as damaging to
+the replay guarantee, was not. But the probe showed the problem is not
+`RANDOM()`. It is that NO function name was checked at all.
+
+Any name - a typo, a PostgreSQL builtin clink does not implement, anything
+- parsed, bound, planned and deployed, then threw
+`json_value_expr: unknown op 'x'` out of the projection operator when the
+first record arrived. Embedded, that is a job failure where a compile error
+belonged. On a cluster it is a job that deploys, starts, and dies on its
+first record, reporting an internal diagnostic, with a restart loop if
+restarts are configured.
+
+**Risk:** a typo reaches production as a crash-looping job rather than a
+rejected submission.
+
+**A correction to the earlier record.** This item was previously written up
+as "`NOW()` and `RANDOM()` are accepted while `CURRENT_TIMESTAMP` is
+refused". That was wrong in both directions: `NOW()` was already refused,
+and the real scope was every unknown name rather than two of them. The
+probe that established it is in section 5.
+
+The same probe corrected a second entry: "unknown or absent connector is
+accepted at DDL time and only fails at plan time" understated the
+behaviour. Both are refused at plan time with actionable messages
+(`format='json' source requires connector='file', 'kafka', ...` and
+`table t missing required property: connector`). No change was needed and
+none was made.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -1239,20 +1270,34 @@ semantics silently.
 `physical_plan.cpp`, and `EveryLegitimateModeValueIsAccepted` guards it.
 A hand-assembled domain list is only safe when it was read off the code.
 
-**Tests:** `tests/test_sql_unsupported_semantics.cpp`, 15 cases.
+**Tests:** `tests/test_sql_unsupported_semantics.cpp`, 20 cases.
 
-**What makes this Partial.** Still accepted and ignored, and NOT addressed:
+**Unknown scalar functions (F25).** Every function name is now resolved at
+BIND time against the evaluator's own op table plus the scalar UDF
+registry. An unrecognised name is refused with a diagnostic that names it
+and suggests the nearest real function; `substringg()` gets "did you mean
+substring()?".
 
-- `HAVING` with no `GROUP BY`.
-- `LIMIT` / `OFFSET` / `FETCH FIRST` - the brief asks specifically whether
-  `LIMIT` is global or per-subtask; that was not determined, so nothing was
-  changed. Answering it needs a runtime experiment at parallelism > 1.
-- `FOR UPDATE`, which is meaningless on a stream.
-- `NOW()` and `RANDOM()` are accepted while `CURRENT_TIMESTAMP` is refused
-  - an inconsistency in the existing non-determinism guard, not something
-  this change introduced, but it should be made uniform.
-- Unknown or absent `connector` is accepted at DDL time and only fails at
-  plan time. Late rather than silent, so lower severity.
+The candidate set is read from `value_op_table()` - the same table the
+dispatcher consults - and never from a list kept in the binder. That is the
+`mode='cdc'` lesson applied in advance: a hand-kept copy drifts the first
+time an op is added, and the symptom of drift here would be refusing a
+function that works.
+`EveryBuiltInScalarFunctionIsStillAccepted` walks the table and asserts
+every listed name is dispatchable, so the two cannot separate.
+
+UDFs stay resolvable late in the evaluator by design, so `DROP FUNCTION`
+behaves as before; the bind-time check only rejects a name unknown to both.
+
+**What makes this Partial.** Still accepted and ignored, and NOT addressed
+(each re-verified by the probe in section 5, not carried over from an
+earlier reading):
+
+- `HAVING` with no `GROUP BY` - accepted.
+- `LIMIT` / `OFFSET` - accepted. Whether `LIMIT` is global or per-subtask
+  is still undetermined; answering it needs a runtime experiment at
+  parallelism > 1, and guessing would be worse than leaving it recorded.
+- `FOR UPDATE` - accepted, and meaningless on a stream.
 
 ---
 
@@ -1688,6 +1733,30 @@ CLINK_FAULT_INJECT="checkpoint.before_write=exit:70@1" \
 1000 race iterations in under 300 ms against an indefinite hang. The Linux
 CI symptom was a `(Timeout)` on `ResetReleasesAParkedThread`, which is the
 same deadlock arrived at by luck rather than by hammering.
+
+**The SQL semantics probe.** Each remaining W13 item was re-established by
+running it rather than by reading the parser, through `clink run` on a
+two-table script:
+
+```
+ACCEPTED  HAVING with no GROUP BY
+ACCEPTED  LIMIT
+ACCEPTED  OFFSET
+ACCEPTED  FOR UPDATE
+ACCEPTED  RANDOM()                 <- fixed; now a compile error
+rejected  NOW()                    -- now() is not supported: clink keeps SQL deterministic
+rejected  unknown connector        -- format='json' source requires connector='file', 'kafka', ...
+rejected  no connector at all      -- table t missing required property: connector
+```
+
+`RANDOM()` was the entry point, but running it showed the failure was
+neither about randomness nor confined to it: it planned, deployed and then
+threw `json_value_expr: unknown op 'random'` from the projection operator
+on the first record. `NO_SUCH_FUNCTION(k)` did exactly the same, which is
+what turned a one-function inconsistency into F25.
+
+Two earlier entries in this document were corrected by the same probe; see
+F25.
 
 **Mutation checks.** Two of the fencing tests were verified by breaking the
 code rather than by reading it:

@@ -87,6 +87,18 @@ public:
         return it == fns_.end() ? nullptr : it->second.return_type;
     }
 
+    // Registered names, for diagnostics: a binder rejecting an unknown
+    // function should be able to suggest a registered one.
+    [[nodiscard]] std::vector<std::string> names() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::vector<std::string> out;
+        out.reserve(fns_.size());
+        for (const auto& [name, entry] : fns_) {
+            out.push_back(name);
+        }
+        return out;
+    }
+
     static ScalarFunctionRegistry& global() {
         static ScalarFunctionRegistry instance;
         return instance;

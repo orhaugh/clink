@@ -12,9 +12,11 @@
 #include "clink/config/json.hpp"
 #include "clink/metrics/sql_metrics.hpp"
 #include "clink/operators/agg_function_registry.hpp"
+#include "clink/operators/json_value_expr.hpp"
 #include "clink/operators/scalar_function_registry.hpp"
 #include "clink/sql/async_function_registry.hpp"
 #include "clink/sql/expr_lowering.hpp"
+#include "clink/sql/name_suggest.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/ptf_registry.hpp"
 #include "clink/sql/type.hpp"
@@ -273,6 +275,47 @@ clink::config::JsonValue lower_value_expr(const ast::Expression& expr,
                            "() is not supported: clink keeps SQL deterministic; "
                            "use the event-time column or a windowing TVF",
                        0);
+        }
+        // A function nobody implements must fail HERE, not on the first
+        // record.
+        //
+        // Until this check, any unknown name - a typo, or a PostgreSQL
+        // builtin clink does not have, RANDOM() among them - parsed,
+        // bound, planned and deployed, then threw
+        // "json_value_expr: unknown op 'x'" out of the projection operator
+        // when the first row arrived. Embedded, that is a job failure
+        // instead of a compile error. On a cluster it is a job that
+        // deploys, starts, and dies on its first record, with an internal
+        // diagnostic and a restart loop if restarts are configured.
+        //
+        // The set is read from the evaluator's own table (value_op_table)
+        // plus the scalar UDF registry, never from a list kept here: a
+        // hand-kept copy drifts the first time an op is added, and the
+        // symptom of drift is refusing a function that works.
+        //
+        // UDFs stay resolvable late by design - the evaluator looks them up
+        // at eval time so DROP FUNCTION behaves - so this only rejects a
+        // name that is unknown to BOTH at bind time. A UDF registered after
+        // binding was already the unusual case, and it now fails at
+        // compile time with a name rather than at runtime with an op.
+        if (!clink::operators::value_expr_detail::lookup_value_op(fc.name).has_value() &&
+            !ScalarFunctionRegistry::global().lookup(fc.name).has_value()) {
+            std::vector<std::string> known;
+            const auto& builtins = clink::operators::value_expr_detail::value_op_names();
+            known.reserve(builtins.size());
+            for (const auto& builtin : builtins) {
+                known.emplace_back(builtin);
+            }
+            for (auto& udf : ScalarFunctionRegistry::global().names()) {
+                known.push_back(std::move(udf));
+            }
+            const auto suggestion = nearest_name(fc.name, known);
+            bind_error(
+                fc.name + "() is not a known function" +
+                    (suggestion.empty() ? std::string{} : " (did you mean " + suggestion + "()?)") +
+                    ". clink implements a fixed set of scalar functions; register a "
+                    "user-defined function with CREATE FUNCTION if you need another.",
+                0);
         }
         JsonObject obj;
         obj["op"] = JsonValue{fc.name};  // lowercase by ast_builder

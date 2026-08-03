@@ -432,7 +432,12 @@ enum class ValueOp {
     Udf,  // not a built-in: resolved via ScalarFunctionRegistry at eval time
 };
 
-inline std::optional<ValueOp> lookup_value_op(std::string_view name) {
+// The single name -> op table. Hoisted out of lookup_value_op so a caller
+// that needs to VALIDATE a name before evaluation reads the same table the
+// dispatcher does; a hand-kept second list would drift the first time an op
+// was added, and the failure would be a job that plans and then dies on its
+// first record.
+inline const std::unordered_map<std::string_view, ValueOp>& value_op_table() {
     static const std::unordered_map<std::string_view, ValueOp> kOps = {
         {"add", ValueOp::Add},
         {"sub", ValueOp::Sub},
@@ -504,11 +509,31 @@ inline std::optional<ValueOp> lookup_value_op(std::string_view name) {
         {"cardinality", ValueOp::Cardinality},
         {"element", ValueOp::Element},
     };
-    auto it = kOps.find(name);
-    if (it == kOps.end()) {
+    return kOps;
+}
+
+inline std::optional<ValueOp> lookup_value_op(std::string_view name) {
+    const auto& ops = value_op_table();
+    auto it = ops.find(name);
+    if (it == ops.end()) {
         return std::nullopt;
     }
     return it->second;
+}
+
+// Every built-in scalar op name, sorted, for diagnostics and near-miss
+// suggestion.
+[[nodiscard]] inline const std::vector<std::string_view>& value_op_names() {
+    static const std::vector<std::string_view> names = [] {
+        std::vector<std::string_view> out;
+        out.reserve(value_op_table().size());
+        for (const auto& [name, op] : value_op_table()) {
+            out.push_back(name);
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    }();
+    return names;
 }
 
 // Parameters some ops carry on the op object itself (not in 'args'),
