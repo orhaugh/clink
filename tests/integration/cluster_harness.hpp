@@ -602,6 +602,20 @@ public:
             "worker-" + std::to_string(idx), spec_.node_binary, std::move(argv), log_dir(), opts);
     }
 
+    // Restart an HA worker at the same index, rediscovering the leader.
+    //
+    // A worker exits on coordinator disconnect by design - there is no
+    // worker-side re-register path, so a supervisor is what heals the
+    // cluster. This is the harness playing that supervisor, and it is
+    // needed for any failover test: without it the surviving coordinator
+    // has no worker to redeploy onto and the job never resumes.
+    [[nodiscard]] bool restart_worker_ha(std::size_t idx, const ProcOptions& opts = {}) {
+        if (idx < workers_.size() && workers_[idx]) {
+            workers_[idx]->kill_and_reap();
+        }
+        return start_ha_worker(idx, opts);
+    }
+
     // The epoch a worker bound to, from its own HA discovery line. This is
     // the value the fencing check compares every later frame against.
     [[nodiscard]] std::optional<std::uint64_t> worker_discovered_epoch(std::size_t idx) const {

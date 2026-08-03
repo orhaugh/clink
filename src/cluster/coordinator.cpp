@@ -2113,6 +2113,28 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     const JobId job_id = allocate_job_id_();
     auto job = std::make_shared<JobState>();
     job->id = job_id;
+    // Continue checkpoint numbering ABOVE the checkpoint being restored
+    // from, rather than restarting at 1.
+    //
+    // Checkpoint ids are not decoration. Several things are named by them:
+    // the COMPLETED-<id> marker the recovery point is read from, and the
+    // 2PC sink's committed output file (committed/sub<N>-<id>.dat). A
+    // recovered or resumed job that starts again at 1 therefore writes over
+    // artefacts of the run it is continuing.
+    //
+    // The consequence is silent DATA LOSS, and it is what
+    // ExactlyOnceSurvivesACoordinatorFailover found: a job whose first two
+    // records had been committed as committed/sub0-1.dat came back, took its
+    // own checkpoint 1, and replaced that file - so records 0 and 1 vanished
+    // from output that had already been published. 38 of 40 records
+    // survived, no duplicates, and nothing failed.
+    //
+    // Not specific to HA. Any resume does it, including an explicit
+    // --restore-from-checkpoint-id=N, which is the documented way to rewind
+    // a job.
+    if (checkpoint.restore_from_checkpoint_id > 0) {
+        job->next_checkpoint_id = checkpoint.restore_from_checkpoint_id + 1;
+    }
     job->notify_client_conn = notify_client_conn;
     job->expected_completion = resolved_plan.tasks.size();
     job->submit_time = std::chrono::steady_clock::now();

@@ -28,7 +28,10 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -67,6 +70,88 @@ std::filesystem::path two_phase_commit_job() {
 #endif
 }
 
+// Records the 2PC job emits, and therefore the exact multiset the committed
+// output must contain after a failover.
+constexpr int kTotalRecords = 40;
+
+// Lines under <out>/committed/ - the output an external consumer sees. A
+// file still in staging/ is a transaction nobody agreed to and must not be
+// counted.
+std::vector<std::string> committed_records(const std::filesystem::path& out_dir) {
+    std::vector<std::string> lines;
+    const auto dir = out_dir / "committed";
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) {
+        return lines;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        std::ifstream in(entry.path());
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty()) {
+                lines.push_back(line);
+            }
+        }
+    }
+    return lines;
+}
+
+struct OutputVerdict {
+    std::vector<std::string> duplicated;
+    std::vector<std::string> missing;
+    std::vector<std::string> unexpected;
+    std::size_t total_lines{0};
+    std::size_t distinct{0};
+};
+
+OutputVerdict verify_exactly_once(const std::filesystem::path& out_dir, int total) {
+    OutputVerdict v;
+    std::map<std::string, int> seen;
+    for (const auto& line : committed_records(out_dir)) {
+        ++seen[line];
+        ++v.total_lines;
+    }
+    v.distinct = seen.size();
+    for (int i = 0; i < total; ++i) {
+        const auto want = "record-" + std::to_string(i);
+        const auto it = seen.find(want);
+        if (it == seen.end()) {
+            v.missing.push_back(want);
+        } else if (it->second > 1) {
+            v.duplicated.push_back(want + " x" + std::to_string(it->second));
+        }
+        seen.erase(want);
+    }
+    for (const auto& [line, count] : seen) {
+        v.unexpected.push_back(line + " x" + std::to_string(count));
+    }
+    return v;
+}
+
+std::string describe(const OutputVerdict& v) {
+    std::ostringstream os;
+    os << v.total_lines << " committed lines, " << v.distinct << " distinct";
+    const auto list = [&os](const char* label, const std::vector<std::string>& xs) {
+        if (xs.empty()) {
+            return;
+        }
+        os << "; " << xs.size() << " " << label << ": ";
+        for (std::size_t i = 0; i < xs.size() && i < 8; ++i) {
+            os << (i ? ", " : "") << xs[i];
+        }
+        if (xs.size() > 8) {
+            os << ", ... (+" << (xs.size() - 8) << ")";
+        }
+    };
+    list("DUPLICATED", v.duplicated);
+    list("MISSING", v.missing);
+    list("UNEXPECTED", v.unexpected);
+    return os.str();
+}
+
 class HaFailoverTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -80,7 +165,7 @@ protected:
         std::filesystem::remove_all(out_dir_);
         std::filesystem::create_directories(out_dir_);
         ::setenv("CLINK_2PC_OUT_DIR", out_dir_.c_str(), 1);
-        ::setenv("CLINK_2PC_TOTAL", "40", 1);
+        ::setenv("CLINK_2PC_TOTAL", std::to_string(kTotalRecords).c_str(), 1);
         ::setenv("CLINK_2PC_TICK_MS", "50", 1);
     }
 
@@ -246,6 +331,85 @@ TEST_F(HaFailoverTest, TheJobManifestRecordsTheWritingLeadersEpoch) {
         checked = true;
     }
     EXPECT_TRUE(checked) << "no manifest.json was found to check";
+}
+
+// --- exactly-once across a COORDINATOR failure ----------------------------
+//
+// The worker-failure case is covered by output equality in
+// test_fault_recovery.cpp. This is the other half, and it exercises a
+// different mechanism end to end: the surviving coordinator has to READ the
+// last completed checkpoint off disk and resume the job from it. That is the
+// path F29 broke - the marker was written flat and read job-scoped, so every
+// completed checkpoint was invisible and a recovered job silently restarted
+// from scratch. A test asserting only "the job ran again" would have passed
+// throughout; only the output says whether it resumed or replayed.
+//
+// The submitter is deliberately NOT the signal. Its connection dies with the
+// leader it was talking to, so its exit code reports the client's fate
+// rather than the job's. The contract is the data: what ended up committed.
+TEST_F(HaFailoverTest, ExactlyOnceSurvivesACoordinatorFailover) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_ha_coordinators(2));
+    ASSERT_TRUE(c.start_ha_worker(0));
+    ASSERT_TRUE(c.await_workers_registered(1));
+
+    auto sub = submit(c);
+    ASSERT_NE(sub, nullptr);
+
+    // Wait for output to be COMMITTED, not merely for a checkpoint marker to
+    // appear.
+    //
+    // Those are different moments: the marker means the coordinator
+    // completed the checkpoint; the commit happens later, when the worker
+    // processes the CommitCheckpoint broadcast. Killing on the marker made
+    // this test's own premise timing-dependent - under the load of the full
+    // suite the commit had not landed, so there was no published work for a
+    // recovery to lose and the test failed on its premise rather than on the
+    // engine. Waiting for committed bytes makes the premise a driven
+    // condition instead of a hope.
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return verify_exactly_once(out_dir_, kTotalRecords).total_lines > 0; },
+        std::chrono::seconds(45)))
+        << "nothing was committed before the failover, so a recovery could not lose or duplicate "
+           "published work and this run would prove nothing";
+
+    const auto committed_before = verify_exactly_once(out_dir_, kTotalRecords).total_lines;
+    ASSERT_GT(committed_before, 0U);
+
+    // Kill the leader. The standby takes over and calls
+    // recover_persisted_jobs(), which resolves a restore point from the
+    // COMPLETED marker on disk.
+    ASSERT_TRUE(c.kill_leader_and_await_failover().has_value())
+        << "no standby took over after the leader was killed";
+
+    // The worker exits on coordinator disconnect by design - there is no
+    // worker-side re-register path, so a supervisor restarts it. The harness
+    // plays the supervisor.
+    ASSERT_TRUE(c.restart_worker_ha(0)) << "the worker did not come back";
+    ASSERT_TRUE(c.await_workers_registered(2))
+        << "the restarted worker never registered with the new leader";
+
+    // Wait for the job to finish under the new leader, judged by the output
+    // rather than by any process: every record committed, or a deadline.
+    const bool finished = clink::itest::await(
+        [&] { return verify_exactly_once(out_dir_, kTotalRecords).missing.empty(); },
+        std::chrono::seconds(90));
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "records were committed MORE than once across the coordinator failover, so the "
+           "recovered job replayed work that had already been published: "
+        << describe(v);
+    EXPECT_TRUE(v.unexpected.empty()) << describe(v);
+    EXPECT_TRUE(finished) << "the job did not finish under the new leader: " << describe(v);
+    EXPECT_TRUE(v.missing.empty())
+        << "records were LOST across the coordinator failover: " << describe(v);
+    // committed_before is asserted non-zero above, so this run genuinely had
+    // published work that a bad recovery could lose - which is exactly what
+    // F34 lost.
+
+    sub->kill_and_reap();
 }
 
 }  // namespace

@@ -807,6 +807,44 @@ moved, and it did not, while the job demonstrably restarted. The obvious
 reading - "the metric is not wired" - was wrong; the restart had gone
 through a mechanism I had not known existed.
 
+### F34. A resumed job overwrote output it had already published
+
+Found by extending the output-equality method to coordinator failover -
+the first thing to check what a recovered job actually PRODUCES rather than
+that it ran.
+
+Result: `38 committed lines, 38 distinct; 2 MISSING: record-0, record-1`.
+Two records that had been committed BEFORE the failover were gone from the
+output afterwards. No duplicates, no errors, nothing logged.
+
+The cause is checkpoint-id reuse. A job's committed output file is named
+`committed/sub<N>-<ckpt>.dat`, and a recovered job is a fresh `JobState`
+whose `next_checkpoint_id` starts at 1. So the recovered job took its own
+checkpoint 1 and its sink renamed a new `sub0-1.dat` over the file holding
+records 0 and 1 - output that had already been published and that a
+downstream consumer may already have read.
+
+Checkpoint ids are not decoration; several things are named by them. The
+`COMPLETED-<id>` marker is one, so a resumed job also overwrites the marker
+history its own recovery point is read from.
+
+**Not specific to HA.** Any resume does it, including an explicit
+`--restore-from-checkpoint-id=N`, which is the documented way to rewind a
+job. A failover is simply the case that happens without anyone asking.
+
+**Risk:** silent loss of already-published output on every resume. Worse
+than a duplicate, because a duplicate is visible to a consumer that checks
+and this is not.
+
+**Fix:** a restore seeds `next_checkpoint_id` to
+`restore_from_checkpoint_id + 1`, so numbering continues above the point
+being resumed from rather than restarting. One line, and the test that found
+it went from a 91-second timeout to passing in 7.7 seconds.
+
+**Why no existing test caught it.** Every failover test asserted the epoch
+advanced, the standby took over, and a job ran again. All of those were true
+throughout. Only the output disagreed.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -2358,9 +2396,10 @@ consistent with a test that reads an empty directory.
 
 **What makes this Partial - stated plainly:**
 
-- **Worker failure only.** Coordinator failover is covered for liveness
-  (the epoch advances, a job runs) but NOT for output equality. That is the
-  next scenario and it is not written.
+- **Rescale is not covered.** Worker failure and coordinator failover are
+  both verified by output equality now
+  (`HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover`), and that
+  extension is what found F34. A rescale mid-stream is not.
 - **One sink.** The file 2PC sink. Kafka's transactional sink, the Postgres
   2PC sink and the S3 multipart sink each have their own commit
   choreography and none is verified this way.
@@ -2539,12 +2578,12 @@ document that only lists wins is worse than none.
 
 ### Not demonstrated
 
-- **End-to-end exactly-once across a WORKER failure is now demonstrated by
-  output equality; across a COORDINATOR failure it is not.** See W8 for
-  what the four new tests assert and how they were validated. What remains
-  unproven: exactly-once across a coordinator failover (the HA tests assert
-  the epoch advances and a job runs, not output equality), across a rescale,
-  and for any sink other than the file 2PC sink.
+- **End-to-end exactly-once is now demonstrated by output equality across a
+  worker failure AND a coordinator failover.** Extending it to failover
+  found F34, a silent loss of already-published output on every resume. What
+  remains unproven: exactly-once across a RESCALE, and for any sink other
+  than the file 2PC sink. Both are scenarios, not mechanisms - the method
+  now exists and has earned its keep twice.
 - **No soak testing.** Everything here runs in seconds to minutes. State
   growth, memory stability, checkpoint-interval drift and connector
   reconnection behaviour over hours or days are untested.
