@@ -836,7 +836,7 @@ lives; evidence is in section 4.
 | W5 | Connector capability contract + runtime/CLI manifest | P0.5 | F5 | **Partial** |
 | W6 | End-to-end delivery-guarantee analyser, enforced at submission | P0.6 | F5 | **Done** |
 | W7 | Deterministic multi-process harness | P0.1 | F7 | **Done** |
-| W8 | Fault-tolerance scenarios on the harness (gating), + sink exactly-once windows | P0.1 | F7 | **Partial** |
+| W8 | Fault-tolerance scenarios (gating) + sink exactly-once verified by output equality | P0.1 | F7 | **Partial** |
 | W9 | Automated sanitizers (PR subset + nightly full), blocking | P1.7 | F8 | **Done** |
 | W10 | `clink checkpoint-verify` + migration path | P1.10, P1.12 | F4 | **Done** |
 | W11 | SQL bounded-state validator, enforced in the planner | P0.3 | F9 | **Done** |
@@ -2307,6 +2307,75 @@ config gate needed a real submission.
 
 ---
 
+### W8 (continued) - exactly-once, verified at the sink
+
+**Source:** `tests/integration/test_fault_recovery.cpp` (4 new cases)
+
+Every fault-recovery test written before this asserted that the job
+COMPLETED and that checkpoints PROGRESSED. Neither says anything about the
+output. A pipeline that duplicated every record after a restart, or silently
+dropped the ones in flight, passes all of them - which is why this document
+said for most of its life that exactly-once was not proven.
+
+These read what an external consumer would actually see and compare it to
+the exact multiset the source promises. The 2PC job emits `record-0`
+through `record-39`, once each, and checkpoints its offset; the sink commits
+by atomic rename from `staging/` into `committed/`. Only `committed/` is
+read, because a file left in `staging/` is a transaction nobody agreed to.
+
+Duplicates, losses and unexpected records are reported SEPARATELY. They are
+different failures - a duplicate means the recovery re-published work
+already committed (an at-least-once leak), a loss means nothing was
+published for records the source had passed - and a single "mismatch" count
+would hide which.
+
+**The four scenarios:**
+
+| | |
+|---|---|
+| clean run | the control: without it, a failure below could be the job, the sink, or the verifier |
+| kill AFTER a completed checkpoint | recovery resumes from the checkpoint; output must be unchanged |
+| kill BEFORE any checkpoint | recovery replays from zero, so exactly-once depends entirely on the sink having committed nothing - a commit only follows a completed checkpoint |
+| uncommitted output invisible | staged-but-uncommitted work must not be readable, and the committed count can never exceed what the source emitted |
+
+**Result: all four pass, three consecutive runs of the full 19-test
+fault-tolerance suite.**
+
+**Validated by mutation, which is the only reason the result means
+anything.** Making the source forget its offset on restore - so a restart
+replays from zero - produced exactly the failure the test is for:
+
+```
+records were committed MORE than once across the recovery, so the pipeline
+is at-least-once rather than exactly-once: 42 committed lines;
+2 DUPLICATED: record-0 x2, record-1 x2
+```
+
+That establishes three things at once: the kill really does cause a replay,
+the verifier detects a duplicate and names it, and the unmutated engine
+does not produce one. Without the mutation, "4 tests passed" would be
+consistent with a test that reads an empty directory.
+
+**What makes this Partial - stated plainly:**
+
+- **Worker failure only.** Coordinator failover is covered for liveness
+  (the epoch advances, a job runs) but NOT for output equality. That is the
+  next scenario and it is not written.
+- **One sink.** The file 2PC sink. Kafka's transactional sink, the Postgres
+  2PC sink and the S3 multipart sink each have their own commit
+  choreography and none is verified this way.
+- **One fault, at two moments.** SIGKILL of one worker, before or after a
+  checkpoint. Not covered: a kill DURING the commit broadcast (the fault
+  point exists), overlapping kills, a kill during state restore with output
+  verification, or a rescale.
+- **40 records over ~2 seconds.** Enough to catch a systematic duplication
+  or loss, nowhere near enough to catch a rare race. A soak run at volume
+  is the thing that would, and it does not exist.
+- **Nothing verifies ORDER.** The comparison is a multiset. Per-key
+  ordering across a recovery is not asserted.
+
+---
+
 ## 5. Test evidence
 
 Commands run, on macOS 26.3 (arm64), Apple clang, `RelWithDebInfo`.
@@ -2363,6 +2432,16 @@ ctest --test-dir build-it --parallel 1 --timeout 300 -R FaultRecovery
 
 ./build-it/tests/clink_integration_tests --gtest_filter='HaFailoverTest.*'
     -> 5 tests from 1 test suite ran. [  PASSED  ] 5 tests. (12 s)
+
+./build-it/tests/clink_integration_tests \
+  --gtest_filter='FaultRecoveryTest.*:HaFailoverTest.*:GracefulShutdownTest.*'
+    -> 19 tests. [  PASSED  ] 19 tests.  (x3 consecutive runs)
+
+# Exactly-once, validated by mutation: source forgets its offset on restore
+./build-it/tests/clink_integration_tests \
+  --gtest_filter='FaultRecoveryTest.EveryRecordIsCommitted*'
+    -> FAILED: "42 committed lines; 2 DUPLICATED: record-0 x2, record-1 x2"
+       (restored; passes)
 
 ./build-it/tests/clink_integration_tests --gtest_filter='GracefulShutdownTest.*'
     -> before the fix: AWorkerRunningAJobExitsOnSigterm FAILED after 17.7 s
@@ -2460,18 +2539,12 @@ document that only lists wins is worse than none.
 
 ### Not demonstrated
 
-- **End-to-end exactly-once across process failure is not proven by these
-  changes.** What IS demonstrated: a job recovers and completes after a
-  worker is SIGKILLed before a checkpoint, after a checkpoint, at a
-  precisely-injected point in state restore, and after two separated
-  losses; every checkpoint the cluster publishes verifies; and a
-  coordinator loss fails fast rather than hanging. What is NOT: that no
-  record is duplicated or lost at the SINK across those events - the tests
-  assert job completion and checkpoint progress, not output equality
-  against an expected multiset. W2/W3 remove three specific ways it was silently violated, and
-  W6 can now *describe* what a pipeline provides. Neither is a proof. The
-  proof needs the fault points wired into sink prepare/commit and the
-  scenarios in W8's "not yet covered" list, run repeatedly.
+- **End-to-end exactly-once across a WORKER failure is now demonstrated by
+  output equality; across a COORDINATOR failure it is not.** See W8 for
+  what the four new tests assert and how they were validated. What remains
+  unproven: exactly-once across a coordinator failover (the HA tests assert
+  the epoch advances and a job runs, not output equality), across a rescale,
+  and for any sink other than the file 2PC sink.
 - **No soak testing.** Everything here runs in seconds to minutes. State
   growth, memory stability, checkpoint-interval drift and connector
   reconnection behaviour over hours or days are untested.

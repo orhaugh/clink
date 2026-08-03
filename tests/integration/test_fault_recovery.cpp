@@ -16,6 +16,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -94,6 +97,12 @@ std::uint64_t latest_completed(const std::filesystem::path& ckpt_root) {
 // file_2pc_sink. Bounded so "did it finish" is a real question, slow
 // enough that several checkpoints land mid-run, and 2PC so the sink's
 // commit protocol is genuinely exercised rather than simulated.
+// Records the 2PC job emits, and therefore the exact multiset the committed
+// output must contain. Named rather than repeated so the environment the job
+// is given and the expectation the test checks cannot drift apart - which
+// would make an output-equality assertion silently vacuous.
+constexpr int kTotalRecords = 40;
+
 class FaultRecoveryTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -106,7 +115,7 @@ protected:
         std::filesystem::remove_all(out_dir_);
         std::filesystem::create_directories(out_dir_);
         ::setenv("CLINK_2PC_OUT_DIR", out_dir_.c_str(), 1);
-        ::setenv("CLINK_2PC_TOTAL", "40", 1);
+        ::setenv("CLINK_2PC_TOTAL", std::to_string(kTotalRecords).c_str(), 1);
         ::setenv("CLINK_2PC_TICK_MS", "50", 1);
     }
 
@@ -450,6 +459,217 @@ TEST_F(FaultRecoveryTest, WorkerKilledAtTheStateRestorePointIsRedeployed) {
         GTEST_SKIP() << "recovery from a worker lost during state restore is finding F13; "
                         "the fault-injection assertions above passed";
     }
+}
+
+// --- exactly-once at the SINK, across a process failure -------------------
+//
+// This is the claim the whole exercise turns on, and until now nothing
+// asserted it. Every fault-recovery test above checks that the job
+// COMPLETES and that checkpoints PROGRESS. Neither says anything about the
+// output: a job that duplicated every record after a restart, or silently
+// dropped the ones in flight, passes all of them.
+//
+// So these read what an external consumer would actually see and compare it
+// to the exact multiset the source promises. The 2PC job emits "record-0"
+// through "record-(N-1)", once each, and checkpoints its offset; the sink
+// commits by atomic rename from staging/ into committed/. Only committed/
+// is visible downstream - a file left in staging/ is a transaction nobody
+// ever agreed to - so that is what gets read.
+//
+// Duplicates and losses are reported SEPARATELY, because they are different
+// failures: a duplicate means the recovery replayed work already published
+// (an at-least-once leak), a loss means it published nothing for records the
+// source had already passed (data loss). A single "mismatch" count would
+// hide which.
+
+// Every line under <out>/committed/, which is the output an external
+// consumer sees.
+std::vector<std::string> committed_records(const std::filesystem::path& out_dir) {
+    std::vector<std::string> lines;
+    const auto dir = out_dir / "committed";
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) {
+        return lines;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        std::ifstream in(entry.path());
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty()) {
+                lines.push_back(line);
+            }
+        }
+    }
+    return lines;
+}
+
+struct OutputVerdict {
+    std::vector<std::string> duplicated;  // published more than once
+    std::vector<std::string> missing;     // never published
+    std::vector<std::string> unexpected;  // published but never emitted
+    std::size_t total_lines{0};
+};
+
+// Compare the committed output against "record-0".."record-(total-1)",
+// each exactly once.
+OutputVerdict verify_exactly_once(const std::filesystem::path& out_dir, int total) {
+    OutputVerdict v;
+    std::map<std::string, int> seen;
+    for (const auto& line : committed_records(out_dir)) {
+        ++seen[line];
+        ++v.total_lines;
+    }
+    for (int i = 0; i < total; ++i) {
+        const auto want = "record-" + std::to_string(i);
+        const auto it = seen.find(want);
+        if (it == seen.end()) {
+            v.missing.push_back(want);
+        } else if (it->second > 1) {
+            v.duplicated.push_back(want + " x" + std::to_string(it->second));
+        }
+        seen.erase(want);
+    }
+    for (const auto& [line, count] : seen) {
+        v.unexpected.push_back(line + " x" + std::to_string(count));
+    }
+    return v;
+}
+
+std::string describe(const OutputVerdict& v) {
+    std::ostringstream os;
+    os << v.total_lines << " committed lines";
+    const auto list = [&os](const char* label, const std::vector<std::string>& xs) {
+        if (xs.empty()) {
+            return;
+        }
+        os << "; " << xs.size() << " " << label << ": ";
+        for (std::size_t i = 0; i < xs.size() && i < 8; ++i) {
+            os << (i ? ", " : "") << xs[i];
+        }
+        if (xs.size() > 8) {
+            os << ", ... (+" << (xs.size() - 8) << ")";
+        }
+    };
+    list("DUPLICATED", v.duplicated);
+    list("MISSING", v.missing);
+    list("UNEXPECTED", v.unexpected);
+    return os.str();
+}
+
+// The premise: on a clean run with no faults, the output is exactly the
+// expected multiset. Without this, a failure in the crash tests below could
+// be the job, the sink, or the verifier, and there would be no way to tell.
+TEST_F(FaultRecoveryTest, ACleanRunCommitsEveryRecordExactlyOnce) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    bring_up(c);
+
+    auto sub = submit(c, /*max_restarts=*/0);
+    ASSERT_NE(sub, nullptr);
+    const auto code = sub->await_exit(std::chrono::seconds(90));
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0);
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty() && v.missing.empty() && v.unexpected.empty())
+        << "a CLEAN run did not commit each record exactly once: " << describe(v);
+}
+
+TEST_F(FaultRecoveryTest, EveryRecordIsCommittedExactlyOnceAcrossAWorkerKill) {
+    // The headline claim. A worker is SIGKILLed after a checkpoint has
+    // completed, the job recovers, and the committed output must still be
+    // each record exactly once - no replay of already-published work, no
+    // gap where the in-flight records were.
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    bring_up(c);
+
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(c.await_job_checkpointing()) << "the job never started";
+    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; },
+                                    std::chrono::seconds(30)))
+        << "no checkpoint completed before the kill, so recovery has nothing to resume from and "
+           "this would be testing a different scenario";
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+
+    const auto code = sub->await_exit(std::chrono::seconds(120));
+    ASSERT_TRUE(code.has_value()) << "submitter never exited after the worker kill";
+    ASSERT_EQ(*code, 0) << "the job did not recover";
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "records were committed MORE than once across the recovery, so the pipeline is "
+           "at-least-once rather than exactly-once: "
+        << describe(v);
+    EXPECT_TRUE(v.missing.empty()) << "records were LOST across the recovery: " << describe(v);
+    EXPECT_TRUE(v.unexpected.empty())
+        << "output contains records the source never emitted: " << describe(v);
+}
+
+TEST_F(FaultRecoveryTest, ExactlyOnceHoldsWhenTheKillPrecedesAnyCheckpoint) {
+    // A genuinely different recovery path, and the one where a naive sink
+    // leaks. With no completed checkpoint there is nothing to resume from,
+    // so the source replays from zero - and exactly-once then depends
+    // entirely on the sink having committed NOTHING, because a commit only
+    // follows a checkpoint the coordinator completed. If anything had been
+    // published before the kill, the replay would duplicate it.
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    bring_up(c);
+
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(c.await_job_checkpointing()) << "the job never started";
+    ASSERT_EQ(latest_completed(c.checkpoint_dir()), 0U)
+        << "a checkpoint completed before the kill; that is the other scenario";
+
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+
+    const auto code = sub->await_exit(std::chrono::seconds(120));
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "the job did not recover from a kill before any checkpoint";
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "the replay re-published records the sink had already committed, which means it "
+           "committed without a completed checkpoint behind it: "
+        << describe(v);
+    EXPECT_TRUE(v.missing.empty()) << "records were lost: " << describe(v);
+    EXPECT_TRUE(v.unexpected.empty()) << describe(v);
+}
+
+TEST_F(FaultRecoveryTest, NoUncommittedOutputIsVisibleAfterAKill) {
+    // The other half of the sink contract, and one no test asserted: a
+    // transaction that was staged but never committed must not be readable.
+    // If a crash left staging files that a consumer would pick up, the
+    // pipeline publishes work the coordinator never agreed to - which is
+    // worse than a duplicate, because no checkpoint ever accounted for it.
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    bring_up(c);
+
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(c.await_job_checkpointing());
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+    const auto code = sub->await_exit(std::chrono::seconds(120));
+    ASSERT_TRUE(code.has_value());
+
+    // Whatever the outcome, nothing in committed/ may be absent from the
+    // source's vocabulary, and the committed count can never exceed the
+    // total the source ever emitted.
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.unexpected.empty()) << describe(v);
+    EXPECT_LE(v.total_lines, static_cast<std::size_t>(kTotalRecords))
+        << "more lines are committed than the source ever emitted: " << describe(v);
 }
 
 }  // namespace
