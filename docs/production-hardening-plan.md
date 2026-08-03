@@ -539,7 +539,7 @@ lives; evidence is in section 4.
 | W19 | Production metrics completion | P1.15 | - | **Open** |
 | W20 | Non-determinism detection API | P2.16 | - | **Partial** |
 | W21 | Cancellation/shutdown audit | P2.17 | F24 | **Partial** |
-| W22 | Side-output / multi-sink propagation validation | P2.18 | - | **Open** |
+| W22 | Side-output / multi-sink propagation validation | P2.18 | - | **Partial** |
 | W23 | Fuzz targets | P1.8 | - | **Open** |
 
 ---
@@ -1647,6 +1647,42 @@ and "survives a real rollout" are the same claim.
 - **No leak check.** Nothing asserts that threads, file descriptors or
   temporary files are released on shutdown. A clean exit code is not
   evidence of a clean teardown.
+
+---
+
+### W22 - Side-output propagation — Partial
+
+**Source:** `tests/test_side_output.cpp` (one new case)
+
+**No defect found, and that is the finding.** Side outputs already had four
+tests, all about where DATA goes. None asserted that the CONTROL stream -
+checkpoint barriers and watermarks - reaches a side-output sink, which is
+the property a side branch actually depends on: a 2PC sink there needs the
+barrier to stage and the commit to publish, and an event-time operator
+needs the watermark to fire. Had that been broken, every existing test
+would still have passed and the branch would simply never have checkpointed.
+
+`BarriersAndWatermarksReachASideOutputSinkToo` drives a source that emits a
+barrier, then a watermark, then data that splits across both branches, and
+asserts both sinks saw all three. It passed first time: the propagation is
+correct. It is now pinned rather than incidentally true.
+
+The test asserts on the MAIN branch first. Without that, a version of the
+test where nothing reached either sink would report a side-output bug that
+did not exist.
+
+**What makes this Partial - stated plainly:**
+
+- **One property, one topology.** A single operator with one side output,
+  in-process. Not covered: side outputs across a network shuffle, more than
+  one side output on an operator, or a side output from an operator that is
+  itself inside a chain.
+- **Multi-sink atomicity is untested.** Two 2PC sinks on the same job either
+  both commit for a checkpoint or the checkpoint is not complete. Nothing
+  asserts that, and it is the more valuable half of P2.18.
+- **No failure interaction.** The barrier reaching a side sink was tested on
+  a healthy run. Whether a side branch recovers correctly when a worker is
+  lost mid-checkpoint was not exercised.
 
 ---
 
