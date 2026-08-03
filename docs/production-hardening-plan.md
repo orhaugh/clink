@@ -757,6 +757,56 @@ by a linter warning about a combination on a command line that had not
 asked for that combination. The warning was correct and the thing it
 pointed at was upstream of it.
 
+### F33. Two operational questions had no metric, and restarts had none at all
+
+The metrics surface turned out to be in better shape than the item assumed.
+Two audits over all 84 declared metric constants found nothing wrong: none
+is dead (every one is referenced beyond its declaration), and none is
+pre-registered-but-never-updated - so there are no panels reading zero
+forever. That is worth recording as a negative result, because it is where
+the item's effort was expected to go.
+
+The gaps are in what is NOT declared:
+
+**No way to alert on checkpoint staleness.** `clink_ckpt_completed_total` is
+a counter, and the canonical streaming alert is "no checkpoint completed in
+N minutes" - a stalled checkpoint means the recovery window is growing
+without bound. A counter cannot express it: one that has stopped moving is
+indistinguishable from an idle job over any short window, and `rate()` over
+a window long enough to tell them apart smears the signal.
+`clink_ckpt_last_completed_unix_seconds` is a gauge carrying the completion
+TIMESTAMP, so a dashboard computes `time() - metric`. A timestamp rather
+than an age because an age must be refreshed on a timer to stay true, and a
+gauge that is only correct when something remembers to update it is exactly
+how metrics come to read zero forever.
+
+**No restart metric at all - and then, two of them.** A job that keeps
+failing and being redeployed is the most informative unhealthy state there
+is, and it emitted nothing: `clink_coordinator_jobs_failed_total` moves only
+when the restart budget is finally exhausted, so the signal arrived after
+the recovery had already been spent.
+
+Instrumenting it revealed a second path. A checkpointed job rolls the WHOLE
+job back to its last checkpoint, because a per-subtask redeploy would leave
+the other subtasks un-rolled-back and break exactly-once. A job WITHOUT a
+checkpoint directory instead retries the failing subtask in place. Counting
+only the first left every non-checkpointed job's retries invisible - and
+those are the jobs with no recovery at all, so their retries matter more,
+not less.
+
+They are separate series rather than one total because they mean different
+things: a whole-job restart replays from a checkpoint, a subtask redeploy
+does not.
+
+**Risk:** a restart-looping job looks healthy until it gives up, and a job
+whose checkpoints have silently stopped cannot be alerted on at all - which
+is the state F28 and F29 both produced.
+
+**How the second path was found:** the test asserted the whole-job counter
+moved, and it did not, while the job demonstrably restarted. The obvious
+reading - "the metric is not wired" - was wrong; the restart had gone
+through a mechanism I had not known existed.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -797,7 +847,7 @@ lives; evidence is in section 4.
 | W16 | Protocol version negotiation across RPC/frames/state | P1.12 | F19, F20 | **Partial** |
 | W17 | Config linter + recovery profiles, enforced at submission | P1.13 | F31 | **Partial** |
 | W18 | OpenTelemetry tracing | P1.14 | - | **Open** |
-| W19 | Production metrics completion | P1.15 | - | **Open** |
+| W19 | Production metrics: staleness gauge, restart counters | P1.15 | F33 | **Partial** |
 | W20 | Non-determinism detection API | P2.16 | - | **Partial** |
 | W21 | Cancellation/shutdown audit | P2.17 | F24 | **Partial** |
 | W22 | Side-output / multi-sink propagation validation | P2.18 | - | **Partial** |
@@ -2201,6 +2251,59 @@ Using the profile flag for the first time is what found F32.
   parallelism, and TTL against checkpoint interval are all unchecked.
 - **No cross-check against the guarantee analyser.** The two gates run in
   sequence and could in principle disagree; nothing asserts they cannot.
+
+---
+
+### W19 - Production metrics — Partial
+
+**Source:** `include/clink/metrics/checkpoint_metrics.hpp`,
+`include/clink/metrics/orchestration_metrics.hpp`,
+`src/cluster/coordinator.cpp`, `tests/test_checkpoint_metrics.cpp`,
+`tests/test_config_lint.cpp`
+
+Three new series, each answering a question that previously had no answer:
+`clink_ckpt_last_completed_unix_seconds`,
+`clink_coordinator_job_restarts_total`,
+`clink_coordinator_subtask_redeploys_total`.
+
+**The audit that found nothing is part of the result.** All 84 declared
+metric constants are genuinely emitted, and none is pre-registered without
+ever being updated. The item's premise - that the metrics surface is
+incomplete - held only for what is absent, not for what is broken.
+
+**Tests:** 4 new cases. The staleness gauge is asserted to exist BEFORE any
+checkpoint completes, because an alert of the form
+`time() - metric > N` has no series to evaluate on a fresh coordinator and
+silently does not fire - which is the window where a job that never
+checkpoints most needs it. Its value is range-checked as a plausible epoch
+SECOND, since a unit mistake would make the alert quietly wrong rather than
+absent. And the counter and the timestamp are asserted independent, so a
+caller cannot stamp a completion it did not have.
+
+The redeploy counter is driven through a REAL retry - a role that fails its
+first attempt - rather than by calling the helper, for the same reason the
+config gate needed a real submission.
+
+**What makes this Partial - stated plainly:**
+
+- **The whole-job restart counter has no test.** It is instrumented at the
+  single site where that restart is decided and logged, and the
+  integration suite exercises that path, but nothing asserts the counter
+  moves. Reaching it in-process needs a failing generic subtask, which the
+  role-handler path cannot produce. Recorded rather than manufactured.
+- **Watermark lag is derivable, not exposed.** `clink_op_watermark_ms` is
+  an absolute value per operator; lag needs `time() - metric/1000` at query
+  time. That works in Prometheus and is worth stating rather than adding a
+  second series that can disagree with the first.
+- **No end-to-end alerting rules ship.** The metrics support the alerts;
+  no rule file, dashboard or runbook exists, so every operator derives the
+  same three queries independently.
+- **Nothing measures state size in bytes at the job level.** `TtlStats`
+  carries `estimated_bytes` per slot and the disaggregated tier reports
+  resident bytes, but there is no per-job total, which is what capacity
+  planning actually needs.
+- **No histogram for checkpoint duration distribution.** There is a sum and
+  a count, so only a mean is available; a p99 checkpoint duration is not.
 
 ---
 

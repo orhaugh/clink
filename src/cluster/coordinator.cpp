@@ -3349,6 +3349,10 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
                         retry_task.extra_config += '\n';
                     }
                     retry_task.extra_config += "clink_attempt=" + std::to_string(attempts);
+                    // Counted here, where the retry is DECIDED, not at the
+                    // send below: a send that fails is still a retry the
+                    // operator needs to see.
+                    metrics::orch::subtask_redeployed();
                     auto worker_it = registered_.find(rec_it->second.first);
                     if (worker_it != registered_.end()) {
                         target_conn = worker_it->second;
@@ -3449,6 +3453,10 @@ void Coordinator::handle_subtask_finished_(MessageReader& r) {
             }
             job.completed_count = 0;  // belongs to the failed attempt
             job.errors.clear();
+            // Counted here rather than at the redeploy below, because both
+            // branches of that redeploy are the same restart and counting in
+            // one would undercount.
+            metrics::orch::job_restarted();
             log::warn("coordinator.restart",
                       "job_id=" + std::to_string(job.id) + " subtask error -> whole-job restart" +
                           " (attempt " + std::to_string(job.restart_attempts + 1) + "/" +
@@ -4003,9 +4011,11 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
                                         std::chrono::steady_clock::now() - sit->second)
                                         .count();
                 clink::metrics::ckpt::completed(static_cast<std::uint64_t>(dur_ms));
+                clink::metrics::ckpt::last_completed_now();
                 job.pending_checkpoint_start_times.erase(sit);
             } else {
                 clink::metrics::ckpt::completed(0);
+                clink::metrics::ckpt::last_completed_now();
             }
 
             // Any operator in Preparing uses THIS

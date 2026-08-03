@@ -13,6 +13,8 @@
 //                       cooldown, mid_rescale, no_bounds}
 //   - clink_ha_leader_takeovers_total
 //   - clink_ha_recovered_jobs_total
+//   - clink_coordinator_job_restarts_total
+//   - clink_coordinator_subtask_redeploys_total
 //   - clink_protocol_mismatches_total
 //   - clink_malformed_frames_total
 //   - clink_client_connections_refused_total
@@ -56,6 +58,32 @@ inline constexpr const char* kRescaleAborts = "clink_rescale_aborts_total";
 inline constexpr const char* kAutoscalerTicks = "clink_autoscaler_ticks_total";
 inline constexpr const char* kHaLeaderTakeovers = "clink_ha_leader_takeovers_total";
 inline constexpr const char* kHaRecoveredJobs = "clink_ha_recovered_jobs_total";
+// Whole-job restarts the coordinator has performed.
+//
+// There was no restart metric at all, which left the most informative
+// unhealthy state invisible: a job that keeps failing and being redeployed
+// is working as designed right up to the moment its budget runs out, and
+// only then does clink_coordinator_jobs_failed_total move. So the signal
+// arrived after the recovery had already been spent, rather than on the
+// first restart.
+//
+// Restart LOOPS are the shape this catches - the crash-per-record job an
+// unknown SQL function used to produce, or a source that cannot replay.
+inline constexpr const char* kJobRestarts = "clink_coordinator_job_restarts_total";
+// Per-SUBTASK redeploys, which are a separate mechanism from the whole-job
+// restart above and were equally uncounted.
+//
+// Two paths exist: a checkpointed job rolls the WHOLE job back to its last
+// checkpoint (kJobRestarts), because a per-subtask redeploy would leave the
+// others un-rolled-back and break exactly-once; a job WITHOUT a checkpoint
+// directory retries the failing subtask in place. Counting only the first
+// left every non-checkpointed job's retries invisible - and those are the
+// jobs with no recovery, so their retries matter more, not less.
+//
+// Separate series rather than one total, because they mean different things
+// operationally: a whole-job restart replays from a checkpoint, a subtask
+// redeploy does not.
+inline constexpr const char* kSubtaskRedeploys = "clink_coordinator_subtask_redeploys_total";
 // Handshakes refused because the peer speaks a wire protocol this build
 // cannot honour. Non-zero during a rolling upgrade means the roll has
 // reached a version boundary it cannot cross; non-zero otherwise means a
@@ -95,6 +123,12 @@ inline void autoscaler_decision(const char* outcome) {
 }
 inline void ha_leader_takeover() {
     MetricsRegistry::global().counter(kHaLeaderTakeovers).increment();
+}
+inline void job_restarted() {
+    MetricsRegistry::global().counter(kJobRestarts).increment();
+}
+inline void subtask_redeployed() {
+    MetricsRegistry::global().counter(kSubtaskRedeploys).increment();
 }
 inline void client_connection_refused() {
     MetricsRegistry::global().counter(kClientConnectionsRefused).increment();

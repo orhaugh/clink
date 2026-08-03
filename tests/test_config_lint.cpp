@@ -14,6 +14,7 @@
 // preference, and the tests name it, so a future reader can tell a rule
 // from an opinion.
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -27,6 +28,8 @@
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/worker.hpp"
+#include "clink/metrics/metrics_registry.hpp"
+#include "clink/metrics/orchestration_metrics.hpp"
 
 using namespace clink::cluster;
 
@@ -504,4 +507,71 @@ TEST(ConfigLint, ARealSubmissionWithAWarningStillSucceeds) {
     coordinator.stop();
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
+}
+
+// --- restart visibility ---------------------------------------------------
+
+// A job that keeps failing and being redeployed is the most informative
+// unhealthy state there is, and until now it emitted nothing:
+// clink_coordinator_jobs_failed_total moves only when the restart budget is
+// finally exhausted, so the signal arrived after the recovery had already
+// been spent.
+//
+// Driven through a REAL restart rather than by calling the helper, because
+// the helper being correct says nothing about whether the restart path
+// reaches it - the same reason the config gate needed a real submission.
+TEST(ConfigLint, ASubtaskRedeployIsCounted) {
+    const auto counter_now = [](const char* name) {
+        auto snap = clink::MetricsRegistry::global().snapshot();
+        for (const auto& [n, v] : snap.counters) {
+            if (n == name) {
+                return v;
+            }
+        }
+        return std::uint64_t{0};
+    };
+
+    Coordinator::Config cfg;
+    cfg.max_restarts = 3;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"w"});
+
+    // A role that fails its first attempt and succeeds after, so the job
+    // restarts exactly once and then completes - a restart, not a failure.
+    std::atomic<int> attempts{0};
+    Worker::Config worker_cfg;
+    worker_cfg.slot_count = 4;
+    Worker worker("w", "127.0.0.1", worker_cfg);
+    worker.register_role("flaky", [&attempts](const DeploymentTask&) {
+        if (attempts.fetch_add(1) == 0) {
+            throw std::runtime_error("first attempt fails");
+        }
+    });
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(std::chrono::seconds(2)));
+
+    // This job has NO checkpoint directory, so the coordinator retries the
+    // failing subtask in place rather than rolling the whole job back -
+    // the second of the two restart mechanisms, and the one that had no
+    // metric even after the first was instrumented.
+    const auto before = counter_now(clink::metrics::kSubtaskRedeploys);
+
+    JobPlan plan;
+    plan.tasks.push_back(PlannedTask{.worker_id = "w",
+                                     .role = "flaky",
+                                     .subtask_idx = 0,
+                                     .data_port = 0,
+                                     .peer_refs = {},
+                                     .extra_config = ""});
+    coordinator.deploy(plan);
+    ASSERT_TRUE(coordinator.await_completion(std::chrono::seconds(5)));
+    ASSERT_GE(attempts.load(), 2) << "the job never restarted, so there is nothing to count";
+
+    EXPECT_GT(counter_now(clink::metrics::kSubtaskRedeploys), before)
+        << "a subtask was redeployed and clink_coordinator_subtask_redeploys_total did not move, "
+           "so a retry-looping job with no checkpointing is invisible in metrics";
+
+    worker.stop();
+    coordinator.stop();
 }

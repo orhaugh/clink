@@ -33,6 +33,7 @@
 // alignment counters use `clink_op_barrier_*` and are keyed by
 // op_id like the operator data-plane metrics.
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -44,6 +45,26 @@ namespace clink::metrics {
 inline constexpr const char* kCheckpointTriggered = "clink_ckpt_triggered_total";
 inline constexpr const char* kCheckpointCompleted = "clink_ckpt_completed_total";
 inline constexpr const char* kCheckpointFailed = "clink_ckpt_failed_total";
+// Wall-clock second at which a checkpoint last reached GLOBAL completion.
+//
+// A gauge, and a timestamp rather than an age, because the question an
+// operator needs answered is "how long since the last successful
+// checkpoint" - the canonical streaming alert, since a stalled checkpoint
+// means the recovery window is growing without bound.
+//
+// kCheckpointCompleted cannot answer it. A counter that has stopped moving
+// looks identical to an idle job over any short window, and rate() over a
+// window long enough to distinguish them smears the signal past use. A
+// timestamp is exact: a dashboard computes
+// time() - clink_ckpt_last_completed_unix_seconds and alerts above a
+// threshold.
+//
+// A timestamp rather than an in-process age, because an age must be
+// refreshed on a timer to stay true, and a gauge that is only correct when
+// something remembers to update it is how metrics come to read 0 forever.
+// This changes exactly when the event happens.
+inline constexpr const char* kCheckpointLastCompletedUnixSeconds =
+    "clink_ckpt_last_completed_unix_seconds";
 inline constexpr const char* kCheckpointDurationMsSum = "clink_ckpt_duration_ms_sum";
 inline constexpr const char* kCheckpointDurationMsCount = "clink_ckpt_duration_ms_count";
 inline constexpr const char* kSubtaskSnapshotAck = "clink_ckpt_subtask_snapshot_ack_total";
@@ -57,6 +78,11 @@ inline void init_checkpoint_metrics() {
     (void)r.counter(kCheckpointTriggered);
     (void)r.counter(kCheckpointCompleted);
     (void)r.counter(kCheckpointFailed);
+    // Pre-registered so the series EXISTS before the first checkpoint
+    // completes. Without it an alert on "time() - last_completed" has no
+    // series to evaluate on a fresh coordinator and silently does not fire -
+    // which is the window where a broken job most needs the alert.
+    (void)r.gauge(kCheckpointLastCompletedUnixSeconds);
     (void)r.counter(kCheckpointDurationMsSum);
     (void)r.counter(kCheckpointDurationMsCount);
     (void)r.counter(kSubtaskSnapshotAck);
@@ -74,6 +100,17 @@ inline void completed(std::uint64_t duration_ms) {
     MetricsRegistry::global().counter(kCheckpointDurationMsSum).increment(duration_ms);
     MetricsRegistry::global().counter(kCheckpointDurationMsCount).increment();
 }
+// Stamp the completion time. Called alongside completed(), not instead of
+// it: the counter answers "how many" and this answers "how recently", and
+// an alert needs the second.
+inline void last_completed_now() {
+    MetricsRegistry::global()
+        .gauge(kCheckpointLastCompletedUnixSeconds)
+        .set(static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                           std::chrono::system_clock::now().time_since_epoch())
+                                           .count()));
+}
+
 inline void failed() {
     MetricsRegistry::global().counter(kCheckpointFailed).increment();
 }

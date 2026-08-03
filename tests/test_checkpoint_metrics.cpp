@@ -29,6 +29,16 @@ std::uint64_t hist_count(const std::string& base) {
     return MetricsRegistry::global().histogram(base).snapshot().count;
 }
 
+std::int64_t gauge_value(const std::string& name) {
+    auto snap = MetricsRegistry::global().snapshot();
+    for (const auto& [n, v] : snap.gauges) {
+        if (n == name) {
+            return v;
+        }
+    }
+    return -1;  // distinguishable from a legitimate 0
+}
+
 }  // namespace
 
 TEST(CheckpointMetrics, HelperFunctionsAccumulate) {
@@ -89,4 +99,51 @@ TEST(CheckpointMetrics, AlignmentMetricsDisabledWhenOpIdUnset) {
     EXPECT_TRUE(adv.forward);
     // No counter created for op_id=0 because the aligner short-circuits.
     EXPECT_EQ(counter_value(clink::metrics::op_metric_name("barrier_alignments_total", 0)), 0u);
+}
+
+// --- checkpoint staleness ------------------------------------------------
+
+TEST(CheckpointMetrics, TheLastCompletedTimestampExistsBeforeAnyCheckpointCompletes) {
+    // The series has to EXIST from startup, not from the first completion.
+    // An alert of the form `time() - clink_ckpt_last_completed_unix_seconds
+    // > N` has nothing to evaluate against a missing series and silently
+    // does not fire - and a fresh coordinator whose very first checkpoint
+    // never completes is exactly when that alert is needed most.
+    clink::metrics::init_checkpoint_metrics();
+    EXPECT_NE(gauge_value(clink::metrics::kCheckpointLastCompletedUnixSeconds), -1)
+        << "the gauge is not pre-registered, so an alert on checkpoint staleness would have no "
+           "series until the first checkpoint completed";
+}
+
+TEST(CheckpointMetrics, TheLastCompletedTimestampAdvancesOnCompletion) {
+    clink::metrics::init_checkpoint_metrics();
+    const auto before = gauge_value(clink::metrics::kCheckpointLastCompletedUnixSeconds);
+    clink::metrics::ckpt::last_completed_now();
+    const auto after = gauge_value(clink::metrics::kCheckpointLastCompletedUnixSeconds);
+    EXPECT_GT(after, before);
+    // A plausible epoch second, not a duration or a millisecond count: the
+    // whole point is that a dashboard can subtract it from time(), and a
+    // unit mistake would make the alert silently wrong rather than absent.
+    // 1.7e9 is 2023; 4e9 is 2096.
+    EXPECT_GT(after, 1'700'000'000) << "value " << after << " is not an epoch SECOND";
+    EXPECT_LT(after, 4'000'000'000) << "value " << after << " is not an epoch second";
+}
+
+TEST(CheckpointMetrics, CompletionCountAndTimestampAnswerDifferentQuestions) {
+    // Both are emitted, and neither substitutes for the other: the counter
+    // says how many, the timestamp says how recently. This asserts they are
+    // separate series rather than one wired to look like two.
+    clink::metrics::init_checkpoint_metrics();
+    const auto count_before = counter_value(clink::metrics::kCheckpointCompleted);
+    const auto stamp_before = gauge_value(clink::metrics::kCheckpointLastCompletedUnixSeconds);
+
+    clink::metrics::ckpt::completed(42);
+    EXPECT_EQ(counter_value(clink::metrics::kCheckpointCompleted), count_before + 1);
+    EXPECT_EQ(gauge_value(clink::metrics::kCheckpointLastCompletedUnixSeconds), stamp_before)
+        << "completed() moved the timestamp; the two must be independent so a caller cannot "
+           "stamp a completion it did not have";
+
+    clink::metrics::ckpt::last_completed_now();
+    EXPECT_EQ(counter_value(clink::metrics::kCheckpointCompleted), count_before + 1)
+        << "last_completed_now() incremented the completion counter";
 }
