@@ -71,12 +71,10 @@ struct PipelineConnector {
     // analysis then has to assume the worst rather than guess.
     bool declaration_missing{false};
     // The commit_group this sink was given, empty when it has none.
-    //
-    // Per-sink exactly-once does not compose into job-level atomicity.
-    // Two transactional sinks that commit independently can be left in
-    // disagreement by a failure between their commits - one published,
-    // one not - and each sink is still, correctly, exactly-once on its
-    // own. Sinks sharing a commit_group commit as a unit instead.
+    // Recorded for diagnostics; the cross-sink analysis deliberately does
+    // not branch on it, because a group does not change cross-sink
+    // atomicity in this engine (see analyse_pipeline step 6b, and
+    // Coordinator::CheckpointGroupState for why).
     std::string commit_group;
 };
 

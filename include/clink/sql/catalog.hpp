@@ -63,12 +63,15 @@ struct TableDef {
     }
     [[nodiscard]] bool is_exactly_once() const { return delivery_guarantee() == "exactly_once"; }
 
-    // Cross-sink commit group. Multiple sinks that share a non-empty
-    // commit_group must commit together or all abort together. Defaults
-    // to "" (no group; sink commits independently). Only meaningful for
+    // Cross-sink commit group. Defaults to "". Only accepted on
     // exactly_once sinks (a non-2PC sink has no commit phase to
     // coordinate); the binder rejects commit_group on non-exactly_once
     // tables.
+    //
+    // Setting it does not change cross-sink atomicity: a job's
+    // transactional sinks already commit on one per-checkpoint broadcast
+    // and abort together on any failed ack. A group only advances WHEN an
+    // abort is issued. See Coordinator::CheckpointGroupState.
     [[nodiscard]] std::string commit_group() const {
         auto it = properties.find("commit_group");
         if (it != properties.end())

@@ -125,23 +125,38 @@ bool await_port_open(std::uint16_t port, std::chrono::milliseconds timeout) {
 }
 
 std::uint64_t latest_completed_checkpoint(const std::filesystem::path& ckpt_dir,
-                                          std::uint64_t /*job_id*/) {
-    // coordinator writes COMPLETED-N markers at the top of checkpoint_dir (not
-    // namespaced per job - single-job runs are the common case).
-    if (!std::filesystem::exists(ckpt_dir))
-        return 0;
+                                          std::uint64_t job_id) {
+    // The coordinator writes markers at
+    // <checkpoint_dir>/_jobs/<job_id>/COMPLETED-<id>. This scanned the TOP
+    // LEVEL and ignored the job id it was handed, with a comment asserting
+    // markers were not namespaced per job - true once, and false since they
+    // were scoped. It therefore reported 0 for a job that was checkpointing
+    // normally, and the failover test read that as "no checkpoint to recover
+    // from".
+    //
+    // Scoped to the job when one is given, recursive otherwise, so a caller
+    // that does not know the id still finds markers.
     std::uint64_t latest = 0;
-    for (const auto& e : std::filesystem::directory_iterator(ckpt_dir)) {
+    std::error_code ec;
+    const auto scan_root = job_id != 0 ? ckpt_dir / "_jobs" / std::to_string(job_id) : ckpt_dir;
+    if (!std::filesystem::exists(scan_root, ec)) {
+        return 0;
+    }
+    for (const auto& e : std::filesystem::recursive_directory_iterator(scan_root, ec)) {
+        if (ec) {
+            break;
+        }
         if (!e.is_regular_file())
             continue;
         const auto name = e.path().filename().string();
         if (name.rfind("COMPLETED-", 0) != 0)
             continue;
         try {
-            const auto id = std::stoull(name.substr(std::string{"COMPLETED-"}.size()));
+            const auto id = static_cast<std::uint64_t>(
+                std::stoull(name.substr(std::string{"COMPLETED-"}.size())));
             if (id > latest)
                 latest = id;
-        } catch (...) {
+        } catch (const std::exception&) {
         }
     }
     return latest;

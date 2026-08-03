@@ -70,6 +70,7 @@ submits to a cluster, unchanged.
 | Failover | Lost-worker detection, drain, redeploy from the latest completed checkpoint (fail-fast by default, config-gated restarts) | [Fault tolerance and rescale](internals/fault-tolerance-and-rescale.md) |
 | Rescale | Key-group repartitioning on deploy, scale up and down, per-operator rescale over HTTP; load-driven autoscaler trigger | [Fault tolerance and rescale](internals/fault-tolerance-and-rescale.md) |
 | High availability | Multi-coordinator leader election via etcd (opt-in); filesystem-backed job persistence; fencing epoch on every control frame so a superseded coordinator cannot deploy, cancel or commit | [Distributed runtime](internals/distributed-runtime.md) |
+| Configuration checking | `clink lint` reports settings that would be accepted and then ignored, or that contradict each other, without contacting a cluster; exits non-zero on anything a submission would refuse, and shares its parsing with `clink run` so the two cannot disagree | [Distributed runtime](internals/distributed-runtime.md) |
 | Security | TLS and mTLS on the cluster transport | [Network stack](internals/network-stack.md) |
 | Kubernetes | Helm chart and a `ClinkCluster`/`ClinkJob` operator with savepoint-on-upgrade | [Distributed runtime](internals/distributed-runtime.md) |
 | HTTP API and console | JSON API, Prometheus metrics, SSE events, embedded dashboard; the full [operations console](https://github.com/orhaugh/clink-fe) is a separate project | [Distributed runtime](internals/distributed-runtime.md) |

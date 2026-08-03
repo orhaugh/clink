@@ -719,6 +719,27 @@ TEST(PluginSubmission, CheckpointAndRestoreAcrossJobRuns) {
         {
             clink::cluster::OperatorSpec op;
             op.id = "counter";
+            // The stateful operator, so it needs a stable uid: the
+            // OperatorId that keyed state is stored under derives from it,
+            // and without one the runtime falls back to a stage-index hash.
+            // This test restores that state into a second job, which is
+            // exactly the case the uid exists for.
+            op.uid = "parity-counter";
+            // Keyed state REQUIRES a key-partitioned input, which this graph
+            // never declared. The job still ran and still checkpointed, but
+            // its state was written by whichever subtask a record landed on,
+            // so at restore each subtask correctly discarded the key groups
+            // it does not own - and half the counters were gone, silently,
+            // on every restore (F38). hello.by_parity is registered by the
+            // plugin for exactly this operator.
+            //
+            // Kept although it does NOT fix the test: with the key declared,
+            // subtask 1 still restores an entry belonging to key group 36
+            // and still discards it. Whatever consumes key_by on this deploy
+            // path is not repartitioning the stream, and that is recorded as
+            // the open half of F38. The declaration stays because the job is
+            // wrong without it either way.
+            op.key_by = "hello.by_parity";
             op.type = "hello.ParityCounter";
             op.out_channel = "hello.Greeting";
             op.inputs = {"src"};
@@ -785,14 +806,25 @@ TEST(PluginSubmission, CheckpointAndRestoreAcrossJobRuns) {
     ASSERT_TRUE(r1.completed) << "run 1 reject: " << r1.reject_message;
     EXPECT_TRUE(r1.ok) << "run 1 errors: " << (r1.errors.empty() ? "(none)" : r1.errors[0]);
 
-    // Find the latest COMPLETED-<id> marker the coordinator wrote.
+    // Find the latest COMPLETED-<id> marker the coordinator wrote. Recursive:
+    // the marker is job-scoped, at <checkpoint_dir>/<job_id>/COMPLETED-<id>,
+    // and a top-level-only scan reports 0 for a job that checkpointed
+    // perfectly well.
     std::uint64_t completed_id = 0;
-    if (std::filesystem::exists(ckpt_dir)) {
-        for (const auto& entry : std::filesystem::directory_iterator(ckpt_dir)) {
+    std::error_code marker_ec;
+    if (std::filesystem::exists(ckpt_dir, marker_ec)) {
+        for (const auto& entry :
+             std::filesystem::recursive_directory_iterator(ckpt_dir, marker_ec)) {
+            if (marker_ec) {
+                break;
+            }
+            if (!entry.is_regular_file()) {
+                continue;
+            }
             const auto fname = entry.path().filename().string();
             if (fname.rfind("COMPLETED-", 0) == 0) {
                 try {
-                    const auto id = std::stoull(fname.substr(10));
+                    const auto id = static_cast<std::uint64_t>(std::stoull(fname.substr(10)));
                     completed_id = std::max<std::uint64_t>(completed_id, id);
                 } catch (...) {
                 }

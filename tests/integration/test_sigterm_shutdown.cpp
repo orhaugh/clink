@@ -19,6 +19,8 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 
 #include "clink/core/codec.hpp"
@@ -55,6 +57,40 @@ pid_t spawn_proc(const std::vector<std::string>& argv, const std::filesystem::pa
 std::uint16_t probe_free_port() {
     NetworkChannelSource<std::int64_t> probe(0, int64_codec());
     return probe.listen();
+}
+
+// Wait until the node is actually accepting on `port`.
+//
+// The condition SIGTERM handling depends on. This was a fixed
+// sleep_for(300ms) with the comment "let the coordinator bind + start its
+// accept loop", which is the right condition expressed as a bet on process
+// startup - and the bet loses under load: SIGTERM delivered before main()
+// installs the handler takes the DEFAULT action, so the process dies of
+// signal 15 and the test reports a shutdown-handling regression that is not
+// there. Observed exactly that with a parallel container build running
+// alongside.
+//
+// Accepting on the port is not proof the handler is installed, since nothing
+// observable is, but it is downstream of process startup rather than a guess
+// at its duration, and it removes the load sensitivity.
+bool await_port_accepting(std::uint16_t port, std::chrono::milliseconds timeout = 10s) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(port);
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            const bool ok = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+            ::close(fd);
+            if (ok) {
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    return false;
 }
 
 // Wait for `pid` to exit. Return (exited, was_signal_terminated, exit_or_signal_code).
@@ -103,8 +139,9 @@ TEST(SigtermShutdown, CoordinatorExitsCleanlyOnSIGTERM) {
     const pid_t pid =
         spawn_proc({"clink_node", "--role=coordinator", "--port=" + std::to_string(port)}, node);
     ASSERT_GT(pid, 0);
-    // Let the coordinator bind + start its accept loop before signalling.
-    std::this_thread::sleep_for(300ms);
+    ASSERT_TRUE(await_port_accepting(port))
+        << "coordinator never accepted on its port, so a SIGTERM now would test process startup "
+           "rather than shutdown handling";
 
     ::kill(pid, SIGTERM);
     const auto info = wait_for_exit(pid, 5s);
@@ -131,7 +168,8 @@ TEST(SigtermShutdown, WorkerExitsCleanlyOnSIGTERM) {
     const pid_t coordinator_pid =
         spawn_proc({"clink_node", "--role=coordinator", "--port=" + std::to_string(port)}, node);
     ASSERT_GT(coordinator_pid, 0);
-    std::this_thread::sleep_for(200ms);
+    ASSERT_TRUE(await_port_accepting(port))
+        << "coordinator never accepted, so the worker below has nothing to register against";
 
     const pid_t worker_pid = spawn_proc({"clink_node",
                                          "--role=worker",
@@ -140,7 +178,11 @@ TEST(SigtermShutdown, WorkerExitsCleanlyOnSIGTERM) {
                                          "--coordinator-port=" + std::to_string(port)},
                                         node);
     ASSERT_GT(worker_pid, 0);
-    std::this_thread::sleep_for(400ms);
+    // The worker exposes no port to poll, so this one stays a duration - but
+    // a generous one, and the assertion below distinguishes the two failure
+    // modes anyway: signalled-too-early shows up as WIFSIGNALED, whereas a
+    // genuinely broken handler shows up as a timeout.
+    std::this_thread::sleep_for(1500ms);
 
     ::kill(worker_pid, SIGTERM);
     const auto info = wait_for_exit(worker_pid, 5s);

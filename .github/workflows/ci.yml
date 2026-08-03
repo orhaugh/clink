@@ -207,9 +207,25 @@ jobs:
         # conditions are what made the older tests unfit to gate.
         #
         # Serial: each test stands up its own coordinator + workers.
+        #
+        # Widened beyond FaultRecovery once each addition met the same bar -
+        # waits on conditions, passes repeatedly - rather than because it
+        # happened to be green:
+        #   CliLint            no cluster at all; runs a binary and checks
+        #                      exit codes, so there is nothing to race.
+        #   CommitGroupAtomicity / UngroupedSinkAtomicity
+        #                      written on the harness; the one place they
+        #                      wait for quiescence polls for the committed
+        #                      set to stop changing rather than sleeping.
+        #
+        # TwoPhaseCommit and WorkerCrashRecovery are NOT here despite now
+        # passing. They still use the pre-harness helpers (a fixed 200ms
+        # sleep for cluster startup), and gating on a test that waits for a
+        # duration is the gated-and-hoped move this file already refuses.
         run: >-
           ctest --test-dir build --output-on-failure --parallel 1 --timeout 300
-          -L integration -R 'FaultRecovery'
+          -L integration
+          -R 'FaultRecovery|CliLint|CommitGroupAtomicity|UngroupedSinkAtomicity'
       - name: Test (remaining integration, serial) [advisory]
         # Everything else under the integration label. Still advisory, and
         # deliberately so rather than gated-and-hoped: these tests use the
@@ -220,11 +236,18 @@ jobs:
         # remove this line; each conversion moves a test into the gate above
         # and shrinks this set.
         #
-        # -E FaultRecovery so the gated tests are not run twice.
+        # -E the gated set so those tests are not run twice.
+        #
+        # Known RED in this set: PluginSubmission.CheckpointAndRestoreAcrossJobRuns
+        # (F38 - half a job's keyed state silently does not survive a
+        # restore). It is left failing rather than adjusted, because the
+        # only way to make it pass today would be to assert that losing half
+        # the state is correct.
         continue-on-error: true
         run: >-
           ctest --test-dir build --output-on-failure --parallel 1 --timeout 240
-          -L integration -E 'FaultRecovery'
+          -L integration
+          -E 'FaultRecovery|CliLint|CommitGroupAtomicity|UngroupedSinkAtomicity'
       - name: Upload integration artifacts on failure
         # A multi-process failure with no child logs cannot be diagnosed
         # from a CI transcript. The harness keeps its scratch tree (with

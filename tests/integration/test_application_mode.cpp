@@ -19,7 +19,42 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
+
+namespace {
+
+// Wait until something is accepting on `port`.
+//
+// Replaces a fixed sleep. The coordinator has to be listening before the
+// worker can register and before the submission below can connect, and 200ms
+// was a guess at how long that takes. It holds when the test runs alone and
+// loses when it runs back-to-back with the rest of the label or beside a
+// container build - the test then fails describing an application-mode
+// problem that is really "the process had not finished starting".
+bool await_port_accepting(std::uint16_t port,
+                          std::chrono::milliseconds timeout = std::chrono::seconds{10}) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(port);
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            const bool ok = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+            ::close(fd);
+            if (ok) {
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    return false;
+}
+
+}  // namespace
 
 #include "clink/application/job_submitter.hpp"
 #include "clink/cluster/job_graph.hpp"
@@ -85,7 +120,8 @@ TEST(ApplicationMode, JobSubmitterPushesAndWaitsForCompletion) {
     const pid_t coordinator_pid = spawn_node(
         {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
     ASSERT_GT(coordinator_pid, 0);
-    std::this_thread::sleep_for(200ms);
+    ASSERT_TRUE(await_port_accepting(coordinator_port))
+        << "coordinator never accepted; nothing below can register or submit";
 
     const pid_t worker_pid = spawn_node({"clink_node",
                                          "--role=worker",
@@ -94,7 +130,10 @@ TEST(ApplicationMode, JobSubmitterPushesAndWaitsForCompletion) {
                                          "--coordinator-port=" + std::to_string(coordinator_port)},
                                         binary);
     ASSERT_GT(worker_pid, 0);
-    std::this_thread::sleep_for(300ms);
+    // The worker exposes no port of its own here, so this stays a duration -
+    // but a generous one rather than a tight guess, since the submission
+    // below needs the worker registered and a slot free.
+    std::this_thread::sleep_for(1500ms);
 
     // Build the job graph programmatically rather than reading JSON
     // from disk. This is the whole point of the API: applications

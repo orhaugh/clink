@@ -1,6 +1,7 @@
 // Checkpoint metric helpers + MultiInputAlignment metric emission.
 
 #include <chrono>
+#include <numeric>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -8,6 +9,7 @@
 #include "clink/checkpoint/checkpoint_barrier.hpp"
 #include "clink/metrics/checkpoint_metrics.hpp"
 #include "clink/metrics/metrics_registry.hpp"
+#include "clink/metrics/prometheus.hpp"
 #include "clink/runtime/multi_input_alignment.hpp"
 
 using namespace clink;
@@ -65,7 +67,25 @@ TEST(CheckpointMetrics, HelperFunctionsAccumulate) {
     EXPECT_EQ(counter_value(kCheckpointFailed) - fail_before, 1u);
     EXPECT_EQ(counter_value(kSubtaskSnapshotAck) - ok_before, 1u);
     EXPECT_EQ(counter_value(kSubtaskSnapshotFailure) - bad_before, 1u);
-    EXPECT_GE(counter_value(kCheckpointDurationMsSum), 200u);
+    // Duration is a histogram now. The sum is still asserted, because the
+    // `_sum`/`_count` exposition names are unchanged and existing queries
+    // depend on them; the observations and a quantile are asserted too,
+    // because a histogram whose sum is right and whose buckets are empty
+    // would satisfy the old assertion alone.
+    const auto duration = MetricsRegistry::global()
+                              .histogram(kCheckpointDurationMs, checkpoint_duration_buckets_ms())
+                              .snapshot();
+    EXPECT_GE(duration.sum, 200.0);
+    EXPECT_GE(duration.count, 2u);
+    EXPECT_GT(std::accumulate(duration.bucket_counts.begin(), duration.bucket_counts.end(), 0ULL),
+              0ULL)
+        << "the duration histogram recorded a sum but landed no observation in any bucket";
+    // 120ms and 80ms both fall in the 100ms/250ms region, so a p99 has to sit
+    // inside the plausible range rather than at 0 or at the +Inf edge.
+    const auto p99 = duration.quantile(0.99);
+    EXPECT_GT(p99, 0.0) << "p99 checkpoint duration is unavailable, which is the reason this is a "
+                           "histogram rather than a counter pair";
+    EXPECT_LE(p99, 60000.0);
     EXPECT_GE(hist_count(kRestoreFromSavepointNs), 1u);
 }
 
@@ -146,4 +166,36 @@ TEST(CheckpointMetrics, CompletionCountAndTimestampAnswerDifferentQuestions) {
     clink::metrics::ckpt::last_completed_now();
     EXPECT_EQ(counter_value(clink::metrics::kCheckpointCompleted), count_before + 1)
         << "last_completed_now() incremented the completion counter";
+}
+
+TEST(CheckpointMetrics, TheDurationHistogramExposesOneSumAndOneCountNotTwo) {
+    // Duration moved from a counter PAIR to a histogram, and the histogram's
+    // derived names are exactly the names the counters had. That is what
+    // keeps existing queries working - and it is also the trap: if the
+    // counters were ever reinstated alongside the histogram, the scrape would
+    // carry two `clink_ckpt_duration_ms_sum` lines. Prometheus rejects a
+    // duplicated series, so the whole endpoint fails, not just this metric.
+    //
+    // Counting occurrences rather than checking presence is the point; a
+    // contains() assertion passes just as happily on a broken scrape.
+    clink::metrics::init_checkpoint_metrics();
+    clink::metrics::ckpt::completed(120);
+
+    const auto text = clink::metrics::render_prometheus(MetricsRegistry::global().snapshot());
+    const auto occurrences = [&text](const std::string& needle) {
+        std::size_t n = 0;
+        std::size_t pos = 0;
+        while ((pos = text.find(needle, pos)) != std::string::npos) {
+            ++n;
+            pos += needle.size();
+        }
+        return n;
+    };
+
+    EXPECT_EQ(occurrences("clink_ckpt_duration_ms_sum"), 1u)
+        << "duplicate _sum series would make the entire scrape endpoint invalid";
+    EXPECT_EQ(occurrences("clink_ckpt_duration_ms_count"), 1u);
+    EXPECT_GT(occurrences("clink_ckpt_duration_ms_bucket"), 1u)
+        << "no bucket lines, so a p99 is still unavailable and this is a counter pair by another "
+           "name";
 }

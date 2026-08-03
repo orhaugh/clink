@@ -33,6 +33,18 @@ namespace {
 using namespace clink;
 using namespace std::chrono_literals;
 
+// Distinctly named: identically-named helpers in two anonymous namespaces in
+// one binary have collided here before.
+std::int64_t g_typed_ttl_fake_now_ms = 2'000'000;
+
+std::int64_t typed_ttl_fake_clock() {
+    return g_typed_ttl_fake_now_ms;
+}
+
+void typed_advance(std::chrono::milliseconds by) {
+    g_typed_ttl_fake_now_ms += by.count();
+}
+
 constexpr OperatorId kOp{21};
 
 TtlConfig event_ttl(std::chrono::milliseconds ttl) {
@@ -271,12 +283,20 @@ TEST(TypedStateTtl, RestoreResumesTheOriginalDeadline) {
 }
 
 TEST(TypedStateTtl, ProcessingTimeIsAvailableForStreamsWithoutWatermarks) {
+    // Processing time is injected rather than slept through: a sleep asserts
+    // the eviction AND bets on the scheduler, and the margin is what a loaded
+    // runner loses (see the seam's own note in keyed_state.hpp).
     InMemoryStateBackend b;
     ListState<std::int64_t, std::string> l(
-        b, kOp, "lst", int64_codec(), string_codec(), TtlConfig{.ttl = 30ms});
+        b,
+        kOp,
+        "lst",
+        int64_codec(),
+        string_codec(),
+        TtlConfig{.ttl = 30ms, .clock_ms = &typed_ttl_fake_clock});
     l.add(1, "a");
     EXPECT_EQ(l.get(1).size(), 1U);
-    std::this_thread::sleep_for(60ms);
+    typed_advance(60ms);
     EXPECT_TRUE(l.get(1).empty());
 }
 

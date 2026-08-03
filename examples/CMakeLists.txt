@@ -94,6 +94,17 @@ set_target_properties(clink_two_phase_commit_job PROPERTIES
 )
 clink_set_warnings(clink_two_phase_commit_job)
 
+# two_sink_commit_group_job: one source fanned out to TWO 2PC sinks sharing a
+# commit_group. Drives the cross-sink atomicity tests - sinks in a group are
+# supposed to commit as a unit, and nothing exercised that under failure.
+add_library(clink_two_sink_commit_group_job MODULE two_sink_commit_group_job.cpp)
+target_link_libraries(clink_two_sink_commit_group_job PRIVATE clink::core)
+set_target_properties(clink_two_sink_commit_group_job PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "two_sink_commit_group_job"
+)
+clink_set_warnings(clink_two_sink_commit_group_job)
+
 # rescale_test_job: slow generator source -> keyBy -> reduce(sum) ->
 # file sink. Drives test_coordinator_rescale.cpp; the source's per-record
 # sleep keeps the pipeline alive long enough to checkpoint and then

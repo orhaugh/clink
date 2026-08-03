@@ -742,7 +742,7 @@ private:
 
         // Per-checkpoint ack tracking: id -> set of "role:subtask_idx"
         // strings still pending. When the set empties the coordinator writes a
-        // <checkpoint_dir>/<job_id>/COMPLETED-<id> marker and updates
+        // <checkpoint_dir>/_jobs/<job_id>/COMPLETED-<id> marker and updates
         // `latest_completed_checkpoint_id`.
         std::unordered_map<std::uint64_t, std::unordered_set<std::string>> pending_checkpoint_acks;
         // Subtasks that acked a checkpoint with ok=false, per checkpoint id.
@@ -799,24 +799,45 @@ private:
         // together once every member has acked its pre-commit
         // successfully, or all abort together on any member's failure.
         // Empty when no sinks declared a commit_group (the default
-        // behaviour).
+        // behaviour). See CheckpointGroupState below for what membership
+        // does and does not buy - it is less than this name implies.
         std::unordered_map<std::string, std::unordered_set<std::string>> commit_groups;
         // Reverse index: "role:subtask_idx" -> group_name. nullopt
         // entry / absent key means "no group; commits independently"
         // (the default behaviour).
         std::unordered_map<std::string, std::string> subtask_commit_group;
 
-        // Per-checkpoint group state. For each in-flight
-        // checkpoint that touches at least one commit-group,
-        // group_state[ckpt_id][group_name] tracks the set of subtasks
-        // that have NOT yet acked. When the set empties the coordinator
-        // broadcasts CommitCheckpoint to the group's members; if any
-        // ack reports ok=false the group is aborted and every member
-        // gets AbortCheckpoint.
+        // Per-checkpoint group state, for each in-flight checkpoint that
+        // touches at least one commit-group.
+        //
+        // What this actually does, which is narrower than the name
+        // suggests: a group does NOT gate the commit broadcast. There is
+        // no group-scoped CommitCheckpoint. Commit is broadcast per
+        // checkpoint, job-wide, once every subtask has acked ok - so all
+        // of a job's sinks are told to commit together whether or not
+        // they share a group, and one failed ack aborts the checkpoint
+        // for all of them. Cross-sink agreement comes from that protocol,
+        // not from here. Verified by running a two-sink job with and
+        // without a group: identical per-checkpoint agreement either way
+        // (tests/integration/test_commit_group_atomicity.cpp).
+        //
+        // The one thing a group adds is WHEN the abort goes out. A failing
+        // ack aborts the group immediately, whereas the checkpoint-level
+        // abort waits until every subtask has answered - and nothing times
+        // a pending checkpoint out, so if a peer never answers the
+        // checkpoint-level abort never fires and staged sink transactions
+        // stay staged. A group releases them at the first failure.
+        //
+        // `aborted` is what carries that. There used to be a `committed`
+        // flag and the pending set was described as gating a group-scoped
+        // commit; neither was ever read, and the stale comment is what
+        // kept the false guarantee alive. `pending` is retained because
+        // it is the membership accounting a real group-scoped commit gate
+        // would need, and it is cheap; it is deliberately not load-bearing
+        // today.
         struct CheckpointGroupState {
             std::unordered_set<std::string> pending;  // role:subtask keys still to ack
             bool aborted{false};
-            bool committed{false};
         };
         std::unordered_map<std::uint64_t, std::unordered_map<std::string, CheckpointGroupState>>
             commit_group_progress;

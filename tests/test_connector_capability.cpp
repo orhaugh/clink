@@ -357,8 +357,8 @@ TEST_F(ConnectorCapabilityTest, SinkOnlyPipelineWithNoSinksStillReportsSomething
 // Every step of the analysis before this reasons about connectors one at
 // a time and takes the weakest, so two strong sinks produce a strong
 // answer - and per-sink exactly-once does not compose into job-level
-// atomicity. A failure between two independent commits publishes one and
-// not the other, with both sinks still correctly exactly-once on their own.
+// atomicity. A failure between two commits can publish one and not the
+// other, with both sinks still correctly exactly-once on their own.
 
 bool mentions(const GuaranteeReport& r, std::string_view needle) {
     return std::any_of(r.warnings.begin(), r.warnings.end(), [needle](const std::string& w) {
@@ -366,7 +366,21 @@ bool mentions(const GuaranteeReport& r, std::string_view needle) {
     });
 }
 
-TEST_F(ConnectorCapabilityTest, TwoUngroupedTransactionalSinksAreFlaggedAsNonAtomic) {
+// These four cases changed shape once the engine was measured rather than
+// read. The warning used to fire only on UNGROUPED sinks, saying they
+// "commit INDEPENDENTLY" and prescribing a commit_group. Running a two-sink
+// job with and without a group showed identical per-checkpoint agreement
+// (tests/integration/test_commit_group_atomicity.cpp): commit is one
+// per-checkpoint job-wide broadcast after every subtask acks, so grouping
+// changes nothing here. The old assertions were faithful to the old
+// comments and wrong about the code, and the prescription sent operators to
+// set an option that does not do what they were told.
+//
+// So the warning now fires on sink count alone, and these tests assert the
+// residual limitation that IS real: the commits are not atomic with each
+// other, and a restart is what repairs a split.
+
+TEST_F(ConnectorCapabilityTest, TwoTransactionalSinksAreFlaggedAsNonAtomic) {
     PipelineFacts f;
     f.connectors = {src("file"),
                     snk_grouped("file_2pc", "", "_a", {"dir"}),
@@ -381,39 +395,57 @@ TEST_F(ConnectorCapabilityTest, TwoUngroupedTransactionalSinksAreFlaggedAsNonAto
     EXPECT_EQ(r.level, EndToEndGuarantee::EndToEndExactlyOnce) << r.render_text();
     EXPECT_TRUE(r.acceptable());
 
-    EXPECT_TRUE(mentions(r, "commit INDEPENDENTLY"))
-        << "two independent transactional sinks were reported as end-to-end exactly-once with "
-           "nothing said about cross-sink atomicity: "
+    EXPECT_TRUE(mentions(r, "NOT atomic"))
+        << "two transactional sinks were reported as end-to-end exactly-once with nothing said "
+           "about cross-sink atomicity: "
         << r.render_text();
-    EXPECT_TRUE(mentions(r, "commit_group"))
-        << "the warning does not say how to fix it: " << r.render_text();
+    EXPECT_TRUE(mentions(r, "restart"))
+        << "the warning does not say what resolves a split: " << r.render_text();
     EXPECT_TRUE(mentions(r, "file_2pc_sink_a") && mentions(r, "file_2pc_sink_b"))
         << "the warning does not name the sinks: " << r.render_text();
 }
 
-TEST_F(ConnectorCapabilityTest, TransactionalSinksSharingACommitGroupAreNotFlagged) {
+TEST_F(ConnectorCapabilityTest, TheWarningDoesNotPrescribeACommitGroupAsTheFix) {
+    // The specific regression to keep out. A commit_group does not make
+    // two sinks' commits atomic, so telling an operator to set one is
+    // advice that cannot work - worse than saying nothing, because it
+    // reads as a resolved issue.
     PipelineFacts f;
     f.connectors = {src("file"),
-                    snk_grouped("file_2pc", "atomic-out", "_a", {"dir"}),
-                    snk_grouped("file_2pc", "atomic-out", "_b", {"dir"})};
+                    snk_grouped("file_2pc", "", "_a", {"dir"}),
+                    snk_grouped("file_2pc", "", "_b", {"dir"})};
     f.checkpointing_enabled = true;
     f.durable_state_backend = true;
     const auto r = analyse_pipeline(f);
-    EXPECT_EQ(r.level, EndToEndGuarantee::EndToEndExactlyOnce);
-    EXPECT_FALSE(mentions(r, "commit INDEPENDENTLY"))
-        << "sinks that DO commit as a unit were warned about anyway: " << r.render_text();
+    EXPECT_FALSE(mentions(r, "Set the same commit_group"))
+        << "the warning prescribes a commit_group, which does not deliver cross-sink commit "
+           "atomicity in this engine: "
+        << r.render_text();
+    EXPECT_TRUE(mentions(r, "commit_group does"))
+        << "the warning should say outright that a commit_group does not fix this, since the "
+           "option exists and an operator will reach for it: "
+        << r.render_text();
 }
 
-TEST_F(ConnectorCapabilityTest, TransactionalSinksInDifferentGroupsAreFlagged) {
-    // Grouped is not the same as grouped TOGETHER. Two sinks in two
-    // groups still commit independently of each other.
-    PipelineFacts f;
-    f.connectors = {src("file"),
-                    snk_grouped("file_2pc", "group-a", "_a", {"dir"}),
-                    snk_grouped("file_2pc", "group-b", "_b", {"dir"})};
-    f.checkpointing_enabled = true;
-    f.durable_state_backend = true;
-    EXPECT_TRUE(mentions(analyse_pipeline(f), "commit INDEPENDENTLY"));
+TEST_F(ConnectorCapabilityTest, GroupingDoesNotSilenceTheCrossSinkWarning) {
+    // Grouped, and grouped separately, both still warn. Gating the warning
+    // on grouping would hide a live limitation from exactly the jobs whose
+    // authors thought they had addressed it.
+    for (const auto& [group_a, group_b] :
+         {std::pair{"atomic-out", "atomic-out"}, std::pair{"group-a", "group-b"}}) {
+        PipelineFacts f;
+        f.connectors = {src("file"),
+                        snk_grouped("file_2pc", group_a, "_a", {"dir"}),
+                        snk_grouped("file_2pc", group_b, "_b", {"dir"})};
+        f.checkpointing_enabled = true;
+        f.durable_state_backend = true;
+        const auto r = analyse_pipeline(f);
+        EXPECT_EQ(r.level, EndToEndGuarantee::EndToEndExactlyOnce);
+        EXPECT_TRUE(mentions(r, "NOT atomic"))
+            << "groups '" << group_a << "'/'" << group_b
+            << "' silenced the cross-sink warning, but grouping does not change the exposure: "
+            << r.render_text();
+    }
 }
 
 TEST_F(ConnectorCapabilityTest, ASingleTransactionalSinkIsNotFlagged) {
@@ -423,7 +455,7 @@ TEST_F(ConnectorCapabilityTest, ASingleTransactionalSinkIsNotFlagged) {
     f.connectors = {src("file"), snk("file_2pc", {"dir"})};
     f.checkpointing_enabled = true;
     f.durable_state_backend = true;
-    EXPECT_FALSE(mentions(analyse_pipeline(f), "commit INDEPENDENTLY"));
+    EXPECT_FALSE(mentions(analyse_pipeline(f), "NOT atomic"));
 }
 
 TEST_F(ConnectorCapabilityTest, ANonTransactionalSecondSinkIsNotFlagged) {
@@ -434,7 +466,7 @@ TEST_F(ConnectorCapabilityTest, ANonTransactionalSecondSinkIsNotFlagged) {
     f.connectors = {src("file"), snk("file_2pc", {"dir"}), snk("file")};
     f.checkpointing_enabled = true;
     f.durable_state_backend = true;
-    EXPECT_FALSE(mentions(analyse_pipeline(f), "commit INDEPENDENTLY"));
+    EXPECT_FALSE(mentions(analyse_pipeline(f), "NOT atomic"));
 }
 
 }  // namespace

@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "clink/metrics/state_metrics.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/state/snapshot_arrow_writer.hpp"
 
 #ifndef CLINK_HAS_ARROW
@@ -154,6 +155,7 @@ void InMemoryStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg
     }
 
     const bool apply_filter = !kg_filter.covers_all();
+    std::uint64_t dropped_out_of_range = 0;
     std::shared_ptr<arrow::RecordBatch> batch;
     while (true) {
         if (auto s = reader->ReadNext(&batch); !s.ok()) {
@@ -184,6 +186,15 @@ void InMemoryStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg
             if (apply_filter && klen > 0 && static_cast<KeyGroup>(kptr[0]) < kNumKeyGroups) {
                 const auto kg = static_cast<KeyGroup>(kptr[0]);
                 if (!kg_filter.contains(kg)) {
+                    // Counted, not merely skipped. During a rescale this is
+                    // correct and expected - a subtask reads a parent's
+                    // snapshot and keeps its own share. Outside one it is
+                    // state loss: the entry was written by a subtask that did
+                    // not own its key group, so no subtask will ever restore
+                    // it. The caller knows which case it is; this only has to
+                    // make the number visible rather than discard it in
+                    // silence, which is how F38 hid.
+                    ++dropped_out_of_range;
                     continue;
                 }
             }
@@ -215,6 +226,21 @@ void InMemoryStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg
             }
             slot[std::move(key)] = std::move(val);
         }
+    }
+    if (dropped_out_of_range > 0) {
+        clink::metrics::state::restore_keys_dropped("in_memory", dropped_out_of_range);
+        clink::log::warn("state.restore",
+                         "restore discarded " + std::to_string(dropped_out_of_range) +
+                             " keyed entries whose key group falls outside this subtask's "
+                             "assigned range [" +
+                             std::to_string(static_cast<unsigned>(kg_filter.first)) + ", " +
+                             std::to_string(static_cast<unsigned>(kg_filter.last)) +
+                             "). During a rescale that is correct - a subtask keeps only its "
+                             "share of a parent's snapshot. Outside one it is state LOSS: those "
+                             "entries were written by a subtask that did not own their key group, "
+                             "so no subtask will restore them, and this job has resumed with a "
+                             "hole in its state. The usual cause is an operator keeping keyed "
+                             "state on a stream that was never key-partitioned.");
     }
     const auto dt =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)

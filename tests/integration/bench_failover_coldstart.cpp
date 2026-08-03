@@ -215,7 +215,12 @@ std::uint64_t latest_completed_checkpoint(const fs::path& ckpt_dir) {
     if (!fs::exists(ckpt_dir)) {
         return 0;
     }
-    for (const auto& e : fs::directory_iterator(ckpt_dir)) {
+    // Recursive: markers are job-scoped under <ckpt_dir>/_jobs/<job_id>/.
+    std::error_code scan_ec;
+    for (const auto& e : fs::recursive_directory_iterator(ckpt_dir, scan_ec)) {
+        if (scan_ec) {
+            break;
+        }
         if (!e.is_regular_file()) {
             continue;
         }

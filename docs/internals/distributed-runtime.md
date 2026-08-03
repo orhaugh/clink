@@ -158,7 +158,7 @@ Whether a restart is attempted is gated by `effective_max_restarts(job.checkpoin
 
 ### Checkpoint coordination
 
-The coordinator owns a `checkpoint_trigger_loop_` thread. For each job with a checkpoint directory and a positive `interval_ms`, it allocates the next checkpoint id, seeds a pending-ack set from the live task set, and broadcasts `TriggerCheckpoint` to every worker hosting the job. Each worker injects a barrier into its source subtasks; as subtasks snapshot they reply `SubtaskCheckpointed`. When the pending set for an id empties, the coordinator writes a `COMPLETED-<id>` marker under the checkpoint dir and advances `latest_completed_checkpoint_id`. Sinks implementing two-phase commit then receive `CommitCheckpoint` (or `AbortCheckpoint` if a commit group could not commit atomically). Bounded sources at clean end-of-stream use `RequestFinalCheckpoint`/`FinalCheckpointAssigned` to obtain one job-wide final checkpoint id so the post-last-checkpoint tail is durably committed before completion. The barrier mechanics and 2PC sink protocol are covered in [./checkpointing.md](./checkpointing.md).
+The coordinator owns a `checkpoint_trigger_loop_` thread. For each job with a checkpoint directory and a positive `interval_ms`, it allocates the next checkpoint id, seeds a pending-ack set from the live task set, and broadcasts `TriggerCheckpoint` to every worker hosting the job. Each worker injects a barrier into its source subtasks; as subtasks snapshot they reply `SubtaskCheckpointed`. When the pending set for an id empties, the coordinator writes a `COMPLETED-<id>` marker under the checkpoint dir and advances `latest_completed_checkpoint_id`. Sinks implementing two-phase commit then receive `CommitCheckpoint` (or `AbortCheckpoint` if any subtask failed its snapshot). Bounded sources at clean end-of-stream use `RequestFinalCheckpoint`/`FinalCheckpointAssigned` to obtain one job-wide final checkpoint id so the post-last-checkpoint tail is durably committed before completion. The barrier mechanics and 2PC sink protocol are covered in [./checkpointing.md](./checkpointing.md).
 
 ### HA leader election
 
@@ -322,6 +322,25 @@ Worker (`Worker::Config`):
 - `checkpoint_num_retained` = 1 (clamped to >= 1); completed checkpoints kept per job.
 
 Per-job `CheckpointConfig` (`protocol.hpp`): `checkpoint_dir` (empty disables checkpointing), `interval_ms` (0 disables periodic triggers), `restore_from_dir` + `restore_from_checkpoint_id`, `max_restarts_on_worker_loss` (`kRestartAuto` resolves to self-heal when checkpointing is on, else fail-fast), `alignment` (default `Aligned`), and `state_backend_uri`.
+
+### Checking a configuration before deploying it
+
+`clink lint` (`tools/clink_lint.cpp`) applies the same checks a submission is
+gated on, without contacting a cluster. It takes the same flags as `clink run`
+and `clink_node`, so a command line can be pasted in as-is, and reports every
+setting that would be accepted and then ignored (`--checkpoint-interval-ms`
+with no `--checkpoint-dir`, a half-set restore pair, `--capture-records` with
+no `--capture-dir`) along with combinations that contradict each other.
+
+Exit codes rather than text are the interface: 0 clean, 1 at least one error,
+2 bad usage. Warnings print but do not fail the command - a gate that refuses
+legitimate deployments gets switched off.
+
+The flag parsing and `CheckpointConfig` assembly live in
+`tools/cli_config_args.hpp`, shared with `clink run`. That sharing is
+load-bearing: a linter that parsed flags its own way could reach a different
+verdict from the gate it claims to preview, and a clean lint would stop
+meaning the submission will be accepted.
 
 `clink_node` (`tools/clink_node.cpp`) flags: `--role={coordinator|worker}`, `--id` (worker), `--coordinator-host`/`--coordinator-port`, `--ha-dir`, `--etcd-endpoints`/`--etcd-cluster`/`--etcd-lease-ttl-s`, `--http-port`, `--slots`, `--sql-catalog-dir` (coordinator, see below), and TLS flags. The etcd path additionally requires building with the etcd impl (`CLINK_WITH_ETCD`, linked as `clink_etcd`).
 

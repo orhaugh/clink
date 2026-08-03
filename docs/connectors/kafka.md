@@ -109,7 +109,7 @@ Accepts `brokers`, `topic`, `client_id` (default `clink-sink-2pc`), `compression
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `transactional_id` | Yes | (none) | librdkafka `transactional.id`. Must be unique per producer instance. When `parallelism > 1` the factory appends the subtask index. |
-| `commit_group` | No | (none) | Declares commit-group membership so the coordinator can gate this sink's commit on its group peers. |
+| `commit_group` | No | (none) | Declares commit-group membership. Does NOT add cross-sink atomicity: a job's transactional sinks already commit on one per-checkpoint broadcast and abort together on any failed ack. Membership only advances when an abort is issued. See [../internals/checkpointing.md](../internals/checkpointing.md). |
 
 This factory does not parse `acks`; the transactional producer is configured with `enable.idempotence=true` by the underlying sink.
 

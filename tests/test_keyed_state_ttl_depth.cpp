@@ -33,6 +33,21 @@ using namespace std::chrono_literals;
 
 constexpr OperatorId kOp{11};
 
+// Processing time is injected where a case needs it to move. A sleep can only
+// ever prove "the TTL had not fired yet after 20ms", which is close to
+// nothing; a controlled clock can advance an hour and prove an event-time TTL
+// genuinely ignores processing time. Named distinctively - identically-named
+// helpers in two anonymous namespaces in one binary have collided here.
+std::int64_t g_ttl_depth_fake_now_ms = 5'000'000;
+
+std::int64_t ttl_depth_fake_clock() {
+    return g_ttl_depth_fake_now_ms;
+}
+
+void depth_advance(std::chrono::milliseconds by) {
+    g_ttl_depth_fake_now_ms += by.count();
+}
+
 KeyedState<std::int64_t, std::string> slot(StateBackend& b,
                                            TtlConfig cfg,
                                            const std::string& name = "s") {
@@ -40,7 +55,10 @@ KeyedState<std::int64_t, std::string> slot(StateBackend& b,
 }
 
 TtlConfig event_time(std::chrono::milliseconds ttl) {
-    return TtlConfig{.ttl = ttl, .refresh_on_write = true, .domain = TtlTimeDomain::EventTime};
+    return TtlConfig{.ttl = ttl,
+                     .refresh_on_write = true,
+                     .domain = TtlTimeDomain::EventTime,
+                     .clock_ms = &ttl_depth_fake_clock};
 }
 
 // Count entries physically present in the backend for this operator. The
@@ -62,10 +80,12 @@ TEST(KeyedStateTtlDepth, EventTimeExpiryFollowsTheWatermarkNotTheWallClock) {
     s.put(1, "v");
     ASSERT_TRUE(s.get(1).has_value());
 
-    // Wall clock moves; the watermark does not. A processing-time TTL of
-    // 1 s would be at risk here; an event-time one must not be.
-    std::this_thread::sleep_for(20ms);
-    EXPECT_TRUE(s.get(1).has_value()) << "event-time TTL expired against the wall clock";
+    // Processing time moves; the watermark does not. This used to sleep 20ms
+    // against a 1s TTL, which no correct OR incorrect implementation would
+    // have failed. An hour is the statement actually worth making.
+    depth_advance(1h);
+    EXPECT_TRUE(s.get(1).has_value())
+        << "an event-time TTL expired against processing time after an hour of it";
 
     // Watermark to just before the deadline: still live.
     s.advance_watermark(10'999);
@@ -348,10 +368,10 @@ TEST(KeyedStateTtlDepth, ALateRecordTargetingExpiredStateSeesNothing) {
 TEST(KeyedStateTtlDepth, ProcessingTimeRemainsTheDefaultAndIsUnchanged) {
     InMemoryStateBackend b;
     // Default domain, so a watermark is irrelevant.
-    auto s = slot(b, TtlConfig{.ttl = 50ms});
+    auto s = slot(b, TtlConfig{.ttl = 50ms, .clock_ms = &ttl_depth_fake_clock});
     s.put(1, "v");
     EXPECT_TRUE(s.get(1).has_value());
-    std::this_thread::sleep_for(80ms);
+    depth_advance(80ms);
     EXPECT_FALSE(s.get(1).has_value());
 }
 

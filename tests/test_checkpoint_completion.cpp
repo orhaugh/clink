@@ -284,7 +284,8 @@ JobGraphSpec two_subtask_graph(const std::filesystem::path& out) {
 std::filesystem::path written_marker_path(const std::filesystem::path& checkpoint_dir,
                                           JobId job_id,
                                           std::uint64_t ckpt_id) {
-    return checkpoint_dir / std::to_string(job_id) / ("COMPLETED-" + std::to_string(ckpt_id));
+    return checkpoint_dir / "_jobs" / std::to_string(job_id) /
+           ("COMPLETED-" + std::to_string(ckpt_id));
 }
 
 // A cluster with one fake worker and one submitted job, ready to be told
@@ -383,12 +384,12 @@ struct CheckpointFixture {
     CheckpointFixture(const CheckpointFixture&) = delete;
     CheckpointFixture& operator=(const CheckpointFixture&) = delete;
 
-    // <checkpoint_dir>/<job_id>/COMPLETED-<id>: the path recovery reads,
+    // <checkpoint_dir>/_jobs/<job_id>/COMPLETED-<id>: the path recovery reads,
     // and - since F29 - the path the coordinator writes.
     [[nodiscard]] bool marker_exists(JobId job_id, std::uint64_t ckpt_id) const {
         std::error_code ec;
         return std::filesystem::exists(
-            dir / std::to_string(job_id) / ("COMPLETED-" + std::to_string(ckpt_id)), ec);
+            dir / "_jobs" / std::to_string(job_id) / ("COMPLETED-" + std::to_string(ckpt_id)), ec);
     }
 
     std::filesystem::path dir;
@@ -492,7 +493,7 @@ TEST(CheckpointCompletion, TheRecoveryPointSurvivesALaterFailedCheckpoint) {
 
 // The marker is written flat at <checkpoint_dir>/COMPLETED-N. The recovery
 // lookup (latest_completed_id_on_disk) reads
-// <checkpoint_dir>/<job_id>/COMPLETED-N. Those cannot both be right.
+// <checkpoint_dir>/_jobs/<job_id>/COMPLETED-N. Those cannot both be right.
 //
 // A code reading says recovery must therefore always resolve to 0 and
 // restore a job from scratch, throwing away every completed checkpoint.
@@ -585,7 +586,7 @@ TEST(CheckpointCompletion, RecoveryRestoresFromTheLastCompletedCheckpoint) {
             << " when checkpoint " << completed
             << " had completed and its marker is on disk. The marker is written to "
             << written_marker_path(ckpt_dir, job_id, completed).string()
-            << " and the recovery lookup reads <checkpoint_dir>/<job_id>/COMPLETED-N; every "
+            << " and the recovery lookup reads <checkpoint_dir>/_jobs/<job_id>/COMPLETED-N; every "
                "completed checkpoint is invisible to recovery and the job restarts from "
                "scratch.";
 

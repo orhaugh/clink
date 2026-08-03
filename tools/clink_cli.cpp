@@ -37,6 +37,7 @@ int clink_cmd_rescale(int argc, char** argv);
 int clink_cmd_rescale_op(int argc, char** argv);
 int clink_cmd_list(int argc, char** argv);
 int clink_cmd_checkpoint_verify(int argc, char** argv);
+int clink_cmd_lint(int argc, char** argv);
 
 namespace {
 
@@ -67,6 +68,9 @@ void usage() {
         << "  list              List active and recently-completed jobs (alias of  list).\n"
         << "  checkpoint-verify Verify a checkpoint directory's integrity; --repair mints\n"
         << "                    sidecars for a directory written before they existed.\n"
+        << "  lint              Check a job/cluster configuration for settings that will be\n"
+        << "                    ignored or that contradict each other. No cluster needed;\n"
+        << "                    exits 1 on anything submission would refuse.\n"
         << "\n"
         << "Flags:\n"
         << "  --capabilities        What THIS BINARY can do: connectors compiled in, their\n"
@@ -176,6 +180,9 @@ int main(int argc, char** argv) {
     }
     if (cmd == "list") {
         return clink_cmd_list(sub_argc, sub_argv);
+    }
+    if (cmd == "lint") {
+        return clink_cmd_lint(sub_argc, sub_argv);
     }
     if (cmd == "checkpoint-verify") {
         return clink_cmd_checkpoint_verify(sub_argc, sub_argv);

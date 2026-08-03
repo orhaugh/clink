@@ -364,7 +364,20 @@ TEST(HttpSql, CompileReturnsParallelisedSpec) {
                                      "INSERT INTO d SELECT a FROM s WHERE b > 5;");
     EXPECT_EQ(resp.status, 200) << resp.body;
     EXPECT_NE(resp.body.find("\"specs\""), std::string::npos) << resp.body;
-    EXPECT_NE(resp.body.find("\"ops\""), std::string::npos) << resp.body;
+    // The graph is carried as an ESCAPED JSON string under spec_json, so the
+    // ops appear as \"ops\" rather than "ops". This asserted the unescaped
+    // form and had been failing since the response started nesting the spec -
+    // unnoticed, because the broad integration label ran advisory (W24).
+    EXPECT_NE(resp.body.find("\"spec_json\""), std::string::npos)
+        << "compile did not return a spec at all: " << resp.body;
+    EXPECT_NE(resp.body.find("\\\"ops\\\""), std::string::npos)
+        << "the returned spec carries no operators: " << resp.body;
+    // And the thing the test is NAMED for, which neither assertion above
+    // covered: ?parallelism=3 must actually reach the compiled operators. A
+    // spec that came back at parallelism 1 satisfied the old assertions
+    // completely.
+    EXPECT_NE(resp.body.find("\\\"parallelism\\\":3"), std::string::npos)
+        << "the requested parallelism did not reach the compiled spec: " << resp.body;
 }
 
 TEST(HttpSql, RejectsBadSqlWithPosition) {

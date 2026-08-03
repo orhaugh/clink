@@ -799,6 +799,16 @@ clink_node --role=worker --coordinator-host=127.0.0.1 --coordinator-port=6123 &
 clink run --coordinator 127.0.0.1:6123 ./my_job.so
 ```
 
+`clink lint` checks a configuration before anything is deployed. It takes the
+same flags, contacts no cluster, and exits non-zero on anything a submission
+would refuse - a checkpoint interval with no checkpoint directory, a half-set
+restore pair, a `production` profile with no durable state store:
+
+```bash
+clink lint --checkpoint-dir=/var/lib/clink/ckpt --checkpoint-interval-ms=5000 \
+           --max-restarts-on-worker-loss=3
+```
+
 ```cpp
 #include <clink/api/builtin_connectors.hpp>
 #include <clink/api/pipeline.hpp>

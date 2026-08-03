@@ -1,0 +1,211 @@
+# Prometheus alerting rules for a clink cluster.
+#
+# Every expression here uses a series clink actually exports. Nothing is
+# aspirational: if a rule references a metric, that metric is emitted by
+# `include/clink/metrics/*.hpp` and rendered by the coordinator's and
+# workers' /metrics endpoints. Metric names are asserted against this file by
+# tests/test_alert_rules.cpp, so a renamed metric fails the build rather than
+# silently disabling an alert - the failure mode that makes shipped alert
+# rules worse than none.
+#
+# Thresholds are the part you should change. They are deliberate but they are
+# defaults, and the right value for `CheckpointsStalled` is a function of your
+# checkpoint interval, not of clink. Each rule says what it assumes.
+#
+# Load with:
+#   rule_files:
+#     - /etc/prometheus/rules/clink-alerts.yaml
+
+groups:
+  - name: clink.checkpointing
+    rules:
+      # The canonical streaming alert. A stalled checkpoint is not visible in
+      # a completion COUNTER - a counter that has stopped moving looks
+      # identical to an idle job - which is why clink exports the completion
+      # TIMESTAMP as a gauge. The recovery window grows for exactly as long
+      # as this is true.
+      #
+      # Threshold assumes a checkpoint interval of 60s or less. Set it to a
+      # small multiple of your interval: too tight and a slow checkpoint
+      # pages someone, too loose and hours of replay accumulate unnoticed.
+      - alert: ClinkCheckpointsStalled
+        expr: time() - clink_ckpt_last_completed_unix_seconds > 300
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No checkpoint has completed for over 5 minutes"
+          description: >-
+            {{ $labels.instance }} last completed a checkpoint
+            {{ $value | humanizeDuration }} ago. Recovery would replay from
+            that point, and the window is still growing. Check for a subtask
+            that cannot snapshot (clink_ckpt_subtask_snapshot_failure_total)
+            and for a backpressured operator holding up barrier alignment.
+
+      # A checkpoint that never completes and one that is never triggered
+      # both leave the gauge stale, so this separates them: triggers firing
+      # with no completions means the barrier is not making it round.
+      - alert: ClinkCheckpointsFailing
+        expr: |
+          rate(clink_ckpt_failed_total[15m]) > 0
+          and rate(clink_ckpt_completed_total[15m]) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Checkpoints are failing and none are completing"
+          description: >-
+            Every checkpoint in the last 15 minutes failed. A failed
+            checkpoint writes no COMPLETED marker and leaves the recovery
+            point where it was, so this is the stalled case with a known
+            cause. Look at clink_ckpt_subtask_snapshot_failure_total for
+            which subtask could not snapshot.
+
+      # The tail, not the mean. A job whose checkpoints usually take 200ms
+      # and occasionally take 40s has a healthy mean and a broken tail, and
+      # the tail is what eats the interval.
+      #
+      # Assumes a 60s interval: a p99 duration above a third of the interval
+      # means checkpoints are starting to overlap their own cadence.
+      - alert: ClinkCheckpointDurationP99High
+        expr: |
+          histogram_quantile(0.99, rate(clink_ckpt_duration_ms_bucket[15m])) > 20000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 checkpoint duration above 20s"
+          description: >-
+            The slowest 1% of checkpoints on {{ $labels.instance }} take
+            {{ $value }}ms. Below the interval, so nothing has stalled yet;
+            above it, checkpoints queue and the recovery window grows.
+
+  - name: clink.cluster
+    rules:
+      - alert: ClinkWorkerLost
+        expr: increase(clink_coordinator_workers_lost_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A worker was declared lost"
+          description: >-
+            {{ $value }} worker(s) lost in the last 10 minutes. One is a
+            restart; a repeating count is a crash loop or a heartbeat timeout
+            set too tight for the network.
+
+      # Restarts are the self-healing path working. A SUSTAINED restart rate
+      # is that path failing to converge, which is a different thing and the
+      # one worth waking someone for.
+      - alert: ClinkJobRestartLoop
+        expr: increase(clink_coordinator_job_restarts_total[30m]) > 5
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A job is restarting repeatedly"
+          description: >-
+            {{ $value }} job restarts in 30 minutes. Each one replays from
+            the last completed checkpoint, so a loop makes no forward
+            progress while consuming full throughput.
+
+      - alert: ClinkNoSlotCapacity
+        expr: |
+          clink_coordinator_slots_capacity > 0
+          and clink_coordinator_slots_in_use >= clink_coordinator_slots_capacity
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Every slot in the cluster is in use"
+          description: >-
+            No spare capacity, so a submission is rejected or waits and a
+            lost worker cannot be replaced. Add workers before the next
+            failure rather than during it.
+
+      # Fencing rejects control frames from a superseded coordinator. Any
+      # sustained count means two coordinators believe they are leader, or a
+      # partitioned one is still issuing commands.
+      - alert: ClinkFencedFrames
+        expr: increase(clink_worker_fenced_frames_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Workers are rejecting frames from a superseded coordinator"
+          description: >-
+            {{ $value }} fenced frame(s) in 10 minutes on
+            {{ $labels.instance }}. The fencing is doing its job - this is
+            not data loss - but it means a coordinator that lost leadership
+            is still trying to act.
+
+      - alert: ClinkProtocolMismatch
+        expr: increase(clink_protocol_mismatches_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A peer was rejected for an incompatible protocol version"
+          description: >-
+            Almost always a partial upgrade: a node running a build outside
+            the negotiated compatible range cannot join. It will keep
+            retrying and will never succeed.
+
+      # Non-zero outside a rescale window means a restore threw keyed state
+      # away: entries were written by a subtask that did not own their key
+      # group, so nothing will ever restore them and the job resumed with a
+      # hole in its state. During a rescale the same discard is correct, so
+      # this warns rather than pages and says which case to check.
+      - alert: ClinkRestoreDiscardedKeyedState
+        expr: increase(clink_state_restore_keys_dropped_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A restore discarded keyed state"
+          description: >-
+            {{ $value }} keyed entries were discarded on restore at
+            {{ $labels.instance }} because their key group fell outside the
+            restoring subtask's range. Expected during a rescale. Outside
+            one it is state loss, and the usual cause is an operator keeping
+            keyed state on a stream that was never key-partitioned.
+
+  - name: clink.health
+    rules:
+      - alert: ClinkSubtaskFailures
+        expr: increase(clink_worker_subtasks_failed_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Subtasks are failing on a worker"
+          description: >-
+            {{ $value }} subtask failure(s) on {{ $labels.instance }} in 15
+            minutes. Whether the job survives depends on its restart budget;
+            the failures themselves are worth reading either way.
+
+      - alert: ClinkMalformedFrames
+        expr: increase(clink_malformed_frames_total[10m]) > 10
+        labels:
+          severity: warning
+        annotations:
+          summary: "Malformed frames arriving on the control plane"
+          description: >-
+            The frame reader is rejecting input rather than trusting it,
+            which is the intended behaviour. A sustained rate means either a
+            misconfigured client or something scanning the port.
+
+      # The gauges are labelled by volume - `workdir` always, and
+      # `checkpoint` when the node has a checkpoint or HA path (which is the
+      # one that matters). The division matches on all labels, so each
+      # volume is evaluated against its own total rather than another's.
+      - alert: ClinkDiskFillingWhereStateLives
+        expr: |
+          clink_disk_free_bytes / clink_disk_total_bytes < 0.10
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Under 10% disk free on a clink volume"
+          description: >-
+            Volume {{ $labels.volume }} on {{ $labels.instance }} is
+            {{ $value | humanizePercentage }} free. A checkpoint that cannot
+            be written fails, and clink withholds the completed marker rather
+            than committing sinks against a checkpoint that does not exist -
+            so the job stops making durable progress before it stops
+            running.

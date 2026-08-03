@@ -1,7 +1,6 @@
 #include "clink/connectors/delivery_guarantee.hpp"
 
 #include <algorithm>
-#include <set>
 #include <sstream>
 
 namespace clink::connectors {
@@ -274,22 +273,38 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
 
     // ---- 6b. Cross-sink atomicity.
     //
-    // Per-sink exactly-once does not compose. Two transactional sinks that
-    // commit independently can be left disagreeing by a failure between
-    // their commits - one published, one not - and each sink is still,
-    // correctly, exactly-once on its own. Nothing above notices, because
-    // every step so far reasons about connectors one at a time and takes
-    // the weakest; two strong sinks produce a strong answer.
-    //
-    // A warning rather than a downgrade or a rejection. For many jobs two
-    // independent outputs are exactly what was wanted and their mutual
-    // consistency is not a property anyone needs; refusing those would be
-    // wrong. What must not happen is reporting end-to-end exactly-once
+    // Per-sink exactly-once does not compose into job-level atomicity, and
+    // nothing above notices: every step so far reasons about connectors one
+    // at a time and takes the weakest, so two strong sinks produce a strong
+    // answer. What must not happen is reporting end-to-end exactly-once
     // while leaving the reader to work out that it is per sink.
+    //
+    // This warning used to say the sinks "commit INDEPENDENTLY" unless they
+    // shared a commit_group, and to prescribe a commit_group as the fix.
+    // Both halves were wrong, and the fix was worse than the omission - it
+    // sent operators to change a setting that changes nothing. What the
+    // engine actually does: the coordinator broadcasts commit per
+    // checkpoint, job-wide, only after every subtask acked ok, and one
+    // failed ack aborts that checkpoint for every sink. So a job's
+    // transactional sinks are told to commit together whether or not they
+    // share a group, and a commit_group adds no atomicity here (see
+    // Coordinator::CheckpointGroupState). Established by running a
+    // two-sink job both ways, not by reading the option:
+    // tests/integration/test_commit_group_atomicity.cpp.
+    //
+    // The residual limitation is real but different, and grouping does not
+    // touch it. Being TOLD to commit together is not committing atomically:
+    // one sink can finish its commit and another's worker can die before
+    // finishing its own. That split is repaired on restart, when a sink
+    // bridges its staged-but-uncommitted transactions against the
+    // COMPLETED-N marker. A job that never restarts - restart budget
+    // exhausted, or abandoned - keeps the split.
+    //
+    // Still a warning rather than a downgrade or rejection: for many jobs
+    // two outputs are wanted and their mutual consistency is nobody's
+    // requirement, and the level is not wrong - each sink is exactly-once.
     if (r.level == EndToEndGuarantee::EndToEndExactlyOnce) {
         std::vector<std::string> transactional_sinks;
-        std::set<std::string> unique_groups;
-        bool any_ungrouped = false;
         for (const auto& c : facts.connectors) {
             if (c.is_source) {
                 continue;
@@ -303,13 +318,12 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
                 continue;
             }
             transactional_sinks.push_back(c.op_type);
-            if (c.commit_group.empty()) {
-                any_ungrouped = true;
-            } else {
-                unique_groups.insert(c.commit_group);
-            }
         }
-        if (transactional_sinks.size() > 1 && (any_ungrouped || unique_groups.size() > 1)) {
+        // Fires on sink count alone. Grouping is deliberately not consulted:
+        // it does not change the exposure, so gating the warning on it would
+        // silence a live limitation for the jobs that set an option which
+        // does nothing.
+        if (transactional_sinks.size() > 1) {
             std::string names;
             for (std::size_t i = 0; i < transactional_sinks.size(); ++i) {
                 names += (i > 0 ? ", " : "") + transactional_sinks[i];
@@ -317,10 +331,14 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
             r.warnings.emplace_back(
                 "this job has " + std::to_string(transactional_sinks.size()) +
                 " transactional sinks (" + names +
-                ") that do not all share one commit_group, so they commit INDEPENDENTLY. Each is "
-                "exactly-once on its own, but a failure between their commits can publish some "
-                "and not others, leaving the outputs disagreeing. Set the same "
-                "commit_group='<name>' on all of them if they must commit as a unit.");
+                "). Each is exactly-once on its own, and clink commits them together: commit is "
+                "broadcast per checkpoint once every subtask has acked, and one failed ack aborts "
+                "that checkpoint for all of them. What is NOT atomic is the commits themselves - "
+                "one sink can finish committing and another lose its worker before finishing, "
+                "leaving the outputs briefly disagreeing about the last checkpoint. A restart "
+                "repairs it by resolving staged transactions against the completed-checkpoint "
+                "marker; a job that never restarts keeps the disagreement. A commit_group does "
+                "NOT change this, and setting one to avoid it will not work.");
         }
     }
 

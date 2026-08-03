@@ -163,7 +163,7 @@ A value of `0` is reserved (the default-constructed sentinel), so derivation map
 | `Source<Out>` | autonomous producer; `produce`, `is_bounded`, `split_count`, offset snapshot/restore |
 | `Operator<In, Out>` | single-input operator; `process`, columnar + async opt-ins, timer + barrier hooks |
 | `CoOperator<In1, In2, Out>` | two-input operator; `process_element1/2`, shared emitter, aligned inputs |
-| `Sink<In>` | terminal consumer; `on_data`, `on_commit`/`on_abort` for 2PC, commit groups |
+| `Sink<In>` | terminal consumer; `on_data`, `on_commit`/`on_abort` for 2PC, commit-group declaration (informational; nothing in the engine reads it - the coordinator groups from op params) |
 | `ChainedOperator<A, B, C>` | fuses two adjacent operators with zero-channel forwarding |
 | `OperatorId` / `operator_id_from_uid` | stable strong-typed operator identity |
 | `Dag` | owns operators, channels and runners; the `add_*` topology builders |

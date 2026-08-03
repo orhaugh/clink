@@ -6,8 +6,10 @@
 //   - checkpoints_triggered_total      : coordinator-side trigger fires
 //   - checkpoints_completed_total      : all-acked completions
 //   - checkpoints_failed_total         : aborted / hit max retries
-//   - checkpoint_duration_ms_sum/count : end-to-end coordinator trigger -> all
-//                                        acked, aggregated
+//   - checkpoint_duration_ms_{bucket,sum,count} : end-to-end coordinator
+//                                        trigger -> all acked, as a
+//                                        histogram so a p99 is available and
+//                                        not just a mean
 //   - barrier_alignments_total         : per-operator successful
 //                                        alignments (every alive
 //                                        input delivered the same
@@ -36,6 +38,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/metrics/operator_metrics.hpp"
@@ -65,8 +68,26 @@ inline constexpr const char* kCheckpointFailed = "clink_ckpt_failed_total";
 // This changes exactly when the event happens.
 inline constexpr const char* kCheckpointLastCompletedUnixSeconds =
     "clink_ckpt_last_completed_unix_seconds";
-inline constexpr const char* kCheckpointDurationMsSum = "clink_ckpt_duration_ms_sum";
-inline constexpr const char* kCheckpointDurationMsCount = "clink_ckpt_duration_ms_count";
+// Checkpoint duration as a histogram rather than a counter pair.
+//
+// The exposition is unchanged where it already existed: a histogram named
+// `clink_ckpt_duration_ms` renders `_sum` and `_count` under exactly the
+// names the two counters used, so every existing query keeps working. What
+// it adds is `_bucket{le}`, and with it a p99 - which is the number that
+// matters here, because the mean of a checkpoint duration hides precisely
+// the case worth alerting on. A job whose checkpoints usually take 200ms and
+// occasionally take 40s has a healthy-looking mean and a broken tail, and
+// the tail is what eats the interval and stalls the barrier.
+//
+// Buckets are milliseconds, ascending, spanning the range a checkpoint
+// plausibly occupies: sub-100ms for a small in-memory job, seconds for a
+// large RocksDB one, and a minute at the top because a checkpoint that slow
+// is the thing being hunted rather than an outlier to clip.
+inline constexpr const char* kCheckpointDurationMs = "clink_ckpt_duration_ms";
+
+inline std::vector<double> checkpoint_duration_buckets_ms() {
+    return {10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000};
+}
 inline constexpr const char* kSubtaskSnapshotAck = "clink_ckpt_subtask_snapshot_ack_total";
 inline constexpr const char* kSubtaskSnapshotFailure = "clink_ckpt_subtask_snapshot_failure_total";
 // Restore-from-savepoint latency histogram base (OBS-1b). Exposes
@@ -83,8 +104,7 @@ inline void init_checkpoint_metrics() {
     // series to evaluate on a fresh coordinator and silently does not fire -
     // which is the window where a broken job most needs the alert.
     (void)r.gauge(kCheckpointLastCompletedUnixSeconds);
-    (void)r.counter(kCheckpointDurationMsSum);
-    (void)r.counter(kCheckpointDurationMsCount);
+    (void)r.histogram(kCheckpointDurationMs, checkpoint_duration_buckets_ms());
     (void)r.counter(kSubtaskSnapshotAck);
     (void)r.counter(kSubtaskSnapshotFailure);
     (void)r.histogram(kRestoreFromSavepointNs);
@@ -97,8 +117,9 @@ inline void triggered() {
 }
 inline void completed(std::uint64_t duration_ms) {
     MetricsRegistry::global().counter(kCheckpointCompleted).increment();
-    MetricsRegistry::global().counter(kCheckpointDurationMsSum).increment(duration_ms);
-    MetricsRegistry::global().counter(kCheckpointDurationMsCount).increment();
+    MetricsRegistry::global()
+        .histogram(kCheckpointDurationMs, checkpoint_duration_buckets_ms())
+        .observe(static_cast<double>(duration_ms));
 }
 // Stamp the completion time. Called alongside completed(), not instead of
 // it: the counter answers "how many" and this answers "how recently", and

@@ -191,45 +191,70 @@ std::optional<Cluster> start_cluster(int n_workers) {
 
 }  // namespace
 
-TEST(HttpDashboard, CoordinatorRootServesDashboardHtml) {
+// These two cases asserted an embedded HTML dashboard - a title tag and an
+// `new EventSource('/api/v1/events')` bootstrap - that the coordinator no
+// longer serves and is not meant to. The console is a separate project
+// (clink-fe) mounted with --http-static-dir; without one, `/` answers with a
+// signpost so `curl host:8081/` tells a human where the API and metrics are
+// rather than returning 404.
+//
+// They had been failing since that change, unnoticed, because the broad
+// integration label ran advisory in CI (W24). Rewritten against the contract
+// that exists rather than deleted: `/` still has a job to do, and nothing
+// else covered it.
+TEST(HttpDashboard, CoordinatorRootSignpostsTheApiWhenNoConsoleIsMounted) {
     auto c = start_cluster(/*n_workers=*/0);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
     const auto r = http_get("127.0.0.1", c->coordinator_http_port, "/");
-    ASSERT_EQ(r.status, 200);
-    EXPECT_NE(r.content_type.find("text/html"), std::string::npos)
+    ASSERT_EQ(r.status, 200) << "`/` should answer, not 404: a human curling the port needs to be "
+                                "told where to go";
+    EXPECT_NE(r.content_type.find("application/json"), std::string::npos)
         << "content_type=" << r.content_type;
-    EXPECT_NE(r.body.find("<title>clink dashboard</title>"), std::string::npos)
-        << "missing title; body head: " << r.body.substr(0, 200);
-    // The SPA bootstraps an SSE connection to /api/v1/events; if this
-    // line ever moves out of the embedded HTML, the dashboard is broken.
-    EXPECT_NE(r.body.find("new EventSource('/api/v1/events')"), std::string::npos)
-        << "missing EventSource bootstrap";
+    // Each of these is a route an operator would otherwise have to guess.
+    EXPECT_NE(r.body.find("\"api\":\"/api/v1\""), std::string::npos)
+        << "signpost does not name the API root; body: " << r.body;
+    EXPECT_NE(r.body.find("\"metrics\":\"/metrics\""), std::string::npos)
+        << "signpost does not name the metrics endpoint; body: " << r.body;
+    EXPECT_NE(r.body.find("--http-static-dir"), std::string::npos)
+        << "signpost does not say how to mount a console, which is the one thing someone hitting "
+           "`/` expecting a UI needs to know; body: "
+        << r.body;
 }
 
-TEST(HttpDashboard, CoordinatorDashboardPathServesSameHtml) {
+TEST(HttpDashboard, TheSignpostIsNotServedWhereARealRouteExists) {
+    // The signpost is bound to `/` only. A path that no route claims must
+    // still 404 rather than absorb everything, or a typo'd API call would
+    // come back 200 with a signpost body and read as success.
     auto c = start_cluster(/*n_workers=*/0);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
     const auto root = http_get("127.0.0.1", c->coordinator_http_port, "/");
-    const auto dash = http_get("127.0.0.1", c->coordinator_http_port, "/dashboard");
     ASSERT_EQ(root.status, 200);
-    ASSERT_EQ(dash.status, 200);
-    EXPECT_EQ(root.body, dash.body) << "/ and /dashboard should serve the same HTML";
+
+    const auto missing = http_get("127.0.0.1", c->coordinator_http_port, "/no-such-route");
+    EXPECT_NE(missing.status, 200)
+        << "an unknown path returned 200; body: " << missing.body.substr(0, 200);
+
+    // And a real API route is untouched by it.
+    const auto api = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/workers");
+    EXPECT_EQ(api.status, 200) << "the API root stopped answering";
+    EXPECT_EQ(api.body.find("--http-static-dir"), std::string::npos)
+        << "the signpost body leaked into an API response";
 }
 
-TEST(HttpDashboard, WorkerRootDoesNotServeDashboard) {
+TEST(HttpDashboard, WorkerRootDoesNotServeTheCoordinatorSignpost) {
     auto c = start_cluster(/*n_workers=*/1);
     if (!c.has_value()) {
         GTEST_SKIP() << "cluster startup failed";
     }
     const auto r = http_get("127.0.0.1", c->worker_http_ports[0], "/");
-    // worker has no `/` route, so cpp-httplib's default 404 fires. We don't
-    // strictly assert 404 (different cpp-httplib versions might serve
-    // a directory listing), but we DO assert the body doesn't carry
-    // the dashboard title.
-    EXPECT_EQ(r.body.find("clink dashboard"), std::string::npos)
-        << "worker should not serve the dashboard; body head: " << r.body.substr(0, 200);
+    // The worker has no `/` route. What matters is that it does not
+    // impersonate the coordinator: a tool that probes `/` to identify a node
+    // must not read a worker as one.
+    EXPECT_EQ(r.body.find("clink coordinator"), std::string::npos)
+        << "worker answers `/` as though it were the coordinator; body head: "
+        << r.body.substr(0, 200);
 }

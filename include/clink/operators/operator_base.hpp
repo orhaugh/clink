@@ -1220,13 +1220,18 @@ public:
     void attach_runtime(RuntimeContext* ctx) noexcept { runtime_ = ctx; }
     RuntimeContext* runtime() const noexcept { return runtime_; }
 
-    // Commit-group declaration. Sinks that share a non-empty
-    // commit_group must commit together or all abort together; the
-    // Coordinator will only broadcast CommitCheckpoint to group
-    // members once every member of the group has acked its pre-commit
-    // (on_barrier). Empty string (the default) means "this sink is
-    // not in any commit group; it commits independently as soon as
-    // the coordinator marks the checkpoint COMPLETED".
+    // Commit-group declaration, informational on this object: nothing in
+    // the engine reads it. The coordinator builds its groups from the
+    // sink's OP PARAMS ("commit_group"), so setting this alone joins no
+    // group.
+    //
+    // And joining one buys less than the name suggests. There is no
+    // group-scoped commit broadcast: commit goes out per checkpoint,
+    // job-wide, once every subtask acked ok, so a job's sinks commit
+    // together either way and one failed ack aborts the checkpoint for all
+    // of them. A group only makes an abort fire at the first failing ack
+    // instead of after the last answer. See
+    // Coordinator::CheckpointGroupState.
     void set_commit_group(std::string group) noexcept { commit_group_ = std::move(group); }
     [[nodiscard]] const std::string& commit_group() const noexcept { return commit_group_; }
     [[nodiscard]] bool has_commit_group() const noexcept { return !commit_group_.empty(); }

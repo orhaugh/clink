@@ -178,21 +178,41 @@ std::vector<std::filesystem::path> list_staging_files(const std::filesystem::pat
     return files;
 }
 
+// The highest COMPLETED-N anywhere under the checkpoint tree, or 0.
+//
+// RECURSIVE, and that is the whole point. The coordinator writes the marker
+// job-scoped, at <checkpoint_dir>/<job_id>/COMPLETED-<id>. This used to scan
+// only the top level for regular files, so once the marker moved into the
+// job directory it found nothing and reported 0 - the test then failed
+// claiming no checkpoint had completed when one had. Nothing caught it
+// because the integration suite is opt-in and does not run in CI.
 std::uint64_t latest_completed_checkpoint(const std::filesystem::path& ckpt_dir) {
     std::uint64_t latest = 0;
-    if (!std::filesystem::exists(ckpt_dir))
+    std::error_code ec;
+    if (!std::filesystem::exists(ckpt_dir, ec)) {
         return 0;
-    for (const auto& e : std::filesystem::directory_iterator(ckpt_dir)) {
-        if (!e.is_regular_file())
+    }
+    for (const auto& e : std::filesystem::recursive_directory_iterator(ckpt_dir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!e.is_regular_file()) {
             continue;
+        }
         const auto name = e.path().filename().string();
-        if (name.rfind("COMPLETED-", 0) != 0)
+        if (name.rfind("COMPLETED-", 0) != 0) {
             continue;
+        }
         try {
-            const auto id = std::stoull(name.substr(std::string{"COMPLETED-"}.size()));
-            if (id > latest)
+            // Explicit cast rather than the two-arg std::max: stoull returns
+            // unsigned long long, and std::uint64_t is unsigned long on
+            // Linux/gcc, so max() cannot deduce T from the mismatched pair.
+            const auto id = static_cast<std::uint64_t>(
+                std::stoull(name.substr(std::string{"COMPLETED-"}.size())));
+            if (id > latest) {
                 latest = id;
-        } catch (...) {
+            }
+        } catch (const std::exception&) {
         }
     }
     return latest;
@@ -372,10 +392,19 @@ TEST(TwoPhaseCommit, RecoveryCommitsPreCommittedFilesOnRestart) {
         ASSERT_GT(submit_pid, 0);
 
         // Wait until at least one checkpoint has completed, then crash
-        // before the source finishes. Bounded source emits 30 records
-        // at 40ms each = ~1.2s total; first checkpoint should land
-        // within ~200ms.
-        const auto deadline = std::chrono::steady_clock::now() + 1s;
+        // before the source finishes.
+        //
+        // The bound is a SAFETY bound, not a synchronisation delay: the loop
+        // returns the instant the marker appears. It used to be 1s, on the
+        // reasoning that a 100ms interval puts the first checkpoint at
+        // ~200ms. Measured, the first COMPLETED marker lands at ~1.3s
+        // (1367 / 1398 / 1269 ms over three runs) because deploy, peer
+        // resolution and the coordinator's hold-off until peer_updates_sent
+        // all precede the first trigger. The test was betting on a number it
+        // had never measured and losing every time; a generous bound costs
+        // nothing when the condition holds early and still fails outright if
+        // no checkpoint ever completes.
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
         while (std::chrono::steady_clock::now() < deadline &&
                latest_completed_checkpoint(ckpt_dir) == 0) {
             std::this_thread::sleep_for(50ms);

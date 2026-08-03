@@ -258,9 +258,16 @@ TEST(CoordinatorRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
     bool saw_checkpoint = false;
     const auto checkpoint_deadline = std::chrono::steady_clock::now() + 8s;
     while (std::chrono::steady_clock::now() < checkpoint_deadline) {
+        // Recursive: markers live at <ckpt_dir>/_jobs/<job_id>/COMPLETED-<id>,
+        // so a top-level scan sees nothing and this wait times out on a job
+        // that checkpointed perfectly well.
         std::error_code ec;
-        for (auto const& entry : std::filesystem::directory_iterator(ckpt_dir, ec)) {
-            if (entry.path().filename().string().starts_with("COMPLETED-")) {
+        for (auto const& entry : std::filesystem::recursive_directory_iterator(ckpt_dir, ec)) {
+            if (ec) {
+                break;
+            }
+            if (entry.is_regular_file() &&
+                entry.path().filename().string().starts_with("COMPLETED-")) {
                 saw_checkpoint = true;
                 break;
             }
@@ -418,9 +425,16 @@ TEST(CoordinatorRescale, WholeRoleRescaleAcceptedAndRedeploys) {
     bool saw_checkpoint = false;
     const auto ckpt_deadline = std::chrono::steady_clock::now() + 8s;
     while (std::chrono::steady_clock::now() < ckpt_deadline) {
+        // Recursive: markers live at <ckpt_dir>/_jobs/<job_id>/COMPLETED-<id>,
+        // so a top-level scan sees nothing and this wait times out on a job
+        // that checkpointed perfectly well.
         std::error_code ec;
-        for (auto const& entry : std::filesystem::directory_iterator(ckpt_dir, ec)) {
-            if (entry.path().filename().string().starts_with("COMPLETED-")) {
+        for (auto const& entry : std::filesystem::recursive_directory_iterator(ckpt_dir, ec)) {
+            if (ec) {
+                break;
+            }
+            if (entry.is_regular_file() &&
+                entry.path().filename().string().starts_with("COMPLETED-")) {
                 saw_checkpoint = true;
                 break;
             }
@@ -546,10 +560,15 @@ TEST(CoordinatorCheckpoint, ChainedJobCompletesPeriodicCheckpointInMultiProcess)
     bool saw_marker = false;
     const auto deadline = std::chrono::steady_clock::now() + 15s;
     while (std::chrono::steady_clock::now() < deadline && !saw_marker) {
+        // Recursive: the marker is at <ckpt_dir>/_jobs/<job_id>/COMPLETED-<id>.
         std::error_code ec;
         if (std::filesystem::exists(ckpt_dir, ec)) {
-            for (const auto& entry : std::filesystem::directory_iterator(ckpt_dir, ec)) {
-                if (entry.path().filename().string().rfind("COMPLETED-", 0) == 0) {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(ckpt_dir, ec)) {
+                if (ec) {
+                    break;
+                }
+                if (entry.is_regular_file() &&
+                    entry.path().filename().string().rfind("COMPLETED-", 0) == 0) {
                     saw_marker = true;
                     break;
                 }

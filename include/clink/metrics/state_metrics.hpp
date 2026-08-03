@@ -71,6 +71,24 @@ inline void restore_completed(const std::string& backend, std::uint64_t duration
         .observe(static_cast<double>(duration_ns));
 }
 
+// Keyed entries a restore DISCARDED because their key group falls outside
+// the restoring subtask's assigned range.
+//
+// Legitimate during a rescale, where a subtask reads a parent's snapshot and
+// keeps only its own share. Outside a rescale it is silent state loss: the
+// entry was written by a subtask that did not own its key group, so nothing
+// will ever restore it, and the job comes back with a hole in its state and
+// no error. That is the shape of F38 - half a job's keyed state gone, job
+// reports success.
+//
+// A counter rather than a log line alone, so the condition is alertable:
+// non-zero outside a rescale window means state was dropped.
+inline void restore_keys_dropped(const std::string& backend, std::uint64_t n) {
+    MetricsRegistry::global()
+        .counter(state_metric_name("restore_keys_dropped_total", backend))
+        .increment(n);
+}
+
 inline void restore_failed(const std::string& backend) {
     MetricsRegistry::global()
         .counter(state_metric_name("restore_failures_total", backend))

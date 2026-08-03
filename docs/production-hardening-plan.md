@@ -4,7 +4,7 @@
 > done against it, the evidence for each claim, and - stated as plainly as
 > the rest - what is still not demonstrated.
 
-**Status date:** 2026-08-02
+**Status date:** 2026-08-03
 **Baseline commit:** `d0b8bd0`
 **Scope:** runtime, scheduler, channels, checkpoint coordinator, state
 backends, SQL binder/planner, connector SPI, coordinator/worker control
@@ -668,9 +668,42 @@ Also added while there: an assertion that a refreshed entry still expires
 eventually. Without it the test passes against a TTL that has been
 accidentally disabled altogether.
 
-**Not done:** the other 15 sleeps, in 7 files. The seam they need now
-exists; converting them is mechanical and is left as recorded work rather
-than done under a fuzzing item.
+**Now converted:** the remaining sleeps in the TTL suites are gone -
+`test_keyed_state_ttl.cpp` (8), `test_keyed_state_ttl_depth.cpp` (2) and
+`test_typed_state_ttl.cpp` (1) all drive `clock_ms`. 52 TTL cases pass and
+the processing-time ones run in 0 ms rather than roughly a second of
+sleeping.
+
+Speed was the least of it. A controlled clock can sit ON a boundary, which a
+sleep cannot, so the conversion added the cases that pin behaviour rather
+than merely observe it:
+
+- `TtlIsInclusiveAtTheExpiryInstant` - expiry is `now >= expire_at`, so an
+  entry written at T with a 100 ms TTL is gone at exactly T+100. Unpinned,
+  either comparison passed.
+- `AnEntryOneMillisecondShortOfExpiryStillReads` - the other side, which a
+  TTL expiring everything one tick early would otherwise satisfy.
+- `NoTtlBehavesLikeBeforeAndKeepsValuesIndefinitely` now advances a YEAR.
+  Previously it slept 150 ms, so "indefinitely" meant "longer than the test
+  was willing to wait".
+- The event-time case advances an HOUR of processing time to show the
+  watermark is what drives it. It used to sleep 20 ms against a 1 s TTL,
+  which no implementation, correct or broken, would have failed.
+- Both refresh cases now also assert the entry expires when left alone.
+  Without that they pass against a TTL accidentally disabled altogether.
+
+Mutation-checked: flipping expiry from `>=` to `<` at all four comparison
+sites fails `TtlIsInclusiveAtTheExpiryInstant` by name, along with five
+event-time cases.
+
+**One sleep is left, deliberately**, in
+`test_sql_state_ttl_runtime.cpp`. The SQL path builds its `TtlConfig`
+internally from table properties, so injecting a clock would mean adding a
+test-only hook to the runtime. It is safe in the direction that matters: it
+asserts the entry HAS gone, with a 1 ms TTL and a 20 ms sleep, so a loaded
+runner only oversleeps and still evicts. The flaky shape is the opposite -
+asserting something has NOT yet expired - and the test says so, so the
+pattern is not copied into that case.
 
 **A second flake, this one mine.** The same Linux run then failed
 `FrameRobustness.ClientConnectionsAreReapedRatherThanAccumulated`, written
@@ -845,6 +878,270 @@ it went from a 91-second timeout to passing in 7.7 seconds.
 advanced, the standby took over, and a job ran again. All of those were true
 throughout. Only the output disagreed.
 
+### F35. `commit_group` did not do what three layers of the codebase said it did
+
+Found by writing the test W22 recorded as missing - whether a `commit_group`
+delivers cross-sink atomicity under failure. It does not, and neither did
+the absence of one cause the harm that was claimed for it.
+
+The claim, stated in `Coordinator::CheckpointGroupState`, in
+`Sink::set_commit_group`, in the SQL catalog, and acted on by the guarantee
+analyser: sinks sharing a group commit as a unit, the coordinator holding
+the commit broadcast until every member has acked its pre-commit; sinks
+without one "commit INDEPENDENTLY" and can be left disagreeing.
+
+What the code does:
+
+- There is no group-scoped commit broadcast. Commit is one per-checkpoint,
+  job-wide broadcast, sent only after every subtask acked ok, and any failed
+  ack aborts that checkpoint for every sink.
+- `CheckpointGroupState::pending` is assigned and erased from, and never
+  tested for emptiness. Nothing gates on it.
+- `CheckpointGroupState::committed` was never written or read anywhere.
+- The group's only behavioural effect is that a failing ack issues the abort
+  immediately rather than after every subtask has answered. That is not
+  nothing - no timeout ever abandons a pending checkpoint, so if a peer
+  never answers, the checkpoint-level abort never fires and staged sink
+  transactions would sit staged - but it is a liveness detail, not
+  atomicity.
+
+**Established by running it, not by reading.** The same two-sink job, the
+same worker kill, with `commit_group` set and with no group at all: identical
+per-checkpoint agreement both ways. If the group were load-bearing the
+ungrouped run would have split.
+
+**Risk:** the analyser told operators their outputs could disagree and to fix
+it by setting an option that changes nothing. Advice that cannot work is
+worse than silence, because setting it reads as a resolved issue. The
+opposite error is also present: sinks that DID share a group were told
+nothing, while still carrying the residual exposure below.
+
+**Fix:** correct the claims rather than implement the documented mechanism.
+Implementing group-scoped commit would add no correctness a single job does
+not already have (and `commit_groups` is per-job, so cross-job atomicity is
+not representable at all), so it would be complexity for no behavioural
+gain. Instead: the dead `committed` field is gone, the four comment sites now
+describe what the code does, and the analyser warning fires on sink count
+alone - grouping is deliberately not consulted, so setting a group cannot
+silence a live limitation.
+
+**The residual exposure, which is real and which grouping does not touch.**
+Being told to commit together is not committing atomically: one sink can
+finish its commit and another's worker die before finishing its own. That
+split is repaired at restart, when a sink resolves staged transactions
+against the `COMPLETED-N` marker. A job that never restarts - restart budget
+exhausted, or abandoned - keeps it. The warning now says this.
+
+**Tests:** `tests/integration/test_commit_group_atomicity.cpp` (4 cases,
+built on `examples/two_sink_commit_group_job.cpp`: one source fanned out to
+two 2PC sinks). Per-checkpoint agreement is externally checkable because
+committed output is named `committed/sub<N>-<ckpt>.dat`, so the set of
+checkpoints each sink published is readable from the filesystem.
+
+Mutation-checked, and the mutation is what makes the cases worth having:
+making one sink silently skip its commit fails all three grouped cases with
+the split named (`sink A committed checkpoints {1..15}, sink B {}`). A test
+that only counted records would have passed that mutation on the clean run,
+since the totals can be complete while the two sides disagree.
+
+The ungrouped case is asserted alongside the grouped ones rather than as a
+contrast, since it is the same guarantee by the same mechanism. It exists so
+that a change making ungrouped sinks genuinely commit independently fails a
+test instead of quietly making the old advice true again. The two analyser
+mutations - restoring the ungrouped gate, and dropping the explicit "a
+commit_group does NOT change this" - each fail exactly one of the two new
+analyser cases and leave the other 24 green.
+
+**What did not change.** `commit_group` is still accepted everywhere it was,
+including the SQL property and the binder's rejection of it on non-2PC
+sinks. Removing a documented option is a separate decision from correcting
+what it claims to do.
+
+### F36. Five config-linter checks could not fire through the CLI
+
+Found by building `clink lint` (the W17 gap) and running it on the linter's
+own motivating example. `config_lint.hpp` opens by saying what it exists for:
+"Neither notices that `--checkpoint-interval-ms=500` with no
+`--checkpoint-dir` produces no checkpoints at all." Running exactly that
+returned `lint: no problems found`.
+
+The cause is in the CLI, not the linter. `clink run` assembled its
+`CheckpointConfig` inside `if (!ckpt_dir.empty())`, so with no directory the
+interval, the restart budget, the restore pair and the capture settings were
+all discarded before anything looked at them. Five of the linter's checks are
+of the form "X was set but checkpoint_dir is empty", and every one of them was
+unreachable from the command line. Each was unit-tested against a
+hand-built config, and each passed.
+
+**Risk:** the class of misconfiguration the linter was written to catch was
+the class it could not catch. A job submitted with an interval and no
+directory ran with no checkpoints, no error, and a clean lint.
+
+**Fix:** the config is assembled from the flags whether or not a directory
+was resolved, so the contradiction reaches the gate. This changes no runtime
+behaviour - the coordinator's trigger loop already skips a job with no
+directory - but the submission is now refused rather than silently accepted.
+The assembly lives in `tools/cli_config_args.hpp`, shared by `clink run` and
+`clink lint`, because a linter that parses flags its own way can disagree
+with the gate it claims to preview, and then a clean lint means nothing.
+
+**Also fixed while here:** the client-side lint ran only when `--profile` was
+given. It now runs on every submission, which matches what the coordinator
+already does (`check_config`, `coordinator.cpp:1861`) and moves the same
+refusal earlier, before a connection is opened.
+
+**Tests:** `tests/integration/test_cli_lint.cpp`, 10 cases against the real
+binary, asserting exit codes rather than text because the exit code is what a
+deploy pipeline gates on. Mutation-checked: restoring the flag-dropping
+behaviour fails exactly the two cases written for this defect and leaves the
+other eight green.
+
+One of those cases, `TheNodeDefaultsAreWhatGetLinted`, exists for the one way
+this command could do harm: filling unset liveness flags with defaults that
+are not `clink_node`'s, so the combination linted is not the combination that
+runs. Writing it caught two of my three defaults being wrong - the watchdog
+interval is 200 rather than 1000, and the heartbeat interval is not a
+`clink_node` flag at all but a fixed 500.
+
+### F37. Completed-checkpoint markers were written into a subtask's state directory
+
+Found by running the integration suite, which is opt-in
+(`-DCLINK_INTEGRATION_TESTS=ON`) and therefore does not run in CI. Eleven of
+its 110 cases were failing, and none of the failures were visible from the
+unit suites.
+
+Two distinct defects, both mine, both from the F29 fix that made the
+`COMPLETED-N` marker job-scoped:
+
+**The marker path collided with the per-subtask state namespace.** F29 moved
+the marker to `<checkpoint_dir>/<job_id>/COMPLETED-N`. A job's per-subtask
+state directories are `<checkpoint_dir>/0`, `/1`, `/2` - bare integers - so
+job id 1 wrote every one of its markers into subtask 1's state directory. A
+checkpoint tree for a three-subtask job looked like this, with nine markers
+sitting alongside one subtask's snapshot:
+
+```
+0/checkpoint-9.snap
+1/COMPLETED-1 .. COMPLETED-9   <- job 1's markers, inside subtask 1's directory
+1/checkpoint-9.snap
+2/checkpoint-9.snap
+```
+
+Fixed by moving them to `<checkpoint_dir>/_jobs/<job_id>/COMPLETED-N`: a
+prefixed component cannot collide, because a subtask directory is always a
+bare integer. Markers written by an older build are not migrated, and
+nothing reads them.
+
+**Three test helpers were left reading the old path.** F29 changed where the
+marker is written and did not update the integration tests that look for it.
+`test_two_phase_commit.cpp`, `test_worker_crash_recovery.cpp` and
+`test_plugin_submission.cpp` each scanned only the TOP level of the
+checkpoint directory for regular files, so once the marker moved one level
+down they found nothing and failed claiming no checkpoint had completed -
+while checkpointing worked perfectly. Now recursive, matching the harness
+and `test_fault_recovery.cpp`, which were written with the job-scoped path
+in mind and were correct throughout.
+
+**Risk:** the marker collision is the more serious of the two. Coordinator
+metadata was being written into a directory owned by a state backend, which
+is a boundary violation whether or not it corrupted anything, and it scaled
+with the job id: any job whose id happened to match a live subtask index
+polluted that subtask's state directory.
+
+**And a test that was betting on a number nobody had measured.**
+`TwoPhaseCommit.RecoveryCommitsPreCommittedFilesOnRestart` waited up to 1s
+for the first checkpoint, on the reasoning that a 100ms interval puts it at
+about 200ms. Measured over three runs, the first `COMPLETED` marker lands at
+1367 / 1398 / 1269 ms, because deploy, peer resolution and the coordinator's
+hold-off until `peer_updates_sent` all precede the first trigger. The bound
+is now 30s and the loop still returns the instant the marker appears - a
+safety bound, not a synchronisation delay.
+
+**Still failing, and not fixed:** see F38.
+
+### F38. Half a job's keyed state silently does not survive a restore
+
+`PluginSubmission.CheckpointAndRestoreAcrossJobRuns` restores the even-parity
+count and starts the odd-parity one again from zero:
+
+```
+expected  5:1:3  6:0:3  7:1:4  8:0:4
+actual    5:1:1  6:0:3  7:1:2  8:0:4
+```
+
+Nothing is logged and the job reports success. Left failing rather than
+adjusted; making it pass today would mean asserting that losing half a job's
+state is correct.
+
+**The mechanism, established rather than guessed.** Dumping the snapshot with
+`clink state-cat` settled where the loss is:
+
+```
+op 5447233828030261258 slot "parity_counts" (2 entries)
+  kg=69 key (int64 0) = 2
+  kg=36 key (int64 1) = 2
+```
+
+The snapshot is COMPLETE - both keys, both counts, in subtask 1's file. So
+the write of the snapshot is not the problem, and neither is the read. The
+job runs at parallelism 3, and instrumenting the worker's restore showed the
+key-group ranges it hands each subtask:
+
+```
+subtask 0: [0, 43)    subtask 1: [43, 86)    subtask 2: [86, 128)
+```
+
+Subtask 1 restores its own file, keeps kg 69 because it owns it, and
+discards kg 36 because it does not. Subtask 0, which does own kg 36, restores
+an empty snapshot. Both halves of the system behave correctly and the state
+is gone.
+
+**The root cause is placement at write time.** Every record went through
+subtask 1 whatever its key, so subtask 1 wrote state for a key group it does
+not own. `JobGraphSpec::key_by` exists for exactly this and its comment
+states the contract - "Same key always lands on the same subtask -> keyed
+state with K is correct at parallelism > 1" - and the test's graph never set
+it. The engine accepted the job, ran it, checkpointed it and restored it,
+losing half the state at the last step without a word.
+
+**What was fixed:** the silence. A restore that discards keyed entries now
+counts them (`clink_state_restore_keys_dropped_total`) and logs a warning
+naming the count and the range, which fires on this job at the default log
+level:
+
+> restore discarded 1 keyed entries whose key group falls outside this
+> subtask's assigned range [43, 86). During a rescale that is correct ...
+> Outside one it is state LOSS ...
+
+Not an error and not a throw, deliberately: discarding out-of-range entries
+is correct and routine during a rescale, and the backend cannot tell a
+rescale from a same-parallelism restore. Only the caller knows, so the
+backend's job is to count and report and the counter is what an alert
+watches. `tests/test_restore_key_group_drop.cpp` pins it, including that a
+restore which drops nothing does NOT move the counter - without that the
+metric would be non-zero on every healthy restore and useless for alerting.
+
+**What is still open, and it is the more interesting half.** Declaring the
+key does not fix it. With `op.key_by = "hello.by_parity"` set - the extractor
+the plugin registers for precisely this operator - the run is byte-identical:
+subtask 1 still holds kg 36 and still discards it. `key_by` is serialised
+(`job_graph.cpp:265`), read back (`:391`), and consulted by the planner
+(`job_planner.cpp:687`), so something between the declaration and the
+partitioner is not applying it on this deploy path, and nothing warns. A
+declared key that silently does not partition is the same class of defect as
+the one above and probably its cause.
+
+**Not caused by this workstream.** The test could not have passed since the
+marker moved (F37): it failed at the earlier assertion and never reached this
+comparison.
+
+**Recommended next step, recorded rather than rushed.** The symmetric check
+belongs at snapshot time: a subtask writing a keyed entry whose key group is
+outside its own range is provably producing state nothing can restore, and
+that is detectable at the moment the mistake is made rather than at the next
+restore. It needs the owned range plumbed into the backend, which is a bigger
+change than is wise to land unreviewed at the end of a session.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -876,6 +1173,7 @@ lives; evidence is in section 4.
 | W7 | Deterministic multi-process harness | P0.1 | F7 | **Done** |
 | W8 | Fault-tolerance scenarios (gating) + sink exactly-once verified by output equality | P0.1 | F7 | **Partial** |
 | W9 | Automated sanitizers (PR subset + nightly full), blocking | P1.7 | F8 | **Done** |
+| W24 | Widen the blocking integration gate; 11 advisory failures had gone unseen | P0.1 | F37, F38 | **Partial** |
 | W10 | `clink checkpoint-verify` + migration path | P1.10, P1.12 | F4 | **Done** |
 | W11 | SQL bounded-state validator, enforced in the planner | P0.3 | F9 | **Done** |
 | W12 | State TTL depth: event time, incremental cleanup, metrics, SQL `state_ttl` enforced by GROUP BY | P0.3 | F9 | **Partial** |
@@ -883,12 +1181,12 @@ lives; evidence is in section 4.
 | W14 | Resource and overload limits: frame size cap, bounded element counts, exception boundaries | P1.9 | F21, F22, F23 | **Partial** |
 | W15 | Coordinator fencing: epoch on the wire, worker enforcement, metadata guard | P1.11 | F16 | **Partial** |
 | W16 | Protocol version negotiation across RPC/frames/state | P1.12 | F19, F20 | **Partial** |
-| W17 | Config linter + recovery profiles, enforced at submission | P1.13 | F31 | **Partial** |
+| W17 | Config linter + recovery profiles, enforced at submission | P1.13 | F31, F36 | **Partial** |
 | W18 | OpenTelemetry tracing | P1.14 | - | **Open** |
 | W19 | Production metrics: staleness gauge, restart counters | P1.15 | F33 | **Partial** |
 | W20 | Non-determinism detection API | P2.16 | - | **Partial** |
 | W21 | Cancellation/shutdown audit | P2.17 | F24 | **Partial** |
-| W22 | Side-output / multi-sink propagation validation | P2.18 | - | **Partial** |
+| W22 | Side-output / multi-sink propagation validation | P2.18 | F35 | **Partial** |
 | W23 | Fuzz targets + committed-corpus regression replay | P1.8 | - | **Partial** |
 
 ---
@@ -2039,16 +2337,11 @@ The test asserts on the MAIN branch first. Without that, a version of the
 test where nothing reached either sink would report a side-output bug that
 did not exist.
 
-**Multi-sink atomicity (F26).** The other half of P2.18, and the one that
-turned up a defect. `commit_group` already existed - sinks sharing one
-commit as a unit, gated on the group's collective ack - but it is opt-in,
-the default is independent commit, and the analyser did not mention it.
-Two 2PC sinks with no shared group were reported as
-`END_TO_END_EXACTLY_ONCE` full stop.
-
-The analyser now carries each sink's `commit_group` and warns when a
-pipeline has more than one transactional sink that do not all share one:
-it names them, says they commit independently, and says what to set.
+**Multi-sink atomicity (F26).** The other half of P2.18. Two 2PC sinks with
+no shared `commit_group` were reported as `END_TO_END_EXACTLY_ONCE` full
+stop, with nothing said about whether the two outputs could disagree. The
+analyser now warns when a pipeline has more than one transactional sink,
+naming them and stating the exposure.
 
 A warning rather than a downgrade or a rejection, deliberately. For many
 jobs two independent outputs are exactly what was wanted and their mutual
@@ -2057,11 +2350,10 @@ and downgrading the level would misreport in the opposite direction, since
 each sink IS exactly-once. What must not happen is reporting end-to-end
 exactly-once and leaving the reader to discover it means per sink.
 
-Four of the five new cases are negatives - one sink, sinks sharing a
-group, sinks in DIFFERENT groups (grouped is not grouped together), and a
-non-transactional second sink. A warning that fires on the commonest
-pipeline there is would be worse than none. Mutation-checked: disabling the
-condition fails the two positives and leaves the negatives green.
+The first version of that warning said the sinks "commit INDEPENDENTLY"
+unless they shared a `commit_group`, and prescribed setting one. Testing the
+claim showed both halves were wrong - see **F35**, which is what closed the
+gap this section used to record.
 
 **What makes this Partial - stated plainly:**
 
@@ -2069,14 +2361,18 @@ condition fails the two positives and leaves the negatives green.
   one side output, in-process. Not covered: side outputs across a network
   shuffle, more than one side output on an operator, or a side output from
   an operator inside a chain.
-- **The cross-sink warning is analysis, not enforcement.** Nothing verifies
-  that a `commit_group` actually delivers atomicity under failure - that
-  both members commit or neither, across a worker loss between their
-  commits. The gating code exists and is read; it is not exercised by a
-  failure test.
 - **No failure interaction for side outputs.** The barrier reaching a side
   sink was tested on a healthy run. Whether a side branch recovers
   correctly when a worker is lost mid-checkpoint was not exercised.
+- **Cross-sink atomicity is now tested, but only for two file sinks in one
+  job.** F35's tests use two `file_2pc_sink_string` instances. Two sinks of
+  DIFFERENT kinds (say Postgres and S3, whose commits fail in different
+  ways and take different times) are not covered, and neither is more than
+  two.
+- **The commits are still not atomic with each other, by design.** F35
+  establishes that a split is repaired at restart rather than prevented. A
+  job that exhausts its restart budget keeps the disagreement. No test
+  covers that specific end state.
 
 ---
 
@@ -2261,34 +2557,41 @@ alone survive it. That is the snapshot-format-version lesson applied
 without having to relearn it - a gate tested only through its predicate is
 not proven to be wired.
 
-**What makes this Partial - stated plainly:**
-
-- **The linter is not exposed as a standalone command.** There is no
-  `clink lint --config ...`, so an operator cannot check a configuration
-  without submitting a job. The enforcement path (submission) and the
-  profile path (`--profile`) both run it, so this is a convenience rather
-  than a hole, but it is not done.
-
-Two gaps recorded in the first draft of this section are now closed,
-because "the mechanism exists and nothing calls it" is the exact pattern
-this document criticises elsewhere and it would have been indefensible to
-leave:
+**Three gaps recorded in earlier drafts of this section are now closed,**
+because "the mechanism exists and nothing calls it" is the exact pattern this
+document criticises elsewhere and it would have been indefensible to leave:
 
 - `--profile=development|production` is wired into `clink_submit_job`. It
   applies the profile's defaults, runs both `lint_profile` and the general
   checks, prints every problem, and refuses on any error before opening a
-  connection.
+  connection. Using the profile flag for the first time is what found F32.
 - `lint_liveness_config` is called at coordinator startup in `clink_node`,
   warning rather than refusing: an operator may have a reason, and
   declining to start a coordinator over a heartbeat ratio would be a worse
   failure than the one being warned about.
+- **`clink lint` exists** (`tools/clink_lint.cpp`, 10 cases in
+  `tests/integration/test_cli_lint.cpp`), so a configuration can be checked
+  without submitting a job. It shares flag parsing and config assembly with
+  `clink run` via `tools/cli_config_args.hpp` so the two cannot reach
+  different verdicts, and exits 1 on anything submission would refuse.
 
-Using the profile flag for the first time is what found F32.
+  Building it found **F36**: five of the linter's checks could not fire
+  through the CLI at all, because `clink run` discarded the flags they test
+  before the linter saw them. The judgement in the original entry - "a
+  convenience rather than a hole" - was wrong, and wrong in the direction
+  that matters.
+
+**What makes this Partial - stated plainly:**
+
 - **Job-graph settings are not linted.** Only `CheckpointConfig`.
   Per-operator parallelism against slot capacity, key-group counts against
   parallelism, and TTL against checkpoint interval are all unchecked.
 - **No cross-check against the guarantee analyser.** The two gates run in
   sequence and could in principle disagree; nothing asserts they cannot.
+- **`clink lint` reads flags, not deployed configuration.** It checks a
+  command line. A Helm values file or a running coordinator's settings have
+  to be turned into flags by hand first, so drift between what was linted
+  and what is deployed is still possible.
 
 ---
 
@@ -2333,15 +2636,39 @@ config gate needed a real submission.
   an absolute value per operator; lag needs `time() - metric/1000` at query
   time. That works in Prometheus and is worth stating rather than adding a
   second series that can disagree with the first.
-- **No end-to-end alerting rules ship.** The metrics support the alerts;
-  no rule file, dashboard or runbook exists, so every operator derives the
-  same three queries independently.
+- **No dashboard or runbook ships.** Alert RULES now do
+  (`deploy/prometheus/clink-alerts.yaml`, 11 rules over checkpointing,
+  cluster health and disk), but a Grafana dashboard and a written response
+  procedure do not, so an operator still assembles those.
+
+  Shipping rules is the kind of change that can be worse than not shipping
+  them: a rule whose metric has been renamed does not error, it evaluates
+  against no series, never fires, and leaves the operator believing they are
+  covered. `tests/test_alert_rules.cpp` therefore checks every `clink_*`
+  token in the file - including the ones inside annotation prose - against
+  the metric CONSTANTS, so a rename fails the build either by assertion or
+  by compile error. Two further cases pin the reasoning rather than the
+  text: the staleness alert must use the completion timestamp gauge and must
+  not use `rate()` on the completion counter, which cannot tell a stalled
+  job from an idle one. Mutation-checked both ways.
 - **Nothing measures state size in bytes at the job level.** `TtlStats`
   carries `estimated_bytes` per slot and the disaggregated tier reports
   resident bytes, but there is no per-job total, which is what capacity
   planning actually needs.
-- **No histogram for checkpoint duration distribution.** There is a sum and
-  a count, so only a mean is available; a p99 checkpoint duration is not.
+- ~~No histogram for checkpoint duration distribution.~~ **Closed.**
+  `clink_ckpt_duration_ms` is a histogram with 12 millisecond buckets, so a
+  p99 is available. The exposition is unchanged where it already existed:
+  Prometheus renders a histogram's `_sum` and `_count` under exactly the
+  names the two counters used, so existing queries keep working and
+  `_bucket{le}` is added.
+
+  That name equivalence is also the trap, and it has a test:
+  reinstating the counters alongside the histogram would emit two
+  `clink_ckpt_duration_ms_sum` lines, and Prometheus rejects a duplicated
+  series - so the whole scrape endpoint fails, not just the one metric.
+  `TheDurationHistogramExposesOneSumAndOneCountNotTwo` counts occurrences
+  rather than checking presence, because a contains() assertion passes just
+  as happily on a broken scrape.
 
 ---
 
@@ -2412,6 +2739,51 @@ consistent with a test that reads an empty directory.
   is the thing that would, and it does not exist.
 - **Nothing verifies ORDER.** The comparison is a multiset. Per-key
   ordering across a recovery is not asserted.
+
+---
+
+### W24 - Widening the blocking integration gate — Partial
+
+**Source:** `.github/workflows/ci.yml`
+
+The integration suite was already built and run in CI. The problem was that
+everything except `FaultRecovery` ran under `continue-on-error: true`, so
+eleven red cases sat in a green pipeline. An advisory line is not a neutral
+choice: it converts a failing test into a log nobody reads, and it did that
+here for three real defects (F37, F38).
+
+The gate now covers `FaultRecovery`, `CliLint`, `CommitGroupAtomicity` and
+`UngroupedSinkAtomicity`. Each addition had to meet the bar this file already
+set for `FaultRecovery` - waits on conditions rather than durations, passes
+repeatedly - not merely be green today:
+
+- `CliLint` stands up no cluster at all. It runs a binary and checks exit
+  codes, so there is nothing to race.
+- The two atomicity suites are written on the harness, and the one place
+  they wait for quiescence polls until the committed set stops changing
+  rather than sleeping for a guessed interval.
+
+Validated by two consecutive clean runs of the gated set (29/29 each).
+
+**What makes this Partial - stated plainly:**
+
+- **`TwoPhaseCommit` and `WorkerCrashRecovery` pass now and are still NOT
+  gated.** They use the pre-harness helpers, including a fixed 200ms sleep
+  standing in for cluster startup. Promoting a test that waits for a
+  duration is the gated-and-hoped move this document argues against
+  everywhere else, and doing it because the test is currently green would be
+  the same mistake in a better mood.
+- **One case in the advisory set is knowingly RED.**
+  `PluginSubmission.CheckpointAndRestoreAcrossJobRuns` fails on F38. It stays
+  advisory and stays failing; the alternative is to assert that losing half a
+  job's keyed state is correct.
+- **The advisory remainder still has no shrinking deadline.** The mechanism
+  for moving tests into the gate is proven now, but the ~100 remaining cases
+  are converted one at a time and nothing schedules that work.
+- **Nothing prevents a new test from landing in the advisory set.** The split
+  is two ctest regexes; a test added tomorrow is advisory by default, which
+  is the wrong default and is the reason this whole class of failure went
+  unnoticed.
 
 ---
 
@@ -2593,6 +2965,16 @@ document that only lists wins is worse than none.
   passed on macOS repeatedly. Nothing here has been run on any other
   platform, libc, or architecture.
 - **No independent review.** Single-author work.
+- **Keyed state is not demonstrated to survive a restore intact.** F38 is an
+  open, reproducible case where half of one operator's keyed state comes back
+  and half does not, silently. Until it is understood, every other restore
+  claim in this document should be read as "the mechanism ran", not "the
+  state was complete" - the two are not the same, and this document has
+  argued that distinction against other people's tests all round.
+- **Cross-sink commit atomicity is bounded to what F35 establishes.** A job's
+  transactional sinks are told to commit together, and a split is repaired at
+  restart rather than prevented. A job that exhausts its restart budget keeps
+  the disagreement, and `commit_group` does not change that.
 
 ### Known gaps in what was implemented
 
@@ -2665,6 +3047,55 @@ doing nothing" kind, and both now have regression guards:
 That is the argument for gating these rather than trusting them: three of
 the seven scenarios were wrong in ways that a green advisory run would
 never have surfaced.
+
+**Update, and the reason W24 exists.** Running the whole label found that
+eleven of its 110 cases were RED, and had been for some time. The advisory
+line was doing exactly what an advisory line does: the pipeline stayed green
+while a suite that exercises real multi-process failure and recovery did not
+pass. Three distinct causes, none of which a green advisory run would ever
+have surfaced:
+
+- three helpers reading a checkpoint-marker path the engine had stopped
+  writing to, so they reported "no checkpoint completed" for jobs that
+  checkpointed perfectly (F37);
+- a test whose 1s deadline was shorter than the ~1.3s the operation actually
+  takes, so it could never have passed on this machine (F37);
+- a genuine silent loss of half a job's keyed state across a restore, which
+  the first defect had been masking (F38).
+
+All eleven are now accounted for, by running them rather than by inferring
+from a shared cause. Ten pass; F38 is the one left failing.
+
+The eleven were not one defect but five, which is why the count mattered:
+
+- **three helpers reading a moved marker path** (F37) - `TwoPhaseCommit` x3,
+  `WorkerCrashRecovery`;
+- **three more of the same, found only by running the whole label** -
+  `CoordinatorHaFailover` (which ignored the job id it was handed and
+  scanned the top level), `CoordinatorRescale` (two inline scans), and
+  `CoordinatorCheckpoint`; plus the same in the failover benchmark harness;
+- **a 1s deadline on a ~1.3s operation** (F37);
+- **two tests asserting removed features** - `HttpDashboard` x2 still
+  expected the embedded HTML dashboard that `--http-static-dir` replaced,
+  and `HttpSql` grepped for an unescaped `"ops"` after the response began
+  nesting the spec as an escaped string under `spec_json`. Both rewritten
+  against the contract that exists, and the SQL one now also asserts the
+  thing its name claims - that `?parallelism=3` reaches the compiled
+  operators, which neither old assertion covered;
+- **F38**, silent loss of half a job's keyed state.
+
+A sweep of the full label also failed `SigtermShutdown` and
+`ApplicationModeE2E`, which were NOT in the original eleven. Both slept a
+fixed 200-300ms for process startup. Neither is flaky in the usual
+hand-waving sense: each passes alone in under two seconds and fails when the
+machine is busy - beside a container build, or simply running back-to-back
+with the other 108 cases. A guess at how long a process takes to start is not
+a synchronisation primitive, and when it loses, the test reports a defect in
+the thing it was testing rather than in its own timing.
+
+Both now wait for the coordinator's port to accept. One duration remains in
+each, for the worker, which exposes no port of its own to poll - raised to a
+generous bound rather than a tight guess, and noted as such in the code.
 
 The pre-existing `integration` label remains advisory in `ci.yml` for now.
 Making the whole label blocking before its sleep-based tests are converted

@@ -711,7 +711,7 @@ public:
         std::uint64_t checkpoint_id,
         std::chrono::milliseconds t =
             std::chrono::duration_cast<std::chrono::milliseconds>(kDefaultDeadline)) const {
-        const auto marker = checkpoint_dir() / std::to_string(job_id) /
+        const auto marker = checkpoint_dir() / "_jobs" / std::to_string(job_id) /
                             ("COMPLETED-" + std::to_string(checkpoint_id));
         return await(
             [&marker] {
@@ -727,7 +727,7 @@ public:
         std::chrono::milliseconds t =
             std::chrono::duration_cast<std::chrono::milliseconds>(kDefaultDeadline)) const {
         std::optional<std::uint64_t> found;
-        const auto job_dir = checkpoint_dir() / std::to_string(job_id);
+        const auto job_dir = checkpoint_dir() / "_jobs" / std::to_string(job_id);
         await(
             [&] {
                 std::error_code ec;

@@ -338,13 +338,26 @@ void persist_job_manifest_(const std::string& ha_dir,
 
 namespace {
 
-// Hand-roll the "find latest COMPLETED-N marker under <ckpt_dir>/
-// <job_id>/" lookup. coordinator's existing latest_completed_checkpoint_id is
-// updated in-memory but NOT in the file system before a crash.
+// Where a job's COMPLETED-N markers live.
+//
+// The `_jobs/` component is load-bearing, not tidiness. The markers were
+// briefly written to <checkpoint_dir>/<job_id>/, which shares a namespace
+// with the per-subtask state directories: a job with parallelism 3 owns
+// <checkpoint_dir>/0, /1 and /2, so job_id 1 wrote its markers straight into
+// subtask 1's state directory. A prefixed component cannot collide, because
+// a subtask directory is always a bare integer.
+std::filesystem::path completed_marker_dir_for(const std::string& checkpoint_dir, JobId job_id) {
+    return std::filesystem::path{checkpoint_dir} / "_jobs" / std::to_string(job_id);
+}
+
+// Hand-roll the "find latest COMPLETED-N marker under
+// <ckpt_dir>/_jobs/<job_id>/" lookup. coordinator's existing
+// latest_completed_checkpoint_id is updated in-memory but NOT in the file
+// system before a crash.
 std::uint64_t latest_completed_id_on_disk(const std::string& checkpoint_dir, JobId job_id) {
     if (checkpoint_dir.empty())
         return 0;
-    const auto job_dir = std::filesystem::path{checkpoint_dir} / std::to_string(job_id);
+    const auto job_dir = completed_marker_dir_for(checkpoint_dir, job_id);
     if (!std::filesystem::exists(job_dir))
         return 0;
     std::uint64_t latest = 0;
@@ -3936,9 +3949,19 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             job.failed_checkpoint_acks[msg.checkpoint_id].insert(key);
         }
 
-        // Commit-group progress accounting. If this subtask
-        // belongs to a commit_group, update group state. A failed ack
-        // aborts the whole group; we mark it and queue a broadcast.
+        // Commit-group progress accounting. A failed ack aborts the
+        // group, marked here and broadcast below.
+        //
+        // Note what this does NOT do: it does not gate the commit. The
+        // commit broadcast further down is per-checkpoint and job-wide,
+        // fired once every subtask acked ok, so a job's sinks are told to
+        // commit together with or without a group. `gs.pending` is
+        // maintained but never tested - there is no group-scoped commit.
+        // The group's only effect is that a failing ack aborts NOW rather
+        // than after every subtask has answered, which matters because no
+        // timeout ever abandons a pending checkpoint: if a peer never
+        // answers, the checkpoint-level abort below never runs and staged
+        // sink transactions would sit staged indefinitely.
         if (auto cg_it = job.subtask_commit_group.find(key);
             cg_it != job.subtask_commit_group.end()) {
             const auto& group_name = cg_it->second;
@@ -4129,7 +4152,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
         // resolved on the next successful checkpoint or at restore, whereas
         // committing without a durable marker is unrecoverable.
         if (!completed_marker_dir.empty()) {
-            // <checkpoint_dir>/<job_id>/COMPLETED-<id>.
+            // <checkpoint_dir>/_jobs/<job_id>/COMPLETED-<id>.
             //
             // The job id used to be missing, which broke two things at
             // once. Recovery could not find the marker at all -
@@ -4143,12 +4166,18 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             // came back with restore_from_checkpoint_id=0 while
             // COMPLETED-1 sat on disk.
             //
-            // Markers written by an older build sit at the flat path and
-            // are not migrated. Nothing ever read them, so nothing is
-            // lost by leaving them.
-            const std::filesystem::path marker = std::filesystem::path{completed_marker_dir} /
-                                                 std::to_string(jid) /
-                                                 ("COMPLETED-" + std::to_string(ckpt_id));
+            // The `_jobs/` component came second, and from the same
+            // method. Scoping to a bare <job_id> put the markers into the
+            // per-subtask state namespace - subtask directories are bare
+            // integers, so job 1 wrote its markers inside subtask 1's
+            // state directory. See completed_marker_dir_for.
+            //
+            // Markers written by an older build sit at the flat or bare
+            // job-id path and are not migrated. Nothing reads them, so
+            // nothing is lost by leaving them.
+            const std::filesystem::path marker =
+                completed_marker_dir_for(completed_marker_dir, jid) /
+                ("COMPLETED-" + std::to_string(ckpt_id));
             std::error_code ec;
             std::filesystem::create_directories(marker.parent_path(), ec);
             CLINK_FAULT_POINT(clink::fault::points::kCoordinatorBeforeCompletedMarker);

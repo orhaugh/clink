@@ -1228,6 +1228,7 @@ add_library(clink_cli_cmds OBJECT
     tools/clink_capture_sync.cpp
     tools/clink_list.cpp
     tools/clink_checkpoint_verify.cpp
+    tools/clink_lint.cpp
 )
 target_link_libraries(clink_cli_cmds PUBLIC clink::core)
 # `clink run <file>.sql` and `clink replay` need the SQL frontend +

@@ -331,6 +331,18 @@ TEST(SqlStateTtlRuntime, DistinctEvictsNothingBeforeTheFirstWatermark) {
 TEST(SqlStateTtlRuntime, ProcessingTimeDomainIsHonoured) {
     // With processing time selected, watermarks are irrelevant and the
     // wall clock decides. A 1 ms TTL plus a real sleep must evict.
+    //
+    // The last remaining sleep in the TTL tests, and deliberately kept. The
+    // others were converted to TtlConfig::clock_ms, but the SQL path builds
+    // its TtlConfig internally from table properties, so there is no seam to
+    // inject through without adding a test-only hook to the runtime.
+    //
+    // It is safe in the direction that matters: the assertion is that the
+    // entry HAS gone, the TTL is 1ms and the sleep is 20ms, so a slow or
+    // loaded runner only oversleeps and still evicts. The flaky shape is the
+    // opposite one - asserting something has NOT yet expired, where a
+    // scheduler hiccup crosses the boundary and the failure reads as a TTL
+    // bug. Do not copy this pattern for that case.
     Probe p;
     p.start({{"state_ttl_ms", "1"}, {"state_ttl_domain", "processing_time"}});
     p.feed(1, 10);
