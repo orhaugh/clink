@@ -2750,7 +2750,8 @@ The integration suite was already built and run in CI. The problem was that
 everything except `FaultRecovery` ran under `continue-on-error: true`, so
 eleven red cases sat in a green pipeline. An advisory line is not a neutral
 choice: it converts a failing test into a log nobody reads, and it did that
-here for three real defects (F37, F38).
+here for five distinct defects (F37, F38, two tests asserting removed
+features, and a deadline shorter than the operation it waited for).
 
 The gate now covers `FaultRecovery`, `CliLint`, `CommitGroupAtomicity` and
 `UngroupedSinkAtomicity`. Each addition had to meet the bar this file already
@@ -2763,7 +2764,9 @@ repeatedly - not merely be green today:
   they wait for quiescence polls until the committed set stops changing
   rather than sleeping for a guessed interval.
 
-Validated by two consecutive clean runs of the gated set (29/29 each).
+Validated by two consecutive clean runs of the gated set (29/29 each), and
+then by the whole label: 108 of 109 pass, the one failure being F38, which is
+knowingly red.
 
 **What makes this Partial - stated plainly:**
 
@@ -2932,6 +2935,28 @@ code rather than by reading it:
 Both were restored and the suite re-run green. A per-handler check that no
 test can distinguish from its absence is not covered, whatever the line
 count says.
+
+**Round of 2026-08-03**, same machine:
+
+```
+./build-it/tests/clink_core_tests
+    -> 1923 tests. [  PASSED  ] 1923 tests.
+./build-it/tests/clink_sql_tests
+    -> [  PASSED  ] 984 tests.
+ctest --test-dir build-it -L integration --parallel 1 --timeout 200
+    -> 99% tests passed, 1 tests failed out of 109
+       PluginSubmission.CheckpointAndRestoreAcrossJobRuns (F38, knowingly red)
+```
+
+The integration figure is the one that matters, and it is the first time the
+WHOLE label has been run this round rather than a `--gtest_filter` subset of
+the suites being edited. The subset was 19 of 110 cases and reported green
+throughout; the label reported eleven failures. Every claim about integration
+coverage before this point was narrower than it sounded.
+
+Run it through ctest, not by executing the binary: `gtest_discover_tests`
+registers each case as its own test, and running ~90 multi-process cluster
+tests in a single process produces failures that are artefacts of that.
 
 Two numbers worth noting. The harness smoke test
 (`HarnessBringsUpAClusterAndReapsIt`) completes in **304 ms** - the
