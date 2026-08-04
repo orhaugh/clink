@@ -2858,9 +2858,17 @@ then by the whole label.
   `PluginSubmission.CheckpointAndRestoreAcrossJobRuns` fails on F38. It stays
   advisory and stays failing; the alternative is to assert that losing half a
   job's keyed state is correct.
-- **The advisory remainder still has no shrinking deadline.** The mechanism
-  for moving tests into the gate is proven now, but the ~100 remaining cases
-  are converted one at a time and nothing schedules that work.
+- **The advisory remainder is now green but still advisory.** Three
+  consecutive full-label sweeps passed 109/109 after the five defects and
+  four startup bets above were fixed. That is not yet a reason to gate the
+  whole label: several of those tests still contain fixed durations for
+  worker registration, which has no observable in them, and this machine is
+  quieter than a CI runner. Promoting them on the strength of three green
+  runs HERE would be the gated-and-hoped move in a better disguise.
+
+  What would justify it: the same three sweeps on the CI runner, or the
+  remaining durations replaced with conditions. Until then the gate holds
+  the tests that wait on conditions end to end.
 - **Nothing prevents a new test from landing in the advisory set.** The split
   is two ctest regexes; a test added tomorrow is advisory by default, which
   is the wrong default and is the reason this whole class of failure went
@@ -3043,6 +3051,13 @@ one-checkpoint difference is the window F35 documents as permitted. The test
 asserted a guarantee this document had already recorded as absent, so the
 test was wrong and the engine was right. It now asserts the absence of an
 INTERIOR disagreement instead - see F35.
+
+**Three consecutive full-label sweeps then passed 109/109.** That is the
+first time the integration suite has been reliably green, and it took five
+defects and four startup bets to get there. Worth stating why it was worth
+doing: every one of those failures had been sitting in a green pipeline
+because the label ran advisory, and one of them (F38) was silently losing
+half a job's keyed state on every restore.
 
 The integration figure is the one that matters, and it is the first time the
 WHOLE label has been run this round rather than a `--gtest_filter` subset of
