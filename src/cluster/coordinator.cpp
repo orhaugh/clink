@@ -703,7 +703,23 @@ void Coordinator::accept_loop_() {
 }
 
 bool Coordinator::handle_first_frame_(std::unique_ptr<network::Connection> conn) {
+    // Bound the first read. This runs on the ACCEPT THREAD, so without a deadline
+    // one connection that opens a socket and sends nothing parks the only thread
+    // that admits anything: no client connects, no worker registers, and
+    // max_client_connections becomes unreachable - a connection limit defeated by
+    // a single connection carrying no bytes.
+    //
+    // The bound is heartbeat_timeout, reused rather than given its own knob. The
+    // coordinator already declares that a peer silent for that long is dead
+    // (mark_worker_lost_locked_ uses it on ESTABLISHED peers); a peer that cannot
+    // get its first frame out inside that window is, by the coordinator's own
+    // definition of liveness, not live. No new number to justify.
+    (void)conn->set_recv_timeout(cfg_.heartbeat_timeout);
     auto frame = read_frame(*conn);
+    // Cleared before the connection is handed to a thread of its own, where a
+    // blocking read is correct: a client holds an idle connection open between
+    // commands, and a worker between heartbeats.
+    (void)conn->set_recv_timeout(std::chrono::milliseconds{0});
     if (!frame.has_value()) {
         return false;  // conn destructor closes
     }
@@ -2141,6 +2157,17 @@ void Coordinator::handle_submit_(network::Connection& conn, MessageReader& r) {
             const auto path = write_plugin_to_cache(plug);
             auto load_result = PluginLoader::default_instance().load_into(path, bundle_preg);
             if (!load_result.ok) {
+                // Remove what we just wrote. This runs BEFORE any slot or
+                // admission check, so a peer sending submissions that fail to load
+                // was writing one file per attempt - up to the 256 MiB frame limit
+                // each - into a directory nothing prunes for the life of the
+                // process. Unbounded disk from an unauthenticated peer, and the
+                // only cost of an attempt was the bytes.
+                //
+                // Only on failure: a module that loaded is legitimately cached, and
+                // the next submission of the same bytes reuses it.
+                std::error_code rm_ec;
+                std::filesystem::remove(path, rm_ec);
                 throw std::runtime_error("plugin '" + plug.name +
                                          "' failed to load on coordinator: " + load_result.error);
             }

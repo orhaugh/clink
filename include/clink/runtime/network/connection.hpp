@@ -17,6 +17,7 @@
 // implementation does a hard close, which is fine for the watchdog
 // use case (the connection is going away anyway).
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -48,6 +49,21 @@ public:
     virtual void close() = 0;
 
     virtual bool is_open() const noexcept = 0;
+
+    // Bound how long a single recv() on this connection may block.
+    //
+    // Exists because the coordinator reads a new peer's FIRST frame on the
+    // ACCEPT THREAD. Without a deadline, one connection that opens a socket and
+    // sends nothing parks that thread forever: no client can connect, no worker
+    // can register, and max_client_connections becomes unreachable - a cap
+    // defeated by a single connection that sends no bytes at all.
+    //
+    // Returns false when the transport cannot set one, in which case the caller
+    // is no worse off than before. Bounds each recv(), not a whole recv_all: a
+    // peer dribbling one byte per window can still stretch a transfer. That
+    // converts an unbounded PARK into a bounded STALL, which is what unwedges
+    // admission; a total-transfer deadline is a separate, larger change.
+    virtual bool set_recv_timeout(std::chrono::milliseconds /*timeout*/) { return false; }
 };
 
 // Wrap an already-accepted int fd as a plain-TCP Connection. Takes

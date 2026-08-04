@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <unistd.h>
@@ -63,7 +64,26 @@ std::string write_plugin_to_cache(const PluginBinary& blob, const std::string& b
         throw std::runtime_error("plugin cache: cannot create " + base.string() + ": " +
                                  ec.message());
     }
-    const auto filename = blob.content_hash + suffix_for_platform();
+    // The filename is derived from the BYTES, not from the hash the peer sent.
+    //
+    // content_hash arrives off the wire and was used verbatim as a path component,
+    // unvalidated - so a peer could steer the write outside this directory, and a
+    // peer whose declared hash did not match its bytes would have its module cached
+    // under a name that means something else. Recomputing costs one pass over
+    // bytes that were just received, and makes the cache content-addressed in fact
+    // rather than by assertion.
+    //
+    // A mismatch is not silently corrected: it means the peer and this coordinator
+    // disagree about what was sent, which is worth refusing rather than papering
+    // over, because every idempotency decision below keys on that name.
+    const auto computed = fnv1a_64_hex(std::span<const std::byte>{blob.bytes});
+    if (!blob.content_hash.empty() && blob.content_hash != computed) {
+        throw std::runtime_error("plugin cache: plugin '" + blob.name + "' declared content_hash " +
+                                 blob.content_hash + " but its bytes hash to " + computed +
+                                 "; refusing to cache a module under a name that does not "
+                                 "describe it");
+    }
+    const auto filename = computed + suffix_for_platform();
     const auto path = base / filename;
     if (std::filesystem::exists(path)) {
         // Idempotent: same hash, same path, assume same bytes.

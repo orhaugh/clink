@@ -2,6 +2,9 @@
 
 #include <mutex>
 
+#include <sys/socket.h>
+#include <sys/time.h>
+
 #include "clink/runtime/network/network_socket.hpp"
 
 namespace clink::network {
@@ -34,6 +37,18 @@ public:
         if (fd_ < 0)
             return false;
         return NetworkSocket::recv_all(fd_, buf, len);
+    }
+
+    bool set_recv_timeout(std::chrono::milliseconds timeout) override {
+        if (fd_ < 0) {
+            return false;
+        }
+        // Zero clears it (blocking again), which is what the coordinator does
+        // once a connection is admitted and handed to its own thread.
+        struct timeval tv{};
+        tv.tv_sec = static_cast<decltype(tv.tv_sec)>(timeout.count() / 1000);
+        tv.tv_usec = static_cast<decltype(tv.tv_usec)>((timeout.count() % 1000) * 1000);
+        return ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
     }
 
     void shutdown_write() override {

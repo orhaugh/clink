@@ -564,3 +564,80 @@ TEST(FrameRobustness, AnOverLongLengthPrefixDoesNotKillTheCoordinator) {
     worker.stop();
     coordinator.stop();
 }
+
+// --- A silent connection must not wedge admission --------------------
+//
+// The coordinator reads a new peer's FIRST frame on the ACCEPT THREAD. That makes
+// a connection which opens a socket and sends nothing the cheapest denial there
+// is: one such connection parks the only thread that admits anything, so no
+// client connects and no worker registers - and max_client_connections, the cap
+// meant to bound exactly this, becomes unreachable, because reaching it requires
+// being admitted.
+//
+// Not a rate problem, which is how the follow-up item framed it. A rate limit
+// would not have helped: the peer sends no frames at all.
+
+TEST(FrameRobustness, AConnectionThatSendsNothingDoesNotStopAdmission) {
+    Coordinator::Config cfg;
+    // Short, so the test does not wait out a production liveness window. This is
+    // the same knob the fix reuses as its deadline, which is the point: the bound
+    // is the coordinator's own definition of a live peer, not a new number.
+    cfg.heartbeat_timeout = 300ms;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"w-silent"});
+
+    // Open a socket and send NOTHING. Held open for the rest of the test.
+    auto silent = network::connect_plain("127.0.0.1", port);
+    ASSERT_NE(silent, nullptr);
+
+    // A second, well-behaved peer must still be admitted. Pre-fix this never
+    // returns: the accept thread is blocked in the silent connection's first
+    // read, so the registration is never even seen.
+    Worker worker("w-silent", "127.0.0.1");
+    worker.register_role("noop", [](const DeploymentTask&) {});
+    ASSERT_NO_THROW(worker.connect_to_coordinator("127.0.0.1", port))
+        << "a peer that opened a connection and sent nothing blocked admission entirely";
+    EXPECT_TRUE(coordinator.await_registrations(5s))
+        << "the coordinator never registered a worker while one silent connection was open; the "
+           "accept thread is parked on that connection's first frame";
+
+    silent->close();
+    worker.stop();
+    coordinator.stop();
+}
+
+TEST(FrameRobustness, AFirstFrameHeaderWithNoBodyIsDroppedRatherThanHeld) {
+    // The same wedge, one step further in: a peer that sends a length header and
+    // then stalls. read_frame has the length and blocks for the body, still on the
+    // accept thread. The connection must be dropped, and must not be counted as a
+    // client session - a half-open peer that occupies a slot in the cap is a
+    // slower version of the same denial.
+    Coordinator::Config cfg;
+    cfg.heartbeat_timeout = 300ms;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+
+    auto stalled = network::connect_plain("127.0.0.1", port);
+    ASSERT_NE(stalled, nullptr);
+    // A 4-byte big-endian length claiming a 64-byte body, then nothing.
+    const std::array<std::byte, 4> hdr{std::byte{0}, std::byte{0}, std::byte{0}, std::byte{64}};
+    ASSERT_TRUE(stalled->send_all(hdr.data(), hdr.size()));
+
+    // Admission still works.
+    Worker worker("w-stalled", "127.0.0.1");
+    coordinator.expect_workers({"w-stalled"});
+    worker.register_role("noop", [](const DeploymentTask&) {});
+    ASSERT_NO_THROW(worker.connect_to_coordinator("127.0.0.1", port))
+        << "a peer that sent a header and stalled blocked admission";
+    EXPECT_TRUE(coordinator.await_registrations(5s));
+
+    // And the stalled peer was never admitted as a client.
+    EXPECT_EQ(coordinator.client_session_count(), 0u)
+        << "a peer that never completed its first frame was counted as a client session, so it "
+           "occupies a slot in max_client_connections";
+
+    stalled->close();
+    worker.stop();
+    coordinator.stop();
+}
