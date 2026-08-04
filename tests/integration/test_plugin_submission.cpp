@@ -37,6 +37,8 @@
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -146,7 +148,8 @@ TEST(PluginSubmission, ClientShipsPluginAndClusterRunsUserTypes) {
     const pid_t coordinator_pid = spawn_node(
         {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
     ASSERT_GT(coordinator_pid, 0);
-    std::this_thread::sleep_for(200ms);
+    ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
+        << "coordinator never accepted on its port";
 
     const pid_t worker_a_pid =
         spawn_node({"clink_node",
@@ -164,7 +167,11 @@ TEST(PluginSubmission, ClientShipsPluginAndClusterRunsUserTypes) {
                    binary);
     ASSERT_GT(worker_a_pid, 0);
     ASSERT_GT(worker_b_pid, 0);
-    std::this_thread::sleep_for(300ms);
+    // No observable for worker registration here (workers expose no port,
+    // the coordinator no HTTP API), so this stays a duration - generous
+    // rather than a tight guess, since a submission that arrives before a
+    // slot registers is rejected outright and reads as a submission bug.
+    std::this_thread::sleep_for(3s);
 
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
@@ -236,7 +243,8 @@ TEST(PluginSubmission, KeyedStateCountersAccumulateInPluginOperator) {
     const pid_t coordinator_pid = spawn_node(
         {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
     ASSERT_GT(coordinator_pid, 0);
-    std::this_thread::sleep_for(200ms);
+    ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
+        << "coordinator never accepted on its port";
 
     const pid_t worker_pid = spawn_node({"clink_node",
                                          "--role=worker",
@@ -259,7 +267,11 @@ TEST(PluginSubmission, KeyedStateCountersAccumulateInPluginOperator) {
     ASSERT_GT(worker_pid, 0);
     ASSERT_GT(tm2_pid, 0);
     ASSERT_GT(tm3_pid, 0);
-    std::this_thread::sleep_for(300ms);
+    // No observable for worker registration here (workers expose no port,
+    // the coordinator no HTTP API), so this stays a duration - generous
+    // rather than a tight guess, since a submission that arrives before a
+    // slot registers is rejected outright and reads as a submission bug.
+    std::this_thread::sleep_for(3s);
 
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
@@ -344,7 +356,8 @@ TEST(PluginSubmission, CoOperatorRunsTwoHeterogeneousInputs) {
     const pid_t coordinator_pid = spawn_node(
         {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
     ASSERT_GT(coordinator_pid, 0);
-    std::this_thread::sleep_for(200ms);
+    ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
+        << "coordinator never accepted on its port";
 
     const pid_t worker1 = spawn_node({"clink_node",
                                       "--role=worker",
@@ -374,7 +387,11 @@ TEST(PluginSubmission, CoOperatorRunsTwoHeterogeneousInputs) {
     ASSERT_GT(worker2, 0);
     ASSERT_GT(worker3, 0);
     ASSERT_GT(worker4, 0);
-    std::this_thread::sleep_for(300ms);
+    // No observable for worker registration here (workers expose no port,
+    // the coordinator no HTTP API), so this stays a duration - generous
+    // rather than a tight guess, since a submission that arrives before a
+    // slot registers is rejected outright and reads as a submission bug.
+    std::this_thread::sleep_for(3s);
 
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
@@ -478,7 +495,8 @@ TEST(PluginSubmission, SideOutputCrossesTheClusterWire) {
     const pid_t coordinator_pid = spawn_node(
         {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
     ASSERT_GT(coordinator_pid, 0);
-    std::this_thread::sleep_for(200ms);
+    ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
+        << "coordinator never accepted on its port";
     std::vector<pid_t> workers;
     for (int i = 1; i <= 4; ++i) {
         workers.push_back(spawn_node({"clink_node",
@@ -489,7 +507,11 @@ TEST(PluginSubmission, SideOutputCrossesTheClusterWire) {
                                      binary));
         ASSERT_GT(workers.back(), 0);
     }
-    std::this_thread::sleep_for(300ms);
+    // No observable for worker registration here (workers expose no port,
+    // the coordinator no HTTP API), so this stays a duration - generous
+    // rather than a tight guess, since a submission that arrives before a
+    // slot registers is rejected outright and reads as a submission bug.
+    std::this_thread::sleep_for(3s);
 
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
@@ -583,7 +605,8 @@ TEST(PluginSubmission, KeyByPartitionsRecordsAcrossParallelSubtasks) {
     const pid_t coordinator_pid = spawn_node(
         {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
     ASSERT_GT(coordinator_pid, 0);
-    std::this_thread::sleep_for(200ms);
+    ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
+        << "coordinator never accepted on its port";
 
     // Need 1 source + 2 counter + 2 sink = 5 subtask slots. Spawn 5 workers.
     std::vector<pid_t> workers;
@@ -596,7 +619,11 @@ TEST(PluginSubmission, KeyByPartitionsRecordsAcrossParallelSubtasks) {
                                      binary));
         ASSERT_GT(workers.back(), 0);
     }
-    std::this_thread::sleep_for(300ms);
+    // No observable for worker registration here (workers expose no port,
+    // the coordinator no HTTP API), so this stays a duration - generous
+    // rather than a tight guess, since a submission that arrives before a
+    // slot registers is rejected outright and reads as a submission bug.
+    std::this_thread::sleep_for(3s);
 
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;
@@ -768,7 +795,11 @@ TEST(PluginSubmission, CheckpointAndRestoreAcrossJobRuns) {
         c.coordinator_pid = spawn_node(
             {"clink_node", "--role=coordinator", "--port=" + std::to_string(c.coordinator_port)},
             binary);
-        std::this_thread::sleep_for(200ms);
+        // EXPECT, not ASSERT: this is inside a lambda returning Cluster, and
+        // ASSERT_ expands to a bare `return`. A false here still fails the
+        // test, via the submission that follows.
+        EXPECT_TRUE(clink::itest::await_port_accepting(c.coordinator_port))
+            << "coordinator never accepted on its port";
         for (int i = 1; i <= 3; ++i) {
             c.workers.push_back(
                 spawn_node({"clink_node",
@@ -778,7 +809,12 @@ TEST(PluginSubmission, CheckpointAndRestoreAcrossJobRuns) {
                             "--coordinator-port=" + std::to_string(c.coordinator_port)},
                            binary));
         }
-        std::this_thread::sleep_for(300ms);
+        // No observable for worker registration here (workers expose no
+        // port, the coordinator no HTTP API), so this stays a duration -
+        // generous rather than a tight guess, since a submission arriving
+        // before a slot registers is rejected outright and reads as a
+        // submission bug.
+        std::this_thread::sleep_for(3s);
         return c;
     };
     auto teardown = [](auto& cluster) {

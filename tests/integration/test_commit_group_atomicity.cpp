@@ -29,6 +29,7 @@
 // filesystem. That is what makes this testable without instrumenting the
 // engine.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -162,6 +163,58 @@ SinkSets await_settled(const std::filesystem::path& out_a,
         }
     }
     return last;
+}
+
+// The disagreement the engine actually permits, versus the one it does not.
+//
+// F35 records the guarantee precisely: a job's transactional sinks are told
+// to commit together, but the commits are not atomic with each other. One
+// sink can finish committing checkpoint N and another lose its worker before
+// finishing its own, and that split is repaired on RESTART, when the sink
+// resolves its staged transaction against the completed-checkpoint marker. A
+// job that never restarts keeps it.
+//
+// So a trailing difference - one side has the last checkpoint and the other
+// does not - is the documented window, and asserting it away would be
+// asserting a guarantee the engine does not make. An INTERIOR gap is a
+// different animal: sink A holding checkpoints 1..48 while sink B holds
+// 1..47 and 49 means B published something after a checkpoint it never
+// published, which no failure window explains.
+//
+// Returns the ids present in exactly one set that are NOT in the trailing
+// window - the ones that represent real divergence.
+std::vector<std::uint64_t> interior_disagreements(const std::set<std::uint64_t>& a,
+                                                  const std::set<std::uint64_t>& b) {
+    std::vector<std::uint64_t> out;
+    if (a.empty() && b.empty()) {
+        return out;  // neither published; the premise checks cover that
+    }
+    if (a.empty() || b.empty()) {
+        // One side published everything and the other nothing. There is no
+        // trailing window that explains that, and an early return here would
+        // have been a hole big enough to drive the original defect through -
+        // a sink that never commits at all would have passed.
+        for (const auto id : a) {
+            out.push_back(id);
+        }
+        for (const auto id : b) {
+            out.push_back(id);
+        }
+        return out;
+    }
+    // Everything at or below the point BOTH sides had reached must match.
+    const auto common_high = std::min(*a.rbegin(), *b.rbegin());
+    for (const auto id : a) {
+        if (id <= common_high && b.find(id) == b.end()) {
+            out.push_back(id);
+        }
+    }
+    for (const auto id : b) {
+        if (id <= common_high && a.find(id) == a.end()) {
+            out.push_back(id);
+        }
+    }
+    return out;
 }
 
 std::string describe_split(const std::set<std::uint64_t>& a, const std::set<std::uint64_t>& b) {
@@ -316,9 +369,10 @@ TEST_F(CommitGroupAtomicityTest, GroupedSinksNeverSplitAcrossAWorkerKill) {
     const auto settled = await_settled(out_a_, out_b_);
     const auto& a = settled.a;
     const auto& b = settled.b;
-    EXPECT_EQ(a, b) << "the two sinks SPLIT across a worker kill: one published a checkpoint the "
-                       "other did not, so the outputs disagree about what happened. "
-                    << describe_split(a, b);
+    EXPECT_TRUE(interior_disagreements(a, b).empty())
+        << "the two sinks disagree about a checkpoint BOTH had already passed, which no failure "
+           "window explains: a sink published something after a checkpoint it never published. "
+        << describe_split(a, b);
 
     sub->kill_and_reap();
 }
@@ -410,11 +464,12 @@ TEST_F(UngroupedSinkAtomicityTest, SinksWithNoCommitGroupAlsoNeverSplitAcrossAWo
     const auto settled = await_settled(out_a_, out_b_);
     const auto& a = settled.a;
     const auto& b = settled.b;
-    EXPECT_EQ(a, b) << "two UNGROUPED sinks split across a worker kill. That is the behaviour the "
-                       "engine's comments used to describe and the analyser used to warn about; if "
-                       "it is now real, the grouped cases above are the only ones safe and the "
-                       "analyser needs its commit_group advice back. "
-                    << describe_split(a, b);
+    EXPECT_TRUE(interior_disagreements(a, b).empty())
+        << "two UNGROUPED sinks disagree about a checkpoint both had already passed. A TRAILING "
+           "difference is the documented window (F35: the commits are not atomic with each other, "
+           "and a split is repaired at restart); an interior gap is not, and would mean grouping "
+           "is load-bearing after all. "
+        << describe_split(a, b);
 
     sub->kill_and_reap();
 }

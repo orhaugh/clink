@@ -932,6 +932,24 @@ split is repaired at restart, when a sink resolves staged transactions
 against the `COMPLETED-N` marker. A job that never restarts - restart budget
 exhausted, or abandoned - keeps it. The warning now says this.
 
+**A test of mine that asserted more than the engine promises.** The two
+kill cases originally required the sinks' published sets to be EQUAL after a
+worker kill. A full-label sweep failed the ungrouped one with
+`sink A {1,35..48}, sink B {1,35..49}` - a trailing difference of exactly one
+checkpoint, which is the window this same finding documents as permitted:
+the commits are not atomic with each other, and the split is repaired at
+restart. The engine was right and the test was wrong, in precisely the way
+the text above predicted.
+
+They now assert the absence of an INTERIOR disagreement - a checkpoint both
+sinks had already passed that only one published, which no failure window
+explains. Weakening in the direction of a real guarantee, not away from one:
+mutation-checked with a sink that never commits (all four cases fail) and
+with a sink that skips one middle checkpoint (caught). The first version of
+the helper returned early when either set was empty, which would have let a
+sink that committed nothing at all pass; that hole was found by running the
+mutation rather than by reading the code.
+
 **Tests:** `tests/integration/test_commit_group_atomicity.cpp` (4 cases,
 built on `examples/two_sink_commit_group_job.cpp`: one source fanned out to
 two 2PC sinks). Per-checkpoint agreement is externally checkable because

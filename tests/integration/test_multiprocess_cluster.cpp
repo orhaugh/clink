@@ -25,6 +25,8 @@
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -134,7 +136,8 @@ TEST(MultiprocessCluster, SubmitJobOverWireProducesExpectedOutput) {
     };
     const pid_t coordinator_pid = spawn_node(coordinator_argv, binary);
     ASSERT_GT(coordinator_pid, 0);
-    std::this_thread::sleep_for(200ms);  // give coordinator time to bind.
+    ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
+        << "coordinator never accepted on its port";
 
     // 2. workers: empty, register and idle.
     const std::vector<std::string> worker_a_argv{
@@ -155,7 +158,13 @@ TEST(MultiprocessCluster, SubmitJobOverWireProducesExpectedOutput) {
     const pid_t worker_b_pid = spawn_node(worker_b_argv, binary);
     ASSERT_GT(worker_a_pid, 0);
     ASSERT_GT(worker_b_pid, 0);
-    std::this_thread::sleep_for(300ms);  // give workers time to register.
+    // Workers expose no port of their own here and the coordinator is
+    // started without an HTTP API, so registration has no observable to poll
+    // - this stays a duration. Raised from 300ms, which passed in isolation
+    // and lost when 109 multi-process tests ran back to back: the submission
+    // below is rejected outright if no slot has registered yet, and the test
+    // then reports a wire-protocol failure that is really a startup race.
+    std::this_thread::sleep_for(3s);
 
     // 3. Submit the graph in-process via JobSubmitter and wait for completion.
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
