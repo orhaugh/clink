@@ -295,3 +295,83 @@ TEST(OperatorRescaleBounds, TheDocumentedInvariantsAreRejectedAtConstruction) {
             << "an op at parallelism 1 accepted bounds [2, 4]";
     }
 }
+
+// --- set_parallelism reaches KEYED operators -------------------------
+//
+// Found while writing a rescale test that wanted to start a keyed operator at
+// parallelism 4 and scale it down: it started at 1 instead, and the rescale was
+// refused as a no-op.
+//
+// Every attach point in the fluent API applies the pipeline default with the
+// idiom `desc.parallelism > 1 ? desc.parallelism : default_parallelism()`.
+// Eight KeyedDataStream methods - process, process_async, connect,
+// connect_process and their overloads - set op.key_by and went straight to
+// append_op without it, so a keyed operator ran at parallelism 1 regardless of
+// what the job asked for. A keyed operator is the one you most want to scale,
+// so set_parallelism(4) appeared to work while the job's only stateful operator
+// stayed single. Normalising in append_op fixes every attach point, including
+// any added later.
+
+TEST(PipelineParallelism, SetParallelismAppliesToAKeyedOperator) {
+    using namespace clink::api;
+    auto env = Pipeline::create();
+    env.set_parallelism(4);
+    auto src = env.from_elements<std::int64_t>({1, 2, 3});
+    auto keyed = src.key_by([](const std::int64_t& v) { return v % 4; })
+                     .process<std::int64_t>("identity_int64", {}, "keyed-op");
+
+    bool found = false;
+    for (const auto& op : env.graph().ops) {
+        if (op.id == "keyed-op") {
+            EXPECT_EQ(op.parallelism, 4u)
+                << "a keyed operator ignored set_parallelism(4) and would run single-subtask, so "
+                   "the job's stateful work would not be distributed at all";
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found) << "no op carried the id, so nothing was checked";
+}
+
+TEST(PipelineParallelism, SetParallelismAppliesToEveryOperatorKindInOneJob) {
+    // The point is uniformity: a job that sets one default should not have some
+    // of its operators honour it and others quietly not. Checked across a
+    // source, a map, a keyed process and a sink in one graph.
+    using namespace clink::api;
+    auto env = Pipeline::create();
+    env.set_parallelism(2);
+    auto src = env.from_elements<std::int64_t>({1, 2, 3, 4});
+    auto mapped = src.map<std::int64_t>([](const std::int64_t& v) { return v + 1; });
+    auto keyed = mapped.key_by([](const std::int64_t& v) { return v % 2; })
+                     .process<std::int64_t>("identity_int64", {}, "keyed-op");
+
+    ASSERT_FALSE(env.graph().ops.empty());
+    for (const auto& op : env.graph().ops) {
+        EXPECT_EQ(op.parallelism, 2u) << "operator '" << op.id << "' (type " << op.type
+                                      << ") did not take the pipeline default parallelism";
+    }
+}
+
+TEST(PipelineParallelism, AnOperatorThatAsksForItsOwnParallelismKeepsIt) {
+    // The default must not override an explicit request. Windowed streams have
+    // their own .parallelism(n), and a descriptor can carry one; neither may be
+    // clobbered by the pipeline default.
+    using namespace clink::api;
+    auto env = Pipeline::create();
+    env.set_parallelism(2);
+    SourceDescriptor src;
+    src.op_type = "int64_range_source";
+    src.channel_type = "int64";
+    src.params["count"] = "10";
+    src.parallelism = 4;  // explicit, higher than the default
+    auto stream = env.source<std::int64_t>(src);
+
+    bool found = false;
+    for (const auto& op : env.graph().ops) {
+        if (op.type == "int64_range_source") {
+            EXPECT_EQ(op.parallelism, 4u) << "an explicit parallelism was overwritten by the "
+                                             "pipeline default";
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found);
+}

@@ -6,6 +6,54 @@
 
 namespace clink::cluster {
 
+RescaleParentMapping rescale_parent_mapping(std::uint32_t old_parallelism,
+                                            std::uint32_t new_parallelism,
+                                            std::uint32_t subtask_idx_in_op) {
+    RescaleParentMapping out;
+    if (old_parallelism == 0 || new_parallelism == 0) {
+        out.error =
+            "rescale: parallelism must be non-zero (old=" + std::to_string(old_parallelism) +
+            " new=" + std::to_string(new_parallelism) + ")";
+        return out;
+    }
+    if (subtask_idx_in_op >= new_parallelism) {
+        out.error = "rescale: subtask index " + std::to_string(subtask_idx_in_op) +
+                    " is outside the new parallelism " + std::to_string(new_parallelism);
+        return out;
+    }
+    if (new_parallelism == old_parallelism) {
+        // Not an error: an unchanged operator in a job where another operator
+        // is being rescaled restores from its own snapshot.
+        out.parent_idx = subtask_idx_in_op;
+        out.parent_count = 1;
+        out.ok = true;
+        return out;
+    }
+    if (new_parallelism > old_parallelism) {
+        if (new_parallelism % old_parallelism != 0) {
+            out.error = "rescale: target parallelism " + std::to_string(new_parallelism) +
+                        " must be an integer multiple of current " +
+                        std::to_string(old_parallelism);
+            return out;
+        }
+        const std::uint32_t k_up = new_parallelism / old_parallelism;
+        out.parent_idx = subtask_idx_in_op / k_up;
+        out.parent_count = 1;
+        out.ok = true;
+        return out;
+    }
+    if (old_parallelism % new_parallelism != 0) {
+        out.error = "rescale: current parallelism " + std::to_string(old_parallelism) +
+                    " must be an integer multiple of target " + std::to_string(new_parallelism);
+        return out;
+    }
+    const std::uint32_t k_down = old_parallelism / new_parallelism;
+    out.parent_idx = subtask_idx_in_op * k_down;
+    out.parent_count = k_down;
+    out.ok = true;
+    return out;
+}
+
 CutoverDeployment plan_operator_cutover(
     const std::string& op_id,
     std::uint32_t current_parallelism,
@@ -69,15 +117,17 @@ CutoverDeployment plan_operator_cutover(
         d.key_group_first = range.first;
         d.key_group_last = range.second;
 
-        if (new_p > old_p) {
-            const std::uint32_t k_up = new_p / old_p;
-            d.restore_from_subtask_idx = i / k_up;
-            d.restore_from_parent_count = 1;
-        } else {
-            const std::uint32_t k_down = old_p / new_p;
-            d.restore_from_subtask_idx = i * k_down;
-            d.restore_from_parent_count = k_down;
+        // Same helper the replan-based rescale uses, so the two paths cannot
+        // disagree about which parent a subtask restores from. `i` is the index
+        // within this operator, which is what the mapping needs.
+        const auto mapping = rescale_parent_mapping(old_p, new_p, i);
+        if (!mapping.ok) {
+            out.error = mapping.error;
+            out.new_tasks.clear();
+            return out;
         }
+        d.restore_from_subtask_idx = mapping.parent_idx;
+        d.restore_from_parent_count = mapping.parent_count;
 
         // Greedy placement: scan starting at rr looking for a worker with
         // free capacity. We've already validated total_free >= new_p

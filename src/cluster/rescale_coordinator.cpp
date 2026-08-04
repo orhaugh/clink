@@ -160,6 +160,29 @@ bool RescaleCoordinator::mark_new_ready(const std::string& op_id, std::uint32_t 
     return true;
 }
 
+bool RescaleCoordinator::mark_replan_complete(const std::string& op_id,
+                                              std::uint32_t new_parallelism) {
+    std::lock_guard lock(mu_);
+    auto it = ops_.find(op_id);
+    if (it == ops_.end())
+        return false;
+    auto& entry = it->second;
+    auto& st = entry.status;
+    if (st.state != RescaleState::Preparing) {
+        return false;
+    }
+    st.current_parallelism = new_parallelism;
+    st.target_parallelism = new_parallelism;
+    st.state = RescaleState::Complete;
+    st.cutover_checkpoint = 0;
+    st.old_subtasks_drained = 0;
+    st.new_subtasks_ready = 0;
+    entry.drained_subtasks.clear();
+    entry.ready_subtasks.clear();
+    clink::metrics::orch::rescale_state_transition("Preparing", "Complete");
+    return true;
+}
+
 bool RescaleCoordinator::abort(const std::string& op_id, std::string /*reason*/) {
     std::lock_guard lock(mu_);
     auto it = ops_.find(op_id);

@@ -1680,86 +1680,205 @@ void Coordinator::handle_rescale_operator_(network::Connection& conn, MessageRea
 
 RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
     JobId job_id, const std::string& op_id, std::uint32_t new_parallelism) {
-    std::lock_guard lock(mu_);
-    auto it = jobs_.find(job_id);
-    if (it == jobs_.end()) {
-        return RescaleCoordinator::RequestResult{.ok = false, .reason = "unknown job_id"};
-    }
-    auto& job = *it->second;
-    if (!job.rescale_coordinator) {
-        return RescaleCoordinator::RequestResult{
-            .ok = false, .reason = "job has no rescale coordinator (rescale not enabled)"};
-    }
-    // A rescale advances Preparing -> Draining only when a checkpoint
-    // lands (mark_checkpoint_ready, driven by the periodic-checkpoint
-    // loop, which is itself gated on checkpoint_dir + interval_ms). With
-    // no periodic checkpointing no checkpoint ever lands, so the rescale
-    // would sit in Preparing indefinitely. Fail fast with a clear reason
-    // instead of hanging silently. Uses the same predicate as the
-    // periodic-checkpoint loop so the two cannot disagree.
-    if (job.checkpoint.checkpoint_dir.empty() || job.checkpoint.interval_ms <= 0) {
-        return RescaleCoordinator::RequestResult{
-            .ok = false,
-            .reason =
-                "operator rescale requires periodic checkpointing (set checkpoint_dir and "
-                "interval_ms > 0); without it the rescale would wait in Preparing forever "
-                "for a checkpoint that never lands"};
-    }
-    // The coordinator addresses an operator's subtasks by matching
-    // DeploymentTask::role against the operator id - dispatch_begin_rescale_locked_,
-    // dispatch_cutover_deploy_locked_, and the drain/ready ack paths all do it.
-    // The planner, however, gives EVERY task the one shared role
-    // kGenericSubtaskRole, so for a job planned the normal way that match never
-    // succeeds: the request was accepted, BeginRescale went to zero workers, and
-    // the operator sat in Draining until the job ended. `clink rescale-op` printed
-    // ok=1 and nothing happened - and the autoscaler, which routes through this
-    // same function, fired the same inert requests on a timer.
+    // Change ONE operator's parallelism on a running job.
     //
-    // Refuse instead. A request the coordinator cannot carry out must not be
-    // acknowledged as accepted; that is worse than no rescale at all, because a
-    // caller waits for something that will never occur. When per-operator
-    // addressing lands this check becomes a no-op on its own.
-    bool addressable = false;
-    for (const auto& [_, rec] : job.task_records) {
-        if (rec.second.role == op_id) {
-            addressable = true;
-            break;
-        }
-    }
-    if (!addressable) {
-        const std::string reason =
-            "no deployed subtask is addressable as operator '" + op_id +
-            "': the planner deploys every subtask under the single shared role '" +
-            std::string{kGenericSubtaskRole} +
-            "', so the coordinator cannot target one operator's subtasks for a drain and "
-            "cutover. Per-operator rescale of a planned job is therefore not executable in "
-            "this build. To change a running job's parallelism, take a savepoint and resubmit "
-            "at the new parallelism.";
+    // The mechanism is a replan, not an in-place cutover: validate, drain the
+    // job, re-derive the whole task set from the retained job graph at the new
+    // parallelism, and redeploy from the last completed checkpoint with each
+    // subtask told which parent's state it inherits. Everything that makes a
+    // task set correct - chain specs, edge fan-out, key-group ranges - comes
+    // from the planner, which is the same code submit uses.
+    //
+    // The alternative, resizing the deployed task set by cloning a
+    // DeploymentTask, is what the role-based path does, and it cannot work for
+    // a multi-operator job: a task's operator identity lives inside its packed
+    // OperatorChainSpec, which cloning does not rewrite (F41).
+    //
+    // The cost is that this is a stop: the job stops, then starts again from
+    // the checkpoint. Exactly-once is preserved by the same mechanism failover
+    // uses - a replayable source plus a transactional sink - and NOT by the
+    // rescale being seamless.
+    auto refuse = [&](const std::string& reason) {
         log::warn("coordinator.rescale",
                   "refused job_id=" + std::to_string(job_id) + " op_id=" + op_id +
                       " target=" + std::to_string(new_parallelism) + ": " + reason);
         clink::metrics::orch::rescale_request_rejected();
         return RescaleCoordinator::RequestResult{.ok = false, .reason = reason};
+    };
+
+    std::vector<network::Connection*> worker_conns;
+    std::uint32_t old_parallelism = 0;
+    {
+        std::lock_guard lock(mu_);
+        auto it = jobs_.find(job_id);
+        if (it == jobs_.end()) {
+            return RescaleCoordinator::RequestResult{.ok = false, .reason = "unknown job_id"};
+        }
+        auto& job = *it->second;
+        if (!job.rescale_coordinator) {
+            return refuse("job has no rescale coordinator (rescale not enabled)");
+        }
+        if (job.completion_signalled) {
+            return refuse("job has already completed");
+        }
+        if (job.cancel_requested) {
+            return refuse("a cancel is in progress for this job");
+        }
+        if (job.awaiting_restart) {
+            return refuse(
+                "this job is already draining for a restart or rescale; wait for it to finish");
+        }
+        if (job.graph_json.empty()) {
+            return refuse(
+                "this job has no retained graph, so it cannot be replanned at a new "
+                "parallelism");
+        }
+        // The operator has to exist in the graph, and the graph is what gets
+        // replanned - so check there rather than against the deployed set.
+        JobGraphSpec graph;
+        try {
+            graph = JobGraphSpec::from_json(job.graph_json);
+        } catch (const std::exception& e) {
+            return refuse(std::string{"the job's retained graph does not parse: "} + e.what());
+        }
+        const auto op_it = std::find_if(graph.ops.begin(),
+                                        graph.ops.end(),
+                                        [&](const OperatorSpec& o) { return o.id == op_id; });
+        if (op_it == graph.ops.end()) {
+            std::string known;
+            for (const auto& o : graph.ops) {
+                known += (known.empty() ? "" : ", ") + o.id;
+            }
+            return refuse("this job has no operator '" + op_id + "'. It has: " + known);
+        }
+
+        // How many subtasks the operator is ACTUALLY running, which is what its
+        // snapshots correspond to. The graph's value is the fallback for a job
+        // whose tasks did not come from the chain planner.
+        for (const auto& [_, ident] : job.task_op_identity) {
+            if (ident.op_id == op_id) {
+                ++old_parallelism;
+            }
+        }
+        if (old_parallelism == 0) {
+            old_parallelism = op_it->parallelism;
+        }
+        if (new_parallelism == 0) {
+            return refuse("parallelism must be at least 1");
+        }
+        if (new_parallelism == old_parallelism) {
+            return refuse("operator '" + op_id + "' already runs at parallelism " +
+                          std::to_string(new_parallelism) + "; nothing to do");
+        }
+        // Integer factor only, and refused HERE rather than discovered after
+        // the job has already drained. The same helper the redeploy uses.
+        if (const auto mapping = rescale_parent_mapping(old_parallelism, new_parallelism, 0);
+            !mapping.ok) {
+            return refuse(mapping.error + " (operator '" + op_id + "' currently runs " +
+                          std::to_string(old_parallelism) + ")");
+        }
+        // Declared bounds. An operator with no bounds is not scalable by
+        // policy: whoever built the job did not say what range is safe, and
+        // guessing is worse than refusing. `.rescalable(min, max)` on the
+        // fluent API or min/max_parallelism on the spec declares it.
+        if (op_it->min_parallelism == 0 && op_it->max_parallelism == 0) {
+            return refuse("operator '" + op_id +
+                          "' declares no rescale bounds, so it is not scalable. Set them with "
+                          ".rescalable(min, max) on the stream, or min_parallelism / "
+                          "max_parallelism on the operator spec");
+        }
+        if (new_parallelism < op_it->min_parallelism) {
+            return refuse("requested parallelism " + std::to_string(new_parallelism) +
+                          " is below operator '" + op_id + "' min_parallelism " +
+                          std::to_string(op_it->min_parallelism));
+        }
+        if (new_parallelism > op_it->max_parallelism) {
+            return refuse("requested parallelism " + std::to_string(new_parallelism) +
+                          " is above operator '" + op_id + "' max_parallelism " +
+                          std::to_string(op_it->max_parallelism));
+        }
+        // Feasibility, checked after the request itself is known to make sense.
+        // Order matters for the message the caller gets: telling someone who
+        // mistyped an operator name to "retry once a checkpoint has landed"
+        // sends them to wait for something that will not help.
+        //
+        // A replan redeploys from a checkpoint, so there has to be one. Without
+        // periodic checkpointing there never will be, and the operator's state
+        // would silently start empty at the new parallelism.
+        if (job.checkpoint.checkpoint_dir.empty() || job.checkpoint.interval_ms <= 0) {
+            return refuse(
+                "operator rescale requires periodic checkpointing (set checkpoint_dir and "
+                "interval_ms > 0); the new subtasks restore their state from a completed "
+                "checkpoint, and without one they would start empty");
+        }
+        if (job.latest_completed_checkpoint_id == 0) {
+            return refuse(
+                "no checkpoint has completed yet for this job; the rescale would have no "
+                "state to restore from. Retry once one has landed");
+        }
+        // Capacity for the growth. Scale-down always fits. The deployed tasks
+        // still hold their slots now and free them during the drain, so only
+        // the net increase has to be available.
+        if (new_parallelism > old_parallelism) {
+            const std::uint32_t growth = new_parallelism - old_parallelism;
+            std::size_t total_free = 0;
+            for (const auto& [_, worker] : registered_) {
+                if (!worker->lost && worker->conn && worker->slot_capacity > worker->slots_in_use) {
+                    total_free += (worker->slot_capacity - worker->slots_in_use);
+                }
+            }
+            if (total_free < growth) {
+                return refuse("rescaling '" + op_id + "' from " + std::to_string(old_parallelism) +
+                              " to " + std::to_string(new_parallelism) + " needs " +
+                              std::to_string(growth) + " more slot(s); the cluster has " +
+                              std::to_string(total_free) + " free");
+            }
+        }
+
+        // Record the request on the state machine too, so
+        // operator_rescale_status and the autoscaler's cooldown see a rescale
+        // in flight. It validates bounds a second time against what deploy
+        // registered; a disagreement between that and the graph is a bug worth
+        // surfacing rather than papering over.
+        auto sm = job.rescale_coordinator->request_rescale(op_id, new_parallelism);
+        if (!sm.ok) {
+            return refuse(sm.reason);
+        }
+
+        // Stage the replan and start the drain. handle_subtask_finished_ routes
+        // the drain acks and fires restart_job_locked_ when the last one lands.
+        job.pending_op_parallelism[op_id] = new_parallelism;
+        job.pre_rescale_op_parallelism[op_id] = old_parallelism;
+        job.awaiting_restart = true;
+        job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
+        for (const auto& [worker_id, pending] : job.pending_per_worker) {
+            for (const auto& [role, sub] : pending) {
+                job.restart_drain_expected.insert(role + ":" + std::to_string(sub));
+            }
+        }
+        for (const auto& [worker_id, _] : job.tasks_by_worker) {
+            auto worker_it = registered_.find(worker_id);
+            if (worker_it != registered_.end() && !worker_it->second->lost &&
+                worker_it->second->conn) {
+                worker_conns.push_back(worker_it->second->conn.get());
+            }
+        }
+        log::info("coordinator.rescale",
+                  "accepted job_id=" + std::to_string(job_id) + " op_id=" + op_id + " " +
+                      std::to_string(old_parallelism) + "->" + std::to_string(new_parallelism) +
+                      "; draining " + std::to_string(worker_conns.size()) +
+                      " worker connection(s) before replanning from checkpoint " +
+                      std::to_string(job.latest_completed_checkpoint_id));
     }
 
-    auto result = job.rescale_coordinator->request_rescale(op_id, new_parallelism);
-    // Logged on both outcomes. An accepted request is not a completed rescale:
-    // it advances only when a checkpoint lands, the old subtasks drain, and the
-    // cutover deploys - each of which logs under the same "coordinator.rescale"
-    // name. Without this first line the ack to the client was the only evidence
-    // the coordinator had seen the request at all, so a rescale that was
-    // accepted and then went nowhere left nothing in the log to say so.
-    if (result.ok) {
-        log::info("coordinator.rescale",
-                  "accepted job_id=" + std::to_string(job_id) + " op_id=" + op_id +
-                      " target=" + std::to_string(result.accepted_target) +
-                      " (awaiting the next completed checkpoint before draining)");
-    } else {
-        log::warn("coordinator.rescale",
-                  "refused job_id=" + std::to_string(job_id) + " op_id=" + op_id +
-                      " target=" + std::to_string(new_parallelism) + ": " + result.reason);
+    // Drain outside the lock, as rescale_job does.
+    CancelJobMsg cj;
+    cj.job_id = job_id;
+    const auto frame = fenced_frame_(MessageKind::CancelJob, cj);
+    for (auto* c : worker_conns) {
+        send_frame(*c, frame);
     }
-    return result;
+    return RescaleCoordinator::RequestResult{.ok = true, .accepted_target = new_parallelism};
 }
 
 std::optional<OperatorRescaleStatus> Coordinator::operator_rescale_status(
@@ -2400,6 +2519,19 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         }
     }
 
+    // Which operator each task hosts. Only the plan knows: the deploy
+    // directive carries a role shared by every task and a job-global index.
+    // A later rescale needs it to translate (operator, index within operator)
+    // back to the global index whose snapshot directory it must read.
+    std::unordered_map<std::string, JobState::TaskOpIdentity> plan_op_identity;
+    for (const auto& t : resolved_plan.tasks) {
+        if (t.op_id.empty()) {
+            continue;  // not from the chain planner; identity unknown
+        }
+        plan_op_identity[t.role + ":" + std::to_string(t.subtask_idx)] =
+            JobState::TaskOpIdentity{.op_id = t.op_id, .subtask_idx_in_op = t.subtask_idx_in_op};
+    }
+
     {
         std::lock_guard lock(mu_);
         for (const auto& [worker_id, tasks] : by_worker) {
@@ -2409,6 +2541,9 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
             for (const auto& t : tasks) {
                 const std::string key = t.role + ":" + std::to_string(t.subtask_idx);
                 job->task_records[key] = {worker_id, t};
+                if (auto oit = plan_op_identity.find(key); oit != plan_op_identity.end()) {
+                    job->task_op_identity[key] = oit->second;
+                }
                 job->subtask_timing[key].started_ms = deploy_ms;
                 job->subtask_timing[key].finished_ms = 0;  // (re)deploy clears any prior finish
                 job->pending_per_worker[worker_id].emplace_back(t.role, t.subtask_idx);
@@ -2942,6 +3077,40 @@ void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id
     }
 }
 
+JobPlan Coordinator::replan_at_new_parallelism_(const JobState& job) const {
+    if (job.graph_json.empty()) {
+        throw std::runtime_error(
+            "rescale: this job has no retained graph, so it cannot be replanned");
+    }
+    auto graph = JobGraphSpec::from_json(job.graph_json);
+    for (const auto& [op_id, new_p] : job.pending_op_parallelism) {
+        auto it = std::find_if(graph.ops.begin(), graph.ops.end(), [&](const OperatorSpec& o) {
+            return o.id == op_id;
+        });
+        if (it == graph.ops.end()) {
+            throw std::runtime_error("rescale: the job graph has no operator '" + op_id + "'");
+        }
+        it->parallelism = new_p;
+        // Widen the declared bounds to admit the new value. The request was
+        // validated against the bounds as SUBMITTED, and those bounds are what
+        // makes the operator scalable at all; but JobGraphSpec::validate()
+        // requires min <= parallelism <= max, and a scale to the boundary
+        // leaves that intact while a bound of 0/0 on an operator being carried
+        // along unchanged does not. Only the requested operator is touched.
+        if (it->min_parallelism != 0 || it->max_parallelism != 0) {
+            it->min_parallelism = std::min(it->min_parallelism, new_p);
+            it->max_parallelism = std::max(it->max_parallelism, new_p);
+        }
+    }
+    // Plan with the job's OWN registries when it has a bundle: a plugin job's
+    // operator types live in the bundle's view, not the default instance, and
+    // planning against the default instance would reject every one of them.
+    if (job.bundle != nullptr) {
+        return plan_job(graph, job.bundle->operator_registry(), job.bundle->runner_registry());
+    }
+    return plan_job(graph, OperatorRegistry::default_instance());
+}
+
 std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobState& job) {
     // 1. Snapshot the task set we need to redeploy. Build a topology
     //    template (extra_config + original peer_refs) from task_records
@@ -2963,6 +3132,98 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         }
         t.base.data_port = 0;
         templates[key] = std::move(t);
+    }
+
+    // Where each operator's subtasks lived BEFORE this redeploy: the global
+    // index its block started at, and how many subtasks it had. Captured now,
+    // while task_op_identity still describes the deployed set, because a
+    // replan below rebuilds it.
+    //
+    // base = global index - index within operator. Every task of an operator
+    // must agree on that number; the planner allocates a contiguous block per
+    // operator, and the restore addressing below depends on it.
+    struct OldOpBlock {
+        std::uint32_t base{};
+        std::uint32_t parallelism{};
+        bool consistent{true};
+        bool base_set{false};
+    };
+    std::unordered_map<std::string, OldOpBlock> old_op_blocks;
+    for (const auto& [key, ident] : job.task_op_identity) {
+        const auto colon = key.find(':');
+        if (colon == std::string::npos || ident.op_id.empty()) {
+            continue;
+        }
+        std::uint32_t global_idx = 0;
+        try {
+            global_idx = static_cast<std::uint32_t>(std::stoul(key.substr(colon + 1)));
+        } catch (const std::exception&) {
+            continue;
+        }
+        if (global_idx < ident.subtask_idx_in_op) {
+            continue;  // impossible; treat as unknown rather than underflow
+        }
+        const std::uint32_t base = global_idx - ident.subtask_idx_in_op;
+        auto& block = old_op_blocks[ident.op_id];
+        if (block.base_set && block.base != base) {
+            block.consistent = false;
+        }
+        block.base = block.base_set ? std::min(block.base, base) : base;
+        block.base_set = true;
+        ++block.parallelism;
+    }
+
+    // Replan rescale: the requested per-operator parallelism is applied to the
+    // retained job graph and the whole task set is re-derived by the planner.
+    // See JobState::pending_op_parallelism for why this replans rather than
+    // resizing the deployed set.
+    const bool is_replan_rescale = !job.pending_op_parallelism.empty();
+    std::unordered_map<std::string, JobState::TaskOpIdentity> new_op_identity;
+    std::unordered_map<std::string, std::uint32_t> new_op_parallelism;
+    if (is_replan_rescale) {
+        JobPlan new_plan;
+        try {
+            new_plan = replan_at_new_parallelism_(job);
+        } catch (const std::exception& e) {
+            // The job has already drained by the time this runs, so there is
+            // nothing to fall back to: report the failure rather than leave it
+            // half-deployed or silently stopped.
+            job.errors.push_back(std::string{"rescale: replan failed: "} + e.what());
+            job.awaiting_restart = false;
+            job.restart_deadline = {};
+            job.restart_pending.clear();
+            job.restart_drained_keys.clear();
+            job.restart_drain_expected.clear();
+            job.pending_op_parallelism.clear();
+            job.pre_rescale_op_parallelism.clear();
+            log::warn("coordinator.rescale",
+                      "job_id=" + std::to_string(job.id) + " replan failed: " + e.what());
+            job.completed_count = job.expected_completion;
+            signal_job_completion_locked_(job);
+            return {};
+        }
+        templates.clear();
+        for (const auto& t : new_plan.tasks) {
+            const std::string key = t.role + ":" + std::to_string(t.subtask_idx);
+            Template tmpl;
+            tmpl.base.role = t.role;
+            tmpl.base.subtask_idx = t.subtask_idx;
+            tmpl.base.data_port = 0;
+            tmpl.base.extra_config = t.extra_config;
+            tmpl.base.key_group_first = t.key_group_first;
+            tmpl.base.key_group_last = t.key_group_last;
+            // Peer host/port are filled in by the placement step below and
+            // then by PeerUpdate once each subtask reports its bound port.
+            for (const auto& [pr_role, pr_sub] : t.peer_refs) {
+                tmpl.base.peers.push_back(PeerAddress{.role = pr_role, .subtask_idx = pr_sub});
+            }
+            templates[key] = std::move(tmpl);
+            if (!t.op_id.empty()) {
+                new_op_identity[key] = JobState::TaskOpIdentity{
+                    .op_id = t.op_id, .subtask_idx_in_op = t.subtask_idx_in_op};
+                ++new_op_parallelism[t.op_id];
+            }
+        }
     }
 
     // Rescale path: when rescale_overrides is non-empty the caller
@@ -3033,7 +3294,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
     }
 
     std::vector<std::pair<std::string, std::uint32_t>> tasks_to_redeploy;
-    if (is_rescale) {
+    if (is_rescale || is_replan_rescale) {
         // Drain expected covers everyone currently in flight; redeploy
         // the FULL new task set (including roles not being rescaled at
         // their current parallelism, plus the expanded set for rescaled
@@ -3164,8 +3425,13 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
     // set (the old pending set referenced pre-restart subtask keys).
     job.final_checkpoint_id.reset();
     job.sources_requested_final.clear();
-    if (is_rescale) {
+    if (is_rescale || is_replan_rescale) {
         job.expected_completion = tasks_to_redeploy.size();
+    }
+    if (is_replan_rescale) {
+        // The deployed set is about to be a different shape; the old identities
+        // describe indices that no longer mean the same thing.
+        job.task_op_identity = new_op_identity;
     }
 
     // 5. Build new DeploymentTasks with refreshed peer addresses.
@@ -3207,7 +3473,47 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         //   per new subtask; parent_idx = new_idx * k_down;
         //   parent_count = k_down (contiguous range merged at the
         //   state backend factory).
-        if (is_rescale) {
+        if (is_replan_rescale) {
+            // EVERY task gets an explicit restore directive, not only those of
+            // the operator being rescaled. The planner allocates global indices
+            // as one contiguous block per operator in graph order, so changing
+            // one operator's parallelism moves every later operator's block:
+            // an untouched operator left on the default "restore from my own
+            // index" would read a directory that now belongs to a different
+            // operator. That is silent state corruption, the same shape as F38.
+            //
+            // So: find which operator this task belongs to, map its index
+            // within that operator onto the parent index, and translate that
+            // back through the operator's OLD block base.
+            auto ident = new_op_identity.find(key);
+            if (ident != new_op_identity.end() && !ident->second.op_id.empty()) {
+                const auto& op_id = ident->second.op_id;
+                const auto idx_in_op = ident->second.subtask_idx_in_op;
+                auto old_block = old_op_blocks.find(op_id);
+                auto new_p_it = new_op_parallelism.find(op_id);
+                if (old_block != old_op_blocks.end() && old_block->second.consistent &&
+                    old_block->second.parallelism != 0 && new_p_it != new_op_parallelism.end()) {
+                    const auto mapping = rescale_parent_mapping(
+                        old_block->second.parallelism, new_p_it->second, idx_in_op);
+                    if (mapping.ok) {
+                        d.restore_from_subtask_idx = old_block->second.base + mapping.parent_idx;
+                        d.restore_from_parent_count = mapping.parent_count;
+                    } else {
+                        // Refused earlier by the request validation; reaching
+                        // here means the two disagree. Restore nothing rather
+                        // than restore the wrong slice.
+                        log::warn("coordinator.rescale",
+                                  "job_id=" + std::to_string(job.id) + " op_id=" + op_id +
+                                      " subtask " + std::to_string(idx_in_op) +
+                                      ": no parent mapping (" + mapping.error +
+                                      "); this subtask starts with EMPTY state");
+                    }
+                }
+                // No old block means the operator did not exist before this
+                // deploy, so there is nothing of its to restore. The key-group
+                // range from the planner still applies.
+            }
+        } else if (is_rescale) {
             auto ov = job.rescale_overrides.find(k.role);
             auto old = job.pre_rescale_parallelism.find(k.role);
             if (ov != job.rescale_overrides.end() && old != job.pre_rescale_parallelism.end() &&
@@ -3258,6 +3564,33 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
     if (is_rescale) {
         job.rescale_overrides.clear();
         job.pre_rescale_parallelism.clear();
+    }
+    if (is_replan_rescale) {
+        // The rescale has landed: the new task set is built and about to
+        // deploy. Close the state machine so operator_rescale_status stops
+        // reporting Preparing for something that has finished.
+        if (job.rescale_coordinator) {
+            for (const auto& [op_id, new_p] : job.pending_op_parallelism) {
+                job.rescale_coordinator->mark_replan_complete(op_id, new_p);
+            }
+        }
+        std::string changed;
+        for (const auto& [op_id, new_p] : job.pending_op_parallelism) {
+            const auto old_it = job.pre_rescale_op_parallelism.find(op_id);
+            changed +=
+                (changed.empty() ? "" : ",") + op_id + "=" +
+                (old_it != job.pre_rescale_op_parallelism.end() ? std::to_string(old_it->second)
+                                                                : std::string{"?"}) +
+                "->" + std::to_string(new_p);
+        }
+        log::info(
+            "coordinator.rescale",
+            "replanned job_id=" + std::to_string(job.id) + " " + changed +
+                " tasks=" + std::to_string(tasks_to_redeploy.size()) +
+                " restore_from_checkpoint=" + std::to_string(job.latest_completed_checkpoint_id) +
+                " topology_version=" + std::to_string(job.topology_version));
+        job.pending_op_parallelism.clear();
+        job.pre_rescale_op_parallelism.clear();
     }
 
     // 7. Build Deploy frames + claim slots; return for caller to send.

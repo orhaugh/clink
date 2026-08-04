@@ -1284,6 +1284,11 @@ JobPlan plan_job(const JobGraphSpec& graph,
             t.role = kGenericSubtaskRole;
             t.subtask_idx = chain.subtask_idx;
             t.data_port = 0;
+            // The operator this task hosts, and its index within that
+            // operator. The role cannot express either, and `subtask_idx`
+            // counts across the whole job. See PlannedTask.
+            t.op_id = head.id;
+            t.subtask_idx_in_op = sub_i;
             // The key-group slice, from this task's index WITHIN its operator
             // and that operator's parallelism - the two numbers deploy cannot
             // recover from a global index and a role name, which is how it

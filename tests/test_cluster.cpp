@@ -981,6 +981,189 @@ TEST(CoordinatorRescale, RequestOperatorRescaleUnknownJobReturnsError) {
     EXPECT_NE(result.reason.find("unknown job_id"), std::string::npos);
 }
 
+// Every refusal that can be decided without a running job, each with the reason
+// it must give.
+//
+// These matter more than they look: a per-operator rescale DRAINS the job before
+// it replans, so a request that turns out to be impossible after the drain
+// leaves a stopped job with nothing to fall back to. Each of these has to be
+// caught up front.
+TEST(CoordinatorRescale, RefusalsThatCanBeDecidedBeforeDrainingAreDecidedUpFront) {
+    using namespace std::chrono_literals;
+    ensure_built_ins_registered();
+
+    Coordinator coordinator;
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-rs-validate"});
+    Worker::Config worker_cfg;
+    worker_cfg.slot_count = 8;
+    Worker worker("worker-rs-validate", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto out_path = std::filesystem::temp_directory_path() /
+                          ("clink_rescale_validate_" + std::to_string(::getpid()) + ".txt");
+    const auto ckpt_dir = std::filesystem::temp_directory_path() /
+                          ("clink_rescale_validate_ckpt_" + std::to_string(::getpid()));
+    std::filesystem::remove(out_path);
+    std::filesystem::remove_all(ckpt_dir);
+
+    JobGraphSpec g;
+    OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    src.parallelism = 1;
+    src.min_parallelism = 1;
+    src.max_parallelism = 4;
+    src.out_channel = std::string{kChannelInt64};
+    src.params = {{"count", "200000"}};  // long enough to still be running below
+    g.ops.push_back(src);
+    OperatorSpec snk;
+    snk.type = "file_int64_sink";
+    snk.id = "snk";
+    snk.inputs = {"src"};
+    snk.parallelism = 1;  // deliberately NO bounds
+    snk.out_channel = std::string{kChannelInt64};
+    snk.params = {{"path", out_path.string()}};
+    g.ops.push_back(snk);
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = ckpt_dir.string();
+    ckpt.interval_ms = 50;
+    const auto job_id = coordinator.submit_job(
+        g, OperatorRegistry::default_instance(), std::vector<PluginBinary>{}, ckpt, nullptr);
+
+    // Wait until the rescale coordinator has registered the job's operators.
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    bool ready = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (coordinator.operator_rescale_status(job_id, "src").has_value()) {
+            ready = true;
+            break;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_TRUE(ready) << "operator rescale coordinator was not registered";
+
+    // An operator the graph does not contain. Named alternatives in the reason,
+    // because "unknown operator" on its own leaves the caller guessing.
+    {
+        auto r = coordinator.request_operator_rescale(job_id, "not_an_op", 2);
+        EXPECT_FALSE(r.ok);
+        EXPECT_NE(r.reason.find("has no operator"), std::string::npos) << r.reason;
+        EXPECT_NE(r.reason.find("src"), std::string::npos)
+            << "the refusal should name the operators the job does have: " << r.reason;
+    }
+    // An operator that declared no bounds is not scalable by policy: the job
+    // never said what range is safe.
+    {
+        auto r = coordinator.request_operator_rescale(job_id, "snk", 2);
+        EXPECT_FALSE(r.ok);
+        EXPECT_NE(r.reason.find("declares no rescale bounds"), std::string::npos) << r.reason;
+    }
+    // Outside the declared bounds, both directions.
+    {
+        auto r = coordinator.request_operator_rescale(job_id, "src", 8);
+        EXPECT_FALSE(r.ok);
+        EXPECT_NE(r.reason.find("above operator"), std::string::npos) << r.reason;
+    }
+    // Zero is not a parallelism.
+    {
+        auto r = coordinator.request_operator_rescale(job_id, "src", 0);
+        EXPECT_FALSE(r.ok);
+        EXPECT_NE(r.reason.find("at least 1"), std::string::npos) << r.reason;
+    }
+    // A request for the parallelism it already runs at would drain the job for
+    // no change, which is a stop the caller did not ask for.
+    {
+        auto r = coordinator.request_operator_rescale(job_id, "src", 1);
+        EXPECT_FALSE(r.ok);
+        EXPECT_NE(r.reason.find("already runs at parallelism"), std::string::npos) << r.reason;
+    }
+    // Every one of the above is answerable from the request and the graph alone,
+    // and those assertions are also asserting that ORDER: each returns its own
+    // reason rather than the "no checkpoint has completed yet" gate that comes
+    // afterwards. That gate used to run first, so a mistyped operator name was
+    // answered with "retry once a checkpoint has landed" - advice that would
+    // never have helped. Accepting a well-formed request, and refusing a second
+    // one while the first is draining, need a completed checkpoint and so live
+    // in the integration tests.
+
+    worker.stop();
+    coordinator.stop();
+    std::filesystem::remove(out_path);
+    std::filesystem::remove_all(ckpt_dir);
+}
+
+// A rescale replans from a checkpoint, so there has to be one to replan from.
+TEST(CoordinatorRescale, RefusesWhenNoCheckpointHasCompletedYet) {
+    using namespace std::chrono_literals;
+    ensure_built_ins_registered();
+
+    Coordinator coordinator;
+    const auto coordinator_port = coordinator.start();
+    coordinator.expect_workers({"worker-rs-nockptyet"});
+    Worker::Config worker_cfg;
+    worker_cfg.slot_count = 4;
+    Worker worker("worker-rs-nockptyet", "127.0.0.1", worker_cfg);
+    worker.connect_to_coordinator("127.0.0.1", coordinator_port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto out_path = std::filesystem::temp_directory_path() /
+                          ("clink_rescale_nockpt_" + std::to_string(::getpid()) + ".txt");
+    const auto ckpt_dir = std::filesystem::temp_directory_path() /
+                          ("clink_rescale_nockpt_ckpt_" + std::to_string(::getpid()));
+    std::filesystem::remove(out_path);
+    std::filesystem::remove_all(ckpt_dir);
+
+    JobGraphSpec g;
+    OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    src.parallelism = 1;
+    src.min_parallelism = 1;
+    src.max_parallelism = 4;
+    src.out_channel = std::string{kChannelInt64};
+    src.params = {{"count", "200000"}};
+    g.ops.push_back(src);
+    OperatorSpec snk;
+    snk.type = "file_int64_sink";
+    snk.id = "snk";
+    snk.inputs = {"src"};
+    snk.parallelism = 1;
+    snk.out_channel = std::string{kChannelInt64};
+    snk.params = {{"path", out_path.string()}};
+    g.ops.push_back(snk);
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = ckpt_dir.string();
+    // A cadence far longer than this test lives, so the periodic-checkpoint
+    // predicate is satisfied but no checkpoint has landed.
+    ckpt.interval_ms = 600'000;
+    const auto job_id = coordinator.submit_job(
+        g, OperatorRegistry::default_instance(), std::vector<PluginBinary>{}, ckpt, nullptr);
+
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (coordinator.operator_rescale_status(job_id, "src").has_value()) {
+            break;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+
+    auto r = coordinator.request_operator_rescale(job_id, "src", 2);
+    EXPECT_FALSE(r.ok);
+    EXPECT_NE(r.reason.find("no checkpoint has completed"), std::string::npos)
+        << "a rescale with no checkpoint to restore from must be refused, not accepted and left "
+           "to start the operator with empty state: "
+        << r.reason;
+
+    worker.stop();
+    coordinator.stop();
+    std::filesystem::remove(out_path);
+    std::filesystem::remove_all(ckpt_dir);
+}
+
 // A per-operator rescale only advances out of Preparing when a
 // checkpoint lands. A job with no periodic checkpointing would sit in
 // Preparing forever, so request_operator_rescale must reject up front

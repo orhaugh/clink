@@ -190,6 +190,22 @@ public:
         } else if (used_ids_.count(op.id) != 0) {
             throw std::runtime_error("Pipeline: duplicate operator id '" + op.id + "'");
         }
+        // Apply the pipeline default to any operator that did not ask for a
+        // parallelism of its own. Treating 1 as "did not ask" is the convention
+        // every attach point in this file already follows (`desc.parallelism > 1
+        // ? desc.parallelism : default_parallelism()`); doing it here as well
+        // means an attach point that forgets the idiom still honours
+        // set_parallelism.
+        //
+        // Eight of them had forgotten it: every KeyedDataStream::process,
+        // process_async, connect and connect_process overload set op.key_by and
+        // went straight to append_op, so a keyed operator ran at parallelism 1
+        // no matter what the job asked for. A keyed operator is the kind you
+        // most want to scale, so set_parallelism(4) looked like it worked while
+        // the job's only stateful operator stayed single.
+        if (op.parallelism <= 1) {
+            op.parallelism = default_parallelism_;
+        }
         used_ids_.insert(op.id);
         std::string id = op.id;
         graph_.ops.push_back(std::move(op));

@@ -59,6 +59,23 @@ struct PlannedTask {
     // data, unlike one that restores a third of it.
     std::uint32_t key_group_first{};
     std::uint32_t key_group_last{};
+    // Which operator this task hosts, and which of that operator's subtasks
+    // it is. Both are known to the planner - the chain head's id and the loop
+    // index - and neither is recoverable from the fields above, because every
+    // task carries the same role and `subtask_idx` counts across the whole job.
+    //
+    // The coordinator needs them to reason about an operator at all. A rescale
+    // has to map each new subtask onto the parent snapshot it restores from,
+    // and that mapping is a function of the index WITHIN the operator and that
+    // operator's old and new parallelism. Using the global index instead is the
+    // same mistake as F38 and gives the wrong parent for every operator after
+    // the first.
+    //
+    // Empty / 0 for tasks that do not come from the chain planner (the
+    // in-process test API and queryable-state routing build their own plans).
+    // Callers must treat an empty op_id as "unknown", not as a match.
+    std::string op_id;
+    std::uint32_t subtask_idx_in_op{};
 };
 
 struct JobPlan {
@@ -709,6 +726,44 @@ private:
         // index for each new subtask. Populated alongside
         // rescale_overrides; cleared together.
         std::unordered_map<std::string, std::uint32_t> pre_rescale_parallelism;
+        // Set by rescale_operator_parallelism: operator id -> requested
+        // parallelism, with the parallelism each of those operators had when
+        // the request was accepted. When non-empty, the next
+        // restart_job_locked_ REPLANS the job from `graph_json` at the new
+        // parallelism instead of resizing the deployed task set.
+        //
+        // Why replan rather than clone. The role-based path resizes a role's
+        // template set by cloning one subtask's DeploymentTask, and a
+        // template's operator identity lives inside its packed
+        // OperatorChainSpec (`extra_config`), which cloning does not rewrite.
+        // On a multi-operator job that produced N clones of one chain, with
+        // edges naming subtask indices that were no longer deployed
+        // ("missing resolved peer for edge"), and the job died - F41.
+        // Replanning cannot produce that: the planner derives the whole task
+        // set, its chain specs, its edges and its key-group ranges from the
+        // graph, which is the same thing submit does.
+        //
+        // Keyed by OPERATOR id, unlike rescale_overrides which is keyed by
+        // role. Every task shares one role, so a role key cannot name an
+        // operator.
+        std::unordered_map<std::string, std::uint32_t> pending_op_parallelism;
+        std::unordered_map<std::string, std::uint32_t> pre_rescale_op_parallelism;
+        // Which operator each deployed task hosts, keyed like task_records
+        // ("role:subtask_idx"). Populated at every deploy from the plan.
+        //
+        // Needed because a snapshot lives at <checkpoint_dir>/<subtask_idx>/,
+        // addressed by the JOB-GLOBAL index, and the planner allocates those
+        // indices as one contiguous block per operator in graph order. Change
+        // one operator's parallelism and every LATER operator's block moves. So
+        // a replanned task cannot restore from "its own" index - that directory
+        // now belongs to a different operator - and the coordinator has to
+        // translate (operator, index within operator) back to the old global
+        // index. This map is what makes that translation possible.
+        struct TaskOpIdentity {
+            std::string op_id;
+            std::uint32_t subtask_idx_in_op{};
+        };
+        std::unordered_map<std::string, TaskOpIdentity> task_op_identity;
         // Surviving-worker subtasks we've already received SubtaskFinished
         // for during the awaiting_restart drain.
         std::unordered_set<std::string> restart_drained_keys;
@@ -927,6 +982,20 @@ private:
         std::vector<std::byte> frame;
     };
     std::vector<PendingDeploy> restart_job_locked_(JobState& job);
+
+    // Replan a job at a changed per-operator parallelism.
+    //
+    // Parses `job.graph_json`, applies `job.pending_op_parallelism`, and runs
+    // the ordinary planner over the result using the job's own registries. The
+    // returned plan is the post-rescale task set in full: chain specs, edges
+    // and key-group ranges all derived from the graph, exactly as a fresh
+    // submit would derive them. Placement is left to the caller (worker_id
+    // stays empty).
+    //
+    // Throws on an unparseable graph, an operator the graph does not contain,
+    // or a plan the registries reject - the caller turns that into a failed
+    // rescale rather than a half-deployed job.
+    [[nodiscard]] JobPlan replan_at_new_parallelism_(const JobState& job) const;
 
     // Coordinator-driven adaptive rescale dispatch.
     //

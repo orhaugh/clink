@@ -24,6 +24,124 @@ DeploymentTask make_template(const std::string& role, const std::string& extra_c
     return t;
 }
 
+// --- rescale_parent_mapping ------------------------------------------
+//
+// The arithmetic that decides which parent snapshot a rescaled subtask reads.
+// Getting it wrong loses or duplicates keyed state silently: a subtask that
+// reads the wrong parent restores state for keys it does not own and finds
+// nothing for the keys it does. Exhaustive rather than sampled, because the
+// only cheap place to be exhaustive about it is here.
+
+TEST(RescaleParentMapping, ScalingUpSharesEachParentAcrossItsChildren) {
+    // 1 -> 4: every child reads parent 0 and filters to its key-group slice.
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        const auto m = rescale_parent_mapping(1, 4, i);
+        ASSERT_TRUE(m.ok) << m.error << " (i=" << i << ")";
+        EXPECT_EQ(m.parent_idx, 0u) << "i=" << i;
+        EXPECT_EQ(m.parent_count, 1u) << "i=" << i;
+    }
+    // 2 -> 4: children 0,1 read parent 0; children 2,3 read parent 1.
+    const std::uint32_t expected_2_to_4[] = {0, 0, 1, 1};
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        const auto m = rescale_parent_mapping(2, 4, i);
+        ASSERT_TRUE(m.ok) << m.error;
+        EXPECT_EQ(m.parent_idx, expected_2_to_4[i]) << "i=" << i;
+        EXPECT_EQ(m.parent_count, 1u) << "i=" << i;
+    }
+}
+
+TEST(RescaleParentMapping, ScalingDownMergesAContiguousRunOfParents) {
+    // 4 -> 2: child 0 merges parents 0,1; child 1 merges parents 2,3.
+    const auto a = rescale_parent_mapping(4, 2, 0);
+    ASSERT_TRUE(a.ok) << a.error;
+    EXPECT_EQ(a.parent_idx, 0u);
+    EXPECT_EQ(a.parent_count, 2u);
+    const auto b = rescale_parent_mapping(4, 2, 1);
+    ASSERT_TRUE(b.ok) << b.error;
+    EXPECT_EQ(b.parent_idx, 2u);
+    EXPECT_EQ(b.parent_count, 2u);
+    // 4 -> 1: the single child absorbs all four.
+    const auto c = rescale_parent_mapping(4, 1, 0);
+    ASSERT_TRUE(c.ok) << c.error;
+    EXPECT_EQ(c.parent_idx, 0u);
+    EXPECT_EQ(c.parent_count, 4u);
+}
+
+TEST(RescaleParentMapping, EveryParentIsCoveredExactlyOnceWhenScalingDown) {
+    // The property that matters, not just the two endpoints: scaling down must
+    // read each old subtask's snapshot exactly once across all new subtasks. A
+    // gap loses that parent's state; an overlap restores it twice.
+    for (const auto [old_p, new_p] : std::vector<std::pair<std::uint32_t, std::uint32_t>>{
+             {4, 2}, {4, 1}, {8, 2}, {8, 4}, {6, 3}, {12, 4}}) {
+        std::vector<int> reads(old_p, 0);
+        for (std::uint32_t i = 0; i < new_p; ++i) {
+            const auto m = rescale_parent_mapping(old_p, new_p, i);
+            ASSERT_TRUE(m.ok) << m.error << " (" << old_p << "->" << new_p << " i=" << i << ")";
+            for (std::uint32_t k = 0; k < m.parent_count; ++k) {
+                ASSERT_LT(m.parent_idx + k, old_p)
+                    << old_p << "->" << new_p << ": subtask " << i << " reads parent "
+                    << (m.parent_idx + k) << ", which does not exist";
+                ++reads[m.parent_idx + k];
+            }
+        }
+        for (std::uint32_t j = 0; j < old_p; ++j) {
+            EXPECT_EQ(reads[j], 1) << old_p << "->" << new_p << ": parent " << j << " was read "
+                                   << reads[j] << " times, not once";
+        }
+    }
+}
+
+TEST(RescaleParentMapping, EveryChildHasAParentWhenScalingUp) {
+    // The mirror property: scaling up, every new subtask must map to a parent
+    // that exists, and the children of one parent must be contiguous.
+    for (const auto [old_p, new_p] : std::vector<std::pair<std::uint32_t, std::uint32_t>>{
+             {1, 2}, {1, 4}, {2, 4}, {2, 8}, {3, 6}, {4, 12}}) {
+        std::uint32_t prev = 0;
+        for (std::uint32_t i = 0; i < new_p; ++i) {
+            const auto m = rescale_parent_mapping(old_p, new_p, i);
+            ASSERT_TRUE(m.ok) << m.error;
+            EXPECT_LT(m.parent_idx, old_p) << old_p << "->" << new_p << " i=" << i;
+            EXPECT_EQ(m.parent_count, 1u);
+            EXPECT_GE(m.parent_idx, prev) << "parents must be non-decreasing across children";
+            prev = m.parent_idx;
+        }
+        // The last child must map to the last parent, or some parent's state
+        // was never handed to anybody.
+        const auto last = rescale_parent_mapping(old_p, new_p, new_p - 1);
+        EXPECT_EQ(last.parent_idx, old_p - 1) << old_p << "->" << new_p;
+    }
+}
+
+TEST(RescaleParentMapping, UnchangedParallelismRestoresFromSelf) {
+    // Not an error. A job where one operator is rescaled replans every
+    // operator, and the untouched ones must restore from their own snapshots.
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        const auto m = rescale_parent_mapping(3, 3, i);
+        ASSERT_TRUE(m.ok) << m.error;
+        EXPECT_EQ(m.parent_idx, i);
+        EXPECT_EQ(m.parent_count, 1u);
+    }
+}
+
+TEST(RescaleParentMapping, RefusesNonIntegerFactorsAndImpossibleInputs) {
+    // 2 -> 3 would leave a key group straddling two parents.
+    const auto up = rescale_parent_mapping(2, 3, 0);
+    EXPECT_FALSE(up.ok);
+    EXPECT_NE(up.error.find("integer multiple"), std::string::npos) << up.error;
+
+    const auto down = rescale_parent_mapping(3, 2, 0);
+    EXPECT_FALSE(down.ok);
+    EXPECT_NE(down.error.find("integer multiple"), std::string::npos) << down.error;
+
+    EXPECT_FALSE(rescale_parent_mapping(0, 4, 0).ok);
+    EXPECT_FALSE(rescale_parent_mapping(4, 0, 0).ok);
+    // A subtask index at or beyond the new parallelism is a caller bug, and
+    // silently returning parent 0 would restore the wrong slice.
+    const auto oob = rescale_parent_mapping(2, 4, 4);
+    EXPECT_FALSE(oob.ok);
+    EXPECT_NE(oob.error.find("outside the new parallelism"), std::string::npos) << oob.error;
+}
+
 TEST(PlanOperatorCutover, ScaleUpDoublesParallelismAndSplitsKeyGroups) {
     auto plan = plan_operator_cutover("agg",
                                       /*current_parallelism=*/2,

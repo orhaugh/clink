@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -20,6 +21,7 @@
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/job_planner.hpp"
 #include "clink/cluster/operator_registry.hpp"
+#include "clink/cluster/rescale_dispatch.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/type_registry.hpp"
 #include "clink/core/codec.hpp"
@@ -1006,5 +1008,267 @@ TEST(JobPlanner, APartitionedOperatorsSlicesTileTheKeySpaceExactlyOnce) {
         EXPECT_EQ(slices[i].first, slices[i - 1].second)
             << "slice " << i << " starts at " << slices[i].first << " but the previous ended at "
             << slices[i - 1].second << " - a gap loses state, an overlap duplicates it";
+    }
+}
+
+// --- Replanning at a new parallelism ---------------------------------
+//
+// A live rescale changes one operator's parallelism and re-derives the whole
+// task set from the graph. Everything that makes the result correct is a pure
+// function of the graph, so it can be checked here rather than only by standing
+// up a cluster - which matters, because the failure this guards against (F41)
+// destroyed the job and was invisible until a multi-process test looked at its
+// output.
+
+namespace {
+
+// src (par 1) -> counter (keyed, par varies) -> snk (par 1). The shape a
+// rescale is asked for in practice: a stateful keyed operator between a
+// single-subtask source and sink.
+JobGraphSpec keyed_three_op_graph(std::uint32_t counter_parallelism) {
+    JobGraphSpec g;
+    g.ops.push_back(OperatorSpec{
+        .type = "int64_range_source",
+        .id = "src",
+        .inputs = {},
+        .parallelism = 1,
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"count", "100"}},
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "identity_int64",
+        .id = "counter",
+        .inputs = {"src"},
+        .parallelism = counter_parallelism,
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .key_by = "identity",
+        .min_parallelism = 1,
+        .max_parallelism = 8,
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "file_int64_sink",
+        .id = "snk",
+        .inputs = {"counter"},
+        .parallelism = 1,
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"path", "/tmp/x"}},
+    });
+    return g;
+}
+
+// Every (role, subtask_idx) the plan deploys.
+std::set<std::pair<std::string, std::uint32_t>> deployed_keys(const JobPlan& plan) {
+    std::set<std::pair<std::string, std::uint32_t>> keys;
+    for (const auto& t : plan.tasks) {
+        keys.emplace(t.role, t.subtask_idx);
+    }
+    return keys;
+}
+
+}  // namespace
+
+TEST(JobPlannerReplan, EveryPeerReferenceNamesATaskThatExists) {
+    // The F41 failure mode, reduced to a property. The role-based rescale
+    // resized the deployed task set by cloning a DeploymentTask and left its
+    // chain spec naming subtask indices that were no longer deployed; the job
+    // died with "missing resolved peer for edge" at every restart attempt. A
+    // replanned task set cannot contain that, and this is the assertion that
+    // says so - at every parallelism the operator can be scaled to.
+    for (const std::uint32_t par : {1u, 2u, 4u, 8u}) {
+        auto g = keyed_three_op_graph(par);
+        auto plan = plan_job(g, OperatorRegistry::default_instance());
+        const auto keys = deployed_keys(plan);
+        for (const auto& t : plan.tasks) {
+            for (const auto& [peer_role, peer_sub] : t.peer_refs) {
+                EXPECT_TRUE(keys.count({peer_role, peer_sub}) != 0)
+                    << "counter at parallelism " << par << ": task " << t.subtask_idx
+                    << " references peer " << peer_role << "/" << peer_sub
+                    << ", which the plan does not deploy";
+            }
+        }
+        // The same check through the chain spec, which is what the worker
+        // actually resolves against. peer_refs is derived from it, so a
+        // divergence between the two would be invisible above.
+        for (const auto& t : plan.tasks) {
+            const auto chain = OperatorChainSpec::from_json(t.extra_config);
+            for (const auto& group : chain.output_groups) {
+                for (const auto& e : group.edges) {
+                    EXPECT_TRUE(keys.count({e.peer_role, e.peer_subtask_idx}) != 0)
+                        << "counter at parallelism " << par << ": output edge to " << e.peer_role
+                        << "/" << e.peer_subtask_idx << " is not deployed";
+                }
+            }
+            for (const auto& e : chain.input_edges) {
+                EXPECT_TRUE(keys.count({e.peer_role, e.peer_subtask_idx}) != 0)
+                    << "counter at parallelism " << par << ": input edge from " << e.peer_role
+                    << "/" << e.peer_subtask_idx << " is not deployed";
+            }
+        }
+    }
+}
+
+TEST(JobPlannerReplan, EachOperatorGetsExactlyItsParallelismInContiguousIndices) {
+    // Two properties the rescale restore path depends on:
+    //
+    //  - an operator's subtask_idx_in_op values are exactly 0..parallelism-1,
+    //    because that index is what the parent mapping is computed from;
+    //  - an operator's GLOBAL indices are one contiguous block, because a
+    //    scale-down tells the state backend to read parents
+    //    [base, base + count) and the backend walks consecutive directories.
+    //
+    // If the planner ever allocated indices per-operator interleaved, a
+    // scale-down would silently merge another operator's snapshots.
+    for (const std::uint32_t par : {1u, 2u, 4u, 8u}) {
+        auto g = keyed_three_op_graph(par);
+        auto plan = plan_job(g, OperatorRegistry::default_instance());
+
+        std::map<std::string, std::vector<std::uint32_t>> in_op;
+        std::map<std::string, std::vector<std::uint32_t>> global;
+        for (const auto& t : plan.tasks) {
+            ASSERT_FALSE(t.op_id.empty()) << "planner left op_id unset at parallelism " << par;
+            in_op[t.op_id].push_back(t.subtask_idx_in_op);
+            global[t.op_id].push_back(t.subtask_idx);
+        }
+        const std::map<std::string, std::uint32_t> expected{
+            {"src", 1}, {"counter", par}, {"snk", 1}};
+        for (const auto& [op_id, want] : expected) {
+            ASSERT_EQ(in_op[op_id].size(), want) << op_id << " at counter parallelism " << par;
+            auto idxs = in_op[op_id];
+            std::sort(idxs.begin(), idxs.end());
+            for (std::uint32_t i = 0; i < want; ++i) {
+                EXPECT_EQ(idxs[i], i) << op_id << ": index within operator " << i << " is missing";
+            }
+            auto g_idxs = global[op_id];
+            std::sort(g_idxs.begin(), g_idxs.end());
+            for (std::size_t i = 1; i < g_idxs.size(); ++i) {
+                EXPECT_EQ(g_idxs[i], g_idxs[i - 1] + 1)
+                    << op_id << ": global indices are not contiguous (" << g_idxs[i - 1] << " then "
+                    << g_idxs[i] << "); scale-down restore reads a consecutive run of them";
+            }
+        }
+    }
+}
+
+TEST(JobPlannerReplan, TheKeyedOperatorsSlicesTileTheKeySpaceAtEveryParallelism) {
+    // Gaps lose state, overlaps duplicate it, and either is silent. Asserted
+    // per operator rather than over the whole plan, because the bug this
+    // replaced (F38) came from mixing operators together.
+    for (const std::uint32_t par : {1u, 2u, 4u, 8u}) {
+        auto g = keyed_three_op_graph(par);
+        auto plan = plan_job(g, OperatorRegistry::default_instance());
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> slices;
+        for (const auto& t : plan.tasks) {
+            if (t.op_id == "counter") {
+                slices.emplace_back(t.key_group_first, t.key_group_last);
+            }
+        }
+        ASSERT_EQ(slices.size(), par);
+        std::sort(slices.begin(), slices.end());
+        EXPECT_EQ(slices.front().first, 0u) << "parallelism " << par << ": first slice misses 0";
+        EXPECT_EQ(slices.back().second, static_cast<std::uint32_t>(clink::kNumKeyGroups))
+            << "parallelism " << par << ": last slice does not reach the end";
+        for (std::size_t i = 1; i < slices.size(); ++i) {
+            EXPECT_EQ(slices[i].first, slices[i - 1].second)
+                << "parallelism " << par << ": slice " << i << " leaves a gap or overlap";
+        }
+    }
+}
+
+TEST(JobPlannerReplan, RescalingOneOperatorMovesTheOthersGlobalIndices) {
+    // The reason a replanned rescale has to give EVERY task an explicit restore
+    // directive, not just the rescaled operator's.
+    //
+    // Snapshots live at <checkpoint_dir>/<global subtask_idx>/, and the planner
+    // allocates one contiguous block of global indices per operator in graph
+    // order. Grow the middle operator and the sink's block moves. A sink left on
+    // "restore from my own index" would read a directory belonging to the
+    // counter. This test pins the fact the design rests on, so that if the
+    // planner ever stops moving indices the reason for that machinery is still
+    // recorded.
+    auto before = plan_job(keyed_three_op_graph(1), OperatorRegistry::default_instance());
+    auto after = plan_job(keyed_three_op_graph(4), OperatorRegistry::default_instance());
+
+    const auto global_of = [](const JobPlan& plan, const std::string& op_id) {
+        std::vector<std::uint32_t> out;
+        for (const auto& t : plan.tasks) {
+            if (t.op_id == op_id) {
+                out.push_back(t.subtask_idx);
+            }
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+
+    const auto snk_before = global_of(before, "snk");
+    const auto snk_after = global_of(after, "snk");
+    ASSERT_EQ(snk_before.size(), 1u);
+    ASSERT_EQ(snk_after.size(), 1u);
+    EXPECT_NE(snk_before.front(), snk_after.front())
+        << "growing the counter did not move the sink's global index; if that is now the "
+           "planner's behaviour, the per-task restore translation in restart_job_locked_ "
+           "is no longer load-bearing and this test should be revisited rather than deleted";
+
+    // And the counter's own block: 1 subtask before, 4 after, still contiguous.
+    EXPECT_EQ(global_of(before, "counter").size(), 1u);
+    EXPECT_EQ(global_of(after, "counter").size(), 4u);
+}
+
+TEST(JobPlannerReplan, TranslatingAParentThroughTheOldBlockLandsInTheRightOperator) {
+    // The whole restore-addressing calculation, end to end, without a cluster:
+    // for each task of the new plan, map its index within its operator onto a
+    // parent index, translate that through the operator's OLD block base, and
+    // check the result is a global index the OLD plan actually deployed FOR THE
+    // SAME OPERATOR. Reading another operator's snapshot directory is the
+    // failure this guards, and it is silent.
+    struct Change {
+        std::uint32_t from;
+        std::uint32_t to;
+    };
+    for (const auto ch : {Change{1, 2},
+                          Change{1, 4},
+                          Change{2, 4},
+                          Change{4, 2},
+                          Change{4, 1},
+                          Change{2, 8},
+                          Change{8, 2}}) {
+        auto before = plan_job(keyed_three_op_graph(ch.from), OperatorRegistry::default_instance());
+        auto after = plan_job(keyed_three_op_graph(ch.to), OperatorRegistry::default_instance());
+
+        // Old block base + parallelism per operator, and which operator owns
+        // each old global index.
+        std::map<std::string, std::pair<std::uint32_t, std::uint32_t>> old_block;  // base, count
+        std::map<std::uint32_t, std::string> owner_of_old_global;
+        for (const auto& t : before.tasks) {
+            const std::uint32_t base = t.subtask_idx - t.subtask_idx_in_op;
+            auto& blk = old_block[t.op_id];
+            blk.first = blk.second == 0 ? base : std::min(blk.first, base);
+            ++blk.second;
+            owner_of_old_global[t.subtask_idx] = t.op_id;
+        }
+
+        for (const auto& t : after.tasks) {
+            const auto blk = old_block.at(t.op_id);
+            std::uint32_t new_p = 0;
+            for (const auto& u : after.tasks) {
+                if (u.op_id == t.op_id) {
+                    ++new_p;
+                }
+            }
+            const auto mapping = rescale_parent_mapping(blk.second, new_p, t.subtask_idx_in_op);
+            ASSERT_TRUE(mapping.ok)
+                << ch.from << "->" << ch.to << " op " << t.op_id << ": " << mapping.error;
+            for (std::uint32_t i = 0; i < mapping.parent_count; ++i) {
+                const std::uint32_t old_global = blk.first + mapping.parent_idx + i;
+                const auto owner = owner_of_old_global.find(old_global);
+                ASSERT_NE(owner, owner_of_old_global.end())
+                    << ch.from << "->" << ch.to << ": " << t.op_id << " subtask "
+                    << t.subtask_idx_in_op << " would restore from global index " << old_global
+                    << ", which the previous deploy did not use";
+                EXPECT_EQ(owner->second, t.op_id)
+                    << ch.from << "->" << ch.to << ": " << t.op_id << " subtask "
+                    << t.subtask_idx_in_op << " would restore from global index " << old_global
+                    << ", which belonged to operator '" << owner->second << "'";
+            }
+        }
     }
 }

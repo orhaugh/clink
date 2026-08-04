@@ -44,7 +44,10 @@
 //   CLINK_RXO_TICK_MS    pause between records (default 40)
 //   CLINK_RXO_KEYS       distinct keys (default 4)
 //   CLINK_RXO_MAX_PAR    its max_parallelism bound (default 4)
+//   CLINK_RXO_PAR        the counter's STARTING parallelism (default 1), so a
+//                        test can scale it either up or down
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -235,6 +238,7 @@ void define_job(clink::api::Pipeline& pipeline) {
     const auto tick = std::chrono::milliseconds{env_int("CLINK_RXO_TICK_MS", 40)};
     const auto keys = env_int("CLINK_RXO_KEYS", 4);
     const auto max_par = static_cast<std::uint32_t>(env_int("CLINK_RXO_MAX_PAR", 4));
+    const auto start_par = static_cast<std::uint32_t>(env_int("CLINK_RXO_PAR", 1));
     const auto out_dir = env_or("CLINK_RXO_OUT", "/tmp/clink_rescale_xo_out");
 
     auto& reg = pipeline.registry();
@@ -266,8 +270,14 @@ void define_job(clink::api::Pipeline& pipeline) {
     // stream; KeyedDataStream::process(op_type, ...) is the attach point that
     // carries key_by onto the OperatorSpec, which OperatorDescriptor cannot
     // express.
+    // The counter's starting parallelism. Set as the pipeline default just
+    // before the operator is created, since a plain DataStream has no
+    // per-operator setter; reset to 1 afterwards so the sink stays single so
+    // its committed files are one series and a duplicate is unambiguous.
+    pipeline.set_parallelism(start_par);
     auto counted = stream.key_by("rescale_xo.by_index_mod")
                        .process<std::string>("rescale_xo.keyed_count_check", {}, "counter");
+    pipeline.set_parallelism(1);
 
     // `.rescalable()` is what makes `clink rescale-op` accept a request for
     // this operator at all: without bounds the RescaleCoordinator registers it
@@ -276,7 +286,7 @@ void define_job(clink::api::Pipeline& pipeline) {
     // It starts at 1 and may go to max_par, so the test scales UP - the
     // direction where key groups have to be redistributed across subtasks that
     // did not exist when the state was written.
-    counted.uid("rescale-xo-counter").rescalable(1, max_par);
+    counted.uid("rescale-xo-counter").rescalable(1, std::max(max_par, start_par));
 
     clink::api::SinkDescriptor sink;
     sink.op_type = "file_2pc_sink_string";

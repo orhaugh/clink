@@ -37,6 +37,38 @@
 
 namespace clink::cluster {
 
+// Which parent snapshot a rescaled subtask restores from.
+//
+// `parent_idx` is the OLD subtask index whose snapshot file this new subtask
+// reads; `parent_count` is how many consecutive parents to merge starting
+// there. Scaling up, several new subtasks share one parent and each filters it
+// down to its own key-group slice (parent_count == 1). Scaling down, one new
+// subtask absorbs a contiguous run of parents and the snapshot loader
+// concatenates them.
+struct RescaleParentMapping {
+    std::uint32_t parent_idx{};
+    std::uint32_t parent_count{1};
+    bool ok{false};
+    std::string error;
+};
+
+// Compute that mapping. `subtask_idx_in_op` is the index WITHIN the operator
+// being rescaled - NOT the job-global subtask index. Passing the global index
+// gives the wrong parent for every operator after the first, which is the same
+// class of error as F38, so the parameter is named for the only thing that is
+// correct to pass.
+//
+// Only integer factors are supported: a non-integer factor would leave a key
+// group straddling two parents, and the snapshot loader has no way to merge
+// half a parent.
+//
+// Pulled out of the coordinator so the arithmetic can be tested exhaustively
+// without a cluster. It was previously inline in restart_job_locked_, keyed off
+// the global index, and reachable only through a multi-process rescale.
+[[nodiscard]] RescaleParentMapping rescale_parent_mapping(std::uint32_t old_parallelism,
+                                                          std::uint32_t new_parallelism,
+                                                          std::uint32_t subtask_idx_in_op);
+
 struct CutoverDeployment {
     // (worker_id, DeploymentTask). Each entry is one new-parallelism
     // subtask placed on the given worker. role / extra_config / peers are

@@ -127,6 +127,18 @@ public:
     // Complete). Typical trigger: a hard worker failure during cutover
     // that makes the rescale unrecoverable. The operator returns to
     // its pre-rescale parallelism; current_parallelism is unchanged.
+    // Close out a rescale that was carried out by REPLANNING the job rather
+    // than by the graceful in-place cutover this state machine models.
+    //
+    // The replan path drains the whole job and redeploys it from the graph, so
+    // there is no Draining -> CuttingOver -> Complete sequence to walk: the old
+    // subtasks and the new ones never coexist. Without this the status would
+    // sit at Preparing for a rescale that had already finished, and
+    // `operator_rescale_status` is what the HTTP surface and the autoscaler's
+    // cooldown read. Accepts Preparing (the normal case) and is a no-op from
+    // any other state.
+    bool mark_replan_complete(const std::string& op_id, std::uint32_t new_parallelism);
+
     bool abort(const std::string& op_id, std::string reason);
 
     // Look up status for one operator. Returns nullopt if the op

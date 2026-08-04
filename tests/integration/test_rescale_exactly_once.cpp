@@ -110,6 +110,12 @@ constexpr int kTotalRecords = 240;
 constexpr int kTickMs = 125;
 constexpr int kKeys = 12;
 constexpr int kMaxParallelism = 4;
+// How much committed output a rescale test waits for before rescaling. A fifth
+// of the run is roughly 4 records per key, so a subtask that restored the wrong
+// slice, or nothing, is several counts adrift and the operator's self-check
+// reports it. Rescaling at the first committed record does not distinguish the
+// two - mutation-checked, and it did not.
+constexpr unsigned kMinCommittedBefore = kTotalRecords / 5;
 
 std::vector<std::string> committed_records(const std::filesystem::path& out_dir) {
     std::vector<std::string> lines;
@@ -202,6 +208,10 @@ protected:
         ::setenv("CLINK_RXO_TICK_MS", std::to_string(kTickMs).c_str(), 1);
         ::setenv("CLINK_RXO_KEYS", std::to_string(kKeys).c_str(), 1);
         ::setenv("CLINK_RXO_MAX_PAR", std::to_string(kMaxParallelism).c_str(), 1);
+        // Reset per test: one case below starts the operator at 4 so it can
+        // scale DOWN, and gtest runs every case in one process, so a leaked
+        // value would silently change what a later test is exercising.
+        ::setenv("CLINK_RXO_PAR", "1", 1);
     }
 
     void TearDown() override {
@@ -310,27 +320,32 @@ TEST_F(RescaleExactlyOnceTest, TheJobCommitsEveryRecordExactlyOnceWithNoRescale)
         << describe(v);
 }
 
-// Per-operator rescale: `clink rescale-op --op=counter --parallelism=4`.
+// The thing this file was written for: change a running job's parallelism and
+// assert every record still lands exactly once.
 //
-// This case was written to demonstrate exactly-once ACROSS a per-operator
-// rescale. It cannot, because the rescale does not happen, and finding that out
-// is what the test now pins.
+// How the rescale works, because it decides what this test has to prove. The
+// coordinator drains the job, re-derives the whole task set from the retained
+// job graph at the new parallelism, and redeploys from the last completed
+// checkpoint, telling each new subtask which parent's state it inherits. It is
+// a stop and restart, not a seamless cutover, so exactly-once rests on the same
+// two things failover rests on: a source that replays from a checkpointed
+// offset, and a sink that only publishes at a completed checkpoint.
 //
-// The coordinator used to accept the request (`ok=1 accepted_target=4`) and then
-// do nothing: every step after the accept addresses the operator's subtasks by
-// matching DeploymentTask::role against the operator id, while the planner gives
-// every subtask the one shared role "__clink_subtask". BeginRescale went to
-// zero workers, the operator sat in Draining until the job ended, and no log line
-// said so. The first version of this test passed on that - it waited for output
-// equality after an accepted request, and got it, because nothing had been
-// resized. It also passed with the rescale path's key-group arithmetic
-// deliberately broken, three separate ways.
+// Three ways this could pass while being worthless, each closed below:
 //
-// So the contract asserted here is the honest one: a request the coordinator
-// cannot execute is REFUSED, with a reason that says why, and the running job is
-// untouched. When per-operator addressing lands, this test should be replaced by
-// one that drives a real rescale and asserts output equality across it.
-TEST_F(RescaleExactlyOnceTest, PerOperatorRescaleIsRefusedRatherThanSilentlyAccepted) {
+//   1. The rescale never happens. An earlier version of this test asserted
+//      output equality after an accepted request and passed with the key-group
+//      arithmetic broken three different ways, because the request was accepted
+//      and then dropped. So the test requires the coordinator's own "replanned"
+//      line AND a changed subtask count, not an ack.
+//   2. The rescale happens after the job has finished. The job runs for about
+//      30 seconds; the rescale is requested as soon as output appears.
+//   3. Nothing keyed moves. The operator being scaled is keyed, holds per-key
+//      counters, and checks them against the record index itself - so a subtask
+//      that restored the wrong slice of key groups emits STATE-MISMATCH, which
+//      is not in the expected multiset and shows up as unexpected output naming
+//      the key.
+TEST_F(RescaleExactlyOnceTest, ScalingAKeyedOperatorUpPreservesExactlyOnceOutput) {
     Cluster c(spec());
     ScopedDiagnostics diag(c);
     ASSERT_TRUE(c.start_coordinator());
@@ -341,64 +356,178 @@ TEST_F(RescaleExactlyOnceTest, PerOperatorRescaleIsRefusedRatherThanSilentlyAcce
     auto sub = submit(c);
     ASSERT_NE(sub, nullptr);
 
-    // Ask only once the job is genuinely running and has published output, so
-    // the refusal is about addressability and not about an un-started job.
+    // Wait for COMMITTED output, not for a checkpoint marker. Those are
+    // different moments, and rescaling before anything is published would leave
+    // no published work for a replay to duplicate.
+    // Wait for a MEANINGFUL amount of committed output, not just the first
+    // record. The amount of accumulated per-key state is what a broken restore
+    // has to lose for the operator's self-check to notice: rescaling after two
+    // records leaves every counter at 0 or 1, and a subtask that restored
+    // nothing then looks indistinguishable from one that restored correctly.
+    // Verified - with the restore translation deliberately broken, rescaling
+    // early was caught by the scale-up case but NOT by the scale-down one.
     ASSERT_TRUE(clink::itest::await(
-        [&] { return verify_exactly_once(out_dir_, kTotalRecords).total_lines > 0; },
-        std::chrono::seconds(60)))
-        << "nothing was committed before the rescale request, so the job was not yet running";
+        [&] {
+            return verify_exactly_once(out_dir_, kTotalRecords).total_lines >= kMinCommittedBefore;
+        },
+        std::chrono::seconds(90)))
+        << "fewer than " << kMinCommittedBefore
+        << " records were committed before the rescale, so there was too little accumulated "
+           "state for a bad restore to show up";
+    const auto committed_before = verify_exactly_once(out_dir_, kTotalRecords).total_lines;
+    ASSERT_GE(committed_before, kMinCommittedBefore);
 
     std::string rescale_out;
     const int rc = rescale_operator(c, "counter", kMaxParallelism, &rescale_out);
     std::cerr << "RESCALE-OP-OUTCOME rc=" << rc << ": " << rescale_out << "\n";
 
-    const auto exit_code = sub->await_exit(std::chrono::seconds(120));
+    // Evidence the rescale LANDED. "accepted" only means the request was
+    // staged; the redeploy happens after the drain and logs "replanned".
+    const bool replanned = clink::itest::await(
+        [&] { return c.coordinator().log_contains("replanned"); }, std::chrono::seconds(45));
+
+    const auto exit_code = sub->await_exit(std::chrono::seconds(180));
     const auto v = verify_exactly_once(out_dir_, kTotalRecords);
     const std::string context =
-        "rescale-op rc=" + std::to_string(rc) + " reply=" + rescale_out + " | " + describe(v);
+        "rescale rc=" + std::to_string(rc) + " reply=" + rescale_out +
+        (replanned ? " | replanned" : " | NEVER REPLANNED") + " | " + describe(v) +
+        " | committed before the rescale: " + std::to_string(committed_before);
 
-    EXPECT_NE(rc, 0) << "the coordinator accepted a per-operator rescale it cannot execute. An "
-                        "accepted request that never runs is worse than a refusal: the caller "
-                        "waits for a resize that will never happen. "
-                     << context;
-    EXPECT_NE(rescale_out.find("shared role"), std::string::npos)
-        << "the refusal must say WHY - that every subtask carries one shared role, so a single "
-           "operator's subtasks cannot be targeted - otherwise an operator cannot tell this "
-           "apart from a bad argument. "
-        << context;
+    ASSERT_EQ(rc, 0) << "the rescale request was refused. " << context;
+    ASSERT_TRUE(replanned) << "the request was accepted but no replan landed within 45s, so the "
+                              "operator never resized and the output below says nothing about "
+                              "rescale. "
+                           << context;
+    // The new parallelism has to be visible in what the coordinator says it is
+    // running, or "replanned" could have redeployed the same shape.
+    EXPECT_TRUE(c.coordinator().log_contains("counter=1->4"))
+        << "the replan did not report the requested parallelism change. " << context;
 
-    // The refusal must be a no-op on the running job, not a rescale that half
-    // happened. Both halves matter: nothing dispatched, and the job unharmed.
-    EXPECT_FALSE(c.coordinator().log_contains("begin rescale dispatched"))
-        << "a refused request still dispatched a drain. " << context;
     ASSERT_TRUE(exit_code.has_value()) << "submitter never exited. " << context;
-    EXPECT_EQ(*exit_code, 0) << "the job did not finish cleanly after a refused rescale. "
-                             << context;
-    EXPECT_TRUE(v.missing.empty()) << "records were lost after a refused rescale. " << context;
+    EXPECT_EQ(*exit_code, 0) << "the rescaled job did not run to completion. " << context;
+
     EXPECT_TRUE(v.duplicated.empty())
-        << "records were duplicated after a refused rescale. " << context;
-    EXPECT_TRUE(v.unexpected.empty())
-        << "output contains records the source never emitted. A STATE-MISMATCH marker here is "
-           "the keyed operator reporting that its own per-key counter disagreed with the record "
-           "index. "
+        << "records were committed MORE than once across the rescale: work that had already been "
+           "published was replayed. "
         << context;
+    EXPECT_TRUE(v.unexpected.empty())
+        << "output contains records the source never emitted. A STATE-MISMATCH marker here is the "
+           "keyed operator reporting that its per-key counter disagreed with the record index - "
+           "key-group state was lost or duplicated when the operator resized. "
+        << context;
+    EXPECT_TRUE(v.missing.empty()) << "records were LOST across the rescale. " << context;
 }
 
-// Whole-job rescale: `clink rescale --role=__clink_subtask --parallelism=1`, the
-// path that DOES execute.
-//
-// It must not run on a multi-operator job. Measured before the refusal was added,
-// on exactly this job: the rescale was accepted ("rescale initiated; draining 2
-// worker connection(s)"), the coordinator redeployed the job as ONE task cloned
-// from a single operator chain, that task failed immediately with "missing
-// resolved peer for edge" because the peers it referenced were no longer
-// deployed, every restart attempt failed the same way, and the job finished
-// FAILED having committed 3 of 240 records.
-//
-// So this asserts the refusal, and - the part that makes it sensitive - that the
-// job is still intact afterwards. Reverting the refusal does not merely flip the
-// exit code, it destroys the job, and the output assertions below fail with 237
-// records missing.
+// The same, downwards. Scale-down is the harder direction for state: one new
+// subtask has to absorb a contiguous run of parent snapshots and merge them,
+// where scale-up only has to filter one parent down to a slice. A merge that
+// dropped a parent, or read the wrong one, shows up as STATE-MISMATCH.
+TEST_F(RescaleExactlyOnceTest, ScalingAKeyedOperatorDownPreservesExactlyOnceOutput) {
+    ::setenv("CLINK_RXO_PAR", "4", 1);  // start at 4, scale to 1
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c);
+    ASSERT_NE(sub, nullptr);
+    // As above: enough accumulated per-key state that a bad merge is visible.
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return verify_exactly_once(out_dir_, kTotalRecords).total_lines >= kMinCommittedBefore;
+        },
+        std::chrono::seconds(90)))
+        << "too little was committed before the scale-down for a bad merge to show up";
+
+    std::string rescale_out;
+    const int rc = rescale_operator(c, "counter", 1, &rescale_out);
+    std::cerr << "RESCALE-DOWN-OUTCOME rc=" << rc << ": " << rescale_out << "\n";
+    const bool replanned = clink::itest::await(
+        [&] { return c.coordinator().log_contains("replanned"); }, std::chrono::seconds(45));
+
+    const auto exit_code = sub->await_exit(std::chrono::seconds(180));
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    const std::string context = "rescale rc=" + std::to_string(rc) + " reply=" + rescale_out +
+                                (replanned ? " | replanned" : " | NEVER REPLANNED") + " | " +
+                                describe(v);
+
+    ASSERT_EQ(rc, 0) << "the scale-down request was refused. " << context;
+    ASSERT_TRUE(replanned) << "the scale-down was accepted but never landed. " << context;
+    EXPECT_TRUE(c.coordinator().log_contains("counter=4->1"))
+        << "the replan did not report the requested parallelism change. " << context;
+    ASSERT_TRUE(exit_code.has_value()) << "submitter never exited. " << context;
+    EXPECT_EQ(*exit_code, 0) << "the rescaled job did not run to completion. " << context;
+    EXPECT_TRUE(v.duplicated.empty())
+        << "records were duplicated across the scale-down. " << context;
+    EXPECT_TRUE(v.unexpected.empty())
+        << "output contains records the source never emitted. A STATE-MISMATCH here means the "
+           "merge of the four parent snapshots into one subtask lost or double-counted state. "
+        << context;
+    EXPECT_TRUE(v.missing.empty()) << "records were LOST across the scale-down. " << context;
+}
+
+// Refusals. Each is a decision the coordinator has to take BEFORE draining the
+// job, because a request discovered to be impossible after the drain leaves a
+// stopped job and nothing to fall back to.
+TEST_F(RescaleExactlyOnceTest, ImpossibleRescaleRequestsAreRefusedWithoutTouchingTheJob) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return verify_exactly_once(out_dir_, kTotalRecords).total_lines > 0; },
+        std::chrono::seconds(60)));
+
+    struct Case {
+        const char* op;
+        int parallelism;
+        const char* expect_substring;
+        const char* why;
+    };
+    // The non-integer-factor refusal is covered exhaustively by the unit tests
+    // over rescale_parent_mapping; these are the ones that need a live job to
+    // reach, because they read the job's retained graph and deployed shape.
+    const std::vector<Case> cases{
+        {"no_such_op", 2, "has no operator", "an operator the graph does not contain"},
+        {"sink", 2, "declares no rescale bounds", "an operator that never declared bounds"},
+        {"counter", 99, "above operator", "a target above the declared maximum"},
+        {"counter", 1, "already runs at parallelism", "a no-op request"},
+    };
+    for (const auto& tc : cases) {
+        std::string out;
+        const int rc = rescale_operator(c, tc.op, tc.parallelism, &out);
+        EXPECT_NE(rc, 0) << "accepted " << tc.why << " (op=" << tc.op
+                         << " parallelism=" << tc.parallelism << "): " << out;
+        EXPECT_NE(out.find(tc.expect_substring), std::string::npos)
+            << "refusal for " << tc.why << " did not say why: " << out;
+    }
+
+    // None of those refusals may have disturbed the job.
+    EXPECT_FALSE(c.coordinator().log_contains("replanned"))
+        << "a refused request replanned the job anyway";
+    const auto exit_code = sub->await_exit(std::chrono::seconds(180));
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    ASSERT_TRUE(exit_code.has_value()) << "submitter never exited. " << describe(v);
+    EXPECT_EQ(*exit_code, 0) << "the job did not finish cleanly after refused requests. "
+                             << describe(v);
+    EXPECT_TRUE(v.missing.empty()) << "records were lost after refused requests. " << describe(v);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "records were duplicated after refused requests. " << describe(v);
+    EXPECT_TRUE(v.unexpected.empty()) << describe(v);
+}
+
+// Whole-JOB rescale by role remains refused for a multi-operator job, and this
+// is the regression guard for F41. `clink rescale --role=__clink_subtask` names
+// every subtask of every operator at once, so one parallelism for it cannot
+// express the graph; carrying it out redeployed the job as clones of a single
+// chain and killed it. Per-operator rescale, above, is the supported surface.
 TEST_F(RescaleExactlyOnceTest, WholeRoleRescaleOfAMultiOperatorJobIsRefused) {
     Cluster c(spec());
     ScopedDiagnostics diag(c);
@@ -412,13 +541,13 @@ TEST_F(RescaleExactlyOnceTest, WholeRoleRescaleOfAMultiOperatorJobIsRefused) {
     ASSERT_TRUE(clink::itest::await(
         [&] { return verify_exactly_once(out_dir_, kTotalRecords).total_lines > 0; },
         std::chrono::seconds(60)))
-        << "nothing was committed before the rescale request, so the job was not yet running";
+        << "nothing was committed before the rescale, so the job was not yet running";
 
     std::string rescale_out;
     const int rc = rescale_whole_role(c, 1, &rescale_out);
     std::cerr << "RESCALE-WHOLE-ROLE-OUTCOME rc=" << rc << ": " << rescale_out << "\n";
 
-    const auto exit_code = sub->await_exit(std::chrono::seconds(120));
+    const auto exit_code = sub->await_exit(std::chrono::seconds(180));
     const auto v = verify_exactly_once(out_dir_, kTotalRecords);
     const std::string context =
         "rescale rc=" + std::to_string(rc) + " reply=" + rescale_out + " | " + describe(v);
@@ -429,8 +558,8 @@ TEST_F(RescaleExactlyOnceTest, WholeRoleRescaleOfAMultiOperatorJobIsRefused) {
     EXPECT_NE(rescale_out.find("covers all"), std::string::npos)
         << "the refusal must explain that the role spans every operator in the job. " << context;
 
-    // The job must be untouched. This is the assertion that would have caught
-    // the destructive behaviour: it fails with hundreds of records missing.
+    // The job must be untouched. With the refusal reverted this fails with
+    // hundreds of records missing, not merely on an exit code.
     ASSERT_TRUE(exit_code.has_value()) << "submitter never exited. " << context;
     EXPECT_EQ(*exit_code, 0) << "the job did not finish cleanly after a refused rescale. "
                              << context;

@@ -80,7 +80,7 @@ subtask   = key_group * parallelism / 128
 
 `subtask_for_key_group` gives every subtask a contiguous slice of groups, and `key_group_range_for_subtask` is its inverse. Because groups, not raw keys, are the unit of ownership, changing parallelism redistributes whole slices rather than rehashing individual keys, and the snapshot loader can read or filter exactly the state that belongs to a new subtask's range.
 
-clink has two rescale paths that share this math. Read the limits below before either: **neither path can change the parallelism of an operator inside a multi-operator job on the fly.** The supported way to run a multi-operator job at a different parallelism is to take a savepoint and resubmit at the new value.
+clink has two rescale paths that share this math. **Per-operator rescale is the supported way to change a running job's parallelism**; whole-job rescale by role predates it and is limited to single-operator jobs (see below).
 
 **Whole-job rescale** (`Coordinator::rescale_job`) changes the parallelism of one or more roles at once. It requires a `checkpoint_dir` and at least one completed checkpoint, validates that each new parallelism is an integer multiple (scale-up) or divisor (scale-down) of the current value, and checks free slot capacity if the change net-grows usage.
 
@@ -91,23 +91,38 @@ It then stages `rescale_overrides`, marks the job `awaiting_restart`, sets the d
 
 Whole-job rescale refuses the shared role on a multi-operator job, and that refusal is the difference between this path working and destroying the job. The planner deploys every subtask of every operator under one role, `kGenericSubtaskRole` ("__clink_subtask"), so on a job with more than one operator "the role's parallelism" is the job's total subtask count, not any operator's parallelism. Asking for N therefore keeps the templates for subtask indices below N and prunes the rest - and since a template's operator identity lives in its packed `OperatorChainSpec` (`extra_config`), which the rescale branch does not rewrite, the surviving templates are N clones of whichever chains happened to sit at those indices. Peer fan-out is rewritten at the `peers` level, but the chain spec inside `extra_config` still names input and output edges to subtask indices that are no longer deployed. Measured on a 3-operator job asked to scale to 1: the redeployed task failed with `missing resolved peer for edge`, every restart attempt failed identically until the restart budget was exhausted, and the job finished FAILED having committed 3 of its 240 records - while the CLI had reported `ok=1 "rescale initiated"`. Reproduced on a second, unrelated job (4 subtasks, restart budget 10) with the same failure at every attempt. The coordinator now refuses that combination up front. A single-operator job, where the role's parallelism and the operator's parallelism are the same number, is unaffected and is the case this path handles.
 
-**Operator-level adaptive rescale** is driven by the per-operator `RescaleCoordinator` (`include/clink/cluster/rescale_coordinator.hpp`). Its purpose is to run a graceful cutover under a coordinator state machine rather than a full job restart. An operator is registered with its current parallelism plus `[min_parallelism, max_parallelism]` bounds taken from the `OperatorSpec`; `min == 0 && max == 0` means the operator is not scalable and rescale requests are rejected. The state machine is:
+**Per-operator rescale** changes one operator's parallelism on a running job. `clink rescale-op --job-id=N --op=<operator id> --parallelism=P`, or the equivalent HTTP surface, or the autoscaler.
+
+The mechanism is a **replan**, not an in-place cutover:
+
+1. Validate the request against the job's retained graph - the operator exists, it declares `[min_parallelism, max_parallelism]` bounds and the target is inside them, the target is an integer multiple or divisor of what the operator currently runs, a checkpoint has completed, and the cluster has slots for any growth. Everything answerable from the request and the graph is answered before anything is disturbed, because the next step stops the job.
+2. Drain the job. `CancelJob` goes to every worker hosting a task; the existing `awaiting_restart` machinery collects the acks.
+3. When the last ack lands, `restart_job_locked_` parses `graph_json`, sets the requested parallelism on that operator, and runs `plan_job` over the result using the job's own registries. The plan is the post-rescale task set in full - chain specs, edge fan-out, key-group ranges - derived the same way a fresh submit derives them.
+4. Redeploy from `latest_completed_checkpoint_id`, with each new subtask told which parent's snapshot it inherits.
+
+Why replan rather than resize the deployed task set: a task's operator identity lives inside its packed `OperatorChainSpec`, and cloning a `DeploymentTask` does not rewrite it. That is what the role-based path does, and on a multi-operator job it produced clones of one chain with edges naming subtasks that were no longer deployed (F41). A replanned task set cannot contain that by construction, and `JobPlannerReplan.EveryPeerReferenceNamesATaskThatExists` asserts it without needing a cluster.
+
+**This is a stop, not a seamless cutover.** The job stops and starts again from its last completed checkpoint. Exactly-once across it therefore rests on the same two things exactly-once across a failover rests on - a source that replays from a checkpointed offset, and a sink that only publishes at a completed checkpoint - and not on the rescale being transparent. In-flight records between the checkpoint and the drain are reprocessed.
+
+**Restore addressing, and why every task gets a directive.** A snapshot lives at `<checkpoint_dir>/<subtask_idx>/`, addressed by the job-global index, and the planner allocates global indices as one contiguous block per operator in graph order. Change one operator's parallelism and every *later* operator's block moves. So a replan cannot leave the untouched operators on the default "restore from my own index" - that directory now belongs to a different operator. The coordinator therefore records, per deployed task, which operator hosts it and which of that operator's subtasks it is (`JobState::task_op_identity`), and for every task in the new plan it:
+
+- takes the operator's old block base and old parallelism from that record;
+- maps the task's index *within the operator* onto a parent index via `rescale_parent_mapping` (`rescale_dispatch.hpp`);
+- sets `restore_from_subtask_idx` to `old_base + parent_idx` and `restore_from_parent_count` to the number of parents to merge.
+
+Using the job-global index for that mapping instead of the index within the operator is the same class of error as F38, so the helper's parameter is named `subtask_idx_in_op` and refuses an index outside the new parallelism rather than silently returning parent 0.
+
+**The `RescaleCoordinator` state machine** (`include/clink/cluster/rescale_coordinator.hpp`) is the status record, not the mechanism. It validates bounds, marks the operator `Preparing` when a request is accepted, and `mark_replan_complete` closes it when the redeploy fires - the replan has no `Draining -> CuttingOver` sequence to walk, because the old subtasks and the new ones never coexist. `operator_rescale_status` and the HTTP surface read it, and the autoscaler's cooldown depends on it not sitting at `Preparing` for a rescale that has finished.
 
 ```mermaid
 stateDiagram-v2
   [*] --> Idle
-  Idle --> Preparing: request_rescale (validate bounds, mark target)
-  Preparing --> Draining: mark_checkpoint_ready (a checkpoint landed)
-  Draining --> CuttingOver: all old subtasks acked
-  CuttingOver --> Complete: all new subtasks ready (current = target)
+  Idle --> Preparing: request accepted (bounds validated, target marked)
+  Preparing --> Complete: mark_replan_complete (redeploy fired at the new parallelism)
   Preparing --> Aborted: abort (revert parallelism)
-  Draining --> Aborted: abort
-  CuttingOver --> Aborted: abort
 ```
 
-**This path does not execute for a job planned by the planner, and the coordinator now refuses such requests.** Every step after the request addresses an operator's subtasks by matching `DeploymentTask::role` against the operator id - `dispatch_begin_rescale_locked_`, `dispatch_cutover_deploy_locked_`, and the drain and ready ack paths all do it - while the planner gives every task the single shared role `kGenericSubtaskRole`. That match never succeeds, so before the refusal was added the request was accepted (`clink rescale-op` printed `ok=1 accepted_target=N`), `BeginRescale` was sent to zero workers, and the operator sat in `Draining` until the job ended, with nothing in the log to say so. The autoscaler routes through the same function and so fired the same inert requests on a timer. Making per-operator rescale work needs chain-aware addressing (a task recording which operator it hosts, and the coordinator mapping a drain or ready ack back to that operator) plus fan-out rewiring on the upstream edge, since `plan_operator_cutover` clones the template task's peers verbatim and does not re-point an upstream partitioner at a changed downstream subtask count. Until then the state machine below is exercised by unit tests and by the in-process coordinator tests, not by a running planned job.
-
-`Coordinator::request_operator_rescale` validates the request and refuses if the job has no coordinator, if periodic checkpointing is not configured (`checkpoint_dir` empty or `interval_ms <= 0`) because the `Preparing -> Draining` transition is driven by a checkpoint landing and would otherwise wait forever, or if no deployed subtask is addressable as the named operator (the shared-role limitation above). The actual cutover deployment math lives in `plan_operator_cutover` (`rescale_dispatch.cpp`), which computes the same key-group ranges and `restore_from_*` mapping as the whole-job path and places the new subtasks greedily onto workers with free slots. `Coordinator::dispatch_begin_rescale_locked_` sends `BeginRescale` to every worker hosting the operator; each worker fires its drain callbacks so the running subtask emits a `DrainMarker` and shuts down. The coordinator itself is purely the state record: each transition is mutex-protected and the coordinator RPC handlers update it via `mark_checkpoint_ready`, `mark_old_drained`, and `mark_new_ready`.
+The graceful in-place cutover the state machine originally modelled - `Preparing -> Draining -> CuttingOver -> Complete`, driven by `BeginRescale`, `plan_operator_cutover` and per-subtask drain acks - is still present and unit tested, but is not what a `rescale-op` request drives. It cannot be: every one of its steps addresses an operator's subtasks by matching `DeploymentTask::role` against the operator id, and the planner gives every task the one shared role, so the match never succeeds. Reaching it needs chain-aware addressing on the deploy directive plus fan-out rewiring on the upstream edge, since `plan_operator_cutover` clones the template's peers verbatim. Doing that would remove the stop; it would not change the correctness argument above.
 
 #### Sources as operator state
 
@@ -215,11 +230,15 @@ Scope and honesty: Row-channel operators (the SQL frontend's set - GROUP BY, win
 - **Rescale is integer-factor only.** Both the whole-job and operator paths require the new parallelism to be an integer multiple (scale-up) or divisor (scale-down) of the current value. Non-integer factors would leave key groups straddling parents and are not supported.
 - **Operator rescale needs periodic checkpointing.** `request_operator_rescale` rejects the request unless `checkpoint_dir` is set and `interval_ms > 0`, because the cutover is gated on a checkpoint landing.
 
-- **Per-operator rescale is not executable on a planned job.** The coordinator addresses an operator's subtasks by role, and the planner gives every subtask the same role, so no operator's subtasks can be targeted. Requests are refused with that reason rather than accepted and dropped. The autoscaler, which requests through the same call, is inert for the same reason.
+- **A per-operator rescale stops the job.** It drains, replans and redeploys from the last completed checkpoint. There is no seamless cutover, so a rescale costs a restart's worth of latency and reprocesses whatever was in flight past the checkpoint. Exactly-once across it depends on a replayable source and a transactional sink, exactly as a failover does.
 
-- **Whole-job rescale is for single-operator jobs.** On a multi-operator job the shared role covers every subtask, so a single parallelism for it cannot express the job graph; the request is refused. Change a multi-operator job's parallelism by taking a savepoint and resubmitting.
+- **An operator must declare rescale bounds to be scalable.** `min_parallelism == 0 && max_parallelism == 0` means "nobody said what range is safe", and the request is refused rather than guessed at. Declare them with `.rescalable(min, max)` on the stream or on the `OperatorSpec`.
 
-- **Exactly-once across a rescale is not demonstrated.** There is no test that scales a running keyed operator and then asserts output equality, because neither rescale path can carry out that change. Restart-from-checkpoint failover at a fixed parallelism is covered; a parallelism change is not.
+- **Whole-job rescale by role is for single-operator jobs.** On a multi-operator job the shared role covers every subtask, so a single parallelism for it cannot express the job graph; the request is refused. Use per-operator rescale.
+
+- **Exactly-once across a rescale is demonstrated for the file 2PC sink only.** `RescaleExactlyOnceTest` scales a keyed operator up (1 to 4) and down (4 to 1) on a running job and asserts the committed multiset is exactly the input, with a keyed operator that checks its own per-key counters and reports a mismatch as visible output. Other sinks have commit tests, not rescale runs.
+
+- **The source is not rescaled by these tests.** Source offsets are operator-list state, restored whole by every subtask (above), so rescaling a source's parallelism redistributes no offsets and its replay correctness is entirely the source's own affair. The covered case is rescaling a keyed operator downstream of a parallelism-1 source.
 - **Operator-list state is not repartitioned.** Source offsets and broadcast slots carry the `0xFF` operator-state prefix and are restored whole by every subtask on rescale, not split by key group.
 - **Migration must stay name-stable.** Schema migration looks state up by `(op, state_type)` and filters by slot name, so both the `state_type` tag and the slot name must stay stable from the generation that wrote a savepoint to the one that restores it. Renaming a tag or slot across a restore is unsupported and needs an explicit transform step first. An absent stamp is assumed v1, which is safe only when the tag is genuinely new.
 - **TTL slots cannot be migrated in v1.** A TTL-enabled slot stores values as `[8B expire-at][user bytes]`; the migrator hands the full stored value to the migration function, which expects raw user bytes, so do not bump the schema version of a TTL slot.

@@ -1408,7 +1408,10 @@ attempt to break it changed the test instead: require the coordinator's own
 `cutover deploy` line rather than trusting the ack. That failed immediately,
 and pointed here.
 
-**Fixed** by refusing a request the coordinator cannot carry out. The
+**Fixed** twice over: first by refusing a request the coordinator cannot carry
+out, then by making the request work through a replan (F44), which is what the
+CLI drives today. The refusal text below is superseded; the reasoning for
+refusing rather than silently accepting is not. The
 addressability check runs after the existing checkpointing gate, so the
 existing "requires periodic checkpointing" refusal keeps precedence and its
 test still holds. An accepted request that never runs is worse than a refusal:
@@ -1423,12 +1426,16 @@ this build. To change a running job's parallelism, take a savepoint and
 resubmit at the new parallelism."
 ```
 
-Making the feature actually work is a separate, feature-sized piece: tasks
-must record which operator they host, the coordinator must map a drain or
-ready ack back to that operator, and `plan_operator_cutover` must re-point the
-upstream partitioner at the changed downstream subtask count instead of
-cloning the template's peers verbatim. That is on the follow-up list, not in
-this round.
+Making the GRACEFUL in-place cutover work is still a separate, feature-sized
+piece: tasks must be addressable by operator on the deploy directive, the
+coordinator must map a drain or ready ack back to that operator, and
+`plan_operator_cutover` must re-point the upstream partitioner at the changed
+downstream subtask count instead of cloning the template's peers verbatim.
+
+The capability itself, however, was built immediately afterwards by a different
+route - drain, replan from the retained graph, redeploy from checkpoint - and
+`clink rescale-op` now works. See F44. What remains missing is only the
+seamlessness: a rescale costs a restart.
 
 ### F41. Whole-job rescale destroyed any multi-operator job it was asked to resize
 
@@ -1500,6 +1507,93 @@ explains that the role name it sends is minted inside the `.so` and unknowable
 from the test - so it is evidence that a rescale request survives a wire
 round-trip and nothing more. It is now called
 `RescaleRequestSurvivesTheWireRoundTrip`.
+
+### F43. `set_parallelism` did not reach any keyed operator
+
+Found while writing a rescale test that wanted a keyed operator to START at
+parallelism 4 so it could be scaled down. It started at 1, and the rescale was
+refused as a no-op.
+
+Every attach point in `include/clink/api/pipeline.hpp` applies the pipeline
+default with the idiom `desc.parallelism > 1 ? desc.parallelism :
+default_parallelism()`. Eight `KeyedDataStream` methods - `process`,
+`process_async`, `connect`, `connect_process` and their overloads - set
+`op.key_by` and went straight to `append_op` without it. So a keyed operator ran
+at parallelism 1 whatever the job asked for, and a keyed operator is the one you
+most want to scale: `set_parallelism(4)` looked like it worked while the job's
+only stateful operator stayed single.
+
+**Fixed** in `append_op` rather than at the eight call sites, so an attach point
+added later cannot forget it again. Three tests in `test_operator_uid.cpp`,
+including one that walks every operator in a mixed job and requires them all to
+carry the default.
+
+### F44. Live rescale of a running job
+
+Not a defect but the feature F40 and F41 said clink did not have. Recorded here
+because the two findings above are what shaped it.
+
+**What it does.** `clink rescale-op --job-id=N --op=<id> --parallelism=P`
+changes one operator's parallelism on a running job: validate, drain, replan the
+whole task set from the retained job graph at the new parallelism, redeploy from
+the last completed checkpoint with each subtask told which parent's state it
+inherits.
+
+**Why replan.** The mechanism it replaces resized the deployed task set by
+cloning a `DeploymentTask`, and a task's operator identity lives inside its
+packed `OperatorChainSpec`, which cloning does not rewrite - F41. A replanned
+task set cannot contain a dangling edge by construction, because the planner
+derives every task, chain spec, edge and key-group range from the graph, which
+is what submit does. HA recovery already replanned from `graph_json`; this reuses
+the same retained graph.
+
+**The part that took the most care.** A snapshot lives at
+`<checkpoint_dir>/<subtask_idx>/`, addressed by the JOB-GLOBAL index, and the
+planner allocates global indices as one contiguous block per operator in graph
+order. Grow one operator and every later operator's block moves. So a replan
+cannot leave the untouched operators restoring from "their own" index - that
+directory now belongs to a different operator. Every task in the new plan gets
+an explicit restore directive, translated through its operator's old block base.
+Getting this wrong is silent: the operator reads a directory full of another
+operator's state and finds nothing for its own keys.
+
+`JobPlannerReplan.RescalingOneOperatorMovesTheOthersGlobalIndices` pins the fact
+the translation exists for, so that if the planner ever stops moving indices the
+reason for the machinery is still on record rather than looking like dead code.
+
+**It is a stop, not a cutover.** The job restarts from its checkpoint.
+Exactly-once across it rests on the same two things exactly-once across a
+failover rests on - a replayable source and a transactional sink - and not on
+the rescale being transparent. Stated in the docs rather than implied.
+
+**Evidence.** `RescaleExactlyOnceTest` scales a keyed operator 1 to 4 and 4 to 1
+on a running job and asserts the committed multiset is exactly the 240 records
+the source emitted: nothing missing, nothing duplicated, nothing unexpected. The
+operator checks its own per-key counters against the record index and emits
+`STATE-MISMATCH-key<K>-at<N>-got<G>-want<W>` when they disagree, so a lost or
+duplicated key-group slice surfaces as attributable output rather than as a
+number nobody printed.
+
+**Four mutations, each caught by a named test:**
+
+| Mutation | Caught by | How it failed |
+|---|---|---|
+| Drop the old-block base translation | both `RescaleExactlyOnceTest` scaling cases | 12 `STATE-MISMATCH` records naming keys, plus 12 missing, scaling up; 3 of each scaling down |
+| Key-group range keyed off the global index (the F38 shape) | 3 planner tests | slices no longer tile the key space per operator |
+| Scale-down parent stride dropped | 3 mapping tests | a parent's state read twice and another never |
+| Replan disabled entirely | `ScalingAKeyedOperatorUp...` | "NEVER REPLANNED" - and the output was still perfectly exactly-once, which is the whole point: the test fails on the evidence, not on the output |
+
+That last row is the one worth keeping. The first version of this test asserted
+output equality after an accepted request and passed while the rescale did not
+happen at all. Requiring the coordinator's own "replanned" line, and a reported
+parallelism change, is what makes the output assertions mean anything.
+
+**A refusal ordering bug found by its own test.** The validation originally
+checked "has a checkpoint completed" before "does this operator exist", so a
+mistyped operator name was answered with "retry once one has landed" - advice
+that would never have helped. Request shape is now validated before world state,
+and the unit test asserts the order by requiring each refusal to give its own
+reason.
 
 ## 3. Work items
 
@@ -3593,11 +3687,11 @@ against the defect they were written for until the mutation exposed them.
 - **A restored job completing on Linux.** Two exactly-once-under-failure tests
   fail there and are not diagnosed. This is the largest single hole and the
   first follow-up item.
-- **Exactly-once across a rescale.** The scenario was attempted in the
-  follow-up round and cannot be run: neither rescale path can change a
-  running multi-operator job's parallelism (F40, F41). Both now refuse rather
-  than accept-and-do-nothing or accept-and-destroy-the-job, which is the
-  honest state, not the demonstrated one.
+- **Exactly-once across a rescale of anything but the file 2PC sink.** The
+  scenario is now demonstrated (F44): a keyed operator scaled up and down on a
+  running job, committed output equal to the input as a multiset, four
+  mutations each caught. What is not covered is any other sink, rescaling a
+  source, and a non-integer scale factor (refused rather than supported).
 - **Any sink other than the file 2PC sink under failure.** Kafka, Postgres and
   S3 have commit tests, not output-equality runs.
 - **Per-key ordering.** Every output check is a multiset; a recovery that
@@ -3612,11 +3706,11 @@ against the defect they were written for until the mutation exposed them.
 ### Residual risk, in order
 
 1. **Recovery on Linux** is not proven end to end. Two tests say so.
-2. **Rescale of a running job does not work.** Per-operator rescale is not
-   executable on a planned job and whole-job rescale is unsafe for a
-   multi-operator one; both refuse (F40, F41). The autoscaler is inert as a
-   consequence. Changing parallelism means savepoint and resubmit, and output
-   equality across that has not been verified either.
+2. **Rescale is a stop.** Per-operator rescale works and preserves exactly-once
+   (F44), but by draining and restarting from a checkpoint - so it costs a
+   restart's latency and reprocesses in-flight records. The graceful in-place
+   cutover the state machine models is still not reachable. Whole-job rescale
+   by role remains refused for multi-operator jobs (F41).
 3. **Sinks other than file** carry the delivery guarantee the analyser
    reports, on the strength of unit tests rather than failure runs.
 4. **The data plane** is the largest unexamined surface in the engine.
@@ -3676,9 +3770,9 @@ multi-operator job. Those are fixed. Other things turned out to be true and
 are now pinned by tests that fail if they stop being true.
 
 The list of what is not demonstrated is longer than the list of what is, and
-the follow-up backlog stands at 26 items - the first two worked have already
-added three findings (F40 to F42) and removed a claim rather than confirming
-one. An engine is production-ready when
+the follow-up backlog stands at 27 items. The first three worked added five
+findings (F40 to F44): two of them removed a claim rather than confirming one,
+and the capability behind the removed claim was then built. An engine is production-ready when
 an operator can predict how it behaves in the failure modes their deployment
 will actually meet; this round narrowed that gap and documented where it
 remains open.
