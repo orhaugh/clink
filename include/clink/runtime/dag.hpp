@@ -389,6 +389,16 @@ public:
             drain_pending_barriers();
             while (!should_stop() && source->produce(emitter)) {
                 drain_pending_barriers();
+                // Graceful stop. Leaves the loop but NOT via should_stop(), so
+                // the end-of-input path below still runs: flush, then the
+                // coordinator-coordinated final checkpoint that commits the tail
+                // and blocks until it is durable. That is what makes a stop land
+                // on a savepoint instead of discarding the records since the last
+                // periodic checkpoint. Contrast the rescale drain, which sets
+                // `drained` and skips that tail on purpose.
+                if (ctx.stop_requested()) {
+                    break;
+                }
             }
             drain_pending_barriers();
             if (!should_stop()) {
@@ -3500,6 +3510,12 @@ public:
                         typed_emitter.emit_drain(DrainMarker{.subtask_idx = subtask_idx_for_drain,
                                                              .target_parallelism = t});
                         drained = true;
+                        break;
+                    }
+                    // Graceful stop: leave the loop WITHOUT setting `drained`, so
+                    // the end-of-input path below runs and takes the final
+                    // checkpoint. See the same check in the single-source runner.
+                    if (ctx.stop_requested()) {
                         break;
                     }
                 }

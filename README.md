@@ -418,7 +418,7 @@ This writes:
 | `<prefix>/lib/libclink_core.a`     | Engine static library                                                    |
 | `<prefix>/lib/libclink_<impl>.a`   | One static lib per built impl (`kafka`, `postgres`, `s3`, `rocksdb`, …)  |
 | `<prefix>/lib/librocksdb.a`        | Bundled RocksDB (transitive dep of `clink::rocksdb`)                     |
-| `<prefix>/bin/clink`               | client CLI (`run`, `run-application`, `cancel`, `savepoint`, `check-savepoint`, `rescale`, `rescale-op`, `list`) |
+| `<prefix>/bin/clink`               | client CLI (`run`, `run-application`, `stop`, `cancel`, `savepoint`, `check-savepoint`, `rescale`, `rescale-op`, `list`) |
 | `<prefix>/bin/clink_node`          | Server daemon (run as `--role=coordinator` or `--role=worker` for cluster mode)       |
 | `<prefix>/bin/clink_{submit_job,app,cancel_job,rescale_job,savepoint}` | Standalone client binaries (the `clink` subcommands dispatch to these) |
 | `<prefix>/lib/cmake/clink/`        | `clinkConfig.cmake`, `clinkTargets.cmake`, version file                  |

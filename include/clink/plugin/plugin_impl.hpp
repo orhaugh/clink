@@ -430,8 +430,19 @@ void PluginRegistry::register_source(
                     },
                 });
             }
+            // Graceful stop: same bridging shape as the drain signal above, but
+            // its own atomic, because the source runner treats the two
+            // differently - a drain skips the end-of-input tail and a stop runs
+            // it (which is where the final checkpoint is taken).
+            auto stop_signal = std::make_shared<std::atomic<bool>>(false);
+            if (rctx.register_stop_callbacks) {
+                rctx.register_stop_callbacks({
+                    [stop_signal]() { stop_signal->store(true, std::memory_order_release); },
+                });
+            }
             auto cfg = detail::make_subtask_job_config(rctx);
             cfg.drain_target = drain_signal;
+            cfg.stop_requested = stop_signal;
             clink::LocalExecutor exec(std::move(dag), std::move(cfg));
             detail::run_subtask_to_completion(exec, rctx.cancel_token);
         };

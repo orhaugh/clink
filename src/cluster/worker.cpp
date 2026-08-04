@@ -641,6 +641,9 @@ void Worker::dispatch_control_frame_(MessageReader& r) {
             case MessageKind::AbortCheckpoint:
                 handle_abort_checkpoint_(r);
                 break;
+            case MessageKind::StopSubtasks:
+                handle_stop_subtasks_(r);
+                break;
             case MessageKind::BeginRescale:
                 handle_begin_rescale_(r);
                 break;
@@ -743,6 +746,38 @@ void Worker::handle_final_checkpoint_assigned_(MessageReader& r) {
         }
     }
     final_ckpt_cv_.notify_all();
+}
+
+void Worker::handle_stop_subtasks_(MessageReader& r) {
+    auto msg = decode_stop_subtasks(r);
+    if (!accept_epoch_(msg.coordinator_epoch, "StopSubtasks")) {
+        return;
+    }
+    // Snapshot under the lock, invoke outside it - same discipline as the
+    // commit, abort and drain dispatchers. Setting the stop flag does not block,
+    // but the callback is user-supplied through RunnerContext and holding mu_
+    // across it would be a latent deadlock.
+    std::vector<StopCallback> to_invoke;
+    {
+        std::lock_guard lock(mu_);
+        auto it = per_job_stop_callbacks_.find(msg.job_id);
+        if (it != per_job_stop_callbacks_.end()) {
+            to_invoke = it->second;
+        }
+    }
+    log::info("worker.stop",
+              "job_id=" + std::to_string(msg.job_id) + ": stopping " +
+                  std::to_string(to_invoke.size()) +
+                  " source subtask(s); each will run its end-of-input path and take a final "
+                  "checkpoint");
+    for (auto& fn : to_invoke) {
+        try {
+            fn();
+        } catch (...) {
+            // Best-effort, as with the drain dispatcher: one subtask failing to
+            // set its flag must not stop the others being told.
+        }
+    }
 }
 
 void Worker::handle_begin_rescale_(MessageReader& r) {
@@ -1454,6 +1489,14 @@ void Worker::run_generic_subtask_(JobId job_id,
                     for (auto& cb : cbs)
                         bucket.push_back(std::move(cb));
                 };
+            // Graceful stop. Keyed by job only: a stop addresses every subtask,
+            // so there is no role to select on.
+            auto register_stops = [this, job_id](std::vector<RunnerContext::StopFn> cbs) {
+                std::lock_guard lock(mu_);
+                auto& bucket = per_job_stop_callbacks_[job_id];
+                for (auto& cb : cbs)
+                    bucket.push_back(std::move(cb));
+            };
             // Checkpoint-retention registration. make_subtask_job_config
             // calls this with the subtask's freshly-built state backend;
             // CommitCheckpoint then purges its superseded checkpoints.
@@ -1514,6 +1557,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                 .register_commit_callbacks = std::move(register_commits),
                 .register_abort_callbacks = std::move(register_aborts),
                 .register_drain_callbacks = std::move(register_drains),
+                .register_stop_callbacks = std::move(register_stops),
                 .register_checkpoint_backend = std::move(register_backend),
                 .runner_role = task.role,
             };

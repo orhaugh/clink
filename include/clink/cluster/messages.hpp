@@ -275,6 +275,23 @@ inline void encode_body(MessageBuilder& b, const SubtaskCheckpointedMsg& m) {
     b.put_string(m.error);
 }
 
+inline void encode_body(MessageBuilder& b, const StopJobMsg& m) {
+    b.put_u64_be(m.job_id);
+    b.put_u64_be(m.timeout_ms);
+}
+
+inline void encode_body(MessageBuilder& b, const StopSubtasksMsg& m) {
+    b.put_u64_be(m.job_id);
+    b.put_u64_be(m.coordinator_epoch);
+}
+
+inline void encode_body(MessageBuilder& b, const StopJobAckMsg& m) {
+    b.put_u64_be(m.job_id);
+    b.put_u8(m.ok ? 1 : 0);
+    b.put_u64_be(m.savepoint_checkpoint_id);
+    b.put_string(m.message);
+}
+
 inline void encode_body(MessageBuilder& b, const ListJobsAckMsg& m) {
     b.put_u32_be(static_cast<std::uint32_t>(m.jobs.size()));
     for (const auto& j : m.jobs) {
@@ -690,6 +707,29 @@ inline SubtaskCheckpointedMsg decode_subtask_checkpointed(MessageReader& r) {
     m.subtask_idx = r.read_u32_be();
     m.ok = r.read_u8() != 0;
     m.error = r.read_string();
+    return m;
+}
+
+inline StopJobMsg decode_stop_job(MessageReader& r) {
+    StopJobMsg m;
+    m.job_id = r.read_u64_be();
+    m.timeout_ms = r.eof() ? 0 : r.read_u64_be();
+    return m;
+}
+
+inline StopSubtasksMsg decode_stop_subtasks(MessageReader& r) {
+    StopSubtasksMsg m;
+    m.job_id = r.read_u64_be();
+    m.coordinator_epoch = r.eof() ? 0 : r.read_u64_be();
+    return m;
+}
+
+inline StopJobAckMsg decode_stop_job_ack(MessageReader& r) {
+    StopJobAckMsg m;
+    m.job_id = r.read_u64_be();
+    m.ok = r.read_u8() != 0;
+    m.savepoint_checkpoint_id = r.eof() ? 0 : r.read_u64_be();
+    m.message = r.eof() ? std::string{} : r.read_string();
     return m;
 }
 

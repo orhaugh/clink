@@ -22,6 +22,7 @@ int clink_cmd_run(int argc, char** argv);
 int clink_cmd_run_application(int argc, char** argv);
 int clink_cmd_cancel(int argc, char** argv);
 int clink_cmd_savepoint(int argc, char** argv);
+int clink_cmd_stop_job(int argc, char** argv);
 int clink_cmd_check_savepoint(int argc, char** argv);
 int clink_cmd_state_diff(int argc, char** argv);
 int clink_cmd_state_cat(int argc, char** argv);
@@ -50,7 +51,10 @@ void usage() {
         << "                    script embedded in this process (`clink run job.sql`).\n"
         << "  run-application   Start an in-process coordinator and run a job (alias of  "
            "run-application).\n"
-        << "  cancel            Cancel an active job by id (alias of  cancel).\n"
+        << "  cancel            Cancel an active job by id, abruptly - everything since the "
+           "last checkpoint replays on restart.\n"
+        << "  stop              Stop a job gracefully: drain, commit the tail at a final "
+           "checkpoint, print the id to resume from.\n"
         << "  savepoint         Trigger a synchronous savepoint (alias of  savepoint).\n"
         << "  check-savepoint   Inspect state-schema version stamps inside a savepoint file.\n"
         << "  state-diff        Compare the keyed state of two checkpoints/savepoints.\n"
@@ -138,6 +142,9 @@ int main(int argc, char** argv) {
     }
     if (cmd == "savepoint") {
         return clink_cmd_savepoint(sub_argc, sub_argv);
+    }
+    if (cmd == "stop") {
+        return clink_cmd_stop_job(sub_argc, sub_argv);
     }
     if (cmd == "check-savepoint") {
         return clink_cmd_check_savepoint(sub_argc, sub_argv);

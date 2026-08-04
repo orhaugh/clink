@@ -188,6 +188,51 @@ Both exit when `await_termination()` flips `running_` to false.
 - Timer restore on the operator path is same-parallelism only: timers ride operator-state and `restore_timers` narrows by key-group range on a rescale; the rescale timer-routing story is detailed in [./fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md).
 - `take_savepoint` requires the job to be stopped and a backend to be configured, and throws otherwise; it does not interrupt a running job.
 
+## Stopping a job: `stop` versus `cancel`
+
+Two ways to end a running job, and the difference is what happens to the records
+in flight.
+
+**`clink cancel`** is abrupt. The coordinator broadcasts `CancelJob`, the subtasks
+stop where they are, and everything processed since the last completed checkpoint
+is discarded. Resubmitting replays it, so nothing is lost - but the job reports
+failure, and the operator has no point they chose to resume from. This is the
+right behaviour for "stop now", and SIGTERM uses it.
+
+**`clink stop`** drains. The coordinator sends `StopSubtasks` to every worker
+hosting the job; each source's produce loop leaves at the next iteration and then
+runs its ordinary end-of-input path - flush, then a coordinator-coordinated final
+checkpoint that commits the tail, blocking until the sinks have committed it
+before the subtask reports finished. The job therefore ends as a SUCCESS with its
+tail durable, and the ack carries the checkpoint id to resubmit from:
+
+```
+$ clink stop --job-id=1
+stop: job_id=1 ok=1 savepoint_checkpoint_id=42 message="stopped at checkpoint 42"
+
+$ clink run --job=./job.so --restore-from-dir=/var/clink/ckpt \
+            --restore-from-checkpoint-id=42
+```
+
+The stop signal is deliberately NOT the rescale drain signal, though both make a
+source leave its produce loop. A rescale drain emits a `DrainMarker` and skips the
+end-of-input path, because the cutover checkpoint has already been taken; a stop
+must run that path, because it is where the final checkpoint happens. They are
+separate atomics on `JobConfig` (`drain_target` and `stop_requested`) for exactly
+that reason, and conflating them would turn "stop at a savepoint" back into
+"stop".
+
+What a stop does not do: fire event-time windows. An unbounded source that is
+stopped does not emit a maximum watermark, so open windows stay open and are
+carried in the checkpoint rather than being flushed as though complete. Resuming
+continues them. A BOUNDED source that reaches its natural end still emits the
+maximum watermark, as before - that is genuine end of input, not a stop.
+
+**SIGTERM still cancels.** Making it stop gracefully would change the meaning of
+an existing signal, and a process being terminated is not always one that has
+time to drain. Choosing the graceful path is explicit.
+
+
 ## Related
 
 - [./architecture.md](./architecture.md) - where the local runtime sits in the component stack.

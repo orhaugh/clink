@@ -1020,6 +1020,10 @@ bool Coordinator::dispatch_client_frame_(network::Connection& conn, MessageReade
         handle_savepoint_(conn, r);
         return true;
     }
+    if (kind == MessageKind::StopJob) {
+        handle_stop_job_(conn, r);
+        return true;
+    }
     // Unknown frame from a client - drop the connection, and SAY so.
     //
     // This used to close silently, which made it indistinguishable from the
@@ -1987,6 +1991,100 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
     ack.checkpoint_id = ckpt_id;
     ack.message = "savepoint complete";
     return ack;
+}
+
+StopJobAckMsg Coordinator::stop_job(JobId job_id, std::chrono::milliseconds timeout) {
+    StopJobAckMsg ack;
+    ack.job_id = job_id;
+    if (timeout == std::chrono::milliseconds{0}) {
+        timeout = std::chrono::milliseconds{60'000};
+    }
+
+    std::vector<network::Connection*> worker_conns;
+    {
+        std::lock_guard lock(mu_);
+        auto it = jobs_.find(job_id);
+        if (it == jobs_.end()) {
+            ack.message = "no such job";
+            return ack;
+        }
+        auto& job = *it->second;
+        if (job.completion_signalled) {
+            ack.message = "job has already finished";
+            return ack;
+        }
+        if (job.cancel_requested) {
+            ack.message = "a cancel is already in progress; that path does not drain";
+            return ack;
+        }
+        if (job.awaiting_restart) {
+            ack.message = "the job is draining for a restart or rescale; retry once it is running";
+            return ack;
+        }
+        // Deliberately NOT cancel_requested. That flag decides the reported
+        // outcome, and a job that stopped cleanly at a savepoint must report
+        // success, not "cancelled by client".
+        job.stop_requested = true;
+        for (const auto& [worker_id, _] : job.tasks_by_worker) {
+            auto worker_it = registered_.find(worker_id);
+            if (worker_it != registered_.end() && !worker_it->second->lost &&
+                worker_it->second->conn) {
+                worker_conns.push_back(worker_it->second->conn.get());
+            }
+        }
+        log::info("coordinator.stop",
+                  "job_id=" + std::to_string(job_id) + " graceful stop requested; telling " +
+                      std::to_string(worker_conns.size()) +
+                      " worker(s) to stop producing and take a final checkpoint");
+    }
+
+    StopSubtasksMsg msg;
+    msg.job_id = job_id;
+    const auto frame = fenced_frame_(MessageKind::StopSubtasks, msg);
+    for (auto* c : worker_conns) {
+        send_frame(*c, frame);
+    }
+
+    // Wait for the job to finish on its own. The runners take the final
+    // checkpoint and block until the sinks commit it before reporting finished,
+    // so completion here already means the tail is durable.
+    const bool finished = await_job_completion(job_id, timeout);
+
+    std::lock_guard lock(mu_);
+    auto it = jobs_.find(job_id);
+    if (it == jobs_.end()) {
+        ack.message = "the job disappeared while stopping";
+        return ack;
+    }
+    auto& job = *it->second;
+    // The final checkpoint the runners took on the way out is the savepoint to
+    // resume from. Fall back to the latest completed one when the job had no
+    // sources that take a final checkpoint (nothing was in flight to commit).
+    ack.savepoint_checkpoint_id =
+        job.final_checkpoint_id.value_or(job.latest_completed_checkpoint_id);
+    if (!finished) {
+        ack.message = "the job did not finish within " + std::to_string(timeout.count()) +
+                      "ms of the stop request; it may still be draining. Latest completed "
+                      "checkpoint is " +
+                      std::to_string(job.latest_completed_checkpoint_id);
+        return ack;
+    }
+    if (!job.errors.empty()) {
+        ack.message = "the job stopped with errors: " + job.errors.front();
+        return ack;
+    }
+    ack.ok = true;
+    ack.message = "stopped at checkpoint " + std::to_string(ack.savepoint_checkpoint_id);
+    log::info("coordinator.stop",
+              "job_id=" + std::to_string(job_id) + " stopped cleanly at checkpoint " +
+                  std::to_string(ack.savepoint_checkpoint_id));
+    return ack;
+}
+
+void Coordinator::handle_stop_job_(network::Connection& conn, MessageReader& r) {
+    auto req = decode_stop_job(r);
+    const auto ack = stop_job(req.job_id, std::chrono::milliseconds{req.timeout_ms});
+    send_frame(conn, encode_frame(MessageKind::StopJobAck, ack));
 }
 
 void Coordinator::handle_savepoint_(network::Connection& conn, MessageReader& r) {

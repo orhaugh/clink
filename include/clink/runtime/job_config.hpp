@@ -168,6 +168,23 @@ struct JobConfig {
     // source runner observes a null signal and produces normally.
     std::shared_ptr<std::atomic<std::uint32_t>> drain_target;
 
+    // Shared stop-with-savepoint signal, and deliberately NOT the same thing as
+    // drain_target above.
+    //
+    // A rescale drain makes the source emit a DrainMarker and leave, SKIPPING
+    // the end-of-input tail - correct there, because the cutover checkpoint was
+    // already taken. A graceful stop needs the opposite: the source stops
+    // producing and then runs that whole tail - flush, then a
+    // coordinator-coordinated final checkpoint that commits the records since
+    // the last periodic one and blocks until they are durable. So this signal
+    // breaks the produce loop while leaving the runner's clean-exit path intact,
+    // which is what turns "stop" into "stop at a savepoint" without any new
+    // checkpoint machinery.
+    //
+    // Null (LocalExecutor / non-cluster path) means the source produces until it
+    // exhausts or is cancelled, as before.
+    std::shared_ptr<std::atomic<bool>> stop_requested;
+
     // Per-operator override of the global alignment mode.
     // Maps OperatorId -> Mode. When an operator's id appears in this
     // map, the runner stamps every barrier passing through that

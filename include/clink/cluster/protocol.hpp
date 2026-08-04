@@ -143,6 +143,17 @@ enum class MessageKind : std::uint8_t {
     // frame to the wrong handler (this previously collided with
     // RescaleOperator=12 and aborted the coordinator on every savepoint).
     Savepoint = 13,
+    // client → coordinator. Stop a running job GRACEFULLY: the sources stop
+    // producing, the runners take their end-of-input final checkpoint, the sinks
+    // commit it, and the job completes as a success. The ack carries the
+    // checkpoint id to resubmit from, so an upgrade is stop-then-resubmit rather
+    // than cancel-and-replay.
+    //
+    // Distinct from CancelJob (103), which does not drain: records since the last
+    // completed checkpoint are simply discarded and replay on restart. Both are
+    // needed - a cancel must stay abrupt - so this is a separate kind rather than
+    // a flag on that one.
+    StopJob = 14,
     // CancelJob (kind 103) is overloaded for the client→coordinator direction:
     // the client sends it to ask the coordinator to cancel a running job. The
     // coordinator responds with CancelJobAck.
@@ -186,6 +197,11 @@ enum class MessageKind : std::uint8_t {
     // this id as a normal barrier through its own drain path, then blocks
     // until it observes CommitCheckpoint for it.
     FinalCheckpointAssigned = 116,
+    // coordinator → worker. Tell every subtask of a job to stop producing and
+    // run its end-of-input path. Fired by a client StopJob.
+    StopSubtasks = 117,
+    // coordinator → client. Reply to StopJob.
+    StopJobAck = 118,
 };
 
 // Sentinel marking "no rescale-specific restore override" on a
@@ -637,6 +653,31 @@ inline std::string_view to_string(JobTerminalStatus s) noexcept {
     }
     return "?";
 }
+
+// Client → coordinator. Stop `job_id` gracefully. timeout_ms bounds how long the
+// coordinator waits for the drain and final checkpoint before giving up and
+// reporting what happened; 0 means the coordinator's default.
+struct StopJobMsg {
+    JobId job_id{};
+    std::uint64_t timeout_ms{};
+};
+
+// Coordinator → worker. Every subtask of `job_id` on the receiving worker stops
+// producing and runs its end-of-input path.
+struct StopSubtasksMsg {
+    JobId job_id{};
+    std::uint64_t coordinator_epoch{};
+};
+
+// Coordinator → client. `savepoint_checkpoint_id` is the checkpoint the stopped
+// job can be resubmitted from - the final one its runners took on the way out.
+// Zero means the job stopped without one, which the message explains.
+struct StopJobAckMsg {
+    JobId job_id{};
+    bool ok{};
+    std::uint64_t savepoint_checkpoint_id{};
+    std::string message;
+};
 
 // JobInfo: a snapshot of one running or recently-completed job, returned
 // inside ListJobsAck. The coordinator does NOT prune completed jobs immediately,

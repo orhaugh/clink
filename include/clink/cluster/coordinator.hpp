@@ -517,6 +517,19 @@ public:
     // ack the savepoint. 0 picks a 30s default.
     SavepointAckMsg take_savepoint(JobId job_id, std::chrono::milliseconds timeout = {});
 
+    // Stop a running job GRACEFULLY and report the checkpoint to resume from.
+    //
+    // Tells every subtask to stop producing and run its end-of-input path, which
+    // is where the runners take a coordinator-coordinated final checkpoint,
+    // block until the sinks have committed it, and only then report finished. So
+    // the job ends as a SUCCESS with its tail durable, and the returned
+    // checkpoint id is what a resubmit restores from.
+    //
+    // Distinct from cancel_job, which does not drain: everything since the last
+    // completed checkpoint is discarded and replays on restart. Both are wanted -
+    // a cancel has to stay abrupt - so this is a separate operation, not a flag.
+    StopJobAckMsg stop_job(JobId job_id, std::chrono::milliseconds timeout = {});
+
     // Override the factory used to wrap each accepted int fd into a
     // Connection. Default = plain-TCP; clink_node installs a TLS
     // factory when --tls-cert is given. Must be called before start().
@@ -684,6 +697,11 @@ private:
         // it to surface "cancelled by client" instead of the bare
         // SubtaskFinished error messages.
         bool cancel_requested{false};
+        // A graceful stop is in progress: the subtasks have been told to stop
+        // producing and run their end-of-input path. Deliberately not
+        // cancel_requested, which decides the REPORTED OUTCOME - a job that
+        // stopped cleanly at a savepoint must report success, not "cancelled".
+        bool stop_requested{false};
         // An unrecoverable subtask error has already broadcast CancelJob to the
         // job's workers, so peers wedged by the failed task drain and the job can
         // complete. Deliberately NOT cancel_requested: that flag decides the
@@ -959,6 +977,7 @@ private:
     // Per-operator rescale request dispatch.
     void handle_rescale_operator_(network::Connection& conn, MessageReader& r);
     void handle_savepoint_(network::Connection& conn, MessageReader& r);
+    void handle_stop_job_(network::Connection& conn, MessageReader& r);
     void start_reader_for_(std::shared_ptr<WorkerConnection> worker);
     void watchdog_loop_();
     void mark_worker_lost_locked_(WorkerConnection& worker);

@@ -268,6 +268,44 @@ TEST(WireProtocol, RegisterWithoutSlotCountDefaultsToOne) {
     EXPECT_EQ(out.slot_count, 1u);
 }
 
+// ----- StopJob: the graceful-stop trio -----
+
+TEST(WireProtocol, StopJobRoundTrips) {
+    StopJobMsg in{.job_id = 7, .timeout_ms = 45'000};
+    auto out = round_trip(MessageKind::StopJob, in, decode_stop_job);
+    EXPECT_EQ(out.job_id, in.job_id);
+    EXPECT_EQ(out.timeout_ms, in.timeout_ms);
+}
+
+TEST(WireProtocol, StopSubtasksCarriesTheCoordinatorEpoch) {
+    // The worker fences this frame like every other coordinator->worker command,
+    // so the epoch has to survive the round trip or a superseded coordinator
+    // could stop a job it no longer owns.
+    StopSubtasksMsg in{.job_id = 3, .coordinator_epoch = 9};
+    auto out = round_trip(MessageKind::StopSubtasks, in, decode_stop_subtasks);
+    EXPECT_EQ(out.job_id, in.job_id);
+    EXPECT_EQ(out.coordinator_epoch, 9u);
+}
+
+TEST(WireProtocol, StopJobAckRoundTripsTheSavepointId) {
+    StopJobAckMsg in{
+        .job_id = 4, .ok = true, .savepoint_checkpoint_id = 42, .message = "stopped at 42"};
+    auto out = round_trip(MessageKind::StopJobAck, in, decode_stop_job_ack);
+    EXPECT_EQ(out.job_id, 4u);
+    EXPECT_TRUE(out.ok);
+    EXPECT_EQ(out.savepoint_checkpoint_id, 42u)
+        << "the checkpoint id is the whole point of the ack - it is what an operator resubmits "
+           "from";
+    EXPECT_EQ(out.message, "stopped at 42");
+
+    StopJobAckMsg refused{
+        .job_id = 4, .ok = false, .savepoint_checkpoint_id = 0, .message = "no such job"};
+    auto refused_out = round_trip(MessageKind::StopJobAck, refused, decode_stop_job_ack);
+    EXPECT_FALSE(refused_out.ok);
+    EXPECT_EQ(refused_out.savepoint_checkpoint_id, 0u);
+    EXPECT_EQ(refused_out.message, "no such job");
+}
+
 // ----- ListJobsAck: terminal status rides an additive tail -----
 
 TEST(WireProtocol, ListJobsAckRoundTripsTerminalStatusPerJob) {
@@ -367,6 +405,13 @@ TEST(WireProtocol, MessageKindValuesArePinnedForCompatibility) {
     EXPECT_EQ(static_cast<int>(MessageKind::SubmitJob), 5);
     EXPECT_EQ(static_cast<int>(MessageKind::SubtaskListening), 6);
     EXPECT_EQ(static_cast<int>(MessageKind::RescaleJob), 11);
+    // StopJob shares the client->coordinator space with Savepoint=13 and
+    // RescaleOperator=12. A duplicate there silently routes the frame to the
+    // wrong handler, which is how Savepoint once collided with RescaleOperator
+    // and aborted the coordinator on every savepoint - hence pinning it.
+    EXPECT_EQ(static_cast<int>(MessageKind::StopJob), 14);
+    EXPECT_EQ(static_cast<int>(MessageKind::StopSubtasks), 117);
+    EXPECT_EQ(static_cast<int>(MessageKind::StopJobAck), 118);
     EXPECT_EQ(static_cast<int>(MessageKind::RegisterAck), 100);
     EXPECT_EQ(static_cast<int>(MessageKind::Deploy), 101);
     EXPECT_EQ(static_cast<int>(MessageKind::StartJob), 102);

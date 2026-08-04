@@ -208,6 +208,7 @@ private:
     // the lock with the target_parallelism. Subtask runners
     // belonging to other operators are unaffected.
     void handle_begin_rescale_(MessageReader& r);
+    void handle_stop_subtasks_(MessageReader& r);
     bool send_frame_(const std::vector<std::byte>& frame);
     void heartbeat_loop_();
 
@@ -350,6 +351,13 @@ private:
     using DrainCallback = std::function<void(std::uint32_t target_parallelism)>;
     std::unordered_map<JobId, std::unordered_map<std::string, std::vector<DrainCallback>>>
         per_job_drain_callbacks_;
+
+    // Graceful-stop closures, per job. Not keyed by role, unlike the drain map:
+    // a stop addresses the WHOLE job, so there is nothing to select on. Same
+    // idempotency story - a late dispatch for an already-finished subtask finds
+    // nothing registered and no-ops.
+    using StopCallback = std::function<void()>;
+    std::unordered_map<JobId, std::vector<StopCallback>> per_job_stop_callbacks_;
 
     // Per-job registry bundle on the worker. Plugin .so bytes shipped with
     // each Deploy are dlopened into THIS job's bundle (instead of the

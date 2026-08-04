@@ -269,6 +269,18 @@ public:
         return drain_target_->load(std::memory_order_acquire);
     }
 
+    // Stop-with-savepoint signal. Set by the cluster's StopJob dispatch; the
+    // source runner polls it between produce() calls and leaves the loop
+    // WITHOUT marking itself drained, so the runner's end-of-input path still
+    // runs and takes the final checkpoint. See JobConfig::stop_requested for
+    // why this is separate from drain_target().
+    void set_stop_requested_signal(std::shared_ptr<std::atomic<bool>> sig) noexcept {
+        stop_requested_ = std::move(sig);
+    }
+    [[nodiscard]] bool stop_requested() const noexcept {
+        return stop_requested_ && stop_requested_->load(std::memory_order_acquire);
+    }
+
     // Per-operator alignment mode override. When set, the
     // operator's runner stamps every barrier passing through with
     // this mode before the aligner pins it; the override propagates
@@ -528,6 +540,7 @@ private:
     KeyGroupRange restore_kg_range_{};  // default {0, kNumKeyGroups} = covers all
     std::optional<CheckpointBarrier::Mode> barrier_mode_override_;
     std::shared_ptr<std::atomic<std::uint32_t>> drain_target_;
+    std::shared_ptr<std::atomic<bool>> stop_requested_;
 };
 
 }  // namespace clink

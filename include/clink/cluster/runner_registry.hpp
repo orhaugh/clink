@@ -224,6 +224,17 @@ struct RunnerContext {
     using DrainFn = std::function<void(std::uint32_t /*target_parallelism*/)>;
     std::function<void(std::vector<DrainFn>)> register_drain_callbacks;
 
+    // Graceful-stop hook, and deliberately separate from the drain above.
+    //
+    // A drain leaves the source WITHOUT running the end-of-input path, because
+    // a rescale has already taken its cutover checkpoint. A stop needs that path
+    // to run - it is where the final checkpoint that commits the tail is taken -
+    // so it gets its own signal rather than a special value of the drain target.
+    // The distinction is the whole difference between "stop" and "stop at a
+    // savepoint".
+    using StopFn = std::function<void()>;
+    std::function<void(std::vector<StopFn>)> register_stop_callbacks;
+
     // Checkpoint-retention hook. make_subtask_job_config calls this once
     // with the subtask's freshly-built state backend so the worker can purge
     // that backend's superseded checkpoint artefacts when a newer

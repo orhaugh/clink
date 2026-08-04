@@ -1239,6 +1239,7 @@ add_library(clink_cli_cmds OBJECT
     tools/clink_rescale_job.cpp
     tools/clink_rescale_op.cpp
     tools/clink_savepoint.cpp
+    tools/clink_stop_job.cpp
     tools/clink_check_savepoint.cpp
     tools/clink_state_diff.cpp
     tools/clink_capture_sync.cpp
