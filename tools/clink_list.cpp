@@ -120,10 +120,15 @@ int clink_cmd_list(int argc, char** argv) {
     auto ack = clink::cluster::decode_list_jobs_ack(r);
     clink::network::NetworkSocket::close(fd);
 
-    std::cout << "JOB_ID  COMPLETED/TOTAL  SIGNALLED\n";
+    // STATUS, not just SIGNALLED: a job that finished because every restart
+    // attempt failed signalled completion exactly like one that finished
+    // cleanly, so a listing showing only the flag could not tell an operator
+    // which had happened.
+    std::cout << "JOB_ID  COMPLETED/TOTAL  SIGNALLED  STATUS\n";
     for (const auto& j : ack.jobs) {
         std::cout << j.job_id << "  " << j.completed_subtasks << "/" << j.total_subtasks << "  "
-                  << (j.completion_signalled ? "yes" : "no") << "\n";
+                  << (j.completion_signalled ? "yes" : "no") << "  "
+                  << clink::cluster::to_string(j.terminal_status) << "\n";
     }
     return 0;
 }

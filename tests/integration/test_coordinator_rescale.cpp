@@ -174,7 +174,12 @@ std::optional<ListJobsAckMsg> list_jobs_over_wire(std::uint16_t coordinator_port
 
 }  // namespace
 
-TEST(CoordinatorRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
+// Named for what it checks: the rescale REQUEST survives a wire round-trip. The
+// body says so itself - the inline sink's role name is minted inside the .so and
+// unknowable from here, so the test accepts either an acceptance (0) or a
+// refusal (8). It is not evidence that a rescale redeployed anything, and the
+// old name ("...RedeploysAtNewParallelism") read as though it were.
+TEST(CoordinatorRescale, RescaleRequestSurvivesTheWireRoundTrip) {
     const auto node = node_binary_path();
     const auto submit = submit_binary_path();
     const auto rescale = rescale_binary_path();
@@ -322,26 +327,31 @@ TEST(CoordinatorRescale, StatefulIntegerScaleUpRedeploysAtNewParallelism) {
     }
 }
 
-// Drive a REAL, accepted whole-role rescale end to end and assert the coordinator
-// resizes + redeploys the running job. This hardens the smoke test above (which
-// sends a deliberately-unknown role and accepts the rejection): here we send the
-// actual shared role kGenericSubtaskRole = "__clink_subtask" (every clink v1
-// subtask carries this single role, job_planner.cpp) with a valid divisor
-// parallelism (scale-down to 1: always a divisor, fits one slot). We assert the
-// CLI is ACCEPTED (exit 0), the coordinator reports the new smaller total_subtasks (the
-// redeploy actually landed, not just an ack), and the redeployed job reaches
-// completion.
+// A whole-role rescale of a MULTI-OPERATOR job must be refused, and the job must
+// come through it untouched.
 //
-// What this deliberately does NOT assert, and why (verified, engine-level - not
-// a test weakness): per-key state survival across the rescale. The v1 whole-role
-// rescale resizes the single shared role by cloning subtask 0's chain spec, so a
-// multi-operator job collapses onto one chain (empirically here 4 -> 1) rather
-// than rescaling the reduce operator in place; and the v1 GeneratorSource has no
-// replay-offset checkpoint, so a restart-from-checkpoint re-emits from 0 and
-// per-key sums double-count. A per-key exactly-once assertion needs both an
-// op-level rescale path (RescaleCoordinator, gated on per-op bounds today) and a
-// replay-correct source. Those are separate engine items, tracked as such.
-TEST(CoordinatorRescale, WholeRoleRescaleAcceptedAndRedeploys) {
+// This test previously asserted the opposite - that the rescale is accepted and
+// the coordinator "resizes + redeploys the running job" - and it was green. What
+// it was actually observing, confirmed by re-running it and reading the
+// coordinator log:
+//
+//   * the rescale collapsed the job from 4 subtasks to 1, cloned from a single
+//     operator chain;
+//   * that task failed immediately with "missing resolved peer for edge", because
+//     the peers its edges named were no longer deployed;
+//   * every one of the 10 restart attempts failed the same way;
+//   * the coordinator logged "job_id=1 failed errors=1".
+//
+// The test passed because completion_signalled is set on failure exactly as it is
+// on success, so "the redeployed job should reach completion" held for a job that
+// had been destroyed. JobInfo now carries a terminal status for precisely this
+// reason, and the assertions below use it.
+//
+// The engine now refuses this combination. The role kGenericSubtaskRole =
+// "__clink_subtask" covers every subtask of every operator (job_planner.cpp), so
+// one parallelism for it cannot express a multi-operator DAG. Single-operator
+// jobs - the case the path handles - are unaffected.
+TEST(CoordinatorRescale, WholeRoleRescaleOfMultiOperatorJobIsRefusedAndLeavesJobIntact) {
     const auto node = node_binary_path();
     const auto submit = submit_binary_path();
     const auto rescale = rescale_binary_path();
@@ -460,37 +470,44 @@ TEST(CoordinatorRescale, WholeRoleRescaleAcceptedAndRedeploys) {
     const bool rescale_exited = wait_for(rescale_pid, 8s, rescale_exit);
     std::cerr << "[OBS] rescale exited=" << rescale_exited << " exit_code=" << rescale_exit << "\n";
 
-    // Observe the post-rescale topology over the wire.
+    // Observe the job over the wire after the refusal. Every sample is checked,
+    // not just the last one: a job that failed and was then pruned would leave a
+    // final sample that looked innocent.
     std::uint32_t p_after = p_before;
     bool completion = false;
-    const auto after_deadline = std::chrono::steady_clock::now() + 6s;
+    bool ever_failed = false;
+    auto last_status = clink::cluster::JobTerminalStatus::Running;
+    const auto after_deadline = std::chrono::steady_clock::now() + 8s;
     while (std::chrono::steady_clock::now() < after_deadline) {
         auto resp = list_jobs_over_wire(coordinator_port);
         if (resp.has_value() && !resp->jobs.empty()) {
             p_after = resp->jobs.front().total_subtasks;
             completion = resp->jobs.front().completion_signalled;
+            last_status = resp->jobs.front().terminal_status;
+            if (last_status == clink::cluster::JobTerminalStatus::Failed) {
+                ever_failed = true;
+            }
         }
         std::this_thread::sleep_for(150ms);
     }
     std::cerr << "[OBS] total_subtasks after rescale = " << p_after
-              << ", completion_signalled = " << completion << "\n";
+              << ", completion_signalled = " << completion
+              << ", terminal_status = " << clink::cluster::to_string(last_status) << "\n";
 
     cleanup();
 
-    // The rescale request used the correct shared role + a valid divisor, so the
-    // coordinator must ACCEPT it (exit 0), not reject it.
     EXPECT_TRUE(rescale_exited);
-    EXPECT_EQ(rescale_exit, 0) << "whole-role rescale with the correct role + a "
-                                  "valid divisor must be accepted";
-    // The job started multi-subtask and the accepted rescale must have actually
-    // resized + redeployed it (the coordinator reports the new, smaller total_subtasks -
-    // proving the redeploy landed, not just that the request was acked).
+    // 8 is the CLI's exit code for a coordinator refusal.
+    EXPECT_EQ(rescale_exit, 8) << "a whole-role rescale of a multi-operator job must be refused; "
+                                  "carrying it out drops every operator chain but one";
     EXPECT_GE(p_before, 2u) << "chained job should start with >1 subtask";
-    EXPECT_EQ(p_after, 1u) << "coordinator should report the post-rescale parallelism";
-    EXPECT_LT(p_after, p_before) << "scale-down must shrink the deployed subtasks";
-    // The redeployed job must run to completion (the source drains on the new
-    // topology), proving the redeploy is live, not wedged.
-    EXPECT_TRUE(completion) << "redeployed job should reach completion";
+
+    // The refusal must leave the job exactly as it was. These are the assertions
+    // the old version lacked: with the refusal reverted, p_after collapses to 1
+    // and terminal_status becomes FAILED.
+    EXPECT_EQ(p_after, p_before) << "a refused rescale resized the job anyway";
+    EXPECT_FALSE(ever_failed) << "the job failed after a refused rescale, so the refusal was not "
+                                 "the no-op it must be";
 }
 
 // Regression guard: a CHAINED job must complete a periodic checkpoint in

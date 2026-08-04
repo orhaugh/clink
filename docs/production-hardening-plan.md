@@ -1364,6 +1364,143 @@ nothing enforced:
 
 ---
 
+### F40. Per-operator rescale accepted every request and executed none
+
+`clink rescale-op --job-id=1 --op=counter --parallelism=4` replied
+
+```
+rescale-op: job_id=1 op=counter ok=1 accepted_target=4 message=""
+```
+
+and the operator never resized. Nothing failed, nothing was logged, and the
+job ran to completion at its original parallelism.
+
+**The mechanism.** Every step after the accept addresses an operator's
+subtasks by matching `DeploymentTask::role` against the operator id -
+`dispatch_begin_rescale_locked_` (`coordinator.cpp:3219`),
+`dispatch_cutover_deploy_locked_` (`:3264`, `:3295`, `:3338`), and the drain
+and ready ack paths. The planner assigns every task the single shared role
+`kGenericSubtaskRole` ("__clink_subtask") - one assignment, at
+`job_planner.cpp:1284`, and there is no other. So the match never succeeds. The
+operator stayed in `Preparing`, then `Draining` once a checkpoint landed, and
+sat there until the job ended.
+
+The added log line makes it visible:
+
+```
+[coordinator.rescale] accepted job_id=1 op_id=counter target=4
+[coordinator.rescale] begin rescale dispatched job_id=1 op_id=counter target=4
+                      cutover_checkpoint=6 workers=0/0
+```
+
+`workers=0/0`. Before this round neither line existed, so the only evidence a
+request had been seen was the ack sent back to the client.
+
+The autoscaler requests through the same `request_operator_rescale`, so it was
+firing the same inert requests on a timer whenever it was configured.
+
+**How this was nearly missed.** The test written to demonstrate exactly-once
+across a per-operator rescale passed first time. It waited for an accepted
+request and then asserted output equality, and got it, because nothing had
+been resized. It also passed with the rescale path's key-group arithmetic
+deliberately broken - three separate mutations, all undetected. The fourth
+attempt to break it changed the test instead: require the coordinator's own
+`cutover deploy` line rather than trusting the ack. That failed immediately,
+and pointed here.
+
+**Fixed** by refusing a request the coordinator cannot carry out. The
+addressability check runs after the existing checkpointing gate, so the
+existing "requires periodic checkpointing" refusal keeps precedence and its
+test still holds. An accepted request that never runs is worse than a refusal:
+the caller waits for a resize that will never happen.
+
+```
+ok=0 message="no deployed subtask is addressable as operator 'counter': the
+planner deploys every subtask under the single shared role '__clink_subtask',
+so the coordinator cannot target one operator's subtasks for a drain and
+cutover. Per-operator rescale of a planned job is therefore not executable in
+this build. To change a running job's parallelism, take a savepoint and
+resubmit at the new parallelism."
+```
+
+Making the feature actually work is a separate, feature-sized piece: tasks
+must record which operator they host, the coordinator must map a drain or
+ready ack back to that operator, and `plan_operator_cutover` must re-point the
+upstream partitioner at the changed downstream subtask count instead of
+cloning the template's peers verbatim. That is on the follow-up list, not in
+this round.
+
+### F41. Whole-job rescale destroyed any multi-operator job it was asked to resize
+
+`clink rescale --role=__clink_subtask --parallelism=1` on a three-operator job
+replied `ok=1 "rescale initiated; draining 2 worker connection(s)"` and then:
+
+```
+[coordinator.rescale]  job_id=1 roles=1 slot_delta=-2
+[coordinator.rescale]  job_id=1 attempt=1 survivors=2 tasks=1
+[coordinator.restart]  job_id=1 subtask error -> whole-job restart (attempt 2/2)
+                       cause=generic subtask: missing resolved peer for edge
+[coordinator.complete] job_id=1 failed errors=1
+```
+
+The job finished FAILED having committed 3 of its 240 records. Reproduced on a
+second, unrelated job (4 subtasks, restart budget 10): the same error at every
+one of the 10 attempts.
+
+**The mechanism.** The shared role covers every subtask of every operator, so
+"the role's parallelism" is the job's total subtask count and not any
+operator's parallelism. Asking for N keeps the templates whose subtask index is
+below N and prunes the rest (`coordinator.cpp`, the `is_rescale` branch of
+`restart_job_locked_`). A template's operator identity lives in its packed
+`OperatorChainSpec` inside `extra_config`, which that branch does not rewrite,
+so the survivors are N clones of whichever chains happened to sit at those
+indices. Peer fan-out *is* rewritten at the `peers` level, but the chain spec
+still names input and output edges to subtask indices that are no longer
+deployed - hence `missing resolved peer for edge` on every attempt.
+
+**Fixed** by refusing the shared role when the job has more than one operator.
+The operator count comes from the `RescaleCoordinator`, which deploy populates
+from the job graph. A single-operator job, where the role's parallelism and the
+operator's parallelism are the same number, is unaffected and is the case the
+path handles.
+
+### F42. A failed job and a successful one were indistinguishable in the job listing
+
+`CoordinatorRescale.WholeRoleRescaleAcceptedAndRedeploys` asserted that an
+accepted whole-role rescale "resizes + redeploys the running job" and that "the
+redeployed job should reach completion". It was green. It was watching the
+job destruction in F41: 4 subtasks collapsed to 1, ten failed restart attempts,
+`job_id=1 failed errors=1`.
+
+It passed because the only status in `JobInfo` was `completion_signalled`,
+which the coordinator sets on success, on failure and on cancellation alike. So
+"reached completion" was true of a job whose every restart had failed. `clink
+list` had the same blind spot, and an operator reading it could not tell a
+failed job from a finished one.
+
+**Fixed** by adding `JobTerminalStatus` (`Running` / `CompletedOk` / `Failed` /
+`Cancelled`) to `JobInfo`, filled with the same precedence
+`signal_job_completion_locked_` uses for its log line so the listing and the
+log cannot disagree. It rides an additive tail on `ListJobsAck` rather than
+sitting inline with the existing fields, because the jobs are a repeated group
+and a field added mid-group would shift every subsequent job's fields for a
+peer that did not expect it. A peer that sends no tail decodes as `Running` -
+"this peer cannot tell us" - rather than as a terminal verdict nobody sent, and
+an out-of-range byte from a future peer decodes the same way instead of
+becoming a garbage enum that later compares equal to `Failed`. `clink list`
+gained a STATUS column.
+
+The test was rewritten to assert the refusal from F41 and, more usefully, that
+the job comes through it intact: same subtask count, and never observed
+`Failed` on any sample. With the refusal reverted it fails on both.
+
+A second test in the same file was renamed. `StatefulIntegerScaleUpRedeploys-
+AtNewParallelism` accepts either an acceptance or a refusal - its own body
+explains that the role name it sends is minted inside the `.so` and unknowable
+from the test - so it is evidence that a rescale request survives a wire
+round-trip and nothing more. It is now called
+`RescaleRequestSurvivesTheWireRoundTrip`.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
@@ -3456,8 +3593,11 @@ against the defect they were written for until the mutation exposed them.
 - **A restored job completing on Linux.** Two exactly-once-under-failure tests
   fail there and are not diagnosed. This is the largest single hole and the
   first follow-up item.
-- **Exactly-once across a rescale.** The method exists and has earned its keep
-  twice; the scenario has not been run.
+- **Exactly-once across a rescale.** The scenario was attempted in the
+  follow-up round and cannot be run: neither rescale path can change a
+  running multi-operator job's parallelism (F40, F41). Both now refuse rather
+  than accept-and-do-nothing or accept-and-destroy-the-job, which is the
+  honest state, not the demonstrated one.
 - **Any sink other than the file 2PC sink under failure.** Kafka, Postgres and
   S3 have commit tests, not output-equality runs.
 - **Per-key ordering.** Every output check is a multiset; a recovery that
@@ -3472,8 +3612,11 @@ against the defect they were written for until the mutation exposed them.
 ### Residual risk, in order
 
 1. **Recovery on Linux** is not proven end to end. Two tests say so.
-2. **Rescale** touches the key-group arithmetic that F38 showed was wrong, and
-   nothing verifies output equality across one.
+2. **Rescale of a running job does not work.** Per-operator rescale is not
+   executable on a planned job and whole-job rescale is unsafe for a
+   multi-operator one; both refuse (F40, F41). The autoscaler is inert as a
+   consequence. Changing parallelism means savepoint and resubmit, and output
+   equality across that has not been verified either.
 3. **Sinks other than file** carry the delivery guarantee the analyser
    reports, on the strength of unit tests rather than failure runs.
 4. **The data plane** is the largest unexamined surface in the engine.
@@ -3533,7 +3676,9 @@ multi-operator job. Those are fixed. Other things turned out to be true and
 are now pinned by tests that fail if they stop being true.
 
 The list of what is not demonstrated is longer than the list of what is, and
-the follow-up backlog has 24 items on it. An engine is production-ready when
+the follow-up backlog stands at 26 items - the first two worked have already
+added three findings (F40 to F42) and removed a claim rather than confirming
+one. An engine is production-ready when
 an operator can predict how it behaves in the failure modes their deployment
 will actually meet; this round narrowed that gap and documented where it
 remains open.

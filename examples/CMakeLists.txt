@@ -94,6 +94,16 @@ set_target_properties(clink_two_phase_commit_job PROPERTIES
 )
 clink_set_warnings(clink_two_phase_commit_job)
 
+# rescale_exactly_once_job: replayable source -> keyed self-checking counter
+# (rescale bounds declared) -> 2PC sink. Written to demonstrate exactly-once
+# across a rescale; it instead established that a running job cannot be
+# rescaled, and now drives the tests that pin the refusals.
+add_library(clink_rescale_exactly_once_job MODULE rescale_exactly_once_job.cpp)
+target_link_libraries(clink_rescale_exactly_once_job PRIVATE clink::core)
+set_target_properties(clink_rescale_exactly_once_job PROPERTIES
+    PREFIX "" SUFFIX ".so")
+clink_set_warnings(clink_rescale_exactly_once_job)
+
 # two_sink_commit_group_job: one source fanned out to TWO 2PC sinks sharing a
 # commit_group. Drives the cross-sink atomicity tests - sinks in a group are
 # supposed to commit as a unit, and nothing exercised that under failure.

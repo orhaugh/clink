@@ -1511,6 +1511,45 @@ RescaleJobAckMsg Coordinator::rescale_job(
             ++current_p[rec.second.role];
         }
 
+        // A whole-role rescale sets ONE parallelism for a role and rebuilds the
+        // job's task set from it. That is coherent only while the role's tasks
+        // are subtasks of the same operator chain. The planner puts every
+        // subtask of every operator under the one shared role
+        // kGenericSubtaskRole, so on a multi-operator job "the role's
+        // parallelism" is the job's total subtask count, and setting it to N
+        // deploys N tasks cloned from one chain - the other operators' chains
+        // simply cease to exist, and the surviving clone's edges point at peers
+        // that are no longer deployed.
+        //
+        // Measured, not theorised: a 3-operator job rescaled to parallelism 1
+        // redeployed as a single task, failed every restart attempt with
+        // "missing resolved peer for edge", exhausted its restart budget
+        // and finished FAILED, having produced 3 of 240 records. The CLI had
+        // reported ok=1 "rescale initiated".
+        //
+        // Refuse that combination. A single-operator job is unaffected, which
+        // is the case the path was built for and the only one it handles.
+        // The operator count comes from the RescaleCoordinator, which deploy
+        // populates from the job graph.
+        if (job.rescale_coordinator) {
+            const auto ops = job.rescale_coordinator->all();
+            if (ops.size() > 1 && role_p.find(kGenericSubtaskRole) != role_p.end()) {
+                ack.ok = false;
+                ack.message =
+                    "rescale: role '" + std::string{kGenericSubtaskRole} + "' covers all " +
+                    std::to_string(ops.size()) +
+                    " operators in this job, so one parallelism for it cannot express the "
+                    "job graph: the rescale would redeploy the job as clones of a single "
+                    "operator chain and the remaining operators' subtasks would be dropped, "
+                    "leaving edges pointing at peers that no longer exist. Whole-job rescale "
+                    "is supported for single-operator jobs only. To change a multi-operator "
+                    "job's parallelism, take a savepoint and resubmit at the new parallelism.";
+                log::warn("coordinator.rescale",
+                          "refused job_id=" + std::to_string(job_id) + ": " + ack.message);
+                return ack;
+            }
+        }
+
         // Validate the rescale request. v1 supports integer scale-up
         // (new_p = k * old_p) and integer scale-down (old_p = k_down *
         // new_p). Non-integer factors would leave key groups straddling
@@ -1666,7 +1705,61 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
                 "interval_ms > 0); without it the rescale would wait in Preparing forever "
                 "for a checkpoint that never lands"};
     }
-    return job.rescale_coordinator->request_rescale(op_id, new_parallelism);
+    // The coordinator addresses an operator's subtasks by matching
+    // DeploymentTask::role against the operator id - dispatch_begin_rescale_locked_,
+    // dispatch_cutover_deploy_locked_, and the drain/ready ack paths all do it.
+    // The planner, however, gives EVERY task the one shared role
+    // kGenericSubtaskRole, so for a job planned the normal way that match never
+    // succeeds: the request was accepted, BeginRescale went to zero workers, and
+    // the operator sat in Draining until the job ended. `clink rescale-op` printed
+    // ok=1 and nothing happened - and the autoscaler, which routes through this
+    // same function, fired the same inert requests on a timer.
+    //
+    // Refuse instead. A request the coordinator cannot carry out must not be
+    // acknowledged as accepted; that is worse than no rescale at all, because a
+    // caller waits for something that will never occur. When per-operator
+    // addressing lands this check becomes a no-op on its own.
+    bool addressable = false;
+    for (const auto& [_, rec] : job.task_records) {
+        if (rec.second.role == op_id) {
+            addressable = true;
+            break;
+        }
+    }
+    if (!addressable) {
+        const std::string reason =
+            "no deployed subtask is addressable as operator '" + op_id +
+            "': the planner deploys every subtask under the single shared role '" +
+            std::string{kGenericSubtaskRole} +
+            "', so the coordinator cannot target one operator's subtasks for a drain and "
+            "cutover. Per-operator rescale of a planned job is therefore not executable in "
+            "this build. To change a running job's parallelism, take a savepoint and resubmit "
+            "at the new parallelism.";
+        log::warn("coordinator.rescale",
+                  "refused job_id=" + std::to_string(job_id) + " op_id=" + op_id +
+                      " target=" + std::to_string(new_parallelism) + ": " + reason);
+        clink::metrics::orch::rescale_request_rejected();
+        return RescaleCoordinator::RequestResult{.ok = false, .reason = reason};
+    }
+
+    auto result = job.rescale_coordinator->request_rescale(op_id, new_parallelism);
+    // Logged on both outcomes. An accepted request is not a completed rescale:
+    // it advances only when a checkpoint lands, the old subtasks drain, and the
+    // cutover deploys - each of which logs under the same "coordinator.rescale"
+    // name. Without this first line the ack to the client was the only evidence
+    // the coordinator had seen the request at all, so a rescale that was
+    // accepted and then went nowhere left nothing in the log to say so.
+    if (result.ok) {
+        log::info("coordinator.rescale",
+                  "accepted job_id=" + std::to_string(job_id) + " op_id=" + op_id +
+                      " target=" + std::to_string(result.accepted_target) +
+                      " (awaiting the next completed checkpoint before draining)");
+    } else {
+        log::warn("coordinator.rescale",
+                  "refused job_id=" + std::to_string(job_id) + " op_id=" + op_id +
+                      " target=" + std::to_string(new_parallelism) + ": " + result.reason);
+    }
+    return result;
 }
 
 std::optional<OperatorRescaleStatus> Coordinator::operator_rescale_status(
@@ -1794,6 +1887,18 @@ void Coordinator::handle_list_jobs_(network::Connection& conn) {
             info.total_subtasks = static_cast<std::uint32_t>(job->expected_completion);
             info.completed_subtasks = static_cast<std::uint32_t>(job->completed_count);
             info.completion_signalled = job->completion_signalled;
+            // Same precedence signal_job_completion_locked_ uses for its log
+            // line, so a listing and the log cannot disagree about how a job
+            // ended.
+            if (!job->completion_signalled) {
+                info.terminal_status = JobTerminalStatus::Running;
+            } else if (job->cancel_requested) {
+                info.terminal_status = JobTerminalStatus::Cancelled;
+            } else if (!job->errors.empty()) {
+                info.terminal_status = JobTerminalStatus::Failed;
+            } else {
+                info.terminal_status = JobTerminalStatus::CompletedOk;
+            }
             ack.jobs.push_back(info);
         }
     }
@@ -3211,13 +3316,20 @@ void Coordinator::dispatch_begin_rescale_locked_(JobState& job,
     msg.target_parallelism = target_parallelism;
     msg.cutover_checkpoint = cutover_checkpoint;
     const auto frame = fenced_frame_(MessageKind::BeginRescale, msg);
+    std::size_t dispatched = 0;
     for (const auto& worker_id : workers_with_op) {
         auto worker_it = registered_.find(worker_id);
         if (worker_it == registered_.end() || worker_it->second->lost || !worker_it->second->conn) {
             continue;
         }
         out.push_back({worker_it->second->conn.get(), frame});
+        ++dispatched;
     }
+    log::info("coordinator.rescale",
+              "begin rescale dispatched job_id=" + std::to_string(job.id) + " op_id=" + op_id +
+                  " target=" + std::to_string(target_parallelism) + " cutover_checkpoint=" +
+                  std::to_string(cutover_checkpoint) + " workers=" + std::to_string(dispatched) +
+                  "/" + std::to_string(workers_with_op.size()));
 }
 
 void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,

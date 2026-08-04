@@ -268,6 +268,93 @@ TEST(WireProtocol, RegisterWithoutSlotCountDefaultsToOne) {
     EXPECT_EQ(out.slot_count, 1u);
 }
 
+// ----- ListJobsAck: terminal status rides an additive tail -----
+
+TEST(WireProtocol, ListJobsAckRoundTripsTerminalStatusPerJob) {
+    // Per-job, and in order: the tail is a parallel array, so a bug that
+    // dropped or shifted it would be invisible with one job or one status.
+    ListJobsAckMsg in;
+    in.jobs.push_back({.job_id = 1,
+                       .total_subtasks = 4,
+                       .completed_subtasks = 4,
+                       .completion_signalled = true,
+                       .terminal_status = JobTerminalStatus::CompletedOk});
+    in.jobs.push_back({.job_id = 2,
+                       .total_subtasks = 2,
+                       .completed_subtasks = 1,
+                       .completion_signalled = false,
+                       .terminal_status = JobTerminalStatus::Running});
+    in.jobs.push_back({.job_id = 3,
+                       .total_subtasks = 3,
+                       .completed_subtasks = 3,
+                       .completion_signalled = true,
+                       .terminal_status = JobTerminalStatus::Failed});
+    in.jobs.push_back({.job_id = 4,
+                       .total_subtasks = 1,
+                       .completed_subtasks = 0,
+                       .completion_signalled = true,
+                       .terminal_status = JobTerminalStatus::Cancelled});
+
+    auto out = round_trip(MessageKind::ListJobsAck, in, decode_list_jobs_ack);
+    ASSERT_EQ(out.jobs.size(), in.jobs.size());
+    for (std::size_t i = 0; i < in.jobs.size(); ++i) {
+        EXPECT_EQ(out.jobs[i].job_id, in.jobs[i].job_id) << "job " << i;
+        EXPECT_EQ(out.jobs[i].completion_signalled, in.jobs[i].completion_signalled) << "job " << i;
+        EXPECT_EQ(out.jobs[i].terminal_status, in.jobs[i].terminal_status) << "job " << i;
+    }
+}
+
+TEST(WireProtocol, ListJobsAckWithoutTheTailDecodesAsRunning) {
+    // A peer built before the tail existed sends the job group and stops. Every
+    // field before the tail must still decode, and the status must read as
+    // Running - "this peer cannot tell us" - rather than as a terminal verdict
+    // nobody sent. Encoded by hand because the current encoder always writes
+    // the tail.
+    MessageBuilder b;
+    b.put_u8(static_cast<std::uint8_t>(MessageKind::ListJobsAck));
+    b.put_u32_be(2);
+    b.put_u64_be(7);
+    b.put_u32_be(3);
+    b.put_u32_be(3);
+    b.put_u8(1);
+    b.put_u64_be(8);
+    b.put_u32_be(5);
+    b.put_u32_be(2);
+    b.put_u8(0);
+    MessageReader r(body_of(b.finalize()));
+    EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::ListJobsAck);
+    auto out = decode_list_jobs_ack(r);
+    ASSERT_EQ(out.jobs.size(), 2u);
+    EXPECT_EQ(out.jobs[0].job_id, 7u);
+    EXPECT_EQ(out.jobs[0].completed_subtasks, 3u);
+    EXPECT_TRUE(out.jobs[0].completion_signalled);
+    EXPECT_EQ(out.jobs[0].terminal_status, JobTerminalStatus::Running);
+    EXPECT_EQ(out.jobs[1].job_id, 8u);
+    EXPECT_EQ(out.jobs[1].total_subtasks, 5u);
+    EXPECT_FALSE(out.jobs[1].completion_signalled);
+    EXPECT_EQ(out.jobs[1].terminal_status, JobTerminalStatus::Running);
+}
+
+TEST(WireProtocol, ListJobsAckRejectsAnOutOfRangeTerminalStatus) {
+    // A future peer may send a status this build has no name for. It must not
+    // become a garbage enum value that later compares equal to Failed and gets
+    // reported as one.
+    MessageBuilder b;
+    b.put_u8(static_cast<std::uint8_t>(MessageKind::ListJobsAck));
+    b.put_u32_be(1);
+    b.put_u64_be(9);
+    b.put_u32_be(1);
+    b.put_u32_be(1);
+    b.put_u8(1);
+    b.put_u32_be(1);
+    b.put_u8(200);  // not a status this build knows
+    MessageReader r(body_of(b.finalize()));
+    EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::ListJobsAck);
+    auto out = decode_list_jobs_ack(r);
+    ASSERT_EQ(out.jobs.size(), 1u);
+    EXPECT_EQ(out.jobs[0].terminal_status, JobTerminalStatus::Running);
+}
+
 // ----- MessageKind values are stable -----
 
 TEST(WireProtocol, MessageKindValuesArePinnedForCompatibility) {

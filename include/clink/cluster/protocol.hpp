@@ -609,15 +609,51 @@ struct JobCompletedMsg {
     std::vector<std::string> errors;
 };
 
+// How a job ENDED, as distinct from whether it ended.
+//
+// completion_signalled alone cannot answer that: the coordinator sets it on
+// success, on failure and on cancellation alike, so a listing that reported
+// only that flag showed a job whose every restart attempt had failed as
+// indistinguishable from one that finished cleanly. A test asserting "the job
+// reached completion" passed on a job that had been destroyed, which is how
+// this came to be noticed.
+enum class JobTerminalStatus : std::uint8_t {
+    Running = 0,      // still has subtasks in flight
+    CompletedOk = 1,  // every subtask finished, no errors recorded
+    Failed = 2,       // finished with at least one subtask error
+    Cancelled = 3,    // ended because a cancel was requested
+};
+
+inline std::string_view to_string(JobTerminalStatus s) noexcept {
+    switch (s) {
+        case JobTerminalStatus::Running:
+            return "RUNNING";
+        case JobTerminalStatus::CompletedOk:
+            return "COMPLETED_OK";
+        case JobTerminalStatus::Failed:
+            return "FAILED";
+        case JobTerminalStatus::Cancelled:
+            return "CANCELLED";
+    }
+    return "?";
+}
+
 // JobInfo: a snapshot of one running or recently-completed job, returned
 // inside ListJobsAck. The coordinator does NOT prune completed jobs immediately,
 // so list_jobs() shows both live and recently-finished jobs - the
-// completion_signalled flag distinguishes them.
+// completion_signalled flag distinguishes them, and terminal_status says which
+// way a finished one went.
 struct JobInfo {
     JobId job_id{};
     std::uint32_t total_subtasks{};
     std::uint32_t completed_subtasks{};
     bool completion_signalled{};
+    // Rides an ADDITIVE TAIL on ListJobsAck rather than sitting inline with the
+    // fields above: the jobs are a repeated group, so a field added mid-group
+    // would shift every subsequent job's fields for a peer that did not expect
+    // it. The tail is a parallel array in the same order, which an older
+    // decoder simply stops before reading.
+    JobTerminalStatus terminal_status{JobTerminalStatus::Running};
 };
 
 // Client → coordinator. Empty body; the coordinator replies with a snapshot of every job

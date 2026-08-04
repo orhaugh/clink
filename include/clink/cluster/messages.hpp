@@ -283,6 +283,12 @@ inline void encode_body(MessageBuilder& b, const ListJobsAckMsg& m) {
         b.put_u32_be(j.completed_subtasks);
         b.put_u8(j.completion_signalled ? 1 : 0);
     }
+    // Additive tail: terminal status per job, same order as the group above.
+    // Appended rather than inlined because the group is repeated - see JobInfo.
+    b.put_u32_be(static_cast<std::uint32_t>(m.jobs.size()));
+    for (const auto& j : m.jobs) {
+        b.put_u8(static_cast<std::uint8_t>(j.terminal_status));
+    }
 }
 
 inline void encode_body(MessageBuilder& b, const SubtaskListeningMsg& m) {
@@ -698,6 +704,19 @@ inline ListJobsAckMsg decode_list_jobs_ack(MessageReader& r) {
         j.completed_subtasks = r.read_u32_be();
         j.completion_signalled = r.read_u8() != 0;
         m.jobs.push_back(j);
+    }
+    // Additive tail. A pre-tail peer sends nothing here, and its jobs keep the
+    // Running default - which is what "this peer cannot tell us" should look
+    // like, not a wrong terminal status.
+    if (!r.eof()) {
+        const std::uint32_t tail_n = r.read_count();
+        for (std::uint32_t i = 0; i < tail_n && i < m.jobs.size() && !r.eof(); ++i) {
+            const auto raw = r.read_u8();
+            m.jobs[i].terminal_status =
+                raw <= static_cast<std::uint8_t>(JobTerminalStatus::Cancelled)
+                    ? static_cast<JobTerminalStatus>(raw)
+                    : JobTerminalStatus::Running;
+        }
     }
     return m;
 }
