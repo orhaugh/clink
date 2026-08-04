@@ -132,9 +132,14 @@ struct ScriptedWorker {
         worker->register_role("noop", [this](const DeploymentTask&) {
             deploys.fetch_add(1, std::memory_order_relaxed);
         });
+        // `conn` is ATOMIC because the factory runs on the calling thread and
+        // the seeder below polls it from another. It was a plain pointer, which
+        // TSan reports on every run of this suite - and this helper is the
+        // obvious thing to copy when scripting a worker handshake, so the race
+        // propagated by imitation. Start any copy from this version.
         worker->set_connect_factory([this](const std::string&, std::uint16_t) {
             auto c = std::make_unique<FencingScriptedConnection>();
-            conn = c.get();
+            conn.store(c.get(), std::memory_order_release);
             return c;
         });
         // connect_to_coordinator does a blocking read for the ack, so the
@@ -142,10 +147,11 @@ struct ScriptedWorker {
         // the connection eagerly here would fight the factory, so seed it
         // from another thread the moment the factory hands the pointer over.
         std::thread seeder([this, register_epoch] {
-            while (conn == nullptr) {
+            FencingScriptedConnection* c = nullptr;
+            while ((c = conn.load(std::memory_order_acquire)) == nullptr) {
                 std::this_thread::sleep_for(100us);
             }
-            conn->deliver(encode_frame(
+            c->deliver(encode_frame(
                 MessageKind::RegisterAck,
                 RegisterAckMsg{.ok = true, .message = "", .coordinator_epoch = register_epoch}));
         });
@@ -154,8 +160,8 @@ struct ScriptedWorker {
     }
 
     ~ScriptedWorker() {
-        if (conn != nullptr) {
-            conn->close();
+        if (auto* c = conn.load(std::memory_order_acquire); c != nullptr) {
+            c->close();
         }
         worker->stop();
     }
@@ -166,7 +172,7 @@ struct ScriptedWorker {
     ScriptedWorker& operator=(ScriptedWorker&&) = delete;
 
     std::unique_ptr<Worker> worker;
-    FencingScriptedConnection* conn{nullptr};
+    std::atomic<FencingScriptedConnection*> conn{nullptr};
     std::atomic<int> deploys{0};
 };
 
@@ -229,7 +235,8 @@ std::vector<std::pair<const char*, std::vector<std::byte>>> all_control_frames(s
 
 TEST(CoordinatorFencing, AWorkerBindsTheEpochOfTheCoordinatorThatAdmittedIt) {
     ScriptedWorker sw(7);
-    EXPECT_GT(sw.conn->sent_bytes(), 0U) << "the worker never sent Register, so nothing was tested";
+    EXPECT_GT(sw.conn.load()->sent_bytes(), 0U)
+        << "the worker never sent Register, so nothing was tested";
     EXPECT_EQ(sw.worker->bound_epoch(), 7U);
     EXPECT_EQ(sw.worker->fenced_frame_count(), 0U);
 }
@@ -247,7 +254,7 @@ TEST(CoordinatorFencing, EveryControlFrameFromASupersededCoordinatorIsRefused) {
 
     std::uint64_t expected = 0;
     for (const auto& [name, framed] : frames) {
-        sw.conn->deliver(framed);
+        sw.conn.load()->deliver(framed);
         ++expected;
         EXPECT_TRUE(fencing_await([&] { return sw.worker->fenced_frame_count() >= expected; }))
             << name << " from a superseded coordinator was NOT refused";
@@ -264,7 +271,7 @@ TEST(CoordinatorFencing, TheSameFramesAtTheBoundEpochAreAllAccepted) {
     // fencing - a decode failure, say - this would fail too.
     ScriptedWorker sw(7);
     for (const auto& [name, framed] : all_control_frames(/*e=*/7)) {
-        sw.conn->deliver(framed);
+        sw.conn.load()->deliver(framed);
         (void)name;
     }
     EXPECT_TRUE(fencing_await([&] { return sw.worker->was_cancelled(); }))
@@ -283,7 +290,7 @@ TEST(CoordinatorFencing, AHigherEpochRebindsTheWorkerAndIsAccepted) {
     CancelJobMsg cj;
     cj.job_id = 1;
     cj.coordinator_epoch = 11;
-    sw.conn->deliver(encode_frame(MessageKind::CancelJob, cj));
+    sw.conn.load()->deliver(encode_frame(MessageKind::CancelJob, cj));
 
     EXPECT_TRUE(fencing_await([&] { return sw.worker->was_cancelled(); }))
         << "a frame from a LATER epoch must be accepted";
@@ -294,7 +301,7 @@ TEST(CoordinatorFencing, AHigherEpochRebindsTheWorkerAndIsAccepted) {
     CancelJobMsg stale;
     stale.job_id = 2;
     stale.coordinator_epoch = 4;
-    sw.conn->deliver(encode_frame(MessageKind::CancelJob, stale));
+    sw.conn.load()->deliver(encode_frame(MessageKind::CancelJob, stale));
     EXPECT_TRUE(fencing_await([&] { return sw.worker->fenced_frame_count() == 1U; }))
         << "epoch 4 was still accepted after the worker rebound to 11";
 }
@@ -305,7 +312,7 @@ TEST(CoordinatorFencing, AnUnfencedCoordinatorIsNotFencedOff) {
     ScriptedWorker sw(0);
     EXPECT_EQ(sw.worker->bound_epoch(), 0U);
     for (const auto& [name, framed] : all_control_frames(/*e=*/0)) {
-        sw.conn->deliver(framed);
+        sw.conn.load()->deliver(framed);
         (void)name;
     }
     EXPECT_TRUE(fencing_await([&] { return sw.worker->was_cancelled(); }));
@@ -335,7 +342,7 @@ TEST(CoordinatorFencing, AWorkerBoundToARealEpochStillAcceptsAPreFencingCoordina
     framed[1] = static_cast<std::byte>((body_len >> 16) & 0xFF);
     framed[2] = static_cast<std::byte>((body_len >> 8) & 0xFF);
     framed[3] = static_cast<std::byte>(body_len & 0xFF);
-    sw.conn->deliver(framed);
+    sw.conn.load()->deliver(framed);
 
     EXPECT_TRUE(fencing_await([&] { return sw.worker->fenced_frame_count() == 1U; }))
         << "an epoch-less frame reaching a worker bound to epoch 6 must be counted, not ignored";

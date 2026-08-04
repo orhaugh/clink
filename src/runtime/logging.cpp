@@ -104,7 +104,31 @@ spdlog::level::level_enum to_spdlog(LogSeverity sev) {
 // that never call init() keep their exact behaviour.
 void legacy_emit(spdlog::level::level_enum lvl, std::string_view source, std::string message) {
     const char* lvl_str = ring_level(lvl);
-    std::cerr << '[' << lvl_str << "] " << source << ": " << message << '\n';
+    // One write, under a lock.
+    //
+    // Streaming the parts separately let two threads interleave a line, and -
+    // the part TSan reports - raced on the stream's OWN state: `std::cerr` is
+    // shared, and ios_base::width() is read and written by each insertion. The
+    // report came off the watchdog declaring a worker lost, which is exactly the
+    // moment several threads are logging at once.
+    //
+    // Building the line first also means a concurrent writer cannot split it.
+    // std::cerr is unit-buffered, so this is one write either way; the lock costs
+    // nothing on a path that is already doing I/O.
+    std::string line;
+    line.reserve(source.size() + message.size() + 8);
+    line += '[';
+    line += lvl_str;
+    line += "] ";
+    line.append(source.data(), source.size());
+    line += ": ";
+    line += message;
+    line += '\n';
+    {
+        static std::mutex stderr_mu;
+        std::lock_guard lk(stderr_mu);
+        std::cerr << line;
+    }
     LogRecord rec;
     rec.ts_ms = now_ms();
     rec.level = lvl_str;
