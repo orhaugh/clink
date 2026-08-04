@@ -207,7 +207,17 @@ TEST(WorkerCrashRecovery, JobSurvivesWorkerKillViaRestart) {
                                      node);
     ASSERT_GT(worker1, 0);
     ASSERT_GT(worker2, 0);
-    std::this_thread::sleep_for(500ms);  // both workers register
+    // No sleep for worker registration.
+    //
+    // The submit below already waits for it: clink_node sets
+    // Config::submit_wait_for_slots to 15s, and submit_job blocks on a condition
+    // variable until the cluster has free slots - which requires the workers to
+    // have registered. So the wait this replaces was a second, shorter, less
+    // reliable copy of a wait the engine already does, and being shorter it was
+    // the one that failed first on a loaded machine.
+    //
+    // Removing it is what lets this suite leave the CI quarantine: the file gates
+    // only tests that wait for conditions rather than durations.
 
     // Kick off the job with restart-on-loss enabled.
     const pid_t submit_pid = spawn_proc({"clink_submit_job",

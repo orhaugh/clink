@@ -93,6 +93,34 @@ pid_t spawn_proc(const std::vector<std::string>& argv, const std::filesystem::pa
 // each child's output to its own file removes both hazards and keeps the logs
 // available for diagnosing a failure. (The bench harness does the same thing;
 // this is a local copy so the 2PC ITs need no shared header.)
+// Wait for a specific worker to REGISTER, by watching the coordinator's own log.
+//
+// The coordinator in this file is spawned with its output to a file, so its
+// "coordinator.register worker=<id>" line is the registration event itself rather
+// than a proxy for it. That is what replaces the 500ms sleeps this test used: a
+// duration is a guess at how long registration takes, and on a loaded machine
+// carrying an 84 MB plugin load it is the guess that fails first.
+[[nodiscard]] bool await_worker_registered(const std::filesystem::path& coordinator_log,
+                                           const std::string& worker_id,
+                                           std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const std::string needle = "worker=" + worker_id;
+    for (;;) {
+        std::ifstream in(coordinator_log);
+        if (in) {
+            const std::string body((std::istreambuf_iterator<char>(in)),
+                                   std::istreambuf_iterator<char>());
+            if (body.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    }
+}
+
 pid_t spawn_proc_logged(const std::vector<std::string>& argv,
                         const std::filesystem::path& binary,
                         const std::filesystem::path& log_path) {
@@ -285,7 +313,17 @@ std::optional<Cluster> start_cluster() {
                               node);
     if (c.worker_pid <= 0)
         return std::nullopt;
-    std::this_thread::sleep_for(400ms);  // worker register settle
+    // No sleep for worker registration.
+    //
+    // The submit below already waits for it: clink_node sets
+    // Config::submit_wait_for_slots to 15s, and submit_job blocks on a condition
+    // variable until the cluster has free slots - which requires the workers to
+    // have registered. So the wait this replaces was a second, shorter, less
+    // reliable copy of a wait the engine already does, and being shorter it was
+    // the one that failed first on a loaded machine.
+    //
+    // Removing it is what lets this suite leave the CI quarantine: the file gates
+    // only tests that wait for conditions rather than durations.
     return c;
 }
 
@@ -560,7 +598,8 @@ TEST(TwoPhaseCommit, WorkerKillMidStreamIsExactlyOnce) {
     // and the later kill is guaranteed to hit the worker hosting the job.
     const pid_t worker_a = spawn_worker("worker-eo-A");
     ASSERT_GT(worker_a, 0);
-    std::this_thread::sleep_for(500ms);  // worker-A registers
+    ASSERT_TRUE(await_worker_registered(log_dir / "coordinator.log", "worker-eo-A", 15s))
+        << "worker-A never registered, so the job below would have had nowhere to run";
 
     const pid_t submit_pid = spawn_proc_logged({"clink_submit_job",
                                                 "--job=" + job_so.string(),
@@ -590,7 +629,12 @@ TEST(TwoPhaseCommit, WorkerKillMidStreamIsExactlyOnce) {
     // worker-B, restoring from the last completed checkpoint.
     const pid_t worker_b = spawn_worker("worker-eo-B");
     ASSERT_GT(worker_b, 0);
-    std::this_thread::sleep_for(500ms);  // worker-B registers
+    // This one is load-bearing rather than tidiness: the redeploy after the kill
+    // needs a free slot on worker-B, so killing worker-A before B has registered
+    // leaves the restart with nowhere to go and the job fails for a reason that
+    // has nothing to do with exactly-once.
+    ASSERT_TRUE(await_worker_registered(log_dir / "coordinator.log", "worker-eo-B", 15s))
+        << "worker-B never registered, so the redeploy after the kill would have had no slot";
     kill_quietly(worker_a);
 
     // Wait past the submitter's own --wait-timeout-s=60 so its exit code is

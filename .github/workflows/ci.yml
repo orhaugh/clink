@@ -125,7 +125,7 @@ jobs:
       # excludes it, the advisory step selects it. One literal, so the two
       # cannot drift apart - which is exactly what the old pair of
       # hand-maintained regexes did.
-      IT_QUARANTINE: 'HaFailoverTest\.ExactlyOnceSurvivesACoordinatorFailover|TwoPhaseCommit|WorkerCrashRecovery'
+      IT_QUARANTINE: 'HaFailoverTest\.ExactlyOnceSurvivesACoordinatorFailover'
     steps:
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git
@@ -239,11 +239,12 @@ jobs:
         #       records lost across a failover; passes 3/3 alone. Rare, and
         #       attribution not established - gating on it would make the
         #       pipeline intermittently red for a reason nobody can act on yet.
-        #   TwoPhaseCommit, WorkerCrashRecovery
-        #       follow-up 16. Both now pass, but each still stands up its
-        #       cluster with a 400-500ms sleep for worker registration rather
-        #       than a condition. Gating on a test that waits for a duration is
-        #       the gated-and-hoped move this file refuses.
+        #
+        # TwoPhaseCommit and WorkerCrashRecovery left the quarantine once their
+        # worker-registration sleeps became conditions (follow-up 16): two were
+        # simply redundant, since submit_job already waits for free slots, and the
+        # one that guarded a kill now watches the coordinator's own registration
+        # line.
         continue-on-error: true
         run: >-
           ctest --test-dir build --output-on-failure --parallel 1 --timeout 300
