@@ -1205,6 +1205,53 @@ that is detectable at the moment the mistake is made rather than at the next
 restore. It needs the owned range plumbed into the backend, which is a bigger
 change than is wise to land unreviewed at the end of a session.
 
+### F39. Four integration failures that only happen on Linux
+
+The full integration label had never been run on Linux. Every "verified on
+both platforms" claim in this document up to here rests on the core suites
+and the GATED subset, which is a narrower thing than it sounds, and this
+round said so without noticing the gap.
+
+Running it: core passes (1924), integration is 105 of 109, and the four
+failures do not overlap with the macOS set at all. Two distinct causes:
+
+**Side outputs across the cluster wire fail to attach.** Both
+`PluginSubmission.SideOutputCrossesTheClusterWire` and
+`GatewayPipeline.ReassemblyJoinAndLivenessSideOutputCrossWire` fail the same
+way:
+
+```
+side output: no typed attacher for channel 'string' (tag 'hello.odd_text');
+did you call register_type<T> for the side's element type?
+```
+
+A registration that resolves on macOS and does not on Linux is the shape this
+repository has been bitten by before: `RTLD_LOCAL` gives each dlopened .so
+its own copy of a static registry, so which registry a lookup lands in
+depends on link and load order. The engine reports it properly rather than
+silently dropping the side output, which is why it is a test failure and not
+a data-loss finding - but a side output that cannot attach means a branch of
+the job does not run.
+
+**Two recovery cases lose records.**
+`TwoPhaseCommit.RecoveryCommitsPreCommittedFilesOnRestart` and
+`HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover`, the latter with
+`22 committed lines, 22 distinct; 18 MISSING: record-22 ... (+10)` - the job
+did not finish under the new leader rather than duplicating anything. Both
+are exactly-once-under-failure cases, which makes them the most interesting
+failures in this document and the reason it is worth saying plainly that they
+are open.
+
+**Not diagnosed.** Each Linux cycle is a container rebuild plus a 30-minute
+label run, and guessing at 05:00 is how the earlier wrong claims in this
+document got made. Recorded with the exact assertions and messages so the
+next session starts from evidence rather than from a rerun.
+
+**What this changes about the rest of the document.** Nothing that is claimed
+per-test, since those were run. It does mean "verified on macOS and Linux"
+should be read as "core suites and the gated subset on both, the full
+integration label on macOS only" everywhere it appears before this entry.
+
 ### F10. Behaviour controlled by documentation rather than by code
 
 Collected while reading. Each is a statement in a comment or doc page that
@@ -3095,11 +3142,15 @@ document that only lists wins is worse than none.
 - **No soak testing.** Everything here runs in seconds to minutes. State
   growth, memory stability, checkpoint-interval drift and connector
   reconnection behaviour over hours or days are untested.
-- **Two platforms, not many.** Every round is verified on macOS/arm64 and on
-  Debian/x86-64 in the project's Docker image, and that has earned its keep:
-  F17 (the fault-framework deadlock) was found ONLY by the Linux run, having
-  passed on macOS repeatedly. Nothing here has been run on any other
-  platform, libc, or architecture.
+- **Two platforms, not many, and not equally.** Every round is verified on
+  macOS/arm64 and on Debian/x86-64 in the project's Docker image, and that
+  has earned its keep twice: F17 (the fault-framework deadlock) was found
+  ONLY by the Linux run, and F39 is four integration failures that happen
+  only there. But the coverage is asymmetric and was described as though it
+  were not: the core suites and the gated subset run on both, and the full
+  integration label had never run on Linux until F39. Four of its 109 cases
+  fail there and pass here. Nothing has been run on any other platform, libc,
+  or architecture.
 - **No independent review.** Single-author work.
 - **Keyed state is not demonstrated to survive a restore intact.** F38 is an
   open, reproducible case where half of one operator's keyed state comes back
