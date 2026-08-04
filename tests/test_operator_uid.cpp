@@ -217,3 +217,81 @@ TEST(OperatorUid, FluentApiRejectsDuplicateUid) {
     EXPECT_THROW(a.map<std::int64_t>([](const std::int64_t& v) { return v; }).uid("shared"),
                  std::runtime_error);
 }
+
+// --- rescale bounds ---------------------------------------------------------
+//
+// min_parallelism/max_parallelism existed on OperatorSpec and in the JSON
+// parser with no setter anywhere in the fluent API, so a job built the
+// documented way registered every operator 0/0 and
+// RescaleCoordinator::request_rescale refused them all as "not scalable".
+// Per-operator rescale and the autoscaler were therefore unreachable for any
+// Pipeline-built job, and the refusal read as policy rather than a missing
+// method. These pin the setter and the invariants OperatorSpec documents.
+
+TEST(OperatorRescaleBounds, FluentApiWritesBothBoundsOntoTheSpec) {
+    using namespace clink::api;
+    auto env = Pipeline::create();
+    auto src = env.from_elements<std::int64_t>({1, 2, 3});
+    auto mapped = src.map<std::int64_t>([](const std::int64_t& v) { return v; })
+                      .uid("scalable-op")
+                      .rescalable(1, 4);
+
+    bool found = false;
+    for (const auto& op : env.graph().ops) {
+        if (op.uid == "scalable-op") {
+            EXPECT_EQ(op.min_parallelism, 1u);
+            EXPECT_EQ(op.max_parallelism, 4u)
+                << "the fluent .rescalable() did not reach OperatorSpec, so this op would still be "
+                   "refused as not-scalable";
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found) << "no op carried the uid, so nothing was checked";
+}
+
+TEST(OperatorRescaleBounds, AnOpWithNoBoundsStaysUnscalable) {
+    // The default has to remain 0/0. If .rescalable() were applied implicitly,
+    // every operator would become a rescale candidate and the autoscaler would
+    // act on operators nobody declared scalable.
+    using namespace clink::api;
+    auto env = Pipeline::create();
+    auto src = env.from_elements<std::int64_t>({1});
+    auto mapped = src.map<std::int64_t>([](const std::int64_t& v) { return v; }).uid("plain-op");
+    for (const auto& op : env.graph().ops) {
+        if (op.uid == "plain-op") {
+            EXPECT_EQ(op.min_parallelism, 0u);
+            EXPECT_EQ(op.max_parallelism, 0u);
+        }
+    }
+}
+
+TEST(OperatorRescaleBounds, TheDocumentedInvariantsAreRejectedAtConstruction) {
+    using namespace clink::api;
+
+    // A zero bound. 0/0 already means "not rescalable", so a half-zero pair is
+    // a mistake rather than a weaker declaration.
+    {
+        auto env = Pipeline::create();
+        auto src = env.from_elements<std::int64_t>({1});
+        auto s = src.map<std::int64_t>([](const std::int64_t& v) { return v; });
+        EXPECT_THROW(s.rescalable(0, 4), std::runtime_error);
+        EXPECT_THROW(s.rescalable(1, 0), std::runtime_error);
+    }
+    // min above max.
+    {
+        auto env = Pipeline::create();
+        auto src = env.from_elements<std::int64_t>({1});
+        auto s = src.map<std::int64_t>([](const std::int64_t& v) { return v; });
+        EXPECT_THROW(s.rescalable(4, 2), std::runtime_error);
+    }
+    // The op's own parallelism outside the range it declares. Accepting this
+    // would leave a rescale target compared against a range the operator is
+    // not already inside.
+    {
+        auto env = Pipeline::create();
+        auto src = env.from_elements<std::int64_t>({1});
+        auto s = src.map<std::int64_t>([](const std::int64_t& v) { return v; });
+        EXPECT_THROW(s.rescalable(2, 4), std::runtime_error)
+            << "an op at parallelism 1 accepted bounds [2, 4]";
+    }
+}

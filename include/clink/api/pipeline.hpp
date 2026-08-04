@@ -260,6 +260,51 @@ public:
         op->uid = std::move(new_uid);
     }
 
+    // Declare the rescale bounds of an already-appended op.
+    //
+    // Without these an operator is registered with 0/0 and
+    // RescaleCoordinator::request_rescale refuses it as "not scalable", so
+    // both `clink rescale-op` and the autoscaler decline to touch it. The
+    // fields existed on OperatorSpec and in the JSON parser and had no
+    // setter anywhere in this API, which made per-operator rescale
+    // unreachable for any job built the documented way - the capability was
+    // wired internally and the refusal read as a policy decision rather than
+    // a missing method.
+    //
+    // Invariants are the ones OperatorSpec already documents, checked here so
+    // a bad pair is rejected at construction rather than surfacing as a
+    // puzzling rescale refusal later.
+    void set_op_rescale_bounds(const std::string& op_id,
+                               std::uint32_t min_parallelism,
+                               std::uint32_t max_parallelism) {
+        auto* op = find_op_(op_id);
+        if (op == nullptr) {
+            throw std::runtime_error("Pipeline::set_op_rescale_bounds: unknown op id '" + op_id +
+                                     "'");
+        }
+        if (min_parallelism == 0 || max_parallelism == 0) {
+            throw std::runtime_error(
+                "Pipeline::set_op_rescale_bounds: both bounds must be non-zero (0/0 means "
+                "'not rescalable', which is the default - pass real bounds or do not call this)");
+        }
+        if (min_parallelism > max_parallelism) {
+            throw std::runtime_error("Pipeline::set_op_rescale_bounds: min_parallelism (" +
+                                     std::to_string(min_parallelism) +
+                                     ") exceeds max_parallelism (" +
+                                     std::to_string(max_parallelism) + ")");
+        }
+        if (op->parallelism < min_parallelism || op->parallelism > max_parallelism) {
+            throw std::runtime_error(
+                "Pipeline::set_op_rescale_bounds: op '" + op_id + "' runs at parallelism " +
+                std::to_string(op->parallelism) + ", outside the bounds [" +
+                std::to_string(min_parallelism) + ", " + std::to_string(max_parallelism) +
+                "]. The spec requires min <= parallelism <= max, so a rescale target would be "
+                "compared against a range the operator is not already inside.");
+        }
+        op->min_parallelism = min_parallelism;
+        op->max_parallelism = max_parallelism;
+    }
+
     // Declare a named side output on an already-appended op. The op's
     // ProcessFunction (or windowed-aggregate operator) emits records of
     // type U to OutputTag<U>(tag) via ctx.side_output<U>(tag); the
@@ -1732,6 +1777,14 @@ public:
         return *this;
     }
 
+    // Declare this op rescalable within [min, max]. Without it the op is
+    // registered 0/0 and every rescale request for it is refused as "not
+    // scalable" - see Pipeline::set_op_rescale_bounds.
+    DataStream<T>& rescalable(std::uint32_t min_parallelism, std::uint32_t max_parallelism) {
+        env_->set_op_rescale_bounds(upstream_id_, min_parallelism, max_parallelism);
+        return *this;
+    }
+
     // Declare a named side output on the most-recent op and return a
     // DataStream<U> for the side channel. Mirrors
     // SingleOutputStreamOperator.getSideOutput(OutputTag<U>).
@@ -2104,6 +2157,14 @@ public:
     // is what this handle points at).
     KeyedDataStream<T>& name(std::string display_name) {
         env_->set_op_display_name(upstream_id_, std::move(display_name));
+        return *this;
+    }
+
+    // Declare this op rescalable within [min, max]. Most useful here: a
+    // keyed operator is the one whose state has to move between subtasks
+    // when the parallelism changes.
+    KeyedDataStream<T>& rescalable(std::uint32_t min_parallelism, std::uint32_t max_parallelism) {
+        env_->set_op_rescale_bounds(upstream_id_, min_parallelism, max_parallelism);
         return *this;
     }
 
