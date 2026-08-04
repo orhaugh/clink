@@ -3504,9 +3504,12 @@ ctest -L integration        107/109
                             HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover
 ```
 
-Both failures pass on macOS, and both are follow-up item 1. The label was
-105/109 on Linux when this round first ran it; the two closed since are the
-side-output attacher failures.
+**Both were fixed after this round closed** - follow-up item 1, a plugin `.so`
+unmapped while the registries still held closures pointing into it. Linux is
+now 109/109, so the integration label passes in full on both platforms for the
+first time. The figure above is left as measured at close rather than
+retrofitted, because the sequence matters: the label went 105 to 107 to 109
+as three separate defects came out of it.
 
 The core counts differ between platforms (1931 passing against 1932) because
 each skips cases the other runs - io_uring is Linux-only, and some macOS-only
