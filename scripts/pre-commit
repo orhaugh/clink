@@ -11,6 +11,13 @@ if [ ! -d "$BUILD_DIR" ]; then
     exit 0
 fi
 
+echo "pre-commit: checking fault points have call sites..."
+if ! ./scripts/check-fault-points.sh; then
+    echo ""
+    echo "pre-commit: a declared fault point has no call site. See the message above."
+    exit 1
+fi
+
 echo "pre-commit: checking clang-format..."
 if ! cmake --build "$BUILD_DIR" --target format-check 2>&1; then
     echo ""

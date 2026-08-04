@@ -16,11 +16,16 @@
 // reader misreads", and a bump need not change the column shape, the
 // existing schema check did not stand in for it.
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <arrow/buffer.h>
@@ -33,8 +38,12 @@
 
 #include "clink/cluster/client_handshake.hpp"
 #include "clink/cluster/coordinator.hpp"
+#include "clink/cluster/frame_io.hpp"
 #include "clink/cluster/messages.hpp"
 #include "clink/cluster/protocol.hpp"
+#include "clink/cluster/worker.hpp"
+#include "clink/metrics/metrics_registry.hpp"
+#include "clink/metrics/orchestration_metrics.hpp"
 #include "clink/runtime/network/connection.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/snapshot_arrow_writer.hpp"
@@ -42,6 +51,16 @@
 using namespace clink::cluster;
 
 namespace {
+
+std::uint64_t counter_value(const std::string& name) {
+    auto snap = clink::MetricsRegistry::global().snapshot();
+    for (const auto& [n, v] : snap.counters) {
+        if (n == name) {
+            return v;
+        }
+    }
+    return 0;
+}
 
 std::vector<std::byte> proto_body_of(const std::vector<std::byte>& framed) {
     if (framed.size() < 4) {
@@ -449,4 +468,155 @@ TEST(SnapshotFormatVersion, AMalformedOrImpossibleVersionIsCorruption) {
                      std::runtime_error)
             << "format version '" << bad << "' was accepted";
     }
+}
+
+// --- The two enforcement sites nothing reached ------------------------
+//
+// Three places refuse an incompatible peer: the coordinator at Register, the
+// coordinator at HelloClient, and the WORKER at RegisterAck. Only the first had a
+// test that drove the real handshake. The other two were covered by predicate
+// tests and by a decoder test for the rejection frame - neither of which proves
+// the code that produces it ever runs.
+//
+// The worker direction is the one a single-sided check misses, and this header
+// says so in its own comment: "the coordinator can read me" does not imply "I can
+// read the coordinator".
+
+namespace {
+
+// A connection the test scripts, so a real Worker can be pointed at a
+// coordinator that does not exist and told exactly what it replied. Same shape
+// as FencingScriptedConnection in test_coordinator_fencing.cpp; kept local
+// rather than shared because the two need different frames and a shared helper
+// would have to grow options for both.
+class VersionScriptedConnection final : public clink::network::Connection {
+public:
+    void deliver(const std::vector<std::byte>& framed) {
+        {
+            std::lock_guard lock(mu_);
+            inbound_.insert(inbound_.end(), framed.begin(), framed.end());
+        }
+        cv_.notify_all();
+    }
+
+    bool send_all(const std::byte*, std::size_t) override { return true; }
+
+    bool recv_all(std::byte* buf, std::size_t len) override {
+        std::unique_lock lock(mu_);
+        cv_.wait(lock, [&] { return closed_ || inbound_.size() >= len; });
+        if (closed_ && inbound_.size() < len) {
+            return false;
+        }
+        std::copy_n(inbound_.begin(), len, buf);
+        inbound_.erase(inbound_.begin(), inbound_.begin() + static_cast<std::ptrdiff_t>(len));
+        return true;
+    }
+
+    void shutdown_write() override {}
+    void shutdown_read() override { close(); }
+    void close() override {
+        {
+            std::lock_guard lock(mu_);
+            closed_ = true;
+        }
+        cv_.notify_all();
+    }
+    bool is_open() const noexcept override { return !closed_; }
+
+private:
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<std::byte> inbound_;
+    bool closed_{false};
+};
+
+}  // namespace
+
+TEST(ProtocolVersioning, AWorkerRefusesACoordinatorItCannotSpeakTo) {
+    using namespace std::chrono_literals;
+    const auto before = counter_value(clink::metrics::kProtocolMismatches);
+
+    Worker::Config cfg;
+    cfg.heartbeat_interval = 0ms;
+    Worker worker("w-ver", "127.0.0.1", cfg);
+    // Atomic, because the factory runs on the calling thread and the seeder
+    // below polls it from another. The equivalent helper in
+    // test_coordinator_fencing.cpp uses a plain pointer here and TSan reports it;
+    // copying that would have added a second instance of a known race rather than
+    // one more test.
+    std::atomic<VersionScriptedConnection*> conn{nullptr};
+    worker.set_connect_factory([&conn](const std::string&, std::uint16_t) {
+        auto c = std::make_unique<VersionScriptedConnection>();
+        conn.store(c.get(), std::memory_order_release);
+        return c;
+    });
+
+    // connect_to_coordinator blocks reading the ack, so it has to be queued from
+    // another thread once the factory has handed the pointer over.
+    std::thread seeder([&conn] {
+        VersionScriptedConnection* c = nullptr;
+        while ((c = conn.load(std::memory_order_acquire)) == nullptr) {
+            std::this_thread::sleep_for(100us);
+        }
+        RegisterAckMsg ack;
+        ack.ok = true;
+        ack.protocol_version = kClusterProtocolVersion + 5;
+        ack.min_compatible_protocol_version = kClusterProtocolVersion + 5;
+        c->deliver(encode_frame(MessageKind::RegisterAck, ack));
+    });
+
+    std::string what;
+    try {
+        worker.connect_to_coordinator("127.0.0.1", 1);
+        ADD_FAILURE() << "the worker joined a coordinator speaking a protocol it cannot read; a "
+                         "half-compatible pairing surfaces later as a decode failure on some "
+                         "control frame, a long way from the cause";
+    } catch (const std::exception& e) {
+        what = e.what();
+    }
+    seeder.join();
+
+    EXPECT_NE(what.find("coordinator"), std::string::npos)
+        << "the refusal does not say which end is incompatible: " << what;
+    EXPECT_NE(counter_value(clink::metrics::kProtocolMismatches), before)
+        << "a refused pairing was not counted, so a cluster half-refusing its peers is invisible "
+           "to monitoring";
+
+    if (auto* c = conn.load(std::memory_order_acquire); c != nullptr) {
+        c->close();
+    }
+    worker.stop();
+}
+
+TEST(ProtocolVersioning, ARealCoordinatorRefusesAClientItCannotSpeakTo) {
+    using namespace std::chrono_literals;
+    Coordinator coordinator;
+    const auto port = coordinator.start();
+    const auto before = counter_value(clink::metrics::kProtocolMismatches);
+
+    auto conn = clink::network::connect_plain("127.0.0.1", port);
+    ASSERT_NE(conn, nullptr);
+    HelloClientMsg hello;
+    hello.protocol_version = kClusterProtocolVersion + 5;
+    hello.min_compatible_protocol_version = kClusterProtocolVersion + 5;
+    const auto frame = encode_frame(MessageKind::HelloClient, hello);
+    ASSERT_TRUE(conn->send_all(frame.data(), frame.size()));
+
+    // The refusal arrives as a SubmitJobAck, which is what a client tool decodes
+    // when it asked for something else - the shape protocol_rejection_message
+    // exists for. That helper has a test; the path that PRODUCES the frame did
+    // not.
+    auto reply = clink::cluster::read_frame(*conn);
+    ASSERT_TRUE(reply.has_value()) << "the coordinator closed without saying why";
+    MessageReader r(std::move(*reply));
+    const auto kind = static_cast<MessageKind>(r.read_u8());
+    ASSERT_EQ(kind, MessageKind::SubmitJobAck);
+    const auto ack = decode_submit_job_ack(r);
+    EXPECT_FALSE(ack.ok);
+    EXPECT_NE(ack.message.find("protocol"), std::string::npos)
+        << "the refusal does not name the incompatibility: " << ack.message;
+    EXPECT_NE(counter_value(clink::metrics::kProtocolMismatches), before);
+
+    conn->close();
+    coordinator.stop();
 }

@@ -289,20 +289,31 @@ inline constexpr char kCoordinatorBeforeCommitBroadcast[] = "coordinator.before_
 inline constexpr char kSinkBeforePrepare[] = "sink.before_prepare";
 inline constexpr char kSinkAfterPrepare[] = "sink.after_prepare";
 inline constexpr char kSinkBeforeCommit[] = "sink.before_commit";
-inline constexpr char kSinkDuringCommit[] = "sink.during_commit";
 inline constexpr char kSinkAfterExternalCommit[] = "sink.after_external_commit";
 
 // State backend + restore.
 inline constexpr char kStateBeforeRestore[] = "state.before_restore";
-inline constexpr char kStateDuringFlush[] = "state.during_flush";
 
-// Network.
-inline constexpr char kNetworkBeforeSend[] = "network.before_send";
-inline constexpr char kNetworkDuringFrameWrite[] = "network.during_frame_write";
-
-// Source offset snapshotting.
-inline constexpr char kSourceBeforeOffsetSnapshot[] = "source.before_offset_snapshot";
-inline constexpr char kSourceAfterOffsetSnapshot[] = "source.after_offset_snapshot";
+// Every name here MUST have a CLINK_FAULT_POINT somewhere in include/ or src/.
+// `scripts/check-fault-points.sh` enforces that, and it is not a style rule.
+//
+// Rules are free strings with no catalogue validation - by design, so a rule can
+// name a point this build does not have. The consequence is that a fault point
+// declared but never placed makes
+//   CLINK_FAULT_INJECT="sink.during_commit=exit:70@1"
+// run green having injected nothing at all, and the run reads as coverage. A name
+// that promises a failure it cannot cause is worse than no name.
+//
+// Six were in exactly that state and have been removed rather than left as
+// intentions: sink.during_commit, state.during_flush, network.before_send,
+// network.during_frame_write, source.before_offset_snapshot and
+// source.after_offset_snapshot. Five of those have obvious homes and are worth
+// adding back WITH their call site and a test in the same change - the
+// follow-up list records where each would go. The sixth, state.during_flush, has
+// no home at all: there is no write-flush step on StateBackend. Its only `flush`
+// is flush_pending_reads(), a read-coalescing hook with no durability contract,
+// and state durability already runs through the five points in
+// durable_file_write.hpp.
 
 }  // namespace points
 
