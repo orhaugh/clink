@@ -121,6 +121,11 @@ jobs:
       CCACHE_MAXSIZE: 1500M
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      # Single source of truth for the integration quarantine: the gate
+      # excludes it, the advisory step selects it. One literal, so the two
+      # cannot drift apart - which is exactly what the old pair of
+      # hand-maintained regexes did.
+      IT_QUARANTINE: 'HaFailoverTest\.ExactlyOnceSurvivesACoordinatorFailover|TwoPhaseCommit|WorkerCrashRecovery'
     steps:
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git
@@ -177,7 +182,7 @@ jobs:
         # benchmark is excluded entirely: throughput/timing asserts are
         # meaningless on a shared runner in a Debug (-O0) build and belong to
         # the perf harness on real hardware.
-        run: ctest --test-dir build --output-on-failure -j "$(nproc)" --timeout 180 -LE 'integration|benchmark|sql'
+        run: ctest --test-dir build --output-on-failure -j "$(nproc)" --timeout 180 -LE '^(integration|benchmark|sql)$'
       - name: Test (SQL, low parallelism) [blocking gate]
         # The SQL surface, incl. runtime ITs that stand up in-process
         # coordinator/worker clusters and HTTP servers, at -j2 to avoid the
@@ -195,59 +200,55 @@ jobs:
           ctest --test-dir build --output-on-failure -j 2 --timeout 300
           -L sql -LE integration
           -E 'SqlQueryableState\.Live(GroupByStateServedOverHttp|WholeJobStateExportOverHttp)'
-      - name: Test (fault tolerance, serial) [blocking gate]
+      - name: Test (integration, serial) [blocking gate]
         # The multi-process failure/recovery scenarios, built on the
         # deterministic harness in tests/integration/cluster_harness.hpp.
         #
-        # These GATE. What makes that defensible is that none of them waits
-        # for a duration: every step waits for the condition it actually
-        # depends on (port accepting, worker registered, COMPLETED-N marker
-        # present, process gone, submitter exited) with a monotonic deadline
-        # as a failure bound only. The sleep-based approximations of those
-        # conditions are what made the older tests unfit to gate.
+        # THE DEFAULT IS GATED. This step runs the whole integration label
+        # except an explicit quarantine, so a new test is in the gate the
+        # moment it is written and opting out takes a deliberate, reviewable
+        # edit with a reason.
+        #
+        # It used to be the other way round: the gate named the tests it ran
+        # and everything else fell into an advisory step. That default is how
+        # eleven red tests went unnoticed for a stretch, and it happened again
+        # while nobody was looking - GracefulStopTest, SplitBrainTest,
+        # RescaleExactlyOnceTest, GracefulShutdownTest and HaFailoverTest were
+        # all written on the harness, all met the bar below, and all sat
+        # advisory because nobody edited a regex.
+        #
+        # What makes gating defensible is unchanged: none of these waits for a
+        # duration. Every step waits for the condition it depends on - port
+        # accepting, worker registered, COMPLETED-N marker present, process
+        # gone, submitter exited - with a monotonic deadline as a failure bound
+        # only. Sleep-based approximations of those conditions are what made
+        # the older tests unfit to gate.
         #
         # Serial: each test stands up its own coordinator + workers.
-        #
-        # Widened beyond FaultRecovery once each addition met the same bar -
-        # waits on conditions, passes repeatedly - rather than because it
-        # happened to be green:
-        #   CliLint            no cluster at all; runs a binary and checks
-        #                      exit codes, so there is nothing to race.
-        #   CommitGroupAtomicity / UngroupedSinkAtomicity
-        #                      written on the harness; the one place they
-        #                      wait for quiescence polls for the committed
-        #                      set to stop changing rather than sleeping.
-        #
-        # TwoPhaseCommit and WorkerCrashRecovery are NOT here despite now
-        # passing. They still use the pre-harness helpers (a fixed 200ms
-        # sleep for cluster startup), and gating on a test that waits for a
-        # duration is the gated-and-hoped move this file already refuses.
         run: >-
           ctest --test-dir build --output-on-failure --parallel 1 --timeout 300
           -L integration
-          -R 'FaultRecovery|CliLint|CommitGroupAtomicity|UngroupedSinkAtomicity'
-      - name: Test (remaining integration, serial) [advisory]
-        # Everything else under the integration label. Still advisory, and
-        # deliberately so rather than gated-and-hoped: these tests use the
-        # pre-harness patterns - a bind-close-race free-port probe
-        # (duplicated in 26 files) and sleep_for standing in for readiness
-        # conditions - which are the identified causes of the flakiness, not
-        # a mystery. The fix is to convert them onto the harness, not to
-        # remove this line; each conversion moves a test into the gate above
-        # and shrinks this set.
+          -E "$IT_QUARANTINE"
+      - name: Test (quarantined integration, serial) [advisory]
+        # The quarantine, run so that a test which has silently gone green is
+        # visible rather than forgotten. Every entry needs a follow-up item;
+        # an entry without one is a bug in this file.
         #
-        # -E the gated set so those tests are not run twice.
-        #
-        # Known RED in this set: PluginSubmission.CheckpointAndRestoreAcrossJobRuns
-        # (F38 - half a job's keyed state silently does not survive a
-        # restore). It is left failing rather than adjusted, because the
-        # only way to make it pass today would be to assert that losing half
-        # the state is correct.
+        #   HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover
+        #       follow-up 31. Failed once in a serial Linux sweep with three
+        #       records lost across a failover; passes 3/3 alone. Rare, and
+        #       attribution not established - gating on it would make the
+        #       pipeline intermittently red for a reason nobody can act on yet.
+        #   TwoPhaseCommit, WorkerCrashRecovery
+        #       follow-up 16. Both now pass, but each still stands up its
+        #       cluster with a 400-500ms sleep for worker registration rather
+        #       than a condition. Gating on a test that waits for a duration is
+        #       the gated-and-hoped move this file refuses.
         continue-on-error: true
         run: >-
-          ctest --test-dir build --output-on-failure --parallel 1 --timeout 240
+          ctest --test-dir build --output-on-failure --parallel 1 --timeout 300
           -L integration
-          -E 'FaultRecovery|CliLint|CommitGroupAtomicity|UngroupedSinkAtomicity'
+          -R "$IT_QUARANTINE"
       - name: Upload integration artifacts on failure
         # A multi-process failure with no child logs cannot be diagnosed
         # from a CI transcript. The harness keeps its scratch tree (with
@@ -304,7 +305,8 @@ jobs:
       - name: Build + install clink
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-            -DCLINK_BUILD_TESTS=OFF -DCLINK_BUILD_EXAMPLES=OFF
+            -DCLINK_BUILD_TESTS=OFF -DCLINK_BUILD_EXAMPLES=OFF \
+            -DCLINK_BUILD_SQL=ON
           cmake --build build -j "$(( $(nproc) / 2 ))"
           cmake --install build --prefix /usr/local
       - name: Tiny downstream find_package smoke
@@ -438,9 +440,15 @@ jobs:
         # that adding controller tests needs no workflow change.
         run: go test ./...
 
-  # The sanitizer matrix lives in its own manually-triggered workflow
-  # (sanitizers.yml): a full asan/tsan/ubsan pass takes over an hour per mode
-  # on the hosted runners, far too heavy to pay on every push. Run it with
+  # The sanitizer matrix lives in its own workflow (sanitizers.yml), which runs
+  # a fast ASan+UBSan subset on every pull request and the full asan/tsan/ubsan
+  # matrix nightly, both blocking. A full pass takes over an hour per mode, which
+  # is why the whole matrix is not on every push.
+  #
+  # Force one with:
   #   gh workflow run sanitizers.yml -f mode=all      (or asan|tsan|ubsan)
-  # or from the Actions tab, ideally before a release or after touching
-  # concurrency/memory-sensitive code.
+  # worth doing before a release or after touching concurrency- or
+  # memory-sensitive code.
+  #
+  # (This note used to say the matrix was manually triggered only, contradicting
+  # the header of this file. The header was right.)
