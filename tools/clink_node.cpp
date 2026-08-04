@@ -1970,7 +1970,40 @@ int run_coordinator(int argc, char** argv) {
                     // worker can refuse commands from the leader we just
                     // displaced.
                     coordinator.set_epoch(epoch);
-                    const auto bound = coordinator.start(want_port);
+                    // Retry the bind. A standby taking over RACES the dead
+                    // leader's socket teardown: the leader's port is not free
+                    // the instant its process is signalled, and on Linux the
+                    // bind fails with EADDRINUSE for as long as it takes the
+                    // kernel to release the listener. SO_REUSEADDR does not
+                    // help - it permits rebinding a TIME_WAIT port, not
+                    // stealing one from a process that is still exiting.
+                    //
+                    // This used to be a single attempt whose failure was
+                    // caught, logged and abandoned, leaving the standby a
+                    // standby forever with no leader in the cluster at all.
+                    // On macOS the first attempt won and the defect was
+                    // invisible; on Linux HA failover simply did not work
+                    // (F39).
+                    //
+                    // Bounded, and the failure after the bound is still
+                    // reported - a takeover that cannot bind after 30s is a
+                    // real problem, not a race.
+                    std::uint16_t bound = 0;
+                    {
+                        const auto deadline =
+                            std::chrono::steady_clock::now() + std::chrono::seconds{30};
+                        for (;;) {
+                            try {
+                                bound = coordinator.start(want_port);
+                                break;
+                            } catch (const std::exception&) {
+                                if (std::chrono::steady_clock::now() >= deadline) {
+                                    throw;
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds{50});
+                            }
+                        }
+                    }
                     std::cout << "coordinator became leader (epoch=" << epoch << "), listening on "
                               << advertise_host << ":" << bound << "\n";
                     std::cout.flush();

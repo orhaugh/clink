@@ -23,17 +23,58 @@ namespace {
 using namespace clink::cluster;
 using namespace clink::network;
 
-std::optional<std::vector<std::byte>> read_frame_with_timeout(int fd, int timeout_ms) {
+// Why a frame read failed, not merely that it did.
+//
+// Every one of these used to collapse into nullopt, and every caller
+// reported it as "timed out". A coordinator that CLOSED the connection
+// therefore looked identical to one that was simply slow - and the message
+// sent a reader looking at timeouts. That cost real time on F39, where a
+// "timed out waiting for JobCompleted" arrived inside a three-second test
+// that had asked for a fifteen-second wait: the wait had not expired, the
+// connection had gone.
+enum class ReadFailure {
+    Timeout,       // poll() expired with nothing to read
+    PollError,     // poll() itself failed
+    Closed,        // peer closed, or the read died mid-frame
+    OversizeFrame  // length prefix beyond kMaxFrameBytes
+};
+
+const char* describe(ReadFailure f) {
+    switch (f) {
+        case ReadFailure::Timeout:
+            return "timed out";
+        case ReadFailure::PollError:
+            return "poll failed";
+        case ReadFailure::Closed:
+            return "connection closed by the coordinator";
+        case ReadFailure::OversizeFrame:
+            return "oversize frame (is this a clink coordinator port?)";
+    }
+    return "unknown";
+}
+
+std::optional<std::vector<std::byte>> read_frame_with_timeout(int fd,
+                                                              int timeout_ms,
+                                                              ReadFailure* why = nullptr) {
+    const auto fail = [why](ReadFailure f) {
+        if (why != nullptr) {
+            *why = f;
+        }
+        return std::nullopt;
+    };
     struct pollfd pfd{};
     pfd.fd = fd;
     pfd.events = POLLIN;
     const int rc = ::poll(&pfd, 1, timeout_ms);
-    if (rc <= 0) {
-        return std::nullopt;
+    if (rc == 0) {
+        return fail(ReadFailure::Timeout);
+    }
+    if (rc < 0) {
+        return fail(ReadFailure::PollError);
     }
     std::array<std::byte, 4> hdr{};
     if (!NetworkSocket::recv_all(fd, hdr.data(), hdr.size())) {
-        return std::nullopt;
+        return fail(ReadFailure::Closed);
     }
     std::uint32_t len = 0;
     for (std::size_t i = 0; i < hdr.size(); ++i) {
@@ -45,7 +86,7 @@ std::optional<std::vector<std::byte>> read_frame_with_timeout(int fd, int timeou
     // submitter pointed at a wrong or hostile port would otherwise try to
     // allocate 4 GB from four bytes.
     if (static_cast<std::size_t>(len) > kMaxFrameBytes) {
-        return std::nullopt;
+        return fail(ReadFailure::OversizeFrame);
     }
     std::vector<std::byte> body;
     body.reserve(std::min<std::size_t>(len, kFrameReadChunkBytes));
@@ -54,7 +95,8 @@ std::optional<std::vector<std::byte>> read_frame_with_timeout(int fd, int timeou
     while (got < len) {
         const auto want = std::min<std::size_t>(chunk.size(), len - got);
         if (!NetworkSocket::recv_all(fd, chunk.data(), want)) {
-            return std::nullopt;
+            // Died mid-body: the peer went away, not a timeout.
+            return fail(ReadFailure::Closed);
         }
         body.insert(body.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(want));
         got += want;
@@ -117,9 +159,11 @@ SubmitResult JobSubmitter::submit(const std::string& graph_json,
         return result;
     }
 
-    auto ack_frame = read_frame_with_timeout(fd, static_cast<int>(opts.ack_timeout.count()));
+    ReadFailure ack_why = ReadFailure::Timeout;
+    auto ack_frame =
+        read_frame_with_timeout(fd, static_cast<int>(opts.ack_timeout.count()), &ack_why);
     if (!ack_frame.has_value()) {
-        result.reject_message = "timed out waiting for SubmitJobAck";
+        result.reject_message = std::string{"no SubmitJobAck: "} + describe(ack_why);
         return result;
     }
     MessageReader ack_reader(std::move(*ack_frame));
@@ -142,9 +186,14 @@ SubmitResult JobSubmitter::submit(const std::string& graph_json,
     }
 
     const int wait_ms = static_cast<int>(opts.wait_timeout.count() * 1000);
-    auto done_frame = read_frame_with_timeout(fd, wait_ms);
+    ReadFailure done_why = ReadFailure::Timeout;
+    auto done_frame = read_frame_with_timeout(fd, wait_ms, &done_why);
     if (!done_frame.has_value()) {
-        result.reject_message = "timed out waiting for JobCompleted";
+        // Name the wait, so a message that arrives well inside it is
+        // recognisable as something other than the wait expiring.
+        result.reject_message = std::string{"no JobCompleted after "} +
+                                std::to_string(opts.wait_timeout.count()) +
+                                "s: " + describe(done_why);
         return result;
     }
     MessageReader done_reader(std::move(*done_frame));

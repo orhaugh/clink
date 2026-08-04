@@ -1207,47 +1207,79 @@ change than is wise to land unreviewed at the end of a session.
 
 ### F39. Four integration failures that only happen on Linux
 
-The full integration label had never been run on Linux. Every "verified on
-both platforms" claim in this document up to here rests on the core suites
-and the GATED subset, which is a narrower thing than it sounds, and this
-round said so without noticing the gap.
+The full integration label had never been run on Linux. Core suites and the
+gated subset had, which is narrower than "verified on both platforms", and
+this document had been claiming the broader thing. Running it: core passes,
+integration is 105 of 109, and the four failures do not overlap with the
+macOS set at all.
 
-Running it: core passes (1924), integration is 105 of 109, and the four
-failures do not overlap with the macOS set at all. Two distinct causes:
-
-**Side outputs across the cluster wire fail to attach.** Both
-`PluginSubmission.SideOutputCrossesTheClusterWire` and
-`GatewayPipeline.ReassemblyJoinAndLivenessSideOutputCrossWire` fail the same
-way:
+**Two fixed: side outputs could not attach across the cluster wire.**
 
 ```
 side output: no typed attacher for channel 'string' (tag 'hello.odd_text');
 did you call register_type<T> for the side's element type?
 ```
 
-A registration that resolves on macOS and does not on Linux is the shape this
-repository has been bitten by before: `RTLD_LOCAL` gives each dlopened .so
-its own copy of a static registry, so which registry a lookup lands in
-depends on link and load order. The engine reports it properly rather than
-silently dropping the side output, which is why it is a test failure and not
-a data-loss finding - but a side output that cannot attach means a branch of
-the job does not run.
+`attach_side_output_groups` resolved the attacher from
+`SideOutputAttacherRegistry::default_instance()`, and it runs INSIDE the
+plugin `.so`, where RTLD_LOCAL makes that a different object holding only
+what the `.so` registered itself. A plugin type registered through the host
+registry is absent from it. The worker had already resolved the correct
+registry - the per-job bundle's, which chains to the host default - and had
+nowhere to put it, so it went unused three lines below a comment describing
+this exact trap.
 
-**Two recovery cases lose records.**
+`RunnerContext::side_output_attachers` now carries it across the boundary,
+alongside the logger, metrics and state-backend factory that were already
+carried for the same reason. macOS resolved both names to one object, which
+is why this passed there for as long as it existed.
+
+The second of the two then failed differently - `connect_to(...) failed`,
+a startup race - and now waits for the port like the others.
+
+**One fixed: HA takeover could not bind, so failover never happened.**
+
+```
+coordinator HA takeover failed: Coordinator::start: listen failed
+```
+
+A standby taking over races the dead leader's socket teardown. The leader's
+port is not free the instant its process is signalled, and `SO_REUSEADDR`
+does not help: it permits rebinding a `TIME_WAIT` port, not taking one from
+a process that is still exiting. The takeover made ONE bind attempt, caught
+the failure, logged it and abandoned the takeover - leaving the standby a
+standby forever, with no leader in the cluster at all. It now retries for up
+to 30 seconds and still reports a genuine failure after that.
+
+This is the most serious of the four: on Linux, coordinator failover did not
+work. Now `coordinator became leader (epoch=1), listening on ...` where
+before it was `takeover failed`.
+
+**Two still failing, and they are now the same failure.** Both
 `TwoPhaseCommit.RecoveryCommitsPreCommittedFilesOnRestart` and
-`HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover`, the latter with
-`22 committed lines, 22 distinct; 18 MISSING: record-22 ... (+10)` - the job
-did not finish under the new leader rather than duplicating anything. Both
-are exactly-once-under-failure cases, which makes them the most interesting
-failures in this document and the reason it is worth saying plainly that they
-are open.
+`HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover` come down to a job
+that RESTORES state not completing on Linux. The 2PC one commits 19 of 30
+records and 6 checkpoints, then stops; the HA one reaches 22 of 40 under the
+new leader.
 
-**Not diagnosed.** Each Linux cycle is a container rebuild plus a 30-minute
-label run, and guessing at 05:00 is how the earlier wrong claims in this
-document got made. Recorded with the exact assertions and messages so the
-next session starts from evidence rather than from a rerun.
+Diagnosing that was helped by fixing a diagnostic, which is worth recording
+on its own. The submitter reported `timed out waiting for JobCompleted`, and
+that message arrived inside a 3.3-second test that had asked for a
+15-second wait - so the wait had not expired. `read_frame_with_timeout`
+collapsed four different outcomes into `nullopt` and every caller called it
+a timeout. It now distinguishes them, and the real message is:
 
-**What this changes about the rest of the document.** Nothing that is claimed
+```
+no JobCompleted after 15s: connection closed by the coordinator
+```
+
+Which is a different investigation entirely: not a slow job, a dropped
+connection. Recorded here rather than guessed at - the client loop's exit
+paths and whether the coordinator process survives run 2 are where the next
+session should start, and one of those exits (unknown frame kind) currently
+closes the connection without logging anything.
+
+**What this changes about the rest of the document.** Nothing claimed
 per-test, since those were run. It does mean "verified on macOS and Linux"
 should be read as "core suites and the gated subset on both, the full
 integration label on macOS only" everywhere it appears before this entry.

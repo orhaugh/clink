@@ -37,6 +37,8 @@
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -214,7 +216,12 @@ TEST(GatewayPipeline, ReassemblyJoinAndLivenessSideOutputCrossWire) {
     const pid_t coordinator_pid = spawn_node(
         {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)}, binary);
     ASSERT_GT(coordinator_pid, 0);
-    std::this_thread::sleep_for(200ms);
+    // Was a 200ms guess at bind time, which lost in a full-label sweep on
+    // Linux: the submission below then failed with "connect_to(...) failed"
+    // and the test reported a side-output problem that was really a startup
+    // race (F39).
+    ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
+        << "coordinator never accepted on its port";
 
     // 1 + 1 + 2 + 2 + 2 + 1 = 9 subtasks. The worker default slot count is
     // 1, so spawn 9 workers for clean placement.
@@ -228,7 +235,10 @@ TEST(GatewayPipeline, ReassemblyJoinAndLivenessSideOutputCrossWire) {
                                      binary));
         ASSERT_GT(workers.back(), 0);
     }
-    std::this_thread::sleep_for(400ms);
+    // Worker registration has no observable here (no HTTP API on the
+    // coordinator, no port on the workers), so this stays a duration -
+    // generous rather than a tight guess.
+    std::this_thread::sleep_for(3s);
 
     clink::application::JobSubmitter submitter("127.0.0.1", coordinator_port);
     clink::application::SubmitOptions opts;

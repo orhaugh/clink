@@ -404,7 +404,8 @@ void PluginRegistry::register_source(
                 ops,
                 chain.output_routing,
                 chain.output_selector_fn);
-            clink::cluster::attach_side_output_groups(dag, h0.runner_index, rctx.output_groups);
+            clink::cluster::attach_side_output_groups(
+                dag, h0.runner_index, rctx.output_groups, rctx.side_output_attachers);
             // This subtask hosts one logical operator (the source); attribute
             // every network-bridge runner's bytes to it (its output bridges ->
             // bytes_sent). The source itself ignores the attribution.
@@ -657,7 +658,8 @@ void PluginRegistry::register_operator(
                 ops,
                 chain.output_routing,
                 chain.output_selector_fn);
-            clink::cluster::attach_side_output_groups(dag, h1.runner_index, rctx.output_groups);
+            clink::cluster::attach_side_output_groups(
+                dag, h1.runner_index, rctx.output_groups, rctx.side_output_attachers);
             // This subtask hosts one logical operator; attribute its input
             // bridges' bytes to it (bytes_received) and its output bridges'
             // bytes to it (bytes_sent).
@@ -850,7 +852,8 @@ void PluginRegistry::register_co_operator(
             ops_for_out,
             chain.output_routing,
             chain.output_selector_fn);
-        clink::cluster::attach_side_output_groups(dag, h_out.runner_index, rctx.output_groups);
+        clink::cluster::attach_side_output_groups(
+            dag, h_out.runner_index, rctx.output_groups, rctx.side_output_attachers);
         // This subtask hosts one logical (co-)operator; attribute both input
         // bridges' bytes (bytes_received) and output bridges' bytes (bytes_sent)
         // to it.

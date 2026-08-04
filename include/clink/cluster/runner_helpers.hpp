@@ -113,9 +113,15 @@ private:
 //
 // `parent_runner_idx` is the runner index of the operator that emits
 // the side records (i.e. the runner that owns the side channel map).
+// `attachers` is the registry to resolve against; nullptr means the local
+// default_instance(). Callers inside a dlopened plugin MUST pass the host's
+// (rctx.side_output_attachers), because the .so's default_instance() is a
+// different object under RTLD_LOCAL and holds only what the .so registered
+// itself - see RunnerContext::side_output_attachers, and F39.
 inline void attach_side_output_groups(Dag& dag,
                                       std::size_t parent_runner_idx,
-                                      const std::vector<ResolvedOutputGroup>& groups) {
+                                      const std::vector<ResolvedOutputGroup>& groups,
+                                      const SideOutputAttacherRegistry* attachers = nullptr) {
     for (const auto& g : groups) {
         if (g.side_output_tag.empty()) {
             continue;
@@ -124,7 +130,9 @@ inline void attach_side_output_groups(Dag& dag,
             continue;
         }
         const auto& channel = g.channel_type;
-        const auto* attach = SideOutputAttacherRegistry::default_instance().find(channel);
+        const auto& registry =
+            attachers != nullptr ? *attachers : SideOutputAttacherRegistry::default_instance();
+        const auto* attach = registry.find(channel);
         if (attach == nullptr) {
             throw std::runtime_error(
                 "side output: no typed attacher for channel '" + channel + "' (tag '" +

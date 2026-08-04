@@ -27,6 +27,9 @@ class MetricsRegistry;
 
 namespace clink::cluster {
 
+// Defined in runner_helpers.hpp, which includes this header.
+class SideOutputAttacherRegistry;
+
 struct OperatorChainSpec;
 
 // How records are distributed across the edges of one output group.
@@ -129,6 +132,24 @@ struct RunnerContext {
     // (correct for same-address-space LocalExecutor / legacy paths).
     spdlog::logger* logger{nullptr};
     MetricsRegistry* metrics{nullptr};
+    // The registry that knows how to attach a SIDE output for a given
+    // channel, for exactly the same reason as the three pointers above.
+    //
+    // attach_side_output_groups runs inside the plugin .so, and used to look
+    // the attacher up in SideOutputAttacherRegistry::default_instance() -
+    // which under RTLD_LOCAL is the .so's OWN copy, holding only the
+    // built-ins it registered itself. A plugin type registered through the
+    // HOST registry is absent from it, so a side output carrying a plugin
+    // type failed to attach with "no typed attacher for channel". The worker
+    // already resolved the right registry (the per-job bundle's, which
+    // chains to the host default) and had nowhere to put it.
+    //
+    // Linux-only in practice: macOS resolved both to one object, so this
+    // passed there and failed in the container (F39).
+    //
+    // nullptr falls back to the local default_instance(), which is correct
+    // for the in-process paths where there is only one.
+    const SideOutputAttacherRegistry* side_output_attachers{nullptr};
     // Per-job alignment policy. false = aligned (default); true =
     // unaligned (barriers overtake in-flight records at multi-input
     // operators). Propagated through the wire from CheckpointConfig

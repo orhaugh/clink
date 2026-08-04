@@ -1496,6 +1496,12 @@ void Worker::run_generic_subtask_(JobId job_id,
                 // per-RTLD_LOCAL singletons). See RunnerContext::logger.
                 .logger = clink::logging::host_logger(),
                 .metrics = &clink::MetricsRegistry::global(),
+                // The per-job bundle's attacher registry, resolved above.
+                // The .so's default_instance() is a different object under
+                // RTLD_LOCAL and holds only its own built-ins, so a side
+                // output carrying a PLUGIN type cannot attach without this
+                // (F39: Linux-only, since macOS resolved both to one).
+                .side_output_attachers = job_soar,
                 .unaligned_checkpoints = unaligned_ckpt,
                 .expected_state_versions_packed = expected_state_versions_packed,
                 .restore_from_subtask_idx = rescale_parent_idx,
@@ -1845,6 +1851,9 @@ void Worker::run_generic_subtask_(JobId job_id,
             // across the dlopen boundary by data. See RunnerContext::logger.
             .logger = clink::logging::host_logger(),
             .metrics = &clink::MetricsRegistry::global(),
+            // See above: the plugin .so's own default_instance() holds only
+            // its built-ins under RTLD_LOCAL (F39).
+            .side_output_attachers = job_soar,
             .unaligned_checkpoints = unaligned_ckpt,
             .expected_state_versions_packed = expected_state_versions_packed,
             .restore_from_subtask_idx = task.restore_from_subtask_idx == kRestoreFromSelf
