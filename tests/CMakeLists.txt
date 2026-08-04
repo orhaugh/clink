@@ -89,6 +89,7 @@ add_executable(clink_core_tests
     test_protocol_versioning.cpp
     test_frame_robustness.cpp
     test_plugin_cache.cpp
+    test_cancel_teardown.cpp
     test_checkpoint_completion.cpp
     test_fuzz_corpus.cpp
     test_config_lint.cpp

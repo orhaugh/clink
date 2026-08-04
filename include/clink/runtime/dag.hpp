@@ -3742,7 +3742,15 @@ public:
                         std::this_thread::sleep_for(1ms);
                     }
                 }
-                sink->flush();
+                // flush() only on a CLEAN exit, matching the single-input
+                // runners. A cancel is abrupt by contract - `clink stop` is the
+                // path that drains - and flushing here made that contract depend
+                // on how many inputs an operator happened to have: cancelling a
+                // job drained a multi-input sink's buffered window and join state
+                // while a single-input one discarded it.
+                if (!should_stop()) {
+                    sink->flush();
+                }
                 sink->close();
                 sink->attach_runtime(nullptr);
             };
@@ -4224,7 +4232,11 @@ private:
                         std::this_thread::sleep_for(1ms);
                     }
                 }
-                op->flush(out_emitter);
+                // Clean exit only - see the multi-input sink runner above for
+                // why cancel must not flush.
+                if (!should_stop()) {
+                    op->flush(out_emitter);
+                }
                 op->close();
                 op->attach_runtime(nullptr);
                 stage_emitter->close_all();
