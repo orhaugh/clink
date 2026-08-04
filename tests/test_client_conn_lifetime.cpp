@@ -12,20 +12,30 @@
 // port. That is now fixed with a scope guard, so no future exit path can
 // forget.
 //
-// WHAT THESE TESTS DO AND DO NOT COVER, because the distinction matters more
-// than the coverage. They drive the two previously-unguarded exit paths and
-// assert the coordinator survives them and keeps serving. They do NOT
-// reproduce the use-after-free, because that needs a job SUBMITTED over the
-// wire on the connection (only the wire path sets notify_client_conn; the
-// in-process submit_job API does not) and then COMPLETING after the client
-// has gone. Confirmed by mutation: reverting the guard leaves both cases
-// green.
+// Reproducing it needs FOUR things in order, and the order is the whole
+// difficulty:
 //
-// So the guard's own regression test does not exist yet, and saying so is the
-// point - a file named for a lifetime bug that quietly tests something else
-// is worse than an admitted gap. Writing it needs a wire submission plus a
-// fake worker acking a final checkpoint, which is a fixture this file does
-// not have. Recorded in F39.
+//   1. a job submitted over the WIRE - only that path sets
+//      notify_client_conn; the in-process submit_job API does not;
+//   2. the client leaving through one of the unguarded exits;
+//   3. ANOTHER client connecting, because ClientSession holds a shared_ptr to
+//      the Connection and it is only freed when reap_finished_clients_ drops
+//      the session, which happens on the next admission;
+//   4. and only then the job completing, so something dereferences it.
+//
+// Get step 3 wrong and nothing is freed, so nothing faults. The first draft
+// of this test completed the job before any reap and passed under ASan with
+// the fix reverted - a green test proving nothing.
+//
+// With the order right, ASan on the pre-fix code reports:
+//
+//   heap-use-after-free ... READ of size 8
+//     clink::cluster::send_frame
+//     Coordinator::signal_job_completion_locked_
+//     Coordinator::handle_subtask_finished_
+//
+// which is the defect exactly. AJobCompletingAfterItsClientLeftDoesNotTouchFreedMemory
+// below drives it.
 //
 // What they do catch is real: before the fix, both paths also closed the
 // connection SILENTLY, so a submitter reported "connection closed by the
@@ -42,9 +52,12 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/coordinator.hpp"
 #include "clink/cluster/frame_io.hpp"
+#include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/messages.hpp"
+#include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/protocol.hpp"
 #include "clink/runtime/network/connection.hpp"
 
@@ -155,4 +168,122 @@ TEST(ClientConnLifetime, TheCoordinatorSurvivesAClientThatSendsRubbish) {
         << "the coordinator stopped accepting clients after 8 sent undecodable frames";
 
     coordinator.stop();
+}
+
+// The case that actually reproduces the defect: wire submission, client
+// leaves through an unguarded exit, job completes.
+//
+// Under ASan on the pre-fix code this is a heap-use-after-free in
+// signal_job_completion_locked_. Without a sanitizer it is a crash or
+// nothing, depending on what the allocator did with the freed Connection -
+// so this test is worth most when run under ASan, and is still worth having
+// without it because the crash it caused on Linux was real.
+TEST(ClientConnLifetime, AJobCompletingAfterItsClientLeftDoesNotTouchFreedMemory) {
+    const auto dir =
+        std::filesystem::temp_directory_path() / ("clink_ccl_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator coordinator;
+    const auto port = coordinator.start(0);
+    ASSERT_GT(port, 0);
+    coordinator.expect_workers({"w"});
+
+    // A worker, so the job can be deployed and later reported finished.
+    auto worker = network::connect_plain("127.0.0.1", port);
+    ASSERT_NE(worker, nullptr);
+    RegisterMsg reg{.worker_id = "w", .data_host = "127.0.0.1", .slot_count = 4};
+    ASSERT_TRUE(send_frame(*worker, encode_frame(MessageKind::Register, reg)));
+    auto reg_ack = read_frame(*worker);
+    ASSERT_TRUE(reg_ack.has_value()) << "no RegisterAck";
+
+    // Submit over the wire. This is the only path that records the client
+    // connection on the job, which is the pointer under test.
+    auto client = connect_as_client(port);
+    ASSERT_NE(client, nullptr);
+    SubmitJobMsg sj;
+    {
+        JobGraphSpec g;
+        OperatorSpec src;
+        src.type = "int64_range_source";
+        src.id = "src";
+        src.parallelism = 1;
+        src.out_channel = std::string{kChannelInt64};
+        src.params = {{"count", "1000000"}};  // must not finish on its own
+        g.ops.push_back(src);
+        OperatorSpec snk;
+        snk.type = "file_int64_sink";
+        snk.id = "snk";
+        snk.inputs = {"src"};
+        snk.parallelism = 1;
+        snk.out_channel = std::string{kChannelInt64};
+        snk.params = {{"path", (dir / "out.txt").string()}};
+        g.ops.push_back(snk);
+        sj.graph_json = g.to_json();
+    }
+    ASSERT_TRUE(send_frame(*client, encode_frame(MessageKind::SubmitJob, sj)));
+    auto ack = read_frame(*client);
+    ASSERT_TRUE(ack.has_value()) << "no SubmitJobAck";
+    MessageReader ack_r(std::move(*ack));
+    ASSERT_EQ(static_cast<MessageKind>(ack_r.read_u8()), MessageKind::SubmitJobAck);
+    const auto ack_msg = decode_submit_job_ack(ack_r);
+    ASSERT_TRUE(ack_msg.ok) << "submission rejected: " << ack_msg.message;
+    const auto job_id = ack_msg.job_id;
+    ASSERT_GT(job_id, 0U);
+
+    // Learn the deployed task set, so completion can be reported for the
+    // keys the coordinator is actually tracking.
+    auto deploy = read_frame(*worker);
+    ASSERT_TRUE(deploy.has_value()) << "no Deploy reached the worker";
+    MessageReader dep_r(std::move(*deploy));
+    ASSERT_EQ(static_cast<MessageKind>(dep_r.read_u8()), MessageKind::Deploy);
+    const auto deployed = decode_deploy(dep_r).tasks;
+    ASSERT_FALSE(deployed.empty());
+
+    // The client now leaves through the exit path that used to skip the
+    // cleanup, leaving the job holding a pointer to a Connection that is
+    // about to be destroyed.
+    RegisterMsg unhandled{.worker_id = "not-a-worker", .data_host = "127.0.0.1", .slot_count = 1};
+    ASSERT_TRUE(send_frame(*client, encode_frame(kUnhandledOnClientPath, unhandled)));
+    std::this_thread::sleep_for(500ms);  // let the coordinator drop it
+
+    // FORCE THE FREE, and this ordering is the whole test.
+    //
+    // The loop returning does not destroy the Connection: ClientSession holds
+    // a shared_ptr to it, so it lives until reap_finished_clients_ removes the
+    // session - which happens when the NEXT client is admitted. So a job's
+    // pointer only becomes dangling after another client connects, and a test
+    // that completes the job before that proves nothing. The first draft of
+    // this test did exactly that and passed even under ASan with the fix
+    // reverted.
+    {
+        auto reaper = connect_as_client(port);
+        ASSERT_NE(reaper, nullptr) << "could not admit a client to trigger the reap";
+        std::this_thread::sleep_for(300ms);
+    }
+
+    // And NOW the job completes, dereferencing a pointer to memory that has
+    // been freed.
+    for (const auto& t : deployed) {
+        SubtaskFinishedMsg fin;
+        fin.job_id = job_id;
+        fin.worker_id = "w";
+        fin.role = t.role;
+        fin.subtask_idx = t.subtask_idx;
+        fin.had_error = false;
+        ASSERT_TRUE(send_frame(*worker, encode_frame(MessageKind::SubtaskFinished, fin)));
+    }
+
+    // Survival is the assertion. A coordinator that wrote to the freed
+    // Connection either crashes here or is caught by ASan; one that cleared
+    // the pointer keeps serving.
+    std::this_thread::sleep_for(750ms);
+    auto probe = connect_as_client(port);
+    EXPECT_NE(probe, nullptr)
+        << "the coordinator stopped serving after a job completed with its client gone - the "
+           "completion path wrote to a Connection that had been destroyed";
+
+    coordinator.stop();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }

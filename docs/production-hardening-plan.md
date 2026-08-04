@@ -1298,16 +1298,30 @@ memory, which is why this presented on Linux and passed on macOS.
 made the first hour of this go into looking for a crash rather than at a
 dropped client. It logs now.
 
-**What is NOT yet proven.** `tests/test_client_conn_lifetime.cpp` drives both
-previously-unguarded exit paths and asserts the coordinator survives them,
-but it does NOT reproduce the use-after-free: that needs a job submitted over
-the WIRE on the connection (only the wire path sets
-`notify_client_conn`; the in-process `submit_job` API does not) and then
-completing after the client has gone. Confirmed by mutation - reverting the
-guard leaves both cases green. The fix rests on the crash disappearing from
-the Linux runs plus reading the lifetime, not on a test that fails without
-it. Writing that test needs a wire-submission fixture with a fake worker
-acking a final checkpoint, and it is the honest next piece of work here.
+**Proven, with the stack.** `tests/test_client_conn_lifetime.cpp` now
+reproduces it, and under ASan on the pre-fix code reports:
+
+```
+heap-use-after-free ... READ of size 8
+  clink::cluster::send_frame
+  Coordinator::signal_job_completion_locked_
+  Coordinator::handle_subtask_finished_
+```
+
+Getting there took two corrections to my own test, and the second is the
+interesting one. The first draft asserted only that the coordinator survived
+the odd exits - it never submitted a job, so the pointer was never set, and
+reverting the guard left it green. The second draft submitted over the wire
+and still passed under ASan, because `ClientSession` holds a `shared_ptr` to
+the Connection: the loop returning does not free it. It is freed when
+`reap_finished_clients_` drops the session, which happens on the NEXT client
+admission. So the order has to be submit, client leaves, another client
+connects (forcing the reap), and only then the job completes. Complete the
+job before the reap and nothing is freed, so nothing faults, and the test
+proves nothing while looking thorough.
+
+Both wrong drafts passed. That is the argument for mutation-checking every
+gate in this document, made again at the end of it.
 
 **What this changes about the rest of the document.** Nothing claimed
 per-test, since those were run. It does mean "verified on macOS and Linux"
