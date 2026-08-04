@@ -117,6 +117,19 @@ cmake -S . -B build && cmake --build build --parallel 10 && ctest --test-dir bui
 `-L postgres`, `-L clickhouse`, `-L s3`, `-L rocksdb`, `-L tls`, and
 `-L integration` hit the per-impl test executables.
 
+The SQL frontend is ON by default (`CLINK_BUILD_SQL`), matching what CI, the
+release binaries, the runtime image and the wheel all build. Pass
+`-DCLINK_BUILD_SQL=OFF` to skip it; `build_and_test.sh` pins it off for the
+sanitizer and coverage modes, because the SQL runtime tests hang under ASan and
+because the recorded coverage baseline was measured without them.
+
+**`-L` takes a REGEX, so `-L sql` also matches the `mysql` label.** It reports
+994 frontend cases plus 58 connector ones, and on a build configured with
+`-DCLINK_BUILD_SQL=OFF` it reports a green "sql" run made entirely of those 58 -
+which is how a Linux verification sweep came to record a SQL pass having tested
+no SQL. Use `-L '^sql$'` when you mean the frontend. Note also that the SQL suite
+takes about four minutes on its own, so it is not part of a quick `-L core` loop.
+
 ## Nexmark benchmark ("run a nexmark run")
 
 The harness lives in `benchmarks/nexmark_compare/`. Two scripts do different jobs:

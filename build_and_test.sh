@@ -19,6 +19,11 @@ build_and_run_tests() {
         "-DCMAKE_CXX_FLAGS=-fsanitize=address -fno-omit-frame-pointer"
         "-DCMAKE_C_FLAGS=-fsanitize=address -fno-omit-frame-pointer"
         "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address"
+        # SQL off, pinned rather than inherited, matching the sanitizers CI
+        # job. The SQL runtime tests hang under ASan and time out under a
+        # parallel ctest, so a sanitizer build that pulled the frontend in would
+        # wedge rather than report.
+        "-DCLINK_BUILD_SQL=OFF"
       )
       # LSAN_OPTIONS suppressions are honoured by ASan's integrated leak
       # pass; ignores one-time leaks inside libraries we link but don't own
@@ -32,6 +37,11 @@ build_and_run_tests() {
         "-DCMAKE_CXX_FLAGS=-fsanitize=thread"
         "-DCMAKE_C_FLAGS=-fsanitize=thread"
         "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread"
+        # SQL off, pinned rather than inherited, matching the sanitizers CI
+        # job. The SQL runtime tests hang under ASan and time out under a
+        # parallel ctest, so a sanitizer build that pulled the frontend in would
+        # wedge rather than report.
+        "-DCLINK_BUILD_SQL=OFF"
       )
       # `suppressions=...` ignores reports inside libraries we don't
       # compile with TSan (librdkafka, OpenSSL, libpq) - TSan can't
@@ -46,6 +56,11 @@ build_and_run_tests() {
         "-DCMAKE_CXX_FLAGS=-fsanitize=undefined -fno-omit-frame-pointer"
         "-DCMAKE_C_FLAGS=-fsanitize=undefined -fno-omit-frame-pointer"
         "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=undefined"
+        # SQL off, pinned rather than inherited, matching the sanitizers CI
+        # job. The SQL runtime tests hang under ASan and time out under a
+        # parallel ctest, so a sanitizer build that pulled the frontend in would
+        # wedge rather than report.
+        "-DCLINK_BUILD_SQL=OFF"
       )
       # `suppressions=...` ignores reports inside vendored third-party
       # libraries (RocksDB's ARM64 CRC32C, etc.) - upstream's problem,
@@ -60,6 +75,11 @@ build_and_run_tests() {
         "-DCMAKE_CXX_FLAGS=--coverage -fprofile-arcs -ftest-coverage"
         "-DCMAKE_C_FLAGS=--coverage -fprofile-arcs -ftest-coverage"
         "-DCMAKE_EXE_LINKER_FLAGS=--coverage"
+        # SQL off, pinned rather than inherited: the recorded coverage baseline
+        # was measured without the frontend, and letting the default pull it in
+        # would change the denominator and make the figure incomparable with
+        # every previous run.
+        "-DCLINK_BUILD_SQL=OFF"
       )
       echo "▶ Coverage build"
       ;;

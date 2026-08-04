@@ -63,9 +63,25 @@ option(CLINK_HTTP_TLS       "Enable HTTPS in the HTTP subsystem (links OpenSSL)"
 option(CLINK_BUILD_BENCH    "Build clink benchmarks (placeholder)" OFF)
 option(CLINK_BUILD_HTTP     "Build the HTTP subsystem (cluster dashboard + JSON API)" ON)
 # SQL frontend: parser (libpg_query), binder, logical/physical planner,
-# Table API. Off during initial development to keep the default build
-# fast; flip ON to opt in.
-option(CLINK_BUILD_SQL      "Build the SQL frontend (libpg_query + planner)" OFF)
+# Table API.
+#
+# ON by default because everything that SHIPS is built with it - both CI test
+# jobs, the release binaries, the runtime image and the Python wheel all pass
+# -DCLINK_BUILD_SQL=ON explicitly. A default that differs from what ships is the
+# wrong default: it means the build a contributor gets from a bare `cmake -S . -B
+# build` is not the build CI gates, and 984 tests silently do not run.
+#
+# That divergence is not theoretical. A Linux verification sweep on 2026-08-04
+# reported a green "sql" label containing no SQL tests at all - `ctest -L sql` is
+# a REGEX, so it also matches the `mysql` label, and with the frontend off those
+# 58 connector cases were the entire "SQL" run. Use -L '^sql$' to mean the
+# frontend.
+#
+# Pass -DCLINK_BUILD_SQL=OFF to skip it: worth about 7% of the object count plus
+# libpg_query. The builds that legitimately want it off - sanitizers (the SQL
+# runtime tests hang under ASan), fuzzing, and the live-connector runs - all pass
+# that explicitly already.
+option(CLINK_BUILD_SQL      "Build the SQL frontend (libpg_query + planner)" ON)
 # WS4: route the clink::FlatMap state seam through ankerl::unordered_dense
 # (open-addressing, metadata-byte probing). OFF aliases std::unordered_map (the
 # behaviour-preserving default). The define and include must be GLOBAL because
