@@ -25,6 +25,7 @@
 #include <string_view>
 #include <vector>
 
+#include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/protocol.hpp"
 
 namespace clink::cluster {
@@ -51,6 +52,28 @@ struct ConfigProblem {
 // Pure: it reads the config and nothing else, so it can run in a CLI, in a
 // test, or at submission without a cluster.
 [[nodiscard]] std::vector<ConfigProblem> lint_checkpoint_config(const CheckpointConfig& c);
+
+// Lint one job's GRAPH: the per-operator settings, and the pairs of settings
+// that contradict each other across the graph and the checkpoint config.
+//
+// Separate from lint_checkpoint_config because it needs the graph, and because
+// the two answer different questions - that one is about whether recovery will
+// happen at all, this one is about whether the operators as declared can do what
+// they say.
+//
+// Why this exists at all: F38 was a key-group-versus-parallelism defect that ran
+// for a long time writing keyed state which was silently discarded at restore.
+// The relationship it got wrong is a property of the graph and is checkable
+// before a single record moves.
+//
+// `available_slots` is the total free slot capacity of the cluster, when the
+// caller knows it. Left unset in the CLI, where there is no cluster to ask.
+//
+// Pure, like the rest of this header: no cluster, no filesystem.
+[[nodiscard]] std::vector<ConfigProblem> lint_job_graph(
+    const JobGraphSpec& graph,
+    const CheckpointConfig& checkpoint,
+    std::optional<std::uint32_t> available_slots = std::nullopt);
 
 // Lint the cluster-level liveness settings. Separate from the job config
 // because these belong to the coordinator process, not to a submission.

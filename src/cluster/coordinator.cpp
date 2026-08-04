@@ -2245,6 +2245,28 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
         !reject.empty()) {
         throw std::runtime_error(reject);
     }
+    // Graph-level lint. Errors reject the submission; warnings are logged, since
+    // they are settings that will be ignored rather than settings that break the
+    // job.
+    //
+    // Deliberately WITHOUT a slot count: the capacity check a few lines below
+    // already refuses a plan larger than the cluster, and duplicating a gate that
+    // exists would mean two messages for one fact. The slot check in
+    // lint_job_graph is for callers with no cluster to plan against.
+    {
+        const auto problems = lint_job_graph(graph, checkpoint, /*available_slots=*/std::nullopt);
+        std::string errors;
+        for (const auto& p : problems) {
+            if (p.is_error()) {
+                errors += (errors.empty() ? "" : "; ") + p.setting + ": " + p.message;
+            } else {
+                log::warn("coordinator.lint", p.setting + ": " + p.message);
+            }
+        }
+        if (!errors.empty()) {
+            throw std::runtime_error("submit_job: " + errors);
+        }
+    }
     // Use the bundle's OperatorRegistry (parent-fallback to default
     // singleton for built-ins) when one is provided so the planner's
     // chain-eligibility check can find inline-lambda ops registered by

@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <sstream>
+#include <vector>
+
+#include "clink/runtime/key_groups.hpp"
 
 namespace clink::cluster {
 
@@ -125,6 +128,135 @@ std::vector<ConfigProblem> lint_checkpoint_config(const CheckpointConfig& c) {
              "checkpoint_dir is set but no interval, so no PERIODIC checkpoint is taken. A "
              "bounded source still gets its end-of-stream checkpoint; an unbounded job gets "
              "none at all and replays from the beginning after any failure."});
+    }
+
+    return out;
+}
+
+namespace {
+
+// Whether a rescale from `current` to `target` is one the runtime will actually
+// carry out. rescale_parent_mapping refuses anything that is not an integer
+// multiple or divisor, because a fractional factor leaves a key group straddling
+// two parent snapshots and the loader cannot merge half a parent.
+bool rescale_factor_reachable(std::uint32_t current, std::uint32_t target) noexcept {
+    if (current == 0 || target == 0) {
+        return false;
+    }
+    if (target == current) {
+        return true;  // trivially, and not a rescale
+    }
+    return target > current ? (target % current == 0) : (current % target == 0);
+}
+
+}  // namespace
+
+std::vector<ConfigProblem> lint_job_graph(const JobGraphSpec& graph,
+                                          const CheckpointConfig& checkpoint,
+                                          std::optional<std::uint32_t> available_slots) {
+    std::vector<ConfigProblem> out;
+    const auto key_groups = static_cast<std::uint32_t>(clink::kNumKeyGroups);
+    std::uint64_t total_subtasks = 0;
+
+    for (const auto& op : graph.ops) {
+        total_subtasks += op.parallelism;
+        const std::string where = "operator '" + op.id + "'";
+
+        // A keyed operator at a parallelism above the key-group count has
+        // subtasks that own NOTHING.
+        //
+        // key_group_range_for_subtask divides kNumKeyGroups = 128 groups among
+        // `parallelism` subtasks, so above 128 the arithmetic hands the surplus
+        // subtasks an empty [first, last) range. They receive no records, occupy
+        // a slot each, and any keyed state they somehow wrote would be discarded
+        // by the range filter at restore - which is the shape of F38.
+        if (!op.key_by.empty() && op.parallelism > key_groups) {
+            out.push_back(ConfigProblem{
+                .severity = LintSeverity::Error,
+                .setting = where + " parallelism",
+                .message =
+                    "parallelism " + std::to_string(op.parallelism) + " exceeds the " +
+                    std::to_string(key_groups) +
+                    " key groups the engine partitions keyed state into, so " +
+                    std::to_string(op.parallelism - key_groups) +
+                    " subtask(s) would own an empty key-group range: they receive no records, "
+                    "hold a slot each, and any keyed state written through them is dropped by "
+                    "the range filter at restore. Cap a keyed operator at " +
+                    std::to_string(key_groups) + "."});
+        }
+
+        // Declared rescale bounds the runtime cannot reach.
+        //
+        // request_operator_rescale validates a target through
+        // rescale_parent_mapping, which takes integer factors only. A range whose
+        // ends are not integer factors of the current parallelism is a range the
+        // operator will be refused when they ask for it - a setting accepted and
+        // then unusable, which is what this file is for.
+        if (op.min_parallelism != 0 || op.max_parallelism != 0) {
+            std::vector<std::uint32_t> reachable;
+            for (std::uint32_t t = op.min_parallelism; t <= op.max_parallelism && t != 0; ++t) {
+                if (t != op.parallelism && rescale_factor_reachable(op.parallelism, t)) {
+                    reachable.push_back(t);
+                }
+            }
+            if (reachable.empty()) {
+                out.push_back(ConfigProblem{
+                    .severity = LintSeverity::Warning,
+                    .setting = where + " min_parallelism/max_parallelism",
+                    .message = "the range [" + std::to_string(op.min_parallelism) + ", " +
+                               std::to_string(op.max_parallelism) +
+                               "] contains no parallelism this operator can actually be "
+                               "rescaled to from " +
+                               std::to_string(op.parallelism) +
+                               ": a rescale target must be an integer multiple or divisor of "
+                               "the current parallelism, so every request against this range "
+                               "will be refused. The operator is effectively not scalable."});
+            } else {
+                std::string list;
+                for (const auto t : reachable) {
+                    list += (list.empty() ? "" : ", ") + std::to_string(t);
+                }
+                if (!rescale_factor_reachable(op.parallelism, op.max_parallelism) ||
+                    !rescale_factor_reachable(op.parallelism, op.min_parallelism)) {
+                    out.push_back(ConfigProblem{
+                        .severity = LintSeverity::Warning,
+                        .setting = where + " min_parallelism/max_parallelism",
+                        .message = "the ends of the range [" + std::to_string(op.min_parallelism) +
+                                   ", " + std::to_string(op.max_parallelism) +
+                                   "] are not both reachable from parallelism " +
+                                   std::to_string(op.parallelism) +
+                                   " - a rescale target must be an integer multiple or divisor. "
+                                   "Reachable values in this range: " +
+                                   list + "."});
+                }
+            }
+
+            // Bounds are only actionable when periodic checkpointing is on:
+            // request_operator_rescale refuses otherwise, because the new
+            // subtasks restore their state from a completed checkpoint.
+            if (checkpoint.checkpoint_dir.empty() || checkpoint.interval_ms <= 0) {
+                out.push_back(ConfigProblem{
+                    .severity = LintSeverity::Warning,
+                    .setting = where + " min_parallelism/max_parallelism",
+                    .message =
+                        "rescale bounds are declared but this job has no periodic checkpointing "
+                        "(checkpoint_dir set and interval_ms > 0), and a rescale restores the "
+                        "new subtasks from a completed checkpoint - so every rescale request "
+                        "for this operator will be refused, and the autoscaler cannot act on "
+                        "it either."});
+            }
+        }
+    }
+
+    // Does the graph fit? plan_job already refuses a plan larger than the
+    // cluster, so this is the same fact reported early enough to act on.
+    if (available_slots.has_value() && total_subtasks > *available_slots) {
+        out.push_back(ConfigProblem{.severity = LintSeverity::Error,
+                                    .setting = "total parallelism",
+                                    .message = "the graph needs " + std::to_string(total_subtasks) +
+                                               " subtask slots and the cluster has " +
+                                               std::to_string(*available_slots) +
+                                               " free, so the deploy cannot be placed."});
     }
 
     return out;

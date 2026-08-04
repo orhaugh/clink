@@ -452,6 +452,108 @@ TEST(ConfigLint, ARealSubmissionIsRejectedForAnIncoherentConfig) {
     coordinator.stop();
 }
 
+TEST(JobGraphLint, ARealSubmissionIsRejectedForAKeyedOperatorAboveTheKeyGroupCount) {
+    // The gate, not just the predicate: the coordinator must refuse this at
+    // submission. It is checked before planning, so it does not need a cluster
+    // large enough to host 200 subtasks - which is the point of catching it here
+    // rather than discovering it from state that quietly went missing.
+    Coordinator coordinator;
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"w-kg"});
+
+    Worker worker("w-kg", "127.0.0.1");
+    worker.register_role("noop", [](const DeploymentTask&) {});
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(std::chrono::seconds(2)));
+
+    JobGraphSpec g;
+    OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    src.parallelism = 1;
+    src.out_channel = std::string{kChannelInt64};
+    src.params = {{"count", "1"}};
+    g.ops.push_back(src);
+    OperatorSpec agg;
+    agg.type = "identity_int64";
+    agg.id = "agg";
+    agg.inputs = {"src"};
+    agg.parallelism = 200;  // above kNumKeyGroups
+    agg.key_by = "identity";
+    agg.out_channel = std::string{kChannelInt64};
+    g.ops.push_back(agg);
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = "/tmp/clink_lint_gate_ckpt";
+    ckpt.interval_ms = 500;
+
+    try {
+        (void)coordinator.submit_job(g, OperatorRegistry::default_instance(), {}, ckpt);
+        FAIL() << "the coordinator accepted a keyed operator whose surplus subtasks would own no "
+                  "key groups";
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        EXPECT_NE(what.find("empty key-group range"), std::string::npos) << what;
+        EXPECT_NE(what.find("agg"), std::string::npos)
+            << "the rejection does not name the operator at fault: " << what;
+    }
+
+    worker.stop();
+    coordinator.stop();
+}
+
+TEST(JobGraphLint, ASubmissionWithOnlyGraphWarningsStillSucceeds) {
+    // The other half. Rescale bounds that the runtime cannot reach are a warning,
+    // not an error: the job runs perfectly well, it just cannot be rescaled.
+    // Rejecting it would break every job that declared bounds it never used - and
+    // a gate that refuses working jobs is one people switch off.
+    Coordinator coordinator;
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"w-warn"});
+
+    Worker::Config warn_cfg;
+    warn_cfg.slot_count = 4;
+    Worker worker("w-warn", "127.0.0.1", warn_cfg);
+    worker.register_role("noop", [](const DeploymentTask&) {});
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(std::chrono::seconds(2)));
+
+    const auto out_path = std::filesystem::temp_directory_path() /
+                          ("clink_lint_warn_" + std::to_string(::getpid()) + ".txt");
+    std::filesystem::remove(out_path);
+
+    JobGraphSpec g;
+    OperatorSpec src;
+    src.type = "int64_range_source";
+    src.id = "src";
+    // From parallelism 2, a target of 1 is reachable (a divisor) and 3 is not
+    // (neither multiple nor divisor), so the range is PARTIALLY reachable - a
+    // warning. The bounds also have to satisfy JobGraphSpec::validate, which
+    // requires min <= parallelism <= max.
+    src.parallelism = 2;
+    src.min_parallelism = 1;
+    src.max_parallelism = 3;
+    src.out_channel = std::string{kChannelInt64};
+    src.params = {{"count", "1"}};
+    g.ops.push_back(src);
+    OperatorSpec snk;
+    snk.type = "file_int64_sink";
+    snk.id = "snk";
+    snk.inputs = {"src"};
+    snk.parallelism = 1;
+    snk.out_channel = std::string{kChannelInt64};
+    snk.params = {{"path", out_path.string()}};
+    g.ops.push_back(snk);
+
+    EXPECT_NO_THROW((void)coordinator.submit_job(
+        g, OperatorRegistry::default_instance(), {}, CheckpointConfig{}))
+        << "a graph whose only findings are warnings was refused";
+
+    worker.stop();
+    coordinator.stop();
+    std::filesystem::remove(out_path);
+}
+
 TEST(ConfigLint, ARealSubmissionWithAWarningStillSucceeds) {
     // The other half, and the one a too-eager gate breaks: a directory with
     // no interval warns and MUST still submit. A bounded job configured
@@ -574,4 +676,171 @@ TEST(ConfigLint, ASubtaskRedeployIsCounted) {
 
     worker.stop();
     coordinator.stop();
+}
+
+// --- lint_job_graph ---------------------------------------------------
+//
+// The graph-level checks. Each is a setting the engine accepts and then either
+// cannot honour or silently ignores, which is the bar the rest of this file
+// holds itself to.
+
+namespace {
+
+// src -> keyed op -> sink, with the middle operator's settings under test.
+clink::cluster::JobGraphSpec graph_with_keyed_op(std::uint32_t parallelism,
+                                                 std::uint32_t min_p = 0,
+                                                 std::uint32_t max_p = 0) {
+    using namespace clink::cluster;
+    JobGraphSpec g;
+    g.ops.push_back(OperatorSpec{
+        .type = "int64_range_source",
+        .id = "src",
+        .inputs = {},
+        .parallelism = 1,
+        .out_channel = std::string{kChannelInt64},
+        .params = {{"count", "10"}},
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "identity_int64",
+        .id = "agg",
+        .inputs = {"src"},
+        .parallelism = parallelism,
+        .min_parallelism = min_p,
+        .max_parallelism = max_p,
+        .out_channel = std::string{kChannelInt64},
+        .key_by = "identity",
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "file_int64_sink",
+        .id = "snk",
+        .inputs = {"agg"},
+        .parallelism = 1,
+        .out_channel = std::string{kChannelInt64},
+        .params = {{"path", "/tmp/x"}},
+    });
+    return g;
+}
+
+clink::cluster::CheckpointConfig checkpointed() {
+    clink::cluster::CheckpointConfig c;
+    c.checkpoint_dir = "/tmp/ckpt";
+    c.interval_ms = 500;
+    return c;
+}
+
+bool has_error_mentioning(const std::vector<clink::cluster::ConfigProblem>& ps,
+                          std::string_view needle) {
+    return std::any_of(ps.begin(), ps.end(), [&](const clink::cluster::ConfigProblem& p) {
+        return p.is_error() && p.message.find(needle) != std::string::npos;
+    });
+}
+
+bool has_warning_mentioning(const std::vector<clink::cluster::ConfigProblem>& ps,
+                            std::string_view needle) {
+    return std::any_of(ps.begin(), ps.end(), [&](const clink::cluster::ConfigProblem& p) {
+        return !p.is_error() && p.message.find(needle) != std::string::npos;
+    });
+}
+
+}  // namespace
+
+TEST(JobGraphLint, AKeyedOperatorAboveTheKeyGroupCountIsAnError) {
+    // The F38 shape, checkable before a record moves. 128 key groups divided
+    // among 200 subtasks leaves 72 owning an empty range: no records, a slot
+    // each, and any keyed state written through them dropped at restore.
+    const auto problems = clink::cluster::lint_job_graph(graph_with_keyed_op(200), checkpointed());
+    EXPECT_TRUE(has_error_mentioning(problems, "empty key-group range"))
+        << clink::cluster::render_problems(problems);
+    EXPECT_TRUE(has_error_mentioning(problems, "72 subtask"))
+        << "the message should name how many subtasks own nothing: "
+        << clink::cluster::render_problems(problems);
+}
+
+TEST(JobGraphLint, AKeyedOperatorAtOrBelowTheKeyGroupCountIsFine) {
+    // The boundary matters: exactly 128 gives every subtask one group, which is
+    // legitimate. An off-by-one here would reject a valid job, and a linter that
+    // rejects valid jobs gets switched off.
+    for (const std::uint32_t p : {1u, 2u, 64u, 127u, 128u}) {
+        const auto problems =
+            clink::cluster::lint_job_graph(graph_with_keyed_op(p), checkpointed());
+        EXPECT_FALSE(has_error_mentioning(problems, "empty key-group range"))
+            << "parallelism " << p
+            << " was rejected: " << clink::cluster::render_problems(problems);
+    }
+}
+
+TEST(JobGraphLint, AnUnkeyedOperatorAboveTheKeyGroupCountIsNotFlagged) {
+    // Key groups only partition KEYED state. A stateless operator at parallelism
+    // 200 is a scheduling question, not a correctness one, and flagging it would
+    // be the linter having an opinion rather than a reason.
+    auto g = graph_with_keyed_op(200);
+    for (auto& op : g.ops) {
+        op.key_by.clear();
+    }
+    const auto problems = clink::cluster::lint_job_graph(g, checkpointed());
+    EXPECT_FALSE(has_error_mentioning(problems, "empty key-group range"))
+        << clink::cluster::render_problems(problems);
+}
+
+TEST(JobGraphLint, RescaleBoundsTheRuntimeCannotReachAreFlagged) {
+    // A rescale target must be an integer multiple or divisor of the current
+    // parallelism (rescale_parent_mapping), so bounds of [5, 7] on an operator at
+    // 4 describe a range every request against which will be refused.
+    const auto unreachable =
+        clink::cluster::lint_job_graph(graph_with_keyed_op(4, 5, 7), checkpointed());
+    EXPECT_TRUE(has_warning_mentioning(unreachable, "no parallelism this operator can actually be"))
+        << clink::cluster::render_problems(unreachable);
+
+    // [2, 6] on an operator at 4 IS partly reachable - 2 and 8 are factors, and 2
+    // and 6 are the ends, so 6 is not. The warning should say what does work
+    // rather than just that something does not.
+    const auto partial =
+        clink::cluster::lint_job_graph(graph_with_keyed_op(4, 2, 6), checkpointed());
+    EXPECT_TRUE(has_warning_mentioning(partial, "Reachable values in this range: 2"))
+        << clink::cluster::render_problems(partial);
+
+    // [1, 8] on an operator at 4: both ends are factors, nothing to say.
+    const auto clean = clink::cluster::lint_job_graph(graph_with_keyed_op(4, 1, 8), checkpointed());
+    EXPECT_FALSE(has_warning_mentioning(clean, "not both reachable"))
+        << "a fully reachable range was flagged: " << clink::cluster::render_problems(clean);
+}
+
+TEST(JobGraphLint, RescaleBoundsWithoutPeriodicCheckpointingAreFlagged) {
+    // request_operator_rescale refuses without periodic checkpointing, because
+    // the new subtasks restore from a completed checkpoint. So bounds on a job
+    // that never checkpoints are a setting that cannot be acted on - including by
+    // the autoscaler.
+    clink::cluster::CheckpointConfig none;  // no dir, no interval
+    const auto problems = clink::cluster::lint_job_graph(graph_with_keyed_op(2, 1, 4), none);
+    EXPECT_TRUE(has_warning_mentioning(problems, "no periodic checkpointing"))
+        << clink::cluster::render_problems(problems);
+
+    // A Warning and not an Error on purpose: the job itself runs perfectly well,
+    // it just cannot be rescaled. Rejecting the submission would break jobs that
+    // never intended to rescale but declared bounds anyway.
+    EXPECT_FALSE(has_error_mentioning(problems, "no periodic checkpointing"))
+        << clink::cluster::render_problems(problems);
+}
+
+TEST(JobGraphLint, AGraphLargerThanTheClusterIsAnErrorWhenTheSlotCountIsKnown) {
+    // src(1) + agg(8) + snk(1) = 10 subtasks.
+    const auto g = graph_with_keyed_op(8);
+    EXPECT_TRUE(has_error_mentioning(clink::cluster::lint_job_graph(g, checkpointed(), 4),
+                                     "needs 10 subtask slots"))
+        << "a graph twice the size of the cluster was not flagged";
+    EXPECT_FALSE(has_error_mentioning(clink::cluster::lint_job_graph(g, checkpointed(), 10),
+                                      "subtask slots"))
+        << "a graph that exactly fits was flagged";
+    // Unset means "no cluster to ask", as in the CLI - not "assume zero".
+    EXPECT_FALSE(
+        has_error_mentioning(clink::cluster::lint_job_graph(g, checkpointed()), "subtask slots"))
+        << "an unknown slot count was treated as a failure";
+}
+
+TEST(JobGraphLint, ACleanGraphProducesNothing) {
+    // The check that keeps the rest honest: a reasonable job must lint silent, or
+    // the findings above are noise that trains people to ignore the output.
+    const auto problems =
+        clink::cluster::lint_job_graph(graph_with_keyed_op(4, 2, 8), checkpointed(), 16);
+    EXPECT_TRUE(problems.empty()) << clink::cluster::render_problems(problems);
 }

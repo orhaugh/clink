@@ -18,12 +18,15 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "clink/cluster/config_lint.hpp"
+#include "clink/cluster/job_graph.hpp"
 
 #include "cli_config_args.hpp"
 
@@ -57,6 +60,10 @@ void usage() {
               << "  --restore-from-dir=<dir>               resume source\n"
               << "  --restore-from-checkpoint-id=N         resume point\n"
               << "  --max-restarts-on-worker-loss=auto|N   self-healing budget\n"
+              << "\n"
+              << "Job graph (optional):\n"
+              << "  --graph-json=<file>                    lint the operators in a JobGraphSpec\n"
+              << "  --available-slots=N                    check the graph fits that many slots\n"
               << "  --capture-dir=<dir> --capture-records=N   flight recorder\n"
               << "  --profile=development|production       apply a profile's defaults first,\n"
               << "                                         then check its promises too\n"
@@ -114,6 +121,33 @@ int clink_cmd_lint(int argc, char** argv) {
         const auto wd = std::stoll(get_arg(argc, argv, "watchdog-interval-ms", "200"));
         for (auto& p : clink::cluster::lint_liveness_config(hb, to, wd)) {
             problems.push_back(std::move(p));
+        }
+    }
+
+    // Graph-level lint, when the operator points at a graph. Two ways in: a
+    // JobGraphSpec JSON file, or --available-slots to have the size checked
+    // against a cluster this command cannot see for itself.
+    if (const auto graph_json_path = get_arg(argc, argv, "graph-json"); !graph_json_path.empty()) {
+        std::ifstream in(graph_json_path);
+        if (!in) {
+            std::cerr << "lint: cannot read --graph-json=" << graph_json_path << "\n";
+            return 2;
+        }
+        const std::string body((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        std::optional<std::uint32_t> slots;
+        if (has_arg(argc, argv, "available-slots")) {
+            slots =
+                static_cast<std::uint32_t>(std::stoul(get_arg(argc, argv, "available-slots", "0")));
+        }
+        try {
+            const auto graph = clink::cluster::JobGraphSpec::from_json(body);
+            for (auto& p : clink::cluster::lint_job_graph(graph, config, slots)) {
+                problems.push_back(std::move(p));
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "lint: --graph-json did not parse: " << e.what() << "\n";
+            return 2;
         }
     }
 

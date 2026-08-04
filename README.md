@@ -810,6 +810,20 @@ clink lint --checkpoint-dir=/var/lib/clink/ckpt --checkpoint-interval-ms=5000 \
            --max-restarts-on-worker-loss=3
 ```
 
+Point it at a job graph and it also checks the operators: a keyed operator above
+the 128 key groups the engine partitions state into (whose surplus subtasks would
+own nothing and whose state would be discarded at restore), rescale bounds the
+runtime cannot reach because a target must be an integer multiple or divisor of
+the current parallelism, and bounds on a job with no periodic checkpointing, which
+no rescale request can act on. The key-group check is an error and the coordinator
+refuses such a submission; the rest are warnings, because the job runs, it just
+cannot be rescaled.
+
+```bash
+clink lint --checkpoint-dir=/var/lib/clink/ckpt --checkpoint-interval-ms=5000 \
+           --graph-json=./graph.json --available-slots=32
+```
+
 ```cpp
 #include <clink/api/builtin_connectors.hpp>
 #include <clink/api/pipeline.hpp>

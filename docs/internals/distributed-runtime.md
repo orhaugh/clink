@@ -332,6 +332,29 @@ setting that would be accepted and then ignored (`--checkpoint-interval-ms`
 with no `--checkpoint-dir`, a half-set restore pair, `--capture-records` with
 no `--capture-dir`) along with combinations that contradict each other.
 
+With `--graph-json=<file>` it also lints the operators (`lint_job_graph` in
+`config_lint.hpp`), which is a different question from whether recovery will
+happen: whether the operators as declared can do what they say.
+
+- **A keyed operator above `kNumKeyGroups` (128) is an error.**
+  `key_group_range_for_subtask` divides 128 groups among the subtasks, so above
+  128 the surplus ones get an empty range: no records, a slot each, and any keyed
+  state written through them dropped by the range filter at restore. That is the
+  shape of F38, and it is a property of the graph, checkable before a record
+  moves. The coordinator refuses such a submission.
+- **Rescale bounds the runtime cannot reach are a warning.**
+  `request_operator_rescale` validates a target through `rescale_parent_mapping`,
+  which takes integer multiples and divisors only, so a range whose ends are not
+  integer factors of the current parallelism is a range every request against
+  which is refused. The warning names the values that ARE reachable.
+- **Rescale bounds with no periodic checkpointing are a warning.** A rescale
+  restores the new subtasks from a completed checkpoint, so without one the
+  request is refused and the autoscaler cannot act either.
+- **A graph larger than the cluster is an error**, when the caller passes
+  `--available-slots`. Only reported when asked: the coordinator has its own
+  capacity check at submission and duplicating it would give two messages for one
+  fact.
+
 Exit codes rather than text are the interface: 0 clean, 1 at least one error,
 2 bad usage. Warnings print but do not fail the command - a gate that refuses
 legitimate deployments gets switched off.
