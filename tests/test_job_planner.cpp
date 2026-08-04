@@ -1035,15 +1035,18 @@ JobGraphSpec keyed_three_op_graph(std::uint32_t counter_parallelism) {
         .out_channel = std::string{clink::cluster::kChannelInt64},
         .params = {{"count", "100"}},
     });
+    // Designator order must match OperatorSpec's declaration order
+    // (parallelism, min_parallelism, max_parallelism, out_channel, params,
+    // key_by): g++ rejects any other order outright, where clang accepts it.
     g.ops.push_back(OperatorSpec{
         .type = "identity_int64",
         .id = "counter",
         .inputs = {"src"},
         .parallelism = counter_parallelism,
-        .out_channel = std::string{clink::cluster::kChannelInt64},
-        .key_by = "identity",
         .min_parallelism = 1,
         .max_parallelism = 8,
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .key_by = "identity",
     });
     g.ops.push_back(OperatorSpec{
         .type = "file_int64_sink",

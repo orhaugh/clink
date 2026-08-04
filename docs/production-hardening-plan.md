@@ -1567,8 +1567,19 @@ failover rests on - a replayable source and a transactional sink - and not on
 the rescale being transparent. Stated in the docs rather than implied.
 
 **Evidence.** `RescaleExactlyOnceTest` scales a keyed operator 1 to 4 and 4 to 1
-on a running job and asserts the committed multiset is exactly the 240 records
-the source emitted: nothing missing, nothing duplicated, nothing unexpected. The
+on a running job and asserts the committed multiset is exactly the 160 records
+the source emitted: nothing missing, nothing duplicated, nothing unexpected.
+Verified on both platforms - all five cases pass on macOS and on Linux in the
+project's Debian image, including in the serial full-label sweep.
+
+Full figures for the round: macOS core 1957/1957, integration 114/114, SQL
+1051/1051; Linux core 1969/1969, SQL 984/984, integration 106/114 with the eight
+failures below, none of which is a regression from this work. The two platforms
+report different totals because each skips what the other runs, and because the
+Linux configure needs `-DCLINK_BUILD_SQL=ON` explicitly - it defaults to OFF, so
+a Linux run that does not pass it tests no SQL at all while still reporting a
+green "sql" label made up of the mysql-labelled cases. That is worth knowing
+before quoting a Linux SQL number. The
 operator checks its own per-key counters against the record index and emits
 `STATE-MISMATCH-key<K>-at<N>-got<G>-want<W>` when they disagree, so a lost or
 duplicated key-group slice surfaces as attributable output rather than as a
@@ -1587,6 +1598,12 @@ That last row is the one worth keeping. The first version of this test asserted
 output equality after an accepted request and passed while the rescale did not
 happen at all. Requiring the coordinator's own "replanned" line, and a reported
 parallelism change, is what makes the output assertions mean anything.
+
+**One Linux-only compile error**, caught by the Docker pass and of a familiar
+class: g++ rejects designated initialisers whose order does not match the
+declaration, where clang accepts them. A test helper set `.key_by` before
+`.min_parallelism` on an `OperatorSpec`. Host-green does not mean Linux-green,
+and this is the fifth instance of that in this workstream.
 
 **A refusal ordering bug found by its own test.** The validation originally
 checked "has a checkpoint completed" before "does this operator exist", so a
@@ -3742,11 +3759,59 @@ ctest -L integration        107/109
 ```
 
 **Both were fixed after this round closed** - follow-up item 1, a plugin `.so`
-unmapped while the registries still held closures pointing into it. Linux is
-now 109/109, so the integration label passes in full on both platforms for the
-first time. The figure above is left as measured at close rather than
-retrofitted, because the sequence matters: the label went 105 to 107 to 109
-as three separate defects came out of it.
+unmapped while the registries still held closures pointing into it. The label
+then passed 109/109 on Linux, which is what this document claimed for the state
+of that platform. The figure above is left as measured at close rather than
+retrofitted, because the sequence matters: the label went 105 to 107 to 109 as
+three separate defects came out of it.
+
+**That claim did not hold up when it was re-measured on 2026-08-04.** Five
+integration cases fail on Linux at commit `a27e74c`, which predates the rescale
+work, run one at a time in a fresh container:
+
+```
+CancelJobE2E.ClientInitiatedCancelStopsRunningPipeline
+HttpReadApi.JobsEndpointEmptyThenPopulatedAfterSubmission
+HttpSse.SseSurfacesJobLifecycleEvents
+WorkerCrashRecovery.JobSurvivesWorkerKillViaRestart
+CoordinatorHaFailover.StandbyTakesOverAndRecoversJob
+```
+
+Three of them submit `cancel_test_job` and the submitter reports `ok=0 reject=no
+SubmitJobAck: connection closed by the coordinator` - the coordinator accepts the
+client connection, logs nothing, and closes it. All five pass on macOS. The two
+HTTP-family failures that also appeared under load (`HttpFederation.JobsCancel-
+Endpoint...`, `HttpObservability.JobSubmission...`) submit the same job.
+
+All seven were confirmed failing at `a27e74c` in a fresh container, so none of
+them is a regression from the rescale work.
+
+Whether they regressed after the 109/109 sweep or whether that sweep was
+measured under conditions this one does not reproduce is not established. The
+Docker image was rebuilt on 2026-08-04, so the toolchain underneath both
+measurements is not necessarily the same. What IS established is that the
+platform claim in this document was stale, which is the same failure mode the
+document exists to catch - a green number outliving the thing it measured. It is
+now follow-up item 28.
+
+A ninth case, `UngroupedSinkAtomicityTest.SinksWithNoCommitGroupAlsoNeverSplit-
+AcrossAWorkerKill`, failed once in the serial Linux sweep with an INTERIOR
+disagreement between two ungrouped sinks - one published checkpoint 2 and the
+other never did, while both published 37 onwards. It passes 3 of 3 in isolation
+on Linux and passes on macOS. That is a delivery-guarantee finding rather than a
+platform one and is follow-up item 29; the rescale work touched nothing on the
+commit path, but that is reasoning and not a measurement.
+
+A separate observation from the same session, worth recording because it will
+mislead someone: two `clink_node` containers from an old benchmark compose stack
+were crash-looping on the measuring machine throughout, and the integration label
+run at `--parallel 4` produced three further failures
+(`FaultRecoveryTest.WorkerDeathAfterCheckpoint...`, `...TwoSeparatedWorker-
+FailuresAreSurvived`, `...EveryRecordIsCommittedExactlyOnceAcrossAWorkerKill`)
+that pass when run alone. CI runs this label at `--parallel 1`, so those three
+are a property of the measuring setup rather than of the gate - but a
+`--parallel 4` sweep on a loaded machine is not a usable signal for this label,
+and nothing said so before.
 
 The core counts differ between platforms (1931 passing against 1932) because
 each skips cases the other runs - io_uring is Linux-only, and some macOS-only

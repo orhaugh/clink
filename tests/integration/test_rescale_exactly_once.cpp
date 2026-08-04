@@ -104,10 +104,16 @@ std::filesystem::path rescale_job_so() {
 // deploys the new ones. At 96 records x 25ms the job ran for 2.4s and simply
 // ended first, so the run reported an accepted rescale that never happened - and
 // passed with the rescale path's key-group arithmetic deliberately broken. 240
-// records at 125ms gives the job about 30 seconds, comfortably longer than the
-// cutover takes, and 20 records per key.
-constexpr int kTotalRecords = 240;
-constexpr int kTickMs = 125;
+// records at 100ms gives the job about 16 seconds, and 13 records per key. The
+// rescale is requested a quarter of the way in and lands within a couple of
+// seconds, so there is roughly 12 seconds of margin - and if that is ever too
+// tight the test fails on its "did the replan land" assertion rather than
+// quietly asserting nothing.
+//
+// Kept as short as the margin allows on purpose: these five cases run on a
+// serial CI gate, so every second of job runtime is a second added to it.
+constexpr int kTotalRecords = 160;
+constexpr int kTickMs = 100;
 constexpr int kKeys = 12;
 constexpr int kMaxParallelism = 4;
 // How much committed output a rescale test waits for before rescaling. A fifth
@@ -115,7 +121,7 @@ constexpr int kMaxParallelism = 4;
 // slice, or nothing, is several counts adrift and the operator's self-check
 // reports it. Rescaling at the first committed record does not distinguish the
 // two - mutation-checked, and it did not.
-constexpr unsigned kMinCommittedBefore = kTotalRecords / 5;
+constexpr unsigned kMinCommittedBefore = kTotalRecords / 4;
 
 std::vector<std::string> committed_records(const std::filesystem::path& out_dir) {
     std::vector<std::string> lines;
