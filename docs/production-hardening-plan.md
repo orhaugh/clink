@@ -1612,6 +1612,67 @@ that would never have helped. Request shape is now validated before world state,
 and the unit test asserts the order by requiring each refusal to give its own
 reason.
 
+### F45. The file that tells workers where the leader is was written unfenced
+
+Found by writing the split-brain test the follow-up list had been asking for
+(item 3).
+
+Every control-plane metadata write goes through `fenced_write_file`, which
+refuses to overwrite a record stamped by a later epoch - job manifests, history
+records. One file did not: `active-leader.json`, written by
+`HaCoordinator::refresh_active_leader_()` with a plain atomic rename on every
+poll of the leadership thread, with no epoch comparison at all.
+
+That is the weakest possible place for the gap to be, because it is the file a
+worker reads to find the coordinator to register with. A worker handed the
+endpoint of a superseded coordinator registers with it and **binds its stale
+epoch** - and after that the worker-side epoch check cannot help, because the
+worker's bound epoch IS the stale one, so every subsequent frame from the
+coordinator that lost leadership looks authoritative.
+
+**Producing a real split brain, with no test-only hook.** Leadership is an
+`fcntl` write lock on `<ha_dir>/leader.lock`, and a process holds that lock on
+the file's INODE, not its name. Unlink the file: the holder keeps its lock while
+the name becomes free, so the next coordinator to poll creates a fresh inode,
+locks that, reads the previous epoch out of `active-leader.json` and announces
+itself one above. Two live coordinators, each holding a valid lock on a different
+inode, each believing it leads, at different epochs. Realistic, too - an HA
+directory on a filesystem where the lock does not hold, or an operator clearing
+what looks like a stale lock file.
+
+Measured with two live leaders at epochs 1 and 2, sampling the file 40 times:
+
+```
+the superseded coordinator (epoch 1) rewrote active-leader.json to point at
+itself, 19 of 40 samples
+active-leader.json regressed to epoch 1; B holds epoch 2
+```
+
+The file flapped between them. Reverting the fix reproduces it at 25 of 40.
+
+**Fixed** by giving `refresh_active_leader_()` the same rule the other metadata
+writes use - `metadata_write_allowed`, shared rather than restated so the two
+cannot drift. One wrinkle worth knowing: the rule is applied to the epoch parsed
+out of *this* file's `"epoch"` key, not via `metadata_stored_epoch`, which looks
+for `"coordinator_epoch"`. The two records spell the field differently, so
+reusing the reader as well as the rule would have silently found no epoch and
+allowed every write.
+
+**What the test does not cover, and why.** One worker receiving frames from both
+coordinators. A worker holds a single control connection, so it hears from one at
+a time; the worker-side comparison is unit-tested in
+`test_coordinator_fencing.cpp`. What two live leaders genuinely share is the HA
+directory, and that is what is now asserted.
+
+**Still open (item 4).** The guard is read-then-write, not compare-and-set: two
+writers inside the window between read and rename can both pass. That window is
+microseconds against a poll interval of hundreds of milliseconds, and the
+superseded writer loses every subsequent round, so the file converges on the real
+leader. Closing it properly needs a conditional write - an object store's
+`If-Match`, or etcd's compare-and-swap - which is a dependency decision rather
+than a code change. What has changed is that the gap is now a race window rather
+than an unguarded write.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

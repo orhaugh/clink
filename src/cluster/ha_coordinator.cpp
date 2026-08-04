@@ -15,8 +15,12 @@
 
 #include <sys/file.h>
 
+// For metadata_write_allowed: the epoch rule this file now shares with the
+// coordinator's metadata writes, so the two cannot drift apart.
+#include "clink/cluster/coordinator.hpp"
 #include "clink/http/json_writer.hpp"
 #include "clink/metrics/orchestration_metrics.hpp"
+#include "clink/runtime/log_buffer.hpp"
 
 namespace clink::cluster {
 
@@ -165,6 +169,41 @@ private:
     }
 
     void refresh_active_leader_() {
+        // Do not overwrite a record written by a LATER epoch.
+        //
+        // This is the file a worker reads to find the coordinator to register
+        // with, and it was previously written unconditionally on every poll of
+        // the leadership thread - unlike the job manifests and history records,
+        // which go through the coordinator's fenced_write_file. In a split brain
+        // that made it the weakest link: both coordinators refresh it every
+        // poll, so it flapped between them, and a worker starting in the wrong
+        // window registered with the SUPERSEDED coordinator and bound its stale
+        // epoch. After that the worker-side epoch check cannot help - the
+        // worker's bound epoch IS the stale one, so every subsequent frame from
+        // the coordinator that lost leadership looks authoritative.
+        //
+        // Measured before the guard, with two live leaders at epochs 1 and 2:
+        // the epoch-1 coordinator won 19 of 40 samples of the file and the
+        // recorded epoch regressed from 2 to 1.
+        //
+        // The rule is metadata_write_allowed, shared with the coordinator's
+        // metadata writes rather than restated, so the two cannot drift. Note
+        // it compares the epoch parsed out of THIS file ("epoch"), not the
+        // "coordinator_epoch" key that metadata_stored_epoch looks for; the two
+        // records spell it differently.
+        const auto mine = epoch_.load(std::memory_order_acquire);
+        if (const auto existing = current_leader_endpoint();
+            existing.has_value() && !metadata_write_allowed(mine, existing->epoch)) {
+            clink::log::error(
+                "coordinator.ha",
+                "refusing to rewrite active-leader.json: it names epoch " +
+                    std::to_string(existing->epoch) + " and this coordinator is epoch " +
+                    std::to_string(mine) +
+                    ". Leadership has moved and this process is no longer authoritative; it is "
+                    "still holding a lock and serving, which is a split brain.");
+            return;
+        }
+
         // Atomic write: <path>.tmp then rename. Avoids a reader seeing
         // a partial JSON file.
         clink::http::JsonWriter w;

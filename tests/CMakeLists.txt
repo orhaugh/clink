@@ -332,6 +332,7 @@ if(CLINK_INTEGRATION_TESTS)
         integration/test_commit_group_atomicity.cpp
         integration/test_cli_lint.cpp
         integration/test_rescale_exactly_once.cpp
+        integration/test_split_brain.cpp
         integration/test_graceful_shutdown.cpp
         integration/test_coordinator_ha_failover.cpp
         integration/test_coordinator_rescale.cpp
