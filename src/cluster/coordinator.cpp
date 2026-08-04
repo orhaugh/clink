@@ -2207,17 +2207,50 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     // first deploy without waiting for a rescale; for non-keyed
     // operators the range field is just unread.
     {
+        // Carry the planner's key-group slice onto the deploy directive.
+        //
+        // This used to compute the slice here, from the task's GLOBAL index
+        // and a count of every task sharing its role. Both inputs are wrong
+        // for anything deployed through the generic subtask role, which is
+        // everything: all operators share that one role name, so a job of
+        // three parallelism-1 operators had the key space split three ways
+        // between DIFFERENT operators. A keyed operator that should own all
+        // 128 groups was told it owned 43, wrote state for keys outside that
+        // slice anyway, and lost it at the next restore without a word (F38).
+        //
+        // The planner sets it from the task's index within its operator and
+        // that operator's parallelism, which are the two numbers this loop
+        // could not recover.
+        std::unordered_map<std::string, std::pair<std::uint32_t, std::uint32_t>> planned_kg;
+        for (const auto& t : resolved_plan.tasks) {
+            planned_kg[t.role + ":" + std::to_string(t.subtask_idx)] = {t.key_group_first,
+                                                                        t.key_group_last};
+        }
+        // Fall back to the per-role split for any task whose range the
+        // planner did not set. Not every PlannedTask comes from the chain
+        // planner - queryable-state routing and the in-process test API build
+        // their own - and for a single-operator job the two agree, because
+        // the role count IS that operator's parallelism. It is only a job
+        // with several operators sharing the generic role where the old
+        // formula splits the key space between them.
         std::unordered_map<std::string, std::uint32_t> role_p;
         for (const auto& t : resolved_plan.tasks) {
             ++role_p[t.role];
         }
         for (auto& [_worker_id, tasks] : by_worker) {
             for (auto& d : tasks) {
-                const auto it = role_p.find(d.role);
-                if (it == role_p.end() || it->second == 0) {
+                const auto key = d.role + ":" + std::to_string(d.subtask_idx);
+                if (const auto it = planned_kg.find(key);
+                    it != planned_kg.end() && !(it->second.first == 0 && it->second.second == 0)) {
+                    d.key_group_first = it->second.first;
+                    d.key_group_last = it->second.second;
                     continue;
                 }
-                const auto range = key_group_range_for_subtask(d.subtask_idx, it->second);
+                const auto rp = role_p.find(d.role);
+                if (rp == role_p.end() || rp->second == 0) {
+                    continue;
+                }
+                const auto range = key_group_range_for_subtask(d.subtask_idx, rp->second);
                 d.key_group_first = range.first;
                 d.key_group_last = range.second;
             }

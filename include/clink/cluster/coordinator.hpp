@@ -41,6 +41,24 @@ struct PlannedTask {
     std::uint16_t data_port{};  // 0 if no inbound listener
     std::vector<std::pair<std::string /*role*/, std::uint32_t /*subtask*/>> peer_refs;
     std::string extra_config;
+    // The slice of the key space this task's keyed state belongs to,
+    // [first, last). Set by the planner, which is the only place that knows
+    // both numbers it depends on: the task's index WITHIN its operator, and
+    // that operator's parallelism.
+    //
+    // Deploy used to derive this itself, from the task's GLOBAL index and a
+    // count of every task sharing its role. Every operator deployed through
+    // the generic subtask role shares one role name, so a three-operator job
+    // of three parallelism-1 operators had the key space split three ways
+    // between DIFFERENT operators - a keyed operator that should own all 128
+    // groups owned 43 of them. Keyed state for the other 85 was written
+    // happily and discarded at restore, silently. See F38.
+    //
+    // {0, 0} means unset, and the worker widens that to the full range - a
+    // task that restores everything is wrong in the direction that keeps
+    // data, unlike one that restores a third of it.
+    std::uint32_t key_group_first{};
+    std::uint32_t key_group_last{};
 };
 
 struct JobPlan {

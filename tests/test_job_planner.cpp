@@ -7,10 +7,13 @@
 // These tests pin the contracts the coordinator relies on for slot accounting,
 // peer-ref bookkeeping, and dispatch.
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -22,6 +25,7 @@
 #include "clink/core/codec.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/plugin/plugin.hpp"
+#include "clink/runtime/key_groups.hpp"
 
 using namespace clink::cluster;
 
@@ -925,4 +929,82 @@ TEST(JobGraphSpecJson, ValidateRejectsDuplicateIds) {
         .out_channel = std::string{clink::cluster::kChannelInt64},
     });
     EXPECT_THROW(g.validate(), std::runtime_error);
+}
+
+// --- key-group ranges --------------------------------------------------------
+//
+// The planner assigns each task the slice of the key space its keyed state
+// belongs to. It is the only place that can: the slice depends on the task's
+// index WITHIN its operator and on that operator's parallelism, and deploy
+// sees neither - every operator shares the generic subtask role, and the
+// subtask index it carries is global to the job.
+//
+// Deploy used to derive the slice from those global numbers, which split the
+// key space between DIFFERENT operators. That is F38: a parallelism-1 keyed
+// operator in a three-operator job was told it owned 43 of 128 key groups,
+// wrote state for every key it saw, and discarded everything outside the
+// slice at the next restore. Silently, and only on the restore path.
+
+TEST(JobPlanner, EveryOperatorAtParallelismOneOwnsTheWholeKeySpace) {
+    // The exact shape that lost state: several operators, each parallelism 1.
+    // Each must own ALL key groups, because each is the only subtask of its
+    // operator. A task owning a third of the space is the defect.
+    auto g = linear_int64_graph();
+    auto plan = plan_job(g, OperatorRegistry::default_instance());
+    ASSERT_GE(plan.tasks.size(), 2u);
+
+    for (const auto& t : plan.tasks) {
+        EXPECT_EQ(t.key_group_first, 0u)
+            << "task " << t.subtask_idx << " of a parallelism-1 operator does not own key group 0";
+        EXPECT_EQ(t.key_group_last, static_cast<std::uint32_t>(clink::kNumKeyGroups))
+            << "task " << t.subtask_idx
+            << " of a parallelism-1 operator owns only part of the key space [" << t.key_group_first
+            << ", " << t.key_group_last
+            << "). Anything it stores for a key outside that slice is discarded at restore.";
+    }
+}
+
+TEST(JobPlanner, APartitionedOperatorsSlicesTileTheKeySpaceExactlyOnce) {
+    // The other half of the contract: at parallelism > 1 the slices must
+    // cover every key group with no gap and no overlap. A gap loses state; an
+    // overlap restores the same key into two subtasks.
+    JobGraphSpec g;
+    g.ops.push_back(OperatorSpec{
+        .type = "int64_range_source",
+        .id = "src",
+        .inputs = {},
+        .parallelism = 1,
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"count", "5"}},
+    });
+    g.ops.push_back(OperatorSpec{
+        .type = "file_int64_sink",
+        .id = "snk",
+        .inputs = {"src"},
+        .parallelism = 3,
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"path", "/tmp/x"}},
+    });
+    auto plan = plan_job(g, OperatorRegistry::default_instance());
+
+    // Collect the sink's three slices - the tasks whose range is not the
+    // whole space, which is what a parallelism-1 operator gets.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> slices;
+    for (const auto& t : plan.tasks) {
+        if (t.key_group_last - t.key_group_first !=
+            static_cast<std::uint32_t>(clink::kNumKeyGroups)) {
+            slices.emplace_back(t.key_group_first, t.key_group_last);
+        }
+    }
+    ASSERT_EQ(slices.size(), 3u) << "expected three partial slices for a parallelism-3 operator";
+    std::sort(slices.begin(), slices.end());
+
+    EXPECT_EQ(slices.front().first, 0u) << "the first slice does not start at key group 0";
+    EXPECT_EQ(slices.back().second, static_cast<std::uint32_t>(clink::kNumKeyGroups))
+        << "the last slice does not reach the end of the key space";
+    for (std::size_t i = 1; i < slices.size(); ++i) {
+        EXPECT_EQ(slices[i].first, slices[i - 1].second)
+            << "slice " << i << " starts at " << slices[i].first << " but the previous ended at "
+            << slices[i - 1].second << " - a gap loses state, an overlap duplicates it";
+    }
 }

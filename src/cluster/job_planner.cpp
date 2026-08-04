@@ -14,6 +14,7 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/config/json.hpp"
+#include "clink/runtime/key_groups.hpp"
 
 namespace clink::cluster {
 
@@ -1283,6 +1284,15 @@ JobPlan plan_job(const JobGraphSpec& graph,
             t.role = kGenericSubtaskRole;
             t.subtask_idx = chain.subtask_idx;
             t.data_port = 0;
+            // The key-group slice, from this task's index WITHIN its operator
+            // and that operator's parallelism - the two numbers deploy cannot
+            // recover from a global index and a role name, which is how it
+            // came to split the key space between separate operators (F38).
+            {
+                const auto kg = key_group_range_for_subtask(sub_i, head.parallelism);
+                t.key_group_first = static_cast<std::uint32_t>(kg.first);
+                t.key_group_last = static_cast<std::uint32_t>(kg.second);
+            }
             for (const auto& g : chain.output_groups) {
                 for (const auto& e : g.edges) {
                     t.peer_refs.emplace_back(e.peer_role, e.peer_subtask_idx);

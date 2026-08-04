@@ -1057,9 +1057,10 @@ hold-off until `peer_updates_sent` all precede the first trigger. The bound
 is now 30s and the loop still returns the instant the marker appears - a
 safety bound, not a synchronisation delay.
 
-**Still failing, and not fixed:** see F38.
+**And the failure it was masking:** F38, which turned out to be the more
+serious of the two.
 
-### F38. Half a job's keyed state silently does not survive a restore
+### F38. Keyed state restore was broken for every multi-operator job
 
 `PluginSubmission.CheckpointAndRestoreAcrossJobRuns` restores the even-parity
 count and starts the odd-parity one again from zero:
@@ -1069,9 +1070,7 @@ expected  5:1:3  6:0:3  7:1:4  8:0:4
 actual    5:1:1  6:0:3  7:1:2  8:0:4
 ```
 
-Nothing is logged and the job reports success. Left failing rather than
-adjusted; making it pass today would mean asserting that losing half a job's
-state is correct.
+Nothing was logged and the job reported success.
 
 **The mechanism, established rather than guessed.** Dumping the snapshot with
 `clink state-cat` settled where the loss is:
@@ -1121,15 +1120,61 @@ watches. `tests/test_restore_key_group_drop.cpp` pins it, including that a
 restore which drops nothing does NOT move the counter - without that the
 metric would be non-zero on every healthy restore and useless for alerting.
 
-**What is still open, and it is the more interesting half.** Declaring the
-key does not fix it. With `op.key_by = "hello.by_parity"` set - the extractor
-the plugin registers for precisely this operator - the run is byte-identical:
-subtask 1 still holds kg 36 and still discards it. `key_by` is serialised
-(`job_graph.cpp:265`), read back (`:391`), and consulted by the planner
-(`job_planner.cpp:687`), so something between the declaration and the
-partitioner is not applying it on this deploy path, and nothing warns. A
-declared key that silently does not partition is the same class of defect as
-the one above and probably its cause.
+**The root cause, found by instrumenting the routing rather than reading it.**
+Declaring the key changed nothing, and the reason turned out to be upstream of
+partitioning entirely. The edge WAS hash-partitioned - printing the resolved
+output groups showed `mode=Hash extractor='hello.by_parity' peers=1` - and
+`peers=1` is the whole story: the counter runs at parallelism 1, so hashing
+sends every key to the one subtask that exists, correctly. What was wrong was
+the key-group range that subtask had been given.
+
+Deploy computed the range like this:
+
+```cpp
+for (const auto& t : resolved_plan.tasks) ++role_p[t.role];
+...
+key_group_range_for_subtask(d.subtask_idx, role_p[d.role]);
+```
+
+Both inputs are wrong for anything deployed through the generic subtask role,
+which is everything. Every operator shares that one role name, so `role_p` is
+a count of the job's TASKS rather than an operator's parallelism, and
+`d.subtask_idx` is a global index rather than an index within the operator. A
+three-operator job of three parallelism-1 operators therefore had the key
+space split three ways between DIFFERENT operators:
+
+```
+src     subtask 0 -> [0, 43)
+counter subtask 1 -> [43, 86)     <- should own all 128
+snk     subtask 2 -> [86, 128)
+```
+
+The counter owned 43 of 128 key groups. It wrote state for every key it saw,
+because nothing checks ownership on the way in, and at restore it correctly
+discarded everything outside its slice. Two keys, one inside the slice, one
+outside - hence exactly half the state, every time.
+
+**Fix.** The planner sets the range, since it is the only place that knows
+both numbers: the task's index within its operator (`subtask_idx_in_op`,
+which it already computes) and that operator's parallelism. Deploy carries
+the value instead of deriving it, falling back to the old per-role split for
+tasks the chain planner did not create - queryable-state routing and the
+in-process test API build their own, and for a single-operator job the two
+agree, because the role count IS that operator's parallelism.
+
+`{0, 0}` remains "unset", which the worker widens to the full range. A task
+that restores everything is wrong in the direction that keeps data.
+
+**Blast radius.** This was not specific to the test that found it. Any job
+with more than one operator deployed through the generic subtask role gave
+every keyed operator a fraction of the key space, so keyed state restore was
+broken for essentially all multi-operator jobs - silently, and only on the
+restore path, which is why a suite full of green single-run tests never saw
+it. The reporting added above is what would have caught it, and did.
+
+**Evidence:** `PluginSubmission.CheckpointAndRestoreAcrossJobRuns` passes,
+five consecutive ctest runs. The whole core suite (1926) and the integration
+label were re-run because this touches deploy for every job.
 
 **Not caused by this workstream.** The test could not have passed since the
 marker moved (F37): it failed at the earlier assertion and never reached this
@@ -2781,8 +2826,7 @@ repeatedly - not merely be green today:
   rather than sleeping for a guessed interval.
 
 Validated by two consecutive clean runs of the gated set (29/29 each), and
-then by the whole label: 108 of 109 pass, the one failure being F38, which is
-knowingly red.
+then by the whole label.
 
 **What makes this Partial - stated plainly:**
 
@@ -2961,8 +3005,17 @@ count says.
     -> [  PASSED  ] 984 tests.
 ctest --test-dir build-it -L integration --parallel 1 --timeout 200
     -> 99% tests passed, 1 tests failed out of 109
-       PluginSubmission.CheckpointAndRestoreAcrossJobRuns (F38, knowingly red)
+       PluginSubmission.CheckpointAndRestoreAcrossJobRuns (F38)
 ```
+
+F38 was then root-caused and fixed, and that case passes - five consecutive
+ctest runs, and it no longer appears in a full-label sweep. What a sweep DOES
+still turn up, in ones and twos and never the same pair, are the pre-harness
+tests that sleep a fixed 200-300ms for process startup: `MultiprocessCluster`,
+`PluginSubmission.ClientShipsPlugin`, `ApplicationModeE2E`. Each passes in
+isolation and fails when 109 multi-process tests run back to back. They are
+not gated, and converting them to condition waits is the remaining work in
+this area rather than a mystery to investigate.
 
 The integration figure is the one that matters, and it is the first time the
 WHOLE label has been run this round rather than a `--gtest_filter` subset of
@@ -3105,7 +3158,8 @@ have surfaced:
   the first defect had been masking (F38).
 
 All eleven are now accounted for, by running them rather than by inferring
-from a shared cause. Ten pass; F38 is the one left failing.
+from a shared cause, and all eleven pass. F38 was the last, and fixing it
+meant fixing the engine rather than the test.
 
 The eleven were not one defect but five, which is why the count mattered:
 
@@ -3123,7 +3177,8 @@ The eleven were not one defect but five, which is why the count mattered:
   against the contract that exists, and the SQL one now also asserts the
   thing its name claims - that `?parallelism=3` reaches the compiled
   operators, which neither old assertion covered;
-- **F38**, silent loss of half a job's keyed state.
+- **F38**, silent loss of half a job's keyed state on every restore of any
+  multi-operator job - a defect in deploy, not in the test.
 
 A sweep of the full label also failed `SigtermShutdown` and
 `ApplicationModeE2E`, which were NOT in the original eleven. Both slept a
