@@ -533,6 +533,28 @@ public:
         return std::nullopt;
     }
 
+    // Exit status of each HA coordinator, for diagnosing a failover that
+    // produced no leader. nullopt means still running; a value is the exit
+    // code, or 128+signal for a process that was killed - so 139 is a
+    // segfault and 137 a SIGKILL.
+    //
+    // current_leader_index() deliberately requires a RUNNING process, so a
+    // leader that took over and then died reads as "no leader" and says
+    // nothing about why. This is how a test tells those apart.
+    [[nodiscard]] std::string describe_coordinator_exits() {
+        std::string out;
+        for (std::size_t i = 0; i < ha_coordinators_.size(); ++i) {
+            auto& p = ha_coordinators_[i];
+            if (!p) {
+                continue;
+            }
+            const auto code = p->poll_exit();
+            out += (out.empty() ? "" : ", ") + std::string{"coordinator-"} + std::to_string(i) +
+                   "=" + (code.has_value() ? std::to_string(*code) : std::string{"running"});
+        }
+        return out;
+    }
+
     // The epoch a coordinator announced when it took leadership, parsed out
     // of its own startup line. Absent if it never led.
     [[nodiscard]] std::optional<std::uint64_t> announced_epoch(std::size_t idx) const {

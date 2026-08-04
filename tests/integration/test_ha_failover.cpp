@@ -402,7 +402,9 @@ TEST_F(HaFailoverTest, ExactlyOnceSurvivesACoordinatorFailover) {
            "recovered job replayed work that had already been published: "
         << describe(v);
     EXPECT_TRUE(v.unexpected.empty()) << describe(v);
-    EXPECT_TRUE(finished) << "the job did not finish under the new leader: " << describe(v);
+    EXPECT_TRUE(finished) << "the job did not finish under the new leader: " << describe(v)
+                          << " [processes: " << c.describe_coordinator_exits()
+                          << ", worker-0=" << (c.worker(0).running() ? "running" : "gone") << "]";
     EXPECT_TRUE(v.missing.empty())
         << "records were LOST across the coordinator failover: " << describe(v);
     // committed_before is asserted non-zero above, so this run genuinely had
