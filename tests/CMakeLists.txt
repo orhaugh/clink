@@ -78,6 +78,7 @@ add_executable(clink_core_tests
     test_alert_rules.cpp
     test_restore_key_group_drop.cpp
     test_shutdown_leaks.cpp
+    test_client_conn_lifetime.cpp
     test_connector_metrics.cpp
     test_network_metrics.cpp
     test_orchestration_metrics.cpp

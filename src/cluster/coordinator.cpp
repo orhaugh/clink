@@ -929,17 +929,43 @@ std::size_t Coordinator::reap_finished_clients_() {
 
 void Coordinator::handle_client_loop_(std::shared_ptr<network::Connection> conn) {
     auto* conn_raw = conn.get();
-    while (!stop_.load(std::memory_order_acquire)) {
-        auto frame = read_frame(*conn);
-        if (!frame.has_value()) {
-            // Client closed. The job, if still in flight, continues -
-            // we just lose the ability to push JobCompleted back.
-            std::lock_guard lock(mu_);
-            for (auto& [_, job] : jobs_) {
-                if (job->notify_client_conn == conn_raw) {
+    // Forget this connection on EVERY exit path, not just the one.
+    //
+    // JobState::notify_client_conn is a raw pointer into the Connection this
+    // loop owns, and signal_job_completion_locked_ dereferences it to push
+    // JobCompleted. When the loop returns, the shared_ptr dies and the
+    // Connection with it - so any job still holding the pointer is holding
+    // freed memory, and the next completion segfaults the coordinator.
+    //
+    // The read-failure path below cleared it. The other two - an unknown
+    // frame kind, and a frame that failed to decode - returned without
+    // clearing, which is a use-after-free waiting for a job to finish. It
+    // presented as "connection closed by the coordinator" followed by the
+    // coordinator dying of SIGSEGV, and only on Linux, because whether a
+    // freed Connection faults depends on what the allocator did with it
+    // (F39).
+    //
+    // A guard rather than three copies of the loop body's cleanup: the next
+    // exit path added to this function cannot forget.
+    struct ForgetClientConn {
+        Coordinator* self;
+        network::Connection* raw;
+        ~ForgetClientConn() {
+            std::lock_guard lock(self->mu_);
+            for (auto& [_, job] : self->jobs_) {
+                if (job->notify_client_conn == raw) {
                     job->notify_client_conn = nullptr;
                 }
             }
+        }
+    } forget_guard{this, conn_raw};
+
+    while (!stop_.load(std::memory_order_acquire)) {
+        auto frame = read_frame(*conn);
+        if (!frame.has_value()) {
+            // Client closed. The job, if still in flight, continues - we
+            // just lose the ability to push JobCompleted back. The guard
+            // above drops the pointer.
             return;  // conn destructor closes
         }
         MessageReader r(std::move(*frame));
@@ -994,7 +1020,19 @@ bool Coordinator::dispatch_client_frame_(network::Connection& conn, MessageReade
         handle_savepoint_(conn, r);
         return true;
     }
-    // Unknown frame from a client - drop the connection.
+    // Unknown frame from a client - drop the connection, and SAY so.
+    //
+    // This used to close silently, which made it indistinguishable from the
+    // client hanging up. A submitter waiting for JobCompleted then reported
+    // "connection closed by the coordinator" with nothing on the coordinator
+    // side to explain it, and the first hour of diagnosing F39 went into
+    // looking for a crash that may not have been there.
+    log::warn("coordinator.client",
+              "dropping a client that sent an unhandled frame kind " +
+                  std::to_string(static_cast<int>(kind)) +
+                  ". A job this client was waiting on continues; it just loses the "
+                  "JobCompleted push.");
+    metrics::orch::malformed_frame();
     return false;
 }
 

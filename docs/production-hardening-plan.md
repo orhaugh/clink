@@ -1274,10 +1274,40 @@ no JobCompleted after 15s: connection closed by the coordinator
 ```
 
 Which is a different investigation entirely: not a slow job, a dropped
-connection. Recorded here rather than guessed at - the client loop's exit
-paths and whether the coordinator process survives run 2 are where the next
-session should start, and one of those exits (unknown frame kind) currently
-closes the connection without logging anything.
+connection. Following it produced the answer.
+
+**The coordinator was dying of SIGSEGV.** A liveness probe on the run-2
+coordinator after the failure reported `signalled=1 sig=11`. The close the
+submitter saw was the crash taking its sockets with it, not a cause.
+
+**A use-after-free in the client bookkeeping, fixed.**
+`JobState::notify_client_conn` is a raw pointer into the Connection owned by
+the coordinator's per-client thread, and `signal_job_completion_locked_`
+dereferences it to push `JobCompleted`. When that thread returns the
+Connection is destroyed, so a job still holding the pointer holds freed
+memory. The client loop cleared it on exactly ONE of its three exit paths -
+the client hanging up. An unhandled frame kind and an undecodable frame both
+returned without clearing, and both are reachable by anyone who can connect
+to the control port. Now a scope guard, so no exit path added later can
+forget.
+
+Whether a freed Connection faults depends on what the allocator did with the
+memory, which is why this presented on Linux and passed on macOS.
+
+**And the unhandled-kind path closed the connection silently**, which is what
+made the first hour of this go into looking for a crash rather than at a
+dropped client. It logs now.
+
+**What is NOT yet proven.** `tests/test_client_conn_lifetime.cpp` drives both
+previously-unguarded exit paths and asserts the coordinator survives them,
+but it does NOT reproduce the use-after-free: that needs a job submitted over
+the WIRE on the connection (only the wire path sets
+`notify_client_conn`; the in-process `submit_job` API does not) and then
+completing after the client has gone. Confirmed by mutation - reverting the
+guard leaves both cases green. The fix rests on the crash disappearing from
+the Linux runs plus reading the lifetime, not on a test that fails without
+it. Writing that test needs a wire-submission fixture with a fake worker
+acking a final checkpoint, and it is the honest next piece of work here.
 
 **What this changes about the rest of the document.** Nothing claimed
 per-test, since those were run. It does mean "verified on macOS and Linux"

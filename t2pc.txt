@@ -1,0 +1,191 @@
+[2026-08-04T06:59:30.597] [registry.replace] [info] a source factory for 'int64_range_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.598] [registry.replace] [info] a source factory for 'string_lines_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.598] [registry.replace] [info] a sink factory for 'file_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.598] [registry.replace] [info] a sink factory for 'file_line_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.598] [registry.replace] [info] a sink factory for 'collecting_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.598] [registry.replace] [info] a sink factory for 'collecting_string_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.598] [registry.replace] [info] a operator factory for 'identity_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.598] [registry.replace] [info] a operator factory for 'identity_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.598] [registry.replace] [info] a operator factory for 'multiply_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.598] [registry.replace] [info] a operator factory for 'int64_to_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.598] [registry.replace] [info] a operator factory for 'string_to_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.598] [registry.replace] [info] a operator factory for 'even_filter_int64' was already registered and has been REPLACED; latest registration wins
+Running main() from /src/build-linux-hard/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = TwoPhaseCommit.RecoveryCommitsPreCommittedFilesOnRestart
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from TwoPhaseCommit
+[ RUN      ] TwoPhaseCommit.RecoveryCommitsPreCommittedFilesOnRestart
+[2026-08-04T06:59:30.725] [registry.replace] [info] a source factory for 'int64_range_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.725] [registry.replace] [info] a source factory for 'string_lines_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.726] [registry.replace] [info] a sink factory for 'file_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.726] [registry.replace] [info] a sink factory for 'file_line_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.726] [registry.replace] [info] a sink factory for 'collecting_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.726] [registry.replace] [info] a sink factory for 'collecting_string_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.726] [registry.replace] [info] a operator factory for 'identity_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.726] [registry.replace] [info] a operator factory for 'identity_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.726] [registry.replace] [info] a operator factory for 'multiply_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.726] [registry.replace] [info] a operator factory for 'int64_to_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.726] [registry.replace] [info] a operator factory for 'string_to_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.726] [registry.replace] [info] a operator factory for 'even_filter_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.730] [registry.replace] [info] a sink factory for 'blackhole_sink_row' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.730] [clink] [warning] clink::logging::init called more than once; ignoring
+[2026-08-04T06:59:30.731] [node.allocator] [info] allocator: system
+coordinator listening on 127.0.0.1:35289
+[2026-08-04T06:59:30.784] [registry.replace] [info] a source factory for 'int64_range_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.784] [registry.replace] [info] a source factory for 'string_lines_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.784] [registry.replace] [info] a sink factory for 'file_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.784] [registry.replace] [info] a sink factory for 'file_line_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.784] [registry.replace] [info] a sink factory for 'collecting_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.784] [registry.replace] [info] a sink factory for 'collecting_string_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.784] [registry.replace] [info] a operator factory for 'identity_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.784] [registry.replace] [info] a operator factory for 'identity_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.784] [registry.replace] [info] a operator factory for 'multiply_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.784] [registry.replace] [info] a operator factory for 'int64_to_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.784] [registry.replace] [info] a operator factory for 'string_to_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.784] [registry.replace] [info] a operator factory for 'even_filter_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.787] [registry.replace] [info] a sink factory for 'blackhole_sink_row' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:30.787] [clink] [warning] clink::logging::init called more than once; ignoring
+[2026-08-04T06:59:30.787] [coordinator.register] [info] worker=worker-2pc-1 host=127.0.0.1 slots=4 http_port=0
+[2026-08-04T06:59:30.788] [node.allocator] [info] allocator: system
+worker worker-2pc-1 registered with 127.0.0.1:35289
+[2026-08-04T06:59:31.201] [registry.replace] [info] a source factory for 'int64_range_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.201] [registry.replace] [info] a source factory for 'string_lines_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.201] [registry.replace] [info] a sink factory for 'file_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.201] [registry.replace] [info] a sink factory for 'file_line_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.201] [registry.replace] [info] a sink factory for 'collecting_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.201] [registry.replace] [info] a sink factory for 'collecting_string_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.201] [registry.replace] [info] a operator factory for 'identity_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.202] [registry.replace] [info] a operator factory for 'identity_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.202] [registry.replace] [info] a operator factory for 'multiply_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.202] [registry.replace] [info] a operator factory for 'int64_to_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.202] [registry.replace] [info] a operator factory for 'string_to_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.202] [registry.replace] [info] a operator factory for 'even_filter_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.264] [registry.replace] [info] a source factory for 'int64_range_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.264] [registry.replace] [info] a source factory for 'string_lines_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.264] [registry.replace] [info] a sink factory for 'file_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.265] [registry.replace] [info] a sink factory for 'file_line_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.265] [registry.replace] [info] a sink factory for 'collecting_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.265] [registry.replace] [info] a sink factory for 'collecting_string_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.265] [registry.replace] [info] a operator factory for 'identity_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.265] [registry.replace] [info] a operator factory for 'identity_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.265] [registry.replace] [info] a operator factory for 'multiply_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.265] [registry.replace] [info] a operator factory for 'int64_to_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.265] [registry.replace] [info] a operator factory for 'string_to_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.265] [registry.replace] [info] a operator factory for 'even_filter_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.265] [coordinator.guarantee] [info] job delivery guarantee: AT_MOST_ONCE_SOURCE (limited by source 'twopc_test.bounded_slow_source')
+[2026-08-04T06:59:31.270] [coordinator.submit] [info] job_id=1 tasks=2
+[2026-08-04T06:59:31.349] [registry.replace] [info] a source factory for 'int64_range_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.349] [registry.replace] [info] a source factory for 'string_lines_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.349] [registry.replace] [info] a sink factory for 'file_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.349] [registry.replace] [info] a sink factory for 'file_line_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.350] [registry.replace] [info] a sink factory for 'collecting_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.350] [registry.replace] [info] a sink factory for 'collecting_string_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.350] [registry.replace] [info] a operator factory for 'identity_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.350] [registry.replace] [info] a operator factory for 'identity_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.350] [registry.replace] [info] a operator factory for 'multiply_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.350] [registry.replace] [info] a operator factory for 'int64_to_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.350] [registry.replace] [info] a operator factory for 'string_to_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.350] [registry.replace] [info] a operator factory for 'even_filter_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.816] [registry.replace] [info] a source factory for 'int64_range_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.816] [registry.replace] [info] a source factory for 'string_lines_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.816] [registry.replace] [info] a sink factory for 'file_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.816] [registry.replace] [info] a sink factory for 'file_line_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.816] [registry.replace] [info] a sink factory for 'collecting_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.816] [registry.replace] [info] a sink factory for 'collecting_string_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.817] [registry.replace] [info] a operator factory for 'identity_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.817] [registry.replace] [info] a operator factory for 'identity_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.817] [registry.replace] [info] a operator factory for 'multiply_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.817] [registry.replace] [info] a operator factory for 'int64_to_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.817] [registry.replace] [info] a operator factory for 'string_to_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.817] [registry.replace] [info] a operator factory for 'even_filter_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.820] [registry.replace] [info] a sink factory for 'blackhole_sink_row' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.820] [clink] [warning] clink::logging::init called more than once; ignoring
+[2026-08-04T06:59:31.821] [node.allocator] [info] allocator: system
+coordinator listening on 127.0.0.1:42835
+[2026-08-04T06:59:31.879] [registry.replace] [info] a source factory for 'int64_range_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.879] [registry.replace] [info] a source factory for 'string_lines_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.879] [registry.replace] [info] a sink factory for 'file_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.879] [registry.replace] [info] a sink factory for 'file_line_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.879] [registry.replace] [info] a sink factory for 'collecting_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.879] [registry.replace] [info] a sink factory for 'collecting_string_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.880] [registry.replace] [info] a operator factory for 'identity_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.880] [registry.replace] [info] a operator factory for 'identity_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.880] [registry.replace] [info] a operator factory for 'multiply_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.880] [registry.replace] [info] a operator factory for 'int64_to_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.880] [registry.replace] [info] a operator factory for 'string_to_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.880] [registry.replace] [info] a operator factory for 'even_filter_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.882] [registry.replace] [info] a sink factory for 'blackhole_sink_row' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:31.882] [clink] [warning] clink::logging::init called more than once; ignoring
+[2026-08-04T06:59:31.883] [coordinator.register] [info] worker=worker-2pc-1 host=127.0.0.1 slots=4 http_port=0
+[2026-08-04T06:59:31.883] [node.allocator] [info] allocator: system
+worker worker-2pc-1 registered with 127.0.0.1:42835
+[2026-08-04T06:59:32.295] [registry.replace] [info] a source factory for 'int64_range_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.295] [registry.replace] [info] a source factory for 'string_lines_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.295] [registry.replace] [info] a sink factory for 'file_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.295] [registry.replace] [info] a sink factory for 'file_line_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.295] [registry.replace] [info] a sink factory for 'collecting_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.295] [registry.replace] [info] a sink factory for 'collecting_string_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.296] [registry.replace] [info] a operator factory for 'identity_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.296] [registry.replace] [info] a operator factory for 'identity_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.296] [registry.replace] [info] a operator factory for 'multiply_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.296] [registry.replace] [info] a operator factory for 'int64_to_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.296] [registry.replace] [info] a operator factory for 'string_to_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.296] [registry.replace] [info] a operator factory for 'even_filter_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.358] [registry.replace] [info] a source factory for 'int64_range_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.358] [registry.replace] [info] a source factory for 'string_lines_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.358] [registry.replace] [info] a sink factory for 'file_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.358] [registry.replace] [info] a sink factory for 'file_line_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.358] [registry.replace] [info] a sink factory for 'collecting_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.358] [registry.replace] [info] a sink factory for 'collecting_string_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.358] [registry.replace] [info] a operator factory for 'identity_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.358] [registry.replace] [info] a operator factory for 'identity_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.358] [registry.replace] [info] a operator factory for 'multiply_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.358] [registry.replace] [info] a operator factory for 'int64_to_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.358] [registry.replace] [info] a operator factory for 'string_to_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.358] [registry.replace] [info] a operator factory for 'even_filter_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.369] [registry.replace] [info] a source factory for 'int64_range_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.369] [registry.replace] [info] a source factory for 'string_lines_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.369] [registry.replace] [info] a sink factory for 'file_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.369] [registry.replace] [info] a sink factory for 'file_line_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.369] [registry.replace] [info] a sink factory for 'collecting_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.369] [registry.replace] [info] a sink factory for 'collecting_string_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.369] [registry.replace] [info] a operator factory for 'identity_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.369] [registry.replace] [info] a operator factory for 'identity_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.369] [registry.replace] [info] a operator factory for 'multiply_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.369] [registry.replace] [info] a operator factory for 'int64_to_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.369] [registry.replace] [info] a operator factory for 'string_to_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.369] [registry.replace] [info] a operator factory for 'even_filter_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.370] [coordinator.guarantee] [info] job delivery guarantee: AT_MOST_ONCE_SOURCE (limited by source 'twopc_test.bounded_slow_source')
+[2026-08-04T06:59:32.373] [coordinator.submit] [info] job_id=1 tasks=2
+[2026-08-04T06:59:32.444] [registry.replace] [info] a source factory for 'int64_range_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.444] [registry.replace] [info] a source factory for 'string_lines_source' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.444] [registry.replace] [info] a sink factory for 'file_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.444] [registry.replace] [info] a sink factory for 'file_line_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.445] [registry.replace] [info] a sink factory for 'collecting_int64_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.445] [registry.replace] [info] a sink factory for 'collecting_string_sink' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.445] [registry.replace] [info] a operator factory for 'identity_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.445] [registry.replace] [info] a operator factory for 'identity_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.445] [registry.replace] [info] a operator factory for 'multiply_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.445] [registry.replace] [info] a operator factory for 'int64_to_string' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.445] [registry.replace] [info] a operator factory for 'string_to_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:32.445] [registry.replace] [info] a operator factory for 'even_filter_int64' was already registered and has been REPLACED; latest registration wins
+[2026-08-04T06:59:33.350] [coordinator.final_checkpoint] [info] job_id=1 final_id=6
+submit: name=job completed=0 ok=0 reject=no JobCompleted after 15s: connection closed by the coordinator
+/src/tests/integration/test_two_phase_commit.cpp:449: Failure
+Expected equality of these values:
+  submit2_exit
+    Which is: 8
+  0
+run-2 submitter exited non-zero
+
+[  FAILED  ] TwoPhaseCommit.RecoveryCommitsPreCommittedFilesOnRestart (2819 ms)
+[----------] 1 test from TwoPhaseCommit (2819 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (2822 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] TwoPhaseCommit.RecoveryCommitsPreCommittedFilesOnRestart
+
+ 1 FAILED TEST
