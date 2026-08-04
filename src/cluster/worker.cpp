@@ -30,6 +30,7 @@
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/metrics/orchestration_metrics.hpp"
 #include "clink/metrics/process_metrics.hpp"
+#include "clink/metrics/state_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/operators/udf_language_registry.hpp"
 #include "clink/plugin/plugin.hpp"       // BuildContext
@@ -488,12 +489,57 @@ void Worker::connect_to_coordinator(ServiceDiscovery& sd,
     connect_to_coordinator(ep->host, ep->port);
 }
 
+void Worker::publish_job_state_sizes_() {
+    // Per-job state size, from the backends this worker hosts.
+    //
+    // The worker is the only place this can be computed: a backend has no idea
+    // which job it belongs to, and the coordinator does not hold backends. Here
+    // both facts are in one map.
+    //
+    // Snapshot the (job -> backends) shape under the lock and read the sizes
+    // outside it. last_snapshot_bytes() is an atomic load on the backends that
+    // implement it, so it is safe to call while operator threads are mutating
+    // state - which is the point of sampling the last snapshot rather than
+    // measuring live state.
+    std::unordered_map<JobId, std::vector<std::shared_ptr<StateBackend>>> per_job;
+    {
+        std::lock_guard lock(mu_);
+        for (const auto& [job_id, by_subtask] : per_job_backends_) {
+            auto& v = per_job[job_id];
+            v.reserve(by_subtask.size());
+            for (const auto& [_, backend] : by_subtask) {
+                if (backend) {
+                    v.push_back(backend);
+                }
+            }
+        }
+    }
+    for (const auto& [job_id, backends] : per_job) {
+        std::uint64_t total = 0;
+        std::int64_t reporting = 0;
+        for (const auto& b : backends) {
+            if (const auto bytes = b->last_snapshot_bytes(); bytes.has_value()) {
+                total += *bytes;
+                ++reporting;
+            }
+        }
+        // Publish even when nothing reported, so the reporting-backend count says
+        // "unmeasured" rather than the bytes gauge silently reading zero.
+        metrics::state::job_state_bytes_set(job_id, static_cast<std::int64_t>(total));
+        metrics::state::job_state_reporting_backends_set(job_id, reporting);
+    }
+}
+
 void Worker::heartbeat_loop_() {
     while (!stop_.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(cfg_.heartbeat_interval);
         if (stop_.load(std::memory_order_acquire)) {
             return;
         }
+        // Piggybacked on the heartbeat rather than given its own thread: the
+        // cadence a heartbeat runs at is already the right one for a gauge, and
+        // a state size that updates only at checkpoints does not need finer.
+        publish_job_state_sizes_();
         const auto frame = encode_frame(MessageKind::Heartbeat, HeartbeatMsg{worker_id_});
         if (!send_frame_(frame)) {
             return;

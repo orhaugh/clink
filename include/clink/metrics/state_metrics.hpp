@@ -99,6 +99,41 @@ inline void keyed_keys_set(const std::string& backend, std::int64_t n) {
     MetricsRegistry::global().gauge(state_metric_name("keyed_keys", backend)).set(n);
 }
 
+// Per-JOB state size, as reported by one worker: the sum of the last snapshot
+// sizes of every backend that worker hosts for the job.
+//
+// Tagged by job because capacity planning is a per-job question - "which job is
+// growing" is not answerable from a process-wide total. Summing across workers is
+// the scrape's job (`sum by (job_id)`), which is why this is per worker per job
+// rather than a single number the coordinator aggregates: it avoids putting state
+// sizes on the heartbeat and it is how a Prometheus deployment would total it
+// anyway.
+//
+// SERIALISED size at the last checkpoint, not live heap residency, and stale
+// between checkpoints. A job with checkpointing off never reports one. The
+// alternative - an exact live figure - costs either a counter on the put/erase
+// hot path or a full scan per sample, for a number whose consumer is a capacity
+// trend.
+inline void job_state_bytes_set(std::uint64_t job_id, std::int64_t bytes) {
+    std::string name = kStateMetricPrefix;
+    name += "job_bytes{job_id=\"";
+    name += std::to_string(job_id);
+    name += "\"}";
+    MetricsRegistry::global().gauge(name).set(bytes);
+}
+
+// How many of the job's backends on this worker could report a size. A gauge
+// that silently covered 2 of 8 subtasks would read as a small job rather than an
+// unmeasured one, so the count is exported beside the bytes and a scrape can
+// compare it with the subtask count.
+inline void job_state_reporting_backends_set(std::uint64_t job_id, std::int64_t n) {
+    std::string name = kStateMetricPrefix;
+    name += "job_reporting_backends{job_id=\"";
+    name += std::to_string(job_id);
+    name += "\"}";
+    MetricsRegistry::global().gauge(name).set(n);
+}
+
 }  // namespace state
 
 }  // namespace clink::metrics

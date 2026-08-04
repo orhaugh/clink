@@ -73,6 +73,12 @@ public:
     // write), fused on the operator thread. The async path drives the two
     // halves separately so the slow write lands on the snapshot worker.
     Snapshot snapshot(CheckpointId id) override { return persist(capture(id)); }
+
+    // Set in persist(), which both the sync and async paths go through.
+    [[nodiscard]] std::optional<std::uint64_t> last_snapshot_bytes() const override {
+        const auto v = last_snapshot_bytes_.load(std::memory_order_relaxed);
+        return v == kNoSnapshotYet ? std::nullopt : std::optional<std::uint64_t>{v};
+    }
     [[nodiscard]] std::vector<std::byte> export_arrow_snapshot() const override {
         return inner_.export_arrow_snapshot();
     }
@@ -100,6 +106,8 @@ public:
         const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - t0)
                             .count();
+        last_snapshot_bytes_.store(static_cast<std::uint64_t>(handle.bytes.size()),
+                                   std::memory_order_relaxed);
         clink::metrics::state::snapshot_completed(
             "file_backed", handle.bytes.size(), static_cast<std::uint64_t>(dt));
         return Snapshot{.checkpoint_id = handle.checkpoint_id, .bytes = {}};
@@ -244,6 +252,9 @@ public:
     }
 
 private:
+    static constexpr std::uint64_t kNoSnapshotYet = ~std::uint64_t{0};
+    std::atomic<std::uint64_t> last_snapshot_bytes_{kNoSnapshotYet};
+
     // Write `bytes` to <dir>/checkpoint-<id>.snap via a temp file then an
     // atomic rename, so a crash mid-write can never leave a partial
     // checkpoint that a later restore would happily load (silently dropping

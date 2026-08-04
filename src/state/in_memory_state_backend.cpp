@@ -105,6 +105,7 @@ Snapshot InMemoryStateBackend::snapshot(CheckpointId id) {
     for (const auto& [_, kv] : state_) {
         live_keys += kv.size();
     }
+    last_snapshot_bytes_.store(static_cast<std::uint64_t>(bytes.size()), std::memory_order_relaxed);
     clink::metrics::state::snapshot_completed(
         "in_memory", bytes.size(), static_cast<std::uint64_t>(dt));
     clink::metrics::state::keyed_keys_set("in_memory", static_cast<std::int64_t>(live_keys));

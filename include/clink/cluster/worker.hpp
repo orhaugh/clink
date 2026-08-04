@@ -209,6 +209,9 @@ private:
     // belonging to other operators are unaffected.
     void handle_begin_rescale_(MessageReader& r);
     void handle_stop_subtasks_(MessageReader& r);
+    // Sum the last snapshot size of every backend this worker hosts, per job, and
+    // publish it as a gauge. Called from the heartbeat loop.
+    void publish_job_state_sizes_();
     bool send_frame_(const std::vector<std::byte>& frame);
     void heartbeat_loop_();
 

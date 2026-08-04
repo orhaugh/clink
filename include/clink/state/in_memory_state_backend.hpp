@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <functional>
@@ -87,6 +88,11 @@ public:
     // Drop all keyed entries (state-version metadata is left intact). Used by
     // wrapping backends (e.g. RemoteReadBackend's hot tier) to discard a stale
     // cache before repointing at a different checkpoint.
+    [[nodiscard]] std::optional<std::uint64_t> last_snapshot_bytes() const override {
+        const auto v = last_snapshot_bytes_.load(std::memory_order_relaxed);
+        return v == kNoSnapshotYet ? std::nullopt : std::optional<std::uint64_t>{v};
+    }
+
     void clear() {
         std::lock_guard lock(mu_);
         state_.clear();
@@ -198,6 +204,11 @@ private:
     mutable std::mutex mu_;
     State state_;
     StateVersionMap state_versions_;
+    // Set at snapshot(). Atomic and outside mu_ so the worker's heartbeat thread
+    // can read it while an operator thread is mutating state, which is the whole
+    // point of sampling a snapshot size rather than measuring live state.
+    static constexpr std::uint64_t kNoSnapshotYet = ~std::uint64_t{0};
+    std::atomic<std::uint64_t> last_snapshot_bytes_{kNoSnapshotYet};
 };
 
 }  // namespace clink

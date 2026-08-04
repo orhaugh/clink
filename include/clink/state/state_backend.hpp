@@ -355,6 +355,28 @@ public:
     // already location-independent (in-memory, object-store) need nothing.
     virtual void set_restore_base(const std::string& /*dir*/) {}
 
+    // Bytes the most recent snapshot of this backend occupied, or nullopt when
+    // this backend does not report it.
+    //
+    // Every backend already computes this number - it passes it to
+    // metrics::state::snapshot_completed - and every one discards it afterwards.
+    // Surfacing it is what lets a per-JOB state-size figure exist: a backend has
+    // no idea which job it belongs to, but the worker holds every backend it hosts
+    // keyed by job, so the worker can total them.
+    //
+    // Nullopt rather than 0 for "not reported", deliberately. A backend that
+    // cannot answer and a backend holding nothing are different facts, and
+    // collapsing them would make an unimplemented backend read as an empty one -
+    // which for a capacity-planning number is the wrong way to be wrong.
+    //
+    // It is the SERIALISED size at the last checkpoint, not current heap
+    // residency, and it is stale between checkpoints. That is the honest
+    // trade: an exact live size would need either a counter on the put/erase
+    // hot path or a full scan per sample.
+    [[nodiscard]] virtual std::optional<std::uint64_t> last_snapshot_bytes() const {
+        return std::nullopt;
+    }
+
     virtual std::string description() const = 0;
 
 private:

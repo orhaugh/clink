@@ -64,6 +64,12 @@ namespace clink {
 
 class ChangelogStateBackend final : public StateBackend {
 public:
+    // Set in snapshot(). See StateBackend::last_snapshot_bytes.
+    [[nodiscard]] std::optional<std::uint64_t> last_snapshot_bytes() const override {
+        const auto v = last_snapshot_bytes_.load(std::memory_order_relaxed);
+        return v == kNoSnapshotYet ? std::nullopt : std::optional<std::uint64_t>{v};
+    }
+
     // Convenience ctor: wraps a fresh InMemoryStateBackend, in-blob
     // materialization storage (no external store).
     ChangelogStateBackend() : ChangelogStateBackend(std::make_shared<InMemoryStateBackend>()) {}
@@ -262,6 +268,9 @@ public:
     [[nodiscard]] StateBackend& inner() noexcept { return *inner_; }
 
 private:
+    static constexpr std::uint64_t kNoSnapshotYet = ~std::uint64_t{0};
+    std::atomic<std::uint64_t> last_snapshot_bytes_{kNoSnapshotYet};
+
     struct LogEntry {
         OperatorId op{};
         std::string key;

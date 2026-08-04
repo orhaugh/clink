@@ -193,6 +193,7 @@ CaptureHandle ChangelogStateBackend::capture(CheckpointId id) {
     const auto dt =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
             .count();
+    last_snapshot_bytes_.store(static_cast<std::uint64_t>(bytes.size()), std::memory_order_relaxed);
     clink::metrics::state::snapshot_completed(
         "changelog", bytes.size(), static_cast<std::uint64_t>(dt));
     // The on-thread half ends here: the framing blob is fully serialised and
