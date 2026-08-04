@@ -456,6 +456,11 @@ void write_coordinator_config(clink::http::JsonWriter& w,
          std::chrono::duration_cast<std::chrono::milliseconds>(c.submit_wait_for_slots).count());
     w.kv("restart_drain_timeout_ms",
          std::chrono::duration_cast<std::chrono::milliseconds>(c.restart_drain_timeout).count());
+    // Reported as well as settable: a refused connection tells the operator to
+    // raise a limit, and the endpoint that describes the coordinator should say
+    // what that limit currently is.
+    w.kv("max_client_connections", static_cast<std::int64_t>(c.max_client_connections));
+    w.kv("max_worker_connections", static_cast<std::int64_t>(c.max_worker_connections));
     w.end_object();
 }
 
@@ -1816,6 +1821,16 @@ int run_coordinator(int argc, char** argv) {
     // poll cadence is tunable too.
     const auto heartbeat_timeout_str = get_arg(argc, argv, "heartbeat-timeout-ms", "5000");
     const auto watchdog_interval_str = get_arg(argc, argv, "watchdog-interval-ms", "200");
+    // Connection caps. Both were Config fields with no way to set them from the
+    // command line, which made the refusal messages - "raise
+    // max_worker_connections if the cluster genuinely is this large" - advice an
+    // operator could not act on. Defaults come from Coordinator::Config so the two
+    // cannot drift.
+    const clink::cluster::Coordinator::Config kCfgDefaults;
+    const auto max_client_conns_str = get_arg(
+        argc, argv, "max-client-connections", std::to_string(kCfgDefaults.max_client_connections));
+    const auto max_worker_conns_str = get_arg(
+        argc, argv, "max-worker-connections", std::to_string(kCfgDefaults.max_worker_connections));
     // Cluster-level default state backend for jobs that submit without their
     // own --state-backend. Empty (default) keeps the legacy resolution
     // (memory / file-from-checkpoint-dir). Set it to a deferring backend to
@@ -1839,6 +1854,8 @@ int run_coordinator(int argc, char** argv) {
     cfg.advertise_host = advertise_host;
     cfg.heartbeat_timeout = std::chrono::milliseconds{std::stoll(heartbeat_timeout_str)};
     cfg.watchdog_interval = std::chrono::milliseconds{std::stoll(watchdog_interval_str)};
+    cfg.max_client_connections = static_cast<std::size_t>(std::stoull(max_client_conns_str));
+    cfg.max_worker_connections = static_cast<std::size_t>(std::stoull(max_worker_conns_str));
     cfg.restart_drain_timeout = std::chrono::milliseconds{std::stoll(restart_drain_timeout_str)};
     cfg.default_state_backend_uri = default_state_backend;
     if (!ha_dir.empty()) {
@@ -2979,6 +2996,8 @@ int main(int argc, char** argv) {
                 << "Coordinator flags:\n"
                 << "  --heartbeat-timeout-ms=<n>   worker-loss detection window (default 5000).\n"
                 << "  --watchdog-interval-ms=<n>   worker-liveness poll cadence (default 200).\n"
+                << "  --max-client-connections=<n> concurrent client connections (default 256).\n"
+                << "  --max-worker-connections=<n> concurrent worker connections (default 1024).\n"
                 << "\n"
                 << "Logging flags:\n"
                 << "  --log-level=<lvl>            trace|debug|info|warn|error|off "
