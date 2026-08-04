@@ -1394,3 +1394,119 @@ TEST(CoordinatorAutoscaler, NoAutoscalerWhenOpsLackBounds) {
     coordinator.stop();
     std::filesystem::remove(out_path);
 }
+
+// --- Worker connections: reaped, and capped ---------------------------
+//
+// The client path grew a reaper and a cap; the worker path had neither, and the
+// asymmetry was where the work stopped rather than a decision. What made it worth
+// closing is that the worker side leaks more: a lost worker's reader thread
+// returns but nothing joins it, and the watchdog's shutdown_read() is
+// shutdown(SHUT_RD), not close - so the thread handle and the socket both survive
+// until stop(). Bounded by distinct worker ids ever seen, not by cluster size.
+
+TEST(WorkerConnections, AreReapedRatherThanAccumulated) {
+    using namespace std::chrono_literals;
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 20ms;
+    cfg.heartbeat_timeout = 120ms;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+
+    constexpr int kCycles = 6;
+    for (int i = 0; i < kCycles; ++i) {
+        const auto id = "w-reap-" + std::to_string(i);
+        coordinator.expect_workers({id});
+        Worker::Config wcfg;
+        // No heartbeats, so the watchdog declares this worker lost promptly and
+        // its reader exits - the state the leak accumulated in.
+        wcfg.heartbeat_interval = 0ms;
+        Worker worker(id, "127.0.0.1", wcfg);
+        worker.register_role("noop", [](const DeploymentTask&) {});
+        worker.connect_to_coordinator("127.0.0.1", port);
+        ASSERT_TRUE(coordinator.await_registrations(2s)) << "cycle " << i;
+        worker.stop();
+        // Reaping is driven by admission, as on the client path, so the next
+        // registration is what runs it. The last cycle is reaped by the explicit
+        // wait below.
+    }
+
+    const auto await_until = [](auto pred, std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            if (pred()) {
+                return true;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        }
+    };
+    const bool reaped = await_until(
+        [&] {
+            // Drive the reaper the way a real cluster does: another registration.
+            coordinator.expect_workers({"w-reap-probe"});
+            Worker probe("w-reap-probe", "127.0.0.1");
+            probe.register_role("noop", [](const DeploymentTask&) {});
+            try {
+                probe.connect_to_coordinator("127.0.0.1", port);
+            } catch (const std::exception&) {
+                return false;
+            }
+            const auto held = coordinator.worker_connection_count();
+            probe.stop();
+            return held <= 2;
+        },
+        5s);
+
+    EXPECT_TRUE(reaped) << "after " << kCycles
+                        << " connect/lose cycles the coordinator still holds "
+                        << coordinator.worker_connection_count()
+                        << " worker connections; each one is a thread handle and an open socket "
+                           "that nothing releases before stop()";
+
+    // The RECORD must survive. Several paths distinguish "absent" from "present
+    // and lost" and behave differently, so reaping must release the thread and
+    // the socket without forgetting the worker existed.
+    EXPECT_GE(coordinator.snapshot_workers().size(), static_cast<std::size_t>(kCycles))
+        << "reaping erased worker records, which changes restart and drain semantics";
+
+    coordinator.stop();
+}
+
+TEST(WorkerConnections, AreRefusedBeyondTheLimitRatherThanSpawningThreads) {
+    using namespace std::chrono_literals;
+    Coordinator::Config cfg;
+    cfg.max_worker_connections = 2;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+
+    coordinator.expect_workers({"w-cap-1", "w-cap-2"});
+    Worker w1("w-cap-1", "127.0.0.1");
+    Worker w2("w-cap-2", "127.0.0.1");
+    w1.register_role("noop", [](const DeploymentTask&) {});
+    w2.register_role("noop", [](const DeploymentTask&) {});
+    ASSERT_NO_THROW(w1.connect_to_coordinator("127.0.0.1", port));
+    ASSERT_NO_THROW(w2.connect_to_coordinator("127.0.0.1", port));
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    Worker w3("w-cap-3", "127.0.0.1");
+    w3.register_role("noop", [](const DeploymentTask&) {});
+    EXPECT_THROW(w3.connect_to_coordinator("127.0.0.1", port), std::runtime_error)
+        << "a third worker was admitted past max_worker_connections=2";
+    EXPECT_EQ(coordinator.worker_connection_count(), 2u)
+        << "the refused worker still left a connection behind";
+
+    // A worker already on record must still be able to re-register when the
+    // cluster is at the limit: a restart is not new capacity, and refusing it
+    // would strand a worker that the coordinator is already counting.
+    Worker w1_again("w-cap-1", "127.0.0.1");
+    w1_again.register_role("noop", [](const DeploymentTask&) {});
+    EXPECT_NO_THROW(w1_again.connect_to_coordinator("127.0.0.1", port))
+        << "a restarting worker already on record was refused for being at the limit";
+
+    w1_again.stop();
+    w2.stop();
+    w1.stop();
+    coordinator.stop();
+}

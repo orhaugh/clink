@@ -814,6 +814,40 @@ void Coordinator::handle_register_(std::unique_ptr<network::Connection> conn, Me
         return;  // conn destructor closes
     }
 
+    // Reap before admitting, then cap. Same order and the same reasoning as the
+    // client path: joining readers that have already exited is what keeps this
+    // bounded by CONCURRENT workers rather than by every worker id ever seen -
+    // and without the reap, a cap would be a lifetime quota on distinct ids,
+    // which is the "refuses things that work" failure a linter is warned about.
+    //
+    // A re-registration under the SAME id is not new capacity: it replaces the
+    // existing record further down, so it must not be refused for being at the
+    // limit. Checking membership first is what keeps a restarting worker able to
+    // come back to a full cluster.
+    {
+        const auto live = reap_finished_workers_();
+        bool already_known = false;
+        {
+            std::lock_guard lock(mu_);
+            already_known = registered_.count(reg.worker_id) != 0;
+        }
+        if (!already_known && live >= cfg_.max_worker_connections) {
+            const std::string reason =
+                "coordinator is at its worker-connection limit (" +
+                std::to_string(cfg_.max_worker_connections) + " already connected); refusing '" +
+                reg.worker_id +
+                "'. Refusing is deliberate - admitting would spawn a reader thread the "
+                "coordinator cannot account for. Raise max_worker_connections if the cluster "
+                "genuinely is this large.";
+            log::warn("coordinator.register", reason);
+            metrics::orch::worker_connection_refused();
+            RegisterAckMsg nack{.ok = false, .message = reason};
+            const auto frame = fenced_frame_(MessageKind::RegisterAck, nack);
+            (void)send_frame(*conn, frame);
+            return;  // conn destructor closes
+        }
+    }
+
     auto worker = std::make_shared<WorkerConnection>();
     worker->worker_id = reg.worker_id;
     worker->data_host = reg.data_host;
@@ -935,6 +969,41 @@ std::size_t Coordinator::reap_finished_clients_() {
     // completion, so the join returns at once - but holding a lock across
     // a join is how a future change to the client loop turns into a
     // deadlock, and the cost of not doing it is nothing.
+    for (auto& t : to_join) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    return live;
+}
+
+std::size_t Coordinator::reap_finished_workers_() {
+    std::vector<std::thread> to_join;
+    std::size_t live = 0;
+    {
+        std::lock_guard lock(mu_);
+        for (auto& [_, worker] : registered_) {
+            if (!worker) {
+                continue;
+            }
+            if (worker->reader_finished->load(std::memory_order_acquire)) {
+                if (worker->reader.joinable()) {
+                    to_join.push_back(std::move(worker->reader));
+                }
+                // Drop the socket too. shutdown_read() only half-closes, so
+                // without this the fd survives every lost worker for the life of
+                // the process. Every send site already null-checks conn, which is
+                // why releasing it here is safe rather than a new invariant.
+                worker->conn.reset();
+            }
+            if (worker->conn) {
+                ++live;
+            }
+        }
+    }
+    // Joined OUTSIDE mu_, and never from the reader thread itself. Both matter:
+    // this file has already produced a self-join terminate and a use-after-free
+    // in the equivalent client path.
     for (auto& t : to_join) {
         if (t.joinable()) {
             t.join();
@@ -2751,6 +2820,15 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
 
 void Coordinator::start_reader_for_(std::shared_ptr<WorkerConnection> worker) {
     worker->reader = std::thread([this, worker] {
+        // Set on EVERY exit path, so a finished reader is distinguishable from a
+        // running one and can be joined. Without it the thread and its socket
+        // were held until stop(). Captured by value so it outlives the
+        // WorkerConnection if that is ever replaced under the same id.
+        auto finished = worker->reader_finished;
+        struct MarkFinished {
+            std::shared_ptr<std::atomic<bool>> flag;
+            ~MarkFinished() { flag->store(true, std::memory_order_release); }
+        } mark{finished};
         while (!stop_.load(std::memory_order_acquire)) {
             if (!worker->conn)
                 return;

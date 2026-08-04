@@ -97,6 +97,8 @@ inline constexpr const char* kMalformedFrames = "clink_malformed_frames_total";
 // connection limit. Non-zero means either a client leak somewhere or a
 // limit set too low - both worth knowing before it becomes an outage.
 inline constexpr const char* kClientConnectionsRefused = "clink_client_connections_refused_total";
+inline constexpr const char* kWorkerConnectionsRefused =
+    "clink_coordinator_worker_connections_refused_total";
 
 namespace orch {
 
@@ -132,6 +134,14 @@ inline void subtask_redeployed() {
 }
 inline void client_connection_refused() {
     MetricsRegistry::global().counter(kClientConnectionsRefused).increment();
+}
+
+// A worker registration refused for being at the connection limit. Counted
+// separately from the client refusal: they mean different things operationally -
+// one is a CLI or dashboard being turned away, the other is a worker that will
+// not join the cluster.
+inline void worker_connection_refused() {
+    MetricsRegistry::global().counter(kWorkerConnectionsRefused).increment();
 }
 inline void malformed_frame() {
     MetricsRegistry::global().counter(kMalformedFrames).increment();

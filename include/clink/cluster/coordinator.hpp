@@ -215,6 +215,19 @@ public:
         // default - a CLI is short-lived and a dashboard holds one - so
         // reaching it means something is wrong rather than busy.
         std::size_t max_client_connections{256};
+        // Most WORKER connections the coordinator will hold at once. Beyond this
+        // a registration is refused with a reason rather than admitted into a
+        // thread the coordinator cannot account for - the same contract as the
+        // client cap above, on the path that had none.
+        //
+        // The anchor is the engine's own ceiling rather than taste: a keyed
+        // operator cannot be split finer than kNumKeyGroups = 128 ways, so 128
+        // single-slot workers already saturate the maximum keyed parallelism of
+        // ONE operator. Eight times that leaves room for concurrent jobs and
+        // multi-operator graphs. The multiplier is headroom and nothing more;
+        // what is derived is the anchor, and the direction - strictly above 128
+        // rather than at it.
+        std::size_t max_worker_connections{1024};
         // Host advertised to clients/peers in resolved peer addresses
         // when bind_host is a wildcard. Defaults to bind_host. Set to a
         // routable hostname/IP when bind_host = "0.0.0.0".
@@ -581,6 +594,21 @@ public:
         return client_sessions_.size();
     }
 
+    // Workers still HOLDING a connection, as distinct from workers on record.
+    // The gap between the two is the point: a lost worker keeps its record, so
+    // "does the coordinator leak a socket per registration" is not observable
+    // from snapshot_workers().size() alone.
+    [[nodiscard]] std::size_t worker_connection_count() const {
+        std::lock_guard lock(mu_);
+        std::size_t n = 0;
+        for (const auto& [_, w] : registered_) {
+            if (w && w->conn) {
+                ++n;
+            }
+        }
+        return n;
+    }
+
     // Replay every persisted job manifest under the configured ha_dir
     // back into this coordinator, with restore_from set per job. Called by
     // clink_node when its HaCoordinator fires the become-leader
@@ -595,6 +623,22 @@ private:
         // thread borrows; close() runs on watchdog teardown.
         std::unique_ptr<network::Connection> conn;
         std::thread reader;
+        // Set by the reader as its LAST act, so another thread can tell a
+        // finished reader from a running one and join it safely.
+        //
+        // Without this the coordinator leaked one thread, one file descriptor
+        // and one socket per worker registration, released only at stop(). A
+        // worker declared lost has its reader woken - the watchdog calls
+        // shutdown_read() - and the thread returns, but nothing ever joined the
+        // handle, and shutdown_read is shutdown(SHUT_RD), not close. So the
+        // resources stayed. Bounded by distinct worker ids ever seen, not by
+        // cluster size: any supervisor that mints fresh ids (hostname+pid, a
+        // Deployment rather than a StatefulSet) leaks one fd per restart until
+        // the coordinator cannot accept at all - which takes client admission
+        // down with it. Same shape as the client-session leak, on the path that
+        // had no reaper.
+        std::shared_ptr<std::atomic<bool>> reader_finished =
+            std::make_shared<std::atomic<bool>>(false);
         std::chrono::steady_clock::time_point last_seen;
         bool lost{false};
         std::uint32_t slot_capacity{1};
@@ -1146,6 +1190,14 @@ private:
     // each new client, so the cost is paid by the connection that would
     // otherwise have grown the list. Returns the number still live.
     std::size_t reap_finished_clients_();
+    // Join finished worker readers and drop their sockets, KEEPING the
+    // registration record. Returns the number of workers still holding a
+    // connection, which is what max_worker_connections bounds.
+    //
+    // The record is kept deliberately: several paths distinguish "absent" from
+    // "present and lost" and behave differently, so erasing would quietly change
+    // restart and drain semantics. What is released is the thread and the socket.
+    std::size_t reap_finished_workers_();
 
     // Wraps an accepted listener fd into a Connection. Default plain
     // TCP via make_plain_connection. TLS callers replace via
