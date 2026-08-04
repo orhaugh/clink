@@ -26,6 +26,8 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -220,11 +222,19 @@ TEST(WorkerCrashRecovery, JobSurvivesWorkerKillViaRestart) {
     ASSERT_GT(submit_pid, 0);
 
     // Wait for at least one checkpoint to complete before the crash.
-    const auto deadline = std::chrono::steady_clock::now() + 3s;
-    while (std::chrono::steady_clock::now() < deadline &&
-           latest_completed_checkpoint(ckpt_dir) == 0) {
-        std::this_thread::sleep_for(50ms);
-    }
+    //
+    // The bound was 3s, which is not a bound on "a checkpoint at a 150ms
+    // interval" - it is a bound on the whole submit-plan-deploy-checkpoint
+    // sequence, and the submit part alone takes about 2.7s on Linux because a
+    // job plugin is 84 MB there (it statically links clink_core). That left
+    // ~300ms for the rest, the ASSERT below fired, and because it returns before
+    // the kill_quietly calls at the end of this test the coordinator and workers
+    // were orphaned - which is why ctest reported this as a 300-second TIMEOUT
+    // rather than as the assertion failure it was.
+    //
+    // The wait returns the instant the checkpoint lands, so a generous bound
+    // costs nothing.
+    (void)clink::itest::await_condition([&] { return latest_completed_checkpoint(ckpt_dir) != 0; });
     const auto ckpt_before_crash = latest_completed_checkpoint(ckpt_dir);
     ASSERT_GT(ckpt_before_crash, 0u) << "no checkpoint completed before SIGKILL";
 

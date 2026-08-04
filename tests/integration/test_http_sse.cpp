@@ -31,6 +31,8 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -138,6 +140,10 @@ std::optional<SseReader> open_sse(const std::string& host,
 
 // Read for up to `total_timeout`, accumulating bytes into reader.buf,
 // or stop early once `predicate(reader.buf)` returns true.
+// Where cancel_test_job's sink writes. Fixed inside the .so, so a file left by an
+// earlier run has to be cleared before it can signal "this job started".
+constexpr const char* kSseSinkPath = "/tmp/clink_cancel_test_sink";
+
 bool drain_until(SseReader& reader,
                  std::chrono::milliseconds total_timeout,
                  const std::function<bool(const std::string&)>& predicate) {
@@ -358,6 +364,10 @@ TEST(HttpSse, SseSurfacesJobLifecycleEvents) {
     std::this_thread::sleep_for(150ms);
 
     ::setenv("CLINK_CANCEL_TICK_MS", "20", 1);
+    {
+        std::error_code ec;
+        std::filesystem::remove(kSseSinkPath, ec);
+    }
     const pid_t submit_pid =
         spawn_proc({"clink_submit_job",
                     "--job=" + job_so.string(),
@@ -367,9 +377,15 @@ TEST(HttpSse, SseSurfacesJobLifecycleEvents) {
                    submit);
     ASSERT_GT(submit_pid, 0);
 
-    // First: job_submitted should appear within a few hundred ms.
+    // job_submitted appears once the coordinator has taken the submit. The bound
+    // used to be 3s, with a comment saying "a few hundred ms" - true on macOS,
+    // where a job plugin is about 5 MB, and false on Linux, where the same
+    // module is 84 MB because it statically links clink_core and the submit
+    // takes around 2.7s. The bound is a failure bound, not a wait: this returns
+    // the instant the event arrives, so making it generous costs nothing and
+    // stops it encoding a platform's plugin size.
     EXPECT_TRUE(drain_until(*reader,
-                            3s,
+                            30s,
                             [](const std::string& s) {
                                 return s.find("event: coordinator.job_submitted") !=
                                        std::string::npos;
@@ -377,8 +393,20 @@ TEST(HttpSse, SseSurfacesJobLifecycleEvents) {
         << "no coordinator.job_submitted seen in stream:\n"
         << reader->buf;
 
-    // Cancel it via the HTTP action endpoint we wired in HTTP-3.
-    std::this_thread::sleep_for(500ms);
+    // Cancel it via the HTTP action endpoint we wired in HTTP-3, once the job is
+    // actually RUNNING. The 500ms sleep this replaces assumed deploy finishes
+    // promptly after the submit is registered; on Linux the job plugin is 84 MB
+    // and it does not, so the cancel landed on a job with no deployed subtasks
+    // and no job_completed event followed within the 15s below.
+    //
+    // The sink creates its file in open(), when the subtask starts, so its
+    // existence is the "deployed and running" signal. Existence, not content:
+    // with checkpointing off the file sink buffers, and waiting for bytes waits
+    // for a flush instead.
+    ASSERT_TRUE(clink::itest::await_condition([&] {
+        std::error_code ec;
+        return std::filesystem::exists(kSseSinkPath, ec);
+    })) << "the job never started, so there was nothing to cancel";
     const auto cancel = http_post("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1/cancel");
     EXPECT_EQ(cancel.status, 200) << "cancel ack: " << cancel.body;
 

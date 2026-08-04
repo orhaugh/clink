@@ -3786,6 +3786,18 @@ Endpoint...`, `HttpObservability.JobSubmission...`) submit the same job.
 All seven were confirmed failing at `a27e74c` in a fresh container, so none of
 them is a regression from the rescale work.
 
+**All seven are now fixed, and so are two more that failed the same way**
+(`WorkerCrashRecovery.JobSurvivesWorkerKillViaRestart`,
+`CoordinatorHaFailover.StandbyTakesOverAndRecoversJob`). One premise, encoded in
+nine tests: that submitting a job is fast. A job plugin is 84 MB on Linux against
+5.7 MB on macOS - `clink_core` is a static library and every job `.so` links it -
+so a submit ships 84 MB and takes about 2.7 seconds, and every "sleep 2s then
+assert the job exists" read the state before the submit landed. The submitter's
+"connection closed by the coordinator" was a consequence of the test tearing the
+cluster down mid-submit, not the cause; the first reading of this evidence said
+otherwise and was wrong. Details, and the two things the fixing taught, are in
+follow-up item 28. The serial Linux label went 106/114 to 113/114.
+
 Whether they regressed after the 109/109 sweep or whether that sweep was
 measured under conditions this one does not reproduce is not established. The
 Docker image was rebuilt on 2026-08-04, so the toolchain underneath both
@@ -3794,7 +3806,7 @@ platform claim in this document was stale, which is the same failure mode the
 document exists to catch - a green number outliving the thing it measured. It is
 now follow-up item 28.
 
-A ninth case, `UngroupedSinkAtomicityTest.SinksWithNoCommitGroupAlsoNeverSplit-
+A further case, `UngroupedSinkAtomicityTest.SinksWithNoCommitGroupAlsoNeverSplit-
 AcrossAWorkerKill`, failed once in the serial Linux sweep with an INTERIOR
 disagreement between two ungrouped sinks - one published checkpoint 2 and the
 other never did, while both published 37 onwards. It passes 3 of 3 in isolation

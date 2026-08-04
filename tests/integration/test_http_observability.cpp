@@ -29,6 +29,8 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -351,7 +353,16 @@ TEST(HttpObservability, JobSubmissionBumpsCoordinatorCounters) {
                     "--wait-timeout-s=30"},
                    submit);
     ASSERT_GT(submit_pid, 0);
-    std::this_thread::sleep_for(2s);
+
+    // Wait for the counter to move rather than sleeping a guess at how long a
+    // submit takes. The 2s guess came from macOS, where a job plugin is about
+    // 5 MB; on Linux it is 84 MB (each one statically links clink_core) and the
+    // submit takes around 2.7s, so this read the pre-submit counters.
+    ASSERT_TRUE(clink::itest::await_condition([&] {
+        const auto r = http_get("127.0.0.1", c->coordinator_http_port, "/metrics");
+        return r.status == 200 && r.body.find(std::string{metrics::kCoordinatorJobsSubmittedTotal} +
+                                              " 1") != std::string::npos;
+    })) << "the coordinator never counted the submitted job";
 
     // Mid-flight: jobs_submitted_total = 1, jobs_running = 1.
     {

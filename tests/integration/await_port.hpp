@@ -31,6 +31,35 @@
 
 namespace clink::itest {
 
+// Wait for an arbitrary condition, polling.
+//
+// Same contract as `await` in cluster_harness.hpp - it returns the instant the
+// condition holds, and the timeout is a FAILURE BOUND, not a wait - but usable
+// from the pre-harness tests without pulling the whole harness in.
+//
+// Written because a fixed sleep after a job submit is not just noisy, it encodes
+// a false premise. Those sleeps were set from macOS timings, where a job plugin
+// is about 5 MB; on Linux the same module is about 84 MB, because each one
+// statically links clink_core, so the submit takes around 2.7 seconds and every
+// "sleep 2s then assert the job exists" assertion was measuring the wrong thing.
+// A generous bound on an observable condition cannot go stale that way.
+template <typename Cond>
+[[nodiscard]] inline bool await_condition(
+    Cond&& cond,
+    std::chrono::milliseconds timeout = std::chrono::seconds{30},
+    std::chrono::milliseconds poll = std::chrono::milliseconds{50}) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        if (cond()) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(poll);
+    }
+}
+
 [[nodiscard]] inline bool await_port_accepting(
     std::uint16_t port, std::chrono::milliseconds timeout = std::chrono::seconds{15}) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;

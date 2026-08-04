@@ -32,6 +32,8 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -287,7 +289,16 @@ TEST(HttpReadApi, JobsEndpointEmptyThenPopulatedAfterSubmission) {
                     "--wait-timeout-s=20"},
                    submit);
     ASSERT_GT(submit_pid, 0);
-    std::this_thread::sleep_for(2s);
+
+    // Wait for the job to APPEAR, rather than sleeping a guess at how long a
+    // submit takes. The guess was 2s, taken from macOS where a job plugin is
+    // about 5 MB; on Linux the same module is 84 MB because it statically links
+    // clink_core, the submit takes around 2.7s, and this assertion was reading
+    // an empty job list and calling it a defect in the endpoint.
+    ASSERT_TRUE(clink::itest::await_condition([&] {
+        const auto r = http_get("127.0.0.1", cluster->coordinator_http_port, "/api/v1/jobs");
+        return r.status == 200 && r.body.find("\"id\":1") != std::string::npos;
+    })) << "the submitted job never appeared in /api/v1/jobs";
 
     // /api/v1/jobs should now contain at least job_id=1.
     {

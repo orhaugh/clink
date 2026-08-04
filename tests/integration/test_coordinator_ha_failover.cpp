@@ -36,6 +36,8 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -249,11 +251,15 @@ TEST(CoordinatorHaFailover, StandbyTakesOverAndRecoversJob) {
     ASSERT_GT(submit_pid, 0);
 
     // Wait for first checkpoint on job_id=1 BEFORE the crash.
-    const auto ckpt_deadline = std::chrono::steady_clock::now() + 4s;
-    while (std::chrono::steady_clock::now() < ckpt_deadline &&
-           latest_completed_checkpoint(ckpt_dir, 1) == 0) {
-        std::this_thread::sleep_for(50ms);
-    }
+    //
+    // The bound was 4s, and it is not a bound on the checkpoint interval - it
+    // covers submit, plan, deploy and then the checkpoint. The submit alone takes
+    // about 2.7s on Linux, where a job plugin is 84 MB because it statically
+    // links clink_core, so this asserted before there was a checkpoint and, by
+    // returning early, skipped the process cleanup at the end of the test. ctest
+    // then reported a 300-second timeout instead of the assertion failure.
+    (void)clink::itest::await_condition(
+        [&] { return latest_completed_checkpoint(ckpt_dir, 1) != 0; });
     const auto ckpt_before = latest_completed_checkpoint(ckpt_dir, 1);
     ASSERT_GT(ckpt_before, 0u) << "no checkpoint before failover";
 

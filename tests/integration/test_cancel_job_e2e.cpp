@@ -32,6 +32,8 @@
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -39,6 +41,10 @@ namespace {
 using namespace clink;
 using namespace clink::network;
 using namespace std::chrono_literals;
+
+// Where cancel_test_job's sink writes. Fixed inside the .so, so the test has to
+// know it to tell "the job is running" from "a file an earlier run left behind".
+constexpr const char* kCancelSinkPath = "/tmp/clink_cancel_test_sink";
 
 std::filesystem::path node_binary_path() {
 #ifdef CLINK_NODE_BINARY
@@ -160,6 +166,13 @@ TEST(CancelJobE2E, ClientInitiatedCancelStopsRunningPipeline) {
     }
     std::this_thread::sleep_for(300ms);
 
+    // A previous run's output would make the "is it running yet" wait below
+    // return immediately.
+    {
+        std::error_code ec;
+        std::filesystem::remove(kCancelSinkPath, ec);
+    }
+
     const auto t_submit_start = std::chrono::steady_clock::now();
     const pid_t submit_pid = spawn_proc({"clink_submit_job",
                                          "--job=" + job_so.string(),
@@ -170,12 +183,25 @@ TEST(CancelJobE2E, ClientInitiatedCancelStopsRunningPipeline) {
                                         submit);
     ASSERT_GT(submit_pid, 0);
 
-    // Give the coordinator time to receive SubmitJob, allocate the JobId,
-    // plan + deploy + the workers time to start their subtask runners.
-    // Empirically this needs ~1.5s on dev hardware (the coordinator blocks in
-    // deploy_internal_ until each subtask sends SubtaskListening
-    // before issuing PeerUpdate).
-    std::this_thread::sleep_for(2s);
+    // Wait until the job is not just submitted but RUNNING, by waiting for the
+    // sink to publish. Sleeping a guess at how long submit + plan + deploy +
+    // runner startup takes was the old approach, and the guess - 2s, from macOS
+    // hardware - does not hold on Linux, where a job plugin is 84 MB because it
+    // statically links clink_core and the submit alone takes around 2.7s. The
+    // cancel then arrived before there was anything to cancel.
+    //
+    // The sink path is fixed, so a file left by an earlier run would satisfy
+    // this immediately; it is removed above for that reason.
+    ASSERT_TRUE(clink::itest::await_condition([&] {
+        std::error_code ec;
+        // EXISTENCE, not content. The sink creates its file in open(), which
+        // runs when the subtask starts - that is the "deployed and running"
+        // moment this needs. Waiting for content instead waits for a FLUSH, and
+        // with checkpointing disabled the file sink buffers: measured at about
+        // 28 seconds before the first bytes appeared, which pushed the whole
+        // test past its own wall-clock assertion.
+        return std::filesystem::exists(kCancelSinkPath, ec);
+    })) << "the job never produced output, so it was not running when the cancel was sent";
 
     const pid_t cancel_pid = spawn_proc({"clink_cancel_job",
                                          "--job-id=1",

@@ -27,6 +27,8 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -137,6 +139,11 @@ HttpResult http_request(const std::string& host,
     }
     return r;
 }
+
+// Where cancel_test_job's sink writes. Fixed inside the .so, so a file left by an
+// earlier run has to be cleared before it can be used as a "job is running"
+// signal.
+constexpr const char* kFederationSinkPath = "/tmp/clink_cancel_test_sink";
 
 HttpResult http_get(const std::string& host, std::uint16_t port, const std::string& path) {
     return http_request(host, port, "GET", path);
@@ -315,6 +322,10 @@ TEST(HttpFederation, JobsCancelEndpointCancelsRunningJob) {
     }
 
     ::setenv("CLINK_CANCEL_TICK_MS", "20", 1);
+    {
+        std::error_code ec;
+        std::filesystem::remove(kFederationSinkPath, ec);
+    }
     const pid_t submit_pid =
         spawn_proc({"clink_submit_job",
                     "--job=" + job_so.string(),
@@ -323,9 +334,27 @@ TEST(HttpFederation, JobsCancelEndpointCancelsRunningJob) {
                     "--wait-timeout-s=30"},
                    submit);
     ASSERT_GT(submit_pid, 0);
-    // Let the submitter complete its SubmitJob -> SubmitJobAck round
-    // so the job is registered as id=1 before we POST cancel.
-    std::this_thread::sleep_for(2s);
+    // Wait until the job is RUNNING before POSTing cancel, rather than sleeping a
+    // guess at how long submit + plan + deploy takes. The 2s guess came from
+    // macOS, where a job plugin is about 5 MB; on Linux the same module is 84 MB
+    // because it statically links clink_core and the submit alone takes around
+    // 2.7s, so the cancel arrived for a job that did not exist yet.
+    //
+    // "Registered" is NOT a strong enough condition, which cost a round trip to
+    // discover: GET /api/v1/jobs/1 returns 200 as soon as the JobState exists,
+    // which is before the subtasks are deployed, and a cancel that early left the
+    // submitter running to its own 30s timeout. Waiting for the sink to publish
+    // means the pipeline is actually moving records.
+    ASSERT_TRUE(clink::itest::await_condition([&] {
+        std::error_code ec;
+        // EXISTENCE, not content. The sink creates its file in open(), which
+        // runs when the subtask starts - that is the "deployed and running"
+        // moment this needs. Waiting for content instead waits for a FLUSH, and
+        // with checkpointing disabled the file sink buffers: measured at about
+        // 28 seconds before the first bytes appeared, which pushed the whole
+        // test past its own wall-clock assertion.
+        return std::filesystem::exists(kFederationSinkPath, ec);
+    })) << "the job never produced output, so it was not running when the cancel was sent";
 
     const auto cancel_resp =
         http_post("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1/cancel");
