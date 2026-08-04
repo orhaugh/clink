@@ -4,15 +4,24 @@
 > done against it, the evidence for each claim, and - stated as plainly as
 > the rest - what is still not demonstrated.
 
-**Status date:** 2026-08-03
+**Status date:** 2026-08-04 (round CLOSED - see section 8)
+**Follow-up queue:** 24 prioritised items, kept out of the repository
 **Baseline commit:** `d0b8bd0`
 **Scope:** runtime, scheduler, channels, checkpoint coordinator, state
 backends, SQL binder/planner, connector SPI, coordinator/worker control
 plane, CI.
 
-This document is the working record for the hardening effort. It is kept
-current as items land; an item is only marked Done when its tests have been
-run and the command that ran them is recorded here.
+This document is the working record for the hardening effort. An item is only
+marked Done when its tests have been run and the command that ran them is
+recorded here.
+
+The round is closed. Section 8 states what is demonstrated, what is not, and
+the residual risk. Work that was found and deliberately not done was triaged
+into a prioritised queue held outside this repository, so the gaps recorded
+below are a record of the audit rather than a to-do list. The statuses in
+section 3 are frozen as of the closing date: several items remain Partial
+because they honestly have uncovered parts, and those parts are queued rather
+than pending.
 
 ---
 
@@ -1205,7 +1214,19 @@ that is detectable at the moment the mistake is made rather than at the next
 restore. It needs the owned range plumbed into the backend, which is a bigger
 change than is wise to land unreviewed at the end of a session.
 
-### F39. Four integration failures that only happen on Linux
+### F39. Four integration failures that only happen on Linux — 2 of 4 fixed
+
+**Final status, from a frozen tree (three runs each):** the two side-output
+failures are fixed and pass 3/3. `HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover`
+fails 3/3 and `TwoPhaseCommit.RecoveryCommitsPreCommittedFilesOnRestart` fails
+2/3, both reducing to a restored job not completing. They are carried to the
+follow-up backlog as its first item rather than left implied here.
+
+Three defects were found and fixed underneath those two, so the remaining
+failure is not any of them: the side-output attacher registry, the HA bind
+retry, and the client-connection use-after-free below.
+
+
 
 The full integration label had never been run on Linux. Core suites and the
 gated subset had, which is narrower than "verified on both platforms", and
@@ -3369,3 +3390,147 @@ move the brief forbids. The intended sequence is: convert the fault-relevant
 tests to the harness, establish they pass repeatedly, then split the label
 so the converted subset gates while the remainder stays advisory with a
 named reason and a shrinking list.
+
+---
+
+## 8. Closing assessment
+
+This section closes the round. It states what the engine now demonstrably
+survives, what it does not, and what the remaining risk is. Of the 45 gaps
+named in the sections above, 24 were triaged as work to chase and moved to a
+prioritised queue held outside this repository; the remaining 21 are accepted
+limitations and are named below.
+
+### Why the round is being closed here
+
+The audit never had a stopping condition, and it showed. Twice the test
+surface was widened - first running the whole integration label instead of a
+filtered subset, then running it on Linux - and each widening found real
+defects, so the remaining work grew rather than shrank. Depth-first pursuit of
+each finding was the right instinct for the findings and the wrong shape for
+the engagement: 40 findings and 23 commits in, the status table had barely
+moved, because "Partial" means "has a named gap" and gaps were accumulating
+faster than they closed.
+
+Closing means: no new investigation, the gaps triaged once into chase-or-
+accept, and the conclusions written down. It does not mean the work is
+finished, and the follow-up backlog is the honest expression of that.
+
+### What is demonstrated
+
+Each of these is asserted by a test that has been mutation-checked - the
+assertion was shown to fail when the behaviour it names is broken. That
+qualifier is doing real work: three tests written during this round passed
+against the defect they were written for until the mutation exposed them.
+
+- **Checkpoint integrity.** A truncated, corrupt, or partially-written
+  snapshot is detected and refused rather than restored. Incomplete is
+  distinguished from corrupt, and recovery falls back to the last checkpoint
+  that genuinely completed.
+- **A checkpoint a subtask failed to take is not recorded as complete** (F28),
+  and the recovery point stays where it was.
+- **Completed-checkpoint markers are durable before any sink is told to
+  commit** (F1), and a failure to write one withholds the commit rather than
+  being ignored.
+- **Exactly-once output across a worker kill and across a coordinator
+  failover**, judged by output equality - the full record multiset, checked
+  for duplicates, gaps and unexpected values. This is what found F34, a
+  silent loss of already-published output on every resume.
+- **Keyed state survives a restore intact** (F38), after a defect that gave
+  every operator in a multi-operator job a fraction of the key space and
+  silently discarded the rest at restore.
+- **Cross-sink behaviour under failure** (F35): a job's transactional sinks
+  never disagree about a checkpoint both had passed.
+- **A superseded coordinator cannot act** - fencing epoch on every control
+  frame, enforced worker-side.
+- **Configuration that cannot do what it says is refused at submission**, and
+  checkable before deploying with `clink lint`.
+- **Unbounded SQL state is rejected in the planner** rather than discovered in
+  production.
+- **The control plane refuses malformed and oversized frames** rather than
+  trusting a length prefix, with a committed fuzz corpus replayed on every
+  build.
+
+### What is not demonstrated
+
+- **A restored job completing on Linux.** Two exactly-once-under-failure tests
+  fail there and are not diagnosed. This is the largest single hole and the
+  first follow-up item.
+- **Exactly-once across a rescale.** The method exists and has earned its keep
+  twice; the scenario has not been run.
+- **Any sink other than the file 2PC sink under failure.** Kafka, Postgres and
+  S3 have commit tests, not output-equality runs.
+- **Per-key ordering.** Every output check is a multiset; a recovery that
+  reordered a key's records would pass everything here.
+- **Anything over time.** No soak. State growth, memory stability and
+  reconnection behaviour over hours are untested.
+- **A genuine split brain.** Fencing is tested against a dead leader, not
+  against two live ones.
+- **The data plane.** Every bound, fuzz target and version check in this round
+  covers the control plane. Operator-to-operator Arrow IPC has none of them.
+
+### Residual risk, in order
+
+1. **Recovery on Linux** is not proven end to end. Two tests say so.
+2. **Rescale** touches the key-group arithmetic that F38 showed was wrong, and
+   nothing verifies output equality across one.
+3. **Sinks other than file** carry the delivery guarantee the analyser
+   reports, on the strength of unit tests rather than failure runs.
+4. **The data plane** is the largest unexamined surface in the engine.
+5. **Long-running behaviour** is entirely unknown.
+
+### Verification at close
+
+macOS 26.3 (arm64), Apple clang:
+
+```
+clink_core_tests           1935 ran, 1931 passed, 4 skipped, 0 failed
+clink_sql_tests             984 passed, 0 failed
+ctest -L integration        109/109, three consecutive full sweeps
+```
+
+The skips are platform-gated cases (io_uring, and a jemalloc build assertion),
+not silently disabled tests. Stated as ran/passed/skipped rather than "all
+pass" because the first draft of this line said 1935 pass, which counted test
+NAMES from `--gtest_list_tests` rather than results - the sort of number that
+reads as more coverage than it is.
+
+Debian 13 (x86-64) in the project image, measured at close:
+
+```
+clink_core_tests           1932 passed, 0 failed
+ctest -L integration        107/109
+                            TwoPhaseCommit.RecoveryCommitsPreCommittedFilesOnRestart
+                            HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover
+```
+
+Both failures pass on macOS, and both are follow-up item 1. The label was
+105/109 on Linux when this round first ran it; the two closed since are the
+side-output attacher failures.
+
+The core counts differ between platforms (1931 passing against 1932) because
+each skips cases the other runs - io_uring is Linux-only, and some macOS-only
+paths do not exist in the container. Neither set is the other's subset, which
+is the argument for running both rather than treating one as representative.
+
+Sanitizers: the ASan/TSan/UBSan matrix runs in CI on push. The
+client-connection use-after-free (F39) was confirmed with an ASan stack trace
+and is clean after the fix.
+
+### On production readiness
+
+This work does not make clink production-ready, and nothing in this document
+should be read as saying it does.
+
+What it did was replace a set of assumptions with evidence, in both
+directions. Several things the codebase asserted about itself were false -
+markers were not durable, a `commit_group` did nothing it claimed, five
+config-linter checks could not fire, keyed state restore was broken for every
+multi-operator job. Those are fixed. Other things turned out to be true and
+are now pinned by tests that fail if they stop being true.
+
+The list of what is not demonstrated is longer than the list of what is, and
+the follow-up backlog has 24 items on it. An engine is production-ready when
+an operator can predict how it behaves in the failure modes their deployment
+will actually meet; this round narrowed that gap and documented where it
+remains open.
