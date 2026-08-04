@@ -3026,14 +3026,23 @@ ctest --test-dir build-it -L integration --parallel 1 --timeout 200
        PluginSubmission.CheckpointAndRestoreAcrossJobRuns (F38)
 ```
 
-F38 was then root-caused and fixed, and that case passes - five consecutive
-ctest runs, and it no longer appears in a full-label sweep. What a sweep DOES
-still turn up, in ones and twos and never the same pair, are the pre-harness
-tests that sleep a fixed 200-300ms for process startup: `MultiprocessCluster`,
-`PluginSubmission.ClientShipsPlugin`, `ApplicationModeE2E`. Each passes in
-isolation and fails when 109 multi-process tests run back to back. They are
-not gated, and converting them to condition waits is the remaining work in
-this area rather than a mystery to investigate.
+F38 was then root-caused and fixed, and that case passes.
+
+The sweep then kept turning up one or two failures, never the same pair -
+`MultiprocessCluster`, `PluginSubmission.ClientShipsPlugin`,
+`ApplicationModeE2E`, each passing in isolation in under two seconds. All
+three slept a fixed 200-300ms for coordinator startup; they now poll until
+the port accepts (`tests/integration/await_port.hpp`). Worker registration
+keeps a duration in those tests, because a worker exposes no port and the
+coordinator no HTTP API there, but it is a stated bound rather than a guess.
+
+One more sweep failure was mine and more interesting: the ungrouped
+commit-group case asserted the two sinks' published sets were EQUAL, and a
+sweep produced `sink A {1,35..48}` against `sink B {1,35..49}`. That trailing
+one-checkpoint difference is the window F35 documents as permitted. The test
+asserted a guarantee this document had already recorded as absent, so the
+test was wrong and the engine was right. It now asserts the absence of an
+INTERIOR disagreement instead - see F35.
 
 The integration figure is the one that matters, and it is the first time the
 WHOLE label has been run this round rather than a `--gtest_filter` subset of

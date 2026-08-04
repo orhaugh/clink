@@ -29,6 +29,8 @@
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
+#include "tests/integration/await_port.hpp"
+
 extern char** environ;
 
 namespace {
@@ -159,8 +161,14 @@ TEST(ApplicationModeE2E, AppBinaryStartsCoordinatorRunsJobThenExits) {
                                      app);
     ASSERT_GT(app_pid, 0);
 
-    // Small delay so the coordinator is listening before workers try to connect.
-    std::this_thread::sleep_for(200ms);
+    // Wait for the coordinator to be listening before the workers try to
+    // connect. This was a 200ms delay, which is a guess at how long
+    // clink_app takes to bind - it holds when the test runs alone and loses
+    // in a full-label sweep, where the workers then fail to connect and the
+    // test reports an empty output as though application mode were broken.
+    ASSERT_TRUE(clink::itest::await_port_accepting(port))
+        << "clink_app never bound its coordinator port, so the workers below have nothing to "
+           "register against";
 
     // collision_job_a: from_elements (1 subtask) + map (1 subtask) +
     // sink (1 subtask) = 3 slots. Spawn 3 workers (each defaults to 1 slot).
