@@ -87,7 +87,33 @@ std::string check_restore_compatibility_via_plugins(const std::vector<std::strin
     }
 
     for (const auto& so_path : plugin_so_paths) {
-        void* handle = ::dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        // RTLD_NODELETE, and it is load-bearing.
+        //
+        // Calling clink_job_check_restore_compatibility runs the .so's
+        // build_fn, which REGISTERS factories - std::function closures whose
+        // code lives inside this module - into the process-wide registries.
+        // The dlclose below then used to unmap it, leaving those closures
+        // pointing at nothing, and the caller (recover_persisted_jobs) goes
+        // straight on to submit and deploy that same job. The first call
+        // through one of them jumps into unmapped memory: SIGSEGV with a
+        // garbage PC and no recoverable stack.
+        //
+        // plugin_loader.hpp states the invariant this violated - "dlclose()
+        // with registered std::function closures pointing back into plugin
+        // code is risky without quiescing all in-flight subtasks first" - and
+        // this was the one site doing it.
+        //
+        // Only the RESTORE path reaches here (the function returns early when
+        // restore_from_dir is empty), which is why a normal submission was
+        // unaffected and every recovery crashed the coordinator. Linux only,
+        // because dlclose there really unmaps; macOS kept the pages resident
+        // and the closures kept working.
+        //
+        // NODELETE rather than dropping the dlclose: the refcount is still
+        // managed, the module simply is never unmapped. Matches the "keep
+        // plugins loaded for the process lifetime" policy the loader already
+        // documents.
+        void* handle = ::dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
         if (handle == nullptr) {
             continue;  // a connector .so we can't load; the job .so is what matters
         }
