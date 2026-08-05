@@ -53,6 +53,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -123,6 +125,13 @@ public:
                  << (i * 8);
         }
         counter_ = static_cast<std::int64_t>(u);
+        // Half of the follow-up-44 diagnostic. Its signature is a keyed counter
+        // one too HIGH, which means the operator re-processed a record whose
+        // increment was already in the restored state - i.e. this offset came back
+        // BEHIND the state. Printing it means a single failing run says which side
+        // is wrong, instead of another round of inference. Goes to stderr because
+        // the harness captures each worker's output and dumps it on failure.
+        std::cerr << "RXO-DIAG source restored offset=" << counter_ << "\n";
         return true;
     }
 
@@ -192,7 +201,23 @@ public:
             // ascending index order.
             const std::int64_t expected_before = idx / keys_;
             const auto stored = state_->get(key).value_or(0);
+            // The first value this subtask ever sees for a key is what the RESTORE
+            // produced for it; everything after is this subtask's own counting. On
+            // a mismatch that single number decides between "the restore handed us
+            // state that was already ahead" and "we counted a record twice while
+            // running", which is the question follow-up 44 is stuck on.
+            if (baseline_.find(key) == baseline_.end()) {
+                baseline_[key] = stored;
+            }
+            if (first_idx_seen_ < 0) {
+                first_idx_seen_ = idx;
+                std::cerr << "RXO-DIAG operator first record after open: idx=" << idx << "\n";
+            }
             if (stored != expected_before) {
+                std::cerr << "RXO-DIAG mismatch key=" << key << " idx=" << idx << " got=" << stored
+                          << " want=" << expected_before
+                          << " restored_baseline_for_key=" << baseline_[key]
+                          << " first_idx_after_open=" << first_idx_seen_ << "\n";
                 // State was lost (stored too low) or duplicated (too high).
                 // Emitted rather than logged so the test's output comparison
                 // reports it, with the key and both numbers.
@@ -213,6 +238,9 @@ public:
 private:
     std::int64_t keys_;
     std::optional<clink::KeyedState<std::int64_t, std::int64_t>> state_;
+    // Diagnostic only - see the mismatch branch in process().
+    std::map<std::int64_t, std::int64_t> baseline_;
+    std::int64_t first_idx_seen_{-1};
 };
 
 std::string env_or(const char* name, const char* fallback) {
