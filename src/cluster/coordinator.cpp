@@ -3738,6 +3738,53 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
                 // deploy, so there is nothing of its to restore. The key-group
                 // range from the planner still applies.
             }
+        } else if (restore_needs_pre_rescale_layout(!job.stale_layout_blocks.empty(),
+                                                    job.latest_completed_checkpoint_id,
+                                                    job.stale_layout_through)) {
+            // A plain restart whose restore point is still a PRE-rescale
+            // checkpoint. Not a replan, so without this every task would take the
+            // default "restore from my own index" - into a directory that belongs
+            // to whichever operator held that index under the old layout. The
+            // translation is the same one the replan does, against the layout
+            // retained at that replan.
+            auto ident = new_op_identity.find(key);
+            if (ident == new_op_identity.end() || ident->second.op_id.empty()) {
+                ident = job.task_op_identity.find(key);
+            }
+            if (ident != job.task_op_identity.end() && !ident->second.op_id.empty()) {
+                const auto& op_id = ident->second.op_id;
+                const auto idx_in_op = ident->second.subtask_idx_in_op;
+                const auto stale = job.stale_layout_blocks.find(op_id);
+                std::uint32_t new_p = 0;
+                if (const auto it = new_op_parallelism.find(op_id);
+                    it != new_op_parallelism.end()) {
+                    new_p = it->second;
+                } else {
+                    // Not replanning, so the current deployed parallelism for this
+                    // operator is what the tasks describe.
+                    for (const auto& [other_key, other] : job.task_op_identity) {
+                        if (other.op_id == op_id) {
+                            new_p = std::max(new_p, other.subtask_idx_in_op + 1);
+                        }
+                    }
+                }
+                if (stale != job.stale_layout_blocks.end() && stale->second.parallelism != 0 &&
+                    new_p != 0) {
+                    const auto mapping =
+                        rescale_parent_mapping(stale->second.parallelism, new_p, idx_in_op);
+                    if (mapping.ok) {
+                        d.restore_from_subtask_idx = stale->second.base + mapping.parent_idx;
+                        d.restore_from_parent_count = mapping.parent_count;
+                    } else {
+                        log::warn("coordinator.restart",
+                                  "job_id=" + std::to_string(job.id) + " op_id=" + op_id +
+                                      " subtask " + std::to_string(idx_in_op) +
+                                      ": restoring from a pre-rescale checkpoint but no parent "
+                                      "mapping (" +
+                                      mapping.error + "); this subtask starts with EMPTY state");
+                    }
+                }
+            }
         } else if (is_rescale) {
             auto ov = job.rescale_overrides.find(k.role);
             auto old = job.pre_rescale_parallelism.find(k.role);
@@ -3814,6 +3861,19 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
                 " tasks=" + std::to_string(tasks_to_redeploy.size()) +
                 " restore_from_checkpoint=" + std::to_string(job.latest_completed_checkpoint_id) +
                 " topology_version=" + std::to_string(job.topology_version));
+        // Retain the layout that produced the checkpoint we are restoring from.
+        // The restore point is still a PRE-rescale checkpoint until one completes
+        // under the new topology, and a restart before that is not a replan - it
+        // would fall back to "restore from my own index" and read a directory that
+        // belongs to a different operator. See JobState::stale_layout_blocks.
+        job.stale_layout_blocks.clear();
+        for (const auto& [op_id, block] : old_op_blocks) {
+            if (block.consistent && block.base_set && block.parallelism != 0) {
+                job.stale_layout_blocks[op_id] =
+                    JobState::StaleBlock{.base = block.base, .parallelism = block.parallelism};
+            }
+        }
+        job.stale_layout_through = job.latest_completed_checkpoint_id;
         job.pending_op_parallelism.clear();
         job.pre_rescale_op_parallelism.clear();
     }
@@ -4788,6 +4848,15 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r) {
             job.failed_checkpoint_acks.erase(msg.checkpoint_id);
             job.latest_completed_checkpoint_id =
                 std::max(job.latest_completed_checkpoint_id, msg.checkpoint_id);
+            // The restore point has moved past the last rescale, so every
+            // subtask's own directory now holds state written under the CURRENT
+            // layout and the retained pre-rescale translation is not only
+            // unnecessary but wrong. Drop it.
+            if (!job.stale_layout_blocks.empty() &&
+                job.latest_completed_checkpoint_id > job.stale_layout_through) {
+                job.stale_layout_blocks.clear();
+                job.stale_layout_through = 0;
+            }
             just_completed.emplace_back(msg.job_id, msg.checkpoint_id);
             completed_marker_dir = job.checkpoint.checkpoint_dir;
             job.pending_checkpoint_acks.erase(ckpt_it);

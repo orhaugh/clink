@@ -551,3 +551,70 @@ TEST(StateBackendFactory, TheBeforeRestoreFaultPointFiresOnBothRestorePaths) {
     std::filesystem::remove_all(dir);
 #endif
 }
+
+// Scale-down merge, modelled on the shape the integration test actually runs:
+// four parents each owning a disjoint slice of a 12-key space, folded into one
+// subtask that owns all of them.
+//
+// Follow-up 44 reports a counter one too high after exactly this rescale
+// (STATE-MISMATCH-key5-at41-got4-want3). The merge is the first thing to rule in or
+// out, and it can be ruled on deterministically here rather than by re-running a
+// multi-process test that fails about one time in thirty.
+TEST(StateBackendFactory, ScaleDownMergeKeepsEveryParentsCountExactly) {
+    const auto base = make_temp_dir("scale_down_merge");
+    const std::uint64_t ckpt_id = 30;
+    const clink::OperatorId op{7};
+    constexpr int kKeys = 12;
+    constexpr int kParents = 4;
+
+    // Key k belongs to parent k % kParents, mirroring a key-group split. Its value
+    // is the count of records seen for that key, which is what the job's operator
+    // self-check compares against.
+    const auto expected_count = [](int key) { return 3 + key; };
+
+    for (int p = 0; p < kParents; ++p) {
+        clink::InMemoryStateBackend backend;
+        for (int key = 0; key < kKeys; ++key) {
+            if (key % kParents != p) {
+                continue;
+            }
+            backend.put(op,
+                        clink::StateBackend::KeyView{"key" + std::to_string(key)},
+                        clink::StateBackend::ValueView{std::to_string(expected_count(key))});
+        }
+        auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(
+            base / std::to_string(p + 1) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+            snap.bytes,
+            ckpt_id);
+    }
+
+    // One new subtask inheriting all four parents (global indices 1..4).
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 1;
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = ckpt_id;
+    spec.restore_from_subtask_idx = 1;
+    spec.restore_from_parent_count = kParents;
+
+    auto built = clink::StateBackendFactory::default_instance().build(spec);
+    ASSERT_NE(built.backend, nullptr);
+    ASSERT_TRUE(built.restore_from.has_value()) << "the scale-down restored nothing at all";
+    built.backend->restore(*built.restore_from);
+
+    for (int key = 0; key < kKeys; ++key) {
+        const auto got =
+            built.backend->get(op, clink::StateBackend::KeyView{"key" + std::to_string(key)});
+        ASSERT_TRUE(got.has_value())
+            << "key" << key << " (owned by parent " << (key % kParents)
+            << ") is absent after the merge - a scale-down dropped a parent's slice";
+        const std::string got_str(reinterpret_cast<const char*>(got->data()), got->size());
+        EXPECT_EQ(got_str, std::to_string(expected_count(key)))
+            << "key" << key
+            << " came back with the wrong count after the merge. A value one too "
+               "high is the signature reported in follow-up 44.";
+    }
+
+    std::filesystem::remove_all(base);
+}

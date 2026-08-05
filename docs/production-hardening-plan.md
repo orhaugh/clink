@@ -2121,6 +2121,48 @@ with no exclusion, and hiding a ~1-in-20 state-correctness failure to keep the g
 green is exactly the trade this workstream exists to stop making. The gate will be
 red until this is fixed, which is the honest signal.
 
+### F63. A restart just after a rescale restored by raw index into the old layout
+
+Found by reading while hunting F62, and provable without running anything.
+
+A rescale redeploys from `latest_completed_checkpoint_id`, and that id still names a
+PRE-rescale checkpoint until one completes under the new topology. The replan path
+handles this correctly: it gives EVERY task an explicit restore directive, translating
+(operator, index-within-operator) back through the operator's old block base, because
+the planner allocates one contiguous block per operator in graph order and resizing one
+operator moves every later block.
+
+But `pending_op_parallelism` and `pre_rescale_op_parallelism` were both cleared the
+moment the replan succeeded. A RESTART landing in the window before the first
+post-rescale checkpoint is not a replan, so every task fell back to the default
+"restore from my own subtask index" - into the directory of whichever operator held
+that index under the OLD layout. Scaling `counter` 4->1 in source -> counter -> sink
+moves the sink from index 5 to index 2, so the sink would restore old counter subtask
+1's keyed state and NONE of its own 2PC commit handles.
+
+The header comment on `task_op_identity` already states the invariant this breaks - "a
+replanned task cannot restore from its own index" - and the same is true of a restarted
+one until the restore point moves past the rescale. Third instance of the same root
+cause, after F38 (index arithmetic) and F59 (index aliasing on write): **a job-global
+subtask index is not stable across a topology change, and anything that addresses state
+by it must be translated.**
+
+Fixed by retaining the old layout at replan time (`JobState::stale_layout_blocks`,
+valid through the rescale's restore point) and translating restarts through it until a
+checkpoint completes above that id, at which point it is dropped because each subtask's
+own directory is then correct.
+
+**On evidence.** The translation itself is `rescale_parent_mapping`, already tested
+exhaustively. The new logic is the guard deciding when to apply it, so that is a pure
+predicate (`restore_needs_pre_rescale_layout`) tested over all eight cases including
+the two boundaries - the restore point exactly AT the rescale, and one past it -
+and mutation-checked. The window is short and timing-dependent, so a multi-process
+test could only enter it by luck, which is not evidence; the same reasoning as
+`ha_should_refuse_leadership`.
+
+This is NOT the cause of F62: it produces missing or foreign state, whereas F62's
+signature is a counter one too HIGH.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

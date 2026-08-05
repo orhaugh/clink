@@ -69,6 +69,40 @@ struct RescaleParentMapping {
                                                           std::uint32_t new_parallelism,
                                                           std::uint32_t subtask_idx_in_op);
 
+// Must a RESTART translate its restore through the layout that existed before the
+// last rescale?
+//
+// A rescale redeploys from latest_completed_checkpoint_id, and that id still names
+// a PRE-rescale checkpoint until one completes under the new topology. A restart
+// inside that window is not a replan, so every task would otherwise fall back to
+// "restore from my own subtask index" - and the directory at that index holds the
+// state of whichever operator occupied it under the OLD layout, because the planner
+// allocates one contiguous block per operator in graph order and resizing one
+// operator moves every later block. Same class as F38 and F59: an index reused
+// across a topology change.
+//
+// Pulled out so the guard can be tested exhaustively without a cluster; the
+// translation it guards is rescale_parent_mapping above, which already is. The
+// window it describes is short and timing-dependent, so a multi-process test could
+// only hit it by luck.
+[[nodiscard]] inline bool restore_needs_pre_rescale_layout(
+    bool have_retained_layout,
+    std::uint64_t latest_completed_checkpoint_id,
+    std::uint64_t layout_valid_through) noexcept {
+    if (!have_retained_layout) {
+        return false;
+    }
+    if (latest_completed_checkpoint_id == 0) {
+        // Nothing completed: there is no state to restore, so no translation
+        // applies and an empty restore is correct.
+        return false;
+    }
+    // Strictly at or below the rescale's restore point. Once a checkpoint completes
+    // above it, every subtask's own directory holds state written under the CURRENT
+    // layout and translating would read the wrong one.
+    return latest_completed_checkpoint_id <= layout_valid_through;
+}
+
 struct CutoverDeployment {
     // (worker_id, DeploymentTask). Each entry is one new-parallelism
     // subtask placed on the given worker. role / extra_config / peers are

@@ -810,6 +810,26 @@ private:
         // operator.
         std::unordered_map<std::string, std::uint32_t> pending_op_parallelism;
         std::unordered_map<std::string, std::uint32_t> pre_rescale_op_parallelism;
+        // The operator->block layout that produced every checkpoint at or before
+        // `stale_layout_through`, retained AFTER a replan rather than discarded.
+        //
+        // Why it has to outlive the replan. A rescale redeploys from
+        // latest_completed_checkpoint_id, and that id still names a PRE-rescale
+        // checkpoint until one completes under the new topology. A restart inside
+        // that window is not a replan-rescale, so every task would fall back to
+        // "restore from my own subtask index" - and the directory at that index
+        // holds the state of whichever operator occupied it under the OLD layout,
+        // because the planner allocates one contiguous block per operator in graph
+        // order and resizing one operator moves every later block. The comment
+        // above says a replanned task cannot restore from its own index; the same
+        // is true of a RESTARTED task until the restore point moves past the
+        // rescale. Cleared when a checkpoint completes above that id.
+        struct StaleBlock {
+            std::uint32_t base{};
+            std::uint32_t parallelism{};
+        };
+        std::unordered_map<std::string, StaleBlock> stale_layout_blocks;
+        std::uint64_t stale_layout_through{0};
         // Which operator each deployed task hosts, keyed like task_records
         // ("role:subtask_idx"). Populated at every deploy from the plan.
         //

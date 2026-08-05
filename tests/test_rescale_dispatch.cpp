@@ -301,3 +301,38 @@ TEST(PlanOperatorCutover, ClonesTemplatePeersIntoEveryNewSubtask) {
 
 }  // namespace
 }  // namespace clink::cluster
+
+// When a RESTART must translate its restore through the pre-rescale layout.
+//
+// The window: a rescale redeploys from latest_completed_checkpoint_id, and that id
+// still names a PRE-rescale checkpoint until one completes under the new topology.
+// A restart inside it is not a replan, so without this guard every task falls back
+// to "restore from my own subtask index" - into a directory holding the state of
+// whichever operator occupied that index under the OLD layout. Same class as F38
+// and F59: an index reused across a topology change.
+//
+// Exhaustive here because the window itself is short and timing-dependent; a
+// multi-process test could only enter it by luck, which is not evidence. The
+// translation this guards is rescale_parent_mapping, tested above.
+TEST(RestorePreRescaleLayout, TranslatesOnlyWhileTheRestorePointPredatesTheRescale) {
+    // No retained layout: nothing to translate, whatever the ids say.
+    EXPECT_FALSE(clink::cluster::restore_needs_pre_rescale_layout(false, 10, 10));
+    EXPECT_FALSE(clink::cluster::restore_needs_pre_rescale_layout(false, 1, 99));
+
+    // Retained, and the restore point is the rescale's own - the case that was
+    // silently corrupting state.
+    EXPECT_TRUE(clink::cluster::restore_needs_pre_rescale_layout(true, 20, 20));
+    // Retained, and the restore point is older still (an earlier checkpoint was
+    // chosen because the newest failed verification).
+    EXPECT_TRUE(clink::cluster::restore_needs_pre_rescale_layout(true, 12, 20));
+
+    // A checkpoint has completed under the NEW topology, so each subtask's own
+    // directory is now correct and translating would read the wrong one.
+    EXPECT_FALSE(clink::cluster::restore_needs_pre_rescale_layout(true, 21, 20));
+    EXPECT_FALSE(clink::cluster::restore_needs_pre_rescale_layout(true, 99, 20));
+
+    // Nothing has completed at all: there is no state to restore, so an empty
+    // restore is right and a translation would invent a parent.
+    EXPECT_FALSE(clink::cluster::restore_needs_pre_rescale_layout(true, 0, 20));
+    EXPECT_FALSE(clink::cluster::restore_needs_pre_rescale_layout(true, 0, 0));
+}
