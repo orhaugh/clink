@@ -157,3 +157,60 @@ TEST(HaCoordinator, BecomesLeaderCallbackFiresOnAcquire) {
     EXPECT_TRUE(wait_for([&] { return seen_epoch.load() >= 1; }, kHaWait));
     c->stop();
 }
+
+// The lock-honoured probe, and the decision it feeds.
+//
+// Why this exists. Leadership IS an fcntl write lock on <ha_dir>/leader.lock, so
+// every fencing guarantee in this file rests on the filesystem refusing that lock
+// to a second process. On a filesystem that does not implement locking, every
+// coordinator's acquire succeeds, each announces a higher epoch than the last, and
+// there is no error anywhere - just two live leaders. That was reproduced by
+// accident on a macOS Docker bind mount: coordinator A at epoch 1 and B at epoch 2,
+// both serving, while both HA tests here passed the moment the directory moved back
+// to a real filesystem.
+
+// The probe must AGREE with reality on a filesystem that does work. A probe that
+// returned "unsafe" here would take every correctly configured cluster offline, so
+// this is the assertion that makes the refusal safe to ship.
+TEST(HaCoordinator, TheProbeFindsAWorkingFilesystemSafeAndLeadershipStillHappens) {
+    const auto dir = fresh_ha_dir();
+    auto c = make_file_ha_coordinator(dir.string(), {"127.0.0.1", 6401, 0, 0}, 50ms);
+    std::atomic<std::uint64_t> seen{0};
+    c->set_on_become_leader([&](std::uint64_t e) { seen.store(e, std::memory_order_release); });
+    c->start();
+    EXPECT_TRUE(wait_for([&] { return seen.load(std::memory_order_acquire) >= 1; }, kHaWait))
+        << "leadership was never acquired on a filesystem whose locks do work, which means the "
+           "probe wrongly condemned it";
+    c->stop();
+}
+
+// The probe leaves nothing behind. It creates <ha_dir>/.lock-probe, and a stray
+// probe file would be read by an operator as cluster state.
+TEST(HaCoordinator, TheProbeRemovesItsOwnProbeFile) {
+    const auto dir = fresh_ha_dir();
+    auto c = make_file_ha_coordinator(dir.string(), {"127.0.0.1", 6402, 0, 0}, 50ms);
+    c->start();
+    std::atomic<bool> unused{false};
+    (void)unused;
+    c->stop();
+    EXPECT_FALSE(std::filesystem::exists(dir / ".lock-probe"))
+        << "the lock probe left its file in the HA directory";
+}
+
+// The decision, exhaustively. A filesystem is only condemned when the probe PROVED
+// it grants the lock twice; an inconclusive probe must not, because the probe comes
+// back inconclusive in the normal case of two coordinators starting at once, and
+// treating that as unsafe would refuse leadership to a healthy cluster.
+TEST(HaCoordinator, OnlyAProvenUnsafeFilesystemRefusesLeadership) {
+    EXPECT_TRUE(ha_should_refuse_leadership(false, false))
+        << "a filesystem proven not to honour the lock must not host leadership";
+    EXPECT_FALSE(ha_should_refuse_leadership(true, false));
+    EXPECT_FALSE(ha_should_refuse_leadership(std::nullopt, false))
+        << "an inconclusive probe condemned a filesystem it never measured; two coordinators "
+           "starting together produce exactly this verdict";
+
+    // The override accepts the risk knowingly, so it must win in every case.
+    EXPECT_FALSE(ha_should_refuse_leadership(false, true));
+    EXPECT_FALSE(ha_should_refuse_leadership(true, true));
+    EXPECT_FALSE(ha_should_refuse_leadership(std::nullopt, true));
+}

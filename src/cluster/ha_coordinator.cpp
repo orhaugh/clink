@@ -9,11 +9,14 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include <sys/file.h>
+#include <sys/wait.h>
 
 // For metadata_write_allowed: the epoch rule this file now shares with the
 // coordinator's metadata writes, so the two cannot drift apart.
@@ -32,14 +35,127 @@ std::int64_t unix_ms_now() {
         .count();
 }
 
+// Does this directory's filesystem actually honour POSIX write locks between
+// processes?
+//
+// Leadership here IS an fcntl write lock on <ha_dir>/leader.lock, so the whole
+// fencing scheme rests on one assumption: that a second process asking for the
+// same lock is refused. On a filesystem that does not implement locking, every
+// coordinator's F_SETLK "succeeds", every one of them believes it leads, and each
+// announces a higher epoch than the last. That is a silent split brain - not a
+// crash, not a refusal, just two live leaders and workers registering with
+// whichever they read last.
+//
+// It is not a hypothetical. It was reproduced by accident on a macOS Docker bind
+// mount while chasing something else: two coordinators sharing one HA directory
+// took leadership at epoch 1 and epoch 2 simultaneously, and the only visible
+// symptom was the superseded one logging refusals. Anyone putting an HA directory
+// on a bind mount, an NFS export with locking disabled, or a 9p/virtiofs share
+// gets the same, and gets no warning.
+//
+// The probe has to fork, because POSIX record locks are per-PROCESS: a second
+// descriptor in this process would simply replace our own lock and report success
+// on any filesystem, which measures nothing. The child does nothing but open,
+// fcntl and _exit - no allocation, no logging, no locks inherited from the parent
+// - so forking from a process that already has threads is safe here.
+//
+// Returns nullopt when the probe itself could not run (the parent's own lock
+// failed, or fork failed). That is inconclusive, not a verdict, and is treated as
+// such by the caller: an unusable probe must not condemn a working filesystem.
+std::optional<bool> filesystem_honours_locks(const std::string& ha_dir) {
+    const std::string probe_path = ha_dir + "/.lock-probe";
+    // The child may only use syscalls, so its path argument is built here.
+    const std::vector<char> probe_cstr(probe_path.begin(), probe_path.end() + 1);
+
+    const int fd = ::open(probe_path.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        return std::nullopt;
+    }
+    struct flock fl{};
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    if (::fcntl(fd, F_SETLK, &fl) != 0) {
+        // Something else holds it - another coordinator probing concurrently, most
+        // likely. Inconclusive rather than a failure.
+        ::close(fd);
+        return std::nullopt;
+    }
+
+    const pid_t child = ::fork();
+    if (child < 0) {
+        ::close(fd);
+        std::error_code ec;
+        std::filesystem::remove(probe_path, ec);
+        return std::nullopt;
+    }
+    if (child == 0) {
+        // Syscalls only from here.
+        const int cfd = ::open(probe_cstr.data(), O_RDWR);
+        if (cfd < 0) {
+            ::_exit(2);
+        }
+        struct flock cfl{};
+        cfl.l_type = F_WRLCK;
+        cfl.l_whence = SEEK_SET;
+        cfl.l_start = 0;
+        cfl.l_len = 0;
+        // 0 means the lock was GRANTED while the parent holds it, which is the
+        // broken case.
+        ::_exit(::fcntl(cfd, F_SETLK, &cfl) == 0 ? 0 : 1);
+    }
+
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+    fl.l_type = F_UNLCK;
+    (void)::fcntl(fd, F_SETLK, &fl);
+    ::close(fd);
+    std::error_code ec;
+    std::filesystem::remove(probe_path, ec);
+
+    if (!WIFEXITED(status)) {
+        return std::nullopt;
+    }
+    switch (WEXITSTATUS(status)) {
+        case 0:
+            return false;  // granted to a second process: locking is not honoured
+        case 1:
+            return true;  // refused, as it must be
+        default:
+            return std::nullopt;  // the child could not open the probe
+    }
+}
+
+}  // namespace
+
+// Separated from the probe so the decision can be tested exhaustively without a
+// filesystem that lacks locking - there is no way to conjure one of those in a
+// unit test, and a test-only hook in the product would be worse than the gap.
+//
+// Only a PROVEN-unsafe filesystem refuses. An inconclusive probe must not condemn
+// a working one: the probe fails inconclusively when another coordinator holds the
+// probe file, which is normal during a concurrent start.
+bool ha_should_refuse_leadership(std::optional<bool> locks_honoured, bool allow_unsafe) {
+    if (allow_unsafe) {
+        return false;
+    }
+    return locks_honoured.has_value() && !*locks_honoured;
+}
+
+namespace {
+
 class FileHaCoordinator final : public HaCoordinator {
 public:
     FileHaCoordinator(std::string ha_dir,
                       LeaderEndpoint advertise,
-                      std::chrono::milliseconds poll_interval)
+                      std::chrono::milliseconds poll_interval,
+                      bool allow_unsafe_locks)
         : ha_dir_(std::move(ha_dir)),
           advertise_(std::move(advertise)),
-          poll_interval_(poll_interval) {
+          poll_interval_(poll_interval),
+          allow_unsafe_locks_(allow_unsafe_locks) {
         std::error_code ec;
         std::filesystem::create_directories(ha_dir_, ec);
         if (ec) {
@@ -54,6 +170,29 @@ public:
         bool expected = false;
         if (!started_.compare_exchange_strong(expected, true))
             return;
+        // Once, before the poll loop can acquire anything. A filesystem that does
+        // not honour the lock cannot host leadership at all, so finding out after
+        // taking it would be too late.
+        const auto honoured = filesystem_honours_locks(ha_dir_);
+        refuse_leadership_ = ha_should_refuse_leadership(honoured, allow_unsafe_locks_);
+        if (refuse_leadership_) {
+            clink::log::error(
+                "coordinator.ha",
+                "refusing to stand for leadership: " + ha_dir_ +
+                    " is on a filesystem that GRANTED the leader lock to a second process while "
+                    "this one held it, so the lock cannot fence anything and two coordinators "
+                    "would both believe they lead. Put the HA directory on a local filesystem, "
+                    "or on a network filesystem with locking enabled; bind mounts, 9p/virtiofs "
+                    "shares and NFS exports mounted nolock are the usual causes. Pass "
+                    "--ha-allow-unsafe-locks to proceed anyway and accept the risk of split "
+                    "brain.");
+        } else if (honoured.has_value() && !*honoured) {
+            clink::log::warn("coordinator.ha",
+                             ha_dir_ +
+                                 " does not honour POSIX write locks and "
+                                 "--ha-allow-unsafe-locks was given: leadership is NOT fenced, "
+                                 "and two coordinators may both believe they lead.");
+        }
         poll_thread_ = std::thread([this] { poll_loop_(); });
     }
 
@@ -99,6 +238,13 @@ private:
 
     void poll_loop_() {
         while (!stop_.load(std::memory_order_acquire)) {
+            if (refuse_leadership_) {
+                // A standby that will never stand. It still serves
+                // current_leader_endpoint() so a worker can be told where the
+                // leader is; it simply never claims to be one.
+                std::this_thread::sleep_for(poll_interval_);
+                continue;
+            }
             if (!is_leader()) {
                 try_acquire_();
             } else {
@@ -269,6 +415,9 @@ private:
     int lock_fd_{-1};
     std::thread poll_thread_;
     std::atomic<bool> started_{false};
+    // Set once in start(), read only by the poll loop it starts afterwards.
+    bool allow_unsafe_locks_{false};
+    bool refuse_leadership_{false};
     std::atomic<bool> stop_{false};
     std::atomic<bool> is_leader_{false};
     std::atomic<std::uint64_t> epoch_{0};
@@ -280,9 +429,10 @@ private:
 
 std::unique_ptr<HaCoordinator> make_file_ha_coordinator(std::string ha_dir,
                                                         LeaderEndpoint advertise,
-                                                        std::chrono::milliseconds poll_interval) {
+                                                        std::chrono::milliseconds poll_interval,
+                                                        bool allow_unsafe_locks) {
     return std::make_unique<FileHaCoordinator>(
-        std::move(ha_dir), std::move(advertise), poll_interval);
+        std::move(ha_dir), std::move(advertise), poll_interval, allow_unsafe_locks);
 }
 
 }  // namespace clink::cluster

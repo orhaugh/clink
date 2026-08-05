@@ -84,9 +84,25 @@ public:
 // auto-released by the OS when the holding process exits or crashes.
 // `advertise_endpoint` is the host:port this coordinator would publish if it
 // became leader (used by the worker's discovery). Pass empty for workers.
+//
+// On start() the coordinator PROVES the filesystem honours that lock, by holding it
+// and having a forked child ask for the same one. A filesystem that grants both
+// cannot fence anything: every coordinator sharing the directory believes it leads,
+// and the only symptom is the superseded ones logging refusals. Reproduced on a
+// macOS Docker bind mount; NFS mounted nolock and 9p/virtiofs shares behave the
+// same. Such a coordinator refuses to stand for leadership unless
+// `allow_unsafe_locks` is set, in which case it warns and proceeds.
 std::unique_ptr<HaCoordinator> make_file_ha_coordinator(
     std::string ha_dir,
     LeaderEndpoint advertise_endpoint = {},
-    std::chrono::milliseconds poll_interval = std::chrono::milliseconds{200});
+    std::chrono::milliseconds poll_interval = std::chrono::milliseconds{200},
+    bool allow_unsafe_locks = false);
+
+// Whether a coordinator must decline leadership, given the probe's verdict.
+// `locks_honoured` is nullopt when the probe could not run, which is inconclusive
+// and must NOT condemn a working filesystem. Exposed for testing: the refusal
+// decision is coverable exhaustively, whereas a filesystem without locking cannot
+// be conjured in a unit test.
+bool ha_should_refuse_leadership(std::optional<bool> locks_honoured, bool allow_unsafe);
 
 }  // namespace clink::cluster

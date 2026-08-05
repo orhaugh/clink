@@ -1977,7 +1977,14 @@ int run_coordinator(int argc, char** argv) {
             return 1;
 #endif
         } else {
-            ha_coord = clink::cluster::make_file_ha_coordinator(ha_dir, advertise);
+            // The default is to refuse leadership on a filesystem that does not
+            // honour the leader lock, because the alternative is a silent split
+            // brain. --ha-allow-unsafe-locks accepts that risk deliberately.
+            ha_coord = clink::cluster::make_file_ha_coordinator(
+                ha_dir,
+                advertise,
+                std::chrono::milliseconds{200},
+                has_flag(argc, argv, "ha-allow-unsafe-locks"));
         }
         ha_coord->set_on_become_leader(
             [&coordinator, want_port, advertise_host, sql_catalog_dir](std::uint64_t epoch) {
@@ -2998,6 +3005,13 @@ int main(int argc, char** argv) {
                 << "  --watchdog-interval-ms=<n>   worker-liveness poll cadence (default 200).\n"
                 << "  --max-client-connections=<n> concurrent client connections (default 256).\n"
                 << "  --max-worker-connections=<n> concurrent worker connections (default 1024).\n"
+                << "  --ha-allow-unsafe-locks      Stand for leadership even when --ha-dir is on "
+                   "a\n"
+                   "                               filesystem that does not honour the leader "
+                   "lock.\n"
+                   "                               Without it such a coordinator refuses, because "
+                   "the\n"
+                   "                               lock cannot fence and two would both lead.\n"
                 << "\n"
                 << "Logging flags:\n"
                 << "  --log-level=<lvl>            trace|debug|info|warn|error|off "
