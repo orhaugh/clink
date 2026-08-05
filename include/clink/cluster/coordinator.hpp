@@ -1045,6 +1045,13 @@ private:
     void start_reader_for_(std::shared_ptr<WorkerConnection> worker);
     void watchdog_loop_();
     void mark_worker_lost_locked_(WorkerConnection& worker);
+    // Shared by mark_worker_lost_locked_ and retire_previous_session_subtasks_:
+    // a worker's in-flight subtasks are dead either way, and both must fold them
+    // into an in-progress restart or start one. See F64.
+    void fold_dead_subtasks_into_restart_locked_(JobState& job,
+                                                 const std::string& worker_id,
+                                                 const char* log_channel,
+                                                 const std::string& cause);
 
     // Fold a re-registered worker's PREVIOUS session's in-flight subtasks
     // into any restart drain that is waiting on them. The old process is

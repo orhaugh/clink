@@ -2163,7 +2163,7 @@ test could only enter it by luck, which is not evidence; the same reasoning as
 This is NOT the cause of F62: it produces missing or foreign state, whereas F62's
 signature is a counter one too HIGH.
 
-### F64. A worker killed and restarted immediately leaves the job hung
+### F64. A worker killed and restarted immediately left the job hung
 
 Found while writing the side-output failure test (W22 / follow-up 14), which
 originally killed a worker and brought it straight back.
@@ -2178,15 +2178,39 @@ onto the survivor, so this path had no coverage at all. A worker that dies and i
 restarted quickly is not an exotic case - it is what a container orchestrator does
 by default.
 
-The hypothesis from that one log is that the re-registration arrives before the
-coordinator has processed the loss, "previous session retired" drops the old
-session's task records, and nothing then marks those subtasks lost. It is a guess
-from a single observation and is recorded as such (follow-up 46) rather than fixed
-on the strength of it. What is not in doubt is the OUTCOME: the job hung
-indefinitely instead of recovering or failing.
+**Confirmed and fixed.** The hypothesis held exactly.
+`retire_previous_session_subtasks_` folded the dead session's subtasks into a
+restart only when one was ALREADY in progress:
 
-Not worked around in the side-output test, which now uses the kill-and-leave-dead
-pattern so that it measures side outputs rather than this.
+    if (!job->awaiting_restart || job->completion_signalled || job->cancel_requested)
+        continue;
+
+A worker that died and returned BEFORE the coordinator noticed skipped that branch
+entirely, and the watchdog would never declare it lost afterwards because it is
+alive and heartbeating under the same id. Nothing was left to redeploy those
+subtasks, so the job hung.
+
+Meanwhile `mark_worker_lost_locked_` handled BOTH cases - fold into an in-progress
+restart, or start one. The two paths had diverged: the same event (a worker's
+in-flight subtasks are dead) reached different code depending on how it was
+discovered. The per-job logic is now one shared helper,
+`fold_dead_subtasks_into_restart_locked_`, used by both, so they cannot drift apart
+again. It takes the cause as a parameter, because "worker lost (heartbeat timeout)"
+is untrue of a worker that is alive and has just come back.
+
+**On the test, and a mistake worth recording.** The first version asserted that the
+submitter exited. It PASSED without the fix - in 126 seconds against the fixed
+build's 37, because the submitter's own `--wait-timeout-s` ran out. An assertion a
+child's own timeout can satisfy measures nothing, which is exactly the pattern F58
+and `scripts/check-nested-timeouts.py` exist to stop, and I wrote one anyway.
+
+The assertion is now behavioural: the coordinator must REACT - restart the job or
+fail it - and doing neither is the defect. Verified in both directions: without the
+fix it fails with "the coordinator never reacted to the worker that died and came
+back", with the fix it passes.
+
+Every other fault test kills a worker and leaves it dead, so this path had no
+coverage at all.
 
 ## 3. Work items
 

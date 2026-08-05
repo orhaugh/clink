@@ -3129,125 +3129,147 @@ void Coordinator::watchdog_loop_() {
     }
 }
 
+// The per-job half of losing a worker's in-flight subtasks, shared by the two ways
+// that can happen: the watchdog declaring a worker lost, and a worker RE-REGISTERING
+// under the same id (its previous PROCESS is gone, so whatever that session had in
+// flight can never report). Both must reach the same outcome - fold into an
+// in-progress restart, or start one - and they did not: the re-registration path
+// only handled the fold, so a worker that died and came back before the coordinator
+// noticed left its subtasks with nobody to redeploy them and the job hung forever.
+// See F64 / follow-up 46.
+//
+// `cause` names the reason in the synthesised error and the log, because "worker
+// lost (heartbeat timeout)" is simply untrue of a worker that is alive and has just
+// come back.
+void Coordinator::fold_dead_subtasks_into_restart_locked_(JobState& job,
+                                                          const std::string& worker_id,
+                                                          const char* log_channel,
+                                                          const std::string& cause) {
+    auto it = job.pending_per_worker.find(worker_id);
+    if (it == job.pending_per_worker.end()) {
+        return;
+    }
+    // Deliberately NOT also returning when the list is EMPTY. A worker can be lost
+    // with nothing in flight for this job - every subtask of its already reported
+    // finished - and the job must still roll back to the last checkpoint, because
+    // the redeploy set comes from tasks_by_worker rather than from this list. An
+    // earlier cut of this refactor added that check and broke recovery in three
+    // worker-kill tests: the job never restarted and never checkpointed again.
+    // Second worker lost while this job is already draining for a restart.
+    // Its subtasks were survivors at the first loss, so they sit in
+    // restart_drain_expected - but they can never drain now (their worker is
+    // dead). Fold them into the in-progress restart: drop them from the
+    // expected-drain set and queue them for redeploy (restart_pending is
+    // unioned with restart_drain_expected when restart_job_locked_ builds
+    // the task set). The empty-drain kick in watchdog_loop_, or the
+    // remaining survivors' drains, then fires the restart onto the workers
+    // still alive. Without this the drain never completes and the job
+    // wedges in awaiting_restart forever. We do NOT consume a restart
+    // attempt here - this is still the same restart, now covering both
+    // losses.
+    if (job.awaiting_restart && !job.completion_signalled && !job.cancel_requested) {
+        for (const auto& [role, sub] : it->second) {
+            const std::string k = role + ":" + std::to_string(sub);
+            job.restart_drain_expected.erase(k);
+            job.restart_drained_keys.erase(k);
+            job.restart_pending.emplace_back(role, sub);
+        }
+        log::warn(log_channel,
+                  "job_id=" + std::to_string(job.id) +
+                      " second worker lost during restart drain; folded " +
+                      std::to_string(it->second.size()) +
+                      " subtask(s) into the pending restart, drain_expected=" +
+                      std::to_string(job.restart_drain_expected.size()));
+        it->second.clear();
+        return;
+    }
+    const bool can_restart = !job.awaiting_restart && !job.completion_signalled &&
+                             !job.cancel_requested && !job.checkpoint.checkpoint_dir.empty() &&
+                             job.restart_attempts < effective_max_restarts(job.checkpoint);
+    if (can_restart) {
+        // Defer error synthesis. Capture the lost-worker subtasks for
+        // re-deployment, plus the surviving-worker subtasks we need
+        // to drain. drain_expected pulls from pending_per_worker
+        // (still-in-flight) rather than tasks_by_worker (all subtasks
+        // including completed ones) so a sink that already reported
+        // SubtaskFinished before the watchdog declared the worker lost
+        // doesn't get treated as a still-pending drainee. The
+        // empty-drain case (everyone else finished already)
+        // triggers restart right here.
+        job.awaiting_restart = true;
+        // Bound the drain: if survivors don't all report within
+        // restart_drain_timeout, the watchdog fails the job rather than
+        // wedge (e.g. a survivor that hangs without acking the cancel).
+        job.restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
+        // Redeploy set on worker loss = the FULL topology rolled back to
+        // the last checkpoint: drain every surviving in-flight subtask
+        // (restart_drain_expected) and redeploy every subtask that is not
+        // draining (restart_pending = tasks_by_worker minus in-flight,
+        // which covers the lost worker's tasks AND cleanly-finished
+        // survivors). This mirrors the subtask-error / EOS-timeout path in
+        // handle_subtask_finished_.
+        //
+        // A narrower set - relocating only the lost worker's tasks and
+        // leaving survivors running - is safe ONLY at EOS: a still-running
+        // upstream survivor keeps a live downstream bridge to a peer on the
+        // lost worker, and when that peer is relocated the bridge send fails
+        // ("network_bridge_sink: peer gone"). That failure is itself a
+        // subtask error, which escalated to a fresh whole-job restart and,
+        // over a few hundred milliseconds, burned the entire restart budget
+        // - a mid-stream worker kill cascaded to job failure. Rolling the
+        // whole job back atomically leaves no survivor holding a stale
+        // bridge, so the redeploy converges in one attempt.
+        std::unordered_set<std::string> in_flight;
+        for (const auto& [other_worker_id, pending] : job.pending_per_worker) {
+            if (other_worker_id == worker_id) {
+                continue;
+            }
+            auto other_it = registered_.find(other_worker_id);
+            if (other_it == registered_.end() || other_it->second->lost) {
+                continue;
+            }
+            for (const auto& [role, sub] : pending) {
+                in_flight.insert(role + ":" + std::to_string(sub));
+            }
+        }
+        job.restart_drain_expected = in_flight;
+        for (const auto& [other_worker_id, dts] : job.tasks_by_worker) {
+            for (const auto& dt : dts) {
+                const std::string k = dt.role + ":" + std::to_string(dt.subtask_idx);
+                if (in_flight.count(k) == 0) {
+                    job.restart_pending.emplace_back(dt.role, dt.subtask_idx);
+                }
+            }
+        }
+        log::warn(log_channel,
+                  "job_id=" + std::to_string(job.id) + " awaiting_restart (attempt " +
+                      std::to_string(job.restart_attempts + 1) + "/" +
+                      std::to_string(effective_max_restarts(job.checkpoint)) +
+                      ") drain_expected=" + std::to_string(job.restart_drain_expected.size()));
+        // Bookkeeping: completed_count and errors may already include
+        // entries for surviving-worker subtasks that finished before this
+        // tick. Clear them - they belong to the previous attempt and
+        // restart_job_locked_ will reset transient state anyway.
+        job.completed_count = 0;
+        job.errors.clear();
+    } else {
+        // Fail-fast: synthesise an error per pending task on the
+        // lost worker and free its slot.
+        for (const auto& [role, sub] : it->second) {
+            job.errors.push_back(worker_id + "/" + role + "[" + std::to_string(sub) +
+                                 "]: worker lost (heartbeat timeout)");
+            ++job.completed_count;
+        }
+    }
+    it->second.clear();
+}
+
 void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
     worker.lost = true;
     lost_worker_ids_.push_back(worker.worker_id);
     for (auto& [_, job] : jobs_) {
-        auto it = job->pending_per_worker.find(worker.worker_id);
-        if (it == job->pending_per_worker.end()) {
-            continue;
-        }
-        // Second worker lost while this job is already draining for a restart.
-        // Its subtasks were survivors at the first loss, so they sit in
-        // restart_drain_expected - but they can never drain now (their worker is
-        // dead). Fold them into the in-progress restart: drop them from the
-        // expected-drain set and queue them for redeploy (restart_pending is
-        // unioned with restart_drain_expected when restart_job_locked_ builds
-        // the task set). The empty-drain kick in watchdog_loop_, or the
-        // remaining survivors' drains, then fires the restart onto the workers
-        // still alive. Without this the drain never completes and the job
-        // wedges in awaiting_restart forever. We do NOT consume a restart
-        // attempt here - this is still the same restart, now covering both
-        // losses.
-        if (job->awaiting_restart && !job->completion_signalled && !job->cancel_requested) {
-            for (const auto& [role, sub] : it->second) {
-                const std::string k = role + ":" + std::to_string(sub);
-                job->restart_drain_expected.erase(k);
-                job->restart_drained_keys.erase(k);
-                job->restart_pending.emplace_back(role, sub);
-            }
-            log::warn("coordinator.watchdog",
-                      "job_id=" + std::to_string(job->id) +
-                          " second worker lost during restart drain; folded " +
-                          std::to_string(it->second.size()) +
-                          " subtask(s) into the pending restart, drain_expected=" +
-                          std::to_string(job->restart_drain_expected.size()));
-            it->second.clear();
-            continue;
-        }
-        const bool can_restart = !job->awaiting_restart && !job->completion_signalled &&
-                                 !job->cancel_requested &&
-                                 !job->checkpoint.checkpoint_dir.empty() &&
-                                 job->restart_attempts < effective_max_restarts(job->checkpoint);
-        if (can_restart) {
-            // Defer error synthesis. Capture the lost-worker subtasks for
-            // re-deployment, plus the surviving-worker subtasks we need
-            // to drain. drain_expected pulls from pending_per_worker
-            // (still-in-flight) rather than tasks_by_worker (all subtasks
-            // including completed ones) so a sink that already reported
-            // SubtaskFinished before the watchdog declared the worker lost
-            // doesn't get treated as a still-pending drainee. The
-            // empty-drain case (everyone else finished already)
-            // triggers restart right here.
-            job->awaiting_restart = true;
-            // Bound the drain: if survivors don't all report within
-            // restart_drain_timeout, the watchdog fails the job rather than
-            // wedge (e.g. a survivor that hangs without acking the cancel).
-            job->restart_deadline = std::chrono::steady_clock::now() + cfg_.restart_drain_timeout;
-            // Redeploy set on worker loss = the FULL topology rolled back to
-            // the last checkpoint: drain every surviving in-flight subtask
-            // (restart_drain_expected) and redeploy every subtask that is not
-            // draining (restart_pending = tasks_by_worker minus in-flight,
-            // which covers the lost worker's tasks AND cleanly-finished
-            // survivors). This mirrors the subtask-error / EOS-timeout path in
-            // handle_subtask_finished_.
-            //
-            // A narrower set - relocating only the lost worker's tasks and
-            // leaving survivors running - is safe ONLY at EOS: a still-running
-            // upstream survivor keeps a live downstream bridge to a peer on the
-            // lost worker, and when that peer is relocated the bridge send fails
-            // ("network_bridge_sink: peer gone"). That failure is itself a
-            // subtask error, which escalated to a fresh whole-job restart and,
-            // over a few hundred milliseconds, burned the entire restart budget
-            // - a mid-stream worker kill cascaded to job failure. Rolling the
-            // whole job back atomically leaves no survivor holding a stale
-            // bridge, so the redeploy converges in one attempt.
-            std::unordered_set<std::string> in_flight;
-            for (const auto& [other_worker_id, pending] : job->pending_per_worker) {
-                if (other_worker_id == worker.worker_id) {
-                    continue;
-                }
-                auto other_it = registered_.find(other_worker_id);
-                if (other_it == registered_.end() || other_it->second->lost) {
-                    continue;
-                }
-                for (const auto& [role, sub] : pending) {
-                    in_flight.insert(role + ":" + std::to_string(sub));
-                }
-            }
-            job->restart_drain_expected = in_flight;
-            for (const auto& [other_worker_id, dts] : job->tasks_by_worker) {
-                for (const auto& dt : dts) {
-                    const std::string k = dt.role + ":" + std::to_string(dt.subtask_idx);
-                    if (in_flight.count(k) == 0) {
-                        job->restart_pending.emplace_back(dt.role, dt.subtask_idx);
-                    }
-                }
-            }
-            log::warn("coordinator.watchdog",
-                      "job_id=" + std::to_string(job->id) + " awaiting_restart (attempt " +
-                          std::to_string(job->restart_attempts + 1) + "/" +
-                          std::to_string(effective_max_restarts(job->checkpoint)) +
-                          ") drain_expected=" + std::to_string(job->restart_drain_expected.size()));
-            // Bookkeeping: completed_count and errors may already include
-            // entries for surviving-worker subtasks that finished before this
-            // tick. Clear them - they belong to the previous attempt and
-            // restart_job_locked_ will reset transient state anyway.
-            job->completed_count = 0;
-            job->errors.clear();
-        } else {
-            // Fail-fast: synthesise an error per pending task on the
-            // lost worker and free its slot.
-            for (const auto& [role, sub] : it->second) {
-                job->errors.push_back(worker.worker_id + "/" + role + "[" + std::to_string(sub) +
-                                      "]: worker lost (heartbeat timeout)");
-                ++job->completed_count;
-            }
-        }
-        it->second.clear();
-        // Slots used by this worker for this job are gone with the worker, but
-        // we don't decrement slots_in_use because we're going to mark
-        // the worker lost - it's no longer participating in scheduling.
+        fold_dead_subtasks_into_restart_locked_(
+            *job, worker.worker_id, "coordinator.watchdog", "worker lost (heartbeat timeout)");
     }
     if (worker.conn) {
         worker.conn->shutdown_read();
@@ -3258,46 +3280,38 @@ void Coordinator::mark_worker_lost_locked_(WorkerConnection& worker) {
                     "{\"worker_id\":" + js_quote(worker.worker_id) + "}");
 }
 
-// A worker re-registered under an id that already had a live session. The
-// previous PROCESS is gone, so anything it had in flight can never report.
-// Fold those subtasks into an in-progress restart drain exactly as
-// mark_worker_lost_locked_ does for a lost worker; without this the drain
-// waits on a subtask whose owner no longer exists, hits its deadline, and
-// fails a job that was recovering perfectly well.
+// A worker re-registered under an id that already had a live session. The previous
+// PROCESS is gone, so anything it had in flight can never report.
+//
+// This now takes exactly the same path as a watchdog-declared loss. It used to
+// handle only the case where a restart drain was ALREADY in progress and skip the
+// job otherwise - so a worker that died and was restarted BEFORE the coordinator
+// noticed left its subtasks with nobody to redeploy them: the watchdog never
+// declared the worker lost (it is alive and heartbeating under the same id), no
+// restart was ever triggered, and the job hung indefinitely with subtasks missing.
+// Not exotic - restarting a crashed process quickly is what an orchestrator does by
+// default. F64 / follow-up 46.
 void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id) {
-    std::vector<JobId> folded;
+    bool touched = false;
     {
         std::lock_guard lock(mu_);
         for (auto& [_, job] : jobs_) {
-            auto it = job->pending_per_worker.find(worker_id);
-            if (it == job->pending_per_worker.end() || it->second.empty()) {
+            if (job->pending_per_worker.find(worker_id) == job->pending_per_worker.end() ||
+                job->pending_per_worker[worker_id].empty()) {
                 continue;
             }
-            if (!job->awaiting_restart || job->completion_signalled || job->cancel_requested) {
-                continue;
-            }
-            for (const auto& [role, sub] : it->second) {
-                const std::string k = role + ":" + std::to_string(sub);
-                job->restart_drain_expected.erase(k);
-                job->restart_drained_keys.erase(k);
-                job->restart_pending.emplace_back(role, sub);
-            }
-            log::warn("coordinator.register",
-                      "job_id=" + std::to_string(job->id) + " worker=" + worker_id +
-                          " re-registered mid-restart-drain; folded " +
-                          std::to_string(it->second.size()) +
-                          " subtask(s) from the retired session into the pending restart, "
-                          "drain_expected=" +
-                          std::to_string(job->restart_drain_expected.size()));
-            it->second.clear();
-            folded.push_back(job->id);
+            fold_dead_subtasks_into_restart_locked_(
+                *job,
+                worker_id,
+                "coordinator.register",
+                "worker re-registered; the process holding this subtask is gone");
+            touched = true;
         }
     }
-    // The drain may now be empty, which is the condition that fires the
-    // redeploy. The watchdog checks that on its next tick; nudge it so
-    // recovery does not wait a whole interval for a state change that has
-    // already happened.
-    if (!folded.empty()) {
+    // A fold may have emptied the drain, which is the condition that fires the
+    // redeploy, and a fresh restart needs the watchdog to act on it. Either way,
+    // nudge rather than wait a whole interval for a state change already made.
+    if (touched) {
         cv_.notify_all();
     }
 }

@@ -303,3 +303,86 @@ TEST_F(SideOutputRecoveryTest, BothBranchesStayExactlyOnceAcrossAWorkerKill) {
     EXPECT_TRUE(side_v.unexpected.empty())
         << "the SIDE branch committed records the job never produced. " << context;
 }
+
+// A worker that is killed and comes straight back must not leave the job hung.
+//
+// F64 / follow-up 46, found by accident: an earlier cut of the test above restarted
+// the same worker immediately and the job stopped dead. The coordinator logged
+//
+//     worker=worker-0 re-registered; previous session retired
+//
+// and then nothing at all - no worker-loss detection, no restart, no failure. The
+// dead session's subtasks were never redeployed and the submitter timed out.
+//
+// The cause was that the re-registration path handled only the case where a restart
+// drain was ALREADY in progress. A worker that died and returned BEFORE the
+// coordinator noticed skipped that branch entirely, and the watchdog would never
+// declare it lost afterwards because it is alive and heartbeating under the same id.
+// Nothing was left to redeploy the subtasks.
+//
+// Every other fault test kills a worker and leaves it dead, so this had no coverage.
+// Restarting a crashed process quickly is what an orchestrator does by default.
+//
+// This test does not care WHICH way the job resolves - it asserts only that it
+// resolves. A job that neither completes nor fails is the outcome that cannot be
+// operated around, and it is what the defect produced.
+TEST_F(SideOutputRecoveryTest, AWorkerThatDiesAndReturnsImmediatelyDoesNotHangTheJob) {
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return verify_branch(main_dir(), "record", kTotalRecords).total_lines > 0; },
+        std::chrono::seconds(90)))
+        << "nothing was committed before the kill, so the scenario never ran";
+
+    // Kill and bring the SAME worker straight back, deliberately racing the
+    // coordinator's loss detection - which is the whole point.
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+    ASSERT_TRUE(c.restart_worker(0));
+
+    // THE assertion: the coordinator must REACT to the dead session.
+    //
+    // Not "the submitter exited" - that was the first cut of this test and it was
+    // worthless. Without the fix the submitter still exits, because its own
+    // --wait-timeout-s runs out; the test passed in 126s where the fixed build takes
+    // 37s. An assertion satisfied by a child's own timeout measures nothing, which is
+    // the exact pattern scripts/check-nested-timeouts.py exists to stop.
+    //
+    // What was actually missing was any coordinator reaction at all: its log went
+    // silent after "previous session retired". So assert the reaction, which is
+    // behavioural rather than timing-based - the coordinator either restarts the job
+    // or fails it, and doing neither is the defect.
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return c.coordinator().log_contains("awaiting_restart") ||
+                   c.coordinator().log_contains("failed errors=");
+        },
+        std::chrono::seconds(60)))
+        << "the coordinator never reacted to the worker that died and came back: no restart, no "
+           "failure. Its log stops at 'previous session retired' and the job's subtasks are never "
+           "redeployed, so the job hangs until something else times out.";
+
+    const auto code = sub->await_exit(std::chrono::seconds(150));
+    ASSERT_TRUE(code.has_value()) << "the submitter never exited at all";
+
+    // If it did recover, the output must still be exactly-once on BOTH branches.
+    // A recovery that resolves by losing records is not a recovery.
+    if (*code == 0) {
+        const auto main_v = verify_branch(main_dir(), "record", kTotalRecords);
+        const auto side_v = verify_branch(side_dir(), "side", kTotalRecords);
+        EXPECT_TRUE(main_v.duplicated.empty() && main_v.missing.empty())
+            << "the job reported success but the MAIN branch is not exactly-once: "
+            << describe(main_v);
+        EXPECT_TRUE(side_v.duplicated.empty() && side_v.missing.empty())
+            << "the job reported success but the SIDE branch is not exactly-once: "
+            << describe(side_v);
+    }
+}
