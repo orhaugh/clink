@@ -19,6 +19,10 @@
 #   --load N       background CPU hogs during each run (default 0)
 #   --binary PATH  test binary (default build-it/tests/clink_integration_tests)
 #   --out DIR      where to keep the failing run's output (default ./repeat-fail-out)
+#   --keep-going   run all N and tally failure MODES instead of stopping at the
+#                  first. Needed when a test has more than one intermittent
+#                  failure - a frequent mode otherwise masks a rarer one, and
+#                  "it failed at iteration 3" then tells you nothing about which.
 #
 # Exits 1 on the first failure, having written the run's stdout and named the
 # iteration. Exits 0 if every run passed - which is a result too, and the script
@@ -33,6 +37,8 @@ RUNS=50
 LOAD=0
 BINARY="build-it/tests/clink_integration_tests"
 OUT="repeat-fail-out"
+KEEP_GOING=0
+FAILURES=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -41,6 +47,7 @@ while [ $# -gt 0 ]; do
         --load)   LOAD="$2";   shift 2 ;;
         --binary) BINARY="$2"; shift 2 ;;
         --out)    OUT="$2";    shift 2 ;;
+        --keep-going) KEEP_GOING=1; shift 1 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -82,12 +89,26 @@ for i in $(seq 1 "$RUNS"); do
         # ScopedDiagnostics keeps the cluster's artefacts on failure and prints
         # where; surface that so the next step has somewhere to look.
         grep -a "artifacts kept" "$log" | head -3
-        exit 1
+        if [ "$KEEP_GOING" -eq 0 ]; then
+            exit 1
+        fi
+        # --keep-going exists because a test with MORE THAN ONE intermittent
+        # failure mode cannot be characterised by stopping at the first: the
+        # more frequent mode masks the rarer one, and "it failed" then says
+        # nothing about which. Tally the modes instead.
+        FAILURES=$((FAILURES + 1))
+        mv "$log" "$OUT/failed-$i.log"
+        continue
     fi
     rm -f "$log"
     printf '\rrepeat-until-fail: %d/%d passed' "$i" "$RUNS"
 done
 
 echo ""
+if [ "$KEEP_GOING" -eq 1 ] && [ "$FAILURES" -gt 0 ]; then
+    echo "repeat-until-fail: $FAILURES of $RUNS FAILED under load=$LOAD. Modes, by assertion:"
+    grep -ahoE "test_[a-z_]+\.cpp:[0-9]+" "$OUT"/failed-*.log 2>/dev/null | sort | uniq -c | sort -rn
+    exit 1
+fi
 echo "repeat-until-fail: $RUNS/$RUNS passed under load=$LOAD."
 echo "That bounds the rate, it does not prove absence - say so when quoting it."

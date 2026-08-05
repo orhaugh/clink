@@ -18,6 +18,14 @@ if ! ./scripts/check-fault-points.sh; then
     exit 1
 fi
 
+echo "pre-commit: checking nested test timeouts..."
+if ! ./scripts/check-nested-timeouts.py; then
+    echo ""
+    echo "pre-commit: a test waits on a child for less than the child's own timeout, so the"
+    echo "child's reason for failing can never be printed. See the message above."
+    exit 1
+fi
+
 echo "pre-commit: checking clang-format..."
 if ! cmake --build "$BUILD_DIR" --target format-check 2>&1; then
     echo ""

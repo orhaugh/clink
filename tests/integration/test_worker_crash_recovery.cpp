@@ -255,13 +255,17 @@ TEST(WorkerCrashRecovery, JobSurvivesWorkerKillViaRestart) {
 
     // The submitter should still exit 0 - the job completes after the
     // automatic restart.
+    // Past the submitter's own --wait-timeout-s=30, not inside it. An outer wait
+    // shorter than the inner timeout can only report "did not exit", which hides
+    // the submitter's own account of why - and the gate is unchanged, because a
+    // submitter that self-times-out exits non-zero and the assertion below fails.
     int submit_exit = -1;
-    const bool exited = wait_for_exit(submit_pid, 25s, &submit_exit);
+    const bool exited = wait_for_exit(submit_pid, 38s, &submit_exit);
 
     kill_quietly(worker2);
     kill_quietly(coordinator);
 
-    ASSERT_TRUE(exited) << "submitter did not exit within 25s after worker crash";
+    ASSERT_TRUE(exited) << "submitter did not exit even past its own 30s timeout after the crash";
     EXPECT_EQ(submit_exit, 0) << "submitter exited non-zero after restart; the job did not recover";
     EXPECT_GT(latest_completed_checkpoint(ckpt_dir), ckpt_before_crash)
         << "no new checkpoint completed after restart";

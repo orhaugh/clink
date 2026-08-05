@@ -212,8 +212,12 @@ TEST(CancelJobE2E, ClientInitiatedCancelStopsRunningPipeline) {
     int cancel_exit = -1;
     const bool cancel_done = wait_for(cancel_pid, 10s, cancel_exit);
 
+    // 38s, not 30s: the submitter's own --wait-timeout-s is 30, and an outer wait
+    // equal to the inner one races it, so a submitter that self-times-out is
+    // reported as "did not exit" and its reason is lost. The gate does not soften -
+    // a self-timeout exits non-zero and the wall-time ceiling below still fails.
     int submit_exit = -1;
-    const bool submit_done = wait_for(submit_pid, 30s, submit_exit);
+    const bool submit_done = wait_for(submit_pid, 38s, submit_exit);
     const auto t_submit_end = std::chrono::steady_clock::now();
 
     kill_quietly(coordinator_pid);

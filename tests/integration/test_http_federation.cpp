@@ -362,12 +362,15 @@ TEST(HttpFederation, JobsCancelEndpointCancelsRunningJob) {
     EXPECT_NE(cancel_resp.body.find("\"ok\":true"), std::string::npos)
         << "cancel ack: " << cancel_resp.body;
 
+    // 38s, not 30s: an outer wait equal to the submitter's own --wait-timeout-s=30
+    // races it, so a self-timeout is reported as "didn't exit" and the submitter's
+    // reason is lost. The exit-code assertion below is unchanged either way.
     int submit_exit = -1;
-    const bool exited = wait_for(submit_pid, 30s, submit_exit);
+    const bool exited = wait_for(submit_pid, 38s, submit_exit);
     if (!exited) {
         kill_quietly(submit_pid);
     }
-    EXPECT_TRUE(exited) << "submitter didn't exit after HTTP cancel";
+    EXPECT_TRUE(exited) << "submitter didn't exit after HTTP cancel, even past its own 30s timeout";
     EXPECT_NE(submit_exit, 0) << "submitter should have exited non-zero (cancelled), got "
                               << submit_exit;
 }

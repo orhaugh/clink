@@ -360,9 +360,15 @@ TEST(TwoPhaseCommit, HappyPathExactlyOnceCommittedFiles) {
                     "--checkpoint-interval-ms=150"},
                    submit);
     ASSERT_GT(submit_pid, 0);
+    // Past the submitter's own --wait-timeout-s=15, per the reason spelled out at
+    // the kill-mid-stream case below: an outer wait SHORTER than the inner timeout
+    // can only ever report "did not exit", which hides the submitter's own account
+    // of why. It does not soften the gate - a submitter that self-times-out exits
+    // non-zero and the assertion on the exit code below still fails, now with the
+    // reason attached.
     int submit_exit = -1;
-    ASSERT_TRUE(wait_for_exit(submit_pid, 12s, &submit_exit))
-        << "submitter did not exit within 12s";
+    ASSERT_TRUE(wait_for_exit(submit_pid, 23s, &submit_exit))
+        << "submitter did not exit even past its own 15s timeout";
     EXPECT_EQ(submit_exit, 0) << "submitter exited non-zero";
 
     // At least one checkpoint must have completed during the run.
@@ -481,9 +487,10 @@ TEST(TwoPhaseCommit, RecoveryCommitsPreCommittedFilesOnRestart) {
                     "--restore-from-checkpoint-id=" + std::to_string(run1_ckpt)},
                    submit);
     ASSERT_GT(submit2_pid, 0);
+    // Past the submitter's own --wait-timeout-s=15, for the reason above.
     int submit2_exit = -1;
-    ASSERT_TRUE(wait_for_exit(submit2_pid, 12s, &submit2_exit))
-        << "run-2 submitter did not exit within 12s";
+    ASSERT_TRUE(wait_for_exit(submit2_pid, 23s, &submit2_exit))
+        << "run-2 submitter did not exit even past its own 15s timeout";
     EXPECT_EQ(submit2_exit, 0) << "run-2 submitter exited non-zero";
 
     // After run 2: every line in committed/ is a valid record-N.

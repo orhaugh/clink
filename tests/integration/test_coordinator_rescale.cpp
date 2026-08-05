@@ -172,6 +172,59 @@ std::optional<ListJobsAckMsg> list_jobs_over_wire(std::uint16_t coordinator_port
     return decode_list_jobs_ack(r);
 }
 
+// True once the sink has written anything, which is the point at which the job is
+// demonstrably deployed and running rather than merely accepted.
+//
+// Why the tests below need this rather than one flat deadline. A job appears in
+// ListJobs as soon as the coordinator accepts it, before the plugin is shipped to
+// the workers and opened. On Linux each job .so statically links clink_core and
+// runs to tens of megabytes, so that deploy step takes seconds on a busy machine.
+// A single deadline covering "submitted -> first checkpoint completed" therefore
+// spends most of its budget on deploy and can expire before the first barrier is
+// even taken - a setup timeout that reads as a product failure. Splitting the
+// wait means the checkpoint deadline measures only the checkpoint.
+bool sink_has_emitted(const std::filesystem::path& out_base) {
+    for (int i = 0; i < 8; ++i) {
+        const std::filesystem::path p{out_base.string() + "." + std::to_string(i)};
+        std::error_code ec;
+        if (std::filesystem::exists(p, ec) && std::filesystem::file_size(p, ec) > 0 && !ec) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Recursive because the markers live at <ckpt_dir>/_jobs/<job_id>/COMPLETED-<id>,
+// so a top-level scan sees nothing and the wait times out on a job that
+// checkpointed perfectly well.
+bool any_completed_marker(const std::filesystem::path& ckpt_dir) {
+    std::error_code ec;
+    if (!std::filesystem::exists(ckpt_dir, ec)) {
+        return false;
+    }
+    for (auto const& entry : std::filesystem::recursive_directory_iterator(ckpt_dir, ec)) {
+        if (ec) {
+            return false;
+        }
+        if (entry.is_regular_file() && entry.path().filename().string().starts_with("COMPLETED-")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <typename Pred>
+bool poll_until(Pred pred, std::chrono::milliseconds budget) {
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) {
+            return true;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    return pred();
+}
+
 }  // namespace
 
 // Named for what it checks: the rescale REQUEST survives a wire round-trip. The
@@ -256,32 +309,23 @@ TEST(CoordinatorRescale, RescaleRequestSurvivesTheWireRoundTrip) {
         FAIL() << "job never became visible in ListJobs";
     }
 
+    // Two stages, for the reason given on sink_has_emitted: first wait for the job
+    // to be demonstrably running, then time the checkpoint from there.
+    const bool running = poll_until([&] { return sink_has_emitted(out_base); }, 30s);
+    if (!running) {
+        kill_quietly(submit_pid);
+        kill_quietly(coordinator_pid);
+        for (auto pid : workers)
+            kill_quietly(pid);
+        FAIL() << "the job never emitted a record within 30s, so it never deployed";
+    }
+
     // Need at least one COMPLETED-N marker before rescale_job can
     // accept the request - the rescale path requires
     // latest_completed_checkpoint_id > 0 so it has something to
-    // restore each new subtask from.
-    bool saw_checkpoint = false;
-    const auto checkpoint_deadline = std::chrono::steady_clock::now() + 8s;
-    while (std::chrono::steady_clock::now() < checkpoint_deadline) {
-        // Recursive: markers live at <ckpt_dir>/_jobs/<job_id>/COMPLETED-<id>,
-        // so a top-level scan sees nothing and this wait times out on a job
-        // that checkpointed perfectly well.
-        std::error_code ec;
-        for (auto const& entry : std::filesystem::recursive_directory_iterator(ckpt_dir, ec)) {
-            if (ec) {
-                break;
-            }
-            if (entry.is_regular_file() &&
-                entry.path().filename().string().starts_with("COMPLETED-")) {
-                saw_checkpoint = true;
-                break;
-            }
-        }
-        if (saw_checkpoint) {
-            break;
-        }
-        std::this_thread::sleep_for(100ms);
-    }
+    // restore each new subtask from. The interval is 200ms, so 8s from a
+    // confirmed-running job is 40 intervals.
+    const bool saw_checkpoint = poll_until([&] { return any_completed_marker(ckpt_dir); }, 8s);
     if (!saw_checkpoint) {
         kill_quietly(submit_pid);
         kill_quietly(coordinator_pid);
@@ -432,28 +476,10 @@ TEST(CoordinatorRescale, WholeRoleRescaleOfMultiOperatorJobIsRefusedAndLeavesJob
         FAIL() << "job never became visible";
     }
 
-    bool saw_checkpoint = false;
-    const auto ckpt_deadline = std::chrono::steady_clock::now() + 8s;
-    while (std::chrono::steady_clock::now() < ckpt_deadline) {
-        // Recursive: markers live at <ckpt_dir>/_jobs/<job_id>/COMPLETED-<id>,
-        // so a top-level scan sees nothing and this wait times out on a job
-        // that checkpointed perfectly well.
-        std::error_code ec;
-        for (auto const& entry : std::filesystem::recursive_directory_iterator(ckpt_dir, ec)) {
-            if (ec) {
-                break;
-            }
-            if (entry.is_regular_file() &&
-                entry.path().filename().string().starts_with("COMPLETED-")) {
-                saw_checkpoint = true;
-                break;
-            }
-        }
-        if (saw_checkpoint) {
-            break;
-        }
-        std::this_thread::sleep_for(100ms);
-    }
+    // Same two stages as above: confirm the job is running before timing the
+    // checkpoint, so deploy latency does not eat the checkpoint budget.
+    (void)poll_until([&] { return sink_has_emitted(out_base); }, 30s);
+    const bool saw_checkpoint = poll_until([&] { return any_completed_marker(ckpt_dir); }, 8s);
     std::cerr << "[OBS] total_subtasks before rescale = " << p_before
               << ", saw_checkpoint = " << saw_checkpoint << "\n";
 
@@ -573,28 +599,10 @@ TEST(CoordinatorCheckpoint, ChainedJobCompletesPeriodicCheckpointInMultiProcess)
     ASSERT_GT(submit_pid, 0);
 
     // A COMPLETED-N marker proves a periodic checkpoint fully completed
-    // (every subtask, chained ones included, acked).
-    bool saw_marker = false;
-    const auto deadline = std::chrono::steady_clock::now() + 15s;
-    while (std::chrono::steady_clock::now() < deadline && !saw_marker) {
-        // Recursive: the marker is at <ckpt_dir>/_jobs/<job_id>/COMPLETED-<id>.
-        std::error_code ec;
-        if (std::filesystem::exists(ckpt_dir, ec)) {
-            for (const auto& entry : std::filesystem::recursive_directory_iterator(ckpt_dir, ec)) {
-                if (ec) {
-                    break;
-                }
-                if (entry.is_regular_file() &&
-                    entry.path().filename().string().rfind("COMPLETED-", 0) == 0) {
-                    saw_marker = true;
-                    break;
-                }
-            }
-        }
-        if (!saw_marker) {
-            std::this_thread::sleep_for(100ms);
-        }
-    }
+    // (every subtask, chained ones included, acked). Two stages again, so the
+    // marker deadline is not spent waiting for the plugin to deploy.
+    (void)poll_until([&] { return sink_has_emitted(out_base); }, 30s);
+    const bool saw_marker = poll_until([&] { return any_completed_marker(ckpt_dir); }, 15s);
 
     int submit_exit = -1;
     (void)wait_for(submit_pid, 5s, submit_exit);

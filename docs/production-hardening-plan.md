@@ -1806,6 +1806,147 @@ left the quarantine. The general lesson is the cheap one: a feature verified by
 single runs of a multi-process test has been verified against luck, and the
 repetition harness that found this took twenty minutes to write.
 
+### F55. A setup deadline that measured the wrong thing
+
+`CoordinatorRescale.RescaleRequestSurvivesTheWireRoundTrip` failed once in a
+serial sweep of the whole Linux integration label, at the setup step that waits
+for a first checkpoint: `no COMPLETED-N checkpoint marker landed within 8s`.
+
+The wait was mis-scoped rather than too short. It started as soon as the job
+appeared in `ListJobs`, which happens when the coordinator ACCEPTS a submission -
+before the plugin is shipped to the workers and opened. On Linux a job `.so`
+statically links `clink_core` and runs to tens of megabytes, so on a machine that
+has just run two and a half thousand tests, the deploy alone can consume most of
+an 8s budget. The checkpoint interval in that test is 200ms: the checkpoint was
+never the slow part, and the deadline was mostly measuring `dlopen`.
+
+Fixed by splitting the wait rather than enlarging it. The first stage waits, with
+its own generous budget, for the sink to write anything - which is direct evidence
+the job deployed and is running. Only then does the 8s checkpoint deadline start,
+where it now covers forty checkpoint intervals of a job known to be running. A job
+that genuinely never deploys now fails saying so, which the old single deadline
+reported as a missing checkpoint.
+
+The same two-stage wait replaced the other two flat deadlines in that file.
+5/5 clean on Linux afterwards.
+
+### F56. An exactly-once duplication mode that only appears in a sweep, unattributed
+
+The same sweep showed
+`FaultRecoveryTest.EveryRecordIsCommittedExactlyOnceAcrossAWorkerKill` failing on
+`v.duplicated.empty()` - records committed twice across a worker kill. That is the
+opposite mode to the record LOSS fixed in F53, and it was seen for the first time
+in the run immediately after that fix, which made the fix the obvious suspect.
+
+It is not attributed, and the measurement says why. Twenty runs in isolation with
+the F53 fix reverted to its parent commit: 20/20 pass. Twenty runs with the fix
+restored, same protocol: 20/20 pass. So the mode is rarer than one in twenty in
+isolation and the comparison neither implicates nor clears the fix. Like items 29
+and 31 before it, it reproduces only in a full sweep - on a warm machine with
+other tests' processes winding down.
+
+Two process notes worth keeping, because both cost real time here:
+
+- The first attempt at this comparison was invalid and reported as though it were
+  not. The revert was attempted with `git stash push -- <file>` after the fix had
+  already been committed, so there was nothing to stash; `git stash push` exits 0
+  in that case, and both "baseline" arms therefore ran WITH the fix. Caught by
+  `git stash list` coming back empty. A revert against a commit needs
+  `git checkout <sha>~1 -- <file>`, verified by a non-empty `git diff --stat HEAD`.
+- The repetition harness gained `--keep-going` for this: a test with more than one
+  intermittent failure mode cannot be characterised by stopping at the first,
+  because the more frequent mode masks the rarer one. It now runs all N and tallies
+  modes by assertion line.
+
+Recorded as item 37, and NOT quarantined: quarantining a mode this rare would
+remove the only signal that currently detects it, which is the sweep itself.
+
+It did not recur in the clean 118/118 sweep that closed this round. There is also a
+CONFOUND worth stating rather than hiding: the sweep that produced the single
+sighting may have had its `TMPDIR` pointed at the bind mount described in F57, which
+is slow and does not honour file locks. Both twenty-run arms above ran with that
+override and passed, so the override alone does not produce the duplication - but it
+cannot be ruled out as a contributor, and the sighting is not reproducible on a
+correctly configured filesystem. The honest position is one unexplained sighting,
+not a characterised defect.
+
+### F57. Leader election trusted a filesystem primitive it never verified
+
+The sharpest finding of this round, and it arrived by accident.
+
+Leadership is an `fcntl` write lock on `<ha_dir>/leader.lock`. Every fencing
+guarantee in the HA design rests on one assumption that nothing checked: that a
+second process asking for the same lock is refused. On a filesystem that does not
+implement locking, every coordinator's `F_SETLK` succeeds, each reads the previous
+epoch from `active-leader.json` and announces itself one above it, and there is no
+error anywhere. Two live leaders, different epochs, both serving.
+
+It was reproduced on a real filesystem while chasing something else entirely. Nine
+integration failures had accumulated, including two whose character was semantic
+rather than slow: `SplitBrainTest`'s own PRECONDITION - that a second coordinator
+cannot take leadership while the lock is held - was failing, and
+`HaFailoverTest.FailoverAdvancesTheEpoch` reported both leaders at epoch 1. The
+cause was a `TMPDIR` override pointing the HA directory at a macOS Docker bind
+mount, which does not honour POSIX write locks. Moving it back to the container's
+own filesystem returned all thirteen HA tests to green.
+
+So the condition the split-brain test was written to describe as a hypothetical -
+"an HA directory on a filesystem where the lock does not hold" - is reachable with
+a one-line environment mistake, and clink's response was to proceed silently.
+
+Fixed by proving the primitive rather than assuming it. On `start()` the
+coordinator holds the lock and forks a child that asks for the same one; the fork
+is unavoidable because POSIX record locks are per-process, so a second descriptor
+in the same process would report success on any filesystem and measure nothing. A
+filesystem that grants both refuses to host leadership, with an error naming the
+usual causes (bind mounts, 9p/virtiofs, NFS mounted `nolock`) and the
+`--ha-allow-unsafe-locks` override for anyone who accepts the risk deliberately.
+An inconclusive probe is NOT a condemnation: two coordinators starting together
+produce exactly that verdict, and treating it as unsafe would take a healthy
+cluster offline.
+
+Verified: 8/8 HA unit tests and 13/13 HA integration tests on Linux, where the
+coordinator really forks. Both halves are mutation-checked - a probe hard-wired to
+condemn fails the test that leadership still happens on a working filesystem, and
+removing the probe-file cleanup fails the test that looks for it. The refusal
+decision is a separate pure function so it can be covered exhaustively, including
+the inconclusive case, without a test-only hook in the product and without needing
+a lockless filesystem in a unit test.
+
+**Limitation, stated plainly:** the probe establishes that the filesystem excludes
+a second process AT STARTUP. It does not detect a filesystem whose locking degrades
+later, and it cannot detect one that honours locks between processes on the same
+host but not between hosts - which is the NFS failure mode that matters most for a
+multi-node deployment. A coordinator on such a mount passes the probe and can still
+split brain against a coordinator on another host.
+
+### F58. An outer wait shorter than the child's own timeout, in five places
+
+Not a product defect, but it cost a diagnosis, so it is recorded with the rest.
+
+`clink_submit_job` takes `--wait-timeout-s` and, on expiry, exits non-zero with an
+account of why: `no JobCompleted after 15s: connection closed by the coordinator`.
+Five integration tests waited on the submitter for LESS time than the submitter's
+own timeout, so the test always tripped first and reported `submitter did not exit
+within 12s` - true, uninformative, and pointing at the harness rather than the
+product. A whole-label failure read as a harness timeout until the run was repeated
+and the submitter's own message turned out to be sitting three seconds past the
+deadline the test enforced.
+
+Fixed at all five sites by giving the outer wait a margin over the inner one. This
+does not soften a gate: a child that self-times-out exits non-zero, so every
+assertion on its exit code fails exactly as before, now with the reason attached.
+One site in the same suite already did this and said why in a comment, which makes
+the change a consistency fix rather than a new convention.
+
+`scripts/check-nested-timeouts.py` keeps the class closed and runs in the
+pre-commit hook. It is mutation-checked: reintroducing the 12s wait fails it. Two
+implementation notes worth keeping - it is Python because the hook runs on macOS,
+whose `awk` has no three-argument `match()` and whose failure mode was to report
+every file as a violation; and it pairs only SUBMITTER pids, because the same tests
+spawn `clink_rescale_job` and `clink_cancel_job`, which do not take that flag and
+which produced three false positives on the first run.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change
