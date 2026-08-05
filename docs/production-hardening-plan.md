@@ -1947,6 +1947,73 @@ every file as a violation; and it pairs only SUBMITTER pids, because the same te
 spawn `clink_rescale_job` and `clink_cancel_job`, which do not take that flag and
 which produced three false positives on the first run.
 
+### F59. A rescale restore overwrote the snapshots other subtasks had to inherit
+
+The defect behind item 35, and the most consequential state bug this workstream has
+found: it corrupted a sink's state silently, and the intermittent stall that led to
+it was only the visible symptom.
+
+**What was wrong.** On a rescale, the file state backend stitched a new subtask's
+state from its assigned parents and STAGED it as a file at
+`<base>/<new subtask idx>/checkpoint-<id>.snap`, so the backend could load it
+through its own snapshot dir. Two facts make that write unsafe:
+
+1. The restore base and the working base are the SAME directory. The coordinator
+   sets `restore_from_dir = checkpoint_dir` (`coordinator.cpp:526`) and
+   `plugin_impl` passes `spec.uri = checkpoint_dir`.
+2. Global subtask indices SHIFT when an operator is resized. The planner allocates
+   one contiguous block per operator in graph order, so scaling `counter` from 1 to
+   4 in a source -> counter -> sink job moves the indices from `0,1,2` to
+   `0,{1,2,3,4},5`.
+
+So the staged writes landed on directories that still held other subtasks' state:
+
+- The new counter child at index 2 overwrote the OLD SINK's snapshot, and the new
+  sink at index 5 then inherited it - coming up holding a counter's keyed state.
+  For a 2PC sink that file carries the commit handle, so a staged transaction
+  becomes uncommittable. **Silent.** Nothing logged, nothing refused.
+- The child at index 1 rewrote the very file its siblings were still reading as
+  their parent. A sibling reading between the payload rename and the sidecar write
+  saw the two disagree and failed its integrity check, which is the error the
+  artefacts caught verbatim: `checkpoint-20.snap is 1960 bytes, sidecar declares
+  1208`. That restarted the job, twice, and then failed it - the stall in item 35.
+
+The index MAPPING was already right; F38 fixed that, and each task maps its index
+within its operator through that operator's old block base. It was the write TARGET
+that aliased.
+
+**Why no test caught it.** Every rescale test in `test_state_backend_factory.cpp`
+handed the factory a separate `restore_root` and `working_root`. In production they
+are one directory, so the aliasing could not occur in any fixture.
+
+**The fix** is to hand the stitched bytes over in memory and write nothing:
+`FileBackedStateBackend::restore` now treats non-empty `snap.bytes` as
+authoritative, which is how the changelog builder has always worked. Parent
+snapshots are immutable during a restore, which is the invariant that was missing.
+
+**Verified.** Three deterministic unit tests, on one shared base as production uses:
+parents are byte-identical after a restore; the sink restores its own state and not
+a counter's; and a restore from another directory loads the state while writing
+nothing into the working dir. All three fail if the staging write is reintroduced -
+mutation-checked. Then 20 consecutive Linux runs of all five `RescaleExactlyOnce`
+cases, 100 case-executions, clean; the same harness reproduced the stall at
+iteration 18 of 20 beforehand.
+
+**On the strength of that evidence, stated plainly:** 1-in-20 before and 0-in-20
+after is not on its own a strong statistical result. What establishes causation is
+the deterministic tests plus the artefact: the integrity error in the failing run's
+coordinator log is exactly the payload/sidecar disagreement the aliasing write
+produces, on exactly the path the fix removes.
+
+**Checked across the family, not assumed.** RocksDB, ForSt and the S3 remote-read
+backend all name their parents and re-home onto a per-instance path
+(`source_path + ".restored-<ckpt>-<instance>"`), so none of them mutate a parent.
+The file backend was the only one that did. That pattern is what it now follows.
+
+The integration quarantine is consequently EMPTY, and the mechanism has been
+removed from `ci.yml` along with the advisory arm: the gate runs the whole label
+with no exclusion, so nothing can sit red without failing the build.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

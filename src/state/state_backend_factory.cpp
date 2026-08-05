@@ -219,9 +219,10 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
         const std::string ckpt_name =
             "checkpoint-" + std::to_string(spec.restore_checkpoint_id) + ".snap";
 
+        // The working dir still has to exist - this subtask's own later
+        // checkpoints go here - but nothing from the restore is written into it.
         std::error_code ec;
-        const std::filesystem::path dst_file = subtask_dir / ckpt_name;
-        std::filesystem::create_directories(dst_file.parent_path(), ec);
+        std::filesystem::create_directories(subtask_dir, ec);
 
         // Read one parent snapshot, refusing anything that fails its
         // integrity check. A parent whose bytes are damaged would otherwise
@@ -309,18 +310,35 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
             std::vector<std::byte> final_bytes =
                 parts.size() == 1 ? std::move(parts.front())
                                   : InMemoryStateBackend::merge_snapshot_bytes(parts);
-            // Durable write + sidecar, same contract as any other published
-            // checkpoint. This used to be a bare ofstream whose failure was
-            // silently swallowed by `if (out_stream && ...)` while
-            // restore_from was set regardless - so a rescale that could not
-            // write its stitched state came up believing it had restored,
-            // holding nothing.
-            const auto tmp = dst_file.string() + ".part";
-            clink::state::detail::write_fsync_rename(
-                dst_file, tmp, final_bytes.data(), final_bytes.size());
-            clink::state::write_checkpoint_meta(
-                dst_file, spec.restore_checkpoint_id, final_bytes.data(), final_bytes.size());
-            out.restore_from = Snapshot{CheckpointId{spec.restore_checkpoint_id}, {}};
+            // Handed over IN MEMORY, deliberately not staged as a file here.
+            //
+            // It used to be written to <base>/<this subtask idx>/checkpoint-<id>.snap
+            // so the backend could load it through its own snapshot_dir. That write
+            // is an aliasing bug, because the restore base and the working base are
+            // the SAME directory in production (the coordinator sets
+            // restore_from_dir = checkpoint_dir) and global subtask indices SHIFT
+            // when an operator is resized - the planner allocates one contiguous
+            // block per operator in graph order. Scaling `counter` from 1 to 4 in a
+            // source -> counter -> sink job moves the indices from 0,1,2 to
+            // 0,{1,2,3,4},5, so:
+            //
+            //   - the new counter child at index 2 overwrote the OLD SINK's snapshot,
+            //     which the new sink at index 5 then inherited - it came up holding a
+            //     counter's keyed state, and for a 2PC sink that file is the commit
+            //     handle, so a staged transaction became uncommittable; and
+            //   - the child at index 1 rewrote the very file its siblings were still
+            //     reading as their parent, so a sibling that read between the payload
+            //     rename and the sidecar write saw them disagree and failed its
+            //     integrity check ("is 1960 bytes, sidecar declares 1208"), which
+            //     restarted and then failed the whole job.
+            //
+            // The index MAPPING was already correct (F38): each task maps its index
+            // within its operator through that operator's old block base. It was the
+            // write target that aliased. Nothing needs this staged copy - its only
+            // purpose was to feed the load - and a parent snapshot has to stay
+            // immutable while other subtasks are still reading it.
+            out.restore_from =
+                Snapshot{CheckpointId{spec.restore_checkpoint_id}, std::move(final_bytes)};
         }
     }
     return out;

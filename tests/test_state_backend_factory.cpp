@@ -2,8 +2,10 @@
 // and custom-scheme registration so a new backend (e.g. S3) only needs
 // to plug a builder into the registry.
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -75,20 +77,35 @@ TEST(StateBackendFactory, BarePathSelectsFileBackend) {
     std::filesystem::remove_all(dir);
 }
 
-TEST(StateBackendFactory, FileSchemeStagesRestoreFile) {
-    // Pre-create a snapshot in the restore dir that the factory must
-    // copy into the working dir so the new backend can load it.
+// Restoring from another directory (a savepoint, a relocated checkpoint dir)
+// loads that state and writes NOTHING into the working directory.
+//
+// This replaces an assertion that the factory "should stage the snapshot file in
+// the working dir". That described the implementation rather than the contract,
+// and the implementation was wrong: staging into <base>/<subtask idx> aliases the
+// parent files of other subtasks once an operator is resized, because global
+// indices shift (see ARescaleRestoreLeavesEveryParentSnapshotUntouched below).
+// The old assertion also never checked that the state ARRIVED - its payload was
+// the string "sentinel", which is not a loadable snapshot, so a factory that
+// copied the file and restored nothing would have passed. This asserts the state
+// is loadable and that the working dir stays clean.
+TEST(StateBackendFactory, FileSchemeRestoresFromAnotherDirWithoutWritingToTheWorkingDir) {
     const auto restore_root = make_temp_dir("restore_src");
     const auto working_root = make_temp_dir("restore_dst");
     const std::uint32_t subtask = 1;
     const std::uint64_t ckpt_id = 42;
-    const auto restore_subtask = restore_root / std::to_string(subtask);
-    std::filesystem::create_directories(restore_subtask);
-    const auto snap_file = restore_subtask / ("checkpoint-" + std::to_string(ckpt_id) + ".snap");
+    const clink::OperatorId op{1};
+
     {
-        const std::string sentinel = "sentinel";  // non-empty payload so restore is observable
-        const auto* p = reinterpret_cast<const std::byte*>(sentinel.data());
-        publish_snapshot(snap_file, std::vector<std::byte>(p, p + sentinel.size()), ckpt_id);
+        clink::InMemoryStateBackend seed;
+        seed.put(op,
+                 clink::StateBackend::KeyView{"restored_key"},
+                 clink::StateBackend::ValueView{"restored_value"});
+        auto snap = seed.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(restore_root / std::to_string(subtask) /
+                             ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+                         snap.bytes,
+                         ckpt_id);
     }
 
     clink::StateBackendSpec spec;
@@ -97,15 +114,27 @@ TEST(StateBackendFactory, FileSchemeStagesRestoreFile) {
     spec.restore_uri = "file://" + restore_root.string();
     spec.restore_checkpoint_id = ckpt_id;
 
-    const auto built = clink::StateBackendFactory::default_instance().build(spec);
+    auto built = clink::StateBackendFactory::default_instance().build(spec);
     ASSERT_NE(built.backend, nullptr);
     ASSERT_TRUE(built.restore_from.has_value());
     EXPECT_EQ(built.restore_from->checkpoint_id.value(), ckpt_id);
 
-    const auto dst_file = working_root / std::to_string(subtask) /
-                          ("checkpoint-" + std::to_string(ckpt_id) + ".snap");
-    EXPECT_TRUE(std::filesystem::exists(dst_file))
-        << "factory should stage the snapshot file in the working dir";
+    built.backend->restore(*built.restore_from);
+    EXPECT_TRUE(built.backend->get(op, clink::StateBackend::KeyView{"restored_key"}).has_value())
+        << "the backend did not come up holding the state it was told to restore";
+
+    // No snapshot file may appear in the working dir: this subtask has not taken
+    // a checkpoint yet, and a staged copy is what aliases other subtasks' parents.
+    std::vector<std::string> staged;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(working_root, ec)) {
+        if (e.is_regular_file() && e.path().filename().string().starts_with("checkpoint-")) {
+            staged.push_back(std::filesystem::relative(e.path(), working_root).string());
+        }
+    }
+    EXPECT_TRUE(staged.empty()) << "the restore wrote " << staged.size()
+                                << " checkpoint file(s) into the working dir, the first being "
+                                << (staged.empty() ? std::string{} : staged.front());
 
     std::filesystem::remove_all(restore_root);
     std::filesystem::remove_all(working_root);
@@ -315,3 +344,148 @@ TEST(StateBackendFactory, CommonSchemesAreNotDeferring) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// The restore base and the working base are THE SAME DIRECTORY in production.
+//
+// Every rescale test above hands the factory a separate `restore_root` and
+// `working_root`, and that is why none of them caught what follows. The
+// coordinator sets `restore_from_dir = checkpoint_dir` (coordinator.cpp), and
+// plugin_impl passes `spec.uri = checkpoint_dir`, so a real subtask's working
+// directory sits in the same namespace as the parents it reads:
+//
+//   working  <base>/<new global subtask idx>/checkpoint-<id>.snap
+//   parent   <base>/<old global subtask idx>/checkpoint-<id>.snap
+//
+// The planner allocates global indices as one contiguous block per operator in
+// graph order, so resizing one operator SHIFTS every later operator's block.
+// After scaling `counter` from 1 to 4 in a source -> counter -> sink job, the
+// indices go 0,1,2 to 0,{1,2,3,4},5 - and the new counter children at indices 2,
+// 3 and 4 write their stitched snapshots straight over the directories that
+// still hold the OLD sink's state, which the new sink at index 5 has to read.
+//
+// The index MAPPING is correct (F38 fixed that: each task maps its index within
+// its operator through its operator's old block base). What is not is the write
+// target: a restore rewrites files that other subtasks are reading as parents.
+// The fixtures below use ONE root, as production does.
+
+// The invariant, stated directly: restoring must not modify anybody else's
+// snapshot. Asserted by digesting every parent file before and after, which
+// covers both collisions - a child overwriting another operator's parent, and a
+// child rewriting the very file its siblings still have to read.
+TEST(StateBackendFactory, ARescaleRestoreLeavesEveryParentSnapshotUntouched) {
+    const auto base = make_temp_dir("shared_base_immutable");
+    const std::uint64_t ckpt_id = 20;
+    const clink::OperatorId op{1};
+
+    // The pre-rescale shape: source at 0, counter at 1, sink at 2.
+    auto write_parent = [&](std::uint32_t idx, const std::string& keyed, const std::string& val) {
+        clink::InMemoryStateBackend backend;
+        backend.put(op, clink::StateBackend::KeyView{keyed}, clink::StateBackend::ValueView{val});
+        auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(
+            base / std::to_string(idx) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+            snap.bytes,
+            ckpt_id);
+    };
+    write_parent(0, "source_offset_row", "SRC");
+    write_parent(1, "counter_key", "CNT");
+    write_parent(2, "sink_handle_row", "SNK");
+
+    // Fingerprint every snapshot file and its sidecar before the rescale.
+    std::map<std::string, std::string> before;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(base)) {
+        if (!e.is_regular_file()) {
+            continue;
+        }
+        std::ifstream in(e.path(), std::ios::binary);
+        const std::string body((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        before[std::filesystem::relative(e.path(), base).string()] = body;
+    }
+    ASSERT_GE(before.size(), 3u) << "fixtures did not publish the three parents";
+
+    // A new counter child whose global index (2) lands on the OLD SINK's
+    // directory, inheriting from the old counter at index 1.
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + base.string();
+    spec.subtask_idx = 2;
+    spec.restore_uri = "file://" + base.string();  // the same base, as in production
+    spec.restore_checkpoint_id = ckpt_id;
+    spec.restore_from_subtask_idx = 1;
+    spec.restore_from_parent_count = 1;
+    auto built = clink::StateBackendFactory::default_instance().build(spec);
+    ASSERT_NE(built.backend, nullptr);
+
+    for (const auto& [rel, body] : before) {
+        std::ifstream in(base / rel, std::ios::binary);
+        const std::string now((std::istreambuf_iterator<char>(in)),
+                              std::istreambuf_iterator<char>());
+        EXPECT_EQ(now, body) << "the rescale restore rewrote " << rel
+                             << ", which belongs to another subtask. A parent snapshot must be "
+                                "immutable while other subtasks are still reading it: whoever "
+                                "owns that index next inherits the wrong operator's state, and a "
+                                "sibling reading it mid-rewrite sees the payload and the sidecar "
+                                "disagree and fails its integrity check.";
+    }
+
+    std::filesystem::remove_all(base);
+}
+
+// The consequence, in the terms an operator would see it: the sink comes up
+// holding a counter's state.
+TEST(StateBackendFactory, TheSinkStillRestoresItsOwnStateAfterAnOperatorBeforeItGrew) {
+    const auto base = make_temp_dir("shared_base_sink");
+    const std::uint64_t ckpt_id = 20;
+    const clink::OperatorId op{1};
+
+    auto write_parent = [&](std::uint32_t idx, const std::string& keyed) {
+        clink::InMemoryStateBackend backend;
+        backend.put(op, clink::StateBackend::KeyView{keyed}, clink::StateBackend::ValueView{"V"});
+        auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(
+            base / std::to_string(idx) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+            snap.bytes,
+            ckpt_id);
+    };
+    write_parent(0, "source_offset_row");
+    write_parent(1, "counter_key");
+    write_parent(2, "sink_handle_row");
+
+    const std::string base_uri = "file://" + base.string();
+    // The three new counter children that land on indices 2, 3 and 4, all
+    // inheriting from the single old counter at 1. Index 2 is the old sink's.
+    for (std::uint32_t idx : {2u, 3u, 4u}) {
+        clink::StateBackendSpec child;
+        child.uri = base_uri;
+        child.subtask_idx = idx;
+        child.restore_uri = base_uri;
+        child.restore_checkpoint_id = ckpt_id;
+        child.restore_from_subtask_idx = 1;
+        child.restore_from_parent_count = 1;
+        (void)clink::StateBackendFactory::default_instance().build(child);
+    }
+
+    // Now the new sink at index 5, inheriting the old sink at index 2.
+    clink::StateBackendSpec sink;
+    sink.uri = base_uri;
+    sink.subtask_idx = 5;
+    sink.restore_uri = base_uri;
+    sink.restore_checkpoint_id = ckpt_id;
+    sink.restore_from_subtask_idx = 2;
+    sink.restore_from_parent_count = 1;
+    auto built = clink::StateBackendFactory::default_instance().build(sink);
+    ASSERT_NE(built.backend, nullptr);
+    ASSERT_TRUE(built.restore_from.has_value())
+        << "the sink restored nothing at all after the operator before it was resized";
+    built.backend->restore(*built.restore_from);
+
+    EXPECT_TRUE(built.backend->get(op, clink::StateBackend::KeyView{"sink_handle_row"}).has_value())
+        << "the sink did not restore its OWN state. A counter child's new global index landed on "
+           "the sink's old directory and overwrote the snapshot the sink had to inherit - for a "
+           "2PC sink that is the commit handle, so a staged transaction becomes uncommittable.";
+    EXPECT_FALSE(built.backend->get(op, clink::StateBackend::KeyView{"counter_key"}).has_value())
+        << "the sink restored the COUNTER's keyed state, which it has no business holding.";
+
+    std::filesystem::remove_all(base);
+}

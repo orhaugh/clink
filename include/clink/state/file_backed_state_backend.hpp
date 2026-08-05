@@ -115,6 +115,23 @@ public:
 
     void restore(const Snapshot& snap, const KeyGroupRange& kg_filter = {}) override {
         const auto t0 = std::chrono::steady_clock::now();
+        // Bytes supplied by the caller are authoritative and are NOT looked for on
+        // disk. That is how a rescale hands over the state stitched from its parent
+        // subtasks: it must not stage those bytes as a file in this subtask's
+        // directory first, because global subtask indices shift when an operator is
+        // resized, so the staging write lands on a directory that still belongs to
+        // another operator - and on the very file that this subtask's siblings are
+        // reading as their own parent. See build_file in state_backend_factory.cpp.
+        // The changelog builder has always passed bytes this way; the file builder
+        // wrote a file instead, and that write was the aliasing.
+        if (!snap.bytes.empty()) {
+            inner_.restore(snap, kg_filter);
+            const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
+            clink::metrics::state::restore_completed("file_backed", static_cast<std::uint64_t>(dt));
+            return;
+        }
         const auto path = path_for(snap.checkpoint_id);
         std::error_code ec;
         if (!std::filesystem::exists(path, ec)) {

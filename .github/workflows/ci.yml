@@ -121,11 +121,26 @@ jobs:
       CCACHE_MAXSIZE: 1500M
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      # Single source of truth for the integration quarantine: the gate
-      # excludes it, the advisory step selects it. One literal, so the two
-      # cannot drift apart - which is exactly what the old pair of
-      # hand-maintained regexes did.
-      IT_QUARANTINE: 'RescaleExactlyOnceTest\.ScalingAKeyedOperatorUpPreservesExactlyOnceOutput'
+      # THE INTEGRATION QUARANTINE IS EMPTY, and the mechanism is gone with it.
+      # The gate below runs the whole label with no exclusion and there is no
+      # advisory arm, so nothing can sit red without failing the build.
+      #
+      # What was in it, and how each left:
+      #   RescaleExactlyOnceTest.ScalingAKeyedOperatorUpPreservesExactlyOnce...
+      #       follow-up 35. Root-caused (F59): a rescale restore staged its
+      #       stitched state into <base>/<subtask idx>, which aliases other
+      #       subtasks' parent snapshots once an operator is resized and global
+      #       indices shift. Fixed by handing the bytes over in memory. Held by
+      #       three deterministic unit tests that fail if the write comes back.
+      #   HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover
+      #       follow-up 31. A sink commit handle landed in the wrong checkpoint;
+      #       fixed and re-verified 40/40 under the load that reproduced it.
+      #   TwoPhaseCommit / WorkerCrashRecovery
+      #       follow-up 16. Worker-registration sleeps became conditions.
+      #
+      # To quarantine something again, reintroduce the variable AND the advisory
+      # step, and open a follow-up item first: an entry without one is a bug in
+      # this file, and an empty regex here would silently exclude every test.
     steps:
       - uses: actions/checkout@v4
       - name: Mark workspace safe for git
@@ -204,10 +219,9 @@ jobs:
         # The multi-process failure/recovery scenarios, built on the
         # deterministic harness in tests/integration/cluster_harness.hpp.
         #
-        # THE DEFAULT IS GATED. This step runs the whole integration label
-        # except an explicit quarantine, so a new test is in the gate the
-        # moment it is written and opting out takes a deliberate, reviewable
-        # edit with a reason.
+        # THE DEFAULT IS GATED. This step runs the whole integration label with
+        # NO exclusion, so a new test is in the gate the moment it is written
+        # and taking one out means editing this file with a reason.
         #
         # It used to be the other way round: the gate named the tests it ran
         # and everything else fell into an advisory step. That default is how
@@ -228,34 +242,6 @@ jobs:
         run: >-
           ctest --test-dir build --output-on-failure --parallel 1 --timeout 300
           -L integration
-          -E "$IT_QUARANTINE"
-      - name: Test (quarantined integration, serial) [advisory]
-        # The quarantine, run so that a test which has silently gone green is
-        # visible rather than forgotten. Every entry needs a follow-up item;
-        # an entry without one is a bug in this file.
-        #
-        #   RescaleExactlyOnceTest.ScalingAKeyedOperatorUpPreservesExactlyOnce...
-        #       follow-up 35. The rescaled job intermittently stops producing
-        #       after the replan - about one run in three under repetition, and
-        #       green on any single run, which is why it was not seen when the
-        #       test was written. Pre-existing: it fails identically with the
-        #       item-31 sink-ordering fix reverted.
-        #
-        # HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover LEFT the
-        # quarantine: item 31 was reproduced under load, root-caused to a sink
-        # commit handle landing in the wrong checkpoint, fixed, and re-verified
-        # 40/40 under the load that reproduced it at iteration 3.
-        #
-        # TwoPhaseCommit and WorkerCrashRecovery left the quarantine once their
-        # worker-registration sleeps became conditions (follow-up 16): two were
-        # simply redundant, since submit_job already waits for free slots, and the
-        # one that guarded a kill now watches the coordinator's own registration
-        # line.
-        continue-on-error: true
-        run: >-
-          ctest --test-dir build --output-on-failure --parallel 1 --timeout 300
-          -L integration
-          -R "$IT_QUARANTINE"
       - name: Upload integration artifacts on failure
         # A multi-process failure with no child logs cannot be diagnosed
         # from a CI transcript. The harness keeps its scratch tree (with
