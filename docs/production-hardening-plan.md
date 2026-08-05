@@ -2121,6 +2121,37 @@ with no exclusion, and hiding a ~1-in-20 state-correctness failure to keep the g
 green is exactly the trade this workstream exists to stop making. The gate will be
 red until this is fixed, which is the honest signal.
 
+**NARROWED DECISIVELY, by instrumentation rather than repetition.** Six mechanisms
+had been eliminated by reading and one by a deterministic test, which left a
+hypothesis space rather than an answer, so the job was made to print what it
+restored. The very next failing label gave:
+
+    RXO-DIAG source restored offset=41
+    RXO-DIAG mismatch key=5 idx=41 got=4 want=3
+             restored_baseline_for_key=4 first_idx_after_open=41
+
+`restored_baseline_for_key` is the value the operator's state held the FIRST time it
+touched that key after opening. At 4, the operator did not count a record twice while
+running: **the restore handed it state that was already ahead.** The source resumed
+correctly at 41 - records 0 to 40 emitted - while the merged keyed state for the SAME
+checkpoint already contained record-41's increment.
+
+That eliminates the whole replay side and locates the defect in the checkpoint CUT:
+at checkpoint N the counter's state includes a record the source's offset says had
+not been emitted, so the two snapshots carrying one checkpoint id do not describe one
+consistent moment. Which is a much sharper statement than "a counter was too high".
+
+The next step is inspection, not inference: dump the four parent snapshots and the
+source's offset row at that checkpoint, find which parent holds key5=4, and work back
+to how that parent's barrier ended up behind the record. `clink state-cat` reads the
+canonical Arrow, which is the same route that cracked the earlier keyed-state-loss
+bug.
+
+The general point is worth more than the bug: five rounds of careful reasoning
+narrowed nothing that one printed number did not settle in a single run. When a
+defect resists inference, the cheapest next move is usually to make the failure
+describe itself.
+
 ### F63. A restart just after a rescale restored by raw index into the old layout
 
 Found by reading while hunting F62, and provable without running anything.
