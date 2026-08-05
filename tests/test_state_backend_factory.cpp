@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/fault/fault_injection.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
 #include "clink/state/file_backed_state_backend.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
@@ -488,4 +489,65 @@ TEST(StateBackendFactory, TheSinkStillRestoresItsOwnStateAfterAnOperatorBeforeIt
         << "the sink restored the COUNTER's keyed state, which it has no business holding.";
 
     std::filesystem::remove_all(base);
+}
+
+// The state.before_restore fault point must fire on EVERY restore this backend
+// performs, whichever source the bytes came from.
+//
+// A regression test for a real regression. The rescale fix above added an early
+// return for caller-supplied bytes, and it went in ABOVE the fault point - so
+// arming `state.before_restore` silently stopped killing anything, and
+// FaultRecoveryTest.WorkerKilledAtTheStateRestorePointIsRedeployed failed on Linux
+// with "the armed worker never reached state.before_restore". The scenario had
+// quietly become a test of nothing.
+//
+// Note precisely what scripts/check-fault-points.sh does and does not buy: it
+// proves a declared point has a CALL SITE somewhere, which it still did. It cannot
+// prove the call site is REACHABLE. Only arming the point and counting hits does
+// that, which is what this test is for. `Observe` counts without perturbing.
+TEST(StateBackendFactory, TheBeforeRestoreFaultPointFiresOnBothRestorePaths) {
+#ifndef CLINK_FAULT_INJECTION
+    GTEST_SKIP() << "built without fault injection";
+#else
+    const auto dir = make_temp_dir("fault_point_reach");
+    const std::uint64_t ckpt_id = 5;
+    const clink::OperatorId op{1};
+
+    clink::InMemoryStateBackend seed;
+    seed.put(op, clink::StateBackend::KeyView{"k"}, clink::StateBackend::ValueView{"v"});
+    const auto snap = seed.snapshot(clink::CheckpointId{ckpt_id});
+
+    // Path 1: bytes on disk, nothing supplied by the caller.
+    {
+        clink::fault::ScopedFault guard;
+        clink::fault::Registry::instance().arm(
+            clink::fault::Rule{.point = std::string{clink::fault::points::kStateBeforeRestore},
+                               .action = clink::fault::Action::Observe});
+        publish_snapshot(
+            dir / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"), snap.bytes, ckpt_id);
+        clink::FileBackedStateBackend backend(dir);
+        backend.restore(clink::Snapshot{clink::CheckpointId{ckpt_id}, {}});
+        EXPECT_EQ(
+            clink::fault::Registry::instance().hits(clink::fault::points::kStateBeforeRestore), 1u)
+            << "the fault point did not fire on the from-disk restore path";
+    }
+
+    // Path 2: bytes supplied by the caller, which is how a rescale hands over
+    // state stitched from its parents. This is the path that regressed.
+    {
+        clink::fault::ScopedFault guard;
+        clink::fault::Registry::instance().arm(
+            clink::fault::Rule{.point = std::string{clink::fault::points::kStateBeforeRestore},
+                               .action = clink::fault::Action::Observe});
+        clink::FileBackedStateBackend backend(dir / "supplied");
+        backend.restore(clink::Snapshot{clink::CheckpointId{ckpt_id}, snap.bytes});
+        EXPECT_EQ(
+            clink::fault::Registry::instance().hits(clink::fault::points::kStateBeforeRestore), 1u)
+            << "the fault point did not fire when the bytes were supplied in memory. An early "
+               "return placed above the point makes every fault armed on it inert, and the "
+               "integration scenario that arms it becomes a test of nothing.";
+    }
+
+    std::filesystem::remove_all(dir);
+#endif
 }

@@ -2076,6 +2076,51 @@ fails if either path stops participating.
 Verified: core 1989/1994 (5 platform skips) and SQL 983/983, the latter because
 two-input operators carry the join paths.
 
+### F62. Scaling a keyed operator DOWN loses and double-counts state, pre-existing
+
+`RescaleExactlyOnceTest.ScalingAKeyedOperatorDownPreservesExactlyOnceOutput` fails
+with the keyed operator's own self-check reporting a counter one too high:
+
+    160 committed lines; 1 MISSING: record-41;
+    1 UNEXPECTED: STATE-MISMATCH-key5-at41-got4-want3
+
+`got4-want3` means one record was counted twice for that key while another was lost.
+The operator knows what its per-key counter should read from the record index, so
+state loss and duplication become an attributable record in the output rather than a
+number nobody printed - which is why this is diagnosable at all.
+
+**Measured, not assumed, and it is NOT a consequence of F59.** Ten runs with
+`state_backend_factory.cpp` and `file_backed_state_backend.hpp` reverted to their
+pre-F59 state: **3 of 10 fail**, with the identical signature
+(`STATE-MISMATCH-key6-at42-got4-want3`, `...key5-at41-got4-want3`). So the defect
+predates today's work.
+
+**F59 improved it substantially without closing it.** Post-fix, 20 consecutive runs
+of all five `RescaleExactlyOnce` cases passed - 100 case-executions including this
+one - and it then failed once in a full-label run. So roughly 1 in 21 observations
+after, against 3 in 10 before. That is consistent with the aliasing write having
+been one cause among more than one: pre-F59, a scale-down read parent directories
+that children of an earlier resize had already overwritten, which would double-count
+exactly like this.
+
+**What is left to find.** Scale-down is the harder direction: one new subtask absorbs
+a contiguous run of parent snapshots and merges them, where scale-up filters one
+parent down to a slice. Two candidates worth checking first, in this order:
+
+1. `merge_snapshot_bytes` over several parents, where a key appears in more than one
+   part. Key groups are supposed to be disjoint across parents, so a key present
+   twice is either the merge or the key-group assignment.
+2. The "other parents" union in `build_file`, which iterates EVERY numeric subdirectory
+   of the restore base and takes operator-state rows from each. Those directories
+   belong to every operator in the job, not only to other parents of this one, so a
+   subtask unions operator rows minted by unrelated operators. Harmless if operator
+   state is keyed strictly by `OperatorId`; worth proving rather than assuming.
+
+Recorded as follow-up 44. **Not quarantined** - the gate now runs the whole label
+with no exclusion, and hiding a ~1-in-20 state-correctness failure to keep the gate
+green is exactly the trade this workstream exists to stop making. The gate will be
+red until this is fixed, which is the honest signal.
+
 ## 3. Work items
 
 Ordered by the brief's priorities. Source locations are where the change

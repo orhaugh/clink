@@ -115,6 +115,15 @@ public:
 
     void restore(const Snapshot& snap, const KeyGroupRange& kg_filter = {}) override {
         const auto t0 = std::chrono::steady_clock::now();
+        // BEFORE the in-memory branch below, deliberately. The point is named
+        // "before restore" and has to fire on every restore this backend performs,
+        // whichever source the bytes come from. It first sat below that branch, and
+        // the branch returns early - so arming state.before_restore stopped killing
+        // anything and FaultRecoveryTest.WorkerKilledAtTheStateRestorePointIsRedeployed
+        // failed with "the armed worker never reached state.before_restore". Note
+        // what check-fault-points.sh can and cannot do: it proves a declared point
+        // has a CALL SITE, not that the call site is still reachable.
+        CLINK_FAULT_POINT(clink::fault::points::kStateBeforeRestore);
         // Bytes supplied by the caller are authoritative and are NOT looked for on
         // disk. That is how a rescale hands over the state stitched from its parent
         // subtasks: it must not stage those bytes as a file in this subtask's
@@ -152,7 +161,6 @@ public:
         // here is what lets the caller fall back to an older checkpoint
         // (latest_valid_checkpoint below) instead of continuing on state
         // nobody certified.
-        CLINK_FAULT_POINT(clink::fault::points::kStateBeforeRestore);
         if (const auto verdict = state::verify_checkpoint(path); !verdict.ok()) {
             if (!state::unverified_checkpoints_allowed(verdict)) {
                 throw state::CheckpointIntegrityError(verdict.status, verdict.detail);

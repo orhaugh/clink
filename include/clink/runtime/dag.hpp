@@ -3973,14 +3973,44 @@ public:
         // - because two sinks on different runner threads cannot both precede one
         // snapshot without a rendezvous that does not exist yet. Recorded as its
         // own follow-up rather than left implicit.
-        bool sink_owns_checkpoint = true;
-        if (chain_sink_owns_checkpoint_) {
-            sink_owns_checkpoint = false;  // a second sink on this chain: see above
+        // A shared flag, not a captured bool, because adding a SECOND sink to this
+        // chain has to be able to revoke the first one's ownership - see below.
+        auto sink_owns_checkpoint = std::make_shared<bool>(true);
+        if (chain_first_sink_owner_) {
+            // A second sink on the same chain. Neither sink can be ordered
+            // correctly here: whichever one snapshots would have to do so after
+            // BOTH have staged their handles, and they run on separate runner
+            // threads with no rendezvous between them. So restore the arrangement
+            // that was in place before this change rather than half-applying new
+            // semantics - re-promote the operator that the first sink demoted, and
+            // revoke the first sink's ownership.
+            //
+            // This is not cosmetic. Leaving the first sink as owner made it the only
+            // element that acked, so the second sink never acked and
+            // CommitGroupAtomicityTest.NoSinkPublishesACheckpointTheOtherAborted saw
+            // one sink publish a checkpoint the other had not: "sink A committed
+            // checkpoints {1}, sink B {1,2}". Follow-up 42 covers doing better.
+            // Reproduce the OLD rule exactly, which was
+            // sink_owns_checkpoint = (chain_checkpoint_owner_ == nullptr):
+            //
+            //   * an operator in the chain -> re-promote it, neither sink owns; or
+            //   * no operator (source -> two sinks) -> BOTH sinks own, as before.
+            //
+            // The second case is itself a double write per barrier, which is the
+            // F61 defect on another path. It is left as it was rather than
+            // "improved" into nobody snapshotting at all, which is what an earlier
+            // cut of this did.
+            if (chain_demoted_operator_owner_) {
+                *sink_owns_checkpoint = false;
+                *chain_first_sink_owner_ = false;
+                *chain_demoted_operator_owner_ = true;
+            }
         } else {
             if (chain_checkpoint_owner_) {
                 *chain_checkpoint_owner_ = false;
+                chain_demoted_operator_owner_ = chain_checkpoint_owner_;
             }
-            chain_sink_owns_checkpoint_ = true;
+            chain_first_sink_owner_ = sink_owns_checkpoint;
         }
 
         detail::OperatorRunner runner;
@@ -4032,7 +4062,7 @@ public:
                     // checkpoint once every subtask has reported.
                     const auto& barrier = maybe->as_barrier();
                     const auto ckpt_id = barrier.id();
-                    if (!sink_owns_checkpoint) {
+                    if (!*sink_owns_checkpoint) {
                         // An upstream operator owns the shared backend's
                         // checkpoint; the sink must not double-snapshot a
                         // delta-commit backend. Run the user hook + terminal
@@ -4457,9 +4487,12 @@ private:
     // adding a later operator flips it false. The cluster builds one Dag per
     // subtask, so this is naturally per-subtask.
     std::shared_ptr<bool> chain_checkpoint_owner_;
-    // Set once a sink on this chain has taken checkpoint ownership, so a fan-out
-    // to a second sink cannot produce two snapshotting elements per barrier.
-    bool chain_sink_owns_checkpoint_{false};
+    // The first sink on this chain to take checkpoint ownership, and the operator
+    // it demoted. Held so that a fan-out to a SECOND sink can undo both: two sinks
+    // cannot both precede one snapshot without a rendezvous, so a multi-sink chain
+    // keeps the pre-existing operator-owner arrangement. See add_sink.
+    std::shared_ptr<bool> chain_first_sink_owner_;
+    std::shared_ptr<bool> chain_demoted_operator_owner_;
     std::vector<BarrierInjector> source_injectors_;
     std::vector<OperatorId> source_ids_;
     // Boundedness recorded at registration, parallel to source_ids_ (BATCH-1).

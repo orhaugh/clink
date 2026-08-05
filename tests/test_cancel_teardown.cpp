@@ -595,3 +595,60 @@ TEST(CancelTeardown, OneCheckpointProducesExactlyOneSnapshotOfASharedBackend) {
                            "delta-commit backend such as RemoteReadBackend requires exactly one.";
     }
 }
+
+// A chain that fans out to TWO sinks keeps the pre-existing arrangement.
+//
+// Neither sink can be ordered correctly: whichever one snapshots would have to do
+// so after BOTH have staged their handles, and they run on separate runner threads
+// with no rendezvous between them (follow-up 42). So the item-36 ownership move
+// applies only to a single-sink chain, and a second sink re-promotes the operator
+// the first one demoted.
+//
+// This is pinned by a test because getting it wrong is not cosmetic and was not
+// hypothetical. Leaving the FIRST sink as owner made it the only element that
+// acked, so the second sink never acked and
+// CommitGroupAtomicityTest.NoSinkPublishesACheckpointTheOtherAborted saw one sink
+// publish a checkpoint the other had not - "sink A committed checkpoints {1}, sink
+// B {1,2}". A later cut then revoked both without re-promoting anything, which
+// leaves NOBODY snapshotting. The assertion below is exactly one writer per
+// checkpoint, which both of those violate in opposite directions.
+TEST(CancelTeardown, ATwoSinkChainStillSnapshotsExactlyOncePerCheckpoint) {
+    auto backend = std::make_shared<SnapshotCountingBackend>();
+    static ChainOrderLog log_a;
+    static ChainOrderLog log_b;
+
+    Dag dag;
+    auto h = dag.add_source<int>(std::make_shared<CancelTeardownEndlessSource>());
+    auto op_h = dag.add_operator<int, int>(
+        h, std::make_shared<MapOperator<int, int>>([](const int& v) { return v; }, "fanout_id"));
+    dag.add_sink<int>(op_h, std::make_shared<ChainedOrderRecordingSink>(&log_a));
+    dag.add_sink<int>(op_h, std::make_shared<ChainedOrderRecordingSink>(&log_b));
+
+    CheckpointCoordinator::Config ccfg;
+    ccfg.interval = std::chrono::milliseconds{25};
+    CheckpointCoordinator coord(backend, ccfg);
+    for (const auto& r : dag.runners()) {
+        coord.register_operator(r.id);
+    }
+    coord.set_source_injectors(dag.source_injectors());
+
+    JobConfig cfg;
+    cfg.state_backend = backend;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.start();
+    coord.start_periodic_trigger();
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    coord.stop_periodic_trigger();
+    exec.cancel();
+    exec.await_termination();
+
+    const auto counts = backend->counts();
+    ASSERT_FALSE(counts.empty()) << "no checkpoint snapshotted at all, so nothing was measured: "
+                                    "with two sinks and an operator, the operator must own it";
+    for (const auto& [id, n] : counts) {
+        EXPECT_EQ(n, 1) << "checkpoint " << id << " snapshotted the shared backend " << n
+                        << " times; a chain must have exactly one writer per barrier. 0 means "
+                           "ownership was revoked from both sinks with nothing re-promoted; 2 "
+                           "means two elements own it.";
+    }
+}
